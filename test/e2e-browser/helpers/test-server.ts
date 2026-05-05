@@ -306,9 +306,8 @@ export class TestServer {
       await fsp.mkdir(freshellDir, { recursive: true })
 
       // Pre-seed config.json so the SetupWizard does not block the UI.
-      // On non-WSL systems (including CI), the client shows a SetupWizard modal
-      // when config.json is missing, blocking all interaction. This minimal config
-      // marks the network as already configured, bypassing the wizard.
+      // Preserve any setupHome-provided config and only ensure the network
+      // bootstrap fields needed for the browser harness are present.
       const configPath = path.join(freshellDir, 'config.json')
       await ensureSetupWizardBypassConfig(configPath)
 
