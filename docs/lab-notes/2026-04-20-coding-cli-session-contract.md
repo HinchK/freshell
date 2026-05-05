@@ -94,7 +94,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
     "opencode": {
       "executable": "opencode",
       "resolvedPath": "/home/user/.opencode/bin/opencode",
-      "version": "1.14.33",
+      "version": "1.14.39",
       "runCommandTemplate": "opencode run <prompt> --format json --dangerously-skip-permissions",
       "serveCommandTemplate": "opencode serve --hostname 127.0.0.1 --port <port>",
       "globalHealthPath": "/global/health",
@@ -287,7 +287,7 @@ command -v opencode
 # /home/user/.opencode/bin/opencode
 
 opencode --version
-# 1.14.33
+# 1.14.39
 ```
 
 Fresh isolated runs were probed with:
@@ -312,7 +312,7 @@ curl http://127.0.0.1:<port>/session/status
 
 Observed control behavior:
 
-- `/global/health` returned a healthy payload with version `1.14.33`.
+- `/global/health` returned a healthy payload with version `1.14.39`.
 - `/session/status` returned `{}` while idle.
 - During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned the same authoritative `sessionID` with `{ "type": "busy" }`.
 
