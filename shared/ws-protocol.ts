@@ -9,6 +9,7 @@
 import { z } from 'zod'
 import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
+import { LiveTerminalHandleSchema, SessionRefSchema } from './session-contract.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -20,6 +21,7 @@ export const ErrorCode = z.enum([
   'UNKNOWN_MESSAGE',
   'INVALID_TERMINAL_ID',
   'INVALID_SESSION_ID',
+  'RESTORE_UNAVAILABLE',
   'PTY_SPAWN_FAILED',
   'FILE_WATCHER_ERROR',
   'INTERNAL_ERROR',
@@ -38,10 +40,8 @@ export const CodingCliProviderSchema = z.string().min(1)
 
 export type CodingCliProviderName = z.infer<typeof CodingCliProviderSchema>
 
-export const SessionLocatorSchema = z.object({
+export const SessionLocatorSchema = SessionRefSchema.extend({
   provider: CodingCliProviderSchema,
-  sessionId: z.string().min(1),
-  serverInstanceId: z.string().min(1).optional(),
 })
 
 export type SessionLocator = z.infer<typeof SessionLocatorSchema>
@@ -201,17 +201,29 @@ export const PingSchema = z.object({
   type: z.literal('ping'),
 })
 
+export const ClientDiagnosticSchema = z.object({
+  type: z.literal('client.diagnostic'),
+  event: z.literal('restore_unavailable'),
+  reason: z.literal('dead_live_handle'),
+  terminalId: z.string().min(1),
+  tabId: z.string().min(1),
+  paneId: z.string().min(1),
+  mode: z.string().min(1),
+  hasSessionRef: z.literal(false),
+})
+
 export const TerminalCreateSchema = z.object({
   type: z.literal('terminal.create'),
   requestId: z.string().min(1),
   mode: z.string().default('shell'),
   shell: ShellSchema.default('system'),
   cwd: z.string().optional(),
-  resumeSessionId: z.string().optional(),
+  sessionRef: SessionLocatorSchema.optional(),
+  liveTerminal: LiveTerminalHandleSchema.optional(),
   restore: z.boolean().optional(),
   tabId: z.string().min(1).optional(),
   paneId: z.string().min(1).optional(),
-})
+}).strict()
 
 export const TerminalAttachIntentSchema = z.enum([
   'viewport_hydrate',
@@ -402,6 +414,7 @@ export type BrowserSdkMessage = z.infer<typeof BrowserSdkMessageSchema>
 export const ClientMessageSchema = z.discriminatedUnion('type', [
   HelloSchema,
   PingSchema,
+  ClientDiagnosticSchema,
   TerminalCreateSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
@@ -462,7 +475,6 @@ export type TerminalCreatedMessage = {
   requestId: string
   terminalId: string
   createdAt: number
-  effectiveResumeSessionId?: string
 }
 
 export type TerminalAttachReadyMessage = {
@@ -483,6 +495,14 @@ export type TerminalExitMessage = {
   type: 'terminal.exit'
   terminalId: string
   exitCode: number
+}
+
+export type TerminalStatusMessage = {
+  type: 'terminal.status'
+  terminalId: string
+  status: 'running' | 'recovering'
+  reason?: string
+  attempt?: number
 }
 
 export type TerminalOutputMessage = {
@@ -512,7 +532,7 @@ export type TerminalTitleUpdatedMessage = {
 export type TerminalSessionAssociatedMessage = {
   type: 'terminal.session.associated'
   terminalId: string
-  sessionId: string
+  sessionRef: SessionLocator
 }
 
 export type TerminalsChangedMessage = {
@@ -726,10 +746,11 @@ export type TerminalInventoryMessage = {
     title: string
     description?: string
     mode: string
-    resumeSessionId?: string
+    sessionRef?: SessionLocator
     createdAt: number
     lastActivityAt: number
     status: 'running' | 'exited'
+    runtimeStatus?: 'running' | 'recovering'
     cwd?: string
   }>
   terminalMeta: TerminalMetaRecord[]
@@ -745,6 +766,7 @@ export type ServerMessage =
   | TerminalAttachReadyMessage
   | TerminalDetachedMessage
   | TerminalExitMessage
+  | TerminalStatusMessage
   | TerminalOutputMessage
   | TerminalOutputGapMessage
   | TerminalTitleUpdatedMessage

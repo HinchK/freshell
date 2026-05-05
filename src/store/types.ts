@@ -1,4 +1,4 @@
-export type TerminalStatus = 'creating' | 'running' | 'exited' | 'error'
+export type TerminalStatus = 'creating' | 'running' | 'recovering' | 'exited' | 'error'
 
 import type {
   AttentionDismiss,
@@ -19,7 +19,7 @@ import type {
   TabAttentionStyle,
   WorktreeGrouping,
 } from '@shared/settings'
-import type { CodingCliProviderName, TokenSummary } from '@shared/ws-protocol'
+import type { CodingCliProviderName, TokenSummary, SessionLocator } from '@shared/ws-protocol'
 export type { CodingCliProviderName }
 
 // TabMode includes 'shell' for regular terminals, plus all coding CLI providers
@@ -56,7 +56,9 @@ export interface Tab {
   mode: TabMode
   shell?: ShellType
   initialCwd?: string
-  resumeSessionId?: string     // Mirrored from pane content on session association; serves as fallback if pane layout is lost
+  sessionRef?: SessionLocator
+  serverInstanceId?: string
+  resumeSessionId?: string     // Legacy migration field; canonical durable identity lives in sessionRef
   sessionMetadataByKey?: Record<string, SessionListMetadata>
   createdAt: number
   updatedAt?: number
@@ -71,9 +73,10 @@ export interface BackgroundTerminal {
   lastActivityAt: number
   cwd?: string
   status: 'running' | 'exited'
+  runtimeStatus?: 'running' | 'recovering'
   hasClients: boolean
   mode?: TabMode
-  resumeSessionId?: string
+  sessionRef?: SessionLocator
 }
 
 export interface CodingCliSession {

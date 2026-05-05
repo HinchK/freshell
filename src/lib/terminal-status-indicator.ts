@@ -4,6 +4,8 @@ export function getTerminalStatusIconClassName(status: TerminalStatus): string {
   switch (status) {
     case 'running':
       return 'text-success'
+    case 'recovering':
+      return 'text-warning'
     case 'exited':
       return 'text-muted-foreground/40'
     case 'error':
@@ -18,6 +20,8 @@ export function getTerminalStatusDotClassName(status: TerminalStatus): string {
   switch (status) {
     case 'running':
       return 'fill-success text-success'
+    case 'recovering':
+      return 'fill-warning text-warning'
     case 'exited':
       return 'text-muted-foreground/40'
     case 'error':

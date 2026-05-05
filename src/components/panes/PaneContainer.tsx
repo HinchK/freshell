@@ -45,6 +45,7 @@ import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { applyPaneRename } from '@/store/titleSync'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
+import type { SessionLocator } from '@shared/ws-protocol'
 
 // Stable empty object to avoid selector memoization issues
 const EMPTY_PANE_TITLES: Record<string, string> = {}
@@ -75,8 +76,8 @@ function resolvePaneRuntimeMeta(
   options: {
     terminalId?: string
     isOnlyPane: boolean
+    sessionRef?: SessionLocator
     provider?: CodingCliProviderName
-    resumeSessionId?: string
     initialCwd?: string
   },
 ): TerminalMetaRecord | undefined {
@@ -85,9 +86,10 @@ function resolvePaneRuntimeMeta(
     if (byTerminalId) return byTerminalId
   }
 
-  if (options.resumeSessionId && options.provider) {
+  const sessionRef = options.sessionRef
+  if (sessionRef && sessionRef.provider && sessionRef.sessionId) {
     return Object.values(terminalMetaById).find((record) => (
-      record.provider === options.provider && record.sessionId === options.resumeSessionId
+      record.provider === sessionRef.provider && record.sessionId === sessionRef.sessionId
     ))
   }
 
@@ -387,9 +389,16 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
               : (tab?.mode !== 'shell' ? tab?.mode : undefined)
           )
         : undefined
-    const paneResumeSessionId =
+    const paneSessionRef =
       node.content.kind === 'terminal'
-        ? (node.content.resumeSessionId || tab?.resumeSessionId)
+        ? (
+            node.content.sessionRef
+            ?? (paneProvider && tab?.sessionRef?.provider === paneProvider
+              ? tab.sessionRef
+              : (paneProvider && tab?.resumeSessionId
+                ? { provider: paneProvider, sessionId: tab.resumeSessionId }
+                : undefined))
+          )
         : undefined
     const paneInitialCwd =
       node.content.kind === 'terminal'
@@ -400,8 +409,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         ? resolvePaneRuntimeMeta(terminalMetaById, {
           terminalId: node.content.terminalId,
           isOnlyPane,
+          sessionRef: paneSessionRef,
           provider: paneProvider,
-          resumeSessionId: paneResumeSessionId,
           initialCwd: paneInitialCwd,
         })
         : node.content.kind === 'agent-chat'

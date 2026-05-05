@@ -13,22 +13,17 @@ export function countPaneLeaves(node: PaneNode | undefined): number {
 function stripPanePayload(content: PaneContent, serverInstanceId: string): Record<string, unknown> {
   switch (content.kind) {
     case 'terminal':
-      {
-        const sessionRef = content.sessionRef
-          || (content.resumeSessionId && content.mode !== 'shell'
-            ? {
-                provider: content.mode,
-                sessionId: content.resumeSessionId,
-                serverInstanceId,
-              }
-            : undefined)
-        return {
-          mode: content.mode,
-          shell: content.shell,
-          resumeSessionId: content.resumeSessionId,
-          sessionRef,
-          initialCwd: content.initialCwd,
-        }
+      return {
+        mode: content.mode,
+        shell: content.shell,
+        sessionRef: content.sessionRef,
+        liveTerminal: content.terminalId
+          ? {
+              terminalId: content.terminalId,
+              serverInstanceId: content.serverInstanceId ?? serverInstanceId,
+            }
+          : undefined,
+        initialCwd: content.initialCwd,
       }
     case 'browser':
       return {
@@ -54,6 +49,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
             : undefined)
         return {
           provider: content.provider,
+          sessionId: content.sessionId,
           resumeSessionId: content.resumeSessionId,
           sessionRef,
           initialCwd: content.initialCwd,

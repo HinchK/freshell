@@ -7,11 +7,22 @@ import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-
 import { logger } from '../../logger.js'
 import {
   CodexAppServerClient,
+  type CodexThreadLifecycleEvent,
   type CodexThreadLifecycleLossEvent,
 } from './client.js'
-import type { CodexInitializeResult, CodexThreadResumeParams, CodexThreadStartParams } from './protocol.js'
+import type {
+  CodexFsWatchResult,
+  CodexInitializeResult,
+  CodexThreadHandle,
+  CodexThreadResumeParams,
+  CodexThreadStartParams,
+} from './protocol.js'
 
 type RuntimeStatus = 'running' | 'stopped'
+
+export type CodexAppServerRuntimeFailureSource =
+  | 'app_server_exit'
+  | 'app_server_client_disconnect'
 
 type WrapperIdentity = {
   commandLine: string[]
@@ -464,6 +475,8 @@ export async function runCodexStartupReaper(
   return result
 }
 
+export const reapOrphanedCodexAppServerSidecarsOnStartup = runCodexStartupReaper
+
 export function assertCodexStartupReaperSucceeded(result: ReapOrphanedSidecarsResult): void {
   const unreapedOwnershipIds = [
     ...result.failedOwnershipIds,
@@ -489,6 +502,10 @@ export class CodexAppServerRuntime {
   private ownershipTeardownFailure: Error | null = null
   private shutdownRequested = false
   private lifecycleLossHandlers = new Set<(event: CodexThreadLifecycleLossEvent) => void>()
+  private readonly exitHandlers = new Set<(error?: Error, source?: CodexAppServerRuntimeFailureSource) => void>()
+  private readonly threadStartedHandlers = new Set<(thread: CodexThreadHandle) => void>()
+  private readonly threadLifecycleHandlers = new Set<(event: CodexThreadLifecycleEvent) => void>()
+  private readonly fsChangedHandlers = new Set<(event: { watchId: string; changedPaths: string[] }) => void>()
 
   private readonly command: string
   private readonly commandArgs: string[]
@@ -590,6 +607,44 @@ export class CodexAppServerRuntime {
     }
   }
 
+  onExit(handler: (error?: Error, source?: CodexAppServerRuntimeFailureSource) => void): () => void {
+    this.exitHandlers.add(handler)
+    return () => {
+      this.exitHandlers.delete(handler)
+    }
+  }
+
+  onThreadStarted(handler: (thread: CodexThreadHandle) => void): () => void {
+    this.threadStartedHandlers.add(handler)
+    return () => {
+      this.threadStartedHandlers.delete(handler)
+    }
+  }
+
+  onThreadLifecycle(handler: (event: CodexThreadLifecycleEvent) => void): () => void {
+    this.threadLifecycleHandlers.add(handler)
+    return () => {
+      this.threadLifecycleHandlers.delete(handler)
+    }
+  }
+
+  onFsChanged(handler: (event: { watchId: string; changedPaths: string[] }) => void): () => void {
+    this.fsChangedHandlers.add(handler)
+    return () => {
+      this.fsChangedHandlers.delete(handler)
+    }
+  }
+
+  async watchPath(targetPath: string, watchId: string): Promise<CodexFsWatchResult> {
+    await this.ensureReady()
+    return this.client!.watchPath(targetPath, watchId)
+  }
+
+  async unwatchPath(watchId: string): Promise<void> {
+    await this.ensureReady()
+    await this.client!.unwatchPath(watchId)
+  }
+
   async shutdown(): Promise<void> {
     this.shutdownRequested = true
     try {
@@ -688,6 +743,27 @@ export class CodexAppServerRuntime {
         client.onThreadLifecycleLoss((event) => {
           for (const handler of this.lifecycleLossHandlers) {
             handler(event)
+          }
+        })
+        client.onThreadStarted((thread) => {
+          for (const handler of this.threadStartedHandlers) {
+            handler(thread)
+          }
+        })
+        client.onThreadLifecycle((event) => {
+          for (const handler of this.threadLifecycleHandlers) {
+            handler(event)
+          }
+        })
+        client.onFsChanged((event) => {
+          for (const handler of this.fsChangedHandlers) {
+            handler(event)
+          }
+        })
+        client.onDisconnect((event) => {
+          if (this.shutdownRequested) return
+          for (const handler of this.exitHandlers) {
+            handler(event.error, 'app_server_client_disconnect')
           }
         })
         this.client = client
@@ -870,6 +946,12 @@ export class CodexAppServerRuntime {
         })
       } else {
         void closeClient
+      }
+
+      if (!this.shutdownRequested) {
+        for (const handler of this.exitHandlers) {
+          handler(undefined, 'app_server_exit')
+        }
       }
     })
   }

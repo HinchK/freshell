@@ -49,6 +49,7 @@ import { parseTrustProxyEnv } from './request-ip.js'
 import { createTabsRegistryStore } from './tabs-registry/store.js'
 import { checkForUpdate, createCachedUpdateChecker } from './updater/version-checker.js'
 import { SessionAssociationCoordinator } from './session-association-coordinator.js'
+import { broadcastTerminalSessionAssociation } from './session-association-broadcast.js'
 import { collectAppliedSessionAssociations } from './session-association-updates.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
 import { createAgentChatCapabilitiesRouter } from './agent-chat-capabilities-router.js'
@@ -377,6 +378,21 @@ async function main() {
   opencodeActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastOpencodeActivityUpdated(payload)
   })
+  opencodeActivity.controller.on('associated', ({ terminalId, sessionId }) => {
+    try {
+      broadcastTerminalSessionAssociation({
+        wsHandler,
+        terminalMetadata,
+        broadcastTerminalMetaUpserts,
+        provider: 'opencode',
+        terminalId,
+        sessionId,
+        source: 'opencode_controller',
+      })
+    } catch (err) {
+      log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
+    }
+  })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
     if (upsert.length === 0) return
@@ -554,17 +570,15 @@ async function main() {
         provider: session.provider,
       }, 'session_bind_applied')
       try {
-        wsHandler.broadcast({
-          type: 'terminal.session.associated' as const,
+        broadcastTerminalSessionAssociation({
+          wsHandler,
+          terminalMetadata,
+          broadcastTerminalMetaUpserts: (upserts) => associationMetaUpserts.push(...upserts),
+          provider: session.provider,
           terminalId,
           sessionId: session.sessionId,
+          source: 'indexer_update',
         })
-        const metaUpsert = terminalMetadata.associateSession(
-          terminalId,
-          session.provider,
-          session.sessionId,
-        )
-        if (metaUpsert) associationMetaUpserts.push(metaUpsert)
       } catch (err) {
         log.warn({ err, terminalId }, 'Failed to broadcast session association')
       }
@@ -641,15 +655,15 @@ async function main() {
       sessionId: session.sessionId,
     }, 'session_bind_applied')
     try {
-      wsHandler.broadcast({
-        type: 'terminal.session.associated' as const,
+      broadcastTerminalSessionAssociation({
+        wsHandler,
+        terminalMetadata,
+        broadcastTerminalMetaUpserts,
+        provider: 'claude',
         terminalId,
         sessionId: session.sessionId,
+        source: 'claude_new_session',
       })
-      const metaUpsert = terminalMetadata.associateSession(terminalId, 'claude', session.sessionId)
-      if (metaUpsert) {
-        broadcastTerminalMetaUpserts([metaUpsert])
-      }
     } catch (err) {
       log.warn({ err, terminalId, sessionId: session.sessionId }, 'Failed to broadcast session association')
     }

@@ -1,10 +1,11 @@
-import { describe, it, expect, vi } from 'vitest'
+import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { TerminalRegistry } from '../../server/terminal-registry'
 import { CodingCliSessionIndexer } from '../../server/coding-cli/session-indexer'
 import { makeSessionKey, type CodingCliSession, type ProjectGroup } from '../../server/coding-cli/types'
 import { SessionAssociationCoordinator } from '../../server/session-association-coordinator'
 import { TerminalMetadataService } from '../../server/terminal-metadata-service'
 import { collectAppliedSessionAssociations } from '../../server/session-association-updates'
+import { recordSessionLifecycleEvent } from '../../server/session-observability'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({
@@ -19,6 +20,10 @@ vi.mock('node-pty', () => ({
 vi.mock('../../server/mcp/config-writer.js', () => ({
   generateMcpInjection: vi.fn(() => ({ args: [], env: {} })),
   cleanupMcpConfig: vi.fn(),
+}))
+
+vi.mock('../../server/session-observability.js', () => ({
+  recordSessionLifecycleEvent: vi.fn(),
 }))
 
 const SESSION_ID_ONE = '550e8400-e29b-41d4-a716-446655440000'
@@ -48,6 +53,10 @@ function createMetadataService() {
 function createIndexer(): CodingCliSessionIndexer {
   return new CodingCliSessionIndexer([])
 }
+
+beforeEach(() => {
+  vi.mocked(recordSessionLifecycleEvent).mockClear()
+})
 
 describe('SessionAssociationCoordinator integration', () => {
   it('associates a Claude terminal created with a human-readable resume name after UUID discovery', () => {
@@ -90,6 +99,36 @@ describe('SessionAssociationCoordinator integration', () => {
     registry.shutdown()
   })
 
+  it('keeps the canonical Claude association stable when the terminal title changes', () => {
+    const registry = new TerminalRegistry()
+    const coordinator = new SessionAssociationCoordinator(registry, 30_000)
+
+    const terminal = registry.create({
+      mode: 'claude',
+      cwd: '/home/user/project',
+    })
+
+    registry.updateTitle(terminal.terminalId, 'Release prep')
+
+    const result = coordinator.associateSingleSession({
+      provider: 'claude',
+      sessionId: SESSION_ID_ONE,
+      projectPath: '/home/user/project',
+      lastActivityAt: Date.now(),
+      cwd: '/home/user/project',
+    })
+
+    expect(result).toEqual({ associated: true, terminalId: terminal.terminalId })
+    expect(registry.get(terminal.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
+
+    registry.updateTitle(terminal.terminalId, 'Renamed after attach')
+
+    expect(registry.get(terminal.terminalId)?.title).toBe('Renamed after attach')
+    expect(registry.get(terminal.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
+
+    registry.shutdown()
+  })
+
   it('does not heuristically associate codex sessions', () => {
     const registry = new TerminalRegistry()
     const coordinator = new SessionAssociationCoordinator(registry, 30_000)
@@ -109,6 +148,77 @@ describe('SessionAssociationCoordinator integration', () => {
     expect(result).toEqual({ associated: false, reason: 'provider_managed' })
     expect(registry.get(terminal.terminalId)?.resumeSessionId).toBeUndefined()
     expect(onBound).not.toHaveBeenCalled()
+
+    registry.shutdown()
+  })
+
+  it('records a lifecycle event when Codex durable identity is explicitly bound', () => {
+    const registry = new TerminalRegistry()
+    const terminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+
+    registry.rebindSession(terminal.terminalId, 'codex', 'codex-thread-1', 'association')
+
+    expect(recordSessionLifecycleEvent).toHaveBeenCalledWith({
+      kind: 'terminal_session_bound',
+      provider: 'codex',
+      terminalId: terminal.terminalId,
+      sessionId: 'codex-thread-1',
+      reason: 'association',
+    })
+
+    registry.shutdown()
+  })
+
+  it('records a lifecycle warning when a Codex terminal exits before durable identity exists', () => {
+    const registry = new TerminalRegistry()
+    const terminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+    const pty = terminal.pty as unknown as { onExit: ReturnType<typeof vi.fn> }
+    const onExit = pty.onExit.mock.calls[0][0]
+
+    onExit({ exitCode: 0, signal: 0 })
+
+    expect(recordSessionLifecycleEvent).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'terminal_exit_without_durable_session',
+      terminalId: terminal.terminalId,
+      mode: 'codex',
+      exitCode: 0,
+      reason: 'pty_exit',
+    }))
+
+    registry.shutdown()
+  })
+
+  it('records a lifecycle event when the Codex sidecar reports durable identity', () => {
+    let onDurableSession: ((sessionId: string) => void) | undefined
+    const sidecar = {
+      attachTerminal: vi.fn((callbacks: { onDurableSession: (sessionId: string) => void }) => {
+        onDurableSession = callbacks.onDurableSession
+      }),
+      shutdown: vi.fn(async () => undefined),
+    }
+    const registry = new TerminalRegistry()
+    const terminal = registry.create({
+      mode: 'codex',
+      cwd: '/home/user/project',
+      codexSidecar: sidecar,
+    })
+
+    onDurableSession?.('codex-thread-1')
+    onDurableSession?.('codex-thread-1')
+
+    const durableObservationCalls = vi.mocked(recordSessionLifecycleEvent).mock.calls.filter(([event]) =>
+      event.kind === 'codex_durable_session_observed'
+    )
+    expect(durableObservationCalls).toEqual([[
+      {
+        kind: 'codex_durable_session_observed',
+        provider: 'codex',
+        terminalId: terminal.terminalId,
+        sessionId: 'codex-thread-1',
+        generation: 1,
+        source: 'sidecar',
+      },
+    ]])
 
     registry.shutdown()
   })
@@ -216,7 +326,10 @@ describe('Session-Terminal metadata broadcasts', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
 
       const associatedMeta = metadata.associateSession(term.terminalId, 'claude', session.sessionId)
@@ -255,7 +368,10 @@ describe('Session-Terminal metadata broadcasts', () => {
     expect(broadcasts).toContainEqual({
       type: 'terminal.session.associated',
       terminalId: terminal.terminalId,
-      sessionId: SESSION_ID_TWO,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: SESSION_ID_TWO,
+      },
     })
 
     const latestMeta = broadcasts.filter((m) => m.type === 'terminal.meta.updated').at(-1)
@@ -294,7 +410,10 @@ describe('Session-Terminal Association Integration', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
     })
 
@@ -321,7 +440,10 @@ describe('Session-Terminal Association Integration', () => {
     expect(broadcasts[0]).toEqual({
       type: 'terminal.session.associated',
       terminalId: term.terminalId,
-      sessionId: SESSION_ID_ONE,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: SESSION_ID_ONE,
+      },
     })
 
     // Cleanup
@@ -379,7 +501,10 @@ describe('Session-Terminal Association Integration', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
     })
 
@@ -423,7 +548,10 @@ describe('Session-Terminal Association Integration', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
     })
 
@@ -462,9 +590,15 @@ describe('Session-Terminal Association Integration', () => {
     // Two broadcasts total, one per terminal
     expect(broadcasts).toHaveLength(2)
     expect(broadcasts[0].terminalId).toBe(term1.terminalId)
-    expect(broadcasts[0].sessionId).toBe(SESSION_ID_ONE)
+    expect(broadcasts[0].sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: SESSION_ID_ONE,
+    })
     expect(broadcasts[1].terminalId).toBe(term2.terminalId)
-    expect(broadcasts[1].sessionId).toBe(SESSION_ID_THREE)
+    expect(broadcasts[1].sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: SESSION_ID_THREE,
+    })
 
     // Cleanup
     registry.shutdown()
@@ -596,7 +730,10 @@ describe('Session-Terminal Association Platform-specific', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
     })
 
@@ -617,7 +754,10 @@ describe('Session-Terminal Association Platform-specific', () => {
     // Should match after normalization removes trailing slash
     expect(broadcasts).toHaveLength(1)
     expect(broadcasts[0].terminalId).toBe(term.terminalId)
-    expect(broadcasts[0].sessionId).toBe(SESSION_ID_SEVEN)
+    expect(broadcasts[0].sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: SESSION_ID_SEVEN,
+    })
 
     registry.shutdown()
   })
@@ -637,7 +777,10 @@ describe('Session-Terminal Association Platform-specific', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId: term.terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: session.sessionId,
+        },
       })
     })
 
@@ -681,7 +824,10 @@ describe('Session-Terminal Association via onUpdate', () => {
       broadcasts.push({
         type: 'terminal.session.associated',
         terminalId,
-        sessionId: session.sessionId,
+        sessionRef: {
+          provider: session.provider,
+          sessionId: session.sessionId,
+        },
       })
     }
   }

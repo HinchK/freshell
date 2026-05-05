@@ -27,6 +27,7 @@ import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 import type { CodexLaunchPlan, CodexLaunchSidecar } from './coding-cli/codex-app-server/launch-planner.js'
 import { isCodexSidecarTeardownError } from './coding-cli/codex-app-server/launch-planner.js'
 import { collectShutdownFailures, throwShutdownFailures } from './shutdown-join.js'
+import { recordSessionLifecycleEvent } from './session-observability.js'
 
 const MAX_WS_BUFFERED_AMOUNT = Number(process.env.MAX_WS_BUFFERED_AMOUNT || 2 * 1024 * 1024)
 const DEFAULT_MAX_SCROLLBACK_CHARS = Number(process.env.MAX_SCROLLBACK_CHARS || 512 * 1024)
@@ -1150,6 +1151,26 @@ export class TerminalRegistry extends EventEmitter {
     return n
   }
 
+  private recordTerminalExitWithoutDurableSession(
+    record: TerminalRecord,
+    exitCode: number | undefined,
+    reason: 'pty_exit' | 'user_final_close',
+  ): void {
+    if (record.mode === 'shell' || record.resumeSessionId) {
+      return
+    }
+    const ptyPid = record.pty.pid
+    recordSessionLifecycleEvent({
+      kind: 'terminal_exit_without_durable_session',
+      terminalId: record.terminalId,
+      mode: record.mode,
+      exitCode: exitCode ?? 0,
+      ageMs: Math.max(0, Date.now() - record.createdAt),
+      reason,
+      ...(ptyPid ? { ptyPid } : {}),
+    })
+  }
+
   private reapExitedTerminals(): void {
     const max = this.maxExitedTerminals
     if (!max || max <= 0) return
@@ -1391,6 +1412,7 @@ export class TerminalRegistry extends EventEmitter {
       record.pendingSnapshotClients.clear()
       this.releaseBinding(terminalId, 'exit')
       this.emit('terminal.exit', { terminalId, exitCode: e.exitCode })
+      this.recordTerminalExitWithoutDurableSession(record, e.exitCode, 'pty_exit')
       void this.releaseCodexSidecar(record).catch(() => undefined)
       this.reapExitedTerminals()
     })
@@ -1905,6 +1927,7 @@ export class TerminalRegistry extends EventEmitter {
     term.pendingSnapshotClients.clear()
     this.releaseBinding(terminalId, 'exit')
     this.emit('terminal.exit', { terminalId, exitCode: term.exitCode })
+    this.recordTerminalExitWithoutDurableSession(term, term.exitCode, 'user_final_close')
     void this.releaseCodexSidecar(term).catch(() => undefined)
     this.reapExitedTerminals()
     return true
@@ -2540,6 +2563,13 @@ export class TerminalRegistry extends EventEmitter {
       sessionId: normalized,
       reason,
     } satisfies TerminalSessionBoundEvent)
+    recordSessionLifecycleEvent({
+      kind: 'terminal_session_bound',
+      terminalId,
+      provider,
+      sessionId: normalized,
+      reason,
+    })
     return { ok: true, terminalId, sessionId: normalized }
   }
 
