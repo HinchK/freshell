@@ -74,7 +74,7 @@ Initial migration queue:
 | #323 | Current PR head | `dev` branch workflow, launch guardrails, and queue tooling |
 | #321 | `7eae9acf13d2ecf36de6ecade8354cb22b944f7b` | Sidebar reopen corner behavior |
 | #309 | `93c0e15f8b3e04d7e1bbd8ab312619ae28cfefa2` | Codex startup cwd fix |
-| #319 | `a66568daf0dfd0dd447cc217d6f4c39d1cf22398` | OpenCode native scroll behavior |
+| #319 | `48927eef6b46a2232ebe31d1e1dea38d2203eb72` | OpenCode native scroll behavior |
 | #322 | `0a334be42553929aed033c3aa3920d0bf58a2a65` | Replacement for externally-owned factory terminal orchestration PR |
 
 Initial migration exclusions:
