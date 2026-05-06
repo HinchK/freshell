@@ -58,6 +58,15 @@ npm run dev:queue -- plan --prs 321,309,319
 
 The queue script must fail if a PR is draft, closed, not targeting `main`, or cannot be applied cleanly. Fix PR branches before rebuilding `dev`.
 
+To rebuild local `dev`:
+
+```bash
+git switch dev
+npm run dev:queue -- assemble --prs 321,309,319
+```
+
+Use replacement PR numbers instead of external or superseded PRs. If the script stops on a conflict, do not resolve the conflict on `dev`. Abort the merge, fix the PR branch, and rerun the queue.
+
 ## Local Main Realignment
 
 Only realign local `main` after Freshell is self-hosting from `dev`, the user has explicitly approved the reset, and the intentional OpenCode notification-argument removal has been preserved in an open PR that is included in `dev` or confirmed already present in a selected pending PR.
