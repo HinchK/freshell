@@ -53,7 +53,7 @@ Use an explicit queue. Do not blindly apply every open PR.
 Example:
 
 ```bash
-npm run dev:queue -- plan --prs 321,309,319
+npm run dev:queue -- plan --prs 323,321,309,319,322
 ```
 
 The queue script must fail if a PR is draft, closed, not targeting `main`, or cannot be applied cleanly. Fix PR branches before rebuilding `dev`.
@@ -62,10 +62,27 @@ To rebuild local `dev`:
 
 ```bash
 git switch dev
-npm run dev:queue -- assemble --prs 321,309,319
+npm run dev:queue -- assemble --prs 323,321,309,319,322
 ```
 
 Use replacement PR numbers instead of external or superseded PRs. If the script stops on a conflict, do not resolve the conflict on `dev`. Abort the merge, fix the PR branch, and rerun the queue.
+
+Initial migration queue:
+
+| PR | Head SHA | Purpose |
+| --- | --- | --- |
+| #323 | Current PR head | `dev` branch workflow, launch guardrails, and queue tooling |
+| #321 | `7eae9acf13d2ecf36de6ecade8354cb22b944f7b` | Sidebar reopen corner behavior |
+| #309 | `93c0e15f8b3e04d7e1bbd8ab312619ae28cfefa2` | Codex startup cwd fix |
+| #319 | `a66568daf0dfd0dd447cc217d6f4c39d1cf22398` | OpenCode native scroll behavior |
+| #322 | `0a334be42553929aed033c3aa3920d0bf58a2a65` | Replacement for externally-owned factory terminal orchestration PR |
+
+Initial migration exclusions:
+
+| PR | Head SHA | Reason |
+| --- | --- | --- |
+| #297 | `8cad328c158a6b33d9779ce1748bfe725ecd0d1c` | Externally-owned and superseded by #322 |
+| #289 | `4e4782699adadc3e006b96143f6ead6bda8b136d` | Draft approval artifact |
 
 ## Local Main Realignment
 
