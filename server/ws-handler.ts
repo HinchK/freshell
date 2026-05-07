@@ -4,6 +4,7 @@ import { nanoid } from 'nanoid'
 import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
+import { recordSessionLifecycleEvent } from './session-observability.js'
 import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { buildFreshellTerminalEnv, modeSupportsResume } from './terminal-registry.js'
@@ -54,6 +55,7 @@ import {
   OpencodeActivityUpdatedSchema,
   HelloSchema,
   PingSchema,
+  ClientDiagnosticSchema,
   TerminalAttachSchema,
   TerminalDetachSchema,
   TerminalInputSchema,
@@ -509,6 +511,7 @@ export class WsHandler {
     this.clientMessageSchema = z.discriminatedUnion('type', [
       HelloSchema,
       PingSchema,
+      ClientDiagnosticSchema,
       dynamicTerminalCreateSchema,
       TerminalAttachSchema,
       TerminalDetachSchema,
@@ -1325,6 +1328,13 @@ export class WsHandler {
       err: error instanceof Error ? error : new Error(String(error)),
       sessionId,
     }, 'sdk restore history resolution failed')
+    recordSessionLifecycleEvent({
+      kind: 'client_restore_unavailable',
+      sessionId,
+      connectionId: ws.connectionId || 'unknown',
+      reason: 'restore_internal',
+      hasSessionRef: true,
+    })
     this.send(ws, {
       type: 'sdk.error',
       sessionId,
@@ -1812,6 +1822,21 @@ export class WsHandler {
       }
 
       switch (m.type) {
+      case 'client.diagnostic': {
+        if (m.event === 'restore_unavailable') {
+          recordSessionLifecycleEvent({
+            kind: 'client_restore_unavailable',
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId || 'unknown',
+            ...(m.tabId ? { tabId: m.tabId } : {}),
+            ...(m.paneId ? { paneId: m.paneId } : {}),
+            mode: m.mode,
+            reason: m.reason,
+            hasSessionRef: m.hasSessionRef,
+          })
+        }
+        return
+      }
       case 'ui.screenshot.result': {
         const pending = this.screenshotRequests.get(m.requestId)
         if (!pending) return
@@ -1865,6 +1890,18 @@ export class WsHandler {
           mode: m.mode,
           sessionRef: requestedSessionRef,
         }, '[TRACE sessionRef] terminal.create received')
+        recordSessionLifecycleEvent({
+          kind: 'terminal_create_requested',
+          requestId: m.requestId,
+          connectionId: ws.connectionId || 'unknown',
+          ...(m.tabId ? { tabId: m.tabId } : {}),
+          ...(m.paneId ? { paneId: m.paneId } : {}),
+          ...(m.cwd ? { cwd: m.cwd } : {}),
+          mode: m.mode as TerminalMode,
+          restoreRequested,
+          hasRequestedSessionRef: !!requestedSessionRef,
+          ...(canonicalSessionId ? { requestedSessionId: canonicalSessionId } : {}),
+        })
         const endCreateTimer = startPerfTimer(
           'terminal_create',
           { connectionId: ws.connectionId, mode: m.mode, shell: m.shell },
@@ -1909,9 +1946,16 @@ export class WsHandler {
                 return true
               }
 
+              const recordHasSessionRef = (record: unknown): boolean => {
+                const maybeRecord = record as { sessionRef?: { sessionId?: unknown }; resumeSessionId?: unknown } | null | undefined
+                return typeof maybeRecord?.sessionRef?.sessionId === 'string'
+                  || typeof maybeRecord?.resumeSessionId === 'string'
+              }
+
               const attachReusedTerminal = async (
                 reusedTerminalId: string,
                 createdAt: number,
+                hasSessionRef = false,
               ): Promise<boolean> => {
                 const sent = await sendCreateResult({
                   ws,
@@ -1926,6 +1970,18 @@ export class WsHandler {
                 this.rememberCreatedRequestId(m.requestId, reusedTerminalId)
                 terminalId = reusedTerminalId
                 reused = true
+                recordSessionLifecycleEvent({
+                  kind: 'terminal_created',
+                  requestId: m.requestId,
+                  connectionId: ws.connectionId || 'unknown',
+                  terminalId: reusedTerminalId,
+                  ...(m.tabId ? { tabId: m.tabId } : {}),
+                  ...(m.paneId ? { paneId: m.paneId } : {}),
+                  ...(m.cwd ? { cwd: m.cwd } : {}),
+                  mode: m.mode as TerminalMode,
+                  reused: true,
+                  hasSessionRef,
+                })
                 this.broadcastTerminalsChanged()
                 return true
               }
@@ -1939,7 +1995,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
                 // If it no longer exists, fall through and create a new one.
@@ -1950,7 +2006,7 @@ export class WsHandler {
               if (localLiveTerminalId) {
                 const liveTerminal = this.registry.get(localLiveTerminalId)
                 if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
-                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt)
+                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, recordHasSessionRef(liveTerminal))
                   return
                 }
               }
@@ -1971,7 +2027,7 @@ export class WsHandler {
                   )
                 }
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
               }
@@ -1991,7 +2047,7 @@ export class WsHandler {
                 }
                 const existing = this.registry.get(existingAfterConfigId)
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
                 state.createdByRequestId.delete(m.requestId)
@@ -2018,7 +2074,7 @@ export class WsHandler {
               if (localLiveTerminalId) {
                 const liveTerminal = this.registry.get(localLiveTerminalId)
                 if (liveTerminal?.status === 'running' && liveTerminal.mode === m.mode) {
-                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt)
+                  await attachReusedTerminal(liveTerminal.terminalId, liveTerminal.createdAt, recordHasSessionRef(liveTerminal))
                   return
                 }
               }
@@ -2039,7 +2095,7 @@ export class WsHandler {
                   )
                 }
                 if (existing) {
-                  await attachReusedTerminal(existing.terminalId, existing.createdAt)
+                  await attachReusedTerminal(existing.terminalId, existing.createdAt, recordHasSessionRef(existing))
                   return
                 }
               }
@@ -2193,6 +2249,32 @@ export class WsHandler {
                   return
                 }
 
+                const observedCodexSessionId = m.mode === 'codex'
+                  ? codexPlan?.sessionId ?? requestedCodexResumeSessionId
+                  : undefined
+                if (observedCodexSessionId) {
+                  recordSessionLifecycleEvent({
+                    kind: 'codex_durable_session_observed',
+                    provider: 'codex',
+                    terminalId: record.terminalId,
+                    sessionId: observedCodexSessionId,
+                    generation: 0,
+                    source: 'sidecar',
+                  })
+                }
+                recordSessionLifecycleEvent({
+                  kind: 'terminal_created',
+                  requestId: m.requestId,
+                  connectionId: ws.connectionId || 'unknown',
+                  terminalId: record.terminalId,
+                  ...(m.tabId ? { tabId: m.tabId } : {}),
+                  ...(m.paneId ? { paneId: m.paneId } : {}),
+                  ...(m.cwd ? { cwd: m.cwd } : {}),
+                  mode: m.mode as TerminalMode,
+                  reused: false,
+                  hasSessionRef: !!observedCodexSessionId || !!restoreSessionId || !!requestedSessionRef,
+                })
+
                 // Notify all clients that list changed
                 this.broadcastTerminalsChanged()
               } catch (error) {
@@ -2222,10 +2304,22 @@ export class WsHandler {
       case 'terminal.attach': {
         const record = this.registry.get(m.terminalId)
         if (!record) {
+          recordSessionLifecycleEvent({
+            kind: 'invalid_terminal_id_without_session_ref',
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId || 'unknown',
+            operation: 'terminal.attach',
+          })
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
           return
         }
         if (record.status !== 'running') {
+          recordSessionLifecycleEvent({
+            kind: 'invalid_terminal_id_without_session_ref',
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId || 'unknown',
+            operation: 'terminal.attach',
+          })
           this.sendError(ws, {
             code: 'INVALID_TERMINAL_ID',
             message: formatExitedTerminalAttachMessage(record),
@@ -2247,6 +2341,12 @@ export class WsHandler {
         if (attachResult === 'missing') {
           const latestRecord = this.registry.get(m.terminalId)
           if (latestRecord && latestRecord.status !== 'running') {
+            recordSessionLifecycleEvent({
+              kind: 'invalid_terminal_id_without_session_ref',
+              terminalId: m.terminalId,
+              connectionId: ws.connectionId || 'unknown',
+              operation: 'terminal.attach',
+            })
             this.sendError(ws, {
               code: 'INVALID_TERMINAL_ID',
               message: formatExitedTerminalAttachMessage(latestRecord),
@@ -2254,6 +2354,12 @@ export class WsHandler {
             })
             return
           }
+          recordSessionLifecycleEvent({
+            kind: 'invalid_terminal_id_without_session_ref',
+            terminalId: m.terminalId,
+            connectionId: ws.connectionId || 'unknown',
+            operation: 'terminal.attach',
+          })
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
@@ -2266,6 +2372,14 @@ export class WsHandler {
         const ok = this.terminalStreamBroker.detach(m.terminalId, ws)
         state.attachedTerminalIds.delete(m.terminalId)
         if (!ok) {
+          if (!this.registry.get(m.terminalId)) {
+            recordSessionLifecycleEvent({
+              kind: 'invalid_terminal_id_without_session_ref',
+              terminalId: m.terminalId,
+              connectionId: ws.connectionId || 'unknown',
+              operation: 'terminal.detach',
+            })
+          }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
@@ -2276,6 +2390,15 @@ export class WsHandler {
       case 'terminal.input': {
         const ok = this.registry.input(m.terminalId, m.data)
         if (!ok) {
+          if (!this.registry.get(m.terminalId)) {
+            recordSessionLifecycleEvent({
+              kind: 'invalid_terminal_id_without_session_ref',
+              terminalId: m.terminalId,
+              connectionId: ws.connectionId || 'unknown',
+              operation: 'terminal.input',
+              attemptedInputBytes: Buffer.byteLength(m.data),
+            })
+          }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
         }
         return
@@ -2284,6 +2407,14 @@ export class WsHandler {
       case 'terminal.resize': {
         const ok = this.registry.resize(m.terminalId, m.cols, m.rows)
         if (!ok) {
+          if (!this.registry.get(m.terminalId)) {
+            recordSessionLifecycleEvent({
+              kind: 'invalid_terminal_id_without_session_ref',
+              terminalId: m.terminalId,
+              connectionId: ws.connectionId || 'unknown',
+              operation: 'terminal.resize',
+            })
+          }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
         }
         return
@@ -2292,6 +2423,14 @@ export class WsHandler {
       case 'terminal.kill': {
         const ok = this.registry.kill(m.terminalId)
         if (!ok) {
+          if (!this.registry.get(m.terminalId)) {
+            recordSessionLifecycleEvent({
+              kind: 'invalid_terminal_id_without_session_ref',
+              terminalId: m.terminalId,
+              connectionId: ws.connectionId || 'unknown',
+              operation: 'terminal.kill',
+            })
+          }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Unknown terminalId', terminalId: m.terminalId })
           return
         }
@@ -2897,6 +3036,13 @@ export class WsHandler {
             return
           }
           if (resolved?.kind === 'missing') {
+            recordSessionLifecycleEvent({
+              kind: 'client_restore_unavailable',
+              sessionId: m.sessionId,
+              connectionId: ws.connectionId || 'unknown',
+              reason: 'restore_not_found',
+              hasSessionRef: true,
+            })
             this.send(ws, {
               type: 'sdk.error',
               sessionId: m.sessionId,
@@ -2977,6 +3123,13 @@ export class WsHandler {
           }
           if (snapshotResult?.kind === 'missing') {
             attachSubscriptionOff?.()
+            recordSessionLifecycleEvent({
+              kind: 'client_restore_unavailable',
+              sessionId: m.sessionId,
+              connectionId: ws.connectionId || 'unknown',
+              reason: 'restore_not_found',
+              hasSessionRef: true,
+            })
             this.send(ws, {
               type: 'sdk.error',
               sessionId: m.sessionId,

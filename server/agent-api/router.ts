@@ -65,6 +65,7 @@ async function resolveSpawnProviderSettings(
     envContext?: TerminalEnvContext
     sessionRef?: SessionRef
     codexLaunchPlanner?: CodexLaunchPlanner
+    assertTerminalCreateAccepted?: () => void
   } = {},
 ): Promise<{
   sessionRef?: SessionRef
@@ -78,6 +79,7 @@ async function resolveSpawnProviderSettings(
   codexLaunchFactory?: CodexLaunchFactory
 }> {
   const providerSettings = await resolveProviderSettings(mode, configStore, overrides)
+  opts.assertTerminalCreateAccepted?.()
   const sessionRef = opts.sessionRef?.provider === mode ? opts.sessionRef : undefined
   if (mode === 'codex') {
     if (!opts.codexLaunchPlanner) {
@@ -363,6 +365,7 @@ export function createAgentApiRouter({
               envContext: { tabId, paneId },
               sessionRef: requestedSessionRef,
               codexLaunchPlanner,
+              assertTerminalCreateAccepted: assertTerminalAdmission,
             },
           )
           unownedCodexSidecar = launch.codexSidecar
@@ -387,6 +390,7 @@ export function createAgentApiRouter({
               envContext: { tabId, paneId },
               sessionRef: requestedSessionRef,
               codexLaunchPlanner,
+              assertTerminalCreateAccepted: assertTerminalAdmission,
             },
           )
         }
@@ -767,6 +771,7 @@ export function createAgentApiRouter({
           terminalId: preallocatedTerminalId,
           envContext: { tabId, paneId },
           codexLaunchPlanner,
+          assertTerminalCreateAccepted: assertTerminalAdmission,
         })
         unownedCodexSidecar = launch.codexSidecar
         const created = layoutStore.createTab?.({ title, terminalId: preallocatedTerminalId, tabId, paneId })
@@ -780,6 +785,7 @@ export function createAgentApiRouter({
           cwd,
           envContext: { tabId, paneId },
           codexLaunchPlanner,
+          assertTerminalCreateAccepted: assertTerminalAdmission,
         })
       }
       unownedCodexSidecar = launch.codexSidecar
@@ -886,6 +892,7 @@ export function createAgentApiRouter({
             envContext: { tabId, paneId: newPaneId },
             sessionRef: resolveRequestedSessionRef(splitMode, req.body?.sessionRef),
             codexLaunchPlanner,
+            assertTerminalCreateAccepted: assertTerminalAdmission,
           },
         )
         unownedCodexSidecar = launch.codexSidecar
@@ -1115,6 +1122,7 @@ export function createAgentApiRouter({
           envContext: { tabId, paneId },
           sessionRef: resolveRequestedSessionRef(effectiveMode, req.body?.sessionRef),
           codexLaunchPlanner,
+          assertTerminalCreateAccepted: assertTerminalAdmission,
         },
       )
       unownedCodexSidecar = launch.codexSidecar
