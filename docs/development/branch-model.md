@@ -67,7 +67,9 @@ npm run dev:queue -- assemble --prs 323,321,309,319,324,326,325,322
 
 Use replacement PR numbers instead of external or superseded PRs. If the script stops on a conflict, do not resolve the conflict on `dev`. Abort the merge, fix the PR branch, and rerun the queue.
 
-Initial migration queue:
+Current `dev` queue snapshot:
+
+Refresh this list before rebuilding `dev`; PR heads may move as branches are amended.
 
 | PR | Head SHA | Purpose |
 | --- | --- | --- |
@@ -80,18 +82,18 @@ Initial migration queue:
 | #325 | Current PR head | Intentional removal of broken Codex notification launch args |
 | #322 | Current PR head | Replacement for externally-owned factory terminal orchestration PR |
 
-Initial migration exclusions:
+Current queue exclusions:
 
 | PR | Head SHA | Reason |
 | --- | --- | --- |
 | #297 | `8cad328c158a6b33d9779ce1748bfe725ecd0d1c` | Externally-owned and superseded by #322 |
 | #289 | `4e4782699adadc3e006b96143f6ead6bda8b136d` | Draft approval artifact |
 
-## Local Main Realignment
+## Local Main Mirror
 
-Only realign local `main` after Freshell is self-hosting from `dev`, the user has explicitly approved the reset, and the intentional OpenCode notification-argument removal has been preserved in an open PR that is included in `dev` or confirmed already present in a selected pending PR.
+Local `main` is a read-only mirror of `origin/main`. It should contain no local-only work and should not host the running Freshell server.
 
-The intended final state is:
+Do not commit to, merge into, or fast-forward local `main` during ordinary development. If the user explicitly asks to refresh the mirror, first verify Freshell is self-hosting from local `dev`, then use:
 
 ```bash
 git switch main
@@ -99,4 +101,4 @@ git fetch origin
 git reset --hard origin/main
 ```
 
-Do not run that command during ordinary development. It belongs only to the migration task that realigns local `main` after self-hosting has moved to `dev`.
+Only run this when preserving local `main` history is not required.

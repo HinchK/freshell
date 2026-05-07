@@ -37,7 +37,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - If a change is needed on `dev`, create or update a PR against `origin/main`, then apply that PR head to `dev`.
 - If applying a PR to `dev` needs semantic conflict resolution, stop and fix the PR branch or create a replacement PR. Do not hide behavior changes in a local-only `dev` merge commit.
 - Never run `git merge` directly on `main`.
-- Never reset, force-push, or fast-forward local `main` unless the user explicitly asks to realign it to `origin/main`, the running server is no longer using `main`, and the intentional OpenCode notification-argument removal has been preserved in a PR that is included in `dev`.
+- Never reset, force-push, or fast-forward local `main` during ordinary work. If the user explicitly asks to refresh the mirror, first verify Freshell is self-hosting from `dev` and local `main` has no work to preserve.
 - We cannot approve our own PRs. `dev` may contain unapproved pending work, but `origin/main` changes still require independent review.
 
 ## Process Safety (CRITICAL)
