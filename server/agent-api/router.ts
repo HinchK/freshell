@@ -16,9 +16,28 @@ import { ok, approx, fail } from './response.js'
 import { renderCapture } from './capture.js'
 import { waitForMatch } from './wait-for.js'
 import { resolveScreenshotOutputPath } from './screenshot-path.js'
+import { sanitizeSessionRef, type SessionRef } from '../../shared/session-contract.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
+
+function buildSessionRef(provider: unknown, sessionId: unknown): SessionRef | undefined {
+  if (typeof provider !== 'string' || provider === 'shell') return undefined
+  if (typeof sessionId !== 'string' || !sessionId) return undefined
+  return sanitizeSessionRef({ provider, sessionId })
+}
+
+function resolveTerminalSessionRef({
+  sessionRef,
+  mode,
+  resumeSessionId,
+}: {
+  sessionRef?: unknown
+  mode?: unknown
+  resumeSessionId?: unknown
+}): SessionRef | undefined {
+  return sanitizeSessionRef(sessionRef) ?? buildSessionRef(mode, resumeSessionId)
+}
 
 function agentRouteErrorStatus(error: unknown): number {
   return error instanceof CodexLaunchConfigError ? 400 : 500
@@ -324,9 +343,10 @@ export function createAgentApiRouter({
     const meta = terminalId
       ? terminalMetadata?.list?.().find((entry) => entry.terminalId === terminalId)
       : undefined
-    const resumeSessionId = typeof paneContent?.resumeSessionId === 'string'
+    const paneSessionRef = sanitizeSessionRef(paneContent?.sessionRef)
+    const resumeSessionId = paneSessionRef?.sessionId ?? (typeof paneContent?.resumeSessionId === 'string'
       ? paneContent.resumeSessionId
-      : undefined
+      : undefined)
     const modeCandidates = [
       typeof paneContent?.mode === 'string' ? paneContent.mode : undefined,
       terminalId ? registry.get?.(terminalId)?.mode : undefined,
@@ -344,7 +364,7 @@ export function createAgentApiRouter({
       await configStore.patchTerminalOverride?.(terminalId, { titleOverride: title })
       registry.updateTitle?.(terminalId, title)
 
-      const sessionProvider = typeof meta?.provider === 'string' ? meta.provider : mode
+      const sessionProvider = paneSessionRef?.provider ?? (typeof meta?.provider === 'string' ? meta.provider : mode)
       const sessionId = typeof meta?.sessionId === 'string' ? meta.sessionId : resumeSessionId
       if (sessionProvider && sessionId) {
         try {
@@ -365,7 +385,7 @@ export function createAgentApiRouter({
   }
 
   router.post('/tabs', async (req, res) => {
-    const { name, mode, shell, cwd, browser, editor, resumeSessionId, permissionMode, model, sandbox } = req.body || {}
+    const { name, mode, shell, cwd, browser, editor, resumeSessionId, sessionRef, permissionMode, model, sandbox } = req.body || {}
     const wantsBrowser = !!browser
     const wantsEditor = !!editor
     let launch: ResolvedSpawnProviderSettings | undefined
@@ -381,16 +401,18 @@ export function createAgentApiRouter({
         paneContent = { kind: 'editor', filePath: editor, language: null, readOnly: false, content: '', viewMode: 'source' }
       } else {
         const effectiveMode = mode || 'shell'
+        const requestedSessionRef = resolveTerminalSessionRef({ sessionRef, mode: effectiveMode, resumeSessionId })
+        const requestedResumeSessionId = requestedSessionRef?.sessionId ?? resumeSessionId
         assertTerminalAdmission()
         launch = await resolveSpawnProviderSettings(
           effectiveMode,
           configStore,
           { permissionMode, model, sandbox },
-          { cwd, resumeSessionId, codexLaunchPlanner, assertTerminalCreateAccepted: assertTerminalAdmission },
+          { cwd, resumeSessionId: requestedResumeSessionId, codexLaunchPlanner, assertTerminalCreateAccepted: assertTerminalAdmission },
         )
         assertTerminalAdmission()
         const { tabId, paneId } = layoutStore.createTab({ title: name, browser, editor })
-        const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, resumeSessionId)
+        const sessionBindingReason = getCodexSessionBindingReason(effectiveMode, requestedResumeSessionId)
         assertTerminalAdmission()
         const terminal = registry.create({
           mode: effectiveMode,
@@ -403,10 +425,11 @@ export function createAgentApiRouter({
         })
         createdTerminalId = terminal.terminalId
         const launchResumeSessionId = launch.resumeSessionId
+        const launchSessionRef = requestedSessionRef ?? buildSessionRef(effectiveMode, launchResumeSessionId)
         assertTerminalAdmission()
         await adoptCodexLaunch(launch, terminal.terminalId)
         assertTerminalAdmission()
-        await waitForCodexResumeReadiness(launch, resumeSessionId)
+        await waitForCodexResumeReadiness(launch, requestedResumeSessionId)
         assertCodexCreateTerminalRunning(terminal)
         assertTerminalAdmission()
         publishCodexLaunch(registry, launch, terminal.terminalId)
@@ -418,7 +441,7 @@ export function createAgentApiRouter({
           status: 'running',
           mode: mode || 'shell',
           shell: shell || 'system',
-          resumeSessionId: launchResumeSessionId,
+          ...(launchSessionRef ? { sessionRef: launchSessionRef } : {}),
           initialCwd: cwd,
         }
 
@@ -433,7 +456,7 @@ export function createAgentApiRouter({
             shell,
             terminalId,
             initialCwd: cwd,
-            resumeSessionId: paneContent?.resumeSessionId,
+            ...(launchSessionRef ? { sessionRef: launchSessionRef } : {}),
             paneId,
             paneContent,
           },
@@ -554,13 +577,18 @@ export function createAgentApiRouter({
 
     const title = parseRequiredName(req.body?.name) || term.title || terminalId
     const { tabId, paneId } = layoutStore.createTab({ title })
+    const sessionRef = resolveTerminalSessionRef({
+      sessionRef: term.sessionRef,
+      mode: term.mode,
+      resumeSessionId: term.resumeSessionId,
+    })
     const paneContent = {
       kind: 'terminal',
       terminalId,
       status: term.status || 'running',
       mode: term.mode || 'shell',
       initialCwd: term.cwd,
-      resumeSessionId: term.resumeSessionId,
+      ...(sessionRef ? { sessionRef } : {}),
     }
     layoutStore.attachPaneContent(tabId, paneId, paneContent)
     broadcastReplayableUiCommand({
@@ -571,7 +599,7 @@ export function createAgentApiRouter({
         mode: term.mode || 'shell',
         terminalId,
         initialCwd: term.cwd,
-        resumeSessionId: term.resumeSessionId,
+        ...(sessionRef ? { sessionRef } : {}),
         paneId,
         paneContent,
         status: term.status || 'running',

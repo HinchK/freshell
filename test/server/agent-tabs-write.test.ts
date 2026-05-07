@@ -123,8 +123,8 @@ describe('tab endpoints', () => {
       status: 'running',
       mode: 'shell',
       initialCwd: '/workspace',
-      resumeSessionId: undefined,
     })
+    expect(attachPaneContent.mock.calls[0]?.[2]).not.toHaveProperty('resumeSessionId')
     expect(broadcastUiCommandWithReplay).toHaveBeenCalledWith({
       command: 'tab.create',
       payload: expect.objectContaining({
@@ -140,6 +140,53 @@ describe('tab endpoints', () => {
       terminalId: 'term_1',
       reused: false,
     })
+  })
+
+  it('opens detached coding terminals with canonical sessionRef payloads', async () => {
+    const app = express()
+    app.use(express.json())
+    const registry = new FakeRegistry()
+    registry.get.mockReturnValue({
+      terminalId: 'term_1',
+      title: 'Detached Claude',
+      mode: 'claude',
+      status: 'running',
+      cwd: '/workspace',
+      resumeSessionId: '550e8400-e29b-41d4-a716-446655440000',
+    })
+    const createTab = vi.fn(() => ({ tabId: 'tab_1', paneId: 'pane_1' }))
+    const attachPaneContent = vi.fn()
+    const broadcastUiCommandWithReplay = vi.fn()
+    const layoutStore = {
+      createTab,
+      attachPaneContent,
+      findPaneByTerminalId: vi.fn(() => undefined),
+    }
+    app.use('/api', createAgentApiRouter({
+      layoutStore,
+      registry,
+      wsHandler: { broadcastUiCommandWithReplay },
+    }))
+
+    const res = await request(app)
+      .post('/api/terminals/term_1/open')
+      .send({})
+
+    const sessionRef = { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440000' }
+    expect(res.status).toBe(200)
+    expect(attachPaneContent).toHaveBeenCalledWith('tab_1', 'pane_1', expect.objectContaining({
+      kind: 'terminal',
+      terminalId: 'term_1',
+      sessionRef,
+    }))
+    expect(attachPaneContent.mock.calls[0]?.[2]).not.toHaveProperty('resumeSessionId')
+    expect(broadcastUiCommandWithReplay).toHaveBeenCalledWith({
+      command: 'tab.create',
+      payload: expect.objectContaining({
+        sessionRef,
+      }),
+    })
+    expect(broadcastUiCommandWithReplay.mock.calls[0]?.[0]?.payload).not.toHaveProperty('resumeSessionId')
   })
 
   it('selects the existing pane when opening an already-attached terminal', async () => {
