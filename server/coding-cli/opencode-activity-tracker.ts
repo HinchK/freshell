@@ -104,6 +104,7 @@ type MonitorState = {
   controller?: AbortController
   reconnectDelayMs: number
   sessionParents: Map<string, string>
+  sessionRootCache: Map<string, string>
   reconnectTimer?: ReturnType<typeof setTimeout>
   reconnectResolve?: () => void
 }
@@ -226,6 +227,7 @@ export class OpencodeActivityTracker extends EventEmitter {
       disposed: false,
       reconnectDelayMs: OPENCODE_RECONNECT_BASE_MS,
       sessionParents: new Map(),
+      sessionRootCache: new Map(),
     }
     this.monitors.set(input.terminalId, monitor)
     void this.runMonitor(monitor)
@@ -363,7 +365,7 @@ export class OpencodeActivityTracker extends EventEmitter {
         while (separatorIndex >= 0) {
           const block = buffer.slice(0, separatorIndex)
           buffer = buffer.slice(separatorIndex + 2)
-          this.handleSseBlock(monitor, block)
+          await this.handleSseBlock(monitor, block)
           separatorIndex = buffer.indexOf('\n\n')
         }
       }
@@ -376,7 +378,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     }
   }
 
-  private handleSseBlock(monitor: MonitorState, block: string): void {
+  private async handleSseBlock(monitor: MonitorState, block: string): Promise<void> {
     const terminalId = monitor.terminalId
     const data = parseSseData(block)
     if (!data) return
@@ -400,21 +402,32 @@ export class OpencodeActivityTracker extends EventEmitter {
       const parentId = event.properties.info?.parentID
       if (parentId) {
         monitor.sessionParents.set(event.properties.sessionID, parentId)
+        const rootSessionId = this.resolveTopologyRoot(monitor, event.properties.sessionID)
+        monitor.sessionRootCache.set(event.properties.sessionID, rootSessionId)
+      } else {
+        monitor.sessionRootCache.set(event.properties.sessionID, event.properties.sessionID)
       }
       return
     }
     if (event.type === 'session.idle') {
-      this.removeRecordForSession(terminalId, this.resolveTopologyRoot(monitor, event.properties.sessionID))
+      this.removeRecordForSession(
+        terminalId,
+        await this.resolveRootForEvent(monitor, event.properties.sessionID) ?? event.properties.sessionID,
+      )
       return
     }
     if (event.properties.status.type === 'idle') {
-      this.removeRecordForSession(terminalId, this.resolveTopologyRoot(monitor, event.properties.sessionID))
+      this.removeRecordForSession(
+        terminalId,
+        await this.resolveRootForEvent(monitor, event.properties.sessionID) ?? event.properties.sessionID,
+      )
       return
     }
 
+    const rootSessionId = await this.resolveRootForEvent(monitor, event.properties.sessionID)
     this.upsertRecord({
       terminalId,
-      sessionId: this.resolveTopologyRoot(monitor, event.properties.sessionID),
+      ...(rootSessionId ? { sessionId: rootSessionId } : {}),
       phase: 'busy',
       updatedAt: this.now(),
     })
@@ -430,8 +443,14 @@ export class OpencodeActivityTracker extends EventEmitter {
       const topologyRoot = this.resolveTopologyRoot(monitor, sessionId)
       if (topologyRoot !== sessionId) {
         rootsBySessionId.set(sessionId, topologyRoot)
+        monitor.sessionRootCache.set(sessionId, topologyRoot)
       } else {
-        unresolved.push(sessionId)
+        const cachedRoot = monitor.sessionRootCache.get(sessionId)
+        if (cachedRoot) {
+          rootsBySessionId.set(sessionId, cachedRoot)
+        } else {
+          unresolved.push(sessionId)
+        }
       }
     }
     if (unresolved.length === 0) {
@@ -445,6 +464,7 @@ export class OpencodeActivityTracker extends EventEmitter {
       const resolved = await this.resolveOpencodeSessionRoots(Array.from(new Set(unresolved)))
       for (const [sessionId, rootSessionId] of resolved.rootsBySessionId) {
         rootsBySessionId.set(sessionId, rootSessionId)
+        monitor.sessionRootCache.set(sessionId, rootSessionId)
       }
       return {
         rootsBySessionId,
@@ -460,6 +480,35 @@ export class OpencodeActivityTracker extends EventEmitter {
         rootsBySessionId,
         unresolvedSessionIds: new Set(unresolved),
       }
+    }
+  }
+
+  private async resolveRootForEvent(
+    monitor: MonitorState,
+    sessionId: string,
+  ): Promise<string | undefined> {
+    const topologyRoot = this.resolveTopologyRoot(monitor, sessionId)
+    if (topologyRoot !== sessionId) {
+      monitor.sessionRootCache.set(sessionId, topologyRoot)
+      return topologyRoot
+    }
+
+    const cachedRoot = monitor.sessionRootCache.get(sessionId)
+    if (cachedRoot) return cachedRoot
+
+    try {
+      const resolved = await this.resolveOpencodeSessionRoots([sessionId])
+      const rootSessionId = resolved.rootsBySessionId.get(sessionId)
+      if (!rootSessionId) return undefined
+      monitor.sessionRootCache.set(sessionId, rootSessionId)
+      return rootSessionId
+    } catch (err) {
+      this.log.warn({
+        err,
+        terminalId: monitor.terminalId,
+        sessionId,
+      }, 'Failed to resolve OpenCode root session for activity event')
+      return undefined
     }
   }
 

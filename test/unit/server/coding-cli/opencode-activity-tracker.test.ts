@@ -474,6 +474,54 @@ describe('OpencodeActivityTracker', () => {
     tracker.dispose()
   })
 
+  it('does not let later child SSE status overwrite a snapshot-resolved root binding', async () => {
+    vi.useFakeTimers()
+    const resolveOpencodeSessionRoots = vi.fn(async (sessionIds: readonly string[]) => ({
+      rootsBySessionId: new Map(sessionIds.map((sessionId) => [sessionId, 'root_session'])),
+      unresolvedSessionIds: new Set<string>(),
+    }))
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/global/health')) return createJsonResponse({ ok: true })
+      if (url.endsWith('/session/status')) {
+        return createJsonResponse({
+          child_session: { type: 'busy' },
+        })
+      }
+      if (url.endsWith('/event')) {
+        return createSseResponse([
+          { type: 'server.connected', properties: {} },
+          {
+            type: 'session.status',
+            properties: {
+              sessionID: 'child_session',
+              status: { type: 'busy' },
+            },
+          },
+        ])
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    })
+    const tracker = new OpencodeActivityTracker({
+      fetchImpl: fetchImpl as typeof fetch,
+      resolveOpencodeSessionRoots,
+    })
+
+    tracker.trackTerminal({ terminalId: 'term-opencode-1', endpoint: TEST_ENDPOINT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(resolveOpencodeSessionRoots).toHaveBeenCalledTimes(1)
+    expect(tracker.list()).toEqual([
+      expect.objectContaining({
+        terminalId: 'term-opencode-1',
+        sessionId: 'root_session',
+        phase: 'busy',
+      }),
+    ])
+
+    tracker.dispose()
+  })
+
   it('does not choose an arbitrary durable session when multiple root sessions are active', async () => {
     vi.useFakeTimers()
     const resolveOpencodeSessionRoots = vi.fn(async () => ({

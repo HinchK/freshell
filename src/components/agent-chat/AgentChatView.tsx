@@ -177,13 +177,17 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const surfaceVisibleMarkedRef = useRef(false)
   const sessionRef = useRef(session)
   sessionRef.current = session
-  const persistedTimelineSessionId = isValidClaudeSessionId(paneContent.resumeSessionId)
-    ? paneContent.resumeSessionId
+  const persistedSessionRefId = paneContent.sessionRef?.provider === 'claude'
+    && isValidClaudeSessionId(paneContent.sessionRef.sessionId)
+    ? paneContent.sessionRef.sessionId
     : undefined
+  const persistedTimelineSessionId = persistedSessionRefId
+    ?? (isValidClaudeSessionId(paneContent.resumeSessionId) ? paneContent.resumeSessionId : undefined)
   const canonicalDurableSessionId = getCanonicalDurableSessionId(session) ?? persistedTimelineSessionId
   const timelineSessionId = getPreferredResumeSessionId(session) ?? persistedTimelineSessionId
   const restoreHistoryQueryId = timelineSessionId ?? paneContent.sessionId
   const attachResumeSessionId = getPreferredResumeSessionId(session)
+    ?? persistedSessionRefId
     ?? (
       typeof paneContent.resumeSessionId === 'string' && paneContent.resumeSessionId.trim().length > 0
         ? paneContent.resumeSessionId

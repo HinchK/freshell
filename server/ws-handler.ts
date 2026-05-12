@@ -228,6 +228,15 @@ function terminalCreateSessionProvider(mode: TerminalMode): string | undefined {
   return mode === 'shell' ? undefined : mode
 }
 
+function buildTerminalSessionRef(mode: TerminalMode, resumeSessionId?: string): { provider: string; sessionId: string } | undefined {
+  const provider = terminalCreateSessionProvider(mode)
+  if (!provider || !isNonEmptyString(resumeSessionId)) return undefined
+  return {
+    provider,
+    sessionId: resumeSessionId,
+  }
+}
+
 function isCanonicalSessionRefForMode(mode: TerminalMode, sessionRef: { provider: string; sessionId: string }): boolean {
   const provider = terminalCreateSessionProvider(mode)
   if (!provider || sessionRef.provider !== provider) return false
@@ -1796,7 +1805,13 @@ export class WsHandler {
       }
 
       // Send terminal inventory so the client knows what's alive
-      const terminals = this.registry.list()
+      const terminals = this.registry.list().map(({ resumeSessionId, ...terminal }) => {
+        const sessionRef = buildTerminalSessionRef(terminal.mode, resumeSessionId)
+        return {
+          ...terminal,
+          ...(sessionRef ? { sessionRef } : {}),
+        }
+      })
       const terminalMeta = this.terminalMetaListProvider?.() ?? []
       this.safeSend(ws, {
         type: 'terminal.inventory',
