@@ -1980,7 +1980,8 @@ export class WsHandler {
         const freshRecoveryRequested = m.recoveryIntent === 'fresh_after_restore_unavailable'
         const requestedSessionRef = m.sessionRef
         const legacyResumeSessionId = isNonEmptyString(m.resumeSessionId) ? m.resumeSessionId : undefined
-        const unsupportedLegacyResumeSessionId = !!legacyResumeSessionId && mode !== 'claude'
+        const supportsLegacyResumeSessionId = mode === 'claude' || mode === 'codex'
+        const unsupportedLegacyResumeSessionId = !!legacyResumeSessionId && !supportsLegacyResumeSessionId
         let canonicalSessionRef: { provider: string; sessionId: string } | undefined
         let invalidRequestedSessionRef = false
         if (requestedSessionRef) {
@@ -1989,7 +1990,7 @@ export class WsHandler {
           } else {
             invalidRequestedSessionRef = true
           }
-        } else if (mode === 'claude' && legacyResumeSessionId) {
+        } else if (supportsLegacyResumeSessionId && legacyResumeSessionId) {
           const provider = terminalCreateSessionProvider(mode)
           if (provider) {
             canonicalSessionRef = {
@@ -2065,7 +2066,7 @@ export class WsHandler {
               connectionId: ws.connectionId,
               mode,
               restoreRequested,
-            }, 'terminal.create rejected legacy resumeSessionId for non-Claude provider')
+            }, 'terminal.create rejected legacy resumeSessionId for unsupported provider')
             this.sendError(ws, {
               code: 'INVALID_MESSAGE',
               message: 'terminal.create must use sessionRef for provider session restore.',
