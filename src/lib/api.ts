@@ -364,6 +364,7 @@ export type SearchResult = {
   isNonInteractive?: boolean
   isRunning?: boolean
   runningTerminalId?: string
+  liveTerminalOnly?: boolean
 }
 
 export type SearchResponse = {
@@ -417,6 +418,7 @@ function groupDirectoryItemsAsProjects(items: ReadModelSessionDirectoryItem[]) {
 	      isNonInteractive: item.isNonInteractive,
 	      isRunning: item.isRunning,
 	      runningTerminalId: item.runningTerminalId,
+	      liveTerminalOnly: item.liveTerminalOnly,
 	      firstUserMessage: item.firstUserMessage,
 	      sessionType: item.sessionType,
 	    })),
@@ -510,6 +512,7 @@ export async function searchSessions(options: SearchOptions): Promise<SearchResp
 	      isNonInteractive: item.isNonInteractive,
 	      isRunning: item.isRunning,
 	      runningTerminalId: item.runningTerminalId,
+	      liveTerminalOnly: item.liveTerminalOnly,
 	    })),
     tier,
     query,
