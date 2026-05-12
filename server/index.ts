@@ -198,12 +198,30 @@ async function main() {
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
   const opencodeActivity = wireOpencodeActivityTracker({
     registry,
+    resolveOpencodeSessionRoots: (sessionIds) => opencodeProvider.resolveOpencodeSessionRoots(sessionIds),
     onAssociated: ({ terminalId, sessionId }) => {
       codingCliIndexer.scheduleProviderRefresh('opencode', {
         urgent: true,
         reason: 'opencode_associated',
       })
       log.info({ terminalId, sessionId }, 'OpenCode session associated; scheduled provider refresh')
+    },
+    onTurnComplete: ({ terminalId, sessionId, at }) => {
+      const terminal = registry.get(terminalId)
+      if (
+        !terminal ||
+        terminal.mode !== 'opencode' ||
+        terminal.status !== 'running' ||
+        terminal.resumeSessionId !== sessionId
+      ) {
+        log.warn({ terminalId, sessionId }, 'Suppressed OpenCode turn completion for terminal without current ownership')
+        return
+      }
+      codingCliIndexer.scheduleProviderRefresh('opencode', {
+        urgent: true,
+        reason: 'opencode_turn_complete',
+      })
+      log.info({ terminalId, sessionId, at }, 'OpenCode turn complete; scheduled provider refresh')
     },
   })
 

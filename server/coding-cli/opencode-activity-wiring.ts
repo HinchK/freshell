@@ -1,5 +1,6 @@
 import { OpencodeActivityTracker } from './opencode-activity-tracker.js'
 import { OpencodeSessionController } from './opencode-session-controller.js'
+import type { OpencodeRootResolution } from './providers/opencode.js'
 import type { OpencodeServerEndpoint } from '../local-port.js'
 import type { BindSessionResult, TerminalRecord } from '../terminal-registry.js'
 import type { SessionBindingReason } from '../terminal-stream/registry-events.js'
@@ -34,6 +35,7 @@ export function wireOpencodeActivityTracker(input: {
   setTimeoutFn?: typeof setTimeout
   clearTimeoutFn?: typeof clearTimeout
   random?: () => number
+  resolveOpencodeSessionRoots?: (sessionIds: readonly string[]) => Promise<OpencodeRootResolution>
   onAssociated?: (event: { terminalId: string; sessionId: string }) => void
   onTurnComplete?: (event: { terminalId: string; sessionId: string; at: number }) => void
 }) {
@@ -43,6 +45,7 @@ export function wireOpencodeActivityTracker(input: {
     setTimeoutFn: input.setTimeoutFn,
     clearTimeoutFn: input.clearTimeoutFn,
     random: input.random,
+    resolveOpencodeSessionRoots: input.resolveOpencodeSessionRoots,
   })
   const controller = new OpencodeSessionController({
     tracker,
@@ -71,9 +74,14 @@ export function wireOpencodeActivityTracker(input: {
     input.onAssociated?.(event)
   }
 
+  const onTurnComplete = (event: { terminalId: string; sessionId: string; at: number }) => {
+    input.onTurnComplete?.(event)
+  }
+
   input.registry.on('terminal.created', onCreated)
   input.registry.on('terminal.exit', onExit)
   controller.on('associated', onAssociated)
+  tracker.on('turn.complete', onTurnComplete)
 
   for (const listed of input.registry.list()) {
     const record = input.registry.get(listed.terminalId)
@@ -88,6 +96,7 @@ export function wireOpencodeActivityTracker(input: {
       input.registry.off('terminal.created', onCreated)
       input.registry.off('terminal.exit', onExit)
       controller.off('associated', onAssociated)
+      tracker.off('turn.complete', onTurnComplete)
       controller.dispose()
       tracker.dispose()
     },
