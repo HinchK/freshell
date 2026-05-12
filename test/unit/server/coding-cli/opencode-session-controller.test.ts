@@ -92,6 +92,63 @@ describe('OpencodeSessionController', () => {
     controller.dispose()
   })
 
+  it.each([
+    {
+      name: 'missing terminal',
+      terminal: undefined,
+      reason: 'terminal_missing_or_not_running',
+      extra: {},
+    },
+    {
+      name: 'non-OpenCode terminal',
+      terminal: {
+        terminalId: 'term-opencode-1',
+        mode: 'codex',
+        status: 'running',
+        resumeSessionId: undefined,
+      },
+      reason: 'terminal_not_opencode',
+      extra: { mode: 'codex' },
+    },
+    {
+      name: 'stopped terminal',
+      terminal: {
+        terminalId: 'term-opencode-1',
+        mode: 'opencode',
+        status: 'exited',
+        resumeSessionId: undefined,
+      },
+      reason: 'terminal_missing_or_not_running',
+      extra: { status: 'exited' },
+    },
+  ])('logs rejected association requests for $name', ({ terminal, reason, extra }) => {
+    const tracker = makeTracker()
+    const registry = makeRegistry({
+      get: vi.fn(() => terminal),
+    })
+    const log = { warn: vi.fn() }
+    const controller = new OpencodeSessionController({ tracker, registry, log })
+
+    tracker.emit('changed', {
+      upsert: [{
+        terminalId: 'term-opencode-1',
+        sessionId: 'root_session',
+        phase: 'busy',
+        updatedAt: 1,
+      }],
+      remove: [],
+    })
+
+    expect(log.warn).toHaveBeenCalledWith({
+      terminalId: 'term-opencode-1',
+      sessionId: 'root_session',
+      reason,
+      ...extra,
+    }, 'Rejected OpenCode association request')
+    expect(registry.bindSession).not.toHaveBeenCalled()
+    controller.dispose()
+  })
+
   it('logs rejected association with previous session context', () => {
     const tracker = makeTracker()
     const registry = makeRegistry({
@@ -121,7 +178,34 @@ describe('OpencodeSessionController', () => {
       sessionId: 'next_session',
       previousSessionId: 'previous_session',
       reason: 'ambiguous-session-owner',
-    }, 'Failed to promote OpenCode durable session from authoritative control data')
+    }, 'Rejected OpenCode association request')
+    controller.dispose()
+  })
+
+  it('logs owner terminal id when a bind conflict exposes one', () => {
+    const tracker = makeTracker()
+    const registry = makeRegistry({
+      bindSession: vi.fn(() => ({ ok: false, reason: 'session_already_owned', owner: 'term-owner' })),
+    })
+    const log = { warn: vi.fn() }
+    const controller = new OpencodeSessionController({ tracker, registry, log })
+
+    tracker.emit('changed', {
+      upsert: [{
+        terminalId: 'term-opencode-1',
+        sessionId: 'root_session',
+        phase: 'busy',
+        updatedAt: 1,
+      }],
+      remove: [],
+    })
+
+    expect(log.warn).toHaveBeenCalledWith({
+      terminalId: 'term-opencode-1',
+      sessionId: 'root_session',
+      reason: 'session_already_owned',
+      ownerTerminalId: 'term-owner',
+    }, 'Rejected OpenCode association request')
     controller.dispose()
   })
 })
