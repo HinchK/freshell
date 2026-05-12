@@ -1980,6 +1980,7 @@ export class WsHandler {
         const freshRecoveryRequested = m.recoveryIntent === 'fresh_after_restore_unavailable'
         const requestedSessionRef = m.sessionRef
         const legacyResumeSessionId = isNonEmptyString(m.resumeSessionId) ? m.resumeSessionId : undefined
+        const unsupportedLegacyResumeSessionId = !!legacyResumeSessionId && mode !== 'claude'
         let canonicalSessionRef: { provider: string; sessionId: string } | undefined
         let invalidRequestedSessionRef = false
         if (requestedSessionRef) {
@@ -1988,7 +1989,7 @@ export class WsHandler {
           } else {
             invalidRequestedSessionRef = true
           }
-        } else if (modeSupportsResume(mode) && legacyResumeSessionId) {
+        } else if (mode === 'claude' && legacyResumeSessionId) {
           const provider = terminalCreateSessionProvider(mode)
           if (provider) {
             canonicalSessionRef = {
@@ -2057,6 +2058,22 @@ export class WsHandler {
             return
           }
 
+          if (unsupportedLegacyResumeSessionId) {
+            error = true
+            log.warn({
+              requestId: m.requestId,
+              connectionId: ws.connectionId,
+              mode,
+              restoreRequested,
+            }, 'terminal.create rejected legacy resumeSessionId for non-Claude provider')
+            this.sendError(ws, {
+              code: 'INVALID_MESSAGE',
+              message: 'terminal.create must use sessionRef for provider session restore.',
+              requestId: m.requestId,
+            })
+            return
+          }
+
           if (freshRecoveryRequested) {
             recordSessionLifecycleEvent({
               kind: 'restore_unavailable_fresh_fallback',
@@ -2118,7 +2135,7 @@ export class WsHandler {
                   requestId: opts.requestId,
                   terminalId: opts.terminalId,
                   createdAt: opts.createdAt,
-                  ...(opts.effectiveResumeSessionId ? { effectiveResumeSessionId: opts.effectiveResumeSessionId } : {}),
+                  ...(mode === 'codex' && opts.effectiveResumeSessionId ? { effectiveResumeSessionId: opts.effectiveResumeSessionId } : {}),
                 })
                 return true
               }
