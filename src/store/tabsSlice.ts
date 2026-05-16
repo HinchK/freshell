@@ -762,6 +762,9 @@ export const openSessionTab = createAsyncThunk(
           : undefined
         if (existingTab) {
           updateExistingTabMetadata(existingTab)
+          if (title && title !== existingTab.title && !existingTab.titleSetByUser) {
+            dispatch(updateTab({ id: existingTab.id, updates: { title } }))
+          }
           dispatch(setActiveTab(existingTab.id))
           return
         }
@@ -809,6 +812,9 @@ export const openSessionTab = createAsyncThunk(
         const selectedExistingTabId = existingTabId ?? tabToOpen.id
         const usingStaleSinglePaneFallback = !existingTabId && staleSinglePaneFallbackTab?.id === tabToOpen.id
         updateExistingTabMetadata(tabToOpen)
+        if (title && title !== tabToOpen.title && !tabToOpen.titleSetByUser) {
+          dispatch(updateTab({ id: tabToOpen.id, updates: { title } }))
+        }
         repairExistingTabLayout(tabToOpen, {
           tabFallbackMissingPaneLocator: usingStaleSinglePaneFallback,
         })
