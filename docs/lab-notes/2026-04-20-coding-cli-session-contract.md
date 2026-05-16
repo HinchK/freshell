@@ -102,6 +102,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "canonicalIdentity": "session-id",
       "runEventSessionIdMatchesDbId": true,
       "busyStatusUsesAuthoritativeSessionId": true,
+      "attachFormatJsonEmitsEvents": true,
       "titleOnResumeMutatesStoredTitle": false,
       "sessionSubcommands": [
         "list",
@@ -312,9 +313,10 @@ curl http://127.0.0.1:<port>/session/status
 
 Observed control behavior:
 
-- `/global/health` returned a healthy payload with version `1.14.33`.
+- `/global/health` returned a healthy payload with version `1.15.3`.
 - `/session/status` returned `{}` while idle.
-- During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned the same authoritative `sessionID` with `{ "type": "busy" }`.
+- During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned an authoritative `sessionID` with `{ "type": "busy" }`, and the same id was persisted as a `session.id` row in the isolated OpenCode database.
+- On the 2026-05-16 rerun with OpenCode `1.15.3`, attached `opencode run ... --attach ... --format json` exited successfully and emitted JSON event lines on stdout. `/session/status` remains the authoritative live-control surface while the attached command is busy, and the attached-run stdout session id matched the busy status/database session id in this probe.
 
 Title semantics were probed with:
 
