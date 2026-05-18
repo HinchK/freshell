@@ -49,7 +49,7 @@ export function selectTabIdByTerminalId(state: RootState, terminalId: string): s
   return undefined
 }
 
-export function selectPaneLocationByTerminalId(
+export function selectTabPaneByTerminalId(
   state: RootState,
   terminalId: string,
 ): { tabId: string; paneId: string } | undefined {
@@ -74,7 +74,12 @@ export function selectPaneLocationByTerminalId(
   return undefined
 }
 
-export const selectTabPaneByTerminalId = selectPaneLocationByTerminalId
+export function selectPaneLocationByTerminalId(
+  state: RootState,
+  terminalId: string,
+): { tabId: string; paneId: string } | undefined {
+  return selectTabPaneByTerminalId(state, terminalId)
+}
 
 function findFirstTerminalId(node: PaneNode): string | undefined {
   if (node.type === 'leaf') {

@@ -1,8 +1,8 @@
 # RCA: OpenCode Ambiguous Session Ownership Warnings
 
-**Date:** 2026-05-09
-**App:** Freshell v0.7.0 (production)
-**Component:** `opencode-activity-tracker`
+**Date:** 2026-05-09  
+**App:** Freshell v0.7.0 (production)  
+**Component:** `opencode-activity-tracker`  
 **Severity:** WARN (but functionally correctness-affecting — suppresses durable session adoption)
 
 ## Problem
