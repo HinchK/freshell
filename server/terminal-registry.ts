@@ -35,6 +35,7 @@ import {
 import { CodexRemoteTuiFailureDetector } from './coding-cli/codex-app-server/remote-tui-failure-detector.js'
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
+import { recordSessionLifecycleEvent } from './session-observability.js'
 import {
   createTerminalStartupProbeState,
   extractTerminalStartupProbes,
@@ -1198,6 +1199,26 @@ export class TerminalRegistry extends EventEmitter {
     return n
   }
 
+  private recordTerminalExitWithoutDurableSession(
+    record: TerminalRecord,
+    exitCode: number | undefined,
+    reason: 'pty_exit' | 'user_final_close',
+  ): void {
+    if (record.mode === 'shell' || record.resumeSessionId) {
+      return
+    }
+    const ptyPid = record.pty.pid
+    recordSessionLifecycleEvent({
+      kind: 'terminal_exit_without_durable_session',
+      terminalId: record.terminalId,
+      mode: record.mode,
+      exitCode: exitCode ?? 0,
+      ageMs: Math.max(0, Date.now() - record.createdAt),
+      reason,
+      ...(ptyPid ? { ptyPid } : {}),
+    })
+  }
+
   private reapExitedTerminals(): void {
     const max = this.maxExitedTerminals
     if (!max || max <= 0) return
@@ -2121,6 +2142,7 @@ export class TerminalRegistry extends EventEmitter {
     record.clients.clear()
     record.suppressedOutputClients.clear()
     record.pendingSnapshotClients.clear()
+    this.recordTerminalExitWithoutDurableSession(record, finalExitCode, _reason)
     this.releaseBinding(terminalId, 'exit')
     this.emit('terminal.exit', { terminalId, exitCode: finalExitCode })
     this.reapExitedTerminals()

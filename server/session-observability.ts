@@ -46,7 +46,7 @@ export type SessionLifecycleEvent =
     reason: 'fresh_after_restore_unavailable'
     restoreRequested: false
     treatedAsFresh: true
-    hasSessionRef: false
+    hasSessionRef: boolean
   })
   | {
     kind: 'codex_durable_session_observed'
@@ -163,6 +163,7 @@ function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
         connectionId: event.connectionId,
         tabId: event.tabId,
         paneId: event.paneId,
+        cwd: event.cwd,
         mode: event.mode,
         reason: event.reason,
         restoreRequested: event.restoreRequested,
@@ -175,6 +176,7 @@ function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
         connectionId: event.connectionId,
         tabId: event.tabId,
         paneId: event.paneId,
+        cwd: event.cwd,
         mode: event.mode,
         reason: event.reason,
         restoreRequested: event.restoreRequested,

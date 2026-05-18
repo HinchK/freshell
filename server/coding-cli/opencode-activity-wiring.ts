@@ -1,9 +1,14 @@
 import { OpencodeActivityTracker } from './opencode-activity-tracker.js'
+import type {
+  OpencodeActivityChange,
+  OpencodeTurnCompleteEvent,
+} from './opencode-activity-tracker.js'
 import { OpencodeSessionController } from './opencode-session-controller.js'
 import type { OpencodeRootResolution } from './providers/opencode.js'
 import type { OpencodeServerEndpoint } from '../local-port.js'
 import type { BindSessionResult, TerminalRecord } from '../terminal-registry.js'
 import type { SessionBindingReason } from '../terminal-stream/registry-events.js'
+import type { OpencodeSessionAssociatedEvent } from './opencode-session-controller.js'
 
 type OpencodeActivityRegistry = {
   list: () => Array<{ terminalId: string }>
@@ -14,7 +19,7 @@ type OpencodeActivityRegistry = {
     sessionId: string,
     reason?: SessionBindingReason,
   ) => BindSessionResult
-  rebindSession: (
+  rebindSession?: (
     terminalId: string,
     provider: 'opencode',
     sessionId: string,
@@ -36,8 +41,9 @@ export function wireOpencodeActivityTracker(input: {
   clearTimeoutFn?: typeof clearTimeout
   random?: () => number
   resolveOpencodeSessionRoots?: (sessionIds: readonly string[]) => Promise<OpencodeRootResolution>
-  onAssociated?: (event: { terminalId: string; sessionId: string }) => void
-  onTurnComplete?: (event: { terminalId: string; sessionId: string; at: number }) => void
+  onActivityChanged?: (payload: OpencodeActivityChange) => void
+  onAssociated?: (payload: OpencodeSessionAssociatedEvent) => void
+  onTurnComplete?: (payload: OpencodeTurnCompleteEvent) => void
 }) {
   const tracker = new OpencodeActivityTracker({
     fetchImpl: input.fetchImpl,
@@ -47,10 +53,19 @@ export function wireOpencodeActivityTracker(input: {
     random: input.random,
     resolveOpencodeSessionRoots: input.resolveOpencodeSessionRoots,
   })
+  if (input.onActivityChanged) {
+    tracker.on('changed', input.onActivityChanged)
+  }
+  if (input.onTurnComplete) {
+    tracker.on('turn.complete', input.onTurnComplete)
+  }
   const controller = new OpencodeSessionController({
     tracker,
     registry: input.registry,
   })
+  if (input.onAssociated) {
+    controller.on('associated', input.onAssociated)
+  }
 
   const startTracking = (record: TerminalRecord) => {
     const endpoint = getEndpoint(record)
@@ -58,6 +73,7 @@ export function wireOpencodeActivityTracker(input: {
     tracker.trackTerminal({
       terminalId: record.terminalId,
       endpoint,
+      sessionId: record.resumeSessionId,
     })
   }
 
@@ -70,18 +86,8 @@ export function wireOpencodeActivityTracker(input: {
     tracker.untrackTerminal({ terminalId: event.terminalId })
   }
 
-  const onAssociated = (event: { terminalId: string; sessionId: string }) => {
-    input.onAssociated?.(event)
-  }
-
-  const onTurnComplete = (event: { terminalId: string; sessionId: string; at: number }) => {
-    input.onTurnComplete?.(event)
-  }
-
   input.registry.on('terminal.created', onCreated)
   input.registry.on('terminal.exit', onExit)
-  controller.on('associated', onAssociated)
-  tracker.on('turn.complete', onTurnComplete)
 
   for (const listed of input.registry.list()) {
     const record = input.registry.get(listed.terminalId)
@@ -95,8 +101,15 @@ export function wireOpencodeActivityTracker(input: {
     dispose(): void {
       input.registry.off('terminal.created', onCreated)
       input.registry.off('terminal.exit', onExit)
-      controller.off('associated', onAssociated)
-      tracker.off('turn.complete', onTurnComplete)
+      if (input.onActivityChanged) {
+        tracker.off('changed', input.onActivityChanged)
+      }
+      if (input.onTurnComplete) {
+        tracker.off('turn.complete', input.onTurnComplete)
+      }
+      if (input.onAssociated) {
+        controller.off('associated', input.onAssociated)
+      }
       controller.dispose()
       tracker.dispose()
     },

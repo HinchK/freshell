@@ -2094,6 +2094,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             requestId: reqId,
             terminalId: newId,
             restore: pendingLaunch?.requestId === reqId ? pendingLaunch.restore : false,
+            ...(pendingLaunch?.requestId === reqId && pendingLaunch.recoveryIntent
+              ? { recoveryIntent: pendingLaunch.recoveryIntent }
+              : {}),
             attachReady: false,
           }
           currentAttachRef.current = null
@@ -2320,7 +2323,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 type: 'client.diagnostic',
                 ...restoreDiagnostic,
               })
-              term.writeln('\r\n[Starting a new terminal because the previous live terminal is gone and no durable session identity was saved]\r\n')
+              term.writeln('\r\n[Restore unavailable - the live terminal is gone and no durable session identity was saved]\r\n')
               const newRequestId = nanoid()
               const fallbackAttempt = {
                 staleTerminalId: currentTerminalId,
@@ -2355,7 +2358,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 serverInstanceId: undefined,
                 createRequestId: newRequestId,
                 status: 'creating',
-                restoreError: undefined,
+                restoreError: buildRestoreError('dead_live_handle'),
               })
               const currentTab = tabRef.current
               if (currentTab) {

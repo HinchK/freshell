@@ -53,12 +53,28 @@ export function selectPaneLocationByTerminalId(
   state: RootState,
   terminalId: string,
 ): { tabId: string; paneId: string } | undefined {
+  const activeTabId = state.tabs.activeTabId
+  if (activeTabId) {
+    const activeLayout = state.panes.layouts[activeTabId]
+    if (activeLayout) {
+      const activePaneId = findPaneIdByTerminalId(activeLayout, terminalId)
+      if (activePaneId) {
+        return { tabId: activeTabId, paneId: activePaneId }
+      }
+    }
+  }
+
   for (const [tabId, layout] of Object.entries(state.panes.layouts)) {
+    if (tabId === activeTabId) continue
     const paneId = findPaneIdByTerminalId(layout, terminalId)
-    if (paneId) return { tabId, paneId }
+    if (paneId) {
+      return { tabId, paneId }
+    }
   }
   return undefined
 }
+
+export const selectTabPaneByTerminalId = selectPaneLocationByTerminalId
 
 function findFirstTerminalId(node: PaneNode): string | undefined {
   if (node.type === 'leaf') {
@@ -77,7 +93,9 @@ function nodeContainsTerminalId(node: PaneNode, terminalId: string): boolean {
 
 function findPaneIdByTerminalId(node: PaneNode, terminalId: string): string | undefined {
   if (node.type === 'leaf') {
-    return node.content.kind === 'terminal' && node.content.terminalId === terminalId ? node.id : undefined
+    return node.content.kind === 'terminal' && node.content.terminalId === terminalId
+      ? node.id
+      : undefined
   }
   return findPaneIdByTerminalId(node.children[0], terminalId)
     ?? findPaneIdByTerminalId(node.children[1], terminalId)

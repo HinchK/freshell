@@ -3,6 +3,15 @@ import { z } from 'zod'
 import type { OpencodeServerEndpoint } from '../local-port.js'
 import { logger } from '../logger.js'
 import type { OpencodeRootResolution } from './providers/opencode.js'
+import {
+  confirmOpencodeAssociation,
+  createOpencodeOwnershipState,
+  reduceOpencodeOwnership,
+  rejectOpencodeAssociation,
+  type OpencodeObservation,
+  type OpencodeOwnershipAction,
+  type OpencodeOwnershipState,
+} from './opencode-ownership-reducer.js'
 
 export const OPENCODE_HEALTH_POLL_MS = 200
 // Applies per health-wait cycle; connection failures restart the cycle after backoff.
@@ -22,6 +31,17 @@ export type OpencodeActivityRecord = {
 export type OpencodeActivityChange = {
   upsert: OpencodeActivityRecord[]
   remove: string[]
+}
+
+export type OpencodeAssociationRequestedEvent = {
+  terminalId: string
+  sessionId: string
+}
+
+export type OpencodeTurnCompleteEvent = {
+  terminalId: string
+  sessionId: string
+  at: number
 }
 
 const SessionIdleStatusSchema = z.object({
@@ -68,16 +88,16 @@ const SessionCreatedEventSchema = z.object({
   properties: z.object({
     sessionID: z.string().min(1),
     info: z.object({
-      parentID: z.string().min(1).optional(),
+      parentID: z.string().min(1).nullable().optional(),
     }).passthrough().optional(),
   }).passthrough(),
 }).passthrough()
 
 const OpencodeEventSchema = z.discriminatedUnion('type', [
   ServerConnectedEventSchema,
-  SessionCreatedEventSchema,
   SessionStatusEventSchema,
   SessionIdleEventSchema,
+  SessionCreatedEventSchema,
 ])
 
 const OpencodeEventTypeSchema = z.object({
@@ -86,9 +106,9 @@ const OpencodeEventTypeSchema = z.object({
 
 const KNOWN_OPENCODE_EVENT_TYPES = new Set<z.infer<typeof OpencodeEventSchema>['type']>([
   'server.connected',
-  'session.created',
   'session.status',
   'session.idle',
+  'session.created',
 ])
 
 type FetchLike = typeof fetch
@@ -103,10 +123,15 @@ type MonitorState = {
   disposed: boolean
   controller?: AbortController
   reconnectDelayMs: number
-  sessionParents: Map<string, string>
-  sessionRootCache: Map<string, string>
   reconnectTimer?: ReturnType<typeof setTimeout>
   reconnectResolve?: () => void
+  ownership: OpencodeOwnershipState
+  lastSnapshot?: {
+    cycleId: number
+    streamId: number
+    statuses: Record<string, z.infer<typeof SessionStatusSchema>>
+    at: number
+  }
 }
 
 function createAbortError(): Error {
@@ -173,6 +198,8 @@ const defaultResolveOpencodeSessionRoots = async (
 export class OpencodeActivityTracker extends EventEmitter {
   private readonly records = new Map<string, OpencodeActivityRecord>()
   private readonly monitors = new Map<string, MonitorState>()
+  private readonly childSessionIds = new Map<string, Set<string>>()
+  private readonly sessionRootsByTerminal = new Map<string, Map<string, string>>()
   private readonly fetchImpl: FetchLike
   private readonly log: TrackerLogger
   private readonly now: () => number
@@ -180,6 +207,8 @@ export class OpencodeActivityTracker extends EventEmitter {
   private readonly clearTimeoutFn: typeof clearTimeout
   private readonly random: () => number
   private readonly resolveOpencodeSessionRoots: (sessionIds: readonly string[]) => Promise<OpencodeRootResolution>
+  private nextCycleId = 0
+  private nextStreamId = 0
 
   constructor(input: {
     fetchImpl?: FetchLike
@@ -188,7 +217,9 @@ export class OpencodeActivityTracker extends EventEmitter {
     setTimeoutFn?: typeof setTimeout
     clearTimeoutFn?: typeof clearTimeout
     random?: () => number
+    homeDir?: string
     resolveOpencodeSessionRoots?: (sessionIds: readonly string[]) => Promise<OpencodeRootResolution>
+    allowIdentityRootResolverForTests?: boolean
   } = {}) {
     super()
     this.fetchImpl = input.fetchImpl ?? fetch
@@ -197,7 +228,13 @@ export class OpencodeActivityTracker extends EventEmitter {
     this.setTimeoutFn = input.setTimeoutFn ?? setTimeout
     this.clearTimeoutFn = input.clearTimeoutFn ?? clearTimeout
     this.random = input.random ?? Math.random
-    this.resolveOpencodeSessionRoots = input.resolveOpencodeSessionRoots ?? defaultResolveOpencodeSessionRoots
+    if (input.resolveOpencodeSessionRoots) {
+      this.resolveOpencodeSessionRoots = input.resolveOpencodeSessionRoots
+    } else if (input.allowIdentityRootResolverForTests || process.env.NODE_ENV === 'test') {
+      this.resolveOpencodeSessionRoots = defaultResolveOpencodeSessionRoots
+    } else {
+      throw new Error('OpenCode root session resolver is required outside tests.')
+    }
   }
 
   list(): OpencodeActivityRecord[] {
@@ -208,7 +245,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     return this.records.get(terminalId)
   }
 
-  trackTerminal(input: { terminalId: string; endpoint: OpencodeServerEndpoint }): void {
+  trackTerminal(input: { terminalId: string; endpoint: OpencodeServerEndpoint; sessionId?: string }): void {
     const existing = this.monitors.get(input.terminalId)
     if (
       existing
@@ -216,6 +253,9 @@ export class OpencodeActivityTracker extends EventEmitter {
       && existing.endpoint.port === input.endpoint.port
       && !existing.disposed
     ) {
+      existing.ownership = createOpencodeOwnershipState(input.sessionId)
+      this.childSessionIds.delete(input.terminalId)
+      this.sessionRootsByTerminal.delete(input.terminalId)
       return
     }
 
@@ -226,8 +266,7 @@ export class OpencodeActivityTracker extends EventEmitter {
       endpoint: input.endpoint,
       disposed: false,
       reconnectDelayMs: OPENCODE_RECONNECT_BASE_MS,
-      sessionParents: new Map(),
-      sessionRootCache: new Map(),
+      ownership: createOpencodeOwnershipState(input.sessionId),
     }
     this.monitors.set(input.terminalId, monitor)
     void this.runMonitor(monitor)
@@ -237,6 +276,7 @@ export class OpencodeActivityTracker extends EventEmitter {
     const monitor = this.monitors.get(input.terminalId)
     if (monitor) {
       monitor.disposed = true
+      monitor.lastSnapshot = undefined
       monitor.controller?.abort()
       if (monitor.reconnectTimer) {
         this.clearTimeoutFn(monitor.reconnectTimer)
@@ -246,6 +286,8 @@ export class OpencodeActivityTracker extends EventEmitter {
       monitor.reconnectResolve = undefined
       this.monitors.delete(input.terminalId)
     }
+    this.childSessionIds.delete(input.terminalId)
+    this.sessionRootsByTerminal.delete(input.terminalId)
     this.removeRecord(input.terminalId)
   }
 
@@ -259,11 +301,11 @@ export class OpencodeActivityTracker extends EventEmitter {
     while (!monitor.disposed) {
       const controller = new AbortController()
       monitor.controller = controller
+      const cycleId = ++this.nextCycleId
       try {
         await this.waitForHealth(monitor, controller.signal)
-        await this.refreshSnapshot(monitor, controller.signal)
         monitor.reconnectDelayMs = OPENCODE_RECONNECT_BASE_MS
-        await this.consumeEvents(monitor, controller.signal)
+        await this.consumeEvents(monitor, cycleId, controller.signal)
       } catch (error) {
         if (monitor.disposed || isAbortError(error)) {
           return
@@ -306,7 +348,12 @@ export class OpencodeActivityTracker extends EventEmitter {
     }
   }
 
-  private async refreshSnapshot(monitor: MonitorState, signal: AbortSignal): Promise<void> {
+  private async refreshSnapshot(
+    monitor: MonitorState,
+    cycleId: number,
+    streamId: number,
+    signal: AbortSignal,
+  ): Promise<void> {
     const response = await this.fetchImpl(this.buildUrl(monitor.endpoint, '/session/status'), {
       signal,
     })
@@ -319,20 +366,28 @@ export class OpencodeActivityTracker extends EventEmitter {
       throw new Error('OpenCode session status response did not match the expected schema.')
     }
 
-    const activeSessionIds = Object.entries(parsed.data)
-      .filter(([, status]) => status.type !== 'idle')
-      .map(([sessionId]) => sessionId)
-      .sort()
-    if (activeSessionIds.length === 0) {
-      this.removeRecordForIdleTerminal(monitor.terminalId)
+    const at = this.now()
+    const classified = await this.classifySnapshotStatuses(monitor, parsed.data)
+    monitor.lastSnapshot = { cycleId, streamId, statuses: classified.statuses, at }
+    this.warnIfMultipleActiveRoots(monitor.terminalId, classified.statuses, classified.unresolvedSessionIds)
+    if (classified.unresolvedSessionIds.size > 0) {
+      this.upsertRecord({
+        terminalId: monitor.terminalId,
+        phase: 'busy',
+        updatedAt: at,
+      })
       return
     }
-
-    const resolution = await this.resolveRootsForMonitor(monitor, activeSessionIds)
-    this.upsertClassifiedActivity(monitor.terminalId, resolution)
+    this.observe(monitor, {
+      kind: 'snapshot',
+      cycleId,
+      streamId,
+      statuses: classified.statuses,
+      at,
+    })
   }
 
-  private async consumeEvents(monitor: MonitorState, signal: AbortSignal): Promise<void> {
+  private async consumeEvents(monitor: MonitorState, cycleId: number, signal: AbortSignal): Promise<void> {
     const response = await this.fetchImpl(this.buildUrl(monitor.endpoint, '/event'), {
       signal,
       headers: { accept: 'text/event-stream' },
@@ -345,6 +400,8 @@ export class OpencodeActivityTracker extends EventEmitter {
     const decoder = new TextDecoder()
     const abortPromise = createAbortPromise(signal)
     let buffer = ''
+    let connected = false
+    const streamId = ++this.nextStreamId
 
     try {
       while (true) {
@@ -365,7 +422,13 @@ export class OpencodeActivityTracker extends EventEmitter {
         while (separatorIndex >= 0) {
           const block = buffer.slice(0, separatorIndex)
           buffer = buffer.slice(separatorIndex + 2)
-          await this.handleSseBlock(monitor, block)
+          const event = this.parseSseBlock(monitor.terminalId, block)
+          if (event?.type === 'server.connected' && !connected) {
+            connected = true
+            await this.refreshSnapshot(monitor, cycleId, streamId, signal)
+          } else if (event && event.type !== 'server.connected') {
+            await this.handleOpencodeEvent(monitor, cycleId, streamId, event)
+          }
           separatorIndex = buffer.indexOf('\n\n')
         }
       }
@@ -378,10 +441,12 @@ export class OpencodeActivityTracker extends EventEmitter {
     }
   }
 
-  private async handleSseBlock(monitor: MonitorState, block: string): Promise<void> {
-    const terminalId = monitor.terminalId
+  private parseSseBlock(
+    terminalId: string,
+    block: string,
+  ): z.infer<typeof OpencodeEventSchema> | undefined {
     const data = parseSseData(block)
-    if (!data) return
+    if (!data) return undefined
 
     let event: z.infer<typeof OpencodeEventSchema> | undefined
     try {
@@ -393,115 +458,85 @@ export class OpencodeActivityTracker extends EventEmitter {
         endpoint,
         err: error,
       }, 'OpenCode event payload was invalid; skipping payload.')
-      return
+      return undefined
     }
 
-    if (!event) return
-    if (event.type === 'server.connected') return
+    return event
+  }
+
+  private async handleOpencodeEvent(
+    monitor: MonitorState,
+    cycleId: number,
+    streamId: number,
+    event: Exclude<z.infer<typeof OpencodeEventSchema>, { type: 'server.connected' }>,
+  ): Promise<void> {
     if (event.type === 'session.created') {
       const parentId = event.properties.info?.parentID
       if (parentId) {
-        monitor.sessionParents.set(event.properties.sessionID, parentId)
-        const rootSessionId = this.resolveTopologyRoot(monitor, event.properties.sessionID)
-        monitor.sessionRootCache.set(event.properties.sessionID, rootSessionId)
-      } else {
-        monitor.sessionRootCache.set(event.properties.sessionID, event.properties.sessionID)
-      }
-      return
-    }
-    if (event.type === 'session.idle') {
-      this.removeRecordForSession(
-        terminalId,
-        await this.resolveRootForEvent(monitor, event.properties.sessionID) ?? event.properties.sessionID,
-      )
-      return
-    }
-    if (event.properties.status.type === 'idle') {
-      this.removeRecordForSession(
-        terminalId,
-        await this.resolveRootForEvent(monitor, event.properties.sessionID) ?? event.properties.sessionID,
-      )
-      return
-    }
-
-    const rootSessionId = await this.resolveRootForEvent(monitor, event.properties.sessionID)
-    this.upsertRecord({
-      terminalId,
-      ...(rootSessionId ? { sessionId: rootSessionId } : {}),
-      phase: 'busy',
-      updatedAt: this.now(),
-    })
-  }
-
-  private async resolveRootsForMonitor(
-    monitor: MonitorState,
-    sessionIds: readonly string[],
-  ): Promise<OpencodeRootResolution> {
-    const rootsBySessionId = new Map<string, string>()
-    const unresolved: string[] = []
-    for (const sessionId of sessionIds) {
-      const topologyRoot = this.resolveTopologyRoot(monitor, sessionId)
-      if (topologyRoot !== sessionId) {
-        rootsBySessionId.set(sessionId, topologyRoot)
-        monitor.sessionRootCache.set(sessionId, topologyRoot)
-      } else {
-        const cachedRoot = monitor.sessionRootCache.get(sessionId)
-        if (cachedRoot) {
-          rootsBySessionId.set(sessionId, cachedRoot)
-        } else {
-          unresolved.push(sessionId)
+        this.registerChildSession(monitor.terminalId, event.properties.sessionID, parentId)
+        if (monitor.lastSnapshot && monitor.ownership.kind === 'ambiguous') {
+          monitor.ownership = { ...monitor.ownership, knownSessionId: parentId }
+          this.observe(monitor, {
+            kind: 'snapshot',
+            cycleId: monitor.lastSnapshot.cycleId,
+            streamId: monitor.lastSnapshot.streamId,
+            statuses: this.classifyKnownSnapshotStatuses(monitor.terminalId, monitor.lastSnapshot.statuses),
+            at: monitor.lastSnapshot.at,
+          })
         }
       }
-    }
-    if (unresolved.length === 0) {
-      return {
-        rootsBySessionId,
-        unresolvedSessionIds: new Set<string>(),
-      }
+      return
     }
 
-    try {
-      const resolved = await this.resolveOpencodeSessionRoots(Array.from(new Set(unresolved)))
-      for (const [sessionId, rootSessionId] of resolved.rootsBySessionId) {
-        rootsBySessionId.set(sessionId, rootSessionId)
-        monitor.sessionRootCache.set(sessionId, rootSessionId)
-      }
-      return {
-        rootsBySessionId,
-        unresolvedSessionIds: resolved.unresolvedSessionIds,
-      }
-    } catch (err) {
-      this.log.warn({
-        err,
-        terminalId: monitor.terminalId,
-        sessionIds,
-      }, 'Failed to resolve OpenCode root sessions before activity classification')
-      return {
-        rootsBySessionId,
-        unresolvedSessionIds: new Set(unresolved),
-      }
+    const observedSessionId = await this.resolveRootForEvent(monitor, event.properties.sessionID)
+    const observedStatus = event.type === 'session.idle'
+      ? 'idle'
+      : event.properties.status.type
+
+    if (observedStatus === 'idle') {
+      this.observe(monitor, {
+        kind: 'sse',
+        cycleId,
+        streamId,
+        sessionId: observedSessionId ?? event.properties.sessionID,
+        status: 'idle',
+        at: this.now(),
+      })
+      return
     }
+
+    if (!observedSessionId) {
+      this.upsertRecord({
+        terminalId: monitor.terminalId,
+        phase: 'busy',
+        updatedAt: this.now(),
+      })
+      return
+    }
+
+    this.observe(monitor, {
+      kind: 'sse',
+      cycleId,
+      streamId,
+      sessionId: observedSessionId,
+      status: observedStatus,
+      at: this.now(),
+    })
   }
 
   private async resolveRootForEvent(
     monitor: MonitorState,
     sessionId: string,
   ): Promise<string | undefined> {
-    const topologyRoot = this.resolveTopologyRoot(monitor, sessionId)
-    if (topologyRoot !== sessionId) {
-      monitor.sessionRootCache.set(sessionId, topologyRoot)
-      return topologyRoot
-    }
-
-    const cachedRoot = monitor.sessionRootCache.get(sessionId)
-    if (cachedRoot) return cachedRoot
+    const knownRoot = this.resolveKnownRoot(monitor.terminalId, sessionId)
+    if (knownRoot) return knownRoot
 
     try {
       const resolved = await this.resolveOpencodeSessionRoots([sessionId])
-      const rootSessionId = resolved.rootsBySessionId.get(sessionId)
-      if (!rootSessionId) return undefined
-      monitor.sessionRootCache.set(sessionId, rootSessionId)
-      return rootSessionId
+      for (const [resolvedSessionId, rootSessionId] of resolved.rootsBySessionId) {
+        this.registerSessionRoot(monitor.terminalId, resolvedSessionId, rootSessionId)
+      }
+      return resolved.rootsBySessionId.get(sessionId)
     } catch (err) {
       this.log.warn({
         err,
@@ -512,37 +547,65 @@ export class OpencodeActivityTracker extends EventEmitter {
     }
   }
 
-  private upsertClassifiedActivity(
-    terminalId: string,
-    resolution: OpencodeRootResolution,
-  ): void {
-    const rootIds = new Set(resolution.rootsBySessionId.values())
-    if (rootIds.size === 1 && resolution.unresolvedSessionIds.size === 0) {
-      const [sessionId] = rootIds
-      this.upsertRecord({
-        terminalId,
-        sessionId,
-        phase: 'busy',
-        updatedAt: this.now(),
-      })
-      return
-    }
+  confirmSessionAssociation(input: { terminalId: string; sessionId: string }): void {
+    const monitor = this.monitors.get(input.terminalId)
+    if (!monitor || monitor.disposed) return
+    const result = confirmOpencodeAssociation(monitor.ownership, { sessionId: input.sessionId })
+    monitor.ownership = result.state
+    this.applyActions(monitor.terminalId, result.actions)
+  }
 
-    const rootSessionIds = Array.from(rootIds).sort()
-    const unresolvedSessionIds = Array.from(resolution.unresolvedSessionIds).sort()
-    if (rootSessionIds.length + unresolvedSessionIds.length > 1) {
-      this.log.warn({
-        terminalId,
-        rootSessionIds,
-        unresolvedSessionIds,
-      }, 'OpenCode reported multiple active root sessions; leaving terminal activity unbound.')
-    }
+  rejectSessionAssociation(input: { terminalId: string; sessionId: string }): void {
+    const monitor = this.monitors.get(input.terminalId)
+    if (!monitor || monitor.disposed) return
+    const result = rejectOpencodeAssociation(monitor.ownership, { sessionId: input.sessionId })
+    monitor.ownership = result.state
+    this.applyActions(monitor.terminalId, result.actions)
+  }
 
-    this.upsertRecord({
-      terminalId,
-      phase: 'busy',
-      updatedAt: this.now(),
-    })
+  private observe(monitor: MonitorState, observation: OpencodeObservation): void {
+    const result = reduceOpencodeOwnership(monitor.ownership, observation)
+    monitor.ownership = result.state
+    this.applyActions(monitor.terminalId, result.actions)
+  }
+
+  private applyActions(terminalId: string, actions: OpencodeOwnershipAction[]): void {
+    for (const action of actions) {
+      if (action.kind === 'activityUpsert') {
+        this.upsertRecord({
+          terminalId,
+          ...(action.sessionId ? { sessionId: action.sessionId } : {}),
+          phase: 'busy',
+          updatedAt: action.at,
+        })
+        continue
+      }
+      if (action.kind === 'activityRemove') {
+        this.removeRecord(terminalId)
+        continue
+      }
+      if (action.kind === 'requestAssociation') {
+        this.emit('association.requested', {
+          terminalId,
+          sessionId: action.sessionId,
+        } satisfies OpencodeAssociationRequestedEvent)
+        continue
+      }
+      if (action.kind === 'turnComplete') {
+        this.emit('turn.complete', {
+          terminalId,
+          sessionId: action.sessionId,
+          at: action.at,
+        } satisfies OpencodeTurnCompleteEvent)
+        continue
+      }
+      if (action.kind === 'warnAmbiguous') {
+        this.log.warn({
+          terminalId,
+          sessionIds: action.sessionIds,
+        }, 'OpenCode endpoint reported ambiguous session ownership; suppressing durable adoption.')
+      }
+    }
   }
 
   private async sleepWithBackoff(monitor: MonitorState): Promise<void> {
@@ -595,42 +658,6 @@ export class OpencodeActivityTracker extends EventEmitter {
     return `http://${endpoint.hostname}:${endpoint.port}${pathname}`
   }
 
-  private removeRecordForSession(terminalId: string, sessionId: string): void {
-    const existing = this.records.get(terminalId)
-    if (!existing) return
-    if (existing.sessionId && existing.sessionId !== sessionId) return
-    this.emitTurnComplete(existing)
-    this.removeRecord(terminalId)
-  }
-
-  private removeRecordForIdleTerminal(terminalId: string): void {
-    const existing = this.records.get(terminalId)
-    if (!existing) return
-    this.emitTurnComplete(existing)
-    this.removeRecord(terminalId)
-  }
-
-  private emitTurnComplete(record: OpencodeActivityRecord): void {
-    if (!record.sessionId) return
-    this.emit('turn.complete', {
-      terminalId: record.terminalId,
-      sessionId: record.sessionId,
-      at: this.now(),
-    })
-  }
-
-  private resolveTopologyRoot(monitor: MonitorState, sessionId: string): string {
-    let current = sessionId
-    const seen = new Set<string>()
-    while (true) {
-      if (seen.has(current)) return sessionId
-      seen.add(current)
-      const parentId = monitor.sessionParents.get(current)
-      if (!parentId) return current
-      current = parentId
-    }
-  }
-
   private upsertRecord(record: OpencodeActivityRecord): void {
     const previous = this.records.get(record.terminalId)
     if (
@@ -654,5 +681,115 @@ export class OpencodeActivityTracker extends EventEmitter {
       upsert: [],
       remove: [terminalId],
     } satisfies OpencodeActivityChange)
+  }
+
+  private registerChildSession(terminalId: string, sessionId: string, parentId: string): void {
+    let children = this.childSessionIds.get(terminalId)
+    if (!children) {
+      children = new Set()
+      this.childSessionIds.set(terminalId, children)
+    }
+    children.add(sessionId)
+    const rootSessionId = this.resolveKnownRoot(terminalId, parentId) ?? parentId
+    this.registerSessionRoot(terminalId, parentId, rootSessionId)
+    this.registerSessionRoot(terminalId, sessionId, rootSessionId)
+  }
+
+  private registerSessionRoot(terminalId: string, sessionId: string, rootSessionId: string): void {
+    let roots = this.sessionRootsByTerminal.get(terminalId)
+    if (!roots) {
+      roots = new Map()
+      this.sessionRootsByTerminal.set(terminalId, roots)
+    }
+    roots.set(sessionId, rootSessionId)
+    roots.set(rootSessionId, rootSessionId)
+  }
+
+  private resolveKnownRoot(terminalId: string, sessionId: string): string | undefined {
+    const roots = this.sessionRootsByTerminal.get(terminalId)
+    if (!roots) return undefined
+    let current = sessionId
+    const seen = new Set<string>()
+    while (true) {
+      if (seen.has(current)) return undefined
+      seen.add(current)
+      const next = roots.get(current)
+      if (!next) return current === sessionId ? undefined : current
+      if (next === current) return current
+      current = next
+    }
+  }
+
+  private warnIfMultipleActiveRoots(
+    terminalId: string,
+    statuses: Record<string, z.infer<typeof SessionStatusSchema>>,
+    unresolvedSessionIds: Set<string>,
+  ): void {
+    const activeSessionIds = Object.entries(statuses)
+      .filter(([, status]) => status.type !== 'idle')
+      .map(([sessionId]) => sessionId)
+      .sort()
+    const rootSessionIds = activeSessionIds.filter((sessionId) => !unresolvedSessionIds.has(sessionId))
+    const unresolvedActiveSessionIds = activeSessionIds.filter((sessionId) => unresolvedSessionIds.has(sessionId))
+    if (rootSessionIds.length + unresolvedActiveSessionIds.length <= 1) return
+
+    this.log.warn({
+      terminalId,
+      rootSessionIds,
+      unresolvedSessionIds: unresolvedActiveSessionIds,
+    }, 'OpenCode reported multiple active root sessions; leaving terminal activity unbound.')
+  }
+
+  private async classifySnapshotStatuses(
+    monitor: MonitorState,
+    statuses: Record<string, z.infer<typeof SessionStatusSchema>>,
+  ): Promise<{
+      statuses: Record<string, z.infer<typeof SessionStatusSchema>>
+      unresolvedSessionIds: Set<string>
+    }> {
+    const activeSessionIds = Object.entries(statuses)
+      .filter(([, status]) => status.type !== 'idle')
+      .map(([sessionId]) => sessionId)
+    const unresolvedCandidates = activeSessionIds.filter(
+      (sessionId) => !this.resolveKnownRoot(monitor.terminalId, sessionId),
+    )
+
+    let unresolvedSessionIds = new Set<string>()
+    if (unresolvedCandidates.length > 0) {
+      try {
+        const resolution = await this.resolveOpencodeSessionRoots(unresolvedCandidates)
+        for (const [sessionId, rootSessionId] of resolution.rootsBySessionId) {
+          this.registerSessionRoot(monitor.terminalId, sessionId, rootSessionId)
+        }
+        unresolvedSessionIds = resolution.unresolvedSessionIds
+      } catch (err) {
+        this.log.warn({
+          err,
+          terminalId: monitor.terminalId,
+          sessionIds: unresolvedCandidates,
+        }, 'Failed to resolve OpenCode root sessions before activity classification')
+        unresolvedSessionIds = new Set(unresolvedCandidates)
+      }
+    }
+
+    return {
+      statuses: this.classifyKnownSnapshotStatuses(monitor.terminalId, statuses),
+      unresolvedSessionIds,
+    }
+  }
+
+  private classifyKnownSnapshotStatuses(
+    terminalId: string,
+    statuses: Record<string, z.infer<typeof SessionStatusSchema>>,
+  ): Record<string, z.infer<typeof SessionStatusSchema>> {
+    const classified: Record<string, z.infer<typeof SessionStatusSchema>> = {}
+    for (const [sessionId, status] of Object.entries(statuses)) {
+      const rootSessionId = this.resolveKnownRoot(terminalId, sessionId) ?? sessionId
+      const existing = classified[rootSessionId]
+      if (!existing || existing.type === 'idle' || status.type !== 'idle') {
+        classified[rootSessionId] = status
+      }
+    }
+    return classified
   }
 }

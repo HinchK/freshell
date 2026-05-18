@@ -780,6 +780,7 @@ export const panesSlice = createSlice({
         state.paneTitleSetByUser[tabId] = paneTitleSetByUser
       }
       reconcileRefreshRequestsForTab(state, tabId)
+      delete state.restoreFallbackAttemptsByPane?.[tabId]
     },
 
     resetLayout: (

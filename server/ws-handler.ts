@@ -2437,6 +2437,7 @@ export class WsHandler {
               connectionId: ws.connectionId || 'unknown',
               ...(m.tabId ? { tabId: m.tabId } : {}),
               ...(m.paneId ? { paneId: m.paneId } : {}),
+              ...(m.cwd ? { cwd: m.cwd } : {}),
               mode,
               reason: 'fresh_after_restore_unavailable',
               restoreRequested: false,
@@ -2728,6 +2729,7 @@ export class WsHandler {
               }
 
               if (m.mode === 'opencode' && restoreRequested && !canonicalSessionId) {
+                error = true
                 this.sendError(ws, {
                   code: 'RESTORE_UNAVAILABLE',
                   message: 'OpenCode restore requires a canonical durable session id',
@@ -2737,6 +2739,7 @@ export class WsHandler {
               }
 
               if (m.mode === 'claude' && restoreRequested && !isValidClaudeSessionId(restoreSessionId)) {
+                error = true
                 this.sendError(ws, {
                   code: 'RESTORE_UNAVAILABLE',
                   message: 'Claude restore requires a canonical durable session id',

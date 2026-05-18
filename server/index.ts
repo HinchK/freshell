@@ -20,7 +20,7 @@ import { SessionsSyncService } from './sessions-sync/service.js'
 import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
-import { wireOpencodeActivityTracker } from './coding-cli/opencode-activity-wiring.js'
+import { createOpencodeActivityIntegration } from './coding-cli/opencode-activity-integration.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
 import { opencodeProvider } from './coding-cli/providers/opencode.js'
@@ -197,34 +197,7 @@ async function main() {
   const terminalMetadata = new TerminalMetadataService()
   const layoutStore = new LayoutStore()
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
-  const opencodeActivity = wireOpencodeActivityTracker({
-    registry,
-    resolveOpencodeSessionRoots: (sessionIds) => opencodeProvider.resolveOpencodeSessionRoots(sessionIds),
-    onAssociated: ({ terminalId, sessionId }) => {
-      codingCliIndexer.scheduleProviderRefresh('opencode', {
-        urgent: true,
-        reason: 'opencode_associated',
-      })
-      log.info({ terminalId, sessionId }, 'OpenCode session associated; scheduled provider refresh')
-    },
-    onTurnComplete: ({ terminalId, sessionId, at }) => {
-      const terminal = registry.get(terminalId)
-      if (
-        !terminal ||
-        terminal.mode !== 'opencode' ||
-        terminal.status !== 'running' ||
-        terminal.resumeSessionId !== sessionId
-      ) {
-        log.warn({ terminalId, sessionId }, 'Suppressed OpenCode turn completion for terminal without current ownership')
-        return
-      }
-      codingCliIndexer.scheduleProviderRefresh('opencode', {
-        urgent: true,
-        reason: 'opencode_turn_complete',
-      })
-      log.info({ terminalId, sessionId, at }, 'OpenCode turn complete; scheduled provider refresh')
-    },
-  })
+  let opencodeActivity: ReturnType<typeof createOpencodeActivityIntegration> | undefined
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   const serverInstanceId = await loadOrCreateServerInstanceId()
@@ -362,7 +335,7 @@ async function main() {
       extensionManager,
       codexActivityListProvider: () => codexActivity.tracker.list(),
       agentHistorySource,
-      opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
+      opencodeActivityListProvider: () => opencodeActivity?.tracker.list() ?? [],
     },
   )
   attachProxyUpgradeHandler(server)
@@ -410,9 +383,6 @@ async function main() {
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
   })
-  opencodeActivity.tracker.on('changed', (payload) => {
-    wsHandler.broadcastOpencodeActivityUpdated(payload)
-  })
 
   const broadcastTerminalMetaUpserts = (upsert: ReturnType<TerminalMetadataService['list']>) => {
     if (upsert.length === 0) return
@@ -427,19 +397,6 @@ async function main() {
     wsHandler,
     terminalMetadata,
     broadcastTerminalMetaUpserts,
-  })
-
-  opencodeActivity.controller.on('associated', ({ terminalId, sessionId }) => {
-    try {
-      associationPublisher.publish({
-        provider: 'opencode',
-        terminalId,
-        sessionId,
-        source: 'opencode_controller',
-      })
-    } catch (err) {
-      log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
-    }
   })
 
   const findCodingCliSession = (provider: CodingCliProviderName, sessionId: string): CodingCliSession | undefined => {
@@ -474,6 +431,54 @@ async function main() {
     if (terminalMetadata.retire(terminalId)) {
       broadcastTerminalMetaRemoval(terminalId)
     }
+  })
+
+  opencodeActivity = createOpencodeActivityIntegration({
+    registry,
+    opencodeProvider,
+    onActivityChanged: (payload) => {
+      wsHandler.broadcastOpencodeActivityUpdated(payload)
+    },
+    onAssociated: ({ terminalId, sessionId }) => {
+      try {
+        associationPublisher.publish({
+          provider: 'opencode',
+          terminalId,
+          sessionId,
+          source: 'opencode_controller',
+        })
+        codingCliIndexer.scheduleProviderRefresh('opencode', {
+          urgent: true,
+          reason: 'opencode_associated',
+        })
+        log.info({ terminalId, sessionId }, 'OpenCode session associated; scheduled provider refresh')
+      } catch (err) {
+        log.warn({ err, terminalId, sessionId }, 'Failed to broadcast OpenCode session association')
+      }
+    },
+    onTurnComplete: ({ terminalId, sessionId, at }) => {
+      const terminal = registry.get(terminalId)
+      if (
+        !terminal
+        || terminal.mode !== 'opencode'
+        || terminal.status !== 'running'
+        || terminal.resumeSessionId !== sessionId
+      ) {
+        log.warn({ terminalId, sessionId }, 'Suppressed OpenCode turn completion for terminal without current ownership')
+        return
+      }
+      wsHandler.broadcastTerminalTurnComplete({
+        terminalId,
+        provider: 'opencode',
+        sessionId,
+        at,
+      })
+      codingCliIndexer.scheduleProviderRefresh('opencode', {
+        urgent: true,
+        reason: 'opencode_turn_complete',
+      })
+      log.info({ terminalId, sessionId, at }, 'OpenCode turn complete; scheduled provider refresh')
+    },
   })
 
   const applyDebugLogging = (enabled: boolean, source: string) => {
@@ -864,7 +869,7 @@ async function main() {
 
     // 9b. Stop Codex activity tracker listeners and sweep timer
     codexActivity.dispose()
-    opencodeActivity.dispose()
+    opencodeActivity?.dispose()
 
     // 10. Stop session repair service
     await sessionRepairService.stop()

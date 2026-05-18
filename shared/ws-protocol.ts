@@ -128,6 +128,14 @@ export const OpencodeActivityUpdatedSchema = z.object({
   remove: z.array(z.string().min(1)),
 })
 
+export const TerminalTurnCompleteSchema = z.object({
+  type: z.literal('terminal.turn.complete'),
+  terminalId: z.string().min(1),
+  provider: z.literal('opencode'),
+  sessionId: z.string().min(1),
+  at: z.number().int().nonnegative(),
+})
+
 // ──────────────────────────────────────────────────────────────
 // SDK content block schemas (from Claude Code NDJSON)
 // ──────────────────────────────────────────────────────────────
@@ -553,6 +561,8 @@ export type OpencodeActivityListResponseMessage = z.infer<typeof OpencodeActivit
 
 export type OpencodeActivityUpdatedMessage = z.infer<typeof OpencodeActivityUpdatedSchema>
 
+export type TerminalTurnCompleteMessage = z.infer<typeof TerminalTurnCompleteSchema>
+
 // -- Sessions --
 
 export type SessionsChangedMessage = {
@@ -781,6 +791,7 @@ export type ServerMessage =
   | CodexActivityUpdatedMessage
   | OpencodeActivityListResponseMessage
   | OpencodeActivityUpdatedMessage
+  | TerminalTurnCompleteMessage
   | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage

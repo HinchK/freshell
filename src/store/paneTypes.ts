@@ -261,7 +261,8 @@ export interface PanesState {
    */
   refreshRequestsByPane: Record<string, Record<string, PaneRefreshRequest>>
   /**
-   * Ephemeral one-shot fresh recovery guards keyed by tab and pane id.
+   * Ephemeral one-shot fresh recovery markers for restored terminals whose
+   * live backend handle disappeared before a durable session identity existed.
    * Must never be persisted.
    */
   restoreFallbackAttemptsByPane: Record<string, Record<string, RestoreFallbackAttempt>>

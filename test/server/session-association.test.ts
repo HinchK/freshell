@@ -142,6 +142,99 @@ describe('SessionAssociationCoordinator integration', () => {
 
     registry.shutdown()
   })
+
+  it('records a lifecycle event when Codex durable identity is explicitly bound', () => {
+    const registry = new TerminalRegistry()
+    const terminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+
+    registry.rebindSession(terminal.terminalId, 'codex', 'codex-thread-1', 'association')
+
+    expect(recordSessionLifecycleEvent).toHaveBeenCalledWith({
+      kind: 'terminal_session_bound',
+      provider: 'codex',
+      terminalId: terminal.terminalId,
+      sessionId: 'codex-thread-1',
+      reason: 'association',
+    })
+
+    registry.shutdown()
+  })
+
+  it('records a lifecycle warning when a Codex terminal exits before durable identity exists', () => {
+    const registry = new TerminalRegistry()
+    const terminal = registry.create({ mode: 'codex', cwd: '/home/user/project' })
+    const pty = terminal.pty as unknown as { onExit: ReturnType<typeof vi.fn> }
+    const onExit = pty.onExit.mock.calls[0][0]
+
+    onExit({ exitCode: 0, signal: 0 })
+
+    expect(recordSessionLifecycleEvent).toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'terminal_exit_without_durable_session',
+      terminalId: terminal.terminalId,
+      mode: 'codex',
+      exitCode: 0,
+      reason: 'pty_exit',
+    }))
+
+    registry.shutdown()
+  })
+
+  it('records a lifecycle event when the Codex sidecar reports durable identity', () => {
+    let onDurableSession: ((sessionId: string) => void) | undefined
+    const sidecar = {
+      attachTerminal: vi.fn((callbacks: { onDurableSession: (sessionId: string) => void }) => {
+        onDurableSession = callbacks.onDurableSession
+      }),
+      shutdown: vi.fn(async () => undefined),
+    }
+    const registry = new TerminalRegistry()
+    const terminal = registry.create({
+      mode: 'codex',
+      cwd: '/home/user/project',
+      codexSidecar: sidecar,
+    })
+
+    onDurableSession?.('codex-thread-1')
+    onDurableSession?.('codex-thread-1')
+
+    const durableObservationCalls = vi.mocked(recordSessionLifecycleEvent).mock.calls.filter(([event]) =>
+      event.kind === 'codex_durable_session_observed'
+    )
+    expect(durableObservationCalls).toEqual([[
+      {
+        kind: 'codex_durable_session_observed',
+        provider: 'codex',
+        terminalId: terminal.terminalId,
+        sessionId: 'codex-thread-1',
+        generation: 1,
+        source: 'sidecar',
+      },
+    ]])
+
+    registry.shutdown()
+  })
+
+  it('does not record a missing-durable-session warning when a bound OpenCode terminal is closed', () => {
+    const registry = new TerminalRegistry()
+    const terminal = registry.create({
+      mode: 'opencode',
+      cwd: '/home/user/project',
+      providerSettings: { opencodeServer: { hostname: '127.0.0.1', port: 4173 } },
+    })
+
+    registry.rebindSession(terminal.terminalId, 'opencode', 'ses-opencode-root-1', 'association')
+    vi.mocked(recordSessionLifecycleEvent).mockClear()
+
+    registry.kill(terminal.terminalId)
+
+    expect(recordSessionLifecycleEvent).not.toHaveBeenCalledWith(expect.objectContaining({
+      kind: 'terminal_exit_without_durable_session',
+      terminalId: terminal.terminalId,
+      mode: 'opencode',
+    }))
+
+    registry.shutdown()
+  })
 })
 
 describe('Session-Terminal metadata broadcasts', () => {
@@ -775,7 +868,7 @@ describe('Session-Terminal Association via onUpdate', () => {
     registry.shutdown()
   })
 
-  it('associates opencode sessions when resume is supported', () => {
+  it('skips opencode sessions in onUpdate ownership pass', () => {
     const registry = new TerminalRegistry()
     const broadcasts: any[] = []
 
@@ -796,9 +889,8 @@ describe('Session-Terminal Association via onUpdate', () => {
       }],
     }], broadcasts)
 
-    expect(broadcasts).toHaveLength(1)
-    expect(broadcasts[0].terminalId).toBe(term.terminalId)
-    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('opencode-session-123')
+    expect(broadcasts).toHaveLength(0)
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBeUndefined()
 
     registry.shutdown()
   })

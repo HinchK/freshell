@@ -444,7 +444,7 @@ describe('codex refresh rehydrate flow (e2e)', () => {
     expect(sentMessages().some((msg) => msg?.type === 'terminal.create')).toBe(false)
   })
 
-  it('starts explicit fresh recovery when a live-only Codex terminal is gone', async () => {
+  it('surfaces restore-unavailable while starting explicit fresh recovery when a live-only terminal is gone', async () => {
     const tabId = 'tab-codex-live-only'
     const paneId = 'pane-codex-live-only'
     const store = createStore({
@@ -504,19 +504,20 @@ describe('codex refresh rehydrate flow (e2e)', () => {
     })
 
     await waitFor(() => {
-      const recoveryCreate = sentMessages().slice(baselineMessages).find((msg) => (
-        msg?.type === 'terminal.create'
-        && msg?.recoveryIntent === 'fresh_after_restore_unavailable'
-      ))
+      const recoveryCreate = sentMessages().slice(baselineMessages).find((msg) => msg?.type === 'terminal.create')
       expect(recoveryCreate).toMatchObject({
         type: 'terminal.create',
         mode: 'codex',
         recoveryIntent: 'fresh_after_restore_unavailable',
       })
-      expect(recoveryCreate).not.toHaveProperty('restore')
-      expect(recoveryCreate).not.toHaveProperty('sessionRef')
-      expect(recoveryCreate).not.toHaveProperty('liveTerminal')
-      expect((getTerminalPaneContent(store, tabId) as any)?.restoreError).toBeUndefined()
+      expect(recoveryCreate?.restore).toBeUndefined()
+      expect(recoveryCreate?.sessionRef).toBeUndefined()
+      expect(recoveryCreate?.liveTerminal).toBeUndefined()
+      expect(recoveryCreate?.resumeSessionId).toBeUndefined()
+      expect((getTerminalPaneContent(store, tabId) as any)?.restoreError).toEqual({
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'dead_live_handle',
+      })
     })
   })
 })
