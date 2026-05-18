@@ -7,7 +7,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { shallowEqual } from 'react-redux'
 import { addTab, openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
-import { addPane, initLayout, setActivePane } from '@/store/panesSlice'
+import { addPane, initLayout, setActivePane, updatePaneTitle } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
 import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
@@ -377,6 +377,13 @@ export default function Sidebar({
       localServerInstanceId,
     )
     if (existing) {
+      const existingTab = state.tabs.tabs.find((t) => t.id === existing.tabId)
+      if (existingTab && item.title && item.hasTitle && item.title !== existingTab.title && !existingTab.titleSetByUser) {
+        dispatch(updateTab({ id: existingTab.id, updates: { title: item.title } }))
+      }
+      if (existing.paneId && item.hasTitle && item.title) {
+        dispatch(updatePaneTitle({ tabId: existing.tabId, paneId: existing.paneId, title: item.title, setByUser: false }))
+      }
       dispatch(setActiveTab(existing.tabId))
       if (existing.paneId) {
         dispatch(setActivePane({ tabId: existing.tabId, paneId: existing.paneId }))
@@ -406,6 +413,7 @@ export default function Sidebar({
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
+        hasTitle: item.hasTitle,
       }))
       onNavigate('terminal')
       return
@@ -424,6 +432,7 @@ export default function Sidebar({
         firstUserMessage: item.firstUserMessage,
         isSubagent: item.isSubagent,
         isNonInteractive: item.isNonInteractive,
+        hasTitle: item.hasTitle,
       }))
       onNavigate('terminal')
       return

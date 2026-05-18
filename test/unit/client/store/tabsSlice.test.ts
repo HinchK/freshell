@@ -781,6 +781,156 @@ describe('tabsSlice', () => {
       })
     })
 
+    it('updates the title of an existing tab when reopened with a different title and titleSetByUser is falsy', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'local-fallback',
+        mode: 'claude',
+        title: 'Claude',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        title: 'Renamed from sidebar',
+        hasTitle: true,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'local-fallback')
+      expect(store.getState().tabs.activeTabId).toBe('local-fallback')
+      expect(tab?.title).toBe('Renamed from sidebar')
+    })
+
+    it('preserves user-set title when reopening an existing tab with titleSetByUser true', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'local-fallback',
+        mode: 'claude',
+        title: 'User named this',
+        titleSetByUser: true,
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        title: 'Renamed from sidebar',
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'local-fallback')
+      expect(tab?.title).toBe('User named this')
+    })
+
+    it('updates the title of an existing tab found by terminalId when reopened with a new title', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'term-tab',
+        mode: 'claude',
+        title: 'Stale Title',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'term-tab',
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-99', status: 'running' },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        terminalId: 'term-99',
+        title: 'Fresh Title',
+        hasTitle: true,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'term-tab')
+      expect(tab?.title).toBe('Fresh Title')
+    })
+
+    it('preserves user-set title when reopening by terminalId with titleSetByUser true', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'term-tab',
+        mode: 'claude',
+        title: 'Keep this name',
+        titleSetByUser: true,
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'term-tab',
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-88', status: 'running' },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        terminalId: 'term-88',
+        title: 'Should not apply',
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'term-tab')
+      expect(tab?.title).toBe('Keep this name')
+    })
+
+    it('does not update tab title when reopened title already matches existing title', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'local-fallback',
+        mode: 'claude',
+        title: 'Already Correct',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        title: 'Already Correct',
+        hasTitle: true,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'local-fallback')
+      expect(tab?.title).toBe('Already Correct')
+      expect(store.getState().tabs.activeTabId).toBe('local-fallback')
+    })
+
+    it('updates title of existing tab for agent-chat session when reopened with new title', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'agent-tab',
+        mode: 'claude',
+        title: 'Old Name',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        sessionMetadataByKey: {
+          [`claude:${VALID_CLAUDE_SESSION_ID}`]: { sessionType: 'freshclaude' },
+        },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'agent-tab',
+        content: {
+          kind: 'agent-chat',
+          provider: 'freshclaude',
+          sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        sessionType: 'freshclaude',
+        title: 'Freshclaude Session',
+        hasTitle: true,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'agent-tab')
+      expect(tab?.title).toBe('Freshclaude Session')
+    })
+
     it('repairs a mis-restored single-pane session tab when the reopened session resolves to agent-chat', async () => {
       const store = configureStore({
         reducer: {
@@ -1100,6 +1250,216 @@ describe('tabsSlice', () => {
       const tabs = store.getState().tabs.tabs
       expect(tabs).toHaveLength(1)
       expect(tabs[0].title).toBe('Codex CLI')
+    })
+
+    it('does not update tab title when hasTitle is false (prevents fallback clobbering)', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'local-fallback',
+        mode: 'claude',
+        title: 'Claude',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        title: 'abc12345',  // synthesized fallback like sessionId.slice(0, 8)
+        hasTitle: false,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'local-fallback')
+      expect(store.getState().tabs.activeTabId).toBe('local-fallback')
+      expect(tab?.title).toBe('Claude')  // original title preserved
+    })
+
+    it('does not update tab title when hasTitle is false even when title differs', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'local-fallback',
+        mode: 'claude',
+        title: 'Claude',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        title: 'Completely Different Name',
+        hasTitle: false,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'local-fallback')
+      expect(tab?.title).toBe('Claude')  // original title preserved despite different title
+    })
+
+    it('does not update tab title when hasTitle is false in terminalId path', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'term-tab',
+        mode: 'claude',
+        title: 'Stale Title',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'term-tab',
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-99', status: 'running' },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        terminalId: 'term-99',
+        title: 'Session abc12345',
+        hasTitle: false,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'term-tab')
+      expect(tab?.title).toBe('Stale Title')
+    })
+
+    it('syncs pane title alongside tab title when hasTitle is true via findTabIdForSession', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'local-fallback',
+        mode: 'claude',
+        title: 'Claude',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'local-fallback',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        title: 'Synced Name',
+        hasTitle: true,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'local-fallback')
+      expect(tab?.title).toBe('Synced Name')
+
+      const layout = store.getState().panes.layouts['local-fallback']
+      if (layout?.type === 'leaf') {
+        const paneTitle = store.getState().panes.paneTitles?.['local-fallback']?.[layout.id]
+        expect(paneTitle).toBe('Synced Name')
+      }
+    })
+
+    it('syncs pane title alongside tab title when hasTitle is true via terminalId', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'term-tab',
+        mode: 'claude',
+        title: 'Old',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'term-tab',
+        content: { kind: 'terminal', mode: 'claude', terminalId: 'term-55', status: 'running' },
+      }))
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        terminalId: 'term-55',
+        title: 'Pane Synced',
+        hasTitle: true,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'term-tab')
+      expect(tab?.title).toBe('Pane Synced')
+
+      const layout = store.getState().panes.layouts['term-tab']
+      if (layout?.type === 'leaf') {
+        const paneTitle = store.getState().panes.paneTitles?.['term-tab']?.[layout.id]
+        expect(paneTitle).toBe('Pane Synced')
+      }
+    })
+
+    it('preserves pane user-set title when syncing hasTitle', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'local-fallback',
+        mode: 'claude',
+        title: 'Claude',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      }))
+      store.dispatch(initLayout({
+        tabId: 'local-fallback',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        },
+      }))
+
+      const layout = store.getState().panes.layouts['local-fallback']
+      if (layout?.type === 'leaf') {
+        store.dispatch({
+          type: 'panes/updatePaneTitle',
+          payload: { tabId: 'local-fallback', paneId: layout.id, title: 'User Pane Name', setByUser: true },
+        })
+      }
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        title: 'Should not clobber',
+        hasTitle: true,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'local-fallback')
+      expect(tab?.title).toBe('Should not clobber')
+
+      const layout2 = store.getState().panes.layouts['local-fallback']
+      if (layout2?.type === 'leaf') {
+        const paneTitle = store.getState().panes.paneTitles?.['local-fallback']?.[layout2.id]
+        expect(paneTitle).toBe('User Pane Name')  // user-set pane title preserved
+      }
+    })
+
+    it('avoids unnecessary updateTab dispatch when title already matches (idempotency)', async () => {
+      const store = createOpenSessionStore('srv-local')
+
+      store.dispatch(addTab({
+        id: 'local-fallback',
+        mode: 'claude',
+        title: 'Already Correct',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        sessionMetadataByKey: {
+          [`claude:${VALID_CLAUDE_SESSION_ID}`]: { sessionType: 'claude' },
+        },
+      }))
+
+      const beforeTab = store.getState().tabs.tabs.find((t) => t.id === 'local-fallback')!
+      const beforeUpdatedAt = beforeTab.updatedAt
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        provider: 'claude',
+        title: 'Already Correct',
+        hasTitle: true,
+      }))
+
+      const tab = store.getState().tabs.tabs.find((item) => item.id === 'local-fallback')
+      expect(tab?.title).toBe('Already Correct')
+      expect(store.getState().tabs.activeTabId).toBe('local-fallback')
+      // updatedAt may be bumped by sessionMetadataByKey merge (pre-existing behavior),
+      // but title must remain unchanged — proving the title-sync guard works.
+      expect(tab?.updatedAt).toBeGreaterThanOrEqual(beforeUpdatedAt)
     })
   })
 

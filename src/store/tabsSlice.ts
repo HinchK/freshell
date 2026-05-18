@@ -1,7 +1,7 @@
 import { createSlice, PayloadAction, createAsyncThunk } from '@reduxjs/toolkit'
 import type { Tab, TerminalStatus, TabMode, ShellType, CodingCliProviderName } from './types'
 import { nanoid } from 'nanoid'
-import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent } from './panesSlice'
+import { closePane, initLayout, restoreLayout, removeLayout, updatePaneContent, updatePaneTitleByTerminalId, updatePaneTitle } from './panesSlice'
 import { clearTabAttention, clearPaneAttention } from './turnCompletionSlice.js'
 import type { PaneNode } from './paneTypes'
 import { findTabIdForSession } from '@/lib/session-utils'
@@ -524,7 +524,7 @@ export const reopenClosedTab = createAsyncThunk(
 export const openSessionTab = createAsyncThunk(
   'tabs/openSessionTab',
   async (
-    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive }: {
+    { sessionId, title, cwd, provider, sessionType, terminalId, forceNew, firstUserMessage, isSubagent, isNonInteractive, hasTitle }: {
       sessionId: string
       title?: string
       cwd?: string
@@ -535,6 +535,8 @@ export const openSessionTab = createAsyncThunk(
       firstUserMessage?: string
       isSubagent?: boolean
       isNonInteractive?: boolean
+      /** Only sync title into an existing tab when the session title is a real rename (not a synthesized fallback). */
+      hasTitle?: boolean
     },
     { dispatch, getState }
   ) => {
@@ -762,6 +764,12 @@ export const openSessionTab = createAsyncThunk(
           : undefined
         if (existingTab) {
           updateExistingTabMetadata(existingTab)
+          if (title && hasTitle && title !== existingTab.title && !existingTab.titleSetByUser) {
+            dispatch(updateTab({ id: existingTab.id, updates: { title } }))
+          }
+          if (hasTitle && title) {
+            dispatch(updatePaneTitleByTerminalId({ terminalId, title, setByUser: false }))
+          }
           dispatch(setActiveTab(existingTab.id))
           return
         }
@@ -809,6 +817,36 @@ export const openSessionTab = createAsyncThunk(
         const selectedExistingTabId = existingTabId ?? tabToOpen.id
         const usingStaleSinglePaneFallback = !existingTabId && staleSinglePaneFallbackTab?.id === tabToOpen.id
         updateExistingTabMetadata(tabToOpen)
+        if (title && hasTitle && title !== tabToOpen.title && !tabToOpen.titleSetByUser) {
+          dispatch(updateTab({ id: tabToOpen.id, updates: { title } }))
+        }
+        if (hasTitle && title) {
+          const layout = state.panes.layouts[selectedExistingTabId]
+          if (layout) {
+            const syncPaneTitles = (node: PaneNode) => {
+              if (node.type === 'leaf') {
+                const content = node.content
+                const sessionRef = (content as { sessionRef?: { provider?: unknown; sessionId?: unknown } }).sessionRef
+                const matchesExplicitRef =
+                  typeof sessionRef?.provider === 'string'
+                  && typeof sessionRef?.sessionId === 'string'
+                  && sessionRef.provider === resolvedProvider
+                  && sessionRef.sessionId === sessionId
+                const matchesImplicitRef = (
+                  (content.kind === 'terminal' && content.mode === resolvedProvider && content.resumeSessionId === sessionId) ||
+                  (content.kind === 'agent-chat' && resolvedProvider === 'claude' && content.resumeSessionId === sessionId)
+                )
+                if (matchesExplicitRef || matchesImplicitRef) {
+                  dispatch(updatePaneTitle({ tabId: selectedExistingTabId, paneId: node.id, title, setByUser: false }))
+                }
+                return
+              }
+              syncPaneTitles(node.children[0])
+              syncPaneTitles(node.children[1])
+            }
+            syncPaneTitles(layout)
+          }
+        }
         repairExistingTabLayout(tabToOpen, {
           tabFallbackMissingPaneLocator: usingStaleSinglePaneFallback,
         })
