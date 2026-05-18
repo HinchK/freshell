@@ -1,10 +1,11 @@
-import { describe, it, expect, vi } from 'vitest'
+import { beforeEach, describe, it, expect, vi } from 'vitest'
 import { TerminalRegistry } from '../../server/terminal-registry'
 import { CodingCliSessionIndexer } from '../../server/coding-cli/session-indexer'
 import { makeSessionKey, type CodingCliSession, type ProjectGroup } from '../../server/coding-cli/types'
 import { SessionAssociationCoordinator } from '../../server/session-association-coordinator'
 import { TerminalMetadataService } from '../../server/terminal-metadata-service'
 import { collectAppliedSessionAssociations } from '../../server/session-association-updates'
+import { recordSessionLifecycleEvent } from '../../server/session-observability'
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({
@@ -19,6 +20,10 @@ vi.mock('node-pty', () => ({
 vi.mock('../../server/mcp/config-writer.js', () => ({
   generateMcpInjection: vi.fn(() => ({ args: [], env: {} })),
   cleanupMcpConfig: vi.fn(),
+}))
+
+vi.mock('../../server/session-observability.js', () => ({
+  recordSessionLifecycleEvent: vi.fn(),
 }))
 
 const SESSION_ID_ONE = '550e8400-e29b-41d4-a716-446655440000'
@@ -48,6 +53,10 @@ function createMetadataService() {
 function createIndexer(): CodingCliSessionIndexer {
   return new CodingCliSessionIndexer([])
 }
+
+beforeEach(() => {
+  vi.mocked(recordSessionLifecycleEvent).mockClear()
+})
 
 describe('SessionAssociationCoordinator integration', () => {
   it('associates a Claude terminal created with a human-readable resume name after UUID discovery', () => {
