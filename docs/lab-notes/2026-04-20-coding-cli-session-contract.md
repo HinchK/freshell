@@ -1,6 +1,6 @@
 # Coding CLI Session Contract Lab Note
 
-This note records the real-binary provider probes rerun on `2026-04-26` inside `/home/user/code/freshell/.worktrees/trycycle-codex-session-resilience`. Binary version facts were refreshed on `2026-05-03` inside `/home/user/code/freshell/.worktrees/land-local-main-codex-sidecar-lifecycle`.
+This note records the real-binary provider probes rerun on `2026-04-26` inside `/home/user/code/freshell/.worktrees/trycycle-codex-session-resilience`. Binary version facts were refreshed on `2026-05-14` inside `/home/user/code/freshell/.worktrees/codex-stability-implementation-20260514`; the OpenCode binary version fact was refreshed on `2026-05-16` inside `/home/user/code/freshell/.worktrees/dev-green-20260516`.
 
 The implementation plan file is dated `2026-04-19` because the design work was written the day before. This note is dated `2026-04-26` because the real-provider contracts were re-proved on the implementation machine on that date, and that verification date is the one Freshell is allowed to build on.
 
@@ -9,7 +9,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
 {
   "capturedOn": "2026-04-26",
   "planCreatedOn": "2026-04-19",
-  "dateReason": "The plan was drafted on 2026-04-19, but the checked-in note is dated 2026-04-26 because that is when the durable behavior contract was re-proved on the implementation machine and the earlier 2026-04-23 contract capture was superseded by the newer provider behavior. Binary version facts were refreshed on 2026-05-03 after the installed provider versions changed.",
+  "dateReason": "The plan was drafted on 2026-04-19, but the checked-in note is dated 2026-04-26 because that is when the durable behavior contract was re-proved on the implementation machine and the earlier 2026-04-23 contract capture was superseded by the newer provider behavior. Binary version facts were refreshed on 2026-05-14 after the installed provider versions changed, and the OpenCode binary version fact was refreshed on 2026-05-16 after the installed provider version changed again.",
   "cleanup": {
     "liveProcessAuditCommand": "ps -eo pid,ppid,stat,cmd --sort=pid | rg \"codex|claude|opencode\"",
     "ownershipReportFields": [
@@ -81,7 +81,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "executable": "claude",
       "resolvedPath": "/home/user/bin/claude",
       "isolatedBinaryPath": "/home/user/.local/bin/claude",
-      "version": "2.1.126 (Claude Code)",
+      "version": "2.1.132 (Claude Code)",
       "exactIdCommandTemplate": "HOME=<temp-home> /home/user/.local/bin/claude --bare --dangerously-skip-permissions -p --session-id <uuid> <prompt>",
       "namedResumeCommandTemplate": "HOME=<temp-home> /home/user/.local/bin/claude --bare --dangerously-skip-permissions -p --resume <title-or-uuid> [--name <title>] <prompt>",
       "transcriptGlob": ".claude/projects/*/<uuid>.jsonl",
@@ -94,7 +94,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
     "opencode": {
       "executable": "opencode",
       "resolvedPath": "/home/user/.opencode/bin/opencode",
-      "version": "1.14.33",
+      "version": "1.15.3",
       "runCommandTemplate": "opencode run <prompt> --format json --dangerously-skip-permissions",
       "serveCommandTemplate": "opencode serve --hostname 127.0.0.1 --port <port>",
       "globalHealthPath": "/global/health",
@@ -102,6 +102,7 @@ The implementation plan file is dated `2026-04-19` because the design work was w
       "canonicalIdentity": "session-id",
       "runEventSessionIdMatchesDbId": true,
       "busyStatusUsesAuthoritativeSessionId": true,
+      "attachFormatJsonEmitsEvents": true,
       "titleOnResumeMutatesStoredTitle": false,
       "sessionSubcommands": [
         "list",
@@ -238,8 +239,10 @@ command -v claude
 # /home/user/bin/claude
 
 claude --version
-# 2.1.126 (Claude Code)
+# 2.1.132 (Claude Code)
 ```
+
+This Claude Code version line was refreshed on `2026-05-06`; the behavior observations below remain from the `2026-04-26` real-provider proof.
 
 The wrapper at `/home/user/bin/claude` shells out to `/home/user/.local/bin/claude`. The isolated probes used the actual binary and overrode `HOME` to keep persistence inside the probe temp root.
 
@@ -287,7 +290,7 @@ command -v opencode
 # /home/user/.opencode/bin/opencode
 
 opencode --version
-# 1.14.33
+# 1.15.3
 ```
 
 Fresh isolated runs were probed with:
@@ -312,9 +315,10 @@ curl http://127.0.0.1:<port>/session/status
 
 Observed control behavior:
 
-- `/global/health` returned a healthy payload with version `1.14.33`.
+- `/global/health` returned a healthy payload with version `1.15.3`.
 - `/session/status` returned `{}` while idle.
-- During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned the same authoritative `sessionID` with `{ "type": "busy" }`.
+- During an attached `opencode run ... --attach http://127.0.0.1:<port>`, `/session/status` returned an authoritative `sessionID` with `{ "type": "busy" }`, and the same id was persisted as a `session.id` row in the isolated OpenCode database.
+- On the 2026-05-16 rerun with OpenCode `1.15.3`, attached `opencode run ... --attach ... --format json` exited successfully and emitted JSON event lines on stdout. `/session/status` remains the authoritative live-control surface while the attached command is busy, and the attached-run stdout session id matched the busy status/database session id in this probe.
 
 Title semantics were probed with:
 

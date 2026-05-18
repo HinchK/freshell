@@ -22,6 +22,7 @@ export const ErrorCode = z.enum([
   'INVALID_TERMINAL_ID',
   'INVALID_SESSION_ID',
   'RESTORE_UNAVAILABLE',
+  'INVALID_CREATE_REQUEST',
   'PTY_SPAWN_FAILED',
   'FILE_WATCHER_ERROR',
   'INTERNAL_ERROR',
@@ -127,6 +128,14 @@ export const OpencodeActivityUpdatedSchema = z.object({
   remove: z.array(z.string().min(1)),
 })
 
+export const TerminalTurnCompleteSchema = z.object({
+  type: z.literal('terminal.turn.complete'),
+  terminalId: z.string().min(1),
+  provider: z.literal('opencode'),
+  sessionId: z.string().min(1),
+  at: z.number().int().nonnegative(),
+})
+
 // ──────────────────────────────────────────────────────────────
 // SDK content block schemas (from Claude Code NDJSON)
 // ──────────────────────────────────────────────────────────────
@@ -221,6 +230,7 @@ export const TerminalCreateSchema = z.object({
   sessionRef: SessionLocatorSchema.optional(),
   liveTerminal: LiveTerminalHandleSchema.optional(),
   restore: z.boolean().optional(),
+  recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
   tabId: z.string().min(1).optional(),
   paneId: z.string().min(1).optional(),
 }).strict()
@@ -475,6 +485,7 @@ export type TerminalCreatedMessage = {
   requestId: string
   terminalId: string
   createdAt: number
+  effectiveResumeSessionId?: string
 }
 
 export type TerminalAttachReadyMessage = {
@@ -549,6 +560,8 @@ export type CodexActivityUpdatedMessage = z.infer<typeof CodexActivityUpdatedSch
 export type OpencodeActivityListResponseMessage = z.infer<typeof OpencodeActivityListResponseSchema>
 
 export type OpencodeActivityUpdatedMessage = z.infer<typeof OpencodeActivityUpdatedSchema>
+
+export type TerminalTurnCompleteMessage = z.infer<typeof TerminalTurnCompleteSchema>
 
 // -- Sessions --
 
@@ -778,6 +791,7 @@ export type ServerMessage =
   | CodexActivityUpdatedMessage
   | OpencodeActivityListResponseMessage
   | OpencodeActivityUpdatedMessage
+  | TerminalTurnCompleteMessage
   | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage
