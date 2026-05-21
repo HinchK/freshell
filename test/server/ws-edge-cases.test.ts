@@ -1893,7 +1893,7 @@ describe('WebSocket edge cases', () => {
 
       // Our test infrastructure connects from 127.0.0.1, so any connection we make
       // tests the loopback bypass. The key is that it succeeds despite not being
-      // in ALLOWED_ORIGINS (which only has localhost:5173 and localhost:3001 by default).
+      // in ALLOWED_ORIGINS (which only has localhost:3001 by default).
       const { ws, close } = await createAuthenticatedConnection()
 
       // If we got here, the loopback connection was accepted

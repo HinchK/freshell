@@ -223,34 +223,34 @@ Ethernet adapter vEthernet (WSL):
   })
 
   describe('buildAllowedOrigins', () => {
-    it('includes localhost origins for dev and prod ports', () => {
+    it('includes localhost origins for the production port only', () => {
       const origins = buildAllowedOrigins([])
 
-      expect(origins).toContain('http://localhost:5173')
       expect(origins).toContain('http://localhost:3001')
-      expect(origins).toContain('http://localhost:3002')
-      expect(origins).toContain('http://127.0.0.1:5173')
       expect(origins).toContain('http://127.0.0.1:3001')
-      expect(origins).toContain('http://127.0.0.1:3002')
+      expect(origins).not.toContain('http://localhost:5173')
+      expect(origins).not.toContain('http://localhost:3002')
+      expect(origins).not.toContain('http://127.0.0.1:5173')
+      expect(origins).not.toContain('http://127.0.0.1:3002')
     })
 
-    it('includes LAN IP origins for all ports', () => {
+    it('includes LAN IP origins for the production port only', () => {
       const origins = buildAllowedOrigins(['192.168.1.100'])
 
-      expect(origins).toContain('http://192.168.1.100:5173')
       expect(origins).toContain('http://192.168.1.100:3001')
-      expect(origins).toContain('http://192.168.1.100:3002')
+      expect(origins).not.toContain('http://192.168.1.100:5173')
+      expect(origins).not.toContain('http://192.168.1.100:3002')
     })
 
     it('includes multiple LAN IPs', () => {
       const origins = buildAllowedOrigins(['192.168.1.100', '10.0.0.5'])
 
-      expect(origins).toContain('http://192.168.1.100:5173')
       expect(origins).toContain('http://192.168.1.100:3001')
-      expect(origins).toContain('http://192.168.1.100:3002')
-      expect(origins).toContain('http://10.0.0.5:5173')
       expect(origins).toContain('http://10.0.0.5:3001')
-      expect(origins).toContain('http://10.0.0.5:3002')
+      expect(origins).not.toContain('http://192.168.1.100:5173')
+      expect(origins).not.toContain('http://192.168.1.100:3002')
+      expect(origins).not.toContain('http://10.0.0.5:5173')
+      expect(origins).not.toContain('http://10.0.0.5:3002')
     })
 
     it('returns comma-separated string format', () => {
@@ -511,7 +511,7 @@ Ethernet adapter vEthernet (WSL):
       expect(writtenContent).toContain('192.168.1.100')
     })
 
-    it('generated .env includes only localhost origins when config host is 127.0.0.1', () => {
+    it('generated .env puts dev server origins in EXTRA_ALLOWED_ORIGINS when config host is 127.0.0.1', () => {
       vi.mocked(os.homedir).mockReturnValue('/home/testuser')
       vi.mocked(fs.existsSync).mockReturnValue(false)
       // readConfigHost throws (no config.json) → defaults to 127.0.0.1
@@ -526,7 +526,22 @@ Ethernet adapter vEthernet (WSL):
       ensureEnvFile(mockEnvPath)
 
       expect(writtenContent).toContain('ALLOWED_ORIGINS=')
+      expect(writtenContent).toContain('EXTRA_ALLOWED_ORIGINS=')
       expect(writtenContent).toContain('localhost')
+      const allowedOrigins = writtenContent
+        .split('\n')
+        .find(line => line.startsWith('ALLOWED_ORIGINS=')) ?? ''
+      const extraAllowedOrigins = writtenContent
+        .split('\n')
+        .find(line => line.startsWith('EXTRA_ALLOWED_ORIGINS=')) ?? ''
+      expect(allowedOrigins).toContain('http://localhost:3001')
+      expect(allowedOrigins).toContain('http://127.0.0.1:3001')
+      expect(allowedOrigins).not.toContain('http://localhost:5173')
+      expect(allowedOrigins).not.toContain('http://localhost:3002')
+      expect(extraAllowedOrigins).toContain('http://localhost:5173')
+      expect(extraAllowedOrigins).toContain('http://localhost:3002')
+      expect(extraAllowedOrigins).toContain('http://127.0.0.1:5173')
+      expect(extraAllowedOrigins).toContain('http://127.0.0.1:3002')
       expect(writtenContent).not.toContain('192.168.1.100')
     })
 

@@ -90,7 +90,8 @@ npm run serve   # Production build and run
 |----------|----------|-------------|
 | `AUTH_TOKEN` | Auto | Authentication token (auto-generated on first run, min 16 chars) |
 | `PORT` | No | Server port (default: 3001) |
-| `ALLOWED_ORIGINS` | No | Comma-separated allowed CORS origins (auto-detected from LAN) |
+| `ALLOWED_ORIGINS` | No | Auto-managed CORS origins for the active server bind host and LAN IPs |
+| `EXTRA_ALLOWED_ORIGINS` | No | Comma-separated custom CORS origins preserved across runtime origin rebuilds |
 | `CLAUDE_HOME` | No | Path to Claude config directory (default: `~/.claude`) |
 | `CODEX_HOME` | No | Path to Codex config directory (default: `~/.codex`) |
 | `WINDOWS_SHELL` | No | Windows shell: `wsl` (default), `cmd`, or `powershell` |
