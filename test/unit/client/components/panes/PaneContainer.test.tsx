@@ -1751,15 +1751,15 @@ describe('PaneContainer', () => {
       }))
     })
 
-    it('normalizes stale Freshcodex effort from provider settings when creating a pane', async () => {
+    it('normalizes stale Freshcodex effort from provider settings against the active model', async () => {
       const node = createPickerNode('pane-1')
       const store = createStoreWithClaude(
         node,
         undefined,
-        undefined,
+        { codex: { model: 'gpt-5.4-flash' } },
         ['claude', 'codex'],
         { claude: true, codex: true },
-        { freshcodex: { effort: 'max' } },
+        { freshcodex: { effort: 'xhigh' } },
       )
       mockApiPost.mockResolvedValueOnce({ valid: true, resolvedPath: '/home/user/freshcodex-project' })
 
@@ -1780,7 +1780,8 @@ describe('PaneContainer', () => {
         const paneContent = (state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
         expect(paneContent.kind).toBe('fresh-agent')
         if (paneContent.kind === 'fresh-agent') {
-          expect(paneContent.effort).toBe('xhigh')
+          expect(paneContent.model).toBe('gpt-5.4-flash')
+          expect(paneContent.effort).toBe('high')
         }
       })
     })

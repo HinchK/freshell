@@ -308,6 +308,7 @@ describe('FreshAgentView', () => {
     expect(screen.getByRole('radio', { name: 'GPT-5.5' })).toBeChecked()
     expect(screen.getByRole('radio', { name: 'GPT-5.4 Flash' })).not.toBeChecked()
     expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveValue('xhigh')
+    expect(screen.getByRole('option', { name: 'xhigh' })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('radio', { name: 'GPT-5.3 Codex Spark' }))
     await waitFor(() => {
       expect(screen.getByRole('radio', { name: 'GPT-5.3 Codex Spark' })).toBeChecked()
@@ -347,6 +348,58 @@ describe('FreshAgentView', () => {
       sessionType: 'freshcodex',
       provider: 'codex',
     })
+  })
+
+  it('uses the selected Freshcodex model thinking substrings verbatim', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-flash',
+        sessionId: 'thread-flash',
+        status: 'idle',
+        model: 'gpt-5.5',
+        effort: 'xhigh',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Codex summary')).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole('radio', { name: 'GPT-5.4 Flash' }))
+    await waitFor(() => {
+      expect(screen.getByRole('radio', { name: 'GPT-5.4 Flash' })).toBeChecked()
+    })
+
+    const thinking = screen.getByRole('combobox', { name: 'Thinking level' })
+    expect(thinking).toHaveValue('high')
+    expect(screen.queryByRole('option', { name: 'xhigh' })).not.toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'high' })).toBeInTheDocument()
+
+    wsMock.send.mockClear()
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'reply ok' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.send',
+      settings: expect.objectContaining({
+        model: 'gpt-5.4-flash',
+        effort: 'high',
+      }),
+    }))
   })
 
   it('normalizes obsolete Freshcodex models to the default radio option', async () => {

@@ -60,4 +60,31 @@ describe('Claude fresh-agent adapter', () => {
     expect(sdkBridge.respondQuestion).toHaveBeenCalledWith('sdk-claude-1', 'question-1', { Proceed: 'Yes' })
     expect(sdkBridge.respondPermission).toHaveBeenCalledWith('sdk-claude-1', 'approval-1', { behavior: 'allow' })
   })
+
+  it('normalizes Freshclaude effort values against the active model', async () => {
+    const sdkBridge = {
+      createSession: vi.fn().mockResolvedValue({ sessionId: 'sdk-claude-1' }),
+    }
+
+    const adapter = createClaudeFreshAgentAdapter({
+      sdkBridge: sdkBridge as any,
+      timelineService: {
+        getSnapshot: vi.fn(),
+        getTimelinePage: vi.fn(),
+        getTurnBody: vi.fn(),
+      } as any,
+    })
+
+    await expect(adapter.create({
+      requestId: 'req-1',
+      sessionType: 'freshclaude',
+      model: 'claude-opus-4-6',
+      effort: 'xhigh',
+    })).resolves.toEqual({ sessionId: 'sdk-claude-1' })
+
+    expect(sdkBridge.createSession).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'claude-opus-4-6',
+      effort: 'max',
+    }))
+  })
 })

@@ -9,10 +9,10 @@ import { mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
-  FRESH_AGENT_THINKING_OPTIONS_BY_PROVIDER,
   FRESHCODEX_MODEL_OPTIONS,
+  getFreshAgentThinkingOptions,
   normalizeFreshAgentEffort,
-  normalizeFreshcodexModel,
+  normalizeFreshAgentModel,
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
 import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
@@ -30,14 +30,11 @@ import { FreshAgentSidebar } from './FreshAgentSidebar'
 const EARLY_STATES = new Set(['creating', 'starting'])
 
 function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | undefined {
-  if (content.provider === 'codex') {
-    return normalizeFreshcodexModel(content.model)
-  }
-  return content.model
+  return normalizeFreshAgentModel(content.sessionType, content.provider, content.model)
 }
 
 function getEffectiveFreshAgentEffort(content: FreshAgentPaneContent): string | undefined {
-  return normalizeFreshAgentEffort(content.provider, content.effort)
+  return normalizeFreshAgentEffort(content.sessionType, content.provider, getEffectiveFreshAgentModel(content), content.effort)
 }
 
 function isStatusRegression(current: string, next: string): boolean {
@@ -594,8 +591,9 @@ export function FreshAgentView({
       ? null
       : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
     const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
-    const codexModelValue = normalizeFreshcodexModel(paneContent.model)
-    const thinkingOptions = FRESH_AGENT_THINKING_OPTIONS_BY_PROVIDER[paneContent.provider] ?? []
+    const activeModel = getEffectiveFreshAgentModel(paneContent)
+    const codexModelValue = activeModel ?? ''
+    const thinkingOptions = getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
     const thinkingValue = getEffectiveFreshAgentEffort(paneContent) ?? ''
 
     return (
@@ -623,10 +621,16 @@ export function FreshAgentView({
                         value={option.value}
                         checked={codexModelValue === option.value}
                         onChange={() => {
+                          const nextEffort = normalizeFreshAgentEffort(
+                            paneContent.sessionType,
+                            paneContent.provider,
+                            option.value,
+                            paneContent.effort,
+                          )
                           dispatch(mergePaneContent({
                             tabId,
                             paneId,
-                            updates: { model: option.value },
+                            updates: { model: option.value, effort: nextEffort },
                           }))
                         }}
                       />

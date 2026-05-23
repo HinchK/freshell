@@ -9,6 +9,20 @@ import {
   KilroyIcon,
   OpencodeIcon,
 } from '@/components/icons/provider-icons'
+import {
+  FRESHCODEX_DEFAULT_EFFORT,
+  FRESHCODEX_DEFAULT_MODEL,
+} from '@/lib/fresh-agent-models'
+export {
+  FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
+  FRESHCODEX_DEFAULT_EFFORT,
+  FRESHCODEX_DEFAULT_MODEL,
+  FRESHCODEX_MODEL_OPTIONS,
+  getFreshAgentThinkingOptions,
+  normalizeFreshAgentEffort,
+  normalizeFreshAgentModel,
+  normalizeFreshcodexModel,
+} from '@/lib/fresh-agent-models'
 
 export type FreshAgentRegistryEntry = {
   sessionType: FreshAgentSessionType
@@ -31,54 +45,6 @@ export type FreshAgentRegistryEntry = {
   hidden?: boolean
   disabled?: boolean
   featureFlag?: string
-}
-
-export const FRESHCODEX_DEFAULT_MODEL = 'gpt-5.5'
-export const FRESHCODEX_DEFAULT_EFFORT = 'xhigh'
-export const FRESHCODEX_MODEL_OPTIONS = [
-  { value: 'gpt-5.5', label: 'GPT-5.5' },
-  { value: 'gpt-5.4-flash', label: 'GPT-5.4 Flash' },
-  { value: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' },
-] as const
-export const FRESH_AGENT_THINKING_OPTIONS_BY_PROVIDER = {
-  claude: [
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'max', label: 'Maximum' },
-  ],
-  codex: [
-    { value: 'none', label: 'None' },
-    { value: 'minimal', label: 'Minimal' },
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'xhigh', label: 'Maximum' },
-  ],
-  opencode: [
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'max', label: 'Maximum' },
-  ],
-} as const
-
-export function normalizeFreshcodexModel(model: string | undefined): string {
-  if (model && FRESHCODEX_MODEL_OPTIONS.some((option) => option.value === model)) {
-    return model
-  }
-  return FRESHCODEX_DEFAULT_MODEL
-}
-
-export function normalizeFreshAgentEffort(provider: FreshAgentRuntimeProvider, effort: string | undefined): string | undefined {
-  const options = FRESH_AGENT_THINKING_OPTIONS_BY_PROVIDER[provider] ?? []
-  if (effort && options.some((option) => option.value === effort)) {
-    return effort
-  }
-  if (provider === 'codex') return FRESHCODEX_DEFAULT_EFFORT
-  if (provider === 'claude') return 'max'
-  if (provider === 'opencode') return 'max'
-  return undefined
 }
 
 export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [

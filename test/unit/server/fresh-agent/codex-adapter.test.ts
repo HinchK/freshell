@@ -101,7 +101,7 @@ describe('Codex fresh-agent adapter', () => {
       sessionType: 'freshcodex',
       cwd: '/repo',
       permissionMode: 'on-request',
-      model: 'codex-fixture',
+      model: 'gpt-5.3-codex-spark',
     })).resolves.toEqual({ sessionId: 'thread-new-1', sessionRef: { provider: 'codex', sessionId: 'thread-new-1' } })
 
     await expect(adapter.resume?.({
@@ -110,12 +110,12 @@ describe('Codex fresh-agent adapter', () => {
       resumeSessionId: 'thread-resume-1',
       cwd: '/repo',
       permissionMode: 'never',
-      model: 'codex-fixture',
+      model: 'gpt-5.3-codex-spark',
     })).resolves.toEqual({ sessionId: 'thread-resume-1', sessionRef: { provider: 'codex', sessionId: 'thread-resume-1' } })
 
     expect(runtime.startThread).toHaveBeenCalledWith(expect.objectContaining({
       cwd: '/repo',
-      model: 'codex-fixture',
+      model: 'gpt-5.3-codex-spark',
       approvalPolicy: 'on-request',
     }))
     expect(runtime.startThread).toHaveBeenCalledWith(expect.not.objectContaining({
@@ -124,7 +124,7 @@ describe('Codex fresh-agent adapter', () => {
     expect(runtime.resumeThread).toHaveBeenCalledWith(expect.objectContaining({
       threadId: 'thread-resume-1',
       cwd: '/repo',
-      model: 'codex-fixture',
+      model: 'gpt-5.3-codex-spark',
       approvalPolicy: 'never',
     }))
   })
@@ -342,7 +342,7 @@ describe('Codex fresh-agent adapter', () => {
         requestId: 'req-1',
         sessionType: 'freshcodex',
         cwd: '/repo',
-        model: 'codex-fixture',
+        model: 'gpt-5.3-codex-spark',
         permissionMode: 'never',
         sandbox: 'workspace-write',
       },
@@ -351,14 +351,14 @@ describe('Codex fresh-agent adapter', () => {
     expect(runtime.resumeThread).toHaveBeenCalledWith({
       threadId: 'thread-existing-1',
       cwd: '/repo',
-      model: 'codex-fixture',
+      model: 'gpt-5.3-codex-spark',
       sandbox: 'workspace-write',
       approvalPolicy: 'never',
     })
     expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
       threadId: 'thread-existing-1',
       cwd: '/repo',
-      model: 'codex-fixture',
+      model: 'gpt-5.3-codex-spark',
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'workspaceWrite' },
     }))
@@ -391,7 +391,7 @@ describe('Codex fresh-agent adapter', () => {
     })
     await adapter.send?.('thread-new-1', {
       text: 'Use the small model',
-      settings: { model: 'gpt-5.4-mini' },
+      settings: { model: 'gpt-5.4-flash' },
     })
 
     await expect(adapter.getSnapshot?.({
@@ -401,7 +401,7 @@ describe('Codex fresh-agent adapter', () => {
     }, 7)).resolves.toMatchObject({
       turns: [
         { id: 'turn-1' },
-        { id: 'turn-2', model: 'gpt-5.4-mini' },
+        { id: 'turn-2', model: 'gpt-5.4-flash' },
       ],
     })
     const snapshot = await adapter.getSnapshot?.({
@@ -545,7 +545,7 @@ describe('Codex fresh-agent adapter', () => {
       permissionMode: 'on-request',
       sandbox: 'workspace-write',
       effort: 'xhigh',
-      model: 'codex-fixture',
+      model: 'gpt-5.5',
     })
 
     await adapter.send?.('thread-new-1', {
@@ -563,7 +563,7 @@ describe('Codex fresh-agent adapter', () => {
       cwd: '/repo',
       approvalPolicy: 'on-request',
       sandboxPolicy: { type: 'workspaceWrite' },
-      model: 'codex-fixture',
+      model: 'gpt-5.5',
       effort: 'xhigh',
     })
     expect(runtime.interruptTurn).toHaveBeenCalledWith({
@@ -603,7 +603,7 @@ describe('Codex fresh-agent adapter', () => {
     expect(runtime.interruptTurn).toHaveBeenCalledWith({ threadId: 'thread-existing-1', turnId: 'turn-active-1' })
   })
 
-  it('rejects Claude-only Freshcodex effort values before app-server calls', async () => {
+  it('normalizes Freshcodex effort values against the requested model before app-server calls', async () => {
     const runtime = {
       startThread: vi.fn().mockResolvedValue({
         threadId: 'thread-new-1',
@@ -611,7 +611,7 @@ describe('Codex fresh-agent adapter', () => {
       }),
       resumeThread: vi.fn(),
       forkThread: vi.fn(),
-      startTurn: vi.fn(),
+      startTurn: vi.fn().mockResolvedValue({ turnId: 'turn-1' }),
       interruptTurn: vi.fn(),
       readThread: vi.fn(),
       listThreadTurns: vi.fn(),
@@ -622,10 +622,19 @@ describe('Codex fresh-agent adapter', () => {
     await expect(adapter.create({
       requestId: 'req-1',
       sessionType: 'freshcodex',
-      effort: 'max',
-    })).rejects.toThrow('Freshcodex does not support reasoning effort "max"')
-    expect(runtime.startThread).not.toHaveBeenCalled()
-    expect(runtime.startTurn).not.toHaveBeenCalled()
+      model: 'gpt-5.4-flash',
+      effort: 'xhigh',
+    })).resolves.toEqual({ sessionId: 'thread-new-1', sessionRef: { provider: 'codex', sessionId: 'thread-new-1' } })
+
+    await adapter.send?.('thread-new-1', { text: 'reply ok' })
+
+    expect(runtime.startThread).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'gpt-5.4-flash',
+    }))
+    expect(runtime.startTurn).toHaveBeenCalledWith(expect.objectContaining({
+      model: 'gpt-5.4-flash',
+      effort: 'high',
+    }))
   })
 
   it('forks Codex threads with stored runtime settings and excludeTurns', async () => {
@@ -651,7 +660,7 @@ describe('Codex fresh-agent adapter', () => {
       requestId: 'req-1',
       sessionType: 'freshcodex',
       cwd: '/repo',
-      model: 'codex-fixture',
+      model: 'gpt-5.3-codex-spark',
       permissionMode: 'never',
       sandbox: 'read-only',
     })
@@ -663,7 +672,7 @@ describe('Codex fresh-agent adapter', () => {
     expect(runtime.forkThread).toHaveBeenCalledWith({
       threadId: 'thread-new-1',
       cwd: '/repo',
-      model: 'codex-fixture',
+      model: 'gpt-5.3-codex-spark',
       sandbox: 'read-only',
       approvalPolicy: 'never',
       excludeTurns: true,

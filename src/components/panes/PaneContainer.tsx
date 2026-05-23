@@ -14,7 +14,7 @@ import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
-import { normalizeFreshAgentEffort, normalizeFreshcodexModel, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { buildPaneRefreshTarget } from '@/lib/pane-utils'
@@ -463,11 +463,12 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
                     ...node.content,
                     kind: 'agent-chat',
                     provider: 'freshclaude',
-                    effort: (
-                      node.content.effort === 'none'
-                      || node.content.effort === 'minimal'
-                      || node.content.effort === 'xhigh'
-                    ) ? undefined : node.content.effort,
+                    effort: normalizeFreshAgentEffort(
+                      node.content.sessionType,
+                      node.content.provider,
+                      node.content.model,
+                      node.content.effort,
+                    ),
                   }
                 : node.content,
               node.content.sessionId ? agentChatSessions[node.content.sessionId] : undefined,
@@ -609,6 +610,13 @@ function PickerWrapper({
         ? getAgentChatProviderConfig(type)
         : undefined
       const providerSettings = agentChatSettings?.providers?.[type]
+      const model = normalizeFreshAgentModel(
+        freshAgentType.sessionType,
+        freshAgentType.runtimeProvider,
+        freshAgentType.runtimeProvider === 'codex'
+          ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model
+          : freshAgentType.defaultModel,
+      )
       return {
         kind: 'fresh-agent',
         sessionType: freshAgentType.sessionType,
@@ -616,9 +624,7 @@ function PickerWrapper({
         createRequestId: nanoid(),
         status: 'creating',
         modelSelection: normalizeAgentChatModelSelection(providerSettings?.modelSelection),
-        model: freshAgentType.runtimeProvider === 'codex'
-          ? normalizeFreshcodexModel(settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model)
-          : freshAgentType.defaultModel,
+        model,
         permissionMode: providerSettings?.defaultPermissionMode
           ?? (freshAgentType.runtimeProvider === 'codex'
             ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.permissionMode
@@ -629,7 +635,9 @@ function PickerWrapper({
           ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.sandbox
           : undefined,
         effort: normalizeFreshAgentEffort(
+          freshAgentType.sessionType,
           freshAgentType.runtimeProvider,
+          model,
           normalizeAgentChatEffortOverride(providerSettings?.effort),
         ) ?? freshAgentType.defaultEffort,
         plugins: freshAgentType.runtimeProvider === 'claude' ? agentChatSettings?.defaultPlugins : undefined,

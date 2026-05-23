@@ -10,6 +10,7 @@ import {
   normalizeCodexTurnBody,
   normalizeCodexTurnPage,
 } from './normalize.js'
+import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
 
 type CodexThreadLifecycleEvent =
   | {
@@ -118,6 +119,15 @@ function toCodexUserInput(text: string, images: FreshAgentInputImage[] | undefin
     }
   }
   return input
+}
+
+function normalizeCodexInput(input: FreshAgentCreateRequest): FreshAgentCreateRequest {
+  const model = normalizeFreshAgentModel(input.sessionType, 'codex', input.model)
+  return {
+    ...input,
+    model,
+    effort: normalizeFreshAgentEffort(input.sessionType, 'codex', model, input.effort),
+  }
 }
 
 function normalizeCodexThreadStatus(status: unknown): string {
@@ -270,15 +280,16 @@ export function createCodexFreshAgentAdapter(deps: {
     runtimeProvider: 'codex',
 
     async create(input: FreshAgentCreateRequest) {
-      toCodexReasoningEffort(input.effort)
+      const normalizedInput = normalizeCodexInput(input)
+      toCodexReasoningEffort(normalizedInput.effort)
       const { runtime, owned } = allocateRuntime()
       let started: { threadId: string; wsUrl: string }
       try {
         started = await runtime.startThread({
-          cwd: input.cwd,
-          model: input.model,
-          sandbox: input.sandbox,
-          approvalPolicy: toCodexApprovalPolicy(input.permissionMode),
+          cwd: normalizedInput.cwd,
+          model: normalizedInput.model,
+          sandbox: normalizedInput.sandbox,
+          approvalPolicy: toCodexApprovalPolicy(normalizedInput.permissionMode),
         })
       } catch (error) {
         if (owned) {
@@ -288,7 +299,7 @@ export function createCodexFreshAgentAdapter(deps: {
         throw error
       }
       rememberRuntimeThread(started.threadId, runtime)
-      settingsByThread.set(started.threadId, input)
+      settingsByThread.set(started.threadId, normalizedInput)
       return { sessionId: started.threadId, sessionRef: { provider: 'codex', sessionId: started.threadId } }
     },
 
@@ -296,16 +307,17 @@ export function createCodexFreshAgentAdapter(deps: {
       if (!input.resumeSessionId) {
         throw new Error('Codex rich resume requires resumeSessionId')
       }
-      toCodexReasoningEffort(input.effort)
+      const normalizedInput = normalizeCodexInput(input)
+      toCodexReasoningEffort(normalizedInput.effort)
       const { runtime, owned } = allocateRuntime()
       let resumed: { threadId: string; wsUrl: string }
       try {
         resumed = await runtime.resumeThread({
           threadId: input.resumeSessionId,
-          cwd: input.cwd,
-          model: input.model,
-          sandbox: input.sandbox,
-          approvalPolicy: toCodexApprovalPolicy(input.permissionMode),
+          cwd: normalizedInput.cwd,
+          model: normalizedInput.model,
+          sandbox: normalizedInput.sandbox,
+          approvalPolicy: toCodexApprovalPolicy(normalizedInput.permissionMode),
         })
       } catch (error) {
         if (owned) {
@@ -315,7 +327,7 @@ export function createCodexFreshAgentAdapter(deps: {
         throw error
       }
       rememberRuntimeThread(resumed.threadId, runtime)
-      settingsByThread.set(resumed.threadId, input)
+      settingsByThread.set(resumed.threadId, normalizedInput)
       return { sessionId: resumed.threadId, sessionRef: { provider: 'codex', sessionId: resumed.threadId } }
     },
 
@@ -355,6 +367,9 @@ export function createCodexFreshAgentAdapter(deps: {
         ...settingsByThread.get(sessionId),
         ...input.settings,
       }
+      const model = normalizeFreshAgentModel(settings.sessionType ?? 'freshcodex', 'codex', settings.model)
+      settings.model = model
+      settings.effort = normalizeFreshAgentEffort(settings.sessionType ?? 'freshcodex', 'codex', model, settings.effort)
       const runtime = await ensureRuntime(sessionId, Object.keys(settings).length > 0 ? settings : undefined)
       if (Object.keys(settings).length > 0) {
         settingsByThread.set(sessionId, settings)
