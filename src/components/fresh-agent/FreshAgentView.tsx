@@ -8,7 +8,12 @@ import { getFreshAgentThreadSnapshot } from '@/lib/api'
 import { mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
-import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import {
+  FRESHCODEX_DEFAULT_EFFORT,
+  FRESHCODEX_MODEL_OPTIONS,
+  normalizeFreshcodexModel,
+  resolveFreshAgentType,
+} from '@/lib/fresh-agent-registry'
 import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
@@ -22,10 +27,43 @@ import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
-const CODEX_MODEL_OPTIONS = [
-  { value: 'gpt-5-codex', label: 'GPT-5 Codex' },
-  { value: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
-] as const
+const FRESH_AGENT_THINKING_OPTIONS_BY_PROVIDER = {
+  claude: [
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'max', label: 'Maximum' },
+  ],
+  codex: [
+    { value: 'none', label: 'None' },
+    { value: 'minimal', label: 'Minimal' },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'Maximum' },
+  ],
+  opencode: [
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'max', label: 'Maximum' },
+  ],
+} as const
+
+function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | undefined {
+  if (content.provider === 'codex') {
+    return normalizeFreshcodexModel(content.model)
+  }
+  return content.model
+}
+
+function getEffectiveFreshAgentEffort(content: FreshAgentPaneContent): string | undefined {
+  if (content.effort) return content.effort
+  if (content.provider === 'codex') return FRESHCODEX_DEFAULT_EFFORT
+  if (content.provider === 'claude') return 'max'
+  if (content.provider === 'opencode') return 'max'
+  return undefined
+}
 
 function isStatusRegression(current: string, next: string): boolean {
   return !EARLY_STATES.has(current) && EARLY_STATES.has(next)
@@ -199,10 +237,10 @@ export function FreshAgentView({
       ?? (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined),
     sessionRef: content.sessionRef,
     modelSelection: content.modelSelection,
-    model: content.model,
+    model: getEffectiveFreshAgentModel(content),
     permissionMode: content.permissionMode,
     sandbox: content.sandbox,
-    effort: content.effort,
+    effort: getEffectiveFreshAgentEffort(content),
     plugins: content.plugins,
   } as const), [])
 
@@ -581,10 +619,9 @@ export function FreshAgentView({
       ? null
       : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
     const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
-    const codexModelValue = paneContent.model ?? 'gpt-5-codex'
-    const codexModelOptions = CODEX_MODEL_OPTIONS.some((option) => option.value === codexModelValue)
-      ? CODEX_MODEL_OPTIONS
-      : [{ value: codexModelValue, label: codexModelValue }, ...CODEX_MODEL_OPTIONS]
+    const codexModelValue = normalizeFreshcodexModel(paneContent.model)
+    const thinkingOptions = FRESH_AGENT_THINKING_OPTIONS_BY_PROVIDER[paneContent.provider] ?? []
+    const thinkingValue = getEffectiveFreshAgentEffort(paneContent) ?? ''
 
     return (
       <div className="flex h-full min-h-0 flex-col" data-context="fresh-agent" data-session-id={paneContent.sessionId}>
@@ -598,23 +635,49 @@ export function FreshAgentView({
               <span>{statusLabel}</span>
               {typeof totalTokens === 'number' ? <span>{totalTokens} tokens</span> : null}
               {paneContent.provider === 'codex' ? (
+                <fieldset
+                  className="flex items-center gap-2"
+                  disabled={effectiveStatus === 'running' || effectiveStatus === 'compacting'}
+                >
+                  <legend className="sr-only">Model</legend>
+                  {FRESHCODEX_MODEL_OPTIONS.map((option) => (
+                    <label key={option.value} className="flex items-center gap-1">
+                      <input
+                        type="radio"
+                        name={`${paneId}-freshcodex-model`}
+                        value={option.value}
+                        checked={codexModelValue === option.value}
+                        onChange={() => {
+                          dispatch(mergePaneContent({
+                            tabId,
+                            paneId,
+                            updates: { model: option.value },
+                          }))
+                        }}
+                      />
+                      <span>{option.label}</span>
+                    </label>
+                  ))}
+                </fieldset>
+              ) : null}
+              {thinkingOptions.length > 0 ? (
                 <label className="flex items-center gap-1">
-                  <span className="sr-only">Model</span>
+                  <span>Thinking</span>
                   <select
-                    aria-label="Model"
+                    aria-label="Thinking level"
                     className="rounded border border-border/70 bg-background px-2 py-1 text-xs"
-                    value={codexModelValue}
+                    value={thinkingValue}
                     disabled={effectiveStatus === 'running' || effectiveStatus === 'compacting'}
                     onChange={(event) => {
-                      const nextModel = event.target.value
+                      const nextEffort = event.target.value
                       dispatch(mergePaneContent({
                         tabId,
                         paneId,
-                        updates: { model: nextModel },
+                        updates: { effort: nextEffort },
                       }))
                     }}
                   >
-                    {codexModelOptions.map((option) => (
+                    {thinkingOptions.map((option) => (
                       <option key={option.value} value={option.value}>{option.label}</option>
                     ))}
                   </select>
@@ -766,10 +829,10 @@ export function FreshAgentView({
                   text,
                   settings: {
                     ...(paneContent.initialCwd ? { cwd: paneContent.initialCwd } : {}),
-                    ...(paneContent.model ? { model: paneContent.model } : {}),
+                    ...(getEffectiveFreshAgentModel(paneContent) ? { model: getEffectiveFreshAgentModel(paneContent) } : {}),
                     ...(paneContent.permissionMode ? { permissionMode: paneContent.permissionMode } : {}),
                     ...(paneContent.sandbox ? { sandbox: paneContent.sandbox } : {}),
-                    ...(paneContent.effort ? { effort: paneContent.effort } : {}),
+                    ...(getEffectiveFreshAgentEffort(paneContent) ? { effort: getEffectiveFreshAgentEffort(paneContent) } : {}),
                   },
                 })
               }}

@@ -33,6 +33,20 @@ export type FreshAgentRegistryEntry = {
   featureFlag?: string
 }
 
+export const FRESHCODEX_DEFAULT_MODEL = 'gpt-5.5'
+export const FRESHCODEX_DEFAULT_EFFORT = 'xhigh'
+export const FRESHCODEX_MODEL_OPTIONS = [
+  { value: 'gpt-5.5', label: 'GPT-5.5' },
+  { value: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' },
+] as const
+
+export function normalizeFreshcodexModel(model: string | undefined): string {
+  if (model && FRESHCODEX_MODEL_OPTIONS.some((option) => option.value === model)) {
+    return model
+  }
+  return FRESHCODEX_DEFAULT_MODEL
+}
+
 export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
   {
     sessionType: 'freshclaude',
@@ -41,7 +55,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     icon: FreshclaudeIcon,
     defaultModel: 'claude-opus-4-6',
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'high',
+    defaultEffort: 'max',
     settingsVisibility: {
       model: true,
       permissionMode: true,
@@ -57,14 +71,14 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     runtimeProvider: 'codex',
     label: 'Freshcodex',
     icon: CodexIcon,
-    defaultModel: 'gpt-5-codex',
+    defaultModel: FRESHCODEX_DEFAULT_MODEL,
     defaultPermissionMode: 'on-request',
-    defaultEffort: 'high',
+    defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
     settingsVisibility: {
       model: true,
       permissionMode: true,
       effort: true,
-      thinking: false,
+      thinking: true,
       tools: true,
       timecodes: true,
     },
@@ -78,7 +92,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     icon: KilroyIcon,
     defaultModel: 'claude-opus-4-6',
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'high',
+    defaultEffort: 'max',
     settingsVisibility: {
       model: true,
       permissionMode: true,
@@ -99,12 +113,12 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     icon: OpencodeIcon,
     defaultModel: 'opencode',
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'high',
+    defaultEffort: 'max',
     settingsVisibility: {
       model: true,
       permissionMode: true,
       effort: true,
-      thinking: false,
+      thinking: true,
       tools: true,
       timecodes: true,
     },

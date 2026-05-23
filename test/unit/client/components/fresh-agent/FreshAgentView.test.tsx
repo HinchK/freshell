@@ -256,6 +256,8 @@ describe('FreshAgentView', () => {
       requestId: 'req-create',
       sessionType: 'freshcodex',
       provider: 'codex',
+      model: 'gpt-5.5',
+      effort: 'xhigh',
     }))
 
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
@@ -303,11 +305,11 @@ describe('FreshAgentView', () => {
 
     wsMock.send.mockClear()
 
-    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), {
-      target: { value: 'gpt-5.4-mini' },
-    })
+    expect(screen.getByRole('radio', { name: 'GPT-5.5' })).toBeChecked()
+    expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveValue('xhigh')
+    fireEvent.click(screen.getByRole('radio', { name: 'GPT-5.3 Codex Spark' }))
     await waitFor(() => {
-      expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('gpt-5.4-mini')
+      expect(screen.getByRole('radio', { name: 'GPT-5.3 Codex Spark' })).toBeChecked()
     })
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
@@ -323,7 +325,8 @@ describe('FreshAgentView', () => {
       text: 'Ship it',
       settings: {
         cwd: '/repo',
-        model: 'gpt-5.4-mini',
+        model: 'gpt-5.3-codex-spark',
+        effort: 'xhigh',
       },
     })
 
@@ -345,7 +348,7 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('keeps a configured custom Freshcodex model selectable', async () => {
+  it('normalizes obsolete Freshcodex models to the default radio option', async () => {
     const store = createStore()
     render(
       <Provider store={store}>
@@ -369,8 +372,8 @@ describe('FreshAgentView', () => {
       expect(screen.getByText('Codex summary')).toBeInTheDocument()
     })
 
-    expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('custom-codex-model')
-    expect(screen.getByRole('option', { name: 'custom-codex-model' })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: 'GPT-5.5' })).toBeChecked()
+    expect(screen.queryByRole('radio', { name: 'custom-codex-model' })).not.toBeInTheDocument()
   })
 
   it('switches the pane to the forked Freshcodex thread when the server reports fork success', async () => {
@@ -608,6 +611,7 @@ describe('FreshAgentView', () => {
         sessionType: 'freshclaude',
         provider: 'claude',
         resumeSessionId: durableSessionId,
+        effort: 'max',
       }))
     })
   })

@@ -14,7 +14,7 @@ import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
 import { isAgentChatProviderName, getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
-import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { normalizeFreshcodexModel, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { buildPaneRefreshTarget } from '@/lib/pane-utils'
@@ -617,7 +617,7 @@ function PickerWrapper({
         status: 'creating',
         modelSelection: normalizeAgentChatModelSelection(providerSettings?.modelSelection),
         model: freshAgentType.runtimeProvider === 'codex'
-          ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model ?? freshAgentType.defaultModel
+          ? normalizeFreshcodexModel(settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model)
           : freshAgentType.defaultModel,
         permissionMode: providerSettings?.defaultPermissionMode
           ?? (freshAgentType.runtimeProvider === 'codex'
