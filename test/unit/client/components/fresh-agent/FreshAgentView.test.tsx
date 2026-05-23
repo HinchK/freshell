@@ -306,6 +306,7 @@ describe('FreshAgentView', () => {
     wsMock.send.mockClear()
 
     expect(screen.getByRole('radio', { name: 'GPT-5.5' })).toBeChecked()
+    expect(screen.getByRole('radio', { name: 'GPT-5.4 Flash' })).not.toBeChecked()
     expect(screen.getByRole('combobox', { name: 'Thinking level' })).toHaveValue('xhigh')
     fireEvent.click(screen.getByRole('radio', { name: 'GPT-5.3 Codex Spark' }))
     await waitFor(() => {

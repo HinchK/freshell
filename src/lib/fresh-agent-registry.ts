@@ -37,6 +37,7 @@ export const FRESHCODEX_DEFAULT_MODEL = 'gpt-5.5'
 export const FRESHCODEX_DEFAULT_EFFORT = 'xhigh'
 export const FRESHCODEX_MODEL_OPTIONS = [
   { value: 'gpt-5.5', label: 'GPT-5.5' },
+  { value: 'gpt-5.4-flash', label: 'GPT-5.4 Flash' },
   { value: 'gpt-5.3-codex-spark', label: 'GPT-5.3 Codex Spark' },
 ] as const
 
