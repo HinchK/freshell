@@ -154,6 +154,14 @@ export class FreshAgentRuntimeManager {
     await record.adapter.interrupt(locator.sessionId)
   }
 
+  async compact(locator: FreshAgentSessionLocator, input?: { instructions?: string }) {
+    const record = this.requireSession(locator)
+    if (!record.adapter.compact) {
+      throw new FreshAgentUnsupportedCapabilityError(`Compact is not supported for ${record.sessionType}`)
+    }
+    await record.adapter.compact(locator.sessionId, input)
+  }
+
   async kill(locator: FreshAgentSessionLocator): Promise<boolean> {
     const record = this.requireSession(locator)
     try {

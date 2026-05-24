@@ -158,6 +158,30 @@ describe('FreshAgentRuntimeManager', () => {
     expect(codexAdapter.send).toHaveBeenCalledWith('thread-child-1', { text: 'hello' })
   })
 
+  it('routes freshAgent.compact through the tracked adapter', async () => {
+    const codexAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'thread-compact-1' }),
+      compact: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+        adapter: codexAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+    await manager.create({ requestId: 'req-compact', sessionType: 'freshcodex' })
+
+    await manager.compact({
+      sessionId: 'thread-compact-1',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }, { instructions: 'keep decisions' })
+
+    expect(codexAdapter.compact).toHaveBeenCalledWith('thread-compact-1', { instructions: 'keep decisions' })
+  })
+
   it('routes freshAgent.kill through the tracked adapter and removes the session', async () => {
     const claudeAdapter = {
       create: vi.fn().mockResolvedValue({ sessionId: 'claude-session-1' }),
