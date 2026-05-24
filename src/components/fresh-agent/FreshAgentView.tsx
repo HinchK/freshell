@@ -23,7 +23,7 @@ import { buildRestoreError, type RestoreErrorReason } from '@shared/session-cont
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript } from './FreshAgentTranscript'
-import { FreshAgentComposer } from './FreshAgentComposer'
+import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
 
@@ -154,6 +154,7 @@ export function FreshAgentView({
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
   const slashCommands = useMemo(() => getFreshAgentSlashCommands(paneContent.sessionType), [paneContent.sessionType])
   const paneContentRef = useRef(paneContent)
+  const composerRef = useRef<FreshAgentComposerHandle | null>(null)
   paneContentRef.current = paneContent
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
@@ -660,6 +661,11 @@ export function FreshAgentView({
       && !hasRestoreFailure
       && !['creating', 'starting', 'create-failed', 'exited'].includes(effectiveStatus)
     )
+    const canInterrupt = snapshot?.capabilities?.interrupt === true || (
+      paneContent.provider === 'claude'
+      && Boolean(paneContent.sessionId)
+      && ['connected', 'running', 'idle', 'compacting'].includes(effectiveStatus)
+    )
     const questionAgentLabel = getQuestionAgentLabel(paneContent, descriptor?.label)
     const visibleRestoreFailure = paneContent.provider === 'claude'
       ? claudeSession?.restoreFailureMessage
@@ -668,11 +674,26 @@ export function FreshAgentView({
       ? null
       : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
     const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
+    const sendInterrupt = () => {
+      if (!paneContent.sessionId || !canInterrupt) return
+      sendFreshAgentMessage({
+        type: 'freshAgent.interrupt',
+        sessionId: paneContent.sessionId,
+        sessionType: paneContent.sessionType,
+        provider: paneContent.provider,
+      })
+    }
 
     return (
       <div className="flex h-full min-h-0 flex-col" data-context="fresh-agent" data-session-id={paneContent.sessionId}>
         <div className="flex min-h-0 flex-1">
-          <div className="flex min-h-0 flex-1 flex-col">
+          <div
+            className="flex min-h-0 flex-1 flex-col"
+            onClick={(event) => {
+              if (event.target !== event.currentTarget) return
+              composerRef.current?.focus()
+            }}
+          >
             <div className="space-y-2 px-3 pt-3">
               {isRestoring ? (
                 <FreshAgentApprovalBanner text="Restoring session..." />
@@ -778,7 +799,11 @@ export function FreshAgentView({
             </div>
             <FreshAgentTranscript turns={turns} />
             <FreshAgentComposer
+              ref={composerRef}
               disabled={!canSend || !paneContent.sessionId}
+              storageKey={`fresh-agent-draft:${paneContent.sessionType}:${paneContent.sessionId ?? paneContent.createRequestId}`}
+              canInterrupt={canInterrupt && Boolean(paneContent.sessionId)}
+              onInterrupt={sendInterrupt}
               commands={slashCommands}
               onCommand={runSlashCommand}
               onSend={(text) => {
