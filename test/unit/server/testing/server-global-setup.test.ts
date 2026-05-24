@@ -49,22 +49,27 @@ describe('ensureBuiltServerEntry', () => {
     })
   })
 
-  it('uses npm.cmd on Windows', () => {
+  it('uses the npm CLI JavaScript entrypoint on Windows when npm exposes it', () => {
     const execFileSync = vi.fn()
     const rmSync = vi.fn()
+    const npmExecPath = path.join('C:\\repo', 'node_modules', 'npm', 'bin', 'npm-cli.js')
 
     ensureBuiltServerEntry('C:\\repo', {
       execFileSync,
       rmSync,
-      env: { PATH: 'C:\\Windows\\System32' },
+      env: {
+        PATH: 'C:\\Windows\\System32',
+        npm_execpath: npmExecPath,
+      },
       platform: 'win32',
     })
 
     expect(rmSync).toHaveBeenCalledWith(path.join('C:\\repo', 'dist', '.env'), { force: true })
-    expect(execFileSync).toHaveBeenCalledWith('npm.cmd', ['run', 'build:server'], {
+    expect(execFileSync).toHaveBeenCalledWith(process.execPath, [npmExecPath, 'run', 'build:server'], {
       cwd: 'C:\\repo',
       env: {
         PATH: 'C:\\Windows\\System32',
+        npm_execpath: npmExecPath,
         NODE_ENV: 'production',
       },
       stdio: 'inherit',
