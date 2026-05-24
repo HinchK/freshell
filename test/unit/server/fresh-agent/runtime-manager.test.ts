@@ -182,6 +182,52 @@ describe('FreshAgentRuntimeManager', () => {
     expect(codexAdapter.compact).toHaveBeenCalledWith('thread-compact-1', { instructions: 'keep decisions' })
   })
 
+  it('hydrates adapter state when attaching a restored session before send and compact', async () => {
+    const opencodeAdapter = {
+      create: vi.fn().mockResolvedValue({ sessionId: 'opencode-created-1' }),
+      attach: vi.fn().mockResolvedValue({ sessionId: 'opencode-restored-1' }),
+      send: vi.fn().mockResolvedValue(undefined),
+      compact: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await expect(manager.attach({
+      sessionId: 'opencode-restored-1',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })).resolves.toEqual({
+      sessionId: 'opencode-restored-1',
+      sessionType: 'freshopencode',
+      runtimeProvider: 'opencode',
+      sessionRef: undefined,
+    })
+    await manager.send({
+      sessionId: 'opencode-restored-1',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    }, { text: 'reply ok' })
+    await manager.compact({
+      sessionId: 'opencode-restored-1',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    }, { instructions: 'keep decisions' })
+
+    expect(opencodeAdapter.attach).toHaveBeenCalledWith({
+      sessionId: 'opencode-restored-1',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })
+    expect(opencodeAdapter.send).toHaveBeenCalledWith('opencode-restored-1', { text: 'reply ok' })
+    expect(opencodeAdapter.compact).toHaveBeenCalledWith('opencode-restored-1', { instructions: 'keep decisions' })
+  })
+
   it('routes freshAgent.kill through the tracked adapter and removes the session', async () => {
     const claudeAdapter = {
       create: vi.fn().mockResolvedValue({ sessionId: 'claude-session-1' }),

@@ -146,6 +146,65 @@ describe('OpenCode fresh-agent adapter', () => {
     expect(calls[1]).toContain('ses_real_2')
   })
 
+  it('hydrates an attached restored session for send, compact, and turn loading', async () => {
+    const restoredExport = {
+      ...exportedSession,
+      info: { ...exportedSession.info, id: 'ses_restored_1' },
+    }
+    const { spawnFn, calls } = makeSpawn({
+      'run reply ok --format json --dangerously-skip-permissions --session ses_restored_1': {
+        stdout: '{"type":"step_start","sessionID":"ses_restored_1"}\n',
+      },
+      'run /compact keep decisions --format json --dangerously-skip-permissions --session ses_restored_1': {
+        stdout: '{"type":"step_start","sessionID":"ses_restored_1"}\n',
+      },
+      'export ses_restored_1': {
+        stdout: `Exporting session: ses_restored_1\n${JSON.stringify(restoredExport)}`,
+      },
+    })
+    const adapter = createOpencodeFreshAgentAdapter({ spawnFn: spawnFn as any })
+
+    await adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_restored_1',
+    })
+    await adapter.send?.('ses_restored_1', { text: 'reply ok' })
+    await adapter.compact?.('ses_restored_1', { instructions: 'keep decisions' })
+
+    expect(calls[0]).toEqual([
+      'run',
+      'reply ok',
+      '--format',
+      'json',
+      '--dangerously-skip-permissions',
+      '--session',
+      'ses_restored_1',
+    ])
+    expect(calls[1]).toEqual([
+      'run',
+      '/compact keep decisions',
+      '--format',
+      'json',
+      '--dangerously-skip-permissions',
+      '--session',
+      'ses_restored_1',
+    ])
+    await expect(adapter.getTurnBody?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'ses_restored_1',
+      turnId: 'msg_assistant_1',
+    }, 12)).resolves.toMatchObject({
+      threadId: 'ses_restored_1',
+      turnId: 'msg_assistant_1',
+      role: 'assistant',
+      items: expect.arrayContaining([
+        expect.objectContaining({ kind: 'text', text: 'ok' }),
+      ]),
+    })
+  })
+
   it('accepts partial per-turn settings from the client send path', async () => {
     const { spawnFn, calls } = makeSpawn({
       'run reply ok --format json --dangerously-skip-permissions --model opencode-go/deepseek-v4-flash --variant high': {

@@ -222,6 +222,22 @@ export function createOpencodeFreshAgentAdapter(options: {
       return { sessionId, sessionRef: { provider: 'opencode', sessionId } }
     },
 
+    attach(locator) {
+      const existing = sessions.get(locator.sessionId)
+      if (existing) {
+        remember(existing)
+        return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }
+      }
+      const state: OpencodeSessionState = {
+        placeholderId: locator.sessionId,
+        realSessionId: locator.sessionId,
+        status: 'idle',
+        events: new EventEmitter(),
+      }
+      remember(state)
+      return { sessionId: locator.sessionId, sessionRef: { provider: 'opencode', sessionId: locator.sessionId } }
+    },
+
     subscribe(sessionId, listener) {
       const state = requireState(sessionId)
       const handler = (event: unknown) => listener(event)
