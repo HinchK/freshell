@@ -18,6 +18,7 @@ const DEFAULT_SESSION_LIFECYCLE_LOG_SUFFIX = '.jsonl'
 const DEFAULT_SESSION_LIFECYCLE_LOG_SIZE: SizeString = '10M'
 const DEFAULT_SESSION_LIFECYCLE_LOG_MAX_FILES = 10
 export const DEFAULT_NON_DEBUG_LOG_LEVEL: LevelWithSilent = 'warn'
+const DEFAULT_CONSOLE_LOG_LEVEL: LevelWithSilent = 'error'
 const SOURCE_ENTRY_MATCHERS = [/(^|\/)server\/index\.ts$/i, /(^|\/)server\/index\.js$/i]
 const DIST_ENTRY_MATCHERS = [/(^|\/)dist\/server\/index\.js$/i]
 type LogMode = 'development' | 'production'
@@ -248,7 +249,7 @@ function createConsoleStream(shouldPrettyPrint: boolean): DestinationStream {
   return pretty
 }
 
-function attachDebugStreamWarnings(
+export function attachDebugStreamWarnings(
   stream: RotatingFileStream,
   consoleLogger: pino.Logger,
   filePath: string,
@@ -270,10 +271,18 @@ export function createLogger(destination?: DestinationStream) {
 
   const shouldPrettyPrint = env !== 'production' && env !== 'test'
   const consoleStream = createConsoleStream(shouldPrettyPrint)
-  const consoleLogger = pino(createPinoOptions(), consoleStream)
+  const consoleLogger = pino(createPinoOptions({ level: DEFAULT_CONSOLE_LOG_LEVEL }), consoleStream)
+  const consoleDiagnosticLogger = pino(createPinoOptions({ level: 'warn' }), consoleStream)
   const streams: Array<{ stream: DestinationStream; level: LevelWithSilent }> = [
-    { stream: consoleStream, level: DEFAULT_NON_DEBUG_LOG_LEVEL },
+    { stream: consoleStream, level: DEFAULT_CONSOLE_LOG_LEVEL },
   ]
+  let resolvedDebugLog:
+    | {
+        filePath: string
+        debugMode: LogMode
+        debugInstance: string
+      }
+    | undefined
 
   const debugLogPath = resolveDebugLogPath()
   if (debugLogPath) {
@@ -282,21 +291,22 @@ export function createLogger(destination?: DestinationStream) {
       const debugInstance = resolveDebugInstanceTag()
       const debugStream = createDebugFileStream(debugLogPath)
       streams.push({ stream: debugStream, level: 'debug' })
-      attachDebugStreamWarnings(debugStream, consoleLogger, debugLogPath)
-      consoleLogger.info(
-        {
-          filePath: debugLogPath,
-          debugMode,
-          debugInstance,
-        },
-        'Resolved debug log path',
-      )
+      attachDebugStreamWarnings(debugStream, consoleDiagnosticLogger, debugLogPath)
+      resolvedDebugLog = {
+        filePath: debugLogPath,
+        debugMode,
+        debugInstance,
+      }
     } catch (err) {
-      consoleLogger.warn({ err, filePath: debugLogPath }, 'Debug log file disabled')
+      consoleLogger.error({ err, filePath: debugLogPath }, 'Debug log file disabled')
     }
   }
 
-  return pino(createPinoOptions(), pino.multistream(streams))
+  const nextLogger = pino(createPinoOptions(), pino.multistream(streams))
+  if (resolvedDebugLog) {
+    nextLogger.info(resolvedDebugLog, 'Resolved debug log path')
+  }
+  return nextLogger
 }
 
 export const logger = createLogger()
