@@ -281,7 +281,7 @@ export class CodexAppServerClient {
         } else if (page.revision !== undefined && page.revision !== observedListRevision) {
           throw new Error('Codex app-server thread turn list revision changed while paging thread turns.')
         }
-        if (params.revision !== undefined && page.revision !== params.revision) {
+        if (params.revision !== undefined && page.revision !== undefined && page.revision !== params.revision) {
           throw new Error('Codex app-server thread turn list revision does not match requested revision.')
         }
         const turn = page.turns.find((candidate) => candidate.id === params.turnId)

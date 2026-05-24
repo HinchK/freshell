@@ -598,6 +598,36 @@ describe('CodexAppServerClient', () => {
     })
   })
 
+  it('accepts a pinned individual thread turn read when a list page omits its revision', async () => {
+    const client = new CodexAppServerClient({ wsUrl: 'ws://127.0.0.1:1' })
+    vi.spyOn(client as any, 'request').mockImplementation(async (method: string) => {
+      if (method !== 'thread/turns/list') throw new Error(`unexpected method ${method}`)
+      return {
+        nextCursor: null,
+        turns: [{
+          id: 'turn-target',
+          status: 'completed',
+          itemsView: 'full',
+          items: [],
+          error: null,
+          startedAt: 1770000001,
+          completedAt: 1770000002,
+          durationMs: 1000,
+        }],
+      }
+    })
+
+    await expect(client.readThreadTurn({
+      threadId: 'thread-new-1',
+      turnId: 'turn-target',
+      revision: 7,
+    })).resolves.toMatchObject({
+      turnId: 'turn-target',
+      revision: 7,
+      status: 'completed',
+    })
+  })
+
   it('rejects an individual thread turn when the list revision no longer matches the requested revision', async () => {
     const client = new CodexAppServerClient({ wsUrl: 'ws://127.0.0.1:1' })
     vi.spyOn(client as any, 'request').mockImplementation(async (method: string) => {

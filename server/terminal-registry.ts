@@ -2401,6 +2401,7 @@ export class TerminalRegistry extends EventEmitter {
         const latest = this.terminals.get(record.terminalId)
         if (latest?.codexRecoveryAttempt === attempt) {
           latest.codexRecoveryAttempt = undefined
+          latest.codexRecoveryRetiringPty = undefined
         }
       })
     record.codexRecoveryAttempt = attempt

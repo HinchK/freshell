@@ -170,6 +170,42 @@ describe.sequential('TerminalRegistry Codex durable recovery', () => {
     expect(exited).not.toHaveBeenCalled()
   })
 
+  it('clears the retiring PTY marker when recovery aborts before planning', async () => {
+    const currentSidecar = createFakeSidecar()
+    const replacementSidecar = createFakeSidecar()
+    const planCreate = vi.fn(async () => ({
+      sessionId: 'thread-durable-1',
+      remote: { wsUrl: 'ws://127.0.0.1:46002/' },
+      sidecar: replacementSidecar,
+    }))
+    const record = registry.create({
+      mode: 'codex',
+      cwd: '/repo',
+      resumeSessionId: 'thread-durable-1',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:46001/',
+          sidecar: currentSidecar,
+          recovery: { planCreate, retryDelayMs: 0 },
+        },
+      } as any,
+    })
+    const [oldPty] = await spawnedPtys()
+
+    currentSidecar.emitLifecycleLoss({
+      method: 'thread/status/changed',
+      threadId: 'thread-durable-1',
+      status: 'notLoaded',
+    })
+    expect(record.codexRecoveryRetiringPty).toBe(oldPty)
+
+    ;(record as any).status = 'exited'
+
+    await vi.waitFor(() => expect(record.codexRecoveryAttempt).toBeUndefined())
+    expect(record.codexRecoveryRetiringPty).toBeUndefined()
+    expect(planCreate).not.toHaveBeenCalled()
+  })
+
   it('keeps a durable Codex PTY exit final when the visible process exits cleanly', async () => {
     const exited = vi.fn()
     registry.on('terminal.exit', exited)
