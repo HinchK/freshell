@@ -119,4 +119,3 @@ export function normalizeFreshAgentEffort(
   }
   return options[options.length - 1]?.value
 }
-
