@@ -193,7 +193,28 @@ function createRuntime(options: ConstructorParameters<typeof CodexAppServerRunti
   return runtime
 }
 
-describe('CodexAppServerRuntime', () => {
+if (process.platform !== 'linux') {
+  describe('CodexAppServerRuntime unsupported platform', () => {
+    it('rejects before spawning without Linux /proc ownership support', async () => {
+      const metadataDir = await makeTempDir()
+      const runtime = createRuntime({
+        metadataDir,
+        startupAttemptLimit: 1,
+      })
+
+      await expect(runtime.ensureReady()).rejects.toThrow(/linux.*\/proc/i)
+      const entries = await fsp.readdir(metadataDir).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+        throw error
+      })
+      expect(entries).toEqual([])
+    })
+  })
+}
+
+const describeWithLinuxProc = process.platform === 'linux' ? describe : describe.skip
+
+describeWithLinuxProc('CodexAppServerRuntime', () => {
   it('starts one owned loopback app-server sidecar on first use', async () => {
     const runtime = createRuntime()
 
@@ -484,7 +505,7 @@ describe('CodexAppServerRuntime', () => {
       metadataDir,
       serverInstanceId: 'srv-runtime-test',
       startupAttemptLimit: 1,
-      startupAttemptTimeoutMs: 100,
+      startupAttemptTimeoutMs: 500,
       env: {
         FAKE_CODEX_APP_SERVER_BEHAVIOR: JSON.stringify({
           spawnNativeChild: true,
@@ -591,7 +612,7 @@ describe('CodexAppServerRuntime', () => {
       metadataDir,
       serverInstanceId: 'srv-runtime-test',
       startupAttemptLimit: 2,
-      startupAttemptTimeoutMs: 120,
+      startupAttemptTimeoutMs: 500,
       requestTimeoutMs: 1_000,
       processIdentityReader: async (pid) => {
         identityReadAttempts += 1

@@ -23,6 +23,24 @@ export function resolveVitestCommand(repoRoot: string): { command: string; args:
   }
 }
 
+export function resolveNpmCommand(
+  args: string[],
+  envVars: NodeJS.ProcessEnv = process.env,
+): { command: string; args: string[] } {
+  const npmExecPath = envVars.npm_execpath
+  if (npmExecPath && npmExecPath.endsWith('.js')) {
+    return {
+      command: process.execPath,
+      args: [npmExecPath, ...args],
+    }
+  }
+
+  return {
+    command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
+    args,
+  }
+}
+
 export async function runUpstreamPhase(
   phase: UpstreamPhase,
   envVars: NodeJS.ProcessEnv = process.env,
@@ -42,9 +60,10 @@ export async function runUpstreamPhase(
 function resolveSpawnSpec(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): { command: string; args: string[]; selector: string } {
   if (phase.runner === 'npm') {
     const forwardedArgs = phase.args.length > 0 ? ['--', ...phase.args] : []
+    const npm = resolveNpmCommand(['run', phase.script, ...forwardedArgs], envVars)
     return {
-      command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
-      args: ['run', phase.script, ...forwardedArgs],
+      command: npm.command,
+      args: npm.args,
       selector: `npm:${phase.script}${phase.args.length > 0 ? ` ${phase.args.join(' ')}` : ''}`,
     }
   }

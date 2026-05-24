@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { UpstreamPhase } from '../../../../scripts/testing/coordinator-command-matrix.js'
 import {
   assertNoCoordinatorRecursion,
+  resolveNpmCommand,
   resolveVitestCommand,
   runUpstreamPhase,
 } from '../../../../scripts/testing/coordinator-upstream.js'
@@ -57,6 +58,21 @@ describe('coordinator-upstream', () => {
 
     expect(command.command).toBe(process.execPath)
     expect(command.args).toEqual([require.resolve('vitest/vitest.mjs')])
+  })
+
+  it('prefers the npm CLI JavaScript entrypoint when npm exposes it', () => {
+    const command = resolveNpmCommand(['run', 'test:balanced'], {
+      npm_execpath: path.join(REPO_ROOT, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    })
+
+    expect(command).toEqual({
+      command: process.execPath,
+      args: [
+        path.join(REPO_ROOT, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+        'run',
+        'test:balanced',
+      ],
+    })
   })
 
   it('passes delegated help and watch invocations through the repo-local vitest entry with the recursion guard env set', async () => {
