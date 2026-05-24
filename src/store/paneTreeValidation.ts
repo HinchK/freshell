@@ -1,5 +1,7 @@
 import { isAgentChatModelSelection, normalizeAgentChatEffortOverride, type PaneNode } from './paneTypes'
 import { CodexDurabilityRefSchema } from '@shared/codex-durability'
+import { getFreshAgentThinkingOptions, normalizeFreshAgentModel } from '@/lib/fresh-agent-models'
+import { isFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object'
@@ -60,17 +62,26 @@ function isPaneContentShape(content: unknown): boolean {
     case 'picker':
       return true
     case 'fresh-agent': {
-      const isFreshAgentEffortValid = content.provider === 'claude'
-        ? (content.effort === undefined || (typeof content.effort === 'string' && content.effort.length > 0))
-        : (content.effort === undefined
-          || content.effort === 'none' || content.effort === 'minimal' || content.effort === 'low'
-          || content.effort === 'medium' || content.effort === 'high' || content.effort === 'xhigh'
-          || content.effort === 'max')
+      const sessionType = isFreshAgentSessionType(content.sessionType) ? content.sessionType : undefined
+      const runtimeProvider = sessionType ? resolveFreshAgentRuntimeProvider(sessionType) : undefined
+      const providerValid = typeof content.provider === 'string' && runtimeProvider === content.provider
+      const model = sessionType && runtimeProvider && providerValid
+        ? normalizeFreshAgentModel(
+          sessionType,
+          runtimeProvider,
+          typeof content.model === 'string' ? content.model : undefined,
+        )
+        : undefined
+      const thinkingOptions = sessionType && runtimeProvider && providerValid
+        ? getFreshAgentThinkingOptions(sessionType, runtimeProvider, model)
+        : []
+      const isFreshAgentEffortValid = content.effort === undefined
+        || thinkingOptions.some((option) => option.value === content.effort)
       const hasSessionRef = content.sessionRef !== undefined
         && (typeof content.sessionRef === 'object' || !!(content.sessionRef as object))
       const hasRestoreError = content.restoreError !== undefined
-      return typeof content.sessionType === 'string'
-        && typeof content.provider === 'string'
+      return !!sessionType
+        && providerValid
         && typeof content.createRequestId === 'string'
         && typeof content.status === 'string'
         && isOptionalString(content.sessionId)

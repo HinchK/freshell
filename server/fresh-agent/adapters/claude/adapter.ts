@@ -14,6 +14,7 @@ import {
   normalizeClaudeTurnBody,
   normalizeClaudeTurnPage,
 } from './normalize.js'
+import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
 
 type ClaudeBridgePort = Pick<
   SdkBridge,
@@ -48,6 +49,15 @@ function toClaudeEffort(value: FreshAgentCreateRequest['effort']) {
   throw new Error(`Freshclaude does not support reasoning effort "${value}".`)
 }
 
+function normalizeClaudeInput(input: FreshAgentCreateRequest): FreshAgentCreateRequest {
+  const model = normalizeFreshAgentModel(input.sessionType, 'claude', input.model)
+  return {
+    ...input,
+    model,
+    effort: normalizeFreshAgentEffort(input.sessionType, 'claude', model, input.effort),
+  }
+}
+
 function mapMissingResult(ok: boolean, message: string): void {
   if (!ok) {
     throw new Error(message)
@@ -80,25 +90,27 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
     runtimeProvider: 'claude',
 
     async create(input: FreshAgentCreateRequest) {
+      const normalizedInput = normalizeClaudeInput(input)
       const session = await deps.sdkBridge.createSession({
-        cwd: input.cwd,
-        resumeSessionId: input.resumeSessionId,
-        model: input.model,
-        permissionMode: input.permissionMode,
-        effort: toClaudeEffort(input.effort),
-        plugins: input.plugins,
+        cwd: normalizedInput.cwd,
+        resumeSessionId: normalizedInput.resumeSessionId,
+        model: normalizedInput.model,
+        permissionMode: normalizedInput.permissionMode,
+        effort: toClaudeEffort(normalizedInput.effort),
+        plugins: normalizedInput.plugins,
       })
       return { sessionId: session.sessionId }
     },
 
     async resume(input: FreshAgentCreateRequest) {
+      const normalizedInput = normalizeClaudeInput(input)
       const session = await deps.sdkBridge.createSession({
-        cwd: input.cwd,
-        resumeSessionId: input.resumeSessionId,
-        model: input.model,
-        permissionMode: input.permissionMode,
-        effort: toClaudeEffort(input.effort),
-        plugins: input.plugins,
+        cwd: normalizedInput.cwd,
+        resumeSessionId: normalizedInput.resumeSessionId,
+        model: normalizedInput.model,
+        permissionMode: normalizedInput.permissionMode,
+        effort: toClaudeEffort(normalizedInput.effort),
+        plugins: normalizedInput.plugins,
       })
       return { sessionId: session.sessionId }
     },

@@ -9,6 +9,20 @@ import {
   KilroyIcon,
   OpencodeIcon,
 } from '@/components/icons/provider-icons'
+import {
+  FRESHCODEX_DEFAULT_EFFORT,
+  FRESHCODEX_DEFAULT_MODEL,
+} from '@/lib/fresh-agent-models'
+export {
+  FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
+  FRESHCODEX_DEFAULT_EFFORT,
+  FRESHCODEX_DEFAULT_MODEL,
+  FRESHCODEX_MODEL_OPTIONS,
+  getFreshAgentThinkingOptions,
+  normalizeFreshAgentEffort,
+  normalizeFreshAgentModel,
+  normalizeFreshcodexModel,
+} from '@/lib/fresh-agent-models'
 
 export type FreshAgentRegistryEntry = {
   sessionType: FreshAgentSessionType
@@ -41,7 +55,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     icon: FreshclaudeIcon,
     defaultModel: 'claude-opus-4-6',
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'high',
+    defaultEffort: 'max',
     settingsVisibility: {
       model: true,
       permissionMode: true,
@@ -57,14 +71,14 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     runtimeProvider: 'codex',
     label: 'Freshcodex',
     icon: CodexIcon,
-    defaultModel: 'gpt-5-codex',
+    defaultModel: FRESHCODEX_DEFAULT_MODEL,
     defaultPermissionMode: 'on-request',
-    defaultEffort: 'high',
+    defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
     settingsVisibility: {
       model: true,
       permissionMode: true,
       effort: true,
-      thinking: false,
+      thinking: true,
       tools: true,
       timecodes: true,
     },
@@ -78,7 +92,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     icon: KilroyIcon,
     defaultModel: 'claude-opus-4-6',
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'high',
+    defaultEffort: 'max',
     settingsVisibility: {
       model: true,
       permissionMode: true,
@@ -99,12 +113,12 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     icon: OpencodeIcon,
     defaultModel: 'opencode',
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'high',
+    defaultEffort: 'max',
     settingsVisibility: {
       model: true,
       permissionMode: true,
       effort: true,
-      thinking: false,
+      thinking: true,
       tools: true,
       timecodes: true,
     },
