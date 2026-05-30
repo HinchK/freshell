@@ -1,4 +1,5 @@
 import { test, expect } from '../helpers/fixtures.js'
+import { openPanePicker } from '../helpers/pane-picker.js'
 
 async function enableClaudeAndCodex(page: any) {
   await page.evaluate(() => {
@@ -23,13 +24,6 @@ async function enableClaudeAndCodex(page: any) {
       payload: patchPayload,
     })
   })
-}
-
-async function openPanePicker(page: any) {
-  const termContainer = page.locator('.xterm').first()
-  await termContainer.click({ button: 'right' })
-  await page.getByRole('menuitem', { name: /split horizontally/i }).click()
-  await expect(page.getByRole('toolbar', { name: /pane type picker/i })).toBeVisible({ timeout: 10_000 })
 }
 
 async function getActiveLeaf(harness: any) {
