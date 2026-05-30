@@ -3,6 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { GlobalSetupContext } from 'vitest/node'
+import { resolveNpmExecFileCommand } from './npm-command.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -31,8 +32,8 @@ export function ensureBuiltServerEntry(
   // dist/ is gitignored in worktrees, so rebuild unconditionally here rather
   // than trusting a possibly stale compiled entry from an earlier branch state.
   deps.rmSync(path.join(projectRoot, 'dist', '.env'), { force: true })
-  const npmCommand = deps.platform === 'win32' ? 'npm.cmd' : 'npm'
-  deps.execFileSync(npmCommand, ['run', 'build:server'], {
+  const npm = resolveNpmExecFileCommand(['run', 'build:server'], deps.env, deps.platform)
+  deps.execFileSync(npm.command, npm.args, {
     cwd: projectRoot,
     env: {
       ...deps.env,
