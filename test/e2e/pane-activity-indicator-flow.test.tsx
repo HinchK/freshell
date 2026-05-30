@@ -9,6 +9,9 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import codexActivityReducer from '@/store/codexActivitySlice'
+import claudeActivityReducer, {
+  upsertClaudeActivity,
+} from '@/store/claudeActivitySlice'
 import opencodeActivityReducer, {
   removeOpencodeActivity,
   upsertOpencodeActivity,
@@ -17,7 +20,6 @@ import agentChatReducer, { removePermission } from '@/store/agentChatSlice'
 import type { AgentChatState } from '@/store/agentChatTypes'
 import paneRuntimeActivityReducer, {
   clearPaneRuntimeActivity,
-  setPaneRuntimeActivity,
   type PaneRuntimeActivityState,
 } from '@/store/paneRuntimeActivitySlice'
 import type {
@@ -133,6 +135,7 @@ function renderHarness(options: RenderHarnessOptions) {
       settings: settingsReducer,
       turnCompletion: turnCompletionReducer,
       codexActivity: codexActivityReducer,
+      claudeActivity: claudeActivityReducer,
       opencodeActivity: opencodeActivityReducer,
       agentChat: agentChatReducer,
       paneRuntimeActivity: paneRuntimeActivityReducer,
@@ -169,6 +172,12 @@ function renderHarness(options: RenderHarnessOptions) {
         attentionByPane: {},
       },
       codexActivity: {
+        byTerminalId: {},
+        lastSnapshotSeq: 0,
+        liveMutationSeqByTerminalId: {},
+        removedMutationSeqByTerminalId: {},
+      },
+      claudeActivity: {
         byTerminalId: {},
         lastSnapshotSeq: 0,
         liveMutationSeqByTerminalId: {},
@@ -300,7 +309,7 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
   })
 
-  it('keeps claude terminals non-blue while pending, blue while working, and clears on idle', () => {
+  it('keeps claude terminals non-blue when idle and blue while the server marks them busy', () => {
     const pane: TerminalPaneContent = {
       kind: 'terminal',
       createRequestId: 'req-claude',
@@ -318,15 +327,6 @@ describe('pane activity indicator flow (e2e)', () => {
         terminalId: 'term-claude',
         resumeSessionId: '11111111-1111-4111-8111-111111111111',
       },
-      paneRuntimeActivity: {
-        byPaneId: {
-          'pane-activity': {
-            source: 'terminal',
-            phase: 'pending',
-            updatedAt: 1,
-          },
-        },
-      },
     })
 
     const paneHeader = screen.getByRole('banner', { name: 'Pane: Activity Pane' })
@@ -334,11 +334,8 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
 
     act(() => {
-      store.dispatch(setPaneRuntimeActivity({
-        paneId: 'pane-activity',
-        source: 'terminal',
-        phase: 'working',
-        updatedAt: 2,
+      store.dispatch(upsertClaudeActivity({
+        terminals: [{ terminalId: 'term-claude', phase: 'busy', updatedAt: 1 }],
       }))
     })
 
@@ -346,7 +343,9 @@ describe('pane activity indicator flow (e2e)', () => {
     expect(within(getVisibleSinglePaneTab()).getByTestId('pane-icon').getAttribute('class')).toContain('text-blue-500')
 
     act(() => {
-      store.dispatch(clearPaneRuntimeActivity({ paneId: 'pane-activity' }))
+      store.dispatch(upsertClaudeActivity({
+        terminals: [{ terminalId: 'term-claude', phase: 'idle', updatedAt: 2 }],
+      }))
     })
 
     expect(within(paneHeader).getByTestId('pane-icon').getAttribute('class') ?? '').not.toContain('text-blue-500')
