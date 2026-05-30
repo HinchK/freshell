@@ -825,7 +825,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
       },
     })
 
@@ -864,9 +864,9 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === 'helloworld')).toBe(true)
-    expect(store.getState().turnCompletion.lastEvent?.tabId).toBe(tabId)
-    expect(store.getState().turnCompletion.lastEvent?.paneId).toBe(paneId)
-    expect(store.getState().turnCompletion.lastEvent?.terminalId).toBe(terminalId)
+    expect(store.getState().turnCompletion.pendingEvents.at(-1)?.tabId).toBe(tabId)
+    expect(store.getState().turnCompletion.pendingEvents.at(-1)?.paneId).toBe(paneId)
+    expect(store.getState().turnCompletion.pendingEvents.at(-1)?.terminalId).toBe(terminalId)
     expect(store.getState().turnCompletion.pendingEvents).toHaveLength(1)
   })
 
@@ -915,7 +915,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
       },
     })
 
@@ -954,7 +954,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === '\x1b]0;New title\x07')).toBe(true)
-    expect(store.getState().turnCompletion.lastEvent).toBeNull()
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
   it('tracks claude terminal runtime activity from submit to output to turn completion', async () => {
@@ -1004,7 +1004,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         paneRuntimeActivity: { byPaneId: {} },
       },
     })
@@ -1117,7 +1117,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         paneRuntimeActivity: { byPaneId: {} },
       },
     })
@@ -1248,7 +1248,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         paneRuntimeActivity: { byPaneId: {} },
       },
     })
@@ -1395,7 +1395,7 @@ describe('TerminalView lifecycle updates', () => {
         },
         settings: createSettingsState(),
         connection: { status: 'connected', error: null },
-        turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         paneRuntimeActivity: { byPaneId: {} },
       },
     })
@@ -1526,7 +1526,7 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     expect(terminalInstances[0].write.mock.calls.some((call) => call[0] === 'hello\x07world')).toBe(true)
-    expect(store.getState().turnCompletion.lastEvent).toBeNull()
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
   it('sends a viewport attach after terminal.created without issuing a second resize', async () => {
@@ -3033,7 +3033,7 @@ describe('TerminalView lifecycle updates', () => {
             status: connectionStatus,
             error: null,
           },
-          turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+          turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         },
       })
 
@@ -3105,7 +3105,7 @@ describe('TerminalView lifecycle updates', () => {
             status: 'ready',
             error: null,
           },
-          turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {} },
+          turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
         },
       })
 
@@ -4623,7 +4623,7 @@ describe('TerminalView lifecycle updates', () => {
             },
           }),
           connection: { status: 'connected', error: null },
-          turnCompletion: { seq: 0, lastEvent: null, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
+          turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {}, attentionByPane: {} },
         },
       })
       return { tabId, paneId, paneContent, store }
@@ -4656,7 +4656,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(term.write).not.toHaveBeenCalled()
-      expect(store.getState().turnCompletion.lastEvent).toBeNull()
+      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
     })
 
     it('ignores legacy terminal.snapshot frames', async () => {
@@ -4695,7 +4695,7 @@ describe('TerminalView lifecycle updates', () => {
 
       expect(term.clear).not.toHaveBeenCalled()
       expect(term.write).not.toHaveBeenCalled()
-      expect(store.getState().turnCompletion.lastEvent).toBeNull()
+      expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
     })
   })
 })
