@@ -60,4 +60,27 @@ describe('wireClaudeActivityTracker', () => {
     expect(tracker.getActivity('t1')?.phase).toBe('idle')
     dispose()
   })
+
+  it('binds sessionId from a claude terminal.session.bound event and ignores non-claude providers', () => {
+    const registry = new FakeRegistry()
+    const { tracker, dispose } = wireClaudeActivityTracker({
+      registry: registry as any,
+      now: () => 1000,
+      setIntervalFn: (() => 0 as any),
+      clearIntervalFn: (() => {}),
+    })
+
+    registry.emit('terminal.created', { terminalId: 't1', mode: 'claude', status: 'running' })
+    registry.emit('terminal.created', { terminalId: 't2', mode: 'claude', status: 'running' })
+
+    // A claude-provider bound event flows through onBound -> tracker.bindSession.
+    registry.emit('terminal.session.bound', { provider: 'claude', terminalId: 't1', sessionId: 's-1' })
+    expect(tracker.getActivity('t1')?.sessionId).toBe('s-1')
+
+    // A non-claude (codex) bound event is filtered out by onBound's provider guard.
+    registry.emit('terminal.session.bound', { provider: 'codex', terminalId: 't2', sessionId: 's-2' })
+    expect(tracker.getActivity('t2')?.sessionId).toBeUndefined()
+
+    dispose()
+  })
 })
