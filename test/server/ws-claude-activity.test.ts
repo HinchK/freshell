@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import http from 'http'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
+import { ClaudeActivityTracker } from '../../server/coding-cli/claude-activity-tracker.js'
 
 vi.mock('../../server/config-store', () => ({
   configStore: {
@@ -179,5 +180,102 @@ describe('ws claude activity protocol', () => {
 
     authenticated.close()
     unauthenticated.close()
+  })
+
+  it('broadcasts terminal.turn.complete(provider=claude) only to authenticated sockets', async () => {
+    const authenticated = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    const unauthenticated = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+
+    await Promise.all([
+      new Promise<void>((resolve) => authenticated.on('open', () => resolve())),
+      new Promise<void>((resolve) => unauthenticated.on('open', () => resolve())),
+    ])
+
+    authenticated.send(JSON.stringify({ type: 'hello', token: 'claude-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(authenticated, (msg) => msg.type === 'ready')
+
+    wsHandler.broadcastTerminalTurnComplete({
+      provider: 'claude',
+      terminalId: 'term-claude',
+      at: 1234,
+    })
+
+    const completed = await waitForMessage(authenticated, (msg) => msg.type === 'terminal.turn.complete')
+    expect(completed).toEqual({
+      type: 'terminal.turn.complete',
+      provider: 'claude',
+      terminalId: 'term-claude',
+      at: 1234,
+    })
+
+    await expect(expectNoMatchingMessage(unauthenticated, (msg) => msg.type === 'terminal.turn.complete')).resolves.toBeUndefined()
+
+    authenticated.close()
+    unauthenticated.close()
+  })
+
+  it('wires a real tracker so claude turn.complete fires once per turn and not on reattach/replay', async () => {
+    // Wire the tracker to the handler EXACTLY as server/index.ts does.
+    const tracker = new ClaudeActivityTracker()
+    const onTurnComplete = (payload: { terminalId: string; at: number; sessionId?: string }) => {
+      wsHandler.broadcastTerminalTurnComplete({
+        provider: 'claude',
+        terminalId: payload.terminalId,
+        at: payload.at,
+        ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+      })
+    }
+    tracker.on('turn.complete', onTurnComplete)
+
+    const authenticated = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => authenticated.on('open', () => resolve()))
+    authenticated.send(JSON.stringify({ type: 'hello', token: 'claude-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(authenticated, (msg) => msg.type === 'ready')
+
+    const turnCompletes: any[] = []
+    authenticated.on('message', (raw) => {
+      const msg = JSON.parse(raw.toString())
+      if (msg.type === 'terminal.turn.complete' && msg.terminalId === 't1') {
+        turnCompletes.push(msg)
+      }
+    })
+
+    tracker.trackTerminal({ terminalId: 't1', at: 1000 })
+    tracker.noteInput({ terminalId: 't1', data: '\r', at: 2000 })
+    tracker.noteOutput({ terminalId: 't1', data: 'thinking', at: 2500 }) // no BEL -> still busy, no completion
+    tracker.noteOutput({ terminalId: 't1', data: '\x07', at: 3000 })     // BEL -> one turn.complete
+
+    const completed = await waitForMessage(
+      authenticated,
+      (msg) => msg.type === 'terminal.turn.complete' && msg.terminalId === 't1',
+    )
+    expect(completed).toEqual({
+      type: 'terminal.turn.complete',
+      provider: 'claude',
+      terminalId: 't1',
+      at: 3000,
+    })
+    expect(turnCompletes).toHaveLength(1)
+
+    // A stray BEL while idle does NOT fire another completion.
+    tracker.noteOutput({ terminalId: 't1', data: '\x07', at: 4000 })
+
+    // A SECOND client connecting after the turn completed (reattach/replay) gets
+    // NO turn.complete -- scrollback replay does not re-drive the tracker.
+    const reattached = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => reattached.on('open', () => resolve()))
+    reattached.send(JSON.stringify({ type: 'hello', token: 'claude-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(reattached, (msg) => msg.type === 'ready')
+
+    await expect(
+      expectNoMatchingMessage(reattached, (msg) => msg.type === 'terminal.turn.complete'),
+    ).resolves.toBeUndefined()
+
+    // Still exactly one completion on the original client.
+    expect(turnCompletes).toHaveLength(1)
+
+    tracker.off('turn.complete', onTurnComplete)
+    authenticated.close()
+    reattached.close()
   })
 })

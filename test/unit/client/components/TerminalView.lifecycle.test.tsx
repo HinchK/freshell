@@ -1068,6 +1068,9 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     expect(store.getState().paneRuntimeActivity.byPaneId[paneId]).toBeUndefined()
+    // Claude turn completion is now server-owned (terminal.turn.complete broadcast).
+    // The client must NOT mint a turn-complete from a replayable scrollback BEL.
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
   it('does not re-enter working state when claude output arrives after turn completion BEL', async () => {

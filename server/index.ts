@@ -439,6 +439,14 @@ async function main() {
       ...payload,
     })
   })
+  claudeActivity.tracker.on('turn.complete', (payload) => {
+    wsHandler.broadcastTerminalTurnComplete({
+      provider: 'claude',
+      terminalId: payload.terminalId,
+      at: payload.at,
+      ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+    })
+  })
   opencodeActivity.controller.on('associated', ({ terminalId, sessionId }) => {
     try {
       broadcastTerminalSessionAssociation({

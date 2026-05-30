@@ -420,7 +420,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const lastTapPointRef = useRef<{ x: number; y: number } | null>(null)
   const tapCountRef = useRef(0)
   const terminalFirstOutputMarkedRef = useRef(false)
-  const turnCompletedSinceLastInputRef = useRef(true)
   const lastInputBlockedNoticeRef = useRef<{ reason: TerminalInputBlockedReason; at: number } | null>(null)
 
   // Extract terminal-specific fields (safe because we check kind later)
@@ -1016,17 +1015,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const osc = extractOsc52Events(startup.cleaned, osc52ParserRef.current)
     const { cleaned, count } = extractTurnCompleteSignals(osc.cleaned, mode, turnCompleteSignalStateRef.current)
 
-    if (count > 0 && tid) {
+    if (count > 0 && tid && mode !== 'claude') {
       dispatch(recordTurnComplete({
         tabId,
         paneId: paneIdRef.current,
         terminalId: tid,
         at: Date.now(),
       }))
-      if (mode === 'claude') {
-        dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
-        turnCompletedSinceLastInputRef.current = true
-      }
     }
 
     if (cleaned) {
