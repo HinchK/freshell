@@ -1073,6 +1073,100 @@ describe('TerminalView lifecycle updates', () => {
     expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
 
+  it('does not record a Claude turn-complete from replayed scrollback BEL', async () => {
+    const tabId = 'tab-claude-replay-bel'
+    const paneId = 'pane-claude-replay-bel'
+    const terminalId = 'term-claude-replay-bel'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-claude-replay-bel',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      terminalId,
+      resumeSessionId: '44444444-4444-4444-8444-444444444444',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+        turnCompletion: turnCompletionReducer,
+        paneRuntimeActivity: paneRuntimeActivityReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            terminalId,
+            resumeSessionId: '44444444-4444-4444-8444-444444444444',
+            createRequestId: 'req-claude-replay-bel',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+        turnCompletion: { seq: 0, lastAtByTerminalId: {}, pendingEvents: [], attentionByTab: {} },
+        paneRuntimeActivity: { byPaneId: {} },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+    await waitFor(() => {
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    // Attach with a replay window so the following output frame is replayed scrollback.
+    const initialAttach = wsMocks.send.mock.calls
+      .map(([msg]) => msg)
+      .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+    act(() => {
+      messageHandler!({
+        type: 'terminal.attach.ready',
+        terminalId,
+        headSeq: 0,
+        replayFromSeq: 1,
+        replayToSeq: 1,
+        attachRequestId: initialAttach?.attachRequestId,
+      })
+    })
+
+    // A replayed scrollback BEL must NOT mint a client-side turn-complete.
+    act(() => {
+      messageHandler!({
+        type: 'terminal.output',
+        terminalId,
+        seqStart: 1,
+        seqEnd: 1,
+        data: '\x07',
+      })
+    })
+
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+  })
+
   it('does not re-enter working state when claude output arrives after turn completion BEL', async () => {
     const tabId = 'tab-claude-post-bel'
     const paneId = 'pane-claude-post-bel'
