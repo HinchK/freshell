@@ -150,7 +150,7 @@ function providerNotificationArgs(
 
   if (mode === 'codex') {
     return {
-      args: mcpInjection.args,
+      args: ['-c', 'tui.notification_method=bel', '-c', "tui.notifications=['agent-turn-complete']", ...mcpInjection.args],
       env: mcpInjection.env,
     }
   }
