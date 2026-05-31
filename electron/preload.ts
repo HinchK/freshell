@@ -11,6 +11,20 @@ export interface WizardSetupConfig {
   globalHotkey: string
 }
 
+export interface LaunchChoice {
+  kind: 'connect' | 'remote' | 'start-local'
+  url?: string
+  token?: string
+  port?: number
+  requiresAuth?: boolean
+  alwaysAskOnLaunch: boolean
+  remember: boolean
+}
+
+export type LaunchChoiceResult =
+  | { ok: true }
+  | { ok: false; error: string }
+
 export interface FreshellDesktopApi {
   platform: string
   isElectron: boolean
@@ -21,6 +35,8 @@ export interface FreshellDesktopApi {
   onUpdateDownloaded: (callback: () => void) => void
   installUpdate: () => Promise<void>
   completeSetup: (config: WizardSetupConfig) => Promise<void>
+  getLaunchOptions: () => Promise<any>
+  chooseLaunchOption: (choice: LaunchChoice) => Promise<LaunchChoiceResult>
 }
 
 export interface ContextBridgeApi {
@@ -46,6 +62,8 @@ export function registerPreloadApi(
     onUpdateDownloaded: (callback: () => void) => ipcRenderer.on('update-downloaded', callback),
     installUpdate: () => ipcRenderer.invoke('install-update'),
     completeSetup: (config: WizardSetupConfig) => ipcRenderer.invoke('complete-setup', config),
+    getLaunchOptions: () => ipcRenderer.invoke('get-launch-options'),
+    chooseLaunchOption: (choice: LaunchChoice) => ipcRenderer.invoke('choose-launch-option', choice),
   }
 
   contextBridge.exposeInMainWorld('freshellDesktop', api)

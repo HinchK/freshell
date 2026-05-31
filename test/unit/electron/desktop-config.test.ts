@@ -235,6 +235,81 @@ describe('DesktopConfig', () => {
     })
   })
 
+  describe('launch chooser fields', () => {
+    it('defaults alwaysAskOnLaunch to false', () => {
+      const config = getDefaultDesktopConfig()
+      expect(config.alwaysAskOnLaunch).toBe(false)
+    })
+
+    it('schema defaults alwaysAskOnLaunch to false when omitted', () => {
+      const result = DesktopConfigSchema.parse({
+        serverMode: 'app-bound',
+      })
+      expect(result.alwaysAskOnLaunch).toBe(false)
+    })
+
+    it('preserves known servers from config file', async () => {
+      const freshellDir = path.join(tempDir, '.freshell')
+      await fsp.mkdir(freshellDir, { recursive: true })
+      await fsp.writeFile(
+        path.join(freshellDir, 'desktop.json'),
+        JSON.stringify({
+          serverMode: 'remote',
+          port: 3001,
+          remoteUrl: 'http://10.0.0.5:3001',
+          remoteToken: 'vpn-token',
+          knownServers: [
+            {
+              url: 'http://localhost:3001',
+              label: 'Local dev server',
+              lastConnectedAt: '2026-05-24T18:00:00.000Z',
+            },
+          ],
+          alwaysAskOnLaunch: true,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        }),
+      )
+
+      const config = await readDesktopConfig()
+      expect(config).not.toBeNull()
+      expect(config!.alwaysAskOnLaunch).toBe(true)
+      expect(config!.knownServers).toEqual([
+        {
+          url: 'http://localhost:3001',
+          label: 'Local dev server',
+          lastConnectedAt: '2026-05-24T18:00:00.000Z',
+        },
+      ])
+    })
+
+    it('patches alwaysAskOnLaunch and knownServers', async () => {
+      await writeDesktopConfig(getDefaultDesktopConfig())
+
+      const patched = await patchDesktopConfig({
+        alwaysAskOnLaunch: true,
+        knownServers: [
+          {
+            url: 'http://localhost:3002',
+            label: 'Local 3002',
+            lastConnectedAt: '2026-05-24T18:05:00.000Z',
+          },
+        ],
+      })
+
+      expect(patched.alwaysAskOnLaunch).toBe(true)
+      expect(patched.knownServers).toEqual([
+        {
+          url: 'http://localhost:3002',
+          label: 'Local 3002',
+          lastConnectedAt: '2026-05-24T18:05:00.000Z',
+        },
+      ])
+    })
+  })
+
   describe('schema validation (invariant)', () => {
     it('rejects invalid serverMode', () => {
       const result = DesktopConfigSchema.safeParse({ serverMode: 'invalid-mode' })

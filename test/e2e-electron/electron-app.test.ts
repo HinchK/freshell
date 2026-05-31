@@ -49,6 +49,13 @@ function createTempHome(desktopConfig?: Record<string, unknown>): string {
   return tmpHome
 }
 
+function writeDesktopEnv(tmpHome: string): void {
+  fs.writeFileSync(
+    path.join(tmpHome, '.freshell', '.env'),
+    `AUTH_TOKEN=${getRunningServerToken()}\n`,
+  )
+}
+
 async function launchApp(tmpHome: string, captureOutput = false): Promise<ElectronApplication> {
   const app = await electron.launch({
     args: [PROJECT_ROOT],
@@ -90,12 +97,31 @@ async function waitForNewWindow(
   throw new Error(`Timed out waiting for new window (current: ${currentCount})`)
 }
 
+async function waitForWindowUrl(
+  app: ElectronApplication,
+  pattern: RegExp,
+  timeoutMs = 60_000,
+): Promise<Page> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    for (const win of app.windows()) {
+      if (pattern.test(win.url())) {
+        return win
+      }
+    }
+    await new Promise(r => setTimeout(r, 500))
+  }
+  throw new Error(`Timed out waiting for window URL matching ${pattern}`)
+}
+
 function remoteConfig() {
   return {
     serverMode: 'remote',
     port: 3001,
     remoteUrl: 'http://localhost:3001',
     remoteToken: getRunningServerToken(),
+    knownServers: [],
+    alwaysAskOnLaunch: false,
     globalHotkey: 'CommandOrControl+`',
     startOnLogin: false,
     minimizeToTray: true,
@@ -183,6 +209,67 @@ test.describe('Wizard flow', () => {
     const savedConfig = JSON.parse(fs.readFileSync(configPath, 'utf-8'))
     expect(savedConfig.setupCompleted).toBe(true)
     expect(savedConfig.serverMode).toBe('remote')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Test: Launch chooser
+// ---------------------------------------------------------------------------
+
+test.describe('Launch chooser', () => {
+  let app: ElectronApplication
+  let tmpHome: string
+
+  test.afterEach(async () => {
+    if (app) await app.close().catch(() => {})
+    if (tmpHome) fs.rmSync(tmpHome, { recursive: true, force: true })
+  })
+
+  test('shows launch chooser when alwaysAskOnLaunch is true', async () => {
+    tmpHome = createTempHome({
+      serverMode: 'remote',
+      port: 3001,
+      remoteUrl: 'http://localhost:3001',
+      remoteToken: getRunningServerToken(),
+      knownServers: [],
+      alwaysAskOnLaunch: true,
+      globalHotkey: 'CommandOrControl+`',
+      startOnLogin: false,
+      minimizeToTray: true,
+      setupCompleted: true,
+    })
+
+    app = await launchApp(tmpHome)
+    const chooser = await app.firstWindow()
+    await chooser.waitForLoadState('domcontentloaded')
+
+    await expect(chooser.getByRole('heading', { name: 'Choose Freshell server' })).toBeVisible()
+    await expect(chooser.getByRole('checkbox', { name: 'Always ask on launch' })).toBeChecked()
+  })
+
+  test('connects to an existing server from chooser', async () => {
+    tmpHome = createTempHome({
+      serverMode: 'app-bound',
+      port: 3001,
+      knownServers: [{ url: 'http://localhost:3001', label: 'Test server' }],
+      alwaysAskOnLaunch: true,
+      globalHotkey: 'CommandOrControl+`',
+      startOnLogin: false,
+      minimizeToTray: true,
+      setupCompleted: true,
+    })
+    writeDesktopEnv(tmpHome)
+
+    app = await launchApp(tmpHome)
+    const chooser = await app.firstWindow()
+    await chooser.waitForLoadState('domcontentloaded')
+
+    await chooser.getByRole('checkbox', { name: 'Always ask on launch' }).uncheck()
+    await chooser.getByRole('button', { name: 'Connect', exact: true }).first().click()
+    const mainPage = await waitForWindowUrl(app, /http:\/\/localhost:3001/, 60_000)
+    await mainPage.waitForLoadState('domcontentloaded')
+
+    await expect(mainPage).toHaveURL(/http:\/\/localhost:3001/)
   })
 })
 

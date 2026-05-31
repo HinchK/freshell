@@ -34,7 +34,9 @@ describe('Preload API', () => {
   it('has exactly the expected keys', () => {
     const keys = Object.keys(exposedApi).sort()
     expect(keys).toEqual([
+      'chooseLaunchOption',
       'completeSetup',
+      'getLaunchOptions',
       'getServerMode',
       'getServerStatus',
       'installUpdate',
@@ -58,6 +60,8 @@ describe('Preload API', () => {
     expect(typeof exposedApi.onUpdateDownloaded).toBe('function')
     expect(typeof exposedApi.installUpdate).toBe('function')
     expect(typeof exposedApi.completeSetup).toBe('function')
+    expect(typeof exposedApi.getLaunchOptions).toBe('function')
+    expect(typeof exposedApi.chooseLaunchOption).toBe('function')
   })
 
   it('getServerMode invokes correct IPC channel', () => {
@@ -86,5 +90,22 @@ describe('Preload API', () => {
     }
     exposedApi.completeSetup(config)
     expect(mockIpcRenderer.invoke).toHaveBeenCalledWith('complete-setup', config)
+  })
+
+  it('getLaunchOptions invokes correct IPC channel', () => {
+    exposedApi.getLaunchOptions()
+    expect(mockIpcRenderer.invoke).toHaveBeenCalledWith('get-launch-options')
+  })
+
+  it('chooseLaunchOption invokes correct IPC channel with choice', () => {
+    const choice = {
+      kind: 'remote' as const,
+      url: 'http://10.0.0.5:3001',
+      token: 'vpn-token',
+      alwaysAskOnLaunch: true,
+      remember: true,
+    }
+    exposedApi.chooseLaunchOption(choice)
+    expect(mockIpcRenderer.invoke).toHaveBeenCalledWith('choose-launch-option', choice)
   })
 })

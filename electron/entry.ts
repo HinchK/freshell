@@ -9,10 +9,11 @@
 //        (or via electron-builder's packaged app)
 
 import { app, BrowserWindow, globalShortcut, ipcMain, Tray, Menu, nativeImage } from 'electron'
-import fs from 'fs'
 import path from 'path'
 import os from 'os'
 import http from 'http'
+import https from 'https'
+import fs from 'fs'
 import { fileURLToPath } from 'url'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -26,10 +27,13 @@ import { createHotkeyManager } from './hotkey.js'
 import { createWindowStatePersistence } from './window-state.js'
 import { createUpdateManager } from './updater.js'
 import { createTray } from './tray.js'
+import { resolveTrayIconPath } from './icon-path.js'
 import { buildAppMenu } from './menu.js'
 import { runStartup, type StartupContext, type BrowserWindowLike } from './startup.js'
 import { initMainProcess } from './main.js'
 import { createWizardWindow } from './setup-wizard/wizard-window.js'
+import { createChooseLaunchOptionHandler } from './launch-choice-handler.js'
+import type { LaunchServerCandidate } from './types.js'
 
 const isDev = process.env.ELECTRON_DEV === '1'
 const configDir = path.join(os.homedir(), '.freshell')
@@ -123,6 +127,29 @@ async function main(): Promise<void> {
         })
       })
     },
+    fetchAuthenticated: (url: string, token: string): Promise<boolean> => {
+      return new Promise((resolve) => {
+        let parsed: URL
+        try {
+          parsed = new URL(url)
+        } catch {
+          resolve(false)
+          return
+        }
+
+        const client = parsed.protocol === 'https:' ? https : http
+        const timer = setTimeout(() => resolve(false), 10_000)
+        const req = client.get(parsed, { headers: { 'x-auth-token': token } }, (res) => {
+          clearTimeout(timer)
+          resolve(res.statusCode !== undefined && res.statusCode >= 200 && res.statusCode < 400)
+          res.resume()
+        })
+        req.on('error', () => {
+          clearTimeout(timer)
+          resolve(false)
+        })
+      })
+    },
     readEnvToken: async (envPath: string): Promise<string | undefined> => {
       try {
         const fsp = await import('fs/promises')
@@ -156,11 +183,12 @@ async function main(): Promise<void> {
       return win as unknown as BrowserWindowLike
     },
     createTray: () => {
-      const iconName = process.platform === 'win32' ? 'tray-icon-win.ico' : 'tray-icon.png'
-      const devIconPath = path.join(__dirname, '..', '..', '..', 'assets', 'electron', iconName)
-      const iconPath = isDev || fs.existsSync(devIconPath)
-        ? devIconPath
-        : path.join(process.resourcesPath!, 'assets', iconName)
+      const iconPath = resolveTrayIconPath({
+        platform: process.platform,
+        isDev,
+        moduleDir: __dirname,
+        resourcesPath: process.resourcesPath,
+      })
 
       createTray(
         Tray as any,
@@ -212,6 +240,10 @@ async function main(): Promise<void> {
   ipcMain.removeHandler('get-server-status')
   ipcMain.removeHandler('set-global-hotkey')
   ipcMain.removeHandler('install-update')
+  ipcMain.removeHandler('get-launch-options')
+  ipcMain.removeHandler('choose-launch-option')
+
+  let pendingLaunchChooser: { candidates: LaunchServerCandidate[]; reason: string } | undefined
 
   // Register the complete-setup handler before runStartup so it is available
   // when the wizard renderer calls it via the preload API.
@@ -231,6 +263,30 @@ async function main(): Promise<void> {
       setupCompleted: true,
     })
   })
+
+  ipcMain.handle('get-launch-options', () => ({
+    candidates: pendingLaunchChooser?.candidates ?? [],
+    reason: pendingLaunchChooser?.reason ?? 'Choose how Freshell should connect.',
+    alwaysAskOnLaunch: desktopConfig.alwaysAskOnLaunch,
+    port: desktopConfig.port,
+  }))
+
+  ipcMain.handle('choose-launch-option', createChooseLaunchOptionHandler({
+    patchDesktopConfig,
+    getCurrentPort: () => desktopConfig.port,
+    validateServerAuth: (url: string, token: string) => ctx.fetchAuthenticated?.(`${url}/api/settings`, token) ?? Promise.resolve(false),
+    restartMain: async () => {
+      wizardPhase = true
+      for (const win of BrowserWindow.getAllWindows()) {
+        win.close()
+      }
+      setTimeout(() => {
+        main().catch((err) => {
+          console.error('Failed to restart after launch choice:', err)
+        })
+      }, 250)
+    },
+  }))
 
   // Run startup sequence
   const result = await runStartup(ctx)
@@ -253,6 +309,35 @@ async function main(): Promise<void> {
         })
       }, 500)
     })
+    return
+  }
+
+  if (result.type === 'chooser') {
+    wizardPhase = false
+    pendingLaunchChooser = {
+      candidates: result.candidates,
+      reason: result.reason,
+    }
+
+    const chooserWin = new BrowserWindow({
+      width: 760,
+      height: 720,
+      show: false,
+      webPreferences: {
+        preload: path.join(__dirname, 'preload.js'),
+        nodeIntegration: false,
+        contextIsolation: true,
+      },
+    })
+
+    if (isDev) {
+      await chooserWin.loadURL('http://localhost:5175')
+    } else {
+      const packagedChooser = path.join(process.resourcesPath, 'launch-chooser', 'index.html')
+      const unpackagedChooser = path.join(app.getAppPath(), 'dist', 'launch-chooser', 'index.html')
+      await chooserWin.loadFile(fs.existsSync(packagedChooser) ? packagedChooser : unpackagedChooser)
+    }
+    chooserWin.show()
     return
   }
 

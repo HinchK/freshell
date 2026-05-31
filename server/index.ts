@@ -67,6 +67,7 @@ import { createExtensionRouter } from './extension-routes.js'
 import { createServerInfoRouter } from './server-info-router.js'
 import { SessionMetadataStore } from './session-metadata-store.js'
 import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
+import { createHealthRouter } from './health-router.js'
 import { loadSessionHistory } from './session-history-loader.js'
 import { SessionContentCache } from './session-content-cache.js'
 import { createAgentTimelineService } from './agent-timeline/service.js'
@@ -140,16 +141,15 @@ async function main() {
   app.use('/local-file', createLocalFileRouter())
 
   const startupState = createStartupState()
+  const serverInstanceId = await loadOrCreateServerInstanceId()
 
   // Health check endpoint (no auth required - used by precheck script)
-  app.get('/api/health', (_req, res) => {
-    res.json({
-      app: 'freshell',
-      ok: true,
-      version: APP_VERSION,
-      ready: startupState.isReady(),
-    })
-  })
+  app.use('/api/health', createHealthRouter({
+    appVersion: APP_VERSION,
+    instanceId: serverInstanceId,
+    isReady: () => startupState.isReady(),
+    startedAt: new Date(SERVER_STARTED_AT),
+  }))
 
   // Basic rate limiting for /api
   app.use(
@@ -209,7 +209,6 @@ async function main() {
   const opencodeActivity = createOpencodeActivityIntegration({ registry, opencodeProvider })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
-  const serverInstanceId = await loadOrCreateServerInstanceId()
   await runCodexStartupReaper({ serverInstanceId })
   const agentChatCapabilityRegistry = new AgentChatCapabilityRegistry()
 
