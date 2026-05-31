@@ -2,6 +2,7 @@
 // Tests verify headers validation and node-gyp rebuild flag construction
 // using mocked filesystem and child_process.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import path from 'path'
 
 // We test the individual helper functions exported from the module,
 // not the full script execution (which would download from the internet).
@@ -111,9 +112,11 @@ describe('prepare-bundled-node helpers', () => {
         '../../../scripts/prepare-bundled-node.js'
       )
       const paths = getStagingPaths()
-      expect(paths.nativeModulesDir).toContain('bundled-node/native-modules')
+      expect(paths.nativeModulesDir).toContain(
+        path.join('bundled-node', 'native-modules')
+      )
       expect(paths.nodePtyTarget).toContain(
-        'bundled-node/native-modules/node-pty'
+        path.join('bundled-node', 'native-modules', 'node-pty')
       )
     })
   })
@@ -140,7 +143,9 @@ describe('prepare-bundled-node helpers', () => {
         'x64',
       )
 
-      expect(binaryPath).toBe('/repo/bundled-node/win/x64/node.exe')
+      expect(binaryPath).toBe(
+        path.join('/repo/bundled-node', 'win', 'x64', 'node.exe'),
+      )
     })
 
     it('stages Linux Node without an exe suffix', async () => {
@@ -154,7 +159,9 @@ describe('prepare-bundled-node helpers', () => {
         'x64',
       )
 
-      expect(binaryPath).toBe('/repo/bundled-node/linux/x64/node')
+      expect(binaryPath).toBe(
+        path.join('/repo/bundled-node', 'linux', 'x64', 'node'),
+      )
     })
 
     it('places the Windows node.lib where node-gyp expects it', async () => {
@@ -163,7 +170,7 @@ describe('prepare-bundled-node helpers', () => {
       )
 
       expect(getWindowsNodeImportLibraryPath('C:\\headers\\node-v22.12.0')).toBe(
-        'C:\\headers\\node-v22.12.0/Release/node.lib',
+        path.join('C:\\headers\\node-v22.12.0', 'Release', 'node.lib'),
       )
     })
 

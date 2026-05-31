@@ -4,12 +4,14 @@ import { describe, expect, it } from 'vitest'
 
 const PROJECT_ROOT = path.resolve(import.meta.dirname, '..', '..', '..')
 
+// Repo files are LF, but a Windows checkout may convert them to CRLF.
+// Normalize so `\n`-based regex/content assertions are EOL-agnostic.
+const readText = (filePath: string): string =>
+  readFileSync(filePath, 'utf-8').replace(/\r\n/g, '\n')
+
 describe('electron-builder Windows config', () => {
   it('builds the Windows installer without the portable self-extracting target', () => {
-    const config = readFileSync(
-      path.join(PROJECT_ROOT, 'electron-builder.yml'),
-      'utf-8',
-    )
+    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
 
     expect(config).toMatch(/win:\n(?:.*\n)*?  target:\n(?:.*\n)*?    - nsis/)
     expect(config).not.toMatch(/win:\n(?:.*\n)*?  target:\n(?:.*\n)*?    - portable/)
@@ -26,19 +28,13 @@ describe('electron-builder Windows config', () => {
   })
 
   it('does not require publish metadata for local package builds', () => {
-    const config = readFileSync(
-      path.join(PROJECT_ROOT, 'electron-builder.yml'),
-      'utf-8',
-    )
+    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
 
     expect(config).toMatch(/^publish: null$/m)
   })
 
   it('packages launch chooser assets as extra resources', () => {
-    const config = readFileSync(
-      path.join(PROJECT_ROOT, 'electron-builder.yml'),
-      'utf-8',
-    )
+    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
 
     expect(config).toMatch(
       /extraResources:\n(?:.*\n)*?  - from: dist\/launch-chooser\n    to: launch-chooser/,
@@ -46,10 +42,7 @@ describe('electron-builder Windows config', () => {
   })
 
   it('uses a silent-install friendly NSIS flow', () => {
-    const config = readFileSync(
-      path.join(PROJECT_ROOT, 'electron-builder.yml'),
-      'utf-8',
-    )
+    const config = readText(path.join(PROJECT_ROOT, 'electron-builder.yml'))
 
     expect(config).toMatch(
       /^nsis:\n  oneClick: true\n  runAfterFinish: true\n  include: assets\/electron\/installer\.nsh$/m,
@@ -58,10 +51,7 @@ describe('electron-builder Windows config', () => {
   })
 
   it('lets the built-in NSIS completion flow launch the installed app', () => {
-    const include = readFileSync(
-      path.join(PROJECT_ROOT, 'assets', 'electron', 'installer.nsh'),
-      'utf-8',
-    )
+    const include = readText(path.join(PROJECT_ROOT, 'assets', 'electron', 'installer.nsh'))
 
     expect(include).toContain('!macro customInstall')
     expect(include).not.toContain('SetErrorLevel 0')
@@ -69,10 +59,7 @@ describe('electron-builder Windows config', () => {
   })
 
   it('quits before installation when Freshell is already running', () => {
-    const include = readFileSync(
-      path.join(PROJECT_ROOT, 'assets', 'electron', 'installer.nsh'),
-      'utf-8',
-    )
+    const include = readText(path.join(PROJECT_ROOT, 'assets', 'electron', 'installer.nsh'))
 
     expect(include).toContain('!macro customInit')
     expect(include).toContain('!macro customCheckAppRunning')
@@ -83,10 +70,7 @@ describe('electron-builder Windows config', () => {
   })
 
   it('can provision remote desktop config from silent installer args', () => {
-    const include = readFileSync(
-      path.join(PROJECT_ROOT, 'assets', 'electron', 'installer.nsh'),
-      'utf-8',
-    )
+    const include = readText(path.join(PROJECT_ROOT, 'assets', 'electron', 'installer.nsh'))
 
     expect(include).toContain('${StdUtils.GetParameter} $0 "FRESHELL_REMOTE_URL" ""')
     expect(include).toContain('${StdUtils.GetParameter} $1 "FRESHELL_TOKEN" ""')

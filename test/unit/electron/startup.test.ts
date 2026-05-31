@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import path from 'path'
 import { runStartup, type StartupContext, type BrowserWindowLike } from '../../../electron/startup.js'
 import type { DesktopConfig } from '../../../electron/types.js'
+
+// Spawn paths are built with path.join, so separators are OS-native
+// (backslashes on Windows). Normalize to forward slashes so structural
+// assertions hold on every platform.
+const norm = (p: string): string => p.replace(/\\/g, '/')
 
 function createMockWindow(): BrowserWindowLike {
   let visible = false
@@ -176,10 +182,10 @@ describe('runStartup', () => {
       expect(ctx.serverSpawner.start).toHaveBeenCalledTimes(1)
       const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
       expect(startArgs.spawn.mode).toBe('production')
-      expect(startArgs.spawn.nodeBinary).toContain('/app/resources/bundled-node/bin/node')
-      expect(startArgs.spawn.serverEntry).toContain('/app/resources/server/index.js')
-      expect(startArgs.spawn.nativeModulesDir).toContain('/app/resources/bundled-node/native-modules')
-      expect(startArgs.spawn.serverNodeModulesDir).toContain('/app/resources/server-node-modules')
+      expect(norm(startArgs.spawn.nodeBinary)).toContain('/app/resources/bundled-node/bin/node')
+      expect(norm(startArgs.spawn.serverEntry)).toContain('/app/resources/server/index.js')
+      expect(norm(startArgs.spawn.nativeModulesDir)).toContain('/app/resources/bundled-node/native-modules')
+      expect(norm(startArgs.spawn.serverNodeModulesDir)).toContain('/app/resources/server-node-modules')
       expect(result.type).toBe('main')
       if (result.type === 'main') {
         expect(result.serverUrl).toBe('http://localhost:3001')
@@ -207,7 +213,7 @@ describe('runStartup', () => {
       const result = await runStartup(ctx)
       expect(result.type).toBe('main')
       const startArgs = (ctx.serverSpawner.start as ReturnType<typeof vi.fn>).mock.calls[0][0]
-      expect(startArgs.spawn.nodeBinary).toMatch(/\/node$/)
+      expect(norm(startArgs.spawn.nodeBinary)).toMatch(/\/node$/)
       expect(startArgs.spawn.nodeBinary).not.toMatch(/\.exe$/)
     })
 
@@ -817,7 +823,7 @@ describe('runStartup', () => {
         readEnvToken,
       })
       await runStartup(ctx)
-      expect(readEnvToken).toHaveBeenCalledWith('/home/user/.freshell/.env')
+      expect(readEnvToken).toHaveBeenCalledWith(path.join('/home/user/.freshell', '.env'))
     })
 
     it('does not call readEnvToken for remote mode', async () => {
