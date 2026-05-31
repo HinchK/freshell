@@ -1,0 +1,67 @@
+import { describe, expect, it } from 'vitest'
+import {
+  buildConnectChoice,
+  buildRemoteChoice,
+  buildStartLocalChoice,
+  formatLaunchReason,
+  validateRemoteLaunchUrl,
+} from '../../../../electron/launch-chooser/chooser-logic.js'
+
+describe('launch chooser logic', () => {
+  it('validates remote launch URLs', () => {
+    expect(validateRemoteLaunchUrl('http://10.0.0.5:3001')).toBe('')
+    expect(validateRemoteLaunchUrl('https://freshell.internal')).toBe('')
+    expect(validateRemoteLaunchUrl('localhost:3001')).toBe('Enter a valid http or https URL')
+    expect(validateRemoteLaunchUrl('ftp://example.com')).toBe('Enter a valid http or https URL')
+  })
+
+  it('builds a connect choice', () => {
+    expect(buildConnectChoice({
+      url: 'http://localhost:3001',
+      token: 'local-token',
+      alwaysAskOnLaunch: true,
+      remember: true,
+    })).toEqual({
+      kind: 'connect',
+      url: 'http://localhost:3001',
+      token: 'local-token',
+      alwaysAskOnLaunch: true,
+      remember: true,
+    })
+  })
+
+  it('builds a remote choice', () => {
+    expect(buildRemoteChoice({
+      url: 'http://10.0.0.5:3001/',
+      token: 'vpn-token',
+      alwaysAskOnLaunch: false,
+      remember: true,
+    })).toEqual({
+      kind: 'remote',
+      url: 'http://10.0.0.5:3001',
+      token: 'vpn-token',
+      requiresAuth: true,
+      alwaysAskOnLaunch: false,
+      remember: true,
+    })
+  })
+
+  it('builds a start-local choice', () => {
+    expect(buildStartLocalChoice({
+      port: 3003,
+      alwaysAskOnLaunch: false,
+      remember: true,
+    })).toEqual({
+      kind: 'start-local',
+      port: 3003,
+      alwaysAskOnLaunch: false,
+      remember: true,
+    })
+  })
+
+  it('formats launch reasons for users', () => {
+    expect(formatLaunchReason('saved-remote-token-invalid')).toContain('rejected its stored token')
+    expect(formatLaunchReason('missing-token')).toContain('needs a token')
+    expect(formatLaunchReason('unknown')).toContain('connect to an existing server')
+  })
+})

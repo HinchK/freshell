@@ -21,6 +21,9 @@ function createDefaultContext(overrides: Partial<StartupContext> = {}): StartupC
   return {
     desktopConfig: {
       serverMode: 'app-bound',
+      port: 3001,
+      knownServers: [],
+      alwaysAskOnLaunch: false,
       globalHotkey: 'CommandOrControl+`',
       startOnLogin: false,
       minimizeToTray: true,
@@ -64,6 +67,7 @@ function createDefaultContext(overrides: Partial<StartupContext> = {}): StartupC
     platform: 'linux' as NodeJS.Platform,
     createBrowserWindow: vi.fn().mockReturnValue(createMockWindow()),
     createTray: vi.fn(),
+    discoverLaunchCandidates: vi.fn().mockResolvedValue([]),
     ...overrides,
   }
 }
@@ -81,6 +85,9 @@ describe('runStartup', () => {
     const ctx = createDefaultContext({
       desktopConfig: {
         serverMode: 'app-bound',
+        port: 3001,
+        knownServers: [],
+        alwaysAskOnLaunch: false,
         globalHotkey: 'CommandOrControl+`',
         startOnLogin: false,
         minimizeToTray: true,
@@ -97,6 +104,9 @@ describe('runStartup', () => {
       const ctx = createDefaultContext({
         desktopConfig: {
           serverMode: 'daemon',
+          port: 3001,
+          knownServers: [],
+          alwaysAskOnLaunch: false,
           globalHotkey: 'CommandOrControl+`',
           startOnLogin: false,
           minimizeToTray: true,
@@ -118,6 +128,9 @@ describe('runStartup', () => {
       const ctx = createDefaultContext({
         desktopConfig: {
           serverMode: 'daemon',
+          port: 3001,
+          knownServers: [],
+          alwaysAskOnLaunch: false,
           globalHotkey: 'CommandOrControl+`',
           startOnLogin: false,
           minimizeToTray: true,
@@ -137,6 +150,9 @@ describe('runStartup', () => {
       const ctx = createDefaultContext({
         desktopConfig: {
           serverMode: 'daemon',
+          port: 3001,
+          knownServers: [],
+          alwaysAskOnLaunch: false,
           globalHotkey: 'CommandOrControl+`',
           startOnLogin: false,
           minimizeToTray: true,
@@ -214,10 +230,13 @@ describe('runStartup', () => {
   })
 
   describe('remote mode', () => {
-    it('throws when remoteUrl is not configured', async () => {
+    it('opens chooser when remoteUrl is not configured', async () => {
       const ctx = createDefaultContext({
         desktopConfig: {
           serverMode: 'remote',
+          port: 3001,
+          knownServers: [],
+          alwaysAskOnLaunch: false,
           // remoteUrl intentionally omitted
           globalHotkey: 'CommandOrControl+`',
           startOnLogin: false,
@@ -226,15 +245,144 @@ describe('runStartup', () => {
         },
       })
 
-      await expect(runStartup(ctx)).rejects.toThrow('Remote URL not configured. Please re-run setup.')
+      const result = await runStartup(ctx)
+      expect(result).toEqual({
+        type: 'chooser',
+        candidates: [],
+        reason: 'manual-choice',
+      })
     })
 
-    it('validates connectivity and opens remote URL', async () => {
+    it('validates connectivity and saved token before opening remote URL', async () => {
       const fetchHealthCheck = vi.fn().mockResolvedValue(true)
+      const fetchAuthenticated = vi.fn().mockResolvedValue(true)
       const ctx = createDefaultContext({
         desktopConfig: {
           serverMode: 'remote',
+          port: 3001,
           remoteUrl: 'http://10.0.0.5:3001',
+          remoteToken: 'vpn-token',
+          knownServers: [],
+          alwaysAskOnLaunch: false,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        fetchHealthCheck,
+        fetchAuthenticated,
+      })
+
+      const result = await runStartup(ctx)
+      expect(fetchHealthCheck).toHaveBeenCalledWith('http://10.0.0.5:3001/api/health')
+      expect(fetchAuthenticated).toHaveBeenCalledWith('http://10.0.0.5:3001/api/settings', 'vpn-token')
+      expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
+      expect(ctx.daemonManager.status).not.toHaveBeenCalled()
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://10.0.0.5:3001')
+        const window = (ctx.createBrowserWindow as ReturnType<typeof vi.fn>).mock.results[0].value
+        expect(window.loadURL).toHaveBeenCalledWith('http://10.0.0.5:3001?token=vpn-token')
+      }
+    })
+
+    it('opens chooser when saved remote token is missing', async () => {
+      const fetchHealthCheck = vi.fn().mockResolvedValue(true)
+      const fetchAuthenticated = vi.fn()
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'remote',
+          port: 3001,
+          remoteUrl: 'http://10.0.0.5:3001',
+          knownServers: [],
+          alwaysAskOnLaunch: false,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        fetchHealthCheck,
+        fetchAuthenticated,
+      })
+
+      const result = await runStartup(ctx)
+      expect(fetchHealthCheck).toHaveBeenCalledWith('http://10.0.0.5:3001/api/health')
+      expect(fetchAuthenticated).not.toHaveBeenCalled()
+      expect(result).toEqual({
+        type: 'chooser',
+        candidates: [],
+        reason: 'missing-token',
+      })
+    })
+
+    it('opens chooser when saved remote token is invalid', async () => {
+      const fetchHealthCheck = vi.fn().mockResolvedValue(true)
+      const fetchAuthenticated = vi.fn().mockResolvedValue(false)
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'remote',
+          port: 3001,
+          remoteUrl: 'http://10.0.0.5:3001',
+          remoteToken: 'stale-token',
+          knownServers: [],
+          alwaysAskOnLaunch: false,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        fetchHealthCheck,
+        fetchAuthenticated,
+      })
+
+      const result = await runStartup(ctx)
+      expect(fetchHealthCheck).toHaveBeenCalledWith('http://10.0.0.5:3001/api/health')
+      expect(fetchAuthenticated).toHaveBeenCalledWith('http://10.0.0.5:3001/api/settings', 'stale-token')
+      expect(result).toEqual({
+        type: 'chooser',
+        candidates: [],
+        reason: 'saved-remote-token-invalid',
+      })
+    })
+
+    it('normalizes trailing slash in saved remote URL before health and auth probes', async () => {
+      const fetchHealthCheck = vi.fn().mockResolvedValue(true)
+      const fetchAuthenticated = vi.fn().mockResolvedValue(false)
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'remote',
+          port: 3001,
+          remoteUrl: 'http://10.0.0.5:3001/',
+          remoteToken: 'stale-token',
+          knownServers: [],
+          alwaysAskOnLaunch: false,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        fetchHealthCheck,
+        fetchAuthenticated,
+      })
+
+      const result = await runStartup(ctx)
+      expect(fetchHealthCheck).toHaveBeenCalledWith('http://10.0.0.5:3001/api/health')
+      expect(fetchAuthenticated).toHaveBeenCalledWith('http://10.0.0.5:3001/api/settings', 'stale-token')
+      expect(result).toEqual({
+        type: 'chooser',
+        candidates: [],
+        reason: 'saved-remote-token-invalid',
+      })
+    })
+
+    it('throws user-friendly error when health check returns false', async () => {
+      const fetchHealthCheck = vi.fn().mockResolvedValue(false)
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'remote',
+          port: 3001,
+          remoteUrl: 'http://10.0.0.5:3001',
+          knownServers: [],
+          alwaysAskOnLaunch: false,
           globalHotkey: 'CommandOrControl+`',
           startOnLogin: false,
           minimizeToTray: true,
@@ -244,38 +392,23 @@ describe('runStartup', () => {
       })
 
       const result = await runStartup(ctx)
-      expect(fetchHealthCheck).toHaveBeenCalledWith('http://10.0.0.5:3001/api/health')
-      expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
-      expect(ctx.daemonManager.status).not.toHaveBeenCalled()
-      if (result.type === 'main') {
-        expect(result.serverUrl).toBe('http://10.0.0.5:3001')
-      }
-    })
-
-    it('throws user-friendly error when health check returns false', async () => {
-      const fetchHealthCheck = vi.fn().mockResolvedValue(false)
-      const ctx = createDefaultContext({
-        desktopConfig: {
-          serverMode: 'remote',
-          remoteUrl: 'http://10.0.0.5:3001',
-          globalHotkey: 'CommandOrControl+`',
-          startOnLogin: false,
-          minimizeToTray: true,
-          setupCompleted: true,
-        },
-        fetchHealthCheck,
+      expect(result).toEqual({
+        type: 'chooser',
+        candidates: [],
+        reason: 'saved-remote-unreachable',
       })
-
-      await expect(runStartup(ctx)).rejects.toThrow('Cannot connect to remote server at http://10.0.0.5:3001')
     })
 
-    it('catches fetch TypeError and throws user-friendly error for unreachable hosts', async () => {
+    it('catches fetch TypeError and opens chooser for unreachable hosts', async () => {
       // Simulates what happens when fetch() throws on unreachable host
       const fetchHealthCheck = vi.fn().mockRejectedValue(new TypeError('fetch failed'))
       const ctx = createDefaultContext({
         desktopConfig: {
           serverMode: 'remote',
+          port: 3001,
           remoteUrl: 'http://192.168.99.99:3001',
+          knownServers: [],
+          alwaysAskOnLaunch: false,
           globalHotkey: 'CommandOrControl+`',
           startOnLogin: false,
           minimizeToTray: true,
@@ -284,16 +417,24 @@ describe('runStartup', () => {
         fetchHealthCheck,
       })
 
-      await expect(runStartup(ctx)).rejects.toThrow('Cannot connect to remote server at http://192.168.99.99:3001')
+      const result = await runStartup(ctx)
+      expect(result).toEqual({
+        type: 'chooser',
+        candidates: [],
+        reason: 'saved-remote-unreachable',
+      })
     })
 
-    it('catches network errors and throws user-friendly error', async () => {
+    it('catches network errors and opens chooser', async () => {
       // Simulates ECONNREFUSED or similar network error
       const fetchHealthCheck = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'))
       const ctx = createDefaultContext({
         desktopConfig: {
           serverMode: 'remote',
+          port: 3001,
           remoteUrl: 'http://10.0.0.5:3001',
+          knownServers: [],
+          alwaysAskOnLaunch: false,
           globalHotkey: 'CommandOrControl+`',
           startOnLogin: false,
           minimizeToTray: true,
@@ -302,7 +443,86 @@ describe('runStartup', () => {
         fetchHealthCheck,
       })
 
-      await expect(runStartup(ctx)).rejects.toThrow('Cannot connect to remote server at http://10.0.0.5:3001')
+      const result = await runStartup(ctx)
+      expect(result).toEqual({
+        type: 'chooser',
+        candidates: [],
+        reason: 'saved-remote-unreachable',
+      })
+    })
+  })
+
+  describe('launch discovery integration', () => {
+    it('returns chooser when alwaysAskOnLaunch is enabled', async () => {
+      const ctx = createDefaultContext({
+        desktopConfig: {
+          serverMode: 'app-bound',
+          port: 3001,
+          knownServers: [],
+          alwaysAskOnLaunch: true,
+          globalHotkey: 'CommandOrControl+`',
+          startOnLogin: false,
+          minimizeToTray: true,
+          setupCompleted: true,
+        },
+        discoverLaunchCandidates: vi.fn().mockResolvedValue([
+          {
+            id: 'local-a',
+            url: 'http://localhost:3001',
+            origin: 'port-scan',
+            ownership: 'detected-local',
+            label: 'localhost:3001',
+            token: 'local-token',
+            requiresAuth: true,
+          },
+        ]),
+      })
+
+      const result = await runStartup(ctx)
+
+      expect(result).toEqual({
+        type: 'chooser',
+        candidates: [
+          {
+            id: 'local-a',
+            url: 'http://localhost:3001',
+            origin: 'port-scan',
+            ownership: 'detected-local',
+            label: 'localhost:3001',
+            token: 'local-token',
+            requiresAuth: true,
+          },
+        ],
+        reason: 'always-ask',
+      })
+      expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
+      expect(ctx.createBrowserWindow).not.toHaveBeenCalled()
+    })
+
+    it('auto-connects to one discovered local server without spawning a new server', async () => {
+      const ctx = createDefaultContext({
+        discoverLaunchCandidates: vi.fn().mockResolvedValue([
+          {
+            id: 'local-a',
+            url: 'http://localhost:3001',
+            origin: 'port-scan',
+            ownership: 'detected-local',
+            label: 'localhost:3001',
+            token: 'local-token',
+            requiresAuth: true,
+          },
+        ]),
+      })
+
+      const result = await runStartup(ctx)
+
+      expect(ctx.serverSpawner.start).not.toHaveBeenCalled()
+      expect(result.type).toBe('main')
+      if (result.type === 'main') {
+        expect(result.serverUrl).toBe('http://localhost:3001')
+      }
+      const window = (ctx.createBrowserWindow as ReturnType<typeof vi.fn>).mock.results[0].value
+      expect(window.loadURL).toHaveBeenCalledWith('http://localhost:3001?token=local-token')
     })
   })
 
@@ -552,6 +772,7 @@ describe('runStartup', () => {
     it('appends ?token= to URL for remote mode using remoteToken', async () => {
       const mockWindow = createMockWindow()
       const fetchHealthCheck = vi.fn().mockResolvedValue(true)
+      const fetchAuthenticated = vi.fn().mockResolvedValue(true)
       const ctx = createDefaultContext({
         desktopConfig: {
           serverMode: 'remote',
@@ -564,6 +785,7 @@ describe('runStartup', () => {
         },
         createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
         fetchHealthCheck,
+        fetchAuthenticated,
       })
       await runStartup(ctx)
       expect(mockWindow.loadURL).toHaveBeenCalledWith('http://10.0.0.5:3001?token=remote-secret-123')
@@ -601,6 +823,7 @@ describe('runStartup', () => {
     it('does not call readEnvToken for remote mode', async () => {
       const readEnvToken = vi.fn().mockResolvedValue('should-not-be-used')
       const fetchHealthCheck = vi.fn().mockResolvedValue(true)
+      const fetchAuthenticated = vi.fn().mockResolvedValue(true)
       const ctx = createDefaultContext({
         desktopConfig: {
           serverMode: 'remote',
@@ -613,12 +836,13 @@ describe('runStartup', () => {
         },
         readEnvToken,
         fetchHealthCheck,
+        fetchAuthenticated,
       })
       await runStartup(ctx)
       expect(readEnvToken).not.toHaveBeenCalled()
     })
 
-    it('loads URL without token for remote mode when remoteToken is absent', async () => {
+    it('opens chooser for remote mode when remoteToken is absent', async () => {
       const mockWindow = createMockWindow()
       const fetchHealthCheck = vi.fn().mockResolvedValue(true)
       const ctx = createDefaultContext({
@@ -633,8 +857,13 @@ describe('runStartup', () => {
         createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
         fetchHealthCheck,
       })
-      await runStartup(ctx)
-      expect(mockWindow.loadURL).toHaveBeenCalledWith('http://10.0.0.5:3001')
+      const result = await runStartup(ctx)
+      expect(result).toEqual({
+        type: 'chooser',
+        candidates: [],
+        reason: 'missing-token',
+      })
+      expect(mockWindow.loadURL).not.toHaveBeenCalled()
     })
   })
 

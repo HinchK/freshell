@@ -49,6 +49,11 @@ extraResources:
     to: client
     filter:
       - "**/*"
+  # Launch chooser assets (loaded from the real filesystem before connecting)
+  - from: dist/launch-chooser
+    to: launch-chooser
+    filter:
+      - "**/*"
   # Pruned server runtime dependencies (see prepare-bundled-node.ts Step 4)
   - from: server-node-modules
     to: server-node-modules
@@ -84,8 +89,8 @@ linux:
   icon: assets/electron/icons
 
 nsis:
-  oneClick: false
-  allowToChangeInstallationDirectory: true
+  oneClick: true
+  runAfterFinish: true
+  include: assets/electron/installer.nsh
 
-publish:
-  provider: github
+publish: null

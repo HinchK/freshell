@@ -17,6 +17,8 @@ export function getDefaultDesktopConfig(): DesktopConfig {
   return {
     serverMode: 'app-bound',
     port: 3001,
+    knownServers: [],
+    alwaysAskOnLaunch: false,
     globalHotkey: 'CommandOrControl+`',
     startOnLogin: false,
     minimizeToTray: true,

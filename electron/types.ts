@@ -1,10 +1,18 @@
 import { z } from 'zod'
 
+export const KnownServerSchema = z.object({
+  url: z.string().url(),
+  label: z.string().optional(),
+  lastConnectedAt: z.string().datetime().optional(),
+})
+
 export const DesktopConfigSchema = z.object({
   serverMode: z.enum(['daemon', 'app-bound', 'remote']),
   port: z.number().default(3001),
   remoteUrl: z.string().url().optional(),
   remoteToken: z.string().optional(),
+  knownServers: z.array(KnownServerSchema).default([]),
+  alwaysAskOnLaunch: z.boolean().default(false),
   globalHotkey: z.string().default('CommandOrControl+`'),
   startOnLogin: z.boolean().default(false),
   minimizeToTray: z.boolean().default(true),
@@ -18,4 +26,35 @@ export const DesktopConfigSchema = z.object({
   }).optional(),
 })
 
+export type KnownServer = z.infer<typeof KnownServerSchema>
 export type DesktopConfig = z.infer<typeof DesktopConfigSchema>
+
+export type ServerOwnership = 'owned' | 'detected-local' | 'remote'
+
+export interface LaunchServerCandidate {
+  id: string
+  url: string
+  origin: 'configured' | 'known' | 'port-scan' | 'manual'
+  ownership: ServerOwnership
+  label?: string
+  version?: string
+  instanceId?: string
+  startedAt?: string
+  ready?: boolean
+  requiresAuth?: boolean
+  token?: string
+}
+
+export interface LaunchChoice {
+  kind: 'connect' | 'remote' | 'start-local'
+  url?: string
+  token?: string
+  port?: number
+  requiresAuth?: boolean
+  alwaysAskOnLaunch: boolean
+  remember: boolean
+}
+
+export type LaunchChoiceResult =
+  | { ok: true }
+  | { ok: false; error: string }

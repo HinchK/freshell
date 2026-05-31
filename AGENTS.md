@@ -81,6 +81,8 @@ npm run serve               # Build and run production server
 # `npm run check` for safe verification, or build from a worktree.
 ```
 
+Windows desktop builds (`npm run electron:build:win`) must run on native Windows — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
+
 ### Testing
 ```bash
 npm test                    # Coordinated full suite (default + server configs)

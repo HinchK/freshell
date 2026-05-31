@@ -14,7 +14,7 @@
  * Helper functions are exported for unit testing.
  */
 
-import { execSync } from 'child_process'
+import { execFileSync } from 'child_process'
 import {
   existsSync,
   readFileSync,
@@ -22,13 +22,32 @@ import {
   mkdirSync,
   cpSync,
   rmSync,
+  createWriteStream,
+  readdirSync,
 } from 'fs'
+import http from 'http'
+import https from 'https'
+import { createRequire } from 'module'
 import path from 'path'
+import { pipeline } from 'stream/promises'
 import { fileURLToPath } from 'url'
+import tar from 'tar'
+
+const extractZip = (await import('extract-zip')).default
+const require = createRequire(import.meta.url)
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const PROJECT_ROOT = path.resolve(__dirname, '..')
+
+function removePath(targetPath: string): void {
+  rmSync(targetPath, {
+    recursive: true,
+    force: true,
+    maxRetries: 5,
+    retryDelay: 250,
+  })
+}
 
 // --- Exported helper functions (testable) ---
 
@@ -94,6 +113,52 @@ export function getHeadersDownloadUrl(version: string): string {
 }
 
 /**
+ * electron-builder expands ${os} to win/mac/linux, not Node's win32/darwin.
+ * Stage bundled binaries under those directory names so extraResources can
+ * resolve them consistently on native Windows builds.
+ */
+export function getElectronBuilderOs(platform: string): string {
+  if (platform === 'win32') return 'win'
+  if (platform === 'darwin') return 'mac'
+  return platform
+}
+
+export function getBundledNodeBinaryName(platform: string): string {
+  return platform === 'win32' ? 'node.exe' : 'node'
+}
+
+export function getBundledNodeBinaryPath(
+  bundledNodeDir: string,
+  platform: string,
+  arch: string,
+): string {
+  return path.join(
+    bundledNodeDir,
+    getElectronBuilderOs(platform),
+    arch,
+    getBundledNodeBinaryName(platform),
+  )
+}
+
+export function getWindowsNodeImportLibraryPath(headersDir: string): string {
+  return path.join(headersDir, 'Release', 'node.lib')
+}
+
+export function getWindowsNodeImportLibraryDownloadUrl(
+  version: string,
+  arch: string,
+): string {
+  return `https://nodejs.org/dist/v${version}/win-${arch}/node.lib`
+}
+
+export function getCompiledNativeModuleFilenames(
+  releaseDir: string,
+  readDirFn: (dir: string) => string[] = readdirSync,
+): string[] {
+  return readDirFn(releaseDir).filter((entry) => entry.endsWith('.node'))
+}
+
+/**
  * Get paths for staging native modules.
  */
 export function getStagingPaths(): {
@@ -107,6 +172,165 @@ export function getStagingPaths(): {
   return { nativeModulesDir, nodePtyTarget, bundledNodeDir }
 }
 
+function resolvePackageRoot(packageName: string): string {
+  const localPackageRoot = path.join(PROJECT_ROOT, 'node_modules', packageName)
+  if (existsSync(path.join(localPackageRoot, 'package.json'))) {
+    return localPackageRoot
+  }
+
+  return path.dirname(require.resolve(`${packageName}/package.json`))
+}
+
+function resolveNodeGypBin(): string {
+  const localNodeGypBin = path.join(
+    PROJECT_ROOT,
+    'node_modules',
+    'node-gyp',
+    'bin',
+    'node-gyp.js',
+  )
+  if (existsSync(localNodeGypBin)) {
+    return localNodeGypBin
+  }
+
+  return require.resolve('node-gyp/bin/node-gyp.js')
+}
+
+export function resolveNpmCli(
+  npmExecPath = process.env.npm_execpath,
+  existsFn = existsSync,
+): string {
+  if (npmExecPath && existsFn(npmExecPath)) {
+    return npmExecPath
+  }
+
+  const localNpmCli = path.join(
+    PROJECT_ROOT,
+    'node_modules',
+    'npm',
+    'bin',
+    'npm-cli.js',
+  )
+  if (existsFn(localNpmCli)) {
+    return localNpmCli
+  }
+
+  return require.resolve('npm/bin/npm-cli.js')
+}
+
+async function downloadFile(url: string, destination: string): Promise<void> {
+  mkdirSync(path.dirname(destination), { recursive: true })
+
+  await new Promise<void>((resolve, reject) => {
+    const request = (sourceUrl: string): void => {
+      const client = sourceUrl.startsWith('https:') ? https : http
+      const req = client.get(sourceUrl, (res) => {
+        const statusCode = res.statusCode ?? 0
+        const location = res.headers.location
+
+        if (statusCode >= 300 && statusCode < 400 && location) {
+          res.resume()
+          request(new URL(location, sourceUrl).toString())
+          return
+        }
+
+        if (statusCode !== 200) {
+          res.resume()
+          reject(new Error(`Download failed for ${sourceUrl}: HTTP ${statusCode}`))
+          return
+        }
+
+        pipeline(res, createWriteStream(destination)).then(resolve, reject)
+      })
+
+      req.on('error', reject)
+    }
+
+    request(url)
+  })
+}
+
+async function extractNodeBinary(
+  version: string,
+  platform: string,
+  arch: string,
+  archivePath: string,
+  binaryPath: string,
+): Promise<void> {
+  const tmpDir = path.join(path.dirname(archivePath), `extract-${platform}-${arch}`)
+  removePath(tmpDir)
+  mkdirSync(tmpDir, { recursive: true })
+  mkdirSync(path.dirname(binaryPath), { recursive: true })
+
+  try {
+    if (platform === 'win32') {
+      await extractZip(archivePath, { dir: tmpDir })
+      cpSync(
+        path.join(tmpDir, `node-v${version}-win-${arch}`, 'node.exe'),
+        binaryPath,
+      )
+      return
+    }
+
+    const member = `node-v${version}-${platform}-${arch}/bin/node`
+    await tar.x({
+      file: archivePath,
+      cwd: tmpDir,
+      strip: 2,
+      filter: (entryPath: string) => entryPath === member,
+    })
+    cpSync(path.join(tmpDir, 'node'), binaryPath)
+  } finally {
+    removePath(tmpDir)
+  }
+}
+
+async function prepareWindowsNodeImportLibrary(
+  version: string,
+  arch: string,
+  bundledNodeDir: string,
+  headersDir: string,
+): Promise<void> {
+  if (process.platform !== 'win32') return
+
+  const nodeLibPath = getWindowsNodeImportLibraryPath(headersDir)
+  if (existsSync(nodeLibPath)) {
+    console.log(`Windows Node.js import library already exists at ${nodeLibPath}, skipping`)
+    return
+  }
+
+  const downloadUrl = getWindowsNodeImportLibraryDownloadUrl(version, arch)
+
+  console.log(`Downloading Windows Node.js import library from ${downloadUrl}...`)
+  await downloadFile(downloadUrl, nodeLibPath)
+  console.log(`Windows Node.js import library placed at ${nodeLibPath}`)
+}
+
+async function prepareNodeBinary(
+  version: string,
+  platform: string,
+  arch: string,
+  bundledNodeDir: string,
+): Promise<void> {
+  const binaryPath = getBundledNodeBinaryPath(bundledNodeDir, platform, arch)
+  if (existsSync(binaryPath)) {
+    console.log(`Bundled Node.js binary already exists at ${binaryPath}, skipping`)
+    return
+  }
+
+  const downloadUrl = getNodeDownloadUrl(version, platform, arch)
+  const archivePath = path.join(
+    bundledNodeDir,
+    `node-${platform}-${arch}${platform === 'win32' ? '.zip' : '.tar.gz'}`,
+  )
+
+  console.log(`Downloading Node.js binary from ${downloadUrl}...`)
+  await downloadFile(downloadUrl, archivePath)
+  await extractNodeBinary(version, platform, arch, archivePath, binaryPath)
+  removePath(archivePath)
+  console.log(`Node.js binary placed at ${binaryPath}`)
+}
+
 // --- Main script execution ---
 
 async function main(): Promise<void> {
@@ -118,70 +342,18 @@ async function main(): Promise<void> {
 
   const { bundledNodeDir, nativeModulesDir, nodePtyTarget } = getStagingPaths()
 
-  // Step 1: Download Node.js binary
-  const binaryDir = path.join(bundledNodeDir, platform, arch)
-  mkdirSync(binaryDir, { recursive: true })
-
-  const downloadUrl = getNodeDownloadUrl(version, platform, arch)
-  console.log(`Downloading Node.js binary from ${downloadUrl}...`)
-
-  if (platform === 'win32') {
-    // Download and extract zip on Windows
-    execSync(
-      `curl -sL "${downloadUrl}" -o "${path.join(bundledNodeDir, 'node.zip')}" && ` +
-        `cd "${bundledNodeDir}" && unzip -o node.zip "node-v${version}-win-${arch}/node.exe" -d tmp && ` +
-        `mv "tmp/node-v${version}-win-${arch}/node.exe" "${binaryDir}/node.exe" && ` +
-        'rm -rf tmp node.zip',
-      { stdio: 'inherit' }
-    )
-  } else {
-    // Download and extract tar.gz on macOS/Linux
-    execSync(
-      `curl -sL "${downloadUrl}" | tar xz -C "${bundledNodeDir}" --strip-components=1 ` +
-        `"node-v${version}-${platform}-${arch}/bin/node" && ` +
-        `mkdir -p "${binaryDir}" && mv "${path.join(bundledNodeDir, 'bin', 'node')}" "${binaryDir}/node" && ` +
-        `rmdir "${path.join(bundledNodeDir, 'bin')}" 2>/dev/null || true`,
-      { stdio: 'inherit' }
-    )
-  }
-
-  console.log(`Node.js binary placed at ${binaryDir}`)
+  // Step 1: Download Node.js binary for the current native platform.
+  await prepareNodeBinary(version, platform, arch, bundledNodeDir)
 
   // Step 1b: Download Node.js binaries for cross-build targets
   // When building on Linux, also download the Windows binary so
   // electron-builder can package it for Windows.
-  const crossTargets: Array<{ plat: string; ar: string }> = []
-  if (platform !== 'win32') crossTargets.push({ plat: 'win32', ar: arch })
-  if (platform !== 'linux') crossTargets.push({ plat: 'linux', ar: arch })
+  const crossTargets: Array<{ platform: string; arch: string }> = []
+  if (platform !== 'win32') crossTargets.push({ platform: 'win32', arch })
+  if (platform !== 'linux') crossTargets.push({ platform: 'linux', arch })
 
   for (const target of crossTargets) {
-    const targetDir = path.join(bundledNodeDir, target.plat === 'win32' ? 'win' : target.plat, target.ar)
-    if (existsSync(path.join(targetDir, target.plat === 'win32' ? 'node.exe' : 'node'))) {
-      console.log(`Cross-target ${target.plat}-${target.ar} already exists, skipping`)
-      continue
-    }
-    mkdirSync(targetDir, { recursive: true })
-    const targetUrl = getNodeDownloadUrl(version, target.plat, target.ar)
-    console.log(`Downloading cross-target Node.js for ${target.plat}-${target.ar} from ${targetUrl}...`)
-
-    if (target.plat === 'win32') {
-      execSync(
-        `curl -sL "${targetUrl}" -o "${path.join(bundledNodeDir, 'node-cross.zip')}" && ` +
-          `cd "${bundledNodeDir}" && unzip -o node-cross.zip "node-v${version}-win-${target.ar}/node.exe" -d tmp-cross && ` +
-          `mv "tmp-cross/node-v${version}-win-${target.ar}/node.exe" "${targetDir}/node.exe" && ` +
-          'rm -rf tmp-cross node-cross.zip',
-        { stdio: 'inherit' }
-      )
-    } else {
-      execSync(
-        `curl -sL "${targetUrl}" | tar xz -C "${bundledNodeDir}" --strip-components=1 ` +
-          `"node-v${version}-${target.plat}-${target.ar}/bin/node" && ` +
-          `mkdir -p "${targetDir}" && mv "${path.join(bundledNodeDir, 'bin', 'node')}" "${targetDir}/node" && ` +
-          `rmdir "${path.join(bundledNodeDir, 'bin')}" 2>/dev/null || true`,
-        { stdio: 'inherit' }
-      )
-    }
-    console.log(`Cross-target Node.js binary placed at ${targetDir}`)
+    await prepareNodeBinary(version, target.platform, target.arch, bundledNodeDir)
   }
 
   // Step 2: Download Node.js headers
@@ -191,30 +363,43 @@ async function main(): Promise<void> {
   const headersUrl = getHeadersDownloadUrl(version)
   console.log(`Downloading Node.js headers from ${headersUrl}...`)
 
-  execSync(
-    `curl -sL "${headersUrl}" | tar xz -C "${headersBaseDir}"`,
-    { stdio: 'inherit' }
-  )
+  const headersArchivePath = path.join(headersBaseDir, `node-v${version}-headers.tar.gz`)
+  await downloadFile(headersUrl, headersArchivePath)
+  await tar.x({ file: headersArchivePath, cwd: headersBaseDir })
+  removePath(headersArchivePath)
 
   const headersDir = path.join(headersBaseDir, `node-v${version}`)
   validateHeaders(headersDir)
   console.log(`Node.js headers extracted to ${headersDir}`)
+  await prepareWindowsNodeImportLibrary(version, arch, bundledNodeDir, headersDir)
 
   // Step 3: Recompile node-pty against bundled Node headers
-  const nodePtyDir = path.resolve(PROJECT_ROOT, 'node_modules', 'node-pty')
+  const nodePtyDir = resolvePackageRoot('node-pty')
   const gypCmd = buildNodeGypCommand(version, headersDir)
 
   console.log(`Recompiling node-pty with: ${gypCmd}`)
-  execSync(gypCmd, { cwd: nodePtyDir, stdio: 'inherit' })
+  execFileSync(process.execPath, [
+    resolveNodeGypBin(),
+    'rebuild',
+    `--target=${version}`,
+    `--nodedir=${headersDir}`,
+  ], { cwd: nodePtyDir, stdio: 'inherit' })
 
   // Stage the compiled native module
   mkdirSync(path.join(nodePtyTarget, 'build', 'Release'), { recursive: true })
 
-  // Copy the compiled .node file
-  cpSync(
-    path.join(nodePtyDir, 'build', 'Release', 'pty.node'),
-    path.join(nodePtyTarget, 'build', 'Release', 'pty.node')
-  )
+  const nodePtyReleaseDir = path.join(nodePtyDir, 'build', 'Release')
+  const compiledNativeModules = getCompiledNativeModuleFilenames(nodePtyReleaseDir)
+  if (compiledNativeModules.length === 0) {
+    throw new Error(`No compiled node-pty .node files found in ${nodePtyReleaseDir}`)
+  }
+
+  for (const filename of compiledNativeModules) {
+    cpSync(
+      path.join(nodePtyReleaseDir, filename),
+      path.join(nodePtyTarget, 'build', 'Release', filename)
+    )
+  }
 
   // Copy node-pty JS files (excluding the build directory, except for the Release binary)
   cpSync(nodePtyDir, nodePtyTarget, {
@@ -234,8 +419,8 @@ async function main(): Promise<void> {
   console.log('Pruning and staging server node_modules...')
 
   // Clean up any previous staging
-  rmSync(serverNodeModulesDir, { recursive: true, force: true })
-  rmSync(stagingDir, { recursive: true, force: true })
+  removePath(serverNodeModulesDir)
+  removePath(stagingDir)
   mkdirSync(stagingDir, { recursive: true })
 
   // Copy package.json to staging, stripping comment entries (keys starting
@@ -258,7 +443,7 @@ async function main(): Promise<void> {
   }
 
   // Install production-only dependencies
-  execSync('npm ci --omit=dev', { cwd: stagingDir, stdio: 'inherit' })
+  execFileSync(process.execPath, [resolveNpmCli(), 'ci', '--omit=dev'], { cwd: stagingDir, stdio: 'inherit' })
 
   // Move the resulting node_modules
   cpSync(
@@ -271,11 +456,11 @@ async function main(): Promise<void> {
   // (it was compiled against the dev machine's Node, not the bundled one)
   const prunedNodePtyBuild = path.join(serverNodeModulesDir, 'node-pty', 'build')
   if (existsSync(prunedNodePtyBuild)) {
-    rmSync(prunedNodePtyBuild, { recursive: true, force: true })
+    removePath(prunedNodePtyBuild)
   }
 
   // Clean up staging
-  rmSync(stagingDir, { recursive: true, force: true })
+  removePath(stagingDir)
 
   console.log(`Server node_modules staged at ${serverNodeModulesDir}`)
   console.log('Bundled Node.js preparation complete!')
