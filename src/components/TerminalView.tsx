@@ -2344,7 +2344,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               ...current,
               sessionRef: msg.sessionRef,
               resumeSessionId: undefined,
-              ...(msg.sessionRef.provider === 'codex' ? { codexDurability: nextCodexDurability } : {}),
+              codexDurability: nextCodexDurability,
             }
           }
         }
