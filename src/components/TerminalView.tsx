@@ -99,7 +99,7 @@ import {
   scrollLinesToCursorKeys,
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
-import { buildRestoreError } from '@shared/session-contract'
+import { buildRestoreError, sanitizeSessionRef } from '@shared/session-contract'
 
 const log = createLogger('TerminalView')
 
@@ -123,6 +123,29 @@ function viewportHydrateReplayOptions(content?: TerminalPaneContent | null): { m
   return content?.mode === 'opencode'
     ? undefined
     : { maxReplayBytes: TRUNCATED_REPLAY_BYTES }
+}
+
+function buildSessionAssociationContentUpdates(
+  content: TerminalPaneContent | null | undefined,
+  rawSessionRef: unknown,
+): Pick<TerminalPaneContent, 'sessionRef' | 'resumeSessionId' | 'codexDurability'> | undefined {
+  const sessionRef = sanitizeSessionRef(rawSessionRef)
+  if (!content || !sessionRef) return undefined
+
+  const codexDurability = sessionRef.provider === 'codex'
+    && content.codexDurability?.state === 'durable'
+    && (
+      content.codexDurability.durableThreadId === sessionRef.sessionId
+      || content.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
+    )
+    ? content.codexDurability
+    : undefined
+
+  return {
+    sessionRef,
+    resumeSessionId: undefined,
+    codexDurability,
+  }
 }
 
 type TerminalInputBlockedReason =
@@ -856,6 +879,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       content: next,
     }))
   }, [dispatch, tabId, paneId]) // NO terminalContent dependency - uses ref
+
+  const syncContentRefWithSessionAssociation = useCallback((rawSessionRef: unknown) => {
+    const current = contentRef.current
+    const updates = buildSessionAssociationContentUpdates(current, rawSessionRef)
+    if (!current || !updates) return false
+    contentRef.current = {
+      ...current,
+      ...updates,
+    }
+    return true
+  }, [])
 
   const requestTerminalLayout = useCallback((options: {
     fit?: boolean
@@ -2141,12 +2175,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
           const attachSessionRef = (msg as { sessionRef?: TerminalPaneContent['sessionRef'] }).sessionRef
           if (attachSessionRef) {
-            reconcileTerminalSessionAssociation({
+            const reconciled = reconcileTerminalSessionAssociation({
               dispatch,
               getState: appStore.getState,
               terminalId: tid,
               sessionRef: attachSessionRef,
             })
+            if (reconciled) {
+              syncContentRefWithSessionAssociation(attachSessionRef)
+            }
           }
 
           const nextSeqState = onAttachReady(seqStateRef.current, {
@@ -2200,22 +2237,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             currentResumeSessionId: contentRef.current?.resumeSessionId,
           })
           const createdSessionRef = (msg as { sessionRef?: TerminalPaneContent['sessionRef'] }).sessionRef
+          const createdSessionUpdates = buildSessionAssociationContentUpdates(contentRef.current, createdSessionRef)
           terminalIdRef.current = newId
           updateContent({
             terminalId: newId,
             serverInstanceId: serverInstanceIdRef.current,
             status: 'running',
-            ...(createdSessionRef ? { sessionRef: createdSessionRef, resumeSessionId: undefined } : {}),
+            ...(createdSessionUpdates ?? {}),
             ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
             ...(msg.restoreError ? { restoreError: msg.restoreError } : {}),
           })
           if (createdSessionRef) {
-            reconcileTerminalSessionAssociation({
+            const reconciled = reconcileTerminalSessionAssociation({
               dispatch,
               getState: appStore.getState,
               terminalId: newId,
               sessionRef: createdSessionRef,
             })
+            if (reconciled) {
+              syncContentRefWithSessionAssociation(createdSessionRef)
+            }
           }
           // Also update tab status
           const currentTab = tabRef.current
@@ -2330,22 +2371,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               sessionRef: msg.sessionRef,
             })
           }
-          if (reconciled && contentRef.current) {
-            const current = contentRef.current
-            const nextCodexDurability = msg.sessionRef.provider === 'codex'
-              && current.codexDurability?.state === 'durable'
-              && (
-                current.codexDurability.durableThreadId === msg.sessionRef.sessionId
-                || current.codexDurability.candidate?.candidateThreadId === msg.sessionRef.sessionId
-              )
-              ? current.codexDurability
-              : undefined
-            contentRef.current = {
-              ...current,
-              sessionRef: msg.sessionRef,
-              resumeSessionId: undefined,
-              codexDurability: nextCodexDurability,
-            }
+          if (reconciled) {
+            syncContentRefWithSessionAssociation(msg.sessionRef)
           }
         }
 
@@ -2666,6 +2693,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     markAttachComplete,
     resetStartupProbeParser,
     runRefreshAttach,
+    syncContentRefWithSessionAssociation,
   ])
 
   useEffect(() => {
