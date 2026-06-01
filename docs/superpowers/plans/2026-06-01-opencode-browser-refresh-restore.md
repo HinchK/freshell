@@ -26,10 +26,8 @@ Existing durable identity contracts to preserve:
 
 - Modify `shared/ws-protocol.ts`
   - Add optional `sessionRef?: SessionLocator` to `TerminalCreatedMessage` and `TerminalAttachReadyMessage`.
-- Create `server/terminal-session-ref.ts`
-  - Central server helper for exposing a terminal record's already-known canonical durable `sessionRef`.
 - Modify `server/terminal-registry.ts`
-  - Reuse the helper in `list()` so inventory keeps the existing behavior with less duplicated logic.
+  - Add a helper for exposing a terminal record's already-known canonical durable `sessionRef`, and reuse it in `list()` so inventory keeps the existing behavior with less duplicated logic.
 - Modify `server/ws-handler.ts`
   - Include `sessionRef` on `terminal.created` when the terminal record already has canonical durable identity.
   - Include the same identity for reused existing terminals.
@@ -58,7 +56,6 @@ Existing durable identity contracts to preserve:
 
 **Files:**
 - Modify: `shared/ws-protocol.ts`
-- Create: `server/terminal-session-ref.ts`
 - Modify: `server/terminal-registry.ts`
 - Modify: `server/ws-handler.ts`
 - Modify: `server/terminal-stream/broker.ts`
@@ -159,16 +156,17 @@ export type TerminalAttachReadyMessage = {
 }
 ```
 
-- [ ] **Step 4: Create the server sessionRef helper**
+- [ ] **Step 4: Add the server sessionRef helper**
 
-Create `server/terminal-session-ref.ts`:
+In `server/terminal-registry.ts`, add `SessionLocator` to the existing shared protocol type imports if needed:
 
 ```ts
 import type { SessionLocator } from '../shared/ws-protocol.js'
-import { modeSupportsResume, type TerminalMode, type TerminalRecord } from './terminal-registry.js'
-import type { CodingCliProviderName } from './coding-cli/types.js'
-import type { CodexDurabilityRef } from '../shared/codex-durability.js'
+```
 
+Then add this helper after `modeSupportsResume`:
+
+```ts
 type TerminalSessionRefSource = Pick<TerminalRecord, 'mode' | 'resumeSessionId'> & {
   codexDurability?: CodexDurabilityRef
 }
@@ -195,13 +193,7 @@ export function buildTerminalSessionRef(record: TerminalSessionRefSource): Sessi
 
 - [ ] **Step 5: Use the helper in registry inventory**
 
-In `server/terminal-registry.ts`, import:
-
-```ts
-import { buildTerminalSessionRef } from './terminal-session-ref.js'
-```
-
-Then change the `list()` record mapping from the inline `sessionRef: modeSupportsResume(...) ? ... : undefined` expression to:
+In `server/terminal-registry.ts`, change the `list()` record mapping from the inline `sessionRef: modeSupportsResume(...) ? ... : undefined` expression to:
 
 ```ts
 sessionRef: buildTerminalSessionRef(t),
@@ -214,7 +206,7 @@ This should be behavior-preserving for inventory: OpenCode/Claude records with `
 In `server/ws-handler.ts`, import:
 
 ```ts
-import { buildTerminalSessionRef } from './terminal-session-ref.js'
+import { buildTerminalSessionRef, modeSupportsResume, terminalIdFromCreateError } from './terminal-registry.js'
 import type { SessionLocator } from '../shared/ws-protocol.js'
 ```
 
@@ -293,7 +285,7 @@ with:
 await attachReusedTerminal(existing)
 ```
 
-Update all six existing call sites in `server/ws-handler.ts` the same way, including the live Codex proof branches that currently pass `decision.sessionId` or `live.resumeSessionId`. The new helper always derives the replayed identity from the current `TerminalRecord`; do not pass a session id separately.
+Update all seven existing call sites in `server/ws-handler.ts` the same way, including the live Codex proof branches that currently pass `decision.sessionId` or `live.resumeSessionId`. The new helper always derives the replayed identity from the current `TerminalRecord`; do not pass a session id separately.
 
 For newly created terminals, send:
 
@@ -314,7 +306,7 @@ const sent = await sendCreateResult({
 In `server/terminal-stream/broker.ts`, import:
 
 ```ts
-import { buildTerminalSessionRef } from '../terminal-session-ref.js'
+import { buildTerminalSessionRef, type TerminalRegistry } from '../terminal-registry.js'
 ```
 
 Before sending `terminal.attach.ready`, compute:
@@ -352,7 +344,7 @@ Expected: PASS.
 Run:
 
 ```bash
-git add shared/ws-protocol.ts server/terminal-session-ref.ts server/terminal-registry.ts server/ws-handler.ts server/terminal-stream/broker.ts test/server/ws-protocol.test.ts
+git add shared/ws-protocol.ts server/terminal-registry.ts server/ws-handler.ts server/terminal-stream/broker.ts test/server/ws-protocol.test.ts
 git commit -m "fix: replay terminal session refs over websocket"
 ```
 
@@ -1008,15 +1000,16 @@ git commit -m "fix: reconcile terminal session refs centrally"
 **Files:**
 - Test: `test/e2e/terminal-restart-recovery.test.tsx`
 
-- [ ] **Step 1: Write the failing e2e regression**
+- [ ] **Step 1: Write the e2e regression guard**
 
 Add this test to `test/e2e/terminal-restart-recovery.test.tsx`:
 
 ```tsx
 it('restores an OpenCode pane after inventory recovers a missing sessionRef before stale-handle cleanup', async () => {
+  const paneId = 'pane-codex'
   const layout: PaneNode = {
     type: 'leaf',
-    id: 'pane-opencode',
+    id: paneId,
     content: {
       kind: 'terminal',
       createRequestId: 'req-opencode-old',
@@ -1031,7 +1024,7 @@ it('restores an OpenCode pane after inventory recovers a missing sessionRef befo
 
   render(
     <Provider store={store}>
-      <TerminalViewFromStore tabId="tab-restart" paneId="pane-opencode" />
+      <TerminalViewFromStore tabId="tab-restart" paneId={paneId} />
     </Provider>,
   )
 
@@ -1080,7 +1073,7 @@ Run:
 npm run test:vitest -- test/e2e/terminal-restart-recovery.test.tsx --run -t "inventory recovers a missing sessionRef"
 ```
 
-Expected before Task 2 implementation: FAIL. Expected after Task 2 implementation: PASS.
+Expected: PASS after Task 2. This is a regression guard for the restored-create emission path after the reducer has learned the recovered OpenCode identity.
 
 - [ ] **Step 3: Commit e2e regression**
 
