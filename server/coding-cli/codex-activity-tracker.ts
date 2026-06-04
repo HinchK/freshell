@@ -6,7 +6,12 @@ import {
   isSubmitInput,
   type TurnCompleteSignalParserState,
 } from '../../shared/turn-complete-signal.js'
-import type { SessionBindingReason } from '../terminal-stream/registry-events.js'
+import type { TerminalTurnCompletionSnapshot } from '../../shared/ws-protocol.js'
+import type {
+  CodexTurnCompletedEvent,
+  CodexTurnStartedEvent,
+  SessionBindingReason,
+} from '../terminal-stream/registry-events.js'
 import type { CodingCliSession, ProjectGroup } from './types.js'
 
 export const PENDING_SUBMIT_GATE_MS = 6000
@@ -38,7 +43,15 @@ export type CodexTerminalActivity = CodexActivityRecord & {
   lastSeenTurnAbortedAt?: number
   lastSeenSessionLastActivityAt?: number
   lastObservedAt: number
+  lastEmittedTurnKey?: number
   parserState: TurnCompleteSignalParserState
+}
+
+export type CodexTurnCompleteEvent = {
+  terminalId: string
+  sessionId?: string
+  at: number
+  completionSeq: number
 }
 
 export type CodexActivityChange = {
@@ -82,6 +95,9 @@ function buildProjectIndex(projects: ProjectGroup[]): Map<string, CodingCliSessi
 
 export class CodexActivityTracker extends EventEmitter {
   private readonly states = new Map<string, CodexTerminalActivity>()
+  private readonly completionSeqByTerminalId = new Map<string, number>()
+  private readonly latestCompletions = new Map<string, TerminalTurnCompletionSnapshot>()
+  private pendingCompletions: CodexTurnCompleteEvent[] = []
 
   list(): CodexActivityRecord[] {
     return Array.from(this.states.values()).map((state) => this.toRecord(state))
@@ -89,6 +105,10 @@ export class CodexActivityTracker extends EventEmitter {
 
   getActivity(terminalId: string): CodexTerminalActivity | undefined {
     return this.states.get(terminalId)
+  }
+
+  listLatestCompletions(): TerminalTurnCompletionSnapshot[] {
+    return Array.from(this.latestCompletions.values())
   }
 
   isPromptBlocked(terminalId: string, at?: number): boolean {
@@ -212,6 +232,34 @@ export class CodexActivityTracker extends EventEmitter {
       }
     }
     this.commitState(state, previous)
+    this.flushCompletions()
+  }
+
+  onTurnStarted(input: CodexTurnStartedEvent): void {
+    const state = this.states.get(input.terminalId)
+    if (!state) return
+
+    const previous = this.toRecord(state)
+    state.lastSeenTaskStartedAt = maxDefined(state.lastSeenTaskStartedAt, input.at)
+    this.promoteBusy(state, input.at, input.at)
+    this.commitState(state, previous)
+  }
+
+  onTurnCompleted(input: CodexTurnCompletedEvent): void {
+    const state = this.states.get(input.terminalId)
+    if (!state) return
+
+    const previous = this.toRecord(state)
+    state.lastSeenTaskCompletedAt = maxDefined(state.lastSeenTaskCompletedAt, input.at)
+    if (state.phase === 'pending' && state.pendingSubmitAt !== undefined) {
+      this.transitionPendingAfterTurnClear(state, input.at)
+    } else if (state.acceptedStartAt !== undefined) {
+      this.transitionAfterTurnClear(state, input.at)
+    } else if (state.latentAcceptedStartAt !== undefined) {
+      this.transitionAfterLatentTurnClear(state, input.at)
+    }
+    this.commitState(state, previous)
+    this.flushCompletions()
   }
 
   reconcileProjects(projects: ProjectGroup[], at: number): void {
@@ -296,6 +344,7 @@ export class CodexActivityTracker extends EventEmitter {
 
       this.commitState(state, previous)
     }
+    this.flushCompletions()
   }
 
   expire(at: number): void {
@@ -321,6 +370,7 @@ export class CodexActivityTracker extends EventEmitter {
   }
 
   private transitionAfterTurnClear(state: CodexTerminalActivity, at: number): void {
+    const turnKey = state.acceptedStartAt
     const hasQueuedSubmit = this.hasQueuedSubmit(state)
     state.lastClearedAt = at
     state.acceptedStartAt = undefined
@@ -333,13 +383,14 @@ export class CodexActivityTracker extends EventEmitter {
       state.pendingFreshnessAt = at
       state.pendingUntil = at + PENDING_SUBMIT_GATE_MS
       state.queuedSubmitAt = undefined
-      return
+    } else {
+      state.phase = 'idle'
+      state.pendingSubmitAt = undefined
+      state.pendingFreshnessAt = undefined
+      state.queuedSubmitAt = undefined
+      state.pendingUntil = undefined
     }
-    state.phase = 'idle'
-    state.pendingSubmitAt = undefined
-    state.pendingFreshnessAt = undefined
-    state.queuedSubmitAt = undefined
-    state.pendingUntil = undefined
+    this.recordCompletionIfIdle(state, turnKey, at)
   }
 
   private transitionAfterLatentTurnClear(state: CodexTerminalActivity, at: number): void {
@@ -359,6 +410,7 @@ export class CodexActivityTracker extends EventEmitter {
   }
 
   private transitionPendingAfterTurnClear(state: CodexTerminalActivity, at: number): void {
+    const turnKey = state.pendingSubmitAt
     state.latentAcceptedStartAt = undefined
     state.lastClearedAt = at
     state.updatedAt = at
@@ -369,13 +421,61 @@ export class CodexActivityTracker extends EventEmitter {
       state.pendingFreshnessAt = at
       state.pendingUntil = at + PENDING_SUBMIT_GATE_MS
       state.queuedSubmitAt = undefined
-      return
+    } else {
+      state.phase = 'idle'
+      state.pendingSubmitAt = undefined
+      state.pendingFreshnessAt = undefined
+      state.pendingUntil = undefined
+      state.queuedSubmitAt = undefined
     }
-    state.phase = 'idle'
-    state.pendingSubmitAt = undefined
-    state.pendingFreshnessAt = undefined
-    state.pendingUntil = undefined
-    state.queuedSubmitAt = undefined
+    this.recordCompletionIfIdle(state, turnKey, at)
+  }
+
+  /**
+   * Record a turn completion when (and only when) a real turn-end transition
+   * lands the terminal in `idle`. Re-arms to `pending` (a queued submit) are NOT
+   * turn ends, so they record nothing. Dedupe per turn via `lastEmittedTurnKey`
+   * so the live BEL, JSONL reconcile, and the app-server onTurnCompleted cannot
+   * double-fire for the same turn. Flushed (emitted) after commitState by the
+   * caller.
+   */
+  private recordCompletionIfIdle(state: CodexTerminalActivity, turnKey: number | undefined, at: number): void {
+    if (turnKey === undefined) return
+    if (state.phase !== 'idle') return
+    if (state.lastEmittedTurnKey === turnKey) return
+    state.lastEmittedTurnKey = turnKey
+    this.pendingCompletions.push(this.recordTurnCompletion({
+      terminalId: state.terminalId,
+      ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+      at,
+    }))
+  }
+
+  private flushCompletions(): void {
+    if (this.pendingCompletions.length === 0) return
+    const out = this.pendingCompletions
+    this.pendingCompletions = []
+    for (const completion of out) {
+      this.emit('turn.complete', completion)
+    }
+  }
+
+  private recordTurnCompletion(input: {
+    terminalId: string
+    sessionId?: string
+    at: number
+  }): CodexTurnCompleteEvent {
+    const completionSeq = (this.completionSeqByTerminalId.get(input.terminalId) ?? 0) + 1
+    this.completionSeqByTerminalId.set(input.terminalId, completionSeq)
+    this.latestCompletions.set(input.terminalId, {
+      terminalId: input.terminalId,
+      at: input.at,
+      completionSeq,
+    })
+    return {
+      ...input,
+      completionSeq,
+    }
   }
 
   private refreshExistingBinding(

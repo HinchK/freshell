@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events'
 import { z } from 'zod'
+import type { TerminalTurnCompletionSnapshot } from '../../shared/ws-protocol.js'
 import type { OpencodeServerEndpoint } from '../local-port.js'
 import { logger } from '../logger.js'
 import type { OpencodeRootResolution } from './providers/opencode.js'
@@ -18,6 +19,9 @@ export const OPENCODE_HEALTH_POLL_MS = 200
 export const OPENCODE_HEALTH_TIMEOUT_MS = 15_000
 export const OPENCODE_RECONNECT_BASE_MS = 250
 export const OPENCODE_RECONNECT_MAX_MS = 5_000
+export const OPENCODE_BUSY_DEADMAN_MS = 120_000
+export const OPENCODE_EVENT_READ_STALL_MS = 30_000
+export const OPENCODE_ACTIVITY_SWEEP_MS = 5_000
 
 export type OpencodeActivityPhase = 'busy'
 
@@ -26,6 +30,7 @@ export type OpencodeActivityRecord = {
   sessionId?: string
   phase: OpencodeActivityPhase
   updatedAt: number
+  lastObservedAt: number
 }
 
 export type OpencodeActivityChange = {
@@ -42,6 +47,7 @@ export type OpencodeTurnCompleteEvent = {
   terminalId: string
   sessionId: string
   at: number
+  completionSeq: number
 }
 
 const SessionIdleStatusSchema = z.object({
@@ -198,6 +204,8 @@ const defaultResolveOpencodeSessionRoots = async (
 
 export class OpencodeActivityTracker extends EventEmitter {
   private readonly records = new Map<string, OpencodeActivityRecord>()
+  private readonly completionSeqByTerminalId = new Map<string, number>()
+  private readonly latestCompletions = new Map<string, TerminalTurnCompletionSnapshot>()
   private readonly monitors = new Map<string, MonitorState>()
   private readonly childSessionIds = new Map<string, Set<string>>()
   private readonly sessionRootsByTerminal = new Map<string, Map<string, string>>()
@@ -244,6 +252,18 @@ export class OpencodeActivityTracker extends EventEmitter {
 
   getActivity(terminalId: string): OpencodeActivityRecord | undefined {
     return this.records.get(terminalId)
+  }
+
+  listLatestCompletions(): TerminalTurnCompletionSnapshot[] {
+    return Array.from(this.latestCompletions.values())
+  }
+
+  expire(at = this.now()): void {
+    for (const record of Array.from(this.records.values())) {
+      if (at - record.lastObservedAt > OPENCODE_BUSY_DEADMAN_MS) {
+        this.removeRecord(record.terminalId)
+      }
+    }
   }
 
   trackTerminal(input: { terminalId: string; endpoint: OpencodeServerEndpoint; sessionId?: string }): void {
@@ -403,17 +423,36 @@ export class OpencodeActivityTracker extends EventEmitter {
     let buffer = ''
     let connected = false
     const streamId = ++this.nextStreamId
+    let readStallTimer: ReturnType<typeof setTimeout> | undefined
+    let readStallPromise: Promise<never> = new Promise<never>(() => {})
+
+    const resetReadStallTimer = () => {
+      if (readStallTimer) {
+        this.clearTimeoutFn(readStallTimer)
+        readStallTimer = undefined
+      }
+      readStallPromise = new Promise<never>((_, reject) => {
+        readStallTimer = this.setTimeoutFn(() => {
+          readStallTimer = undefined
+          reject(new Error('OpenCode event stream stalled without data.'))
+        }, OPENCODE_EVENT_READ_STALL_MS)
+      })
+    }
+    resetReadStallTimer()
 
     try {
       while (true) {
         const result = await Promise.race([
           reader.read(),
           abortPromise,
+          readStallPromise,
         ])
 
         if (result.done) {
           return
         }
+
+        resetReadStallTimer()
 
         buffer += decoder.decode(result.value, { stream: true })
           .replace(/\r\n/g, '\n')
@@ -434,6 +473,9 @@ export class OpencodeActivityTracker extends EventEmitter {
         }
       }
     } finally {
+      if (readStallTimer) {
+        this.clearTimeoutFn(readStallTimer)
+      }
       try {
         await reader.cancel()
       } catch {
@@ -593,11 +635,11 @@ export class OpencodeActivityTracker extends EventEmitter {
         continue
       }
       if (action.kind === 'turnComplete') {
-        this.emit('turn.complete', {
+        this.emit('turn.complete', this.recordTurnCompletion({
           terminalId,
           sessionId: action.sessionId,
           at: action.at,
-        } satisfies OpencodeTurnCompleteEvent)
+        }))
         continue
       }
       if (action.kind === 'warnAmbiguous') {
@@ -606,6 +648,24 @@ export class OpencodeActivityTracker extends EventEmitter {
           sessionIds: action.sessionIds,
         }, 'OpenCode endpoint reported ambiguous session ownership; suppressing durable adoption.')
       }
+    }
+  }
+
+  private recordTurnCompletion(input: {
+    terminalId: string
+    sessionId: string
+    at: number
+  }): OpencodeTurnCompleteEvent {
+    const completionSeq = (this.completionSeqByTerminalId.get(input.terminalId) ?? 0) + 1
+    this.completionSeqByTerminalId.set(input.terminalId, completionSeq)
+    this.latestCompletions.set(input.terminalId, {
+      terminalId: input.terminalId,
+      at: input.at,
+      completionSeq,
+    })
+    return {
+      ...input,
+      completionSeq,
     }
   }
 
@@ -659,19 +719,24 @@ export class OpencodeActivityTracker extends EventEmitter {
     return `http://${endpoint.hostname}:${endpoint.port}${pathname}`
   }
 
-  private upsertRecord(record: OpencodeActivityRecord): void {
-    const previous = this.records.get(record.terminalId)
+  private upsertRecord(record: Omit<OpencodeActivityRecord, 'lastObservedAt'> & { lastObservedAt?: number }): void {
+    const nextRecord: OpencodeActivityRecord = {
+      ...record,
+      lastObservedAt: record.lastObservedAt ?? record.updatedAt,
+    }
+    const previous = this.records.get(nextRecord.terminalId)
     if (
       previous
-      && previous.sessionId === record.sessionId
-      && previous.phase === record.phase
-      && previous.updatedAt === record.updatedAt
+      && previous.sessionId === nextRecord.sessionId
+      && previous.phase === nextRecord.phase
+      && previous.updatedAt === nextRecord.updatedAt
+      && previous.lastObservedAt === nextRecord.lastObservedAt
     ) {
       return
     }
-    this.records.set(record.terminalId, record)
+    this.records.set(nextRecord.terminalId, nextRecord)
     this.emit('changed', {
-      upsert: [record],
+      upsert: [nextRecord],
       remove: [],
     } satisfies OpencodeActivityChange)
   }
