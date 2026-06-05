@@ -795,6 +795,12 @@ export default function App() {
         patchSessionRunningStateFromTerminalMeta,
         queueActiveSessionWindowRefresh: () => queueActiveSessionWindowRefresh() as any,
         fetchTerminalDirectoryWindow: (payload) => fetchTerminalDirectoryWindow(payload) as any,
+        onRefreshError: (error, source) => log.debug(
+          source === 'session-window'
+            ? 'active session window background refresh failed'
+            : 'terminal directory background refresh failed',
+          error,
+        ),
       })
 
       const unsubscribe = ws.onMessage((msg) => {
@@ -842,7 +848,9 @@ export default function App() {
           const rev = typeof msg.revision === 'number' ? msg.revision : -1
           if (rev > lastSessionsRevision) {
             lastSessionsRevision = rev
-            void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
+            // Fire-and-forget refresh: the thunk re-throws on failure, so contain the
+            // rejection rather than leak an unhandled rejection (matches the inventory site).
+            void appStore.dispatch(queueActiveSessionWindowRefresh() as any).catch((error: unknown) => log.debug('active session window refresh failed', error))
           }
         }
         if (msg.type === 'settings.updated') {
@@ -938,11 +946,13 @@ export default function App() {
             upsert: terminalMeta,
             remove: removedTerminalMetaIds,
           }))
+          // Fire-and-forget refreshes: the thunks re-throw on failure, so
+          // contain the rejection rather than leak an unhandled rejection.
           void appStore.dispatch(fetchTerminalDirectoryWindow({
             surface: 'sidebar',
             priority: 'visible',
-          }) as any)
-          void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
+          }) as any).catch((error: unknown) => log.debug('terminal directory background refresh failed', error))
+          void appStore.dispatch(queueActiveSessionWindowRefresh() as any).catch((error: unknown) => log.debug('active session window refresh failed', error))
         }
         if (msg.type === 'codex.activity.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
