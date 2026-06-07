@@ -76,10 +76,63 @@ class FakeRuntime {
   }
 }
 
+type FakeProxyOptions = {
+  upstreamWsUrl: string
+  requireCandidatePersistence?: boolean
+}
+
+class FakeProxy {
+  private static nextPort = 54000
+
+  closeCalls = 0
+  closeBlocker?: Promise<void>
+  closeError?: Error
+  readonly wsUrl: string
+  readonly upstreamWsUrl: string
+  readonly requireCandidatePersistence: boolean
+
+  constructor(options: FakeProxyOptions) {
+    this.upstreamWsUrl = options.upstreamWsUrl
+    this.requireCandidatePersistence = options.requireCandidatePersistence ?? true
+    this.wsUrl = `ws://127.0.0.1:${FakeProxy.nextPort++}`
+  }
+
+  async start() {
+    return { wsUrl: this.wsUrl }
+  }
+
+  async close() {
+    this.closeCalls += 1
+    await this.closeBlocker
+    if (this.closeError) throw this.closeError
+  }
+
+  markCandidatePersisted() {}
+  onCandidate() { return () => undefined }
+  onTurnStarted() { return () => undefined }
+  onTurnCompleted() { return () => undefined }
+  onRepairTrigger() { return () => undefined }
+  onThreadLifecycle() { return () => undefined }
+  onLifecycleLoss() { return () => undefined }
+}
+
+function createPlanner(
+  runtimeOrFactory: ConstructorParameters<typeof CodexLaunchPlanner>[0],
+  proxies: FakeProxy[] = [],
+) {
+  return new CodexLaunchPlanner(runtimeOrFactory, {
+    proxyFactory: (options: FakeProxyOptions) => {
+      const proxy = new FakeProxy(options)
+      proxies.push(proxy)
+      return proxy as any
+    },
+  })
+}
+
 describe('CodexLaunchPlanner', () => {
   it('creates a distinct owned sidecar for each launch plan', async () => {
     const runtimes: FakeRuntime[] = []
-    const planner = new CodexLaunchPlanner(() => {
+    const planner = createPlanner(() => {
       const index = runtimes.length + 1
       const runtime = new FakeRuntime(`ws://127.0.0.1:${43000 + index}`, `thread-${index}`)
       runtimes.push(runtime)
@@ -113,7 +166,7 @@ describe('CodexLaunchPlanner', () => {
   it('shuts down the owned sidecar when planning fails before adoption', async () => {
     const runtime = new FakeRuntime('ws://127.0.0.1:43010', 'thread-fail')
     runtime.ensureReadyError = new Error('start failed')
-    const planner = new CodexLaunchPlanner(() => runtime as any)
+    const planner = createPlanner(() => runtime as any)
 
     await expect(planner.planCreate({ cwd: '/repo/fail' })).rejects.toThrow('start failed')
 
@@ -124,7 +177,7 @@ describe('CodexLaunchPlanner', () => {
     const runtime = new FakeRuntime('ws://127.0.0.1:43022', 'thread-fail')
     runtime.ensureReadyError = new Error('start failed')
     runtime.shutdownError = new Error('verified runtime teardown failed')
-    const planner = new CodexLaunchPlanner(() => runtime as any)
+    const planner = createPlanner(() => runtime as any)
 
     let rejection: unknown
     try {
@@ -143,7 +196,7 @@ describe('CodexLaunchPlanner', () => {
     const adoptedRuntime = new FakeRuntime('ws://127.0.0.1:43011', 'thread-adopted')
     const pendingRuntime = new FakeRuntime('ws://127.0.0.1:43012', 'thread-pending')
     const runtimes = [adoptedRuntime, pendingRuntime]
-    const planner = new CodexLaunchPlanner(() => runtimes.shift()! as any)
+    const planner = createPlanner(() => runtimes.shift()! as any)
 
     const adopted = await planner.planCreate({ cwd: '/repo/adopted' })
     const pending = await planner.planCreate({ cwd: '/repo/pending' })
@@ -162,7 +215,7 @@ describe('CodexLaunchPlanner', () => {
   it('keeps a failed-adoption sidecar planner-owned so shutdown can clean it up', async () => {
     const runtime = new FakeRuntime('ws://127.0.0.1:43013', 'thread-adopt-fails')
     runtime.adoptError = new Error('no active owned Codex app-server sidecar')
-    const planner = new CodexLaunchPlanner(() => runtime as any)
+    const planner = createPlanner(() => runtime as any)
 
     const plan = await planner.planCreate({ cwd: '/repo/adopt-fails' })
     await expect(plan.sidecar.adopt({ terminalId: 'term-adopt-fails', generation: 1 }))
@@ -179,7 +232,7 @@ describe('CodexLaunchPlanner', () => {
     const firstRuntime = new FakeRuntime('ws://127.0.0.1:43014', 'thread-before-shutdown')
     firstRuntime.shutdownBlocker = shutdownGate.promise
     const runtimes = [firstRuntime]
-    const planner = new CodexLaunchPlanner(() => {
+    const planner = createPlanner(() => {
       const runtime = runtimes.shift()
       if (!runtime) throw new Error('unexpected runtime allocation')
       return runtime as any
@@ -201,7 +254,7 @@ describe('CodexLaunchPlanner', () => {
     const runtime = new FakeRuntime('ws://127.0.0.1:43018', 'thread-after-shutdown')
     const readinessGate = deferred()
     runtime.ensureReadyBlocker = readinessGate.promise
-    const planner = new CodexLaunchPlanner(() => runtime as any)
+    const planner = createPlanner(() => runtime as any)
 
     const plan = planner.planCreate({ cwd: '/repo/in-flight' })
     await vi.waitFor(() => expect(runtime.ensureReadyCalls).toBe(1))
@@ -220,7 +273,7 @@ describe('CodexLaunchPlanner', () => {
     const runtime = new FakeRuntime('ws://127.0.0.1:43019', 'thread-adopt-after-shutdown')
     const shutdownGate = deferred()
     runtime.shutdownBlocker = shutdownGate.promise
-    const planner = new CodexLaunchPlanner(() => runtime as any)
+    const planner = createPlanner(() => runtime as any)
 
     const plan = await planner.planCreate({ cwd: '/repo/adopt-after-shutdown' })
     const shutdown = planner.shutdown()
@@ -234,10 +287,30 @@ describe('CodexLaunchPlanner', () => {
     await shutdown
   })
 
+  it('starts runtime teardown even when proxy close is still pending', async () => {
+    const runtime = new FakeRuntime('ws://127.0.0.1:43025', 'thread-slow-proxy-close')
+    const proxyCloseGate = deferred()
+    const proxies: FakeProxy[] = []
+    const planner = createPlanner(() => runtime as any, proxies)
+
+    const plan = await planner.planCreate({ cwd: '/repo/slow-proxy-close' })
+    proxies[0].closeBlocker = proxyCloseGate.promise
+
+    const shutdown = planner.shutdown()
+
+    await vi.waitFor(() => expect(proxies[0].closeCalls).toBe(1))
+    await vi.waitFor(() => expect(runtime.shutdownCalls).toBe(1))
+    await expect(plan.sidecar.adopt({ terminalId: 'term-slow-proxy-close', generation: 1 }))
+      .rejects.toThrow(/shutting down/i)
+
+    proxyCloseGate.resolve()
+    await shutdown
+  })
+
   it('keeps failed unadopted sidecar teardown planner-owned and joinable by planner shutdown', async () => {
     const runtime = new FakeRuntime('ws://127.0.0.1:43015', 'thread-teardown-fails')
     runtime.shutdownError = new Error('verified runtime teardown failed')
-    const planner = new CodexLaunchPlanner(() => runtime as any)
+    const planner = createPlanner(() => runtime as any)
 
     const plan = await planner.planCreate({ cwd: '/repo/unadopted' })
 
@@ -249,7 +322,7 @@ describe('CodexLaunchPlanner', () => {
   it('retries a failed planner-owned sidecar teardown on a later shutdown join', async () => {
     const runtime = new FakeRuntime('ws://127.0.0.1:43023', 'thread-teardown-retry')
     runtime.shutdownError = new Error('transient metadata cleanup failure')
-    const planner = new CodexLaunchPlanner(() => runtime as any)
+    const planner = createPlanner(() => runtime as any)
 
     const plan = await planner.planCreate({ cwd: '/repo/unadopted-retry' })
 
@@ -264,7 +337,7 @@ describe('CodexLaunchPlanner', () => {
 
   it('blocks new plans behind a failed planner-owned sidecar teardown until retry succeeds', async () => {
     const runtimes: FakeRuntime[] = []
-    const planner = new CodexLaunchPlanner(() => {
+    const planner = createPlanner(() => {
       const index = runtimes.length + 1
       const runtime = new FakeRuntime(`ws://127.0.0.1:${43030 + index}`, `thread-${index}`)
       runtimes.push(runtime)
@@ -298,7 +371,7 @@ describe('CodexLaunchPlanner', () => {
     const slowShutdown = deferred()
     secondRuntime.shutdownBlocker = slowShutdown.promise
     const runtimes = [firstRuntime, secondRuntime]
-    const planner = new CodexLaunchPlanner(() => runtimes.shift()! as any)
+    const planner = createPlanner(() => runtimes.shift()! as any)
 
     await planner.planCreate({ cwd: '/repo/fast-fails' })
     await planner.planCreate({ cwd: '/repo/slow-shutdown' })
@@ -326,7 +399,7 @@ describe('CodexLaunchPlanner', () => {
       undefined,
       [[], ['other-thread'], ['thread-ready']],
     )
-    const planner = new CodexLaunchPlanner(() => runtime as any)
+    const planner = createPlanner(() => runtime as any)
 
     const plan = await planner.planCreate({ resumeSessionId: 'thread-ready' })
 
@@ -336,7 +409,7 @@ describe('CodexLaunchPlanner', () => {
 
   it('passes resume cwd to sidecar readiness', async () => {
     const runtime = new FakeRuntime('ws://127.0.0.1:43024', 'thread-ready', undefined, [['thread-ready']])
-    const planner = new CodexLaunchPlanner(() => runtime as any)
+    const planner = createPlanner(() => runtime as any)
 
     await planner.planCreate({ resumeSessionId: 'thread-ready', cwd: '/repo/resume' })
 

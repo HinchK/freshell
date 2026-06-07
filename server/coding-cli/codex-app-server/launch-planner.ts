@@ -63,6 +63,28 @@ type PlanCreateInput = {
   approvalPolicy?: string
 }
 
+type CodexLaunchProxyOptions = {
+  upstreamWsUrl: string
+  requireCandidatePersistence?: boolean
+}
+
+type CodexLaunchProxy = Pick<
+  CodexRemoteProxy,
+  | 'start'
+  | 'close'
+  | 'markCandidatePersisted'
+  | 'onCandidate'
+  | 'onTurnStarted'
+  | 'onTurnCompleted'
+  | 'onRepairTrigger'
+  | 'onThreadLifecycle'
+  | 'onLifecycleLoss'
+>
+
+type CodexLaunchPlannerOptions = {
+  proxyFactory?: (options: CodexLaunchProxyOptions) => CodexLaunchProxy
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
@@ -82,13 +104,18 @@ export class CodexLaunchPlanner {
   private readonly activeSidecars = new Set<CodexLaunchSidecar>()
   private readonly failedSidecarShutdowns = new Set<CodexLaunchSidecar>()
   private readonly runtimeFactory: () => CodexRuntimeLike
+  private readonly proxyFactory: (options: CodexLaunchProxyOptions) => CodexLaunchProxy
   private shutdownStarted = false
   private shutdownPromise: Promise<void> | null = null
 
-  constructor(runtimeOrFactory: CodexRuntimeLike | (() => CodexRuntimeLike)) {
+  constructor(
+    runtimeOrFactory: CodexRuntimeLike | (() => CodexRuntimeLike),
+    options: CodexLaunchPlannerOptions = {},
+  ) {
     this.runtimeFactory = typeof runtimeOrFactory === 'function'
       ? runtimeOrFactory
       : () => runtimeOrFactory
+    this.proxyFactory = options.proxyFactory ?? ((proxyOptions) => new CodexRemoteProxy(proxyOptions))
   }
 
   async planCreate(input: PlanCreateInput): Promise<CodexLaunchPlan> {
@@ -97,14 +124,14 @@ export class CodexLaunchPlanner {
     this.assertAcceptingPlans()
 
     const runtime = this.runtimeFactory()
-    let proxy: CodexRemoteProxy | undefined
+    let proxy: CodexLaunchProxy | undefined
     const sidecar = this.createSidecar(runtime, () => proxy)
     this.activeSidecars.add(sidecar)
 
     try {
       if (input.resumeSessionId) {
         const ready = await runtime.ensureReady(input.cwd)
-        proxy = new CodexRemoteProxy({
+        proxy = this.proxyFactory({
           upstreamWsUrl: ready.wsUrl,
           requireCandidatePersistence: false,
         })
@@ -120,7 +147,7 @@ export class CodexLaunchPlanner {
       }
 
       const ready = await runtime.ensureReady(input.cwd)
-      proxy = new CodexRemoteProxy({ upstreamWsUrl: ready.wsUrl })
+      proxy = this.proxyFactory({ upstreamWsUrl: ready.wsUrl })
       const proxyReady = await proxy.start()
       this.assertAcceptingPlans()
 
@@ -187,14 +214,10 @@ export class CodexLaunchPlanner {
     }
   }
 
-  private createSidecar(runtime: CodexRuntimeLike, getProxy: () => CodexRemoteProxy | undefined): CodexLaunchSidecar {
+  private createSidecar(runtime: CodexRuntimeLike, getProxy: () => CodexLaunchProxy | undefined): CodexLaunchSidecar {
     let shutdownPromise: Promise<void> | null = null
     let shutdownAttemptStarted = false
     let shutdownSucceeded = false
-    let notifyShutdownStarted!: () => void
-    const shutdownStarted = new Promise<void>((resolve) => {
-      notifyShutdownStarted = resolve
-    })
     const assertAdoptable = () => {
       if (this.shutdownStarted || shutdownAttemptStarted) {
         throw new Error('Codex launch sidecar is shutting down; it cannot be adopted.')
@@ -255,12 +278,14 @@ export class CodexLaunchPlanner {
         }
         if (!shutdownAttemptStarted) {
           shutdownAttemptStarted = true
-          notifyShutdownStarted()
         }
         const attempt = Promise.resolve()
-          .then(async () => {
-            await getProxy()?.close()
-            await runtime.shutdown()
+          .then(() => {
+            const proxy = getProxy()
+            return waitForAllSettledOrThrow([
+              ...(proxy ? [proxy.close()] : []),
+              runtime.shutdown(),
+            ], 'Codex launch sidecar shutdown failed.')
           })
           .then(() => {
             shutdownSucceeded = true
