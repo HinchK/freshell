@@ -81,6 +81,21 @@ The revised plan was load-bearing checked again. These additional facts change t
 - Existing visible-first audit metrics do not yet capture replay message count, serialized replay bytes, parser-applied lag, gaps, full-hydrate fallback, or stale-generation rejection. Observability work must create those metrics before the browser audit can be acceptance evidence.
 - xterm probes validate the installed 6.0.0 package, not the whole `^6.0.0` dependency range. Pin xterm exactly or add CI probes that run against every allowed resolved version.
 
+### Third Load-Bearing Pass Results
+
+Fresh Eyes and a third load-bearing pass found these additional constraints:
+
+- xterm `dispose()` does not cancel pending `write` callbacks in installed `@xterm/xterm@6.0.0`. Runtime probes showed post-dispose write callbacks after both small and large writes; surface replacement is safe only when every write callback and async parser continuation checks terminal-instance and attach-generation fences before mutating state.
+- Serial callback-chained xterm writes are acceptable on the tested desktop Chromium surface. A 50,000-write, 3.25 MB benchmark completed in 267 ms with fast first render and low callback latency, so one submitted write per terminal surface remains viable for live output on that class of machine. Replay should still coalesce; a single giant write hurt first-render latency.
+- Side-effect gating by a named allow list was incomplete. Write callbacks that persist/advance checkpoints or complete attaches, link/action callbacks, local terminal notices, parser callbacks, clipboard writes, title updates, startup replies, request-mode replies, and turn-complete mutations all belong under a deny-by-default side-effect adapter.
+- Local `term.writeln` notices are real today and are not currently tied to surface invalidation. The plan now requires out-of-band React notices where possible, or explicit surface invalidation before any future warm delta replay.
+- `streamId` cannot be a loose optional field. It must be a server-owned output-stream identity that changes on new PTY/session stream, Codex PTY recovery replacement under the same `terminalId`, incompatible retention loss, and server restart without compatible persisted retention.
+- Checkpoint compatibility needs geometry authority/history, scrollback, and xterm version in addition to terminal/server/stream/surface identity. Multi-client resize with unknown authority must reject warm delta replay unless the server provides compatible geometry history.
+- Replay windows cannot reconstruct stream-stateful barrier scanner state from arbitrary prefixes. Retained frames must store barrier classification and scanner state snapshots at ingestion time.
+- Broker output is centralized for current browser attach paths, but broker direct `ws.send(JSON.stringify(...))` lacks the handler send callback, large-payload instrumentation, and shared payload limits. Terminal broker sends must use a shared WebSocket sender.
+- Batch protocol and capability negotiation do not exist today, and legacy `terminal.output` lacks source/stream/segment metadata. Legacy fallback is safe only as individual modern `terminal.output` frames with `seqStart`, `seqEnd`, `attachRequestId`, and segment `data`; it must not use the old registry direct-output shape.
+- Full Chrome background/freeze behavior remains inconclusive. Chrome may suspend freezable task queues, so the plan now requires a CDP `Page.setWebLifecycleState({ state: 'frozen' })` probe and retention budget acceptance before claiming browser-background safety.
+
 ## Design Summary
 
 ### New Safety Vocabulary
@@ -99,6 +114,9 @@ type TerminalSurfaceCheckpoint = {
   cols: number
   rows: number
   geometryEpoch: number
+  geometryAuthority: 'single_client' | 'server_stream' | 'multi_client_unknown'
+  scrollback: number
+  xtermVersion: string
   bufferType: 'normal' | 'alternate' | 'unknown'
   parserIdle: boolean
 }
@@ -118,10 +136,10 @@ Rules:
 - `knownLostRanges` and `highestObservedSeq` never make a surface safe. They are loss accounting and replay bookkeeping only.
 - `replayRequestSeq` is derived from safe parser-applied state. It must not jump over a gap that xterm did not parse.
 - UI may wait one visible `requestAnimationFrame` before clearing "recovering" state, but protocol safety must not depend on paint.
-- A warm delta replay is valid only when terminal id, stream id, server identity, surface epoch, geometry, and attach generation remain compatible.
-- Retained replay from `sinceSeq=0` is a replay hydrate, not a universal full hydrate. It is trusted only when replay covers a compatible geometry history. Otherwise the surface is recreated and marked untrusted until a compatible snapshot/replay path exists.
+- A warm delta replay is valid only when terminal id, stream id, server identity, surface epoch, geometry, geometry authority, scrollback, xterm version, parser state, and attach generation remain compatible.
+- Retained replay from `sinceSeq=0` is a replay hydrate, not a universal full hydrate. It is trusted only when replay covers a compatible geometry history. Otherwise the old surface is quarantined or replaced; the client must not continue live I/O on a parser whose state was rebuilt from an untrusted hydrate.
 - Explicit refresh, terminal replacement, unsafe geometry change, scrollback-setting change, parser-unsafe gap, stale persisted checkpoint, and stale in-flight writes use drain-then-hydrate, fresh-surface, quarantined-loss, or future snapshot paths. They must not advance a safe replay cursor.
-- Local client writes such as gap notices and status banners invalidate the terminal surface for warm delta replay unless they are written to an out-of-band overlay instead of xterm.
+- Local client notices such as gaps, reconnecting, launch errors, blocked input, and status banners should be rendered out-of-band in React UI rather than written into xterm. Any remaining local `term.write`/`term.writeln` path must bump `surfaceEpoch`, mark the surface local-mutated, and make the checkpoint ineligible for warm delta replay.
 
 ### Server Batching Rules
 
@@ -171,6 +189,7 @@ type TerminalOutputBatch = {
     seqStart: number
     seqEnd: number
     endOffset: number
+    data?: string
     rawFrameCount: number
     barrier?: 'control' | 'startup_probe' | 'osc52' | 'request_mode' | 'turn_complete' | 'gap' | 'geometry'
   }>
@@ -178,6 +197,8 @@ type TerminalOutputBatch = {
 ```
 
 For this plan, `streamId` is server-owned output-stream identity. It is minted when a terminal output stream is created, remains stable across attach/detach/replay for that stream, and changes when the server replaces the stream identity, loses retention across restart, or intentionally starts a new PTY/session stream. Until the server supplies a non-null `streamId`, persisted checkpoints that depend on stream replacement safety must be treated as incompatible rather than silently trusted.
+
+`segments[].endOffset` is a UTF-16 code-unit offset into the batch `data` string, matching JavaScript `String.prototype.slice` semantics. It must always fall on a code-point boundary; the batch builder must test emoji/surrogate-pair segment boundaries. If that contract becomes too fragile during implementation, replace offsets with required per-segment `data` and drop top-level slicing rather than leaving offset units implicit.
 
 Legacy clients that do not advertise `terminalOutputBatchV1` continue to receive compatible `terminal.output` messages, but the fallback must serialize safe batch segments as individual legacy frames. It must not flatten an arbitrary multi-segment batch into one `terminal.output` if that batch crosses replay/live source, parser-barrier, stream-id, attach-id, or budget boundaries. Server-to-client runtime validation is not currently present; if this work adds it, create the schema explicitly and test it as a new behavior.
 
@@ -195,7 +216,7 @@ type TerminalOutputSideEffectContext = {
 }
 ```
 
-Replay context suppresses external side effects such as clipboard prompts, request-mode replies, title updates, and client-minted turn-complete notifications. Because xterm write parsing is asynchronous, context must be terminal-instance scoped and remain associated with the submitted write until its xterm write callback fires. The write queue must allow at most one submitted xterm write per terminal surface unless it can prove parser callbacks are unambiguous for all in-flight writes.
+Replay context suppresses external side effects such as clipboard prompts, request-mode replies, title updates, and client-minted turn-complete notifications. Because xterm write parsing is asynchronous, context must be terminal-instance scoped and remain associated with the submitted write until its xterm write callback fires. The write queue must allow at most one submitted xterm write per terminal surface unless it can prove parser callbacks are unambiguous for all in-flight writes. Parser callbacks and local terminal notices use a deny-by-default side-effect adapter: any new xterm parser callback, browser side effect, Redux mutation, PTY reply, clipboard action, or local xterm write must declare an effect type and be explicitly allowed for the active terminal-instance write scope.
 
 ## File Structure
 
@@ -213,7 +234,7 @@ Replay context suppresses external side effects such as clipboard prompts, reque
   - Define `TerminalSurfaceCheckpoint`.
   - Validate whether an existing xterm surface can be used for delta replay.
   - Name semantics as parser-applied, not rendered.
-  - Include stream/server identity so persisted checkpoints cannot survive incompatible server restarts or stream replacements.
+  - Include stream/server identity, geometry authority, scrollback, and xterm version so persisted checkpoints cannot survive incompatible server restarts, stream replacements, resize history, scrollback changes, or xterm upgrades.
 
 - Modify `src/lib/terminal-attach-policy.ts`
   - Take a checkpoint instead of a bare rendered sequence.
@@ -230,11 +251,16 @@ Replay context suppresses external side effects such as clipboard prompts, reque
 
 - Modify `src/components/TerminalView.tsx`
   - Rename rendered high-water state to parser-applied high-water.
-  - Track `surfaceEpoch`, `streamId`, geometry, and attach generation.
+  - Track `surfaceEpoch`, `streamId`, geometry, geometry authority, scrollback, xterm version, and attach generation.
   - Pass generation metadata into write queue.
   - Drain submitted writes before same-surface clear/replay hydrate, or replace the xterm surface and fence callbacks by terminal-instance token.
   - Associate replay/live write context with the submitted xterm write until its callback fires, not only while `term.write` is on the JavaScript stack.
-  - Treat local xterm writes for gap/status notices as surface-invalidating unless they move to an out-of-band overlay.
+  - Move local gap/status/error notices to an out-of-band React overlay where possible; any remaining local xterm write invalidates the surface for warm delta replay.
+
+- Create `src/lib/terminal-output-side-effects.ts`
+  - Centralize terminal-output side-effect decisions.
+  - Deny by default for replay or unknown write scope.
+  - Require every xterm parser callback, xterm write callback that advances checkpoint/attach state, clipboard write, PTY reply, title update, turn-complete mutation, startup reply, link/action callback, and local xterm notice write to declare an effect type before it can run.
 
 - Modify `src/components/terminal/request-mode-bypass.ts`
   - Consult terminal-instance write scope before sending request-mode replies.
@@ -261,7 +287,8 @@ Replay context suppresses external side effects such as clipboard prompts, reque
   - Unsafe stale in-flight write forces drain-or-surface-replace behavior.
   - Same-surface hydrate waits for xterm write drain; non-draining stale writes replace the xterm surface and bump `surfaceEpoch`.
   - Parser-unsafe output gaps quarantine or replace the surface instead of continuing to write later output into a desynchronized parser.
-  - Replay request-mode replies, OSC52 writes, and title updates are suppressed.
+  - Replay request-mode replies, OSC52 writes, title updates, stale write-callback checkpoint updates, and attach-completion mutations are suppressed.
+  - Link/action callbacks are token-fenced to the current terminal surface or explicitly declared outside replay gating.
 
 ### Server
 
@@ -269,6 +296,11 @@ Replay context suppresses external side effects such as clipboard prompts, reque
   - Track stream-stateful parser barrier state across raw chunks and fragments.
   - Conservative first version treats ESC, BEL, C1, OSC, CSI, DCS, APC, replacement characters, startup-probe spans, request-mode spans, and most control spans as barriers.
   - Expose whether the scanner is in ground state so batches only coalesce spans that start and end safely.
+
+- Create `server/terminal-stream/stream-identity.ts`
+  - Mint and store server-owned `streamId` values for terminal output streams.
+  - Change `streamId` on new PTY/session stream, Codex PTY recovery replacement, incompatible retention loss, and server restart without compatible persisted retention.
+  - Keep `streamId` stable across attach/detach for the same output stream.
 
 - Create `server/terminal-stream/serialized-budget.ts`
   - Compute exact serialized application JSON payload byte size using the same payload shape passed to `ws.send`.
@@ -283,18 +315,25 @@ Replay context suppresses external side effects such as clipboard prompts, reque
 - Create `server/terminal-stream/replay-deque.ts`
   - Replace many-frame replay retention with a deque or indexed ring that does not evict with `Array.shift()`.
   - Retain byte and frame counts.
+  - Retain per-frame barrier metadata and scanner state before/after the frame so arbitrary `sinceSeq` replay windows do not reconstruct stream-stateful parser state from the wrong prefix.
   - Support efficient bounded replay reads.
 
 - Modify `server/terminal-stream/replay-ring.ts`
   - Either wrap `ReplayDeque` for compatibility or migrate callers to the new deque.
   - Assign distinct sequence ranges after fragmentation.
   - Keep gap semantics.
+  - Attach stream identity and barrier metadata to retained frames.
 
 - Create `server/terminal-stream/output-batch.ts`
   - Build batches from replay or live frames.
   - Preserve segment metadata.
   - Enforce serialized payload budget.
   - Stop at barriers.
+  - Treat `segments[].endOffset` as a UTF-16 code-unit offset and prove offsets land on code-point boundaries, or switch to required per-segment `data`.
+
+- Create `server/ws-send.ts`
+  - Own JSON serialization, serialized application byte measurement, `ws.send`, `bufferedAmount` reads, send callback accounting, structured send/backpressure logs, and closed-socket handling.
+  - Export a shared sender used by both `server/ws-handler.ts` and `server/terminal-stream/broker.ts`.
 
 - Modify `server/terminal-stream/client-output-queue.ts`
   - Use the same batch builder for live queued output.
@@ -305,6 +344,7 @@ Replay context suppresses external side effects such as clipboard prompts, reque
   - Pace foreground sends before creating avoidable buffered backpressure.
   - Keep background pause and catastrophic protection.
   - Preserve the synchronous attach critical section; do not add `await` between attach reset, replay snapshot, staging drain, and `mode = 'live'`.
+  - Use the shared WebSocket sender instead of calling `ws.send` directly.
   - Emit structured JSONL logs for replay, batching, gaps, and pressure.
 
 - Modify `shared/ws-protocol.ts`
@@ -318,6 +358,7 @@ Replay context suppresses external side effects such as clipboard prompts, reque
   - ESC/BEL/OSC/DCS/CSI/APC/control spans stop batches.
   - Split `ESC [`, OSC, DCS, APC, and startup-probe spans remain barriers until the terminating state is observed.
   - Replacement characters from lossy PTY decoding are barriers.
+  - Scanner state snapshots before and after a frame can be stored with replay retention and later used without mutating the live scanner.
 
 - Test `test/unit/server/terminal-stream/serialized-budget.test.ts`
   - Escape-heavy data stays within serialized byte budget.
@@ -332,6 +373,7 @@ Replay context suppresses external side effects such as clipboard prompts, reque
   - Batch builder preserves contiguous seq ranges, segment metadata, attach id, source, and budget.
   - Batch builder never emits multiple same-seq chunks for one frame.
   - Batch builder never combines frames unless the scanner starts and ends in ground state.
+  - Batch segment `endOffset` values are UTF-16 code-unit offsets and never point into the middle of a surrogate pair.
 
 - Update `test/unit/server/ws-handler-backpressure.test.ts`
   - Foreground replay pauses/yields before avoidable buffered growth.
@@ -518,6 +560,9 @@ describe('terminal surface checkpoint', () => {
       cols: 120,
       rows: 40,
       geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
       bufferType: 'normal',
       parserIdle: true,
     })
@@ -530,8 +575,11 @@ describe('terminal surface checkpoint', () => {
       cols: 120,
       rows: 40,
       geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
       requireParserIdle: true,
-    })).toEqual({ ok: true, sinceSeq: 42 })
+    })).toMatchObject({ ok: true, sinceSeq: 42 })
   })
 
   it('rejects a checkpoint after geometry changes', () => {
@@ -545,6 +593,9 @@ describe('terminal surface checkpoint', () => {
       cols: 120,
       rows: 40,
       geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
       bufferType: 'normal',
       parserIdle: true,
     })
@@ -557,8 +608,11 @@ describe('terminal surface checkpoint', () => {
       cols: 100,
       rows: 40,
       geometryEpoch: 4,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
       requireParserIdle: true,
-    })).toEqual({ ok: false, reason: 'geometry_changed' })
+    })).toMatchObject({ ok: false, reason: 'geometry_changed' })
   })
 
   it('rejects a checkpoint while parser work is still in flight', () => {
@@ -572,6 +626,9 @@ describe('terminal surface checkpoint', () => {
       cols: 120,
       rows: 40,
       geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
       bufferType: 'normal',
       parserIdle: false,
     })
@@ -584,8 +641,11 @@ describe('terminal surface checkpoint', () => {
       cols: 120,
       rows: 40,
       geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
       requireParserIdle: true,
-    })).toEqual({ ok: false, reason: 'parser_busy' })
+    })).toMatchObject({ ok: false, reason: 'parser_busy' })
   })
 
   it('rejects a checkpoint from a different server instance', () => {
@@ -599,6 +659,9 @@ describe('terminal surface checkpoint', () => {
       cols: 120,
       rows: 40,
       geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
       bufferType: 'normal',
       parserIdle: true,
     })
@@ -611,8 +674,11 @@ describe('terminal surface checkpoint', () => {
       cols: 120,
       rows: 40,
       geometryEpoch: 3,
+      geometryAuthority: 'single_client',
+      scrollback: 5000,
+      xtermVersion: '6.0.0',
       requireParserIdle: true,
-    })).toEqual({ ok: false, reason: 'server_changed' })
+    })).toMatchObject({ ok: false, reason: 'server_changed' })
   })
 })
 ```
@@ -633,6 +699,7 @@ Create `src/lib/terminal-surface-checkpoint.ts`:
 
 ```ts
 export type TerminalBufferType = 'normal' | 'alternate' | 'unknown'
+export type TerminalGeometryAuthority = 'single_client' | 'server_stream' | 'multi_client_unknown'
 
 export type TerminalSurfaceCheckpoint = {
   terminalId: string
@@ -645,6 +712,9 @@ export type TerminalSurfaceCheckpoint = {
   cols: number
   rows: number
   geometryEpoch: number
+  geometryAuthority: TerminalGeometryAuthority
+  scrollback: number
+  xtermVersion: string
   bufferType: TerminalBufferType
   parserIdle: boolean
 }
@@ -658,6 +728,9 @@ export type CheckpointDeltaReplayInput = {
   cols: number
   rows: number
   geometryEpoch: number
+  geometryAuthority: TerminalGeometryAuthority
+  scrollback: number
+  xtermVersion: string
   requireParserIdle: boolean
 }
 
@@ -672,6 +745,9 @@ export type CheckpointDeltaReplayDecision =
         | 'server_changed'
         | 'surface_changed'
         | 'geometry_changed'
+        | 'geometry_authority_unknown'
+        | 'scrollback_changed'
+        | 'xterm_version_changed'
         | 'parser_busy'
         | 'no_applied_sequence'
     }
@@ -690,6 +766,7 @@ export function createTerminalSurfaceCheckpoint(
     cols: normalizePositiveInteger(input.cols),
     rows: normalizePositiveInteger(input.rows),
     geometryEpoch: normalizePositiveInteger(input.geometryEpoch),
+    scrollback: normalizePositiveInteger(input.scrollback),
   }
 }
 
@@ -712,6 +789,14 @@ export function canUseCheckpointForDeltaReplay(
   ) {
     return { ok: false, reason: 'geometry_changed' }
   }
+  if (
+    checkpoint.geometryAuthority !== input.geometryAuthority
+    || checkpoint.geometryAuthority === 'multi_client_unknown'
+  ) {
+    return { ok: false, reason: 'geometry_authority_unknown' }
+  }
+  if (checkpoint.scrollback !== input.scrollback) return { ok: false, reason: 'scrollback_changed' }
+  if (checkpoint.xtermVersion !== input.xtermVersion) return { ok: false, reason: 'xterm_version_changed' }
   if (input.requireParserIdle && !checkpoint.parserIdle) return { ok: false, reason: 'parser_busy' }
   if (checkpoint.parserAppliedSeq <= 0) return { ok: false, reason: 'no_applied_sequence' }
   return { ok: true, sinceSeq: checkpoint.parserAppliedSeq }
@@ -734,6 +819,9 @@ it('does not load a persisted checkpoint for a different server instance', () =>
     cols: 80,
     rows: 24,
     geometryEpoch: 1,
+    geometryAuthority: 'single_client',
+    scrollback: 5000,
+    xtermVersion: '6.0.0',
     bufferType: 'normal',
     parserIdle: true,
   })
@@ -781,7 +869,7 @@ it('falls back to viewport hydrate when the parser-applied checkpoint is unsafe'
     pendingIntent: 'viewport_hydrate',
     pendingReason: 'hidden_reveal',
     checkpointDecision: { ok: false, reason: 'geometry_changed' },
-  })).toEqual({
+  })).toMatchObject({
     intent: 'viewport_hydrate',
     clearViewportFirst: true,
     priority: 'foreground',
@@ -798,7 +886,7 @@ it('does not treat replay from zero as trusted full hydrate without compatible g
     pendingReason: 'hidden_reveal',
     checkpointDecision: { ok: false, reason: 'geometry_changed' },
     replayHydrateCoversCompatibleGeometryHistory: false,
-  })).toEqual({
+  })).toMatchObject({
     intent: 'viewport_hydrate',
     clearViewportFirst: true,
     priority: 'foreground',
@@ -943,6 +1031,9 @@ const markParserAppliedSeq = useCallback((terminalId: string | undefined, seq: n
   cols: number
   rows: number
   geometryEpoch: number
+  geometryAuthority: TerminalGeometryAuthority
+  scrollback: number
+  xtermVersion: string
 }) => {
   if (!terminalId || !Number.isFinite(seq)) return
   const parserAppliedSeq = Math.max(0, Math.floor(seq))
@@ -958,6 +1049,9 @@ const markParserAppliedSeq = useCallback((terminalId: string | undefined, seq: n
     cols: context.cols,
     rows: context.rows,
     geometryEpoch: context.geometryEpoch,
+    geometryAuthority: context.geometryAuthority,
+    scrollback: context.scrollback,
+    xtermVersion: context.xtermVersion,
     bufferType: currentBufferTypeRef.current ?? 'unknown',
     parserIdle: !writeQueueRef.current?.hasInFlightWrites(context.attachRequestId),
   })
@@ -1029,7 +1123,9 @@ git commit -m "Fence terminal catch-up by attach generation"
 
 **Files:**
 - Create: `src/lib/terminal-output-write-scope.ts`
+- Create: `src/lib/terminal-output-side-effects.ts`
 - Create: `test/unit/client/lib/terminal-output-write-scope.test.ts`
+- Create: `test/unit/client/lib/terminal-output-side-effects.test.ts`
 - Modify: `src/components/TerminalView.tsx`
 - Modify: `src/components/terminal/terminal-write-queue.ts`
 - Modify: `src/components/terminal/request-mode-bypass.ts`
@@ -1093,6 +1189,9 @@ Add focused regression tests in existing suites:
 - `request-mode-bypass` does not call `sendInput` while the terminal instance's submitted write scope is replay.
 - OSC52 policy `always` does not write to the clipboard while the terminal instance's submitted write scope is replay.
 - `TerminalView` ignores or defers xterm title callbacks fired during replay-scope writes.
+- xterm write callbacks from stale or replay-suppressed scope do not advance parser-applied checkpoints, persist cursors, or complete attaches.
+- local notices are rendered out-of-band or explicitly mark the terminal surface incompatible for warm delta replay.
+- link/action callbacks are fenced to the current terminal-instance token or declared outside replay parsing.
 - Startup probes and client-minted turn-complete signals are still allowed for live output and suppressed for replay output.
 
 - [ ] **Step 2: Run failing scope and side-effect tests**
@@ -1100,7 +1199,7 @@ Add focused regression tests in existing suites:
 Run:
 
 ```bash
-timeout 180s npm run test:vitest -- --run test/unit/client/lib/terminal-output-write-scope.test.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/shared/turn-complete-signal.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
+timeout 180s npm run test:vitest -- --run test/unit/client/lib/terminal-output-write-scope.test.ts test/unit/client/lib/terminal-output-side-effects.test.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/shared/turn-complete-signal.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
 ```
 
 Expected: fail because submitted-write scope does not exist and replay parser callbacks are not guarded.
@@ -1119,6 +1218,12 @@ export type TerminalOutputSideEffect =
   | 'request_mode_reply'
   | 'title_update'
   | 'turn_complete'
+  | 'parser_applied_checkpoint'
+  | 'attach_completion'
+  | 'cursor_persist'
+  | 'link_action'
+  | 'terminal_action'
+  | 'local_xterm_notice'
 
 export type TerminalOutputWriteContext = {
   terminalInstanceId: string
@@ -1154,7 +1259,7 @@ export function beginTerminalOutputWriteScope(
 }
 ```
 
-Also export `shouldAllowTerminalOutputSideEffect(input)` from this file or a sibling policy module. Replay suppresses all external side effects. Live output still follows existing mode-specific rules, including server-authoritative turn-complete for Claude and Codex.
+Create `src/lib/terminal-output-side-effects.ts` and export `shouldAllowTerminalOutputSideEffect(input)` from there. Replay or unknown scope suppresses all external side effects by default. Live output still follows existing mode-specific rules, including server-authoritative turn-complete for Claude and Codex. New side effects must fail closed until tests explicitly allow them for live/current-surface scope.
 
 - [ ] **Step 4: Make xterm writes serial per terminal surface**
 
@@ -1205,17 +1310,20 @@ Expected: pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/lib/terminal-output-write-scope.ts test/unit/client/lib/terminal-output-write-scope.test.ts src/components/terminal/terminal-write-queue.ts test/unit/client/components/terminal/terminal-write-queue.test.ts src/components/TerminalView.tsx src/components/terminal/request-mode-bypass.ts src/lib/terminal-osc52.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/shared/turn-complete-signal.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
+git add src/lib/terminal-output-write-scope.ts src/lib/terminal-output-side-effects.ts test/unit/client/lib/terminal-output-write-scope.test.ts test/unit/client/lib/terminal-output-side-effects.test.ts src/components/terminal/terminal-write-queue.ts test/unit/client/components/terminal/terminal-write-queue.test.ts src/components/TerminalView.tsx src/components/terminal/request-mode-bypass.ts src/lib/terminal-osc52.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/shared/turn-complete-signal.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
 git commit -m "Gate terminal output side effects by write scope"
 ```
 
 ## Task 5: Serialized Payload Budgeting And Pre-Sequence Fragmentation
 
 **Files:**
+- Create: `server/terminal-stream/stream-identity.ts`
 - Create: `server/terminal-stream/serialized-budget.ts`
 - Create: `server/terminal-stream/output-fragments.ts`
+- Create: `test/unit/server/terminal-stream/stream-identity.test.ts`
 - Create: `test/unit/server/terminal-stream/serialized-budget.test.ts`
 - Create: `test/unit/server/terminal-stream/output-fragments.test.ts`
+- Modify: `server/terminal-registry.ts`
 - Modify: `server/terminal-stream/broker.ts`
 - Modify: `server/terminal-stream/client-output-queue.ts`
 - Modify: `server/terminal-stream/replay-ring.ts`
@@ -1335,17 +1443,50 @@ it('assigns distinct sequence ranges to serialized-budget fragments', () => {
 
 The exact constructor shape can follow the implemented local API, but the invariant is fixed: no two emitted messages may reuse the same sequence range as a workaround for serialized budget overflow.
 
+Create `test/unit/server/terminal-stream/stream-identity.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest'
+import { createTerminalStreamIdentityTracker } from '../../../../server/terminal-stream/stream-identity'
+
+describe('terminal stream identity', () => {
+  it('keeps stream id stable across attach and detach for the same output stream', () => {
+    const tracker = createTerminalStreamIdentityTracker()
+    const initial = tracker.ensureStream('term-1')
+
+    expect(tracker.ensureStream('term-1')).toBe(initial)
+    tracker.recordAttach('term-1', 'attach-1')
+    tracker.recordDetach('term-1', 'attach-1')
+
+    expect(tracker.ensureStream('term-1')).toBe(initial)
+  })
+
+  it('changes stream id on pty replacement and incompatible retention loss', () => {
+    const tracker = createTerminalStreamIdentityTracker()
+    const initial = tracker.ensureStream('term-1')
+
+    const afterRecovery = tracker.replaceStream('term-1', 'codex_pty_recovery')
+    const afterRetentionLoss = tracker.replaceStream('term-1', 'retention_lost')
+
+    expect(afterRecovery).not.toBe(initial)
+    expect(afterRetentionLoss).not.toBe(afterRecovery)
+  })
+})
+```
+
 - [ ] **Step 2: Run failing serialized budget and fragmentation tests**
 
 Run:
 
 ```bash
-timeout 120s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-ring.test.ts
+timeout 120s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-ring.test.ts
 ```
 
 Expected: fail because the helpers and pre-sequence fragmentation path do not exist.
 
 - [ ] **Step 3: Implement serialized budget and Unicode-safe fragmentation helpers**
+
+Create `server/terminal-stream/stream-identity.ts` and wire it into terminal stream ingestion. `streamId` changes on new PTY/session stream, Codex PTY recovery replacement, incompatible retention loss, and server restart without compatible persisted retention. It does not change on attach/detach. Codex recovery paths in `server/terminal-registry.ts` must emit enough lifecycle signal for the terminal stream broker to call `replaceStream('codex_pty_recovery')` when `record.pty` is replaced under the same `terminalId`.
 
 Create `server/terminal-stream/serialized-budget.ts`:
 
@@ -1440,7 +1581,7 @@ Replace raw `Buffer.byteLength(data, 'utf8')` batch limit checks for outgoing We
 Run:
 
 ```bash
-timeout 300s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts
+timeout 300s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts
 ```
 
 Expected: pass.
@@ -1448,7 +1589,7 @@ Expected: pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add server/terminal-stream/serialized-budget.ts server/terminal-stream/output-fragments.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts server/terminal-stream/broker.ts server/terminal-stream/client-output-queue.ts server/terminal-stream/replay-ring.ts test/unit/server/terminal-stream/replay-ring.test.ts
+git add server/terminal-stream/stream-identity.ts test/unit/server/terminal-stream/stream-identity.test.ts server/terminal-stream/serialized-budget.ts server/terminal-stream/output-fragments.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts server/terminal-registry.ts server/terminal-stream/broker.ts server/terminal-stream/client-output-queue.ts server/terminal-stream/replay-ring.ts test/unit/server/terminal-stream/replay-ring.test.ts
 git commit -m "Fragment terminal output before sequence assignment"
 ```
 
@@ -1474,12 +1615,12 @@ import { createTerminalOutputBarrierScanner } from '../../../../server/terminal-
 describe('terminal output barrier scanner', () => {
   it('treats plain printable text and newlines as transparent', () => {
     const scanner = createTerminalOutputBarrierScanner()
-    expect(scanner.scan('hello\nworld\r\n')).toEqual({ barrier: false, ground: true })
+    expect(scanner.scan('hello\nworld\r\n')).toMatchObject({ barrier: false, ground: true })
   })
 
   it('treats escape sequences as barriers', () => {
     const scanner = createTerminalOutputBarrierScanner()
-    expect(scanner.scan('\u001b[31mred')).toEqual({
+    expect(scanner.scan('\u001b[31mred')).toMatchObject({
       barrier: true,
       reason: 'control',
       ground: true,
@@ -1488,7 +1629,7 @@ describe('terminal output barrier scanner', () => {
 
   it('treats BEL as a turn-complete-sensitive barrier', () => {
     const scanner = createTerminalOutputBarrierScanner()
-    expect(scanner.scan('\u0007')).toEqual({
+    expect(scanner.scan('\u0007')).toMatchObject({
       barrier: true,
       reason: 'turn_complete',
       ground: true,
@@ -1497,7 +1638,7 @@ describe('terminal output barrier scanner', () => {
 
   it('treats OSC sequences as OSC52-sensitive barriers', () => {
     const scanner = createTerminalOutputBarrierScanner()
-    expect(scanner.scan('\u001b]52;c;SGVsbG8=\u0007')).toEqual({
+    expect(scanner.scan('\u001b]52;c;SGVsbG8=\u0007')).toMatchObject({
       barrier: true,
       reason: 'osc52',
       ground: true,
@@ -1506,12 +1647,12 @@ describe('terminal output barrier scanner', () => {
 
   it('carries pending CSI state across fragments', () => {
     const scanner = createTerminalOutputBarrierScanner()
-    expect(scanner.scan('\u001b[')).toEqual({
+    expect(scanner.scan('\u001b[')).toMatchObject({
       barrier: true,
       reason: 'control',
       ground: false,
     })
-    expect(scanner.scan('6n')).toEqual({
+    expect(scanner.scan('6n')).toMatchObject({
       barrier: true,
       reason: 'request_mode',
       ground: true,
@@ -1520,12 +1661,12 @@ describe('terminal output barrier scanner', () => {
 
   it('carries pending OSC state across fragments', () => {
     const scanner = createTerminalOutputBarrierScanner()
-    expect(scanner.scan('\u001b]52;c;')).toEqual({
+    expect(scanner.scan('\u001b]52;c;')).toMatchObject({
       barrier: true,
       reason: 'osc52',
       ground: false,
     })
-    expect(scanner.scan('SGVsbG8=\u0007')).toEqual({
+    expect(scanner.scan('SGVsbG8=\u0007')).toMatchObject({
       barrier: true,
       reason: 'osc52',
       ground: true,
@@ -1534,11 +1675,22 @@ describe('terminal output barrier scanner', () => {
 
   it('treats replacement characters from lossy PTY decoding as barriers', () => {
     const scanner = createTerminalOutputBarrierScanner()
-    expect(scanner.scan('\ufffd')).toEqual({
+    expect(scanner.scan('\ufffd')).toMatchObject({
       barrier: true,
       reason: 'control',
       ground: true,
     })
+  })
+
+  it('returns scanner state snapshots that can be stored on retained frames', () => {
+    const scanner = createTerminalOutputBarrierScanner()
+    const first = scanner.scan('\u001b[')
+    const second = scanner.scan('6n')
+
+    expect(first.stateBefore.mode).toBe('ground')
+    expect(first.stateAfter.mode).toBe('csi')
+    expect(second.stateBefore.mode).toBe('csi')
+    expect(second.stateAfter.mode).toBe('ground')
   })
 })
 ```
@@ -1592,6 +1744,25 @@ describe('terminal output batch builder', () => {
 
     expect(batches.map((batch) => batch.data)).toEqual(['a', '\u0007', 'b'])
   })
+
+  it('uses UTF-16 code-unit segment offsets on code-point boundaries', () => {
+    const batches = buildTerminalOutputBatches({
+      terminalId: 'term-1',
+      attachRequestId: 'attach-1',
+      source: 'replay',
+      maxSerializedBytes: 16 * 1024,
+      frames: [
+        { seqStart: 1, seqEnd: 1, data: '😀', bytes: 4, at: 1 },
+        { seqStart: 2, seqEnd: 2, data: 'b', bytes: 1, at: 2 },
+      ],
+    })
+
+    expect(batches[0].data).toBe('😀b')
+    expect(batches[0].segments).toMatchObject([
+      { seqStart: 1, seqEnd: 1, endOffset: 2 },
+      { seqStart: 2, seqEnd: 2, endOffset: 3 },
+    ])
+  })
 })
 ```
 
@@ -1617,9 +1788,26 @@ export type TerminalOutputBarrierReason =
   | 'turn_complete'
   | 'startup_probe'
 
+export type TerminalOutputScannerMode = 'ground' | 'esc' | 'csi' | 'osc' | 'dcs' | 'apc'
+
+export type TerminalOutputScannerState = {
+  mode: TerminalOutputScannerMode
+}
+
 export type TerminalOutputBarrierClassification =
-  | { barrier: false; ground: boolean }
-  | { barrier: true; reason: TerminalOutputBarrierReason; ground: boolean }
+  | {
+      barrier: false
+      ground: boolean
+      stateBefore: TerminalOutputScannerState
+      stateAfter: TerminalOutputScannerState
+    }
+  | {
+      barrier: true
+      reason: TerminalOutputBarrierReason
+      ground: boolean
+      stateBefore: TerminalOutputScannerState
+      stateAfter: TerminalOutputScannerState
+    }
 
 export type TerminalOutputBarrierScanner = {
   scan: (data: string) => TerminalOutputBarrierClassification
@@ -1639,7 +1827,7 @@ export function createTerminalOutputBarrierScanner(): TerminalOutputBarrierScann
 }
 ```
 
-The implementation must be stream-stateful. It must remember pending control/string states across raw chunks and across serialized-budget fragments. A later byte-preserving terminal protocol may replace this scanner; this task must not rely on byte-perfect input.
+The implementation must be stream-stateful. It must remember pending control/string states across raw chunks and across serialized-budget fragments. It must return scanner-state snapshots that can be stored on retained frames at ingestion time; replay batching for arbitrary `sinceSeq` windows must consume stored metadata instead of mutating or reconstructing the live scanner from an unsafe prefix. A later byte-preserving terminal protocol may replace this scanner; this task must not rely on byte-perfect input.
 
 - [ ] **Step 5: Implement batch builder**
 
@@ -1651,7 +1839,9 @@ Create `server/terminal-stream/output-batch.ts` using `createTerminalOutputBarri
 - Stop before serialized budget overflow.
 - Preserve segment metadata.
 - Only coalesce transparent spans when the scanner is in ground state before and after the span.
-- Keep scanner state with the terminal stream so live and replay batching see the same barrier decisions.
+- Consume stored frame barrier metadata (`barrier`, `barrierReason`, `scannerStateBefore`, `scannerStateAfter`) instead of re-scanning retained replay from an arbitrary window.
+- Keep live scanner state with the terminal stream so live and replay batching see the same barrier decisions.
+- Emit `segments[].endOffset` as a UTF-16 code-unit offset on code-point boundaries.
 
 - [ ] **Step 6: Wire server replay and live queues to the batch builder**
 
@@ -1719,6 +1909,34 @@ describe('ReplayDeque', () => {
     expect(replay.missedFromSeq).toBe(1)
     expect(replay.frames.map((frame) => frame.data).join('')).toBe('bcd')
   })
+
+  it('preserves barrier metadata for arbitrary replay windows', () => {
+    const deque = new ReplayDeque(1024)
+    deque.append({
+      data: '\u001b[',
+      barrier: true,
+      barrierReason: 'control',
+      scannerStateBefore: { mode: 'ground' },
+      scannerStateAfter: { mode: 'csi' },
+    })
+    deque.append({
+      data: '6n',
+      barrier: true,
+      barrierReason: 'request_mode',
+      scannerStateBefore: { mode: 'csi' },
+      scannerStateAfter: { mode: 'ground' },
+    })
+
+    const replay = deque.replayBatchSince(1, 1024)
+
+    expect(replay.frames[0]).toMatchObject({
+      data: '6n',
+      barrier: true,
+      barrierReason: 'request_mode',
+      scannerStateBefore: { mode: 'csi' },
+      scannerStateAfter: { mode: 'ground' },
+    })
+  })
 })
 ```
 
@@ -1738,6 +1956,20 @@ Create `server/terminal-stream/replay-deque.ts` with:
 
 ```ts
 import type { ReplayFrame } from './replay-ring.js'
+import type {
+  TerminalOutputBarrierReason,
+  TerminalOutputScannerState,
+} from './output-barrier-scanner.js'
+
+export type ReplayDequeAppendInput =
+  | string
+  | {
+      data: string
+      barrier?: boolean
+      barrierReason?: TerminalOutputBarrierReason
+      scannerStateBefore: TerminalOutputScannerState
+      scannerStateAfter: TerminalOutputScannerState
+    }
 
 export class ReplayDeque {
   private frames: ReplayFrame[] = []
@@ -1748,13 +1980,20 @@ export class ReplayDeque {
 
   constructor(private readonly maxBytes: number) {}
 
-  append(data: string): ReplayFrame {
+  append(input: ReplayDequeAppendInput): ReplayFrame {
+    const data = typeof input === 'string' ? input : input.data
     const frame: ReplayFrame = {
       seqStart: this.nextSeq,
       seqEnd: this.nextSeq,
       data,
       bytes: Buffer.byteLength(data, 'utf8'),
       at: Date.now(),
+      ...(typeof input === 'string' ? {} : {
+        barrier: input.barrier,
+        barrierReason: input.barrierReason,
+        scannerStateBefore: input.scannerStateBefore,
+        scannerStateAfter: input.scannerStateAfter,
+      }),
     }
     this.nextSeq += 1
     this.head = frame.seqEnd
@@ -1835,6 +2074,9 @@ git commit -m "Use deque storage for terminal replay retention"
 ## Task 8: Foreground Replay Pacing
 
 **Files:**
+- Create: `server/ws-send.ts`
+- Create: `test/unit/server/ws-send.test.ts`
+- Modify: `server/ws-handler.ts`
 - Modify: `server/terminal-stream/broker.ts`
 - Modify: `test/unit/server/ws-handler-backpressure.test.ts`
 
@@ -1893,20 +2135,30 @@ Expected before implementation: fail if foreground replay sends too much before 
 
 - [ ] **Step 3: Implement normal foreground pacing**
 
-In `server/terminal-stream/broker.ts`:
+Create `server/ws-send.ts` and route both `server/ws-handler.ts` and `server/terminal-stream/broker.ts` through it. The shared sender must own:
+
+- JSON serialization and serialized application byte measurement.
+- `ws.send` callback handling.
+- `ws.bufferedAmount` reads before and after sends.
+- closed-socket handling.
+- `ws_send_large` and replay/backpressure structured JSONL instrumentation.
+- a single max serialized message budget shared by normal handler sends and terminal broker sends.
+
+Then in `server/terminal-stream/broker.ts`:
 
 - Keep catastrophic threshold behavior.
 - Add a normal foreground replay pacing threshold lower than catastrophic, using serialized bytes and `ws.bufferedAmount`.
 - After each replay send, re-read `ws.bufferedAmount`.
 - If above threshold, schedule the next flush instead of continuing the same flush.
 - Background threshold remains stricter than foreground threshold.
+- Do not call `ws.send(JSON.stringify(...))` directly.
 
 - [ ] **Step 4: Run backpressure tests**
 
 Run:
 
 ```bash
-timeout 240s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/ws-handler-backpressure.test.ts test/server/ws-edge-cases.test.ts
+timeout 240s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/ws-send.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-edge-cases.test.ts
 ```
 
 Expected: pass.
@@ -1914,7 +2166,7 @@ Expected: pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add server/terminal-stream/broker.ts test/unit/server/ws-handler-backpressure.test.ts
+git add server/ws-send.ts test/unit/server/ws-send.test.ts server/ws-handler.ts server/terminal-stream/broker.ts test/unit/server/ws-handler-backpressure.test.ts
 git commit -m "Pace foreground terminal replay under socket pressure"
 ```
 
@@ -1941,7 +2193,8 @@ Add tests in `test/server/ws-protocol.test.ts` and `test/unit/client/lib/ws-clie
 - The server records the capability on the WebSocket/client attachment state.
 - A batch-capable client can receive the batch shape below.
 - A legacy client that omits the capability still receives compatible `terminal.output` messages.
-- Legacy fallback serializes safe batch segments as individual `terminal.output` frames; it does not flatten arbitrary batches across parser barriers or replay/live source boundaries.
+- Legacy fallback serializes safe batch segments as individual modern `terminal.output` frames that include `seqStart`, `seqEnd`, and `attachRequestId`; it must not use the old registry `{ type, terminalId, data }` shape.
+- Legacy fallback does not flatten arbitrary batches across parser barriers, stream id, attach id, budget, or replay/live source boundaries.
 - A batch-capable client rejects or splits any batch whose segments cannot all be accepted before bytes are written to xterm.
 
 Batch shape:
@@ -1958,11 +2211,13 @@ Batch shape:
   data: 'ab',
   serializedBytes: 256,
   segments: [
-    { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
-    { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1 },
+    { seqStart: 1, seqEnd: 1, endOffset: 1, data: 'a', rawFrameCount: 1 },
+    { seqStart: 2, seqEnd: 2, endOffset: 2, data: 'b', rawFrameCount: 1 },
   ],
 }
 ```
+
+`endOffset` is a UTF-16 code-unit offset into top-level `data`; segment `data` is optional redundancy for debugging and legacy fallback. If `data` is present, the client and server tests must assert it equals the slice implied by the previous segment offset and `endOffset`.
 
 Do not write a test against a non-existent `ServerMessageSchema`. If this task adds server-to-client runtime validation, add the schema intentionally in this task and test that new API. Otherwise, use type-level tests and behavior tests around client/server message handling.
 
@@ -1994,9 +2249,9 @@ In `server/ws-handler.ts`, read the capability from the hello payload and pass i
 
 - [ ] **Step 5: Emit batch messages only when supported**
 
-In `server/terminal-stream/broker.ts`, emit `terminal.output.batch` only for clients whose attachment state says `terminalOutputBatchV1` is true. For all other clients, send legacy `terminal.output` messages using the same server-side batch builder internally if useful, but serialize each safe segment as its own compatible output frame.
+In `server/terminal-stream/broker.ts`, emit `terminal.output.batch` only for clients whose attachment state says `terminalOutputBatchV1` is true. For all other clients, send legacy `terminal.output` messages using the same server-side batch builder internally if useful, but serialize each safe segment as its own compatible output frame with `seqStart`, `seqEnd`, `attachRequestId`, and `data`.
 
-Do not flatten an arbitrary batch into one legacy `terminal.output`. Legacy frames have no explicit `source`, `streamId`, or segment metadata, so they must not cross replay/live source, attach id, stream id, parser-barrier, or serialized-budget boundaries.
+Do not flatten an arbitrary batch into one legacy `terminal.output`. Legacy frames have no explicit `source`, `streamId`, or segment metadata, so they must not cross replay/live source, attach id, stream id, parser-barrier, or serialized-budget boundaries. Do not route terminal stream fallback through the legacy registry direct-output shape, because current clients ignore output without sequence ranges.
 
 - [ ] **Step 6: Process batch messages client-side**
 
@@ -2139,6 +2394,7 @@ git commit -m "Instrument terminal catch-up replay safety"
 ## Task 11: Browser-Level Verification
 
 **Files:**
+- Create: `test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts`
 - Modify: `test/e2e-browser/perf/run-sample.ts`
 - Modify: `test/e2e-browser/perf/scenarios.ts`
 - Modify: `test/unit/lib/visible-first-audit-scenarios.test.ts`
@@ -2158,6 +2414,9 @@ Extend the existing `terminal-reconnect-backlog` scenario to record:
 - focused ready time
 - terminal input to first output
 - max RAF gap
+- frozen duration covered by retention
+- WebSocket state after freeze/resume
+- replay gaps or surface quarantine after freeze/resume
 
 - [ ] **Step 2: Add unit tests for metrics contract**
 
@@ -2172,6 +2431,8 @@ expect(scenarioMap.get('terminal-reconnect-backlog')?.requiredMetricIds).toEqual
   'terminalFullHydrateFallbackCount',
   'terminalSurfaceQuarantineCount',
   'terminalStaleGenerationRejectionCount',
+  'terminalFrozenRetentionCoveredMs',
+  'terminalFreezeResumeGapCount',
 ]))
 ```
 
@@ -2204,20 +2465,35 @@ The acceptance target for the 1,200-line backlog case:
 - No replay gaps in the seeded audit scenario.
 - No full hydrate fallback or surface quarantine in the compatible warm surface path.
 
-- [ ] **Step 5: Run browser perf audit for the terminal scenario**
+- [ ] **Step 5: Add browser freeze/resume probe**
+
+Create `test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts`. It must:
+
+- Open an isolated Freshell page through the existing Playwright server fixture.
+- Seed terminal output while the page is active and establish a parser-applied checkpoint.
+- Use CDP `Page.setWebLifecycleState({ state: 'frozen' })` to freeze the page.
+- Generate enough terminal output during freeze to exercise server retention but stay within the configured retention budget.
+- Use CDP `Page.setWebLifecycleState({ state: 'active' })` to resume the page.
+- Assert the WebSocket behavior observed during freeze/resume: still open and stalled, closed/reconnected, or buffered/resumed. The test must record which path happened.
+- Assert catch-up either has no gaps and no quarantine for the covered retention window, or reports explicit gaps/quarantine when retention is exceeded. Silent parser-applied cursor jumps are failures.
+
+This probe is not optional acceptance evidence. Full browser-background/freeze safety remains unproven until this spec exists and passes in the terminal catch-up suite.
+
+- [ ] **Step 6: Run browser perf audit and freeze probe for the terminal scenario**
 
 Run:
 
 ```bash
 timeout 1200s tsx scripts/visible-first-audit.ts --scenario terminal-reconnect-backlog --profile desktop_local --output /tmp/freshell-terminal-catchup-audit.json
+timeout 1200s npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts
 ```
 
-Expected: audit completes and writes `/tmp/freshell-terminal-catchup-audit.json`.
+Expected: audit completes and writes `/tmp/freshell-terminal-catchup-audit.json`; the freeze/resume spec passes and records WebSocket state plus retention coverage.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add test/e2e-browser/perf/run-sample.ts test/e2e-browser/perf/scenarios.ts test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-gate.test.ts
+git add test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts test/e2e-browser/perf/run-sample.ts test/e2e-browser/perf/scenarios.ts test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-gate.test.ts
 git commit -m "Audit terminal catch-up replay performance"
 ```
 
@@ -2226,7 +2502,7 @@ git commit -m "Audit terminal catch-up replay performance"
 - [ ] **Step 1: Run focused client suite**
 
 ```bash
-timeout 600s npm run test:vitest -- --run test/unit/client/components/terminal/terminal-write-queue.test.ts test/unit/client/lib/terminal-surface-checkpoint.test.ts test/unit/client/lib/terminal-cursor.test.ts test/unit/client/lib/terminal-attach-seq-state.test.ts test/unit/client/lib/terminal-attach-policy.test.ts test/unit/client/lib/ws-client.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/terminal-flaky-network-responsiveness.test.tsx
+timeout 600s npm run test:vitest -- --run test/unit/client/components/terminal/terminal-write-queue.test.ts test/unit/client/lib/terminal-surface-checkpoint.test.ts test/unit/client/lib/terminal-cursor.test.ts test/unit/client/lib/terminal-attach-seq-state.test.ts test/unit/client/lib/terminal-attach-policy.test.ts test/unit/client/lib/ws-client.test.ts test/unit/client/lib/terminal-output-side-effects.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/terminal-create-attach-ordering.test.tsx test/e2e/terminal-flaky-network-responsiveness.test.tsx
 ```
 
 Expected: pass.
@@ -2234,7 +2510,7 @@ Expected: pass.
 - [ ] **Step 2: Run focused server suite**
 
 ```bash
-timeout 600s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/output-barrier-scanner.test.ts test/unit/server/terminal-stream/output-batch.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-deque.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-edge-cases.test.ts test/server/ws-protocol.test.ts
+timeout 600s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/stream-identity.test.ts test/unit/server/terminal-stream/output-barrier-scanner.test.ts test/unit/server/terminal-stream/output-batch.test.ts test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-deque.test.ts test/unit/server/terminal-stream/replay-ring.test.ts test/unit/server/terminal-stream/client-output-queue.test.ts test/unit/server/ws-send.test.ts test/unit/server/ws-handler-backpressure.test.ts test/server/ws-terminal-stream-v2-replay.test.ts test/server/ws-edge-cases.test.ts test/server/ws-protocol.test.ts
 ```
 
 Expected: pass.
@@ -2242,7 +2518,7 @@ Expected: pass.
 - [ ] **Step 3: Run parser side-effect suite**
 
 ```bash
-timeout 600s npm run test:vitest -- --run test/unit/client/lib/terminal-output-write-scope.test.ts test/unit/client/lib/terminal-startup-probes.test.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/shared/turn-complete-signal.test.ts test/e2e/codex-startup-probes.test.tsx test/e2e/opencode-startup-probes.test.tsx test/e2e/terminal-osc52-policy-flow.test.tsx
+timeout 600s npm run test:vitest -- --run test/unit/client/lib/terminal-output-write-scope.test.ts test/unit/client/lib/terminal-output-side-effects.test.ts test/unit/client/lib/terminal-startup-probes.test.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/shared/turn-complete-signal.test.ts test/e2e/codex-startup-probes.test.tsx test/e2e/opencode-startup-probes.test.tsx test/e2e/terminal-osc52-policy-flow.test.tsx
 ```
 
 Expected: pass.
@@ -2251,9 +2527,10 @@ Expected: pass.
 
 ```bash
 timeout 1200s tsx scripts/visible-first-audit.ts --scenario terminal-reconnect-backlog --profile desktop_local --output /tmp/freshell-terminal-catchup-audit.json
+timeout 1200s npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts
 ```
 
-Expected: pass and show no replay gaps, no stale cursor advancement, no unexpected surface quarantine, and #397-class replay message count.
+Expected: pass and show no replay gaps, no stale cursor advancement, no unexpected surface quarantine, #397-class replay message count, and explicit freeze/resume retention coverage.
 
 - [ ] **Step 5: Verify xterm dependency policy**
 
@@ -2275,7 +2552,6 @@ Expected: full coordinated check passes.
 
 ## Residual Risks And Cheapest Validations
 
-- Browser page background throttling may still stall parser ACKs. Cheapest validation: Playwright/CDP page background/freeze probe that confirms retention and explicit gap behavior.
 - Stream-stateful barrier scanner may be too conservative and reduce batching for ANSI-heavy output. Cheapest validation: log batch reasons and compare real coding-agent sessions.
 - Multi-client geometry remains inherently constrained by one PTY size. Cheapest validation: visible-client resize authority test plus logs for geometry epoch mismatches.
 - Retained byte replay is not a complete snapshot system, especially across geometry history. Cheapest validation: observe retained age, retained bytes, output rate, gap frequency, and geometry changes before designing snapshots.
@@ -2291,19 +2567,24 @@ Spec coverage:
 - The plan rejects #396's unsupported 32 ms replay budget.
 - The plan fixes stale queued writes/callbacks with attach generation safety.
 - The plan requires terminal-instance write scoping and drain-or-replace behavior for already-submitted xterm writes.
+- The plan treats xterm disposal as non-canceling for pending write callbacks and requires token fences on post-dispose continuations.
+- The plan replaces path-specific side-effect allow lists with a deny-by-default terminal output side-effect adapter.
 - The plan replaces raw-byte send budgets with serialized application JSON payload budgets.
 - The plan fragments oversized PTY output before sequence assignment, preserving distinct sequence ranges.
 - The plan requires Unicode-safe fragmentation that does not split surrogate pairs.
+- The plan defines server-owned stream identity and changes it on PTY/session replacement, Codex recovery replacement, retention loss, and incompatible restart.
 - The plan explicitly preserves current UTF-8 string output semantics and does not claim byte-perfect terminal replay.
 - The plan separates parser-applied sequence, observed sequence, replay request sequence, and known lost ranges.
 - The plan quarantines parser-unsafe gaps instead of continuing to write into a potentially desynchronized parser.
 - The plan replaces unsafe replay retention data structures.
-- The plan treats parser side effects with an async terminal-instance xterm write scope, covering request-mode replies, OSC52 `always`, title updates, startup replies, and turn-complete.
+- The plan treats parser side effects with an async terminal-instance xterm write scope, covering request-mode replies, OSC52 `always`, title updates, startup replies, write-callback checkpoint mutations, attach-completion mutations, local notices, link/action callbacks, and turn-complete.
 - The plan replaces stateless barrier classification with a stream-stateful barrier scanner.
+- The plan stores barrier scanner metadata with retained replay frames so arbitrary replay windows do not reconstruct unsafe parser state.
+- The plan routes terminal broker WebSocket sends through a shared sender with callbacks, payload budgets, and instrumentation.
 - The plan gates `terminal.output.batch` behind `terminalOutputBatchV1` or a protocol version decision and keeps legacy fallback.
 - The plan requires safe legacy fallback segmentation instead of flattening arbitrary batches.
 - The plan adds observability for retention, lag, gaps, serialized bytes, and backpressure.
-- The plan requires visible-first derived metrics before using browser audit results as acceptance evidence.
+- The plan requires visible-first derived metrics and a CDP freeze/resume probe before using browser audit results as acceptance evidence.
 
 Placeholder scan:
 
