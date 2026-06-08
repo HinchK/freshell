@@ -177,6 +177,8 @@ type TerminalOutputBatch = {
 }
 ```
 
+For this plan, `streamId` is server-owned output-stream identity. It is minted when a terminal output stream is created, remains stable across attach/detach/replay for that stream, and changes when the server replaces the stream identity, loses retention across restart, or intentionally starts a new PTY/session stream. Until the server supplies a non-null `streamId`, persisted checkpoints that depend on stream replacement safety must be treated as incompatible rather than silently trusted.
+
 Legacy clients that do not advertise `terminalOutputBatchV1` continue to receive compatible `terminal.output` messages, but the fallback must serialize safe batch segments as individual legacy frames. It must not flatten an arbitrary multi-segment batch into one `terminal.output` if that batch crosses replay/live source, parser-barrier, stream-id, attach-id, or budget boundaries. Server-to-client runtime validation is not currently present; if this work adds it, create the schema explicitly and test it as a new behavior.
 
 The client processes segments in order and runs side-effect parsers with explicit context:
@@ -307,6 +309,7 @@ Replay context suppresses external side effects such as clipboard prompts, reque
 
 - Modify `shared/ws-protocol.ts`
   - Add optional `streamId` metadata where needed without breaking legacy clients.
+  - Define `streamId` lifecycle explicitly: server-minted per terminal output stream, stable across attach/detach for that stream, changed on stream replacement, restart without compatible retention, or new PTY stream.
   - Add `terminalOutputBatchV1` capability negotiation before emitting `terminal.output.batch`.
   - Later PR: add `terminal.output.batch` typing/schema and client/server support.
 
@@ -819,6 +822,8 @@ export type RevealAttachPolicyInput = {
 }
 ```
 
+Add `trustResultingSurfaceForDeltaReplay?: boolean` to the `RevealAttachPlan` return type. Leave it absent for ordinary plans where the resulting surface remains governed by existing compatibility checks, and set it explicitly to `false` when replay hydrate is chosen after an unsafe checkpoint without compatible geometry history.
+
 Use `checkpointDecision.ok ? checkpointDecision.sinceSeq : undefined` when choosing delta replay. Replay hydrate from zero remains the default for explicit refresh or unsafe checkpoint, but it must set `trustResultingSurfaceForDeltaReplay: false` unless the server/client can prove compatible geometry history.
 
 - [ ] **Step 8: Run focused tests**
@@ -895,10 +900,12 @@ it('does not let stale write callbacks advance the current parser-applied cursor
     delayedCallbacks.shift()?.()
   })
 
-  expect(loadTerminalSurfaceCheckpoint(terminalId, {
+  const checkpointAfterStaleCallback = loadTerminalSurfaceCheckpoint(terminalId, {
     streamId: 'stream-1',
     serverInstanceId: 'server-a',
-  })?.parserAppliedSeq ?? 0).toBe(0)
+  })
+  expect(checkpointAfterStaleCallback?.attachRequestId).not.toBe(firstAttach?.attachRequestId)
+  expect(checkpointAfterStaleCallback?.parserAppliedSeq ?? 0).toBe(0)
 
   const currentAttach = wsMocks.send.mock.calls
     .map(([msg]) => msg)
@@ -1024,8 +1031,10 @@ git commit -m "Fence terminal catch-up by attach generation"
 - Create: `src/lib/terminal-output-write-scope.ts`
 - Create: `test/unit/client/lib/terminal-output-write-scope.test.ts`
 - Modify: `src/components/TerminalView.tsx`
+- Modify: `src/components/terminal/terminal-write-queue.ts`
 - Modify: `src/components/terminal/request-mode-bypass.ts`
 - Modify: `src/lib/terminal-osc52.ts`
+- Modify: `test/unit/client/components/terminal/terminal-write-queue.test.ts`
 - Modify: `test/unit/client/lib/terminal-osc52.test.ts`
 - Modify: `test/unit/shared/turn-complete-signal.test.ts`
 - Modify: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
@@ -1151,6 +1160,8 @@ Also export `shouldAllowTerminalOutputSideEffect(input)` from this file or a sib
 
 Update `src/components/terminal/terminal-write-queue.ts` and `src/components/TerminalView.tsx` so the queue submits at most one xterm write at a time for a terminal surface. Start the write scope immediately before submitting the xterm write, and complete it only in the xterm write callback. Do not submit the next queued write until the callback for the current submitted write has run.
 
+Update existing queue tests at the same time. Any queue mock that accepts an `onWritten` callback must either call it explicitly or keep it in a pending callback list and drive it from the test. The existing live-mode time-slice tests must not accidentally stall just because the production queue now waits for xterm write completion before submitting the next write. If an implementation proves a separate live-only fast path is context-safe, cover that proof with tests; otherwise the tests should model serial completion.
+
 Use the same source/generation/terminal-instance metadata passed to the write queue:
 
 ```ts
@@ -1186,7 +1197,7 @@ Update the concrete side-effect paths found by load-bearing:
 Run:
 
 ```bash
-timeout 300s npm run test:vitest -- --run test/unit/client/lib/terminal-output-write-scope.test.ts test/unit/client/lib/terminal-startup-probes.test.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/shared/turn-complete-signal.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/codex-startup-probes.test.tsx test/e2e/opencode-startup-probes.test.tsx test/e2e/terminal-osc52-policy-flow.test.tsx
+timeout 300s npm run test:vitest -- --run test/unit/client/components/terminal/terminal-write-queue.test.ts test/unit/client/lib/terminal-output-write-scope.test.ts test/unit/client/lib/terminal-startup-probes.test.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/shared/turn-complete-signal.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e/codex-startup-probes.test.tsx test/e2e/opencode-startup-probes.test.tsx test/e2e/terminal-osc52-policy-flow.test.tsx
 ```
 
 Expected: pass.
@@ -1194,7 +1205,7 @@ Expected: pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/lib/terminal-output-write-scope.ts test/unit/client/lib/terminal-output-write-scope.test.ts src/components/terminal/terminal-write-queue.ts src/components/TerminalView.tsx src/components/terminal/request-mode-bypass.ts src/lib/terminal-osc52.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/shared/turn-complete-signal.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
+git add src/lib/terminal-output-write-scope.ts test/unit/client/lib/terminal-output-write-scope.test.ts src/components/terminal/terminal-write-queue.ts test/unit/client/components/terminal/terminal-write-queue.test.ts src/components/TerminalView.tsx src/components/terminal/request-mode-bypass.ts src/lib/terminal-osc52.ts test/unit/client/lib/terminal-osc52.test.ts test/unit/shared/turn-complete-signal.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
 git commit -m "Gate terminal output side effects by write scope"
 ```
 
@@ -1245,6 +1256,8 @@ describe('terminal stream serialized budget', () => {
         type: 'terminal.output',
         terminalId: 'term-1',
         data: chunk,
+        seqStart: 1,
+        seqEnd: 1,
         attachRequestId: 'attach-1',
       }),
       data,
@@ -1256,6 +1269,8 @@ describe('terminal stream serialized budget', () => {
         type: 'terminal.output',
         terminalId: 'term-1',
         data: chunk,
+        seqStart: 1,
+        seqEnd: 1,
         attachRequestId: 'attach-1',
       })).toBeLessThanOrEqual(16 * 1024)
     }
@@ -1270,6 +1285,8 @@ describe('terminal stream serialized budget', () => {
         type: 'terminal.output',
         terminalId: 'term-1',
         data: chunk,
+        seqStart: 1,
+        seqEnd: 1,
         attachRequestId: 'attach-1',
       }),
       data,
@@ -1286,6 +1303,8 @@ describe('terminal stream serialized budget', () => {
         type: 'terminal.output',
         terminalId: 'term-1',
         data: chunk,
+        seqStart: 1,
+        seqEnd: 1,
         attachRequestId: 'attach-1',
       }),
       data: `prefix-\ufffd-suffix`,
@@ -1321,7 +1340,7 @@ The exact constructor shape can follow the implemented local API, but the invari
 Run:
 
 ```bash
-timeout 120s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-ring.test.ts -t "serialized|fragment|distinct sequence"
+timeout 120s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/terminal-stream/serialized-budget.test.ts test/unit/server/terminal-stream/output-fragments.test.ts test/unit/server/terminal-stream/replay-ring.test.ts
 ```
 
 Expected: fail because the helpers and pre-sequence fragmentation path do not exist.
@@ -1406,7 +1425,7 @@ export function fragmentTerminalOutputForPayloadBudget(input: {
 
 - [ ] **Step 4: Fragment after raw observers and before assigning replay/live sequence numbers**
 
-Update the terminal-stream broker ingestion path so `fragmentTerminalOutputForPayloadBudget` runs after `terminal.output.raw` observers receive the original string event, and before assigning `seqStart`/`seqEnd` for replay/live frames. The resulting fragments become normal frames with distinct sequence ranges. Do not split a `ReplayFrame` after it already has a sequence number, because the current client treats repeated or overlapping sequence ranges as invalid.
+Update the terminal-stream broker ingestion path so `fragmentTerminalOutputForPayloadBudget` runs after `terminal.output.raw` observers receive the original string event, and before assigning `seqStart`/`seqEnd` for replay/live frames. The budget-measurement payload must still include representative `seqStart` and `seqEnd` fields, because those fields are present in the actual `terminal.output` JSON passed to `ws.send`. The resulting fragments become normal frames with distinct sequence ranges. Do not split a `ReplayFrame` after it already has a sequence number, because the current client treats repeated or overlapping sequence ranges as invalid.
 
 Use the same fragmentation helper for live queue inputs and replay retention so live and replay semantics do not diverge. Keep raw byte counts for retention accounting only.
 
@@ -2288,7 +2307,7 @@ Spec coverage:
 
 Placeholder scan:
 
-- Placeholder tokens were scanned and none remain.
+- Reviewer-facing placeholder tokens were scanned and none remain. Intentional test-first implementation stubs such as `throw new Error('implement stateful scanner')` remain only where the plan explicitly instructs workers to write failing tests before implementation.
 - Every task has exact files, failing tests, commands, expected outcomes, and commits.
 
 Type consistency:
