@@ -25,7 +25,9 @@ export type TerminalOutputBatchSegment = {
 }
 
 export type TerminalOutputBatch = ReplayFrame & FrameBoundaryMetadata & {
-  serializedBytes: number
+  // Internal batching budget measured as the legacy terminal.output envelope.
+  // terminal.output.batch wire payloads compute their own serializedBytes.
+  legacyOutputSerializedBytes: number
   segments: TerminalOutputBatchSegment[]
   barrier: boolean
   barrierReason?: TerminalOutputBarrierReason
@@ -62,7 +64,7 @@ type MutableTerminalOutputBatch = FrameBoundaryMetadata & {
   bytes: number
   at: number
   streamId: string
-  serializedBytes: number
+  legacyOutputSerializedBytes: number
   segments: TerminalOutputBatchSegment[]
   barrier: false
   scannerStateBefore: TerminalOutputScannerState
@@ -219,10 +221,10 @@ function buildSingleBatch(
       : {}),
     scannerStateBefore: cloneScannerState(classification.scannerStateBefore),
     scannerStateAfter: cloneScannerState(classification.scannerStateAfter),
-    serializedBytes: 0,
+    legacyOutputSerializedBytes: 0,
     segments: [segmentForFrame(frame, classification, 0)],
   }
-  batch.serializedBytes = measureBatch(input, batch, jsonStringContentBytes(batch.data))
+  batch.legacyOutputSerializedBytes = measureBatch(input, batch, jsonStringContentBytes(batch.data))
   return batch
 }
 
@@ -265,9 +267,9 @@ function startMutableBatch(
     scannerStateBefore: cloneScannerState(classification.scannerStateBefore),
     scannerStateAfter: cloneScannerState(classification.scannerStateAfter),
     segments: [segmentForFrame(frame, classification, 0)],
-    serializedBytes: 0,
+    legacyOutputSerializedBytes: 0,
   }
-  batch.serializedBytes = measureBatch(input, materializeMutableBatchFrame(batch), dataJsonContentBytes)
+  batch.legacyOutputSerializedBytes = measureBatch(input, materializeMutableBatchFrame(batch), dataJsonContentBytes)
   return batch
 }
 
@@ -291,7 +293,7 @@ function flushMutableBatch(batch: MutableTerminalOutputBatch): TerminalOutputBat
   const frame = materializeMutableBatchFrame(batch)
   return {
     ...frame,
-    serializedBytes: batch.serializedBytes,
+    legacyOutputSerializedBytes: batch.legacyOutputSerializedBytes,
     segments: batch.segments,
   }
 }
@@ -332,7 +334,7 @@ function appendMutableBatch(
   current: MutableTerminalOutputBatch,
   next: AnnotatedReplayFrame,
   nextClassification: FrameClassification,
-  serializedBytes: number,
+  legacyOutputSerializedBytes: number,
 ): void {
   const offset = current.dataLength
   current.seqEnd = next.seqEnd
@@ -343,7 +345,7 @@ function appendMutableBatch(
   current.at = next.at
   current.scannerStateAfter = cloneScannerState(nextClassification.scannerStateAfter)
   current.segments.push(segmentForFrame(next, nextClassification, offset))
-  current.serializedBytes = serializedBytes
+  current.legacyOutputSerializedBytes = legacyOutputSerializedBytes
 }
 
 export function buildTerminalOutputBatches<TFrame extends ReplayFrame>(
@@ -358,18 +360,18 @@ export function buildTerminalOutputBatches<TFrame extends ReplayFrame>(
   const fallbackScanner = createTerminalOutputBarrierScanner()
   const batches: TerminalOutputBatch[] = []
   let current: MutableTerminalOutputBatch | null = null
-  let totalSerializedBytes = 0
+  let totalLegacyOutputSerializedBytes = 0
 
   const pushBatch = (batch: TerminalOutputBatch): boolean => {
     if (
       Number.isFinite(maxTotalSerializedBytes)
-      && totalSerializedBytes + batch.serializedBytes > maxTotalSerializedBytes
+      && totalLegacyOutputSerializedBytes + batch.legacyOutputSerializedBytes > maxTotalSerializedBytes
       && batches.length > 0
     ) {
       return false
     }
     batches.push(batch)
-    totalSerializedBytes += batch.serializedBytes
+    totalLegacyOutputSerializedBytes += batch.legacyOutputSerializedBytes
     return true
   }
 

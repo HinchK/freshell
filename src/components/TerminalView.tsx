@@ -2711,6 +2711,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             : null
           const batchData = typeof msg.data === 'string' ? msg.data : ''
           const rawSegmentsInput = Array.isArray(msg.segments) ? msg.segments : []
+          const batchSeqStart = Number(msg.seqStart)
+          const batchSeqEnd = Number(msg.seqEnd)
           const batchSegments: Array<{
             seqStart: number
             seqEnd: number
@@ -2718,12 +2720,20 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             barrier: boolean
           }> = []
           let previousEndOffset = 0
+          let previousSeqEnd: number | null = null
           let invalidBatchReason: string | null = null
 
           if (!outputSource) {
             invalidBatchReason = 'invalid_source'
           } else if (rawSegmentsInput.length === 0) {
             invalidBatchReason = 'missing_segments'
+          } else if (
+            !Number.isInteger(batchSeqStart)
+            || !Number.isInteger(batchSeqEnd)
+            || batchSeqStart < 0
+            || batchSeqEnd < batchSeqStart
+          ) {
+            invalidBatchReason = 'invalid_batch_range'
           }
 
           for (const rawSegment of rawSegmentsInput) {
@@ -2732,14 +2742,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             const seqEnd = Number(rawSegment?.seqEnd)
             const endOffset = Number(rawSegment?.endOffset)
             if (
-              !Number.isFinite(seqStart)
-              || !Number.isFinite(seqEnd)
-              || !Number.isFinite(endOffset)
+              !Number.isInteger(seqStart)
+              || !Number.isInteger(seqEnd)
+              || !Number.isInteger(endOffset)
+              || seqStart < 0
+              || seqEnd < seqStart
+              || endOffset < 0
             ) {
               invalidBatchReason = 'invalid_segment_range'
               break
             }
-            const normalizedEndOffset = Math.floor(endOffset)
+            if (previousSeqEnd !== null && seqStart !== previousSeqEnd + 1) {
+              invalidBatchReason = 'non_contiguous_segment_range'
+              break
+            }
+            const normalizedEndOffset = endOffset
             if (
               normalizedEndOffset < previousEndOffset
               || normalizedEndOffset > batchData.length
@@ -2753,12 +2770,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               break
             }
             batchSegments.push({
-              seqStart: Math.floor(seqStart),
-              seqEnd: Math.floor(seqEnd),
+              seqStart,
+              seqEnd,
               data: segmentData,
               barrier: typeof rawSegment.barrier === 'string' && rawSegment.barrier.length > 0,
             })
             previousEndOffset = normalizedEndOffset
+            previousSeqEnd = seqEnd
           }
 
           if (!invalidBatchReason && previousEndOffset !== batchData.length) {
@@ -2767,8 +2785,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           if (
             !invalidBatchReason
             && (
-              batchSegments[0]?.seqStart !== msg.seqStart
-              || batchSegments[batchSegments.length - 1]?.seqEnd !== msg.seqEnd
+              batchSegments[0]?.seqStart !== batchSeqStart
+              || batchSegments[batchSegments.length - 1]?.seqEnd !== batchSeqEnd
             )
           ) {
             invalidBatchReason = 'batch_range_mismatch'
@@ -2892,87 +2910,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             clearTerminalCursor(tid)
             resetParserAppliedSurface()
           }
-          const frameAttachRequestId = msg.attachRequestId
-          let raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
           const frameOverlapsReplay = Boolean(
             previousSeqState.pendingReplay
             && msg.seqEnd >= previousSeqState.pendingReplay.fromSeq
             && msg.seqStart <= previousSeqState.pendingReplay.toSeq,
           )
-          const enteringFreshLiveOutput = !frameOverlapsReplay
-            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
-          if (
-            enteringFreshLiveOutput
-            && !startupProbeReplayDiscardStateRef.current.remainder
-            && !startupProbeReplayDiscardStateRef.current.buffered
-          ) {
-            resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
-          }
-          const replayDiscard = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
-          if (replayDiscard.resumeState) {
-            startupProbeStateRef.current = replayDiscard.resumeState
-          }
-          raw = replayDiscard.raw
           const completedAttachOnFrame = !frameDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           applySeqState(frameDecision.state)
-          const frameParserAppliedSeq = frameDecision.state.highestObservedSeq
-          const completeParserAppliedFrame = () => {
-            const activeAttach = currentAttachRef.current
-            if (!activeAttach || activeAttach.requestId !== frameAttachRequestId) return
-            if (!shouldAllowTerminalOutputSideEffect({
-              terminalInstanceId: terminalInstanceIdRef.current,
-              effect: 'parser_applied_checkpoint',
-              mode,
-              generation: frameAttachRequestId,
-            })) {
-              return
-            }
-            const nextSeqState = markParserAppliedSeq(seqStateRef.current, frameParserAppliedSeq)
-            applySeqState(nextSeqState)
-            markParserAppliedFrame(tid, nextSeqState.parserAppliedSeq, activeAttach)
-            if (completedAttachOnFrame) {
-              if (!shouldAllowTerminalOutputSideEffect({
-                terminalInstanceId: terminalInstanceIdRef.current,
-                effect: 'attach_completion',
-                mode,
-                generation: frameAttachRequestId,
-              })) {
-                return
-              }
-              setIsAttaching(false)
-              markAttachComplete()
-            }
-          }
-          handleTerminalOutput(
-            raw,
+          submitAcceptedOutput({
+            raw: msg.data || '',
+            seqStart: msg.seqStart,
+            seqEnd: msg.seqEnd,
+            attachRequestId: msg.attachRequestId,
             mode,
-            tid,
-            !frameOverlapsReplay,
-            completeParserAppliedFrame,
-            {
-              mode: frameOverlapsReplay ? 'replay' : 'live',
-              generation: frameAttachRequestId,
-            },
-          )
-          if (completedAttachOnFrame && frameOverlapsReplay) {
-            resetStartupProbeParser({ discardReplayRemainder: true })
-          }
-          if (
-            raw.length > 0
-            && !terminalFirstOutputMarkedRef.current
-            && activeTabId === tabId
-            && activePaneId === paneId
-            && !hiddenRef.current
-          ) {
-            getInstalledPerfAuditBridge()?.mark('terminal.first_output', {
-              tabId,
-              paneId,
-              terminalId: tid,
-            })
-            terminalFirstOutputMarkedRef.current = true
-          }
+            previousSeqState,
+            outputSource: frameOverlapsReplay ? 'replay' : 'live',
+            parserAppliedSeq: frameDecision.state.highestObservedSeq,
+            completedAttach: completedAttachOnFrame,
+          })
         }
 
         if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {

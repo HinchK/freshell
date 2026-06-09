@@ -193,7 +193,7 @@ describe('terminal output batch builder', () => {
     expect(batches).toHaveLength(frames.length)
     expect(new Set(batches.map((batch) => `${batch.seqStart}:${batch.seqEnd}`)).size)
       .toBe(batches.length)
-    expect(batches.every((batch) => batch.serializedBytes <= maxSerializedBytes)).toBe(true)
+    expect(batches.every((batch) => batch.legacyOutputSerializedBytes <= maxSerializedBytes)).toBe(true)
     expect(batches.every((batch) =>
       measureTerminalOutputPayloadBytes({
         type: 'terminal.output',

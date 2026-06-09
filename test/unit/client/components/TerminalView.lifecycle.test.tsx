@@ -4484,6 +4484,49 @@ describe('TerminalView lifecycle updates', () => {
       expect(terminalWriteStrings(term)).toContain('accepted-after-reject')
     })
 
+    it('rejects terminal.output.batch with non-contiguous segment ranges before writing', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-hole',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 3,
+          data: 'ac',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 3, seqEnd: 3, endOffset: 2, rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'accepted-after-hole',
+        })
+      })
+      expect(terminalWriteStrings(term)).toContain('accepted-after-hole')
+    })
+
     it('rejects terminal.output.batch when segment data disagrees with offsets', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
@@ -4591,6 +4634,58 @@ describe('TerminalView lifecycle updates', () => {
         type: 'terminal.attach',
         terminalId,
         sinceSeq: 1,
+      }))
+    })
+
+    it('does not checkpoint a stripped legacy terminal.output BEL frame as parser-applied', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-legacy-stripped-bel',
+        mode: 'codex',
+        serverInstanceId: 'server-output-legacy-stripped-bel',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: '\x07',
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'B',
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['B'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-legacy-stripped-bel',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
       }))
     })
 
