@@ -2087,10 +2087,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       ? msg.seqEnd
       : (typeof msg.toSeq === 'number' ? msg.toSeq : undefined)
     if (typeof fromSeq === 'number' && typeof toSeq === 'number') {
-      const gapDecision = onOutputGap(seqStateRef.current, { fromSeq, toSeq })
-      applySeqState(gapDecision.state)
+      const previousSeqState = seqStateRef.current
+      const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
+      const nextSeqState = gapDecision.state
+      applySeqState(nextSeqState)
+      resetParserAppliedSurface(parserAppliedSeqRef.current)
+      const completedAttachOnGap = !nextSeqState.pendingReplay
+        && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+      if (completedAttachOnGap) {
+        resetStartupProbeParser({ discardReplayRemainder: Boolean(previousSeqState.pendingReplay) })
+        setIsAttaching(false)
+        markAttachComplete()
+      }
+    } else {
+      resetParserAppliedSurface(parserAppliedSeqRef.current)
     }
-    resetParserAppliedSurface(parserAppliedSeqRef.current)
 
     log.warn('Ignoring terminal stream message with mismatched stream identity', {
       paneId: paneIdRef.current,
@@ -2106,7 +2117,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   }, [
     applySeqState,
     isCurrentAttachMessage,
+    markAttachComplete,
     resetParserAppliedSurface,
+    resetStartupProbeParser,
   ])
 
   const attachTerminal = useCallback((

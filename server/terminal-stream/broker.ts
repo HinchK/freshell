@@ -923,6 +923,7 @@ export class TerminalStreamBroker {
           reason,
           attachment.activeAttachRequestId,
         )
+        this.convertReplayCursorToCurrentStreamGap(terminalId, attachment, streamId)
       }
     }
     log.info({
@@ -947,6 +948,31 @@ export class TerminalStreamBroker {
       reason,
       ...(attachRequestId ? { attachRequestId } : {}),
     })
+  }
+
+  private convertReplayCursorToCurrentStreamGap(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+    streamId: string,
+  ): void {
+    const cursor = attachment.replayCursor
+    if (!cursor) return
+
+    attachment.replayCursor = null
+    const fromSeq = Math.max(cursor.nextSeq, attachment.lastSeq + 1)
+    const toSeq = cursor.toSeq
+    if (toSeq < fromSeq) return
+
+    if (this.sendReplayGap(
+      attachment.ws,
+      terminalId,
+      fromSeq,
+      toSeq,
+      streamId,
+      attachment.activeAttachRequestId,
+    )) {
+      attachment.lastSeq = Math.max(attachment.lastSeq, toSeq)
+    }
   }
 
   private handleReplayRetentionLoss(

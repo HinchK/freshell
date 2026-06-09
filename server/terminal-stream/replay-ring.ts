@@ -1,6 +1,3 @@
-import { fragmentTerminalOutputForPayloadBudget } from './output-fragments.js'
-import type { JsonPayload } from './serialized-budget.js'
-
 export type ReplayFrame = {
   seqStart: number
   seqEnd: number
@@ -80,16 +77,6 @@ export class ReplayRing {
       if (frame.streamId !== fromStreamId) break
       frame.streamId = toStreamId
     }
-  }
-
-  appendFragmentedForPayloadBudget(input: {
-    data: string
-    maxSerializedBytes: number
-    payloadForData: (data: string) => JsonPayload
-    streamId: string
-  }): ReplayFrame[] {
-    const fragments = fragmentTerminalOutputForPayloadBudget(input)
-    return fragments.map((fragment) => this.append(fragment, { streamId: input.streamId }))
   }
 
   replaySince(sinceSeq?: number): { frames: ReplayFrame[]; missedFromSeq?: number } {

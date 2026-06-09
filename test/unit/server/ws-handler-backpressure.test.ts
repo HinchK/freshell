@@ -689,6 +689,89 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('converts a stale replay cursor to a current-stream gap before replacement live output', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-replay-stream-change')
+
+    const seedWs = createMockWs()
+    await broker.attach(seedWs as any, 'term-replay-stream-change', 'viewport_hydrate', 80, 24, 0, 'seed-attach')
+    const initialReady = seedWs.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(initialReady?.streamId).toEqual(expect.any(String))
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-replay-stream-change', data: 'old-a', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-replay-stream-change', data: 'old-b', at: Date.now() })
+
+    const replayWs = createMockWs()
+    await broker.attach(
+      replayWs as any,
+      'term-replay-stream-change',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'replay-attach',
+    )
+
+    registry.emit('terminal.stream.replaced', {
+      terminalId: 'term-replay-stream-change',
+      reason: 'codex_pty_recovery',
+    })
+    registry.emit('terminal.output.raw', { terminalId: 'term-replay-stream-change', data: 'new-live', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    const payloads = replayWs.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const ready = payloads.find((payload) => payload?.type === 'terminal.attach.ready')
+    const streamChangedIndex = payloads.findIndex((payload) => payload?.type === 'terminal.stream.changed')
+    const gapIndex = payloads.findIndex((payload) => payload?.type === 'terminal.output.gap')
+    const newOutputIndex = payloads.findIndex((payload) =>
+      payload?.type === 'terminal.output' && payload.data === 'new-live'
+    )
+    const replayOutputs = payloads
+      .filter((payload) => payload?.type === 'terminal.output')
+      .map((payload) => payload.data)
+
+    expect(ready).toMatchObject({
+      terminalId: 'term-replay-stream-change',
+      streamId: initialReady.streamId,
+      replayFromSeq: 1,
+      replayToSeq: 2,
+      attachRequestId: 'replay-attach',
+    })
+    expect(payloads[streamChangedIndex]).toMatchObject({
+      terminalId: 'term-replay-stream-change',
+      reason: 'codex_pty_recovery',
+      attachRequestId: 'replay-attach',
+      streamId: expect.any(String),
+    })
+    expect(payloads[streamChangedIndex].streamId).not.toBe(initialReady.streamId)
+    expect(payloads[gapIndex]).toMatchObject({
+      terminalId: 'term-replay-stream-change',
+      streamId: payloads[streamChangedIndex].streamId,
+      fromSeq: 1,
+      toSeq: 2,
+      reason: 'replay_window_exceeded',
+      attachRequestId: 'replay-attach',
+    })
+    expect(payloads[newOutputIndex]).toMatchObject({
+      terminalId: 'term-replay-stream-change',
+      streamId: payloads[streamChangedIndex].streamId,
+      seqStart: 3,
+      seqEnd: 3,
+      data: 'new-live',
+      attachRequestId: 'replay-attach',
+    })
+    expect(streamChangedIndex).toBeGreaterThan(-1)
+    expect(gapIndex).toBeGreaterThan(streamChangedIndex)
+    expect(newOutputIndex).toBeGreaterThan(gapIndex)
+    expect(replayOutputs).toEqual(['new-live'])
+
+    broker.close()
+  })
+
   it('notifies active clients when retention loss rotates live stream identity', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(6)

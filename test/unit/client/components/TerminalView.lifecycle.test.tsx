@@ -5,7 +5,7 @@ import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
 import panesReducer, { requestPaneRefresh } from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
-import connectionReducer from '@/store/connectionSlice'
+import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import { persistMiddleware, resetPersistedLayoutCacheForTests, resetPersistFlushListenersForTests } from '@/store/persistMiddleware'
@@ -4149,6 +4149,93 @@ describe('TerminalView lifecycle updates', () => {
         streamId: 'stream-after-change',
         serverInstanceId: 'server-active-stream-change',
       })?.parserAppliedSeq).toBe(2)
+    })
+
+    it('treats mismatched replay after a stream change as a completing lost range', async () => {
+      const { store, terminalId, term, queryByText } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-stale-replay-stream-change-client',
+        serverInstanceId: 'server-stale-replay-stream-change',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-before-change',
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+      const replayAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(replayAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-before-change',
+          headSeq: 2,
+          replayFromSeq: 1,
+          replayToSeq: 2,
+          attachRequestId: replayAttach!.attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.stream.changed',
+          terminalId,
+          streamId: 'stream-after-change',
+          reason: 'codex_pty_recovery',
+          attachRequestId: replayAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-before-change',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'STALE REPLAY SHOULD NOT RENDER',
+          attachRequestId: replayAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-after-change',
+          seqStart: 3,
+          seqEnd: 3,
+          data: 'LIVE AFTER STREAM CHANGE',
+          attachRequestId: replayAttach!.attachRequestId,
+        })
+      })
+
+      const writes = terminalWriteStrings(term).join('')
+      expect(writes).not.toContain('STALE REPLAY SHOULD NOT RENDER')
+      expect(writes).toContain('LIVE AFTER STREAM CHANGE')
+      expect(queryByText('Recovering terminal output...')).toBeNull()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-after-change',
+        serverInstanceId: 'server-stale-replay-stream-change',
+      })).toBeNull()
     })
 
     it('rejects a warm-delta attach when attach-ready reports a different stream id', async () => {
