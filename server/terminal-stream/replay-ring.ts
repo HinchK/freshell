@@ -4,7 +4,7 @@ import {
   type TerminalOutputBarrierReason,
   type TerminalOutputScannerState,
 } from './output-barrier-scanner.js'
-import { buildTerminalOutputBatches } from './output-batch.js'
+import { ReplayDeque } from './replay-deque.js'
 
 export type ReplayFrame = {
   seqStart: number
@@ -42,30 +42,24 @@ function resolveMaxBytes(explicitMaxBytes?: number): number {
 }
 
 export class ReplayRing {
-  private frames: ReplayFrame[] = []
-  private totalBytes = 0
-  private nextSeq = 1
-  private head = 0
+  private readonly storage: ReplayDeque
   private maxBytes: number
-  private retentionLossPending = false
   private readonly utf8FatalDecoder = new TextDecoder('utf-8', { fatal: true })
   private readonly barrierScanner = createTerminalOutputBarrierScanner()
 
   constructor(maxBytes?: number) {
     this.maxBytes = resolveMaxBytes(maxBytes)
+    this.storage = new ReplayDeque(this.maxBytes)
   }
 
   setMaxBytes(nextMaxBytes?: number): void {
     const resolved = resolveMaxBytes(nextMaxBytes)
     if (resolved === this.maxBytes) return
     this.maxBytes = resolved
-    this.evictIfNeeded()
+    this.storage.setMaxBytes(this.maxBytes)
   }
 
   append(data: string, metadata: { streamId: string }): ReplayFrame {
-    const seq = this.nextSeq
-    this.nextSeq += 1
-    this.head = seq
     const streamClassification = this.barrierScanner.scan(data)
     const normalizedData = this.normalizeFrameData(data)
     const wasTruncated = Buffer.byteLength(normalizedData, 'utf8') < Buffer.byteLength(data, 'utf8')
@@ -73,55 +67,27 @@ export class ReplayRing {
       ? this.conservativeTruncatedClassification(streamClassification)
       : streamClassification
 
-    const frame: ReplayFrame = {
-      seqStart: seq,
-      seqEnd: seq,
+    return this.storage.append({
       data: normalizedData,
-      bytes: Buffer.byteLength(normalizedData, 'utf8'),
       at: Date.now(),
       streamId: metadata.streamId,
       barrier: barrierClassification.barrier,
       ...(barrierClassification.barrier ? { barrierReason: barrierClassification.reason } : {}),
       scannerStateBefore: barrierClassification.stateBefore,
       scannerStateAfter: barrierClassification.stateAfter,
-    }
-
-    this.frames.push(frame)
-    this.totalBytes += frame.bytes
-    this.evictIfNeeded()
-    return frame
+    })
   }
 
   consumeRetentionLoss(): boolean {
-    const retentionLossPending = this.retentionLossPending
-    this.retentionLossPending = false
-    return retentionLossPending
+    return this.storage.consumeRetentionLoss()
   }
 
   retagRetainedStreamSuffix(fromStreamId: string, toStreamId: string): void {
-    for (let index = this.frames.length - 1; index >= 0; index -= 1) {
-      const frame = this.frames[index]
-      if (frame.streamId !== fromStreamId) break
-      frame.streamId = toStreamId
-    }
+    this.storage.retagRetainedStreamSuffix(fromStreamId, toStreamId)
   }
 
   replaySince(sinceSeq?: number): { frames: ReplayFrame[]; missedFromSeq?: number } {
-    const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
-    if (this.frames.length === 0) {
-      if (normalizedSinceSeq < this.head) {
-        return { frames: [], missedFromSeq: normalizedSinceSeq + 1 }
-      }
-      return { frames: [] }
-    }
-
-    const tail = this.frames[0].seqStart
-    const missedFromSeq = normalizedSinceSeq < tail - 1
-      ? normalizedSinceSeq + 1
-      : undefined
-
-    const frames = this.frames.slice(this.firstFrameIndexAfter(normalizedSinceSeq))
-    return { frames, missedFromSeq }
+    return this.storage.replaySince(sinceSeq)
   }
 
   replayBatchSince(
@@ -131,77 +97,15 @@ export class ReplayRing {
     measureFrameBytes?: ReplayFrameByteMeasure,
     batchContext?: ReplayBatchContext,
   ): { frames: ReplayFrame[]; missedFromSeq?: number } {
-    const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
-    const normalizedMaxBytes = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0
-    const normalizedToSeq = typeof toSeq === 'number' && Number.isFinite(toSeq)
-      ? Math.max(0, Math.floor(toSeq))
-      : Number.POSITIVE_INFINITY
-
-    if (this.frames.length === 0) {
-      if (normalizedSinceSeq < this.head) {
-        return { frames: [], missedFromSeq: normalizedSinceSeq + 1 }
-      }
-      return { frames: [] }
-    }
-
-    const tail = this.frames[0].seqStart
-    const missedFromSeq = normalizedSinceSeq < tail - 1
-      ? normalizedSinceSeq + 1
-      : undefined
-    const frames = buildTerminalOutputBatches({
-      frames: this.iterReplayFrames(normalizedSinceSeq, normalizedToSeq),
-      maxSerializedBytes: normalizedMaxBytes,
-      maxTotalSerializedBytes: normalizedMaxBytes,
-      measureFrameBytes,
-      terminalId: batchContext?.terminalId,
-      attachRequestId: batchContext?.attachRequestId,
-      source: batchContext?.source,
-    })
-
-    return { frames, missedFromSeq }
+    return this.storage.replayBatchSince(sinceSeq, maxBytes, toSeq, measureFrameBytes, batchContext)
   }
 
   headSeq(): number {
-    return this.head
+    return this.storage.headSeq()
   }
 
   tailSeq(): number {
-    if (this.frames.length === 0) {
-      return this.head + 1
-    }
-    return this.frames[0].seqStart
-  }
-
-  private evictIfNeeded(): void {
-    while (this.totalBytes > this.maxBytes && this.frames.length > 0) {
-      const removed = this.frames.shift()
-      if (!removed) break
-      this.totalBytes -= removed.bytes
-      this.retentionLossPending = true
-    }
-  }
-
-  private firstFrameIndexAfter(seq: number): number {
-    let low = 0
-    let high = this.frames.length
-    while (low < high) {
-      const mid = Math.floor((low + high) / 2)
-      if (this.frames[mid].seqEnd <= seq) {
-        low = mid + 1
-      } else {
-        high = mid
-      }
-    }
-    return low
-  }
-
-  private *iterReplayFrames(sinceSeq: number, toSeq: number): IterableIterator<ReplayFrame> {
-    const startIndex = this.firstFrameIndexAfter(sinceSeq)
-    for (let index = startIndex; index < this.frames.length; index += 1) {
-      const frame = this.frames[index]
-      if (frame.seqStart > toSeq) break
-      yield frame
-    }
+    return this.storage.tailSeq()
   }
 
   private conservativeTruncatedClassification(
