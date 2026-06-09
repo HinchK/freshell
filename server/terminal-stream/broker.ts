@@ -184,13 +184,20 @@ export class TerminalStreamBroker {
       let budgetTruncated = false
       const headSeq = terminalState.replayRing.headSeq()
 
-      // Truncate replay to tail frames within byte budget
+      // maxReplayBytes is a legacy protocol name; interpret it as serialized
+      // application JSON bytes for the terminal.output payloads we will send.
       if (maxReplayBytes !== undefined && maxReplayBytes > 0 && replayFrames.length > 0) {
-        let budgetRemaining = maxReplayBytes
+        const maxReplaySerializedApplicationJsonBytes = Math.floor(maxReplayBytes)
+        let budgetRemaining = maxReplaySerializedApplicationJsonBytes
         let keepFromIndex = replayFrames.length
         for (let i = replayFrames.length - 1; i >= 0; i--) {
-          if (replayFrames[i].bytes > budgetRemaining) break
-          budgetRemaining -= replayFrames[i].bytes
+          const frameSerializedApplicationJsonBytes = this.measureOutputFrameSerializedApplicationJsonBytes(
+            terminalId,
+            replayFrames[i],
+            attachment.activeAttachRequestId,
+          )
+          if (frameSerializedApplicationJsonBytes > budgetRemaining) break
+          budgetRemaining -= frameSerializedApplicationJsonBytes
           keepFromIndex = i
         }
         if (keepFromIndex > 0) {
@@ -204,6 +211,7 @@ export class TerminalStreamBroker {
             terminalId,
             connectionId: ws.connectionId,
             maxReplayBytes,
+            maxReplaySerializedApplicationJsonBytes,
             droppedFrames: keepFromIndex,
             droppedFromSeq: truncatedFromSeq,
             droppedToSeq: truncatedToSeq,

@@ -6,7 +6,10 @@ import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler'
 import { TerminalRegistry } from '../../../server/terminal-registry'
 import { TerminalStreamBroker } from '../../../server/terminal-stream/broker'
-import { TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE } from '../../../server/terminal-stream/serialized-budget'
+import {
+  measureTerminalOutputPayloadBytes,
+  TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+} from '../../../server/terminal-stream/serialized-budget'
 import { MAX_REALTIME_MESSAGE_BYTES } from '../../../shared/read-models.js'
 
 vi.mock('node-pty', () => ({
@@ -486,6 +489,95 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
         seqEnd: expect.any(Number),
       }))
     }
+
+    broker.close()
+  })
+
+  it('uses serialized terminal.output JSON bytes for maxReplayBytes truncation', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-replay-serialized-truncation')
+
+    const wsSeed = createMockWs()
+    await broker.attach(
+      wsSeed as any,
+      'term-replay-serialized-truncation',
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      'seed-serialized-truncation',
+    )
+    const seedReady = wsSeed.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(seedReady?.streamId).toEqual(expect.any(String))
+
+    const replayAttachRequestId = TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE
+    const chunks = [
+      `A${'\u001b'.repeat(100)}`,
+      `B${'\u001b'.repeat(100)}`,
+      `C${'\u001b'.repeat(100)}`,
+    ]
+    for (const chunk of chunks) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-replay-serialized-truncation',
+        data: chunk,
+        at: Date.now(),
+      })
+    }
+
+    const oneSerializedPayloadBudget = measureTerminalOutputPayloadBytes({
+      type: 'terminal.output',
+      terminalId: 'term-replay-serialized-truncation',
+      streamId: seedReady.streamId,
+      seqStart: 3,
+      seqEnd: 3,
+      data: chunks[2],
+      attachRequestId: replayAttachRequestId,
+    })
+    expect(chunks.reduce((sum, chunk) => sum + Buffer.byteLength(chunk, 'utf8'), 0))
+      .toBeLessThan(oneSerializedPayloadBudget)
+
+    const wsReplay = createMockWs()
+    await broker.attach(
+      wsReplay as any,
+      'term-replay-serialized-truncation',
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      replayAttachRequestId,
+      oneSerializedPayloadBudget,
+    )
+    vi.advanceTimersByTime(1)
+
+    const replayMessages = wsReplay.send.mock.calls
+      .map(([raw]) => ({
+        raw,
+        payload: typeof raw === 'string' ? JSON.parse(raw) : raw,
+      }))
+
+    const gap = replayMessages.find(({ payload }) => payload?.type === 'terminal.output.gap')?.payload
+    expect(gap).toMatchObject({
+      fromSeq: 1,
+      toSeq: 2,
+      reason: 'replay_budget_exceeded',
+      attachRequestId: replayAttachRequestId,
+      streamId: seedReady.streamId,
+    })
+
+    const outputFrames = replayMessages
+      .filter(({ payload }) => payload?.type === 'terminal.output')
+    expect(outputFrames.map(({ payload }) => payload.data)).toEqual([chunks[2]])
+    expect(outputFrames[0]?.payload).toMatchObject({
+      seqStart: 3,
+      seqEnd: 3,
+      attachRequestId: replayAttachRequestId,
+      streamId: seedReady.streamId,
+    })
+    expect(Buffer.byteLength(String(outputFrames[0]?.raw ?? ''), 'utf8'))
+      .toBeLessThanOrEqual(oneSerializedPayloadBudget)
 
     broker.close()
   })

@@ -2070,7 +2070,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const messageStreamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
       ? msg.streamId
       : null
-    if (!activeStreamId || !messageStreamId || messageStreamId === activeStreamId) {
+    if (!activeStreamId || messageStreamId === activeStreamId) {
       return true
     }
 

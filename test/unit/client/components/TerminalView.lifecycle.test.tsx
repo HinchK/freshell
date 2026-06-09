@@ -4181,6 +4181,161 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
+    it('does not render or checkpoint terminal.output missing stream id after attach-ready', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-missing-output-stream-client',
+        serverInstanceId: 'server-missing-output-stream',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-active',
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'MISSING STREAM',
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-active',
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'ACTIVE AFTER MISSING',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
+      expect(writes).not.toContain('MISSING STREAM')
+      expect(writes).toContain('ACTIVE AFTER MISSING')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-active',
+        serverInstanceId: 'server-missing-output-stream',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('does not render or checkpoint terminal.output.gap missing stream id after attach-ready', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-missing-gap-stream-client',
+        serverInstanceId: 'server-missing-gap-stream',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-active',
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 5,
+          reason: 'queue_overflow',
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-active',
+          seqStart: 6,
+          seqEnd: 6,
+          data: 'ACTIVE AFTER MISSING GAP',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
+      expect(writes).not.toContain('Output gap 1-5')
+      expect(writes).toContain('ACTIVE AFTER MISSING GAP')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-active',
+        serverInstanceId: 'server-missing-gap-stream',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('keeps the legacy missing-stream output path only before attach-ready establishes stream identity', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-legacy-pre-ready-stream',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'LEGACY BEFORE READY',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
+      expect(writes).toContain('LEGACY BEFORE READY')
+    })
+
     it('ignores xterm title callbacks fired while replay writes are scoped', async () => {
       const { terminalId, term, store, tabId, paneId } = await renderTerminalHarness({
         status: 'running',
