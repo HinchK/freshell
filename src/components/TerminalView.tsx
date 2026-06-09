@@ -512,6 +512,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     sinceSeq: number
     cols: number
     rows: number
+    surfaceQuarantined: boolean
   } | null>(null)
   const launchAttemptRef = useRef<LaunchAttemptState | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
@@ -624,19 +625,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     terminalId: string
     cols: number
     rows: number
+    surfaceQuarantined?: boolean
   }) => {
     if (!terminalId || !Number.isFinite(seq)) return
     const parserAppliedSeq = Math.max(0, Math.floor(seq))
+    const attach = attachContext ?? currentAttachRef.current
+    const surfaceQuarantined = attach?.surfaceQuarantined === true
     if (parserAppliedSeq <= parserAppliedSeqRef.current) {
-      if (parserAppliedSeq > 0) {
+      if (parserAppliedSeq > 0 && !surfaceQuarantined) {
         hasTrustedParserAppliedSurfaceRef.current = true
       }
       return
     }
     parserAppliedSeqRef.current = parserAppliedSeq
-    hasTrustedParserAppliedSurfaceRef.current = true
+    hasTrustedParserAppliedSurfaceRef.current = !surfaceQuarantined
 
-    const attach = attachContext ?? currentAttachRef.current
+    if (surfaceQuarantined) return
     if (!attach || attach.terminalId !== terminalId) return
     const checkpointInput = buildCheckpointReplayInput(terminalId, {
       cols: attach.cols,
@@ -1834,13 +1838,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const sinceSeq = effectiveIntent === 'viewport_hydrate' ? 0 : deltaSeq
     const willResetSurface = effectiveIntent === 'viewport_hydrate'
     const writeQueue = writeQueueRef.current
+    const hasInFlightWrites = writeQueue?.hasInFlightWrites() === true
+    const surfaceQuarantined = willResetSurface && hasInFlightWrites
     writeQueue?.setActiveGeneration(attachRequestId, { dropQueuedStaleWrites: true })
-    if (willResetSurface && writeQueue?.hasInFlightWrites()) {
-      log.warn('Starting terminal surface reset while writes are still in flight', {
+    if (surfaceQuarantined) {
+      log.warn('Quarantining terminal surface reset while writes are still in flight', {
         paneId: paneIdRef.current,
         terminalId: tid,
         attachRequestId,
         intent: effectiveIntent,
+        clearViewportFirst,
       })
     }
 
@@ -1852,7 +1859,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     if (effectiveIntent === 'viewport_hydrate') {
       resetParserAppliedSurface()
-      if (clearViewportFirst) {
+      if (clearViewportFirst && !surfaceQuarantined) {
         try {
           termRef.current?.clear()
         } catch {
@@ -1881,6 +1888,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       sinceSeq,
       cols,
       rows,
+      surfaceQuarantined,
     }
     suppressNextMatchingResizeRef.current = opts?.suppressNextMatchingResize
       ? { terminalId: tid, cols, rows }

@@ -17,7 +17,6 @@ import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import {
   __resetTerminalCursorCacheForTests,
   loadTerminalSurfaceCheckpoint,
-  saveTerminalSurfaceCheckpoint,
 } from '@/lib/terminal-cursor'
 import { resetHydrationQueueForTests } from '@/lib/hydration-queue'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
@@ -3995,6 +3994,7 @@ describe('TerminalView lifecycle updates', () => {
         terminalId: 'term-stale-write-callback',
         serverInstanceId: 'server-a',
         streamId: 'stream-1',
+        ackInitialAttach: false,
         clearSends: false,
       })
 
@@ -4003,17 +4003,43 @@ describe('TerminalView lifecycle updates', () => {
         .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
       expect(firstAttach?.attachRequestId).toBeTruthy()
 
-      const delayedCallbacks: Array<() => void> = []
-      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
-        if (onWritten) delayedCallbacks.push(onWritten)
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'first replay text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const initialCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      })
+      expect(initialCheckpoint?.attachRequestId).toBe(firstAttach?.attachRequestId)
+      expect(initialCheckpoint?.parserAppliedSeq).toBe(1)
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
       })
 
       act(() => {
         messageHandler!({
           type: 'terminal.output',
           terminalId,
-          seqStart: 1,
-          seqEnd: 1,
+          seqStart: 2,
+          seqEnd: 2,
           data: 'old replay text',
           attachRequestId: firstAttach!.attachRequestId,
         })
@@ -4032,25 +4058,32 @@ describe('TerminalView lifecycle updates', () => {
       expect(secondAttach?.attachRequestId).toBeTruthy()
       expect(secondAttach?.attachRequestId).not.toBe(firstAttach?.attachRequestId)
 
-      saveTerminalSurfaceCheckpoint({
-        terminalId,
-        streamId: 'stream-1',
-        serverInstanceId: 'server-a',
-        surfaceEpoch: 1,
-        attachRequestId: secondAttach!.attachRequestId,
-        parserAppliedSeq: 1,
-        cols: 80,
-        rows: 24,
-        geometryEpoch: 1,
-        geometryAuthority: 'single_client',
-        scrollback: 5000,
-        xtermVersion: '6.0.0',
-        bufferType: 'normal',
-        parserIdle: true,
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 4,
+          replayFromSeq: 2,
+          replayToSeq: 4,
+          attachRequestId: secondAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 4,
+          data: 'current replay text',
+          attachRequestId: secondAttach!.attachRequestId,
+        })
       })
 
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual([
+        'old replay text',
+        'current replay text',
+      ])
+
       act(() => {
-        delayedCallbacks.shift()?.()
+        delayedCallbacks.find(({ data }) => data === 'old replay text')?.callback()
       })
 
       const checkpointAfterStaleCallback = loadTerminalSurfaceCheckpoint(terminalId, {
@@ -4058,13 +4091,103 @@ describe('TerminalView lifecycle updates', () => {
         serverInstanceId: 'server-a',
       })
       expect(checkpointAfterStaleCallback).not.toBeNull()
-      expect(checkpointAfterStaleCallback?.attachRequestId).toBe(secondAttach?.attachRequestId)
+      expect(checkpointAfterStaleCallback?.attachRequestId).toBe(firstAttach?.attachRequestId)
       expect(checkpointAfterStaleCallback?.parserAppliedSeq).toBe(1)
 
       const currentAttach = wsMocks.send.mock.calls
         .map(([msg]) => msg)
         .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
       expect(currentAttach?.attachRequestId).toBe(secondAttach?.attachRequestId)
+
+      act(() => {
+        delayedCallbacks.find(({ data }) => data === 'current replay text')?.callback()
+      })
+
+      const checkpointAfterCurrentCallback = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      })
+      expect(checkpointAfterCurrentCallback?.attachRequestId).toBe(secondAttach?.attachRequestId)
+      expect(checkpointAfterCurrentCallback?.parserAppliedSeq).toBe(4)
+    })
+
+    it('does not clear the old surface when full hydrate starts with in-flight writes', async () => {
+      const { store, tabId, paneId, terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-in-flight-full-hydrate',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-in-flight',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'trusted text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const trustedCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-in-flight',
+        serverInstanceId: 'server-a',
+      })
+      expect(trustedCheckpoint?.parserAppliedSeq).toBe(1)
+
+      const delayedCallbacks: Array<() => void> = []
+      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push(onWritten)
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'in-flight text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks).toHaveLength(1)
+
+      term.clear.mockClear()
+      wsMocks.send.mockClear()
+      act(() => {
+        store.dispatch(requestPaneRefresh({ tabId, paneId }))
+      })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'viewport_hydrate',
+          sinceSeq: 0,
+          attachRequestId: expect.any(String),
+        }))
+      })
+      expect(term.clear).not.toHaveBeenCalled()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
     })
 
     it('keeps queued viewport_hydrate intent when reconnect fires before the first hidden attach completes', async () => {
