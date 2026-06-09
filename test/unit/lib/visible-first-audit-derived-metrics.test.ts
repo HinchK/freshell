@@ -158,4 +158,25 @@ describe('deriveVisibleFirstMetrics', () => {
     expect(result.terminalStoppedRetentionCoveredMs).toBe(2_500)
     expect(result.terminalStopResumeGapCount).toBe(1)
   })
+
+  it('omits stop/resume metrics when no stop/resume source event was observed', () => {
+    const result = deriveVisibleFirstMetrics({
+      focusedReadyMilestone: 'terminal.first_output',
+      allowedApiRouteIdsBeforeReady: [],
+      allowedWsTypesBeforeReady: [],
+      browser: {
+        milestones: {
+          'terminal.first_output': 50,
+        },
+        perfEvents: [],
+      },
+      transport: {
+        http: { requests: [] },
+        ws: { frames: [] },
+      },
+    })
+
+    expect(result).not.toHaveProperty('terminalStoppedRetentionCoveredMs')
+    expect(result).not.toHaveProperty('terminalStopResumeGapCount')
+  })
 })

@@ -1,14 +1,17 @@
 import { execFile } from 'child_process'
+import fs from 'fs/promises'
+import path from 'path'
 import { promisify } from 'util'
-import type { Page } from '@playwright/test'
+import type { CDPSession, Page } from '@playwright/test'
 import { test, expect } from '../helpers/fixtures.js'
 import type { TestHarness } from '../helpers/test-harness.js'
 import type { TerminalHelper } from '../helpers/terminal-helpers.js'
 
 const execFileAsync = promisify(execFile)
 const ACTIVE_PROBE_MS = 300
-const STOPPED_PROBE_MS = 1_800
+const STOPPED_PROBE_MS = 2_500
 const RESUMED_PROBE_MS = 500
+const STOPPED_OUTPUT_DELAY_MS = 1_000
 const STOPPED_OUTPUT_LINE_COUNT = 240
 
 type StopProbeSnapshot = {
@@ -24,10 +27,45 @@ type StopProbeSnapshot = {
   messageTypes: Record<string, number>
 }
 
+type ReceivedWsFrame = {
+  observedAtMs: number
+  type: string
+  payloadLength: number
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms)
   })
+}
+
+async function waitForFile(filePath: string, timeoutMs = 15_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      await fs.stat(filePath)
+      return
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error
+      }
+    }
+    await sleep(25)
+  }
+  throw new Error(`Timed out waiting for file ${filePath}`)
+}
+
+function classifyWsPayload(payload: string): string {
+  try {
+    const parsed = JSON.parse(payload) as { type?: unknown }
+    return typeof parsed.type === 'string' ? parsed.type : 'unknown'
+  } catch {
+    return 'unknown'
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
 }
 
 async function selectShellFromPicker(page: Page): Promise<void> {
@@ -297,6 +335,15 @@ function countPerfEvents(events: Array<Record<string, unknown>>, eventName: stri
   return events.filter((event) => event.event === eventName).length
 }
 
+function countTerminalOutputMessages(snapshot: StopProbeSnapshot): number {
+  return (snapshot.messageTypes['terminal.output'] ?? 0)
+    + (snapshot.messageTypes['terminal.output.batch'] ?? 0)
+}
+
+function isTerminalOutputWsFrame(frame: ReceivedWsFrame): boolean {
+  return frame.type === 'terminal.output' || frame.type === 'terminal.output.batch'
+}
+
 test.describe('terminal background freeze catch-up', () => {
   test('process suspend catches up terminal output without silent gaps or quarantine', async ({
     page,
@@ -311,8 +358,20 @@ test.describe('terminal background freeze catch-up', () => {
     })
 
     let stoppedPids: number[] = []
+    let cdpSession: CDPSession | null = null
+    const receivedWsFrames: ReceivedWsFrame[] = []
     try {
       await installStopProbe(page)
+      cdpSession = await page.context().newCDPSession(page)
+      await cdpSession.send('Network.enable')
+      cdpSession.on('Network.webSocketFrameReceived', (event: { response?: { payloadData?: string } }) => {
+        const payload = event.response?.payloadData ?? ''
+        receivedWsFrames.push({
+          observedAtMs: Date.now(),
+          type: classifyWsPayload(payload),
+          payloadLength: Buffer.byteLength(payload),
+        })
+      })
       await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1&perfAudit=1`)
       await harness.waitForHarness()
       await harness.waitForConnection()
@@ -333,20 +392,52 @@ test.describe('terminal background freeze catch-up', () => {
       expect(activeDelta.timerTicks).toBeGreaterThan(0)
       expect(activeDelta.rafTicks).toBeGreaterThan(0)
 
-      const finalLine = `freeze-catchup-${STOPPED_OUTPUT_LINE_COUNT}`
-      await terminal.executeCommand(
-        `node -e "setTimeout(() => { for (let i = 1; i <= ${STOPPED_OUTPUT_LINE_COUNT}; i++) console.log('freeze-catchup-' + i) }, 250)"`,
-      )
-
       stoppedPids = await collectBrowserExecutionPids(page)
+
+      const scheduledLine = 'freeze-catchup-scheduled'
+      const startedLine = 'freeze-catchup-started'
+      const finalLine = `freeze-catchup-${STOPPED_OUTPUT_LINE_COUNT}`
+      const markerId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const outputScriptPath = path.join(serverInfo.homeDir, `freeze-catchup-output-${markerId}.cjs`)
+      const scheduledMarkerPath = path.join(serverInfo.homeDir, `freeze-catchup-scheduled-${markerId}.json`)
+      const startedMarkerPath = path.join(serverInfo.homeDir, `freeze-catchup-started-${markerId}.json`)
+      const outputScript = [
+        'const { writeFileSync } = require("fs");',
+        `const scheduled = ${JSON.stringify(scheduledLine)};`,
+        `const started = ${JSON.stringify(startedLine)};`,
+        `const prefix = ${JSON.stringify('freeze-catchup-')};`,
+        `const scheduledMarkerPath = ${JSON.stringify(scheduledMarkerPath)};`,
+        `const startedMarkerPath = ${JSON.stringify(startedMarkerPath)};`,
+        'writeFileSync(scheduledMarkerPath, JSON.stringify({ scheduledAt: Date.now() }));',
+        'console.log(scheduled);',
+        'setTimeout(() => {',
+        '  writeFileSync(startedMarkerPath, JSON.stringify({ startedAt: Date.now() }));',
+        '  console.log(started);',
+        `  for (let i = 1; i <= ${STOPPED_OUTPUT_LINE_COUNT}; i += 1) console.log(prefix + i);`,
+        `}, ${STOPPED_OUTPUT_DELAY_MS});`,
+        `setTimeout(() => process.exit(0), ${STOPPED_OUTPUT_DELAY_MS + 500});`,
+      ].join('\n')
+      await fs.writeFile(outputScriptPath, `${outputScript}\n`, 'utf8')
+      await terminal.executeCommand(`node ${shellQuote(outputScriptPath)}`)
+      await waitForFile(scheduledMarkerPath)
+
+      const scheduledMarkerObservedAt = Date.now()
       const beforeStop = await stopProbeSnapshot(page)
+      const wsFrameBaseline = receivedWsFrames.length
       const stopStartedAt = Date.now()
+      expect(stopStartedAt - scheduledMarkerObservedAt).toBeLessThan(STOPPED_OUTPUT_DELAY_MS)
       signalPids([...stoppedPids].sort((a, b) => b - a), 'SIGSTOP')
       await sleep(STOPPED_PROBE_MS)
       signalPids([...stoppedPids].sort((a, b) => a - b), 'SIGCONT')
       const stopEndedAt = Date.now()
+      const stoppedDurationMs = stopEndedAt - stopStartedAt
+      expect(stoppedDurationMs).toBeGreaterThan(STOPPED_OUTPUT_DELAY_MS)
       const afterResumeImmediate = await stopProbeSnapshot(page)
       const stoppedDelta = deltaSnapshots(beforeStop, afterResumeImmediate)
+      await waitForFile(startedMarkerPath)
+      const outputStartedAt = JSON.parse(await fs.readFile(startedMarkerPath, 'utf8')).startedAt as number
+      expect(outputStartedAt).toBeGreaterThanOrEqual(stopStartedAt)
+      expect(outputStartedAt).toBeLessThanOrEqual(stopEndedAt)
 
       expect(stoppedDelta.timerTicks).toBeLessThan(5)
       expect(stoppedDelta.rafTicks).toBeLessThan(5)
@@ -359,10 +450,15 @@ test.describe('terminal background freeze catch-up', () => {
       expect(resumedDelta.rafTicks).toBeGreaterThan(0)
 
       const buffer = await terminal.getVisibleText(terminalId)
+      expect(buffer).toContain(startedLine)
       expect(buffer).toContain('freeze-catchup-1')
       expect(buffer).toContain(finalLine)
 
       const perfEvents = (await harness.getPerfAuditSnapshot())?.perfEvents ?? []
+      const pageCatchupDelta = deltaSnapshots(beforeStop, afterCatchup)
+      const pageCatchupOutputMessageCount = countTerminalOutputMessages(pageCatchupDelta)
+      const cdpCatchupFrames = receivedWsFrames.slice(wsFrameBaseline)
+      const cdpCatchupOutputMessageCount = cdpCatchupFrames.filter(isTerminalOutputWsFrame).length
       const outputGapCount = afterCatchup.messageTypes['terminal.output.gap'] ?? 0
       const quarantineCount = countPerfEvents(perfEvents, 'terminal.catchup.surface_quarantined')
       const hydrateFallbackCount = countPerfEvents(perfEvents, 'terminal.catchup.full_hydrate_fallback')
@@ -372,37 +468,51 @@ test.describe('terminal background freeze catch-up', () => {
         afterResumeImmediate,
         afterCatchup,
       })
+      const proofBody = {
+        note: 'Local POSIX process-suspend positive control; not a substitute for the real Windows Chrome gate.',
+        stoppedPids,
+        stoppedDurationMs,
+        stoppedOutputDelayMs: STOPPED_OUTPUT_DELAY_MS,
+        scheduledToStopMs: stopStartedAt - scheduledMarkerObservedAt,
+        outputStartedAt,
+        outputStartedAfterStopMs: outputStartedAt - stopStartedAt,
+        outputStartedBeforeResumeMs: stopEndedAt - outputStartedAt,
+        parserAppliedCheckpoint,
+        wsBehavior,
+        cdpCatchupOutputMessageCount,
+        pageCatchupOutputMessageCount,
+        activeDelta,
+        stoppedDelta,
+        resumedDelta,
+        pageCatchupDelta,
+        cdpCatchupFrames,
+        beforeStop,
+        afterResumeImmediate,
+        afterCatchup,
+        outputGapCount,
+        quarantineCount,
+        hydrateFallbackCount,
+        staleGenerationRejectionCount,
+      }
+
+      const proofPath = testInfo.outputPath('terminal-background-freeze-catchup.json')
+      await fs.writeFile(proofPath, `${JSON.stringify(proofBody, null, 2)}\n`, 'utf8')
+      await testInfo.attach('terminal-background-freeze-catchup', {
+        contentType: 'application/json',
+        path: proofPath,
+      })
 
       expect(['still_open_stalled', 'closed_reconnected', 'buffered_resumed']).toContain(wsBehavior)
+      expect(cdpCatchupOutputMessageCount).toBeGreaterThan(0)
       expect(outputGapCount).toBe(0)
       expect(quarantineCount).toBe(0)
       expect(hydrateFallbackCount).toBe(0)
       expect(staleGenerationRejectionCount).toBe(0)
-
-      await testInfo.attach('terminal-background-freeze-catchup', {
-        contentType: 'application/json',
-        body: JSON.stringify({
-          note: 'Local POSIX process-suspend positive control; not a substitute for the real Windows Chrome gate.',
-          stoppedPids,
-          stoppedDurationMs: stopEndedAt - stopStartedAt,
-          parserAppliedCheckpoint,
-          wsBehavior,
-          activeDelta,
-          stoppedDelta,
-          resumedDelta,
-          beforeStop,
-          afterResumeImmediate,
-          afterCatchup,
-          outputGapCount,
-          quarantineCount,
-          hydrateFallbackCount,
-          staleGenerationRejectionCount,
-        }, null, 2),
-      })
     } finally {
       if (stoppedPids.length > 0) {
         signalPids([...stoppedPids].sort((a, b) => a - b), 'SIGCONT')
       }
+      await cdpSession?.detach().catch(() => {})
       await harness.killAllTerminals(serverInfo).catch(() => {})
     }
   })

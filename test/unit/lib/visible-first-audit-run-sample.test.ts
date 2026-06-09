@@ -49,6 +49,14 @@ describe('runVisibleFirstAuditSample', () => {
             perfEvents: [
               { event: 'visible_first.audit.max_raf_gap', maxGapMs: 16 },
               { event: 'terminal.parser_applied', timestamp: 40, parserAppliedSeq: 1 },
+              {
+                event: 'terminal.catchup.stop_resume',
+                timestamp: 90,
+                source: 'unit_reconnect_fixture',
+                retentionCoveredMs: 0,
+                stoppedDurationMs: 0,
+                gapCount: 0,
+              },
             ],
             terminalLatencySamplesMs: [],
           },
@@ -115,5 +123,73 @@ describe('runVisibleFirstAuditSample', () => {
       terminalStoppedRetentionCoveredMs: 0,
       terminalStopResumeGapCount: 0,
     }))
+  })
+
+  it('fails reconnect backlog samples when stop/resume metrics have no source evidence', async () => {
+    const sample = await runVisibleFirstAuditSample({
+      scenarioId: 'terminal-reconnect-backlog',
+      profileId: 'desktop_local',
+      deps: {
+        executeSample: async () => ({
+          browser: {
+            milestones: { 'terminal.first_output': 100 },
+            perfEvents: [
+              { event: 'visible_first.audit.max_raf_gap', maxGapMs: 16 },
+              { event: 'terminal.parser_applied', timestamp: 40, parserAppliedSeq: 1 },
+            ],
+            terminalLatencySamplesMs: [],
+          },
+          transport: {
+            http: { requests: [] },
+            ws: {
+              frames: [
+                {
+                  timestamp: 10,
+                  direction: 'sent',
+                  type: 'terminal.attach',
+                  payload: JSON.stringify({ type: 'terminal.attach', terminalId: 'term-reconnect' }),
+                  payloadLength: 80,
+                },
+                {
+                  timestamp: 30,
+                  direction: 'received',
+                  type: 'terminal.output.batch',
+                  payload: JSON.stringify({
+                    type: 'terminal.output.batch',
+                    source: 'replay',
+                    terminalId: 'term-reconnect',
+                    seqStart: 1,
+                    seqEnd: 1,
+                    serializedBytes: 120,
+                  }),
+                  payloadLength: 120,
+                },
+              ],
+            },
+            summary: { http: { byRoute: {} }, ws: { byType: {} } },
+          },
+          server: {
+            httpRequests: [],
+            perfEvents: [],
+            perfSystemSamples: [],
+            terminalReplayEvents: [
+              {
+                event: 'terminal.replay.batch',
+                source: 'replay',
+                seqStart: 1,
+                seqEnd: 1,
+                serializedBytes: 120,
+              },
+            ],
+            terminalOutputEvents: [],
+            parserDiagnostics: [],
+          },
+        }),
+      },
+    })
+
+    expect(sample.status).toBe('error')
+    expect(sample.errors.join('\n')).toMatch(/terminalStoppedRetentionCoveredMs/)
+    expect(sample.errors.join('\n')).toMatch(/terminalStopResumeGapCount/)
   })
 })

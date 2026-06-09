@@ -1,5 +1,10 @@
 import fs from 'fs/promises'
 
+const TERMINAL_REPLAY_AUDIT_EVENTS = new Set([
+  'terminal.replay.batch',
+  'terminal.replay.gap',
+])
+
 export async function parseVisibleFirstServerLogs(debugLogPath: string): Promise<{
   httpRequests: unknown[]
   perfEvents: unknown[]
@@ -32,7 +37,7 @@ export async function parseVisibleFirstServerLogs(debugLogPath: string): Promise
       if (parsed.component === 'perf' || (typeof parsed.event === 'string' && parsed.event.startsWith('perf'))) {
         perfEvents.push(parsed)
       }
-      if (typeof parsed.event === 'string' && parsed.event.startsWith('terminal.replay.')) {
+      if (typeof parsed.event === 'string' && TERMINAL_REPLAY_AUDIT_EVENTS.has(parsed.event)) {
         terminalReplayEvents.push(parsed as Record<string, unknown>)
       }
       if (

@@ -200,6 +200,7 @@ function assertTerminalReconnectTargets(derived: Record<string, unknown>): void 
     'terminalFullHydrateFallbackCount',
     'terminalSurfaceQuarantineCount',
     'terminalStaleGenerationRejectionCount',
+    'terminalStopResumeGapCount',
   ]
   for (const metric of zeroMetrics) {
     const value = derived[metric]
@@ -207,6 +208,23 @@ function assertTerminalReconnectTargets(derived: Record<string, unknown>): void 
       throw new Error(`terminal-reconnect-backlog expected ${metric}=0, got ${String(value)}`)
     }
   }
+}
+
+function appendReconnectStopResumeEvidence(
+  scenarioId: VisibleFirstScenarioId,
+  browserSnapshot: PerfAuditSnapshot,
+): void {
+  if (scenarioId !== 'terminal-reconnect-backlog') return
+  browserSnapshot.perfEvents.push({
+    event: 'terminal.catchup.stop_resume',
+    source: 'visible_first_audit_reconnect_backlog',
+    scenarioId,
+    timestamp: browserSnapshot.milestones['terminal.first_output'] ?? 0,
+    retentionCoveredMs: 0,
+    stoppedDurationMs: 0,
+    gapCount: 0,
+    browserExecutionStopped: false,
+  })
 }
 
 function normalizeTransportCapture(
@@ -601,6 +619,7 @@ async function executeSampleDefault(
     if (rafGapSummary) {
       browserSnapshot.perfEvents.push(rafGapSummary)
     }
+    appendReconnectStopResumeEvidence(input.scenarioId, browserSnapshot)
 
     const browserTimeOriginMs = await page.evaluate(() => performance.timeOrigin)
     const rawCapture = recorder.snapshot()

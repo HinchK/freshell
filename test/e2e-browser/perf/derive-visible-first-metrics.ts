@@ -52,8 +52,8 @@ export type VisibleFirstDerivedMetrics = {
   terminalFullHydrateFallbackCount: number
   terminalSurfaceQuarantineCount: number
   terminalStaleGenerationRejectionCount: number
-  terminalStoppedRetentionCoveredMs: number
-  terminalStopResumeGapCount: number
+  terminalStoppedRetentionCoveredMs?: number
+  terminalStopResumeGapCount?: number
 }
 
 const IGNORED_ROUTE_IDS = new Set(['/api/health', '/api/logs/client'])
@@ -315,17 +315,26 @@ function resolveParserAppliedLagMs(input: DerivedMetricsInput, replayFrames: Vis
 }
 
 function resolveStopResumeMetrics(input: DerivedMetricsInput): {
-  terminalStoppedRetentionCoveredMs: number
-  terminalStopResumeGapCount: number
+  terminalStoppedRetentionCoveredMs?: number
+  terminalStopResumeGapCount?: number
 } {
   const events = (input.browser.perfEvents ?? [])
     .filter((entry) => eventName(entry) === 'terminal.catchup.stop_resume')
+  const retentionCoveredValues = events
+    .flatMap((entry) => [entry.retentionCoveredMs, entry.stoppedDurationMs])
+    .map(nonnegativeMetric)
+    .filter((value): value is number => value !== undefined)
+  const gapCountValues = events
+    .map((entry) => nonnegativeMetric(entry.gapCount))
+    .filter((value): value is number => value !== undefined)
+
   return {
-    terminalStoppedRetentionCoveredMs: maxMetric(events.flatMap((entry) => [
-      entry.retentionCoveredMs,
-      entry.stoppedDurationMs,
-    ])),
-    terminalStopResumeGapCount: sumMetric(events.map((entry) => entry.gapCount)),
+    ...(retentionCoveredValues.length > 0
+      ? { terminalStoppedRetentionCoveredMs: Math.max(...retentionCoveredValues) }
+      : {}),
+    ...(gapCountValues.length > 0
+      ? { terminalStopResumeGapCount: gapCountValues.reduce((sum, value) => sum + value, 0) }
+      : {}),
   }
 }
 

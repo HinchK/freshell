@@ -23,6 +23,7 @@ describe('parseVisibleFirstServerLogs', () => {
         JSON.stringify({ event: 'perf_system', rssBytes: 123 }),
         JSON.stringify({ component: 'perf', event: 'http_request_slow', durationMs: 50 }),
         JSON.stringify({ event: 'terminal.replay.batch', source: 'replay', serializedBytes: 456 }),
+        JSON.stringify({ event: 'terminal.replay.diagnostic', source: 'replay', serializedBytes: 999 }),
         JSON.stringify({ event: 'terminal.output.gap', source: 'replay', fromSeq: 1, toSeq: 2 }),
         '{not-json',
       ].join('\n'),
