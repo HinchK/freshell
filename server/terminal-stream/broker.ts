@@ -9,7 +9,6 @@ import { ReplayRing, type ReplayFrame } from './replay-ring.js'
 import type { TerminalOutputBatch } from './output-batch.js'
 import { fragmentTerminalOutputForPayloadBudget } from './output-fragments.js'
 import {
-  MAX_SERIALIZED_APPLICATION_JSON_BYTES,
   prepareJsonMessage,
   readWebSocketBufferedAmount,
   sendJsonMessage,
@@ -1052,15 +1051,11 @@ export class TerminalStreamBroker {
   }
 
   private safeSendPrepared(ws: LiveWebSocket, prepared: PreparedJsonMessage): SendJsonResult {
-    return sendPreparedJsonMessage(ws, prepared, {
-      maxSerializedApplicationJsonBytes: MAX_SERIALIZED_APPLICATION_JSON_BYTES,
-    })
+    return sendPreparedJsonMessage(ws, prepared)
   }
 
   private safeSend(ws: LiveWebSocket, msg: unknown): boolean {
-    return sendJsonMessage(ws, msg, {
-      maxSerializedApplicationJsonBytes: MAX_SERIALIZED_APPLICATION_JSON_BYTES,
-    }).sent
+    return sendJsonMessage(ws, msg).sent
   }
 
   private handleTerminalExit(terminalId: string): void {

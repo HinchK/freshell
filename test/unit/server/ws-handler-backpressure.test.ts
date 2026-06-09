@@ -1080,7 +1080,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       })
     }
 
-    const wsReplay = createMockWs({ bufferedAmount: 512 * 1024 + 32 * 1024 })
+    const wsReplay = createMockWs({ bufferedAmount: 0 })
     wsReplay.send.mockImplementation((raw: string) => {
       wsReplay.bufferedAmount += Buffer.byteLength(raw, 'utf8')
     })
@@ -1096,7 +1096,9 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       undefined,
       'foreground',
     )
-    vi.advanceTimersByTime(5)
+    for (let i = 0; i < 220; i += 1) {
+      vi.runOnlyPendingTimers()
+    }
 
     expect(wsReplay.bufferedAmount).toBeLessThanOrEqual(512 * 1024 + 64 * 1024)
 

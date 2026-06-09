@@ -102,17 +102,6 @@ describe('ws-send', () => {
     )
   })
 
-  it('does not send messages that exceed the serialized JSON byte budget', () => {
-    const ws = createMockWs()
-    const result = sendJsonMessage(ws, { type: 'budget.test', data: 'x'.repeat(64) }, {
-      maxSerializedApplicationJsonBytes: 32,
-    })
-
-    expect(result.sent).toBe(false)
-    expect(result.reason).toBe('oversized')
-    expect(ws.send).not.toHaveBeenCalled()
-  })
-
   it('logs ws_send_large from the ws.send callback with bufferedAmount measurements', () => {
     const ws = createMockWs({ bufferedAmount: 100 })
     ws.send.mockImplementation((raw: string, cb?: (err?: Error) => void) => {
@@ -140,5 +129,34 @@ describe('ws-send', () => {
   it('normalizes unavailable bufferedAmount reads to undefined', () => {
     expect(readWebSocketBufferedAmount({ bufferedAmount: undefined })).toBeUndefined()
     expect(readWebSocketBufferedAmount({ bufferedAmount: Number.NaN })).toBeUndefined()
+  })
+
+  it('uses one shared serialized JSON budget even when WS_MAX_PAYLOAD_BYTES differs', async () => {
+    const originalMaxSerialized = process.env.MAX_SERIALIZED_APPLICATION_JSON_BYTES
+    const originalWsMaxPayload = process.env.WS_MAX_PAYLOAD_BYTES
+    process.env.MAX_SERIALIZED_APPLICATION_JSON_BYTES = '128'
+    process.env.WS_MAX_PAYLOAD_BYTES = '4096'
+    vi.resetModules()
+    try {
+      const { sendJsonMessage: sendWithReloadedBudget } = await import('../../../server/ws-send')
+      const ws = createMockWs()
+      const result = sendWithReloadedBudget(ws, { type: 'budget.test', data: 'x'.repeat(1500) })
+
+      expect(result.sent).toBe(false)
+      expect(result.reason).toBe('oversized')
+      expect(ws.send).not.toHaveBeenCalled()
+    } finally {
+      if (originalMaxSerialized === undefined) {
+        delete process.env.MAX_SERIALIZED_APPLICATION_JSON_BYTES
+      } else {
+        process.env.MAX_SERIALIZED_APPLICATION_JSON_BYTES = originalMaxSerialized
+      }
+      if (originalWsMaxPayload === undefined) {
+        delete process.env.WS_MAX_PAYLOAD_BYTES
+      } else {
+        process.env.WS_MAX_PAYLOAD_BYTES = originalWsMaxPayload
+      }
+      vi.resetModules()
+    }
   })
 })

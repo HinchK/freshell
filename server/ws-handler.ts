@@ -1461,7 +1461,6 @@ export class WsHandler {
       maxBufferedAmount: this.config.maxWsBufferedAmount,
       backpressureCloseCode: CLOSE_CODES.BACKPRESSURE,
       backpressureCloseReason: 'Backpressure',
-      maxSerializedApplicationJsonBytes: this.config.wsMaxPayloadBytes,
     })
   }
 

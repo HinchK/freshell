@@ -33,7 +33,6 @@ export type SendJsonOptions = {
   maxBufferedAmount?: number
   backpressureCloseCode?: number
   backpressureCloseReason?: string
-  maxSerializedApplicationJsonBytes?: number
 }
 
 export type SendJsonResult = {
@@ -117,14 +116,12 @@ export function sendPreparedJsonMessage(
     }
   }
 
-  const maxSerializedApplicationJsonBytes = options.maxSerializedApplicationJsonBytes
-    ?? MAX_SERIALIZED_APPLICATION_JSON_BYTES
-  if (prepared.serializedApplicationJsonBytes > maxSerializedApplicationJsonBytes) {
+  if (prepared.serializedApplicationJsonBytes > MAX_SERIALIZED_APPLICATION_JSON_BYTES) {
     log.warn({
       connectionId: ws.connectionId || 'unknown',
       messageType: prepared.messageType || 'unknown',
       serializedApplicationJsonBytes: prepared.serializedApplicationJsonBytes,
-      maxSerializedApplicationJsonBytes,
+      maxSerializedApplicationJsonBytes: MAX_SERIALIZED_APPLICATION_JSON_BYTES,
     }, 'WebSocket JSON message exceeds serialized byte budget')
     return {
       ...baseResult,
