@@ -1675,6 +1675,9 @@ export function fragmentTerminalOutputForPayloadBudget(input: {
   data: string
   payloadForData: (data: string) => JsonPayload
 }): string[] {
+  // Oversized terminal chunks are rare, but this binary search reserializes
+  // candidate JSON payloads. Keep the helper covered by a stress test or
+  // replace it with incremental measurement if it appears in hot-path logs.
   const maxSerializedBytes = Math.max(1, Math.floor(input.maxSerializedBytes))
   if (measureSerializedJsonBytes(input.payloadForData(input.data)) <= maxSerializedBytes) {
     return [input.data]
@@ -2245,8 +2248,10 @@ it('pauses foreground replay before avoidable buffered growth exceeds the pacing
   const registry = new FakeBrokerRegistry()
   const broker = new TerminalStreamBroker(registry as any, vi.fn())
   registry.createTerminal('term-foreground-paced')
+  const pacingThresholdBytes = 512 * 1024
+  const allowedBatchOvershootBytes = 64 * 1024
 
-  for (let i = 1; i <= 240; i += 1) {
+  for (let i = 1; i <= 1400; i += 1) {
     registry.emit('terminal.output.raw', {
       terminalId: 'term-foreground-paced',
       data: `line-${i};${'x'.repeat(2048)}`,
@@ -2273,7 +2278,9 @@ it('pauses foreground replay before avoidable buffered growth exceeds the pacing
 
   vi.advanceTimersByTime(5)
 
-  expect(wsReplay.bufferedAmount).toBeLessThanOrEqual(512 * 1024)
+  expect(wsReplay.bufferedAmount).toBeLessThanOrEqual(
+    pacingThresholdBytes + allowedBatchOvershootBytes,
+  )
 
   broker.close()
 })
@@ -2287,7 +2294,7 @@ Run:
 timeout 180s npm run test:vitest -- --config vitest.server.config.ts --run test/unit/server/ws-handler-backpressure.test.ts -t "foreground replay"
 ```
 
-Expected before implementation: fail if foreground replay sends too much before pacing.
+Expected before implementation: fail. The seeded backlog is intentionally larger than 2 MiB and the mock socket never drains, so unpaced replay sends the full backlog and exceeds `pacingThresholdBytes + allowedBatchOvershootBytes`.
 
 - [ ] **Step 3: Implement normal foreground pacing**
 
@@ -2554,6 +2561,7 @@ git commit -m "Instrument terminal catch-up replay safety"
 - Modify: `test/e2e-browser/perf/run-sample.ts`
 - Modify: `test/e2e-browser/perf/scenarios.ts`
 - Modify: `test/unit/lib/visible-first-audit-scenarios.test.ts`
+- Modify: `test/unit/lib/visible-first-audit-derived-metrics.test.ts`
 - Modify: `test/unit/lib/visible-first-audit-gate.test.ts`
 
 - [ ] **Step 1: Add terminal catch-up acceptance metrics**
@@ -2573,8 +2581,13 @@ Extend the existing `terminal-reconnect-backlog` scenario to record:
 - stopped/backgrounded duration covered by retention
 - WebSocket state after process suspend/resume or real browser background/resume
 - replay gaps or surface quarantine after suspend/background resume
+- batch protocol coverage when `terminalOutputBatchV1` is enabled
+
+When PR 5 enables `terminal.output.batch`, update the `terminal-reconnect-backlog` audit scenario's `allowedWsTypesBeforeReady` to include both `terminal.output` and `terminal.output.batch`. Otherwise the audit can reject expected batch replay traffic before the first-output milestone for the wrong reason.
 
 - [ ] **Step 2: Add unit tests for metrics contract**
+
+Add a `requiredMetricIds` field to the visible-first audit scenario definitions, including `terminal-reconnect-backlog`, so scenarios can declare required derived metrics directly.
 
 In `test/unit/lib/visible-first-audit-scenarios.test.ts`, `test/unit/lib/visible-first-audit-derived-metrics.test.ts`, and `test/unit/lib/visible-first-audit-gate.test.ts`, assert the scenario and derived metrics include terminal catch-up metrics:
 
