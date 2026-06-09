@@ -4736,6 +4736,76 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
+    it('completes attach when replay ends in a stripped terminal.output.batch BEL segment without checkpointing it', async () => {
+      const { terminalId, term, queryByText, store } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-replay-stripped-complete',
+        mode: 'codex',
+        serverInstanceId: 'server-output-batch-replay-stripped-complete',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      const attachRequestId = attach?.attachRequestId
+      const streamId = 'stream-output-batch-replay-stripped-complete'
+      expect(attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'replay',
+          seqStart: 1,
+          seqEnd: 1,
+          data: '\x07',
+          serializedBytes: 128,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1, barrier: 'turn_complete' },
+          ],
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+      await waitFor(() => {
+        expect(queryByText('Recovering terminal output...')).toBeNull()
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-replay-stripped-complete',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+      }))
+    })
+
     it('does not checkpoint a mixed renderable and stripped terminal.output.batch segment as parser-applied', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
@@ -4822,6 +4892,71 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-stripped-bel',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+      }))
+    })
+
+    it('completes attach when replay ends in a stripped legacy terminal.output BEL frame without checkpointing it', async () => {
+      const { terminalId, term, queryByText, store } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-legacy-replay-stripped-complete',
+        mode: 'codex',
+        serverInstanceId: 'server-output-legacy-replay-stripped-complete',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+      act(() => {
+        store.dispatch(setConnectionStatus('ready'))
+      })
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      const attachRequestId = attach?.attachRequestId
+      const streamId = 'stream-output-legacy-replay-stripped-complete'
+      expect(attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId,
+        })
+      })
+      expect(queryByText('Recovering terminal output...')).not.toBeNull()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: '\x07',
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+      await waitFor(() => {
+        expect(queryByText('Recovering terminal output...')).toBeNull()
+      })
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-legacy-replay-stripped-complete',
       })).toBeNull()
 
       wsMocks.send.mockClear()

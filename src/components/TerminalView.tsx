@@ -2618,13 +2618,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         const completeParserAppliedFrame = (input: {
           attachRequestId?: string
           mode: TerminalPaneContent['mode']
+          terminalInstanceId: string
           parserAppliedSeq: number
           completedAttach: boolean
         }) => {
           const activeAttach = currentAttachRef.current
           if (!activeAttach || activeAttach.requestId !== input.attachRequestId) return
+          if (terminalInstanceIdRef.current !== input.terminalInstanceId) return
           if (!shouldAllowTerminalOutputSideEffect({
-            terminalInstanceId: terminalInstanceIdRef.current,
+            terminalInstanceId: input.terminalInstanceId,
             effect: 'parser_applied_checkpoint',
             mode: input.mode,
             generation: input.attachRequestId,
@@ -2635,17 +2637,40 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           applySeqState(nextSeqState)
           markParserAppliedFrame(tid, nextSeqState.parserAppliedSeq, activeAttach)
           if (input.completedAttach) {
-            if (!shouldAllowTerminalOutputSideEffect({
-              terminalInstanceId: terminalInstanceIdRef.current,
-              effect: 'attach_completion',
+            completeAttachGeneration({
+              attachRequestId: input.attachRequestId,
               mode: input.mode,
-              generation: input.attachRequestId,
-            })) {
-              return
-            }
-            setIsAttaching(false)
-            markAttachComplete()
+              terminalInstanceId: input.terminalInstanceId,
+              terminalId: tid,
+              allowWithoutWriteScope: false,
+            })
           }
+        }
+
+        const completeAttachGeneration = (input: {
+          attachRequestId?: string
+          mode: TerminalPaneContent['mode']
+          terminalInstanceId: string
+          terminalId?: string
+          allowWithoutWriteScope: boolean
+        }) => {
+          const activeAttach = currentAttachRef.current
+          if (!activeAttach || activeAttach.requestId !== input.attachRequestId) return false
+          if (input.terminalId && activeAttach.terminalId !== input.terminalId) return false
+          if (terminalInstanceIdRef.current !== input.terminalInstanceId) return false
+          const allowedByWriteScope = shouldAllowTerminalOutputSideEffect({
+            terminalInstanceId: input.terminalInstanceId,
+            effect: 'attach_completion',
+            mode: input.mode,
+            generation: input.attachRequestId,
+          })
+          if (!allowedByWriteScope) {
+            const activeScope = getTerminalOutputWriteScope(input.terminalInstanceId)
+            if (!input.allowWithoutWriteScope || activeScope) return false
+          }
+          setIsAttaching(false)
+          markAttachComplete()
+          return true
         }
 
         const submitAcceptedOutput = (input: {
@@ -2682,6 +2707,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
           raw = replayDiscard.raw
           const inputBytesEqualSubmission = raw === input.raw
+          const outputTerminalInstanceId = terminalInstanceIdRef.current
           const submission = handleTerminalOutput(
             raw,
             input.mode,
@@ -2691,6 +2717,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               ? () => completeParserAppliedFrame({
                   attachRequestId: input.attachRequestId,
                   mode: input.mode,
+                  terminalInstanceId: outputTerminalInstanceId,
                   parserAppliedSeq: input.parserAppliedSeq,
                   completedAttach: input.completedAttach,
                 })
@@ -2710,6 +2737,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               fromSeq: input.seqStart,
               toSeq: input.seqEnd,
             }))
+            if (input.completedAttach && frameOverlapsReplay) {
+              completeAttachGeneration({
+                attachRequestId: input.attachRequestId,
+                mode: input.mode,
+                terminalInstanceId: outputTerminalInstanceId,
+                terminalId: tid,
+                allowWithoutWriteScope: true,
+              })
+            }
           }
           if (input.completedAttach && frameOverlapsReplay) {
             resetStartupProbeParser({ discardReplayRemainder: true })
