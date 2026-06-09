@@ -4336,6 +4336,83 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
+    it('cancels quarantined repair after invalid-terminal replacement before writes drain', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-quarantine-invalid',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-invalid',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'trusted text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const delayedCallbacks: Array<() => void> = []
+      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push(onWritten)
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'old in-flight text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks).toHaveLength(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      const quarantineAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(quarantineAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'INVALID_TERMINAL_ID',
+          terminalId,
+          message: 'gone',
+        })
+      })
+
+      wsMocks.send.mockClear()
+      await act(async () => {
+        delayedCallbacks.forEach((callback) => callback())
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      })
+
+      expect(wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toHaveLength(0)
+    })
+
     it('keeps queued viewport_hydrate intent when reconnect fires before the first hidden attach completes', async () => {
       const { requestId, rerender, store, tabId, paneId } = await renderTerminalHarness({
         status: 'creating',

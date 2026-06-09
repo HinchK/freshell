@@ -517,6 +517,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const quarantineRepairRef = useRef<{
     terminalId: string
     attachRequestId: string
+    queue: TerminalWriteQueue
     startedAt: number
     timer: ReturnType<typeof setTimeout> | null
   } | null>(null)
@@ -650,15 +651,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
   const scheduleQuarantineRepair = useCallback((terminalId: string, attachRequestId: string) => {
     clearQuarantineRepair()
+    const queue = writeQueueRef.current
+    if (!queue) return
     const startedAt = Date.now()
     const poll = () => {
       const pending = quarantineRepairRef.current
       if (!pending || pending.attachRequestId !== attachRequestId) return
-      if (currentAttachRef.current?.requestId !== attachRequestId) {
+      const activeAttach = currentAttachRef.current
+      if (
+        !mountedRef.current
+        || pending.terminalId !== terminalId
+        || terminalIdRef.current !== terminalId
+        || !activeAttach
+        || activeAttach.terminalId !== terminalId
+        || activeAttach.requestId !== attachRequestId
+        || writeQueueRef.current !== pending.queue
+      ) {
         clearQuarantineRepair(attachRequestId)
         return
       }
-      if (writeQueueRef.current?.hasInFlightWrites() !== true) {
+      if (!pending.queue.hasInFlightWrites()) {
         clearQuarantineRepair(attachRequestId)
         attachTerminalRef.current?.(terminalId, 'viewport_hydrate', {
           clearViewportFirst: true,
@@ -680,6 +692,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     quarantineRepairRef.current = {
       terminalId,
       attachRequestId,
+      queue,
       startedAt,
       timer: setTimeout(poll, QUARANTINE_REPAIR_POLL_MS),
     }
@@ -1722,6 +1735,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     const wrapperEl = wrapperRef.current
     return () => {
+      clearQuarantineRepair()
       requestModeBypass.dispose()
       filePathLinkDisposable?.dispose()
       urlLinkDisposable?.dispose()
@@ -1751,6 +1765,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         runtimeRef.current = null
         term.dispose()
         termRef.current = null
+        mountedRef.current = false
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -2220,6 +2235,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       requestIdRef.current = pending.requestId
       terminalIdRef.current = undefined
       launchAttemptRef.current = null
+      clearQuarantineRepair()
       currentAttachRef.current = null
       deferredAttachStateRef.current = {
         mode: 'none',
@@ -2267,6 +2283,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         reason: 'opencode_replay_window_exceeded',
       }
       clearRateLimitRetry()
+      clearQuarantineRepair()
       currentAttachRef.current = null
       launchAttemptRef.current = null
       deferredAttachStateRef.current = {
@@ -2298,6 +2315,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
       const failLaunch = (message: string, restore: boolean, terminalId?: string) => {
         clearRateLimitRetry()
+        clearQuarantineRepair()
         setIsAttaching(false)
         currentAttachRef.current = null
         deferredAttachStateRef.current = {
@@ -2569,6 +2587,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               : {}),
             attachReady: false,
           }
+          clearQuarantineRepair()
           currentAttachRef.current = null
           if (debugRef.current) log.debug('[TRACE resumeSessionId] terminal.created received', {
             paneId: paneIdRef.current,
@@ -2657,6 +2676,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
 
           launchAttemptRef.current = null
+          clearQuarantineRepair()
           currentAttachRef.current = null
           deferredAttachStateRef.current = {
             mode: 'none',
@@ -2851,6 +2871,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               term.writeln('\r\n[Starting a new terminal because the previous live terminal is gone and no durable session identity was saved]\r\n')
               const newRequestId = nanoid()
               launchAttemptRef.current = null
+              clearQuarantineRepair()
+              currentAttachRef.current = null
               clearRateLimitRetry()
               setIsAttaching(false)
               dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
@@ -2899,6 +2921,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             consumeTerminalRestoreRequestId(requestIdRef.current)
             addTerminalRestoreRequestId(newRequestId)
             requestIdRef.current = newRequestId
+            clearQuarantineRepair()
+            currentAttachRef.current = null
             clearTerminalCursor(currentTerminalId)
             resetParserAppliedSurface()
             forgetSentViewport(currentTerminalId)
@@ -3057,6 +3081,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     dispatch,
     handleTerminalOutput,
     attachTerminal,
+    clearQuarantineRepair,
     getCheckpointDeltaReplayDecision,
     markAttachComplete,
     markParserAppliedFrame,
