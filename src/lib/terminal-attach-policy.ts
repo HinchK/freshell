@@ -34,20 +34,12 @@ export type RevealAttachPlan = {
   trustResultingSurfaceForDeltaReplay?: boolean
 }
 
-function normalizeSeq(seq: number): number {
-  if (!Number.isFinite(seq)) return 0
-  return Math.max(0, Math.floor(seq))
-}
-
 function resolveCheckpointDecision(
   input: RevealAttachPolicyInput | LegacyRevealAttachPolicyInput,
 ): CheckpointDeltaReplayDecision {
   if ('checkpointDecision' in input) return input.checkpointDecision
 
-  const renderedSeq = normalizeSeq(input.renderedSeq)
-  return input.hasTrustedSurface && renderedSeq > 0
-    ? { ok: true, sinceSeq: renderedSeq }
-    : { ok: false, reason: 'missing_checkpoint' }
+  return { ok: false, reason: 'missing_checkpoint' }
 }
 
 function replayHydrateTrust(

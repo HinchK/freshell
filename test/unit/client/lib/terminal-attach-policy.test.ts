@@ -80,6 +80,20 @@ describe('terminal attach policy', () => {
     })
   })
 
+  it('does not trust legacy rendered high-water input during checkpoint migration', () => {
+    expect(resolveRevealAttachPlan({
+      pendingIntent: 'viewport_hydrate',
+      pendingReason: 'hidden_reveal',
+      hasTrustedSurface: true,
+      renderedSeq: 41,
+    })).toEqual({
+      intent: 'viewport_hydrate',
+      clearViewportFirst: true,
+      priority: 'foreground',
+      trustResultingSurfaceForDeltaReplay: false,
+    })
+  })
+
   it('falls back to viewport hydrate when the parser-applied checkpoint is unsafe', () => {
     expect(resolveRevealAttachPlan({
       pendingIntent: 'viewport_hydrate',

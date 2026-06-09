@@ -2246,7 +2246,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             }
           }
           const previousSeqState = seqStateRef.current
-          const nextSeqState = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          const gapDecision = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          const nextSeqState = gapDecision.state
           applySeqState(nextSeqState)
           markRenderedSeq(tid, nextSeqState.lastSeq)
           const completedAttachOnGap = !nextSeqState.pendingReplay
