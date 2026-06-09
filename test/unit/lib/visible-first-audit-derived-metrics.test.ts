@@ -73,6 +73,7 @@ describe('deriveVisibleFirstMetrics', () => {
             event: 'terminal.catchup.stop_resume',
             timestamp: 144,
             retentionCoveredMs: 2_500,
+            stoppedDurationMs: 8_000,
             gapCount: 1,
           },
         ],
@@ -157,6 +158,78 @@ describe('deriveVisibleFirstMetrics', () => {
     expect(result.terminalStaleGenerationRejectionCount).toBe(1)
     expect(result.terminalStoppedRetentionCoveredMs).toBe(2_500)
     expect(result.terminalStopResumeGapCount).toBe(1)
+  })
+
+  it('omits source-dependent required metrics when RAF or parser-applied evidence is absent', () => {
+    const withoutRaf = deriveVisibleFirstMetrics({
+      focusedReadyMilestone: 'terminal.first_output',
+      allowedApiRouteIdsBeforeReady: [],
+      allowedWsTypesBeforeReady: ['terminal.output.batch'],
+      browser: {
+        milestones: {
+          'terminal.first_output': 100,
+        },
+        perfEvents: [
+          { event: 'terminal.parser_applied', timestamp: 40, parserAppliedSeq: 1 },
+        ],
+      },
+      transport: {
+        http: { requests: [] },
+        ws: {
+          frames: [
+            {
+              timestamp: 30,
+              direction: 'received',
+              type: 'terminal.output.batch',
+              payload: JSON.stringify({
+                type: 'terminal.output.batch',
+                source: 'replay',
+                seqStart: 1,
+                seqEnd: 1,
+              }),
+              payloadLength: 120,
+            },
+          ],
+        },
+      },
+    })
+    expect(withoutRaf).not.toHaveProperty('maxRafGapMs')
+    expect(withoutRaf.terminalParserAppliedLagMs).toBe(10)
+
+    const withoutParserApplied = deriveVisibleFirstMetrics({
+      focusedReadyMilestone: 'terminal.first_output',
+      allowedApiRouteIdsBeforeReady: [],
+      allowedWsTypesBeforeReady: ['terminal.output.batch'],
+      browser: {
+        milestones: {
+          'terminal.first_output': 100,
+        },
+        perfEvents: [
+          { event: 'visible_first.audit.max_raf_gap', maxGapMs: 16 },
+        ],
+      },
+      transport: {
+        http: { requests: [] },
+        ws: {
+          frames: [
+            {
+              timestamp: 30,
+              direction: 'received',
+              type: 'terminal.output.batch',
+              payload: JSON.stringify({
+                type: 'terminal.output.batch',
+                source: 'replay',
+                seqStart: 1,
+                seqEnd: 1,
+              }),
+              payloadLength: 120,
+            },
+          ],
+        },
+      },
+    })
+    expect(withoutParserApplied.maxRafGapMs).toBe(16)
+    expect(withoutParserApplied).not.toHaveProperty('terminalParserAppliedLagMs')
   })
 
   it('omits stop/resume metrics when no stop/resume source event was observed', () => {

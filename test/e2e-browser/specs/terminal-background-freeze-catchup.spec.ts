@@ -345,6 +345,9 @@ function isTerminalOutputWsFrame(frame: ReceivedWsFrame): boolean {
 }
 
 test.describe('terminal background freeze catch-up', () => {
+  test.skip(({ browserName }) => browserName !== 'chromium', 'Chromium-only CDP/process-suspend proof')
+  test.skip(process.platform === 'win32', 'POSIX SIGSTOP/SIGCONT process suspend proof is not available on native Windows')
+
   test('process suspend catches up terminal output without silent gaps or quarantine', async ({
     page,
     serverInfo,

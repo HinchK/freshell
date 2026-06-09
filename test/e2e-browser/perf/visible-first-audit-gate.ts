@@ -10,6 +10,7 @@ import { AUDIT_SCENARIOS, type AuditRequiredMetricId } from './scenarios.js'
 
 export type VisibleFirstAuditGateResult = {
   ok: boolean
+  validationErrors?: string[]
   violations: Array<{
     scenarioId: string
     profileId: string

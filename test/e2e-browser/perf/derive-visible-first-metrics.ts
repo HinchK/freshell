@@ -35,7 +35,7 @@ export type DerivedMetricsInput = {
 export type VisibleFirstDerivedMetrics = {
   focusedReadyMs: number
   wsReadyMs?: number
-  maxRafGapMs: number
+  maxRafGapMs?: number
   terminalInputToFirstOutputMs?: number
   httpRequestsBeforeReady: number
   httpBytesBeforeReady: number
@@ -47,7 +47,7 @@ export type VisibleFirstDerivedMetrics = {
   offscreenWsBytesBeforeReady: number
   terminalReplayMessageCount: number
   terminalReplaySerializedBytes: number
-  terminalParserAppliedLagMs: number
+  terminalParserAppliedLagMs?: number
   terminalReplayGapCount: number
   terminalFullHydrateFallbackCount: number
   terminalSurfaceQuarantineCount: number
@@ -151,17 +151,6 @@ function eventName(entry: Record<string, unknown>): string | null {
   return typeof entry.event === 'string' ? entry.event : null
 }
 
-function maxMetric(values: Iterable<unknown>): number {
-  let max = 0
-  for (const value of values) {
-    const numberValue = nonnegativeMetric(value)
-    if (numberValue !== undefined) {
-      max = Math.max(max, numberValue)
-    }
-  }
-  return max
-}
-
 function sumMetric(values: Iterable<unknown>): number {
   let sum = 0
   for (const value of values) {
@@ -177,10 +166,17 @@ function countPerfEvents(input: DerivedMetricsInput, name: string): number {
   return (input.browser.perfEvents ?? []).filter((entry) => eventName(entry) === name).length
 }
 
-function resolveMaxRafGapMs(input: DerivedMetricsInput): number {
-  return maxMetric((input.browser.perfEvents ?? [])
+function finiteNonnegativeValues(values: Iterable<unknown>): number[] {
+  return Array.from(values)
+    .map(nonnegativeMetric)
+    .filter((value): value is number => value !== undefined)
+}
+
+function resolveMaxRafGapMs(input: DerivedMetricsInput): number | undefined {
+  const values = finiteNonnegativeValues((input.browser.perfEvents ?? [])
     .filter((entry) => eventName(entry) === 'visible_first.audit.max_raf_gap')
     .flatMap((entry) => [entry.maxGapMs, entry.durationMs]))
+  return values.length > 0 ? Math.max(...values) : undefined
 }
 
 function isReplayBatchEvent(entry: Record<string, unknown>): boolean {
@@ -288,7 +284,10 @@ function payloadSeqEnd(frame: VisibleFirstWsObservation): number | undefined {
   return typeof seqEnd === 'number' && Number.isFinite(seqEnd) ? seqEnd : undefined
 }
 
-function resolveParserAppliedLagMs(input: DerivedMetricsInput, replayFrames: VisibleFirstWsObservation[]): number {
+function resolveParserAppliedLagMs(
+  input: DerivedMetricsInput,
+  replayFrames: VisibleFirstWsObservation[],
+): number | undefined {
   const frameMilestones = replayFrames
     .map((frame) => {
       const seqEnd = payloadSeqEnd(frame)
@@ -296,9 +295,10 @@ function resolveParserAppliedLagMs(input: DerivedMetricsInput, replayFrames: Vis
     })
     .filter((entry): entry is { seqEnd: number; timestamp: number } => entry !== null)
 
-  if (frameMilestones.length === 0) return 0
+  if (frameMilestones.length === 0) return undefined
 
   let maxLagMs = 0
+  let observedParserAppliedEvidence = false
   const parserAppliedEvents = (input.browser.perfEvents ?? [])
     .filter((entry) => eventName(entry) === 'terminal.parser_applied')
   for (const event of parserAppliedEvents) {
@@ -307,11 +307,12 @@ function resolveParserAppliedLagMs(input: DerivedMetricsInput, replayFrames: Vis
     if (timestamp === undefined || parserAppliedSeq === undefined) continue
     const coveredFrames = frameMilestones.filter((frame) => frame.seqEnd <= parserAppliedSeq)
     if (coveredFrames.length === 0) continue
+    observedParserAppliedEvidence = true
     const lastFrameTimestamp = Math.max(...coveredFrames.map((frame) => frame.timestamp))
     maxLagMs = Math.max(maxLagMs, Math.max(0, timestamp - lastFrameTimestamp))
   }
 
-  return maxLagMs
+  return observedParserAppliedEvidence ? maxLagMs : undefined
 }
 
 function resolveStopResumeMetrics(input: DerivedMetricsInput): {
@@ -321,7 +322,7 @@ function resolveStopResumeMetrics(input: DerivedMetricsInput): {
   const events = (input.browser.perfEvents ?? [])
     .filter((entry) => eventName(entry) === 'terminal.catchup.stop_resume')
   const retentionCoveredValues = events
-    .flatMap((entry) => [entry.retentionCoveredMs, entry.stoppedDurationMs])
+    .map((entry) => entry.retentionCoveredMs)
     .map(nonnegativeMetric)
     .filter((value): value is number => value !== undefined)
   const gapCountValues = events
@@ -358,6 +359,8 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
   const replayFrames = replayWsFramesBeforeReady(input, focusedReadyMs)
   const stopResumeMetrics = resolveStopResumeMetrics(input)
   const terminalInputToFirstOutputMs = resolveTerminalInputToFirstOutputMs(input, focusedReadyMs)
+  const maxRafGapMs = resolveMaxRafGapMs(input)
+  const terminalParserAppliedLagMs = resolveParserAppliedLagMs(input, replayFrames)
 
   let httpRequestsBeforeReady = 0
   let httpBytesBeforeReady = 0
@@ -400,7 +403,7 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
   return {
     focusedReadyMs,
     ...(resolveWsReadyMs(input) !== undefined ? { wsReadyMs: resolveWsReadyMs(input) } : {}),
-    maxRafGapMs: resolveMaxRafGapMs(input),
+    ...(maxRafGapMs !== undefined ? { maxRafGapMs } : {}),
     ...(terminalInputToFirstOutputMs !== undefined
       ? { terminalInputToFirstOutputMs }
       : {}),
@@ -414,7 +417,7 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
     offscreenWsBytesBeforeReady,
     terminalReplayMessageCount: resolveReplayMessageCount(input, replayFrames),
     terminalReplaySerializedBytes: resolveReplaySerializedBytes(input, replayFrames),
-    terminalParserAppliedLagMs: resolveParserAppliedLagMs(input, replayFrames),
+    ...(terminalParserAppliedLagMs !== undefined ? { terminalParserAppliedLagMs } : {}),
     terminalReplayGapCount: resolveReplayGapCount(input, focusedReadyMs),
     terminalFullHydrateFallbackCount: countPerfEvents(input, 'terminal.catchup.full_hydrate_fallback'),
     terminalSurfaceQuarantineCount: countPerfEvents(input, 'terminal.catchup.surface_quarantined'),

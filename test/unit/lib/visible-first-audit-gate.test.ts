@@ -302,4 +302,40 @@ describe('evaluateVisibleFirstAuditGate', () => {
       ],
     })
   })
+
+  it('prints validation errors when the gate CLI rejects missing required metrics', async () => {
+    const base = createArtifact()
+    const candidate = createArtifact()
+    const scenario = getScenario(candidate, 'terminal-reconnect-backlog')
+    delete (scenario.samples[0].derived as Record<string, unknown>).terminalParserAppliedLagMs
+    delete (scenario.summaryByProfile.desktop_local as Record<string, unknown>).terminalParserAppliedLagMs
+
+    const { tempDir, basePath, candidatePath } = await writeArtifacts(base, candidate)
+    tempDirs.add(tempDir)
+
+    const result = await execFileAsync(
+      process.execPath,
+      [
+        require.resolve('tsx/cli'),
+        path.resolve(process.cwd(), 'scripts/assert-visible-first-audit-gate.ts'),
+        '--base',
+        basePath,
+        '--candidate',
+        candidatePath,
+      ],
+      {
+        cwd: process.cwd(),
+      },
+    ).catch((error: any) => error)
+
+    expect(result.code).toBe(1)
+    expect(result.stderr).toBe('')
+    expect(JSON.parse(result.stdout)).toEqual({
+      ok: false,
+      validationErrors: [
+        expect.stringMatching(/terminal-reconnect-backlog\/desktop_local:terminalParserAppliedLagMs/),
+      ],
+      violations: [],
+    })
+  })
 })
