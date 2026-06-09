@@ -54,6 +54,7 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import {
   beginAttach,
   createAttachSeqState,
+  markOutputRangeUnapplied,
   markParserAppliedSeq,
   onAttachReady,
   onOutputBatchSegments,
@@ -1253,15 +1254,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
   }, [suppressNetworkEffects, syncGeometryEpochForViewport, ws])
 
-  const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions) => {
-    if (!data) return
+  const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions): boolean => {
+    if (!data) return false
     const queue = writeQueueRef.current
     if (queue) {
       queue.enqueue(data, onWritten, options)
-      return
+      return true
     }
     const term = termRef.current
-    if (!term) return
+    if (!term) return false
     const mode = options?.mode ?? 'live'
     const generation = options?.generation ?? 'no-attach'
     const scope = beginTerminalOutputWriteScope({
@@ -1279,9 +1280,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           scope.complete()
         }
       })
+      return true
     } catch {
       // disposed
       scope.complete()
+      return false
     }
   }, [])
 
@@ -1360,7 +1363,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     allowReplies: boolean,
     onParserApplied?: () => void,
     writeOptions?: TerminalWriteQueueOptions,
-  ) => {
+  ): boolean => {
     const outputSource = writeOptions?.mode ?? 'live'
     const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
       foreground: resolvedThemeRef.current.foreground,
@@ -1399,28 +1402,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }))
     }
 
-    if (cleaned) {
-      enqueueTerminalWrite(cleaned, onParserApplied, writeOptions)
-    } else {
-      if (onParserApplied) {
-        const scope = beginTerminalOutputWriteScope({
-          terminalInstanceId: terminalInstanceIdRef.current,
-          source: outputSource,
-          attachRequestId: writeOptions?.generation,
-          generation: writeOptions?.generation ?? 'no-attach',
-          suppressExternalSideEffects: outputSource === 'replay',
-        })
-        try {
-          onParserApplied()
-        } finally {
-          scope.complete()
-        }
-      }
-    }
+    const submittedWrite = cleaned
+      ? enqueueTerminalWrite(cleaned, onParserApplied, writeOptions)
+      : false
 
     for (const event of osc.events) {
       handleOsc52Event(event, outputSource, mode)
     }
+    return submittedWrite
   }, [dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
 
   const findNext = useCallback((value: string = searchQuery) => {
@@ -2672,7 +2661,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             startupProbeStateRef.current = replayDiscard.resumeState
           }
           raw = replayDiscard.raw
-          handleTerminalOutput(
+          const submittedWrite = handleTerminalOutput(
             raw,
             input.mode,
             tid,
@@ -2689,6 +2678,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               coalesce: input.disableWriteCoalescing ? false : undefined,
             },
           )
+          if (!submittedWrite) {
+            applySeqState(markOutputRangeUnapplied(seqStateRef.current, {
+              fromSeq: input.seqStart,
+              toSeq: input.seqEnd,
+            }))
+          }
           if (input.completedAttach && frameOverlapsReplay) {
             resetStartupProbeParser({ discardReplayRemainder: true })
           }

@@ -4545,6 +4545,55 @@ describe('TerminalView lifecycle updates', () => {
       expect(terminalWriteStrings(term)).toEqual(['a', 'B', 'c'])
     })
 
+    it('does not checkpoint a stripped terminal.output.batch BEL segment as parser-applied', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-stripped-bel',
+        mode: 'codex',
+        serverInstanceId: 'server-output-batch-stripped-bel',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'A\x07',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1, barrier: 'turn_complete' },
+          ],
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['A'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-stripped-bel',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 1,
+      }))
+    })
+
     it('does not render or checkpoint terminal.output missing stream id after attach-ready', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',

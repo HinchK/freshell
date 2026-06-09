@@ -307,3 +307,19 @@ export function markParserAppliedSeq(state: AttachSeqState, seq: number): Attach
     parserAppliedSeq: acknowledgedSeq,
   })
 }
+
+export function markOutputRangeUnapplied(
+  state: AttachSeqState,
+  range: { fromSeq: number; toSeq: number },
+): AttachSeqState {
+  const current = createAttachSeqState(state)
+  const fromSeq = normalizeSeq(range.fromSeq)
+  const toSeq = Math.max(fromSeq, normalizeSeq(range.toSeq))
+  if (toSeq <= 0) return current
+  return buildState({
+    ...current,
+    knownLostRanges: mergeLostRanges([...current.knownLostRanges, { fromSeq, toSeq }]),
+    surfaceSafeForDeltaReplay: false,
+    requiresSurfaceQuarantine: true,
+  })
+}

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   createAttachSeqState,
   beginAttach,
+  markOutputRangeUnapplied,
   markParserAppliedSeq,
   onAttachReady,
   onOutputBatchSegments,
@@ -210,6 +211,23 @@ describe('terminal-attach-seq-state', () => {
     const gap = onOutputGap(applied, { fromSeq: 2, toSeq: 10 })
 
     expect(markParserAppliedSeq(gap.state, 10).parserAppliedSeq).toBe(1)
+  })
+
+  it('does not mark parser-applied output across an unapplied output range', () => {
+    const accepted = expectAcceptedFrame(onOutputFrame(createAttachSeqState(), {
+      seqStart: 1,
+      seqEnd: 3,
+    }))
+    const withUnappliedRange = markOutputRangeUnapplied(accepted.state, {
+      fromSeq: 2,
+      toSeq: 2,
+    })
+
+    const applied = markParserAppliedSeq(withUnappliedRange, 3)
+
+    expect(withUnappliedRange.knownLostRanges).toEqual([{ fromSeq: 2, toSeq: 2 }])
+    expect(withUnappliedRange.surfaceSafeForDeltaReplay).toBe(false)
+    expect(applied.parserAppliedSeq).toBe(1)
   })
 
   it('allows single fresh restart at seq=1 while awaitingFreshSequence', () => {
