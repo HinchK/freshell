@@ -2857,7 +2857,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               || seqEnd < seqStart
               || endOffset < 0
               || rawFrameCount <= 0
-              || rawFrameCount > seqEnd - seqStart + 1
+              || rawFrameCount !== seqEnd - seqStart + 1
             ) {
               invalidBatchReason = 'invalid_segment_range'
               break

@@ -4556,6 +4556,7 @@ describe('TerminalView lifecycle updates', () => {
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: -1 }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: 1.5 }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: 2 }] },
+        { seqStart: 1, seqEnd: 2, segments: [{ seqStart: 1, seqEnd: 2, endOffset: 1, rawFrameCount: 1 }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, barrier: null }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, barrier: '' }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, barrier: 'unknown' }] },
