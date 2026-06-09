@@ -4,6 +4,8 @@
 
 **Goal:** Make long-hidden terminal catch-up fast, loss-explicit, and safe across server replay batching, xterm parser semantics, attach races, side-effect parsing, and WebSocket backpressure.
 
+**Proof status:** Implementation can proceed from this plan. The evidence dossier is committed at `docs/superpowers/proofs/2026-06-08-terminal-catchup-evidence-dossier.md`. It resolves the prior open architecture questions with reproducible probes and source inspection. The only remaining pre-merge ambiguity is real Windows Chrome background/OS-freeze behavior, which is now an explicit do-not-merge acceptance gate rather than a blocker for starting implementation.
+
 **Architecture:** Keep server-side replay batching as the primary performance fix, but turn it into a protocol-aware stream system. The server owns replay retention, batching, serialized byte budgets, gaps, and backpressure; the client owns xterm surface identity, attach generation safety, parser-applied acknowledgements, and side-effect gating. Paint is a UX signal only, not a replay safety boundary.
 
 **Tech Stack:** TypeScript, Node.js ESM, React 18, xterm 6.0.0 behavior probes with exact dependency pinning or CI-probed dependency policy, ws WebSockets, Zod client-to-server protocol schemas, TypeScript server-to-client message unions, Vitest, Testing Library, Playwright visible-first audit tooling, structured JSONL logs.
@@ -94,7 +96,36 @@ Fresh Eyes and a third load-bearing pass found these additional constraints:
 - Replay windows cannot reconstruct stream-stateful barrier scanner state from arbitrary prefixes. Retained frames must store barrier classification and scanner state snapshots at ingestion time.
 - Broker output is centralized for current browser attach paths, but broker direct `ws.send(JSON.stringify(...))` lacks the handler send callback, large-payload instrumentation, and shared payload limits. Terminal broker sends must use a shared WebSocket sender.
 - Batch protocol and capability negotiation do not exist today, and legacy `terminal.output` lacks source/stream/segment metadata. Legacy fallback is safe only as individual modern `terminal.output` frames with `seqStart`, `seqEnd`, `attachRequestId`, and segment `data`; it must not use the old registry direct-output shape.
-- Full Chrome background/freeze behavior remains inconclusive. Chrome may suspend freezable task queues, so the plan now requires a CDP `Page.setWebLifecycleState({ state: 'frozen' })` probe and retention budget acceptance before claiming browser-background safety.
+- Full Chrome background/freeze behavior remains gated. CDP `Page.setWebLifecycleState({ state: 'frozen' })` and Xvfb tab-background probes were tried and disproven as valid local proof in this environment because timers, RAF, and WebSocket delivery continued while the probes claimed to be frozen/backgrounded. A process-suspend probe proved the failure mechanic: WebSocket frames accumulate while browser execution is stopped and deliver as a burst after resume. Real Windows Chrome background/OS-freeze behavior remains a do-not-merge acceptance gate.
+
+### Proof Dossier Results
+
+The proof worktree produced durable evidence artifacts that are now committed with this plan:
+
+- `docs/superpowers/proofs/2026-06-08-terminal-catchup-evidence-dossier.md`
+- `docs/superpowers/proofs/artifacts/terminal-catchup-pty-metrics.json`
+- `docs/superpowers/proofs/artifacts/terminal-json-serialization.json`
+- `docs/superpowers/proofs/artifacts/xterm-write-dispose.json`
+- `docs/superpowers/proofs/artifacts/browser-freeze-lifecycle.json`
+- `docs/superpowers/proofs/artifacts/browser-background-visibility.json`
+- `docs/superpowers/proofs/artifacts/browser-process-suspend.json`
+- `scripts/proofs/terminal-catchup-pty-metrics.ts`
+- `scripts/proofs/terminal-json-serialization-probe.ts`
+- `scripts/proofs/xterm-write-dispose-probe.ts`
+- `scripts/proofs/browser-freeze-lifecycle-probe.ts`
+- `scripts/proofs/browser-background-visibility-probe.ts`
+- `scripts/proofs/browser-process-suspend-probe.ts`
+
+Decisive proof results:
+
+- The PTY metrics harness exercised the real Freshell path: `TerminalRegistry` spawning a PTY, `TerminalStreamBroker` attaching, raw `terminal.output.raw` capture, and serialized broker sends. It did not rely on stdout-only logs.
+- The `agent-burst-12000` stress trace produced 776,745 bytes in 3,239 raw PTY chunks. Current broker replay compressed that to 33 replay frames, and the conservative scanner would emit 170 batches while respecting control barriers.
+- A real Codex turn produced 2,000 bytes in 15 raw chunks. `codex-help` produced 4,686 bytes in 7 raw chunks.
+- Serialized JSON budgeting is mandatory. A raw 16 KiB ESC-heavy terminal output serialized to 98,423 bytes; a raw 16 KiB ANSI SGR payload serialized to 30,158 bytes.
+- Installed `@xterm/xterm@6.0.0` has asynchronous writes and write callbacks can fire after `dispose()`. Callback fencing by terminal instance, surface epoch, attach generation, and write scope is mandatory.
+- Local CDP freeze and Xvfb background probes are invalid acceptance proof here. The process-suspend probe proved the catch-up burst mechanic by stopping the Chromium process tree, sending 40 WebSocket frames, and observing all 40 arrive immediately after resume.
+- Current 8 MiB coding-agent replay retention covers 8 hours only at about 291 B/s. A 32 MiB hot memory cap covers 8 hours at about 1,165 B/s; a 256 MiB disk cap covers 8 hours at about 9,320 B/s; a 1 GiB hard cap covers 8 hours at about 37,283 B/s.
+- Multi-client geometry, rollout compatibility, sender parity, legacy direct registry output, warm replay validity, and replay side effects are resolved into concrete implementation rules in this plan and the dossier.
 
 ## Design Summary
 
@@ -217,6 +248,114 @@ type TerminalOutputSideEffectContext = {
 ```
 
 Replay context suppresses external side effects such as clipboard prompts, request-mode replies, title updates, and client-minted turn-complete notifications. Because xterm write parsing is asynchronous, context must be terminal-instance scoped and remain associated with the submitted write until its xterm write callback fires. The write queue must allow at most one submitted xterm write per terminal surface unless it can prove parser callbacks are unambiguous for all in-flight writes. Parser callbacks and local terminal notices use a deny-by-default side-effect adapter: any new xterm parser callback, browser side effect, Redux mutation, PTY reply, clipboard action, or local xterm write must declare an effect type and be explicitly allowed for the active terminal-instance write scope.
+
+## Evidence-Backed PR Order
+
+Execute the detailed tasks below in this PR order. The numbered task sections remain implementation work packages with TDD steps; their numeric labels are not the merge order.
+
+### PR 1: Sender, Metrics, And Protocol-Neutral Safety
+
+Purpose: remove unsafe terminal send paths before adding richer replay behavior.
+
+Use these work packages:
+
+- Add `server/ws-send.ts` from the server file-structure section.
+- Apply the shared sender portions of Task 8 and Task 10.
+- Route broker and registry direct terminal sends through the shared sender.
+- Keep output protocol as legacy `terminal.output`; do not add batch frames in this PR.
+
+Must prove before merge:
+
+- Broker, registry direct terminal output, and `ws-handler` use the same serialization, ready-state, payload-measurement, backpressure, send-callback, and structured logging behavior.
+- No browser-visible terminal path can emit unsequenced old-shape `terminal.output` without passing through the shared sender.
+- Structured logs include severity, terminal id, stream id when known, attach id when known, seq range when applicable, serialized bytes, buffered amount, and rejection reason.
+
+### PR 2: Server Stream Identity, Scanner, And Retention Coverage
+
+Purpose: make server replay safe and measurable before the client trusts warm replay.
+
+Use these work packages:
+
+- Task 5: serialized payload budgeting and pre-sequence fragmentation.
+- Task 6: stream-stateful barrier-aware batching.
+- Task 7: replay deque and retained scanner metadata.
+- Add stream identity and retention coverage reporting from the server file-structure section.
+
+Must prove before merge:
+
+- `streamId` is server-minted, stable across attach/detach, and changes on new PTY/session stream, Codex recovery PTY replacement, incompatible retention loss, and restart without compatible persisted retention.
+- Oversized output is fragmented before sequence assignment and never splits Unicode surrogate pairs.
+- Batch candidates never cross stream, attach, source, geometry, gap, scanner barrier, or serialized payload budget boundaries.
+- Retention reports exact coverage for every attach; missing coverage emits a gap/quarantine reason and never advances parser-applied state.
+- Memory and optional disk retention defaults reflect the dossier sizing: 32 MiB hot memory for coding-agent terminals, optional 256 MiB disk spool default, and 1 GiB configurable hard cap.
+
+### PR 3: Client Checkpoint, Write Queue Fencing, And Side Effects
+
+Purpose: make the client safe to consume server replay without stale callbacks or replay side effects corrupting state.
+
+Use these work packages:
+
+- Task 1: client write generation safety fence.
+- Task 2: parser-applied surface checkpoint.
+- Task 3: TerminalView parser-applied cursor and attach generations.
+- Task 4: async xterm write scope and side-effect suppression.
+
+Must prove before merge:
+
+- Every queued/submitted xterm write and callback is fenced by terminal instance, surface epoch, attach generation, and write scope.
+- `parserAppliedSeq` advances only from the active fenced xterm write callback.
+- Gap receipt never advances `parserAppliedSeq`.
+- Replay suppresses PTY replies, request-mode replies, OSC52 writes/prompts, title updates, client-minted turn completion, link opens, and local terminal writes by default.
+- Any remaining local xterm write bumps `surfaceEpoch` and invalidates warm delta replay.
+
+### PR 4: Geometry Authority And Warm Replay Policy
+
+Purpose: make warm replay opt-in based on known-compatible terminal geometry and surface identity.
+
+Use these work packages:
+
+- Geometry parts of Task 2 and Task 3.
+- Server geometry epoch/history work from the server file-structure section.
+- Attach policy updates from the client file-structure section.
+
+Must prove before merge:
+
+- Warm replay is accepted only when terminal id, stream id, server identity, attach generation, surface epoch, geometry, geometry authority/history, scrollback, xterm version, parser-applied checkpoint, retention coverage, and sequence continuity are compatible.
+- `geometryAuthority='multi_client_unknown'` quarantines or rebuilds instead of warm-replaying.
+- `terminal.resize` updates geometry epoch/history and invalidates incompatible checkpoints.
+
+### PR 5: Batch Capability And Legacy Fallback
+
+Purpose: add explicit batch protocol only after both sides are safe and backwards compatible.
+
+Use these work packages:
+
+- Task 9: batch protocol.
+- Server batch builder pieces from Task 6 that were not needed by legacy segmented output.
+- Client batch segment parsing in `TerminalView` and `terminal-attach-seq-state`.
+
+Must prove before merge:
+
+- `terminal.output.batch` is sent only to clients advertising `terminalOutputBatchV1`.
+- New clients still accept old server `terminal.output`.
+- Old clients on a new server receive only legacy segmented `terminal.output` with seq metadata, never `terminal.output.batch`.
+- Legacy fallback emits the same safe segments as batch mode and never flattens across barriers or budgets.
+
+### PR 6: Browser Acceptance And Tuning
+
+Purpose: prove the implemented system handles the user-visible catch-up scenario and preserves the safety invariants under a browser that actually stops or throttles page execution.
+
+Use these work packages:
+
+- Task 10 observability that is not already complete.
+- Task 11 browser-level verification.
+- Final verification.
+
+Must prove before merge:
+
+- Visible-first audit records replay message count, serialized replay bytes, parser-applied lag, gap count/ranges, warm replay accepted/rejected reason, stale callback rejection count, side-effect suppression count, retention coverage, and browser lifecycle state.
+- Local process-suspend or equivalent positive-control testing proves catch-up burst handling when browser execution is stopped.
+- The real Windows Chrome background/OS-freeze gate below passes. CDP freeze or Xvfb tab switching cannot substitute for this gate in this environment.
 
 ## File Structure
 
@@ -2414,9 +2553,9 @@ Extend the existing `terminal-reconnect-backlog` scenario to record:
 - focused ready time
 - terminal input to first output
 - max RAF gap
-- frozen duration covered by retention
-- WebSocket state after freeze/resume
-- replay gaps or surface quarantine after freeze/resume
+- stopped/backgrounded duration covered by retention
+- WebSocket state after process suspend/resume or real browser background/resume
+- replay gaps or surface quarantine after suspend/background resume
 
 - [ ] **Step 2: Add unit tests for metrics contract**
 
@@ -2465,21 +2604,21 @@ The acceptance target for the 1,200-line backlog case:
 - No replay gaps in the seeded audit scenario.
 - No full hydrate fallback or surface quarantine in the compatible warm surface path.
 
-- [ ] **Step 5: Add browser freeze/resume probe**
+- [ ] **Step 5: Add browser stop/resume positive-control probe**
 
 Create `test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts`. It must:
 
 - Open an isolated Freshell page through the existing Playwright server fixture.
 - Seed terminal output while the page is active and establish a parser-applied checkpoint.
-- Use CDP `Page.setWebLifecycleState({ state: 'frozen' })` to freeze the page.
-- Generate enough terminal output during freeze to exercise server retention but stay within the configured retention budget.
-- Use CDP `Page.setWebLifecycleState({ state: 'active' })` to resume the page.
-- Assert the WebSocket behavior observed during freeze/resume: still open and stalled, closed/reconnected, or buffered/resumed. The test must record which path happened.
+- Use a positive-control browser-execution stop mechanism that proves page work actually stopped or was throttled. Acceptable local proof is process-tree suspend/resume or another mechanism that records timer, RAF, and WebSocket counters before, during, and after the stopped period.
+- Generate enough terminal output while browser execution is stopped to exercise server retention but stay within the configured retention budget.
+- Resume browser execution.
+- Assert the WebSocket behavior observed during stop/resume: still open and stalled, closed/reconnected, or buffered/resumed. The test must record which path happened.
 - Assert catch-up either has no gaps and no quarantine for the covered retention window, or reports explicit gaps/quarantine when retention is exceeded. Silent parser-applied cursor jumps are failures.
 
-This probe is not optional acceptance evidence. Full browser-background/freeze safety remains unproven until this spec exists and passes in the terminal catch-up suite.
+This positive-control probe is required implementation evidence, but it does not replace the real Windows Chrome gate. CDP `Page.setWebLifecycleState({ state: 'frozen' })` and Xvfb tab switching were disproven as valid proof in `docs/superpowers/proofs/artifacts/browser-freeze-lifecycle.json` and `docs/superpowers/proofs/artifacts/browser-background-visibility.json` because page work continued at active rates.
 
-- [ ] **Step 6: Run browser perf audit and freeze probe for the terminal scenario**
+- [ ] **Step 6: Run browser perf audit and positive-control probe for the terminal scenario**
 
 Run:
 
@@ -2488,9 +2627,29 @@ timeout 1200s tsx scripts/visible-first-audit.ts --scenario terminal-reconnect-b
 timeout 1200s npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts
 ```
 
-Expected: audit completes and writes `/tmp/freshell-terminal-catchup-audit.json`; the freeze/resume spec passes and records WebSocket state plus retention coverage.
+Expected: audit completes and writes `/tmp/freshell-terminal-catchup-audit.json`; the stop/resume spec passes, proves the page execution stop with timer/RAF/WebSocket counters, and records WebSocket state plus retention coverage.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Run the real Windows Chrome do-not-merge gate**
+
+This gate must run before merging the final terminal catch-up implementation PR. It may be manual if CI cannot produce real Windows Chrome background or OS-freeze behavior, but the result must be retained as an artifact or PR comment with logs.
+
+Required gate:
+
+1. Start an isolated Freshell server from the feature worktree on a unique port. Do not touch the self-hosted dev server.
+2. Open real Windows Chrome, not headless Chromium or Xvfb.
+3. Create a terminal running the deterministic generator and at least one real Codex turn.
+4. Confirm `document.visibilityState === 'hidden'` or record an OS freeze/suspend event while the Freshell tab is backgrounded, minimized, or otherwise stopped by the OS/browser.
+5. Keep it backgrounded for a 4h soak at a calibrated 1 KiB/s stream and one shorter burst of at least 750 KiB.
+6. Refocus and assert:
+   - no unsafe warm replay after retention loss;
+   - no unsequenced `terminal.output`;
+   - no parser-unsafe gap continues on the same parser;
+   - no replay-triggered OSC52/request-mode/title/turn side effect;
+   - catch-up to server head completes under the configured UX budget for covered retention;
+   - all terminal catch-up metrics are present in structured JSONL logs.
+7. If disk retention is part of the PR, repeat one 8h overnight soak before merge.
+
+- [ ] **Step 8: Commit**
 
 ```bash
 git add test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts test/e2e-browser/perf/run-sample.ts test/e2e-browser/perf/scenarios.ts test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-gate.test.ts
@@ -2523,16 +2682,20 @@ timeout 600s npm run test:vitest -- --run test/unit/client/lib/terminal-output-w
 
 Expected: pass.
 
-- [ ] **Step 4: Run terminal visible-first audit**
+- [ ] **Step 4: Run terminal visible-first audit and local stop/resume proof**
 
 ```bash
 timeout 1200s tsx scripts/visible-first-audit.ts --scenario terminal-reconnect-backlog --profile desktop_local --output /tmp/freshell-terminal-catchup-audit.json
 timeout 1200s npm run test:e2e:chromium -- test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts
 ```
 
-Expected: pass and show no replay gaps, no stale cursor advancement, no unexpected surface quarantine, #397-class replay message count, and explicit freeze/resume retention coverage.
+Expected: pass and show no replay gaps, no stale cursor advancement, no unexpected surface quarantine, #397-class replay message count, explicit stop/resume retention coverage, and recorded timer/RAF/WebSocket counters proving the browser page was actually stopped or throttled during the local probe.
 
-- [ ] **Step 5: Verify xterm dependency policy**
+- [ ] **Step 5: Run real Windows Chrome background acceptance gate**
+
+Use the Task 11 Windows Chrome gate. This is a do-not-merge gate for the final implementation PR. Passing local CDP freeze or Xvfb background tests is insufficient unless the counters prove page execution actually stopped or throttled.
+
+- [ ] **Step 6: Verify xterm dependency policy**
 
 Either pin `@xterm/xterm` exactly to the probed version or run committed xterm parser probes in CI against every allowed resolved version.
 
@@ -2542,7 +2705,7 @@ node -e "const p=require('./package.json'); if (p.dependencies['@xterm/xterm'] !
 
 Expected: pass if the implementation chooses exact pinning. If it chooses CI probes instead, replace this command with the committed probe command and explain that choice in the PR.
 
-- [ ] **Step 6: Run repo-supported full check**
+- [ ] **Step 7: Run repo-supported full check**
 
 ```bash
 FRESHELL_TEST_SUMMARY="terminal catch-up stream safety" timeout 1800s npm run check
@@ -2558,6 +2721,7 @@ Expected: full coordinated check passes.
 - Older deployed clients may not understand `terminal.output.batch`. Cheapest validation: keep additive fallback until support policy says old clients can be dropped.
 - Stream/server identity rollout may need a compatibility bridge for existing local cursors. Cheapest validation: tests that old cursor records force full hydrate instead of warm delta replay.
 - Current terminal stream remains UTF-8 string based and is not byte-perfect for invalid UTF-8 or raw 8-bit C1 controls. Cheapest validation: decide whether coding-agent terminals need byte-perfect replay before starting a separate byte-protocol project.
+- Real Windows Chrome background/OS-freeze behavior remains the only gated uncertainty. Cheapest validation: run the Task 11 real Windows Chrome gate before merging the final implementation PR; local CDP freeze and Xvfb background probes are not acceptable substitutes unless their counters prove page execution actually stopped or throttled.
 
 ## Self-Review
 
@@ -2584,7 +2748,7 @@ Spec coverage:
 - The plan gates `terminal.output.batch` behind `terminalOutputBatchV1` or a protocol version decision and keeps legacy fallback.
 - The plan requires safe legacy fallback segmentation instead of flattening arbitrary batches.
 - The plan adds observability for retention, lag, gaps, serialized bytes, and backpressure.
-- The plan requires visible-first derived metrics and a CDP freeze/resume probe before using browser audit results as acceptance evidence.
+- The plan requires visible-first derived metrics, a local stop/resume positive-control probe, and a real Windows Chrome background/OS-freeze do-not-merge gate before using browser audit results as acceptance evidence.
 
 Placeholder scan:
 
