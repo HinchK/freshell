@@ -2,6 +2,21 @@
 import { describe, expect, it } from 'vitest'
 import { runVisibleFirstAuditSample } from '@test/e2e-browser/perf/run-sample'
 
+function validStopResumeEvent() {
+  return {
+    event: 'terminal.catchup.stop_resume',
+    timestamp: 90,
+    source: 'visible_first_audit_process_suspend',
+    browserExecutionStopped: true,
+    retentionCoveredMs: 900,
+    stoppedDurationMs: 1_200,
+    outputStartedAfterStopMs: 300,
+    outputStartedBeforeResumeMs: 900,
+    cdpCatchupOutputMessageCount: 5,
+    gapCount: 0,
+  }
+}
+
 function createReconnectCollectors(input: {
   perfEvents?: Array<Record<string, unknown>>
 } = {}) {
@@ -11,14 +26,7 @@ function createReconnectCollectors(input: {
       perfEvents: input.perfEvents ?? [
         { event: 'visible_first.audit.max_raf_gap', maxGapMs: 16 },
         { event: 'terminal.parser_applied', timestamp: 40, parserAppliedSeq: 1 },
-        {
-          event: 'terminal.catchup.stop_resume',
-          timestamp: 90,
-          source: 'unit_reconnect_fixture',
-          retentionCoveredMs: 0,
-          stoppedDurationMs: 0,
-          gapCount: 0,
-        },
+        validStopResumeEvent(),
       ],
       terminalLatencySamplesMs: [],
     },
@@ -126,12 +134,12 @@ describe('runVisibleFirstAuditSample', () => {
       terminalFullHydrateFallbackCount: 0,
       terminalSurfaceQuarantineCount: 0,
       terminalStaleGenerationRejectionCount: 0,
-      terminalStoppedRetentionCoveredMs: 0,
+      terminalStoppedRetentionCoveredMs: 900,
       terminalStopResumeGapCount: 0,
     }))
   })
 
-  it('fails reconnect backlog samples when stop/resume metrics have no source evidence', async () => {
+  it('fails reconnect backlog samples when stop/resume evidence is synthetic', async () => {
     const sample = await runVisibleFirstAuditSample({
       scenarioId: 'terminal-reconnect-backlog',
       profileId: 'desktop_local',
@@ -140,6 +148,18 @@ describe('runVisibleFirstAuditSample', () => {
           perfEvents: [
             { event: 'visible_first.audit.max_raf_gap', maxGapMs: 16 },
             { event: 'terminal.parser_applied', timestamp: 40, parserAppliedSeq: 1 },
+            {
+              event: 'terminal.catchup.stop_resume',
+              timestamp: 90,
+              source: 'unit_reconnect_fixture',
+              browserExecutionStopped: false,
+              retentionCoveredMs: 900,
+              stoppedDurationMs: 1_200,
+              outputStartedAfterStopMs: 300,
+              outputStartedBeforeResumeMs: 900,
+              cdpCatchupOutputMessageCount: 5,
+              gapCount: 0,
+            },
           ],
         }),
       },
@@ -158,13 +178,7 @@ describe('runVisibleFirstAuditSample', () => {
         executeSample: async () => createReconnectCollectors({
           perfEvents: [
             { event: 'terminal.parser_applied', timestamp: 40, parserAppliedSeq: 1 },
-            {
-              event: 'terminal.catchup.stop_resume',
-              timestamp: 90,
-              source: 'unit_reconnect_fixture',
-              retentionCoveredMs: 0,
-              gapCount: 0,
-            },
+            validStopResumeEvent(),
           ],
         }),
       },
@@ -182,13 +196,7 @@ describe('runVisibleFirstAuditSample', () => {
         executeSample: async () => createReconnectCollectors({
           perfEvents: [
             { event: 'visible_first.audit.max_raf_gap', maxGapMs: 16 },
-            {
-              event: 'terminal.catchup.stop_resume',
-              timestamp: 90,
-              source: 'unit_reconnect_fixture',
-              retentionCoveredMs: 0,
-              gapCount: 0,
-            },
+            validStopResumeEvent(),
           ],
         }),
       },

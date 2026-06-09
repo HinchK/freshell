@@ -72,8 +72,13 @@ describe('deriveVisibleFirstMetrics', () => {
           {
             event: 'terminal.catchup.stop_resume',
             timestamp: 144,
+            source: 'visible_first_audit_process_suspend',
+            browserExecutionStopped: true,
             retentionCoveredMs: 2_500,
             stoppedDurationMs: 8_000,
+            outputStartedAfterStopMs: 1_000,
+            outputStartedBeforeResumeMs: 2_500,
+            cdpCatchupOutputMessageCount: 3,
             gapCount: 1,
           },
         ],
@@ -232,7 +237,7 @@ describe('deriveVisibleFirstMetrics', () => {
     expect(withoutParserApplied).not.toHaveProperty('terminalParserAppliedLagMs')
   })
 
-  it('omits stop/resume metrics when no stop/resume source event was observed', () => {
+  it('omits stop/resume metrics when process-suspend proof evidence is absent or synthetic', () => {
     const result = deriveVisibleFirstMetrics({
       focusedReadyMilestone: 'terminal.first_output',
       allowedApiRouteIdsBeforeReady: [],
@@ -241,7 +246,30 @@ describe('deriveVisibleFirstMetrics', () => {
         milestones: {
           'terminal.first_output': 50,
         },
-        perfEvents: [],
+        perfEvents: [
+          {
+            event: 'terminal.catchup.stop_resume',
+            source: 'unit_reconnect_fixture',
+            browserExecutionStopped: false,
+            retentionCoveredMs: 900,
+            stoppedDurationMs: 1_200,
+            outputStartedAfterStopMs: 300,
+            outputStartedBeforeResumeMs: 900,
+            cdpCatchupOutputMessageCount: 5,
+            gapCount: 0,
+          },
+          {
+            event: 'terminal.catchup.stop_resume',
+            source: 'visible_first_audit_process_suspend',
+            browserExecutionStopped: true,
+            retentionCoveredMs: 900,
+            stoppedDurationMs: 1_200,
+            outputStartedAfterStopMs: 300,
+            outputStartedBeforeResumeMs: 900,
+            cdpCatchupOutputMessageCount: 0,
+            gapCount: 0,
+          },
+        ],
       },
       transport: {
         http: { requests: [] },

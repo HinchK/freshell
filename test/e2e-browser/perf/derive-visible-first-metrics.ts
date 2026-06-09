@@ -321,6 +321,25 @@ function resolveStopResumeMetrics(input: DerivedMetricsInput): {
 } {
   const events = (input.browser.perfEvents ?? [])
     .filter((entry) => eventName(entry) === 'terminal.catchup.stop_resume')
+    .filter((entry) => {
+      const stoppedDurationMs = finiteNumber(entry.stoppedDurationMs)
+      const outputStartedAfterStopMs = finiteNumber(entry.outputStartedAfterStopMs)
+      const outputStartedBeforeResumeMs = finiteNumber(entry.outputStartedBeforeResumeMs)
+      const cdpCatchupOutputMessageCount = finiteNumber(entry.cdpCatchupOutputMessageCount)
+      const catchupOutputMessageCount = finiteNumber(entry.catchupOutputMessageCount)
+      return entry.source === 'visible_first_audit_process_suspend'
+        && entry.browserExecutionStopped === true
+        && stoppedDurationMs !== undefined
+        && stoppedDurationMs > 0
+        && outputStartedAfterStopMs !== undefined
+        && outputStartedAfterStopMs >= 0
+        && outputStartedBeforeResumeMs !== undefined
+        && outputStartedBeforeResumeMs >= 0
+        && (
+          (cdpCatchupOutputMessageCount !== undefined && cdpCatchupOutputMessageCount > 0)
+          || (catchupOutputMessageCount !== undefined && catchupOutputMessageCount > 0)
+        )
+    })
   const retentionCoveredValues = events
     .map((entry) => entry.retentionCoveredMs)
     .map(nonnegativeMetric)
