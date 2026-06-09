@@ -38,7 +38,12 @@ import {
 } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { terminalFollowsOscTitle } from '@/lib/terminal-title-policy'
-import { clearTerminalCursor, loadTerminalCursor, saveTerminalCursor } from '@/lib/terminal-cursor'
+import {
+  clearTerminalCursor,
+  loadTerminalSurfaceCheckpoint,
+  saveTerminalSurfaceCheckpoint,
+} from '@/lib/terminal-cursor'
+import { canUseCheckpointForDeltaReplay } from '@/lib/terminal-surface-checkpoint'
 import {
   resolveRevealAttachPlan,
   type DeferredAttachReason,
@@ -49,6 +54,7 @@ import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import {
   beginAttach,
   createAttachSeqState,
+  markParserAppliedSeq,
   onAttachReady,
   onOutputFrame,
   onOutputGap,
@@ -115,6 +121,7 @@ import { buildRestoreError, sanitizeSessionRef } from '@shared/session-contract'
 const log = createLogger('TerminalView')
 
 const SESSION_ACTIVITY_THROTTLE_MS = 5000
+const TERMINAL_CHECKPOINT_XTERM_VERSION = '6.0.0'
 export const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 5
 export const RATE_LIMIT_RETRY_BASE_MS = 2000
 export const RATE_LIMIT_RETRY_MAX_MS = 12000
@@ -442,6 +449,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     resumeState: null,
   })
   const osc52ParserRef = useRef(createOsc52ParserState())
+  const settingsRef = useRef(settings)
   const resolvedThemeRef = useRef(getTerminalTheme(settings.terminal.theme, settings.theme))
   const osc52PolicyRef = useRef<Osc52Policy>(settings.terminal.osc52Clipboard)
   const pendingOsc52EventRef = useRef<Osc52Event | null>(null)
@@ -491,8 +499,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const requestIdRef = useRef<string>(terminalContent?.createRequestId || '')
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
-  const renderedSeqRef = useRef(0)
-  const hasTrustedSurfaceRef = useRef(false)
+  const parserAppliedSeqRef = useRef(0)
+  const hasTrustedParserAppliedSurfaceRef = useRef(false)
+  const surfaceEpochRef = useRef(0)
+  const geometryEpochRef = useRef(1)
+  const currentBufferTypeRef = useRef<'unknown'>('unknown')
   const attachCounterRef = useRef(0)
   const currentAttachRef = useRef<{
     requestId: string
@@ -532,24 +543,125 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     seqStateRef.current = nextState
   }, [])
 
-  const resetRenderedSurface = useCallback((seq = 0) => {
-    renderedSeqRef.current = Math.max(0, Math.floor(Number.isFinite(seq) ? seq : 0))
-    hasTrustedSurfaceRef.current = false
+  const getTerminalCheckpointStreamId = useCallback((): string | null => {
+    const content = contentRef.current as (TerminalPaneContent & { streamId?: unknown }) | null
+    return typeof content?.streamId === 'string' && content.streamId.length > 0
+      ? content.streamId
+      : null
   }, [])
 
-  const markRenderedSeq = useCallback((terminalId: string | undefined, seq: number) => {
+  const getTerminalCheckpointServerBootId = useCallback((): string | undefined => {
+    const content = contentRef.current as (TerminalPaneContent & { serverBootId?: unknown }) | null
+    return typeof content?.serverBootId === 'string' && content.serverBootId.length > 0
+      ? content.serverBootId
+      : undefined
+  }, [])
+
+  const getTerminalCheckpointServerInstanceId = useCallback((): string | null => {
+    const contentServerInstanceId = contentRef.current?.serverInstanceId
+    if (typeof contentServerInstanceId === 'string' && contentServerInstanceId.length > 0) {
+      return contentServerInstanceId
+    }
+    return typeof serverInstanceIdRef.current === 'string' && serverInstanceIdRef.current.length > 0
+      ? serverInstanceIdRef.current
+      : null
+  }, [])
+
+  const buildCheckpointReplayInput = useCallback((terminalId: string, dimensions?: { cols?: number; rows?: number }) => {
+    const serverInstanceId = getTerminalCheckpointServerInstanceId()
+    if (!terminalId || !serverInstanceId) return null
+    const term = termRef.current
+    const normalizeDimension = (value: number | undefined, fallback: number) => {
+      const resolved = typeof value === 'number' && Number.isFinite(value) ? value : fallback
+      return Math.max(2, Math.floor(resolved))
+    }
+    const normalizeScrollback = (value: number) => (
+      Math.max(0, Math.floor(Number.isFinite(value) ? value : 0))
+    )
+    return {
+      terminalId,
+      streamId: getTerminalCheckpointStreamId(),
+      serverInstanceId,
+      serverBootId: getTerminalCheckpointServerBootId(),
+      surfaceEpoch: surfaceEpochRef.current,
+      cols: normalizeDimension(dimensions?.cols, term?.cols ?? 80),
+      rows: normalizeDimension(dimensions?.rows, term?.rows ?? 24),
+      geometryEpoch: geometryEpochRef.current,
+      geometryAuthority: 'single_client' as const,
+      scrollback: normalizeScrollback(settingsRef.current.terminal.scrollback),
+      xtermVersion: TERMINAL_CHECKPOINT_XTERM_VERSION,
+      requireParserIdle: true,
+    }
+  }, [
+    getTerminalCheckpointServerBootId,
+    getTerminalCheckpointServerInstanceId,
+    getTerminalCheckpointStreamId,
+  ])
+
+  const getCheckpointDeltaReplayDecision = useCallback((terminalId: string, dimensions?: { cols?: number; rows?: number }) => {
+    const checkpointInput = buildCheckpointReplayInput(terminalId, dimensions)
+    if (!checkpointInput) {
+      return { ok: false as const, reason: 'missing_checkpoint' as const }
+    }
+    const checkpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+      streamId: checkpointInput.streamId,
+      serverInstanceId: checkpointInput.serverInstanceId,
+      serverBootId: checkpointInput.serverBootId,
+    })
+    return canUseCheckpointForDeltaReplay(checkpoint, checkpointInput)
+  }, [buildCheckpointReplayInput])
+
+  const resetParserAppliedSurface = useCallback((seq = 0, opts?: { incrementEpoch?: boolean }) => {
+    parserAppliedSeqRef.current = Math.max(0, Math.floor(Number.isFinite(seq) ? seq : 0))
+    hasTrustedParserAppliedSurfaceRef.current = false
+    if (opts?.incrementEpoch !== false) {
+      surfaceEpochRef.current += 1
+    }
+  }, [])
+
+  const markParserAppliedFrame = useCallback((terminalId: string | undefined, seq: number, attachContext?: {
+    requestId: string
+    terminalId: string
+    cols: number
+    rows: number
+  }) => {
     if (!terminalId || !Number.isFinite(seq)) return
-    const renderedSeq = Math.max(0, Math.floor(seq))
-    if (renderedSeq <= renderedSeqRef.current) {
-      if (renderedSeq > 0) {
-        hasTrustedSurfaceRef.current = true
+    const parserAppliedSeq = Math.max(0, Math.floor(seq))
+    if (parserAppliedSeq <= parserAppliedSeqRef.current) {
+      if (parserAppliedSeq > 0) {
+        hasTrustedParserAppliedSurfaceRef.current = true
       }
       return
     }
-    renderedSeqRef.current = renderedSeq
-    hasTrustedSurfaceRef.current = true
-    saveTerminalCursor(terminalId, renderedSeq)
-  }, [])
+    parserAppliedSeqRef.current = parserAppliedSeq
+    hasTrustedParserAppliedSurfaceRef.current = true
+
+    const attach = attachContext ?? currentAttachRef.current
+    if (!attach || attach.terminalId !== terminalId) return
+    const checkpointInput = buildCheckpointReplayInput(terminalId, {
+      cols: attach.cols,
+      rows: attach.rows,
+    })
+    if (!checkpointInput) return
+
+    saveTerminalSurfaceCheckpoint({
+      terminalId: checkpointInput.terminalId,
+      streamId: checkpointInput.streamId,
+      serverInstanceId: checkpointInput.serverInstanceId,
+      ...(checkpointInput.serverBootId ? { serverBootId: checkpointInput.serverBootId } : {}),
+      surfaceEpoch: checkpointInput.surfaceEpoch,
+      attachRequestId: attach.requestId,
+      parserAppliedSeq,
+      cols: checkpointInput.cols,
+      rows: checkpointInput.rows,
+      geometryEpoch: checkpointInput.geometryEpoch,
+      geometryAuthority: checkpointInput.geometryAuthority,
+      scrollback: checkpointInput.scrollback,
+      xtermVersion: checkpointInput.xtermVersion,
+      bufferType: currentBufferTypeRef.current,
+      parserIdle: true,
+    })
+  }, [buildCheckpointReplayInput])
 
   // Keep refs in sync with props
   useEffect(() => {
@@ -566,7 +678,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
       terminalIdRef.current = terminalContent.terminalId
       if (terminalContent.terminalId !== prevTerminalId) {
-        resetRenderedSurface()
+        resetParserAppliedSurface()
         forgetSentViewport(prevTerminalId)
         const cachedViewport = terminalContent.terminalId
           ? lastSentViewportByTerminal.get(terminalContent.terminalId)
@@ -574,15 +686,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         lastSentViewportRef.current = terminalContent.terminalId && cachedViewport
           ? { terminalId: terminalContent.terminalId, cols: cachedViewport.cols, rows: cachedViewport.rows }
           : null
-        const initialSeq = terminalContent.terminalId
-          ? loadTerminalCursor(terminalContent.terminalId)
-          : 0
-        applySeqState(createAttachSeqState({ lastSeq: initialSeq }))
+        applySeqState(createAttachSeqState())
       }
       requestIdRef.current = terminalContent.createRequestId
       contentRef.current = terminalContent
     }
-  }, [terminalContent, paneId, applySeqState, resetRenderedSurface])
+  }, [terminalContent, paneId, applySeqState, resetParserAppliedSurface])
 
   // Register terminal buffer accessor with test harness (for E2E tests).
   // Uses xterm.js Terminal.buffer.active API which works with all renderers
@@ -643,6 +752,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
   // Sync during render (not in useEffect) so refs always have latest values
   paneLastInputAtRef.current = paneLastInputAt
+  settingsRef.current = settings
   debugRef.current = !!settings.logging?.debug
   refreshRequestRef.current = refreshRequest
   providerBehaviorRef.current = providerBehavior
@@ -1072,7 +1182,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     mode: TerminalPaneContent['mode'],
     tid: string | undefined,
     allowReplies: boolean,
-    onRendered?: () => void,
+    onParserApplied?: () => void,
     writeOptions?: TerminalWriteQueueOptions,
   ) => {
     const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
@@ -1103,9 +1213,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
 
     if (cleaned) {
-      enqueueTerminalWrite(cleaned, onRendered, writeOptions)
+      enqueueTerminalWrite(cleaned, onParserApplied, writeOptions)
     } else {
-      onRendered?.()
+      onParserApplied?.()
     }
 
     for (const event of osc.events) {
@@ -1709,42 +1819,64 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
     const cols = Math.max(2, term.cols || 80)
     const rows = Math.max(2, term.rows || 24)
+    const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
+    const checkpointDecision = getCheckpointDeltaReplayDecision(tid, { cols, rows })
+    const explicitSinceSeq = typeof opts?.sinceSeq === 'number'
+      ? Math.max(0, Math.floor(opts.sinceSeq))
+      : undefined
+    let effectiveIntent = intent
+    let clearViewportFirst = opts?.clearViewportFirst === true
+    if (effectiveIntent !== 'viewport_hydrate' && explicitSinceSeq === undefined && !checkpointDecision.ok) {
+      effectiveIntent = 'viewport_hydrate'
+      clearViewportFirst = true
+    }
+    const deltaSeq = Math.max(0, Math.floor(explicitSinceSeq ?? (checkpointDecision.ok ? checkpointDecision.sinceSeq : 0)))
+    const sinceSeq = effectiveIntent === 'viewport_hydrate' ? 0 : deltaSeq
+    const willResetSurface = effectiveIntent === 'viewport_hydrate'
+    const writeQueue = writeQueueRef.current
+    writeQueue?.setActiveGeneration(attachRequestId, { dropQueuedStaleWrites: true })
+    if (willResetSurface && writeQueue?.hasInFlightWrites()) {
+      log.warn('Starting terminal surface reset while writes are still in flight', {
+        paneId: paneIdRef.current,
+        terminalId: tid,
+        attachRequestId,
+        intent: effectiveIntent,
+      })
+    }
+
     setIsAttaching(true)
     setTruncatedHistoryGap(null)
-
-    const renderedSeq = hasTrustedSurfaceRef.current ? renderedSeqRef.current : 0
-    const deltaSeq = Math.max(0, Math.floor(opts?.sinceSeq ?? renderedSeq))
-    const sinceSeq = intent === 'viewport_hydrate' ? 0 : deltaSeq
 
     // Startup probes must not leak across attach generations.
     resetStartupProbeParser()
 
-    if (intent === 'viewport_hydrate') {
-      resetRenderedSurface()
-      if (opts?.clearViewportFirst) {
+    if (effectiveIntent === 'viewport_hydrate') {
+      resetParserAppliedSurface()
+      if (clearViewportFirst) {
         try {
           termRef.current?.clear()
         } catch {
           // disposed
         }
       }
-      // Keep persisted cursor untouched so transport reconnect can still use high-water.
       applySeqState(beginAttach(createAttachSeqState({ lastSeq: 0 })))
     } else {
-      applySeqState(beginAttach(createAttachSeqState({ lastSeq: deltaSeq })))
+      applySeqState(beginAttach(createAttachSeqState({
+        lastSeq: deltaSeq,
+        parserAppliedSeq: deltaSeq,
+      })))
     }
 
     deferredAttachStateRef.current = {
       mode: 'attaching',
-      pendingIntent: intent,
+      pendingIntent: effectiveIntent,
       pendingSinceSeq: sinceSeq,
       pendingReason: opts?.priority === 'background' ? 'background_catchup' : 'initial_hydrate',
     }
 
-    const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
     currentAttachRef.current = {
       requestId: attachRequestId,
-      intent,
+      intent: effectiveIntent,
       terminalId: tid,
       sinceSeq,
       cols,
@@ -1757,7 +1889,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     ws.send({
       type: 'terminal.attach',
       terminalId: tid,
-      intent,
+      intent: effectiveIntent,
       cols,
       rows,
       sinceSeq,
@@ -1767,7 +1899,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     })
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
-  }, [suppressNetworkEffects, ws, applySeqState, resetRenderedSurface, resetStartupProbeParser])
+  }, [
+    suppressNetworkEffects,
+    ws,
+    applySeqState,
+    getCheckpointDeltaReplayDecision,
+    resetParserAppliedSurface,
+    resetStartupProbeParser,
+  ])
 
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {
     if (suppressNetworkEffects) return false
@@ -1840,11 +1979,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           hydrationRegisteredRef.current = false
         }
         getHydrationQueue().onActiveTabChanged(tabId, tabOrderRef.current)
+        const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
         const revealPlan = resolveRevealAttachPlan({
           pendingIntent: deferred.pendingIntent,
           pendingReason: deferred.pendingReason,
-          hasTrustedSurface: hasTrustedSurfaceRef.current,
-          renderedSeq: renderedSeqRef.current,
+          checkpointDecision,
         })
         attachTerminal(tid, revealPlan.intent, {
           clearViewportFirst: revealPlan.clearViewportFirst,
@@ -1860,7 +1999,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
       requestTerminalLayout({ fit: true, resize: true })
     }
-  }, [hidden, isTerminal, paneId, requestTerminalLayout, tabId, attachTerminal])
+  }, [hidden, isTerminal, paneId, requestTerminalLayout, tabId, attachTerminal, getCheckpointDeltaReplayDecision])
 
   // Background hydration: triggered by the hydration queue for hidden tabs
   useEffect(() => {
@@ -1868,11 +2007,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     setBackgroundHydrationTriggered(false)
     const tid = terminalIdRef.current
     if (!tid || !hiddenRef.current) return
-    if (hasTrustedSurfaceRef.current && renderedSeqRef.current > 0) {
+    const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
+    if (checkpointDecision.ok) {
       attachTerminal(tid, 'keepalive_delta', {
         clearViewportFirst: false,
         priority: 'background',
-        sinceSeq: renderedSeqRef.current,
+        sinceSeq: checkpointDecision.sinceSeq,
       })
       return
     }
@@ -1881,7 +2021,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       priority: 'background',
       ...viewportHydrateReplayOptions(contentRef.current),
     })
-  }, [backgroundHydrationTriggered, attachTerminal])
+  }, [backgroundHydrationTriggered, attachTerminal, getCheckpointDeltaReplayDecision])
 
   // Create or attach to backend terminal
   useEffect(() => {
@@ -2054,6 +2194,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       setTruncatedHistoryGap(null)
       dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
       clearTerminalCursor(terminalId)
+      resetParserAppliedSurface()
       forgetSentViewport(terminalId)
       lastSentViewportRef.current = null
       applySeqState(createAttachSeqState())
@@ -2083,6 +2224,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
         if (terminalId) {
           clearTerminalCursor(terminalId)
+          resetParserAppliedSurface()
           forgetSentViewport(terminalId)
         }
         lastSentViewportRef.current = null
@@ -2145,8 +2287,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
           if (tid && frameDecision.freshReset) {
             clearTerminalCursor(tid)
-            resetRenderedSurface()
+            resetParserAppliedSurface()
           }
+          const frameAttachRequestId = msg.attachRequestId
           let raw = msg.data || ''
           const mode = contentRef.current?.mode || 'shell'
           const frameOverlapsReplay = Boolean(
@@ -2170,8 +2313,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           raw = replayDiscard.raw
           const completedAttachOnFrame = !frameDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
-          const completeRenderedFrame = () => {
-            markRenderedSeq(tid, frameDecision.state.lastSeq)
+          applySeqState(frameDecision.state)
+          const frameParserAppliedSeq = frameDecision.state.highestObservedSeq
+          const completeParserAppliedFrame = () => {
+            const activeAttach = currentAttachRef.current
+            if (!activeAttach || activeAttach.requestId !== frameAttachRequestId) return
+            const nextSeqState = markParserAppliedSeq(seqStateRef.current, frameParserAppliedSeq)
+            applySeqState(nextSeqState)
+            markParserAppliedFrame(tid, nextSeqState.parserAppliedSeq, activeAttach)
             if (completedAttachOnFrame) {
               setIsAttaching(false)
               markAttachComplete()
@@ -2182,8 +2331,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             mode,
             tid,
             !frameOverlapsReplay,
-            completeRenderedFrame,
-            { mode: frameOverlapsReplay ? 'replay' : 'live' },
+            completeParserAppliedFrame,
+            {
+              mode: frameOverlapsReplay ? 'replay' : 'live',
+              generation: frameAttachRequestId,
+            },
           )
           if (completedAttachOnFrame && frameOverlapsReplay) {
             resetStartupProbeParser({ discardReplayRemainder: true })
@@ -2202,7 +2354,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             })
             terminalFirstOutputMarkedRef.current = true
           }
-          applySeqState(frameDecision.state)
         }
 
         if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {
@@ -2249,7 +2400,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const gapDecision = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
           const nextSeqState = gapDecision.state
           applySeqState(nextSeqState)
-          markRenderedSeq(tid, nextSeqState.lastSeq)
+          resetParserAppliedSurface(parserAppliedSeqRef.current)
           const completedAttachOnGap = !nextSeqState.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           if (completedAttachOnGap) {
@@ -2430,6 +2581,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
           clearTerminalCursor(tid)
+          resetParserAppliedSurface()
           forgetSentViewport(tid)
           lastSentViewportRef.current = null
           // Clear terminalIdRef AND the stored terminalId to prevent any subsequent
@@ -2621,6 +2773,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               addTerminalFreshRecoveryRequestId(newRequestId, 'fresh_after_restore_unavailable')
               requestIdRef.current = newRequestId
               clearTerminalCursor(currentTerminalId)
+              resetParserAppliedSurface()
               forgetSentViewport(currentTerminalId)
               lastSentViewportRef.current = null
               terminalIdRef.current = undefined
@@ -2662,6 +2815,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             addTerminalRestoreRequestId(newRequestId)
             requestIdRef.current = newRequestId
             clearTerminalCursor(currentTerminalId)
+            resetParserAppliedSurface()
             forgetSentViewport(currentTerminalId)
             lastSentViewportRef.current = null
             terminalIdRef.current = undefined
@@ -2697,12 +2851,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         })
         if (!tid) return
         if (hiddenRef.current) {
-          const canResumeFromRenderedSurface = hasTrustedSurfaceRef.current && renderedSeqRef.current > 0
-          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live' || canResumeFromRenderedSurface
+          const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
+          const canResumeFromParserAppliedSurface = checkpointDecision.ok
+          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live' || canResumeFromParserAppliedSurface
             ? {
                 mode: 'waiting_for_geometry',
                 pendingIntent: 'transport_reconnect',
-                pendingSinceSeq: renderedSeqRef.current,
+                pendingSinceSeq: canResumeFromParserAppliedSurface ? checkpointDecision.sinceSeq : 0,
                 pendingReason: 'transport_reconnect',
               }
             : {
@@ -2711,7 +2866,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 pendingSinceSeq: 0,
                 pendingReason: 'hidden_reveal',
               }
-          registerForBackgroundHydration({ queueIfStarted: canResumeFromRenderedSurface })
+          registerForBackgroundHydration({ queueIfStarted: canResumeFromParserAppliedSurface })
           return
         }
         attachTerminal(tid, 'transport_reconnect')
@@ -2741,12 +2896,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
       if (currentTerminalId) {
         if (hiddenRef.current) {
-          const canResumeFromRenderedSurface = hasTrustedSurfaceRef.current && renderedSeqRef.current > 0
-          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live' || canResumeFromRenderedSurface
+          const checkpointDecision = getCheckpointDeltaReplayDecision(currentTerminalId)
+          const canResumeFromParserAppliedSurface = checkpointDecision.ok
+          deferredAttachStateRef.current = deferredAttachStateRef.current.mode === 'live' || canResumeFromParserAppliedSurface
             ? {
                 mode: 'waiting_for_geometry',
                 pendingIntent: 'transport_reconnect',
-                pendingSinceSeq: renderedSeqRef.current,
+                pendingSinceSeq: canResumeFromParserAppliedSurface ? checkpointDecision.sinceSeq : 0,
                 pendingReason: 'transport_reconnect',
               }
             : {
@@ -2816,10 +2972,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     dispatch,
     handleTerminalOutput,
     attachTerminal,
-    markRenderedSeq,
+    getCheckpointDeltaReplayDecision,
     markAttachComplete,
+    markParserAppliedFrame,
     registerForBackgroundHydration,
-    resetRenderedSurface,
+    resetParserAppliedSurface,
     resetStartupProbeParser,
     runRefreshAttach,
     syncContentRefWithSessionAssociation,

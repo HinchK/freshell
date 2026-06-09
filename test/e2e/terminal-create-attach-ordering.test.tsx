@@ -173,7 +173,7 @@ function createStore(options: {
         paneTitles: {},
       },
       settings: { settings: defaultSettings, status: 'loaded' },
-      connection: { status: 'ready', error: null },
+      connection: { status: 'ready', error: null, serverInstanceId: 'srv-order' },
     },
   })
 }
