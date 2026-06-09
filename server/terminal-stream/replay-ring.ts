@@ -1,12 +1,18 @@
+import { fragmentTerminalOutputForPayloadBudget } from './output-fragments.js'
+import type { JsonPayload } from './serialized-budget.js'
+
 export type ReplayFrame = {
   seqStart: number
   seqEnd: number
   data: string
   bytes: number
   at: number
+  streamId?: string
 }
 
 export const DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES = 1024 * 1024
+
+export type ReplayFrameByteMeasure = (frame: ReplayFrame) => number
 
 function resolveMaxBytes(explicitMaxBytes?: number): number {
   if (typeof explicitMaxBytes === 'number' && Number.isFinite(explicitMaxBytes) && explicitMaxBytes > 0) {
@@ -40,7 +46,7 @@ export class ReplayRing {
     this.evictIfNeeded()
   }
 
-  append(data: string): ReplayFrame {
+  append(data: string, metadata?: { streamId?: string }): ReplayFrame {
     const seq = this.nextSeq
     this.nextSeq += 1
     this.head = seq
@@ -52,12 +58,23 @@ export class ReplayRing {
       data: normalizedData,
       bytes: Buffer.byteLength(normalizedData, 'utf8'),
       at: Date.now(),
+      ...(metadata?.streamId ? { streamId: metadata.streamId } : {}),
     }
 
     this.frames.push(frame)
     this.totalBytes += frame.bytes
     this.evictIfNeeded()
     return frame
+  }
+
+  appendFragmentedForPayloadBudget(input: {
+    data: string
+    maxSerializedBytes: number
+    payloadForData: (data: string) => JsonPayload
+    streamId?: string
+  }): ReplayFrame[] {
+    const fragments = fragmentTerminalOutputForPayloadBudget(input)
+    return fragments.map((fragment) => this.append(fragment, { streamId: input.streamId }))
   }
 
   replaySince(sinceSeq?: number): { frames: ReplayFrame[]; missedFromSeq?: number } {
@@ -82,6 +99,7 @@ export class ReplayRing {
     sinceSeq: number | undefined,
     maxBytes: number,
     toSeq?: number,
+    measureFrameBytes?: ReplayFrameByteMeasure,
   ): { frames: ReplayFrame[]; missedFromSeq?: number } {
     const normalizedSinceSeq = sinceSeq === undefined || sinceSeq === 0 ? 0 : sinceSeq
     const normalizedMaxBytes = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0
@@ -111,18 +129,31 @@ export class ReplayRing {
     for (let i = startIndex; i < this.frames.length; i += 1) {
       const frame = this.frames[i]
       if (frame.seqStart > normalizedToSeq) break
-      if (frame.bytes > budget && frames.length > 0) break
+      const frameBytes = this.measureFrameForBatch(frame, measureFrameBytes)
 
       const previous = frames[frames.length - 1]
       if (previous && frame.seqStart === previous.seqEnd + 1) {
-        previous.seqEnd = frame.seqEnd
-        previous.data += frame.data
-        previous.bytes += frame.bytes
-        previous.at = frame.at
+        const mergedCandidate: ReplayFrame = {
+          ...previous,
+          seqEnd: frame.seqEnd,
+          data: previous.data + frame.data,
+          bytes: previous.bytes + frame.bytes,
+          at: frame.at,
+        }
+        const previousBytes = this.measureFrameForBatch(previous, measureFrameBytes)
+        const mergedBytes = this.measureFrameForBatch(mergedCandidate, measureFrameBytes)
+        const additionalBytes = Math.max(0, mergedBytes - previousBytes)
+        if (additionalBytes > budget) break
+        previous.seqEnd = mergedCandidate.seqEnd
+        previous.data = mergedCandidate.data
+        previous.bytes = mergedCandidate.bytes
+        previous.at = mergedCandidate.at
+        budget -= additionalBytes
       } else {
+        if (frameBytes > budget && frames.length > 0) break
         frames.push({ ...frame })
+        budget -= frameBytes
       }
-      budget -= frame.bytes
       if (budget <= 0) break
     }
 
@@ -160,6 +191,12 @@ export class ReplayRing {
       }
     }
     return low
+  }
+
+  private measureFrameForBatch(frame: ReplayFrame, measureFrameBytes?: ReplayFrameByteMeasure): number {
+    if (!measureFrameBytes) return frame.bytes
+    const measured = measureFrameBytes(frame)
+    return Number.isFinite(measured) && measured > 0 ? Math.floor(measured) : 0
   }
 
   private decodeUtf8Fatal(bytes: Uint8Array): string | null {

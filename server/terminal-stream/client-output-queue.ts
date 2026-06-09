@@ -1,11 +1,17 @@
 import type { ReplayFrame } from './replay-ring.js'
 
+type QueuedReplayFrame = ReplayFrame & {
+  queuedBytes: number
+}
+
 export type GapEvent = {
   type: 'gap'
   fromSeq: number
   toSeq: number
   reason: 'queue_overflow'
 }
+
+export type QueuedFrameByteMeasure = (frame: ReplayFrame) => number
 
 export function isGapEvent(entry: ReplayFrame | GapEvent): entry is GapEvent {
   return 'type' in entry && entry.type === 'gap'
@@ -28,7 +34,7 @@ function resolveMaxBytes(explicitMaxBytes?: number): number {
 
 export class ClientOutputQueue {
   private readonly maxBytes: number
-  private frames: ReplayFrame[] = []
+  private frames: QueuedReplayFrame[] = []
   private totalBytes = 0
   private pendingGap: GapEvent | null = null
   private droppedBytes = 0
@@ -37,13 +43,16 @@ export class ClientOutputQueue {
     this.maxBytes = resolveMaxBytes(maxBytes)
   }
 
-  enqueue(frame: ReplayFrame): void {
-    this.frames.push({ ...frame })
-    this.totalBytes += frame.bytes
+  enqueue(frame: ReplayFrame, queuedBytes = frame.bytes): void {
+    const normalizedQueuedBytes = Number.isFinite(queuedBytes) && queuedBytes > 0
+      ? Math.floor(queuedBytes)
+      : 0
+    this.frames.push({ ...frame, queuedBytes: normalizedQueuedBytes })
+    this.totalBytes += normalizedQueuedBytes
     this.evictOverflow()
   }
 
-  nextBatch(maxBytes: number): Array<ReplayFrame | GapEvent> {
+  nextBatch(maxBytes: number, measureFrameBytes?: QueuedFrameByteMeasure): Array<ReplayFrame | GapEvent> {
     const out: Array<ReplayFrame | GapEvent> = []
     let budget = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0
 
@@ -58,27 +67,39 @@ export class ClientOutputQueue {
 
     while (this.frames.length > 0) {
       const first = this.frames[0]
-      if (first.bytes > budget && out.some((item) => !isGapEvent(item))) break
+      const firstBytes = this.measureFrameForBatch(first, measureFrameBytes)
+      if (firstBytes > budget && out.some((item) => !isGapEvent(item))) break
 
       const frame = this.frames.shift()
       if (!frame) break
-      this.totalBytes -= frame.bytes
-      budget -= frame.bytes
+      this.totalBytes -= frame.queuedBytes
+      budget -= firstBytes
 
-      const merged: ReplayFrame = { ...frame }
+      const merged: ReplayFrame = this.toReplayFrame(frame)
+      let mergedBytes = firstBytes
       while (this.frames.length > 0) {
         const next = this.frames[0]
         if (next.seqStart !== merged.seqEnd + 1) break
-        if (next.bytes > budget) break
+        const mergedCandidate: ReplayFrame = {
+          ...merged,
+          seqEnd: next.seqEnd,
+          data: merged.data + next.data,
+          bytes: merged.bytes + next.bytes,
+          at: next.at,
+        }
+        const mergedCandidateBytes = this.measureFrameForBatch(mergedCandidate, measureFrameBytes)
+        const additionalBytes = Math.max(0, mergedCandidateBytes - mergedBytes)
+        if (additionalBytes > budget) break
 
         const nextFrame = this.frames.shift()
         if (!nextFrame) break
-        this.totalBytes -= nextFrame.bytes
-        budget -= nextFrame.bytes
-        merged.seqEnd = nextFrame.seqEnd
-        merged.data += nextFrame.data
-        merged.bytes += nextFrame.bytes
-        merged.at = nextFrame.at
+        this.totalBytes -= nextFrame.queuedBytes
+        budget -= additionalBytes
+        merged.seqEnd = mergedCandidate.seqEnd
+        merged.data = mergedCandidate.data
+        merged.bytes = mergedCandidate.bytes
+        merged.at = mergedCandidate.at
+        mergedBytes = mergedCandidateBytes
       }
 
       out.push(merged)
@@ -117,9 +138,29 @@ export class ClientOutputQueue {
     while (this.totalBytes > this.maxBytes && this.frames.length > 0) {
       const dropped = this.frames.shift()
       if (!dropped) break
-      this.totalBytes -= dropped.bytes
-      this.droppedBytes += dropped.bytes
+      this.totalBytes -= dropped.queuedBytes
+      this.droppedBytes += dropped.queuedBytes
       this.extendGap(dropped.seqStart, dropped.seqEnd)
+    }
+  }
+
+  private measureFrameForBatch(frame: ReplayFrame, measureFrameBytes?: QueuedFrameByteMeasure): number {
+    if (!measureFrameBytes) {
+      const queuedBytes = (frame as Partial<QueuedReplayFrame>).queuedBytes
+      return typeof queuedBytes === 'number' ? queuedBytes : frame.bytes
+    }
+    const measured = measureFrameBytes(this.toReplayFrame(frame))
+    return Number.isFinite(measured) && measured > 0 ? Math.floor(measured) : 0
+  }
+
+  private toReplayFrame(frame: ReplayFrame): ReplayFrame {
+    return {
+      seqStart: frame.seqStart,
+      seqEnd: frame.seqEnd,
+      data: frame.data,
+      bytes: frame.bytes,
+      at: frame.at,
+      ...(frame.streamId ? { streamId: frame.streamId } : {}),
     }
   }
 
