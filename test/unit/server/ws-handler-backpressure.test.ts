@@ -245,7 +245,9 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     // Recover below threshold and allow queued frame to flush.
     ws.bufferedAmount = 0
     vi.advanceTimersByTime(100)
-    expect(ws.send).toHaveBeenCalledWith(expect.stringContaining('"type":"terminal.output"'))
+    expect(ws.send.mock.calls.some(([raw]) =>
+      typeof raw === 'string' && raw.includes('"type":"terminal.output"')
+    )).toBe(true)
     expect(perfSpy).not.toHaveBeenCalledWith('terminal_stream_catastrophic_close', expect.any(Object), expect.anything())
 
     broker.close()
@@ -1060,6 +1062,47 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('paces foreground replay when socket bufferedAmount grows under replay pressure', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(4 * 1024 * 1024)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-foreground-paced')
+
+    const wsSeed = createMockWs()
+    await broker.attach(wsSeed as any, 'term-foreground-paced', 'viewport_hydrate', 80, 24, 0, 'seed-attach')
+
+    const chunk = 'x'.repeat(2 * 1024)
+    for (let i = 1; i <= 1400; i += 1) {
+      registry.emit('terminal.output.raw', {
+        terminalId: 'term-foreground-paced',
+        data: `foreground-paced-${i};${chunk}`,
+        at: Date.now(),
+      })
+    }
+
+    const wsReplay = createMockWs({ bufferedAmount: 512 * 1024 + 32 * 1024 })
+    wsReplay.send.mockImplementation((raw: string) => {
+      wsReplay.bufferedAmount += Buffer.byteLength(raw, 'utf8')
+    })
+
+    await broker.attach(
+      wsReplay as any,
+      'term-foreground-paced',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'foreground-paced-attach',
+      undefined,
+      'foreground',
+    )
+    vi.advanceTimersByTime(5)
+
+    expect(wsReplay.bufferedAmount).toBeLessThanOrEqual(512 * 1024 + 64 * 1024)
+
+    broker.close()
+  })
+
   it('pauses background replay when socket bufferedAmount is above the background threshold without closing', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -1125,7 +1168,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       })
     }
 
-    const ws = createMockWs({ bufferedAmount: 768 * 1024 })
+    const ws = createMockWs({ bufferedAmount: 512 * 1024 + 16 * 1024 })
     await broker.attach(ws as any, 'term-promoted', 'keepalive_delta', 80, 24, 0, 'background-attach', undefined, 'background')
     vi.advanceTimersByTime(100)
     expect(ws.send.mock.calls

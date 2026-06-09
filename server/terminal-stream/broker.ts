@@ -9,6 +9,15 @@ import { ReplayRing, type ReplayFrame } from './replay-ring.js'
 import type { TerminalOutputBatch } from './output-batch.js'
 import { fragmentTerminalOutputForPayloadBudget } from './output-fragments.js'
 import {
+  MAX_SERIALIZED_APPLICATION_JSON_BYTES,
+  prepareJsonMessage,
+  readWebSocketBufferedAmount,
+  sendJsonMessage,
+  sendPreparedJsonMessage,
+  type PreparedJsonMessage,
+  type SendJsonResult,
+} from '../ws-send.js'
+import {
   isTerminalStreamAttachRequestIdWithinSerializedBudget,
   measureTerminalOutputPayloadBytes,
   TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
@@ -33,6 +42,19 @@ const CODING_CLI_MIN_REPLAY_RING_MAX_BYTES = Number(
   process.env.CODING_CLI_MIN_REPLAY_RING_MAX_BYTES || 8 * 1024 * 1024,
 )
 const TERMINAL_STREAM_BUDGET_SEQ_PLACEHOLDER = Number.MAX_SAFE_INTEGER
+const CONFIGURED_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES = Number(
+  process.env.TERMINAL_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES || 512 * 1024 + 64 * 1024,
+)
+const TERMINAL_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES = Math.min(
+  Math.max(
+    TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES + 1024,
+    Number.isFinite(CONFIGURED_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES)
+      && CONFIGURED_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES > 0
+      ? Math.floor(CONFIGURED_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES)
+      : 512 * 1024 + 64 * 1024,
+  ),
+  Math.max(1024, TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES - 1),
+)
 
 type PerfLevel = 'debug' | 'info' | 'warn' | 'error'
 type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
@@ -41,6 +63,9 @@ type ReplayGapRange = {
   fromSeq: number
   toSeq: number
 }
+type ReplaySendOutcome =
+  | { status: 'sent'; pauseAfter: boolean }
+  | { status: 'paused' | 'failed' }
 type PerfEventLogger = (
   event: TerminalStreamPerfEvent,
   context: Record<string, unknown>,
@@ -542,7 +567,7 @@ export class TerminalStreamBroker {
       return
     }
 
-    const wsBuffered = ws.bufferedAmount as number | undefined
+    const wsBuffered = readWebSocketBufferedAmount(ws)
     if (
       attachment.priority === 'background'
       && typeof wsBuffered === 'number'
@@ -636,53 +661,66 @@ export class TerminalStreamBroker {
         : Math.min(cursor.toSeq + 1, terminalState.replayRing.headSeq() + 1)
       const missedToSeq = Math.min(cursor.toSeq, replayFromSeq - 1)
       if (missedToSeq >= replay.missedFromSeq) {
-        if (!this.sendReplayGap(
-          attachment.ws,
+        const gapSend = this.sendReplayGapWithPacing(
           terminalId,
+          attachment,
           replay.missedFromSeq,
           missedToSeq,
           cursor.streamId,
           attachRequestId,
-        )) return
+        )
+        if (gapSend.status !== 'sent') return
         attachment.lastSeq = Math.max(attachment.lastSeq, missedToSeq)
         cursor.nextSeq = missedToSeq + 1
+        if (gapSend.pauseAfter) return
       }
     }
 
     let skippedGap: ReplayGapRange | null = null
-    const flushSkippedGap = (): boolean => {
-      if (!skippedGap) return true
+    const flushSkippedGap = (): 'sent' | 'paused' | 'failed' | 'none' => {
+      if (!skippedGap) return 'none'
       const gap = skippedGap
-      skippedGap = null
-      if (!this.sendReplayGap(
-        attachment.ws,
+      const gapSend = this.sendReplayGapWithPacing(
         terminalId,
+        attachment,
         gap.fromSeq,
         gap.toSeq,
         cursor.streamId,
         attachRequestId,
-      )) return false
+      )
+      if (gapSend.status !== 'sent') return gapSend.status
+      skippedGap = null
       attachment.lastSeq = Math.max(attachment.lastSeq, gap.toSeq)
       cursor.nextSeq = gap.toSeq + 1
-      return true
+      return gapSend.pauseAfter ? 'paused' : 'sent'
     }
 
     for (const frame of replay.frames) {
       if (frame.streamId !== cursor.streamId) {
         if (!skippedGap || frame.seqStart > skippedGap.toSeq + 1) {
-          if (!flushSkippedGap()) return
+          const gapResult = flushSkippedGap()
+          if (gapResult === 'paused' || gapResult === 'failed') return
           skippedGap = { fromSeq: frame.seqStart, toSeq: frame.seqEnd }
         } else {
           skippedGap.toSeq = Math.max(skippedGap.toSeq, frame.seqEnd)
         }
         continue
       }
-      if (!flushSkippedGap()) return
-      if (!this.sendFrame(attachment.ws, terminalId, frame, attachRequestId)) return
+      const gapResult = flushSkippedGap()
+      if (gapResult === 'paused' || gapResult === 'failed') return
+      const frameSend = this.sendReplayFrameWithPacing(
+        terminalId,
+        attachment,
+        frame,
+        attachRequestId,
+      )
+      if (frameSend.status !== 'sent') return
       attachment.lastSeq = Math.max(attachment.lastSeq, frame.seqEnd)
       cursor.nextSeq = frame.seqEnd + 1
+      if (frameSend.pauseAfter) return
     }
-    if (!flushSkippedGap()) return
+    const gapResult = flushSkippedGap()
+    if (gapResult === 'paused' || gapResult === 'failed') return
 
     if (cursor.nextSeq > cursor.toSeq || replay.frames.length === 0) {
       attachment.replayCursor = null
@@ -787,6 +825,25 @@ export class TerminalStreamBroker {
     }))
   }
 
+  private sendReplayFrameWithPacing(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+    frame: ReplayFrame,
+    attachRequestId?: string,
+  ): ReplaySendOutcome {
+    const prepared = this.prepareSendPayload(this.buildTerminalOutputPayload({
+      type: 'terminal.output',
+      terminalId,
+      streamId: frame.streamId,
+      seqStart: frame.seqStart,
+      seqEnd: frame.seqEnd,
+      data: frame.data,
+      attachRequestId,
+    }))
+    if (!prepared) return { status: 'failed' }
+    return this.sendPreparedReplayPayloadWithPacing(terminalId, attachment, prepared)
+  }
+
   private sendGap(
     ws: LiveWebSocket,
     terminalId: string,
@@ -855,14 +912,155 @@ export class TerminalStreamBroker {
     })
   }
 
-  private safeSend(ws: LiveWebSocket, msg: unknown): boolean {
-    if (ws.readyState !== WebSocket.OPEN) return false
-    try {
-      ws.send(JSON.stringify(msg))
-      return true
-    } catch {
-      return false
+  private sendReplayGapWithPacing(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+    fromSeq: number,
+    toSeq: number,
+    streamId: string,
+    attachRequestId?: string,
+  ): ReplaySendOutcome {
+    const prepared = this.prepareSendPayload({
+      type: 'terminal.output.gap',
+      terminalId,
+      streamId,
+      fromSeq,
+      toSeq,
+      reason: 'replay_window_exceeded',
+      ...(attachRequestId ? { attachRequestId } : {}),
+    })
+    if (!prepared) return { status: 'failed' }
+    if (this.shouldPauseReplayBeforeSend(terminalId, attachment, prepared)) {
+      return { status: 'paused' }
     }
+
+    this.perfEventLogger('terminal_stream_gap', {
+      terminalId,
+      connectionId: attachment.ws.connectionId,
+      fromSeq,
+      toSeq,
+      streamId,
+      reason: 'replay_window_exceeded',
+    }, 'warn')
+
+    const result = this.safeSendPrepared(attachment.ws, prepared)
+    if (!result.sent) return { status: 'failed' }
+    return {
+      status: 'sent',
+      pauseAfter: this.shouldPauseReplayAfterSend(terminalId, attachment, result),
+    }
+  }
+
+  private sendPreparedReplayPayloadWithPacing(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+    prepared: PreparedJsonMessage,
+  ): ReplaySendOutcome {
+    if (this.shouldPauseReplayBeforeSend(terminalId, attachment, prepared)) {
+      return { status: 'paused' }
+    }
+    const result = this.safeSendPrepared(attachment.ws, prepared)
+    if (!result.sent) return { status: 'failed' }
+    return {
+      status: 'sent',
+      pauseAfter: this.shouldPauseReplayAfterSend(terminalId, attachment, result),
+    }
+  }
+
+  private shouldPauseReplayBeforeSend(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+    prepared: PreparedJsonMessage,
+  ): boolean {
+    const buffered = readWebSocketBufferedAmount(attachment.ws)
+    if (typeof buffered !== 'number') return false
+    const threshold = this.replayBufferedPauseThreshold(attachment)
+    const projectedBufferedAmount = buffered + prepared.serializedApplicationJsonBytes
+    if (projectedBufferedAmount <= threshold) return false
+    this.pauseReplayForBackpressure(terminalId, attachment, {
+      bufferedAmount: buffered,
+      projectedBufferedAmount,
+      threshold,
+      serializedApplicationJsonBytes: prepared.serializedApplicationJsonBytes,
+      phase: 'before_send',
+    })
+    return true
+  }
+
+  private shouldPauseReplayAfterSend(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+    result: SendJsonResult,
+  ): boolean {
+    const buffered = result.bufferedAfter
+    if (typeof buffered !== 'number') return false
+    const threshold = this.replayBufferedPauseThreshold(attachment)
+    if (buffered <= threshold) return false
+    this.pauseReplayForBackpressure(terminalId, attachment, {
+      bufferedAmount: buffered,
+      threshold,
+      serializedApplicationJsonBytes: result.serializedApplicationJsonBytes,
+      phase: 'after_send',
+    })
+    return true
+  }
+
+  private replayBufferedPauseThreshold(attachment: BrokerClientAttachment): number {
+    return attachment.priority === 'background'
+      ? TERMINAL_BACKGROUND_BUFFERED_PAUSE_BYTES
+      : TERMINAL_FOREGROUND_REPLAY_BUFFERED_PAUSE_BYTES
+  }
+
+  private replayBufferedPauseDelayMs(attachment: BrokerClientAttachment): number {
+    return attachment.priority === 'background'
+      ? TERMINAL_BACKGROUND_RETRY_FLUSH_MS
+      : TERMINAL_STREAM_RETRY_FLUSH_MS
+  }
+
+  private pauseReplayForBackpressure(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+    context: {
+      bufferedAmount: number
+      threshold: number
+      serializedApplicationJsonBytes?: number
+      projectedBufferedAmount?: number
+      phase: 'before_send' | 'after_send'
+    },
+  ): void {
+    const retryMs = this.replayBufferedPauseDelayMs(attachment)
+    log.debug({
+      event: 'terminal_stream_replay_backpressure_pause',
+      terminalId,
+      connectionId: attachment.ws.connectionId,
+      priority: attachment.priority,
+      retryMs,
+      ...context,
+    }, 'Terminal replay paused for websocket backpressure')
+    this.scheduleFlush(terminalId, attachment, retryMs)
+  }
+
+  private prepareSendPayload(payload: unknown): PreparedJsonMessage | null {
+    try {
+      return prepareJsonMessage(payload)
+    } catch (error) {
+      log.warn({
+        err: error instanceof Error ? error : new Error(String(error)),
+      }, 'WebSocket message serialization failed')
+      return null
+    }
+  }
+
+  private safeSendPrepared(ws: LiveWebSocket, prepared: PreparedJsonMessage): SendJsonResult {
+    return sendPreparedJsonMessage(ws, prepared, {
+      maxSerializedApplicationJsonBytes: MAX_SERIALIZED_APPLICATION_JSON_BYTES,
+    })
+  }
+
+  private safeSend(ws: LiveWebSocket, msg: unknown): boolean {
+    return sendJsonMessage(ws, msg, {
+      maxSerializedApplicationJsonBytes: MAX_SERIALIZED_APPLICATION_JSON_BYTES,
+    }).sent
   }
 
   private handleTerminalExit(terminalId: string): void {

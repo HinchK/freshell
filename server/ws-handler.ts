@@ -4,7 +4,7 @@ import WebSocket, { WebSocketServer } from 'ws'
 import { z } from 'zod'
 import { logger } from './logger.js'
 import { recordSessionLifecycleEvent } from './session-observability.js'
-import { getPerfConfig, logPerfEvent, shouldLog, startPerfTimer } from './perf-logger.js'
+import { getPerfConfig, startPerfTimer } from './perf-logger.js'
 import { getRequiredAuthToken, isLoopbackAddress, isOriginAllowed, timingSafeCompare } from './auth.js'
 import { buildTerminalSessionRef, modeSupportsResume, terminalIdFromCreateError } from './terminal-registry.js'
 import type { TerminalRecord, TerminalRegistry, TerminalMode } from './terminal-registry.js'
@@ -103,6 +103,7 @@ import {
   planCodexCreateRestoreDecision,
   resolveCodexCreateRestoreDecision,
 } from './coding-cli/codex-app-server/restore-decision.js'
+import { sendJsonMessage } from './ws-send.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -1454,88 +1455,14 @@ export class WsHandler {
     }
   }
 
-  private closeForBackpressureIfNeeded(ws: LiveWebSocket, bufferedOverride?: number): boolean {
-    const buffered = bufferedOverride ?? (ws.bufferedAmount as number | undefined)
-    if (typeof buffered !== 'number' || buffered <= this.config.maxWsBufferedAmount) return false
-
-    if (perfConfig.enabled && shouldLog(`ws_backpressure_${ws.connectionId || 'unknown'}`, perfConfig.rateLimitMs)) {
-      logPerfEvent(
-        'ws_backpressure_close',
-        {
-          connectionId: ws.connectionId,
-          bufferedBytes: buffered,
-          limitBytes: this.config.maxWsBufferedAmount,
-        },
-        'warn',
-      )
-    }
-    ws.close(CLOSE_CODES.BACKPRESSURE, 'Backpressure')
-    return true
-  }
-
   private send(ws: LiveWebSocket, msg: unknown, skipBackpressureCheck = false) {
-    let messageType: string | undefined
-    try {
-      // Backpressure guard (skipped for pre-drained chunked sends).
-      const buffered = ws.bufferedAmount as number | undefined
-      if (!skipBackpressureCheck && this.closeForBackpressureIfNeeded(ws, buffered)) return
-      let serialized = ''
-      let payloadBytes: number | undefined
-      let serializeMs: number | undefined
-      let shouldLogSend = false
-
-      if (perfConfig.enabled) {
-        if (msg && typeof msg === 'object' && 'type' in msg) {
-          const typeValue = (msg as { type?: unknown }).type
-          if (typeof typeValue === 'string') messageType = typeValue
-        }
-
-        const serializeStart = process.hrtime.bigint()
-        serialized = JSON.stringify(msg)
-        const serializeEnd = process.hrtime.bigint()
-        payloadBytes = Buffer.byteLength(serialized)
-
-        if (payloadBytes >= perfConfig.wsPayloadWarnBytes) {
-          shouldLogSend = shouldLog(
-            `ws_send_large_${ws.connectionId || 'unknown'}_${messageType || 'unknown'}`,
-            perfConfig.rateLimitMs,
-          )
-          if (shouldLogSend) {
-            serializeMs = Number((Number(serializeEnd - serializeStart) / 1e6).toFixed(2))
-          }
-        }
-      } else {
-        serialized = JSON.stringify(msg)
-      }
-
-      const sendStart = shouldLogSend ? process.hrtime.bigint() : null
-      ws.send(serialized, (err) => {
-        if (!shouldLogSend) return
-        const sendMs = sendStart ? Number((Number(process.hrtime.bigint() - sendStart) / 1e6).toFixed(2)) : undefined
-        logPerfEvent(
-          'ws_send_large',
-          {
-            connectionId: ws.connectionId,
-            messageType,
-            payloadBytes,
-            bufferedBytes: buffered,
-            serializeMs,
-            sendMs,
-            error: !!err,
-          },
-          'warn',
-        )
-      })
-    } catch (err) {
-      log.warn(
-        {
-          err: err instanceof Error ? err : new Error(String(err)),
-          connectionId: ws.connectionId || 'unknown',
-          messageType: messageType || 'unknown',
-        },
-        'WebSocket send failed',
-      )
-    }
+    sendJsonMessage(ws, msg, {
+      skipBackpressureCheck,
+      maxBufferedAmount: this.config.maxWsBufferedAmount,
+      backpressureCloseCode: CLOSE_CODES.BACKPRESSURE,
+      backpressureCloseReason: 'Backpressure',
+      maxSerializedApplicationJsonBytes: this.config.wsMaxPayloadBytes,
+    })
   }
 
   private safeSend(ws: LiveWebSocket, msg: unknown, skipBackpressureCheck = false) {
