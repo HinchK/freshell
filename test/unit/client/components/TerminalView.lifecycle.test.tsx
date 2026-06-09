@@ -4057,6 +4057,12 @@ describe('TerminalView lifecycle updates', () => {
         .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
       expect(secondAttach?.attachRequestId).toBeTruthy()
       expect(secondAttach?.attachRequestId).not.toBe(firstAttach?.attachRequestId)
+      expect(secondAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
 
       act(() => {
         messageHandler!({
@@ -4107,8 +4113,122 @@ describe('TerminalView lifecycle updates', () => {
         streamId: 'stream-1',
         serverInstanceId: 'server-a',
       })
-      expect(checkpointAfterCurrentCallback?.attachRequestId).toBe(secondAttach?.attachRequestId)
-      expect(checkpointAfterCurrentCallback?.parserAppliedSeq).toBe(4)
+      expect(checkpointAfterCurrentCallback?.attachRequestId).toBe(firstAttach?.attachRequestId)
+      expect(checkpointAfterCurrentCallback?.parserAppliedSeq).toBe(1)
+    })
+
+    it('fails closed from delta attach when writes are in flight', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-in-flight-delta',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-delta',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'checkpointed text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const initialCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-delta',
+        serverInstanceId: 'server-a',
+      })
+      expect(initialCheckpoint?.attachRequestId).toBe(firstAttach?.attachRequestId)
+      expect(initialCheckpoint?.parserAppliedSeq).toBe(1)
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'old in-flight delta text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks).toHaveLength(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      const secondAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(secondAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 3,
+          replayFromSeq: 2,
+          replayToSeq: 3,
+          attachRequestId: secondAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 3,
+          data: 'quarantined replay text',
+          attachRequestId: secondAttach!.attachRequestId,
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual([
+        'old in-flight delta text',
+        'quarantined replay text',
+      ])
+
+      act(() => {
+        delayedCallbacks.forEach(({ callback }) => callback())
+      })
+
+      const checkpointAfterCallbacks = loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-delta',
+        serverInstanceId: 'server-a',
+      })
+      expect(checkpointAfterCallbacks?.attachRequestId).toBe(firstAttach?.attachRequestId)
+      expect(checkpointAfterCallbacks?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
     })
 
     it('does not clear the old surface when full hydrate starts with in-flight writes', async () => {

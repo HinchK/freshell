@@ -551,13 +551,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       : null
   }, [])
 
-  const getTerminalCheckpointServerBootId = useCallback((): string | undefined => {
-    const content = contentRef.current as (TerminalPaneContent & { serverBootId?: unknown }) | null
-    return typeof content?.serverBootId === 'string' && content.serverBootId.length > 0
-      ? content.serverBootId
-      : undefined
-  }, [])
-
   const getTerminalCheckpointServerInstanceId = useCallback((): string | null => {
     const contentServerInstanceId = contentRef.current?.serverInstanceId
     if (typeof contentServerInstanceId === 'string' && contentServerInstanceId.length > 0) {
@@ -583,7 +576,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       terminalId,
       streamId: getTerminalCheckpointStreamId(),
       serverInstanceId,
-      serverBootId: getTerminalCheckpointServerBootId(),
       surfaceEpoch: surfaceEpochRef.current,
       cols: normalizeDimension(dimensions?.cols, term?.cols ?? 80),
       rows: normalizeDimension(dimensions?.rows, term?.rows ?? 24),
@@ -594,7 +586,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       requireParserIdle: true,
     }
   }, [
-    getTerminalCheckpointServerBootId,
     getTerminalCheckpointServerInstanceId,
     getTerminalCheckpointStreamId,
   ])
@@ -607,7 +598,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const checkpoint = loadTerminalSurfaceCheckpoint(terminalId, {
       streamId: checkpointInput.streamId,
       serverInstanceId: checkpointInput.serverInstanceId,
-      serverBootId: checkpointInput.serverBootId,
     })
     return canUseCheckpointForDeltaReplay(checkpoint, checkpointInput)
   }, [buildCheckpointReplayInput])
@@ -652,7 +642,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       terminalId: checkpointInput.terminalId,
       streamId: checkpointInput.streamId,
       serverInstanceId: checkpointInput.serverInstanceId,
-      ...(checkpointInput.serverBootId ? { serverBootId: checkpointInput.serverBootId } : {}),
       surfaceEpoch: checkpointInput.surfaceEpoch,
       attachRequestId: attach.requestId,
       parserAppliedSeq,
@@ -1824,29 +1813,34 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const cols = Math.max(2, term.cols || 80)
     const rows = Math.max(2, term.rows || 24)
     const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
+    const writeQueue = writeQueueRef.current
+    const hasInFlightWrites = writeQueue?.hasInFlightWrites() === true
     const checkpointDecision = getCheckpointDeltaReplayDecision(tid, { cols, rows })
     const explicitSinceSeq = typeof opts?.sinceSeq === 'number'
       ? Math.max(0, Math.floor(opts.sinceSeq))
       : undefined
     let effectiveIntent = intent
     let clearViewportFirst = opts?.clearViewportFirst === true
-    if (effectiveIntent !== 'viewport_hydrate' && explicitSinceSeq === undefined && !checkpointDecision.ok) {
+    if (hasInFlightWrites && effectiveIntent !== 'viewport_hydrate') {
+      effectiveIntent = 'viewport_hydrate'
+      clearViewportFirst = true
+    } else if (effectiveIntent !== 'viewport_hydrate' && explicitSinceSeq === undefined && !checkpointDecision.ok) {
       effectiveIntent = 'viewport_hydrate'
       clearViewportFirst = true
     }
     const deltaSeq = Math.max(0, Math.floor(explicitSinceSeq ?? (checkpointDecision.ok ? checkpointDecision.sinceSeq : 0)))
     const sinceSeq = effectiveIntent === 'viewport_hydrate' ? 0 : deltaSeq
     const willResetSurface = effectiveIntent === 'viewport_hydrate'
-    const writeQueue = writeQueueRef.current
-    const hasInFlightWrites = writeQueue?.hasInFlightWrites() === true
-    const surfaceQuarantined = willResetSurface && hasInFlightWrites
+    const surfaceQuarantined = hasInFlightWrites
     writeQueue?.setActiveGeneration(attachRequestId, { dropQueuedStaleWrites: true })
     if (surfaceQuarantined) {
-      log.warn('Quarantining terminal surface reset while writes are still in flight', {
+      log.warn('Quarantining terminal attach while writes are still in flight', {
         paneId: paneIdRef.current,
         terminalId: tid,
         attachRequestId,
         intent: effectiveIntent,
+        requestedIntent: intent,
+        sinceSeq,
         clearViewportFirst,
       })
     }
