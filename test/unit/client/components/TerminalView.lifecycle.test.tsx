@@ -3999,44 +3999,68 @@ describe('TerminalView lifecycle updates', () => {
       expect(secondAttach?.attachRequestId).toBeTruthy()
       expect(secondAttach?.attachRequestId).not.toBe(firstAttach?.attachRequestId)
 
-      messageHandler!({
-        type: 'terminal.output',
-        terminalId,
-        seqStart: 1,
-        seqEnd: 1,
-        data: 'STALE',
-        attachRequestId: firstAttach!.attachRequestId,
-      } as any)
-      messageHandler!({
-        type: 'terminal.output',
-        terminalId,
-        seqStart: 2,
-        seqEnd: 2,
-        data: 'FRESH',
-        attachRequestId: secondAttach!.attachRequestId,
-      } as any)
-      messageHandler!({
-        type: 'terminal.output',
-        terminalId,
-        seqStart: 3,
-        seqEnd: 3,
-        data: 'UNTAGGED',
-        __preserveMissingAttachRequestId: true,
-      } as any)
+      let now = 200
+      const performanceNowSpy = vi.spyOn(performance, 'now').mockImplementation(() => {
+        now += 0.01
+        return now
+      })
+      try {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'STALE',
+          attachRequestId: firstAttach!.attachRequestId,
+        } as any)
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'FRESH',
+          attachRequestId: secondAttach!.attachRequestId,
+        } as any)
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 3,
+          seqEnd: 3,
+          data: 'UNTAGGED',
+          __preserveMissingAttachRequestId: true,
+        } as any)
+      } finally {
+        performanceNowSpy.mockRestore()
+      }
 
       const writes = term.write.mock.calls.map(([d]) => String(d)).join('')
       expect(writes).toContain('FRESH')
       expect(writes).not.toContain('STALE')
       expect(writes).not.toContain('UNTAGGED')
-      expect(bridge.snapshot().milestones['terminal.attach_generation_stale_rejected']).toBeTypeOf('number')
-      expect(bridge.snapshot().metadata['terminal.attach_generation_stale_rejected']).toEqual(
-        expect.objectContaining({
-          terminalId,
-          messageType: 'terminal.output',
-          reason: 'missing_attach_request_id',
-          activeAttachRequestId: secondAttach!.attachRequestId,
-        }),
-      )
+      const staleRejectedEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.attach_generation_stale_rejected')
+      expect(staleRejectedEvents).toHaveLength(2)
+      expect(staleRejectedEvents[0]).toEqual(expect.objectContaining({
+        event: 'terminal.attach_generation_stale_rejected',
+        timestamp: expect.any(Number),
+        terminalId,
+        messageType: 'terminal.output',
+        attachRequestId: firstAttach!.attachRequestId,
+        activeAttachRequestId: secondAttach!.attachRequestId,
+        reason: 'stale_attach_request_id',
+      }))
+      expect(staleRejectedEvents[1]).toEqual(expect.objectContaining({
+        event: 'terminal.attach_generation_stale_rejected',
+        timestamp: expect.any(Number),
+        terminalId,
+        messageType: 'terminal.output',
+        activeAttachRequestId: secondAttach!.attachRequestId,
+        reason: 'missing_attach_request_id',
+      }))
+      expect(staleRejectedEvents[1]).not.toHaveProperty('attachRequestId')
+      expect(Number(staleRejectedEvents[0].timestamp)).toBeLessThan(Number(staleRejectedEvents[1].timestamp))
+      expect(bridge.snapshot().metadata['terminal.attach_generation_stale_rejected']).toBeUndefined()
+      expect(bridge.snapshot().milestones['terminal.attach_generation_stale_rejected']).toBeUndefined()
     })
 
     it('persists attach-ready stream id into pane content and checkpoint identity', async () => {

@@ -2094,7 +2094,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const current = currentAttachRef.current
     if (!current) return true
     if (!msg.attachRequestId) {
-      markTerminalPerfAudit('terminal.attach_generation_stale_rejected', {
+      recordTerminalPerfAuditEvent('terminal.attach_generation_stale_rejected', {
         terminalId: msg.terminalId,
         messageType: msg.type,
         activeAttachRequestId: current.requestId,
@@ -2112,7 +2112,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
     const isCurrent = msg.attachRequestId === current.requestId
     if (!isCurrent) {
-      markTerminalPerfAudit('terminal.attach_generation_stale_rejected', {
+      recordTerminalPerfAuditEvent('terminal.attach_generation_stale_rejected', {
         terminalId: msg.terminalId,
         messageType: msg.type,
         attachRequestId: msg.attachRequestId,
@@ -2121,7 +2121,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       })
     }
     return isCurrent
-  }, [markTerminalPerfAudit])
+  }, [recordTerminalPerfAuditEvent])
 
   const isCurrentAttachStreamMessage = useCallback((msg: {
     type: string
