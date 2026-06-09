@@ -4,6 +4,7 @@ import {
   beginAttach,
   markParserAppliedSeq,
   onAttachReady,
+  onOutputBatchSegments,
   onOutputFrame,
   onOutputGap,
 } from '@/lib/terminal-attach-seq-state'
@@ -91,6 +92,39 @@ describe('terminal-attach-seq-state', () => {
     if (decision.accept) {
       expect(decision.state.lastSeq).toBe(11)
     }
+  })
+
+  it('accepts all batch segments as one preflight decision', () => {
+    let state = beginAttach(createAttachSeqState({ lastSeq: 0 }))
+    state = onAttachReady(state, { headSeq: 8, replayFromSeq: 6, replayToSeq: 8 })
+
+    const decision = onOutputBatchSegments(state, [
+      { seqStart: 6, seqEnd: 6 },
+      { seqStart: 7, seqEnd: 7 },
+      { seqStart: 8, seqEnd: 8 },
+    ])
+
+    expect(decision.accept).toBe(true)
+    if (!decision.accept) throw new Error('expected accepted batch decision')
+    expect(decision.state.lastSeq).toBe(8)
+    expect(decision.state.pendingReplay).toBeNull()
+    expect(decision.segments.map((segment) => segment.parserAppliedSeq)).toEqual([6, 7, 8])
+  })
+
+  it('rejects an entire batch when any segment overlaps already accepted output', () => {
+    const state = createAttachSeqState({ lastSeq: 2 })
+
+    const decision = onOutputBatchSegments(state, [
+      { seqStart: 3, seqEnd: 3 },
+      { seqStart: 2, seqEnd: 2 },
+      { seqStart: 4, seqEnd: 4 },
+    ])
+
+    expect(decision.accept).toBe(false)
+    if (decision.accept) throw new Error('expected rejected batch decision')
+    expect(decision.reason).toBe('overlap')
+    expect(decision.rejectedSegment).toEqual({ seqStart: 2, seqEnd: 2 })
+    expect(decision.state).toEqual(state)
   })
 
   it('drops overlap outside pending replay window', () => {

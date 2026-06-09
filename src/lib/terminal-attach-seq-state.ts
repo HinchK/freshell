@@ -11,6 +11,29 @@ export type OutputGapDecision = {
   requiresSurfaceQuarantine: boolean
 }
 
+export type OutputBatchAcceptedSegment = {
+  seqStart: number
+  seqEnd: number
+  freshReset: boolean
+  parserAppliedSeq: number
+  previousState: AttachSeqState
+  state: AttachSeqState
+}
+
+export type OutputBatchDecision =
+  | {
+      accept: true
+      freshReset: boolean
+      state: AttachSeqState
+      segments: OutputBatchAcceptedSegment[]
+    }
+  | {
+      accept: false
+      reason: 'overlap'
+      rejectedSegment: { seqStart: number; seqEnd: number }
+      state: AttachSeqState
+    }
+
 export type AttachSeqState = {
   /**
    * Backward-compatible alias for highestObservedSeq until TerminalView migrates
@@ -223,6 +246,49 @@ export function onOutputFrame(
       pendingReplay,
       awaitingFreshSequence: false,
     }),
+  }
+}
+
+export function onOutputBatchSegments(
+  state: AttachSeqState,
+  segments: Array<{ seqStart: number; seqEnd: number }>,
+): OutputBatchDecision {
+  const initialState = createAttachSeqState(state)
+  let current = initialState
+  let freshReset = false
+  const acceptedSegments: OutputBatchAcceptedSegment[] = []
+
+  for (const segment of segments) {
+    const previousState = current
+    const decision = onOutputFrame(current, segment)
+    if (!decision.accept) {
+      return {
+        accept: false,
+        reason: decision.reason,
+        rejectedSegment: {
+          seqStart: normalizeSeq(segment.seqStart),
+          seqEnd: Math.max(normalizeSeq(segment.seqStart), normalizeSeq(segment.seqEnd)),
+        },
+        state: initialState,
+      }
+    }
+    freshReset = freshReset || decision.freshReset
+    current = decision.state
+    acceptedSegments.push({
+      seqStart: normalizeSeq(segment.seqStart),
+      seqEnd: Math.max(normalizeSeq(segment.seqStart), normalizeSeq(segment.seqEnd)),
+      freshReset: decision.freshReset,
+      parserAppliedSeq: decision.state.highestObservedSeq,
+      previousState,
+      state: decision.state,
+    })
+  }
+
+  return {
+    accept: true,
+    freshReset,
+    state: current,
+    segments: acceptedSegments,
   }
 }
 

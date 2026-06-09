@@ -214,6 +214,7 @@ export interface LiveWebSocket extends WebSocket {
   connectionId?: string
   connectedAt?: number
   isMobileClient?: boolean
+  supportsTerminalOutputBatchV1?: boolean
   // Generation counter for chunked session updates to prevent interleaving
   sessionUpdateGeneration?: number
 }
@@ -430,6 +431,7 @@ const TabsSyncClientRetireSchema = z.object({
 type ClientState = {
   authenticated: boolean
   supportsUiScreenshotV1: boolean
+  supportsTerminalOutputBatchV1: boolean
   attachedTerminalIds: Set<string>
   createdByRequestId: Map<string, string>
   terminalCreateTimestamps: number[]
@@ -1231,6 +1233,7 @@ export class WsHandler {
     const state: ClientState = {
       authenticated: false,
       supportsUiScreenshotV1: false,
+      supportsTerminalOutputBatchV1: false,
       attachedTerminalIds: new Set(),
       createdByRequestId: new Map(),
       terminalCreateTimestamps: [],
@@ -2056,6 +2059,8 @@ export class WsHandler {
         }
         state.authenticated = true
         state.supportsUiScreenshotV1 = !!m.capabilities?.uiScreenshotV1
+        state.supportsTerminalOutputBatchV1 = !!m.capabilities?.terminalOutputBatchV1
+        ws.supportsTerminalOutputBatchV1 = state.supportsTerminalOutputBatchV1
         state.sidebarOpenSessionKeys = buildSidebarOpenSessionKeys(
           m.sidebarOpenSessions ?? [],
           this.serverInstanceId,
@@ -2970,6 +2975,7 @@ export class WsHandler {
           m.attachRequestId,
           m.maxReplayBytes,
           m.priority ?? 'foreground',
+          state.supportsTerminalOutputBatchV1,
         )
         if (attachResult === 'invalid_attach_request_id') {
           this.sendError(ws, {

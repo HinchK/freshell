@@ -206,7 +206,10 @@ export class WsClient {
       }
     }
 
-    if (msg.type === 'terminal.output' && typeof msg.terminalId === 'string') {
+    if (
+      (msg.type === 'terminal.output' || msg.type === 'terminal.output.batch')
+      && typeof msg.terminalId === 'string'
+    ) {
       markTerminalOutputSeen(msg.terminalId)
     }
 
@@ -334,7 +337,7 @@ export class WsClient {
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { uiScreenshotV1: true },
+          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true },
           ...helloExtensions,
         })
       }

@@ -228,6 +228,7 @@ export const HelloSchema = z.object({
   protocolVersion: z.literal(WS_PROTOCOL_VERSION),
   capabilities: z.object({
     uiScreenshotV1: z.boolean().optional(),
+    terminalOutputBatchV1: z.boolean().optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -704,6 +705,28 @@ export type TerminalOutputMessage = {
   attachRequestId?: string
 }
 
+export type TerminalOutputBatchSegment = {
+  seqStart: number
+  seqEnd: number
+  endOffset: number
+  data?: string
+  rawFrameCount: number
+  barrier?: 'control' | 'startup_probe' | 'osc52' | 'request_mode' | 'turn_complete' | 'gap' | 'geometry'
+}
+
+export type TerminalOutputBatchMessage = {
+  type: 'terminal.output.batch'
+  terminalId: string
+  streamId: string
+  attachRequestId: string
+  source: 'live' | 'replay'
+  seqStart: number
+  seqEnd: number
+  data: string
+  serializedBytes: number
+  segments: TerminalOutputBatchSegment[]
+}
+
 export type TerminalOutputGapMessage = {
   type: 'terminal.output.gap'
   terminalId: string
@@ -1000,6 +1023,7 @@ export type ServerMessage =
   | TerminalExitMessage
   | TerminalStatusMessage
   | TerminalOutputMessage
+  | TerminalOutputBatchMessage
   | TerminalOutputGapMessage
   | TerminalTitleUpdatedMessage
   | TerminalSessionAssociatedMessage

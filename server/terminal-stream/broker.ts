@@ -73,7 +73,7 @@ type ReplayGapRange = {
   toSeq: number
 }
 type ReplaySendOutcome =
-  | { status: 'sent'; pauseAfter: boolean }
+  | { status: 'sent'; pauseAfter: boolean; sentSeqEnd: number }
   | { status: 'paused' | 'failed' }
 type PerfEventLogger = (
   event: TerminalStreamPerfEvent,
@@ -154,6 +154,7 @@ export class TerminalStreamBroker {
     attachRequestId?: string,
     maxReplayBytes?: number,
     priority: AttachPriority = 'foreground',
+    terminalOutputBatchV1 = false,
   ): Promise<'attached' | 'duplicate' | 'missing' | 'invalid_attach_request_id'> {
     if (!isTerminalStreamAttachRequestIdWithinSerializedBudget(attachRequestId)) {
       return 'invalid_attach_request_id'
@@ -194,6 +195,7 @@ export class TerminalStreamBroker {
 
       const terminalState = existingState ?? this.getOrCreateTerminalState(terminalId)
       const attachment = existingAttachment ?? this.getOrCreateAttachment(terminalState, ws, terminalId)
+      attachment.terminalOutputBatchV1 = terminalOutputBatchV1
 
       if (attachment.flushTimer) {
         clearTimeout(attachment.flushTimer)
@@ -474,6 +476,7 @@ export class TerminalStreamBroker {
         lastSeq: 0,
         flushTimer: null,
         catastrophicClosed: false,
+        terminalOutputBatchV1: false,
       }
       terminalState.clients.set(ws, attachment)
       this.registerWsTerminal(ws, terminalId)
@@ -636,7 +639,7 @@ export class TerminalStreamBroker {
         continue
       }
 
-      if (!this.sendFrame(ws, terminalId, item, attachRequestId)) return
+      if (!this.sendFrame(ws, terminalId, item, attachRequestId, 'live', attachment.terminalOutputBatchV1)) return
       attachment.lastSeq = Math.max(attachment.lastSeq, item.seqEnd)
     }
 
@@ -679,8 +682,8 @@ export class TerminalStreamBroker {
           attachRequestId,
         )
         if (gapSend.status !== 'sent') return
-        attachment.lastSeq = Math.max(attachment.lastSeq, missedToSeq)
-        cursor.nextSeq = missedToSeq + 1
+        attachment.lastSeq = Math.max(attachment.lastSeq, gapSend.sentSeqEnd)
+        cursor.nextSeq = gapSend.sentSeqEnd + 1
         if (gapSend.pauseAfter) return
       }
     }
@@ -724,8 +727,8 @@ export class TerminalStreamBroker {
         attachRequestId,
       )
       if (frameSend.status !== 'sent') return
-      attachment.lastSeq = Math.max(attachment.lastSeq, frame.seqEnd)
-      cursor.nextSeq = frame.seqEnd + 1
+      attachment.lastSeq = Math.max(attachment.lastSeq, frameSend.sentSeqEnd)
+      cursor.nextSeq = frameSend.sentSeqEnd + 1
       if (frameSend.pauseAfter) return
     }
     const gapResult = flushSkippedGap()
@@ -821,8 +824,24 @@ export class TerminalStreamBroker {
     terminalId: string,
     frame: ReplayFrame | TerminalOutputBatch,
     attachRequestId?: string,
+    source: 'live' | 'replay' = 'live',
+    terminalOutputBatchV1 = false,
   ): boolean {
-    // Segment metadata stays server-internal until the batch protocol exists.
+    if (this.isTerminalOutputBatch(frame)) {
+      if (terminalOutputBatchV1 && attachRequestId) {
+        for (const payload of this.buildTerminalOutputBatchPayloads({
+          terminalId,
+          batch: frame,
+          attachRequestId,
+          source,
+        })) {
+          if (!this.safeSend(ws, payload)) return false
+        }
+        return true
+      }
+      return this.sendLegacyOutputSegments(ws, terminalId, frame, attachRequestId)
+    }
+
     return this.safeSend(ws, this.buildTerminalOutputPayload({
       type: 'terminal.output',
       terminalId,
@@ -834,12 +853,204 @@ export class TerminalStreamBroker {
     }))
   }
 
+  private isTerminalOutputBatch(frame: ReplayFrame | TerminalOutputBatch): frame is TerminalOutputBatch {
+    return Array.isArray((frame as Partial<TerminalOutputBatch>).segments)
+  }
+
+  private buildTerminalOutputBatchPayloads(input: {
+    terminalId: string
+    batch: TerminalOutputBatch
+    attachRequestId: string
+    source: 'live' | 'replay'
+  }): JsonPayload[] {
+    const fullPayload = this.buildTerminalOutputBatchPayload(input, 0, input.batch.segments.length)
+    const fullPayloadBytes = typeof fullPayload.serializedBytes === 'number'
+      ? fullPayload.serializedBytes
+      : Number.POSITIVE_INFINITY
+    if (
+      fullPayloadBytes <= TERMINAL_STREAM_BATCH_MAX_BYTES
+      || input.batch.segments.length <= 1
+    ) {
+      return [fullPayload]
+    }
+
+    const payloads: JsonPayload[] = []
+    let startIndex = 0
+    while (startIndex < input.batch.segments.length) {
+      let endIndex = startIndex + 1
+      let currentPayload = this.buildTerminalOutputBatchPayload(input, startIndex, endIndex)
+
+      while (endIndex < input.batch.segments.length) {
+        const candidate = this.buildTerminalOutputBatchPayload(input, startIndex, endIndex + 1)
+        const candidateBytes = typeof candidate.serializedBytes === 'number'
+          ? candidate.serializedBytes
+          : Number.POSITIVE_INFINITY
+        if (candidateBytes > TERMINAL_STREAM_BATCH_MAX_BYTES) break
+        currentPayload = candidate
+        endIndex += 1
+      }
+
+      payloads.push(currentPayload)
+      startIndex = endIndex
+    }
+
+    return payloads
+  }
+
+  private buildTerminalOutputBatchPayload(
+    input: {
+      terminalId: string
+      batch: TerminalOutputBatch
+      attachRequestId: string
+      source: 'live' | 'replay'
+    },
+    startSegmentIndex: number,
+    endSegmentIndex: number,
+  ): JsonPayload {
+    const firstSegment = input.batch.segments[startSegmentIndex]
+    const lastSegment = input.batch.segments[endSegmentIndex - 1]
+    const startOffset = startSegmentIndex === 0
+      ? 0
+      : input.batch.segments[startSegmentIndex - 1]?.endOffset ?? 0
+    const endOffset = lastSegment?.endOffset ?? startOffset
+    const basePayload = {
+      type: 'terminal.output.batch',
+      terminalId: input.terminalId,
+      streamId: input.batch.streamId,
+      attachRequestId: input.attachRequestId,
+      source: input.source,
+      seqStart: firstSegment?.seqStart ?? input.batch.seqStart,
+      seqEnd: lastSegment?.seqEnd ?? input.batch.seqEnd,
+      data: input.batch.data.slice(startOffset, endOffset),
+      serializedBytes: 0,
+      segments: this.buildTerminalOutputBatchWireSegments(
+        input.batch,
+        startSegmentIndex,
+        endSegmentIndex,
+        startOffset,
+      ),
+    }
+
+    let serializedBytes = 0
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const measured = measureTerminalOutputPayloadBytes({
+        ...basePayload,
+        serializedBytes,
+      })
+      if (measured === serializedBytes) break
+      serializedBytes = measured
+    }
+
+    return {
+      ...basePayload,
+      serializedBytes,
+    }
+  }
+
+  private buildTerminalOutputBatchWireSegments(
+    batch: TerminalOutputBatch,
+    startSegmentIndex: number,
+    endSegmentIndex: number,
+    baseOffset: number,
+  ): JsonPayload[] {
+    let previousEndOffset = 0
+    return batch.segments.slice(startSegmentIndex, endSegmentIndex).map((segment) => {
+      const relativeEndOffset = Math.max(previousEndOffset, Math.floor(segment.endOffset - baseOffset))
+      previousEndOffset = relativeEndOffset
+      return {
+        seqStart: segment.seqStart,
+        seqEnd: segment.seqEnd,
+        endOffset: relativeEndOffset,
+        rawFrameCount: Math.max(1, segment.seqEnd - segment.seqStart + 1),
+        ...(segment.barrier && segment.barrierReason ? { barrier: segment.barrierReason } : {}),
+      }
+    })
+  }
+
+  private buildLegacyOutputSegmentPayloads(
+    terminalId: string,
+    batch: TerminalOutputBatch,
+    attachRequestId?: string,
+  ): JsonPayload[] {
+    const payloads: JsonPayload[] = []
+    let previousEndOffset = 0
+    for (const segment of batch.segments) {
+      const endOffset = Math.max(previousEndOffset, Math.floor(segment.endOffset))
+      const data = batch.data.slice(previousEndOffset, endOffset)
+      previousEndOffset = endOffset
+      payloads.push(this.buildTerminalOutputPayload({
+        type: 'terminal.output',
+        terminalId,
+        streamId: batch.streamId,
+        seqStart: segment.seqStart,
+        seqEnd: segment.seqEnd,
+        data,
+        attachRequestId,
+      }))
+    }
+    return payloads
+  }
+
+  private sendLegacyOutputSegments(
+    ws: LiveWebSocket,
+    terminalId: string,
+    batch: TerminalOutputBatch,
+    attachRequestId?: string,
+  ): boolean {
+    for (const payload of this.buildLegacyOutputSegmentPayloads(terminalId, batch, attachRequestId)) {
+      if (!this.safeSend(ws, payload)) return false
+    }
+    return true
+  }
+
+  private sendLegacyOutputSegmentsWithPacing(
+    terminalId: string,
+    attachment: BrokerClientAttachment,
+    batch: TerminalOutputBatch,
+    attachRequestId?: string,
+  ): ReplaySendOutcome {
+    let sentSeqEnd = attachment.lastSeq
+    for (const payload of this.buildLegacyOutputSegmentPayloads(terminalId, batch, attachRequestId)) {
+      const prepared = this.prepareSendPayload(payload)
+      if (!prepared) return { status: 'failed' }
+      const payloadSeqEnd = typeof payload.seqEnd === 'number' ? payload.seqEnd : sentSeqEnd
+      const result = this.sendPreparedReplayPayloadWithPacing(
+        terminalId,
+        attachment,
+        prepared,
+        payloadSeqEnd,
+      )
+      if (result.status !== 'sent') return result
+      sentSeqEnd = result.sentSeqEnd
+      if (result.pauseAfter) return result
+    }
+    return {
+      status: 'sent',
+      pauseAfter: false,
+      sentSeqEnd,
+    }
+  }
+
   private sendReplayFrameWithPacing(
     terminalId: string,
     attachment: BrokerClientAttachment,
-    frame: ReplayFrame,
+    frame: ReplayFrame | TerminalOutputBatch,
     attachRequestId?: string,
   ): ReplaySendOutcome {
+    if (this.isTerminalOutputBatch(frame)) {
+      if (attachment.terminalOutputBatchV1 && attachRequestId) {
+        return this.sendBatchPayloadsWithPacing({
+          terminalId,
+          attachment,
+          batch: frame,
+          attachRequestId,
+          source: 'replay',
+        })
+      }
+
+      return this.sendLegacyOutputSegmentsWithPacing(terminalId, attachment, frame, attachRequestId)
+    }
+
     const prepared = this.prepareSendPayload(this.buildTerminalOutputPayload({
       type: 'terminal.output',
       terminalId,
@@ -850,7 +1061,36 @@ export class TerminalStreamBroker {
       attachRequestId,
     }))
     if (!prepared) return { status: 'failed' }
-    return this.sendPreparedReplayPayloadWithPacing(terminalId, attachment, prepared)
+    return this.sendPreparedReplayPayloadWithPacing(terminalId, attachment, prepared, frame.seqEnd)
+  }
+
+  private sendBatchPayloadsWithPacing(input: {
+    terminalId: string
+    attachment: BrokerClientAttachment
+    batch: TerminalOutputBatch
+    attachRequestId: string
+    source: 'live' | 'replay'
+  }): ReplaySendOutcome {
+    let sentSeqEnd = input.attachment.lastSeq
+    for (const payload of this.buildTerminalOutputBatchPayloads(input)) {
+      const prepared = this.prepareSendPayload(payload)
+      if (!prepared) return { status: 'failed' }
+      const payloadSeqEnd = typeof payload.seqEnd === 'number' ? payload.seqEnd : sentSeqEnd
+      const result = this.sendPreparedReplayPayloadWithPacing(
+        input.terminalId,
+        input.attachment,
+        prepared,
+        payloadSeqEnd,
+      )
+      if (result.status !== 'sent') return result
+      sentSeqEnd = result.sentSeqEnd
+      if (result.pauseAfter) return result
+    }
+    return {
+      status: 'sent',
+      pauseAfter: false,
+      sentSeqEnd,
+    }
   }
 
   private sendGap(
@@ -957,6 +1197,7 @@ export class TerminalStreamBroker {
     return {
       status: 'sent',
       pauseAfter: this.shouldPauseReplayAfterSend(terminalId, attachment, result),
+      sentSeqEnd: toSeq,
     }
   }
 
@@ -964,6 +1205,7 @@ export class TerminalStreamBroker {
     terminalId: string,
     attachment: BrokerClientAttachment,
     prepared: PreparedJsonMessage,
+    sentSeqEnd: number,
   ): ReplaySendOutcome {
     if (this.shouldPauseReplayBeforeSend(terminalId, attachment, prepared)) {
       return { status: 'paused' }
@@ -973,6 +1215,7 @@ export class TerminalStreamBroker {
     return {
       status: 'sent',
       pauseAfter: this.shouldPauseReplayAfterSend(terminalId, attachment, result),
+      sentSeqEnd,
     }
   }
 

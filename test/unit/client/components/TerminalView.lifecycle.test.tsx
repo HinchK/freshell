@@ -268,6 +268,7 @@ function withCurrentAttachRequestId<T extends { type?: string; terminalId?: stri
   const isStreamPayload = msg.type === 'terminal.attach.ready'
     || msg.type === 'terminal.stream.changed'
     || msg.type === 'terminal.output'
+    || msg.type === 'terminal.output.batch'
     || msg.type === 'terminal.output.gap'
   if (!isStreamPayload || typeof msg.terminalId !== 'string') {
     return msg
@@ -288,7 +289,7 @@ function withCurrentAttachRequestId<T extends { type?: string; terminalId?: stri
         : (latestStreamIdByTerminal.get(msg.terminalId) ?? `test-stream:${msg.terminalId}`)
       next = { ...next, streamId } as typeof next
       latestStreamIdByTerminal.set(msg.terminalId, streamId)
-    } else if (msg.type === 'terminal.output' || msg.type === 'terminal.output.gap') {
+    } else if (msg.type === 'terminal.output' || msg.type === 'terminal.output.batch' || msg.type === 'terminal.output.gap') {
       const messageStreamId = (next as { streamId?: unknown }).streamId
       const streamId = typeof messageStreamId === 'string' && messageStreamId.length > 0
         ? messageStreamId
@@ -4395,6 +4396,153 @@ describe('TerminalView lifecycle updates', () => {
         sinceSeq: 0,
         attachRequestId: expect.any(String),
       }))
+    })
+
+    it('writes a homogeneous terminal.output.batch once and advances the parser-applied cursor after acknowledgement', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-combined',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 3,
+          data: 'abc',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1 },
+            { seqStart: 3, seqEnd: 3, endOffset: 3, rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toContain('abc')
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 3,
+      }))
+    })
+
+    it('rejects an overlapping terminal.output.batch before writing partial bytes', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-overlap',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'ab',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 1, seqEnd: 2, endOffset: 2, rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'accepted-after-reject',
+        })
+      })
+      expect(terminalWriteStrings(term)).toContain('accepted-after-reject')
+    })
+
+    it('rejects terminal.output.batch when segment data disagrees with offsets', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-data-mismatch',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 2,
+          data: 'ab',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, data: 'a', rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, data: 'not-b', rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+    })
+
+    it('splits terminal.output.batch writes around parser barrier segments', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-barrier',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'replay',
+          seqStart: 1,
+          seqEnd: 3,
+          data: 'aBc',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, rawFrameCount: 1, barrier: 'control' },
+            { seqStart: 3, seqEnd: 3, endOffset: 3, rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['a', 'B', 'c'])
     })
 
     it('does not render or checkpoint terminal.output missing stream id after attach-ready', async () => {

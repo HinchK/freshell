@@ -16,6 +16,7 @@ export type TerminalWriteQueueMode = 'live' | 'replay'
 export type TerminalWriteQueueOptions = {
   mode?: TerminalWriteQueueMode
   generation?: string
+  coalesce?: boolean
 }
 
 type TerminalWriteQueueArgs = {
@@ -193,6 +194,7 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       const previous = queue[queue.length - 1]
       if (
         mode === 'replay'
+        && options?.coalesce !== false
         && previous?.kind === 'write'
         && previous.mode === 'replay'
         && previous.generation === generation

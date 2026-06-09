@@ -25,6 +25,7 @@ export type BrokerClientAttachment = {
   catastrophicClosed?: boolean
   replayBackpressureLogLastAt?: number
   replayBackpressureLogSuppressed?: number
+  terminalOutputBatchV1: boolean
 }
 
 export type BrokerTerminalState = {

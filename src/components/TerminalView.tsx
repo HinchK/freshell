@@ -56,9 +56,11 @@ import {
   createAttachSeqState,
   markParserAppliedSeq,
   onAttachReady,
+  onOutputBatchSegments,
   onOutputFrame,
   onOutputGap,
   type AttachSeqState,
+  type OutputBatchAcceptedSegment,
 } from '@/lib/terminal-attach-seq-state'
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
@@ -2586,6 +2588,267 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       unsub = ws.onMessage((msg) => {
         const tid = terminalIdRef.current
         const reqId = requestIdRef.current
+
+        const markFirstOutputIfNeeded = (raw: string) => {
+          if (
+            raw.length > 0
+            && !terminalFirstOutputMarkedRef.current
+            && activeTabId === tabId
+            && activePaneId === paneId
+            && !hiddenRef.current
+          ) {
+            getInstalledPerfAuditBridge()?.mark('terminal.first_output', {
+              tabId,
+              paneId,
+              terminalId: tid,
+            })
+            terminalFirstOutputMarkedRef.current = true
+          }
+        }
+
+        const completeParserAppliedFrame = (input: {
+          attachRequestId?: string
+          mode: TerminalPaneContent['mode']
+          parserAppliedSeq: number
+          completedAttach: boolean
+        }) => {
+          const activeAttach = currentAttachRef.current
+          if (!activeAttach || activeAttach.requestId !== input.attachRequestId) return
+          if (!shouldAllowTerminalOutputSideEffect({
+            terminalInstanceId: terminalInstanceIdRef.current,
+            effect: 'parser_applied_checkpoint',
+            mode: input.mode,
+            generation: input.attachRequestId,
+          })) {
+            return
+          }
+          const nextSeqState = markParserAppliedSeq(seqStateRef.current, input.parserAppliedSeq)
+          applySeqState(nextSeqState)
+          markParserAppliedFrame(tid, nextSeqState.parserAppliedSeq, activeAttach)
+          if (input.completedAttach) {
+            if (!shouldAllowTerminalOutputSideEffect({
+              terminalInstanceId: terminalInstanceIdRef.current,
+              effect: 'attach_completion',
+              mode: input.mode,
+              generation: input.attachRequestId,
+            })) {
+              return
+            }
+            setIsAttaching(false)
+            markAttachComplete()
+          }
+        }
+
+        const submitAcceptedOutput = (input: {
+          raw: string
+          seqStart: number
+          seqEnd: number
+          attachRequestId?: string
+          mode: TerminalPaneContent['mode']
+          previousSeqState: AttachSeqState
+          outputSource: TerminalOutputSource
+          parserAppliedSeq: number
+          completedAttach: boolean
+          disableWriteCoalescing?: boolean
+        }) => {
+          let raw = input.raw
+          const frameOverlapsReplay = input.outputSource === 'replay' || Boolean(
+            input.previousSeqState.pendingReplay
+            && input.seqEnd >= input.previousSeqState.pendingReplay.fromSeq
+            && input.seqStart <= input.previousSeqState.pendingReplay.toSeq,
+          )
+          const enteringFreshLiveOutput = input.outputSource === 'live'
+            && !frameOverlapsReplay
+            && (Boolean(input.previousSeqState.pendingReplay) || input.previousSeqState.awaitingFreshSequence)
+          if (
+            enteringFreshLiveOutput
+            && !startupProbeReplayDiscardStateRef.current.remainder
+            && !startupProbeReplayDiscardStateRef.current.buffered
+          ) {
+            resetStartupProbeParser({ discardReplayRemainder: Boolean(input.previousSeqState.pendingReplay) })
+          }
+          const replayDiscard = consumeStartupProbeReplayDiscard(raw, startupProbeReplayDiscardStateRef.current)
+          if (replayDiscard.resumeState) {
+            startupProbeStateRef.current = replayDiscard.resumeState
+          }
+          raw = replayDiscard.raw
+          handleTerminalOutput(
+            raw,
+            input.mode,
+            tid,
+            input.outputSource === 'live',
+            () => completeParserAppliedFrame({
+              attachRequestId: input.attachRequestId,
+              mode: input.mode,
+              parserAppliedSeq: input.parserAppliedSeq,
+              completedAttach: input.completedAttach,
+            }),
+            {
+              mode: input.outputSource,
+              generation: input.attachRequestId,
+              coalesce: input.disableWriteCoalescing ? false : undefined,
+            },
+          )
+          if (input.completedAttach && frameOverlapsReplay) {
+            resetStartupProbeParser({ discardReplayRemainder: true })
+          }
+          markFirstOutputIfNeeded(raw)
+        }
+
+        if (msg.type === 'terminal.output.batch' && msg.terminalId === tid) {
+          if (!isCurrentAttachStreamMessage(msg)) {
+            if (debugRef.current) {
+              log.debug('Ignoring stale attach generation message', {
+                paneId: paneIdRef.current,
+                terminalId: msg.terminalId,
+                attachRequestId: msg.attachRequestId,
+                currentAttachRequestId: currentAttachRef.current?.requestId,
+                currentAttachStreamId: currentAttachRef.current?.streamId,
+                streamId: msg.streamId,
+                type: msg.type,
+              })
+            }
+            return
+          }
+
+          const outputSource = msg.source === 'live' || msg.source === 'replay'
+            ? msg.source
+            : null
+          const batchData = typeof msg.data === 'string' ? msg.data : ''
+          const rawSegmentsInput = Array.isArray(msg.segments) ? msg.segments : []
+          const batchSegments: Array<{
+            seqStart: number
+            seqEnd: number
+            data: string
+            barrier: boolean
+          }> = []
+          let previousEndOffset = 0
+          let invalidBatchReason: string | null = null
+
+          if (!outputSource) {
+            invalidBatchReason = 'invalid_source'
+          } else if (rawSegmentsInput.length === 0) {
+            invalidBatchReason = 'missing_segments'
+          }
+
+          for (const rawSegment of rawSegmentsInput) {
+            if (invalidBatchReason) break
+            const seqStart = Number(rawSegment?.seqStart)
+            const seqEnd = Number(rawSegment?.seqEnd)
+            const endOffset = Number(rawSegment?.endOffset)
+            if (
+              !Number.isFinite(seqStart)
+              || !Number.isFinite(seqEnd)
+              || !Number.isFinite(endOffset)
+            ) {
+              invalidBatchReason = 'invalid_segment_range'
+              break
+            }
+            const normalizedEndOffset = Math.floor(endOffset)
+            if (
+              normalizedEndOffset < previousEndOffset
+              || normalizedEndOffset > batchData.length
+            ) {
+              invalidBatchReason = 'invalid_segment_offset'
+              break
+            }
+            const segmentData = batchData.slice(previousEndOffset, normalizedEndOffset)
+            if (typeof rawSegment.data === 'string' && rawSegment.data !== segmentData) {
+              invalidBatchReason = 'segment_data_mismatch'
+              break
+            }
+            batchSegments.push({
+              seqStart: Math.floor(seqStart),
+              seqEnd: Math.floor(seqEnd),
+              data: segmentData,
+              barrier: typeof rawSegment.barrier === 'string' && rawSegment.barrier.length > 0,
+            })
+            previousEndOffset = normalizedEndOffset
+          }
+
+          if (!invalidBatchReason && previousEndOffset !== batchData.length) {
+            invalidBatchReason = 'trailing_batch_data'
+          }
+          if (
+            !invalidBatchReason
+            && (
+              batchSegments[0]?.seqStart !== msg.seqStart
+              || batchSegments[batchSegments.length - 1]?.seqEnd !== msg.seqEnd
+            )
+          ) {
+            invalidBatchReason = 'batch_range_mismatch'
+          }
+
+          if (invalidBatchReason) {
+            if (import.meta.env.DEV) {
+              log.warn('Ignoring invalid terminal.output.batch', {
+                paneId: paneIdRef.current,
+                terminalId: tid,
+                reason: invalidBatchReason,
+              })
+            }
+            return
+          }
+          if (!outputSource) return
+
+          const previousSeqState = seqStateRef.current
+          const batchDecision = onOutputBatchSegments(previousSeqState, batchSegments)
+          if (!batchDecision.accept) {
+            if (import.meta.env.DEV) {
+              log.warn('Ignoring overlapping terminal.output.batch sequence range', {
+                paneId: paneIdRef.current,
+                terminalId: tid,
+                rejectedSegment: batchDecision.rejectedSegment,
+                lastSeq: previousSeqState.lastSeq,
+              })
+            }
+            return
+          }
+
+          if (tid && batchDecision.freshReset) {
+            clearTerminalCursor(tid)
+            resetParserAppliedSurface()
+          }
+
+          const mode = contentRef.current?.mode || 'shell'
+          const completedAttachOnBatch = !batchDecision.state.pendingReplay
+            && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
+          applySeqState(batchDecision.state)
+
+          const containsBarrier = batchSegments.some((segment) => segment.barrier)
+          if (!containsBarrier) {
+            submitAcceptedOutput({
+              raw: batchData,
+              seqStart: msg.seqStart,
+              seqEnd: msg.seqEnd,
+              attachRequestId: msg.attachRequestId,
+              mode,
+              previousSeqState,
+              outputSource,
+              parserAppliedSeq: batchDecision.state.highestObservedSeq,
+              completedAttach: completedAttachOnBatch,
+            })
+            return
+          }
+
+          batchSegments.forEach((segment, index) => {
+            const acceptedSegment: OutputBatchAcceptedSegment | undefined = batchDecision.segments[index]
+            if (!acceptedSegment) return
+            submitAcceptedOutput({
+              raw: segment.data,
+              seqStart: segment.seqStart,
+              seqEnd: segment.seqEnd,
+              attachRequestId: msg.attachRequestId,
+              mode,
+              previousSeqState: acceptedSegment.previousState,
+              outputSource,
+              parserAppliedSeq: acceptedSegment.parserAppliedSeq,
+              completedAttach: completedAttachOnBatch && index === batchSegments.length - 1,
+              disableWriteCoalescing: true,
+            })
+          })
+          return
+        }
 
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
           if (!isCurrentAttachStreamMessage(msg)) {

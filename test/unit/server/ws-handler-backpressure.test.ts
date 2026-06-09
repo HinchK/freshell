@@ -954,7 +954,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
         reason: 'replay_window_exceeded',
       }),
     ])
-    expect(replayOutputsAfterLoss.map((payload) => String(payload.data))).toEqual(['cccddd'])
+    expect(replayOutputsAfterLoss.map((payload) => String(payload.data))).toEqual(['ccc', 'ddd'])
     expect(replayOutputsAfterLoss.every((payload) => payload.streamId === readyAfterLoss.streamId)).toBe(true)
     expect(replayOutputsAfterLoss.every((payload) => payload.streamId !== initialReady.streamId)).toBe(true)
 
@@ -1019,7 +1019,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
-  it('coalesces contiguous replay frames before sending terminal.output payloads', async () => {
+  it('coalesces contiguous replay frames into terminal.output.batch for batch-capable clients', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
     registry.createTerminal('term-replay-coalesced')
@@ -1033,22 +1033,43 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     }
 
     const wsReplay = createMockWs()
-    await broker.attach(wsReplay as any, 'term-replay-coalesced', 'transport_reconnect', 80, 24, 0, 'replay-attach')
+    await broker.attach(
+      wsReplay as any,
+      'term-replay-coalesced',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'replay-attach',
+      undefined,
+      'foreground',
+      true,
+    )
     vi.advanceTimersByTime(5)
 
     const outputs = wsReplay.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
-      .filter((payload) => payload?.type === 'terminal.output')
+      .filter((payload) => payload?.type === 'terminal.output.batch')
 
-    expect(outputs).toHaveLength(1)
+    expect(outputs.length).toBeGreaterThan(0)
+    expect(outputs.length).toBeLessThan(1000)
     expect(outputs[0]).toMatchObject({
+      type: 'terminal.output.batch',
       attachRequestId: 'replay-attach',
+      source: 'replay',
       seqStart: 1,
+      segments: expect.any(Array),
+    })
+    expect(outputs[outputs.length - 1]).toMatchObject({
+      attachRequestId: 'replay-attach',
+      source: 'replay',
       seqEnd: 1000,
     })
-    expect(outputs[0].data).toContain('f1;')
-    expect(outputs[0].data).toContain('f1000;')
-    expect(Buffer.byteLength(outputs[0].data, 'utf8')).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
+    expect(outputs.every((payload) => payload.serializedBytes <= MAX_REALTIME_MESSAGE_BYTES)).toBe(true)
+    expect(outputs.reduce((sum, payload) => sum + payload.segments.length, 0)).toBe(1000)
+    const joinedData = outputs.map((payload) => String(payload.data)).join('')
+    expect(joinedData).toContain('f1;')
+    expect(joinedData).toContain('f1000;')
 
     broker.close()
   })
