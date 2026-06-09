@@ -547,7 +547,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     }
   })
 
-  it('replaces stream identity after replay retention loss before subsequent output', async () => {
+  it('retags retained replay frames when retention loss rotates stream identity', async () => {
     const registry = new FakeBrokerRegistry()
     registry.setReplayRingMaxBytes(6)
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -576,20 +576,29 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       0,
       'after-retention-loss',
     )
-    const readyAfterLoss = wsAfterLoss.send.mock.calls
+    vi.advanceTimersByTime(1)
+
+    const payloadsAfterLoss = wsAfterLoss.send.mock.calls
       .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const readyAfterLoss = payloadsAfterLoss
       .find((payload) => payload?.type === 'terminal.attach.ready')
     expect(readyAfterLoss?.streamId).toEqual(expect.any(String))
     expect(readyAfterLoss.streamId).not.toBe(initialStreamId)
 
-    registry.emit('terminal.output.raw', { terminalId: 'term-retention-stream', data: 'ddd', at: Date.now() })
-    vi.advanceTimersByTime(1)
+    const gapAfterLoss = payloadsAfterLoss
+      .find((payload) => payload?.type === 'terminal.output.gap')
+    expect(gapAfterLoss).toMatchObject({
+      streamId: readyAfterLoss.streamId,
+      fromSeq: 1,
+      toSeq: 1,
+      reason: 'replay_window_exceeded',
+    })
 
-    const liveOutputsAfterLoss = ws.send.mock.calls
-      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
-      .filter((payload) => payload?.type === 'terminal.output' && payload.data === 'ddd')
-    expect(liveOutputsAfterLoss).toHaveLength(1)
-    expect(liveOutputsAfterLoss[0].streamId).toBe(readyAfterLoss.streamId)
+    const replayOutputsAfterLoss = payloadsAfterLoss
+      .filter((payload) => payload?.type === 'terminal.output')
+    expect(replayOutputsAfterLoss.map((payload) => String(payload.data)).join('')).toBe('bbbccc')
+    expect(replayOutputsAfterLoss.every((payload) => payload.streamId === readyAfterLoss.streamId)).toBe(true)
+    expect(replayOutputsAfterLoss.every((payload) => payload.streamId !== initialStreamId)).toBe(true)
 
     broker.close()
   })

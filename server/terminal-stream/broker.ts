@@ -469,8 +469,9 @@ export class TerminalStreamBroker {
     const frames: ReplayFrame[] = []
     for (const fragment of fragments) {
       frames.push(state.replayRing.append(fragment, { streamId }))
-      if (this.handleReplayRetentionLoss(terminalId, state)) {
-        streamId = this.streamIdentity.ensureStream(terminalId)
+      const retainedStreamId = this.handleReplayRetentionLoss(terminalId, state)
+      if (retainedStreamId) {
+        streamId = retainedStreamId
       }
     }
     return frames
@@ -834,10 +835,11 @@ export class TerminalStreamBroker {
     return streamId
   }
 
-  private handleReplayRetentionLoss(terminalId: string, state: BrokerTerminalState): boolean {
-    if (!state.replayRing.consumeRetentionLoss()) return false
-    this.replaceStreamIdentity(terminalId, 'retention_lost')
-    return true
+  private handleReplayRetentionLoss(terminalId: string, state: BrokerTerminalState): string | undefined {
+    if (!state.replayRing.consumeRetentionLoss()) return undefined
+    const streamId = this.replaceStreamIdentity(terminalId, 'retention_lost')
+    state.replayRing.retagRetainedFrames(streamId)
+    return streamId
   }
 
   private withTerminalLock(terminalId: string, task: () => Promise<void>): Promise<void> {

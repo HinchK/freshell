@@ -74,6 +74,12 @@ export class ReplayRing {
     return retentionLossPending
   }
 
+  retagRetainedFrames(streamId: string): void {
+    for (const frame of this.frames) {
+      frame.streamId = streamId
+    }
+  }
+
   appendFragmentedForPayloadBudget(input: {
     data: string
     maxSerializedBytes: number
