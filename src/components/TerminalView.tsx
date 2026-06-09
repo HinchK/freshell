@@ -2865,13 +2865,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             const barrier = rawSegment?.barrier
             if (
               barrier !== undefined
-              && barrier !== null
               && (
                 typeof barrier !== 'string'
-                || (
-                  barrier.length > 0
-                  && !TERMINAL_OUTPUT_BATCH_BARRIER_REASONS.has(barrier)
-                )
+                || !TERMINAL_OUTPUT_BATCH_BARRIER_REASONS.has(barrier)
               )
             ) {
               invalidBatchReason = 'invalid_segment_barrier'
