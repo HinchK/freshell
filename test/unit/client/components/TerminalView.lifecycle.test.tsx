@@ -4105,9 +4105,22 @@ describe('TerminalView lifecycle updates', () => {
         .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
       expect(currentAttach?.attachRequestId).toBe(secondAttach?.attachRequestId)
 
+      wsMocks.send.mockClear()
+      term.clear.mockClear()
       act(() => {
         delayedCallbacks.find(({ data }) => data === 'current replay text')?.callback()
       })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'viewport_hydrate',
+          sinceSeq: 0,
+          attachRequestId: expect.any(String),
+        }))
+      })
+      expect(term.clear).toHaveBeenCalledTimes(1)
 
       const checkpointAfterCurrentCallback = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-1',
@@ -4117,7 +4130,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(checkpointAfterCurrentCallback?.parserAppliedSeq).toBe(1)
     })
 
-    it('fails closed from delta attach when writes are in flight', async () => {
+    it('fails closed from delta attach when writes are in flight and repairs quarantine after drain', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-in-flight-delta',
@@ -4206,9 +4219,22 @@ describe('TerminalView lifecycle updates', () => {
         'quarantined replay text',
       ])
 
+      wsMocks.send.mockClear()
+      term.clear.mockClear()
       act(() => {
         delayedCallbacks.forEach(({ callback }) => callback())
       })
+
+      await waitFor(() => {
+        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'terminal.attach',
+          terminalId,
+          intent: 'viewport_hydrate',
+          sinceSeq: 0,
+          attachRequestId: expect.any(String),
+        }))
+      })
+      expect(term.clear).toHaveBeenCalledTimes(1)
 
       const checkpointAfterCallbacks = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-delta',

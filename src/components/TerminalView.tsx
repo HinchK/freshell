@@ -122,6 +122,8 @@ const log = createLogger('TerminalView')
 
 const SESSION_ACTIVITY_THROTTLE_MS = 5000
 const TERMINAL_CHECKPOINT_XTERM_VERSION = '6.0.0'
+const QUARANTINE_REPAIR_POLL_MS = 16
+const QUARANTINE_REPAIR_TIMEOUT_MS = 2000
 export const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 5
 export const RATE_LIMIT_RETRY_BASE_MS = 2000
 export const RATE_LIMIT_RETRY_MAX_MS = 12000
@@ -298,6 +300,15 @@ type PendingDurableReplacement = {
   terminalId: string
   requestId: string
   reason: 'opencode_replay_window_exceeded'
+}
+
+type AttachTerminalOptions = {
+  clearViewportFirst?: boolean
+  suppressNextMatchingResize?: boolean
+  skipPreAttachFit?: boolean
+  maxReplayBytes?: number
+  priority?: TerminalAttachPriority
+  sinceSeq?: number
 }
 
 type SentViewport = {
@@ -500,10 +511,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
   const parserAppliedSeqRef = useRef(0)
-  const hasTrustedParserAppliedSurfaceRef = useRef(false)
   const surfaceEpochRef = useRef(0)
   const geometryEpochRef = useRef(1)
-  const currentBufferTypeRef = useRef<'unknown'>('unknown')
+  const attachTerminalRef = useRef<((tid: string, intent: AttachIntent, opts?: AttachTerminalOptions) => void) | null>(null)
+  const quarantineRepairRef = useRef<{
+    terminalId: string
+    attachRequestId: string
+    startedAt: number
+    timer: ReturnType<typeof setTimeout> | null
+  } | null>(null)
   const attachCounterRef = useRef(0)
   const currentAttachRef = useRef<{
     requestId: string
@@ -580,6 +596,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       cols: normalizeDimension(dimensions?.cols, term?.cols ?? 80),
       rows: normalizeDimension(dimensions?.rows, term?.rows ?? 24),
       geometryEpoch: geometryEpochRef.current,
+      // Task 3 only has this client's xterm viewport as geometry authority.
+      // Server/multi-client authority is expected to land with the later geometry work.
       geometryAuthority: 'single_client' as const,
       scrollback: normalizeScrollback(settingsRef.current.terminal.scrollback),
       xtermVersion: TERMINAL_CHECKPOINT_XTERM_VERSION,
@@ -604,11 +622,68 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
   const resetParserAppliedSurface = useCallback((seq = 0, opts?: { incrementEpoch?: boolean }) => {
     parserAppliedSeqRef.current = Math.max(0, Math.floor(Number.isFinite(seq) ? seq : 0))
-    hasTrustedParserAppliedSurfaceRef.current = false
     if (opts?.incrementEpoch !== false) {
       surfaceEpochRef.current += 1
     }
   }, [])
+
+  const syncGeometryEpochForViewport = useCallback((terminalId: string, cols: number, rows: number) => {
+    const lastSentViewport = lastSentViewportRef.current
+    if (
+      lastSentViewport
+      && lastSentViewport.terminalId === terminalId
+      && (lastSentViewport.cols !== cols || lastSentViewport.rows !== rows)
+    ) {
+      geometryEpochRef.current += 1
+    }
+  }, [])
+
+  const clearQuarantineRepair = useCallback((attachRequestId?: string) => {
+    const pending = quarantineRepairRef.current
+    if (!pending) return
+    if (attachRequestId && pending.attachRequestId !== attachRequestId) return
+    if (pending.timer) {
+      clearTimeout(pending.timer)
+    }
+    quarantineRepairRef.current = null
+  }, [])
+
+  const scheduleQuarantineRepair = useCallback((terminalId: string, attachRequestId: string) => {
+    clearQuarantineRepair()
+    const startedAt = Date.now()
+    const poll = () => {
+      const pending = quarantineRepairRef.current
+      if (!pending || pending.attachRequestId !== attachRequestId) return
+      if (currentAttachRef.current?.requestId !== attachRequestId) {
+        clearQuarantineRepair(attachRequestId)
+        return
+      }
+      if (writeQueueRef.current?.hasInFlightWrites() !== true) {
+        clearQuarantineRepair(attachRequestId)
+        attachTerminalRef.current?.(terminalId, 'viewport_hydrate', {
+          clearViewportFirst: true,
+          ...viewportHydrateReplayOptions(contentRef.current),
+        })
+        return
+      }
+      if (Date.now() - pending.startedAt >= QUARANTINE_REPAIR_TIMEOUT_MS) {
+        log.warn('Terminal quarantine repair timed out while writes remained in flight', {
+          paneId: paneIdRef.current,
+          terminalId,
+          attachRequestId,
+        })
+        clearQuarantineRepair(attachRequestId)
+        return
+      }
+      pending.timer = setTimeout(poll, QUARANTINE_REPAIR_POLL_MS)
+    }
+    quarantineRepairRef.current = {
+      terminalId,
+      attachRequestId,
+      startedAt,
+      timer: setTimeout(poll, QUARANTINE_REPAIR_POLL_MS),
+    }
+  }, [clearQuarantineRepair])
 
   const markParserAppliedFrame = useCallback((terminalId: string | undefined, seq: number, attachContext?: {
     requestId: string
@@ -622,13 +697,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const attach = attachContext ?? currentAttachRef.current
     const surfaceQuarantined = attach?.surfaceQuarantined === true
     if (parserAppliedSeq <= parserAppliedSeqRef.current) {
-      if (parserAppliedSeq > 0 && !surfaceQuarantined) {
-        hasTrustedParserAppliedSurfaceRef.current = true
-      }
       return
     }
     parserAppliedSeqRef.current = parserAppliedSeq
-    hasTrustedParserAppliedSurfaceRef.current = !surfaceQuarantined
 
     if (surfaceQuarantined) return
     if (!attach || attach.terminalId !== terminalId) return
@@ -651,10 +722,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       geometryAuthority: checkpointInput.geometryAuthority,
       scrollback: checkpointInput.scrollback,
       xtermVersion: checkpointInput.xtermVersion,
-      bufferType: currentBufferTypeRef.current,
+      // Task 3 cannot yet prove normal vs alternate buffer. Keep checkpoints conservative
+      // until the geometry/buffer authority work supplies this context.
+      bufferType: 'unknown',
       parserIdle: true,
     })
   }, [buildCheckpointReplayInput])
+
+  useEffect(() => () => {
+    clearQuarantineRepair()
+  }, [clearQuarantineRepair])
 
   // Keep refs in sync with props
   useEffect(() => {
@@ -672,6 +749,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       terminalIdRef.current = terminalContent.terminalId
       if (terminalContent.terminalId !== prevTerminalId) {
         resetParserAppliedSurface()
+        geometryEpochRef.current = 1
+        clearQuarantineRepair()
         forgetSentViewport(prevTerminalId)
         const cachedViewport = terminalContent.terminalId
           ? lastSentViewportByTerminal.get(terminalContent.terminalId)
@@ -684,7 +763,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       requestIdRef.current = terminalContent.createRequestId
       contentRef.current = terminalContent
     }
-  }, [terminalContent, paneId, applySeqState, resetParserAppliedSurface])
+  }, [terminalContent, paneId, applySeqState, clearQuarantineRepair, resetParserAppliedSurface])
 
   // Register terminal buffer accessor with test harness (for E2E tests).
   // Uses xterm.js Terminal.buffer.active API which works with all renderers
@@ -1083,6 +1162,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           if (matchesSuppressedViewport) {
             suppressNextMatchingResizeRef.current = null
           } else if (!matchesLastSentViewport && !suppressNetworkEffects) {
+            syncGeometryEpochForViewport(tid, term.cols, term.rows)
             ws.send({ type: 'terminal.resize', terminalId: tid, cols: term.cols, rows: term.rows })
             rememberSentViewport(tid, term.cols, term.rows)
             lastSentViewportRef.current = { terminalId: tid, cols: term.cols, rows: term.rows }
@@ -1097,7 +1177,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (shouldFocus) {
       term.focus()
     }
-  }, [suppressNetworkEffects, ws])
+  }, [suppressNetworkEffects, syncGeometryEpochForViewport, ws])
 
   const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions) => {
     if (!data) return
@@ -1790,14 +1870,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const attachTerminal = useCallback((
     tid: string,
     intent: AttachIntent,
-    opts?: {
-      clearViewportFirst?: boolean
-      suppressNextMatchingResize?: boolean
-      skipPreAttachFit?: boolean
-      maxReplayBytes?: number
-      priority?: TerminalAttachPriority
-      sinceSeq?: number
-    },
+    opts?: AttachTerminalOptions,
   ) => {
     if (suppressNetworkEffects) return
     const term = termRef.current
@@ -1812,6 +1885,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
     const cols = Math.max(2, term.cols || 80)
     const rows = Math.max(2, term.rows || 24)
+    syncGeometryEpochForViewport(tid, cols, rows)
     const attachRequestId = `${paneIdRef.current}:${++attachCounterRef.current}:${nanoid(6)}`
     const writeQueue = writeQueueRef.current
     const hasInFlightWrites = writeQueue?.hasInFlightWrites() === true
@@ -1830,9 +1904,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
     const deltaSeq = Math.max(0, Math.floor(explicitSinceSeq ?? (checkpointDecision.ok ? checkpointDecision.sinceSeq : 0)))
     const sinceSeq = effectiveIntent === 'viewport_hydrate' ? 0 : deltaSeq
-    const willResetSurface = effectiveIntent === 'viewport_hydrate'
     const surfaceQuarantined = hasInFlightWrites
     writeQueue?.setActiveGeneration(attachRequestId, { dropQueuedStaleWrites: true })
+    if (!surfaceQuarantined) {
+      clearQuarantineRepair()
+    }
     if (surfaceQuarantined) {
       log.warn('Quarantining terminal attach while writes are still in flight', {
         paneId: paneIdRef.current,
@@ -1901,14 +1977,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     })
     rememberSentViewport(tid, cols, rows)
     lastSentViewportRef.current = { terminalId: tid, cols, rows }
+    if (surfaceQuarantined) {
+      scheduleQuarantineRepair(tid, attachRequestId)
+    }
   }, [
     suppressNetworkEffects,
     ws,
     applySeqState,
+    clearQuarantineRepair,
     getCheckpointDeltaReplayDecision,
     resetParserAppliedSurface,
+    scheduleQuarantineRepair,
     resetStartupProbeParser,
+    syncGeometryEpochForViewport,
   ])
+  attachTerminalRef.current = attachTerminal
 
   const runRefreshAttach = useCallback((request: PaneRefreshRequest | null | undefined) => {
     if (suppressNetworkEffects) return false
