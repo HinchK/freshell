@@ -867,11 +867,11 @@ export class TerminalStreamBroker {
     const fullPayloadBytes = typeof fullPayload.serializedBytes === 'number'
       ? fullPayload.serializedBytes
       : Number.POSITIVE_INFINITY
-    if (
-      fullPayloadBytes <= TERMINAL_STREAM_BATCH_MAX_BYTES
-      || input.batch.segments.length <= 1
-    ) {
+    if (fullPayloadBytes <= TERMINAL_STREAM_BATCH_MAX_BYTES) {
       return [fullPayload]
+    }
+    if (input.batch.segments.length <= 1) {
+      return this.buildTerminalOutputBatchSingleSegmentFallbackPayloads(input, 0)
     }
 
     const payloads: JsonPayload[] = []
@@ -879,6 +879,14 @@ export class TerminalStreamBroker {
     while (startIndex < input.batch.segments.length) {
       let endIndex = startIndex + 1
       let currentPayload = this.buildTerminalOutputBatchPayload(input, startIndex, endIndex)
+      const currentPayloadBytes = typeof currentPayload.serializedBytes === 'number'
+        ? currentPayload.serializedBytes
+        : Number.POSITIVE_INFINITY
+      if (currentPayloadBytes > TERMINAL_STREAM_BATCH_MAX_BYTES) {
+        payloads.push(...this.buildTerminalOutputBatchSingleSegmentFallbackPayloads(input, startIndex))
+        startIndex = endIndex
+        continue
+      }
 
       while (endIndex < input.batch.segments.length) {
         const candidate = this.buildTerminalOutputBatchPayload(input, startIndex, endIndex + 1)
@@ -895,6 +903,31 @@ export class TerminalStreamBroker {
     }
 
     return payloads
+  }
+
+  private buildTerminalOutputBatchSingleSegmentFallbackPayloads(
+    input: {
+      terminalId: string
+      batch: TerminalOutputBatch
+      attachRequestId: string
+    },
+    segmentIndex: number,
+  ): JsonPayload[] {
+    const segment = input.batch.segments[segmentIndex]
+    if (!segment) return []
+    const startOffset = segmentIndex === 0
+      ? 0
+      : input.batch.segments[segmentIndex - 1]?.endOffset ?? 0
+    const endOffset = Math.max(startOffset, Math.floor(segment.endOffset))
+    return [this.buildTerminalOutputPayload({
+      type: 'terminal.output',
+      terminalId: input.terminalId,
+      streamId: input.batch.streamId,
+      seqStart: segment.seqStart,
+      seqEnd: segment.seqEnd,
+      data: input.batch.data.slice(startOffset, endOffset),
+      attachRequestId: input.attachRequestId,
+    })]
   }
 
   private buildTerminalOutputBatchPayload(

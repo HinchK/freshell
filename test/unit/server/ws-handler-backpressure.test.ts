@@ -1074,6 +1074,113 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('falls back to budget-safe terminal.output when one batch segment exceeds the batch envelope budget', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    const terminalId = 'term-single-batch-budget'
+    const attachRequestId = TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE
+    registry.createTerminal(terminalId)
+
+    const ws = createMockWs()
+    await broker.attach(
+      ws as any,
+      terminalId,
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      attachRequestId,
+      undefined,
+      'foreground',
+      true,
+    )
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+    const streamId = String(ready.streamId)
+
+    const legacyBudgetBytes = (data: string) => measureTerminalOutputPayloadBytes({
+      type: 'terminal.output',
+      terminalId,
+      streamId,
+      seqStart: Number.MAX_SAFE_INTEGER,
+      seqEnd: Number.MAX_SAFE_INTEGER,
+      data,
+      attachRequestId,
+    })
+    const batchBudgetBytes = (data: string) => {
+      let serializedBytes = 0
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const measured = measureTerminalOutputPayloadBytes({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 1,
+          data,
+          serializedBytes,
+          segments: [{ seqStart: 1, seqEnd: 1, endOffset: data.length, rawFrameCount: 1 }],
+        })
+        if (measured === serializedBytes) return measured
+        serializedBytes = measured
+      }
+      return measureTerminalOutputPayloadBytes({
+        type: 'terminal.output.batch',
+        terminalId,
+        streamId,
+        attachRequestId,
+        source: 'live',
+        seqStart: 1,
+        seqEnd: 1,
+        data,
+        serializedBytes,
+        segments: [{ seqStart: 1, seqEnd: 1, endOffset: data.length, rawFrameCount: 1 }],
+      })
+    }
+
+    let data = ''
+    for (let length = 1; length <= MAX_REALTIME_MESSAGE_BYTES; length += 1) {
+      const candidate = 'x'.repeat(length)
+      if (
+        legacyBudgetBytes(candidate) <= MAX_REALTIME_MESSAGE_BYTES
+        && batchBudgetBytes(candidate) > MAX_REALTIME_MESSAGE_BYTES
+      ) {
+        data = candidate
+        break
+      }
+    }
+    expect(data.length).toBeGreaterThan(0)
+    expect(legacyBudgetBytes(data)).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
+    expect(batchBudgetBytes(data)).toBeGreaterThan(MAX_REALTIME_MESSAGE_BYTES)
+
+    ws.send.mockClear()
+    registry.emit('terminal.output.raw', { terminalId, data, at: Date.now() })
+    vi.advanceTimersByTime(5)
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const batchOutputs = payloads.filter((payload) => payload?.type === 'terminal.output.batch')
+    const outputFallbacks = payloads.filter((payload) => payload?.type === 'terminal.output')
+
+    expect(batchOutputs.every((payload) => payload.serializedBytes <= MAX_REALTIME_MESSAGE_BYTES)).toBe(true)
+    expect(outputFallbacks).toHaveLength(1)
+    expect(outputFallbacks[0]).toMatchObject({
+      type: 'terminal.output',
+      terminalId,
+      streamId,
+      attachRequestId,
+      seqStart: 1,
+      seqEnd: 1,
+      data,
+    })
+    expect(measureTerminalOutputPayloadBytes(outputFallbacks[0])).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
+
+    broker.close()
+  })
+
   it('drains foreground replay batches without the background pacing delay', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
