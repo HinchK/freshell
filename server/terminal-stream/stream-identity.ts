@@ -9,8 +9,8 @@ export type TerminalStreamReplacementReason =
 export type TerminalStreamIdentityTracker = {
   ensureStream: (terminalId: string) => string
   getStream: (terminalId: string) => string | undefined
-  recordAttach: (terminalId: string, attachRequestId?: string) => string
-  recordDetach: (terminalId: string, attachRequestId?: string) => string | undefined
+  recordAttach: (terminalId: string) => string
+  recordDetach: (terminalId: string) => string | undefined
   replaceStream: (terminalId: string, reason: TerminalStreamReplacementReason) => string
   forgetStream: (terminalId: string) => void
 }
@@ -46,11 +46,11 @@ export function createTerminalStreamIdentityTracker(): TerminalStreamIdentityTra
     getStream(terminalId) {
       return streams.get(terminalId)?.streamId
     },
-    recordAttach(terminalId, _attachRequestId) {
+    recordAttach(terminalId) {
       const state = ensureState(terminalId)
       return state.streamId
     },
-    recordDetach(terminalId, _attachRequestId) {
+    recordDetach(terminalId) {
       const state = streams.get(terminalId)
       if (!state) return undefined
       return state.streamId

@@ -539,6 +539,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     cols: number
     rows: number
     surfaceQuarantined: boolean
+    streamId?: string
   } | null>(null)
   const launchAttemptRef = useRef<LaunchAttemptState | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
@@ -571,9 +572,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   }, [])
 
   const getTerminalCheckpointStreamId = useCallback((): string | null => {
-    const content = contentRef.current as (TerminalPaneContent & { streamId?: unknown }) | null
-    return typeof content?.streamId === 'string' && content.streamId.length > 0
-      ? content.streamId
+    const streamId = contentRef.current?.streamId
+    return typeof streamId === 'string' && streamId.length > 0
+      ? streamId
       : null
   }, [])
 
@@ -2052,6 +2053,56 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     return msg.attachRequestId === current.requestId
   }, [])
 
+  const isCurrentAttachStreamMessage = useCallback((msg: {
+    type: string
+    terminalId: string
+    attachRequestId?: string
+    streamId?: unknown
+    seqStart?: unknown
+    seqEnd?: unknown
+    fromSeq?: unknown
+    toSeq?: unknown
+  }) => {
+    if (!isCurrentAttachMessage(msg)) return false
+
+    const current = currentAttachRef.current
+    const activeStreamId = current?.streamId
+    const messageStreamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
+      ? msg.streamId
+      : null
+    if (!activeStreamId || !messageStreamId || messageStreamId === activeStreamId) {
+      return true
+    }
+
+    const fromSeq = typeof msg.seqStart === 'number'
+      ? msg.seqStart
+      : (typeof msg.fromSeq === 'number' ? msg.fromSeq : undefined)
+    const toSeq = typeof msg.seqEnd === 'number'
+      ? msg.seqEnd
+      : (typeof msg.toSeq === 'number' ? msg.toSeq : undefined)
+    if (typeof fromSeq === 'number' && typeof toSeq === 'number') {
+      const gapDecision = onOutputGap(seqStateRef.current, { fromSeq, toSeq })
+      applySeqState(gapDecision.state)
+    }
+    resetParserAppliedSurface(parserAppliedSeqRef.current)
+
+    log.warn('Ignoring terminal stream message with mismatched stream identity', {
+      paneId: paneIdRef.current,
+      terminalId: msg.terminalId,
+      type: msg.type,
+      attachRequestId: msg.attachRequestId,
+      activeStreamId,
+      messageStreamId,
+      fromSeq,
+      toSeq,
+    })
+    return false
+  }, [
+    applySeqState,
+    isCurrentAttachMessage,
+    resetParserAppliedSurface,
+  ])
+
   const attachTerminal = useCallback((
     tid: string,
     intent: AttachIntent,
@@ -2420,6 +2471,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       updateContent({
         terminalId: undefined,
         serverInstanceId: undefined,
+        streamId: undefined,
         createRequestId: pending.requestId,
         status: 'creating',
         restoreError: undefined,
@@ -2500,7 +2552,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         terminalIdRef.current = undefined
         launchAttemptRef.current = null
         applySeqState(createAttachSeqState())
-        updateContent({ terminalId: undefined, status: 'error' })
+        updateContent({ terminalId: undefined, streamId: undefined, status: 'error' })
         const currentTab = tabRef.current
         if (currentTab) {
           dispatch(updateTab({ id: currentTab.id, updates: { status: 'error' } }))
@@ -2514,13 +2566,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         const reqId = requestIdRef.current
 
         if (msg.type === 'terminal.output' && msg.terminalId === tid) {
-          if (!isCurrentAttachMessage(msg)) {
+          if (!isCurrentAttachStreamMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
                 paneId: paneIdRef.current,
                 terminalId: msg.terminalId,
                 attachRequestId: msg.attachRequestId,
                 currentAttachRequestId: currentAttachRef.current?.requestId,
+                currentAttachStreamId: currentAttachRef.current?.streamId,
+                streamId: msg.streamId,
                 type: msg.type,
               })
             }
@@ -2642,13 +2696,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.output.gap' && msg.terminalId === tid) {
-          if (!isCurrentAttachMessage(msg)) {
+          if (!isCurrentAttachStreamMessage(msg)) {
             if (debugRef.current) {
               log.debug('Ignoring stale attach generation message', {
                 paneId: paneIdRef.current,
                 terminalId: msg.terminalId,
                 attachRequestId: msg.attachRequestId,
                 currentAttachRequestId: currentAttachRef.current?.requestId,
+                currentAttachStreamId: currentAttachRef.current?.streamId,
+                streamId: msg.streamId,
                 type: msg.type,
               })
             }
@@ -2703,6 +2759,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               })
             }
             return
+          }
+
+          const readyStreamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
+            ? msg.streamId
+            : undefined
+          if (readyStreamId) {
+            const previousStreamId = getTerminalCheckpointStreamId()
+            const activeAttach = currentAttachRef.current
+            if (activeAttach?.terminalId === tid && activeAttach.requestId === msg.attachRequestId) {
+              currentAttachRef.current = {
+                ...activeAttach,
+                streamId: readyStreamId,
+              }
+            }
+            if (previousStreamId !== readyStreamId) {
+              if (previousStreamId) {
+                resetParserAppliedSurface(parserAppliedSeqRef.current)
+              }
+              updateContent({ streamId: readyStreamId })
+            }
           }
 
           if (launchAttemptRef.current?.terminalId === tid) {
@@ -2779,6 +2855,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           updateContent({
             terminalId: newId,
             serverInstanceId: serverInstanceIdRef.current,
+            streamId: undefined,
             status: 'running',
             ...(createdSessionUpdates ?? {}),
             ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
@@ -2874,7 +2951,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // would otherwise reset the ref from the Redux state on re-render.
           terminalIdRef.current = undefined
           applySeqState(createAttachSeqState())
-          updateContent({ terminalId: undefined, status: 'exited' })
+          updateContent({ terminalId: undefined, streamId: undefined, status: 'exited' })
           const exitTab = tabRef.current
           if (exitTab) {
             const code = typeof msg.exitCode === 'number' ? msg.exitCode : undefined
@@ -2972,6 +3049,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
           updateContent({
             status: 'error',
+            streamId: undefined,
             ...(launchAttempt?.recoveryIntent
               ? { restoreError: buildRestoreError('dead_live_handle') }
               : {}),
@@ -3088,6 +3166,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               updateContent({
                 terminalId: undefined,
                 serverInstanceId: undefined,
+                streamId: undefined,
                 createRequestId: newRequestId,
                 status: 'creating',
                 restoreError: undefined,
@@ -3132,6 +3211,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             updateContent({
               terminalId: undefined,
               serverInstanceId: undefined,
+              streamId: undefined,
               createRequestId: newRequestId,
               status: 'creating',
             })
@@ -3277,6 +3357,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     attachTerminal,
     clearQuarantineRepair,
     getCheckpointDeltaReplayDecision,
+    getTerminalCheckpointStreamId,
+    isCurrentAttachMessage,
+    isCurrentAttachStreamMessage,
     markAttachComplete,
     markParserAppliedFrame,
     registerForBackgroundHydration,

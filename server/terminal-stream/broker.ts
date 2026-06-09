@@ -176,7 +176,7 @@ export class TerminalStreamBroker {
         }
       }
 
-      const streamId = this.streamIdentity.recordAttach(terminalId, attachRequestId)
+      const streamId = this.streamIdentity.recordAttach(terminalId)
 
       const replay = terminalState.replayRing.replaySince(normalizedSinceSeq)
       let replayFrames = replay.frames
@@ -320,7 +320,7 @@ export class TerminalStreamBroker {
       attachment.flushTimer = null
     }
 
-    this.streamIdentity.recordDetach(terminalId, attachment?.activeAttachRequestId)
+    this.streamIdentity.recordDetach(terminalId)
     state.clients.delete(ws)
     this.unregisterWsTerminal(ws, terminalId)
     this.registry.detach(terminalId, ws)
@@ -351,7 +351,7 @@ export class TerminalStreamBroker {
       this.terminals.set(terminalId, state)
     } else {
       state.replayRing.setMaxBytes(replayRingMaxBytes)
-      this.handleReplayRetentionLoss(terminalId, state)
+      this.handleReplayRetentionLoss(terminalId, state, this.streamIdentity.ensureStream(terminalId))
     }
     return state
   }
@@ -469,7 +469,7 @@ export class TerminalStreamBroker {
     const frames: ReplayFrame[] = []
     for (const fragment of fragments) {
       frames.push(state.replayRing.append(fragment, { streamId }))
-      const retainedStreamId = this.handleReplayRetentionLoss(terminalId, state)
+      const retainedStreamId = this.handleReplayRetentionLoss(terminalId, state, streamId)
       if (retainedStreamId) {
         streamId = retainedStreamId
       }
@@ -835,10 +835,14 @@ export class TerminalStreamBroker {
     return streamId
   }
 
-  private handleReplayRetentionLoss(terminalId: string, state: BrokerTerminalState): string | undefined {
+  private handleReplayRetentionLoss(
+    terminalId: string,
+    state: BrokerTerminalState,
+    retainedSuffixStreamId: string,
+  ): string | undefined {
     if (!state.replayRing.consumeRetentionLoss()) return undefined
     const streamId = this.replaceStreamIdentity(terminalId, 'retention_lost')
-    state.replayRing.retagRetainedFrames(streamId)
+    state.replayRing.retagRetainedStreamSuffix(retainedSuffixStreamId, streamId)
     return streamId
   }
 

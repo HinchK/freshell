@@ -603,6 +603,57 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('does not erase retained stream-replacement boundaries when retention loss rotates the compatible suffix', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(9)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-retained-boundary')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-retained-boundary', 'viewport_hydrate', 80, 24, 0, 'boundary-seed')
+    const initialReady = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(initialReady?.streamId).toEqual(expect.any(String))
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-retained-boundary', data: 'aaa', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retained-boundary', data: 'bbb', at: Date.now() })
+    registry.emit('terminal.stream.replaced', {
+      terminalId: 'term-retained-boundary',
+      reason: 'codex_pty_recovery',
+    })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retained-boundary', data: 'ccc', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retained-boundary', data: 'ddd', at: Date.now() })
+
+    const wsAfterLoss = createMockWs()
+    await broker.attach(
+      wsAfterLoss as any,
+      'term-retained-boundary',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'boundary-after-loss',
+    )
+    vi.advanceTimersByTime(1)
+
+    const payloadsAfterLoss = wsAfterLoss.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const readyAfterLoss = payloadsAfterLoss
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    const replayOutputsAfterLoss = payloadsAfterLoss
+      .filter((payload) => payload?.type === 'terminal.output')
+
+    expect(readyAfterLoss?.streamId).toEqual(expect.any(String))
+    expect(readyAfterLoss.streamId).not.toBe(initialReady.streamId)
+    expect(replayOutputsAfterLoss.map((payload) => String(payload.data))).toEqual(['bbb', 'cccddd'])
+    expect(replayOutputsAfterLoss[0].streamId).toBe(initialReady.streamId)
+    expect(replayOutputsAfterLoss[1].streamId).toBe(readyAfterLoss.streamId)
+    expect(new Set(replayOutputsAfterLoss.map((payload) => payload.streamId)).size).toBe(2)
+
+    broker.close()
+  })
+
   it('superseding attach on same socket clears stale queued frames and avoids duplicate old-frame delivery', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())

@@ -74,9 +74,11 @@ export class ReplayRing {
     return retentionLossPending
   }
 
-  retagRetainedFrames(streamId: string): void {
-    for (const frame of this.frames) {
-      frame.streamId = streamId
+  retagRetainedStreamSuffix(fromStreamId: string, toStreamId: string): void {
+    for (let index = this.frames.length - 1; index >= 0; index -= 1) {
+      const frame = this.frames[index]
+      if (frame.streamId !== fromStreamId) break
+      frame.streamId = toStreamId
     }
   }
 

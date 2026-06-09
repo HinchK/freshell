@@ -3509,7 +3509,7 @@ describe('TerminalView lifecycle updates', () => {
       const terminalId = opts?.terminalId
       const mode = opts?.mode ?? 'shell'
 
-      const paneContent: TerminalPaneContent & { streamId?: string } = {
+      const paneContent: TerminalPaneContent = {
         kind: 'terminal',
         createRequestId: requestId,
         status: initialStatus,
@@ -3985,6 +3985,200 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).toContain('FRESH')
       expect(writes).not.toContain('STALE')
       expect(writes).not.toContain('UNTAGGED')
+    })
+
+    it('persists attach-ready stream id into pane content and checkpoint identity', async () => {
+      const { store, tabId, terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-attach-stream-checkpoint',
+        serverInstanceId: 'server-attach-stream',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-from-ready',
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-from-ready',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'checkpointed on stream',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content.kind).toBe('terminal')
+      expect(layout.content.streamId).toBe('stream-from-ready')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-from-ready',
+        serverInstanceId: 'server-attach-stream',
+      })?.parserAppliedSeq).toBe(1)
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: null,
+        serverInstanceId: 'server-attach-stream',
+      })).toBeNull()
+    })
+
+    it('uses changed attach-ready stream id to invalidate warm delta replay eligibility', async () => {
+      const { store, tabId, terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-stream-rotation-client',
+        serverInstanceId: 'server-stream-rotation',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const initialAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(initialAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-before-rotation',
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: initialAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-before-rotation',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'before rotation',
+          attachRequestId: initialAttach!.attachRequestId,
+        })
+      })
+
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-before-rotation',
+        serverInstanceId: 'server-stream-rotation',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+      const warmDeltaAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(warmDeltaAttach).toMatchObject({
+        intent: 'transport_reconnect',
+        sinceSeq: 1,
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-after-rotation',
+          headSeq: 1,
+          replayFromSeq: 2,
+          replayToSeq: 1,
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+        })
+      })
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content.kind).toBe('terminal')
+      expect(layout.content.streamId).toBe('stream-after-rotation')
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+    })
+
+    it('does not render or checkpoint terminal.output from a mismatched stream id', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-stream-mismatch-client',
+        serverInstanceId: 'server-stream-mismatch',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const attach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-active',
+          headSeq: 0,
+          replayFromSeq: 1,
+          replayToSeq: 0,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-stale',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'STALE STREAM',
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-active',
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'ACTIVE STREAM',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
+      expect(writes).not.toContain('STALE STREAM')
+      expect(writes).toContain('ACTIVE STREAM')
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-active',
+        serverInstanceId: 'server-stream-mismatch',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
     })
 
     it('ignores xterm title callbacks fired while replay writes are scoped', async () => {

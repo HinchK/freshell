@@ -7,8 +7,8 @@ describe('terminal stream identity', () => {
     const initial = tracker.ensureStream('term-1')
 
     expect(tracker.ensureStream('term-1')).toBe(initial)
-    tracker.recordAttach('term-1', 'attach-1')
-    tracker.recordDetach('term-1', 'attach-1')
+    tracker.recordAttach('term-1')
+    tracker.recordDetach('term-1')
 
     expect(tracker.ensureStream('term-1')).toBe(initial)
   })
