@@ -566,23 +566,60 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     registry.emit('terminal.output.raw', { terminalId: 'term-structured-retention', data: 'bbb', at: Date.now() })
     registry.emit('terminal.output.raw', { terminalId: 'term-structured-retention', data: 'ccc', at: Date.now() })
 
-    expect(structuredLogs('warn', 'terminal.replay.retention')).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          event: 'terminal.replay.retention',
-          severity: 'warn',
-          terminalId: 'term-structured-retention',
-          attachRequestId: 'structured-retention-attach',
-          previousStreamId: ready.streamId,
-          streamId: expect.any(String),
-          reason: 'retention_lost',
-          retainedBytes: expect.any(Number),
-          maxBytes: 6,
-          tailSeq: expect.any(Number),
-          headSeq: expect.any(Number),
-        }),
-      ]),
-    )
+    const retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === 'term-structured-retention')
+    expect(retentionLogs).toHaveLength(1)
+    expect(retentionLogs[0]).toEqual(expect.objectContaining({
+      event: 'terminal.replay.retention',
+      severity: 'warn',
+      terminalId: 'term-structured-retention',
+      attachRequestIds: ['structured-retention-attach'],
+      attachmentCount: 1,
+      previousStreamId: ready.streamId,
+      streamId: expect.any(String),
+      reason: 'retention_lost',
+      retainedBytes: expect.any(Number),
+      maxBytes: 6,
+      tailSeq: expect.any(Number),
+      headSeq: expect.any(Number),
+    }))
+    expect(retentionLogs[0]?.attachRequestId).toBeUndefined()
+
+    broker.close()
+  })
+
+  it('emits one aggregate terminal.replay.retention log for multiple attached clients', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-retention-multi-client')
+
+    const wsA = createMockWs()
+    const wsB = createMockWs()
+    await broker.attach(wsA as any, 'term-retention-multi-client', 'viewport_hydrate', 80, 24, 0, 'retention-attach-a')
+    await broker.attach(wsB as any, 'term-retention-multi-client', 'viewport_hydrate', 80, 24, 0, 'retention-attach-b')
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-multi-client', data: 'aaa', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-multi-client', data: 'bbb', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-multi-client', data: 'ccc', at: Date.now() })
+
+    const retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === 'term-retention-multi-client')
+    expect(retentionLogs).toHaveLength(1)
+    expect(retentionLogs[0]).toEqual(expect.objectContaining({
+      event: 'terminal.replay.retention',
+      severity: 'warn',
+      terminalId: 'term-retention-multi-client',
+      attachRequestIds: expect.arrayContaining(['retention-attach-a', 'retention-attach-b']),
+      attachmentCount: 2,
+      reason: 'retention_lost',
+      retainedBytes: expect.any(Number),
+      maxBytes: 6,
+      tailSeq: expect.any(Number),
+      headSeq: expect.any(Number),
+    }))
+    expect(retentionLogs[0]?.attachRequestIds).toHaveLength(2)
+    expect(retentionLogs[0]?.attachRequestId).toBeUndefined()
 
     broker.close()
   })
@@ -607,9 +644,11 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       event: 'terminal.replay.retention',
       severity: 'warn',
       terminalId: 'term-retention-rate-limit',
-      attachRequestId: 'retention-rate-attach',
+      attachRequestIds: ['retention-rate-attach'],
+      attachmentCount: 1,
       reason: 'retention_lost',
     }))
+    expect(retentionLogs[0]?.attachRequestId).toBeUndefined()
     expect(retentionLogs[0]?.suppressedCount).toBeUndefined()
 
     registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'ddd', at: Date.now() })
@@ -629,10 +668,12 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       event: 'terminal.replay.retention',
       severity: 'warn',
       terminalId: 'term-retention-rate-limit',
-      attachRequestId: 'retention-rate-attach',
+      attachRequestIds: ['retention-rate-attach'],
+      attachmentCount: 1,
       reason: 'retention_lost',
       suppressedCount: 2,
     }))
+    expect(retentionLogs[1]?.attachRequestId).toBeUndefined()
 
     broker.close()
   })

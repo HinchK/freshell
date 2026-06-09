@@ -990,6 +990,7 @@ export class TerminalStreamBroker {
     streamId: string
     previousStreamId?: string
     attachRequestIds: string[]
+    attachmentCount: number
     reason: TerminalStreamReplacementReason
     retainedBytes: number
     maxBytes: number
@@ -1003,6 +1004,8 @@ export class TerminalStreamBroker {
       terminalId: input.terminalId,
       streamId: input.streamId,
       ...(input.previousStreamId ? { previousStreamId: input.previousStreamId } : {}),
+      attachRequestIds: input.attachRequestIds,
+      attachmentCount: input.attachmentCount,
       reason: input.reason,
       retainedBytes: input.retainedBytes,
       maxBytes: input.maxBytes,
@@ -1012,16 +1015,7 @@ export class TerminalStreamBroker {
         ? { suppressedCount: input.suppressedCount }
         : {}),
     }
-    if (input.attachRequestIds.length === 0) {
-      log.warn(basePayload, 'Terminal replay retention loss changed stream identity')
-      return
-    }
-    for (const attachRequestId of input.attachRequestIds) {
-      log.warn({
-        ...basePayload,
-        attachRequestId,
-      }, 'Terminal replay retention loss changed stream identity')
-    }
+    log.warn(basePayload, 'Terminal replay retention loss changed stream identity')
   }
 
   private sendFrame(
@@ -1875,6 +1869,7 @@ export class TerminalStreamBroker {
       attachRequestIds: [...state.clients.values()]
         .map((attachment) => attachment.activeAttachRequestId)
         .filter((attachRequestId): attachRequestId is string => Boolean(attachRequestId)),
+      attachmentCount: state.clients.size,
       reason: 'retention_lost',
       retainedBytes: state.replayRing.retainedBytes(),
       maxBytes: state.replayRing.retentionMaxBytes(),
