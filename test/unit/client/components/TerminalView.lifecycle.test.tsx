@@ -4542,10 +4542,18 @@ describe('TerminalView lifecycle updates', () => {
       const malformedBatches: Array<Record<string, unknown>> = [
         { seqStart: '1', seqEnd: 1, segments: [validSegment] },
         { seqStart: 1, seqEnd: null, segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, serializedBytes: '128', segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, serializedBytes: null, segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, serializedBytes: -1, segments: [validSegment] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, seqStart: '1' }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, seqEnd: null }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, endOffset: true }] },
         { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, endOffset: Number.POSITIVE_INFINITY }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: '1' }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: null }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: 0 }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: -1 }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, rawFrameCount: 1.5 }] },
       ]
 
       term.write.mockClear()
@@ -4580,6 +4588,41 @@ describe('TerminalView lifecycle updates', () => {
         terminalId,
         sinceSeq: 0,
       }))
+    })
+
+    it('rejects terminal.output.batch when an endOffset splits a UTF-16 surrogate pair', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-surrogate-split',
+        serverInstanceId: 'server-output-batch-surrogate-split',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 2,
+          data: '\ud83d\ude00',
+          serializedBytes: 128,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 1, data: '\ud83d', rawFrameCount: 1 },
+            { seqStart: 2, seqEnd: 2, endOffset: 2, data: '\ude00', rawFrameCount: 1 },
+          ],
+        })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-surrogate-split',
+      })).toBeNull()
     })
 
     it('rejects terminal.output.batch when segment data disagrees with offsets', async () => {
@@ -4692,6 +4735,54 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
+    it('does not checkpoint a mixed renderable and stripped terminal.output.batch segment as parser-applied', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-mixed-stripped-bel',
+        mode: 'codex',
+        serverInstanceId: 'server-output-batch-mixed-stripped-bel',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'A\x07',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 1, seqEnd: 1, endOffset: 2, rawFrameCount: 1, barrier: 'turn_complete' },
+          ],
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['A'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-mixed-stripped-bel',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+      }))
+    })
+
     it('does not checkpoint a stripped legacy terminal.output BEL frame as parser-applied', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
@@ -4730,6 +4821,49 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-stripped-bel',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+      }))
+    })
+
+    it('does not checkpoint a mixed renderable and stripped legacy terminal.output frame as parser-applied', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-legacy-mixed-stripped-bel',
+        mode: 'codex',
+        serverInstanceId: 'server-output-legacy-mixed-stripped-bel',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'A\x07',
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['A'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-legacy-mixed-stripped-bel',
       })).toBeNull()
 
       wsMocks.send.mockClear()

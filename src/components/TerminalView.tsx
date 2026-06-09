@@ -210,8 +210,23 @@ type StartupProbeReplayDiscardState = {
   resumeState: TerminalStartupProbeState | null
 }
 
+type TerminalOutputSubmission = {
+  submittedWrite: boolean
+  submittedBytesEqualInput: boolean
+}
+
 function resolveMinimumContrastRatio(theme?: { isDark?: boolean } | null): number {
   return theme?.isDark === false ? LIGHT_THEME_MIN_CONTRAST_RATIO : DEFAULT_MIN_CONTRAST_RATIO
+}
+
+function isUtf16SurrogateSplitOffset(data: string, offset: number): boolean {
+  if (offset <= 0 || offset >= data.length) return false
+  const previous = data.charCodeAt(offset - 1)
+  const next = data.charCodeAt(offset)
+  return previous >= 0xD800
+    && previous <= 0xDBFF
+    && next >= 0xDC00
+    && next <= 0xDFFF
 }
 
 function consumeStartupProbeReplayDiscard(
@@ -1363,7 +1378,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     allowReplies: boolean,
     onParserApplied?: () => void,
     writeOptions?: TerminalWriteQueueOptions,
-  ): boolean => {
+  ): TerminalOutputSubmission => {
     const outputSource = writeOptions?.mode ?? 'live'
     const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
       foreground: resolvedThemeRef.current.foreground,
@@ -1402,14 +1417,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }))
     }
 
+    const submittedBytesEqualInput = cleaned === raw
     const submittedWrite = cleaned
-      ? enqueueTerminalWrite(cleaned, onParserApplied, writeOptions)
+      ? enqueueTerminalWrite(
+          cleaned,
+          submittedBytesEqualInput ? onParserApplied : undefined,
+          writeOptions,
+        )
       : false
 
     for (const event of osc.events) {
       handleOsc52Event(event, outputSource, mode)
     }
-    return submittedWrite
+    return { submittedWrite, submittedBytesEqualInput: submittedWrite && submittedBytesEqualInput }
   }, [dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
 
   const findNext = useCallback((value: string = searchQuery) => {
@@ -2661,24 +2681,31 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             startupProbeStateRef.current = replayDiscard.resumeState
           }
           raw = replayDiscard.raw
-          const submittedWrite = handleTerminalOutput(
+          const inputBytesEqualSubmission = raw === input.raw
+          const submission = handleTerminalOutput(
             raw,
             input.mode,
             tid,
             input.outputSource === 'live',
-            () => completeParserAppliedFrame({
-              attachRequestId: input.attachRequestId,
-              mode: input.mode,
-              parserAppliedSeq: input.parserAppliedSeq,
-              completedAttach: input.completedAttach,
-            }),
+            inputBytesEqualSubmission
+              ? () => completeParserAppliedFrame({
+                  attachRequestId: input.attachRequestId,
+                  mode: input.mode,
+                  parserAppliedSeq: input.parserAppliedSeq,
+                  completedAttach: input.completedAttach,
+                })
+              : undefined,
             {
               mode: input.outputSource,
               generation: input.attachRequestId,
               coalesce: input.disableWriteCoalescing ? false : undefined,
             },
           )
-          if (!submittedWrite) {
+          if (
+            !submission.submittedWrite
+            || !inputBytesEqualSubmission
+            || !submission.submittedBytesEqualInput
+          ) {
             applySeqState(markOutputRangeUnapplied(seqStateRef.current, {
               fromSeq: input.seqStart,
               toSeq: input.seqEnd,
@@ -2713,6 +2740,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const rawSegmentsInput = Array.isArray(msg.segments) ? msg.segments : []
           const batchSeqStart = msg.seqStart
           const batchSeqEnd = msg.seqEnd
+          const batchSerializedBytes = msg.serializedBytes
           const batchSegments: Array<{
             seqStart: number
             seqEnd: number
@@ -2738,6 +2766,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             || batchSeqEnd < batchSeqStart
           ) {
             invalidBatchReason = 'invalid_batch_range'
+          } else if (
+            typeof batchSerializedBytes !== 'number'
+            || !Number.isFinite(batchSerializedBytes)
+            || batchSerializedBytes < 0
+          ) {
+            invalidBatchReason = 'invalid_batch_serialized_bytes'
           }
 
           for (const rawSegment of rawSegmentsInput) {
@@ -2745,19 +2779,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             const seqStart = rawSegment?.seqStart
             const seqEnd = rawSegment?.seqEnd
             const endOffset = rawSegment?.endOffset
+            const rawFrameCount = rawSegment?.rawFrameCount
             if (
               typeof seqStart !== 'number'
               || typeof seqEnd !== 'number'
               || typeof endOffset !== 'number'
+              || typeof rawFrameCount !== 'number'
               || !Number.isFinite(seqStart)
               || !Number.isFinite(seqEnd)
               || !Number.isFinite(endOffset)
+              || !Number.isFinite(rawFrameCount)
               || !Number.isInteger(seqStart)
               || !Number.isInteger(seqEnd)
               || !Number.isInteger(endOffset)
+              || !Number.isInteger(rawFrameCount)
               || seqStart < 0
               || seqEnd < seqStart
               || endOffset < 0
+              || rawFrameCount <= 0
             ) {
               invalidBatchReason = 'invalid_segment_range'
               break
@@ -2770,6 +2809,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             if (
               normalizedEndOffset < previousEndOffset
               || normalizedEndOffset > batchData.length
+            ) {
+              invalidBatchReason = 'invalid_segment_offset'
+              break
+            }
+            if (
+              isUtf16SurrogateSplitOffset(batchData, previousEndOffset)
+              || isUtf16SurrogateSplitOffset(batchData, normalizedEndOffset)
             ) {
               invalidBatchReason = 'invalid_segment_offset'
               break
