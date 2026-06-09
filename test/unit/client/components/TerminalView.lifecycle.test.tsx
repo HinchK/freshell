@@ -4527,6 +4527,61 @@ describe('TerminalView lifecycle updates', () => {
       expect(terminalWriteStrings(term)).toContain('accepted-after-hole')
     })
 
+    it('rejects terminal.output.batch with malformed numeric fields before writing or checkpointing', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-malformed-numbers',
+        serverInstanceId: 'server-output-batch-malformed-numbers',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      const validSegment = { seqStart: 1, seqEnd: 1, endOffset: 1, rawFrameCount: 1 }
+      const malformedBatches: Array<Record<string, unknown>> = [
+        { seqStart: '1', seqEnd: 1, segments: [validSegment] },
+        { seqStart: 1, seqEnd: null, segments: [validSegment] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, seqStart: '1' }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, seqEnd: null }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, endOffset: true }] },
+        { seqStart: 1, seqEnd: 1, segments: [{ ...validSegment, endOffset: Number.POSITIVE_INFINITY }] },
+      ]
+
+      term.write.mockClear()
+      act(() => {
+        for (const malformed of malformedBatches) {
+          messageHandler!({
+            type: 'terminal.output.batch',
+            terminalId,
+            streamId,
+            attachRequestId,
+            source: 'live',
+            data: 'x',
+            serializedBytes: 128,
+            ...malformed,
+          })
+        }
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-malformed-numbers',
+      })).toBeNull()
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        sinceSeq: 0,
+      }))
+    })
+
     it('rejects terminal.output.batch when segment data disagrees with offsets', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',

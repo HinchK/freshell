@@ -2711,8 +2711,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             : null
           const batchData = typeof msg.data === 'string' ? msg.data : ''
           const rawSegmentsInput = Array.isArray(msg.segments) ? msg.segments : []
-          const batchSeqStart = Number(msg.seqStart)
-          const batchSeqEnd = Number(msg.seqEnd)
+          const batchSeqStart = msg.seqStart
+          const batchSeqEnd = msg.seqEnd
           const batchSegments: Array<{
             seqStart: number
             seqEnd: number
@@ -2728,7 +2728,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           } else if (rawSegmentsInput.length === 0) {
             invalidBatchReason = 'missing_segments'
           } else if (
-            !Number.isInteger(batchSeqStart)
+            typeof batchSeqStart !== 'number'
+            || typeof batchSeqEnd !== 'number'
+            || !Number.isFinite(batchSeqStart)
+            || !Number.isFinite(batchSeqEnd)
+            || !Number.isInteger(batchSeqStart)
             || !Number.isInteger(batchSeqEnd)
             || batchSeqStart < 0
             || batchSeqEnd < batchSeqStart
@@ -2738,11 +2742,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
           for (const rawSegment of rawSegmentsInput) {
             if (invalidBatchReason) break
-            const seqStart = Number(rawSegment?.seqStart)
-            const seqEnd = Number(rawSegment?.seqEnd)
-            const endOffset = Number(rawSegment?.endOffset)
+            const seqStart = rawSegment?.seqStart
+            const seqEnd = rawSegment?.seqEnd
+            const endOffset = rawSegment?.endOffset
             if (
-              !Number.isInteger(seqStart)
+              typeof seqStart !== 'number'
+              || typeof seqEnd !== 'number'
+              || typeof endOffset !== 'number'
+              || !Number.isFinite(seqStart)
+              || !Number.isFinite(seqEnd)
+              || !Number.isFinite(endOffset)
+              || !Number.isInteger(seqStart)
               || !Number.isInteger(seqEnd)
               || !Number.isInteger(endOffset)
               || seqStart < 0
