@@ -1,3 +1,5 @@
+import type { CheckpointDeltaReplayDecision } from './terminal-surface-checkpoint'
+
 export type TerminalAttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
 export type TerminalAttachPriority = 'foreground' | 'background'
 
@@ -12,8 +14,16 @@ export type DeferredAttachReason =
 export type RevealAttachPolicyInput = {
   pendingIntent: TerminalAttachIntent
   pendingReason: DeferredAttachReason
+  checkpointDecision: CheckpointDeltaReplayDecision
+  replayHydrateCoversCompatibleGeometryHistory?: boolean
+}
+
+type LegacyRevealAttachPolicyInput = {
+  pendingIntent: TerminalAttachIntent
+  pendingReason: DeferredAttachReason
   hasTrustedSurface: boolean
   renderedSeq: number
+  replayHydrateCoversCompatibleGeometryHistory?: boolean
 }
 
 export type RevealAttachPlan = {
@@ -21,6 +31,7 @@ export type RevealAttachPlan = {
   clearViewportFirst: boolean
   priority: TerminalAttachPriority
   sinceSeq?: number
+  trustResultingSurfaceForDeltaReplay?: boolean
 }
 
 function normalizeSeq(seq: number): number {
@@ -28,28 +39,52 @@ function normalizeSeq(seq: number): number {
   return Math.max(0, Math.floor(seq))
 }
 
-export function resolveRevealAttachPlan(input: RevealAttachPolicyInput): RevealAttachPlan {
+function resolveCheckpointDecision(
+  input: RevealAttachPolicyInput | LegacyRevealAttachPolicyInput,
+): CheckpointDeltaReplayDecision {
+  if ('checkpointDecision' in input) return input.checkpointDecision
+
   const renderedSeq = normalizeSeq(input.renderedSeq)
+  return input.hasTrustedSurface && renderedSeq > 0
+    ? { ok: true, sinceSeq: renderedSeq }
+    : { ok: false, reason: 'missing_checkpoint' }
+}
+
+function replayHydrateTrust(
+  input: RevealAttachPolicyInput | LegacyRevealAttachPolicyInput,
+  checkpointDecision: CheckpointDeltaReplayDecision,
+): Pick<RevealAttachPlan, 'trustResultingSurfaceForDeltaReplay'> {
+  const replayHydrateNeedsProvenGeometry = !checkpointDecision.ok
+    || input.pendingReason === 'explicit_refresh'
+  if (!replayHydrateNeedsProvenGeometry) return {}
+  if (input.replayHydrateCoversCompatibleGeometryHistory === true) return {}
+  return { trustResultingSurfaceForDeltaReplay: false }
+}
+
+export function resolveRevealAttachPlan(
+  input: RevealAttachPolicyInput | LegacyRevealAttachPolicyInput,
+): RevealAttachPlan {
+  const checkpointDecision = resolveCheckpointDecision(input)
+  const sinceSeq = checkpointDecision.ok ? checkpointDecision.sinceSeq : undefined
 
   if (input.pendingIntent !== 'viewport_hydrate') {
     return {
       intent: input.pendingIntent,
       clearViewportFirst: false,
       priority: 'foreground',
-      ...(input.hasTrustedSurface && renderedSeq > 0 ? { sinceSeq: renderedSeq } : {}),
+      ...(sinceSeq ? { sinceSeq } : {}),
     }
   }
 
   if (
     input.pendingReason !== 'explicit_refresh'
-    && input.hasTrustedSurface
-    && renderedSeq > 0
+    && sinceSeq
   ) {
     return {
       intent: 'transport_reconnect',
       clearViewportFirst: false,
       priority: 'foreground',
-      sinceSeq: renderedSeq,
+      sinceSeq,
     }
   }
 
@@ -57,5 +92,6 @@ export function resolveRevealAttachPlan(input: RevealAttachPolicyInput): RevealA
     intent: 'viewport_hydrate',
     clearViewportFirst: true,
     priority: 'foreground',
+    ...replayHydrateTrust(input, checkpointDecision),
   }
 }
