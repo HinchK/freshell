@@ -126,6 +126,62 @@ describe('createTerminalWriteQueue', () => {
     expect(callbacks).toEqual(['A', 'B'])
   })
 
+  it('drops queued writes from stale generations before they reach xterm', () => {
+    const writes: string[] = []
+    const callbacks: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+
+    const queue = createTerminalWriteQueue({
+      write: (chunk, onWritten) => {
+        writes.push(chunk)
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.setActiveGeneration('attach-1')
+    queue.enqueue('old', () => callbacks.push('old'), { generation: 'attach-1' })
+    queue.setActiveGeneration('attach-2', { dropQueuedStaleWrites: true })
+    queue.enqueue('new', () => callbacks.push('new'), { generation: 'attach-2' })
+
+    rafCallbacks.shift()?.(16)
+
+    expect(writes).toEqual(['new'])
+    expect(callbacks).toEqual(['new'])
+  })
+
+  it('suppresses stale write callbacks after generation changes', () => {
+    const callbacks: string[] = []
+    const pendingCallbacks: Array<() => void> = []
+    const rafCallbacks: FrameRequestCallback[] = []
+
+    const queue = createTerminalWriteQueue({
+      write: (_chunk, onWritten) => {
+        if (onWritten) pendingCallbacks.push(onWritten)
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.setActiveGeneration('attach-1')
+    queue.enqueue('old', () => callbacks.push('old'), { generation: 'attach-1' })
+    rafCallbacks.shift()?.(16)
+
+    expect(queue.hasInFlightWrites()).toBe(true)
+    queue.setActiveGeneration('attach-2', { dropQueuedStaleWrites: true })
+    pendingCallbacks.shift()?.()
+
+    expect(callbacks).toEqual([])
+    expect(queue.hasInFlightWrites()).toBe(false)
+  })
+
   it('keeps replay work on the normal frame budget', () => {
     const tasks: string[] = []
     const rafCallbacks: FrameRequestCallback[] = []
