@@ -1,3 +1,5 @@
+import { beginTerminalOutputWriteScope } from '@/lib/terminal-output-write-scope'
+
 export type TerminalWriteQueue = {
   enqueue: (data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions) => void
   enqueueTask: (task: () => void, options?: TerminalWriteQueueOptions) => void
@@ -17,6 +19,7 @@ export type TerminalWriteQueueOptions = {
 }
 
 type TerminalWriteQueueArgs = {
+  terminalInstanceId: string
   write: (data: string, onWritten?: () => void) => void
   onDrain?: () => void
   budgetMs?: number
@@ -54,6 +57,8 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
   let scheduled = false
   let activeGeneration: string | undefined
   let inFlightWrites = 0
+  let submittedWriteInFlight = false
+  let flushing = false
   const inFlightWritesByGeneration = new Map<string | undefined, number>()
 
   const resolveGeneration = (options?: TerminalWriteQueueOptions) => options?.generation ?? activeGeneration
@@ -90,6 +95,15 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
     inFlightWritesByGeneration.set(generation, generationCount - 1)
   }
 
+  const continueAfterWriteCompletion = () => {
+    if (flushing) return
+    if (queue.length > 0) {
+      scheduleFlush()
+      return
+    }
+    args.onDrain?.()
+  }
+
   const runItem = (item: QueueItem) => {
     if (isStaleGeneration(item.generation)) {
       return
@@ -101,15 +115,28 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
     }
 
     incrementInFlightWrites(item.generation)
+    submittedWriteInFlight = true
     let didWriteComplete = false
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId: args.terminalInstanceId,
+      source: item.mode,
+      attachRequestId: item.generation,
+      generation: item.generation ?? 'no-attach',
+      suppressExternalSideEffects: item.mode === 'replay',
+    })
     const onWritten = () => {
       if (didWriteComplete) return
       didWriteComplete = true
-      decrementInFlightWrites(item.generation)
-      if (isStaleGeneration(item.generation)) {
-        return
+      try {
+        if (!isStaleGeneration(item.generation)) {
+          for (const callback of item.callbacks) callback()
+        }
+      } finally {
+        scope.complete()
+        decrementInFlightWrites(item.generation)
+        submittedWriteInFlight = false
+        continueAfterWriteCompletion()
       }
-      for (const callback of item.callbacks) callback()
     }
 
     try {
@@ -117,17 +144,28 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
     } catch (error) {
       if (!didWriteComplete) {
         didWriteComplete = true
+        scope.complete()
         decrementInFlightWrites(item.generation)
+        submittedWriteInFlight = false
       }
       throw error
     }
   }
 
   const flush = () => {
+    if (submittedWriteInFlight) return
     const deadline = now() + budgetMs
-    while (queue.length > 0 && now() <= deadline) {
-      const next = queue.shift()
-      if (next) runItem(next)
+    flushing = true
+    try {
+      while (queue.length > 0 && now() <= deadline && !submittedWriteInFlight) {
+        const next = queue.shift()
+        if (next) runItem(next)
+      }
+    } finally {
+      flushing = false
+    }
+    if (submittedWriteInFlight) {
+      return
     }
     if (queue.length > 0) {
       scheduleFlush()

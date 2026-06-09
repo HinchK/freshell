@@ -75,9 +75,16 @@ import {
 import {
   createOsc52ParserState,
   extractOsc52Events,
+  shouldAllowOsc52ClipboardWrite,
+  shouldAllowOsc52Prompt,
   type Osc52Event,
   type Osc52Policy,
 } from '@/lib/terminal-osc52'
+import {
+  beginTerminalOutputWriteScope,
+  shouldAllowTerminalOutputSideEffect,
+  type TerminalOutputSource,
+} from '@/lib/terminal-output-write-scope'
 import {
   createTerminalStartupProbeState,
   extractTerminalStartupProbes,
@@ -433,6 +440,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const containerRef = useRef<HTMLDivElement | null>(null)
   const wrapperRef = useRef<HTMLDivElement | null>(null)
   const termRef = useRef<Terminal | null>(null)
+  const terminalInstanceIdRef = useRef(`terminal-surface:${nanoid()}`)
   const runtimeRef = useRef<TerminalRuntime | null>(null)
   const writeQueueRef = useRef<TerminalWriteQueue | null>(null)
   const layoutSchedulerRef = useRef<ReturnType<typeof createLayoutScheduler> | null>(null)
@@ -741,6 +749,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       parserIdle: true,
     })
   }, [buildCheckpointReplayInput])
+
+  const writeLocalXtermNotice = useCallback((term: Terminal, data: string) => {
+    if (!shouldAllowTerminalOutputSideEffect({
+      terminalInstanceId: terminalInstanceIdRef.current,
+      source: 'live',
+      effect: 'local_xterm_notice',
+      mode: contentRef.current?.mode,
+    })) {
+      return
+    }
+    resetParserAppliedSurface(parserAppliedSeqRef.current)
+    try {
+      term.writeln(data)
+    } catch {
+      // disposed
+    }
+  }, [resetParserAppliedSurface])
 
   useEffect(() => () => {
     clearQuarantineRepair()
@@ -1201,10 +1226,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
     const term = termRef.current
     if (!term) return
+    const mode = options?.mode ?? 'live'
+    const generation = options?.generation ?? 'no-attach'
+    const scope = beginTerminalOutputWriteScope({
+      terminalInstanceId: terminalInstanceIdRef.current,
+      source: mode,
+      attachRequestId: options?.generation,
+      generation,
+      suppressExternalSideEffects: mode === 'replay',
+    })
     try {
-      term.write(data, onWritten)
+      term.write(data, () => {
+        try {
+          onWritten?.()
+        } finally {
+          scope.complete()
+        }
+      })
     } catch {
       // disposed
+      scope.complete()
     }
   }, [])
 
@@ -1228,13 +1269,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     setPendingOsc52Event(null)
   }, [])
 
-  const handleOsc52Event = useCallback((event: Osc52Event) => {
+  const handleOsc52Event = useCallback((event: Osc52Event, source: TerminalOutputSource, mode: TerminalPaneContent['mode']) => {
     const policy = osc52PolicyRef.current
     if (policy === 'always') {
-      attemptOsc52ClipboardWrite(event.text)
+      if (shouldAllowOsc52ClipboardWrite({
+        terminalInstanceId: terminalInstanceIdRef.current,
+        source,
+        mode,
+      })) {
+        attemptOsc52ClipboardWrite(event.text)
+      }
       return
     }
     if (policy === 'never') {
+      return
+    }
+    if (!shouldAllowOsc52Prompt({
+      terminalInstanceId: terminalInstanceIdRef.current,
+      source,
+      mode,
+    })) {
       return
     }
     if (pendingOsc52EventRef.current) {
@@ -1271,13 +1325,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     onParserApplied?: () => void,
     writeOptions?: TerminalWriteQueueOptions,
   ) => {
+    const outputSource = writeOptions?.mode ?? 'live'
     const startup = extractTerminalStartupProbes(raw, startupProbeStateRef.current, {
       foreground: resolvedThemeRef.current.foreground,
       background: resolvedThemeRef.current.background,
       cursor: resolvedThemeRef.current.cursor,
     })
 
-    if (allowReplies) {
+    if (allowReplies && shouldAllowTerminalOutputSideEffect({
+      terminalInstanceId: terminalInstanceIdRef.current,
+      source: outputSource,
+      effect: 'startup_reply',
+      mode,
+    })) {
       for (const reply of startup.replies) {
         sendInput(reply)
       }
@@ -1289,7 +1349,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     // claude and codex turn-completion are server-authoritative (terminal.turn.complete
     // broadcast). The client must not mint a completion from output (live or replayed)
     // for those modes — only opencode/other modes still use the client BEL path.
-    if (count > 0 && tid && mode !== 'claude' && mode !== 'codex') {
+    if (count > 0 && tid && shouldAllowTerminalOutputSideEffect({
+      terminalInstanceId: terminalInstanceIdRef.current,
+      source: outputSource,
+      effect: 'turn_complete',
+      mode,
+    })) {
       dispatch(recordTurnComplete({
         tabId,
         paneId: paneIdRef.current,
@@ -1301,11 +1366,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (cleaned) {
       enqueueTerminalWrite(cleaned, onParserApplied, writeOptions)
     } else {
-      onParserApplied?.()
+      if (onParserApplied) {
+        const scope = beginTerminalOutputWriteScope({
+          terminalInstanceId: terminalInstanceIdRef.current,
+          source: outputSource,
+          attachRequestId: writeOptions?.generation,
+          generation: writeOptions?.generation ?? 'no-attach',
+          suppressExternalSideEffects: outputSource === 'replay',
+        })
+        try {
+          onParserApplied()
+        } finally {
+          scope.complete()
+        }
+      }
     }
 
     for (const event of osc.events) {
-      handleOsc52Event(event)
+      handleOsc52Event(event, outputSource, mode)
     }
   }, [dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
 
@@ -1451,6 +1529,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     const resolvedTheme = getTerminalTheme(settings.terminal.theme, settings.theme)
     resolvedThemeRef.current = resolvedTheme
+    const terminalInstanceId = `terminal-surface:${nanoid()}`
+    terminalInstanceIdRef.current = terminalInstanceId
+
     const term = new Terminal({
       allowProposedApi: true,
       convertEol: true,
@@ -1502,11 +1583,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     termRef.current = term
     runtimeRef.current = runtime
     const writeQueue = createTerminalWriteQueue({
+      terminalInstanceId,
       write: (data, onWritten) => {
         try {
           term.write(data, onWritten)
         } catch {
           // disposed
+          onWritten?.()
         }
       },
     })
@@ -1515,7 +1598,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     layoutSchedulerRef.current = layoutScheduler
 
     term.open(containerRef.current)
-    const requestModeBypass = registerTerminalRequestModeBypass(term, sendInput)
+    const requestModeBypass = registerTerminalRequestModeBypass(term, sendInput, { terminalInstanceId })
     term.attachCustomWheelEventHandler((event) => {
       const lines = event.deltaY < 0 ? -1 : event.deltaY > 0 ? 1 : 0
       if (!translateScrollLinesToInput(term, lines)) {
@@ -1528,6 +1611,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     })
 
     // Register custom link provider for clickable local file paths
+    const linkProviderTerminalInstanceId = terminalInstanceId
     const filePathLinkDisposable = typeof term.registerLinkProvider === 'function'
       ? term.registerLinkProvider({
         provideLinks(bufferLineNumber: number, callback: (links: import('@xterm/xterm').ILink[] | undefined) => void) {
@@ -1544,6 +1628,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             text: m.path,
             activate: (event: MouseEvent) => {
               if (event && event.button !== 0) return
+              if (terminalInstanceIdRef.current !== linkProviderTerminalInstanceId) return
               queuePaneSplit({
                 kind: 'editor',
                 filePath: m.path,
@@ -1576,6 +1661,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             text: m.url,
             activate: (event: MouseEvent) => {
               if (event && event.button !== 0) return
+              if (terminalInstanceIdRef.current !== linkProviderTerminalInstanceId) return
               if (warnExternalLinksRef.current !== false) {
                 setPendingLinkUriRef.current(m.url)
               } else {
@@ -1583,12 +1669,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               }
             },
             hover: () => {
+              if (terminalInstanceIdRef.current !== linkProviderTerminalInstanceId) return
               setHoveredUrl(paneId, m.url)
               if (wrapperRef.current) {
                 wrapperRef.current.dataset.hoveredUrl = m.url
               }
             },
             leave: () => {
+              if (terminalInstanceIdRef.current !== linkProviderTerminalInstanceId) return
               clearHoveredUrl(paneId)
               if (wrapperRef.current) {
                 delete wrapperRef.current.dataset.hoveredUrl
@@ -1797,12 +1885,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     if (!isTerminal) return
     const term = termRef.current
     if (!term) return
+    const titleTerminalInstanceId = terminalInstanceIdRef.current
 
     const disposable = term.onTitleChange((rawTitle: string) => {
       // Only shell terminals follow the program's OSC window title. Coding-agent
       // terminals are named from the server session (working dir / first message
       // / Gemini) and must stay stable, so they ignore OSC titles entirely.
       if (!terminalFollowsOscTitle(contentRef.current?.mode)) return
+      if (!shouldAllowTerminalOutputSideEffect({
+        terminalInstanceId: titleTerminalInstanceId,
+        source: 'live',
+        effect: 'title_update',
+        mode: contentRef.current?.mode,
+      })) {
+        return
+      }
       // Strip prefix noise (spinners, status chars) - everything before first letter
       const match = rawTitle.match(/[a-zA-Z]/)
       if (!match) return // No letters = all noise, ignore
@@ -2222,7 +2319,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         if (requestIdRef.current !== requestId) return
         sendCreate(requestId)
       }, delayMs)
-      term.writeln(`\r\n[Rate limited - retrying in ${(delayMs / 1000).toFixed(0)}s]\r\n`)
+      writeLocalXtermNotice(term, `\r\n[Rate limited - retrying in ${(delayMs / 1000).toFixed(0)}s]\r\n`)
       return true
     }
 
@@ -2300,11 +2397,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       forgetSentViewport(terminalId)
       lastSentViewportRef.current = null
       applySeqState(createAttachSeqState())
-      try {
-        term.writeln('\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
-      } catch {
-        // disposed
-      }
+      writeLocalXtermNotice(term, '\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
       ws.send({ type: 'terminal.kill', terminalId })
       return true
     }
@@ -2340,7 +2433,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           dispatch(updateTab({ id: currentTab.id, updates: { status: 'error' } }))
         }
         const prefix = restore ? '[Restore failed]' : '[Launch failed]'
-        term.writeln(`\r\n${prefix} ${message}\r\n`)
+        writeLocalXtermNotice(term, `\r\n${prefix} ${message}\r\n`)
       }
 
       unsub = ws.onMessage((msg) => {
@@ -2421,10 +2514,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const completeParserAppliedFrame = () => {
             const activeAttach = currentAttachRef.current
             if (!activeAttach || activeAttach.requestId !== frameAttachRequestId) return
+            if (!shouldAllowTerminalOutputSideEffect({
+              terminalInstanceId: terminalInstanceIdRef.current,
+              effect: 'parser_applied_checkpoint',
+              mode,
+              generation: frameAttachRequestId,
+            })) {
+              return
+            }
             const nextSeqState = markParserAppliedSeq(seqStateRef.current, frameParserAppliedSeq)
             applySeqState(nextSeqState)
             markParserAppliedFrame(tid, nextSeqState.parserAppliedSeq, activeAttach)
             if (completedAttachOnFrame) {
+              if (!shouldAllowTerminalOutputSideEffect({
+                terminalInstanceId: terminalInstanceIdRef.current,
+                effect: 'attach_completion',
+                mode,
+                generation: frameAttachRequestId,
+              })) {
+                return
+              }
               setIsAttaching(false)
               markAttachComplete()
             }
@@ -2493,11 +2602,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             const reason = msg.reason === 'replay_window_exceeded'
               ? 'reconnect window exceeded'
               : 'slow link backlog'
-            try {
-              term.writeln(`\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
-            } catch {
-              // disposed
-            }
+            writeLocalXtermNotice(term, `\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
           }
           const previousSeqState = seqStateRef.current
           const gapDecision = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
@@ -2773,7 +2878,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const previous = lastInputBlockedNoticeRef.current
           if (!previous || previous.reason !== reason || now - previous.at >= INPUT_BLOCKED_NOTICE_THROTTLE_MS) {
             lastInputBlockedNoticeRef.current = { reason, at: now }
-            term.writeln(`\r\n[${terminalInputBlockedNotice(reason)}]\r\n`)
+            writeLocalXtermNotice(term, `\r\n[${terminalInputBlockedNotice(reason)}]\r\n`)
           }
           return
         }
@@ -2805,7 +2910,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const prefix = launchAttempt
             ? (launchAttempt.restore ? '[Restore failed]' : '[Launch failed]')
             : '[Error]'
-          term.writeln(`\r\n${prefix} ${msg.message || msg.code || 'Unknown error'}\r\n`)
+          writeLocalXtermNotice(term, `\r\n${prefix} ${msg.message || msg.code || 'Unknown error'}\r\n`)
         }
 
         const activeAttachForInvalidTerminalError = currentAttachRef.current
@@ -2847,7 +2952,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             // Show feedback if the terminal already exited (the ID was cleared by
             // the exit handler, so msg.terminalId no longer matches the ref)
             if (current?.status === 'exited') {
-              term.writeln('\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
+              writeLocalXtermNotice(term, '\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
             }
             return
           }
@@ -2884,7 +2989,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
                 type: 'client.diagnostic',
                 ...restoreDiagnostic,
               })
-              term.writeln('\r\n[Starting a new terminal because the previous live terminal is gone and no durable session identity was saved]\r\n')
+              writeLocalXtermNotice(term, '\r\n[Starting a new terminal because the previous live terminal is gone and no durable session identity was saved]\r\n')
               const newRequestId = nanoid()
               launchAttemptRef.current = null
               clearQuarantineRepair()
@@ -2920,7 +3025,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               }
               return
             }
-            term.writeln('\r\n[Reconnecting...]\r\n')
+            writeLocalXtermNotice(term, '\r\n[Reconnecting...]\r\n')
             const newRequestId = nanoid()
             if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID reconnecting', {
               paneId: paneIdRef.current,
@@ -2962,7 +3067,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
             }
           } else if (current?.status === 'exited') {
-            term.writeln('\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
+            writeLocalXtermNotice(term, '\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
           }
         }
       })
@@ -3106,6 +3211,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     resetStartupProbeParser,
     runRefreshAttach,
     syncContentRefWithSessionAssociation,
+    writeLocalXtermNotice,
   ])
 
   useEffect(() => {

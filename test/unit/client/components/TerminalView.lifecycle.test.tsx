@@ -3988,6 +3988,86 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).not.toContain('UNTAGGED')
     })
 
+    it('ignores xterm title callbacks fired while replay writes are scoped', async () => {
+      const { terminalId, term, store, tabId, paneId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-replay-title',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      await waitFor(() => {
+        expect(term.onTitleChange).toHaveBeenCalled()
+      })
+      const titleHandler = term.onTitleChange.mock.calls[0]?.[0]
+      expect(typeof titleHandler).toBe('function')
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      const attach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(attach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: attach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'replay title frame',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['replay title frame'])
+
+      act(() => {
+        titleHandler('Replay Title')
+      })
+
+      expect(store.getState().tabs.tabs.find((tab) => tab.id === tabId)?.title).toBe('Shell')
+      expect(store.getState().panes.paneTitles[tabId]?.[paneId]).toBeUndefined()
+
+      act(() => {
+        delayedCallbacks[0]?.callback()
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'live title frame',
+          attachRequestId: attach!.attachRequestId,
+        })
+      })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual([
+        'replay title frame',
+        'live title frame',
+      ])
+
+      act(() => {
+        titleHandler('Live Title')
+      })
+
+      expect(store.getState().tabs.tabs.find((tab) => tab.id === tabId)?.title).toBe('Live Title')
+      expect(store.getState().panes.paneTitles[tabId]?.[paneId]).toBe('Live Title')
+    })
+
     it('does not let stale write callbacks advance the current parser-applied cursor', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
@@ -4083,14 +4163,16 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
-      expect(delayedCallbacks.map(({ data }) => data)).toEqual([
-        'old replay text',
-        'current replay text',
-      ])
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old replay text'])
 
       act(() => {
         delayedCallbacks.find(({ data }) => data === 'old replay text')?.callback()
       })
+
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual([
+        'old replay text',
+        'current replay text',
+      ])
 
       const checkpointAfterStaleCallback = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-1',
@@ -4214,6 +4296,12 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old in-flight delta text'])
+
+      act(() => {
+        delayedCallbacks.find(({ data }) => data === 'old in-flight delta text')?.callback()
+      })
+
       expect(delayedCallbacks.map(({ data }) => data)).toEqual([
         'old in-flight delta text',
         'quarantined replay text',
@@ -4222,7 +4310,7 @@ describe('TerminalView lifecycle updates', () => {
       wsMocks.send.mockClear()
       term.clear.mockClear()
       act(() => {
-        delayedCallbacks.forEach(({ callback }) => callback())
+        delayedCallbacks.find(({ data }) => data === 'quarantined replay text')?.callback()
       })
 
       await waitFor(() => {
