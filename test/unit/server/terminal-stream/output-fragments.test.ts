@@ -54,6 +54,39 @@ describe('terminal output fragmentation', () => {
     expect(chunks.every((chunk) => !containsLoneSurrogate(chunk))).toBe(true)
   })
 
+  it('preserves lone surrogates already present in string-mode output', () => {
+    const data = `prefix-\uD800-middle-\uDC00-suffix`
+    const chunks = fragmentTerminalOutputForPayloadBudget({
+      maxSerializedBytes: 128,
+      payloadForData: (chunk) => ({
+        type: 'terminal.output',
+        terminalId: 'term-1',
+        data: chunk,
+        seqStart: 1,
+        seqEnd: 1,
+        attachRequestId: 'attach-1',
+      }),
+      data,
+    })
+
+    expect(chunks.join('')).toBe(data)
+    expect(chunks.some((chunk) => containsLoneSurrogate(chunk))).toBe(true)
+  })
+
+  it('throws when the budget is too small for one code point', () => {
+    expect(() => fragmentTerminalOutputForPayloadBudget({
+      maxSerializedBytes: 1,
+      payloadForData: (chunk) => ({
+        type: 'terminal.output',
+        terminalId: 'term-1',
+        data: chunk,
+        seqStart: 1,
+        seqEnd: 1,
+      }),
+      data: 'x',
+    })).toThrow(/too small for one code point/)
+  })
+
   it('preserves replacement characters emitted by current string-mode PTY decoding', () => {
     const data = `prefix-\uFFFD-\uFFFD-suffix`
     const chunks = fragmentTerminalOutputForPayloadBudget({

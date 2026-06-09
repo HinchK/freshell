@@ -8,6 +8,7 @@ export type GapEvent = {
   type: 'gap'
   fromSeq: number
   toSeq: number
+  streamId: string
   reason: 'queue_overflow'
 }
 
@@ -36,7 +37,7 @@ export class ClientOutputQueue {
   private readonly maxBytes: number
   private frames: QueuedReplayFrame[] = []
   private totalBytes = 0
-  private pendingGap: GapEvent | null = null
+  private pendingGaps: GapEvent[] = []
   private droppedBytes = 0
 
   constructor(maxBytes?: number) {
@@ -56,9 +57,9 @@ export class ClientOutputQueue {
     const out: Array<ReplayFrame | GapEvent> = []
     let budget = Number.isFinite(maxBytes) && maxBytes > 0 ? Math.floor(maxBytes) : 0
 
-    if (this.pendingGap) {
-      out.push(this.pendingGap)
-      this.pendingGap = null
+    if (this.pendingGaps.length > 0) {
+      out.push(...this.pendingGaps)
+      this.pendingGaps = []
     }
 
     if (budget <= 0) {
@@ -131,7 +132,7 @@ export class ClientOutputQueue {
   clear(): void {
     this.frames = []
     this.totalBytes = 0
-    this.pendingGap = null
+    this.pendingGaps = []
     this.droppedBytes = 0
   }
 
@@ -141,7 +142,7 @@ export class ClientOutputQueue {
       if (!dropped) break
       this.totalBytes -= dropped.queuedBytes
       this.droppedBytes += dropped.queuedBytes
-      this.extendGap(dropped.seqStart, dropped.seqEnd)
+      this.extendGap(dropped.streamId, dropped.seqStart, dropped.seqEnd)
     }
   }
 
@@ -161,22 +162,24 @@ export class ClientOutputQueue {
       data: frame.data,
       bytes: frame.bytes,
       at: frame.at,
-      ...(frame.streamId ? { streamId: frame.streamId } : {}),
+      streamId: frame.streamId,
     }
   }
 
-  private extendGap(fromSeq: number, toSeq: number): void {
-    if (!this.pendingGap) {
-      this.pendingGap = {
+  private extendGap(streamId: string, fromSeq: number, toSeq: number): void {
+    const pendingGap = this.pendingGaps[this.pendingGaps.length - 1]
+    if (!pendingGap || pendingGap.streamId !== streamId || fromSeq > pendingGap.toSeq + 1) {
+      this.pendingGaps.push({
         type: 'gap',
         fromSeq,
         toSeq,
+        streamId,
         reason: 'queue_overflow',
-      }
+      })
       return
     }
 
-    this.pendingGap.fromSeq = Math.min(this.pendingGap.fromSeq, fromSeq)
-    this.pendingGap.toSeq = Math.max(this.pendingGap.toSeq, toSeq)
+    pendingGap.fromSeq = Math.min(pendingGap.fromSeq, fromSeq)
+    pendingGap.toSeq = Math.max(pendingGap.toSeq, toSeq)
   }
 }

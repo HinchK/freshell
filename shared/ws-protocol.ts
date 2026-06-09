@@ -659,6 +659,7 @@ export type TerminalCreatedMessage = {
 export type TerminalAttachReadyMessage = {
   type: 'terminal.attach.ready'
   terminalId: string
+  streamId: string
   headSeq: number
   replayFromSeq: number
   replayToSeq: number
@@ -688,6 +689,7 @@ export type TerminalStatusMessage = {
 export type TerminalOutputMessage = {
   type: 'terminal.output'
   terminalId: string
+  streamId: string
   seqStart: number
   seqEnd: number
   data: string
@@ -697,6 +699,7 @@ export type TerminalOutputMessage = {
 export type TerminalOutputGapMessage = {
   type: 'terminal.output.gap'
   terminalId: string
+  streamId: string
   fromSeq: number
   toSeq: number
   reason: 'queue_overflow' | 'replay_window_exceeded' | 'replay_budget_exceeded'

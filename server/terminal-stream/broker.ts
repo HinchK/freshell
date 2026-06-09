@@ -6,6 +6,7 @@ import { logTerminalStreamPerfEvent, type TerminalStreamPerfEvent } from '../per
 import type { TerminalOutputRawEvent } from './registry-events.js'
 import { ClientOutputQueue, isGapEvent, type GapEvent } from './client-output-queue.js'
 import { ReplayRing, type ReplayFrame } from './replay-ring.js'
+import { fragmentTerminalOutputForPayloadBudget } from './output-fragments.js'
 import {
   isTerminalStreamAttachRequestIdWithinSerializedBudget,
   measureTerminalOutputPayloadBytes,
@@ -153,7 +154,6 @@ export class TerminalStreamBroker {
       }
 
       const terminalState = existingState ?? this.getOrCreateTerminalState(terminalId)
-      const streamId = this.streamIdentity.recordAttach(terminalId, attachRequestId)
       const attachment = existingAttachment ?? this.getOrCreateAttachment(terminalState, ws, terminalId)
 
       if (attachment.flushTimer) {
@@ -175,6 +175,8 @@ export class TerminalStreamBroker {
           this.appendOutputFrames(terminalId, snapshot)
         }
       }
+
+      const streamId = this.streamIdentity.recordAttach(terminalId, attachRequestId)
 
       const replay = terminalState.replayRing.replaySince(normalizedSinceSeq)
       let replayFrames = replay.frames
@@ -349,6 +351,7 @@ export class TerminalStreamBroker {
       this.terminals.set(terminalId, state)
     } else {
       state.replayRing.setMaxBytes(replayRingMaxBytes)
+      this.handleReplayRetentionLoss(terminalId, state)
     }
     return state
   }
@@ -450,10 +453,9 @@ export class TerminalStreamBroker {
 
   private appendOutputFrames(terminalId: string, data: string): ReplayFrame[] {
     const state = this.getOrCreateTerminalState(terminalId)
-    const streamId = this.streamIdentity.ensureStream(terminalId)
-    return state.replayRing.appendFragmentedForPayloadBudget({
+    let streamId = this.streamIdentity.ensureStream(terminalId)
+    const fragments = fragmentTerminalOutputForPayloadBudget({
       data,
-      streamId,
       maxSerializedBytes: TERMINAL_STREAM_BATCH_MAX_BYTES,
       payloadForData: (chunk) => this.buildTerminalOutputPayload({
         terminalId,
@@ -464,6 +466,14 @@ export class TerminalStreamBroker {
         attachRequestId: TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
       }),
     })
+    const frames: ReplayFrame[] = []
+    for (const fragment of fragments) {
+      frames.push(state.replayRing.append(fragment, { streamId }))
+      if (this.handleReplayRetentionLoss(terminalId, state)) {
+        streamId = this.streamIdentity.ensureStream(terminalId)
+      }
+    }
+    return frames
   }
 
   private scheduleFlush(
@@ -594,6 +604,7 @@ export class TerminalStreamBroker {
           terminalId,
           replay.missedFromSeq,
           missedToSeq,
+          this.streamIdentity.ensureStream(terminalId),
           attachRequestId,
         )) return
         attachment.lastSeq = Math.max(attachment.lastSeq, missedToSeq)
@@ -677,7 +688,7 @@ export class TerminalStreamBroker {
     return this.safeSend(ws, this.buildTerminalOutputPayload({
       type: 'terminal.output',
       terminalId,
-      streamId: frame.streamId ?? this.streamIdentity.ensureStream(terminalId),
+      streamId: frame.streamId,
       seqStart: frame.seqStart,
       seqEnd: frame.seqEnd,
       data: frame.data,
@@ -703,6 +714,7 @@ export class TerminalStreamBroker {
       connectionId: ws.connectionId,
       fromSeq: gap.fromSeq,
       toSeq: gap.toSeq,
+      streamId: gap.streamId,
       reason: gap.reason,
       ...(typeof queueContext?.queueDepth === 'number' ? { queueDepth: queueContext.queueDepth } : {}),
       ...(typeof droppedSerializedApplicationJsonBytes === 'number'
@@ -716,7 +728,7 @@ export class TerminalStreamBroker {
     return this.safeSend(ws, {
       type: 'terminal.output.gap',
       terminalId,
-      streamId: this.streamIdentity.ensureStream(terminalId),
+      streamId: gap.streamId,
       fromSeq: gap.fromSeq,
       toSeq: gap.toSeq,
       reason: gap.reason,
@@ -729,6 +741,7 @@ export class TerminalStreamBroker {
     terminalId: string,
     fromSeq: number,
     toSeq: number,
+    streamId: string,
     attachRequestId?: string,
   ): boolean {
     this.perfEventLogger('terminal_stream_gap', {
@@ -736,13 +749,14 @@ export class TerminalStreamBroker {
       connectionId: ws.connectionId,
       fromSeq,
       toSeq,
+      streamId,
       reason: 'replay_window_exceeded',
     }, 'warn')
 
     return this.safeSend(ws, {
       type: 'terminal.output.gap',
       terminalId,
-      streamId: this.streamIdentity.ensureStream(terminalId),
+      streamId,
       fromSeq,
       toSeq,
       reason: 'replay_window_exceeded',
@@ -762,7 +776,10 @@ export class TerminalStreamBroker {
 
   private handleTerminalExit(terminalId: string): void {
     const state = this.terminals.get(terminalId)
-    if (!state) return
+    if (!state) {
+      this.streamIdentity.forgetStream(terminalId)
+      return
+    }
     for (const attachment of state.clients.values()) {
       if (attachment.flushTimer) clearTimeout(attachment.flushTimer)
       this.unregisterWsTerminal(attachment.ws, terminalId)
@@ -799,7 +816,7 @@ export class TerminalStreamBroker {
   ): number {
     return measureTerminalOutputPayloadBytes(this.buildTerminalOutputPayload({
       terminalId,
-      streamId: frame.streamId ?? this.streamIdentity.ensureStream(terminalId),
+      streamId: frame.streamId,
       seqStart: frame.seqStart,
       seqEnd: frame.seqEnd,
       data: frame.data,
@@ -807,13 +824,20 @@ export class TerminalStreamBroker {
     }))
   }
 
-  private replaceStreamIdentity(terminalId: string, reason: TerminalStreamReplacementReason): void {
+  private replaceStreamIdentity(terminalId: string, reason: TerminalStreamReplacementReason): string {
     const streamId = this.streamIdentity.replaceStream(terminalId, reason)
     log.info({
       terminalId,
       streamId,
       reason,
     }, 'Terminal output stream identity replaced')
+    return streamId
+  }
+
+  private handleReplayRetentionLoss(terminalId: string, state: BrokerTerminalState): boolean {
+    if (!state.replayRing.consumeRetentionLoss()) return false
+    this.replaceStreamIdentity(terminalId, 'retention_lost')
+    return true
   }
 
   private withTerminalLock(terminalId: string, task: () => Promise<void>): Promise<void> {

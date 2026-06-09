@@ -6,6 +6,7 @@ import WebSocket from 'ws'
 import { WsHandler } from '../../../server/ws-handler'
 import { TerminalRegistry } from '../../../server/terminal-registry'
 import { TerminalStreamBroker } from '../../../server/terminal-stream/broker'
+import { TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE } from '../../../server/terminal-stream/serialized-budget'
 import { MAX_REALTIME_MESSAGE_BYTES } from '../../../shared/read-models.js'
 
 vi.mock('node-pty', () => ({
@@ -399,6 +400,196 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
 
     expect(payloads.length).toBeGreaterThan(0)
     expect(payloads.every((payload) => Buffer.byteLength(payload.data ?? '', 'utf8') <= MAX_REALTIME_MESSAGE_BYTES)).toBe(true)
+
+    broker.close()
+  })
+
+  it('keeps actual live and replay terminal.output JSON payloads within the serialized budget', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-serialized-budget')
+
+    const wsLive = createMockWs()
+    await broker.attach(
+      wsLive as any,
+      'term-serialized-budget',
+      'viewport_hydrate',
+      80,
+      24,
+      0,
+      TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+    )
+
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-serialized-budget',
+      data: '\u001b'.repeat(20 * 1024),
+      at: Date.now(),
+    })
+    for (let i = 0; i < 20; i += 1) {
+      vi.advanceTimersByTime(1)
+    }
+
+    const liveOutputFrames = wsLive.send.mock.calls
+      .map(([raw]) => raw)
+      .filter((raw): raw is string => {
+        if (typeof raw !== 'string') return false
+        const payload = JSON.parse(raw)
+        return payload?.type === 'terminal.output'
+      })
+    expect(liveOutputFrames.length).toBeGreaterThan(1)
+
+    for (const raw of liveOutputFrames) {
+      const payload = JSON.parse(raw)
+      expect(Buffer.byteLength(raw, 'utf8')).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
+      expect(payload).toEqual(expect.objectContaining({
+        type: 'terminal.output',
+        terminalId: 'term-serialized-budget',
+        attachRequestId: TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+        streamId: expect.any(String),
+        seqStart: expect.any(Number),
+        seqEnd: expect.any(Number),
+      }))
+    }
+
+    const wsReplay = createMockWs()
+    await broker.attach(
+      wsReplay as any,
+      'term-serialized-budget',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+    )
+    for (let i = 0; i < 20; i += 1) {
+      vi.advanceTimersByTime(1)
+    }
+
+    const replayOutputFrames = wsReplay.send.mock.calls
+      .map(([raw]) => raw)
+      .filter((raw): raw is string => {
+        if (typeof raw !== 'string') return false
+        const payload = JSON.parse(raw)
+        return payload?.type === 'terminal.output'
+      })
+    expect(replayOutputFrames.length).toBeGreaterThan(1)
+
+    for (const raw of replayOutputFrames) {
+      const payload = JSON.parse(raw)
+      expect(Buffer.byteLength(raw, 'utf8')).toBeLessThanOrEqual(MAX_REALTIME_MESSAGE_BYTES)
+      expect(payload).toEqual(expect.objectContaining({
+        type: 'terminal.output',
+        terminalId: 'term-serialized-budget',
+        attachRequestId: TERMINAL_STREAM_ATTACH_REQUEST_ID_RESERVE_VALUE,
+        streamId: expect.any(String),
+        seqStart: expect.any(Number),
+        seqEnd: expect.any(Number),
+      }))
+    }
+
+    broker.close()
+  })
+
+  it('emits separate queue overflow gaps for different stream ids', async () => {
+    const originalClientQueueMaxBytes = process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
+    process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = '2048'
+
+    try {
+      const registry = new FakeBrokerRegistry()
+      const broker = new TerminalStreamBroker(registry as any, vi.fn())
+      registry.createTerminal('term-gap-stream')
+
+      const ws = createMockWs()
+      await broker.attach(ws as any, 'term-gap-stream', 'viewport_hydrate', 80, 24, 0, 'gap-attach')
+      const attachReady = ws.send.mock.calls
+        .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+        .find((payload) => payload?.type === 'terminal.attach.ready')
+      expect(attachReady?.streamId).toEqual(expect.any(String))
+
+      for (let i = 0; i < 3; i += 1) {
+        registry.emit('terminal.output.raw', {
+          terminalId: 'term-gap-stream',
+          data: `old-${i}-${'o'.repeat(900)}`,
+          at: Date.now(),
+        })
+      }
+      registry.emit('terminal.stream.replaced', {
+        terminalId: 'term-gap-stream',
+        reason: 'codex_pty_recovery',
+      })
+      for (let i = 0; i < 3; i += 1) {
+        registry.emit('terminal.output.raw', {
+          terminalId: 'term-gap-stream',
+          data: `new-${i}-${'n'.repeat(900)}`,
+          at: Date.now(),
+        })
+      }
+      vi.advanceTimersByTime(5)
+
+      const gaps = ws.send.mock.calls
+        .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+        .filter((payload) => payload?.type === 'terminal.output.gap')
+
+      expect(gaps.length).toBeGreaterThanOrEqual(2)
+      expect(gaps[0]).toEqual(expect.objectContaining({
+        streamId: attachReady.streamId,
+        reason: 'queue_overflow',
+      }))
+      expect(new Set(gaps.map((gap) => gap.streamId)).size).toBeGreaterThanOrEqual(2)
+
+      broker.close()
+    } finally {
+      if (originalClientQueueMaxBytes === undefined) {
+        delete process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
+      } else {
+        process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = originalClientQueueMaxBytes
+      }
+    }
+  })
+
+  it('replaces stream identity after replay retention loss before subsequent output', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-retention-stream')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-retention-stream', 'viewport_hydrate', 80, 24, 0, 'retention-attach')
+    const initialReady = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    const initialStreamId = initialReady?.streamId
+    expect(initialStreamId).toEqual(expect.any(String))
+
+    for (const data of ['aaa', 'bbb', 'ccc']) {
+      registry.emit('terminal.output.raw', { terminalId: 'term-retention-stream', data, at: Date.now() })
+      vi.advanceTimersByTime(1)
+    }
+
+    const wsAfterLoss = createMockWs()
+    await broker.attach(
+      wsAfterLoss as any,
+      'term-retention-stream',
+      'transport_reconnect',
+      80,
+      24,
+      0,
+      'after-retention-loss',
+    )
+    const readyAfterLoss = wsAfterLoss.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(readyAfterLoss?.streamId).toEqual(expect.any(String))
+    expect(readyAfterLoss.streamId).not.toBe(initialStreamId)
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-stream', data: 'ddd', at: Date.now() })
+    vi.advanceTimersByTime(1)
+
+    const liveOutputsAfterLoss = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .filter((payload) => payload?.type === 'terminal.output' && payload.data === 'ddd')
+    expect(liveOutputsAfterLoss).toHaveLength(1)
+    expect(liveOutputsAfterLoss[0].streamId).toBe(readyAfterLoss.streamId)
 
     broker.close()
   })

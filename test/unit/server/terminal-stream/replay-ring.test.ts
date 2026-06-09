@@ -4,6 +4,12 @@ import {
   ReplayRing,
 } from '../../../../server/terminal-stream/replay-ring'
 
+const STREAM_ID = 'stream-1'
+
+function append(ring: ReplayRing, data: string, streamId = STREAM_ID) {
+  return ring.append(data, { streamId })
+}
+
 describe('ReplayRing', () => {
   const originalMaxBytes = process.env.TERMINAL_REPLAY_RING_MAX_BYTES
 
@@ -17,9 +23,9 @@ describe('ReplayRing', () => {
 
   it('assigns monotonic sequence numbers starting at 1', () => {
     const ring = new ReplayRing(1024)
-    const one = ring.append('a')
-    const two = ring.append('b')
-    const three = ring.append('c')
+    const one = append(ring, 'a')
+    const two = append(ring, 'b')
+    const three = append(ring, 'c')
 
     expect(one.seqStart).toBe(1)
     expect(one.seqEnd).toBe(1)
@@ -31,9 +37,9 @@ describe('ReplayRing', () => {
 
   it('evicts oldest frames to enforce byte budget', () => {
     const ring = new ReplayRing(5)
-    ring.append('abc') // 3
-    ring.append('de') // 2 (total 5)
-    ring.append('f') // 1 (evict seq 1)
+    append(ring, 'abc') // 3
+    append(ring, 'de') // 2 (total 5)
+    append(ring, 'f') // 1 (evict seq 1)
 
     expect(ring.headSeq()).toBe(3)
     expect(ring.tailSeq()).toBe(2)
@@ -43,9 +49,9 @@ describe('ReplayRing', () => {
 
   it('replays only frames newer than sinceSeq', () => {
     const ring = new ReplayRing(1024)
-    ring.append('a')
-    ring.append('b')
-    ring.append('c')
+    append(ring, 'a')
+    append(ring, 'b')
+    append(ring, 'c')
 
     const replay = ring.replaySince(1)
     expect(replay.frames.map((f) => f.data)).toEqual(['b', 'c'])
@@ -55,10 +61,10 @@ describe('ReplayRing', () => {
 
   it('returns coalesced bounded replay batches without materializing the full replay window', () => {
     const ring = new ReplayRing(1024)
-    ring.append('aa')
-    ring.append('bb')
-    ring.append('cc')
-    ring.append('dd')
+    append(ring, 'aa')
+    append(ring, 'bb')
+    append(ring, 'cc')
+    append(ring, 'dd')
 
     const firstBatch = ring.replayBatchSince(0, 4, 4)
     expect(firstBatch.frames).toHaveLength(1)
@@ -82,9 +88,9 @@ describe('ReplayRing', () => {
 
   it('splits coalesced replay batches at the byte budget', () => {
     const ring = new ReplayRing(1024)
-    ring.append('aaa')
-    ring.append('bbb')
-    ring.append('ccc')
+    append(ring, 'aaa')
+    append(ring, 'bbb')
+    append(ring, 'ccc')
 
     const firstBatch = ring.replayBatchSince(0, 6, 3)
     expect(firstBatch.frames).toHaveLength(1)
@@ -107,8 +113,8 @@ describe('ReplayRing', () => {
 
   it('does not coalesce adjacent replay frames from different stream ids', () => {
     const ring = new ReplayRing(1024)
-    ring.append('old', { streamId: 'stream-old' })
-    ring.append('new', { streamId: 'stream-new' })
+    append(ring, 'old', 'stream-old')
+    append(ring, 'new', 'stream-new')
 
     const limitedBatch = ring.replayBatchSince(0, 3, 2)
     expect(limitedBatch.frames).toHaveLength(1)
@@ -138,11 +144,11 @@ describe('ReplayRing', () => {
 
   it('reports replay miss when requested sequence is older than tail', () => {
     const ring = new ReplayRing(2)
-    ring.append('1')
-    ring.append('2')
-    ring.append('3')
-    ring.append('4')
-    ring.append('5')
+    append(ring, '1')
+    append(ring, '2')
+    append(ring, '3')
+    append(ring, '4')
+    append(ring, '5')
 
     expect(ring.headSeq()).toBe(5)
     expect(ring.tailSeq()).toBe(4)
@@ -157,20 +163,20 @@ describe('ReplayRing', () => {
     const ring = new ReplayRing()
     const half = 'x'.repeat(DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES / 2)
 
-    ring.append(half)
-    ring.append(half)
+    append(ring, half)
+    append(ring, half)
     expect(ring.tailSeq()).toBe(1)
 
-    ring.append('y')
+    append(ring, 'y')
     expect(ring.headSeq()).toBe(3)
     expect(ring.tailSeq()).toBe(2)
   })
 
   it('supports runtime max-byte resize and re-evicts to the new budget', () => {
     const ring = new ReplayRing(1024)
-    ring.append('x'.repeat(300))
-    ring.append('y'.repeat(300))
-    ring.append('z'.repeat(300))
+    append(ring, 'x'.repeat(300))
+    append(ring, 'y'.repeat(300))
+    append(ring, 'z'.repeat(300))
 
     ring.setMaxBytes(400)
 
@@ -181,7 +187,7 @@ describe('ReplayRing', () => {
 
   it('retains truncated tail bytes when a single append exceeds maxBytes', () => {
     const ring = new ReplayRing(8)
-    ring.append('0123456789')
+    append(ring, '0123456789')
 
     const replay = ring.replaySince(0)
     expect(replay.frames).toHaveLength(1)
@@ -192,7 +198,7 @@ describe('ReplayRing', () => {
 
   it('truncates oversized multi-byte frames on UTF-8 boundaries', () => {
     const ring = new ReplayRing(7)
-    ring.append('🙂🙂🙂')
+    append(ring, '🙂🙂🙂')
 
     const replay = ring.replaySince(0)
     expect(replay.frames).toHaveLength(1)
@@ -202,7 +208,7 @@ describe('ReplayRing', () => {
 
   it('preserves literal U+FFFD characters emitted by the source output', () => {
     const ring = new ReplayRing(4)
-    ring.append(`A\uFFFDB`)
+    append(ring, `A\uFFFDB`)
 
     const replay = ring.replaySince(0)
     expect(replay.frames).toHaveLength(1)
@@ -212,10 +218,10 @@ describe('ReplayRing', () => {
 
   it('keeps the current head anchor stable after older frames overflow out of the replay window', () => {
     const ring = new ReplayRing(3)
-    ring.append('a')
-    ring.append('b')
-    ring.append('c')
-    ring.append('d')
+    append(ring, 'a')
+    append(ring, 'b')
+    append(ring, 'c')
+    append(ring, 'd')
 
     expect(ring.headSeq()).toBe(4)
     expect(ring.tailSeq()).toBe(2)

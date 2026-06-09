@@ -7,7 +7,7 @@ export type ReplayFrame = {
   data: string
   bytes: number
   at: number
-  streamId?: string
+  streamId: string
 }
 
 export const DEFAULT_TERMINAL_REPLAY_RING_MAX_BYTES = 1024 * 1024
@@ -33,6 +33,7 @@ export class ReplayRing {
   private nextSeq = 1
   private head = 0
   private maxBytes: number
+  private retentionLossPending = false
   private readonly utf8FatalDecoder = new TextDecoder('utf-8', { fatal: true })
 
   constructor(maxBytes?: number) {
@@ -46,7 +47,7 @@ export class ReplayRing {
     this.evictIfNeeded()
   }
 
-  append(data: string, metadata?: { streamId?: string }): ReplayFrame {
+  append(data: string, metadata: { streamId: string }): ReplayFrame {
     const seq = this.nextSeq
     this.nextSeq += 1
     this.head = seq
@@ -58,7 +59,7 @@ export class ReplayRing {
       data: normalizedData,
       bytes: Buffer.byteLength(normalizedData, 'utf8'),
       at: Date.now(),
-      ...(metadata?.streamId ? { streamId: metadata.streamId } : {}),
+      streamId: metadata.streamId,
     }
 
     this.frames.push(frame)
@@ -67,11 +68,17 @@ export class ReplayRing {
     return frame
   }
 
+  consumeRetentionLoss(): boolean {
+    const retentionLossPending = this.retentionLossPending
+    this.retentionLossPending = false
+    return retentionLossPending
+  }
+
   appendFragmentedForPayloadBudget(input: {
     data: string
     maxSerializedBytes: number
     payloadForData: (data: string) => JsonPayload
-    streamId?: string
+    streamId: string
   }): ReplayFrame[] {
     const fragments = fragmentTerminalOutputForPayloadBudget(input)
     return fragments.map((fragment) => this.append(fragment, { streamId: input.streamId }))
@@ -183,6 +190,7 @@ export class ReplayRing {
       const removed = this.frames.shift()
       if (!removed) break
       this.totalBytes -= removed.bytes
+      this.retentionLossPending = true
     }
   }
 

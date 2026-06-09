@@ -1,15 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { ClientOutputQueue } from '../../../../server/terminal-stream/client-output-queue'
+import { ClientOutputQueue, isGapEvent } from '../../../../server/terminal-stream/client-output-queue'
 import type { ReplayFrame } from '../../../../server/terminal-stream/replay-ring'
 
-function frame(seq: number, data: string, streamId?: string): ReplayFrame {
+function frame(seq: number, data: string, streamId = 'stream-1'): ReplayFrame {
   return {
     seqStart: seq,
     seqEnd: seq,
     data,
     bytes: Buffer.byteLength(data, 'utf8'),
     at: seq,
-    ...(streamId ? { streamId } : {}),
+    streamId,
   }
 }
 
@@ -90,6 +90,7 @@ describe('ClientOutputQueue', () => {
       type: 'gap',
       fromSeq: 1,
       toSeq: 3,
+      streamId: 'stream-1',
       reason: 'queue_overflow',
     })
     const dataFrames = batch.filter((entry): entry is ReplayFrame => entry.type !== 'gap')
@@ -111,5 +112,40 @@ describe('ClientOutputQueue', () => {
     expect(queue.peekDroppedBytes()).toBe(1)
     expect(queue.consumeDroppedBytes()).toBe(1)
     expect(queue.peekDroppedBytes()).toBe(0)
+  })
+
+  it('splits overflow gaps at stream id boundaries', () => {
+    const queue = new ClientOutputQueue(1)
+    queue.enqueue(frame(1, '1', 'stream-old'))
+    queue.enqueue(frame(2, '2', 'stream-old'))
+    queue.enqueue(frame(3, '3', 'stream-new'))
+    queue.enqueue(frame(4, '4', 'stream-new'))
+
+    const batch = queue.nextBatch(64)
+    const gaps = batch.filter(isGapEvent)
+    const dataFrames = batch.filter((entry): entry is ReplayFrame => entry.type !== 'gap')
+
+    expect(gaps).toEqual([
+      {
+        type: 'gap',
+        fromSeq: 1,
+        toSeq: 2,
+        streamId: 'stream-old',
+        reason: 'queue_overflow',
+      },
+      {
+        type: 'gap',
+        fromSeq: 3,
+        toSeq: 3,
+        streamId: 'stream-new',
+        reason: 'queue_overflow',
+      },
+    ])
+    expect(dataFrames).toHaveLength(1)
+    expect(dataFrames[0]).toMatchObject({
+      seqStart: 4,
+      seqEnd: 4,
+      streamId: 'stream-new',
+    })
   })
 })

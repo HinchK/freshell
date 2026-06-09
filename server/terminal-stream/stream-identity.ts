@@ -18,8 +18,6 @@ export type TerminalStreamIdentityTracker = {
 type StreamState = {
   streamId: string
   generation: number
-  attachedRequestIds: Set<string>
-  lastReplacementReason?: TerminalStreamReplacementReason
 }
 
 export function createTerminalStreamIdentityTracker(): TerminalStreamIdentityTracker {
@@ -35,8 +33,6 @@ export function createTerminalStreamIdentityTracker(): TerminalStreamIdentityTra
       state = {
         streamId: mintStreamId(terminalId, 1),
         generation: 1,
-        attachedRequestIds: new Set(),
-        lastReplacementReason: 'new_pty_session',
       }
       streams.set(terminalId, state)
     }
@@ -50,27 +46,19 @@ export function createTerminalStreamIdentityTracker(): TerminalStreamIdentityTra
     getStream(terminalId) {
       return streams.get(terminalId)?.streamId
     },
-    recordAttach(terminalId, attachRequestId) {
+    recordAttach(terminalId, _attachRequestId) {
       const state = ensureState(terminalId)
-      if (attachRequestId) {
-        state.attachedRequestIds.add(attachRequestId)
-      }
       return state.streamId
     },
-    recordDetach(terminalId, attachRequestId) {
+    recordDetach(terminalId, _attachRequestId) {
       const state = streams.get(terminalId)
       if (!state) return undefined
-      if (attachRequestId) {
-        state.attachedRequestIds.delete(attachRequestId)
-      }
       return state.streamId
     },
-    replaceStream(terminalId, reason) {
+    replaceStream(terminalId, _reason) {
       const state = ensureState(terminalId)
       state.generation += 1
       state.streamId = mintStreamId(terminalId, state.generation)
-      state.attachedRequestIds.clear()
-      state.lastReplacementReason = reason
       return state.streamId
     },
     forgetStream(terminalId) {
