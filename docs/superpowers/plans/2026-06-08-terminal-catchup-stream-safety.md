@@ -1233,7 +1233,17 @@ Change frame completion callbacks to check attach generation before mutating sta
 const completeParserAppliedFrame = () => {
   const activeAttach = currentAttachRef.current
   if (!activeAttach || activeAttach.attachRequestId !== frameAttachRequestId) return
-  markParserAppliedSeq(tid, frameDecision.state.lastSeq)
+  markParserAppliedSeq(tid, frameDecision.state.lastSeq, {
+    streamId: frameDecision.state.streamId,
+    serverInstanceId: frameDecision.state.serverInstanceId,
+    attachRequestId: activeAttach.attachRequestId,
+    cols: frameDecision.state.cols,
+    rows: frameDecision.state.rows,
+    geometryEpoch: frameDecision.state.geometryEpoch,
+    geometryAuthority: frameDecision.state.geometryAuthority,
+    scrollback: terminalScrollback,
+    xtermVersion: XTERM_VERSION,
+  })
   if (completedAttachOnFrame) {
     setIsAttaching(false)
     markAttachComplete()
@@ -2100,6 +2110,13 @@ import type {
   TerminalOutputScannerState,
 } from './output-barrier-scanner.js'
 
+export type ReplayDequeFrame = ReplayFrame & {
+  barrier?: boolean
+  barrierReason?: TerminalOutputBarrierReason
+  scannerStateBefore?: TerminalOutputScannerState
+  scannerStateAfter?: TerminalOutputScannerState
+}
+
 export type ReplayDequeAppendInput =
   | string
   | {
@@ -2111,7 +2128,7 @@ export type ReplayDequeAppendInput =
     }
 
 export class ReplayDeque {
-  private frames: ReplayFrame[] = []
+  private frames: ReplayDequeFrame[] = []
   private start = 0
   private bytes = 0
   private nextSeq = 1
@@ -2119,9 +2136,9 @@ export class ReplayDeque {
 
   constructor(private readonly maxBytes: number) {}
 
-  append(input: ReplayDequeAppendInput): ReplayFrame {
+  append(input: ReplayDequeAppendInput): ReplayDequeFrame {
     const data = typeof input === 'string' ? input : input.data
-    const frame: ReplayFrame = {
+    const frame: ReplayDequeFrame = {
       seqStart: this.nextSeq,
       seqEnd: this.nextSeq,
       data,
@@ -2156,12 +2173,12 @@ export class ReplayDeque {
   }
 
   replayBatchSince(sinceSeq: number, maxBytes: number, toSeq = Number.POSITIVE_INFINITY): {
-    frames: ReplayFrame[]
+    frames: ReplayDequeFrame[]
     missedFromSeq?: number
   } {
     const tail = this.tailSeq()
     const missedFromSeq = sinceSeq < tail - 1 ? sinceSeq + 1 : undefined
-    const frames: ReplayFrame[] = []
+    const frames: ReplayDequeFrame[] = []
     let budget = Math.max(0, Math.floor(maxBytes))
 
     for (let i = this.start; i < this.frames.length; i += 1) {
@@ -2191,7 +2208,7 @@ export class ReplayDeque {
 }
 ```
 
-Make `ReplayRing` delegate to `ReplayDeque` so existing imports and tests remain stable while the internal storage changes.
+Make `ReplayRing` delegate to `ReplayDeque` so existing imports remain stable while the internal storage changes. Update the affected `replay-ring.test.ts` assertions where the new scanner/barrier and no-implicit-coalescing semantics intentionally replace the old coalesced replay behavior.
 
 - [ ] **Step 4: Run replay tests**
 
@@ -2570,8 +2587,8 @@ expect(scenarioMap.get('terminal-reconnect-backlog')?.requiredMetricIds).toEqual
   'terminalFullHydrateFallbackCount',
   'terminalSurfaceQuarantineCount',
   'terminalStaleGenerationRejectionCount',
-  'terminalFrozenRetentionCoveredMs',
-  'terminalFreezeResumeGapCount',
+  'terminalStoppedRetentionCoveredMs',
+  'terminalStopResumeGapCount',
 ]))
 ```
 
@@ -2580,7 +2597,7 @@ expect(scenarioMap.get('terminal-reconnect-backlog')?.requiredMetricIds).toEqual
 Run:
 
 ```bash
-timeout 120s npm run test:vitest -- --run test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-gate.test.ts
+timeout 120s npm run test:vitest -- --run test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-derived-metrics.test.ts test/unit/lib/visible-first-audit-gate.test.ts
 ```
 
 Expected: fail until metric contract is added.
@@ -2652,7 +2669,7 @@ Required gate:
 - [ ] **Step 8: Commit**
 
 ```bash
-git add test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts test/e2e-browser/perf/run-sample.ts test/e2e-browser/perf/scenarios.ts test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-gate.test.ts
+git add test/e2e-browser/specs/terminal-background-freeze-catchup.spec.ts test/e2e-browser/perf/run-sample.ts test/e2e-browser/perf/scenarios.ts test/unit/lib/visible-first-audit-scenarios.test.ts test/unit/lib/visible-first-audit-derived-metrics.test.ts test/unit/lib/visible-first-audit-gate.test.ts
 git commit -m "Audit terminal catch-up replay performance"
 ```
 
