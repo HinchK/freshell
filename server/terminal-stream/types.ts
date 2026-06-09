@@ -31,4 +31,6 @@ export type BrokerClientAttachment = {
 export type BrokerTerminalState = {
   replayRing: ReplayRing
   clients: Map<LiveWebSocket, BrokerClientAttachment>
+  replayRetentionLogLastAt?: number
+  replayRetentionLogSuppressed?: number
 }

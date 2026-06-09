@@ -484,6 +484,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
             terminalId: 'term-structured-gap',
             attachRequestId: 'structured-gap-attach',
             streamId: expect.any(String),
+            source: 'replay',
             fromSeq: 1,
             toSeq: 1,
             reason: 'replay_window_exceeded',
@@ -582,6 +583,56 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
         }),
       ]),
     )
+
+    broker.close()
+  })
+
+  it('rate limits structured terminal.replay.retention logs and reports suppressed losses', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(6)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-retention-rate-limit')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-retention-rate-limit', 'viewport_hydrate', 80, 24, 0, 'retention-rate-attach')
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'aaa', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'bbb', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'ccc', at: Date.now() })
+
+    let retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === 'term-retention-rate-limit')
+    expect(retentionLogs).toHaveLength(1)
+    expect(retentionLogs[0]).toEqual(expect.objectContaining({
+      event: 'terminal.replay.retention',
+      severity: 'warn',
+      terminalId: 'term-retention-rate-limit',
+      attachRequestId: 'retention-rate-attach',
+      reason: 'retention_lost',
+    }))
+    expect(retentionLogs[0]?.suppressedCount).toBeUndefined()
+
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'ddd', at: Date.now() })
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'eee', at: Date.now() })
+
+    retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === 'term-retention-rate-limit')
+    expect(retentionLogs).toHaveLength(1)
+
+    vi.advanceTimersByTime(1000)
+    registry.emit('terminal.output.raw', { terminalId: 'term-retention-rate-limit', data: 'fff', at: Date.now() })
+
+    retentionLogs = structuredLogs('warn', 'terminal.replay.retention')
+      .filter((payload) => payload.terminalId === 'term-retention-rate-limit')
+    expect(retentionLogs).toHaveLength(2)
+    expect(retentionLogs[1]).toEqual(expect.objectContaining({
+      event: 'terminal.replay.retention',
+      severity: 'warn',
+      terminalId: 'term-retention-rate-limit',
+      attachRequestId: 'retention-rate-attach',
+      reason: 'retention_lost',
+      suppressedCount: 2,
+    }))
 
     broker.close()
   })
@@ -1721,6 +1772,28 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       payload.droppedBytes > 0 &&
       level === 'warn',
     )).toBe(true)
+    expect(structuredLogs('warn', 'terminal.replay.gap')
+      .filter((payload) => (
+        payload.terminalId === 'term-overflow'
+        && payload.reason === 'queue_overflow'
+      ))).toHaveLength(0)
+    expect(structuredLogs('warn', 'terminal.output.gap')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: 'terminal.output.gap',
+          severity: 'warn',
+          terminalId: 'term-overflow',
+          source: 'live',
+          reason: 'queue_overflow',
+          fromSeq: expect.any(Number),
+          toSeq: expect.any(Number),
+          streamId: expect.any(String),
+          queueDepth: expect.any(Number),
+          droppedBytes: expect.any(Number),
+          droppedSerializedApplicationJsonBytes: expect.any(Number),
+        }),
+      ]),
+    )
 
     broker.close()
   })

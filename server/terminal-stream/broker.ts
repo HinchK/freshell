@@ -64,6 +64,16 @@ const TERMINAL_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS = Math.max(
     ? Math.floor(CONFIGURED_REPLAY_BACKPRESSURE_LOG_RATE_LIMIT_MS)
     : 1000,
 )
+const CONFIGURED_REPLAY_RETENTION_LOG_RATE_LIMIT_MS = Number(
+  process.env.TERMINAL_REPLAY_RETENTION_LOG_RATE_LIMIT_MS || 1000,
+)
+const TERMINAL_REPLAY_RETENTION_LOG_RATE_LIMIT_MS = Math.max(
+  1,
+  Number.isFinite(CONFIGURED_REPLAY_RETENTION_LOG_RATE_LIMIT_MS)
+    && CONFIGURED_REPLAY_RETENTION_LOG_RATE_LIMIT_MS > 0
+    ? Math.floor(CONFIGURED_REPLAY_RETENTION_LOG_RATE_LIMIT_MS)
+    : 1000,
+)
 
 type PerfLevel = 'debug' | 'info' | 'warn' | 'error'
 type AttachIntent = 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect'
@@ -953,8 +963,9 @@ export class TerminalStreamBroker {
     queueDepth?: number
     droppedSerializedApplicationJsonBytes?: number
   }): void {
+    const event = input.source === 'replay' ? 'terminal.replay.gap' : 'terminal.output.gap'
     log.warn({
-      event: 'terminal.replay.gap',
+      event,
       severity: 'warn',
       terminalId: input.terminalId,
       fromSeq: input.fromSeq,
@@ -971,7 +982,7 @@ export class TerminalStreamBroker {
             droppedBytes: input.droppedSerializedApplicationJsonBytes,
           }
         : {}),
-    }, 'Terminal replay gap emitted')
+    }, input.source === 'replay' ? 'Terminal replay gap emitted' : 'Terminal output gap emitted')
   }
 
   private logTerminalReplayRetention(input: {
@@ -984,6 +995,7 @@ export class TerminalStreamBroker {
     maxBytes: number
     tailSeq: number
     headSeq: number
+    suppressedCount?: number
   }): void {
     const basePayload = {
       event: 'terminal.replay.retention',
@@ -996,6 +1008,9 @@ export class TerminalStreamBroker {
       maxBytes: input.maxBytes,
       tailSeq: input.tailSeq,
       headSeq: input.headSeq,
+      ...(typeof input.suppressedCount === 'number' && input.suppressedCount > 0
+        ? { suppressedCount: input.suppressedCount }
+        : {}),
     }
     if (input.attachRequestIds.length === 0) {
       log.warn(basePayload, 'Terminal replay retention loss changed stream identity')
@@ -1841,6 +1856,18 @@ export class TerminalStreamBroker {
     const previousStreamId = this.streamIdentity.getStream(terminalId)
     const streamId = this.replaceStreamIdentity(terminalId, 'retention_lost')
     state.replayRing.retagRetainedStreamSuffix(retainedSuffixStreamId, streamId)
+    const now = Date.now()
+    const lastLogAt = state.replayRetentionLogLastAt
+    if (
+      typeof lastLogAt === 'number'
+      && now - lastLogAt < TERMINAL_REPLAY_RETENTION_LOG_RATE_LIMIT_MS
+    ) {
+      state.replayRetentionLogSuppressed = (state.replayRetentionLogSuppressed ?? 0) + 1
+      return streamId
+    }
+    const suppressedCount = state.replayRetentionLogSuppressed ?? 0
+    state.replayRetentionLogLastAt = now
+    state.replayRetentionLogSuppressed = 0
     this.logTerminalReplayRetention({
       terminalId,
       streamId,
@@ -1853,6 +1880,7 @@ export class TerminalStreamBroker {
       maxBytes: state.replayRing.retentionMaxBytes(),
       tailSeq: state.replayRing.tailSeq(),
       headSeq: state.replayRing.headSeq(),
+      ...(suppressedCount > 0 ? { suppressedCount } : {}),
     })
     return streamId
   }

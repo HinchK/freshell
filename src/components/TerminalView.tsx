@@ -687,15 +687,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     quarantineRepairRef.current = null
   }, [])
 
-  const markTerminalPerfAudit = useCallback((name: string, data: Record<string, unknown> = {}) => {
-    const payload = Object.fromEntries(Object.entries({
-      tabId,
-      paneId: paneIdRef.current,
-      ...data,
-    }).filter(([, value]) => value !== undefined))
-    getInstalledPerfAuditBridge()?.mark(name, payload)
-  }, [tabId])
-
   const recordTerminalPerfAuditEvent = useCallback((event: string, data: Record<string, unknown> = {}) => {
     const payload = Object.fromEntries(Object.entries({
       event,
@@ -2159,7 +2150,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       const nextSeqState = gapDecision.state
       applySeqState(nextSeqState)
       resetParserAppliedSurface(parserAppliedSeqRef.current)
-      markTerminalPerfAudit('terminal.catchup.surface_quarantined', {
+      recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
         terminalId: msg.terminalId,
         messageType: msg.type,
         attachRequestId: msg.attachRequestId,
@@ -2181,7 +2172,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
     } else {
       resetParserAppliedSurface(parserAppliedSeqRef.current)
-      markTerminalPerfAudit('terminal.catchup.surface_quarantined', {
+      recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
         terminalId: msg.terminalId,
         messageType: msg.type,
         attachRequestId: msg.attachRequestId,
@@ -2208,7 +2199,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     applySeqState,
     isCurrentAttachMessage,
     markAttachComplete,
-    markTerminalPerfAudit,
+    recordTerminalPerfAuditEvent,
     resetParserAppliedSurface,
     resetStartupProbeParser,
   ])
@@ -2312,7 +2303,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       expectedStreamId,
     }
     if (fullHydrateFallbackReason) {
-      markTerminalPerfAudit('terminal.catchup.full_hydrate_fallback', {
+      recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
         terminalId: tid,
         attachRequestId,
         requestedIntent: intent,
@@ -2325,7 +2316,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       })
     }
     if (surfaceQuarantined) {
-      markTerminalPerfAudit('terminal.catchup.surface_quarantined', {
+      recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
         terminalId: tid,
         attachRequestId,
         requestedIntent: intent,
@@ -2363,7 +2354,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     clearQuarantineRepair,
     getCheckpointDeltaReplayDecision,
     getTerminalCheckpointStreamId,
-    markTerminalPerfAudit,
+    recordTerminalPerfAuditEvent,
     resetParserAppliedSurface,
     scheduleQuarantineRepair,
     resetStartupProbeParser,
@@ -3207,7 +3198,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           applySeqState(nextSeqState)
           resetParserAppliedSurface(parserAppliedSeqRef.current)
           if (gapDecision.requiresSurfaceQuarantine) {
-            markTerminalPerfAudit('terminal.catchup.surface_quarantined', {
+            recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
               terminalId: tid,
               attachRequestId: msg.attachRequestId,
               activeAttachRequestId: currentAttachRef.current?.requestId,
@@ -3298,7 +3289,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               readyStreamId,
               sinceSeq: activeAttach.sinceSeq,
             })
-            markTerminalPerfAudit('terminal.catchup.full_hydrate_fallback', {
+            recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
               terminalId: tid,
               attachRequestId: msg.attachRequestId,
               activeAttachRequestId: activeAttach.requestId,
@@ -3916,7 +3907,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     isCurrentAttachStreamMessage,
     markAttachComplete,
     markParserAppliedFrame,
-    markTerminalPerfAudit,
+    recordTerminalPerfAuditEvent,
     registerForBackgroundHydration,
     resetParserAppliedSurface,
     resetStartupProbeParser,

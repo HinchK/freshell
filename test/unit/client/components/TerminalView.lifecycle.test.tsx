@@ -4368,9 +4368,12 @@ describe('TerminalView lifecycle updates', () => {
         .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
         .at(-1)
       expect(repairAttach?.attachRequestId).not.toBe(warmDeltaAttach!.attachRequestId)
-      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeTypeOf('number')
-      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toEqual(
+      const fallbackEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.catchup.full_hydrate_fallback')
+      expect(fallbackEvents).toEqual([
         expect.objectContaining({
+          event: 'terminal.catchup.full_hydrate_fallback',
+          timestamp: expect.any(Number),
           terminalId,
           attachRequestId: warmDeltaAttach!.attachRequestId,
           reason: 'stream_identity_changed',
@@ -4378,7 +4381,9 @@ describe('TerminalView lifecycle updates', () => {
           streamId: 'stream-after-rotation',
           sinceSeq: 1,
         }),
-      )
+      ])
+      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
     })
 
     it('does not render or checkpoint terminal.output from a mismatched stream id', async () => {
@@ -5941,9 +5946,12 @@ describe('TerminalView lifecycle updates', () => {
         sinceSeq: 0,
         attachRequestId: expect.any(String),
       })
-      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeTypeOf('number')
-      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toEqual(
+      const fallbackEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.catchup.full_hydrate_fallback')
+      expect(fallbackEvents).toEqual([
         expect.objectContaining({
+          event: 'terminal.catchup.full_hydrate_fallback',
+          timestamp: expect.any(Number),
           terminalId,
           attachRequestId: secondAttach!.attachRequestId,
           requestedIntent: 'transport_reconnect',
@@ -5951,17 +5959,24 @@ describe('TerminalView lifecycle updates', () => {
           reason: 'in_flight_writes',
           hasInFlightWrites: true,
         }),
-      )
-      expect(bridge.snapshot().milestones['terminal.catchup.surface_quarantined']).toBeTypeOf('number')
-      expect(bridge.snapshot().metadata['terminal.catchup.surface_quarantined']).toEqual(
+      ])
+      const quarantineEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.catchup.surface_quarantined')
+      expect(quarantineEvents).toEqual([
         expect.objectContaining({
+          event: 'terminal.catchup.surface_quarantined',
+          timestamp: expect.any(Number),
           terminalId,
           attachRequestId: secondAttach!.attachRequestId,
           requestedIntent: 'transport_reconnect',
           intent: 'viewport_hydrate',
           reason: 'in_flight_writes',
         }),
-      )
+      ])
+      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+      expect(bridge.snapshot().milestones['terminal.catchup.surface_quarantined']).toBeUndefined()
+      expect(bridge.snapshot().metadata['terminal.catchup.surface_quarantined']).toBeUndefined()
 
       act(() => {
         messageHandler!({
@@ -6029,6 +6044,123 @@ describe('TerminalView lifecycle updates', () => {
         sinceSeq: 0,
         attachRequestId: expect.any(String),
       }))
+    })
+
+    it('records repeated in-flight full-hydrate fallback and quarantine audit events separately', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-repeat-fallback-quarantine',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-repeat',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'checkpoint before repeat fallback',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const delayedCallbacks: Array<() => void> = []
+      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push(onWritten)
+      })
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'held in-flight write',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks).toHaveLength(1)
+
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      let now = 200
+      const performanceNowSpy = vi.spyOn(performance, 'now').mockImplementation(() => {
+        now += 0.01
+        return now
+      })
+      try {
+        wsMocks.send.mockClear()
+        act(() => {
+          reconnectHandler?.()
+          reconnectHandler?.()
+        })
+
+        const reconnectAttaches = sentMessages()
+          .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        expect(reconnectAttaches).toHaveLength(2)
+        expect(reconnectAttaches[0]?.attachRequestId).not.toBe(reconnectAttaches[1]?.attachRequestId)
+
+        const fallbackEvents = bridge.snapshot().perfEvents
+          .filter((event) => event.event === 'terminal.catchup.full_hydrate_fallback')
+        expect(fallbackEvents).toHaveLength(2)
+        expect(fallbackEvents[0]).toEqual(expect.objectContaining({
+          event: 'terminal.catchup.full_hydrate_fallback',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: reconnectAttaches[0]!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+          hasInFlightWrites: true,
+        }))
+        expect(fallbackEvents[1]).toEqual(expect.objectContaining({
+          event: 'terminal.catchup.full_hydrate_fallback',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: reconnectAttaches[1]!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+          hasInFlightWrites: true,
+        }))
+        expect(Number(fallbackEvents[0]!.timestamp)).toBeLessThan(Number(fallbackEvents[1]!.timestamp))
+
+        const quarantineEvents = bridge.snapshot().perfEvents
+          .filter((event) => event.event === 'terminal.catchup.surface_quarantined')
+        expect(quarantineEvents).toHaveLength(2)
+        expect(quarantineEvents[0]).toEqual(expect.objectContaining({
+          event: 'terminal.catchup.surface_quarantined',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: reconnectAttaches[0]!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+        }))
+        expect(quarantineEvents[1]).toEqual(expect.objectContaining({
+          event: 'terminal.catchup.surface_quarantined',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: reconnectAttaches[1]!.attachRequestId,
+          requestedIntent: 'transport_reconnect',
+          intent: 'viewport_hydrate',
+          reason: 'in_flight_writes',
+        }))
+        expect(Number(quarantineEvents[0]!.timestamp)).toBeLessThan(Number(quarantineEvents[1]!.timestamp))
+
+        expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+        expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+        expect(bridge.snapshot().metadata['terminal.catchup.surface_quarantined']).toBeUndefined()
+        expect(bridge.snapshot().milestones['terminal.catchup.surface_quarantined']).toBeUndefined()
+      } finally {
+        performanceNowSpy.mockRestore()
+      }
     })
 
     it('does not clear the old surface when full hydrate starts with in-flight writes', async () => {
