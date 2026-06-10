@@ -30,7 +30,7 @@ export function isGapEvent(entry: ReplayFrame | GapEvent): entry is GapEvent {
   return 'type' in entry && entry.type === 'gap'
 }
 
-export const DEFAULT_TERMINAL_CLIENT_QUEUE_MAX_BYTES = 128 * 1024
+export const DEFAULT_TERMINAL_CLIENT_QUEUE_MAX_BYTES = 32 * 1024 * 1024
 
 function resolveMaxBytes(explicitMaxBytes?: number): number {
   if (typeof explicitMaxBytes === 'number' && Number.isFinite(explicitMaxBytes) && explicitMaxBytes > 0) {

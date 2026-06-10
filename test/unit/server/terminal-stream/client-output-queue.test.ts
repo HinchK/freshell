@@ -30,6 +30,22 @@ describe('ClientOutputQueue', () => {
     expect(queue.pendingBytes()).toBeLessThanOrEqual(5)
   })
 
+  it('keeps a four-hour one-kib-per-second hidden-tab backlog by default', () => {
+    const queue = new ClientOutputQueue()
+    const frameCount = 4 * 60 * 60
+    const queuedBytesPerSecond = 1024
+
+    for (let seq = 1; seq <= frameCount; seq += 1) {
+      queue.enqueue(frame(seq, `line-${seq}\n`), queuedBytesPerSecond)
+    }
+
+    const prepared = queue.prepareBatch(64 * 1024)
+
+    expect(queue.pendingFrames()).toBe(frameCount)
+    expect(queue.peekDroppedBytes()).toBe(0)
+    expect(prepared.entries.some(isGapEvent)).toBe(false)
+  })
+
   it('coalesces adjacent frames when queued', () => {
     const queue = new ClientOutputQueue(1024)
     queue.enqueue(frame(1, 'hello '))

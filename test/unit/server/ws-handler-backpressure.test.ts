@@ -105,9 +105,11 @@ class FakeBrokerRegistry extends EventEmitter {
 }
 
 let originalAuthToken: string | undefined
+let originalTerminalClientQueueMaxBytes: string | undefined
 
 beforeEach(() => {
   originalAuthToken = process.env.AUTH_TOKEN
+  originalTerminalClientQueueMaxBytes = process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
   process.env.AUTH_TOKEN = TEST_AUTH_TOKEN
   loggerMocks.logger.debug.mockClear()
   loggerMocks.logger.info.mockClear()
@@ -118,10 +120,19 @@ beforeEach(() => {
 afterEach(() => {
   if (originalAuthToken === undefined) {
     delete process.env.AUTH_TOKEN
-    return
+  } else {
+    process.env.AUTH_TOKEN = originalAuthToken
   }
-  process.env.AUTH_TOKEN = originalAuthToken
+  if (originalTerminalClientQueueMaxBytes === undefined) {
+    delete process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES
+  } else {
+    process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = originalTerminalClientQueueMaxBytes
+  }
 })
+
+function forceSmallTerminalClientQueueForOverflowTest(): void {
+  process.env.TERMINAL_CLIENT_QUEUE_MAX_BYTES = String(128 * 1024)
+}
 
 describe('WsHandler backpressure', () => {
   let server: http.Server
@@ -729,6 +740,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
   })
 
   it('echoes attachRequestId on attach.ready, output, and output.gap for a client attachment', async () => {
+    forceSmallTerminalClientQueueForOverflowTest()
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
     registry.createTerminal('term-attach-id')
@@ -1822,6 +1834,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
   })
 
   it('emits terminal_stream_replay_hit, terminal_stream_queue_pressure, and terminal_stream_gap on overflow', async () => {
+    forceSmallTerminalClientQueueForOverflowTest()
     const registry = new FakeBrokerRegistry()
     const perfSpy = vi.fn()
     const broker = new TerminalStreamBroker(registry as any, perfSpy)
