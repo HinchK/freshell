@@ -213,6 +213,21 @@ describe('terminal-attach-seq-state', () => {
     expect(markParserAppliedSeq(gap.state, 10).parserAppliedSeq).toBe(1)
   })
 
+  it('does not mark parser-applied output through the tail of an overlapping known lost range', () => {
+    const frame = expectAcceptedFrame(onOutputFrame(createAttachSeqState(), {
+      seqStart: 1,
+      seqEnd: 12,
+    }))
+    const applied = markParserAppliedSeq(frame.state, 10)
+    const gap = onOutputGap(applied, { fromSeq: 9, toSeq: 11 })
+
+    const afterTail = markParserAppliedSeq(gap.state, 12)
+
+    expect(gap.state.knownLostRanges).toEqual([{ fromSeq: 9, toSeq: 11 }])
+    expect(afterTail.parserAppliedSeq).toBe(10)
+    expect(afterTail.highestObservedSeq).toBe(12)
+  })
+
   it('does not mark parser-applied output across an unapplied output range', () => {
     const accepted = expectAcceptedFrame(onOutputFrame(createAttachSeqState(), {
       seqStart: 1,

@@ -296,7 +296,14 @@ export function markParserAppliedSeq(state: AttachSeqState, seq: number): Attach
   const current = createAttachSeqState(state)
   let acknowledgedSeq = Math.min(normalizeSeq(seq), current.highestObservedSeq)
   for (const range of current.knownLostRanges) {
-    if (current.parserAppliedSeq < range.fromSeq && acknowledgedSeq >= range.fromSeq) {
+    if (range.toSeq <= current.parserAppliedSeq || acknowledgedSeq < range.fromSeq) {
+      continue
+    }
+    if (range.fromSeq <= current.parserAppliedSeq) {
+      acknowledgedSeq = current.parserAppliedSeq
+      break
+    }
+    if (acknowledgedSeq >= range.fromSeq) {
       acknowledgedSeq = range.fromSeq - 1
       break
     }

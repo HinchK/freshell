@@ -5024,6 +5024,83 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
+    it('does not checkpoint through the unapplied tail of an invalid terminal.output.batch that overlaps the current cursor', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-output-batch-invalid-overlap-tail',
+        serverInstanceId: 'server-output-batch-invalid-overlap-tail',
+      })
+      const attachRequestId = latestAttachRequestIdForTerminal(terminalId)
+      const streamId = latestStreamIdByTerminal.get(terminalId)
+      expect(attachRequestId).toBeTruthy()
+      expect(streamId).toBeTruthy()
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 1,
+          seqEnd: 10,
+          data: 'abcdefghij',
+        })
+      })
+
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-invalid-overlap-tail',
+      })?.parserAppliedSeq).toBe(10)
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.batch',
+          terminalId,
+          streamId,
+          attachRequestId,
+          source: 'live',
+          seqStart: 9,
+          seqEnd: 11,
+          data: 'ijk',
+          serializedBytes: 256,
+          segments: [
+            { seqStart: 9, seqEnd: 9, endOffset: 1, data: 'i', rawFrameCount: 1 },
+            { seqStart: 10, seqEnd: 10, endOffset: 2, data: 'j', rawFrameCount: 1 },
+            { seqStart: 11, seqEnd: 11, endOffset: 3, data: 'not-k', rawFrameCount: 1 },
+          ],
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId,
+          attachRequestId,
+          seqStart: 12,
+          seqEnd: 12,
+          data: 'l',
+        })
+      })
+
+      expect(terminalWriteStrings(term)).toEqual(['l'])
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId,
+        serverInstanceId: 'server-output-batch-invalid-overlap-tail',
+      })?.parserAppliedSeq).toBe(10)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      }))
+    })
+
     it('splits terminal.output.batch writes around parser barrier segments', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
