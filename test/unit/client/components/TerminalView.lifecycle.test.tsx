@@ -6323,6 +6323,115 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
+    it('drops quarantined replay and forces a clearing hydrate when quarantine repair times out before writes drain', async () => {
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-in-flight-quarantine-timeout',
+        serverInstanceId: 'server-a',
+        streamId: 'stream-timeout',
+        clearSends: false,
+      })
+
+      const firstAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(firstAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'checkpointed text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+
+      const delayedCallbacks: Array<{ data: string; callback: () => void }> = []
+      term.write.mockImplementation((data: string, onWritten?: () => void) => {
+        if (onWritten) delayedCallbacks.push({ data, callback: onWritten })
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'old in-flight timeout text',
+          attachRequestId: firstAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old in-flight timeout text'])
+
+      vi.useFakeTimers()
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+
+      const quarantinedAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(quarantinedAttach).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 3,
+          replayFromSeq: 2,
+          replayToSeq: 3,
+          attachRequestId: quarantinedAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 3,
+          data: 'quarantined replay timeout text',
+          attachRequestId: quarantinedAttach!.attachRequestId,
+        })
+      })
+      expect(delayedCallbacks.map(({ data }) => data)).toEqual(['old in-flight timeout text'])
+
+      act(() => {
+        vi.advanceTimersByTime(2_100)
+      })
+
+      wsMocks.send.mockClear()
+      term.clear.mockClear()
+      act(() => {
+        delayedCallbacks.find(({ data }) => data === 'old in-flight timeout text')?.callback()
+      })
+
+      expect(terminalWriteStrings(term)).not.toContain('quarantined replay timeout text')
+
+      act(() => {
+        vi.advanceTimersByTime(100)
+      })
+
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+      expect(term.clear).toHaveBeenCalledTimes(1)
+      const repairAttach = wsMocks.send.mock.calls
+        .map(([msg]) => msg)
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(repairAttach?.attachRequestId).not.toBe(quarantinedAttach?.attachRequestId)
+    })
+
     it('records repeated in-flight full-hydrate fallback and quarantine audit events separately', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',

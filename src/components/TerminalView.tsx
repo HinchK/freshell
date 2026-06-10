@@ -572,8 +572,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     attachRequestId: string
     queue: TerminalWriteQueue
     startedAt: number
+    timedOut: boolean
     timer: ReturnType<typeof setTimeout> | null
   } | null>(null)
+  const abandonedAttachRequestIdsRef = useRef(new Set<string>())
   const attachCounterRef = useRef(0)
   const currentAttachRef = useRef<{
     requestId: string
@@ -698,11 +700,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
   const clearQuarantineRepair = useCallback((attachRequestId?: string) => {
     const pending = quarantineRepairRef.current
-    if (!pending) return
+    if (!pending) {
+      if (attachRequestId) {
+        abandonedAttachRequestIdsRef.current.delete(attachRequestId)
+      }
+      return
+    }
     if (attachRequestId && pending.attachRequestId !== attachRequestId) return
     if (pending.timer) {
       clearTimeout(pending.timer)
     }
+    abandonedAttachRequestIdsRef.current.delete(pending.attachRequestId)
     quarantineRepairRef.current = null
   }, [])
 
@@ -746,14 +754,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         })
         return
       }
-      if (Date.now() - pending.startedAt >= QUARANTINE_REPAIR_TIMEOUT_MS) {
+      if (!pending.timedOut && Date.now() - pending.startedAt >= QUARANTINE_REPAIR_TIMEOUT_MS) {
         log.warn('Terminal quarantine repair timed out while writes remained in flight', {
           paneId: paneIdRef.current,
           terminalId,
           attachRequestId,
         })
-        clearQuarantineRepair(attachRequestId)
-        return
+        abandonedAttachRequestIdsRef.current.add(attachRequestId)
+        pending.timedOut = true
+        pending.queue.setActiveGeneration(`${attachRequestId}:quarantine-timeout`, {
+          dropQueuedStaleWrites: true,
+        })
+        recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantine_timeout', {
+          terminalId,
+          attachRequestId,
+          parserAppliedSeq: parserAppliedSeqRef.current,
+          reason: 'in_flight_writes_timeout',
+        })
       }
       pending.timer = setTimeout(poll, QUARANTINE_REPAIR_POLL_MS)
     }
@@ -762,9 +779,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       attachRequestId,
       queue,
       startedAt,
+      timedOut: false,
       timer: setTimeout(poll, QUARANTINE_REPAIR_POLL_MS),
     }
-  }, [clearQuarantineRepair])
+  }, [clearQuarantineRepair, recordTerminalPerfAuditEvent])
 
   const markParserAppliedFrame = useCallback((terminalId: string | undefined, seq: number, attachContext?: {
     requestId: string
@@ -2177,6 +2195,25 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           paneId: paneIdRef.current,
           terminalId: msg.terminalId,
           type: msg.type,
+          currentAttachRequestId: current.requestId,
+        })
+      }
+      return false
+    }
+    if (abandonedAttachRequestIdsRef.current.has(msg.attachRequestId)) {
+      recordTerminalPerfAuditEvent('terminal.attach_generation_stale_rejected', {
+        terminalId: msg.terminalId,
+        messageType: msg.type,
+        attachRequestId: msg.attachRequestId,
+        activeAttachRequestId: current.requestId,
+        reason: 'abandoned_attach_request_id',
+      })
+      if (debugRef.current) {
+        log.debug('Ignoring abandoned attach generation message', {
+          paneId: paneIdRef.current,
+          terminalId: msg.terminalId,
+          type: msg.type,
+          attachRequestId: msg.attachRequestId,
           currentAttachRequestId: current.requestId,
         })
       }
