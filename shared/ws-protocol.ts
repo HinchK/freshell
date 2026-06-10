@@ -7,6 +7,7 @@
  * Client MUST use `import type` to avoid bundling Zod runtime code.
  */
 import { z } from 'zod'
+import { WS_PROTOCOL_VERSION } from './ws-version.js'
 import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
 import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
@@ -34,7 +35,7 @@ export const ErrorCode = z.enum([
 
 export type ErrorCode = z.infer<typeof ErrorCode>
 
-export const WS_PROTOCOL_VERSION = 5 as const
+export { WS_PROTOCOL_VERSION }
 
 export const ShellSchema = z.enum(['system', 'cmd', 'powershell', 'wsl'])
 

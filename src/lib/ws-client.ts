@@ -6,6 +6,7 @@ import {
 } from '@/lib/perf-logger'
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
+import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
 import type { ServerMessage, SessionLocator } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
 
@@ -74,7 +75,6 @@ type InFlightCreate = {
 }
 
 const CONNECTION_TIMEOUT_MS = 10_000
-const WS_PROTOCOL_VERSION = 5
 const perfConfig = getClientPerfConfig()
 
 function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage {
