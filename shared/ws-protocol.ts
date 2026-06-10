@@ -661,12 +661,19 @@ export type TerminalAttachReadyMessage = {
   type: 'terminal.attach.ready'
   terminalId: string
   streamId: string
+  geometryEpoch?: number
+  geometryAuthority?: TerminalGeometryAuthority
+  requestedSinceSeq?: number
+  effectiveSinceSeq?: number
+  replayResetReason?: 'geometry_authority_unknown'
   headSeq: number
   replayFromSeq: number
   replayToSeq: number
   attachRequestId?: string
   sessionRef?: SessionLocator
 }
+
+export type TerminalGeometryAuthority = 'single_client' | 'server_stream' | 'multi_client_unknown'
 
 export type TerminalStreamChangedMessage = {
   type: 'terminal.stream.changed'

@@ -3162,6 +3162,8 @@ export class WsHandler {
             })
           }
           this.sendError(ws, { code: 'INVALID_TERMINAL_ID', message: 'Terminal not running', terminalId: m.terminalId })
+        } else {
+          this.terminalStreamBroker.recordResize(m.terminalId, ws, m.cols, m.rows)
         }
         return
       }

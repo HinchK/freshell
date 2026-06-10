@@ -1,6 +1,7 @@
 import type { LiveWebSocket } from '../ws-handler.js'
 import type { ClientOutputQueue } from './client-output-queue.js'
 import type { ReplayFrame, ReplayRing } from './replay-ring.js'
+import type { TerminalGeometryAuthority } from '../../shared/ws-protocol.js'
 
 export type BrokerClientMode = 'attaching' | 'live'
 export type BrokerClientPriority = 'foreground' | 'background'
@@ -31,6 +32,10 @@ export type BrokerClientAttachment = {
 export type BrokerTerminalState = {
   replayRing: ReplayRing
   clients: Map<LiveWebSocket, BrokerClientAttachment>
+  geometryEpoch: number
+  geometryAuthority: TerminalGeometryAuthority
+  geometryCols?: number
+  geometryRows?: number
   replayRetentionLogLastAt?: number
   replayRetentionLogSuppressed?: number
 }

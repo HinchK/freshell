@@ -4386,6 +4386,116 @@ describe('TerminalView lifecycle updates', () => {
       expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
     })
 
+    it('rejects a warm-delta attach when attach-ready reports unknown geometry authority', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-geometry-authority-client',
+        serverInstanceId: 'server-geometry-authority',
+        ackInitialAttach: false,
+        clearSends: false,
+      })
+
+      const initialAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(initialAttach?.attachRequestId).toBeTruthy()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-geometry',
+          geometryEpoch: 1,
+          geometryAuthority: 'single_client',
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: initialAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-geometry',
+          seqStart: 1,
+          seqEnd: 1,
+          data: 'before geometry conflict',
+          attachRequestId: initialAttach!.attachRequestId,
+        })
+      })
+
+      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+        streamId: 'stream-geometry',
+        serverInstanceId: 'server-geometry-authority',
+      })?.parserAppliedSeq).toBe(1)
+
+      wsMocks.send.mockClear()
+      act(() => {
+        reconnectHandler?.()
+      })
+      const warmDeltaAttach = sentMessages()
+        .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      expect(warmDeltaAttach).toMatchObject({
+        intent: 'transport_reconnect',
+        sinceSeq: 1,
+      })
+
+      term.write.mockClear()
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          streamId: 'stream-geometry',
+          geometryEpoch: 2,
+          geometryAuthority: 'multi_client_unknown',
+          headSeq: 1,
+          replayFromSeq: 1,
+          replayToSeq: 1,
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          streamId: 'stream-geometry',
+          seqStart: 2,
+          seqEnd: 2,
+          data: 'GEOMETRY DELTA SHOULD NOT RENDER',
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+        })
+      })
+
+      expect(terminalWriteStrings(term).join('')).not.toContain('GEOMETRY DELTA SHOULD NOT RENDER')
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      }))
+      const repairAttach = sentMessages()
+        .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        .at(-1)
+      expect(repairAttach?.attachRequestId).not.toBe(warmDeltaAttach!.attachRequestId)
+      const fallbackEvents = bridge.snapshot().perfEvents
+        .filter((event) => event.event === 'terminal.catchup.full_hydrate_fallback')
+      expect(fallbackEvents).toEqual([
+        expect.objectContaining({
+          event: 'terminal.catchup.full_hydrate_fallback',
+          timestamp: expect.any(Number),
+          terminalId,
+          attachRequestId: warmDeltaAttach!.attachRequestId,
+          reason: 'geometry_authority_unknown',
+          geometryAuthority: 'multi_client_unknown',
+          geometryEpoch: 2,
+          expectedGeometryAuthority: 'single_client',
+          expectedGeometryEpoch: 1,
+          sinceSeq: 1,
+        }),
+      ])
+      expect(bridge.snapshot().milestones['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+      expect(bridge.snapshot().metadata['terminal.catchup.full_hydrate_fallback']).toBeUndefined()
+    })
+
     it('does not render or checkpoint terminal.output from a mismatched stream id', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',

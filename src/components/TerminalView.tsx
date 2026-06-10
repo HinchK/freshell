@@ -43,7 +43,10 @@ import {
   loadTerminalSurfaceCheckpoint,
   saveTerminalSurfaceCheckpoint,
 } from '@/lib/terminal-cursor'
-import { canUseCheckpointForDeltaReplay } from '@/lib/terminal-surface-checkpoint'
+import {
+  canUseCheckpointForDeltaReplay,
+  type TerminalGeometryAuthority,
+} from '@/lib/terminal-surface-checkpoint'
 import {
   resolveRevealAttachPlan,
   type DeferredAttachReason,
@@ -352,6 +355,19 @@ type SentViewport = {
   rows: number
 }
 
+function parseTerminalGeometryAuthority(value: unknown): TerminalGeometryAuthority | null {
+  return value === 'single_client' || value === 'server_stream' || value === 'multi_client_unknown'
+    ? value
+    : null
+}
+
+function normalizeGeometryEpoch(value: unknown, fallback: number): number {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return Math.max(0, Math.floor(value))
+  }
+  return Math.max(0, Math.floor(Number.isFinite(fallback) ? fallback : 1))
+}
+
 const lastSentViewportByTerminal = new Map<string, { cols: number; rows: number }>()
 
 function rememberSentViewport(terminalId: string, cols: number, rows: number): void {
@@ -549,6 +565,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const parserAppliedSeqRef = useRef(0)
   const surfaceEpochRef = useRef(0)
   const geometryEpochRef = useRef(1)
+  const geometryAuthorityRef = useRef<TerminalGeometryAuthority>('single_client')
   const attachTerminalRef = useRef<((tid: string, intent: AttachIntent, opts?: AttachTerminalOptions) => void) | null>(null)
   const quarantineRepairRef = useRef<{
     terminalId: string
@@ -568,6 +585,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     surfaceQuarantined: boolean
     streamId?: string | null
     expectedStreamId?: string | null
+    geometryEpoch: number
+    geometryAuthority: TerminalGeometryAuthority
+    expectedGeometryEpoch: number
+    expectedGeometryAuthority: TerminalGeometryAuthority
   } | null>(null)
   const launchAttemptRef = useRef<LaunchAttemptState | null>(null)
   const suppressNextMatchingResizeRef = useRef<{
@@ -635,9 +656,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       cols: normalizeDimension(dimensions?.cols, term?.cols ?? 80),
       rows: normalizeDimension(dimensions?.rows, term?.rows ?? 24),
       geometryEpoch: geometryEpochRef.current,
-      // Task 3 only has this client's xterm viewport as geometry authority.
-      // Server/multi-client authority is expected to land with the later geometry work.
-      geometryAuthority: 'single_client' as const,
+      geometryAuthority: geometryAuthorityRef.current,
       scrollback: normalizeScrollback(settingsRef.current.terminal.scrollback),
       xtermVersion: TERMINAL_CHECKPOINT_XTERM_VERSION,
       requireParserIdle: true,
@@ -871,6 +890,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       if (terminalContent.terminalId !== prevTerminalId) {
         resetParserAppliedSurface()
         geometryEpochRef.current = 1
+        geometryAuthorityRef.current = 'single_client'
         clearQuarantineRepair()
         forgetSentViewport(prevTerminalId)
         const cachedViewport = terminalContent.terminalId
@@ -2227,7 +2247,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const writeQueue = writeQueueRef.current
     const hasInFlightWrites = writeQueue?.hasInFlightWrites() === true
     const expectedStreamId = getTerminalCheckpointStreamId()
+    const checkpointInput = buildCheckpointReplayInput(tid, { cols, rows })
     const checkpointDecision = getCheckpointDeltaReplayDecision(tid, { cols, rows })
+    const expectedGeometryEpoch = checkpointInput?.geometryEpoch ?? geometryEpochRef.current
+    const expectedGeometryAuthority = checkpointInput?.geometryAuthority ?? geometryAuthorityRef.current
     const explicitSinceSeq = typeof opts?.sinceSeq === 'number'
       ? Math.max(0, Math.floor(opts.sinceSeq))
       : undefined
@@ -2301,6 +2324,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       rows,
       surfaceQuarantined,
       expectedStreamId,
+      geometryEpoch: expectedGeometryEpoch,
+      geometryAuthority: expectedGeometryAuthority,
+      expectedGeometryEpoch,
+      expectedGeometryAuthority,
     }
     if (fullHydrateFallbackReason) {
       recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
@@ -2351,6 +2378,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     suppressNetworkEffects,
     ws,
     applySeqState,
+    buildCheckpointReplayInput,
     clearQuarantineRepair,
     getCheckpointDeltaReplayDecision,
     getTerminalCheckpointStreamId,
@@ -3271,15 +3299,34 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const readyStreamId = typeof msg.streamId === 'string' && msg.streamId.length > 0
             ? msg.streamId
             : null
+          const readyGeometryAuthority = parseTerminalGeometryAuthority(
+            (msg as { geometryAuthority?: unknown }).geometryAuthority,
+          ) ?? geometryAuthorityRef.current
+          const readyGeometryEpoch = normalizeGeometryEpoch(
+            (msg as { geometryEpoch?: unknown }).geometryEpoch,
+            geometryEpochRef.current,
+          )
           const previousStreamId = getTerminalCheckpointStreamId()
           const activeAttach = currentAttachRef.current
           const expectedStreamId = activeAttach?.expectedStreamId ?? previousStreamId
+          const expectedGeometryAuthority = activeAttach?.expectedGeometryAuthority ?? geometryAuthorityRef.current
+          const expectedGeometryEpoch = activeAttach?.expectedGeometryEpoch ?? geometryEpochRef.current
           const incompatibleDeltaStream = activeAttach?.terminalId === tid
             && activeAttach.requestId === msg.attachRequestId
             && activeAttach.sinceSeq > 0
             && typeof expectedStreamId === 'string'
             && expectedStreamId.length > 0
             && readyStreamId !== expectedStreamId
+          const incompatibleDeltaGeometry = activeAttach?.terminalId === tid
+            && activeAttach.requestId === msg.attachRequestId
+            && activeAttach.sinceSeq > 0
+            && (
+              readyGeometryAuthority === 'multi_client_unknown'
+              || readyGeometryAuthority !== expectedGeometryAuthority
+              || readyGeometryEpoch !== expectedGeometryEpoch
+            )
+          geometryAuthorityRef.current = readyGeometryAuthority
+          geometryEpochRef.current = readyGeometryEpoch
           if (incompatibleDeltaStream) {
             log.warn('Rejecting warm-delta terminal attach after stream identity changed', {
               paneId: paneIdRef.current,
@@ -3306,10 +3353,47 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             })
             return
           }
+          if (incompatibleDeltaGeometry) {
+            const reason = readyGeometryAuthority === 'multi_client_unknown'
+              ? 'geometry_authority_unknown'
+              : 'geometry_changed'
+            log.warn('Rejecting warm-delta terminal attach after geometry authority changed', {
+              paneId: paneIdRef.current,
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              expectedGeometryAuthority,
+              expectedGeometryEpoch,
+              geometryAuthority: readyGeometryAuthority,
+              geometryEpoch: readyGeometryEpoch,
+              sinceSeq: activeAttach.sinceSeq,
+              reason,
+            })
+            recordTerminalPerfAuditEvent('terminal.catchup.full_hydrate_fallback', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              activeAttachRequestId: activeAttach.requestId,
+              streamId: readyStreamId,
+              expectedStreamId,
+              geometryAuthority: readyGeometryAuthority,
+              geometryEpoch: readyGeometryEpoch,
+              expectedGeometryAuthority,
+              expectedGeometryEpoch,
+              sinceSeq: activeAttach.sinceSeq,
+              reason,
+            })
+            resetParserAppliedSurface(parserAppliedSeqRef.current)
+            attachTerminal(tid, 'viewport_hydrate', {
+              clearViewportFirst: true,
+              ...viewportHydrateReplayOptions(contentRef.current),
+            })
+            return
+          }
           if (activeAttach?.terminalId === tid && activeAttach.requestId === msg.attachRequestId) {
             currentAttachRef.current = {
               ...activeAttach,
               streamId: readyStreamId,
+              geometryAuthority: readyGeometryAuthority,
+              geometryEpoch: readyGeometryEpoch,
             }
           }
           if (readyStreamId) {

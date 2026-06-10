@@ -39,6 +39,7 @@ import {
   TERMINAL_WS_CATASTROPHIC_STALL_MS,
 } from './constants.js'
 import type { BrokerClientAttachment, BrokerTerminalState } from './types.js'
+import type { TerminalGeometryAuthority } from '../../shared/ws-protocol.js'
 
 const log = logger.child({ component: 'terminal-stream-broker' })
 const DEFAULT_CODING_CLI_REPLAY_RING_MAX_BYTES = 32 * 1024 * 1024
@@ -265,13 +266,23 @@ export class TerminalStreamBroker {
           && (!hasOtherAttachedSockets || Boolean(existingAttachment))
         )
 
+      const terminalState = existingState ?? this.getOrCreateTerminalState(terminalId)
       if (shouldResize && !this.registry.resize(terminalId, cols, rows)) {
         this.registry.detach(terminalId, ws)
         result = 'missing'
         return
       }
+      if (shouldResize) {
+        this.recordTerminalGeometry(
+          terminalState,
+          cols,
+          rows,
+          hasOtherAttachedSockets ? 'multi_client_unknown' : 'single_client',
+        )
+      } else if (hasOtherAttachedSockets) {
+        terminalState.geometryAuthority = 'multi_client_unknown'
+      }
 
-      const terminalState = existingState ?? this.getOrCreateTerminalState(terminalId)
       const attachment = existingAttachment ?? this.getOrCreateAttachment(terminalState, ws, terminalId)
       attachment.terminalOutputBatchV1 = terminalOutputBatchV1
 
@@ -296,8 +307,12 @@ export class TerminalStreamBroker {
       }
 
       const streamId = this.streamIdentity.recordAttach(terminalId)
+      const replayResetReason = terminalState.geometryAuthority === 'multi_client_unknown' && normalizedSinceSeq > 0
+        ? 'geometry_authority_unknown' as const
+        : undefined
+      const effectiveSinceSeq = replayResetReason ? 0 : normalizedSinceSeq
 
-      const replay = terminalState.replayRing.replaySince(normalizedSinceSeq)
+      const replay = terminalState.replayRing.replaySince(effectiveSinceSeq)
       let replayFrames = replay.frames
       let effectiveMissedFromSeq = replay.missedFromSeq
       let budgetTruncated = false
@@ -351,7 +366,7 @@ export class TerminalStreamBroker {
         this.perfEventLogger('terminal_stream_replay_hit', {
           terminalId,
           connectionId: ws.connectionId,
-          sinceSeq: normalizedSinceSeq,
+          sinceSeq: effectiveSinceSeq,
           replayFromSeq,
           replayToSeq,
           replayFrameCount: replayFrames.length,
@@ -363,6 +378,11 @@ export class TerminalStreamBroker {
         type: 'terminal.attach.ready',
         terminalId,
         streamId,
+        geometryEpoch: terminalState.geometryEpoch,
+        geometryAuthority: terminalState.geometryAuthority,
+        requestedSinceSeq: normalizedSinceSeq,
+        effectiveSinceSeq,
+        ...(replayResetReason ? { replayResetReason } : {}),
         headSeq,
         replayFromSeq,
         replayToSeq,
@@ -379,7 +399,7 @@ export class TerminalStreamBroker {
           this.perfEventLogger('terminal_stream_replay_miss', {
             terminalId,
             connectionId: ws.connectionId,
-            sinceSeq: normalizedSinceSeq,
+            sinceSeq: effectiveSinceSeq,
             missedFromSeq: effectiveMissedFromSeq,
             missedToSeq,
             replayFromSeq,
@@ -501,6 +521,40 @@ export class TerminalStreamBroker {
     return this.terminals.get(terminalId)?.clients.size || 0
   }
 
+  recordResize(terminalId: string, ws: LiveWebSocket, cols: number, rows: number): void {
+    const state = this.terminals.get(terminalId)
+    if (!state) return
+    const hasOtherAttachedSockets = [...state.clients.keys()].some((attachedWs) => attachedWs !== ws)
+    this.recordTerminalGeometry(
+      state,
+      cols,
+      rows,
+      hasOtherAttachedSockets ? 'multi_client_unknown' : 'single_client',
+    )
+  }
+
+  private recordTerminalGeometry(
+    state: BrokerTerminalState,
+    cols: number,
+    rows: number,
+    authority: TerminalGeometryAuthority,
+  ): void {
+    const normalizedCols = Math.max(2, Math.floor(Number.isFinite(cols) ? cols : 80))
+    const normalizedRows = Math.max(2, Math.floor(Number.isFinite(rows) ? rows : 24))
+    const hasPreviousGeometry = typeof state.geometryCols === 'number'
+      && typeof state.geometryRows === 'number'
+    const geometryChanged = !hasPreviousGeometry
+      ? false
+      : state.geometryCols !== normalizedCols || state.geometryRows !== normalizedRows
+
+    if (geometryChanged) {
+      state.geometryEpoch += 1
+    }
+    state.geometryCols = normalizedCols
+    state.geometryRows = normalizedRows
+    state.geometryAuthority = authority
+  }
+
   private getOrCreateTerminalState(terminalId: string): BrokerTerminalState {
     const replayRingMaxBytes = this.resolveReplayRingMaxBytes(terminalId)
     let state = this.terminals.get(terminalId)
@@ -508,6 +562,8 @@ export class TerminalStreamBroker {
       state = {
         replayRing: new ReplayRing(replayRingMaxBytes),
         clients: new Map(),
+        geometryEpoch: 1,
+        geometryAuthority: 'single_client',
       }
       this.terminals.set(terminalId, state)
     } else {
@@ -632,13 +688,24 @@ export class TerminalStreamBroker {
     })
     const frames: ReplayFrame[] = []
     for (const fragment of fragments) {
+      const fragmentStreamId = streamId
       frames.push(state.replayRing.append(fragment, { streamId }))
-      const retainedStreamId = this.handleReplayRetentionLoss(terminalId, state, streamId)
+      const retainedStreamId = this.handleReplayRetentionLoss(terminalId, state, fragmentStreamId)
       if (retainedStreamId) {
+        this.retagFrames(frames, fragmentStreamId, retainedStreamId)
         streamId = retainedStreamId
       }
     }
     return frames
+  }
+
+  private retagFrames(frames: ReplayFrame[], fromStreamId: string, toStreamId: string): void {
+    if (!fromStreamId || !toStreamId || fromStreamId === toStreamId) return
+    for (const frame of frames) {
+      if (frame.streamId === fromStreamId) {
+        frame.streamId = toStreamId
+      }
+    }
   }
 
   private scheduleFlush(

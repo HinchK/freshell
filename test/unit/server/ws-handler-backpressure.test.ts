@@ -800,6 +800,54 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     broker.close()
   })
 
+  it('reports unknown geometry authority and ignores warm delta when another client is attached', async () => {
+    const registry = new FakeBrokerRegistry()
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-geometry-authority')
+
+    const wsA = createMockWs()
+    await broker.attach(wsA as any, 'term-geometry-authority', 'viewport_hydrate', 80, 24, 0, 'geometry-a-1')
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-geometry-authority',
+      data: 'geometry-seed',
+      at: Date.now(),
+    })
+    vi.advanceTimersByTime(1)
+
+    const wsB = createMockWs()
+    await broker.attach(wsB as any, 'term-geometry-authority', 'viewport_hydrate', 100, 30, 0, 'geometry-b-1')
+    const readyB = wsB.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(readyB).toMatchObject({
+      terminalId: 'term-geometry-authority',
+      attachRequestId: 'geometry-b-1',
+      geometryAuthority: 'multi_client_unknown',
+      geometryEpoch: expect.any(Number),
+    })
+
+    wsA.send.mockClear()
+    await broker.attach(wsA as any, 'term-geometry-authority', 'transport_reconnect', 80, 24, 1, 'geometry-a-2')
+    const readyA2 = wsA.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+
+    expect(readyA2).toMatchObject({
+      terminalId: 'term-geometry-authority',
+      attachRequestId: 'geometry-a-2',
+      geometryAuthority: 'multi_client_unknown',
+      geometryEpoch: expect.any(Number),
+      requestedSinceSeq: 1,
+      effectiveSinceSeq: 0,
+      replayResetReason: 'geometry_authority_unknown',
+      replayFromSeq: 1,
+      replayToSeq: 1,
+    })
+    expect(readyA2.geometryEpoch).toBeGreaterThan(readyB.geometryEpoch)
+
+    broker.close()
+  })
+
   it('keeps each live terminal.output frame within the shared realtime byte budget', async () => {
     const registry = new FakeBrokerRegistry()
     const broker = new TerminalStreamBroker(registry as any, vi.fn())
@@ -1285,6 +1333,48 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
       expect(payloads.indexOf(output)).toBeGreaterThan(streamChangedIndex)
       expect(output.attachRequestId).toBe('live-retention-queued-attach')
     }
+
+    broker.close()
+  })
+
+  it('retags returned live fragments when retention loss rotates stream identity before enqueue', async () => {
+    const registry = new FakeBrokerRegistry()
+    registry.setReplayRingMaxBytes(64 * 1024)
+    const broker = new TerminalStreamBroker(registry as any, vi.fn())
+    registry.createTerminal('term-live-retention-fragments')
+
+    const ws = createMockWs()
+    await broker.attach(ws as any, 'term-live-retention-fragments', 'viewport_hydrate', 80, 24, 0, 'live-retention-fragments-attach')
+    const ready = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+      .find((payload) => payload?.type === 'terminal.attach.ready')
+    expect(ready?.streamId).toEqual(expect.any(String))
+    ws.send.mockClear()
+
+    registry.emit('terminal.output.raw', {
+      terminalId: 'term-live-retention-fragments',
+      data: 'x'.repeat(200 * 1024),
+      at: Date.now(),
+    })
+    for (let i = 0; i < 100; i += 1) {
+      vi.advanceTimersByTime(1)
+    }
+
+    const payloads = ws.send.mock.calls
+      .map(([raw]) => (typeof raw === 'string' ? JSON.parse(raw) : raw))
+    const streamChanges = payloads.filter((payload) =>
+      payload?.type === 'terminal.stream.changed' && payload.reason === 'retention_lost'
+    )
+    const outputs = payloads.filter((payload) => payload?.type === 'terminal.output')
+    const finalStreamId = streamChanges.at(-1)?.streamId
+
+    expect(streamChanges.length).toBeGreaterThan(0)
+    expect(finalStreamId).toEqual(expect.any(String))
+    expect(finalStreamId).not.toBe(ready.streamId)
+    expect(outputs.length).toBeGreaterThan(0)
+    expect(outputs.every((payload) => payload.streamId === finalStreamId)).toBe(true)
+    expect(outputs.every((payload) => payload.streamId !== ready.streamId)).toBe(true)
+    expect(outputs.map((payload) => payload.data).join('')).toHaveLength(200 * 1024)
 
     broker.close()
   })
@@ -1889,6 +1979,7 @@ describe('TerminalStreamBroker catastrophic bufferedAmount handling', () => {
     await broker.attach(wsSeed as any, 'term-overflow', 'viewport_hydrate', 80, 24, 0)
     registry.emit('terminal.output.raw', { terminalId: 'term-overflow', data: 'seed-1', at: Date.now() })
     registry.emit('terminal.output.raw', { terminalId: 'term-overflow', data: 'seed-2', at: Date.now() })
+    broker.detach('term-overflow', wsSeed as any)
 
     const wsReplay = createMockWs()
     await broker.attach(wsReplay as any, 'term-overflow', 'viewport_hydrate', 80, 24, 1)
