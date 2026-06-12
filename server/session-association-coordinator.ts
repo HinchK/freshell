@@ -27,6 +27,7 @@ export type SessionAssociationResult = {
     | 'missing_cwd'
     | 'subagent'
     | 'non_interactive'
+    | 'ambiguous_terminal_candidates'
 }
 
 export class SessionAssociationCoordinator {
@@ -62,8 +63,13 @@ export class SessionAssociationCoordinator {
     const unassociated = this.registry.findUnassociatedTerminals(session.provider, cwd)
     if (unassociated.length === 0) return { associated: false }
 
-    const term = unassociated.find((candidate) => session.lastActivityAt >= candidate.createdAt - this.maxAssociationAgeMs)
-    if (!term) return { associated: false }
+    const eligible = unassociated.filter((candidate) => (
+      session.lastActivityAt >= candidate.createdAt - this.maxAssociationAgeMs
+    ))
+    if (eligible.length === 0) return { associated: false }
+    if (eligible.length > 1) return { associated: false, reason: 'ambiguous_terminal_candidates' }
+
+    const term = eligible[0]
 
     const bound = this.registry.bindSession(term.terminalId, session.provider, session.sessionId, 'association')
     if (!bound.ok) return { associated: false }

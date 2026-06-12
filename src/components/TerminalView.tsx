@@ -3587,6 +3587,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             currentResumeSessionId: contentRef.current?.resumeSessionId,
           })
           const createdSessionRef = (msg as { sessionRef?: TerminalPaneContent['sessionRef'] }).sessionRef
+          const createdCwd = typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined
           const createdSessionUpdates = buildSessionAssociationContentUpdates(contentRef.current, createdSessionRef)
           terminalIdRef.current = newId
           updateContent({
@@ -3594,6 +3595,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             serverInstanceId: serverInstanceIdRef.current,
             streamId: undefined,
             status: 'running',
+            ...(createdCwd && !contentRef.current?.initialCwd ? { initialCwd: createdCwd } : {}),
             ...(createdSessionUpdates ?? {}),
             ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
             ...(msg.restoreError ? { restoreError: msg.restoreError } : {}),

@@ -65,6 +65,7 @@ const perfConfig = getPerfConfig()
 // 'shell' is the only built-in; all CLI modes come from registered extensions.
 export type TerminalMode = 'shell' | (string & {})
 export type ShellType = 'system' | 'cmd' | 'powershell' | 'wsl'
+export type ProviderLaunchIntent = 'start' | 'resume'
 
 export type CodingCliCommandSpec = {
   label: string
@@ -73,6 +74,7 @@ export type CodingCliCommandSpec = {
   args?: string[]
   env?: Record<string, string>
   resumeArgs?: (sessionId: string) => string[]
+  createSessionArgs?: (sessionId: string) => string[]
   modelArgs?: (model: string) => string[]
   sandboxArgs?: (sandbox: string) => string[]
   permissionModeArgs?: (permissionMode: string) => string[]
@@ -86,6 +88,7 @@ const FALLBACK_CODING_CLI_COMMAND_SPECS: Array<[string, CodingCliCommandSpec]> =
     envVar: 'CLAUDE_CMD',
     defaultCommand: 'claude',
     resumeArgs: (sessionId: string) => ['--resume', sessionId],
+    createSessionArgs: (sessionId: string) => ['--session-id', sessionId],
     permissionModeArgs: (permissionMode: string) => ['--permission-mode', permissionMode],
   }],
   ['codex', {
@@ -267,6 +270,7 @@ function resolveCodingCliCommand(
   providerSettings?: ProviderSettings,
   terminalId?: string,
   cwd?: string,
+  launchIntent: ProviderLaunchIntent = 'resume',
 ) {
   if (mode === 'shell') return null
   const spec = codingCliCommands.get(mode)
@@ -295,7 +299,12 @@ function resolveCodingCliCommand(
   }
   let resumeArgs: string[] = []
   if (resumeSessionId) {
-    if (spec.resumeArgs) {
+    if (launchIntent === 'start') {
+      if (!spec.createSessionArgs) {
+        throw new Error(`Fresh ${spec.label} launch requires createSessionArgs support.`)
+      }
+      resumeArgs = spec.createSessionArgs(resumeSessionId)
+    } else if (spec.resumeArgs) {
       resumeArgs = spec.resumeArgs(resumeSessionId)
     } else {
       logger.warn({ mode, resumeSessionId }, 'Resume requested but no resume args configured')
@@ -380,9 +389,29 @@ function normalizeResumeForBinding(mode: TerminalMode, resumeSessionId?: string)
   return undefined
 }
 
-function matchesScopedSession(mode: TerminalMode, term: TerminalRecord, sessionId: string, _cwd?: string): boolean {
-  return term.mode === mode
+function isCwdScopedSessionMode(mode: TerminalMode): boolean {
+  return mode === 'claude'
+}
+
+function normalizeSessionCwd(cwd: string): string {
+  const normalized = cwd.replace(/\\/g, '/').replace(/\/+$/, '')
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+function isScopedOwnerCwdMismatch(mode: TerminalMode, term: TerminalRecord, sessionId: string, cwd?: string): boolean {
+  return isCwdScopedSessionMode(mode)
+    && !!cwd
+    && term.mode === mode
+    && term.status === 'running'
     && term.resumeSessionId === sessionId
+    && (!term.cwd || normalizeSessionCwd(term.cwd) !== normalizeSessionCwd(cwd))
+}
+
+function matchesScopedSession(mode: TerminalMode, term: TerminalRecord, sessionId: string, cwd?: string): boolean {
+  if (term.mode !== mode || term.resumeSessionId !== sessionId) return false
+  if (!isCwdScopedSessionMode(mode) || !cwd) return true
+  if (!term.cwd) return false
+  return normalizeSessionCwd(term.cwd) === normalizeSessionCwd(cwd)
 }
 
 function getModeLabel(mode: TerminalMode): string {
@@ -852,6 +881,7 @@ export function buildSpawnSpec(
   providerSettings?: ProviderSettings,
   envOverrides?: Record<string, string>,
   terminalId?: string,
+  launchIntent: ProviderLaunchIntent = 'resume',
 ) {
   // Reject modes that aren't the built-in shell or a registered coding CLI.
   // Otherwise the fallbacks below (`cli?.command || mode`, and the WSL bash
@@ -949,7 +979,7 @@ export function buildSpawnSpec(
 
       // The coding CLI runs inside WSL, so its launch target stays Unix, but any
       // host-side MCP file writes must use the server host's native cwd.
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, wslMcpCwd)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, wslMcpCwd, launchIntent)
       if (!cli) {
         args.push('--exec', 'bash', '-l')
         return { file: wsl, args, cwd: undefined, mcpCwd: wslMcpCwd, env }
@@ -988,7 +1018,7 @@ export function buildSpawnSpec(
       }
       // Pass the host-resolved cwd for MCP injection.
       const cmdMcpCwd = resolveMcpCwd(cwd)
-      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, cmdMcpCwd)
+      const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, cmdMcpCwd, launchIntent)
       const cmd = cli?.command || mode
       const command = buildCmdCommand(cmd, cli?.args || [])
       const cd = winCwd ? `cd /d ${quoteCmdArg(winCwd)} && ` : ''
@@ -1021,7 +1051,7 @@ export function buildSpawnSpec(
 
     // Pass the host-resolved cwd for MCP injection.
     const psMcpCwd = resolveMcpCwd(cwd)
-    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, psMcpCwd)
+    const cli = resolveCodingCliCommand(mode, normalizedResume, 'windows', providerSettings, terminalId, psMcpCwd, launchIntent)
     const cmd = cli?.command || mode
     const invocation = buildPowerShellCommand(cmd, cli?.args || [])
     const cd = winCwd ? `Set-Location -LiteralPath ${quotePowerShellLiteral(winCwd)}; ` : ''
@@ -1046,7 +1076,7 @@ export function buildSpawnSpec(
   // (via providerNotificationArgs → generateMcpInjection) receives a valid
   // Linux path. On WSL, raw cwd could be a Windows-style path (e.g. D:\project)
   // which would fail existsSync checks in config-writer.ts.
-  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, unixCwd)
+  const cli = resolveCodingCliCommand(mode, normalizedResume, 'unix', providerSettings, terminalId, unixCwd, launchIntent)
   const cmd = cli?.command || mode
   const args = cli?.args || []
   return { file: cmd, args, cwd: unixCwd, mcpCwd: unixCwd, env: cli ? { ...env, ...cli.env } : env }
@@ -1341,6 +1371,8 @@ export class TerminalRegistry extends EventEmitter {
     const resumeForBinding = normalizeResumeForBinding(opts.mode, opts.resumeSessionId)
     const shell = opts.shell || 'system'
     const baseEnv = this.buildTerminalBaseEnv(terminalId, opts.envContext)
+    const launchIntent: ProviderLaunchIntent =
+      opts.mode === 'claude' && opts.sessionBindingReason === 'start' ? 'start' : 'resume'
 
     const { file, args, env, cwd: procCwd, mcpCwd } = buildSpawnSpec(
       opts.mode,
@@ -1350,6 +1382,7 @@ export class TerminalRegistry extends EventEmitter {
       opts.providerSettings,
       baseEnv,
       terminalId,
+      launchIntent,
     )
 
     const endSpawnTimer = startPerfTimer(
@@ -3568,7 +3601,7 @@ export class TerminalRegistry extends EventEmitter {
 
   /**
    * Find provider-mode terminals that match a session by exact resumeSessionId.
-   * Providers with cwd-scoped session IDs (such as Kimi) also filter by cwd
+   * Providers with cwd-scoped session IDs (such as Claude) also filter by cwd
    * when one is supplied.
    */
   findTerminalsBySession(mode: TerminalMode, sessionId: string, cwd?: string): TerminalRecord[] {
@@ -3592,6 +3625,9 @@ export class TerminalRegistry extends EventEmitter {
         if (rec && rec.status === 'running' && matchesScopedSession(mode, rec, sessionId, cwd)) {
           return rec
         }
+        if (rec && isScopedOwnerCwdMismatch(mode, rec, sessionId, cwd)) {
+          return undefined
+        }
         this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId, cwd })
       }
     }
@@ -3608,6 +3644,9 @@ export class TerminalRegistry extends EventEmitter {
       const rec = this.terminals.get(owner)
       if (rec && rec.status === 'running' && matchesScopedSession(mode, rec, sessionId, cwd)) {
         return rec
+      }
+      if (rec && isScopedOwnerCwdMismatch(mode, rec, sessionId, cwd)) {
+        return undefined
       }
       this.releaseBinding(owner, 'stale_owner', { provider: mode as CodingCliProviderName, sessionId, cwd })
     }

@@ -1436,6 +1436,42 @@ describe('buildSpawnSpec Unix paths', () => {
       expect(spec.args.slice(-2)).toEqual(['--resume', VALID_CLAUDE_SESSION_ID])
     })
 
+    it('uses --session-id for a fresh Claude start with a preallocated UUID', () => {
+      delete process.env.CLAUDE_CMD
+
+      const spec = buildSpawnSpec(
+        'claude',
+        '/home/user/project',
+        'system',
+        VALID_CLAUDE_SESSION_ID,
+        undefined,
+        undefined,
+        undefined,
+        'start',
+      )
+
+      expect(spec.args).toContain('--session-id')
+      expect(spec.args).toContain(VALID_CLAUDE_SESSION_ID)
+      expect(spec.args).not.toContain('--resume')
+      expectClaudeMcpArgs(spec.args)
+      expect(spec.args.slice(-2)).toEqual(['--session-id', VALID_CLAUDE_SESSION_ID])
+    })
+
+    it('fails clearly when a fresh provider start lacks createSessionArgs support', () => {
+      expect(() =>
+        buildSpawnSpec(
+          'codex',
+          '/home/user/project',
+          'system',
+          VALID_CLAUDE_SESSION_ID,
+          undefined,
+          undefined,
+          undefined,
+          'start',
+        ),
+      ).toThrow('Fresh Codex CLI launch requires createSessionArgs support.')
+    })
+
     it('includes proper env vars in claude mode on Linux', () => {
       delete process.env.TERM
       delete process.env.COLORTERM
@@ -2063,6 +2099,32 @@ describe('TerminalRegistry', () => {
       expect(record.mode).toBe('claude')
     })
 
+    it('binds a fresh Claude start immediately and exposes its sessionRef', async () => {
+      const record = registry.create({
+        mode: 'claude',
+        cwd: '/home/user/project',
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        sessionBindingReason: 'start',
+      })
+
+      const pty = await import('node-pty')
+      const spawnCall = vi.mocked(pty.spawn).mock.calls.at(-1)
+      expect(spawnCall?.[0]).toBe('claude')
+      expect(spawnCall?.[1]).toContain('--session-id')
+      expect(spawnCall?.[1]).toContain(VALID_CLAUDE_SESSION_ID)
+      expect(spawnCall?.[1]).not.toContain('--resume')
+
+      expect(record.resumeSessionId).toBe(VALID_CLAUDE_SESSION_ID)
+      expect(registry.isSessionBound('claude', VALID_CLAUDE_SESSION_ID)).toBe(true)
+      expect(registry.list()[0]).toMatchObject({
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        sessionRef: {
+          provider: 'claude',
+          sessionId: VALID_CLAUDE_SESSION_ID,
+        },
+      })
+    })
+
     it('leaves resumeSessionId undefined when not provided', () => {
       const record = registry.create({
         mode: 'claude',
@@ -2273,7 +2335,7 @@ describe('TerminalRegistry', () => {
     })
   })
 
-  describe('findTerminalsBySession() ignores cwd parameter', () => {
+  describe('findTerminalsBySession() cwd-scoped providers', () => {
     it('does not match by cwd, only by resumeSessionId', () => {
       registry.create({
         mode: 'claude',
@@ -2287,18 +2349,29 @@ describe('TerminalRegistry', () => {
       expect(found).toHaveLength(0)
     })
 
-    it('finds terminal by exact resumeSessionId ignoring cwd', () => {
+    it('does not return a Claude session from a different cwd when cwd is supplied', () => {
       const record = registry.create({
         mode: 'claude',
         cwd: '/home/user/project-a',
         resumeSessionId: VALID_CLAUDE_SESSION_ID,
       })
 
-      // cwd differs but sessionId matches - should find terminal
       const found = registry.findTerminalsBySession('claude', VALID_CLAUDE_SESSION_ID, '/home/user/different')
 
-      expect(found).toHaveLength(1)
-      expect(found[0].terminalId).toBe(record.terminalId)
+      expect(found).toHaveLength(0)
+      expect(registry.findTerminalsBySession('claude', VALID_CLAUDE_SESSION_ID)).toHaveLength(1)
+      expect(registry.findTerminalsBySession('claude', VALID_CLAUDE_SESSION_ID)[0].terminalId).toBe(record.terminalId)
+    })
+
+    it('does not reuse a canonical Claude owner from a different cwd when cwd is supplied', () => {
+      const record = registry.create({
+        mode: 'claude',
+        cwd: '/home/user/project-a',
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+      })
+
+      expect(registry.getCanonicalRunningTerminalBySession('claude', VALID_CLAUDE_SESSION_ID, '/home/user/project-b')).toBeUndefined()
+      expect(registry.getSessionOwner('claude', VALID_CLAUDE_SESSION_ID)).toBe(record.terminalId)
     })
   })
 

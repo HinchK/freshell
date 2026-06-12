@@ -434,6 +434,7 @@ type ClientState = {
   supportsTerminalOutputBatchV1: boolean
   attachedTerminalIds: Set<string>
   createdByRequestId: Map<string, string>
+  claudeFreshSessionIdByRequestId: Map<string, string>
   terminalCreateTimestamps: number[]
   codingCliSessions: Set<string>
   codingCliSubscriptions: Map<string, () => void>
@@ -872,6 +873,14 @@ export class WsHandler {
     return `request:${requestId}`
   }
 
+  private reserveClaudeFreshSessionId(state: ClientState, requestId: string): string {
+    const existing = state.claudeFreshSessionIdByRequestId.get(requestId)
+    if (existing) return existing
+    const next = randomUUID()
+    state.claudeFreshSessionIdByRequestId.set(requestId, next)
+    return next
+  }
+
   private withTerminalCreateLock(key: string, task: () => Promise<void>): Promise<void> {
     const previous = this.terminalCreateLocks.get(key) ?? Promise.resolve()
 
@@ -1236,6 +1245,7 @@ export class WsHandler {
       supportsTerminalOutputBatchV1: false,
       attachedTerminalIds: new Set(),
       createdByRequestId: new Map(),
+      claudeFreshSessionIdByRequestId: new Map(),
       terminalCreateTimestamps: [],
       codingCliSessions: new Set(),
       codingCliSubscriptions: new Map(),
@@ -2272,6 +2282,7 @@ export class WsHandler {
           })
           : undefined
         let effectiveResumeSessionId: string | undefined
+        let sessionBindingReason: 'start' | 'resume' | undefined
         if (codexRestorePlan?.kind === 'durable_session_ref_resume') {
           effectiveResumeSessionId = codexRestorePlan.sessionId
         } else if (m.mode !== 'codex') {
@@ -2281,6 +2292,27 @@ export class WsHandler {
         }
         if (m.mode !== 'codex' && !effectiveResumeSessionId && requestedSessionRef && requestedSessionRef.provider === m.mode) {
           effectiveResumeSessionId = requestedSessionRef.sessionId
+        }
+        const shouldPreallocateFreshClaudeSession =
+          m.mode === 'claude'
+          && m.restore !== true
+          && !requestedSessionRef
+          && !m.resumeSessionId
+          && !m.recoveryIntent
+        if (shouldPreallocateFreshClaudeSession) {
+          effectiveResumeSessionId = this.reserveClaudeFreshSessionId(state, m.requestId)
+          sessionBindingReason = 'start'
+          recordSessionLifecycleEvent({
+            kind: 'claude_fresh_session_preallocated',
+            requestId: m.requestId,
+            connectionId: ws.connectionId || 'unknown',
+            sessionId: effectiveResumeSessionId,
+            ...(m.tabId ? { tabId: m.tabId } : {}),
+            ...(m.paneId ? { paneId: m.paneId } : {}),
+            ...(m.cwd ? { cwd: m.cwd } : {}),
+          })
+        } else if (effectiveResumeSessionId && m.mode === 'claude') {
+          sessionBindingReason = 'resume'
         }
         if (codexRestorePlan?.kind === 'reject_invalid_raw_codex_resume_request') {
           error = true
@@ -2373,6 +2405,7 @@ export class WsHandler {
                   requestId: opts.requestId,
                   terminalId: opts.record.terminalId,
                   createdAt: opts.record.createdAt,
+                  ...(opts.record.cwd ? { cwd: opts.record.cwd } : {}),
                   ...(sessionRef ? { sessionRef } : {}),
                   ...(opts.clearCodexDurability ? { clearCodexDurability: true } : {}),
                   ...(opts.restoreError ? { restoreError: opts.restoreError } : {}),
@@ -2609,15 +2642,18 @@ export class WsHandler {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
                   effectiveResumeSessionId,
+                  m.cwd,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                 }
                 if (existing) {
@@ -2673,15 +2709,18 @@ export class WsHandler {
                 let existing = this.registry.getCanonicalRunningTerminalBySession(
                   m.mode as TerminalMode,
                   effectiveResumeSessionId,
+                  m.cwd,
                 )
                 if (!existing) {
                   this.registry.repairLegacySessionOwners(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                   existing = this.registry.getCanonicalRunningTerminalBySession(
                     m.mode as TerminalMode,
                     effectiveResumeSessionId,
+                    m.cwd,
                   )
                 }
                 if (existing) {
@@ -2697,7 +2736,13 @@ export class WsHandler {
               // Session repair is Claude-specific (uses JSONL session files).
               // Other providers (codex, opencode, etc.) don't use the same file
               // structure, so this block correctly remains gated on mode === 'claude'.
-              if (m.mode === 'claude' && effectiveResumeSessionId && isValidClaudeSessionId(effectiveResumeSessionId) && this.sessionRepairService) {
+              if (
+                m.mode === 'claude'
+                && sessionBindingReason !== 'start'
+                && effectiveResumeSessionId
+                && isValidClaudeSessionId(effectiveResumeSessionId)
+                && this.sessionRepairService
+              ) {
                 const sessionId = effectiveResumeSessionId
                 const cached = this.sessionRepairService.getResult(sessionId)
                 if (cached?.status === 'missing') {
@@ -2800,16 +2845,15 @@ export class WsHandler {
               )
 
               this.assertTerminalCreateAccepted()
+              const terminalSessionBindingReason = codexPlan
+                ? getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId)
+                : sessionBindingReason
               const record = this.registry.create({
                 mode: m.mode as TerminalMode,
                 shell: m.shell as 'system' | 'cmd' | 'powershell' | 'wsl',
                 cwd: m.cwd,
                 resumeSessionId: effectiveResumeSessionId,
-                ...(codexPlan
-                  ? {
-                      sessionBindingReason: getCodexSessionBindingReason(m.mode, requestedCodexResumeSessionId),
-                    }
-                  : {}),
+                ...(terminalSessionBindingReason ? { sessionBindingReason: terminalSessionBindingReason } : {}),
                 envContext: { tabId: m.tabId, paneId: m.paneId },
                 providerSettings: spawnProviderSettings,
               })

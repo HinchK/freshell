@@ -53,6 +53,7 @@ const CliConfigSchema = z.strictObject({
   env: z.record(z.string(), z.string()).optional(),
   envVar: z.string().optional(),              // env var to override command (e.g., 'CLAUDE_CMD')
   resumeArgs: z.array(z.string()).optional(), // template with {{sessionId}} placeholder
+  createSessionArgs: z.array(z.string()).optional(), // template with {{sessionId}} placeholder for fresh session identity
   modelArgs: z.array(z.string()).optional(),  // template with {{model}} placeholder
   sandboxArgs: z.array(z.string()).optional(), // template with {{sandbox}} placeholder
   permissionModeArgs: z.array(z.string()).optional(), // template with {{permissionMode}} placeholder

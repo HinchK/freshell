@@ -653,6 +653,7 @@ export type TerminalCreatedMessage = {
   requestId: string
   terminalId: string
   createdAt: number
+  cwd?: string
   sessionRef?: SessionLocator
   clearCodexDurability?: boolean
   restoreError?: RestoreError

@@ -1260,9 +1260,18 @@ export async function findClaudeTranscript(
   sessionId: string,
 ): Promise<string> {
   return waitFor(`Claude transcript ${sessionId}`, async () => {
-    const files = await listFilesRecursive(workspace.inTemp('.claude', 'projects'))
-    return files.find((filePath) => filePath.endsWith(`${sessionId}.jsonl`))
+    return (await findClaudeTranscripts(workspace, sessionId))[0]
   }, 30_000, 200)
+}
+
+export async function findClaudeTranscripts(
+  workspace: ProbeWorkspace,
+  sessionId: string,
+): Promise<string[]> {
+  const files = await listFilesRecursive(workspace.inTemp('.claude', 'projects'))
+  return files
+    .filter((filePath) => filePath.endsWith(`${sessionId}.jsonl`))
+    .sort()
 }
 
 export async function readClaudeTranscriptLines(transcriptPath: string): Promise<string[]> {
