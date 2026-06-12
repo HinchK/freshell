@@ -2553,7 +2553,7 @@ describe('FreshAgentView', () => {
   })
 })
 
-describe('FreshAgentView font scale', () => {
+describe('FreshAgentView transcript font size', () => {
   const freshClaudePane = {
     kind: 'fresh-agent',
     sessionType: 'freshclaude',
@@ -2563,7 +2563,7 @@ describe('FreshAgentView font scale', () => {
     status: 'connected',
   } as const
 
-  it('applies the default 50%-larger font scale to the fresh-agent pane root', async () => {
+  it('inherits the default terminal font size without transforming pane geometry', async () => {
     const store = createStore()
     render(
       <Provider store={store}>
@@ -2573,15 +2573,17 @@ describe('FreshAgentView font scale', () => {
 
     const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
     expect(root).toBeTruthy()
-    expect(root.style.getPropertyValue('--fresh-font-scale')).toBe('1.5')
-    expect(root.querySelector('.fresh-agent-scaled-content')).toBeTruthy()
+    expect(root.style.getPropertyValue('--fresh-transcript-font-size')).toBe('16px')
+    expect(root.style.getPropertyValue('--fresh-font-scale')).toBe('')
+    expect(root.querySelector('.fresh-agent-layout')).toBeTruthy()
+    expect(root.querySelector('.fresh-agent-scaled-content')).toBeNull()
 
     await act(async () => {
       await Promise.resolve()
     })
   })
 
-  it('updates the fresh-agent pane font scale live when the setting changes', async () => {
+  it('updates the transcript font size live when the terminal font size changes', async () => {
     const store = createStore()
     render(
       <Provider store={store}>
@@ -2590,15 +2592,14 @@ describe('FreshAgentView font scale', () => {
     )
 
     const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
-    expect(root.style.getPropertyValue('--fresh-font-scale')).toBe('1.5')
+    expect(root.style.getPropertyValue('--fresh-transcript-font-size')).toBe('16px')
 
     await act(async () => {
       store.dispatch(updateSettingsLocal({
-        freshAgent: { fontScale: 1.25 },
-        agentChat: { fontScale: 1.25 },
+        terminal: { fontSize: 20 },
       }))
     })
 
-    expect(root.style.getPropertyValue('--fresh-font-scale')).toBe('1.25')
+    expect(root.style.getPropertyValue('--fresh-transcript-font-size')).toBe('20px')
   })
 })

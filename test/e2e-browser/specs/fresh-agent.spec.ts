@@ -255,7 +255,7 @@ test.describe('Fresh Agent', () => {
     })
   })
 
-  test('renders the fresh-agent pane at the configured font scale without clipping the composer', async ({ freshellPage, page, harness, terminal }) => {
+  test('renders the fresh-agent transcript at the terminal font size without clipping the composer', async ({ freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     const { tabId, paneId } = await getActiveLeaf(harness)
     const sessionId = '44444444-4444-4444-8444-444444444444'
@@ -272,13 +272,19 @@ test.describe('Fresh Agent', () => {
           revision: 1,
           latestTurnId: null,
           status: 'idle',
-          summary: 'Scaled summary line',
+          summary: 'Terminal-sized summary line',
           capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: false },
           settings: { model: 'claude-opus-4-6', permissionMode: 'default', plugins: [] },
           tokenUsage: { inputTokens: 10, outputTokens: 20, totalTokens: 30, costUsd: 0 },
           pendingApprovals: [],
           pendingQuestions: [],
-          turns: [],
+          turns: [{
+            id: 'turn-scaled',
+            turnId: 'turn-scaled',
+            role: 'assistant',
+            summary: 'Terminal-sized transcript line',
+            items: [{ id: 'item-scaled', kind: 'text', text: 'Terminal-sized transcript line' }],
+          }],
           extensions: {
             claude: {
               liveSessionId: sessionId,
@@ -299,7 +305,7 @@ test.describe('Fresh Agent', () => {
             kind: 'fresh-agent',
             sessionType: 'freshclaude',
             provider: 'claude',
-            createRequestId: 'req-e2e-fontscale',
+            createRequestId: 'req-e2e-terminal-font-size',
             sessionId: currentSessionId,
             sessionRef: { provider: 'claude', sessionId: currentSessionId },
             resumeSessionId: currentSessionId,
@@ -313,41 +319,58 @@ test.describe('Fresh Agent', () => {
     const paneRoot = page.locator('[data-context="fresh-agent"]')
     await expect(paneRoot).toBeVisible({ timeout: 10_000 })
 
-    const readScale = () =>
-      paneRoot.evaluate((el) => getComputedStyle(el).getPropertyValue('--fresh-font-scale').trim())
+    const readTranscriptFontSize = () =>
+      paneRoot.evaluate((el) => getComputedStyle(el).getPropertyValue('--fresh-transcript-font-size').trim())
 
-    // The fresh-agent panes default to 150% (the +50% larger default).
-    expect(await readScale()).toBe('1.5')
+    expect(await readTranscriptFontSize()).toBe('16px')
 
-    const textLine = page.getByText('Scaled summary line')
+    const textLine = paneRoot
+      .locator('article[aria-label="Assistant transcript turn"] p')
+      .filter({ hasText: 'Terminal-sized transcript line' })
+      .first()
     await expect(textLine).toBeVisible()
-    const heightAt150 = (await textLine.boundingBox())!.height
+    const readPositiveTextHeight = async () => {
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        const height = await textLine
+          .evaluate((el) => el.getBoundingClientRect().height)
+          .catch(() => 0)
+        if (height > 0) return height
+        await page.waitForTimeout(50)
+      }
+      throw new Error('Terminal-sized transcript line did not have a measurable height')
+    }
+    const heightAt16 = await readPositiveTextHeight()
 
-    // No clipping: the composer textarea stays within the pane at the larger scale.
+    // No clipping or hidden geometry growth: the composer textarea and responsive
+    // layout stay within the pane when transcript text follows terminal sizing.
     const composer = paneRoot.locator('textarea').first()
     await expect(composer).toBeVisible()
-    const scaledContent = paneRoot.locator('.fresh-agent-scaled-content')
-    await expect(scaledContent).toBeVisible()
+    const layout = paneRoot.locator('.fresh-agent-layout')
+    await expect(layout).toBeVisible()
     const paneBox = (await paneRoot.boundingBox())!
-    const scaledBox = (await scaledContent.boundingBox())!
-    expect(scaledBox.width).toBeGreaterThanOrEqual(paneBox.width - 2)
-    expect(scaledBox.height).toBeGreaterThanOrEqual(paneBox.height - 2)
+    const layoutBox = (await layout.boundingBox())!
+    expect(layoutBox.width).toBeLessThanOrEqual(paneBox.width + 2)
+    expect(layoutBox.height).toBeLessThanOrEqual(paneBox.height + 2)
     const composerBox = (await composer.boundingBox())!
     expect(composerBox.y + composerBox.height).toBeLessThanOrEqual(paneBox.y + paneBox.height + 2)
+    await expect.poll(async () => paneRoot.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1)
+    const transcript = paneRoot.locator('[data-context="fresh-agent-transcript"]')
+    await expect.poll(async () => transcript.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1)
 
-    // Shrinking the setting to 100% scales the rendered transcript down ~1.5x.
+    // Changing the terminal font size updates the transcript size. The legacy
+    // freshAgent.fontScale setting no longer drives Fresh Agent body text.
     await page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
         type: 'settings/updateSettingsLocal',
-        payload: { freshAgent: { fontScale: 1 }, agentChat: { fontScale: 1 } },
+        payload: { terminal: { fontSize: 20 }, freshAgent: { fontScale: 2 }, agentChat: { fontScale: 2 } },
       })
     })
-    await expect.poll(readScale).toBe('1')
-    const heightAt100 = (await textLine.boundingBox())!.height
+    await expect.poll(readTranscriptFontSize).toBe('20px')
+    const heightAt20 = await readPositiveTextHeight()
 
-    const ratio = heightAt150 / heightAt100
-    expect(ratio).toBeGreaterThan(1.35)
-    expect(ratio).toBeLessThan(1.65)
+    const ratio = heightAt20 / heightAt16
+    expect(ratio).toBeGreaterThan(1.15)
+    expect(ratio).toBeLessThan(1.35)
   })
 
   test('browser user can create and resume Freshcodex with worktree, review, and fork metadata in the shared pane', async ({ freshellPage, page, harness, terminal, serverInfo }) => {
@@ -399,7 +422,8 @@ test.describe('Fresh Agent', () => {
     }, activePaneId)
     await page.getByRole('button', { name: /^Freshcodex$/i }).click()
     await page.getByRole('option').first().click()
-    await expect(page.getByRole('group', { name: /pane: freshcodex/i }).last()).toBeVisible()
+    await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible()
+    await expect(page.getByText('Freshcodex', { exact: true })).toBeVisible()
 
     await page.evaluate(({ currentTabId, currentPaneId }) => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
