@@ -238,7 +238,7 @@ describe('fresh-agent extras router', () => {
         .post('/api/fresh-agent/checkpoints/restore')
         .send({ cwd: dir, id: first.body.id })
         .expect(200)
-      expect(await fsp.readFile(file, 'utf8')).toBe('version one\n')
+      expect((await fsp.readFile(file, 'utf8')).replace(/\r\n/g, '\n')).toBe('version one\n')
       // The cwd itself never became a git repo.
       await expect(fsp.access(path.join(dir, '.git'))).rejects.toThrow()
     })
