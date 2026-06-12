@@ -1751,7 +1751,7 @@ describe('PaneContainer', () => {
           expect(paneContent.provider).toBe('codex')
           expect(paneContent.initialCwd).toBe('/home/user/freshcodex-project')
           expect(paneContent.model).toBe('gpt-5.5')
-          expect(paneContent.effort).toBe('xhigh')
+          expect(paneContent.effort).toBe('max')
         }
       })
 

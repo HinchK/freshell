@@ -13,7 +13,8 @@ export type FreshAgentModelOption = {
 }
 
 export const FRESHCODEX_DEFAULT_MODEL = 'gpt-5.5'
-export const FRESHCODEX_DEFAULT_EFFORT = 'xhigh'
+export const FRESHCODEX_DEFAULT_EFFORT = 'max'
+export const FRESHCLAUDE_DEFAULT_EFFORT = 'high'
 export const FRESHOPENCODE_DEFAULT_MODEL = 'opencode-go/deepseek-v4-flash'
 export const FRESHOPENCODE_DEFAULT_EFFORT = 'max'
 
@@ -22,15 +23,15 @@ export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
     {
       value: 'claude-opus-4-6',
       label: 'Claude Opus 4.6',
-      thinkingEfforts: ['low', 'medium', 'high', 'max'],
-      defaultEffort: 'max',
+      thinkingEfforts: ['low', 'medium', 'high'],
+      defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     },
   ],
   freshcodex: [
     {
       value: FRESHCODEX_DEFAULT_MODEL,
       label: 'GPT-5.5',
-      thinkingEfforts: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'],
+      thinkingEfforts: ['none', 'minimal', 'low', 'medium', 'high', 'max'],
       defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
     },
     {
@@ -42,7 +43,7 @@ export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
     {
       value: 'gpt-5.3-codex-spark',
       label: 'GPT-5.3 Codex Spark',
-      thinkingEfforts: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'],
+      thinkingEfforts: ['none', 'minimal', 'low', 'medium', 'high', 'max'],
       defaultEffort: FRESHCODEX_DEFAULT_EFFORT,
     },
   ],
@@ -50,8 +51,8 @@ export const FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE = {
     {
       value: 'claude-opus-4-6',
       label: 'Claude Opus 4.6',
-      thinkingEfforts: ['low', 'medium', 'high', 'max'],
-      defaultEffort: 'max',
+      thinkingEfforts: ['low', 'medium', 'high'],
+      defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     },
   ],
   freshopencode: [
@@ -122,8 +123,9 @@ export function normalizeFreshAgentEffort(
   effort: string | undefined,
 ): string | undefined {
   const options = getFreshAgentThinkingOptions(sessionType, provider, model)
-  if (effort && options.some((option) => option.value === effort)) {
-    return effort
+  const normalizedEffort = provider === 'codex' && effort === 'xhigh' ? 'max' : effort
+  if (normalizedEffort && options.some((option) => option.value === normalizedEffort)) {
+    return normalizedEffort
   }
   const normalizedModel = normalizeFreshAgentModel(sessionType, provider, model)
   const modelOption = resolveFreshAgentModelOption(sessionType, normalizedModel)

@@ -46,8 +46,10 @@ async function suppressFreshAgentNetworkForActivePane(page: any) {
   })
 }
 
-async function openFreshAgentSettings(page: any, paneName: RegExp) {
-  const pane = page.getByRole('group', { name: paneName }).last()
+async function openFreshAgentSettings(page: any, providerName: string) {
+  const pane = page.getByRole('group').filter({
+    has: page.getByText(providerName, { exact: true }),
+  }).last()
   await expect(pane).toBeVisible({ timeout: 10_000 })
 
   const dialog = pane.getByRole('dialog', { name: 'Agent settings' })
@@ -104,15 +106,15 @@ test.describe('Fresh Agent', () => {
     await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
     await page.getByRole('option').first().click()
 
-    const dialog = await openFreshAgentSettings(page, /pane: freshclaude/i)
+    const dialog = await openFreshAgentSettings(page, 'Freshclaude')
     await expect(dialog.getByRole('radio', { name: 'Claude Opus 4.6' })).toBeChecked()
 
     const thinking = dialog.getByRole('combobox', { name: /^Thinking level$/i })
     const thinkingOptions = await thinking.locator('option').evaluateAll(
       (options) => options.map((option) => option.textContent),
     )
-    expect(thinkingOptions).toEqual(['low', 'medium', 'high', 'max'])
-    await expect(thinking).toHaveValue('max')
+    expect(thinkingOptions).toEqual(['low', 'medium', 'high'])
+    await expect(thinking).toHaveValue('high')
 
     await expect.poll(async () => {
       const sent = await harness.getSentWsMessages()
@@ -122,7 +124,7 @@ test.describe('Fresh Agent', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       model: 'claude-opus-4-6',
-      effort: 'max',
+      effort: 'high',
     })
   })
 

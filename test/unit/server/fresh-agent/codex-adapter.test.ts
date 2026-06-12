@@ -547,7 +547,7 @@ describe('Codex fresh-agent adapter', () => {
       cwd: '/repo',
       permissionMode: 'on-request',
       sandbox: 'workspace-write',
-      effort: 'xhigh',
+      effort: 'max',
       model: 'gpt-5.5',
     })
 

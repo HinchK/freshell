@@ -399,7 +399,7 @@ describe('createContentForType with ext: prefix', () => {
         expect(paneContent.plugins).toEqual(['planner', 'sandbox'])
         expect(paneContent.modelSelection).toEqual({ kind: 'tracked', modelId: 'opus[1m]' })
         expect(paneContent.permissionMode).toBe('default')
-        expect(paneContent.effort).toBe('max')
+        expect(paneContent.effort).toBe('high')
       }
     })
   })
