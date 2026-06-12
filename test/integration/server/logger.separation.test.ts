@@ -18,6 +18,7 @@ const REPO_ROOT = path.resolve(__dirname, '../../..')
 const require = createRequire(import.meta.url)
 let TSX_CLI: string | undefined
 const DEFAULT_TEST_TIMEOUT_MS = 120_000
+const FILE_CONTENT_TIMEOUT_MS = process.platform === 'win32' ? 30_000 : 5_000
 const ANSI_ESCAPE_PATTERN = /\u001b\[[0-9;]*m/g
 const SOURCE_LOGGER_PROBE = [
   '(async () => {',
@@ -129,7 +130,7 @@ async function startDistLoggerProcess(env: NodeJS.ProcessEnv) {
   )
 }
 
-async function waitForFileContent(filePath: string, pattern: RegExp, timeoutMs = 5000): Promise<string> {
+async function waitForFileContent(filePath: string, pattern: RegExp, timeoutMs = FILE_CONTENT_TIMEOUT_MS): Promise<string> {
   const deadline = Date.now() + timeoutMs
   let lastContent = ''
 

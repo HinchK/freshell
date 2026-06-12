@@ -1930,6 +1930,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         return false
       }
 
+      if (
+        event.key === 'Escape' &&
+        event.type === 'keydown' &&
+        !event.ctrlKey &&
+        !event.shiftKey &&
+        !event.altKey &&
+        !event.metaKey
+      ) {
+        event.preventDefault()
+        sendInput('\u001b')
+        return false
+      }
+
       const tabSwitchDirection = getTabSwitchShortcutDirection(event)
       if (tabSwitchDirection && event.type === 'keydown' && !event.repeat) {
         event.preventDefault()

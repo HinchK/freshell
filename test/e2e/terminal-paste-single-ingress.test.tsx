@@ -267,4 +267,50 @@ describe('terminal paste single-ingress (e2e)', () => {
       data: 'meta-alt paste payload',
     })
   })
+
+  it('sends plain Escape once as terminal input', async () => {
+    const store = createStore()
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-1',
+      status: 'running',
+      mode: 'shell',
+      shell: 'system',
+      terminalId: 'term-1',
+      initialCwd: '/tmp',
+    }
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId="tab-1" paneId="pane-1" paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(keyHandler).not.toBeNull()
+    })
+
+    wsMocks.send.mockClear()
+    const preventDefault = vi.fn()
+    const blocked = keyHandler!({
+      key: 'Escape',
+      code: 'Escape',
+      ctrlKey: false,
+      metaKey: false,
+      shiftKey: false,
+      altKey: false,
+      type: 'keydown',
+      repeat: false,
+      preventDefault,
+    } as unknown as KeyboardEvent)
+
+    expect(blocked).toBe(false)
+    expect(preventDefault).toHaveBeenCalled()
+    expect(wsMocks.send).toHaveBeenCalledTimes(1)
+    expect(wsMocks.send).toHaveBeenCalledWith({
+      type: 'terminal.input',
+      terminalId: 'term-1',
+      data: '\u001b',
+    })
+  })
 })
