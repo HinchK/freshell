@@ -288,6 +288,7 @@ function createKeyboardEvent(key: string, modifiers: { ctrlKey?: boolean; shiftK
     '[': 'BracketLeft',
     ']': 'BracketRight',
     Insert: 'Insert',
+    Escape: 'Escape',
     ArrowLeft: 'ArrowLeft',
     ArrowRight: 'ArrowRight',
     t: 'KeyT',
@@ -874,6 +875,33 @@ describe('TerminalView keyboard handling', () => {
   })
 
   describe('other keys', () => {
+    it('sends plain Escape directly as terminal input', async () => {
+      const { store, tabId, paneId, paneContent } = createTestStore('term-1')
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>
+      )
+
+      await waitFor(() => {
+        expect(capturedKeyHandler).not.toBeNull()
+      })
+
+      const wsSendCountBefore = wsMocks.send.mock.calls.length
+      const event = createKeyboardEvent('Escape')
+      const result = capturedKeyHandler!(event)
+
+      expect(result).toBe(false)
+      expect(event.preventDefault).toHaveBeenCalled()
+      expect(wsMocks.send).toHaveBeenCalledTimes(wsSendCountBefore + 1)
+      expect(wsMocks.send).toHaveBeenLastCalledWith({
+        type: 'terminal.input',
+        terminalId: 'term-1',
+        data: '\u001b',
+      })
+    })
+
     it('returns true for unhandled keys to let xterm process them', async () => {
       const { store, tabId, paneId, paneContent } = createTestStore('term-1')
 
