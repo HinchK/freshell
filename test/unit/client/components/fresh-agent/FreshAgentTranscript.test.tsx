@@ -241,6 +241,35 @@ describe('FreshAgentTranscript', () => {
     expect(screen.getByText('Thinking')).toBeInTheDocument()
   })
 
+  it('keeps auto-scroll enabled for streamed text when already at the bottom', () => {
+    let scrollHeight = 1000
+    const turns = [{
+      id: 'turn-1',
+      role: 'assistant' as const,
+      summary: 'streaming',
+      items: [{ id: 'item-1', kind: 'text' as const, text: 'first line' }],
+    }]
+    const { container, rerender } = render(<FreshAgentTranscript turns={turns} />)
+    const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => scrollHeight })
+    scroller.scrollTop = 800
+    fireEvent.scroll(scroller)
+
+    scrollHeight = 1200
+    rerender(
+      <FreshAgentTranscript
+        turns={[{
+          ...turns[0],
+          items: [{ id: 'item-1', kind: 'text', text: 'first line\nsecond streamed line' }],
+        }]}
+      />,
+    )
+
+    expect(scroller.scrollTop).toBe(1200)
+  })
+
   it('counts files changed in the settled summary', () => {
     render(
       <FreshAgentTranscript

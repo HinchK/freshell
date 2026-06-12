@@ -404,6 +404,67 @@ describe('createContentForType with ext: prefix', () => {
     })
   })
 
+  it('starts Freshcodex panes with the persisted fresh-agent provider defaults', async () => {
+    const node = createPickerNode('pane-1')
+    const store = createStore(
+      { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
+      [],
+      {
+        codingCli: {
+          enabledProviders: ['codex'],
+          providers: {
+            codex: {
+              model: 'gpt-5.4-mini',
+              permissionMode: 'on-request',
+              cwd: '/workspace/default',
+            },
+          },
+        },
+        freshAgent: {
+          enabled: true,
+          providers: {
+            freshcodex: {
+              modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+              defaultPermissionMode: 'never',
+              effort: 'high',
+            },
+          },
+        },
+      },
+      {
+        status: 'ready',
+        platform: 'linux',
+        availableClis: { codex: true },
+      },
+    )
+
+    render(
+      <Provider store={store}>
+        <PaneContainer tabId="tab-1" node={node} />
+      </Provider>,
+    )
+
+    const container = getPickerContainer()
+    fireEvent.keyDown(container, { key: 'x' })
+    fireEvent.transitionEnd(container)
+
+    const input = await screen.findByLabelText('Starting directory for Freshcodex')
+    fireEvent.change(input, { target: { value: '/workspace/project' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => {
+      const paneContent = (store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>).content
+      expect(paneContent.kind).toBe('fresh-agent')
+      if (paneContent.kind !== 'fresh-agent') return
+      expect(paneContent.sessionType).toBe('freshcodex')
+      expect(paneContent.provider).toBe('codex')
+      expect(paneContent.modelSelection).toEqual({ kind: 'exact', modelId: 'gpt-5.4-flash' })
+      expect(paneContent.model).toBe('gpt-5.4-flash')
+      expect(paneContent.permissionMode).toBe('never')
+      expect(paneContent.effort).toBe('high')
+    })
+  })
+
   it('creates editor content when the editor option is selected', async () => {
     const node = createPickerNode('pane-1')
     const store = createStore(

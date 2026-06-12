@@ -157,6 +157,20 @@ describe('FreshAgentComposer', () => {
     expect(getInput().value).toBe('a draft in progress')
   })
 
+  it('focuses the chat input by default when requested and enabled', async () => {
+    render(<FreshAgentComposer commands={COMMANDS} focusOnReady onSend={vi.fn()} />)
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(getInput())
+    })
+  })
+
+  it('renders the subtle thinking bar while the agent is working', () => {
+    render(<FreshAgentComposer commands={COMMANDS} thinking onSend={vi.fn()} />)
+
+    expect(screen.getByTestId('fresh-agent-thinking-bar')).toBeInTheDocument()
+  })
+
   describe('state-aware disabled behavior', () => {
     it('shows the provided placeholder instead of the generic read-only text', () => {
       render(

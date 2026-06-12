@@ -458,7 +458,26 @@ export function FreshAgentTranscript({
   const [contextMenu, setContextMenu] = useState<FreshAgentTurnContextMenuState>(null)
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
   const coarsePointer = useCoarsePointer()
-  const turnKeys = useMemo(() => turns.map((turn) => turn.id).join('|'), [turns])
+  const transcriptSignature = useMemo(() => (
+    turns.map((turn) => {
+      const itemSignature = turn.items.map((item) => {
+        if (item.kind === 'text' || item.kind === 'thinking') {
+          return `${item.id}:${item.kind}:${item.text.length}`
+        }
+        if (item.kind === 'reasoning') {
+          return `${item.id}:${item.kind}:${item.text?.length ?? 0}:${item.summary.join('\n').length}`
+        }
+        if ('status' in item) {
+          return `${item.id}:${item.kind}:${item.status}`
+        }
+        if (item.kind === 'tool_result') {
+          return `${item.id}:${item.kind}:${item.isError ? 'error' : 'ok'}:${formatJson(item.content).length}`
+        }
+        return `${item.id}:${item.kind}`
+      }).join(',')
+      return `${turn.id}:${turn.summary?.length ?? 0}:${itemSignature}`
+    }).join('|')
+  ), [turns])
 
   const handleTurnContextMenu = useCallback((event: React.MouseEvent, turn: FreshAgentTurn) => {
     setContextMenu({ x: event.clientX, y: event.clientY, turn })
@@ -485,7 +504,7 @@ export function FreshAgentTranscript({
     } else {
       setNewMessages((count) => count + 1)
     }
-  }, [atBottom, turnKeys])
+  }, [atBottom, transcriptSignature])
 
   const collapsedCutoff = Math.max(0, turns.length - 8)
 

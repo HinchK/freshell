@@ -45,11 +45,14 @@ type FreshAgentComposerProps = {
   canInterrupt?: boolean
   commands?: readonly FreshAgentSlashCommand[]
   onCommand?: (command: FreshAgentSlashCommand, args: string) => void
+  focusOnReady?: boolean
+  thinking?: boolean
 }
 
 export type FreshAgentComposerHandle = {
   focus: () => void
   insertText: (text: string) => void
+  appendText: (text: string) => void
 }
 
 type MenuMode = 'chat' | 'browse' | 'files'
@@ -133,6 +136,11 @@ function writeHistory(historyKey: string | undefined, entries: string[]) {
   }
 }
 
+function isTextEntryElement(value: Element | null): boolean {
+  if (!(value instanceof HTMLElement)) return false
+  return Boolean(value.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]'))
+}
+
 /**
  * Raw binary upload. Deliberately NOT base64-in-JSON: the server's global
  * express.json caps JSON bodies at 1mb, so attachments ship as
@@ -170,6 +178,8 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
   commands = [],
   onCommand,
   placeholder,
+  focusOnReady = false,
+  thinking = false,
 }, ref) {
   const [text, setText] = useState(() => {
     if (!storageKey || typeof window === 'undefined') return ''
@@ -197,7 +207,12 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       setText((current) => (current ? `${current.replace(/\s$/, '')} ${value}` : value))
       requestAnimationFrame(() => textareaRef.current?.focus())
     },
-  }), [])
+    appendText: (value: string) => {
+      if (disabled) return
+      setText((current) => `${current}${value}`)
+      requestAnimationFrame(() => textareaRef.current?.focus())
+    },
+  }), [disabled])
 
   const chatPrefix = getCommandPrefix(text)
   const mention = useMemo(() => getMentionToken(text), [text])
@@ -217,6 +232,18 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
       window.sessionStorage.removeItem(storageKey)
     }
   }, [storageKey, text])
+
+  useEffect(() => {
+    if (!focusOnReady || disabled) return
+    const frame = requestAnimationFrame(() => {
+      const textarea = textareaRef.current
+      if (!textarea) return
+      const active = document.activeElement
+      if (active && active !== document.body && active !== textarea && isTextEntryElement(active)) return
+      textarea.focus()
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [focusOnReady, disabled])
 
   useEffect(() => {
     const textarea = textareaRef.current
@@ -584,6 +611,18 @@ export const FreshAgentComposer = forwardRef<FreshAgentComposerHandle, FreshAgen
               </button>
             </span>
           ))}
+        </div>
+      ) : null}
+
+      {thinking ? (
+        <div
+          className="mb-2 flex justify-center"
+          aria-hidden="true"
+          data-testid="fresh-agent-thinking-bar"
+        >
+          <div className="h-[0.5em] w-[80%] overflow-hidden rounded-sm bg-muted/50">
+            <div className="fresh-agent-thinking-gradient h-full w-2/5" />
+          </div>
         </div>
       ) : null}
 

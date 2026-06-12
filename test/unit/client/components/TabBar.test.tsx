@@ -1107,6 +1107,35 @@ describe('TabBar', () => {
       expect(state.tabs[2].id).toBe('tab-3')
     })
 
+    it('does not move tabs for Ctrl+Shift+ArrowRight from a focused textbox', () => {
+      const tab1 = createTab({ id: 'tab-1', title: 'Tab 1' })
+      const tab2 = createTab({ id: 'tab-2', title: 'Tab 2' })
+
+      const store = createStore({
+        tabs: [tab1, tab2],
+        activeTabId: 'tab-1',
+      })
+
+      renderWithStore(<TabBar />, store)
+
+      const textarea = document.createElement('textarea')
+      document.body.appendChild(textarea)
+      try {
+        textarea.focus()
+        fireEvent.keyDown(textarea, {
+          key: 'ArrowRight',
+          ctrlKey: true,
+          shiftKey: true,
+        })
+
+        const state = store.getState().tabs
+        expect(state.tabs[0].id).toBe('tab-1')
+        expect(state.tabs[1].id).toBe('tab-2')
+      } finally {
+        textarea.remove()
+      }
+    })
+
     it('Ctrl+Shift+ArrowLeft moves active tab left', () => {
       const tab1 = createTab({ id: 'tab-1', title: 'Tab 1' })
       const tab2 = createTab({ id: 'tab-2', title: 'Tab 2' })

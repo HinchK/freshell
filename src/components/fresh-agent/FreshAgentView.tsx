@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from 'react'
 import { nanoid } from 'nanoid'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
@@ -161,6 +170,18 @@ function composeOutgoingText(text: string, attachmentPaths: string[]): string {
   return `${text ? `${text}\n\n` : ''}Attached files (read them from disk):\n${list}`
 }
 
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  return Boolean(target.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]'))
+}
+
+function isPlainTextKey(event: ReactKeyboardEvent<HTMLElement>): boolean {
+  return event.key.length === 1
+    && !event.ctrlKey
+    && !event.metaKey
+    && !event.altKey
+}
+
 export function FreshAgentView({
   tabId,
   paneId,
@@ -180,8 +201,6 @@ export function FreshAgentView({
   const pendingCreateFailure = useAppSelector(
     (state) => state.freshAgent?.pendingCreateFailures?.[paneContent.createRequestId],
   )
-  const currentTab = useAppSelector((state) => state.tabs?.tabs?.find((tab) => tab.id === tabId))
-  const tabTitleSetByUser = currentTab?.titleSetByUser ?? false
   const claudeSession = useAppSelector((state) => {
     if (paneContent.provider !== 'claude' || !paneContent.sessionId) return undefined
     const sessionKey = makeFreshAgentSessionKey({
@@ -893,6 +912,15 @@ export function FreshAgentView({
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
   const sessionErrorMessage = agentSessionMeta?.lastError ?? null
 
+  useEffect(() => {
+    if (hidden) return
+    const frame = requestAnimationFrame(() => {
+      if (isEditableTarget(document.activeElement)) return
+      composerRef.current?.focus()
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [effectiveStatus, hidden, paneContent.sessionId])
+
   // Fallback poll while the agent is (or claims to be) working: if a
   // transport event is missed, the pane self-heals within a few seconds
   // instead of stranding on an empty turn with a stop button.
@@ -1082,6 +1110,19 @@ export function FreshAgentView({
       ? null
       : (paneContent.restoreError ? getRestoreErrorMessage(paneContent.restoreError.reason) : null)
     const visibleLoadError = visibleRestoreFailure || visiblePaneRestoreFailure || isRestoring ? null : loadError
+    const WatermarkIcon = descriptor?.icon
+    const handlePanePointerUp = (event: ReactPointerEvent<HTMLElement>) => {
+      if (isEditableTarget(event.target)) return
+      if (window.getSelection()?.toString()) return
+      requestAnimationFrame(() => composerRef.current?.focus())
+    }
+    const handlePaneKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+      if (event.defaultPrevented) return
+      if (isEditableTarget(event.target)) return
+      if (!isPlainTextKey(event)) return
+      event.preventDefault()
+      composerRef.current?.appendText(event.key)
+    }
     const sendInterrupt = () => {
       if (!paneContent.sessionId || !canInterrupt) return
       sendFreshAgentMessage({
@@ -1108,19 +1149,22 @@ export function FreshAgentView({
 
     return (
       <div
-        className="flex h-full min-h-0 flex-col"
+        className="relative flex h-full min-h-0 flex-col overflow-hidden"
         data-context="fresh-agent"
         data-session-id={paneContent.sessionId}
         style={{ '--fresh-font-scale': String(freshFontScale) } as CSSProperties}
+        onPointerUpCapture={handlePanePointerUp}
+        onKeyDownCapture={handlePaneKeyDown}
       >
-        <div className="flex min-h-0 flex-1">
-          <div
-            className="flex min-h-0 flex-1 flex-col"
-            onClick={(event) => {
-              if (event.target !== event.currentTarget) return
-              composerRef.current?.focus()
-            }}
-          >
+        {WatermarkIcon ? (
+          <WatermarkIcon
+            className="pointer-events-none absolute left-1/2 top-1/2 z-0 h-[min(34rem,64%)] w-[min(34rem,64%)] -translate-x-1/2 -translate-y-1/2 text-foreground opacity-5"
+            aria-hidden="true"
+            data-testid="fresh-agent-watermark"
+          />
+        ) : null}
+        <div className="relative z-10 flex min-h-0 flex-1">
+          <div className="flex min-h-0 flex-1 flex-col">
             <div className="space-y-2 px-3 pt-3">
               {isRestoring ? (
                 <FreshAgentApprovalBanner text="Restoring session..." />
@@ -1253,6 +1297,8 @@ export function FreshAgentView({
               historyKey={`fresh-agent-prompt-history:${paneContent.sessionType}`}
               cwd={paneContent.initialCwd}
               provider={paneContent.provider}
+              focusOnReady={!hidden}
+              thinking={isBusy}
               queuedMessages={queuedMessages}
               onCancelQueued={(index) => {
                 setQueuedMessages((queue) => queue.filter((_, i) => i !== index))
@@ -1287,9 +1333,11 @@ export function FreshAgentView({
     )
   }, [
     claudeSession?.restoreFailureMessage,
+    descriptor?.icon,
     descriptor?.label,
     effectiveStatus,
     hasRestoreFailure,
+    hidden,
     isBusy,
     isRestoring,
     loadError,
@@ -1312,7 +1360,6 @@ export function FreshAgentView({
     paneId,
     sendFreshAgentMessage,
     tabId,
-    tabTitleSetByUser,
     freshFontScale,
   ])
 

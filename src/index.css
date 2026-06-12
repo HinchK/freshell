@@ -27,6 +27,26 @@ html {
   height: calc(100% / var(--fresh-font-scale, 1));
 }
 
+@keyframes fresh-agent-thinking-sweep {
+  0%, 100% {
+    transform: translateX(-120%);
+  }
+  50% {
+    transform: translateX(250%);
+  }
+}
+
+.fresh-agent-thinking-gradient {
+  background: linear-gradient(
+    90deg,
+    hsl(var(--primary) / 0),
+    hsl(var(--primary) / 0.28),
+    hsl(var(--accent-foreground) / 0.24),
+    hsl(var(--primary) / 0)
+  );
+  animation: fresh-agent-thinking-sweep 3.6s ease-in-out infinite;
+}
+
 body {
   background: hsl(var(--background));
   color: hsl(var(--foreground));

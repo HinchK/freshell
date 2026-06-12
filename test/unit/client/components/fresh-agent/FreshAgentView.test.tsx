@@ -27,6 +27,11 @@ const apiMock = vi.hoisted(() => ({
   getFreshAgentThreadSnapshot: vi.fn(),
 }))
 
+const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
+  type: 'settings/saveServerSettingsPatch',
+  payload: patch,
+})))
+
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMock,
 }))
@@ -42,6 +47,10 @@ vi.mock('@/lib/api', async () => {
     getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
   }
 })
+
+vi.mock('@/store/settingsThunks', () => ({
+  saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
+}))
 
 function createStore(tabTitleSetByUser = false) {
   return configureStore({
@@ -135,6 +144,7 @@ beforeEach(() => {
   wsMock.onMessage.mockReset()
   wsMock.onMessage.mockImplementation(() => () => {})
   apiMock.getFreshAgentThreadSnapshot.mockReset()
+  saveServerSettingsPatchSpy.mockClear()
   apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
     status: 'idle',
     summary: 'Codex summary',
@@ -222,6 +232,39 @@ describe('FreshAgentView', () => {
       requestId: 'question-1',
       answers: { 'How should Claude proceed?': 'Continue' },
     })
+  })
+
+  it('shows the provider watermark behind the workspace and redirects pane typing into the composer', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-watermark',
+        sessionId: 'thread-watermark',
+        status: 'idle',
+        model: 'gpt-5.4-mini',
+        effort: 'medium',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+    await waitFor(() => expect(textbox).not.toBeDisabled())
+    expect(screen.getByTestId('fresh-agent-watermark')).toBeInTheDocument()
+
+    const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
+    fireEvent.keyDown(root, { key: 'h' })
+
+    expect(textbox.value).toBe('h')
   })
 
   it('renders Codex review and fork metadata in the shared shell', async () => {
@@ -1585,6 +1628,64 @@ describe('FreshAgentView', () => {
     expect(layout?.type).toBe('leaf')
     expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.model : null).toBe('gpt-5.4-flash')
     expect(layout?.type === 'leaf' && layout.content.kind === 'fresh-agent' ? layout.content.effort : null).toBe('high')
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      freshAgent: {
+        providers: {
+          freshcodex: {
+            modelSelection: { kind: 'exact', modelId: 'gpt-5.4-flash' },
+            effort: 'high',
+          },
+        },
+      },
+    })
+  })
+
+  it('persists Freshcodex thinking and permission settings as fresh-agent provider defaults', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-persist-settings',
+        sessionId: 'thread-persist-settings',
+        status: 'idle',
+        model: 'gpt-5.4-flash',
+        permissionMode: 'on-request',
+        effort: 'medium',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentSettingsButton tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Agent settings' }))
+    fireEvent.change(screen.getByRole('combobox', { name: 'Thinking level' }), {
+      target: { value: 'high' },
+    })
+    fireEvent.change(screen.getByRole('combobox', { name: 'Permission mode' }), {
+      target: { value: 'never' },
+    })
+
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      freshAgent: {
+        providers: {
+          freshcodex: { effort: 'high' },
+        },
+      },
+    })
+    expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
+      freshAgent: {
+        providers: {
+          freshcodex: { defaultPermissionMode: 'never' },
+        },
+      },
+    })
   })
 
   it('lets Freshopencode settings choose model and thinking controls from the gear popover', async () => {

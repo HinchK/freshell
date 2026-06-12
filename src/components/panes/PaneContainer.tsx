@@ -619,8 +619,13 @@ function PickerWrapper({
         ? getAgentChatProviderConfig(type)
         : undefined
       const providerSettings = agentChatSettings?.providers?.[type]
+      const providerDefaultModel = typeof providerSettings?.modelSelection?.modelId === 'string'
+        ? providerSettings.modelSelection.modelId
+        : undefined
       const configuredModel = freshAgentType.runtimeProvider === 'codex' || freshAgentType.runtimeProvider === 'opencode'
-        ? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model ?? freshAgentType.defaultModel
+        ? providerDefaultModel
+          ?? settings?.codingCli?.providers?.[freshAgentType.runtimeProvider]?.model
+          ?? freshAgentType.defaultModel
         : freshAgentType.defaultModel
       const model = normalizeFreshAgentModel(freshAgentType.sessionType, freshAgentType.runtimeProvider, configuredModel) ?? configuredModel
       const permissionMode = freshAgentType.settingsVisibility.permissionMode === false
