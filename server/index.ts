@@ -236,6 +236,7 @@ async function main() {
       modelArgs: compileArgTemplate(cli.modelArgs, '{{model}}'),
       sandboxArgs: compileArgTemplate(cli.sandboxArgs, '{{sandbox}}'),
       permissionModeArgs: compileArgTemplate(cli.permissionModeArgs, '{{permissionMode}}'),
+      createSessionArgs: compileArgTemplate(cli.createSessionArgs, '{{sessionId}}'),
       permissionModeEnvVar: cli.permissionModeEnvVar,
       permissionModeEnvValues: cli.permissionModeValues,
     }

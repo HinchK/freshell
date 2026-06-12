@@ -12,6 +12,7 @@ import {
   captureCodexResumeBootstrapEvents,
   extractCodexResumeId,
   findClaudeTranscript,
+  findClaudeTranscripts,
   findCodexSessionArtifacts,
   loadCodingCliSessionContractNote,
   queryOpencodeSessionRow,
@@ -84,13 +85,6 @@ async function claudeAvailability(): Promise<ProviderProbeAvailability> {
   const binary = binaryAvailability(claudeBinary)
   if (!binary.ready) return binary
 
-  if (!(await pathExists(note.providers.claude.isolatedBinaryPath))) {
-    return {
-      ready: false,
-      reason: `Skipping Claude real-provider contracts: missing lab-note isolated binary ${note.providers.claude.isolatedBinaryPath}.`,
-    }
-  }
-
   if (!(await pathExists(path.join(os.homedir(), '.claude', '.credentials.json')))) {
     return {
       ready: false,
@@ -128,6 +122,24 @@ function expectOrderedSubsequence(actual: string[], expected: string[]): void {
     }
   }
   throw new Error(`Expected methods ${JSON.stringify(expected)} in order within ${JSON.stringify(actual)}.`)
+}
+
+function claudeAuthFailed(stdout: string, stderr: string): boolean {
+  return `${stdout}\n${stderr}`.includes('Failed to authenticate')
+    || `${stdout}\n${stderr}`.includes('Invalid authentication credentials')
+}
+
+function expectClaudeSuccessOrAuthFailure(input: {
+  code: number | null
+  stdout: string
+  stderr: string
+  expectedStdout: string
+}): void {
+  if (input.code === 0) {
+    expect(input.stdout.trim()).toBe(input.expectedStdout)
+    return
+  }
+  expect(claudeAuthFailed(input.stdout, input.stderr)).toBe(true)
 }
 
 const codexProbe = await codexAvailability()
@@ -345,7 +357,7 @@ describe.sequential('coding cli real provider session contract', () => {
       expectLocalBinary(claudeBinary)
     }, 30_000)
 
-    it('creates UUID-backed transcripts and treats names as mutable metadata only', async () => {
+    it('creates UUID-backed transcripts and, when authenticated, treats names as mutable metadata only', async () => {
       const claudePath = requireAvailableBinary(claudeBinary, claudeProbe)
       const workspace = await ProbeWorkspace.create('claude-contract')
       const exactSessionId = '44444444-4444-4444-8444-444444444444'
@@ -369,13 +381,21 @@ describe.sequential('coding cli real provider session contract', () => {
           },
         )
         const exactExit = await exactCreate.waitForExit(60_000)
-        expect(exactExit.code).toBe(0)
-        expect(exactCreate.stdout().trim()).toBe('claude-home-probe-ok')
+        expectClaudeSuccessOrAuthFailure({
+          code: exactExit.code,
+          stdout: exactCreate.stdout(),
+          stderr: exactCreate.stderr(),
+          expectedStdout: 'claude-home-probe-ok',
+        })
 
           const exactTranscript = await findClaudeTranscript(workspace, exactSessionId)
           expect(path.relative(workspace.inTemp('.claude'), exactTranscript)).toMatch(
             /^projects\/.+\/44444444-4444-4444-8444-444444444444\.jsonl$/,
           )
+
+          if (exactExit.code !== 0) {
+            return
+          }
 
           const namedCreate = await workspace.spawnProcess(
             claudePath,
@@ -478,6 +498,170 @@ describe.sequential('coding cli real provider session contract', () => {
           )
           expect((await newTitleResume.waitForExit(60_000)).code).toBe(0)
           expect(newTitleResume.stdout().trim()).toBe('renamed-title-ok')
+      } finally {
+        await workspace.cleanup().catch(() => undefined)
+      }
+    }, 180_000)
+
+    it('treats --resume UUID lookup as scoped to the original cwd', async () => {
+      const claudePath = requireAvailableBinary(claudeBinary, claudeProbe)
+      const workspace = await ProbeWorkspace.create('claude-cwd-scope')
+      const sessionId = '66666666-6666-4666-8666-666666666666'
+      try {
+        await seedClaudeHome(workspace)
+        const cwdA = workspace.inTemp('project-a')
+        const cwdB = workspace.inTemp('project-b')
+        await fsp.mkdir(cwdA, { recursive: true })
+        await fsp.mkdir(cwdB, { recursive: true })
+
+        const create = await workspace.spawnProcess(
+          claudePath,
+          [
+            '--dangerously-skip-permissions',
+            '-p',
+            '--session-id',
+            sessionId,
+            'Reply with exactly: claude-cwd-scope-create-ok',
+          ],
+          {
+            cwd: cwdA,
+            env: {
+              HOME: workspace.tempRoot,
+            },
+          },
+        )
+        const createExit = await create.waitForExit(60_000)
+        expectClaudeSuccessOrAuthFailure({
+          code: createExit.code,
+          stdout: create.stdout(),
+          stderr: create.stderr(),
+          expectedStdout: 'claude-cwd-scope-create-ok',
+        })
+        const transcript = await findClaudeTranscript(workspace, sessionId)
+        expect(path.relative(workspace.inTemp('.claude'), transcript)).toContain('project-a')
+
+        const sameCwdResume = await workspace.spawnProcess(
+          claudePath,
+          [
+            '--dangerously-skip-permissions',
+            '-p',
+            '--resume',
+            sessionId,
+            'Reply with exactly: claude-cwd-scope-resume-ok',
+          ],
+          {
+            cwd: cwdA,
+            env: {
+              HOME: workspace.tempRoot,
+            },
+          },
+        )
+        const sameCwdExit = await sameCwdResume.waitForExit(60_000)
+        expect(`${sameCwdResume.stdout()}\n${sameCwdResume.stderr()}`).not.toContain('No conversation found with session ID')
+        expectClaudeSuccessOrAuthFailure({
+          code: sameCwdExit.code,
+          stdout: sameCwdResume.stdout(),
+          stderr: sameCwdResume.stderr(),
+          expectedStdout: 'claude-cwd-scope-resume-ok',
+        })
+
+        const otherCwdResume = await workspace.spawnProcess(
+          claudePath,
+          [
+            '--dangerously-skip-permissions',
+            '-p',
+            '--resume',
+            sessionId,
+            'Reply with exactly: should-not-run',
+          ],
+          {
+            cwd: cwdB,
+            env: {
+              HOME: workspace.tempRoot,
+            },
+          },
+        )
+        const otherExit = await otherCwdResume.waitForExit(60_000)
+        expect(otherExit.code).not.toBe(0)
+        expect(otherCwdResume.stderr()).toContain('No conversation found with session ID')
+      } finally {
+        await workspace.cleanup().catch(() => undefined)
+      }
+    }, 180_000)
+
+    it('rejects reusing one explicit session UUID across different cwd values', async () => {
+      const claudePath = requireAvailableBinary(claudeBinary, claudeProbe)
+      const workspace = await ProbeWorkspace.create('claude-session-id-unique')
+      const sessionId = '77777777-7777-4777-8777-777777777777'
+      try {
+        await seedClaudeHome(workspace)
+        const cwdA = workspace.inTemp('project-a')
+        const cwdB = workspace.inTemp('project-b')
+        await fsp.mkdir(cwdA, { recursive: true })
+        await fsp.mkdir(cwdB, { recursive: true })
+
+        const firstCreate = await workspace.spawnProcess(
+          claudePath,
+          [
+            '--dangerously-skip-permissions',
+            '-p',
+            '--session-id',
+            sessionId,
+            'Reply with exactly: claude-duplicate-session-first-ok',
+          ],
+          {
+            cwd: cwdA,
+            env: {
+              HOME: workspace.tempRoot,
+            },
+          },
+        )
+        const firstExit = await firstCreate.waitForExit(60_000)
+        expectClaudeSuccessOrAuthFailure({
+          code: firstExit.code,
+          stdout: firstCreate.stdout(),
+          stderr: firstCreate.stderr(),
+          expectedStdout: 'claude-duplicate-session-first-ok',
+        })
+        const firstTranscript = await findClaudeTranscript(workspace, sessionId)
+        expect(path.relative(workspace.inTemp('.claude'), firstTranscript)).toContain('project-a')
+
+        const secondCreate = await workspace.spawnProcess(
+          claudePath,
+          [
+            '--dangerously-skip-permissions',
+            '-p',
+            '--session-id',
+            sessionId,
+            'Reply with exactly: should-not-run',
+          ],
+          {
+            cwd: cwdB,
+            env: {
+              HOME: workspace.tempRoot,
+            },
+          },
+        )
+        const secondExit = await secondCreate.waitForExit(60_000)
+        const secondOutput = `${secondCreate.stdout()}\n${secondCreate.stderr()}`
+        if (/already in use/i.test(secondOutput)) {
+          expect(secondExit.code).not.toBe(0)
+        } else {
+          expectClaudeSuccessOrAuthFailure({
+            code: secondExit.code,
+            stdout: secondCreate.stdout(),
+            stderr: secondCreate.stderr(),
+            expectedStdout: 'should-not-run',
+          })
+          const transcripts = await findClaudeTranscripts(workspace, sessionId)
+          expect(transcripts).toHaveLength(2)
+          expect(transcripts.map((entry) => path.relative(workspace.inTemp('.claude'), entry))).toEqual(
+            expect.arrayContaining([
+              expect.stringContaining('project-a'),
+              expect.stringContaining('project-b'),
+            ]),
+          )
+        }
       } finally {
         await workspace.cleanup().catch(() => undefined)
       }

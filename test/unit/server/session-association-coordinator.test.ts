@@ -91,6 +91,37 @@ describe('SessionAssociationCoordinator', () => {
     expect(registry.bindSession).toHaveBeenCalledWith('term-1', 'claude', 'session-main', 'association')
   })
 
+  it('refuses to heuristically associate a Claude session when multiple same-cwd terminals match', () => {
+    const registry = {
+      findUnassociatedTerminals: vi.fn(() => [
+        { terminalId: 'stale-term', createdAt: 1_000 },
+        { terminalId: 'new-term', createdAt: 1_100 },
+      ]),
+      bindSession: vi.fn(() => ({ ok: true, terminalId: 'stale-term', sessionId: 'session-main' })),
+      isSessionBound: vi.fn(() => false),
+    }
+    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
+
+    const result = coordinator.associateSingleSession(createSession({ lastActivityAt: 2_000 }))
+
+    expect(result).toEqual({ associated: false, reason: 'ambiguous_terminal_candidates' })
+    expect(registry.bindSession).not.toHaveBeenCalled()
+  })
+
+  it('still allows one unassociated Claude terminal to be repaired by the legacy heuristic', () => {
+    const registry = {
+      findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-1', createdAt: 1_000 }]),
+      bindSession: vi.fn(() => ({ ok: true, terminalId: 'term-1', sessionId: 'session-main' })),
+      isSessionBound: vi.fn(() => false),
+    }
+    const coordinator = new SessionAssociationCoordinator(registry as any, 30_000)
+
+    const result = coordinator.associateSingleSession(createSession({ lastActivityAt: 2_000 }))
+
+    expect(result).toEqual({ associated: true, terminalId: 'term-1' })
+    expect(registry.bindSession).toHaveBeenCalledWith('term-1', 'claude', 'session-main', 'association')
+  })
+
   it('does not attempt heuristic association for opencode sessions', () => {
     const registry = {
       findUnassociatedTerminals: vi.fn(() => [{ terminalId: 'term-2', createdAt: 1_000 }]),

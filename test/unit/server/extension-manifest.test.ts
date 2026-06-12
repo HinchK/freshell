@@ -80,6 +80,7 @@ describe('ExtensionManifestSchema', () => {
       cli: {
         command: 'opencode',
         resumeArgs: ['--session', '{{sessionId}}'],
+        createSessionArgs: ['--session-id', '{{sessionId}}'],
         modelArgs: ['--model', '{{model}}'],
         sandboxArgs: ['--sandbox', '{{sandbox}}'],
         permissionModeArgs: ['--permission-mode', '{{permissionMode}}'],
@@ -93,6 +94,9 @@ describe('ExtensionManifestSchema', () => {
       },
     })
     expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.cli?.createSessionArgs).toEqual(['--session-id', '{{sessionId}}'])
+    }
   })
 
   it('rejects missing required fields', () => {

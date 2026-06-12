@@ -19,6 +19,7 @@ const { snapshotSpy } = vi.hoisted(() => ({
 vi.mock('../../server/config-store', () => ({
   configStore: {
     snapshot: snapshotSpy,
+    pushRecentDirectory: vi.fn().mockResolvedValue(undefined),
   },
 }))
 
@@ -185,6 +186,8 @@ class FakeBuffer {
 
 class FakeRegistry {
   record: any
+  records = new Map<string, any>()
+  createCalls: any[] = []
   attachCalls: Array<{ terminalId: string; opts?: { suppressOutput?: boolean } }> = []
 
   constructor(terminalId: string) {
@@ -199,16 +202,22 @@ class FakeRegistry {
       cols: 80,
       rows: 24,
       resumeSessionId: VALID_SESSION_ID,
+      lastActivityAt: Date.now(),
       clients: new Set<WebSocket>(),
     }
+    this.records.set(terminalId, this.record)
   }
 
   get(terminalId: string) {
-    return this.record.terminalId === terminalId ? this.record : null
+    return this.records.get(terminalId) ?? null
   }
 
   findRunningTerminalBySession(mode: string, sessionId: string) {
-    if (mode === this.record.mode && sessionId === VALID_SESSION_ID) return this.record
+    for (const record of this.records.values()) {
+      if (record.mode === mode && record.status === 'running' && record.resumeSessionId === sessionId) {
+        return record
+      }
+    }
     return undefined
   }
 
@@ -230,24 +239,68 @@ class FakeRegistry {
 
   attach(terminalId: string, ws: WebSocket, opts?: { suppressOutput?: boolean }) {
     this.attachCalls.push({ terminalId, opts })
-    this.record.clients.add(ws)
-    return this.record
+    const record = this.records.get(terminalId)
+    if (!record) return undefined
+    record.clients.add(ws)
+    return record
   }
 
   resize(terminalId: string, cols: number, rows: number) {
-    if (this.record.terminalId !== terminalId) return false
-    this.record.cols = cols
-    this.record.rows = rows
+    const record = this.records.get(terminalId)
+    if (!record) return false
+    record.cols = cols
+    record.rows = rows
     return true
   }
 
   detach(_terminalId: string, ws: WebSocket) {
-    this.record.clients.delete(ws)
+    for (const record of this.records.values()) {
+      record.clients.delete(ws)
+    }
     return true
   }
 
+  async killAndWait(terminalId: string) {
+    this.records.delete(terminalId)
+    return true
+  }
+
+  create(opts: any) {
+    this.createCalls.push(opts)
+    const record = {
+      terminalId: `term-created-${this.createCalls.length}`,
+      createdAt: Date.now(),
+      buffer: new FakeBuffer(),
+      title: 'Claude',
+      mode: opts.mode,
+      shell: opts.shell ?? 'system',
+      status: 'running',
+      cols: opts.cols ?? 80,
+      rows: opts.rows ?? 24,
+      cwd: opts.cwd,
+      resumeSessionId: opts.resumeSessionId,
+      lastActivityAt: Date.now(),
+      clients: new Set<WebSocket>(),
+    }
+    this.records.set(record.terminalId, record)
+    return record
+  }
+
   list() {
-    return []
+    return [...this.records.values()].map((record) => ({
+      terminalId: record.terminalId,
+      title: record.title,
+      mode: record.mode,
+      resumeSessionId: record.resumeSessionId,
+      sessionRef: record.resumeSessionId
+        ? { provider: record.mode, sessionId: record.resumeSessionId }
+        : undefined,
+      createdAt: record.createdAt,
+      lastActivityAt: record.lastActivityAt,
+      status: record.status,
+      hasClients: record.clients.size > 0,
+      cwd: record.cwd,
+    }))
   }
 }
 
@@ -455,6 +508,105 @@ describe('terminal.create reuse running claude terminal', () => {
       }))
       const ready = await attachReadyPromise
       expect(ready.terminalId).toBe(created.terminalId)
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('fresh Claude terminal.create returns a canonical sessionRef immediately', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'fresh-claude-preallocated'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        shell: 'system',
+        cwd: '/home/user/project',
+        tabId: 'tab-claude-fresh',
+        paneId: 'pane-claude-fresh',
+      }))
+
+      const created = await createdPromise
+      expect(created.sessionRef?.provider).toBe('claude')
+      expect(created.sessionRef?.sessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+      expect(created.cwd).toBe('/home/user/project')
+      expect(registry.createCalls.at(-1)).toMatchObject({
+        mode: 'claude',
+        resumeSessionId: created.sessionRef.sessionId,
+        sessionBindingReason: 'start',
+        cwd: '/home/user/project',
+      })
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('fresh Claude recovery terminal.create also preallocates a canonical sessionRef', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'fresh-claude-recovery-preallocated'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        shell: 'system',
+        cwd: '/home/user/recovered-project',
+        recoveryIntent: 'fresh_after_restore_unavailable',
+        tabId: 'tab-claude-recovery',
+        paneId: 'pane-claude-recovery',
+      }))
+
+      const created = await createdPromise
+      expect(created.sessionRef?.provider).toBe('claude')
+      expect(created.sessionRef?.sessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+      expect(created.cwd).toBe('/home/user/recovered-project')
+      expect(registry.createCalls.at(-1)).toMatchObject({
+        mode: 'claude',
+        resumeSessionId: created.sessionRef.sessionId,
+        sessionBindingReason: 'start',
+        cwd: '/home/user/recovered-project',
+      })
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
+  it('duplicate fresh Claude terminal.create reuses the preallocated sessionRef', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'fresh-claude-duplicate'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+
+      const payload = {
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        shell: 'system',
+        cwd: '/home/user/project',
+      }
+      ws.send(JSON.stringify(payload))
+      ws.send(JSON.stringify(payload))
+
+      const first = await createdPromise
+      const extraMessages = await collectMessages(ws, 200)
+      const duplicateCreated = extraMessages.filter((m) => m.type === 'terminal.created' && m.requestId === requestId)
+      expect(duplicateCreated).toHaveLength(0)
+      expect(registry.createCalls).toHaveLength(1)
+      expect(registry.createCalls[0]?.resumeSessionId).toBe(first.sessionRef.sessionId)
     } finally {
       await closeWebSocket(ws)
     }

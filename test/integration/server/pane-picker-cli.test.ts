@@ -104,11 +104,40 @@ class FakeRegistry {
       lastActivityAt: r.createdAt,
       status: 'running',
       hasClients: r.clients.size > 0,
+      cwd: r.cwd,
+      sessionRef: r.resumeSessionId
+        ? { provider: r.mode, sessionId: r.resumeSessionId }
+        : undefined,
     }))
   }
 
-  findRunningClaudeTerminalBySession(_sessionId: string) {
+  findRunningTerminalBySession(mode: string, sessionId: string, cwd?: string) {
+    for (const record of this.records.values()) {
+      if (record.mode !== mode || record.status !== 'running' || record.resumeSessionId !== sessionId) continue
+      if (cwd && record.cwd && record.cwd !== cwd) continue
+      return record
+    }
     return undefined
+  }
+
+  getCanonicalRunningTerminalBySession(mode: string, sessionId: string, cwd?: string) {
+    return this.findRunningTerminalBySession(mode, sessionId, cwd)
+  }
+
+  repairLegacySessionOwners() {
+    return {
+      repaired: false,
+      clearedTerminalIds: [] as string[],
+    }
+  }
+
+  findRunningClaudeTerminalBySession(sessionId: string) {
+    return this.findRunningTerminalBySession('claude', sessionId)
+  }
+
+  async killAndWait(terminalId: string) {
+    this.records.delete(terminalId)
+    return true
   }
 }
 

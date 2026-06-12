@@ -240,6 +240,84 @@ describe('TerminalView durable session contract', () => {
     })
   })
 
+  it('persists server-created cwd when pane content did not already have an initial cwd', async () => {
+    const tabId = 'tab-created-cwd'
+    const paneId = 'pane-created-cwd'
+    let messageHandler: ((msg: any) => void) | null = null
+
+    wsMocks.onMessage.mockImplementation((handler: (msg: any) => void) => {
+      messageHandler = handler
+      return () => {}
+    })
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-created-cwd',
+      status: 'creating',
+      mode: 'claude',
+      shell: 'system',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            createRequestId: 'req-created-cwd',
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+        },
+        settings: { settings: defaultSettings, status: 'loaded' },
+        connection: { status: 'connected', error: null, serverInstanceId: 'srv-local' },
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'terminal.create',
+        requestId: 'req-created-cwd',
+      }))
+    })
+
+    messageHandler?.({
+      type: 'terminal.created',
+      requestId: 'req-created-cwd',
+      terminalId: 'term-created-cwd',
+      cwd: '/home/user/server-resolved-project',
+    })
+
+    await waitFor(() => {
+      const layout = store.getState().panes.layouts[tabId]
+      if (layout?.type !== 'leaf') throw new Error('unexpected layout')
+      if (layout.content.kind !== 'terminal') throw new Error('unexpected content')
+      expect(layout.content.terminalId).toBe('term-created-cwd')
+      expect(layout.content.initialCwd).toBe('/home/user/server-resolved-project')
+    })
+  })
+
   it('persists canonical sessionRef from terminal.created when the server replays it', async () => {
     const tabId = 'tab-opencode'
     const paneId = 'pane-opencode'

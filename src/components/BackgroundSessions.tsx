@@ -90,12 +90,14 @@ export default function BackgroundSessions() {
                     onClick={() => {
                       const tabId = nanoid()
                       const mode = ((t.mode as any) || 'shell') as string
+                      const initialCwd = typeof t.cwd === 'string' && t.cwd.trim() ? t.cwd : undefined
                       dispatch(addTab({
                         id: tabId,
                         title: t.title,
                         status: 'running',
                         mode: mode as any,
                         sessionRef: t.sessionRef,
+                        ...(initialCwd ? { initialCwd } : {}),
                       }))
                       dispatch(initLayout({
                         tabId,
@@ -105,6 +107,7 @@ export default function BackgroundSessions() {
                           terminalId: t.terminalId,
                           status: 'running',
                           sessionRef: t.sessionRef,
+                          ...(initialCwd ? { initialCwd } : {}),
                         },
                       }))
                     }}

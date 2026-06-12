@@ -534,21 +534,20 @@ describe('Session-Terminal Association Integration', () => {
     registry.shutdown()
   })
 
-  it('should only associate the oldest terminal when multiple match same cwd', () => {
+  it('should not associate any terminal when multiple match same cwd', () => {
     const registry = new TerminalRegistry()
     const indexer = createIndexer()
+    const coordinator = new SessionAssociationCoordinator(registry, 30_000)
     const broadcasts: any[] = []
+    const results: any[] = []
 
     indexer.onNewSession((session) => {
-      if (session.provider !== 'claude') return
-      if (!session.cwd) return
-      const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
-      if (unassociated.length === 0) return
-      const term = unassociated[0] // Only oldest
-      registry.setResumeSessionId(term.terminalId, session.sessionId)
+      const result = coordinator.associateSingleSession(session)
+      results.push(result)
+      if (!result.associated || !result.terminalId) return
       broadcasts.push({
         type: 'terminal.session.associated',
-        terminalId: term.terminalId,
+        terminalId: result.terminalId,
         sessionRef: {
           provider: 'claude',
           sessionId: session.sessionId,
@@ -571,31 +570,29 @@ describe('Session-Terminal Association Integration', () => {
       cwd: '/home/user/project',
     }])
 
-    // Should only associate the OLDEST terminal (term1)
-    expect(broadcasts).toHaveLength(1)
-    expect(broadcasts[0].terminalId).toBe(term1.terminalId)
-    expect(registry.get(term1.terminalId)?.resumeSessionId).toBe(SESSION_ID_TWO)
+    expect(results).toEqual([{ associated: false, reason: 'ambiguous_terminal_candidates' }])
+    expect(broadcasts).toHaveLength(0)
+    expect(registry.get(term1.terminalId)?.resumeSessionId).toBeUndefined()
     expect(registry.get(term2.terminalId)?.resumeSessionId).toBeUndefined()
 
     // Cleanup
     registry.shutdown()
   })
 
-  it('should correctly associate two terminals when two sessions are created in sequence', () => {
+  it('should keep sequential same-cwd sessions unassociated while terminal candidates are ambiguous', () => {
     const registry = new TerminalRegistry()
     const indexer = createIndexer()
+    const coordinator = new SessionAssociationCoordinator(registry, 30_000)
     const broadcasts: any[] = []
+    const results: any[] = []
 
     indexer.onNewSession((session) => {
-      if (session.provider !== 'claude') return
-      if (!session.cwd) return
-      const unassociated = registry.findUnassociatedClaudeTerminals(session.cwd)
-      if (unassociated.length === 0) return
-      const term = unassociated[0] // Only oldest unassociated
-      registry.setResumeSessionId(term.terminalId, session.sessionId)
+      const result = coordinator.associateSingleSession(session)
+      results.push(result)
+      if (!result.associated || !result.terminalId) return
       broadcasts.push({
         type: 'terminal.session.associated',
-        terminalId: term.terminalId,
+        terminalId: result.terminalId,
         sessionRef: {
           provider: 'claude',
           sessionId: session.sessionId,
@@ -618,8 +615,7 @@ describe('Session-Terminal Association Integration', () => {
       cwd: '/home/user/project',
     }])
 
-    // term1 should now be associated
-    expect(registry.get(term1.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
+    expect(registry.get(term1.terminalId)?.resumeSessionId).toBeUndefined()
     expect(registry.get(term2.terminalId)?.resumeSessionId).toBeUndefined()
 
     // Second Claude (term2) creates its session
@@ -631,22 +627,13 @@ describe('Session-Terminal Association Integration', () => {
       cwd: '/home/user/project',
     }])
 
-    // Now term2 should also be associated (with different session)
-    expect(registry.get(term1.terminalId)?.resumeSessionId).toBe(SESSION_ID_ONE)
-    expect(registry.get(term2.terminalId)?.resumeSessionId).toBe(SESSION_ID_THREE)
-
-    // Two broadcasts total, one per terminal
-    expect(broadcasts).toHaveLength(2)
-    expect(broadcasts[0].terminalId).toBe(term1.terminalId)
-    expect(broadcasts[0].sessionRef).toEqual({
-      provider: 'claude',
-      sessionId: SESSION_ID_ONE,
-    })
-    expect(broadcasts[1].terminalId).toBe(term2.terminalId)
-    expect(broadcasts[1].sessionRef).toEqual({
-      provider: 'claude',
-      sessionId: SESSION_ID_THREE,
-    })
+    expect(results).toEqual([
+      { associated: false, reason: 'ambiguous_terminal_candidates' },
+      { associated: false, reason: 'ambiguous_terminal_candidates' },
+    ])
+    expect(registry.get(term1.terminalId)?.resumeSessionId).toBeUndefined()
+    expect(registry.get(term2.terminalId)?.resumeSessionId).toBeUndefined()
+    expect(broadcasts).toHaveLength(0)
 
     // Cleanup
     registry.shutdown()

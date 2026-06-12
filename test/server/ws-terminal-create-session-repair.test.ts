@@ -1310,7 +1310,7 @@ describe('terminal.create session repair wait', () => {
         cwd: '/repo/project',
       }))
 
-      await createdPromise
+      const created = await createdPromise
 
       expect(registry.createCallCount).toBe(1)
       expect(registry.records.size).toBe(1)
@@ -1318,7 +1318,14 @@ describe('terminal.create session repair wait', () => {
         mode,
         cwd: '/repo/project',
       })
-      if (mode !== 'codex') {
+      if (mode === 'claude') {
+        expect(registry.lastCreateOpts?.resumeSessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+        expect(registry.lastCreateOpts?.sessionBindingReason).toBe('start')
+        expect(created.sessionRef).toEqual({
+          provider: 'claude',
+          sessionId: registry.lastCreateOpts.resumeSessionId,
+        })
+      } else if (mode !== 'codex') {
         expect(registry.lastCreateOpts?.resumeSessionId).toBeUndefined()
       }
     } finally {

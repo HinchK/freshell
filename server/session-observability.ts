@@ -30,6 +30,12 @@ export type SessionLifecycleEvent =
     hasSessionRef: boolean
   })
   | (OptionalUiContext & {
+    kind: 'claude_fresh_session_preallocated'
+    requestId: string
+    connectionId: string
+    sessionId: string
+  })
+  | (OptionalUiContext & {
     kind: 'restore_unavailable'
     requestId: string
     connectionId: string
@@ -180,6 +186,16 @@ function buildPayload(event: SessionLifecycleEvent): Record<string, unknown> {
         mode: event.mode,
         reused: event.reused,
         hasSessionRef: event.hasSessionRef,
+      }
+    case 'claude_fresh_session_preallocated':
+      return {
+        ...base,
+        requestId: event.requestId,
+        connectionId: event.connectionId,
+        sessionId: event.sessionId,
+        tabId: event.tabId,
+        paneId: event.paneId,
+        cwd: event.cwd,
       }
     case 'restore_unavailable':
       return {
