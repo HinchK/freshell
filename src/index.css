@@ -15,12 +15,12 @@ html {
   font-size: calc(100% * var(--ui-scale, 1.25));
 }
 
-/* Fresh-agent panes use their real pane geometry at every font scale. Only
-   transcript copy scales with the Fresh agent font setting, so chrome, rails,
-   buttons, and textarea layout remain responsive on desktop and phone. */
+/* Fresh-agent panes use their real pane geometry. Transcript copy inherits the
+   terminal font-size setting, while chrome, rails, buttons, and textarea layout
+   keep normal responsive UI sizing on desktop and phone. */
 .fresh-agent-pane {
   container-type: inline-size;
-  --fresh-transcript-font-size: calc(0.875rem * var(--fresh-font-scale, 1));
+  --fresh-transcript-font-size: 16px;
 }
 
 .fresh-agent-layout {
@@ -71,7 +71,7 @@ html {
 
 .fresh-agent-transcript-copy {
   font-size: var(--fresh-transcript-font-size);
-  line-height: 1.45;
+  line-height: 1.25;
 }
 
 .fresh-agent-transcript-copy [data-markdown-body] {

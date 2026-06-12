@@ -26,7 +26,6 @@ import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getCanonicalDurableSessionId, getPreferredResumeSessionId } from '@/store/persistControl'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
-import { FRESH_AGENT_FONT_SCALE_DEFAULT } from '@shared/settings'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
 import { getFreshAgentSlashCommands, type FreshAgentSlashCommand } from '@shared/fresh-agent-slash-commands'
 import { buildRestoreError, type RestoreErrorReason } from '@shared/session-contract'
@@ -195,9 +194,9 @@ export function FreshAgentView({
 }) {
   const dispatch = useAppDispatch()
   const ws = getWsClient()
-  const freshFontScale = useAppSelector(
-    (state) => state.settings.settings.freshAgent?.fontScale,
-  ) ?? FRESH_AGENT_FONT_SCALE_DEFAULT
+  const terminalFontSize = useAppSelector(
+    (state) => state.settings.settings.terminal?.fontSize,
+  ) ?? 16
   const pendingCreateFailure = useAppSelector(
     (state) => state.freshAgent?.pendingCreateFailures?.[paneContent.createRequestId],
   )
@@ -1156,7 +1155,7 @@ export function FreshAgentView({
         className="fresh-agent-pane relative flex h-full min-h-0 flex-col overflow-hidden"
         data-context="fresh-agent"
         data-session-id={paneContent.sessionId}
-        style={{ '--fresh-font-scale': String(freshFontScale) } as CSSProperties}
+        style={{ '--fresh-transcript-font-size': `${terminalFontSize}px` } as CSSProperties}
         onPointerUpCapture={handlePanePointerUp}
         onKeyDownCapture={handlePaneKeyDown}
       >
@@ -1364,7 +1363,7 @@ export function FreshAgentView({
     paneId,
     sendFreshAgentMessage,
     tabId,
-    freshFontScale,
+    terminalFontSize,
   ])
 
   useEffect(() => {
