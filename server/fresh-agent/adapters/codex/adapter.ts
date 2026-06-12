@@ -71,10 +71,11 @@ function toCodexApprovalPolicy(value: string | undefined) {
 
 function toCodexReasoningEffort(value: FreshAgentCreateRequest['effort'] | undefined) {
   if (value === undefined) return undefined
-  if (value === 'none' || value === 'minimal' || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh') {
+  if (value === 'max' || value === 'xhigh') return 'xhigh'
+  if (value === 'none' || value === 'minimal' || value === 'low' || value === 'medium' || value === 'high') {
     return value
   }
-  throw new Error(`Freshcodex does not support reasoning effort "${value}". Choose none, minimal, low, medium, high, or xhigh.`)
+  throw new Error(`Freshcodex does not support reasoning effort "${value}". Choose none, minimal, low, medium, high, or max.`)
 }
 
 function toCodexSandboxPolicy(value: FreshAgentCreateRequest['sandbox'] | undefined): CodexTurnStartParams['sandboxPolicy'] {

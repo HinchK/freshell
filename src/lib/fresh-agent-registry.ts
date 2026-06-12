@@ -12,6 +12,7 @@ import {
 import {
   FRESHCODEX_DEFAULT_EFFORT,
   FRESHCODEX_DEFAULT_MODEL,
+  FRESHCLAUDE_DEFAULT_EFFORT,
   FRESHOPENCODE_DEFAULT_EFFORT,
   FRESHOPENCODE_DEFAULT_MODEL,
 } from '@/lib/fresh-agent-models'
@@ -19,6 +20,7 @@ export {
   FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
   FRESHCODEX_DEFAULT_EFFORT,
   FRESHCODEX_DEFAULT_MODEL,
+  FRESHCLAUDE_DEFAULT_EFFORT,
   FRESHCODEX_MODEL_OPTIONS,
   FRESHOPENCODE_DEFAULT_EFFORT,
   FRESHOPENCODE_DEFAULT_MODEL,
@@ -60,7 +62,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     icon: FreshclaudeIcon,
     defaultModel: 'claude-opus-4-6',
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'max',
+    defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     settingsVisibility: {
       model: true,
       permissionMode: true,
@@ -97,7 +99,7 @@ export const FRESH_AGENT_REGISTRY: readonly FreshAgentRegistryEntry[] = [
     icon: KilroyIcon,
     defaultModel: 'claude-opus-4-6',
     defaultPermissionMode: 'bypassPermissions',
-    defaultEffort: 'max',
+    defaultEffort: FRESHCLAUDE_DEFAULT_EFFORT,
     settingsVisibility: {
       model: true,
       permissionMode: true,

@@ -337,7 +337,7 @@ describe('FreshAgentView', () => {
       sessionType: 'freshcodex',
       provider: 'codex',
       model: 'gpt-5.5',
-      effort: 'xhigh',
+      effort: 'max',
     }))
 
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
@@ -402,7 +402,7 @@ describe('FreshAgentView', () => {
       settings: {
         cwd: '/repo',
         model: 'gpt-5.3-codex-spark',
-        effort: 'xhigh',
+        effort: 'max',
       },
     })
 
@@ -1558,7 +1558,7 @@ describe('FreshAgentView', () => {
         sessionId: 'thread-flash',
         status: 'idle',
         model: 'gpt-5.5',
-        effort: 'xhigh',
+        effort: 'max',
       },
     }))
 
@@ -1760,7 +1760,7 @@ describe('FreshAgentView', () => {
         provider: 'codex',
         createRequestId: 'req-stale-effort',
         status: 'creating',
-        effort: 'max',
+        effort: 'xhigh',
       },
     }))
 
@@ -1773,7 +1773,7 @@ describe('FreshAgentView', () => {
     expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.create',
       requestId: 'req-stale-effort',
-      effort: 'xhigh',
+      effort: 'max',
     }))
 
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
@@ -1799,7 +1799,7 @@ describe('FreshAgentView', () => {
 
     expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'freshAgent.send',
-      settings: expect.objectContaining({ effort: 'xhigh' }),
+      settings: expect.objectContaining({ effort: 'max' }),
     }))
   })
 
@@ -2136,7 +2136,7 @@ describe('FreshAgentView', () => {
         sessionType: 'freshclaude',
         provider: 'claude',
         resumeSessionId: durableSessionId,
-        effort: 'max',
+        effort: 'high',
       }))
     })
   })

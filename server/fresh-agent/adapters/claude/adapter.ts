@@ -5,8 +5,10 @@ import {
   type AgentTimelineService,
 } from '../../../agent-timeline/service.js'
 import type { AgentHistorySource } from '../../../agent-timeline/history-source.js'
+import { synthesizeLiveMessageId, type RestoreResolution } from '../../../agent-timeline/ledger.js'
 import type { SdkBridge } from '../../../sdk-bridge.js'
 import type { SdkSessionState } from '../../../sdk-bridge-types.js'
+import { logger } from '../../../logger.js'
 import { FreshAgentStaleThreadRevisionError } from '../../runtime-manager.js'
 import type { FreshAgentCreateRequest, FreshAgentRuntimeAdapter, FreshAgentThreadLocator } from '../../runtime-adapter.js'
 import {
@@ -15,6 +17,8 @@ import {
   normalizeClaudeTurnPage,
 } from './normalize.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
+
+const log = logger.child({ component: 'fresh-agent-claude-adapter' })
 
 type ClaudeBridgePort = Pick<
   SdkBridge,
@@ -61,6 +65,41 @@ function normalizeClaudeInput(input: FreshAgentCreateRequest): FreshAgentCreateR
 function mapMissingResult(ok: boolean, message: string): void {
   if (!ok) {
     throw new Error(message)
+  }
+}
+
+function buildLiveOnlyResolution(threadId: string, liveSession: SdkSessionState): Extract<RestoreResolution, { kind: 'resolved' }> {
+  const turns = liveSession.messages.map((message, index) => {
+    const messageId = typeof message.messageId === 'string' && message.messageId.trim().length > 0
+      ? message.messageId
+      : synthesizeLiveMessageId(liveSession.sessionId, index)
+    return {
+      turnId: `turn:${messageId}`,
+      messageId,
+      ordinal: index,
+      source: 'live' as const,
+      message: {
+        ...message,
+        messageId,
+      },
+    }
+  })
+
+  return {
+    kind: 'resolved',
+    queryId: liveSession.sessionId,
+    liveSessionId: liveSession.sessionId,
+    timelineSessionId: liveSession.cliSessionId ?? liveSession.resumeSessionId ?? threadId,
+    readiness: 'live_only',
+    revision: 1,
+    latestTurnId: turns.at(-1)?.turnId ?? null,
+    turns,
+  }
+}
+
+function assertFreshAgentRevision(currentRevision: number, requestedRevision?: number): void {
+  if (requestedRevision != null && requestedRevision !== currentRevision) {
+    throw new FreshAgentStaleThreadRevisionError(currentRevision)
   }
 }
 
@@ -167,12 +206,41 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
     },
 
     async getSnapshot(thread: FreshAgentThreadLocator, revision?: number) {
-      const resolvedSnapshot = await loadResolved(thread.threadId, revision)
       const liveSession = resolveLiveSession(thread.threadId)
-      const resolved = await deps.agentHistorySource?.resolve(
-        thread.threadId,
-        liveSession ? { liveSessionOverride: liveSession } : undefined,
-      )
+      if (liveSession) {
+        const resolved = await deps.agentHistorySource?.resolve(
+          thread.threadId,
+          { liveSessionOverride: liveSession },
+        )
+        if (resolved?.kind === 'resolved') {
+          assertFreshAgentRevision(resolved.revision, revision)
+          return normalizeClaudeThreadSnapshot({
+            threadId: thread.threadId,
+            resolved,
+            liveSession,
+            status: liveSession.status,
+          })
+        }
+
+        log.warn({
+          threadId: thread.threadId,
+          liveSessionId: liveSession.sessionId,
+          code: resolved?.code ?? 'RESTORE_NOT_FOUND',
+          message: resolved?.kind === 'fatal' ? resolved.message : undefined,
+        }, 'Falling back to live-only Claude fresh-agent snapshot')
+
+        const liveOnly = buildLiveOnlyResolution(thread.threadId, liveSession)
+        assertFreshAgentRevision(liveOnly.revision, revision)
+        return normalizeClaudeThreadSnapshot({
+          threadId: thread.threadId,
+          resolved: liveOnly,
+          liveSession,
+          status: liveSession.status,
+        })
+      }
+
+      const resolvedSnapshot = await loadResolved(thread.threadId, revision)
+      const resolved = await deps.agentHistorySource?.resolve(thread.threadId)
       if (!resolved || resolved.kind !== 'resolved') {
         throw new RestoreResolutionError('RESTORE_NOT_FOUND', 'Restore session not found')
       }
@@ -185,7 +253,7 @@ export function createClaudeFreshAgentAdapter(deps: ClaudeFreshAgentAdapterDeps)
           turns: resolvedSnapshot.turns,
         },
         liveSession,
-        status: liveSession?.status ?? 'idle',
+        status: 'idle',
       })
     },
 
