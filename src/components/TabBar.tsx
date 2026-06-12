@@ -50,6 +50,11 @@ function escapeSelector(id: string): string {
   return id.replace(/(["\\])/g, '\\$1')
 }
 
+function isEditableShortcutTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  return Boolean(target.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]'))
+}
+
 interface SortableTabProps {
   tab: Tab
   displayTitle: string
@@ -362,6 +367,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.ctrlKey && e.shiftKey && activeTabId) {
+        if (isEditableShortcutTarget(e.target)) return
         const currentIndex = tabs.findIndex((t: Tab) => t.id === activeTabId)
         if (e.key === 'ArrowLeft' && currentIndex > 0) {
           dispatch(reorderTabs({ fromIndex: currentIndex, toIndex: currentIndex - 1 }))

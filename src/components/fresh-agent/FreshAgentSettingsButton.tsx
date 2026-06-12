@@ -3,6 +3,7 @@ import { Settings } from 'lucide-react'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch } from '@/store/hooks'
 import { mergePaneContent } from '@/store/panesSlice'
+import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import {
   FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE,
   getFreshAgentThinkingOptions,
@@ -71,6 +72,19 @@ export function FreshAgentSettingsButton({
   const settingsDisabled = paneContent.status === 'running' || paneContent.status === 'compacting'
 
   const close = useCallback(() => setOpen(false), [])
+  const persistProviderDefaults = useCallback((defaults: {
+    modelSelection?: { kind: 'exact'; modelId: string }
+    defaultPermissionMode?: string
+    effort?: string
+  }) => {
+    void dispatch(saveServerSettingsPatch({
+      freshAgent: {
+        providers: {
+          [paneContent.sessionType]: defaults,
+        },
+      },
+    }))
+  }, [dispatch, paneContent.sessionType])
 
   useEffect(() => {
     if (!open) return
@@ -154,6 +168,10 @@ export function FreshAgentSettingsButton({
                             paneId,
                             updates: { model: nextModel, effort: nextEffort },
                           }))
+                          persistProviderDefaults({
+                            modelSelection: { kind: 'exact', modelId: nextModel },
+                            ...(nextEffort ? { effort: nextEffort } : {}),
+                          })
                         }}
                       />
                       <span>{option.label}</span>
@@ -172,11 +190,13 @@ export function FreshAgentSettingsButton({
                   value={thinkingValue}
                   disabled={settingsDisabled}
                   onChange={(event) => {
+                    const nextEffort = event.target.value
                     dispatch(mergePaneContent({
                       tabId,
                       paneId,
-                      updates: { effort: event.target.value },
+                      updates: { effort: nextEffort },
                     }))
+                    persistProviderDefaults({ effort: nextEffort })
                   }}
                 >
                   {thinkingOptions.map((option) => (
@@ -195,11 +215,13 @@ export function FreshAgentSettingsButton({
                   value={permissionModeValue}
                   disabled={settingsDisabled}
                   onChange={(event) => {
+                    const nextPermissionMode = event.target.value
                     dispatch(mergePaneContent({
                       tabId,
                       paneId,
-                      updates: { permissionMode: event.target.value },
+                      updates: { permissionMode: nextPermissionMode },
                     }))
+                    persistProviderDefaults({ defaultPermissionMode: nextPermissionMode })
                   }}
                 >
                   {permissionModes.map((option) => (
