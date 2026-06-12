@@ -2298,7 +2298,6 @@ export class WsHandler {
           && m.restore !== true
           && !requestedSessionRef
           && !m.resumeSessionId
-          && !m.recoveryIntent
         if (shouldPreallocateFreshClaudeSession) {
           effectiveResumeSessionId = this.reserveClaudeFreshSessionId(state, m.requestId)
           sessionBindingReason = 'start'

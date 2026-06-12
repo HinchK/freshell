@@ -547,6 +547,41 @@ describe('terminal.create reuse running claude terminal', () => {
     }
   })
 
+  it('fresh Claude recovery terminal.create also preallocates a canonical sessionRef', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    try {
+      await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+      await waitForReady(ws)
+
+      const requestId = 'fresh-claude-recovery-preallocated'
+      const createdPromise = waitForMessage(ws, (m) => m.type === 'terminal.created' && m.requestId === requestId)
+
+      ws.send(JSON.stringify({
+        type: 'terminal.create',
+        requestId,
+        mode: 'claude',
+        shell: 'system',
+        cwd: '/home/user/recovered-project',
+        recoveryIntent: 'fresh_after_restore_unavailable',
+        tabId: 'tab-claude-recovery',
+        paneId: 'pane-claude-recovery',
+      }))
+
+      const created = await createdPromise
+      expect(created.sessionRef?.provider).toBe('claude')
+      expect(created.sessionRef?.sessionId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+      expect(created.cwd).toBe('/home/user/recovered-project')
+      expect(registry.createCalls.at(-1)).toMatchObject({
+        mode: 'claude',
+        resumeSessionId: created.sessionRef.sessionId,
+        sessionBindingReason: 'start',
+        cwd: '/home/user/recovered-project',
+      })
+    } finally {
+      await closeWebSocket(ws)
+    }
+  })
+
   it('duplicate fresh Claude terminal.create reuses the preallocated sessionRef', async () => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     try {
