@@ -13,10 +13,12 @@ import {
 vi.mock('fs', () => {
   const existsSync = vi.fn()
   const statSync = vi.fn()
+  const realpathSync = Object.assign(vi.fn(), { native: vi.fn() })
   return {
     existsSync,
     statSync,
-    default: { existsSync, statSync },
+    realpathSync,
+    default: { existsSync, statSync, realpathSync },
   }
 })
 
@@ -2361,6 +2363,45 @@ describe('TerminalRegistry', () => {
       expect(found).toHaveLength(0)
       expect(registry.findTerminalsBySession('claude', VALID_CLAUDE_SESSION_ID)).toHaveLength(1)
       expect(registry.findTerminalsBySession('claude', VALID_CLAUDE_SESSION_ID)[0].terminalId).toBe(record.terminalId)
+    })
+
+    it('matches Claude sessions when cwd realpaths resolve to the same directory', () => {
+      vi.mocked(fs.realpathSync.native).mockImplementation((cwd) => {
+        const path = String(cwd)
+        if (path === '/workspaces/project-link') return '/mnt/repos/project'
+        if (path === '/mnt/repos/project') return '/mnt/repos/project'
+        throw new Error(`unexpected cwd: ${path}`)
+      })
+
+      const record = registry.create({
+        mode: 'claude',
+        cwd: '/workspaces/project-link',
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+      })
+
+      expect(
+        registry.findTerminalsBySession('claude', VALID_CLAUDE_SESSION_ID, '/mnt/repos/project')[0]?.terminalId,
+      ).toBe(record.terminalId)
+      expect(
+        registry.getCanonicalRunningTerminalBySession('claude', VALID_CLAUDE_SESSION_ID, '/mnt/repos/project')?.terminalId,
+      ).toBe(record.terminalId)
+    })
+
+    it('falls back to lexical cwd matching when cwd realpath cannot be resolved', () => {
+      vi.mocked(fs.realpathSync.native).mockImplementation(() => {
+        throw new Error('path unavailable')
+      })
+
+      const record = registry.create({
+        mode: 'claude',
+        cwd: '/missing/project/',
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+      })
+
+      const found = registry.findTerminalsBySession('claude', VALID_CLAUDE_SESSION_ID, '/missing/project')
+
+      expect(found).toHaveLength(1)
+      expect(found[0].terminalId).toBe(record.terminalId)
     })
 
     it('does not reuse a canonical Claude owner from a different cwd when cwd is supplied', () => {

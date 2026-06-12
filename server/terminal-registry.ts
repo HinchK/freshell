@@ -393,9 +393,23 @@ function isCwdScopedSessionMode(mode: TerminalMode): boolean {
   return mode === 'claude'
 }
 
-function normalizeSessionCwd(cwd: string): string {
+function normalizeLexicalSessionCwd(cwd: string): string {
   const normalized = cwd.replace(/\\/g, '/').replace(/\/+$/, '')
   return process.platform === 'win32' ? normalized.toLowerCase() : normalized
+}
+
+function normalizeSessionCwd(cwd: string): string {
+  try {
+    const realpathSync = fs.realpathSync.native || fs.realpathSync
+    const realpath = realpathSync(cwd)
+    if (typeof realpath === 'string') {
+      return normalizeLexicalSessionCwd(realpath)
+    }
+  } catch {
+    // Missing or virtual paths still participate via lexical normalization.
+  }
+
+  return normalizeLexicalSessionCwd(cwd)
 }
 
 function isScopedOwnerCwdMismatch(mode: TerminalMode, term: TerminalRecord, sessionId: string, cwd?: string): boolean {
