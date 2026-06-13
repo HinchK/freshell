@@ -18,17 +18,26 @@ export type OpencodeTurnBodyResult = {
   revision: number
 }
 
+export type OpencodeLegacySessionResolveInput = {
+  cwd?: string
+  title?: string
+  createdAt?: number
+  updatedAt?: number
+}
+
 export type OpencodeHistoryExportPage = OpencodeHistoryPage & OpencodeExport
 export type OpencodeHistoryTurnBody = OpencodeTurnBodyResult & NonNullable<OpencodeExport['messages']>[number]
 
 export type OpencodeHistoryReadRequest =
   | { type: 'session_info'; sessionId: string }
+  | { type: 'legacy_session'; query: OpencodeLegacySessionResolveInput }
   | { type: 'snapshot_page'; sessionId: string; limit?: number }
   | { type: 'turn_page'; sessionId: string; query?: { cursor?: string; limit?: number } }
   | { type: 'turn_body'; sessionId: string; turnId: string }
 
 export type OpencodeHistoryReadResult =
   | { type: 'session_info'; sessionInfo: OpencodeSessionInfo }
+  | { type: 'legacy_session'; sessionInfo: OpencodeSessionInfo }
   | { type: 'snapshot_page'; page: OpencodeHistoryExportPage }
   | { type: 'turn_page'; page: OpencodeHistoryExportPage }
   | { type: 'turn_body'; body: OpencodeHistoryTurnBody }
@@ -80,6 +89,38 @@ type HydratedMessage = NonNullable<OpencodeExport['messages']>[number]
 const OPENCODE_DB_BUSY_TIMEOUT_MS = 5000
 
 export const DEFAULT_SNAPSHOT_TURN_LIMIT = 200
+
+const LEGACY_PLACEHOLDER_LOOKAHEAD_MS = 24 * 60 * 60_000
+const LEGACY_PLACEHOLDER_LOOKBEHIND_MS = 5 * 60_000
+const LEGACY_PLACEHOLDER_CANDIDATE_LIMIT = 50
+const LEGACY_TITLE_STOP_WORDS = new Set([
+  'the',
+  'and',
+  'for',
+  'from',
+  'into',
+  'onto',
+  'that',
+  'this',
+  'with',
+  'your',
+  'ours',
+  'mine',
+  'have',
+  'has',
+  'had',
+  'are',
+  'was',
+  'were',
+  'can',
+  'cannot',
+  'cant',
+  'dont',
+  'list',
+  'all',
+  'each',
+  'one',
+])
 
 const SESSION_REQUIRED_COLUMNS = [
   'id',
@@ -199,6 +240,36 @@ function numberValue(value: unknown): number | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+function normalizedTitleTokens(value: unknown): Set<string> {
+  const text = stringValue(value)
+  if (!text) return new Set()
+  const tokens = text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 && !LEGACY_TITLE_STOP_WORDS.has(token))
+    .map((token) => token.endsWith('s') && token.length > 4 ? token.slice(0, -1) : token)
+  return new Set(tokens)
+}
+
+function titleOverlapScore(left: Set<string>, right: Set<string>): number {
+  let overlap = 0
+  for (const token of left) {
+    if (right.has(token)) overlap += 1
+  }
+  return overlap
+}
+
+function hasLegacyTitleMatch(queryTokens: Set<string>, candidateTitle: unknown): boolean {
+  if (queryTokens.size === 0) return true
+  const candidateTokens = normalizedTitleTokens(candidateTitle)
+  if (candidateTokens.size === 0) return false
+  const overlap = titleOverlapScore(queryTokens, candidateTokens)
+  const requiredOverlap = Math.min(2, queryTokens.size, candidateTokens.size)
+  return overlap >= requiredOverlap
 }
 
 function setIfString(target: Record<string, unknown>, key: string, value: unknown): void {
@@ -414,6 +485,52 @@ export function readOpencodeSessionInfo(
   })
 }
 
+export function resolveOpencodeLegacySession(
+  db: DatabaseLike,
+  input: OpencodeLegacySessionResolveInput,
+): OpencodeSessionInfo | undefined {
+  const cwd = stringValue(input.cwd)
+  if (!cwd) return undefined
+  const createdAt = numberValue(input.createdAt)
+  const updatedAt = numberValue(input.updatedAt)
+  const titleTokens = normalizedTitleTokens(input.title)
+  if (createdAt === undefined && updatedAt === undefined && titleTokens.size === 0) return undefined
+
+  return withReadTransaction(db, () => {
+    const sessionColumns = requireColumns(db, 'session', SESSION_REQUIRED_COLUMNS)
+    const filters = ['s.id LIKE ?', 's.directory = ?']
+    const params: unknown[] = ['ses_%', cwd]
+
+    if (sessionColumns.has('time_archived')) {
+      filters.push('s.time_archived IS NULL')
+    }
+    if (sessionColumns.has('parent_id')) {
+      filters.push('s.parent_id IS NULL')
+    }
+    const anchor = createdAt ?? updatedAt
+    if (anchor !== undefined) {
+      filters.push('s.time_created >= ?')
+      params.push(anchor - LEGACY_PLACEHOLDER_LOOKBEHIND_MS)
+      filters.push('s.time_created <= ?')
+      params.push(anchor + LEGACY_PLACEHOLDER_LOOKAHEAD_MS)
+    }
+
+    const rows = db.prepare(`
+      SELECT ${sessionSelectList(sessionColumns)}
+      FROM session s
+      WHERE ${filters.join('\n        AND ')}
+      ORDER BY s.time_created DESC, s.id DESC
+      LIMIT ?
+    `).all(...params, LEGACY_PLACEHOLDER_CANDIDATE_LIMIT) as SessionRow[]
+
+    const matches = rows
+      .filter((row) => hasLegacyTitleMatch(titleTokens, row.title))
+      .map(hydrateSessionInfo)
+
+    return matches.length === 1 ? matches[0] : undefined
+  })
+}
+
 export function readOpencodeSnapshotPage(
   db: DatabaseLike,
   input: { sessionId: string; limit?: number },
@@ -519,6 +636,10 @@ export async function runOpencodeHistoryQuery(
       case 'session_info': {
         const sessionInfo = readOpencodeSessionInfo(db, { sessionId: input.request.sessionId })
         return sessionInfo ? { type: 'session_info', sessionInfo } : undefined
+      }
+      case 'legacy_session': {
+        const sessionInfo = resolveOpencodeLegacySession(db, input.request.query)
+        return sessionInfo ? { type: 'legacy_session', sessionInfo } : undefined
       }
       case 'snapshot_page': {
         const page = readOpencodeSnapshotPage(db, {

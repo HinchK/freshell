@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   encodeOpencodeCursor,
+  resolveOpencodeLegacySession,
   readOpencodeSessionInfo,
   readOpencodeSnapshotPage,
   readOpencodeTurnBody,
@@ -435,6 +436,80 @@ describe('OpenCode DB history query', () => {
       const body = readOpencodeTurnBody(db, { sessionId, turnId: 'primary-message-2' })
       expect(body?.parts.map((part) => part.id)).toEqual(['primary-part-2'])
       expect(readOpencodeTurnBody(db, { sessionId, turnId: 'other-message-1' })).toBeNull()
+    } finally {
+      db.close()
+    }
+  })
+
+  it('resolves a legacy freshopencode placeholder to one same-cwd title/time candidate', () => {
+    const db = createDatabase()
+    try {
+      createOpenCodeSchema(db)
+      insertSession(db, {
+        id: 'ses_legacy_match',
+        directory: '/home/dan/code',
+        title: 'Skills from public repos',
+        timeCreated: baseTime + 54 * 60_000,
+        timeUpdated: baseTime + 2 * 60 * 60_000,
+      })
+      insertSession(db, {
+        id: 'ses_same_cwd_unrelated',
+        directory: '/home/dan/code',
+        title: 'Audit build install scripts',
+        timeCreated: baseTime + 55 * 60_000,
+        timeUpdated: baseTime + 56 * 60_000,
+      })
+      insertSession(db, {
+        id: 'ses_old_same_title',
+        directory: '/home/dan/code',
+        title: 'Skills from old repos',
+        timeCreated: baseTime - 7 * 24 * 60 * 60_000,
+        timeUpdated: baseTime - 7 * 24 * 60 * 60_000,
+      })
+      insertSession(db, {
+        id: 'ses_other_cwd_same_title',
+        directory: '/home/dan/other',
+        title: 'Skills from public repos',
+        timeCreated: baseTime + 54 * 60_000,
+        timeUpdated: baseTime + 2 * 60 * 60_000,
+      })
+
+      const resolved = resolveOpencodeLegacySession(db, {
+        cwd: '/home/dan/code',
+        title: 'Identifying skills from GitHub repos',
+        createdAt: baseTime,
+        updatedAt: baseTime + 30_000,
+      })
+
+      expect(resolved?.id).toBe('ses_legacy_match')
+      expect(resolved?.directory).toBe('/home/dan/code')
+    } finally {
+      db.close()
+    }
+  })
+
+  it('does not resolve an ambiguous legacy freshopencode placeholder', () => {
+    const db = createDatabase()
+    try {
+      createOpenCodeSchema(db)
+      insertSession(db, {
+        id: 'ses_legacy_match_a',
+        directory: '/home/dan/code',
+        title: 'Skills from public repos',
+        timeCreated: baseTime + 54 * 60_000,
+      })
+      insertSession(db, {
+        id: 'ses_legacy_match_b',
+        directory: '/home/dan/code',
+        title: 'Public repo skills inventory',
+        timeCreated: baseTime + 55 * 60_000,
+      })
+
+      expect(resolveOpencodeLegacySession(db, {
+        cwd: '/home/dan/code',
+        title: 'Identifying skills from GitHub repos',
+        createdAt: baseTime,
+      })).toBeUndefined()
     } finally {
       db.close()
     }

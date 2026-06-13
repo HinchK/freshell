@@ -490,6 +490,57 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('sends tab restore context when recreating a legacy freshopencode placeholder', async () => {
+    const store = createStore()
+    store.dispatch(updateTab({
+      id: 'tab-1',
+      updates: {
+        title: 'Identifying skills from GitHub repos',
+        createdAt: 1_781_291_230_743,
+      },
+    }))
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: '-gP4qyCL7bwp8-xbw9G7b',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode--gP4qyCL7bwp8-xbw9G7b' },
+        initialCwd: '/home/dan/code',
+        status: 'connected',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create').at(-1)).toMatchObject({
+        requestId: '-gP4qyCL7bwp8-xbw9G7b',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/home/dan/code',
+        resumeSessionId: 'freshopencode--gP4qyCL7bwp8-xbw9G7b',
+        legacyRestoreContext: {
+          title: 'Identifying skills from GitHub repos',
+          createdAt: 1_781_291_230_743,
+          updatedAt: expect.any(Number),
+        },
+      })
+    })
+    expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalledWith(
+      'freshopencode',
+      'opencode',
+      'freshopencode--gP4qyCL7bwp8-xbw9G7b',
+      expect.any(Object),
+    )
+  })
+
   it('clears a restored Freshopencode placeholder when history reports FRESH_AGENT_LOST_SESSION', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce({

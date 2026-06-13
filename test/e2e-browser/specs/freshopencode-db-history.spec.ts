@@ -3,6 +3,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { DatabaseSync } from 'node:sqlite'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TestServer } from '../helpers/test-server.js'
@@ -138,6 +139,108 @@ async function sendFreshAgentPrompt(page: Page, prompt: string): Promise<void> {
   await page.getByRole('button', { name: 'Send' }).click()
 }
 
+async function seedLegacyOpencodeSession(input: {
+  sharedOpencodeDataDir: string
+  cwd: string
+  sessionId: string
+  title: string
+  prompt: string
+  response: string
+  createdAt: number
+}): Promise<void> {
+  await fsp.mkdir(input.sharedOpencodeDataDir, { recursive: true })
+  const db = new DatabaseSync(path.join(input.sharedOpencodeDataDir, 'opencode.db'))
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS project (
+        id text PRIMARY KEY,
+        worktree text
+      );
+      CREATE TABLE IF NOT EXISTS session (
+        id text PRIMARY KEY,
+        project_id text NOT NULL,
+        workspace_id text,
+        parent_id text,
+        slug text NOT NULL,
+        directory text NOT NULL,
+        path text,
+        title text NOT NULL,
+        version text NOT NULL,
+        share_url text,
+        summary_additions integer,
+        summary_deletions integer,
+        summary_files integer,
+        summary_diffs text,
+        metadata text,
+        cost real NOT NULL DEFAULT 0,
+        tokens_input integer NOT NULL DEFAULT 0,
+        tokens_output integer NOT NULL DEFAULT 0,
+        tokens_reasoning integer NOT NULL DEFAULT 0,
+        tokens_cache_read integer NOT NULL DEFAULT 0,
+        tokens_cache_write integer NOT NULL DEFAULT 0,
+        revert text,
+        permission text,
+        agent text,
+        model text NOT NULL,
+        time_created integer NOT NULL,
+        time_updated integer NOT NULL,
+        time_compacting integer,
+        time_archived integer
+      );
+      CREATE TABLE IF NOT EXISTS message (
+        id text PRIMARY KEY,
+        session_id text NOT NULL,
+        time_created integer NOT NULL,
+        time_updated integer NOT NULL,
+        data text NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS part (
+        id text PRIMARY KEY,
+        message_id text NOT NULL,
+        session_id text NOT NULL,
+        time_created integer NOT NULL,
+        time_updated integer NOT NULL,
+        data text NOT NULL
+      );
+    `)
+    db.prepare('INSERT OR REPLACE INTO project (id, worktree) VALUES (?, ?)').run('proj-legacy', input.cwd)
+    db.prepare(`
+      INSERT OR REPLACE INTO session (
+        id, project_id, workspace_id, parent_id, slug, directory, path, title, version,
+        share_url, summary_additions, summary_deletions, summary_files, summary_diffs,
+        metadata, cost, tokens_input, tokens_output, tokens_reasoning, tokens_cache_read,
+        tokens_cache_write, revert, permission, agent, model, time_created, time_updated,
+        time_compacting, time_archived
+      )
+      VALUES (?, 'proj-legacy', NULL, NULL, ?, ?, ?, ?, 'fake-opencode-e2e',
+        NULL, 0, 0, 0, NULL, NULL, 0, 0, 0, 0, 0, 0, NULL, NULL, 'fake',
+        ?, ?, ?, NULL, NULL)
+    `).run(
+      input.sessionId,
+      input.sessionId,
+      input.cwd,
+      input.cwd,
+      input.title,
+      JSON.stringify({ providerID: 'opencode', modelID: 'fake-opencode' }),
+      input.createdAt,
+      input.createdAt + 2_000,
+    )
+
+    const userMessageId = `${input.sessionId}_legacy_user`
+    const assistantMessageId = `${input.sessionId}_legacy_assistant`
+    db.prepare('INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+      .run(userMessageId, input.sessionId, input.createdAt, input.createdAt, JSON.stringify({ role: 'user' }))
+    db.prepare('INSERT OR REPLACE INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(`${userMessageId}_part`, userMessageId, input.sessionId, input.createdAt, input.createdAt, JSON.stringify({ type: 'text', text: input.prompt }))
+    db.prepare('INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+      .run(assistantMessageId, input.sessionId, input.createdAt + 1_000, input.createdAt + 1_000, JSON.stringify({ role: 'assistant' }))
+    db.prepare('INSERT OR REPLACE INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(`${assistantMessageId}_part`, assistantMessageId, input.sessionId, input.createdAt + 1_000, input.createdAt + 1_000, JSON.stringify({ type: 'text', text: input.response }))
+  } finally {
+    db.close()
+  }
+}
+
 test.describe('Freshopencode DB history restore', () => {
   test.setTimeout(180_000)
 
@@ -269,6 +372,108 @@ test.describe('Freshopencode DB history restore', () => {
         },
         status: 'idle',
       })
+    } finally {
+      await server.stop().catch(() => {})
+      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('repairs a persisted legacy placeholder from a unique DB session', async ({ page }) => {
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-legacy-'))
+    const binDir = path.join(sharedRoot, 'bin')
+    const logsDir = path.join(sharedRoot, 'logs')
+    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
+    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
+    const cwd = path.join(sharedRoot, 'project')
+    const sessionId = 'ses_legacy_unique'
+    const placeholderId = 'freshopencode--legacyUnique'
+    const prompt = 'Which skills come from public repos'
+    const response = 'Only the unique legacy DB session should render'
+    const tabCreatedAt = Date.now()
+    await fsp.mkdir(cwd, { recursive: true })
+    await installFakeOpencode(binDir)
+    await seedLegacyOpencodeSession({
+      sharedOpencodeDataDir,
+      cwd,
+      sessionId,
+      title: 'Skills from public repos',
+      prompt,
+      response,
+      createdAt: tabCreatedAt + 60_000,
+    })
+
+    const server = new TestServer(createServerOptions({
+      binDir,
+      auditLogPath,
+      logsDir,
+      sharedOpencodeDataDir,
+      env: {
+        FAKE_OPENCODE_TRUNCATE_EXPORT: '1',
+      },
+    }))
+
+    try {
+      const info = await server.start()
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harness = new TestHarness(page)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+      await enableFreshOpencode(page)
+
+      await page.evaluate(({ cwd, placeholderId, tabCreatedAt }) => {
+        const harness = window.__FRESHELL_TEST_HARNESS__
+        harness?.dispatch({
+          type: 'tabs/addTab',
+          payload: {
+            id: 'tab-legacy-freshopencode',
+            title: 'Identifying skills from GitHub repos',
+            mode: 'shell',
+            status: 'running',
+          },
+        })
+        harness?.dispatch({
+          type: 'tabs/updateTab',
+          payload: {
+            id: 'tab-legacy-freshopencode',
+            updates: {
+              title: 'Identifying skills from GitHub repos',
+              createdAt: tabCreatedAt,
+            },
+          },
+        })
+        harness?.dispatch({
+          type: 'panes/initLayout',
+          payload: {
+            tabId: 'tab-legacy-freshopencode',
+            paneId: 'pane-legacy-freshopencode',
+            content: {
+              kind: 'fresh-agent',
+              sessionType: 'freshopencode',
+              provider: 'opencode',
+              createRequestId: '-legacyUnique',
+              sessionRef: { provider: 'opencode', sessionId: placeholderId },
+              initialCwd: cwd,
+              status: 'connected',
+            },
+          },
+        })
+        harness?.dispatch({ type: 'tabs/setActiveTab', payload: 'tab-legacy-freshopencode' })
+      }, { cwd, placeholderId, tabCreatedAt })
+
+      await expect(page.getByText(prompt)).toBeVisible({ timeout: 30_000 })
+      await expect(page.getByText(response)).toBeVisible({ timeout: 30_000 })
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 30_000 }).toMatchObject({
+        sessionId,
+        resumeSessionId: sessionId,
+        sessionRef: {
+          provider: 'opencode',
+          sessionId,
+        },
+      })
+
+      const auditEvents = await readAuditEvents(auditLogPath)
+      expect(auditEvents.some((event) => event.event === 'export')).toBe(false)
+      expect(auditEvents.some((event) => event.event === 'run')).toBe(false)
     } finally {
       await server.stop().catch(() => {})
       await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
