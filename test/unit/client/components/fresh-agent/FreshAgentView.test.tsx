@@ -315,6 +315,63 @@ describe('FreshAgentView', () => {
     expect(root).toHaveClass('fresh-agent-style-serif')
   })
 
+  it('only exposes the stop action while the agent is working', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [],
+    })
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-stop-idle',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'idle',
+          }}
+        />
+      </Provider>,
+    )
+
+    await screen.findByRole('textbox', { name: 'Chat message input' })
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+
+    cleanup()
+
+    const runningStore = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'running',
+      capabilities: { send: false, interrupt: true, fork: false },
+      turns: [],
+    })
+
+    render(
+      <Provider store={runningStore}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-stop-running',
+            sessionId: CLAUDE_RESTORE_THREAD_ID,
+            status: 'running',
+          }}
+        />
+      </Provider>,
+    )
+
+    expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+  })
+
   it('renders Codex review and fork metadata in the shared shell', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
