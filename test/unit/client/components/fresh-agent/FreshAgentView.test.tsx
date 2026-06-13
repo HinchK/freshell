@@ -129,6 +129,25 @@ function getFreshAgentSessionId() {
   return document.querySelector('[data-context="fresh-agent"]')?.getAttribute('data-session-id')
 }
 
+function getFreshAgentPaneContent(store: ReturnType<typeof createStore>) {
+  const layout = store.getState().panes.layouts['tab-1']
+  if (!layout || layout.type !== 'leaf' || layout.content.kind !== 'fresh-agent') {
+    throw new Error('Expected fresh-agent leaf content')
+  }
+  return layout.content
+}
+
+function sentFreshAgentMessages(type: string) {
+  return wsMock.send.mock.calls
+    .map(([message]) => message)
+    .filter((message): message is Record<string, unknown> => (
+      !!message
+      && typeof message === 'object'
+      && !Array.isArray(message)
+      && (message as { type?: unknown }).type === type
+    ))
+}
+
 function createDeferred<T>() {
   let resolve!: (value: T) => void
   let reject!: (error?: unknown) => void
@@ -397,6 +416,119 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-created', expect.any(Object))
     })
+  })
+
+  it('promotes Freshopencode panes when freshAgent.session.materialized arrives', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      onMessage = handler
+      return () => {}
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-opencode-materialize',
+        sessionId: 'freshopencode-req-opencode-materialize',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-opencode-materialize' },
+        resumeSessionId: 'freshopencode-req-opencode-materialize',
+        status: 'idle',
+        model: 'opencode-go/deepseek-v4-flash',
+        effort: 'max',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const textbox = await screen.findByRole('textbox', { name: 'Chat message input' })
+    fireEvent.change(textbox, { target: { value: 'before materialized' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(sentFreshAgentMessages('freshAgent.send').at(-1)).toMatchObject({
+      sessionId: 'freshopencode-req-opencode-materialize',
+    })
+
+    await waitFor(() => {
+      expect(onMessage).toBeTypeOf('function')
+    })
+    act(() => {
+      onMessage?.({
+        type: 'freshAgent.session.materialized',
+        previousSessionId: 'freshopencode-req-opencode-materialize',
+        sessionId: 'ses_real_materialized_1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_real_materialized_1' },
+      })
+    })
+
+    await waitFor(() => {
+      const content = getFreshAgentPaneContent(store)
+      expect(content.sessionId).toBe('ses_real_materialized_1')
+      expect(content.sessionRef).toEqual({ provider: 'opencode', sessionId: 'ses_real_materialized_1' })
+      expect(content.resumeSessionId).toBe('ses_real_materialized_1')
+      expect(content.restoreError).toBeUndefined()
+    })
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'after materialized' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(sentFreshAgentMessages('freshAgent.send').at(-1)).toMatchObject({
+      sessionId: 'ses_real_materialized_1',
+    })
+  })
+
+  it('clears a restored Freshopencode placeholder when history reports FRESH_AGENT_LOST_SESSION', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce({
+      status: 404,
+      message: 'OpenCode fresh-agent placeholder freshopencode-restored is not restorable.',
+      details: {
+        code: 'FRESH_AGENT_LOST_SESSION',
+      },
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-restored-opencode',
+        sessionId: 'freshopencode-restored',
+        sessionRef: { provider: 'opencode', sessionId: 'freshopencode-restored' },
+        resumeSessionId: 'freshopencode-restored',
+        status: 'connected',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      const content = getFreshAgentPaneContent(store)
+      expect(content.sessionId).toBeUndefined()
+      expect(content.sessionRef).toBeUndefined()
+      expect(content.resumeSessionId).toBeUndefined()
+      expect(content.status).toBe('idle')
+      expect(content.restoreError).toEqual({
+        code: 'RESTORE_UNAVAILABLE',
+        reason: 'durable_artifact_missing',
+      })
+    })
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
   })
 
   it('sends through fresh-agent WS actions with pane settings when available', async () => {

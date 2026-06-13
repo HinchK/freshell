@@ -127,6 +127,16 @@ function isUnmaterializedCodexThreadError(error: unknown): boolean {
     && (error as { message: string }).message.includes('no rollout found for thread id')
 }
 
+function isLostFreshOpencodeThreadError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const status = 'status' in error ? (error as { status?: unknown }).status : undefined
+  const details = 'details' in error ? (error as { details?: unknown }).details : undefined
+  const code = details && typeof details === 'object' && 'code' in details
+    ? (details as { code?: unknown }).code
+    : undefined
+  return status === 404 && code === 'FRESH_AGENT_LOST_SESSION'
+}
+
 function getRestoreErrorMessage(reason: RestoreErrorReason): string {
   switch (reason) {
     case 'invalid_legacy_restore_target':
@@ -655,6 +665,27 @@ export function FreshAgentView({
         }))
       }
       if (
+        message.type === 'freshAgent.session.materialized'
+        && message.previousSessionId === paneContentRef.current.sessionId
+        && message.sessionType === paneContentRef.current.sessionType
+        && message.provider === paneContentRef.current.provider
+      ) {
+        const current = paneContentRef.current
+        const sessionRef = message.sessionRef ?? { provider: message.provider, sessionId: message.sessionId }
+        setSnapshotRefreshNonce((value) => value + 1)
+        dispatch(updatePaneContent({
+          tabId,
+          paneId,
+          content: {
+            ...current,
+            sessionId: message.sessionId,
+            sessionRef,
+            resumeSessionId: message.sessionId,
+            restoreError: undefined,
+          },
+        }))
+      }
+      if (
         message.type === 'freshAgent.event'
         && message.sessionId === paneContent.sessionId
         && message.sessionType === paneContent.sessionType
@@ -795,6 +826,26 @@ export function FreshAgentView({
               ...fresh,
               sessionId: undefined,
               sessionRef: undefined,
+              createRequestId: nanoid(),
+              status: 'idle',
+              createError: undefined,
+              restoreError: buildRestoreError('durable_artifact_missing'),
+            },
+          }))
+          return
+        }
+        if (paneContent.provider === 'opencode' && isLostFreshOpencodeThreadError(error)) {
+          const fresh = paneContentRef.current
+          setLoadError(null)
+          setSnapshot(null)
+          dispatch(updatePaneContent({
+            tabId,
+            paneId,
+            content: {
+              ...fresh,
+              sessionId: undefined,
+              sessionRef: undefined,
+              resumeSessionId: undefined,
               createRequestId: nanoid(),
               status: 'idle',
               createError: undefined,
