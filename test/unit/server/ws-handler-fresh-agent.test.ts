@@ -517,6 +517,10 @@ describe('WsHandler fresh-agent routing', () => {
           images: undefined,
           settings: undefined,
         })
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith(
+          { sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode' },
+          expect.any(Function),
+        )
         expect(seenMessages).toContainEqual({
           type: 'freshAgent.session.materialized',
           previousSessionId: 'freshopencode-req-1',

@@ -3674,6 +3674,11 @@ export class WsHandler {
         try {
           const result = await manager.send(locator, { text: m.text, images: m.images, settings: m.settings })
           if (result?.sessionId && result.sessionId !== m.sessionId) {
+            this.ensureFreshAgentSubscription(ws, state, {
+              sessionId: result.sessionId,
+              sessionType: m.sessionType,
+              provider: m.provider,
+            })
             this.send(ws, {
               type: 'freshAgent.session.materialized',
               previousSessionId: m.sessionId,

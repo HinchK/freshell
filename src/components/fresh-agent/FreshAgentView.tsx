@@ -278,6 +278,7 @@ export function FreshAgentView({
   const autoTitleCreateRequestIdRef = useRef(paneContent.createRequestId)
   const autoTitleDurableIdentityRef = useRef<string | null>(null)
   const autoTitleIdentityRef = useRef<string | null>(null)
+  const pendingAutoTitleBySessionIdRef = useRef<Map<string, string>>(new Map())
   const handledRefreshRequestIdRef = useRef<string | null>(null)
   const preferredResumeSessionId = getPreferredResumeSessionId(claudeSession) ?? paneContent.resumeSessionId
   const snapshotThreadId = getFreshAgentSnapshotThreadId(paneContent, claudeSession)
@@ -349,6 +350,24 @@ export function FreshAgentView({
     }
     ws.send(message as never)
   }, [paneId, ws])
+
+  const migratePendingAutoTitle = useCallback((
+    previousSessionId: string | undefined,
+    nextSessionId: string | undefined,
+    provider: string,
+  ) => {
+    if (!previousSessionId || !nextSessionId || previousSessionId === nextSessionId) return
+    const firstMessage = pendingAutoTitleBySessionIdRef.current.get(previousSessionId)
+    if (!firstMessage) return
+    pendingAutoTitleBySessionIdRef.current.delete(previousSessionId)
+    dispatch(finalizeCodingAgentSessionName({
+      tabId,
+      paneId,
+      provider,
+      sessionId: nextSessionId,
+      firstMessage,
+    }))
+  }, [dispatch, paneId, tabId])
 
   const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
   if (prevCreateRequestIdRef.current !== paneContent.createRequestId) {
@@ -440,6 +459,7 @@ export function FreshAgentView({
     setQueuedMessages([])
     setLocalEcho(null)
     alwaysAllowToolsRef.current.clear()
+    pendingAutoTitleBySessionIdRef.current.clear()
     dispatch(updatePaneContent({
       tabId,
       paneId,
@@ -672,6 +692,7 @@ export function FreshAgentView({
       ) {
         const current = paneContentRef.current
         const sessionRef = message.sessionRef ?? { provider: message.provider, sessionId: message.sessionId }
+        migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider)
         setSnapshotRefreshNonce((value) => value + 1)
         dispatch(updatePaneContent({
           tabId,
@@ -737,7 +758,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [dispatch, paneContent, paneContent.createRequestId, paneId, sendFreshAgentMessage, tabId, ws])
+  }, [dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, sendFreshAgentMessage, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -784,6 +805,9 @@ export function FreshAgentView({
         const nextSessionId = snapshotSessionRef?.sessionId ?? fresh.sessionId
         const nextSessionRef = snapshotSessionRef ?? fresh.sessionRef
         const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? sessionId
+        if (snapshotSessionRef) {
+          migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider)
+        }
         if (
           nextStatus === fresh.status
           && nextSessionId === fresh.sessionId
@@ -872,6 +896,7 @@ export function FreshAgentView({
     paneContent.sessionType,
     paneId,
     autoTitleIdentity,
+    migratePendingAutoTitle,
     snapshotThreadId,
     snapshotRefreshNonce,
     tabId,
@@ -1009,6 +1034,7 @@ export function FreshAgentView({
     if (isFirstMessage) {
       autoTitleFreshBoundaryRef.current = false
       autoTitleSentRef.current = true
+      pendingAutoTitleBySessionIdRef.current.set(current.sessionId, text)
       dispatch(finalizeCodingAgentSessionName({
         tabId,
         paneId,

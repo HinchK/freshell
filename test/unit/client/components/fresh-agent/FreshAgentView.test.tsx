@@ -25,6 +25,7 @@ const wsMock = vi.hoisted(() => ({
 
 const apiMock = vi.hoisted(() => ({
   getFreshAgentThreadSnapshot: vi.fn(),
+  post: vi.fn(),
 }))
 
 const saveServerSettingsPatchSpy = vi.hoisted(() => vi.fn((patch: unknown) => ({
@@ -44,6 +45,7 @@ vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
   return {
     ...actual,
+    api: { ...actual.api, post: apiMock.post },
     getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
   }
 })
@@ -163,6 +165,8 @@ beforeEach(() => {
   wsMock.onMessage.mockReset()
   wsMock.onMessage.mockImplementation(() => () => {})
   apiMock.getFreshAgentThreadSnapshot.mockReset()
+  apiMock.post.mockReset()
+  apiMock.post.mockResolvedValue({ title: null, source: 'none' })
   saveServerSettingsPatchSpy.mockClear()
   apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
     status: 'idle',
@@ -1058,6 +1062,11 @@ describe('FreshAgentView', () => {
 
   it('does not reopen auto-title when freshopencode materializes a live session id for the same durable thread', async () => {
     const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -1098,24 +1107,30 @@ describe('FreshAgentView', () => {
     })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
 
+    await waitFor(() => {
+      expect(apiMock.post).toHaveBeenCalledWith(
+        '/api/sessions/opencode%3Afreshopencode-req-1/generate-title',
+        { firstMessage: 'First opencode title' },
+      )
+      expect(onMessage).toBeTypeOf('function')
+    })
+
     act(() => {
-      store.dispatch(updatePaneContent({
-        tabId: 'tab-1',
-        paneId: 'pane-1',
-        content: {
-          kind: 'fresh-agent',
-          sessionType: 'freshopencode',
-          provider: 'opencode',
-          createRequestId: 'req-opencode-auto-title',
-          sessionId: 'ses_real_1',
-          sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-1' },
-          resumeSessionId: 'freshopencode-req-1',
-          status: 'idle',
-        },
-      }))
+      onMessage?.({
+        type: 'freshAgent.session.materialized',
+        previousSessionId: 'freshopencode-req-1',
+        sessionId: 'ses_real_1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
+      })
     })
     await waitFor(() => {
       expect(getFreshAgentSessionId()).toBe('ses_real_1')
+      expect(apiMock.post).toHaveBeenCalledWith(
+        '/api/sessions/opencode%3Ases_real_1/generate-title',
+        { firstMessage: 'First opencode title' },
+      )
     })
 
     fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
