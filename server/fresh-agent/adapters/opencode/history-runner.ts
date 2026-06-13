@@ -1,6 +1,7 @@
 import { Worker } from 'node:worker_threads'
 import type {
   OpencodeHistoryPage,
+  OpencodeLegacySessionResolveInput,
   OpencodeHistoryReadRequest,
   OpencodeHistoryReadResult,
   OpencodeHistoryTurnBody,
@@ -19,6 +20,7 @@ import {
 
 export type OpencodeHistoryReader = {
   readSessionInfo(sessionId: string): Promise<OpencodeSessionInfo | undefined>
+  resolveLegacySession(input: OpencodeLegacySessionResolveInput): Promise<OpencodeSessionInfo | undefined>
   readSnapshotPage(sessionId: string, limit?: number): Promise<OpencodeHistoryPage | undefined>
   readTurnPage(sessionId: string, query: { cursor?: string; limit?: number }): Promise<OpencodeHistoryPage | undefined>
   readTurnBody(sessionId: string, turnId: string): Promise<OpencodeTurnBodyResult | undefined>
@@ -86,6 +88,8 @@ function isReadResult(value: unknown): value is OpencodeHistoryReadResult {
   if (!isObject(value) || typeof value.type !== 'string') return false
   switch (value.type) {
     case 'session_info':
+      return isObject(value.sessionInfo)
+    case 'legacy_session':
       return isObject(value.sessionInfo)
     case 'snapshot_page':
     case 'turn_page':
@@ -205,6 +209,9 @@ export function createWorkerHistoryReader(
     async readSessionInfo(sessionId) {
       return resultForType(await run({ type: 'session_info', sessionId }), 'session_info')?.sessionInfo
     },
+    async resolveLegacySession(input) {
+      return resultForType(await run({ type: 'legacy_session', query: input }), 'legacy_session')?.sessionInfo
+    },
     async readSnapshotPage(sessionId, limit) {
       return resultForType(await run({ type: 'snapshot_page', sessionId, limit }), 'snapshot_page')?.page
     },
@@ -228,6 +235,9 @@ export function createInProcessHistoryReader(options: { dbPath: string }): Openc
   return {
     async readSessionInfo(sessionId) {
       return resultForType(await run({ type: 'session_info', sessionId }), 'session_info')?.sessionInfo
+    },
+    async resolveLegacySession(input) {
+      return resultForType(await run({ type: 'legacy_session', query: input }), 'legacy_session')?.sessionInfo
     },
     async readSnapshotPage(sessionId, limit) {
       return resultForType(await run({ type: 'snapshot_page', sessionId, limit }), 'snapshot_page')?.page

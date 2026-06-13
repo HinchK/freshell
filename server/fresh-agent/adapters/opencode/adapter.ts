@@ -198,6 +198,58 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     }
   }
 
+  async function resolveLegacyPlaceholderResume(input: FreshAgentCreateRequest, placeholderId: string): Promise<OpencodeSessionState> {
+    const context = input.legacyRestoreContext
+    const title = typeof context?.title === 'string' ? context.title : undefined
+    const createdAt = typeof context?.createdAt === 'number' ? context.createdAt : undefined
+    const updatedAt = typeof context?.updatedAt === 'number' ? context.updatedAt : undefined
+    if (!input.cwd || (!title && createdAt === undefined && updatedAt === undefined)) {
+      throw new FreshAgentLostSessionError(`OpenCode session ${placeholderId} is not a durable OpenCode session.`)
+    }
+
+    let resolved: Awaited<ReturnType<OpencodeHistoryReader['resolveLegacySession']>>
+    try {
+      resolved = await historyReader.resolveLegacySession({
+        cwd: input.cwd,
+        title,
+        createdAt,
+        updatedAt,
+      })
+    } catch (error) {
+      logHistoryWarning(
+        'legacy_placeholder_resolve_failed',
+        'OpenCode legacy placeholder resolution failed.',
+        { error, sessionId: placeholderId, extra: { cwd: input.cwd, title, createdAt, updatedAt } },
+      )
+      throw new FreshAgentLostSessionError(`OpenCode session ${placeholderId} is not a durable OpenCode session.`)
+    }
+
+    if (!resolved?.id || !isRealOpencodeSessionId(resolved.id)) {
+      throw new FreshAgentLostSessionError(`OpenCode session ${placeholderId} is not a durable OpenCode session.`)
+    }
+
+    log.info({
+      messageClass: 'legacy_placeholder_resolved',
+      placeholderSessionId: placeholderId,
+      sessionId: resolved.id,
+      cwd: input.cwd,
+      title,
+    }, 'Resolved legacy Freshopencode placeholder to durable OpenCode session.')
+
+    const state: OpencodeSessionState = {
+      placeholderId,
+      realSessionId: resolved.id,
+      cwd: resolved.directory ?? input.cwd,
+      model: input.model,
+      effort: input.effort,
+      status: 'idle',
+      events: new EventEmitter(),
+      sendQueue: Promise.resolve(),
+    }
+    remember(state)
+    return state
+  }
+
   function runCli(
     args: string[],
     cwd?: string,
@@ -354,7 +406,11 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       const normalized = normalizeOpencodeInput(input)
       const sessionId = normalized.resumeSessionId
       if (!sessionId) throw new Error('OpenCode resume requires a session id.')
-      if (isPlaceholderOpencodeSessionId(sessionId) || !isRealOpencodeSessionId(sessionId)) {
+      if (isPlaceholderOpencodeSessionId(sessionId)) {
+        const state = await resolveLegacyPlaceholderResume(normalized, sessionId)
+        return { sessionId: state.realSessionId!, sessionRef: { provider: 'opencode', sessionId: state.realSessionId! } }
+      }
+      if (!isRealOpencodeSessionId(sessionId)) {
         throw new FreshAgentLostSessionError(`OpenCode session ${sessionId} is not a durable OpenCode session.`)
       }
       const state: OpencodeSessionState = {

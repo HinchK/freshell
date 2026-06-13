@@ -76,6 +76,13 @@ function getCanonicalPaneResumeSessionId(pane: FreshAgentPaneContent): string | 
   return undefined
 }
 
+function isFreshOpencodePlaceholderId(pane: FreshAgentPaneContent, sessionId: string | undefined): boolean {
+  return pane.provider === 'opencode'
+    && pane.sessionType === 'freshopencode'
+    && typeof sessionId === 'string'
+    && sessionId.startsWith('freshopencode-')
+}
+
 function getFreshAgentSnapshotThreadId(
   pane: FreshAgentPaneContent,
   claudeSession: Parameters<typeof getCanonicalDurableSessionId>[0],
@@ -91,8 +98,15 @@ function getFreshAgentSnapshotThreadId(
     // While a new session is still being created, avoid reading an older durable ref.
     return pane.sessionId
   }
+  const sessionRefId = pane.sessionRef?.provider === pane.provider ? pane.sessionRef.sessionId : undefined
+  if (!pane.sessionId && isFreshOpencodePlaceholderId(pane, sessionRefId)) {
+    // Legacy Freshopencode panes could persist only the placeholder sessionRef.
+    // Let freshAgent.create/resume repair it before snapshot loading; otherwise
+    // the placeholder 404 races the promotion and marks the pane unrecoverable.
+    return undefined
+  }
   return pane.sessionId
-    ?? (pane.sessionRef?.provider === pane.provider ? pane.sessionRef.sessionId : undefined)
+    ?? sessionRefId
 }
 
 function getCreatedResumeSessionId(
@@ -103,6 +117,25 @@ function getCreatedResumeSessionId(
   if (message.sessionRef?.provider === current.provider) return message.sessionRef.sessionId
   if (current.provider === 'claude' && !isValidClaudeSessionId(message.sessionId)) return undefined
   return message.sessionId
+}
+
+function buildLegacyRestoreContext(tab: { title?: string; createdAt?: number; updatedAt?: number } | undefined) {
+  if (!tab) return undefined
+  const title = typeof tab.title === 'string' && tab.title.trim().length > 0
+    ? tab.title.trim()
+    : undefined
+  const createdAt = typeof tab.createdAt === 'number' && Number.isFinite(tab.createdAt)
+    ? tab.createdAt
+    : undefined
+  const updatedAt = typeof tab.updatedAt === 'number' && Number.isFinite(tab.updatedAt)
+    ? tab.updatedAt
+    : undefined
+  if (!title && createdAt === undefined && updatedAt === undefined) return undefined
+  return {
+    ...(title ? { title } : {}),
+    ...(createdAt !== undefined ? { createdAt } : {}),
+    ...(updatedAt !== undefined ? { updatedAt } : {}),
+  }
 }
 
 function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLabel?: string): string {
@@ -210,6 +243,9 @@ export function FreshAgentView({
   const pendingCreateFailure = useAppSelector(
     (state) => state.freshAgent?.pendingCreateFailures?.[paneContent.createRequestId],
   )
+  const tabRestoreSource = useAppSelector((state) => (
+    state.tabs?.tabs?.find((tab) => tab.id === tabId)
+  ))
   const claudeSession = useAppSelector((state) => {
     if (paneContent.provider !== 'claude' || !paneContent.sessionId) return undefined
     const sessionKey = makeFreshAgentSessionKey({
@@ -427,22 +463,28 @@ export function FreshAgentView({
     snapshotConfirmsUserTurns,
   ])
 
-  const buildCreateMessage = useCallback((content: FreshAgentPaneContent) => ({
-    type: 'freshAgent.create',
-    requestId: content.createRequestId,
-    sessionType: content.sessionType,
-    provider: content.provider,
-    cwd: content.initialCwd,
-    resumeSessionId: content.resumeSessionId
-      ?? (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined),
-    sessionRef: content.sessionRef,
-    modelSelection: content.modelSelection,
-    model: getEffectiveFreshAgentModel(content),
-    ...(getEffectiveFreshAgentPermissionMode(content) ? { permissionMode: getEffectiveFreshAgentPermissionMode(content) } : {}),
-    sandbox: content.sandbox,
-    effort: getEffectiveFreshAgentEffort(content),
-    plugins: content.plugins,
-  } as const), [])
+  const buildCreateMessage = useCallback((content: FreshAgentPaneContent) => {
+    const legacyRestoreContext = content.provider === 'opencode'
+      ? buildLegacyRestoreContext(tabRestoreSource)
+      : undefined
+    return {
+      type: 'freshAgent.create',
+      requestId: content.createRequestId,
+      sessionType: content.sessionType,
+      provider: content.provider,
+      cwd: content.initialCwd,
+      ...(legacyRestoreContext ? { legacyRestoreContext } : {}),
+      resumeSessionId: content.resumeSessionId
+        ?? (content.sessionRef?.provider === content.provider ? content.sessionRef.sessionId : undefined),
+      sessionRef: content.sessionRef,
+      modelSelection: content.modelSelection,
+      model: getEffectiveFreshAgentModel(content),
+      ...(getEffectiveFreshAgentPermissionMode(content) ? { permissionMode: getEffectiveFreshAgentPermissionMode(content) } : {}),
+      sandbox: content.sandbox,
+      effort: getEffectiveFreshAgentEffort(content),
+      plugins: content.plugins,
+    } as const
+  }, [tabRestoreSource])
 
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current

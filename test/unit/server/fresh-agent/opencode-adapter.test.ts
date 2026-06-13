@@ -57,6 +57,7 @@ function deferred<T = void>() {
 function makeHistoryReader(overrides: Partial<OpencodeHistoryReader> = {}): OpencodeHistoryReader {
   return {
     readSessionInfo: vi.fn().mockRejectedValue(new OpencodeHistoryReaderError('missing_db', 'missing db')),
+    resolveLegacySession: vi.fn().mockResolvedValue(undefined),
     readSnapshotPage: vi.fn().mockRejectedValue(new OpencodeHistoryReaderError('missing_db', 'missing db')),
     readTurnPage: vi.fn().mockRejectedValue(new OpencodeHistoryReaderError('missing_db', 'missing db')),
     readTurnBody: vi.fn().mockRejectedValue(new OpencodeHistoryReaderError('missing_db', 'missing db')),
@@ -263,6 +264,64 @@ describe('OpenCode fresh-agent adapter', () => {
 
     expect(historyReader.readSessionInfo).toHaveBeenCalledWith('ses_restored_1')
     expect(cwdCalls[0]).toBe('/db/resume-repo')
+  })
+
+  it('promotes a restored legacy freshopencode placeholder to a unique DB session on resume', async () => {
+    const restoredExport = {
+      ...exportedSession,
+      info: { ...exportedSession.info, id: 'ses_legacy_real', title: 'Skills from public repos' },
+    }
+    const historyReader = makeHistoryReader({
+      resolveLegacySession: vi.fn().mockResolvedValue({
+        id: 'ses_legacy_real',
+        directory: '/home/dan/code',
+        title: 'Skills from public repos',
+        time: { created: 1_781_294_496_953, updated: 1_781_301_483_332 },
+      }),
+      readSnapshotPage: vi.fn().mockResolvedValue({
+        exported: restoredExport,
+        ...restoredExport,
+        revision: 1_781_301_483_332,
+        nextCursor: null,
+        hasMoreBefore: false,
+      }),
+    })
+    const adapter = createOpencodeFreshAgentAdapter({
+      spawnFn: makeSpawn({}).spawnFn as any,
+      historyReader,
+    })
+
+    const resumed = await adapter.resume?.({
+      requestId: '-gP4qyCL7bwp8-xbw9G7b',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/home/dan/code',
+      resumeSessionId: 'freshopencode--gP4qyCL7bwp8-xbw9G7b',
+      legacyRestoreContext: {
+        title: 'Identifying skills from GitHub repos',
+        createdAt: 1_781_291_230_743,
+        updatedAt: 1_781_291_259_546,
+      },
+    })
+
+    expect(resumed).toEqual({
+      sessionId: 'ses_legacy_real',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_legacy_real' },
+    })
+    expect(historyReader.resolveLegacySession).toHaveBeenCalledWith({
+      cwd: '/home/dan/code',
+      title: 'Identifying skills from GitHub repos',
+      createdAt: 1_781_291_230_743,
+      updatedAt: 1_781_291_259_546,
+    })
+    await expect(adapter.getSnapshot?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'freshopencode--gP4qyCL7bwp8-xbw9G7b',
+    })).resolves.toMatchObject({
+      sessionId: 'ses_legacy_real',
+      summary: 'Skills from public repos',
+    })
   })
 
   it('uses DB history before export and does not call truncated export when DB succeeds', async () => {
