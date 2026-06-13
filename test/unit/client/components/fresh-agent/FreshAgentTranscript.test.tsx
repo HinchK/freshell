@@ -566,9 +566,8 @@ describe('FreshAgentTranscript', () => {
     expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('1 tool used')
 
     fireEvent.click(screen.getByRole('button', { name: 'Toggle activity details' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Read tool call' }))
     expect(screen.getByText('docs/plan.md')).toBeInTheDocument()
-    expect(screen.getByText('# Plan')).toBeInTheDocument()
+    expect(container.querySelector('[data-tool-output]')).toHaveTextContent('# Plan')
   })
 
   it('coalesces adjacent Claude tool-use/result exchanges without rendering synthetic You turns', () => {
@@ -633,7 +632,9 @@ describe('FreshAgentTranscript', () => {
       .filter(Boolean)
     expect(visibleHeaders).toEqual(['You', 'Freshclaude'])
     expect(container.querySelectorAll('[data-turn-role="user"] .fresh-agent-activity-strip')).toHaveLength(0)
-    expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('2 tools used')
+    const strips = screen.getAllByRole('region', { name: 'Activity strip' })
+    expect(strips).toHaveLength(2)
+    expect(strips.every((strip) => strip.textContent?.includes('1 tool used'))).toBe(true)
   })
 
   it('shows the speaker label once for consecutive turns from the same role', () => {
