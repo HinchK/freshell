@@ -227,6 +227,14 @@ test.describe('Fresh Agent', () => {
     await expect(transcript.getByText('Serif transcript line')).toBeVisible()
     const transcriptFont = await transcript.evaluate((node) => getComputedStyle(node).fontFamily)
     expect(transcriptFont.toLowerCase()).toContain('georgia')
+    const rootFont = await freshcodexRoot.evaluate((node) => getComputedStyle(node).fontFamily)
+    expect(rootFont.toLowerCase()).toContain('georgia')
+    const composerFont = await freshcodexRoot.getByRole('textbox', { name: 'Chat message input' })
+      .evaluate((node) => getComputedStyle(node).fontFamily)
+    expect(composerFont.toLowerCase()).toContain('georgia')
+    const watermarkOpacity = await freshcodexRoot.getByTestId('fresh-agent-watermark')
+      .evaluate((node) => Number(getComputedStyle(node).opacity))
+    expect(watermarkOpacity).toBeLessThanOrEqual(0.004)
 
     await page.keyboard.press('Escape')
     await page.evaluate(() => {

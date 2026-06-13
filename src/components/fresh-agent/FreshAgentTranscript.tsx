@@ -22,12 +22,12 @@ import {
 import { FreshAgentActionSheet } from './FreshAgentActionSheet'
 import { buildLongPressHandlers, useCoarsePointer } from '@/lib/pointer'
 
-function getTurnLabel(turn: FreshAgentTurn): string {
+function getTurnLabel(turn: FreshAgentTurn, agentLabel?: string): string {
   switch (turn.role) {
     case 'user':
       return 'You'
     case 'assistant':
-      return 'Assistant'
+      return agentLabel ?? 'Assistant'
     case 'system':
       return 'System'
     case 'tool':
@@ -307,14 +307,14 @@ function countTools(turn: FreshAgentTurn): number {
   return activityTools(buildActivity(turn.items.filter(isToolLike))).length
 }
 
-function getTurnSummary(turn: FreshAgentTurn): string {
+function getTurnSummary(turn: FreshAgentTurn, agentLabel?: string): string {
   const text = turn.items
     .filter((item): item is Extract<FreshAgentTranscriptItem, { kind: 'text' }> => item.kind === 'text')
     .map((item) => stripSystemReminders(item.text))
     .join(' ')
     .trim()
     .replace(/\s+/g, ' ')
-  const base = text || turn.summary || getTurnLabel(turn)
+  const base = text || turn.summary || getTurnLabel(turn, agentLabel)
   const short = base.length > 44 ? `${base.slice(0, 41)}...` : base
   const toolCount = countTools(turn)
   const itemCount = turn.items.filter((item) => item.kind === 'text').length
@@ -333,9 +333,19 @@ type TurnActionProps = {
   onOpenActions?: (turn: FreshAgentTurn) => void
 }
 
-function CollapsedFreshAgentTurn({ turn, actions }: { turn: FreshAgentTurn; actions: TurnActionProps }) {
+function CollapsedFreshAgentTurn({
+  turn,
+  actions,
+  agentLabel,
+  showModel,
+}: {
+  turn: FreshAgentTurn
+  actions: TurnActionProps
+  agentLabel?: string
+  showModel: boolean
+}) {
   const [expanded, setExpanded] = useState(false)
-  const summary = getTurnSummary(turn)
+  const summary = getTurnSummary(turn, agentLabel)
   if (expanded) {
     return (
       <div className="space-y-2">
@@ -349,7 +359,14 @@ function CollapsedFreshAgentTurn({ turn, actions }: { turn: FreshAgentTurn; acti
           <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />
           <span className="truncate font-mono opacity-70">{summary}</span>
         </button>
-        <FreshAgentTurnArticle turn={turn} compact={false} isLatest={false} actions={actions} />
+        <FreshAgentTurnArticle
+          turn={turn}
+          compact={false}
+          isLatest={false}
+          actions={actions}
+          agentLabel={agentLabel}
+          showModel={showModel}
+        />
       </div>
     )
   }
@@ -372,14 +389,19 @@ function FreshAgentTurnArticle({
   compact,
   isLatest,
   actions,
+  agentLabel,
+  showModel,
 }: {
   turn: FreshAgentTurn
   compact: boolean
   isLatest: boolean
   actions: TurnActionProps
+  agentLabel?: string
+  showModel: boolean
 }) {
   const isUser = turn.role === 'user'
   const blocks = buildBlocks(turn.items)
+  const turnLabel = getTurnLabel(turn, agentLabel)
   // Long-press opens the action sheet on touch devices (iOS fires no
   // contextmenu event; Android does — both paths land on onOpenActions and
   // the second call is a no-op re-set of the same state).
@@ -395,7 +417,7 @@ function FreshAgentTurnArticle({
         isUser ? 'border-l-[hsl(var(--primary))]' : 'border-l-border',
         compact && 'opacity-95',
       )}
-      aria-label={`${getTurnLabel(turn)} transcript turn`}
+      aria-label={`${turnLabel} transcript turn`}
       onContextMenu={(event) => {
         // stopPropagation matters: freshell has a global contextmenu handler
         // that renders the app menu over ours otherwise (live-test finding).
@@ -419,9 +441,9 @@ function FreshAgentTurnArticle({
         onRewindToTurn={actions.onRewindToTurn}
         onOpenActions={actions.onOpenActions}
       />
-      <div className="mb-1 flex items-center justify-between gap-2 text-[11px] uppercase text-muted-foreground">
-        <span>{getTurnLabel(turn)}</span>
-        {turn.model ? <span className="truncate normal-case">{turn.model}</span> : null}
+      <div className="fresh-agent-turn-header mb-1 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+        <span>{turnLabel}</span>
+        {showModel && turn.model ? <span className="truncate">{turn.model}</span> : null}
       </div>
       <div className="fresh-agent-transcript-copy space-y-1.5">
         {blocks.length > 0 ? blocks.map((block, blockIndex) => {
@@ -450,11 +472,15 @@ function FreshAgentTurnArticle({
 export function FreshAgentTranscript({
   turns,
   canFork = false,
+  agentLabel,
+  showModel = false,
   onForkFromTurn,
   onRewindToTurn,
 }: {
   turns: FreshAgentTurn[]
   canFork?: boolean
+  agentLabel?: string
+  showModel?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
 }) {
@@ -527,7 +553,15 @@ export function FreshAgentTranscript({
       >
         {turns.map((turn, index) => (
           index < collapsedCutoff
-            ? <CollapsedFreshAgentTurn key={turn.id} turn={turn} actions={actions} />
+            ? (
+              <CollapsedFreshAgentTurn
+                key={turn.id}
+                turn={turn}
+                actions={actions}
+                agentLabel={agentLabel}
+                showModel={showModel}
+              />
+            )
             : (
               <FreshAgentTurnArticle
                 key={turn.id}
@@ -535,6 +569,8 @@ export function FreshAgentTranscript({
                 compact={index < collapsedCutoff}
                 isLatest={index === turns.length - 1}
                 actions={actions}
+                agentLabel={agentLabel}
+                showModel={showModel}
               />
             )
         ))}
@@ -548,7 +584,7 @@ export function FreshAgentTranscript({
       />
       {sheetTurn ? (
         <FreshAgentActionSheet
-          title={turnPlainText(sheetTurn).slice(0, 80) || getTurnLabel(sheetTurn)}
+          title={turnPlainText(sheetTurn).slice(0, 80) || getTurnLabel(sheetTurn, agentLabel)}
           items={buildTurnActionItems(sheetTurn, { canFork, onForkFromTurn, onRewindToTurn })}
           onClose={() => setSheetTurn(null)}
         />

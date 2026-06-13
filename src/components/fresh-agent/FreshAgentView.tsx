@@ -248,6 +248,11 @@ export function FreshAgentView({
       ?? state.settings.settings.agentChat?.providers?.[paneContent.sessionType]
       ?? state.settings.serverSettings?.agentChat?.providers?.[paneContent.sessionType],
   )
+  const showTranscriptModel = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.showTimecodes
+      ?? state.settings.settings.agentChat?.showTimecodes
+      ?? false,
+  )
   const activeStyle = normalizeFreshAgentStyle(
     paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
   )
@@ -1224,11 +1229,11 @@ export function FreshAgentView({
       && !hasRestoreFailure
       && !['creating', 'starting', 'create-failed', 'exited'].includes(effectiveStatus)
     ))
-    const canInterrupt = snapshot?.capabilities?.interrupt === true || (
+    const canInterrupt = isBusy && (snapshot?.capabilities?.interrupt === true || (
       paneContent.provider === 'claude'
       && Boolean(paneContent.sessionId)
-      && ['connected', 'running', 'idle', 'compacting'].includes(effectiveStatus)
-    )
+      && ['connected', 'running', 'compacting'].includes(effectiveStatus)
+    ))
     const canFork = snapshot?.capabilities?.fork === true
     // Providers report capabilities.send=false WHILE BUSY — that must not
     // disable the composer, or queueing becomes unreachable for codex and
@@ -1295,7 +1300,7 @@ export function FreshAgentView({
       >
         {WatermarkIcon ? (
           <WatermarkIcon
-            className="pointer-events-none absolute left-1/2 top-1/2 z-0 h-[min(34rem,64%)] w-[min(34rem,64%)] -translate-x-1/2 -translate-y-1/2 text-foreground opacity-[0.01]"
+            className="fresh-agent-watermark pointer-events-none absolute left-1/2 top-1/2 z-0 h-[min(34rem,64%)] w-[min(34rem,64%)] -translate-x-1/2 -translate-y-1/2 text-foreground"
             aria-hidden="true"
             data-testid="fresh-agent-watermark"
           />
@@ -1413,6 +1418,8 @@ export function FreshAgentView({
                   } as FreshAgentTurn]
                 : turns}
               canFork={canFork}
+              agentLabel={descriptor?.label}
+              showModel={showTranscriptModel}
               onForkFromTurn={(turnId) => sendFork(turnId)}
               onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
             />
@@ -1488,6 +1495,7 @@ export function FreshAgentView({
     runShellCommand,
     sessionEnded,
     sessionErrorMessage,
+    showTranscriptModel,
     startNewConversation,
     runSlashCommand,
     sendFork,

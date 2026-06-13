@@ -35,6 +35,26 @@ describe('FreshAgentTranscript', () => {
     expect(screen.getByText('Hello from Fresh Agent')).toBeInTheDocument()
   })
 
+  it('uses the pane agent label for assistant turns when provided', () => {
+    render(
+      <FreshAgentTranscript
+        agentLabel="Freshcodex"
+        turns={[
+          {
+            id: 'turn-1',
+            role: 'assistant',
+            model: 'gpt-5.4-flash',
+            items: [{ id: 'item-1', kind: 'text', text: 'Label check' }],
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText('Freshcodex')).toBeInTheDocument()
+    expect(screen.queryByText('Assistant')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Freshcodex transcript turn')).toBeInTheDocument()
+  })
+
   it('renders assistant text as markdown', () => {
     render(
       <FreshAgentTranscript
