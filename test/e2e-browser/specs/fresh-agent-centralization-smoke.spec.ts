@@ -229,6 +229,20 @@ async function sendLegacyLayoutSync(page: Page) {
   }, legacyLayoutPayload())
 }
 
+function normalizedRemoteFreshAgentPaneContent() {
+  return {
+    kind: 'fresh-agent',
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    createRequestId: 'req-remote-rendered-agent',
+    sessionId: CANONICAL_CLAUDE_SESSION_ID,
+    resumeSessionId: CANONICAL_CLAUDE_SESSION_ID,
+    sessionRef: { provider: 'claude', sessionId: CANONICAL_CLAUDE_SESSION_ID },
+    status: 'idle',
+    settingsDismissed: true,
+  }
+}
+
 async function fetchWithAuth(serverInfo: TestServerInfo, path: string, init: RequestInit = {}) {
   return fetch(`${serverInfo.baseUrl}${path}`, {
     ...init,
@@ -303,6 +317,7 @@ test.describe('Fresh-agent centralization smoke', () => {
   })
 
   test('normalizes remote legacy layout sync before exposing server pane snapshots', async ({ freshellPage: _freshellPage, page, harness, serverInfo }) => {
+    await mockFreshAgentReadRoutes(page)
     await harness.waitForConnection()
 
     await sendLegacyLayoutSync(page)
@@ -324,6 +339,35 @@ test.describe('Fresh-agent centralization smoke', () => {
       status: 'error',
       message: expect.stringContaining('pane kind "fresh-agent"'),
     })
+
+    const remoteRenderTabId = 'tab-remote-rendered'
+    const remoteRenderPaneId = 'pane-remote-rendered-agent'
+    await page.evaluate((paneId) => {
+      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(paneId, true)
+    }, remoteRenderPaneId)
+    await harness.receiveWsMessage({
+      type: 'ui.command',
+      command: 'tab.create',
+      payload: {
+        id: remoteRenderTabId,
+        title: 'Remote normalized legacy',
+        paneId: remoteRenderPaneId,
+        paneContent: normalizedRemoteFreshAgentPaneContent(),
+      },
+    })
+    await harness.receiveWsMessage({
+      type: 'ui.command',
+      command: 'tab.select',
+      payload: { id: remoteRenderTabId },
+    })
+
+    await expect(page.locator('[data-context="fresh-agent"]')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('[data-context="agent-chat"]')).toHaveCount(0)
+
+    const browserState = await harness.getState()
+    const renderedLayout = browserState.panes.layouts[remoteRenderTabId]
+    expect(JSON.stringify(renderedLayout)).toContain('"fresh-agent"')
+    expect(JSON.stringify(renderedLayout)).not.toContain('"agent-chat"')
   })
 
   test('keeps fresh-agent settings and routes while legacy settings and routes are removed', async ({ freshellPage: _freshellPage, page, serverInfo }) => {
