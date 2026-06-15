@@ -196,10 +196,18 @@ describe('crossTabSync', () => {
             kind: 'terminal',
             mode: 'codex',
             createRequestId: 'req-a',
-            status: 'creating',
+            status: 'running',
+            terminalId: 'term-local',
+            serverInstanceId: 'srv-local',
+            streamId: 'stream-local',
             sessionRef: {
               provider: 'codex',
               sessionId: 'thread-1',
+            },
+            codexDurability: {
+              schemaVersion: 1,
+              state: 'durable',
+              durableThreadId: 'thread-1',
             },
           },
         } as any,
@@ -244,13 +252,20 @@ describe('crossTabSync', () => {
 
     const layout = store.getState().panes.layouts['tab-1'] as any
     expect(layout.content).toMatchObject({
+      createRequestId: 'req-a',
+      status: 'running',
       sessionRef: {
         provider: 'codex',
         sessionId: 'thread-1',
       },
-      terminalId: undefined,
-      serverInstanceId: undefined,
-      streamId: undefined,
+      terminalId: 'term-local',
+      serverInstanceId: 'srv-local',
+      streamId: 'stream-local',
+      codexDurability: {
+        schemaVersion: 1,
+        state: 'durable',
+        durableThreadId: 'thread-1',
+      },
     })
   })
 

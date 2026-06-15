@@ -2424,19 +2424,59 @@ export class WsHandler {
           return
         }
 
-        const attachResult = await this.terminalStreamBroker.attach(
-          ws,
-          m.terminalId,
-          m.intent,
-          m.cols,
-          m.rows,
-          m.sinceSeq,
-          expectedSessionRef,
-          m.attachRequestId,
-          m.maxReplayBytes,
-          m.priority ?? 'foreground',
-          state.supportsTerminalOutputBatchV1,
-        )
+        const attachBroker = this.terminalStreamBroker as {
+          attach: (
+            ws: LiveWebSocket,
+            terminalId: string,
+            intent: 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect',
+            cols: number,
+            rows: number,
+            sinceSeq: number | undefined,
+            attachRequestId?: string,
+            maxReplayBytes?: number,
+            priority?: 'foreground' | 'background',
+            terminalOutputBatchV1?: boolean,
+          ) => Promise<any>
+          attachWithExpectedSession?: (
+            ws: LiveWebSocket,
+            terminalId: string,
+            intent: 'viewport_hydrate' | 'keepalive_delta' | 'transport_reconnect',
+            cols: number,
+            rows: number,
+            sinceSeq: number | undefined,
+            expectedSessionRef: { provider: string; sessionId: string } | undefined,
+            attachRequestId?: string,
+            maxReplayBytes?: number,
+            priority?: 'foreground' | 'background',
+            terminalOutputBatchV1?: boolean,
+          ) => Promise<any>
+        }
+        const attachResult = typeof attachBroker.attachWithExpectedSession === 'function'
+          ? await attachBroker.attachWithExpectedSession(
+            ws,
+            m.terminalId,
+            m.intent,
+            m.cols,
+            m.rows,
+            m.sinceSeq,
+            expectedSessionRef,
+            m.attachRequestId,
+            m.maxReplayBytes,
+            m.priority ?? 'foreground',
+            state.supportsTerminalOutputBatchV1,
+          )
+          : await attachBroker.attach(
+            ws,
+            m.terminalId,
+            m.intent,
+            m.cols,
+            m.rows,
+            m.sinceSeq,
+            m.attachRequestId,
+            m.maxReplayBytes,
+            m.priority ?? 'foreground',
+            state.supportsTerminalOutputBatchV1,
+          )
         if (attachResult === 'invalid_attach_request_id') {
           this.sendError(ws, {
             code: 'INVALID_MESSAGE',

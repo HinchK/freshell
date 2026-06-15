@@ -2923,10 +2923,18 @@ describe('panesSlice', () => {
       const localState = stateWithLeaf('pane-canonical', {
         kind: 'terminal',
         createRequestId: 'req-1',
-        status: 'creating',
+        status: 'running',
         mode: 'codex',
         shell: 'system',
+        terminalId: 'term-local',
+        serverInstanceId: 'srv-local',
+        streamId: 'stream-local',
         sessionRef: { provider: 'codex', sessionId: 'thread-1' },
+        codexDurability: {
+          schemaVersion: 1,
+          state: 'durable',
+          durableThreadId: 'thread-1',
+        },
       })
 
       const incoming: PanesState = {
@@ -2965,12 +2973,18 @@ describe('panesSlice', () => {
       const leaf = merged.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
       expect(leaf.content).toMatchObject({
         kind: 'terminal',
+        createRequestId: 'req-1',
+        status: 'running',
         sessionRef: { provider: 'codex', sessionId: 'thread-1' },
-        terminalId: undefined,
-        serverInstanceId: undefined,
-        streamId: undefined,
+        terminalId: 'term-local',
+        serverInstanceId: 'srv-local',
+        streamId: 'stream-local',
+        codexDurability: {
+          schemaVersion: 1,
+          state: 'durable',
+          durableThreadId: 'thread-1',
+        },
       })
-      expect((leaf.content as TerminalPaneContent).codexDurability).toBeUndefined()
     })
 
     it('TerminalPaneContent has required lifecycle fields', () => {

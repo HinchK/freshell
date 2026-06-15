@@ -522,6 +522,19 @@ function codexDurabilityMatchesCanonicalSession(
   )
 }
 
+function pickCanonicalCodexDurability(
+  localContent: TerminalPaneContent,
+  incomingContent: TerminalPaneContent,
+  sessionRef: { provider?: string; sessionId?: string } | undefined,
+): TerminalPaneContent['codexDurability'] | undefined {
+  if (codexDurabilityMatchesCanonicalSession(localContent.codexDurability, sessionRef)) {
+    return localContent.codexDurability
+  }
+  return codexDurabilityMatchesCanonicalSession(incomingContent.codexDurability, sessionRef)
+    ? incomingContent.codexDurability
+    : undefined
+}
+
 function preserveLocalCanonicalTerminalIdentity(
   localContent: TerminalPaneContent,
   incomingContent: TerminalPaneContent,
@@ -530,14 +543,14 @@ function preserveLocalCanonicalTerminalIdentity(
   if (!localSessionRef) return incomingContent
   return {
     ...incomingContent,
+    createRequestId: localContent.createRequestId,
+    status: localContent.status,
     sessionRef: localSessionRef,
     resumeSessionId: undefined,
     terminalId: localContent.terminalId,
     serverInstanceId: localContent.serverInstanceId,
     streamId: localContent.streamId,
-    codexDurability: codexDurabilityMatchesCanonicalSession(incomingContent.codexDurability, localSessionRef)
-      ? incomingContent.codexDurability
-      : undefined,
+    codexDurability: pickCanonicalCodexDurability(localContent, incomingContent, localSessionRef),
   }
 }
 

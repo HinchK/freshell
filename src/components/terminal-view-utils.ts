@@ -129,10 +129,7 @@ export function buildCodexIdentityMismatchRepairContent(
   if (!content) return undefined
   const matchingDurableCodexIdentity = expectedSessionRef.provider === 'codex'
     && content.codexDurability?.state === 'durable'
-    && (
-      content.codexDurability.durableThreadId === expectedSessionRef.sessionId
-      || content.codexDurability.candidate?.candidateThreadId === expectedSessionRef.sessionId
-    )
+    && content.codexDurability.durableThreadId === expectedSessionRef.sessionId
       ? content.codexDurability
       : undefined
   return {

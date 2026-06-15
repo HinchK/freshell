@@ -124,6 +124,19 @@ type PerfEventLogger = (
   context: Record<string, unknown>,
   level?: PerfLevel,
 ) => void
+type AttachRequest = {
+  ws: LiveWebSocket
+  terminalId: string
+  intent: AttachIntent
+  cols: number
+  rows: number
+  sinceSeq: number | undefined
+  expectedSessionRef?: SessionLocator
+  attachRequestId?: string
+  maxReplayBytes?: number
+  priority: AttachPriority
+  terminalOutputBatchV1: boolean
+}
 type ReplayGapReason = 'replay_window_exceeded' | 'replay_budget_exceeded' | 'queue_overflow'
 type ReplayBackpressurePayloadFields = {
   seqStart?: number
@@ -249,38 +262,66 @@ export class TerminalStreamBroker {
     cols: number,
     rows: number,
     sinceSeq: number | undefined,
-    expectedSessionRefOrAttachRequestId?: SessionLocator | string,
-    attachRequestIdOrMaxReplayBytes?: string | number,
-    maxReplayBytesOrPriority?: number | AttachPriority,
-    priorityOrTerminalOutputBatchV1: AttachPriority | boolean = 'foreground',
+    attachRequestId?: string,
+    maxReplayBytes?: number,
+    priority: AttachPriority = 'foreground',
     terminalOutputBatchV1 = false,
   ): Promise<AttachResult> {
-    const totalArgs = arguments.length
-    const usesExplicitExpectedSessionRef = Boolean(
-      expectedSessionRefOrAttachRequestId
-      && typeof expectedSessionRefOrAttachRequestId === 'object'
-      && 'provider' in expectedSessionRefOrAttachRequestId
-      && 'sessionId' in expectedSessionRefOrAttachRequestId
-    )
-    const usesNewSignature = usesExplicitExpectedSessionRef || totalArgs >= 11
-    const expectedSessionRef = usesExplicitExpectedSessionRef
-      ? expectedSessionRefOrAttachRequestId as SessionLocator
-      : undefined
-    const attachRequestId = usesNewSignature
-      ? (typeof attachRequestIdOrMaxReplayBytes === 'string' ? attachRequestIdOrMaxReplayBytes : undefined)
-      : (typeof expectedSessionRefOrAttachRequestId === 'string' ? expectedSessionRefOrAttachRequestId : undefined)
-    const maxReplayBytes = usesNewSignature
-      ? (typeof maxReplayBytesOrPriority === 'number' ? maxReplayBytesOrPriority : undefined)
-      : (typeof attachRequestIdOrMaxReplayBytes === 'number' ? attachRequestIdOrMaxReplayBytes : undefined)
-    const priority = (
-      usesNewSignature
-        ? (typeof priorityOrTerminalOutputBatchV1 === 'string' ? priorityOrTerminalOutputBatchV1 : 'foreground')
-        : (typeof maxReplayBytesOrPriority === 'string' ? maxReplayBytesOrPriority : 'foreground')
-    ) as AttachPriority
-    const batchV1 = usesNewSignature
-      ? terminalOutputBatchV1
-      : (typeof priorityOrTerminalOutputBatchV1 === 'boolean' ? priorityOrTerminalOutputBatchV1 : false)
+    return this.attachInternal({
+      ws,
+      terminalId,
+      intent,
+      cols,
+      rows,
+      sinceSeq,
+      attachRequestId,
+      maxReplayBytes,
+      priority,
+      terminalOutputBatchV1,
+    })
+  }
 
+  async attachWithExpectedSession(
+    ws: LiveWebSocket,
+    terminalId: string,
+    intent: AttachIntent,
+    cols: number,
+    rows: number,
+    sinceSeq: number | undefined,
+    expectedSessionRef: SessionLocator | undefined,
+    attachRequestId?: string,
+    maxReplayBytes?: number,
+    priority: AttachPriority = 'foreground',
+    terminalOutputBatchV1 = false,
+  ): Promise<AttachResult> {
+    return this.attachInternal({
+      ws,
+      terminalId,
+      intent,
+      cols,
+      rows,
+      sinceSeq,
+      expectedSessionRef,
+      attachRequestId,
+      maxReplayBytes,
+      priority,
+      terminalOutputBatchV1,
+    })
+  }
+
+  private async attachInternal({
+    ws,
+    terminalId,
+    intent,
+    cols,
+    rows,
+    sinceSeq,
+    expectedSessionRef,
+    attachRequestId,
+    maxReplayBytes,
+    priority,
+    terminalOutputBatchV1,
+  }: AttachRequest): Promise<AttachResult> {
     if (!isTerminalStreamAttachRequestIdWithinSerializedBudget(attachRequestId)) {
       return 'invalid_attach_request_id'
     }
@@ -355,7 +396,7 @@ export class TerminalStreamBroker {
       }
 
       const attachment = existingAttachment ?? this.getOrCreateAttachment(terminalState, ws, terminalId)
-      attachment.terminalOutputBatchV1 = batchV1
+      attachment.terminalOutputBatchV1 = terminalOutputBatchV1
 
       if (attachment.flushTimer) {
         clearTimeout(attachment.flushTimer)
