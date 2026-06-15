@@ -629,7 +629,7 @@ async function resolveBrowserStorageSeed(input: {
     case 'terminal-cold-boot':
     case 'sidebar-search-large-corpus':
       return buildTerminalBrowserStorageSeed()
-    case 'agent-chat-cold-boot':
+    case 'fresh-agent-cold-boot':
       return buildAgentChatBrowserStorageSeed()
     case 'offscreen-tab-selection':
       return buildOffscreenTabBrowserStorageSeed()
@@ -700,7 +700,7 @@ async function driveScenarioInteraction(input: {
         })
         return
       }
-      await input.page.locator('[data-context="tab"][data-tab-id="tab-heavy-agent-chat"]').click()
+      await input.page.locator('[data-context="tab"][data-tab-id="tab-heavy-fresh-agent"]').click()
       return
     }
     case 'terminal-reconnect-backlog': {
