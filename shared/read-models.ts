@@ -74,7 +74,7 @@ export const TerminalDirectoryQuerySchema = z.object({
   limit: z.number().int().positive().max(MAX_DIRECTORY_PAGE_ITEMS).optional(),
 })
 
-export const AgentTimelinePageQuerySchema = z.object({
+export const FreshAgentThreadTurnsQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema.optional(),
   revision: z.coerce.number().int().nonnegative(),
@@ -85,7 +85,7 @@ export const AgentTimelinePageQuerySchema = z.object({
   ]).optional(),
 })
 
-export const AgentTimelineTurnBodyQuerySchema = z.object({
+export const FreshAgentThreadTurnBodyQuerySchema = z.object({
   revision: z.coerce.number().int().nonnegative(),
 })
 
@@ -118,8 +118,8 @@ export type SessionDirectoryQuery = z.infer<typeof SessionDirectoryQuerySchema>
 export type SessionDirectoryItem = z.infer<typeof SessionDirectoryItemSchema>
 export type SessionDirectoryPage = z.infer<typeof SessionDirectoryPageSchema>
 export type TerminalDirectoryQuery = z.infer<typeof TerminalDirectoryQuerySchema>
-export type AgentTimelinePageQuery = z.infer<typeof AgentTimelinePageQuerySchema>
-export type AgentTimelineTurnBodyQuery = z.infer<typeof AgentTimelineTurnBodyQuerySchema>
+export type FreshAgentThreadTurnsQuery = z.infer<typeof FreshAgentThreadTurnsQuerySchema>
+export type FreshAgentThreadTurnBodyQuery = z.infer<typeof FreshAgentThreadTurnBodyQuerySchema>
 export type RestoreStaleRevisionResponse = z.infer<typeof RestoreStaleRevisionResponseSchema>
 export type FreshAgentStaleRevisionResponse = z.infer<typeof FreshAgentStaleRevisionResponseSchema>
 export type TerminalScrollbackQuery = z.infer<typeof TerminalScrollbackQuerySchema>

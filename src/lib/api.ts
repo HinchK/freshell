@@ -14,15 +14,15 @@ import {
 } from '@shared/fresh-agent-model-capabilities'
 import { parseFreshAgentModelCapabilitiesResponse } from '@/lib/fresh-agent-model-capabilities'
 import {
-  AgentTimelinePageQuerySchema,
-  AgentTimelineTurnBodyQuerySchema,
+  FreshAgentThreadTurnBodyQuerySchema,
+  FreshAgentThreadTurnsQuerySchema,
   SessionDirectoryPageSchema,
   SessionDirectoryQuerySchema,
   TerminalDirectoryQuerySchema,
   TerminalScrollbackQuerySchema,
   TerminalSearchQuerySchema,
-  type AgentTimelinePageQuery,
-  type AgentTimelineTurnBodyQuery,
+  type FreshAgentThreadTurnBodyQuery,
+  type FreshAgentThreadTurnsQuery,
   type SessionDirectoryItem as ReadModelSessionDirectoryItem,
   type SessionDirectoryPage as ReadModelSessionDirectoryPage,
   type SessionDirectoryQuery,
@@ -271,12 +271,12 @@ export async function getTerminalDirectoryPage(
   )
 }
 
-export async function getAgentTimelinePage(
+export async function getFreshAgentThreadTurns(
   sessionId: string,
-  query: AgentTimelinePageQuery,
+  query: FreshAgentThreadTurnsQuery,
   options: ApiRequestOptions = {},
 ): Promise<any> {
-  const parsed = AgentTimelinePageQuerySchema.parse(query)
+  const parsed = FreshAgentThreadTurnsQuerySchema.parse(query)
   return api.get(
     `/api/fresh-agent/threads/freshclaude/claude/${encodeURIComponent(sessionId)}/turns${buildQueryString([
       ['cursor', parsed.cursor],
@@ -289,13 +289,13 @@ export async function getAgentTimelinePage(
   )
 }
 
-export async function getAgentTurnBody(
+export async function getFreshAgentThreadTurnBody(
   sessionId: string,
   turnId: string,
-  query: AgentTimelineTurnBodyQuery & { signal?: AbortSignal },
+  query: FreshAgentThreadTurnBodyQuery & { signal?: AbortSignal },
   options: ApiRequestOptions = {},
 ): Promise<any> {
-  const parsed = AgentTimelineTurnBodyQuerySchema.parse(query)
+  const parsed = FreshAgentThreadTurnBodyQuerySchema.parse(query)
   const signal = query.signal ?? options.signal
   return api.get(
     `/api/fresh-agent/threads/freshclaude/claude/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([

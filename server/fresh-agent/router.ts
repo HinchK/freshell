@@ -2,8 +2,8 @@ import { Router } from 'express'
 import { z } from 'zod'
 
 import {
-  AgentTimelinePageQuerySchema,
-  AgentTimelineTurnBodyQuerySchema,
+  FreshAgentThreadTurnBodyQuerySchema,
+  FreshAgentThreadTurnsQuerySchema,
   ReadModelPrioritySchema,
 } from '../../shared/read-models.js'
 import {
@@ -180,7 +180,7 @@ export function createFreshAgentRouter(deps: {
 
   router.get('/fresh-agent/threads/:sessionType/:provider/:threadId/turns', async (req, res) => {
     const params = ThreadParamsSchema.safeParse(req.params)
-    const query = AgentTimelinePageQuerySchema.safeParse({
+    const query = FreshAgentThreadTurnsQuerySchema.safeParse({
       cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
       priority: typeof req.query.priority === 'string' ? req.query.priority : undefined,
       revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
@@ -224,7 +224,7 @@ export function createFreshAgentRouter(deps: {
 
   router.get('/fresh-agent/threads/:sessionType/:provider/:threadId/turns/:turnId', async (req, res) => {
     const params = TurnParamsSchema.safeParse(req.params)
-    const query = AgentTimelineTurnBodyQuerySchema.safeParse({
+    const query = FreshAgentThreadTurnBodyQuerySchema.safeParse({
       revision: typeof req.query.revision === 'string' ? req.query.revision : undefined,
     })
     if (!params.success || !query.success) {

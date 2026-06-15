@@ -1,6 +1,6 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest'
-import { AgentTimelinePageQuerySchema } from '../../../../shared/read-models.js'
+import { FreshAgentThreadTurnsQuerySchema } from '../../../../shared/read-models.js'
 import { createClaudeFreshAgentHistoryService } from '../../../../server/fresh-agent/history/claude/history-service.js'
 
 const mockMessages = [
@@ -52,37 +52,37 @@ function makeResolvedHistory(options: {
   }
 }
 
-describe('AgentTimelinePageQuerySchema includeBodies parsing', () => {
+describe('FreshAgentThreadTurnsQuerySchema includeBodies parsing', () => {
   it('accepts boolean true from client code', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: true, priority: 'visible', revision: 7 })
+    const result = FreshAgentThreadTurnsQuerySchema.parse({ includeBodies: true, priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(true)
   })
 
   it('accepts boolean false from client code', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: false, priority: 'visible', revision: 7 })
+    const result = FreshAgentThreadTurnsQuerySchema.parse({ includeBodies: false, priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(false)
   })
 
   it('accepts string "true" from query parameters', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'true', priority: 'visible', revision: 7 })
+    const result = FreshAgentThreadTurnsQuerySchema.parse({ includeBodies: 'true', priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(true)
   })
 
   it('accepts string "false" from query parameters and parses to false', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ includeBodies: 'false', priority: 'visible', revision: 7 })
+    const result = FreshAgentThreadTurnsQuerySchema.parse({ includeBodies: 'false', priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBe(false)
   })
 
   it('treats omitted includeBodies as undefined', () => {
-    const result = AgentTimelinePageQuerySchema.parse({ priority: 'visible', revision: 7 })
+    const result = FreshAgentThreadTurnsQuerySchema.parse({ priority: 'visible', revision: 7 })
     expect(result.includeBodies).toBeUndefined()
   })
 
   it('rejects invalid string values for includeBodies', () => {
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'abc', priority: 'visible', revision: 7 })).toThrow()
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '0', priority: 'visible', revision: 7 })).toThrow()
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: '1', priority: 'visible', revision: 7 })).toThrow()
-    expect(() => AgentTimelinePageQuerySchema.parse({ includeBodies: 'yes', priority: 'visible', revision: 7 })).toThrow()
+    expect(() => FreshAgentThreadTurnsQuerySchema.parse({ includeBodies: 'abc', priority: 'visible', revision: 7 })).toThrow()
+    expect(() => FreshAgentThreadTurnsQuerySchema.parse({ includeBodies: '0', priority: 'visible', revision: 7 })).toThrow()
+    expect(() => FreshAgentThreadTurnsQuerySchema.parse({ includeBodies: '1', priority: 'visible', revision: 7 })).toThrow()
+    expect(() => FreshAgentThreadTurnsQuerySchema.parse({ includeBodies: 'yes', priority: 'visible', revision: 7 })).toThrow()
   })
 })
 

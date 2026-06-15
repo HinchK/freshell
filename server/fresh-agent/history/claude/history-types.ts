@@ -1,12 +1,12 @@
 import type { ChatMessage } from '../../../session-history-loader.js'
 import type { ClaudeFreshAgentHistoryCanonicalTurn } from './history-ledger.js'
 import type {
-  AgentTimelinePageQuery as SharedAgentTimelinePageQuery,
-  AgentTimelineTurnBodyQuery as SharedAgentTimelineTurnBodyQuery,
+  FreshAgentThreadTurnBodyQuery as SharedFreshAgentThreadTurnBodyQuery,
+  FreshAgentThreadTurnsQuery as SharedFreshAgentThreadTurnsQuery,
 } from '../../../../shared/read-models.js'
 
-export type ClaudeFreshAgentHistoryPageQuery = SharedAgentTimelinePageQuery
-export type ClaudeFreshAgentHistoryTurnBodyQuery = SharedAgentTimelineTurnBodyQuery
+export type ClaudeFreshAgentHistoryPageQuery = SharedFreshAgentThreadTurnsQuery
+export type ClaudeFreshAgentHistoryTurnBodyQuery = SharedFreshAgentThreadTurnBodyQuery
 
 export type ClaudeFreshAgentHistoryItem = {
   turnId: string
