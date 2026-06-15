@@ -29,7 +29,7 @@ export async function runLiveSupportedModelsProbe() {
       }),
     ])
 
-    const normalizedModels = normalizeFreshAgentModelCapabilityCatalog(rawModels)
+    const normalizedModels = normalizeFreshAgentModelCapabilityCatalog(rawModels, 'claude')
     const parsed = FreshAgentModelCapabilitiesSchema.parse({
       sessionType: 'freshclaude',
       runtimeProvider: 'claude',
