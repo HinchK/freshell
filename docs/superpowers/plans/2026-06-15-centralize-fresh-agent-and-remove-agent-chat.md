@@ -143,14 +143,15 @@ describe('fresh-agent shared transcript widgets', () => {
   })
 
   it('renders the moved slot reel from the fresh-agent namespace', () => {
-    render(<SlotReel values={['Read', 'Bash']} activeIndex={1} ariaLabel="Activity" />)
-    expect(screen.getByLabelText('Activity')).toBeInTheDocument()
+    render(<SlotReel toolName="Bash" previewText="$ npm test" />)
+    expect(screen.getByRole('status')).toBeInTheDocument()
     expect(screen.getByText('Bash')).toBeInTheDocument()
+    expect(screen.getByText('$ npm test')).toBeInTheDocument()
   })
 
   it('keeps tool previews available without importing agent-chat modules', () => {
     expect(getToolPreview('Read', { file_path: '/tmp/example.txt' })).toBe('/tmp/example.txt')
-    expect(getToolPreview('Bash', { command: 'npm test' })).toBe('npm test')
+    expect(getToolPreview('Bash', { command: 'npm test' })).toBe('$ npm test')
   })
 })
 ```
@@ -391,7 +392,34 @@ function readLegacyAgentChatInput(candidate: Record<string, unknown>): LegacyAge
 }
 ```
 
-Add an exported helper for tests and config-store load paths:
+First replace the existing private `mergeFreshAgentAliasObjects(agentChatInput, freshAgentInput)` implementation with an options-aware implementation. Its default options must preserve existing current behavior, while `migrateLegacyFreshAgentSettingsInput` uses `{ canonicalWins: true, fieldMergeProviders: true, preserveExplicitEmptyArrays: true }`. Do not call a helper that has not been defined in this task.
+
+Extract the current `sanitizeServerSettingsPatch` fresh-agent block into a reusable helper such as:
+
+```ts
+function sanitizeFreshAgentSettingsPatchInput(rawFreshAgent: Record<string, unknown>): ServerSettingsPatch['freshAgent'] {
+  const freshAgent: ServerSettingsPatch['freshAgent'] = {}
+  if (hasOwn(rawFreshAgent, 'enabled')) {
+    freshAgent.enabled = !!rawFreshAgent.enabled
+  }
+  if (hasOwn(rawFreshAgent, 'initialSetupDone') && typeof rawFreshAgent.initialSetupDone === 'boolean') {
+    freshAgent.initialSetupDone = rawFreshAgent.initialSetupDone
+  }
+  if (hasOwn(rawFreshAgent, 'defaultPlugins') && Array.isArray(rawFreshAgent.defaultPlugins)) {
+    freshAgent.defaultPlugins = sanitizeAgentChatPluginPaths(rawFreshAgent.defaultPlugins)
+  }
+  if (isRecord(rawFreshAgent.providers)) {
+    const providers: NonNullable<ServerSettingsPatch['freshAgent']>['providers'] = {}
+    // Move the existing provider-patch parsing loop here unchanged.
+    if (Object.keys(providers).length > 0) {
+      freshAgent.providers = providers
+    }
+  }
+  return Object.keys(freshAgent).length > 0 ? freshAgent : undefined
+}
+```
+
+Then add an exported helper for tests and config-store load paths:
 
 ```ts
 export function migrateLegacyFreshAgentSettingsInput(candidate: Record<string, unknown>): Pick<ServerSettingsPatch & LocalSettingsPatch, 'freshAgent'> {
@@ -402,7 +430,8 @@ export function migrateLegacyFreshAgentSettingsInput(candidate: Record<string, u
     fieldMergeProviders: true,
     preserveExplicitEmptyArrays: true,
   })
-  return merged ? { freshAgent: sanitizeFreshAgentSettingsObject(merged) } : {}
+  const freshAgent = merged ? sanitizeFreshAgentSettingsPatchInput(merged) : undefined
+  return freshAgent ? { freshAgent } : {}
 }
 ```
 
@@ -815,7 +844,7 @@ Add a synthetic layout-size test using a generated layout with at least 100 tabs
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/fresh-agent-pane-migration.test.ts test/unit/server/agent-layout-schema.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/tab-registry-fresh-agent-migration.test.ts test/unit/server/tabs-registry/fresh-agent-migration.test.ts test/unit/client/panesSlice.test.ts --run
+npm run test:vitest -- test/unit/client/fresh-agent-pane-migration.test.ts test/unit/server/agent-layout-schema.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/tab-registry-fresh-agent-migration.test.ts test/unit/server/tabs-registry/fresh-agent-migration.test.ts test/unit/client/store/panesSlice.test.ts --run
 ```
 
 Expected: PASS.
@@ -905,7 +934,7 @@ Expected: FAIL because `store.getState()` still includes `agentChat`.
 
 - [ ] **Step 3: Create the behavior coverage map before deleting legacy tests**
 
-Create `test/unit/client/fresh-agent-legacy-behavior-coverage.test.ts` or a markdown checklist in the implementation notes for the branch that maps old agent-chat tests to fresh-agent replacements. The executable tests are preferred; the mapping must include:
+Create `test/unit/client/fresh-agent-legacy-behavior-coverage.test.ts` that maps old agent-chat tests to fresh-agent replacements. This must be an executable Vitest gate, not a markdown checklist. The mapping must include:
 
 ```text
 test/unit/client/agentChatSlice.test.ts -> freshAgentSlice + freshAgentThunks restore/history/stream/result/permission tests
@@ -939,7 +968,7 @@ Do not `git rm` a legacy test file until either:
 - its user-story behavior has an equivalent fresh-agent test that fails before the port and passes after it, or
 - the behavior is intentionally obsolete and the architecture guard or browser smoke proves the new behavior.
 
-The coverage test/checklist must fail if any file under `test/unit/client/components/agent-chat`, `test/unit/client/agentChatSlice.test.ts`, `test/unit/client/sdk-message-handler.test.ts`, `test/unit/client/ws-client-sdk.test.ts`, `test/unit/client/components/context-menu/*agent-chat*`, or `test/e2e/agent-chat-*.tsx` is missing from the matrix. Category-only mapping is not sufficient.
+The coverage test must fail if any file under `test/unit/client/components/agent-chat`, `test/unit/client/agentChatSlice.test.ts`, `test/unit/client/sdk-message-handler.test.ts`, `test/unit/client/ws-client-sdk.test.ts`, `test/unit/client/components/context-menu/*agent-chat*`, or `test/e2e/agent-chat-*.tsx` is missing from the matrix. Category-only mapping is not sufficient.
 
 - [ ] **Step 4: Remove `agentChat` reducer from root store**
 
@@ -1115,7 +1144,13 @@ describe('fresh-agent model capabilities router', () => {
 
     expect(res.body.sessionType).toBe('freshopencode')
     expect(res.body.runtimeProvider).toBe('opencode')
-    expect(res.body.provider).not.toBe('freshclaude')
+    expect(res.body).not.toMatchObject({
+      runtimeProvider: 'opencode',
+      models: expect.arrayContaining([
+        expect.objectContaining({ provider: 'claude' }),
+      ]),
+    })
+    expect(res.body.status === 'unavailable' || res.body.models.every((model: { provider?: string }) => model.provider === 'opencode')).toBe(true)
   })
 })
 ```
@@ -1271,14 +1306,37 @@ import { describe, expect, it } from 'vitest'
 import { createFreshAgentRouter } from '../../../server/fresh-agent/router.js'
 import { FreshAgentRuntimeManager } from '../../../server/fresh-agent/runtime-manager.js'
 import { createFreshAgentProviderRegistry } from '../../../server/fresh-agent/provider-registry.js'
+import type { FreshAgentRuntimeAdapter } from '../../../server/fresh-agent/runtime-adapter.js'
+
+function restoreError(code: string) {
+  return Object.assign(new Error(code), { code })
+}
+
+function makeClaudeHistoryParityAdapter(): FreshAgentRuntimeAdapter {
+  return {
+    runtimeProvider: 'claude',
+    async create() {
+      return { sessionId: 'created' }
+    },
+    async getSnapshot({ threadId }) {
+      if (threadId === 'not-found') throw restoreError('RESTORE_NOT_FOUND')
+      if (threadId === 'unavailable') throw restoreError('RESTORE_UNAVAILABLE')
+      if (threadId === 'diverged') throw restoreError('RESTORE_DIVERGED')
+      if (threadId === 'stale') throw Object.assign(restoreError('RESTORE_STALE_REVISION'), { currentRevision: 2 })
+      return { threadId, revision: 1, turns: [] }
+    },
+  }
+}
 
 describe('fresh-agent route centralization', () => {
   it('maps Claude restore errors through fresh-agent thread routes before legacy route removal', async () => {
     const app = express()
-    const registry = createFreshAgentProviderRegistry({
-      claude: makeClaudeHistoryParityAdapter(),
-    })
-    const runtimeManager = new FreshAgentRuntimeManager(registry)
+    const registry = createFreshAgentProviderRegistry([{
+      sessionType: 'freshclaude',
+      runtimeProvider: 'claude',
+      adapter: makeClaudeHistoryParityAdapter(),
+    }])
+    const runtimeManager = new FreshAgentRuntimeManager({ registry })
     app.use('/api', createFreshAgentRouter({ runtimeManager }))
 
     await request(app).get('/api/fresh-agent/threads/freshclaude/claude/not-found?revision=1').expect(404)
@@ -1306,6 +1364,7 @@ Expected: FAIL until fresh-agent route error mapping and Claude history imports 
 Run:
 
 ```bash
+mkdir -p server/fresh-agent/history/claude
 git mv server/agent-timeline/history-source.ts server/fresh-agent/history/claude/history-source.ts
 git mv server/agent-timeline/ledger.ts server/fresh-agent/history/claude/history-ledger.ts
 git mv server/agent-timeline/service.ts server/fresh-agent/history/claude/history-service.ts
@@ -1386,19 +1445,22 @@ Create `test/integration/server/fresh-agent-removes-legacy-routes.test.ts` after
 Run:
 
 ```bash
+mkdir -p test/unit/server/fresh-agent
 git mv test/unit/server/agent-timeline-history-source.test.ts test/unit/server/fresh-agent/claude-history-source.test.ts
 git mv test/unit/server/agent-timeline-include-bodies.test.ts test/unit/server/fresh-agent/claude-history-include-bodies.test.ts
+git mv test/unit/server/agent-timeline-ledger.test.ts test/unit/server/fresh-agent/claude-history-ledger.test.ts
+git mv test/unit/server/agent-timeline/service.test.ts test/unit/server/fresh-agent/claude-history-service.test.ts
 git rm test/integration/server/agent-timeline-router.test.ts
 ```
 
-Update imports in the moved tests to the new paths and symbol names from Step 4. Convert the old route integration assertions into the new route-parity file before deleting `agent-timeline-router.test.ts`; do not simply drop them.
+Update imports in every moved test to the new paths and symbol names from Step 4. Convert the old route integration assertions into the new route-parity file before deleting `agent-timeline-router.test.ts`; do not simply drop them. After this step, `rg -n "server/agent-timeline|agent-timeline" test/unit test/integration` must have no hits except the fresh-agent route-parity test description text.
 
 - [ ] **Step 9: Run focused server history tests**
 
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/claude-history-source.test.ts test/unit/server/fresh-agent/claude-history-include-bodies.test.ts test/unit/server/fresh-agent/claude-restore-contract.test.ts test/integration/server/fresh-agent-claude-history-route-parity.test.ts test/integration/server/fresh-agent-removes-legacy-routes.test.ts --run
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/claude-history-source.test.ts test/unit/server/fresh-agent/claude-history-include-bodies.test.ts test/unit/server/fresh-agent/claude-history-ledger.test.ts test/unit/server/fresh-agent/claude-history-service.test.ts test/unit/server/fresh-agent/claude-restore-contract.test.ts test/integration/server/fresh-agent-claude-history-route-parity.test.ts test/integration/server/fresh-agent-removes-legacy-routes.test.ts --run
 ```
 
 Expected: PASS.
@@ -1422,10 +1484,15 @@ git commit -m "Move Claude history under fresh-agent"
 - Modify: `src/App.tsx:1119-1123`
 - Modify: `src/lib/ws-client.ts`
 - Modify: `src/lib/fresh-agent-ws.ts:1-186`
+- Modify: `src/lib/create-cancellation.ts`
 - Modify: `src/store/freshAgentSlice.ts`
 - Delete: `src/lib/sdk-message-handler.ts`
+- Modify: `src/components/panes/PaneContainer.tsx`
+- Modify/delete: tests that import `@/lib/sdk-message-handler`
 - Modify: `server/ws-handler.ts`
+- Modify: `shared/ws-version.ts`
 - Test: `test/unit/client/fresh-agent-ws.test.ts`
+- Test: `test/unit/client/ws-client-protocol-reload.test.ts`
 - Test: `test/unit/server/ws-fresh-agent-contract.test.ts`
 - Test: `test/unit/server/ws-handler-fresh-agent-ownership.test.ts`
 - Test: `test/unit/server/ws-handler-fresh-agent-lifecycle-parity.test.ts`
@@ -1455,7 +1522,7 @@ export type FreshAgentProviderEvent =
 
 `server/sdk-bridge.ts` may continue to emit its internal SDK-shaped events temporarily, but `server/ws-handler.ts` must normalize them to `FreshAgentProviderEvent` before sending to the browser. After this task, no browser-facing type or handler should require top-level `SdkServerMessage`.
 
-Bump `WS_PROTOCOL_VERSION` in this task. Add a client test proving a stale bundle that receives `PROTOCOL_MISMATCH` does not flush queued `sdk.*`, `freshAgent.*`, or `ui.layout.sync` messages. The client must either call the existing reload path automatically or enter an intentional, non-reconnecting hard-stop state with clear reload UI.
+Bump `WS_PROTOCOL_VERSION` in `shared/ws-version.ts` in this task. Add a client test proving a stale bundle that receives `PROTOCOL_MISMATCH` does not flush queued `sdk.*`, `freshAgent.*`, or `ui.layout.sync` messages. The client must either call the existing reload path automatically or enter an intentional, non-reconnecting hard-stop state with clear reload UI.
 
 - [ ] **Step 1: Write the fresh-agent transport client test**
 
@@ -1513,6 +1580,8 @@ describe('fresh-agent websocket transport', () => {
 })
 ```
 
+Also create `test/unit/client/ws-client-protocol-reload.test.ts` for the stale-bundle behavior named above. The test must drive the real `src/lib/ws-client.ts` protocol-mismatch path, enqueue representative `freshAgent.*`, legacy `sdk.*`, and `ui.layout.sync` messages before the mismatch, then assert no queued message is sent after `PROTOCOL_MISMATCH`.
+
 - [ ] **Step 2: Run the client transport test and verify it fails**
 
 Run:
@@ -1566,6 +1635,18 @@ with:
 ```ts
 handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)
 ```
+
+- [ ] **Step 4.5: Move create-cancellation imports out of `sdk-message-handler`**
+
+Before deleting `src/lib/sdk-message-handler.ts`, update every remaining `cancelCreate`, `consumeCancelledCreate`, or `_resetCancelledCreates` import to come from `@/lib/create-cancellation` or the equivalent relative path. This includes production imports such as `src/components/panes/PaneContainer.tsx` and fresh-agent tests that still import cancellation helpers through `sdk-message-handler`.
+
+After the import move, run:
+
+```bash
+rg -n "sdk-message-handler" src test
+```
+
+Expected before Step 8: no production hits and no fresh-agent test hits. Legacy tests that are being ported or deleted in this task may remain only until their replacement tests pass.
 
 - [ ] **Step 5: Translate server provider events before sending to clients**
 
@@ -1683,6 +1764,8 @@ git rm src/lib/sdk-message-handler.ts
 git rm test/unit/server/ws-sdk-session-history-cache.test.ts
 ```
 
+If any legacy client tests still import `src/lib/sdk-message-handler.ts`, port their asserted behavior to `test/unit/client/fresh-agent-ws.test.ts`, `test/unit/client/ws-client-protocol-reload.test.ts`, or the server lifecycle/ownership tests before deleting them. Do not leave a deleted-module import for typecheck to find.
+
 - [ ] **Step 9: Run websocket focused tests and typechecks**
 
 Run:
@@ -1697,7 +1780,7 @@ Expected: PASS.
 - [ ] **Step 10: Commit**
 
 ```bash
-git add shared/ws-protocol.ts server/fresh-agent/sdk-events.ts server/sdk-bridge-types.ts src/App.tsx src/lib/ws-client.ts src/lib/fresh-agent-ws.ts src/store/freshAgentSlice.ts server/ws-handler.ts test src/lib
+git add shared/ws-protocol.ts shared/ws-version.ts server/fresh-agent/sdk-events.ts server/sdk-bridge-types.ts src/App.tsx src/components/panes/PaneContainer.tsx src/lib/ws-client.ts src/lib/fresh-agent-ws.ts src/lib/create-cancellation.ts src/store/freshAgentSlice.ts server/ws-handler.ts test src/lib
 git commit -m "Remove legacy sdk websocket surface"
 ```
 
@@ -1717,7 +1800,7 @@ git commit -m "Remove legacy sdk websocket surface"
 - Modify: `src/components/context-menu/menu-defs.ts`
 - Modify: `server/mcp/freshell-tool.ts`
 - Test: `test/unit/client/components/panes/PanePicker.test.tsx`
-- Test: `test/unit/client/tabsSlice.test.ts`
+- Test: `test/unit/client/store/tabsSlice.test.ts`
 - Test: `test/unit/server/mcp/freshell-tool.test.ts`
 
 - [ ] **Step 1: Write the picker and resume behavior tests**
@@ -1740,19 +1823,23 @@ it('labels fresh clients without any agent-chat live option wording', () => {
 })
 ```
 
-In `test/unit/client/tabsSlice.test.ts`, add:
+In `test/unit/client/store/tabsSlice.test.ts`, add an async thunk test using the existing `createOpenSessionStore` helper:
 
 ```ts
-it('reopens Claude agent sessions as fresh-agent panes', () => {
-  const state = tabsReducer(initialTabsState, reopenSession({
+it('opens Claude agent sessions as fresh-agent panes', async () => {
+  const store = createOpenSessionStore()
+
+  await store.dispatch(openSessionTab({
     provider: 'claude',
     sessionId: '00000000-0000-4000-8000-000000000111',
     sessionType: 'freshclaude',
     cwd: '/repo',
   }))
 
-  const activeTab = state.tabs.find((tab) => tab.id === state.activeTabId)
-  const content = activeTab?.layout?.type === 'leaf' ? activeTab.layout.content : undefined
+  const state = store.getState()
+  const activeTab = state.tabs.tabs.find((tab) => tab.id === state.tabs.activeTabId)
+  const layout = activeTab ? state.panes.layouts[activeTab.id] : undefined
+  const content = layout?.type === 'leaf' ? layout.content : undefined
   expect(content).toMatchObject({
     kind: 'fresh-agent',
     sessionType: 'freshclaude',
@@ -1766,16 +1853,20 @@ it('reopens Claude agent sessions as fresh-agent panes', () => {
 Add non-Claude reopen coverage in the same file:
 
 ```ts
-it('reopens non-Claude fresh-agent sessions with explicit sessionRef instead of Claude fallback inference', () => {
-  const state = tabsReducer(initialTabsState, reopenSession({
+it('opens non-Claude fresh-agent sessions with explicit sessionRef instead of Claude fallback inference', async () => {
+  const store = createOpenSessionStore()
+
+  await store.dispatch(openSessionTab({
     provider: 'opencode',
     sessionId: 'opencode-thread-1',
     sessionType: 'freshopencode',
     cwd: '/repo',
   }))
 
-  const activeTab = state.tabs.find((tab) => tab.id === state.activeTabId)
-  const content = activeTab?.layout?.type === 'leaf' ? activeTab.layout.content : undefined
+  const state = store.getState()
+  const activeTab = state.tabs.tabs.find((tab) => tab.id === state.tabs.activeTabId)
+  const layout = activeTab ? state.panes.layouts[activeTab.id] : undefined
+  const content = layout?.type === 'leaf' ? layout.content : undefined
   expect(content).toMatchObject({
     kind: 'fresh-agent',
     sessionType: 'freshopencode',
@@ -1791,7 +1882,7 @@ it('reopens non-Claude fresh-agent sessions with explicit sessionRef instead of 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/panes/PanePicker.test.tsx test/unit/client/tabsSlice.test.ts --run
+npm run test:vitest -- test/unit/client/components/panes/PanePicker.test.tsx test/unit/client/store/tabsSlice.test.ts --run
 ```
 
 Expected: FAIL on stale `agentChat` naming/imports or missing helper renames.
@@ -1858,7 +1949,7 @@ In `src/lib/tab-fallback-identity.ts`, remove Claude-only inference for non-Clau
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/panes/PanePicker.test.tsx test/unit/client/tabsSlice.test.ts test/unit/server/mcp/freshell-tool.test.ts --run
+npm run test:vitest -- test/unit/client/components/panes/PanePicker.test.tsx test/unit/client/store/tabsSlice.test.ts test/unit/server/mcp/freshell-tool.test.ts --run
 ```
 
 Expected: PASS.
@@ -1885,16 +1976,34 @@ Create `test/unit/architecture/fresh-agent-only-runtime.test.ts`:
 import { execFileSync } from 'node:child_process'
 import { describe, expect, it } from 'vitest'
 
-function rg(pattern: string, paths: string[]): string {
+function rgContent(pattern: string, paths: string[]): string[] {
   try {
     return execFileSync('rg', ['-n', pattern, ...paths], {
       encoding: 'utf8',
       cwd: process.cwd(),
       stdio: ['ignore', 'pipe', 'pipe'],
     })
+      .split('\n')
+      .filter(Boolean)
   } catch (error) {
     const status = (error as { status?: number }).status
-    if (status === 1) return ''
+    if (status === 1) return []
+    throw error
+  }
+}
+
+function rgFiles(paths: string[]): string[] {
+  try {
+    return execFileSync('rg', ['--files', ...paths], {
+      encoding: 'utf8',
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+      .split('\n')
+      .filter(Boolean)
+  } catch (error) {
+    const status = (error as { status?: number }).status
+    if (status === 1) return []
     throw error
   }
 }
@@ -1902,16 +2011,16 @@ function rg(pattern: string, paths: string[]): string {
 describe('fresh-agent-only runtime architecture', () => {
   it('has no live agent-chat runtime imports, routes, pane kinds, or Redux state', () => {
     const forbidden = String.raw`agent-chat|agentChat|AgentChat|/api/agent-chat|/api/agent-sessions|createAgentTimelineRouter`
-    const legacyAgentOutput = rg(forbidden, ['src', 'server', 'shared'])
-      .split('\n')
-      .filter(Boolean)
+    const contentHits = rgContent(forbidden, ['src', 'server', 'shared'])
       .filter((line) => !line.includes('migrateLegacyFreshAgentContent'))
       .filter((line) => !line.includes('migrateLegacyFreshAgentDurableState'))
       .filter((line) => !line.includes('migrateLegacyAgentChatDurableState'))
       .filter((line) => !line.includes('legacy agentChat input'))
       .filter((line) => !line.includes('readLegacyAgentChatInput'))
+    const pathHits = rgFiles(['src', 'server', 'shared'])
+      .filter((path) => /agent-chat|agentChat|AgentChat/.test(path))
 
-    expect(legacyAgentOutput).toEqual([])
+    expect([...contentHits, ...pathHits]).toEqual([])
   })
 
   it('keeps sdk-prefixed events server-internal only', () => {
@@ -1924,9 +2033,7 @@ describe('fresh-agent-only runtime architecture', () => {
       'server/fresh-agent/adapters/opencode/',
       'test/unit/server/',
     ]
-    const output = rg(String.raw`sdk\.`, ['src', 'server', 'shared'])
-      .split('\n')
-      .filter(Boolean)
+    const output = rgContent(String.raw`sdk\.`, ['src', 'server', 'shared'])
       .filter((line) => !allowedSdkInternalPaths.some((path) => line.includes(path)))
 
     expect(output).toEqual([])
@@ -2062,10 +2169,11 @@ Run:
 
 ```bash
 rg -n "agent-chat|agentChat|AgentChat|/api/agent-chat|/api/agent-sessions|createAgentTimelineRouter" src server shared docs/index.html README.md
+rg --files src server shared | rg "agent-chat|agentChat|AgentChat"
 rg -n "sdk\\." src shared
 ```
 
-Expected: no production-source hits except explicit one-time migration helper names:
+Expected: no production-source content hits except explicit one-time migration helper names, and no production file-path hits:
 
 ```text
 migrateLegacyFreshAgentContent
