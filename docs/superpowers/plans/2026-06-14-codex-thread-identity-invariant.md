@@ -191,18 +191,13 @@ git commit -m "test: define canonical terminal session identity"
 
 - [ ] **Step 1: Write failing protocol tests**
 
-Add schema tests proving `terminal.attach`, `terminal.input`, and `terminal.resize` accept:
+Add schema tests proving `terminal.attach`, `terminal.input`, and `terminal.resize` parse and preserve:
 
 ```ts
 expectedSessionRef: { provider: 'codex', sessionId: 'thread-1' }
 ```
 
-Add an error-shape test proving `ErrorMessage` can include:
-
-```ts
-expectedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
-actualSessionRef: { provider: 'codex', sessionId: 'thread-old' },
-```
+The assertion must inspect the parsed result, not only `safeParse().success`, because the current non-strict Zod object schemas silently strip unknown keys. Add a protocol enum test proving `ErrorCode` accepts `SESSION_IDENTITY_MISMATCH`. Do not add a tautological runtime test for the `ErrorMessage` TypeScript type; Task 3 proves the server actually emits the mismatch fields.
 
 - [ ] **Step 2: Run failing protocol tests**
 
@@ -210,7 +205,7 @@ actualSessionRef: { provider: 'codex', sessionId: 'thread-old' },
 npm run test:vitest -- test/server/ws-protocol.test.ts --run
 ```
 
-Expected: FAIL because the schemas reject `expectedSessionRef` and the error enum lacks `SESSION_IDENTITY_MISMATCH`.
+Expected: FAIL because parsed attach/input/resize messages do not retain `expectedSessionRef`, and the error enum lacks `SESSION_IDENTITY_MISMATCH`.
 
 - [ ] **Step 3: Extend schemas**
 
@@ -473,9 +468,7 @@ Do not derive expected identity from `codexDurability`.
 export function getExpectedSessionRefForTerminalOperation(
   content: TerminalPaneContent | null | undefined,
 ): SessionLocator | undefined {
-  return content?.sessionRef?.provider === 'codex'
-    ? content.sessionRef
-    : content?.sessionRef
+  return content?.sessionRef
 }
 ```
 
@@ -590,7 +583,6 @@ git commit -m "fix: ignore stale Codex identity broadcasts"
 - Modify: `src/store/panesSlice.ts`
 - Modify: `src/components/TerminalView.tsx`
 - Test: `test/unit/client/components/TerminalView.codex-identity.test.tsx`
-- Test: `test/e2e/codex-wrong-thread-resume.test.tsx`
 
 - [ ] **Step 1: Write failing repair tests**
 
@@ -608,7 +600,6 @@ Cover:
 ```bash
 npm run test:vitest -- \
   test/unit/client/components/TerminalView.codex-identity.test.tsx \
-  test/e2e/codex-wrong-thread-resume.test.tsx \
   --run
 ```
 
@@ -655,7 +646,6 @@ On `SESSION_IDENTITY_MISMATCH`:
 ```bash
 npm run test:vitest -- \
   test/unit/client/components/TerminalView.codex-identity.test.tsx \
-  test/e2e/codex-wrong-thread-resume.test.tsx \
   --run
 ```
 
@@ -664,7 +654,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/store/panesSlice.ts src/components/TerminalView.tsx test/unit/client/components/TerminalView.codex-identity.test.tsx test/e2e/codex-wrong-thread-resume.test.tsx
+git add src/store/panesSlice.ts src/components/TerminalView.tsx test/unit/client/components/TerminalView.codex-identity.test.tsx
 git commit -m "fix: repair stale Codex runtime plumbing"
 ```
 
@@ -793,12 +783,18 @@ Expected: coordinator is idle or shows a reusable green baseline. If another age
 - [ ] **Step 2: Run focused suites**
 
 ```bash
-npm run test:vitest -- \
+FRESHELL_TEST_SUMMARY="codex identity focused server" npm run test:vitest -- \
   test/unit/server/terminal-session-identity.test.ts \
+  test/server/ws-protocol.test.ts \
   test/server/ws-terminal-codex-identity-invariant.test.ts \
   test/server/ws-terminal-create-reuse-running-codex.test.ts \
   test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts \
   test/server/agent-codex-identity-invariant.test.ts \
+  --run
+```
+
+```bash
+FRESHELL_TEST_SUMMARY="codex identity focused client" npm run test:vitest -- \
   test/unit/client/components/terminal-view-utils.test.ts \
   test/unit/client/components/TerminalView.codex-identity.test.tsx \
   test/unit/client/lib/terminal-session-association.test.ts \
@@ -807,6 +803,8 @@ npm run test:vitest -- \
   test/e2e/codex-wrong-thread-resume.test.tsx \
   --run
 ```
+
+Keep server-owned and default-owned targets in separate invocations. The coordinated `test:vitest` passthrough routes mixed ownership through the default config, which excludes `test/server/**` and `test/unit/server/**`.
 
 Expected: PASS.
 
@@ -840,4 +838,5 @@ git commit -m "fix: enforce Codex thread identity invariant"
 - Load-bearing fixes: Every falsified load-bearing assumption now changes a task: side-effect gates move inside operation owners, create reuse is centralized, REST/MCP/CLI paths are in scope, broadcasts are identity-aware, and tab-registry/cross-tab sync drops stale runtime fields.
 - Non-legacy approach: The plan still ignores heuristic recovery. When canonical `sessionRef` is absent, Freshell refuses to guess.
 - Test shape: Tests protect the incident behavior directly: input/replay must not reach the old thread, stale runtime plumbing must be cleared, and restore/create must target the expected Codex `sessionRef`.
+- PR callout: Removing `proof_failed_attach_live_candidate` intentionally reduces Codex live-terminal reuse when rollout proof fails, because resuming the wrong thread is worse than a fresh/restore-unavailable path. The eventual PR description should make this behavior change explicit.
 - Known implementation adjustment: Helper and fixture names must follow the repo's existing test harnesses. Preserve the behavior and assertion shape when adapting names.
