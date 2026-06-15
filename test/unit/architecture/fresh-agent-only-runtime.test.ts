@@ -125,6 +125,19 @@ function includesLegacyNeedle(value: string): boolean {
   return legacyRuntimeNeedles.some((needle) => value.includes(needle))
 }
 
+function collapseObviousStringFragmentSyntax(value: string): string {
+  return value.replace(/[\s'"`+$\{\}()]/g, '')
+}
+
+function containsLegacyNeedle(value: string): boolean {
+  if (includesLegacyNeedle(value)) {
+    return true
+  }
+
+  const joinedFragments = collapseObviousStringFragmentSyntax(value)
+  return legacyRuntimeNeedles.some((needle) => joinedFragments.includes(needle))
+}
+
 function legacyAllowanceFor(file: string, line: string): LegacyBoundaryAllowance | undefined {
   return legacyMigrationBoundaryAllowances.find((allowance) => (
     allowance.file === file
@@ -140,7 +153,7 @@ function findLegacyRuntimeReferences(file: string, contents: string): Finding[] 
   return contents
     .split(/\r?\n/)
     .flatMap((line, index): Finding[] => {
-      if (!includesLegacyNeedle(line) || legacyAllowanceFor(file, line)) {
+      if (!containsLegacyNeedle(line) || legacyAllowanceFor(file, line)) {
         return []
       }
 
@@ -188,6 +201,51 @@ function formatFindings(findings: Finding[]): string {
 }
 
 describe('fresh-agent-only runtime architecture', () => {
+  describe('legacy reference detection', () => {
+    it('detects direct and obviously split legacy references', () => {
+      const snippets = [
+        "router.use('/api/agent-chat', router)",
+        "router.use('/api/agent-' + 'chat', router)",
+        "const kind = `agent-${'chat'}`",
+        "const key = `agent${'Chat'}`",
+        "const component = 'Agent' + 'Chat'",
+        "const route = '/api/agent-' + 'sessions'",
+        "const factory = 'createAgent' + 'TimelineRouter'",
+      ]
+
+      expect(snippets.map(containsLegacyNeedle)).toEqual(snippets.map(() => true))
+    })
+
+    it('preserves explicit migration-boundary allowances', () => {
+      expect(findLegacyRuntimeReferences(
+        'shared/settings.ts',
+        "  return isRecord(candidate.agentChat)\n    ? candidate.agentChat as LegacyFreshAgentSettingsInput",
+      )).toEqual([])
+      expect(findLegacyRuntimeReferences(
+        'server/settings-router.ts',
+        "    res.status(400).json({ error: 'agentChat settings have been migrated; use freshAgent' })",
+      )).toEqual([])
+    })
+
+    it('reports obfuscated legacy references outside migration boundaries', () => {
+      expect(findLegacyRuntimeReferences(
+        'src/live-runtime.ts',
+        "router.use('/api/agent-' + 'chat', router)\nconst key = `agent${'Chat'}`",
+      )).toMatchObject([
+        {
+          file: 'src/live-runtime.ts',
+          line: 1,
+          reason: 'legacy agent-chat runtime reference is not an explicit migration boundary',
+        },
+        {
+          file: 'src/live-runtime.ts',
+          line: 2,
+          reason: 'legacy agent-chat runtime reference is not an explicit migration boundary',
+        },
+      ])
+    })
+  })
+
   it('keeps legacy agent-chat infrastructure out of production runtime source', async () => {
     const files = await collectRuntimeSourceFiles()
     const pathFindings = files
