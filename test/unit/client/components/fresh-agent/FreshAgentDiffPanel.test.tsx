@@ -15,9 +15,10 @@ describe('FreshAgentDiffPanel', () => {
       <DiffView oldStr="const value = 1\n" newStr="const value = 2\n" filePath="src/app.tsx" />,
     )
 
-    expect(screen.getByRole('figure', { name: 'diff view' })).toBeInTheDocument()
+    const diffView = screen.getByRole('figure', { name: 'diff view' })
+    expect(diffView).toBeInTheDocument()
     expect(container.querySelector('[data-diff]')).toHaveAttribute('data-file-path', 'src/app.tsx')
-    expect(screen.getByText('const value = 1')).toBeInTheDocument()
-    expect(screen.getByText('const value = 2')).toBeInTheDocument()
+    expect(diffView).toHaveTextContent(/const value = 1/)
+    expect(diffView).toHaveTextContent(/const value = 2/)
   })
 })
