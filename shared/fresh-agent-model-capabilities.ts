@@ -34,7 +34,7 @@ export const FreshAgentModelSelectionSchema = z.discriminatedUnion('kind', [
 export const FreshAgentModelCapabilitySchema = z.object({
   id: FreshAgentModelCapabilitiesOpaqueStringSchema,
   displayName: FreshAgentModelCapabilitiesOpaqueStringSchema,
-  provider: FreshAgentModelCapabilitiesRuntimeProviderSchema.optional(),
+  provider: FreshAgentModelCapabilitiesRuntimeProviderSchema,
   description: z.string().optional(),
   supportsEffort: z.boolean(),
   supportedEffortLevels: z.array(FreshAgentModelCapabilitiesOpaqueStringSchema),

@@ -22,6 +22,7 @@ const capabilities = {
     {
       id: 'opus',
       displayName: 'Opus',
+      provider: 'claude',
       description: 'Latest Opus track',
       supportsEffort: true,
       supportedEffortLevels: ['turbo', 'warp'],
@@ -30,6 +31,7 @@ const capabilities = {
     {
       id: 'opus[1m]',
       displayName: 'Opus 1M',
+      provider: 'claude',
       description: 'Long context',
       supportsEffort: true,
       supportedEffortLevels: ['warp'],
@@ -38,6 +40,7 @@ const capabilities = {
     {
       id: 'haiku',
       displayName: 'Haiku',
+      provider: 'claude',
       description: 'Fast path',
       supportsEffort: false,
       supportedEffortLevels: [],
@@ -111,6 +114,7 @@ describe('fresh-agent-model-capabilities helpers', () => {
         {
           id: 'opus',
           displayName: 'Opus',
+          provider: 'claude',
           supportsEffort: false,
           supportedEffortLevels: ['turbo'],
           supportsAdaptiveThinking: true,
@@ -263,6 +267,7 @@ describe('fresh-agent-model-capabilities helpers', () => {
       models: Array.from({ length: 2_000 }, (_, index) => ({
         id: `model-${index}`,
         displayName: `Model ${index}`,
+        provider: 'claude' as const,
         description: `Synthetic model ${index}`,
         supportsEffort: index % 2 === 0,
         supportedEffortLevels: index % 2 === 0 ? ['turbo', 'warp', `custom-${index % 5}`] : [],

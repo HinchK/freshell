@@ -160,7 +160,7 @@ function normalizeModelCapability(
 
 export function normalizeFreshAgentModelCapabilityCatalog(
   rawModels: unknown,
-  runtimeProvider: FreshAgentRuntimeProvider = 'claude',
+  runtimeProvider: FreshAgentRuntimeProvider,
 ): FreshAgentModelCapability[] {
   if (!Array.isArray(rawModels)) {
     throw invalidCapabilityPayload('Capability payload must be an array of models')

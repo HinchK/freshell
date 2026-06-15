@@ -11,6 +11,10 @@ type FreshAgentModelCapabilityRegistryLike = {
   refreshCapabilities: (sessionType: FreshAgentSessionType) => Promise<unknown>
 }
 
+function statusForModelCapabilitiesResult(result: { ok: boolean }): number {
+  return result.ok ? 200 : 503
+}
+
 export function createFreshAgentModelCapabilitiesRouter(
   deps: { registry: FreshAgentModelCapabilityRegistryLike },
 ): Router {
@@ -26,7 +30,7 @@ export function createFreshAgentModelCapabilitiesRouter(
       await deps.registry.getCapabilities(parsedSessionType.data),
     )
 
-    return res.status(200).json(result)
+    return res.status(statusForModelCapabilitiesResult(result)).json(result)
   })
 
   router.post('/:sessionType/refresh', async (req, res) => {
@@ -39,7 +43,7 @@ export function createFreshAgentModelCapabilitiesRouter(
       await deps.registry.refreshCapabilities(parsedSessionType.data),
     )
 
-    return res.status(200).json(result)
+    return res.status(statusForModelCapabilitiesResult(result)).json(result)
   })
 
   return router
