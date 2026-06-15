@@ -18,6 +18,7 @@ import {
   LAYOUT_FRESH_AGENT_BACKUP_KEY,
   LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
   LAYOUT_FRESH_AGENT_MIGRATION_ID,
+  LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
   LAYOUT_SCHEMA_VERSION,
   PANES_SCHEMA_VERSION,
   hashPersistedLayoutRaw,
@@ -273,10 +274,12 @@ function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: strin
     try {
       localStorage.removeItem(LAYOUT_FRESH_AGENT_BACKUP_KEY)
       localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
+      localStorage.removeItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
     } catch (error) {
       warnStructured('fresh_agent_layout_interleaving_cleanup_failed', {
         backupKey: LAYOUT_FRESH_AGENT_BACKUP_KEY,
         markerKey: LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+        pendingMarkerKey: LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
         error: error instanceof Error ? error.message : String(error),
       })
     }
@@ -286,10 +289,34 @@ function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: strin
     return false
   }
 
+  const pendingMarkerRaw = JSON.stringify({
+    version: 1,
+    migration: LAYOUT_FRESH_AGENT_MIGRATION_ID,
+    backupKey: LAYOUT_FRESH_AGENT_BACKUP_KEY,
+    originalHash: hashPersistedLayoutRaw(originalRaw),
+    migratedHash: hashPersistedLayoutRaw(migratedRaw),
+    startedAt: Date.now(),
+  })
+
   try {
     localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
+    localStorage.setItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY, pendingMarkerRaw)
+  } catch (error) {
+    warnStructured('fresh_agent_layout_pending_marker_write_failed', {
+      key: LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return false
+  }
+
+  try {
     localStorage.setItem(LAYOUT_STORAGE_KEY, migratedRaw)
   } catch (error) {
+    try {
+      localStorage.removeItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
+    } catch {
+      // keep the original write failure as the useful signal
+    }
     warnStructured('fresh_agent_layout_write_failed', {
       key: LAYOUT_STORAGE_KEY,
       error: error instanceof Error ? error.message : String(error),
@@ -312,6 +339,15 @@ function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: strin
       error: error instanceof Error ? error.message : String(error),
     })
     return false
+  }
+
+  try {
+    localStorage.removeItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
+  } catch (error) {
+    warnStructured('fresh_agent_layout_pending_marker_cleanup_failed', {
+      key: LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
+      error: error instanceof Error ? error.message : String(error),
+    })
   }
 
   return true

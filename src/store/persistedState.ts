@@ -15,6 +15,7 @@ export const TABS_SCHEMA_VERSION = 2
 export const PANES_SCHEMA_VERSION = 7
 export const LAYOUT_FRESH_AGENT_BACKUP_KEY = `${LAYOUT_STORAGE_KEY}.backup-before-fresh-agent-centralization`
 export const LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-commit`
+export const LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-pending`
 export const LAYOUT_FRESH_AGENT_MIGRATION_ID = 'fresh-agent-centralization'
 
 const zTabMode = z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])
@@ -346,6 +347,15 @@ export type LayoutFreshAgentCommitMarker = {
   committedAt: number
 }
 
+export type LayoutFreshAgentPendingMarker = {
+  version: 1
+  migration: typeof LAYOUT_FRESH_AGENT_MIGRATION_ID
+  backupKey: typeof LAYOUT_FRESH_AGENT_BACKUP_KEY
+  originalHash: string
+  migratedHash: string
+  startedAt: number
+}
+
 export function hashPersistedLayoutRaw(raw: string): string {
   let hash = 0x811c9dc5
   for (let index = 0; index < raw.length; index += 1) {
@@ -375,18 +385,48 @@ export function parseLayoutFreshAgentCommitMarker(raw: string | null): LayoutFre
   }
 }
 
+export function parseLayoutFreshAgentPendingMarker(raw: string | null): LayoutFreshAgentPendingMarker | null {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as Partial<LayoutFreshAgentPendingMarker>
+    if (
+      parsed?.version !== 1
+      || parsed.migration !== LAYOUT_FRESH_AGENT_MIGRATION_ID
+      || parsed.backupKey !== LAYOUT_FRESH_AGENT_BACKUP_KEY
+      || typeof parsed.originalHash !== 'string'
+      || typeof parsed.migratedHash !== 'string'
+      || typeof parsed.startedAt !== 'number'
+    ) {
+      return null
+    }
+    return parsed as LayoutFreshAgentPendingMarker
+  } catch {
+    return null
+  }
+}
+
 export function readRecoverablePersistedLayoutRaw(storage: Pick<Storage, 'getItem'> = localStorage): string | null {
   const raw = storage.getItem(LAYOUT_STORAGE_KEY)
   const backup = storage.getItem(LAYOUT_FRESH_AGENT_BACKUP_KEY)
   const markerRaw = storage.getItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
+  const pendingMarkerRaw = storage.getItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
 
   if (!raw) return backup
   if (!backup) return raw
 
+  const currentHash = hashPersistedLayoutRaw(raw)
   const marker = parseLayoutFreshAgentCommitMarker(markerRaw)
-  if (!markerRaw) return backup
-  if (marker && marker.migratedHash === hashPersistedLayoutRaw(raw)) {
+  if (marker && marker.migratedHash === currentHash) {
     return raw
+  }
+
+  const pendingMarker = parseLayoutFreshAgentPendingMarker(pendingMarkerRaw)
+  if (
+    pendingMarker
+    && pendingMarker.originalHash === hashPersistedLayoutRaw(backup)
+    && pendingMarker.migratedHash === currentHash
+  ) {
+    return backup
   }
 
   return parsePersistedLayoutRaw(raw) ? raw : backup

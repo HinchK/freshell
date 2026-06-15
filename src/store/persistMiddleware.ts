@@ -8,6 +8,7 @@ import { isWellFormedPaneTree } from './paneTreeValidation.js'
 import {
   LAYOUT_FRESH_AGENT_BACKUP_KEY,
   LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+  LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
   PANES_SCHEMA_VERSION,
   LAYOUT_SCHEMA_VERSION,
   parsePersistedLayoutRaw,
@@ -503,6 +504,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         localStorage.setItem(LAYOUT_STORAGE_KEY, raw)
         localStorage.removeItem(LAYOUT_FRESH_AGENT_BACKUP_KEY)
         localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
+        localStorage.removeItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
         broadcastPersistedRaw(LAYOUT_STORAGE_KEY, raw)
       }
 

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const LAYOUT_KEY = 'freshell.layout.v3'
 const BACKUP_KEY = 'freshell.layout.v3.backup-before-fresh-agent-centralization'
 const MARKER_KEY = 'freshell.layout.v3.fresh-agent-centralization-commit'
+const PENDING_KEY = 'freshell.layout.v3.fresh-agent-centralization-pending'
 const VERSION_KEY = 'freshell_version'
 
 type StorageHooks = {
@@ -273,6 +274,7 @@ describe('storage-migration fresh-agent', () => {
     expect(localStorage.getItem(LAYOUT_KEY)).toBe(originalRaw)
     expect(localStorage.getItem(BACKUP_KEY)).toBe(originalRaw)
     expect(localStorage.getItem(MARKER_KEY)).toBeNull()
+    expect(localStorage.getItem(PENDING_KEY)).toBeNull()
     expect(localStorage.getItem(VERSION_KEY)).toBeNull()
   })
 
@@ -300,6 +302,36 @@ describe('storage-migration fresh-agent', () => {
     expect(localStorage.getItem(LAYOUT_KEY)).toBe(concurrentRaw)
     expect(localStorage.getItem(BACKUP_KEY)).toBeNull()
     expect(localStorage.getItem(MARKER_KEY)).toBeNull()
+    expect(localStorage.getItem(VERSION_KEY)).toBeNull()
+    expect(readRecoverablePersistedLayoutRaw(localStorage)).toBe(concurrentRaw)
+  })
+
+  it('keeps a valid post-layout interleaving write when the commit marker is missing', async () => {
+    const originalRaw = makeLegacyLayoutRaw()
+    const concurrentRaw = JSON.stringify(makeLayoutWithContent({
+      kind: 'terminal',
+      mode: 'codex',
+      createRequestId: 'post-layout-req',
+      status: 'running',
+    }))
+    const storage = createStorage({
+      failSetItem: (key) => key === MARKER_KEY,
+      onSetItem: (key, value, currentStorage) => {
+        if (key === LAYOUT_KEY && value.includes('"fresh-agent"')) {
+          currentStorage.seed(LAYOUT_KEY, concurrentRaw)
+        }
+      },
+    })
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(LAYOUT_KEY, originalRaw)
+
+    await import('@/store/storage-migration')
+    const { readRecoverablePersistedLayoutRaw } = await import('@/store/persistedState')
+
+    expect(localStorage.getItem(LAYOUT_KEY)).toBe(concurrentRaw)
+    expect(localStorage.getItem(BACKUP_KEY)).toBe(originalRaw)
+    expect(localStorage.getItem(MARKER_KEY)).toBeNull()
+    expect(localStorage.getItem(PENDING_KEY)).not.toBeNull()
     expect(localStorage.getItem(VERSION_KEY)).toBeNull()
     expect(readRecoverablePersistedLayoutRaw(localStorage)).toBe(concurrentRaw)
   })

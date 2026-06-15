@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   LAYOUT_FRESH_AGENT_BACKUP_KEY,
   LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+  LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
   LAYOUT_STORAGE_KEY,
   hashPersistedLayoutRaw,
   parsePersistedLayoutRaw,
@@ -229,18 +230,41 @@ describe('persistedState fresh-agent migration', () => {
     expect(content.resumeSessionId).toBeUndefined()
   })
 
-  it('prefers the backup when the fresh-agent migration commit marker is missing', () => {
+  it('prefers the backup when a pending fresh-agent migration matches the current raw layout without a commit marker', () => {
     const backupRaw = layoutRaw({
       'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),
     })
     const partialRaw = layoutRaw({
       'tab-1': leaf('pane-partial', { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude' }),
     })
+    const pendingMarker = JSON.stringify({
+      version: 1,
+      migration: 'fresh-agent-centralization',
+      backupKey: LAYOUT_FRESH_AGENT_BACKUP_KEY,
+      originalHash: hashPersistedLayoutRaw(backupRaw),
+      migratedHash: hashPersistedLayoutRaw(partialRaw),
+      startedAt: 1,
+    })
 
     expect(readRecoverablePersistedLayoutRaw(storageWith({
       [LAYOUT_STORAGE_KEY]: partialRaw,
       [LAYOUT_FRESH_AGENT_BACKUP_KEY]: backupRaw,
+      [LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY]: pendingMarker,
     }) as Storage)).toBe(backupRaw)
+  })
+
+  it('keeps a valid current layout when backup remains but no recovery marker identifies it as partial', () => {
+    const backupRaw = layoutRaw({
+      'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),
+    })
+    const currentRaw = layoutRaw({
+      'tab-1': leaf('pane-current', { kind: 'terminal', mode: 'codex' }),
+    })
+
+    expect(readRecoverablePersistedLayoutRaw(storageWith({
+      [LAYOUT_STORAGE_KEY]: currentRaw,
+      [LAYOUT_FRESH_AGENT_BACKUP_KEY]: backupRaw,
+    }) as Storage)).toBe(currentRaw)
   })
 
   it('ignores a stale marker and keeps the current valid layout', () => {
