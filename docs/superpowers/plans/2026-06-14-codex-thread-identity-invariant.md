@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make new Codex panes resume the correct Codex thread by construction by treating the Codex thread id as pane identity and terminal ids as disposable live plumbing.
+**Goal:** Make new Freshell Codex panes resume the correct Codex thread by construction. A pane's canonical Codex `sessionRef` is the identity. Terminal ids, same-server live handles, tab/pane ids, and Codex durability records are evidence or plumbing, not pane identity.
 
-**Architecture:** Freshell already captures Codex `candidateThreadId`, proves it from the rollout file, and persists `sessionRef`; this plan makes that existing identity contract authoritative on every create, attach, input, and resize path. Stale `liveTerminal` handles become recoverable implementation details: if they do not match the pane's expected Codex identity, they are ignored or repaired before any replay or input reaches a PTY.
+**Architecture:** The implementation must make canonical identity authoritative at every place a stale terminal could be reused, replayed, written to, or rebound into a pane. When canonical identity is missing, Freshell must prefer a restore-unavailable/fresh-safe path over guessing. Resuming the wrong Codex thread is worse than refusing to resume.
 
 **Tech Stack:** TypeScript, NodeNext/ESM, React 18, Redux Toolkit, WebSocket protocol schemas with Zod, Vitest, superwstest, Testing Library.
 
@@ -12,264 +12,163 @@
 
 ## Scope
 
-This plan deliberately ignores heuristic recovery for already-corrupted historical panes. It does not add "latest Codex history", cwd/title/time matching, or prompt-recency guessing. If a pane has no pane-bound `sessionRef`, no pane-bound `codexDurability`, and no matching server-side Codex durability record, it follows the existing restore-unavailable/fresh-terminal path.
+This plan deliberately ignores heuristic recovery for already-corrupted historical panes. It does not add "latest Codex history", cwd/title/time matching, prompt-recency guessing, or a legacy resolver.
 
-The fix is future-facing and invariant-based:
+The fixed invariant for future sessions is:
 
-- A Codex pane's expected identity is its canonical `sessionRef.provider === "codex"` plus `sessionRef.sessionId`, or its durable `codexDurability.durableThreadId`.
-- A `liveTerminal.terminalId` is reusable only when the server record proves it is running the same Codex identity.
-- `terminal.attach`, `terminal.input`, and `terminal.resize` cannot operate on terminal id alone when the client knows the pane's expected Codex identity.
-- Mismatch is not a normal user-facing end state. When the client has expected identity, mismatch clears stale live plumbing and triggers restore/create for the expected identity.
+- A Codex pane's expected identity is only a canonical `sessionRef` with `provider === "codex"` and a non-empty `sessionId`.
+- `codexDurability` is restore evidence. It may help prove or resume a session, but it is not enough by itself to authorize attach/input/resize or live-terminal reuse for a pane.
+- A `candidateThreadId` is never authoritative for user replay/input/resize. Candidate state can trigger proof or block input while proof runs, but cannot authorize side effects.
+- A `liveTerminal` handle, `terminalId`, `serverInstanceId`, `tabId`, and `paneId` are never identity. They can be reused only after the server proves the live terminal's canonical identity matches the expected `sessionRef`.
+- Mismatch is recoverable when the client has a canonical expected identity: clear stale runtime plumbing, keep `sessionRef`, bump `createRequestId`, and let the normal create effect restore that session.
+- Mismatch is an error only when Freshell cannot determine a canonical target without guessing.
 
-## Current Evidence
+## Load-Bearing Review Findings
 
-Existing implementation already has the core Codex identity machinery:
+The load-bearing review falsified several assumptions in the first plan. The implementation must account for all of these facts:
 
-- `shared/codex-durability.ts` defines `candidateThreadId`, `rolloutPath`, `durableThreadId`, and durability states.
-- `server/coding-cli/codex-app-server/remote-proxy.ts` captures candidates from `thread/start` responses and `thread/started` notifications.
-- `server/coding-cli/codex-app-server/durability-store.ts` writes records under `~/.freshell/codex-durability/<terminalId>.json`.
-- `server/coding-cli/codex-app-server/durability-proof.ts` proves the first rollout JSONL record is `session_meta` with matching `payload.id`.
-- `server/terminal-registry.ts` persists candidates, promotes durable sessions, and broadcasts `terminal.session.associated`.
-- `src/components/TerminalView.tsx` persists `terminal.session.associated` and `terminal.codex.durability.updated` into pane/tab state.
-
-The observed incident shows the missing invariant: a pane can still be recreated, attached, or written to through stale live terminal plumbing or stale persisted identity without every path proving it matches the Codex thread the pane should own.
+- Candidate-only Codex identity is not safe for side effects. Current `restore-decision.ts` can return `proof_failed_attach_live_candidate`, and `ws-handler.ts` can then attach that live terminal even after proof fails.
+- `TerminalRecord.mode`, `resumeSessionId`, and `codexDurability` are not a complete actual-identity authority by themselves. `buildTerminalSessionRef` already refuses Codex identity unless `resumeSessionId` and durable state agree, and the registry also has a binding authority.
+- `terminal.attach`, `terminal.input`, and `terminal.resize` currently operate by `terminalId` only. `TerminalStreamBroker.attach` mutates attach/resize/replay state internally after an async lock.
+- All `terminal.create` reuse returns currently funnel through `attachReusedTerminal`, which is the right central server gate. The request-id caches currently store only `requestId -> terminalId`, so the gate must validate cached reuse too.
+- `restore-decision.ts` does not accept an arbitrary requested live terminal object. Requested live handle validation belongs in `ws-handler.ts` unless the decision API is intentionally redesigned.
+- Client association and durability messages are currently accepted by `terminalId`. A stale `terminal.session.associated` can overwrite pane `sessionRef`, and stale `terminal.codex.durability.updated` can reintroduce stale durability.
+- `TerminalView` has multiple outbound attach/input/resize send sites. `contentRef` is synchronized by effect, not guaranteed current during render, so send helpers should read current pane state from Redux or a deliberately updated ref boundary.
+- Mismatch repair cannot just clear fields and send `terminal.create`. `terminal.created` is request-id gated, and the create effect reruns on `createRequestId`. Repair needs an explicit request-id-bumped transition.
+- Pane content has no `liveTerminal` field. Persisted stale live plumbing is `terminalId`, `serverInstanceId`, and `streamId`; outbound `liveTerminal` is derived from those fields.
+- REST/MCP/CLI paths are in scope. `/api/panes/:id/attach` can bind a pane to a caller-supplied terminal id, and `/api/panes/:id/send-keys` writes through `registry.input` without expected identity.
+- Durability-store fallback by `terminalId` / `tabId` / `paneId` is not pane identity. It must not be used to choose a Codex session when the pane lacks canonical `sessionRef`.
+- Tab-registry snapshots publish both `sessionRef` and `liveTerminal`; `TabsView` restores same-server `liveTerminal` without validating it against `sessionRef`. Cross-tab merge can reintroduce stale runtime fields unless hardened.
 
 ## File Structure
 
 - Modify `shared/ws-protocol.ts`
   - Add optional `expectedSessionRef?: SessionLocator` to `terminal.attach`, `terminal.input`, and `terminal.resize`.
-  - Add `SESSION_IDENTITY_MISMATCH` to `ErrorCode` and add optional `expectedSessionRef` / `actualSessionRef` fields to `ErrorMessage`.
+  - Add `SESSION_IDENTITY_MISMATCH` to `ErrorCode`.
+  - Add optional `expectedSessionRef` and `actualSessionRef` to `ErrorMessage`.
 
 - Create `server/terminal-session-identity.ts`
-  - Central helper for comparing an expected session locator to a `TerminalRecord`.
-  - Keeps the identity rule out of `ws-handler.ts`.
+  - Central server helper for actual canonical identity.
+  - Uses `buildTerminalSessionRef(record)` for canonical identity.
+  - Does not treat Codex candidate identity as a side-effect authority.
 
 - Modify `server/ws-handler.ts`
-  - Validate expected identity before terminal stream attach, input, and resize.
-  - Prefer expected Codex `sessionRef` over stale `liveTerminal` during `terminal.create`.
-  - Return a repairable mismatch response without replaying output or writing input.
+  - Validate identity before and during attach/input/resize operations.
+  - Centralize create reuse authorization in `attachReusedTerminal`.
+  - Reject or ignore stale live-terminal/request-id reuse when expected identity does not match.
+  - Stop using durability-store fallback to infer a restore target when no canonical `sessionRef` exists.
+
+- Modify `server/terminal-stream/broker.ts`
+  - Accept an optional expected identity predicate/session ref for attach.
+  - Re-check identity inside the broker terminal lock immediately before `registry.attach`, resize, and replay.
+
+- Modify `server/terminal-registry.ts`
+  - Add identity-aware `input` and `resize` variants or options.
+  - Keep `buildTerminalSessionRef` as the canonical actual identity source for side effects.
 
 - Modify `server/coding-cli/codex-app-server/restore-decision.ts`
-  - Make live terminal reuse require same Codex identity when a requested `sessionRef` or durable `codexDurability` exists.
-  - Remove or narrow any fallback where a requested live terminal wins because `codexDurability` is absent.
+  - Remove proof-failed live-candidate attach as an allowed restore result, or keep the type only for non-side-effect diagnostics. A failed proof must not attach/replay/write to a Codex terminal as a restored pane.
 
-- Modify `src/components/TerminalView.tsx`
-  - Send expected session identity with `terminal.attach`, `terminal.input`, and `terminal.resize`.
-  - On mismatch, clear stale `liveTerminal`, preserve `sessionRef`/durable `codexDurability`, flush layout, and issue restore/create for the expected session.
+- Modify `server/agent-api/router.ts`
+  - Enforce expected identity on `/api/panes/:id/attach` and `/api/panes/:id/send-keys`.
+  - Allow terminal-id-only attach/send only for non-Codex terminals or for panes without canonical Codex identity, according to tests.
+
+- Modify `server/mcp/freshell-tool.ts` and `server/cli/index.ts`
+  - Pass `sessionRef`/expected identity through attach and send-keys when available.
+  - Make Codex terminal attach by raw terminal id require matching identity or fail clearly.
 
 - Modify `src/components/terminal-view-utils.ts`
-  - Add a helper that derives the expected session locator from pane content.
-  - Keep the derivation testable outside the large `TerminalView.tsx` component.
+  - Add helpers for expected identity, operation message construction, stale runtime clearing, and safe live-terminal inclusion.
+  - Do not derive expected operation identity from `codexDurability` alone.
 
-- Modify `src/lib/terminal-session-association.ts`
-  - Preserve existing canonical association persistence.
-  - Add regression coverage that `terminal.session.associated` clears stale live-only assumptions and keeps matching durable Codex state.
+- Modify `src/components/TerminalView.tsx`
+  - Use centralized helpers for every attach/input/resize send.
+  - Guard stale association/durability broadcasts against existing canonical `sessionRef`.
+  - Repair identity mismatch by bumping `createRequestId`, clearing `terminalId`/`serverInstanceId`/`streamId`, preserving `sessionRef`, and relying on the normal create effect.
+
+- Modify `src/lib/terminal-session-association.ts` and `src/store/panesSlice.ts`
+  - Refuse conflicting `terminal.session.associated` updates for panes that already have a different canonical `sessionRef`.
+  - Provide an atomic reducer for Codex identity mismatch repair.
+
+- Modify `src/lib/tab-registry-snapshot.ts`, `src/components/TabsView.tsx`, and cross-tab merge code in `src/store/panesSlice.ts`
+  - Preserve canonical `sessionRef` over live runtime fields.
+  - Discard or quarantine same-server `liveTerminal` handles when they are paired with a canonical `sessionRef` that has not been server-validated.
 
 - Add tests:
   - `test/unit/server/terminal-session-identity.test.ts`
   - `test/server/ws-terminal-codex-identity-invariant.test.ts`
+  - `test/server/ws-terminal-create-reuse-running-codex.test.ts`
+  - `test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts`
+  - `test/server/agent-codex-identity-invariant.test.ts`
   - `test/unit/client/components/terminal-view-utils.test.ts`
   - `test/unit/client/components/TerminalView.codex-identity.test.tsx`
-  - Extend `test/server/ws-terminal-create-reuse-running-codex.test.ts`
+  - `test/unit/client/lib/terminal-session-association.test.ts`
+  - `test/unit/client/store/crossTabSync.test.ts`
+  - `test/unit/client/components/TabsView.test.tsx`
+  - `test/e2e/codex-wrong-thread-resume.test.tsx`
 
 ## Identity Rule
 
-Use this exact rule everywhere:
+Use this rule for side-effecting operations:
 
 ```ts
 type SessionLocator = {
-  provider: 'codex' | 'claude' | 'opencode'
+  provider: string
   sessionId: string
 }
 
-function terminalMatchesExpectedSession(record: TerminalRecord, expected: SessionLocator | undefined): boolean {
-  if (!expected) return true
-  if (record.mode !== expected.provider) return false
-  if (record.resumeSessionId === expected.sessionId) return true
-  if (record.codexDurability?.state === 'durable' && record.codexDurability.durableThreadId === expected.sessionId) {
-    return true
-  }
-  if (record.codexDurability?.candidate?.candidateThreadId === expected.sessionId) {
-    return true
-  }
-  return false
+function canonicalActualSessionRef(record: TerminalRecord): SessionLocator | undefined {
+  return buildTerminalSessionRef(record)
+}
+
+function terminalMatchesExpectedSession(
+  record: TerminalRecord,
+  expectedSessionRef: SessionLocator | undefined,
+): boolean {
+  if (!expectedSessionRef) return true
+  const actual = canonicalActualSessionRef(record)
+  return actual?.provider === expectedSessionRef.provider
+    && actual.sessionId === expectedSessionRef.sessionId
 }
 ```
 
-Non-Codex providers may use `resumeSessionId` only. Codex gets the extra durable/candidate checks because current records already store those identities.
+Do not add candidate acceptance here. Candidate state is pre-proof evidence and can only trigger proof/recovery/blocking behavior.
 
-## Task 1: Add Server Identity Helper
+Durability-only behavior:
+
+- `codexDurability.state === "durable"` can be used by create/restore code as proof evidence when a pane already has matching canonical `sessionRef`, or to promote an association when proof is server-owned.
+- A pane without canonical `sessionRef` is not restored from durability fallback for this future-facing invariant. It follows restore-unavailable/fresh-safe behavior.
+
+## Task 1: Define Canonical Server Identity
 
 **Files:**
 - Create: `server/terminal-session-identity.ts`
 - Test: `test/unit/server/terminal-session-identity.test.ts`
 
-- [ ] **Step 1: Write the failing unit tests**
+- [ ] **Step 1: Write failing unit tests**
 
-Create `test/unit/server/terminal-session-identity.test.ts`:
+Cover these cases:
 
-```ts
-import { describe, expect, it } from 'vitest'
-import { terminalMatchesExpectedSession } from '../../../server/terminal-session-identity.js'
+- Missing expected identity returns match for backwards-compatible non-Codex paths.
+- Codex durable identity matches only when `buildTerminalSessionRef(record)` returns the same `{ provider: "codex", sessionId }`.
+- Codex candidate-only durability does not match expected identity for side effects.
+- Codex durable state with a mismatched `resumeSessionId` does not match.
+- Provider mismatch fails.
+- Mismatch payload includes expected and actual canonical identities when actual exists.
 
-function record(overrides: Record<string, unknown> = {}) {
-  return {
-    terminalId: 'term-1',
-    mode: 'codex',
-    status: 'running',
-    resumeSessionId: undefined,
-    codexDurability: undefined,
-    ...overrides,
-  } as any
-}
-
-describe('terminalMatchesExpectedSession', () => {
-  it('accepts missing expected identity for backwards-compatible live-only paths', () => {
-    expect(terminalMatchesExpectedSession(record(), undefined)).toBe(true)
-  })
-
-  it('accepts a matching resumeSessionId', () => {
-    expect(terminalMatchesExpectedSession(
-      record({ resumeSessionId: 'thread-1' }),
-      { provider: 'codex', sessionId: 'thread-1' },
-    )).toBe(true)
-  })
-
-  it('accepts a matching durable Codex thread id', () => {
-    expect(terminalMatchesExpectedSession(
-      record({
-        codexDurability: {
-          schemaVersion: 1,
-          state: 'durable',
-          durableThreadId: 'thread-1',
-        },
-      }),
-      { provider: 'codex', sessionId: 'thread-1' },
-    )).toBe(true)
-  })
-
-  it('accepts a matching captured Codex candidate before durable promotion', () => {
-    expect(terminalMatchesExpectedSession(
-      record({
-        codexDurability: {
-          schemaVersion: 1,
-          state: 'captured_pre_turn',
-          candidate: {
-            provider: 'codex',
-            candidateThreadId: 'thread-1',
-            rolloutPath: '/home/dan/.codex/sessions/2026/06/14/rollout-thread-1.jsonl',
-            source: 'thread_start_response',
-            capturedAt: 1,
-          },
-        },
-      }),
-      { provider: 'codex', sessionId: 'thread-1' },
-    )).toBe(true)
-  })
-
-  it('rejects a Codex terminal for the wrong thread', () => {
-    expect(terminalMatchesExpectedSession(
-      record({
-        resumeSessionId: 'thread-old',
-        codexDurability: {
-          schemaVersion: 1,
-          state: 'durable',
-          durableThreadId: 'thread-old',
-        },
-      }),
-      { provider: 'codex', sessionId: 'thread-new' },
-    )).toBe(false)
-  })
-
-  it('rejects a provider mismatch', () => {
-    expect(terminalMatchesExpectedSession(
-      record({ mode: 'opencode', resumeSessionId: 'thread-1' }),
-      { provider: 'codex', sessionId: 'thread-1' },
-    )).toBe(false)
-  })
-})
-```
-
-- [ ] **Step 2: Run the failing test**
-
-Run:
+- [ ] **Step 2: Run failing test**
 
 ```bash
 npm run test:vitest -- test/unit/server/terminal-session-identity.test.ts --run
 ```
 
-Expected: FAIL because `server/terminal-session-identity.ts` does not exist.
+Expected: FAIL because the helper does not exist.
 
-- [ ] **Step 3: Implement the helper**
+- [ ] **Step 3: Implement helper**
 
-Create `server/terminal-session-identity.ts`:
+The helper must call `buildTerminalSessionRef(record)` rather than duplicating Codex candidate/durability rules. That keeps side-effect identity aligned with the registry's canonical binding behavior.
 
-```ts
-import type { SessionLocator } from '../shared/ws-protocol.js'
-import type { TerminalRecord } from './terminal-registry.js'
-
-export type SessionIdentityMismatch = {
-  code: 'SESSION_IDENTITY_MISMATCH'
-  terminalId: string
-  expectedSessionRef: SessionLocator
-  actualSessionRef?: SessionLocator
-}
-
-export function terminalActualSessionRef(record: Pick<TerminalRecord, 'mode' | 'resumeSessionId' | 'codexDurability'>): SessionLocator | undefined {
-  if (record.mode === 'codex') {
-    const durableThreadId = record.codexDurability?.state === 'durable'
-      ? record.codexDurability.durableThreadId
-      : undefined
-    const candidateThreadId = record.codexDurability?.candidate?.candidateThreadId
-    const sessionId = durableThreadId ?? record.resumeSessionId ?? candidateThreadId
-    return sessionId ? { provider: 'codex', sessionId } : undefined
-  }
-
-  if (record.resumeSessionId && (record.mode === 'claude' || record.mode === 'opencode')) {
-    return { provider: record.mode, sessionId: record.resumeSessionId }
-  }
-
-  return undefined
-}
-
-export function terminalMatchesExpectedSession(
-  record: Pick<TerminalRecord, 'mode' | 'resumeSessionId' | 'codexDurability'>,
-  expectedSessionRef: SessionLocator | undefined,
-): boolean {
-  if (!expectedSessionRef) return true
-  if (record.mode !== expectedSessionRef.provider) return false
-
-  if (record.resumeSessionId === expectedSessionRef.sessionId) return true
-
-  if (expectedSessionRef.provider === 'codex') {
-    if (
-      record.codexDurability?.state === 'durable'
-      && record.codexDurability.durableThreadId === expectedSessionRef.sessionId
-    ) return true
-
-    if (record.codexDurability?.candidate?.candidateThreadId === expectedSessionRef.sessionId) return true
-  }
-
-  return false
-}
-
-export function buildSessionIdentityMismatch(
-  terminalId: string,
-  record: Pick<TerminalRecord, 'mode' | 'resumeSessionId' | 'codexDurability'>,
-  expectedSessionRef: SessionLocator,
-): SessionIdentityMismatch {
-  return {
-    code: 'SESSION_IDENTITY_MISMATCH',
-    terminalId,
-    expectedSessionRef,
-    ...(terminalActualSessionRef(record) ? { actualSessionRef: terminalActualSessionRef(record) } : {}),
-  }
-}
-```
-
-- [ ] **Step 4: Run the unit test**
-
-Run:
+- [ ] **Step 4: Run tests**
 
 ```bash
 npm run test:vitest -- test/unit/server/terminal-session-identity.test.ts --run
@@ -281,7 +180,7 @@ Expected: PASS.
 
 ```bash
 git add server/terminal-session-identity.ts test/unit/server/terminal-session-identity.test.ts
-git commit -m "test: define terminal session identity matching"
+git commit -m "test: define canonical terminal session identity"
 ```
 
 ## Task 2: Add Expected Identity To WebSocket Protocol
@@ -292,96 +191,32 @@ git commit -m "test: define terminal session identity matching"
 
 - [ ] **Step 1: Write failing protocol tests**
 
-Append tests to `test/server/ws-protocol.test.ts` near the existing attach/input/resize protocol tests:
+Add schema tests proving `terminal.attach`, `terminal.input`, and `terminal.resize` accept:
 
 ```ts
-it('terminal.attach accepts expectedSessionRef', async () => {
-  const { ws, terminalId } = await createTerminal()
-  ws.send(JSON.stringify({
-    type: 'terminal.attach',
-    terminalId,
-    intent: 'viewport_hydrate',
-    cols: 120,
-    rows: 40,
-    expectedSessionRef: { provider: 'codex', sessionId: 'thread-1' },
-  }))
-  const ready = await waitForMessage(ws, (msg) => msg.type === 'terminal.attach.ready' && msg.terminalId === terminalId)
-  expect(ready.type).toBe('terminal.attach.ready')
-})
-
-it('terminal.input accepts expectedSessionRef', async () => {
-  const { ws, terminalId } = await createTerminal()
-  ws.send(JSON.stringify({
-    type: 'terminal.input',
-    terminalId,
-    data: 'echo hello',
-    expectedSessionRef: { provider: 'codex', sessionId: 'thread-1' },
-  }))
-  await expectNoInvalidMessage(ws)
-})
-
-it('terminal.resize accepts expectedSessionRef', async () => {
-  const { ws, terminalId } = await createTerminal()
-  ws.send(JSON.stringify({
-    type: 'terminal.resize',
-    terminalId,
-    cols: 120,
-    rows: 40,
-    expectedSessionRef: { provider: 'codex', sessionId: 'thread-1' },
-  }))
-  await expectNoInvalidMessage(ws)
-})
+expectedSessionRef: { provider: 'codex', sessionId: 'thread-1' }
 ```
 
-If the helpers in this file have different names, use the local existing helpers that create a terminal, wait for messages, and assert no protocol validation error. Do not weaken the assertions.
+Add an error-shape test proving `ErrorMessage` can include:
 
-- [ ] **Step 2: Run the failing protocol tests**
+```ts
+expectedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
+actualSessionRef: { provider: 'codex', sessionId: 'thread-old' },
+```
 
-Run:
+- [ ] **Step 2: Run failing protocol tests**
 
 ```bash
 npm run test:vitest -- test/server/ws-protocol.test.ts --run
 ```
 
-Expected: FAIL because the schemas reject `expectedSessionRef`.
+Expected: FAIL because the schemas reject `expectedSessionRef` and the error enum lacks `SESSION_IDENTITY_MISMATCH`.
 
 - [ ] **Step 3: Extend schemas**
 
-Modify `shared/ws-protocol.ts`:
-
-```ts
-export const TerminalAttachSchema = z.object({
-  type: z.literal('terminal.attach'),
-  terminalId: z.string().min(1),
-  sinceSeq: z.number().int().nonnegative().optional(),
-  maxReplayBytes: z.number().int().positive().optional(),
-  attachRequestId: z.string().min(1).optional(),
-  intent: TerminalAttachIntentSchema,
-  priority: TerminalAttachPrioritySchema.optional(),
-  cols: z.number().int().min(2).max(1000),
-  rows: z.number().int().min(2).max(500),
-  expectedSessionRef: SessionLocatorSchema.optional(),
-})
-
-export const TerminalInputSchema = z.object({
-  type: z.literal('terminal.input'),
-  terminalId: z.string().min(1),
-  data: z.string(),
-  expectedSessionRef: SessionLocatorSchema.optional(),
-})
-
-export const TerminalResizeSchema = z.object({
-  type: z.literal('terminal.resize'),
-  terminalId: z.string().min(1),
-  cols: z.number().int().min(2).max(1000),
-  rows: z.number().int().min(2).max(500),
-  expectedSessionRef: SessionLocatorSchema.optional(),
-})
-```
+Add `expectedSessionRef: SessionLocatorSchema.optional()` to attach/input/resize. Add `SESSION_IDENTITY_MISMATCH` to `ErrorCode`. Extend `ErrorMessage` with optional `expectedSessionRef` and `actualSessionRef`.
 
 - [ ] **Step 4: Run protocol tests**
-
-Run:
 
 ```bash
 npm run test:vitest -- test/server/ws-protocol.test.ts --run
@@ -396,234 +231,57 @@ git add shared/ws-protocol.ts test/server/ws-protocol.test.ts
 git commit -m "feat: carry expected session identity on terminal operations"
 ```
 
-## Task 3: Enforce Identity Before Attach/Input/Resize
+## Task 3: Enforce Identity At Side-Effect Boundaries
 
 **Files:**
 - Modify: `server/ws-handler.ts`
-- Modify: `shared/ws-protocol.ts` if an error type is needed
+- Modify: `server/terminal-stream/broker.ts`
+- Modify: `server/terminal-registry.ts`
 - Test: `test/server/ws-terminal-codex-identity-invariant.test.ts`
 
 - [ ] **Step 1: Write failing server tests**
 
-Create `test/server/ws-terminal-codex-identity-invariant.test.ts`:
+Test all three side effects:
 
-```ts
-import { describe, expect, it } from 'vitest'
-import { createTestServer, waitForMessage } from './helpers/ws-test-server.js'
+- `terminal.attach` with expected `thread-new` against live Codex `thread-old` returns `SESSION_IDENTITY_MISMATCH` and does not send `terminal.attach.ready` or replay old output.
+- `terminal.input` with expected `thread-new` against live Codex `thread-old` returns `SESSION_IDENTITY_MISMATCH` and does not call `pty.write`.
+- `terminal.resize` with expected `thread-new` against live Codex `thread-old` returns `SESSION_IDENTITY_MISMATCH` and does not resize.
 
-describe('Codex terminal identity invariant', () => {
-  it('rejects attach before replay when terminal id belongs to a different Codex thread', async () => {
-    const app = await createTestServer()
-    const ws = await app.openWs()
-    const terminal = await app.createFakeTerminal({
-      mode: 'codex',
-      terminalId: 'term-old',
-      resumeSessionId: 'thread-old',
-      codexDurability: {
-        schemaVersion: 1,
-        state: 'durable',
-        durableThreadId: 'thread-old',
-      },
-      output: 'old transcript must not replay',
-    })
+Also test candidate-only Codex durability:
 
-    ws.send(JSON.stringify({
-      type: 'terminal.attach',
-      terminalId: terminal.terminalId,
-      intent: 'viewport_hydrate',
-      cols: 120,
-      rows: 40,
-      expectedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
-    }))
+- A terminal with `codexDurability.state === "captured_pre_turn"` and matching candidate id must not satisfy expected identity for attach/input/resize.
 
-    const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.code === 'SESSION_IDENTITY_MISMATCH')
-    expect(error).toMatchObject({
-      code: 'SESSION_IDENTITY_MISMATCH',
-      terminalId: 'term-old',
-      expectedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
-      actualSessionRef: { provider: 'codex', sessionId: 'thread-old' },
-    })
-    expect(app.sentMessages()).not.toContainEqual(expect.objectContaining({ type: 'terminal.attach.ready' }))
-    expect(app.sentOutput()).not.toContain('old transcript must not replay')
-  })
-
-  it('rejects input before writing to a mismatched Codex terminal', async () => {
-    const app = await createTestServer()
-    const ws = await app.openWs()
-    const terminal = await app.createFakeTerminal({
-      mode: 'codex',
-      terminalId: 'term-old',
-      resumeSessionId: 'thread-old',
-      codexDurability: {
-        schemaVersion: 1,
-        state: 'durable',
-        durableThreadId: 'thread-old',
-      },
-    })
-
-    ws.send(JSON.stringify({
-      type: 'terminal.input',
-      terminalId: terminal.terminalId,
-      data: 'Repeat the last 5 lines\\n',
-      expectedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
-    }))
-
-    const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.code === 'SESSION_IDENTITY_MISMATCH')
-    expect(error.terminalId).toBe('term-old')
-    expect(terminal.inputWrites).toEqual([])
-  })
-
-  it('rejects resize before mutating a mismatched Codex terminal', async () => {
-    const app = await createTestServer()
-    const ws = await app.openWs()
-    const terminal = await app.createFakeTerminal({
-      mode: 'codex',
-      terminalId: 'term-old',
-      resumeSessionId: 'thread-old',
-    })
-
-    ws.send(JSON.stringify({
-      type: 'terminal.resize',
-      terminalId: terminal.terminalId,
-      cols: 132,
-      rows: 50,
-      expectedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
-    }))
-
-    const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.code === 'SESSION_IDENTITY_MISMATCH')
-    expect(error.terminalId).toBe('term-old')
-    expect(terminal.resizeCalls).toEqual([])
-  })
-})
-```
-
-Use the existing server test helpers in `test/server/ws-protocol.test.ts` or `test/server/ws-terminal-create-reuse-running-codex.test.ts`. If there is no `createFakeTerminal` helper, create a local fake registry/terminal harness in this test that exercises `WsHandler` at the same abstraction level as the neighboring server tests.
-
-- [ ] **Step 2: Run the failing tests**
-
-Run:
+- [ ] **Step 2: Run failing tests**
 
 ```bash
 npm run test:vitest -- test/server/ws-terminal-codex-identity-invariant.test.ts --run
 ```
 
-Expected: FAIL because attach/input/resize only validate `terminalId`.
+Expected: FAIL because operations currently use `terminalId` only.
 
-- [ ] **Step 3: Add mismatch guard in `ws-handler.ts`**
+- [ ] **Step 3: Implement identity mismatch responses**
 
-Import the helper:
+Add a single server mismatch builder. Log a structured lifecycle event with:
 
-```ts
-import {
-  buildSessionIdentityMismatch,
-  terminalMatchesExpectedSession,
-} from './terminal-session-identity.js'
-```
+- operation
+- terminalId
+- expected provider/session id
+- actual provider/session id when available
 
-Add a local guard near the terminal operation handlers:
+The server must return `SESSION_IDENTITY_MISMATCH` before replay/write/resize.
 
-```ts
-const rejectSessionIdentityMismatch = (
-  ws: AuthedWebSocket,
-  terminalId: string,
-  record: TerminalRecord,
-  expectedSessionRef: SessionLocator | undefined,
-  requestId?: string,
-): boolean => {
-  if (!expectedSessionRef) return false
-  if (terminalMatchesExpectedSession(record, expectedSessionRef)) return false
+- [ ] **Step 4: Re-check inside side-effect owners**
 
-  const mismatch = buildSessionIdentityMismatch(terminalId, record, expectedSessionRef)
-  recordSessionLifecycleEvent({
-    kind: 'terminal_session_identity_mismatch',
-    provider: expectedSessionRef.provider,
-    terminalId,
-    sessionId: expectedSessionRef.sessionId,
-    operation: 'terminal.operation',
-  })
-  this.sendError(ws, {
-    code: mismatch.code,
-    message: 'Terminal belongs to a different session than the pane expects.',
-    terminalId,
-    requestId,
-    expectedSessionRef: mismatch.expectedSessionRef,
-    actualSessionRef: mismatch.actualSessionRef,
-  })
-  return true
-}
-```
+Do not rely only on a pre-call check in `ws-handler.ts`.
 
-Apply the guard:
+- `TerminalStreamBroker.attach` must accept expected identity or a predicate and evaluate it inside the terminal lock immediately before `registry.attach`, before resize, and before replay.
+- `TerminalRegistry.input` must accept expected identity or expose `inputIfSessionMatches`.
+- `TerminalRegistry.resize` must accept expected identity or expose `resizeIfSessionMatches`.
 
-```ts
-if (rejectSessionIdentityMismatch(ws, m.terminalId, record, m.expectedSessionRef, m.attachRequestId)) return
-```
-
-before `terminalStreamBroker.attach`.
-
-```ts
-const record = this.registry.get(m.terminalId)
-if (record && rejectSessionIdentityMismatch(ws, m.terminalId, record, m.expectedSessionRef)) return
-const result = this.registry.input(m.terminalId, m.data)
-```
-
-before `registry.input`.
-
-```ts
-const record = this.registry.get(m.terminalId)
-if (record && rejectSessionIdentityMismatch(ws, m.terminalId, record, m.expectedSessionRef)) return
-```
-
-before `registry.resize`.
-
-In `shared/ws-protocol.ts`, extend the protocol error shape:
-
-```ts
-export const ErrorCode = z.enum([
-  'NOT_AUTHENTICATED',
-  'INVALID_MESSAGE',
-  'UNKNOWN_MESSAGE',
-  'INVALID_TERMINAL_ID',
-  'INVALID_SESSION_ID',
-  'RESTORE_UNAVAILABLE',
-  'INVALID_CREATE_REQUEST',
-  'PTY_SPAWN_FAILED',
-  'FILE_WATCHER_ERROR',
-  'INTERNAL_ERROR',
-  'RATE_LIMITED',
-  'UNAUTHORIZED',
-  'PROTOCOL_MISMATCH',
-  'SESSION_IDENTITY_MISMATCH',
-])
-
-export type ErrorMessage = {
-  type: 'error'
-  code: ErrorCode
-  message: string
-  requestId?: string
-  terminalId?: string
-  timestamp: string
-  expectedSessionRef?: SessionLocator
-  actualSessionRef?: SessionLocator
-}
-```
-
-- [ ] **Step 4: Run the focused server tests**
-
-Run:
+- [ ] **Step 5: Run focused tests**
 
 ```bash
 npm run test:vitest -- test/server/ws-terminal-codex-identity-invariant.test.ts --run
-```
-
-Expected: PASS.
-
-- [ ] **Step 5: Run existing protocol coverage**
-
-Run:
-
-```bash
-npm run test:vitest -- test/server/ws-protocol.test.ts --run
 ```
 
 Expected: PASS.
@@ -631,11 +289,11 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add server/ws-handler.ts server/terminal-session-identity.ts shared/ws-protocol.ts test/server/ws-terminal-codex-identity-invariant.test.ts
-git commit -m "fix: reject stale terminal operations for mismatched sessions"
+git add shared/ws-protocol.ts server/ws-handler.ts server/terminal-stream/broker.ts server/terminal-registry.ts server/terminal-session-identity.ts test/server/ws-terminal-codex-identity-invariant.test.ts
+git commit -m "fix: enforce session identity at terminal side effects"
 ```
 
-## Task 4: Make Create Prefer Expected Codex Identity Over Stale Live Handles
+## Task 4: Make Create Reuse Identity-Gated
 
 **Files:**
 - Modify: `server/ws-handler.ts`
@@ -645,107 +303,132 @@ git commit -m "fix: reject stale terminal operations for mismatched sessions"
 
 - [ ] **Step 1: Write failing create/reuse tests**
 
-Add to `test/server/ws-terminal-create-reuse-running-codex.test.ts`:
+Cover these branches:
 
-```ts
-it('does not reuse a live Codex terminal when sessionRef points at a different thread', async () => {
-  const harness = await createCodexReuseHarness()
-  const old = await harness.createRunningCodexTerminal({
-    terminalId: 'term-old',
-    sessionRef: { provider: 'codex', sessionId: 'thread-old' },
-    codexDurability: {
-      schemaVersion: 1,
-      state: 'durable',
-      durableThreadId: 'thread-old',
-    },
-  })
+- Requested `liveTerminal` for `thread-old` with `sessionRef` `thread-new` is ignored. Create/restore targets `thread-new`.
+- Cached request-id reuse for `thread-old` with current request `sessionRef` `thread-new` is rejected or ignored, not returned.
+- Canonical running-terminal reuse for matching `thread-new` still works.
+- Same-server live handle without `sessionRef` does not invent Codex identity.
 
-  harness.ws.send(JSON.stringify({
-    type: 'terminal.create',
-    requestId: 'restore-thread-new',
-    mode: 'codex',
-    cwd: '/home/dan/code/freshell',
-    sessionRef: { provider: 'codex', sessionId: 'thread-new' },
-    liveTerminal: {
-      terminalId: old.terminalId,
-      serverInstanceId: harness.serverInstanceId,
-    },
-    restore: true,
-    tabId: 'tab-1',
-    paneId: 'pane-1',
-  }))
+- [ ] **Step 2: Write failing restore-decision tests**
 
-  const created = await harness.waitForCreated('restore-thread-new')
-  expect(created.terminalId).not.toBe(old.terminalId)
-  expect(harness.launches()).toContainEqual(expect.objectContaining({
-    mode: 'codex',
-    resumeSessionId: 'thread-new',
-  }))
-})
-```
+Update the restore-decision tests to match the real API boundary:
 
-Add to `test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts`:
+- `resolveCodexCreateRestoreDecision` accepts `findLiveTerminalByCandidate`, not an arbitrary requested live terminal.
+- Proof failure must not return a side-effecting `proof_failed_attach_live_candidate` decision. It should return `proof_failed_fresh_create` or another non-side-effect result.
+- Proof success can return a live terminal only after proof promotes the durable session id.
 
-```ts
-it('requires live terminal identity to match requested durable sessionRef', () => {
-  const decision = resolveCodexCreateRestoreDecision({
-    restoreRequested: true,
-    requestedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
-    codexDurability: undefined,
-    requestedLiveTerminal: {
-      terminalId: 'term-old',
-      resumeSessionId: 'thread-old',
-      codexDurability: {
-        schemaVersion: 1,
-        state: 'durable',
-        durableThreadId: 'thread-old',
-      },
-    } as any,
-  })
-
-  expect(decision.kind).not.toBe('attach_live')
-})
-```
-
-Adapt helper names to existing test helpers. Keep the assertion: a stale live terminal must not win over `sessionRef`.
-
-- [ ] **Step 2: Run failing tests**
-
-Run:
+- [ ] **Step 3: Run failing tests**
 
 ```bash
-npm run test:vitest -- test/server/ws-terminal-create-reuse-running-codex.test.ts test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts --run
+npm run test:vitest -- \
+  test/server/ws-terminal-create-reuse-running-codex.test.ts \
+  test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts \
+  --run
 ```
 
-Expected: FAIL because a requested live terminal can still be reused without enough identity validation.
+Expected: FAIL on stale live/cached reuse and proof-failed live candidate behavior.
 
-- [ ] **Step 3: Tighten create/reuse logic**
+- [ ] **Step 4: Centralize create reuse authorization**
 
-In `server/ws-handler.ts`, update the `requestedLiveTerminal()` path so it returns a record only when:
+Make `attachReusedTerminal(record)` the one identity gate for every reuse branch, including:
+
+- existing request-id cache
+- existing-after-config request-id cache
+- requested live terminal
+- proof-promoted live terminal
+- canonical running terminal by session
+
+`attachReusedTerminal` must receive the current expected `sessionRef` and refuse mismatched records before sending `terminal.created` or remembering `requestId -> terminalId`.
+
+- [ ] **Step 5: Fix request-id idempotency**
+
+Store or validate an identity fingerprint with created request ids:
 
 ```ts
-if (requestedSessionRef && !terminalMatchesExpectedSession(live, requestedSessionRef)) {
-  recordSessionLifecycleEvent({
-    kind: 'terminal_session_identity_mismatch',
-    provider: requestedSessionRef.provider,
-    terminalId: live.terminalId,
-    sessionId: requestedSessionRef.sessionId,
-    operation: 'terminal.create.liveTerminal',
-  })
-  return undefined
+type CreatedTerminalRequestBinding = {
+  terminalId: string
+  expectedSessionKey?: string
 }
 ```
 
-Apply the same check to any branch that attaches a requested live terminal because `codexDurabilityForDecision?.candidate` is absent. The rule is: if `sessionRef` exists, stale `liveTerminal` is ignored; restore/create proceeds from `sessionRef`.
+If the same request id is later used with a different expected session key, do not return the cached terminal.
 
-In `restore-decision.ts`, make any `attach_live` decision require a matching expected Codex session when `requestedSessionRef` or durable `codexDurability` is present.
+- [ ] **Step 6: Remove unsafe durability fallback**
+
+When Codex `restore === true` and there is no canonical `sessionRef`, do not read durability by `terminalId`/`tabId`/`paneId` to pick a thread. Return restore unavailable. Keep durability proof only when it is already tied to the pane's canonical `sessionRef`.
+
+- [ ] **Step 7: Run focused tests**
+
+```bash
+npm run test:vitest -- \
+  test/server/ws-terminal-create-reuse-running-codex.test.ts \
+  test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts \
+  --run
+```
+
+Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add server/ws-handler.ts server/coding-cli/codex-app-server/restore-decision.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts
+git commit -m "fix: gate Codex create reuse by canonical identity"
+```
+
+## Task 5: Cover REST, MCP, And CLI Terminal Paths
+
+**Files:**
+- Modify: `server/agent-api/router.ts`
+- Modify: `server/mcp/freshell-tool.ts`
+- Modify: `server/cli/index.ts`
+- Test: `test/server/agent-codex-identity-invariant.test.ts`
+- Extend: `test/server/agent-panes-write.test.ts`
+- Extend: `test/server/agent-send-keys.test.ts`
+
+- [ ] **Step 1: Write failing API tests**
+
+Cover:
+
+- `/api/panes/:id/attach` cannot attach a Codex terminal whose canonical identity differs from the pane's existing `sessionRef`.
+- `/api/panes/:id/send-keys` cannot write to a Codex terminal when the pane has a conflicting canonical `sessionRef`.
+- Existing shell/non-Codex attach/send behavior remains unchanged.
+- MCP `attach` and CLI `attach` pass enough expected identity or receive the same server-side rejection.
+
+- [ ] **Step 2: Run failing tests**
+
+```bash
+npm run test:vitest -- \
+  test/server/agent-codex-identity-invariant.test.ts \
+  test/server/agent-panes-write.test.ts \
+  test/server/agent-send-keys.test.ts \
+  --run
+```
+
+Expected: FAIL because attach/send-keys currently operate by terminal id.
+
+- [ ] **Step 3: Implement API identity enforcement**
+
+In `server/agent-api/router.ts`:
+
+- Resolve pane content before attach/send.
+- If pane has canonical Codex `sessionRef`, require target terminal actual identity to match before attach/send.
+- If request includes `sessionRef`, validate it against the target terminal and preserve it in pane content.
+- If pane has no canonical Codex `sessionRef`, do not infer one from `codexDurability` or terminal id.
+
+In MCP and CLI:
+
+- Include `sessionRef` where the tool can derive it from pane/session context.
+- Surface `SESSION_IDENTITY_MISMATCH` as an actionable error.
 
 - [ ] **Step 4: Run focused tests**
 
-Run:
-
 ```bash
-npm run test:vitest -- test/server/ws-terminal-create-reuse-running-codex.test.ts test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts --run
+npm run test:vitest -- \
+  test/server/agent-codex-identity-invariant.test.ts \
+  test/server/agent-panes-write.test.ts \
+  test/server/agent-send-keys.test.ts \
+  --run
 ```
 
 Expected: PASS.
@@ -753,11 +436,11 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add server/ws-handler.ts server/coding-cli/codex-app-server/restore-decision.ts test/server/ws-terminal-create-reuse-running-codex.test.ts test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts
-git commit -m "fix: prefer Codex session identity over stale live handles"
+git add server/agent-api/router.ts server/mcp/freshell-tool.ts server/cli/index.ts test/server/agent-codex-identity-invariant.test.ts test/server/agent-panes-write.test.ts test/server/agent-send-keys.test.ts
+git commit -m "fix: enforce Codex identity on agent terminal APIs"
 ```
 
-## Task 5: Send Expected Identity From TerminalView
+## Task 6: Centralize Client Operation Sends
 
 **Files:**
 - Modify: `src/components/terminal-view-utils.ts`
@@ -767,162 +450,65 @@ git commit -m "fix: prefer Codex session identity over stale live handles"
 
 - [ ] **Step 1: Write failing helper tests**
 
-Add to `test/unit/client/components/terminal-view-utils.test.ts`:
+Add helpers that:
 
-```ts
-import { getExpectedSessionRefForTerminalOperation } from '../../../src/components/terminal-view-utils'
-
-describe('getExpectedSessionRefForTerminalOperation', () => {
-  it('returns canonical sessionRef when present', () => {
-    expect(getExpectedSessionRefForTerminalOperation({
-      mode: 'codex',
-      sessionRef: { provider: 'codex', sessionId: 'thread-1' },
-      codexDurability: {
-        schemaVersion: 1,
-        state: 'durable',
-        durableThreadId: 'thread-1',
-      },
-    } as any)).toEqual({ provider: 'codex', sessionId: 'thread-1' })
-  })
-
-  it('returns durable Codex identity when sessionRef is missing', () => {
-    expect(getExpectedSessionRefForTerminalOperation({
-      mode: 'codex',
-      codexDurability: {
-        schemaVersion: 1,
-        state: 'durable',
-        durableThreadId: 'thread-1',
-      },
-    } as any)).toEqual({ provider: 'codex', sessionId: 'thread-1' })
-  })
-
-  it('does not synthesize identity from cwd, title, or liveTerminal', () => {
-    expect(getExpectedSessionRefForTerminalOperation({
-      mode: 'codex',
-      initialCwd: '/home/dan/code/freshell',
-      liveTerminal: { terminalId: 'term-1', serverInstanceId: 'srv-1' },
-    } as any)).toBeUndefined()
-  })
-})
-```
+- Return expected operation identity only from canonical `content.sessionRef`.
+- Return `undefined` for Codex durability-only content.
+- Include outbound `liveTerminal` only when no canonical `sessionRef` exists, or when the caller explicitly allows a live handle after server validation.
+- Build attach/input/resize payloads with `expectedSessionRef` whenever canonical identity exists.
 
 - [ ] **Step 2: Run failing helper tests**
-
-Run:
 
 ```bash
 npm run test:vitest -- test/unit/client/components/terminal-view-utils.test.ts --run
 ```
 
-Expected: FAIL because the helper does not exist.
+Expected: FAIL because helpers do not exist.
 
 - [ ] **Step 3: Implement helper**
 
-In `src/components/terminal-view-utils.ts`:
+Do not derive expected identity from `codexDurability`.
 
 ```ts
-import type { SessionLocator, TerminalPaneContent } from '@/store/paneTypes'
-
 export function getExpectedSessionRefForTerminalOperation(
   content: TerminalPaneContent | null | undefined,
 ): SessionLocator | undefined {
-  if (!content) return undefined
-  if (content.sessionRef) return content.sessionRef
-
-  if (
-    content.mode === 'codex'
-    && content.codexDurability?.state === 'durable'
-    && content.codexDurability.durableThreadId
-  ) {
-    return { provider: 'codex', sessionId: content.codexDurability.durableThreadId }
-  }
-
-  return undefined
+  return content?.sessionRef?.provider === 'codex'
+    ? content.sessionRef
+    : content?.sessionRef
 }
 ```
 
-- [ ] **Step 4: Wire helper into TerminalView sends**
+Keep the provider generic, but tests must pin Codex behavior.
 
-In `src/components/TerminalView.tsx`, compute before each send:
+- [ ] **Step 4: Replace TerminalView call sites**
 
-```ts
-const expectedSessionRef = getExpectedSessionRefForTerminalOperation(contentRef.current)
-```
+Every TerminalView operation send must use the central helper:
 
-Add it to attach:
+- `sendInput`
+- Shift+Enter direct input
+- resize send
+- attach send
 
-```ts
-ws.send({
-  type: 'terminal.attach',
-  terminalId: tid,
-  intent: effectiveIntent,
-  cols,
-  rows,
-  sinceSeq,
-  attachRequestId,
-  priority: opts?.priority ?? 'foreground',
-  ...(opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
-  ...(expectedSessionRef ? { expectedSessionRef } : {}),
-})
-```
+The current TerminalView send sites to cover are the input helper, resize, direct Shift+Enter input, and attach. Keep firewall setup input outside TerminalView either intentionally exempted in tests or covered separately.
 
-Add it to input:
+- [ ] **Step 5: Write TerminalView outbound tests**
 
-```ts
-ws.send({
-  type: 'terminal.input',
-  terminalId: tid,
-  data,
-  ...(expectedSessionRef ? { expectedSessionRef } : {}),
-})
-```
+Test:
 
-Add it to resize:
-
-```ts
-ws.send({
-  type: 'terminal.resize',
-  terminalId: tid,
-  cols: term.cols,
-  rows: term.rows,
-  ...(expectedSessionRef ? { expectedSessionRef } : {}),
-})
-```
-
-- [ ] **Step 5: Write TerminalView message regression test**
-
-Create `test/unit/client/components/TerminalView.codex-identity.test.tsx`:
-
-```ts
-it('sends expected Codex session identity with terminal input', async () => {
-  const ws = renderCodexTerminalView({
-    content: {
-      mode: 'codex',
-      terminalId: 'term-1',
-      sessionRef: { provider: 'codex', sessionId: 'thread-1' },
-      shell: 'system',
-      initialCwd: '/home/dan/code/freshell',
-    },
-  })
-
-  await typeIntoTerminal('hello')
-
-  expect(ws.sentMessages()).toContainEqual(expect.objectContaining({
-    type: 'terminal.input',
-    terminalId: 'term-1',
-    expectedSessionRef: { provider: 'codex', sessionId: 'thread-1' },
-  }))
-})
-```
-
-Use existing TerminalView render helpers and xterm input helpers. If this repository already covers outbound messages in another TerminalView lifecycle test file, add the case there instead of creating a new harness.
+- attach includes expected Codex `sessionRef`
+- normal input includes expected Codex `sessionRef`
+- Shift+Enter input includes expected Codex `sessionRef`
+- resize includes expected Codex `sessionRef`
+- durability-only Codex content does not send expected identity and does not send a guessed session id
 
 - [ ] **Step 6: Run client tests**
 
-Run:
-
 ```bash
-npm run test:vitest -- test/unit/client/components/terminal-view-utils.test.ts test/unit/client/components/TerminalView.codex-identity.test.tsx --run
+npm run test:vitest -- \
+  test/unit/client/components/terminal-view-utils.test.ts \
+  test/unit/client/components/TerminalView.codex-identity.test.tsx \
+  --run
 ```
 
 Expected: PASS.
@@ -931,239 +517,62 @@ Expected: PASS.
 
 ```bash
 git add src/components/terminal-view-utils.ts src/components/TerminalView.tsx test/unit/client/components/terminal-view-utils.test.ts test/unit/client/components/TerminalView.codex-identity.test.tsx
-git commit -m "feat: send pane session identity with terminal operations"
+git commit -m "feat: send canonical session identity with terminal operations"
 ```
 
-## Task 6: Client Repairs Stale Live Terminal Handles
-
-**Files:**
-- Modify: `src/components/TerminalView.tsx`
-- Modify: `src/store/panesSlice.ts` if a reducer helper is needed
-- Test: `test/unit/client/components/TerminalView.codex-identity.test.tsx`
-
-- [ ] **Step 1: Write failing client repair test**
-
-Add:
-
-```ts
-it('clears stale liveTerminal and recreates expected Codex session after identity mismatch', async () => {
-  const ws = renderCodexTerminalView({
-    content: {
-      mode: 'codex',
-      terminalId: 'term-old',
-      liveTerminal: { terminalId: 'term-old', serverInstanceId: 'srv-1' },
-      sessionRef: { provider: 'codex', sessionId: 'thread-new' },
-      shell: 'system',
-      initialCwd: '/home/dan/code/freshell',
-    },
-  })
-
-  ws.receive({
-    type: 'error',
-    code: 'SESSION_IDENTITY_MISMATCH',
-    message: 'Terminal belongs to a different session than the pane expects.',
-    terminalId: 'term-old',
-    expectedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
-    actualSessionRef: { provider: 'codex', sessionId: 'thread-old' },
-  })
-
-  await waitFor(() => {
-    expect(currentPaneContent()).toMatchObject({
-      mode: 'codex',
-      sessionRef: { provider: 'codex', sessionId: 'thread-new' },
-    })
-    expect(currentPaneContent().liveTerminal).toBeUndefined()
-    expect(currentPaneContent().terminalId).toBeUndefined()
-  })
-
-  expect(ws.sentMessages()).toContainEqual(expect.objectContaining({
-    type: 'terminal.create',
-    mode: 'codex',
-    sessionRef: { provider: 'codex', sessionId: 'thread-new' },
-  }))
-})
-```
-
-- [ ] **Step 2: Run failing client test**
-
-Run:
-
-```bash
-npm run test:vitest -- test/unit/client/components/TerminalView.codex-identity.test.tsx --run
-```
-
-Expected: FAIL because mismatch errors are not repaired.
-
-- [ ] **Step 3: Implement repair handling**
-
-In the WebSocket message handler in `TerminalView.tsx`, add:
-
-```ts
-if (
-  msg.type === 'error'
-  && msg.code === 'SESSION_IDENTITY_MISMATCH'
-  && msg.terminalId === tid
-) {
-  const expectedSessionRef = sanitizeSessionRef(msg.expectedSessionRef)
-  if (expectedSessionRef) {
-    updateContent({
-      terminalId: undefined,
-      liveTerminal: undefined,
-      sessionRef: expectedSessionRef,
-    })
-    dispatch(flushPersistedLayoutNow())
-    queueMicrotask(() => {
-      const nextRequestId = nanoid()
-      sendCreate(nextRequestId)
-    })
-  }
-  return
-}
-```
-
-Use local helper names for `updateContent`, request id generation, and `sendCreate`. If `sendCreate` is not in scope at the message handler, extract a small `scheduleRestoreCreateForExpectedSession` callback inside `TerminalView.tsx` that has access to the same refs.
-
-- [ ] **Step 4: Run client repair test**
-
-Run:
-
-```bash
-npm run test:vitest -- test/unit/client/components/TerminalView.codex-identity.test.tsx --run
-```
-
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/components/TerminalView.tsx src/store/panesSlice.ts test/unit/client/components/TerminalView.codex-identity.test.tsx
-git commit -m "fix: repair stale Codex live terminal handles"
-```
-
-## Task 7: Prove Association Flush Is The Persistence Boundary
+## Task 7: Guard Client Association And Durability Broadcasts
 
 **Files:**
 - Modify: `src/lib/terminal-session-association.ts`
+- Modify: `src/store/panesSlice.ts`
+- Modify: `src/components/TerminalView.tsx`
 - Test: `test/unit/client/lib/terminal-session-association.test.ts`
-- Test: `test/unit/server/terminal-registry.codex-sidecar.test.ts`
+- Test: `test/unit/client/components/TerminalView.codex-identity.test.tsx`
 
-- [ ] **Step 1: Write failing client association test**
+- [ ] **Step 1: Write failing association tests**
 
-Add to `test/unit/client/lib/terminal-session-association.test.ts`:
+Cover:
 
-```ts
-it('persists canonical Codex sessionRef and keeps matching durable state on association', () => {
-  const store = createTabsStoreWithPane({
-    tabId: 'tab-1',
-    paneId: 'pane-1',
-    terminalId: 'term-1',
-    content: {
-      mode: 'codex',
-      terminalId: 'term-1',
-      codexDurability: {
-        schemaVersion: 1,
-        state: 'durable',
-        durableThreadId: 'thread-1',
-        candidate: {
-          provider: 'codex',
-          candidateThreadId: 'thread-1',
-          rolloutPath: '/home/dan/.codex/sessions/2026/06/14/rollout-thread-1.jsonl',
-          source: 'thread_start_response',
-          capturedAt: 1,
-        },
-      },
-    },
-  })
+- Existing pane `sessionRef: thread-new` plus `terminal.session.associated` for same terminal id but `thread-old` must not overwrite the pane.
+- Matching association still persists canonical identity and clears raw `resumeSessionId`.
+- Conflicting association returns a clear status so callers can repair or ignore it.
 
-  const reconciled = reconcileTerminalSessionAssociation({
-    dispatch: store.dispatch,
-    getState: store.getState,
-    terminalId: 'term-1',
-    sessionRef: { provider: 'codex', sessionId: 'thread-1' },
-  })
+- [ ] **Step 2: Write failing durability broadcast tests**
 
-  expect(reconciled).toBe(true)
-  expect(selectPaneContent(store.getState(), 'tab-1', 'pane-1')).toMatchObject({
-    sessionRef: { provider: 'codex', sessionId: 'thread-1' },
-    resumeSessionId: undefined,
-    codexDurability: {
-      state: 'durable',
-      durableThreadId: 'thread-1',
-    },
-  })
-})
-```
+Cover:
 
-- [ ] **Step 2: Write failing server association test**
+- Existing pane `sessionRef: thread-new` plus durability update for `thread-old` is ignored and does not update pane or tab durability.
+- Matching durable update is preserved.
+- Candidate-only update is persisted only as evidence when no canonical sessionRef exists, and never changes expected operation identity.
 
-Add to `test/unit/server/terminal-registry.codex-sidecar.test.ts`:
-
-```ts
-it('broadcasts terminal.session.associated only after matching Codex rollout proof succeeds', async () => {
-  const registry = createRegistryWithCodexDurabilityStore()
-  const terminal = await registry.createCodexTerminalWithCandidate({
-    terminalId: 'term-1',
-    candidateThreadId: 'thread-1',
-    rolloutPath: await writeCodexRollout({ threadId: 'thread-1' }),
-  })
-
-  await registry.handleCodexTurnCompletedForTest(terminal.terminalId, {
-    threadId: 'thread-1',
-    turnId: 'turn-1',
-  })
-
-  await vi.waitFor(() => {
-    expect(registry.broadcasts()).toContainEqual(expect.objectContaining({
-      type: 'terminal.session.associated',
-      terminalId: 'term-1',
-      sessionRef: { provider: 'codex', sessionId: 'thread-1' },
-    }))
-  })
-})
-```
-
-Use existing helper names in this file; this test already has many Codex durability helpers.
-
-- [ ] **Step 3: Run focused tests**
-
-Run:
+- [ ] **Step 3: Run failing tests**
 
 ```bash
-npm run test:vitest -- test/unit/client/lib/terminal-session-association.test.ts test/unit/server/terminal-registry.codex-sidecar.test.ts --run
+npm run test:vitest -- \
+  test/unit/client/lib/terminal-session-association.test.ts \
+  test/unit/client/components/TerminalView.codex-identity.test.tsx \
+  --run
 ```
 
-Expected: PASS when the existing association path already satisfies the invariant, or FAIL with a missing pane persistence / missing broadcast assertion.
+Expected: FAIL because association/durability currently reconcile by terminal id.
 
-- [ ] **Step 4: Confirm or apply the association persistence code**
+- [ ] **Step 4: Implement guards**
 
-Inspect `src/lib/terminal-session-association.ts`. It must preserve matching durable Codex state with this logic:
+`reconcileTerminalSessionAssociation` must refuse a conflicting update when matched pane content already has a different canonical `sessionRef`.
 
-```ts
-const nextCodexDurability = sessionRef.provider === 'codex'
-  && content.codexDurability?.state === 'durable'
-  && (
-    content.codexDurability.durableThreadId === sessionRef.sessionId
-    || content.codexDurability.candidate?.candidateThreadId === sessionRef.sessionId
-  )
-    ? content.codexDurability
-    : undefined
-```
+`TerminalView` durability handling must compare durability durable/candidate ids against existing `sessionRef`:
 
-Inspect `server/terminal-registry.ts`. It must keep this order after proof success:
-
-```ts
-this.broadcastCodexDurability(record, stored)
-this.broadcastCodexSessionAssociated(record, proof.rolloutProofId)
-```
-
-Do not broadcast association before rollout proof succeeds.
+- durable id matches sessionRef: accept
+- candidate id matches sessionRef but state is not durable: store only if needed, but do not treat as expected identity
+- durable/candidate conflicts with sessionRef: ignore, log structured warning, and do not send candidate persisted ack
 
 - [ ] **Step 5: Run focused tests**
 
-Run:
-
 ```bash
-npm run test:vitest -- test/unit/client/lib/terminal-session-association.test.ts test/unit/server/terminal-registry.codex-sidecar.test.ts --run
+npm run test:vitest -- \
+  test/unit/client/lib/terminal-session-association.test.ts \
+  test/unit/client/components/TerminalView.codex-identity.test.tsx \
+  --run
 ```
 
 Expected: PASS.
@@ -1171,280 +580,189 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/lib/terminal-session-association.ts server/terminal-registry.ts test/unit/client/lib/terminal-session-association.test.ts test/unit/server/terminal-registry.codex-sidecar.test.ts
-git commit -m "test: lock Codex association persistence boundary"
+git add src/lib/terminal-session-association.ts src/store/panesSlice.ts src/components/TerminalView.tsx test/unit/client/lib/terminal-session-association.test.ts test/unit/client/components/TerminalView.codex-identity.test.tsx
+git commit -m "fix: ignore stale Codex identity broadcasts"
 ```
 
-## Task 8: Incident-Shaped Component E2E Regression
+## Task 8: Repair Stale Runtime Plumbing With A Request-Id Transition
+
+**Files:**
+- Modify: `src/store/panesSlice.ts`
+- Modify: `src/components/TerminalView.tsx`
+- Test: `test/unit/client/components/TerminalView.codex-identity.test.tsx`
+- Test: `test/e2e/codex-wrong-thread-resume.test.tsx`
+
+- [ ] **Step 1: Write failing repair tests**
+
+Cover:
+
+- On `SESSION_IDENTITY_MISMATCH`, pane keeps `sessionRef: thread-new`.
+- Pane clears `terminalId`, `serverInstanceId`, and `streamId`.
+- Pane receives a new `createRequestId`.
+- Pane status becomes `creating`.
+- The next `terminal.create` sent by the normal create effect includes `restore: true` and `sessionRef: thread-new`.
+- Duplicate mismatch errors for the same stale terminal id do not create multiple competing request ids.
+
+- [ ] **Step 2: Run failing tests**
+
+```bash
+npm run test:vitest -- \
+  test/unit/client/components/TerminalView.codex-identity.test.tsx \
+  test/e2e/codex-wrong-thread-resume.test.tsx \
+  --run
+```
+
+Expected: FAIL because mismatch repair does not exist.
+
+- [ ] **Step 3: Add atomic reducer**
+
+Add a reducer such as:
+
+```ts
+repairCodexIdentityMismatch({
+  tabId,
+  paneId,
+  staleTerminalId,
+  expectedSessionRef,
+  createRequestId,
+})
+```
+
+It must:
+
+- no-op if pane no longer has `staleTerminalId`
+- no-op if pane has a different canonical `sessionRef`
+- clear runtime plumbing: `terminalId`, `serverInstanceId`, `streamId`
+- preserve `sessionRef`
+- preserve matching durable `codexDurability` only when it is durable and matches sessionRef
+- set `createRequestId`
+- set status `creating`
+
+- [ ] **Step 4: Wire TerminalView to reducer**
+
+On `SESSION_IDENTITY_MISMATCH`:
+
+- validate `msg.expectedSessionRef`
+- generate new request id
+- mark it as restore via `addTerminalRestoreRequestId(newRequestId)`
+- update `requestIdRef.current`
+- clear terminal refs/checkpoints for the stale terminal
+- dispatch reducer
+- do not manually call `sendCreate`; let the create effect run from `createRequestId`
+
+- [ ] **Step 5: Run focused tests**
+
+```bash
+npm run test:vitest -- \
+  test/unit/client/components/TerminalView.codex-identity.test.tsx \
+  test/e2e/codex-wrong-thread-resume.test.tsx \
+  --run
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/store/panesSlice.ts src/components/TerminalView.tsx test/unit/client/components/TerminalView.codex-identity.test.tsx test/e2e/codex-wrong-thread-resume.test.tsx
+git commit -m "fix: repair stale Codex runtime plumbing"
+```
+
+## Task 9: Harden Tab Registry And Cross-Tab Sync
+
+**Files:**
+- Modify: `src/lib/tab-registry-snapshot.ts`
+- Modify: `src/components/TabsView.tsx`
+- Modify: `src/store/panesSlice.ts`
+- Test: `test/unit/client/components/TabsView.test.tsx`
+- Test: `test/unit/client/store/crossTabSync.test.ts`
+
+- [ ] **Step 1: Write failing tab-registry tests**
+
+Cover:
+
+- A registry record with `sessionRef: thread-new` and same-server `liveTerminal: term-old` does not hydrate `terminalId: term-old` unless the live handle is proven/declared matching.
+- A registry record without `sessionRef` may still use liveTerminal for non-Codex live-only behavior.
+- `tab-registry-snapshot` still publishes `liveTerminal` for UI discovery, but consumers treat it as runtime plumbing.
+
+- [ ] **Step 2: Write failing cross-tab tests**
+
+Cover:
+
+- Incoming pane content cannot overwrite local canonical `sessionRef` with a different `sessionRef`.
+- Incoming `terminalId`/`serverInstanceId`/`streamId` are discarded when they conflict with local canonical Codex `sessionRef`.
+- Matching canonical session can still merge safe non-runtime fields.
+
+- [ ] **Step 3: Run failing tests**
+
+```bash
+npm run test:vitest -- \
+  test/unit/client/components/TabsView.test.tsx \
+  test/unit/client/store/crossTabSync.test.ts \
+  --run
+```
+
+Expected: FAIL because same-server live handles and cross-tab merge currently allow stale runtime fields.
+
+- [ ] **Step 4: Implement sync hardening**
+
+In `TabsView`:
+
+- If sanitized payload has canonical `sessionRef`, do not hydrate `terminalId` from `liveTerminal` unless there is a server-validated matching proof in the record. If no such proof exists, leave `terminalId` undefined and let create/restore target the sessionRef.
+
+In cross-tab merge:
+
+- canonical `sessionRef` wins over incoming runtime fields
+- conflicting runtime fields are dropped
+- `codexDurability` is retained only when it matches canonical `sessionRef`
+
+- [ ] **Step 5: Run focused tests**
+
+```bash
+npm run test:vitest -- \
+  test/unit/client/components/TabsView.test.tsx \
+  test/unit/client/store/crossTabSync.test.ts \
+  --run
+```
+
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/lib/tab-registry-snapshot.ts src/components/TabsView.tsx src/store/panesSlice.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/crossTabSync.test.ts
+git commit -m "fix: keep canonical Codex identity across tab sync"
+```
+
+## Task 10: Incident-Shaped End-To-End Regression
 
 **Files:**
 - Create: `test/e2e/codex-wrong-thread-resume.test.tsx`
 
-- [ ] **Step 1: Write the failing e2e regression**
+- [ ] **Step 1: Write the regression**
 
-Create `test/e2e/codex-wrong-thread-resume.test.tsx`:
+Model the incident:
 
-```ts
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, waitFor } from '@testing-library/react'
-import { Provider } from 'react-redux'
-import { configureStore } from '@reduxjs/toolkit'
-import tabsReducer from '@/store/tabsSlice'
-import panesReducer from '@/store/panesSlice'
-import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
-import connectionReducer from '@/store/connectionSlice'
-import { useAppSelector } from '@/store/hooks'
-import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
-import TerminalView from '@/components/TerminalView'
+- Pane has canonical `sessionRef: thread-new`.
+- Pane has stale runtime plumbing `terminalId: term-old`, `serverInstanceId`, and `streamId`.
+- Client first tries attach/input with `expectedSessionRef: thread-new`.
+- Server emits `SESSION_IDENTITY_MISMATCH` with actual `thread-old`.
+- Client clears stale runtime plumbing, bumps `createRequestId`, and sends restore create for `thread-new`.
+- Test asserts no input goes to `term-old` after mismatch.
 
-const wsHarness = vi.hoisted(() => {
-  const messageHandlers = new Set<(msg: any) => void>()
-  const restoreRequestIds = new Set<string>()
-  return {
-    send: vi.fn(),
-    connect: vi.fn().mockResolvedValue(undefined),
-    onMessage: vi.fn((handler: (msg: any) => void) => {
-      messageHandlers.add(handler)
-      return () => messageHandlers.delete(handler)
-    }),
-    onReconnect: vi.fn(() => () => {}),
-    addRestoreRequestId(id: string) {
-      restoreRequestIds.add(id)
-    },
-    consumeRestoreRequestId(id: string) {
-      const hasId = restoreRequestIds.has(id)
-      restoreRequestIds.delete(id)
-      return hasId
-    },
-    emit(msg: any) {
-      for (const handler of messageHandlers) handler(msg)
-    },
-    reset() {
-      messageHandlers.clear()
-      restoreRequestIds.clear()
-      this.send.mockClear()
-    },
-  }
-})
+Use the existing component-level e2e style in `test/e2e/terminal-restart-recovery.test.tsx`.
 
-vi.mock('@/lib/ws-client', () => ({
-  getWsClient: () => ({
-    send: wsHarness.send,
-    connect: wsHarness.connect,
-    onMessage: wsHarness.onMessage,
-    onReconnect: wsHarness.onReconnect,
-  }),
-}))
-
-vi.mock('@/lib/terminal-restore', () => ({
-  addTerminalRestoreRequestId: (id: string) => wsHarness.addRestoreRequestId(id),
-  consumeTerminalRestoreRequestId: (id: string) => wsHarness.consumeRestoreRequestId(id),
-  addTerminalFreshRecoveryRequestId: vi.fn(),
-  consumeTerminalFreshRecoveryRequest: vi.fn(() => undefined),
-}))
-
-vi.mock('@/lib/terminal-themes', () => ({
-  getTerminalTheme: () => ({}),
-}))
-
-vi.mock('@/components/terminal/terminal-runtime', () => ({
-  createTerminalRuntime: () => ({
-    attachAddons: vi.fn(),
-    fit: vi.fn(),
-    findNext: vi.fn(() => false),
-    findPrevious: vi.fn(() => false),
-    clearDecorations: vi.fn(),
-    onDidChangeResults: vi.fn(() => ({ dispose: vi.fn() })),
-    dispose: vi.fn(),
-    webglActive: vi.fn(() => false),
-  }),
-}))
-
-vi.mock('@xterm/xterm', () => {
-  class MockTerminal {
-    options: Record<string, unknown> = {}
-    cols = 80
-    rows = 24
-    open = vi.fn()
-    registerLinkProvider = vi.fn(() => ({ dispose: vi.fn() }))
-    onData = vi.fn(() => ({ dispose: vi.fn() }))
-    onTitleChange = vi.fn(() => ({ dispose: vi.fn() }))
-    attachCustomKeyEventHandler = vi.fn()
-    attachCustomWheelEventHandler = vi.fn()
-    dispose = vi.fn()
-    focus = vi.fn()
-    getSelection = vi.fn(() => '')
-    clear = vi.fn()
-    write = vi.fn((data: string, cb?: () => void) => {
-      cb?.()
-      return data.length
-    })
-    writeln = vi.fn()
-  }
-  return { Terminal: MockTerminal }
-})
-
-vi.mock('@xterm/xterm/css/xterm.css', () => ({}))
-
-class MockResizeObserver {
-  observe = vi.fn()
-  disconnect = vi.fn()
-  unobserve = vi.fn()
-}
-
-function findLeaf(node: PaneNode | undefined, paneId: string): Extract<PaneNode, { type: 'leaf' }> | null {
-  if (!node) return null
-  if (node.type === 'leaf') return node.id === paneId ? node : null
-  return findLeaf(node.children[0], paneId) || findLeaf(node.children[1], paneId)
-}
-
-function TerminalViewFromStore({ tabId, paneId }: { tabId: string; paneId: string }) {
-  const paneContent = useAppSelector((state) => findLeaf(state.panes.layouts[tabId], paneId)?.content ?? null)
-  if (!paneContent || paneContent.kind !== 'terminal') return null
-  return <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
-}
-
-function createStore(content: TerminalPaneContent) {
-  return configureStore({
-    reducer: {
-      tabs: tabsReducer,
-      panes: panesReducer,
-      settings: settingsReducer,
-      connection: connectionReducer,
-    },
-    preloadedState: {
-      tabs: {
-        tabs: [{
-          id: 'tab-codex',
-          mode: 'codex',
-          status: 'running',
-          title: 'Codex',
-          titleSetByUser: false,
-          createRequestId: 'tab-codex',
-        }],
-        activeTabId: 'tab-codex',
-      },
-      panes: {
-        layouts: {
-          'tab-codex': {
-            type: 'leaf',
-            id: 'pane-codex',
-            content,
-          },
-        },
-        activePane: { 'tab-codex': 'pane-codex' },
-        paneTitles: {},
-      },
-      settings: { settings: defaultSettings, status: 'loaded' },
-      connection: { status: 'ready', error: null, serverInstanceId: 'srv-new' },
-    },
-  })
-}
-
-function sentMessages() {
-  return wsHarness.send.mock.calls.map(([msg]) => msg)
-}
-
-describe('Codex wrong-thread resume regression', () => {
-  beforeEach(() => {
-    wsHarness.reset()
-    vi.stubGlobal('ResizeObserver', MockResizeObserver)
-    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) => {
-      cb(0)
-      return 1
-    })
-    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation(() => {})
-  })
-
-  afterEach(() => {
-    cleanup()
-    vi.restoreAllMocks()
-    vi.unstubAllGlobals()
-  })
-
-  it('repairs stale Codex terminal plumbing instead of continuing the wrong thread', async () => {
-    const store = createStore({
-      kind: 'terminal',
-      createRequestId: 'req-old',
-      status: 'running',
-      mode: 'codex',
-      shell: 'system',
-      terminalId: 'term-old',
-      serverInstanceId: 'srv-new',
-      sessionRef: { provider: 'codex', sessionId: 'thread-new' },
-      codexDurability: {
-        schemaVersion: 1,
-        state: 'durable',
-        durableThreadId: 'thread-new',
-      },
-      initialCwd: '/home/dan/code/freshell',
-    })
-
-    render(
-      <Provider store={store}>
-        <TerminalViewFromStore tabId="tab-codex" paneId="pane-codex" />
-      </Provider>,
-    )
-
-    await waitFor(() => {
-      expect(sentMessages()).toContainEqual(expect.objectContaining({
-        type: 'terminal.attach',
-        terminalId: 'term-old',
-        expectedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
-      }))
-    })
-
-    wsHarness.send.mockClear()
-    wsHarness.emit({
-      type: 'error',
-      code: 'SESSION_IDENTITY_MISMATCH',
-      message: 'Terminal belongs to a different session than the pane expects.',
-      terminalId: 'term-old',
-      timestamp: new Date().toISOString(),
-      expectedSessionRef: { provider: 'codex', sessionId: 'thread-new' },
-      actualSessionRef: { provider: 'codex', sessionId: 'thread-old' },
-    })
-
-    await waitFor(() => {
-      expect(sentMessages()).toContainEqual(expect.objectContaining({
-        type: 'terminal.create',
-        mode: 'codex',
-        restore: true,
-        sessionRef: { provider: 'codex', sessionId: 'thread-new' },
-      }))
-    })
-
-    const state = store.getState()
-    const content = findLeaf(state.panes.layouts['tab-codex'], 'pane-codex')?.content
-    expect(content).toMatchObject({
-      kind: 'terminal',
-      mode: 'codex',
-      sessionRef: { provider: 'codex', sessionId: 'thread-new' },
-    })
-    expect((content as TerminalPaneContent).terminalId).toBeUndefined()
-  })
-})
-```
-
-This e2e regression is intentionally component-level because the existing restart recovery e2e tests are component-level. It proves the user-facing reload path: stale terminal plumbing is cleared and the recreate path targets the expected Codex `sessionRef`.
-
-- [ ] **Step 2: Run the failing e2e test**
-
-Run:
+- [ ] **Step 2: Run failing e2e**
 
 ```bash
 FRESHELL_TEST_SUMMARY="codex wrong-thread resume e2e" npm run test:vitest -- test/e2e/codex-wrong-thread-resume.test.tsx --run
 ```
 
-Expected: FAIL before all identity guards and client repair are wired.
+Expected: FAIL before the implementation tasks are complete.
 
-- [ ] **Step 3: Implement only production repair code**
+- [ ] **Step 3: Run passing e2e**
 
-Do not add fixture support for this task. The test file above owns its local mocks and should pass once Tasks 5 and 6 are implemented.
-
-- [ ] **Step 4: Run e2e regression**
-
-Run:
+After Tasks 1-9:
 
 ```bash
 FRESHELL_TEST_SUMMARY="codex wrong-thread resume e2e" npm run test:vitest -- test/e2e/codex-wrong-thread-resume.test.tsx --run
@@ -1452,21 +770,19 @@ FRESHELL_TEST_SUMMARY="codex wrong-thread resume e2e" npm run test:vitest -- tes
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add test/e2e/codex-wrong-thread-resume.test.tsx
 git commit -m "test: cover Codex wrong-thread resume regression"
 ```
 
-## Task 9: Full Verification
+## Task 11: Full Verification
 
 **Files:**
 - No production file changes unless verification exposes failures.
 
 - [ ] **Step 1: Run status check**
-
-Run:
 
 ```bash
 npm run test:status
@@ -1476,26 +792,25 @@ Expected: coordinator is idle or shows a reusable green baseline. If another age
 
 - [ ] **Step 2: Run focused suites**
 
-Run:
-
 ```bash
 npm run test:vitest -- \
   test/unit/server/terminal-session-identity.test.ts \
   test/server/ws-terminal-codex-identity-invariant.test.ts \
   test/server/ws-terminal-create-reuse-running-codex.test.ts \
   test/unit/server/coding-cli/codex-app-server/restore-decision.test.ts \
+  test/server/agent-codex-identity-invariant.test.ts \
   test/unit/client/components/terminal-view-utils.test.ts \
   test/unit/client/components/TerminalView.codex-identity.test.tsx \
   test/unit/client/lib/terminal-session-association.test.ts \
-  test/unit/server/terminal-registry.codex-sidecar.test.ts \
+  test/unit/client/components/TabsView.test.tsx \
+  test/unit/client/store/crossTabSync.test.ts \
+  test/e2e/codex-wrong-thread-resume.test.tsx \
   --run
 ```
 
 Expected: PASS.
 
 - [ ] **Step 3: Run repo check**
-
-Run:
 
 ```bash
 FRESHELL_TEST_SUMMARY="codex thread identity invariant final check" npm run check
@@ -1504,8 +819,6 @@ FRESHELL_TEST_SUMMARY="codex thread identity invariant final check" npm run chec
 Expected: PASS.
 
 - [ ] **Step 4: Inspect git diff**
-
-Run:
 
 ```bash
 git status --short
@@ -1523,7 +836,8 @@ git commit -m "fix: enforce Codex thread identity invariant"
 
 ## Self-Review
 
-- Spec coverage: The plan covers the requested non-legacy approach. It uses the existing Codex durability system, makes it authoritative for create/attach/input/resize, rejects stale live terminal reuse, and repairs stale handles from the client.
-- Placeholder scan: There is no heuristic recovery, no "latest history" matching, and no deferred legacy resolver. Test snippets identify the exact user-visible failure: input must not reach the old thread and restore must target the expected thread.
-- Type consistency: The plan consistently uses `expectedSessionRef`, `sessionRef`, `candidateThreadId`, `durableThreadId`, and `SESSION_IDENTITY_MISMATCH`.
-- Known implementation adjustment: Some test helper names in snippets may need to map onto the repo's existing fixtures. Preserve the behavior and assertion shape when adapting helper names.
+- Spec coverage: The revised plan no longer relies on candidate-only identity, durability-only identity, same-server live handles, request-id cache identity, or terminal id as proof.
+- Load-bearing fixes: Every falsified load-bearing assumption now changes a task: side-effect gates move inside operation owners, create reuse is centralized, REST/MCP/CLI paths are in scope, broadcasts are identity-aware, and tab-registry/cross-tab sync drops stale runtime fields.
+- Non-legacy approach: The plan still ignores heuristic recovery. When canonical `sessionRef` is absent, Freshell refuses to guess.
+- Test shape: Tests protect the incident behavior directly: input/replay must not reach the old thread, stale runtime plumbing must be cleared, and restore/create must target the expected Codex `sessionRef`.
+- Known implementation adjustment: Helper and fixture names must follow the repo's existing test harnesses. Preserve the behavior and assertion shape when adapting names.
