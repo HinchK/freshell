@@ -37,6 +37,13 @@ function getTurnLabel(turn: FreshAgentTurn, agentLabel?: string): string {
   }
 }
 
+function formatTurnTimecode(timestamp: string | undefined): string | null {
+  if (!timestamp) return null
+  const date = new Date(timestamp)
+  if (Number.isNaN(date.getTime())) return timestamp
+  return date.toLocaleTimeString()
+}
+
 function isToolLike(item: FreshAgentTranscriptItem): boolean {
   return item.kind === 'tool_use'
     || item.kind === 'tool_result'
@@ -55,6 +62,20 @@ function isToolLike(item: FreshAgentTranscriptItem): boolean {
  */
 function isActivityLike(item: FreshAgentTranscriptItem): boolean {
   return isToolLike(item) || item.kind === 'thinking' || item.kind === 'reasoning'
+}
+
+type TranscriptDisplayOptions = {
+  showThinking: boolean
+}
+
+function shouldDisplayTranscriptItem(
+  item: FreshAgentTranscriptItem,
+  options: TranscriptDisplayOptions,
+): boolean {
+  if (item.kind === 'thinking' || item.kind === 'reasoning') {
+    return options.showThinking
+  }
+  return true
 }
 
 function formatJson(value: unknown): string {
@@ -169,7 +190,10 @@ type RenderBlock =
   | { kind: 'item'; item: FreshAgentTranscriptItem }
   | { kind: 'activity'; id: string; rows: ActivityRow[] }
 
-function buildBlocks(items: FreshAgentTranscriptItem[]): RenderBlock[] {
+function buildBlocks(
+  items: FreshAgentTranscriptItem[],
+  options: TranscriptDisplayOptions,
+): RenderBlock[] {
   const blocks: RenderBlock[] = []
   let pending: FreshAgentTranscriptItem[] = []
   const flush = () => {
@@ -185,6 +209,9 @@ function buildBlocks(items: FreshAgentTranscriptItem[]): RenderBlock[] {
     pending = []
   }
   for (const item of items) {
+    if (!shouldDisplayTranscriptItem(item, options)) {
+      continue
+    }
     if (isActivityLike(item)) {
       pending.push(item)
       continue
@@ -231,6 +258,19 @@ function coalesceActivityOnlyTurns(turns: FreshAgentTurn[]): FreshAgentTurn[] {
   return coalesced
 }
 
+function filterTurnsForDisplay(
+  turns: FreshAgentTurn[],
+  options: TranscriptDisplayOptions,
+): FreshAgentTurn[] {
+  return turns
+    .map((turn) => {
+      const items = turn.items.filter((item) => shouldDisplayTranscriptItem(item, options))
+      if (turn.items.length > 0 && items.length === 0) return null
+      return items === turn.items ? turn : { ...turn, items }
+    })
+    .filter((turn): turn is FreshAgentTurn => turn !== null)
+}
+
 function normalizeActivityRows(rows: ActivityRow[], live: boolean): ActivityRow[] {
   const runningToolIds = rows
     .filter((row): row is Extract<ActivityRow, { type: 'tool' }> => row.type === 'tool' && row.tool.status === 'running')
@@ -258,12 +298,16 @@ function normalizeActivityRows(rows: ActivityRow[], live: boolean): ActivityRow[
   return changed ? settledRows : rows
 }
 
-function selectLiveActivityBlockId(turns: FreshAgentTurn[], isStreaming: boolean): string | null {
+function selectLiveActivityBlockId(
+  turns: FreshAgentTurn[],
+  isStreaming: boolean,
+  options: TranscriptDisplayOptions,
+): string | null {
   let latestActivityBlockId: string | null = null
   let latestTrailingThinkingBlockId: string | null = null
 
   turns.forEach((turn, turnIndex) => {
-    const blocks = buildBlocks(turn.items)
+    const blocks = buildBlocks(turn.items, options)
     for (const block of blocks) {
       if (block.kind === 'activity') {
         latestActivityBlockId = block.id
@@ -308,11 +352,14 @@ function FreshAgentThinkingRow({ text }: { text: string }) {
 function FreshAgentActivityStrip({
   rows,
   live = false,
+  initialExpanded = false,
 }: {
   rows: ActivityRow[]
   live?: boolean
+  initialExpanded?: boolean
 }) {
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(initialExpanded)
+  useEffect(() => { setExpanded(initialExpanded) }, [initialExpanded])
   const displayRows = useMemo(() => (
     normalizeActivityRows(rows, live)
   ), [live, rows])
@@ -375,7 +422,7 @@ function FreshAgentActivityStrip({
           {displayRows.map((row) => (
             row.type === 'thinking'
               ? <FreshAgentThinkingRow key={row.id} text={row.text} />
-              : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={false} />
+              : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={initialExpanded} />
           ))}
         </div>
       )}
@@ -396,22 +443,27 @@ function FreshAgentTurnArticle({
   turn,
   actions,
   agentLabel,
-  showModel,
+  showTimecodes,
+  showTools,
   showHeader,
   continuation,
   liveActivityBlockId,
+  displayOptions,
 }: {
   turn: FreshAgentTurn
   actions: TurnActionProps
   agentLabel?: string
-  showModel: boolean
+  showTimecodes: boolean
+  showTools: boolean
   showHeader: boolean
   continuation: boolean
   liveActivityBlockId: string | null
+  displayOptions: TranscriptDisplayOptions
 }) {
   const isUser = turn.role === 'user'
-  const blocks = buildBlocks(turn.items)
+  const blocks = buildBlocks(turn.items, displayOptions)
   const turnLabel = getTurnLabel(turn, agentLabel)
+  const timecode = formatTurnTimecode(turn.timestamp)
   // Long-press opens the action sheet on touch devices (iOS fires no
   // contextmenu event; Android does — both paths land on onOpenActions and
   // the second call is a no-op re-set of the same state).
@@ -456,7 +508,12 @@ function FreshAgentTurnArticle({
       {showHeader ? (
         <div className="fresh-agent-turn-header mb-1 flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
           <span>{turnLabel}</span>
-          {showModel && turn.model ? <span className="truncate">{turn.model}</span> : null}
+          {showTimecodes && (timecode || turn.model) ? (
+            <span className="flex min-w-0 items-center gap-2">
+              {timecode ? <time>{timecode}</time> : null}
+              {turn.model ? <span className="truncate">{turn.model}</span> : null}
+            </span>
+          ) : null}
         </div>
       ) : null}
       <div className="fresh-agent-transcript-copy space-y-1.5">
@@ -467,6 +524,7 @@ function FreshAgentTurnArticle({
                 key={block.id}
                 rows={block.rows}
                 live={block.id === liveActivityBlockId}
+                initialExpanded={showTools}
               />
             )
           }
@@ -488,6 +546,9 @@ export function FreshAgentTranscript({
   canFork = false,
   agentLabel,
   showModel = false,
+  showThinking = true,
+  showTools = false,
+  showTimecodes,
   isStreaming = false,
   onForkFromTurn,
   onRewindToTurn,
@@ -496,6 +557,9 @@ export function FreshAgentTranscript({
   canFork?: boolean
   agentLabel?: string
   showModel?: boolean
+  showThinking?: boolean
+  showTools?: boolean
+  showTimecodes?: boolean
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
@@ -506,10 +570,19 @@ export function FreshAgentTranscript({
   const [contextMenu, setContextMenu] = useState<FreshAgentTurnContextMenuState>(null)
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
   const coarsePointer = useCoarsePointer()
-  const displayTurns = useMemo(() => coalesceActivityOnlyTurns(turns), [turns])
-  const liveActivityBlockId = useMemo(() => selectLiveActivityBlockId(displayTurns, isStreaming), [displayTurns, isStreaming])
+  const resolvedShowTimecodes = showTimecodes ?? showModel
+  const displayOptions = useMemo<TranscriptDisplayOptions>(() => ({
+    showThinking,
+  }), [showThinking])
+  const displayTurns = useMemo(() => (
+    coalesceActivityOnlyTurns(filterTurnsForDisplay(turns, displayOptions))
+  ), [displayOptions, turns])
+  const liveActivityBlockId = useMemo(
+    () => selectLiveActivityBlockId(displayTurns, isStreaming, displayOptions),
+    [displayOptions, displayTurns, isStreaming],
+  )
   const transcriptSignature = useMemo(() => (
-    turns.map((turn) => {
+    displayTurns.map((turn) => {
       const itemSignature = turn.items.map((item) => {
         if (item.kind === 'text' || item.kind === 'thinking') {
           return `${item.id}:${item.kind}:${item.text.length}`
@@ -527,7 +600,7 @@ export function FreshAgentTranscript({
       }).join(',')
       return `${turn.id}:${turn.summary?.length ?? 0}:${itemSignature}`
     }).join('|')
-  ), [turns])
+  ), [displayTurns])
 
   const handleTurnContextMenu = useCallback((event: React.MouseEvent, turn: FreshAgentTurn) => {
     setContextMenu({ x: event.clientX, y: event.clientY, turn })
@@ -573,10 +646,12 @@ export function FreshAgentTranscript({
             turn={turn}
             actions={actions}
             agentLabel={agentLabel}
-            showModel={showModel}
+            showTimecodes={resolvedShowTimecodes}
+            showTools={showTools}
             showHeader={index === 0 || displayTurns[index - 1]?.role !== turn.role}
             continuation={index > 0 && displayTurns[index - 1]?.role === turn.role}
             liveActivityBlockId={liveActivityBlockId}
+            displayOptions={displayOptions}
           />
         ))}
       </div>

@@ -41,6 +41,20 @@ function legacyAgentPane(payload: Record<string, unknown>) {
   } as never
 }
 
+function freshAgentPane(payload: Record<string, unknown>) {
+  return {
+    paneId: 'pane-agent',
+    kind: 'fresh-agent',
+    payload: {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      createRequestId: 'req-agent',
+      status: 'idle',
+      ...payload,
+    },
+  } as never
+}
+
 describe('client tab registry fresh-agent migration', () => {
   it('serializes live fresh-agent pane snapshots without agent-chat kinds', () => {
     const layout: PaneNode = {
@@ -124,6 +138,30 @@ describe('client tab registry fresh-agent migration', () => {
     })
   })
 
+  it('normalizes incoming fresh-agent registry records with bad Claude session refs', () => {
+    const normalized = normalizeTabRegistryRecordsForSync([
+      makeRecord({
+        panes: [
+          freshAgentPane({
+            sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+            resumeSessionId: '00000000-0000-4000-8000-000000000004',
+            showTimecodes: true,
+          }),
+        ],
+      }) as never,
+    ])
+
+    expect(normalized[0]?.panes[0]).toMatchObject({
+      kind: 'fresh-agent',
+      payload: {
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+        showTimecodes: true,
+      },
+    })
+    expect(normalized[0]?.panes[0]?.payload.sessionRef).toBeUndefined()
+    expect(normalized[0]?.panes[0]?.payload.resumeSessionId).toBeUndefined()
+  })
+
   it('reopens old registry panes as fresh-agent inputs with durable identity', () => {
     const record = makeRecord()
     const content = sanitizePaneSnapshot(record, legacyAgentPane({
@@ -151,5 +189,21 @@ describe('client tab registry fresh-agent migration', () => {
       restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
     })
     expect((content as { sessionRef?: unknown }).sessionRef).toBeUndefined()
+  })
+
+  it('reopens fresh-agent registry panes through durable identity instead of stale live session id', () => {
+    const record = makeRecord({ serverInstanceId: 'srv-1' })
+    const content = sanitizePaneSnapshot(record, freshAgentPane({
+      sessionId: 'stale-live-session',
+      sessionRef: { provider: 'claude', sessionId: '00000000-0000-4000-8000-000000000005' },
+    }), 'srv-1')
+
+    expect(content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      sessionRef: { provider: 'claude', sessionId: '00000000-0000-4000-8000-000000000005' },
+    })
+    expect((content as { sessionId?: unknown }).sessionId).toBeUndefined()
   })
 })

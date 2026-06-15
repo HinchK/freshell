@@ -113,6 +113,28 @@ describe('fresh-agent pane migration', () => {
     expect((migrated as { sessionRef?: unknown }).sessionRef).toBeUndefined()
   })
 
+  it('rejects non-canonical Claude sessionRef aliases in existing fresh-agent records', () => {
+    const migrated = migrateLegacyFreshAgentContent({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      createRequestId: 'req-fresh-alias',
+      status: 'idle',
+      sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+      initialCwd: '/work',
+      showTools: true,
+    })
+    expect(migrated).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+      initialCwd: '/work',
+      showTools: true,
+    })
+    expect((migrated as { sessionRef?: unknown }).sessionRef).toBeUndefined()
+  })
+
   it('keeps a bad Claude sessionRef alias as a restore error even when resumeSessionId is canonical', () => {
     const canonical = '00000000-0000-4000-8000-000000000777'
     const migrated = migrateLegacyFreshAgentContent({

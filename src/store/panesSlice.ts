@@ -135,6 +135,7 @@ function normalizePaneContent(
         : (typeof rawFreshAgent.timelineSessionId === 'string'
             ? rawFreshAgent.timelineSessionId
             : (typeof rawFreshAgent.cliSessionId === 'string' ? rawFreshAgent.cliSessionId : undefined)),
+      rejectNonCanonicalClaudeSessionRef: true,
     })
     const sessionRef = durableState.sessionRef
     return {
@@ -693,6 +694,17 @@ function stripStaleIds(content: PaneContent): PaneContentInput {
   }
   if (content.kind === 'browser') {
     const { browserInstanceId: _browserInstanceId, ...rest } = content
+    return rest
+  }
+  if (content.kind === 'fresh-agent') {
+    const {
+      sessionId: _sessionId,
+      createRequestId: _createRequestId,
+      status: _status,
+      serverInstanceId: _serverInstanceId,
+      createError: _createError,
+      ...rest
+    } = content
     return rest
   }
   return content

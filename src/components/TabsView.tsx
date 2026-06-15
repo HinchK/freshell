@@ -177,7 +177,6 @@ export function sanitizePaneSnapshot(
       kind: 'fresh-agent',
       sessionType,
       provider,
-      sessionId: sameServer && typeof payload.sessionId === 'string' ? payload.sessionId : undefined,
       resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
       ...(restoreError.success && !sessionRef ? { restoreError: restoreError.data } : {}),

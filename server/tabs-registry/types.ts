@@ -24,10 +24,15 @@ function stripUndefinedValues(value: Record<string, unknown>): Record<string, un
 }
 
 function normalizeRegistryPaneSnapshotInput(value: unknown): unknown {
-  if (!isRecord(value) || value.kind !== 'agent-chat') return value
+  if (
+    !isRecord(value)
+    || (value.kind !== 'agent-chat' && value.kind !== 'fresh-agent')
+  ) {
+    return value
+  }
   const payload = isRecord(value.payload) ? value.payload : {}
   const migrated = migrateLegacyFreshAgentContent({
-    kind: 'agent-chat',
+    kind: value.kind,
     ...payload,
   }) as Record<string, unknown>
   if (migrated.kind !== 'fresh-agent') return value

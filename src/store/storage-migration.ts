@@ -270,6 +270,16 @@ function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: strin
 
   const currentRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
   if (currentRaw !== expectedCurrentRaw) {
+    try {
+      localStorage.removeItem(LAYOUT_FRESH_AGENT_BACKUP_KEY)
+      localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
+    } catch (error) {
+      warnStructured('fresh_agent_layout_interleaving_cleanup_failed', {
+        backupKey: LAYOUT_FRESH_AGENT_BACKUP_KEY,
+        markerKey: LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+        error: error instanceof Error ? error.message : String(error),
+      })
+    }
     warnStructured('fresh_agent_layout_interleaving_write_detected', {
       key: LAYOUT_STORAGE_KEY,
     })

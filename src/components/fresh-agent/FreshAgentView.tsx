@@ -313,10 +313,21 @@ export function FreshAgentView({
     (state) => state.settings.settings.freshAgent?.providers?.[paneContent.sessionType]
       ?? state.settings.serverSettings?.freshAgent?.providers?.[paneContent.sessionType],
   )
-  const showTranscriptModel = useAppSelector(
+  const globalShowThinking = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.showThinking
+      ?? false,
+  )
+  const globalShowTools = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.showTools
+      ?? false,
+  )
+  const globalShowTimecodes = useAppSelector(
     (state) => state.settings.settings.freshAgent?.showTimecodes
       ?? false,
   )
+  const effectiveShowThinking = paneContent.showThinking ?? globalShowThinking
+  const effectiveShowTools = paneContent.showTools ?? globalShowTools
+  const effectiveShowTimecodes = paneContent.showTimecodes ?? globalShowTimecodes
   const activeStyle = normalizeFreshAgentStyle(
     paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
   )
@@ -1508,7 +1519,9 @@ export function FreshAgentView({
                 : turns}
               canFork={canFork}
               agentLabel={descriptor?.label}
-              showModel={showTranscriptModel}
+              showThinking={effectiveShowThinking}
+              showTools={effectiveShowTools}
+              showTimecodes={effectiveShowTimecodes}
               isStreaming={isBusy}
               onForkFromTurn={(turnId) => sendFork(turnId)}
               onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
@@ -1571,6 +1584,9 @@ export function FreshAgentView({
     descriptor?.icon,
     descriptor?.label,
     effectiveStatus,
+    effectiveShowThinking,
+    effectiveShowTimecodes,
+    effectiveShowTools,
     hasRestoreFailure,
     hidden,
     isBusy,
@@ -1585,7 +1601,6 @@ export function FreshAgentView({
     runShellCommand,
     sessionEnded,
     sessionErrorMessage,
-    showTranscriptModel,
     startNewConversation,
     runSlashCommand,
     sendFork,

@@ -78,4 +78,41 @@ describe('LayoutStore fresh-agent titles', () => {
       mode: 'shell',
     })
   })
+
+  it('normalizes existing fresh-agent panes with bad Claude session refs before storing snapshots', () => {
+    const store = new LayoutStore()
+    store.updateFromUi({
+      tabs: [{ id: 'tab-1', title: 'Fresh Agent' }],
+      activeTabId: 'tab-1',
+      activePane: { 'tab-1': 'pane-agent' },
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-agent',
+          content: {
+            kind: 'fresh-agent',
+            provider: 'claude',
+            sessionType: 'freshclaude',
+            createRequestId: 'req-agent',
+            status: 'idle',
+            sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+            initialCwd: '/repo',
+            showTimecodes: true,
+          },
+        },
+      },
+    }, 'conn-1')
+
+    const agentPane = store.getPaneSnapshot('pane-agent')
+
+    expect(agentPane?.paneContent).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+      initialCwd: '/repo',
+      showTimecodes: true,
+    })
+    expect(agentPane?.paneContent?.sessionRef).toBeUndefined()
+  })
 })

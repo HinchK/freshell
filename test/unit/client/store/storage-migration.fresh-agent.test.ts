@@ -213,6 +213,37 @@ describe('storage-migration fresh-agent', () => {
     expect(content.resumeSessionId).toBeUndefined()
   })
 
+  it('turns existing fresh-agent panes with invalid Claude sessionRef into restore errors', async () => {
+    const originalRaw = makeLegacyLayoutRaw({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      createRequestId: 'req-fresh-alias',
+      status: 'idle',
+      sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+      resumeSessionId: '00000000-0000-4000-8000-000000000779',
+      showTimecodes: true,
+    })
+    const storage = createStorage()
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(VERSION_KEY, '5')
+    storage.seed(LAYOUT_KEY, originalRaw)
+
+    await import('@/store/storage-migration')
+
+    const parsed = JSON.parse(localStorage.getItem(LAYOUT_KEY)!)
+    const content = parsed.panes.layouts['tab-1'].content
+    expect(content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+      showTimecodes: true,
+    })
+    expect(content.sessionRef).toBeUndefined()
+    expect(content.resumeSessionId).toBeUndefined()
+  })
+
   it('aborts before touching the original layout when the backup write fails', async () => {
     const originalRaw = makeLegacyLayoutRaw()
     const storage = createStorage({
@@ -264,11 +295,13 @@ describe('storage-migration fresh-agent', () => {
     storage.seed(LAYOUT_KEY, originalRaw)
 
     await import('@/store/storage-migration')
+    const { readRecoverablePersistedLayoutRaw } = await import('@/store/persistedState')
 
     expect(localStorage.getItem(LAYOUT_KEY)).toBe(concurrentRaw)
-    expect(localStorage.getItem(BACKUP_KEY)).toBe(originalRaw)
+    expect(localStorage.getItem(BACKUP_KEY)).toBeNull()
     expect(localStorage.getItem(MARKER_KEY)).toBeNull()
     expect(localStorage.getItem(VERSION_KEY)).toBeNull()
+    expect(readRecoverablePersistedLayoutRaw(localStorage)).toBe(concurrentRaw)
   })
 
   it('migrates a synthetic 100-tab 1000-leaf layout within the performance budget', async () => {

@@ -130,4 +130,44 @@ describe('UiLayoutSyncSchema', () => {
       provider: 'claude',
     })
   })
+
+  it('normalizes existing fresh-agent panes with bad Claude session refs to restore errors', () => {
+    const parsed = UiLayoutSyncSchema.safeParse({
+      type: 'ui.layout.sync',
+      tabs: [{ id: 'tab_a', title: 'alpha' }],
+      activeTabId: 'tab_a',
+      layouts: {
+        tab_a: {
+          type: 'leaf',
+          id: 'pane_agent',
+          content: {
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-agent',
+            status: 'idle',
+            sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+            initialCwd: '/repo',
+            showTools: true,
+          },
+        },
+      },
+      activePane: { tab_a: 'pane_agent' },
+      paneTitles: {},
+      paneTitleSetByUser: {},
+      timestamp: Date.now(),
+    })
+
+    expect(parsed.success).toBe(true)
+    if (!parsed.success) return
+    expect(parsed.data.layouts.tab_a.content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+      initialCwd: '/repo',
+      showTools: true,
+    })
+    expect(parsed.data.layouts.tab_a.content.sessionRef).toBeUndefined()
+  })
 })

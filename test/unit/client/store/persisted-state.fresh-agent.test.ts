@@ -200,6 +200,35 @@ describe('persistedState fresh-agent migration', () => {
     expect(content.resumeSessionId).toBeUndefined()
   })
 
+  it('normalizes existing fresh-agent panes with non-canonical Claude session refs to restore errors', () => {
+    const canonical = '00000000-0000-4000-8000-000000000778'
+    const parsed = parsePersistedLayoutRaw(layoutRaw({
+      'tab-1': leaf('pane-fresh-alias', {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+        resumeSessionId: canonical,
+        initialCwd: '/repo',
+        modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+        showTools: true,
+      }),
+    }))
+
+    const content = collectLeafContents(parsed!.panes.layouts['tab-1'])[0]
+    expect(content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+      initialCwd: '/repo',
+      modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+      showTools: true,
+    })
+    expect(content.sessionRef).toBeUndefined()
+    expect(content.resumeSessionId).toBeUndefined()
+  })
+
   it('prefers the backup when the fresh-agent migration commit marker is missing', () => {
     const backupRaw = layoutRaw({
       'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),

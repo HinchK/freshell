@@ -261,6 +261,67 @@ describe('FreshAgentView', () => {
     })
   })
 
+  it('honors pane display overrides ahead of global fresh-agent settings', async () => {
+    const store = createStore()
+    store.dispatch(updateSettingsLocal({
+      freshAgent: {
+        showThinking: false,
+        showTools: false,
+        showTimecodes: false,
+      },
+    }))
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'Display summary',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [{
+        id: 'turn-display',
+        turnId: 'turn-display',
+        role: 'assistant',
+        timestamp: '2026-06-15T12:34:56.000Z',
+        model: 'claude-opus-4-6',
+        summary: 'used tools',
+        items: [
+          { id: 'think-display', kind: 'thinking', text: 'pane-level thinking' },
+          {
+            id: 'tool-display',
+            kind: 'tool_use',
+            toolUseId: 'call-display',
+            name: 'Bash',
+            input: { command: 'npm run display-check' },
+          },
+        ],
+      }],
+    })
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-display',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            showThinking: true,
+            showTools: true,
+            showTimecodes: true,
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('npm run display-check')).toBeInTheDocument()
+    })
+    expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+    expect(screen.getByText('claude-opus-4-6')).toBeInTheDocument()
+    expect(screen.getByText(new Date('2026-06-15T12:34:56.000Z').toLocaleTimeString())).toBeInTheDocument()
+  })
+
   it('shows the provider watermark behind the workspace and redirects pane typing into the composer', async () => {
     const store = createStore()
     store.dispatch(initLayout({

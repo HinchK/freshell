@@ -240,11 +240,39 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
       }
     }
 
+    const resumeSessionId = typeof input.resumeSessionId === 'string'
+      ? input.resumeSessionId
+      : (typeof input.timelineSessionId === 'string'
+          ? input.timelineSessionId
+          : (typeof input.cliSessionId === 'string' ? input.cliSessionId : undefined))
+    const durableState = migrateLegacyFreshAgentDurableState({
+      provider,
+      sessionRef: input.sessionRef,
+      resumeSessionId,
+      rejectNonCanonicalClaudeSessionRef: true,
+    })
+    const {
+      kind: _legacyKind,
+      provider: _legacyProvider,
+      sessionRef: _legacySessionRef,
+      resumeSessionId: _legacyResumeSessionId,
+      timelineSessionId: _legacyTimelineSessionId,
+      cliSessionId: _legacyCliSessionId,
+      restoreError: _legacyRestoreError,
+      ...rest
+    } = input
+
     return {
-      ...input,
+      ...rest,
       kind: 'fresh-agent',
       provider,
       sessionType,
+      ...(durableState.restoreError
+        ? { restoreError: durableState.restoreError }
+        : {
+            ...(typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {}),
+            ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
+          }),
     }
   }
 

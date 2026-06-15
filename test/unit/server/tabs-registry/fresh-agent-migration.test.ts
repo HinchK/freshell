@@ -40,6 +40,20 @@ function legacyAgentPane(payload: Record<string, unknown>) {
   } as never
 }
 
+function freshAgentPane(payload: Record<string, unknown>) {
+  return {
+    paneId: 'pane-agent',
+    kind: 'fresh-agent',
+    payload: {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      createRequestId: 'req-agent',
+      status: 'idle',
+      ...payload,
+    },
+  } as never
+}
+
 async function replace(store: TabsRegistryStore, records: RegistryTabRecord[]) {
   return store.replaceClientSnapshot({
     deviceId: 'device-1',
@@ -107,5 +121,35 @@ describe('server tabs registry fresh-agent migration', () => {
         restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
       },
     })
+  })
+
+  it('normalizes fresh-agent records with bad Claude session refs before persistence and query', async () => {
+    await replace(store, [
+      makeRecord({
+        panes: [
+          freshAgentPane({
+            sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+            resumeSessionId: '00000000-0000-4000-8000-000000000004',
+            showTools: true,
+          }),
+        ],
+      }) as never,
+    ])
+
+    const result = await store.query({
+      deviceId: 'device-2',
+      clientInstanceId: 'window-2',
+      closedTabRetentionDays: 30,
+    })
+
+    expect(result.remoteOpen[0]?.panes[0]).toMatchObject({
+      kind: 'fresh-agent',
+      payload: {
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+        showTools: true,
+      },
+    })
+    expect(result.remoteOpen[0]?.panes[0]?.payload.sessionRef).toBeUndefined()
+    expect(result.remoteOpen[0]?.panes[0]?.payload.resumeSessionId).toBeUndefined()
   })
 })

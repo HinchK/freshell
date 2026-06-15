@@ -217,6 +217,83 @@ describe('FreshAgentTranscript', () => {
     expect(screen.getAllByText('the race is in the close handler').length).toBeGreaterThanOrEqual(1)
   })
 
+  it('hides thinking rows when showThinking is false', () => {
+    render(
+      <FreshAgentTranscript
+        showThinking={false}
+        turns={[
+          {
+            id: 'turn-1',
+            role: 'assistant',
+            summary: 'thought then ran',
+            items: [
+              { id: 'think-1', kind: 'thinking', text: 'hidden reasoning' },
+              {
+                id: 'tool-1',
+                kind: 'tool_use',
+                toolUseId: 'call-1',
+                name: 'Bash',
+                input: { command: 'npm test' },
+              },
+            ],
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByRole('region', { name: 'Activity strip' })).toHaveTextContent('1 tool used')
+    expect(screen.queryByText(/thought/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Thinking' })).not.toBeInTheDocument()
+  })
+
+  it('opens activity details by default when showTools is true', () => {
+    render(
+      <FreshAgentTranscript
+        showTools
+        turns={[
+          {
+            id: 'turn-1',
+            role: 'assistant',
+            summary: 'used tools',
+            items: [
+              {
+                id: 'tool-1',
+                kind: 'tool_use',
+                toolUseId: 'call-1',
+                name: 'Bash',
+                input: { command: 'npm run check' },
+              },
+            ],
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByRole('button', { name: 'Toggle activity details' })).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByText('npm run check')).toBeInTheDocument()
+  })
+
+  it('shows timestamp and model when showTimecodes is true', () => {
+    render(
+      <FreshAgentTranscript
+        showTimecodes
+        turns={[
+          {
+            id: 'turn-1',
+            role: 'assistant',
+            timestamp: '2026-06-15T12:34:56.000Z',
+            model: 'gpt-5.4-flash',
+            summary: 'model metadata',
+            items: [{ id: 'item-1', kind: 'text', text: 'Done.' }],
+          },
+        ]}
+      />,
+    )
+
+    expect(screen.getByText('gpt-5.4-flash')).toBeInTheDocument()
+    expect(screen.getByText(new Date('2026-06-15T12:34:56.000Z').toLocaleTimeString())).toBeInTheDocument()
+  })
+
   it('shows a live reel while a tool is running', () => {
     const { container } = render(
       <FreshAgentTranscript
