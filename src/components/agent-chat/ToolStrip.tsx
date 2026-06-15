@@ -2,9 +2,9 @@ import { memo, useEffect, useMemo, useState } from 'react'
 import { ChevronRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useMobile } from '@/hooks/useMobile'
-import { getToolPreview } from './tool-preview'
+import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import ToolBlock from './ToolBlock'
-import SlotReel from './SlotReel'
+import SlotReel from '@/components/fresh-agent/shared/SlotReel'
 
 export interface ToolPair {
   id: string

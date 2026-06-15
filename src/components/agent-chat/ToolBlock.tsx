@@ -1,8 +1,8 @@
 import { useState, memo, useMemo } from 'react'
 import { ChevronRight, Loader2, Check, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import DiffView from './DiffView'
-import { getToolPreview } from './tool-preview'
+import DiffView from '@/components/fresh-agent/shared/DiffView'
+import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 
 interface ToolBlockProps {
   name: string

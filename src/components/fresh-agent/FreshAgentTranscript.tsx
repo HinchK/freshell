@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
-import SlotReel from '@/components/agent-chat/SlotReel'
-import { getToolPreview } from '@/components/agent-chat/tool-preview'
+import SlotReel from '@/components/fresh-agent/shared/SlotReel'
+import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import { cn } from '@/lib/utils'
 import type { FreshAgentTranscriptItem, FreshAgentTurn } from '@shared/fresh-agent-contract'
 import {

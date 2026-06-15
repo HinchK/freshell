@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import { render, screen, cleanup, act } from '@testing-library/react'
-import SlotReel from '@/components/agent-chat/SlotReel'
+import SlotReel from '@/components/fresh-agent/shared/SlotReel'
 
 describe('SlotReel', () => {
   afterEach(() => {
