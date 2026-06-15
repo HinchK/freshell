@@ -75,7 +75,7 @@ export type FreshAgentClaudeSnapshot = {
   turns: FreshAgentNormalizedTurn[]
   extensions: {
     claude: {
-      timelineSessionId?: string
+      historySessionId?: string
       liveSessionId?: string
       cliSessionId?: string
       readiness?: ClaudeFreshAgentHistoryRestoreResolution extends infer T ? T extends { kind: 'resolved'; readiness: infer R } ? R : never : never
@@ -203,7 +203,7 @@ export function normalizeClaudeThreadSnapshot(input: {
     turns,
     extensions: {
       claude: {
-        timelineSessionId: input.resolved.timelineSessionId,
+        historySessionId: input.resolved.timelineSessionId,
         liveSessionId: input.resolved.liveSessionId,
         cliSessionId: input.liveSession?.cliSessionId,
         readiness: input.resolved.readiness,

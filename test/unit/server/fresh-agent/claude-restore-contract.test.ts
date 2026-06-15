@@ -65,7 +65,7 @@ describe('Claude fresh-agent restore contract', () => {
     })
     expect(snapshot?.turns.map((turn: { source: string }) => turn.source)).toEqual(['durable', 'live'])
     expect(snapshot?.extensions.claude).toMatchObject({
-      timelineSessionId: '00000000-0000-4000-8000-000000000111',
+      historySessionId: '00000000-0000-4000-8000-000000000111',
       readiness: 'merged',
     })
   })

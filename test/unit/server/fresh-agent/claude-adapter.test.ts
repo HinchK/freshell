@@ -179,10 +179,10 @@ describe('Claude fresh-agent adapter', () => {
       status: liveSession.status,
       extensions: {
         claude: {
-          liveSessionId: liveSession.sessionId,
-          timelineSessionId: liveSession.cliSessionId,
-          readiness: 'live_only',
-        },
+        liveSessionId: liveSession.sessionId,
+        historySessionId: liveSession.cliSessionId,
+        readiness: 'live_only',
+      },
       },
     })
     expect(snapshot?.turns.map((turn: { source: string }) => turn.source)).toEqual(['live'])
