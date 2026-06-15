@@ -1,16 +1,19 @@
 // @vitest-environment node
-import fs from 'node:fs'
-import path from 'node:path'
 import express from 'express'
 import request from 'supertest'
 import { describe, expect, it, vi } from 'vitest'
 
 import { createFreshAgentProviderRegistry } from '../../../server/fresh-agent/provider-registry.js'
-import { createFreshAgentRouter } from '../../../server/fresh-agent/router.js'
+import { registerFreshAgentThreadRoutes } from '../../../server/fresh-agent/register-routes.js'
 import { FreshAgentRuntimeManager } from '../../../server/fresh-agent/runtime-manager.js'
 import type { FreshAgentRuntimeAdapter } from '../../../server/fresh-agent/runtime-adapter.js'
 
-const repoRoot = path.resolve(__dirname, '../../..')
+type ExpressLayer = {
+  route?: { path?: unknown }
+  regexp?: RegExp
+  name?: string
+  handle?: { stack?: ExpressLayer[] }
+}
 
 function createProductionFreshAgentRouteApp() {
   const adapter = {
@@ -55,18 +58,30 @@ function createProductionFreshAgentRouteApp() {
   })
   const app = express()
   app.use(express.json())
-  app.use('/api', createFreshAgentRouter({ runtimeManager }))
+  registerFreshAgentThreadRoutes(app, { runtimeManager })
   return app
 }
 
-describe('fresh-agent removes legacy Claude history routes', () => {
-  it('does not register legacy agent-session routes in the production entrypoint', () => {
-    const source = fs.readFileSync(path.join(repoRoot, 'server/index.ts'), 'utf8')
+function collectExpressRouteStack(app: express.Express): string[] {
+  const stack = ((app as unknown as { _router?: { stack?: ExpressLayer[] } })._router?.stack ?? [])
+  const entries: string[] = []
+  const visit = (layer: ExpressLayer): void => {
+    if (typeof layer.route?.path === 'string') entries.push(layer.route.path)
+    if (layer.regexp) entries.push(String(layer.regexp))
+    if (layer.name) entries.push(layer.name)
+    for (const child of layer.handle?.stack ?? []) visit(child)
+  }
+  for (const layer of stack) visit(layer)
+  return entries
+}
 
-    expect(source).not.toContain('/api/agent-sessions')
-    expect(source).not.toContain('createAgentTimelineRouter')
-    expect(source).not.toContain('createAgentTimelineService')
-    expect(source).toMatch(/app\.use\('\/api', createFreshAgentRouter\(\{\s*runtimeManager: freshAgentRuntimeManager/)
+describe('fresh-agent removes legacy Claude history routes', () => {
+  it('does not register legacy agent-session routes through the production fresh-agent route helper', () => {
+    const app = createProductionFreshAgentRouteApp()
+    const routes = collectExpressRouteStack(app)
+
+    expect(routes.some((entry) => entry.includes('agent-sessions'))).toBe(false)
+    expect(routes).toContain('/fresh-agent/threads/:sessionType/:provider/:threadId')
   })
 
   it('does not mount /api/agent-sessions routes while fresh-agent threads still resolve', async () => {

@@ -78,7 +78,7 @@ import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registry.js'
 import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
-import { createFreshAgentRouter } from './fresh-agent/router.js'
+import { registerFreshAgentThreadRoutes } from './fresh-agent/register-routes.js'
 import { createClaudeFreshAgentAdapter } from './fresh-agent/adapters/claude/adapter.js'
 import { createCodexFreshAgentAdapter } from './fresh-agent/adapters/codex/adapter.js'
 import { createOpencodeFreshAgentAdapter } from './fresh-agent/adapters/opencode/adapter.js'
@@ -406,9 +406,9 @@ async function main() {
     codexLaunchPlanner,
     assertTerminalCreateAccepted,
   }))
-  app.use('/api', createFreshAgentRouter({
+  registerFreshAgentThreadRoutes(app, {
     runtimeManager: freshAgentRuntimeManager,
-  }))
+  })
 
   // --- Extension lifecycle broadcasts ---
   extensionManager.on('server.starting', ({ name }: { name: string }) => {

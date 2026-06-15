@@ -57,7 +57,7 @@ export const claudeContractSnapshot = {
   turns: [claudeContractTurn],
   extensions: {
     claude: {
-      timelineSessionId: '00000000-0000-4000-8000-000000000111',
+      historySessionId: '00000000-0000-4000-8000-000000000111',
       liveSessionId: 'sdk-claude-1',
     },
   },
