@@ -150,8 +150,8 @@ describe('ConfigStore', () => {
             ...defaultSettings.terminal,
             scrollback: 12000,
           },
-          agentChat: {
-            ...defaultSettings.agentChat,
+          freshAgent: {
+            ...defaultSettings.freshAgent,
             defaultPlugins: ['fs'],
           },
         },
@@ -166,7 +166,8 @@ describe('ConfigStore', () => {
 
       expect(config.settings.defaultCwd).toBe('/workspace')
       expect(config.settings.terminal.scrollback).toBe(12000)
-      expect(config.settings.agentChat.defaultPlugins).toEqual(['fs'])
+      expect(config.settings.freshAgent.defaultPlugins).toEqual(['fs'])
+      expect('agentChat' in config.settings).toBe(false)
       expect(config.sessionOverrides['session-1']?.titleOverride).toBe('Custom Title')
       expect(config.terminalOverrides['term-1']?.deleted).toBe(true)
       expect(config.projectColors['/projects/foo']).toBe('#ff0000')
@@ -221,15 +222,12 @@ describe('ConfigStore', () => {
           ...defaultSettings.codingCli,
           knownProviders: undefined,
         },
-        agentChat: {
-          ...defaultSettings.agentChat,
-          defaultPlugins: ['fs'],
-        },
         freshAgent: {
           ...defaultSettings.freshAgent,
           defaultPlugins: ['fs'],
         },
       })
+      expect('agentChat' in config.settings).toBe(false)
       expect(config.legacyLocalSettingsSeed).toEqual({
         theme: 'dark',
         terminal: {
@@ -258,8 +256,8 @@ describe('ConfigStore', () => {
         version: 1,
         settings: {
           ...defaultSettings,
-          agentChat: {
-            ...defaultSettings.agentChat,
+          freshAgent: {
+            ...defaultSettings.freshAgent,
             defaultPlugins: [
               '/home/user/code/freshell/.claude/plugins/freshell-orchestration',
               '/custom/plugin',
@@ -275,7 +273,8 @@ describe('ConfigStore', () => {
       const store = new ConfigStore()
       const config = await store.load()
 
-      expect(config.settings.agentChat.defaultPlugins).toEqual(['/custom/plugin'])
+      expect(config.settings.freshAgent.defaultPlugins).toEqual(['/custom/plugin'])
+      expect('agentChat' in config.settings).toBe(false)
     })
 
     it('merges existing legacyLocalSettingsSeed with moved local fields still present in settings', async () => {
@@ -816,12 +815,12 @@ describe('ConfigStore', () => {
       await store.load()
 
       const updated = await store.patchSettings({
-        agentChat: {
+        freshAgent: {
           defaultPlugins: ['fs', 'search'],
         },
       })
 
-      expect(updated.agentChat.defaultPlugins).toEqual(['fs', 'search'])
+      expect(updated.freshAgent.defaultPlugins).toEqual(['fs', 'search'])
 
       const saved = JSON.parse(await fsp.readFile(configPath, 'utf-8'))
       expect(saved.legacyLocalSettingsSeed).toEqual({
@@ -832,7 +831,8 @@ describe('ConfigStore', () => {
       })
       expect(saved.settings.theme).toBeUndefined()
       expect(saved.settings.terminal.fontFamily).toBeUndefined()
-      expect(saved.settings.agentChat.defaultPlugins).toEqual(['fs', 'search'])
+      expect(saved.settings.freshAgent.defaultPlugins).toEqual(['fs', 'search'])
+      expect(saved.settings.agentChat).toBeUndefined()
     })
 
   })
@@ -1028,14 +1028,14 @@ describe('ConfigStore', () => {
       })
     })
 
-    it('agentChat defaultPlugins survives load and patch', async () => {
+    it('freshAgent defaultPlugins survives load and patch', async () => {
       await fsp.mkdir(configDir, { recursive: true })
       const existingConfig: UserConfig = {
         version: 1,
         settings: {
           ...defaultSettings,
-          agentChat: {
-            ...defaultSettings.agentChat,
+          freshAgent: {
+            ...defaultSettings.freshAgent,
             defaultPlugins: ['fs'],
           },
         },
@@ -1047,13 +1047,14 @@ describe('ConfigStore', () => {
 
       const store = new ConfigStore()
       const loaded = await store.load()
-      expect(loaded.settings.agentChat.defaultPlugins).toEqual(['fs'])
+      expect(loaded.settings.freshAgent.defaultPlugins).toEqual(['fs'])
+      expect('agentChat' in loaded.settings).toBe(false)
 
       const updated = await store.patchSettings({
-        agentChat: { defaultPlugins: ['fs', 'search'] },
+        freshAgent: { defaultPlugins: ['fs', 'search'] },
       })
 
-      expect(updated.agentChat.defaultPlugins).toEqual(['fs', 'search'])
+      expect(updated.freshAgent.defaultPlugins).toEqual(['fs', 'search'])
     })
 
     it('terminal scrollback accepts number values', async () => {
@@ -1122,13 +1123,13 @@ describe('ConfigStore', () => {
     })
   })
 
-  describe('agentChat defaults', () => {
-    it('patchSettings merges agentChat providers', async () => {
+  describe('freshAgent defaults', () => {
+    it('patchSettings merges freshAgent providers', async () => {
       const store = new ConfigStore()
       await store.load()
 
       const updated = await store.patchSettings({
-        agentChat: {
+        freshAgent: {
           providers: {
             freshclaude: {
               modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
@@ -1137,18 +1138,19 @@ describe('ConfigStore', () => {
         },
       })
 
-      expect(updated.agentChat?.providers?.freshclaude?.modelSelection).toEqual({
+      expect(updated.freshAgent?.providers?.freshclaude?.modelSelection).toEqual({
         kind: 'tracked',
         modelId: 'opus[1m]',
       })
+      expect('agentChat' in updated).toBe(false)
     })
 
-    it('patchSettings deep-merges agentChat providers without clobbering other keys', async () => {
+    it('patchSettings deep-merges freshAgent providers without clobbering other keys', async () => {
       const store = new ConfigStore()
       await store.load()
 
       await store.patchSettings({
-        agentChat: {
+        freshAgent: {
           providers: {
             freshclaude: {
               modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
@@ -1158,15 +1160,15 @@ describe('ConfigStore', () => {
         },
       })
       const updated = await store.patchSettings({
-        agentChat: { providers: { freshclaude: { defaultPermissionMode: 'default' } } },
+        freshAgent: { providers: { freshclaude: { defaultPermissionMode: 'default' } } },
       })
 
-      expect(updated.agentChat?.providers?.freshclaude?.modelSelection).toEqual({
+      expect(updated.freshAgent?.providers?.freshclaude?.modelSelection).toEqual({
         kind: 'exact',
         modelId: 'claude-opus-4-6',
       })
-      expect(updated.agentChat?.providers?.freshclaude?.defaultPermissionMode).toBe('default')
-      expect(updated.agentChat?.providers?.freshclaude?.effort).toBe('high')
+      expect(updated.freshAgent?.providers?.freshclaude?.defaultPermissionMode).toBe('default')
+      expect(updated.freshAgent?.providers?.freshclaude?.effort).toBe('high')
     })
 
     it('patchSettings removes stored model selections and effort overrides when cleared', async () => {
@@ -1174,7 +1176,7 @@ describe('ConfigStore', () => {
       await store.load()
 
       await store.patchSettings({
-        agentChat: {
+        freshAgent: {
           providers: {
             freshclaude: {
               modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
@@ -1184,7 +1186,7 @@ describe('ConfigStore', () => {
         },
       })
       const updated = await store.patchSettings({
-        agentChat: {
+        freshAgent: {
           providers: {
             freshclaude: {
               modelSelection: undefined,
@@ -1194,15 +1196,16 @@ describe('ConfigStore', () => {
         },
       })
 
-      expect(updated.agentChat?.providers?.freshclaude?.modelSelection).toBeUndefined()
-      expect(updated.agentChat?.providers?.freshclaude?.effort).toBeUndefined()
+      expect(updated.freshAgent?.providers?.freshclaude?.modelSelection).toBeUndefined()
+      expect(updated.freshAgent?.providers?.freshclaude?.effort).toBeUndefined()
     })
 
-    it('defaultSettings includes empty agentChat providers', () => {
-      expect(defaultSettings.agentChat).toEqual({ enabled: false, defaultPlugins: [], providers: {} })
+    it('defaultSettings includes empty freshAgent providers', () => {
+      expect(defaultSettings.freshAgent).toEqual({ enabled: false, defaultPlugins: [], providers: {} })
+      expect('agentChat' in defaultSettings).toBe(false)
     })
 
-    it('migrates legacy flat freshclaude settings to agentChat.providers.freshclaude on load', async () => {
+    it('migrates legacy flat freshclaude settings to freshAgent.providers.freshclaude on load', async () => {
       await fsp.mkdir(configDir, { recursive: true })
       const legacyConfig: UserConfig = {
         version: 1,
@@ -1214,28 +1217,28 @@ describe('ConfigStore', () => {
         terminalOverrides: {},
         projectColors: {},
       }
-      delete (legacyConfig.settings as any).agentChat
       await fsp.writeFile(configPath, JSON.stringify(legacyConfig, null, 2))
 
       const store = new ConfigStore()
       const loaded = await store.load()
 
-      expect(loaded.settings.agentChat?.providers?.freshclaude?.modelSelection).toEqual({
+      expect(loaded.settings.freshAgent?.providers?.freshclaude?.modelSelection).toEqual({
         kind: 'exact',
         modelId: 'claude-opus-4-6',
       })
-      expect(loaded.settings.agentChat?.providers?.freshclaude?.effort).toBe('high')
+      expect(loaded.settings.freshAgent?.providers?.freshclaude?.effort).toBe('high')
+      expect('agentChat' in loaded.settings).toBe(false)
       expect((loaded.settings as any).freshclaude).toBeUndefined()
     })
 
-    it('merges legacy freshclaude into existing agentChat.providers.freshclaude on load', async () => {
+    it('merges legacy freshclaude into existing freshAgent.providers.freshclaude on load', async () => {
       await fsp.mkdir(configDir, { recursive: true })
       const mixedConfig: UserConfig = {
         version: 1,
         settings: {
           ...defaultSettings,
           freshclaude: { defaultModel: 'claude-opus-4-6', defaultEffort: 'high' },
-          agentChat: { providers: { freshclaude: { defaultPermissionMode: 'normal' } } },
+          freshAgent: { providers: { freshclaude: { defaultPermissionMode: 'normal' } } },
         } as any,
         sessionOverrides: {},
         terminalOverrides: {},
@@ -1246,14 +1249,15 @@ describe('ConfigStore', () => {
       const store = new ConfigStore()
       const loaded = await store.load()
 
-      // agentChat value wins over legacy for overlapping keys
-      expect(loaded.settings.agentChat?.providers?.freshclaude?.defaultPermissionMode).toBe('normal')
+      // freshAgent value wins over legacy for overlapping keys
+      expect(loaded.settings.freshAgent?.providers?.freshclaude?.defaultPermissionMode).toBe('normal')
       // Legacy-only keys are preserved
-      expect(loaded.settings.agentChat?.providers?.freshclaude?.modelSelection).toEqual({
+      expect(loaded.settings.freshAgent?.providers?.freshclaude?.modelSelection).toEqual({
         kind: 'exact',
         modelId: 'claude-opus-4-6',
       })
-      expect(loaded.settings.agentChat?.providers?.freshclaude?.effort).toBe('high')
+      expect(loaded.settings.freshAgent?.providers?.freshclaude?.effort).toBe('high')
+      expect('agentChat' in loaded.settings).toBe(false)
       // Legacy key removed
       expect((loaded.settings as any).freshclaude).toBeUndefined()
     })

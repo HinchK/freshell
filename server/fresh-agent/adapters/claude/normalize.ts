@@ -1,7 +1,10 @@
-import type { RestoreResolution } from '../../../agent-timeline/ledger.js'
-import type { AgentTimelinePage, AgentTimelineTurn } from '../../../agent-timeline/types.js'
+import type { ClaudeFreshAgentHistoryRestoreResolution } from '../../history/claude/history-ledger.js'
+import type {
+  ClaudeFreshAgentHistoryPage,
+  ClaudeFreshAgentHistoryTurn,
+} from '../../history/claude/history-types.js'
 import type { QuestionDefinition, SdkSessionState } from '../../../sdk-bridge-types.js'
-import type { SdkSessionStatus } from '../../../../shared/ws-protocol.js'
+import type { SdkSessionStatus } from '../../../sdk-bridge-types.js'
 import type { ContentBlock } from '../../../../shared/ws-protocol.js'
 import {
   FreshAgentSnapshotSchema,
@@ -72,10 +75,10 @@ export type FreshAgentClaudeSnapshot = {
   turns: FreshAgentNormalizedTurn[]
   extensions: {
     claude: {
-      timelineSessionId?: string
+      historySessionId?: string
       liveSessionId?: string
       cliSessionId?: string
-      readiness?: RestoreResolution extends infer T ? T extends { kind: 'resolved'; readiness: infer R } ? R : never : never
+      readiness?: ClaudeFreshAgentHistoryRestoreResolution extends infer T ? T extends { kind: 'resolved'; readiness: infer R } ? R : never : never
     }
   }
 }
@@ -104,7 +107,9 @@ function blockSummary(blocks: ContentBlock[]): string {
   return ''
 }
 
-export function normalizeClaudeTurn(input: Pick<AgentTimelineTurn, 'turnId' | 'messageId' | 'ordinal' | 'source' | 'message'>): FreshAgentNormalizedTurn {
+export function normalizeClaudeTurn(
+  input: Pick<ClaudeFreshAgentHistoryTurn, 'turnId' | 'messageId' | 'ordinal' | 'source' | 'message'>,
+): FreshAgentNormalizedTurn {
   return {
     id: input.turnId,
     turnId: input.turnId,
@@ -159,7 +164,7 @@ function normalizePendingQuestions(liveSession?: SdkSessionState): FreshAgentPen
 
 export function normalizeClaudeThreadSnapshot(input: {
   threadId: string
-  resolved: Extract<RestoreResolution, { kind: 'resolved' }>
+  resolved: Extract<ClaudeFreshAgentHistoryRestoreResolution, { kind: 'resolved' }>
   liveSession?: SdkSessionState
   status: SdkSessionStatus
 }): FreshAgentClaudeSnapshot {
@@ -198,7 +203,7 @@ export function normalizeClaudeThreadSnapshot(input: {
     turns,
     extensions: {
       claude: {
-        timelineSessionId: input.resolved.timelineSessionId,
+        historySessionId: input.resolved.timelineSessionId,
         liveSessionId: input.resolved.liveSessionId,
         cliSessionId: input.liveSession?.cliSessionId,
         readiness: input.resolved.readiness,
@@ -209,7 +214,7 @@ export function normalizeClaudeThreadSnapshot(input: {
 
 export function normalizeClaudeTurnPage(input: {
   threadId: string
-  page: AgentTimelinePage
+  page: ClaudeFreshAgentHistoryPage
 }): FreshAgentClaudeTurnPage {
   return FreshAgentTurnPageSchema.parse({
     sessionType: 'freshclaude',
@@ -237,7 +242,7 @@ export function normalizeClaudeTurnPage(input: {
 }
 
 export function normalizeClaudeTurnBody(input: {
-  turn: AgentTimelineTurn
+  turn: ClaudeFreshAgentHistoryTurn
   revision: number
   threadId: string
 }) {

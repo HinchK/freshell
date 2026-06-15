@@ -1,11 +1,11 @@
 import { z } from 'zod'
 
 import {
-  AgentChatModelSelectionSchema,
-  AgentChatOpaqueStringSchema,
-  type AgentChatModelSelection,
-} from './agent-chat-capabilities.js'
-import { sanitizeAgentChatPluginPaths } from './agent-chat-plugins.js'
+  FreshAgentModelSelectionSchema,
+  FreshAgentModelCapabilitiesOpaqueStringSchema,
+  type FreshAgentModelSelection,
+} from './fresh-agent-model-capabilities.js'
+import { sanitizeFreshAgentPluginPaths } from './fresh-agent-plugins.js'
 import { DEFAULT_ENABLED_CLI_PROVIDERS } from './coding-cli-defaults.js'
 import { normalizeTrimmedStringList } from './string-list.js'
 
@@ -73,7 +73,7 @@ const SIDEBAR_LOCAL_KEYS = [
   'width',
   'collapsed',
 ] as const
-const AGENT_CHAT_LOCAL_KEYS = [
+const FRESH_AGENT_LOCAL_KEYS = [
   'showThinking',
   'showTools',
   'showTimecodes',
@@ -94,7 +94,7 @@ export type CodexSandboxMode = (typeof CODEX_SANDBOX_VALUES)[number]
 export type ClaudePermissionMode = (typeof CLAUDE_PERMISSION_MODE_VALUES)[number]
 export type ExternalEditor = (typeof EXTERNAL_EDITOR_VALUES)[number]
 export type NetworkHost = (typeof NETWORK_HOST_VALUES)[number]
-export type AgentChatEffort = string
+export type FreshAgentEffort = string
 
 export type DeepPartial<T> = T extends readonly (infer U)[]
   ? U[]
@@ -117,10 +117,10 @@ export type CodingCliSettings = {
   mcpServer: boolean
 }
 
-export type AgentChatProviderDefaults = {
-  modelSelection?: AgentChatModelSelection
+export type FreshAgentProviderDefaults = {
+  modelSelection?: FreshAgentModelSelection
   defaultPermissionMode?: string
-  effort?: AgentChatEffort
+  effort?: FreshAgentEffort
   style?: FreshAgentStyle
 }
 
@@ -157,13 +157,7 @@ export type ServerSettings = {
     enabled: boolean
     initialSetupDone?: boolean
     defaultPlugins: string[]
-    providers: Partial<Record<string, AgentChatProviderDefaults>>
-  }
-  agentChat: {
-    enabled: boolean
-    initialSetupDone?: boolean
-    defaultPlugins: string[]
-    providers: Partial<Record<string, AgentChatProviderDefaults>>
+    providers: Partial<Record<string, FreshAgentProviderDefaults>>
   }
   extensions: {
     disabled: string[]
@@ -214,12 +208,6 @@ export type LocalSettings = {
     showTimecodes: boolean
     fontScale: number
   }
-  agentChat: {
-    showThinking: boolean
-    showTools: boolean
-    showTimecodes: boolean
-    fontScale: number
-  }
   notifications: {
     soundEnabled: boolean
   }
@@ -242,7 +230,6 @@ export type ResolvedSettings = {
   panes: ServerSettings['panes'] & LocalSettings['panes']
   editor: ServerSettings['editor']
   freshAgent: ServerSettings['freshAgent'] & LocalSettings['freshAgent']
-  agentChat: ServerSettings['agentChat'] & LocalSettings['agentChat']
   extensions: ServerSettings['extensions']
   network: ServerSettings['network']
 }
@@ -302,34 +289,78 @@ function mergeRecordOfObjects<T extends Record<string, unknown>>(
   return merged
 }
 
+type LegacyFreshAgentSettingsInput = Partial<ServerSettings['freshAgent'] & LocalSettings['freshAgent']> & {
+  providers?: Record<string, unknown>
+}
+
+type FreshAgentSettingsPatchInput = Partial<ServerSettings['freshAgent'] & LocalSettings['freshAgent']> & {
+  providers?: Partial<Record<string, FreshAgentProviderDefaults>>
+}
+
+type FreshAgentAliasMergeOptions = {
+  canonicalWins?: boolean
+  fieldMergeProviders?: boolean
+  preserveExplicitEmptyArrays?: boolean
+}
+
+export function readLegacyFreshAgentSettingsInput(candidate: Record<string, unknown>): LegacyFreshAgentSettingsInput | null {
+  return isRecord(candidate.agentChat)
+    ? candidate.agentChat as LegacyFreshAgentSettingsInput
+    : null
+}
+
 function mergeFreshAgentAliasObjects(
-  agentChatInput: Record<string, unknown> | null | undefined,
-  freshAgentInput: Record<string, unknown> | null | undefined,
+  legacyFreshAgentInput: Record<string, unknown> | null | undefined,
+  canonicalFreshAgentInput: Record<string, unknown> | null | undefined,
+  options: FreshAgentAliasMergeOptions = {},
 ): Record<string, unknown> | null {
-  if (!agentChatInput && !freshAgentInput) {
+  if (!legacyFreshAgentInput && !canonicalFreshAgentInput) {
     return null
   }
 
-  const merged: Record<string, unknown> = { ...(agentChatInput || {}), ...(freshAgentInput || {}) }
-  const rawAgentChatProviders = agentChatInput && isRecord(agentChatInput.providers)
-    ? agentChatInput.providers
+  const canonicalWins = options.canonicalWins ?? true
+  const fieldMergeProviders = options.fieldMergeProviders ?? true
+  const preserveExplicitEmptyArrays = options.preserveExplicitEmptyArrays ?? true
+  const lowerPriorityInput = canonicalWins ? legacyFreshAgentInput : canonicalFreshAgentInput
+  const higherPriorityInput = canonicalWins ? canonicalFreshAgentInput : legacyFreshAgentInput
+  const merged: Record<string, unknown> = { ...(lowerPriorityInput || {}), ...(higherPriorityInput || {}) }
+
+  if (
+    preserveExplicitEmptyArrays
+    && higherPriorityInput
+    && hasOwn(higherPriorityInput, 'defaultPlugins')
+    && Array.isArray(higherPriorityInput.defaultPlugins)
+  ) {
+    merged.defaultPlugins = higherPriorityInput.defaultPlugins
+  }
+
+  const rawLegacyProviders = legacyFreshAgentInput && isRecord(legacyFreshAgentInput.providers)
+    ? legacyFreshAgentInput.providers
     : null
-  const rawFreshAgentProviders = freshAgentInput && isRecord(freshAgentInput.providers)
-    ? freshAgentInput.providers
+  const rawCanonicalProviders = canonicalFreshAgentInput && isRecord(canonicalFreshAgentInput.providers)
+    ? canonicalFreshAgentInput.providers
     : null
 
-  if (rawAgentChatProviders || rawFreshAgentProviders) {
-    const providers: Record<string, unknown> = {}
-    for (const [providerName, providerPatch] of Object.entries(rawAgentChatProviders || {})) {
-      providers[providerName] = providerPatch
+  if (rawLegacyProviders || rawCanonicalProviders) {
+    if (fieldMergeProviders) {
+      const providers: Record<string, unknown> = {}
+      const firstProviders = canonicalWins ? rawLegacyProviders : rawCanonicalProviders
+      const secondProviders = canonicalWins ? rawCanonicalProviders : rawLegacyProviders
+      for (const [providerName, providerPatch] of Object.entries(firstProviders || {})) {
+        providers[providerName] = providerPatch
+      }
+      for (const [providerName, providerPatch] of Object.entries(secondProviders || {})) {
+        const existingProviderPatch = providers[providerName]
+        providers[providerName] = isRecord(existingProviderPatch) && isRecord(providerPatch)
+          ? { ...existingProviderPatch, ...providerPatch }
+          : providerPatch
+      }
+      merged.providers = providers
+    } else {
+      merged.providers = canonicalWins
+        ? rawCanonicalProviders ?? rawLegacyProviders
+        : rawLegacyProviders ?? rawCanonicalProviders
     }
-    for (const [providerName, providerPatch] of Object.entries(rawFreshAgentProviders || {})) {
-      const existingProviderPatch = providers[providerName]
-      providers[providerName] = isRecord(existingProviderPatch) && isRecord(providerPatch)
-        ? { ...existingProviderPatch, ...providerPatch }
-        : providerPatch
-    }
-    merged.providers = providers
   }
 
   return merged
@@ -563,27 +594,27 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     }
   }
 
-  if (isRecord(patch.agentChat)) {
-    const agentChat: LocalSettingsPatch['agentChat'] = {}
-    if (typeof patch.agentChat.showThinking === 'boolean') {
-      agentChat.showThinking = patch.agentChat.showThinking as boolean
+  if (isRecord(patch.freshAgent)) {
+    const freshAgent: LocalSettingsPatch['freshAgent'] = {}
+    if (typeof patch.freshAgent.showThinking === 'boolean') {
+      freshAgent.showThinking = patch.freshAgent.showThinking as boolean
     }
-    if (typeof patch.agentChat.showTools === 'boolean') {
-      agentChat.showTools = patch.agentChat.showTools as boolean
+    if (typeof patch.freshAgent.showTools === 'boolean') {
+      freshAgent.showTools = patch.freshAgent.showTools as boolean
     }
-    if (typeof patch.agentChat.showTimecodes === 'boolean') {
-      agentChat.showTimecodes = patch.agentChat.showTimecodes as boolean
+    if (typeof patch.freshAgent.showTimecodes === 'boolean') {
+      freshAgent.showTimecodes = patch.freshAgent.showTimecodes as boolean
     }
     const normalizedFontScale = normalizeClampedNumber(
-      patch.agentChat.fontScale,
+      patch.freshAgent.fontScale,
       FRESH_AGENT_FONT_SCALE_MIN,
       FRESH_AGENT_FONT_SCALE_MAX,
     )
     if (normalizedFontScale !== undefined) {
-      agentChat.fontScale = normalizedFontScale
+      freshAgent.fontScale = normalizedFontScale
     }
-    if (Object.keys(agentChat).length > 0) {
-      normalized.agentChat = agentChat
+    if (Object.keys(freshAgent).length > 0) {
+      normalized.freshAgent = freshAgent
     }
   }
 
@@ -637,23 +668,23 @@ function createCodingCliProviderConfigPatchSchema() {
     .strict()
 }
 
-function createAgentChatProviderDefaultsSchema() {
+function createFreshAgentProviderDefaultsSchema() {
   return z
     .object({
-      modelSelection: AgentChatModelSelectionSchema.optional(),
+      modelSelection: FreshAgentModelSelectionSchema.optional(),
       defaultPermissionMode: z.string().optional(),
-      effort: AgentChatOpaqueStringSchema.optional(),
+      effort: FreshAgentModelCapabilitiesOpaqueStringSchema.optional(),
       style: FreshAgentStyleSchema.optional(),
     })
     .strict()
 }
 
-function createAgentChatProviderDefaultsPatchSchema() {
+function createFreshAgentProviderDefaultsPatchSchema() {
   return z
     .object({
-      modelSelection: AgentChatModelSelectionSchema.nullable().optional(),
+      modelSelection: FreshAgentModelSelectionSchema.nullable().optional(),
       defaultPermissionMode: z.string().optional(),
-      effort: z.union([AgentChatOpaqueStringSchema, z.literal('')]).nullable().optional(),
+      effort: z.union([FreshAgentModelCapabilitiesOpaqueStringSchema, z.literal('')]).nullable().optional(),
       style: FreshAgentStyleSchema.optional(),
     })
     .strict()
@@ -692,13 +723,7 @@ export function buildServerSettingsSchema(validCliProviders?: readonly string[])
       enabled: z.boolean(),
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()),
-      providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()),
-    }).strict(),
-    agentChat: z.object({
-      enabled: z.boolean(),
-      initialSetupDone: z.boolean().optional(),
-      defaultPlugins: z.array(z.string()),
-      providers: z.record(z.string(), createAgentChatProviderDefaultsSchema()),
+      providers: z.record(z.string(), createFreshAgentProviderDefaultsPatchSchema()),
     }).strict(),
     extensions: z.object({
       disabled: z.array(z.string()),
@@ -743,13 +768,7 @@ export function buildServerSettingsPatchSchema(validCliProviders?: readonly stri
       enabled: z.coerce.boolean().optional(),
       initialSetupDone: z.boolean().optional(),
       defaultPlugins: z.array(z.string()).optional(),
-      providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()).optional(),
-    }).strict().optional(),
-    agentChat: z.object({
-      enabled: z.coerce.boolean().optional(),
-      initialSetupDone: z.boolean().optional(),
-      defaultPlugins: z.array(z.string()).optional(),
-      providers: z.record(z.string(), createAgentChatProviderDefaultsPatchSchema()).optional(),
+      providers: z.record(z.string(), createFreshAgentProviderDefaultsPatchSchema()).optional(),
     }).strict().optional(),
     extensions: z.object({
       disabled: z.array(z.string()).optional(),
@@ -803,11 +822,6 @@ export function createDefaultServerSettings(options: SettingsDefaultsOptions = {
       defaultPlugins: [],
       providers: {},
     },
-    agentChat: {
-      enabled: false,
-      defaultPlugins: [],
-      providers: {},
-    },
     extensions: {
       disabled: [],
     },
@@ -856,12 +870,6 @@ export const defaultLocalSettings: LocalSettings = {
     showTimecodes: false,
     fontScale: FRESH_AGENT_FONT_SCALE_DEFAULT,
   },
-  agentChat: {
-    showThinking: false,
-    showTools: false,
-    showTimecodes: false,
-    fontScale: FRESH_AGENT_FONT_SCALE_DEFAULT,
-  },
   notifications: {
     soundEnabled: true,
   },
@@ -871,17 +879,122 @@ export function createDefaultResolvedSettings(options: SettingsDefaultsOptions =
   return composeResolvedSettings(createDefaultServerSettings(options), defaultLocalSettings)
 }
 
+function sanitizeFreshAgentLocalSettingsPatchInput(
+  rawFreshAgent: Record<string, unknown>,
+): LocalSettingsPatch['freshAgent'] {
+  const freshAgent: LocalSettingsPatch['freshAgent'] = {}
+  if (typeof rawFreshAgent.showThinking === 'boolean') {
+    freshAgent.showThinking = rawFreshAgent.showThinking
+  }
+  if (typeof rawFreshAgent.showTools === 'boolean') {
+    freshAgent.showTools = rawFreshAgent.showTools
+  }
+  if (typeof rawFreshAgent.showTimecodes === 'boolean') {
+    freshAgent.showTimecodes = rawFreshAgent.showTimecodes
+  }
+  const normalizedFontScale = normalizeClampedNumber(
+    rawFreshAgent.fontScale,
+    FRESH_AGENT_FONT_SCALE_MIN,
+    FRESH_AGENT_FONT_SCALE_MAX,
+  )
+  if (normalizedFontScale !== undefined) {
+    freshAgent.fontScale = normalizedFontScale
+  }
+  return Object.keys(freshAgent).length > 0 ? freshAgent : undefined
+}
+
+function sanitizeFreshAgentServerSettingsPatchInput(
+  rawFreshAgent: Record<string, unknown>,
+): ServerSettingsPatch['freshAgent'] {
+  const freshAgent: ServerSettingsPatch['freshAgent'] = {}
+  const freshAgentProviderDefaultsPatchSchema = createFreshAgentProviderDefaultsPatchSchema()
+
+  if (hasOwn(rawFreshAgent, 'enabled')) {
+    freshAgent.enabled = !!rawFreshAgent.enabled
+  }
+  if (hasOwn(rawFreshAgent, 'initialSetupDone') && typeof rawFreshAgent.initialSetupDone === 'boolean') {
+    freshAgent.initialSetupDone = rawFreshAgent.initialSetupDone
+  }
+  if (hasOwn(rawFreshAgent, 'defaultPlugins') && Array.isArray(rawFreshAgent.defaultPlugins)) {
+    freshAgent.defaultPlugins = sanitizeFreshAgentPluginPaths(rawFreshAgent.defaultPlugins)
+  }
+  if (isRecord(rawFreshAgent.providers)) {
+    const providers: NonNullable<NonNullable<ServerSettingsPatch['freshAgent']>['providers']> = {}
+    for (const [providerName, providerPatch] of Object.entries(rawFreshAgent.providers)) {
+      const normalizedProviderPatchInput = normalizeLegacyFreshAgentProviderDefaultsInput(providerPatch)
+      const parsed = freshAgentProviderDefaultsPatchSchema.safeParse(
+        normalizedProviderPatchInput,
+      )
+      if (
+        parsed.success
+        && isRecord(normalizedProviderPatchInput)
+        && Object.keys(normalizedProviderPatchInput).length > 0
+      ) {
+        const normalizedProviderPatch: FreshAgentProviderDefaults = {}
+        if (hasOwn(normalizedProviderPatchInput, 'modelSelection')) {
+          normalizedProviderPatch.modelSelection = parsed.data.modelSelection ?? undefined
+        }
+        if (hasOwn(normalizedProviderPatchInput, 'defaultPermissionMode')) {
+          normalizedProviderPatch.defaultPermissionMode = parsed.data.defaultPermissionMode
+        }
+        if (hasOwn(normalizedProviderPatchInput, 'effort')) {
+          const parsedEffort = parsed.data.effort
+          normalizedProviderPatch.effort = typeof parsedEffort === 'string' && parsedEffort.trim().length === 0
+            ? undefined
+            : parsedEffort ?? undefined
+        }
+        if (hasOwn(normalizedProviderPatchInput, 'style')) {
+          normalizedProviderPatch.style = parsed.data.style
+        }
+        providers[providerName] = normalizedProviderPatch
+      }
+    }
+    if (Object.keys(providers).length > 0) {
+      freshAgent.providers = providers
+    }
+  }
+
+  return Object.keys(freshAgent).length > 0 ? freshAgent : undefined
+}
+
+function sanitizeFreshAgentSettingsPatchInput(
+  rawFreshAgent: Record<string, unknown>,
+): FreshAgentSettingsPatchInput | undefined {
+  const serverFreshAgent = sanitizeFreshAgentServerSettingsPatchInput(rawFreshAgent)
+  const localFreshAgent = sanitizeFreshAgentLocalSettingsPatchInput(rawFreshAgent)
+  const freshAgent = {
+    ...(serverFreshAgent || {}),
+    ...(localFreshAgent || {}),
+  } as FreshAgentSettingsPatchInput
+  return Object.keys(freshAgent).length > 0 ? freshAgent : undefined
+}
+
+export function migrateLegacyFreshAgentSettingsInput(
+  candidate: Record<string, unknown>,
+): Pick<ServerSettingsPatch & LocalSettingsPatch, 'freshAgent'> {
+  const legacy = readLegacyFreshAgentSettingsInput(candidate)
+  const canonical = isRecord(candidate.freshAgent) ? candidate.freshAgent : null
+  const merged = mergeFreshAgentAliasObjects(legacy, canonical, {
+    canonicalWins: true,
+    fieldMergeProviders: true,
+    preserveExplicitEmptyArrays: true,
+  })
+  const freshAgent = merged ? sanitizeFreshAgentSettingsPatchInput(merged) : undefined
+  return (freshAgent ? { freshAgent } : {}) as Pick<ServerSettingsPatch & LocalSettingsPatch, 'freshAgent'>
+}
+
 function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettingsPatch {
   if (!isRecord(patch)) {
     return {}
   }
 
-  const candidate = stripLocalSettings(patch as Record<string, unknown>)
+  const candidate = stripLocalSettings(patch as Record<string, unknown>, {
+    migrateLegacyFreshAgentAlias: false,
+  })
   const sanitized: ServerSettingsPatch = {}
   // Merge/load paths must preserve runtime provider names that were already accepted elsewhere.
   const cliProviderNameSchema = z.string().min(1)
   const codingCliProviderConfigPatchSchema = createCodingCliProviderConfigPatchSchema()
-  const agentChatProviderDefaultsPatchSchema = createAgentChatProviderDefaultsPatchSchema()
 
   if (
     hasOwn(candidate, 'defaultCwd')
@@ -1021,59 +1134,10 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
     }
   }
 
-  const rawAgentChatInput = isRecord(candidate.agentChat) ? candidate.agentChat : null
-  const rawFreshAgentInput = isRecord(candidate.freshAgent) ? candidate.freshAgent : null
-  const rawFreshAgent = mergeFreshAgentAliasObjects(rawAgentChatInput, rawFreshAgentInput)
-
-  if (rawFreshAgent) {
-    const freshAgent: ServerSettingsPatch['freshAgent'] = {}
-    if (hasOwn(rawFreshAgent, 'enabled')) {
-      freshAgent.enabled = !!rawFreshAgent.enabled
-    }
-    if (hasOwn(rawFreshAgent, 'initialSetupDone') && typeof rawFreshAgent.initialSetupDone === 'boolean') {
-      freshAgent.initialSetupDone = rawFreshAgent.initialSetupDone
-    }
-    if (hasOwn(rawFreshAgent, 'defaultPlugins') && Array.isArray(rawFreshAgent.defaultPlugins)) {
-      freshAgent.defaultPlugins = sanitizeAgentChatPluginPaths(rawFreshAgent.defaultPlugins)
-    }
-    if (isRecord(rawFreshAgent.providers)) {
-      const providers: NonNullable<ServerSettingsPatch['freshAgent']>['providers'] = {}
-      for (const [providerName, providerPatch] of Object.entries(rawFreshAgent.providers)) {
-        const normalizedProviderPatchInput = normalizeLegacyAgentChatProviderDefaultsInput(providerPatch)
-        const parsed = agentChatProviderDefaultsPatchSchema.safeParse(
-          normalizedProviderPatchInput,
-        )
-        if (
-          parsed.success
-          && isRecord(normalizedProviderPatchInput)
-          && Object.keys(normalizedProviderPatchInput).length > 0
-        ) {
-          const normalizedProviderPatch: AgentChatProviderDefaults = {}
-          if (hasOwn(normalizedProviderPatchInput, 'modelSelection')) {
-            normalizedProviderPatch.modelSelection = parsed.data.modelSelection ?? undefined
-          }
-          if (hasOwn(normalizedProviderPatchInput, 'defaultPermissionMode')) {
-            normalizedProviderPatch.defaultPermissionMode = parsed.data.defaultPermissionMode
-          }
-          if (hasOwn(normalizedProviderPatchInput, 'effort')) {
-            const parsedEffort = parsed.data.effort
-            normalizedProviderPatch.effort = typeof parsedEffort === 'string' && parsedEffort.trim().length === 0
-              ? undefined
-              : parsedEffort ?? undefined
-          }
-          if (hasOwn(normalizedProviderPatchInput, 'style')) {
-            normalizedProviderPatch.style = parsed.data.style
-          }
-          providers[providerName] = normalizedProviderPatch
-        }
-      }
-      if (Object.keys(providers).length > 0) {
-        freshAgent.providers = providers
-      }
-    }
-    if (Object.keys(freshAgent).length > 0) {
+  if (isRecord(candidate.freshAgent)) {
+    const freshAgent = sanitizeFreshAgentServerSettingsPatchInput(candidate.freshAgent)
+    if (freshAgent) {
       sanitized.freshAgent = freshAgent
-      sanitized.agentChat = freshAgent
     }
   }
 
@@ -1108,7 +1172,7 @@ function sanitizeServerSettingsPatch(patch: ServerSettingsPatch): ServerSettings
   return sanitized
 }
 
-function normalizeLegacyAgentChatProviderDefaultsInput(
+function normalizeLegacyFreshAgentProviderDefaultsInput(
   providerPatch: unknown,
 ): Record<string, unknown> | unknown {
   if (!isRecord(providerPatch)) {
@@ -1145,7 +1209,7 @@ function normalizeLegacyAgentChatProviderDefaultsInput(
 export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsPatch): ServerSettings {
   const normalizedPatch = sanitizeServerSettingsPatch(patch)
   const codingCliPatch = normalizedPatch.codingCli
-  const freshAgentPatch = (normalizedPatch.freshAgent ?? normalizedPatch.agentChat) as
+  const freshAgentPatch = normalizedPatch.freshAgent as
     | Partial<ServerSettings['freshAgent']>
     | undefined
 
@@ -1181,16 +1245,9 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
     freshAgent: {
       ...mergeDefined(base.freshAgent, freshAgentPatch),
       defaultPlugins: hasOwn(freshAgentPatch, 'defaultPlugins')
-        ? sanitizeAgentChatPluginPaths(freshAgentPatch?.defaultPlugins)
+        ? sanitizeFreshAgentPluginPaths(freshAgentPatch?.defaultPlugins)
         : base.freshAgent.defaultPlugins,
       providers: mergeRecordOfObjects(base.freshAgent.providers, freshAgentPatch?.providers),
-    },
-    agentChat: {
-      ...mergeDefined(base.agentChat, freshAgentPatch),
-      defaultPlugins: hasOwn(freshAgentPatch, 'defaultPlugins')
-        ? sanitizeAgentChatPluginPaths(freshAgentPatch?.defaultPlugins)
-        : base.agentChat.defaultPlugins,
-      providers: mergeRecordOfObjects(base.agentChat.providers, freshAgentPatch?.providers),
     },
     extensions: {
       disabled: hasOwn(normalizedPatch.extensions, 'disabled')
@@ -1202,7 +1259,12 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
 }
 
 export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings {
-  const freshAgentPatch = patch?.freshAgent ?? patch?.agentChat
+  const migratedFreshAgentPatch = patch
+    ? migrateLegacyFreshAgentSettingsInput(patch as Record<string, unknown>).freshAgent as FreshAgentSettingsPatchInput | undefined
+    : undefined
+  const freshAgentPatch = sanitizeFreshAgentLocalSettingsPatchInput(
+    isRecord(migratedFreshAgentPatch) ? migratedFreshAgentPatch : {},
+  )
   return {
     ...defaultLocalSettings,
     ...(hasOwn(patch, 'theme') ? { theme: patch?.theme ?? defaultLocalSettings.theme } : {}),
@@ -1215,7 +1277,6 @@ export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings 
       worktreeGrouping: normalizeWorktreeGrouping(patch?.sidebar?.worktreeGrouping),
     },
     freshAgent: normalizeLocalFreshAgent(mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch)),
-    agentChat: normalizeLocalFreshAgent(mergeDefined(defaultLocalSettings.agentChat, freshAgentPatch)),
     notifications: mergeDefined(defaultLocalSettings.notifications, patch?.notifications),
   }
 }
@@ -1256,13 +1317,18 @@ export function mergeLocalSettings(base: LocalSettingsPatch | undefined, patch: 
     next.sidebar = sidebar as LocalSettingsPatch['sidebar']
   }
 
+  const baseFreshAgent = base
+    ? migrateLegacyFreshAgentSettingsInput(base as Record<string, unknown>).freshAgent as FreshAgentSettingsPatchInput | undefined
+    : undefined
+  const patchFreshAgent = migrateLegacyFreshAgentSettingsInput(patch as Record<string, unknown>).freshAgent as
+    | FreshAgentSettingsPatchInput
+    | undefined
   const freshAgent = mergeDefined(
-    (base?.freshAgent || base?.agentChat || {}) as Record<string, unknown>,
-    (patch.freshAgent || patch.agentChat) as Record<string, unknown> | undefined,
+    (sanitizeFreshAgentLocalSettingsPatchInput(isRecord(baseFreshAgent) ? baseFreshAgent : {}) || {}) as Record<string, unknown>,
+    (sanitizeFreshAgentLocalSettingsPatchInput(isRecord(patchFreshAgent) ? patchFreshAgent : {}) || {}) as Record<string, unknown>,
   )
   if (Object.keys(freshAgent).length > 0) {
     next.freshAgent = freshAgent as LocalSettingsPatch['freshAgent']
-    next.agentChat = freshAgent as LocalSettingsPatch['agentChat']
   }
 
   const notifications = mergeDefined(
@@ -1311,12 +1377,6 @@ export function composeResolvedSettings(server: ServerSettings, local: LocalSett
       providers: mergeRecordOfObjects(server.freshAgent.providers),
       ...local.freshAgent,
     },
-    agentChat: {
-      ...server.agentChat,
-      defaultPlugins: [...server.agentChat.defaultPlugins],
-      providers: mergeRecordOfObjects(server.agentChat.providers),
-      ...local.agentChat,
-    },
     extensions: {
       disabled: [...server.extensions.disabled],
     },
@@ -1351,14 +1411,12 @@ export function extractLegacyLocalSettingsSeed(
     }
     maybeAssignNested(patch, 'sidebar', sidebarPatch)
   }
-  const rawFreshAgentLocal = mergeFreshAgentAliasObjects(
-    isRecord(raw.agentChat) ? raw.agentChat : null,
-    isRecord(raw.freshAgent) ? raw.freshAgent : null,
-  )
-  if (rawFreshAgentLocal) {
-    const freshAgentPatch = pickKeys(rawFreshAgentLocal, AGENT_CHAT_LOCAL_KEYS)
+  const migratedFreshAgentLocal = migrateLegacyFreshAgentSettingsInput(raw).freshAgent as
+    | FreshAgentSettingsPatchInput
+    | undefined
+  if (migratedFreshAgentLocal) {
+    const freshAgentPatch = pickKeys(migratedFreshAgentLocal, FRESH_AGENT_LOCAL_KEYS)
     maybeAssignNested(patch, 'freshAgent', freshAgentPatch)
-    maybeAssignNested(patch, 'agentChat', freshAgentPatch)
   }
   if (isRecord(raw.notifications)) {
     maybeAssignNested(patch, 'notifications', pickKeys(raw.notifications, ['soundEnabled']))
@@ -1369,12 +1427,13 @@ export function extractLegacyLocalSettingsSeed(
 
 export function stripLocalSettings(
   raw: Record<string, unknown> | null | undefined,
+  options: { migrateLegacyFreshAgentAlias?: boolean } = {},
 ): Record<string, unknown> {
   if (!raw) {
     return {}
   }
 
-  const next = omitKeys(raw, ['theme', 'uiScale', 'notifications'])
+  const next = omitKeys(raw, ['theme', 'uiScale', 'notifications', 'agentChat'])
 
   if (isRecord(raw.terminal)) {
     const strippedTerminal = omitKeys(raw.terminal, TERMINAL_LOCAL_KEYS)
@@ -1403,18 +1462,18 @@ export function stripLocalSettings(
     }
   }
 
-  const rawFreshAgent = mergeFreshAgentAliasObjects(
-    isRecord(raw.agentChat) ? raw.agentChat : null,
-    isRecord(raw.freshAgent) ? raw.freshAgent : null,
-  )
-  if (rawFreshAgent) {
-    const strippedFreshAgent = omitKeys(rawFreshAgent, AGENT_CHAT_LOCAL_KEYS)
+  const shouldMigrateFreshAgentAlias = options.migrateLegacyFreshAgentAlias ?? true
+  const migratedFreshAgent = shouldMigrateFreshAgentAlias
+    ? migrateLegacyFreshAgentSettingsInput(raw).freshAgent as FreshAgentSettingsPatchInput | undefined
+    : isRecord(raw.freshAgent)
+      ? sanitizeFreshAgentSettingsPatchInput(raw.freshAgent)
+      : undefined
+  if (migratedFreshAgent) {
+    const strippedFreshAgent = omitKeys(migratedFreshAgent, FRESH_AGENT_LOCAL_KEYS)
     if (Object.keys(strippedFreshAgent).length > 0) {
       next.freshAgent = strippedFreshAgent
-      next.agentChat = strippedFreshAgent
     } else {
       delete next.freshAgent
-      delete next.agentChat
     }
   }
 

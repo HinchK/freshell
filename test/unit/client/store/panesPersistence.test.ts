@@ -792,7 +792,7 @@ describe('legacy agent-chat display settings migration', () => {
     resetPersistedLayoutCacheForTests()
   })
 
-  it('migrates showThinking/showTools/showTimecodes from agent-chat panes to browser preferences', async () => {
+  it('preserves showThinking/showTools/showTimecodes from agent-chat panes as pane overrides', async () => {
     localStorageMock.clear()
     localStorage.setItem('freshell.layout.v3', JSON.stringify({
       version: 3,
@@ -826,16 +826,15 @@ describe('legacy agent-chat display settings migration', () => {
     const store = configureStore({ reducer: { panes: freshPanesReducer } })
     const content = (store.getState().panes.layouts['tab1'] as any).content
 
-    expect(content.showThinking).toBeUndefined()
-    expect(content.showTools).toBeUndefined()
-    expect(content.showTimecodes).toBeUndefined()
-
-    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
-    expect(bp.settings.agentChat).toEqual({
+    expect(content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       showThinking: true,
       showTools: true,
       showTimecodes: true,
     })
+    expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
   })
 
   it('migrates legacy display settings from panes inside splits', async () => {
@@ -883,10 +882,11 @@ describe('legacy agent-chat display settings migration', () => {
     const store = configureStore({ reducer: { panes: freshPanesReducer } })
     const split = store.getState().panes.layouts['tab1'] as any
 
-    expect(split.children[1].content.showTools).toBeUndefined()
-
-    const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
-    expect(bp.settings.agentChat.showTools).toBe(true)
+    expect(split.children[1].content).toMatchObject({
+      kind: 'fresh-agent',
+      showTools: true,
+    })
+    expect(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY)).toBeNull()
   })
 
   it('does not touch panes that have no legacy fields', async () => {
@@ -950,12 +950,17 @@ describe('legacy agent-chat display settings migration', () => {
 
     vi.resetModules()
     const { default: freshPanesReducer } = await import('../../../../src/store/panesSlice')
-    configureStore({ reducer: { panes: freshPanesReducer } })
+    const store = configureStore({ reducer: { panes: freshPanesReducer } })
 
     const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
     expect(bp.settings.theme).toBe('dark')
-    expect(bp.tabs.closedTabRetentionDays).toBe(30)
-    expect(bp.settings.agentChat.showThinking).toBe(true)
+    expect(bp.tabs.searchRangeDays).toBe(60)
+    expect(bp.settings.freshAgent).toBeUndefined()
+    const content = (store.getState().panes.layouts['tab1'] as any).content
+    expect(content).toMatchObject({
+      kind: 'fresh-agent',
+      showThinking: true,
+    })
   })
 })
 

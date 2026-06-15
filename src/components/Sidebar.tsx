@@ -9,7 +9,8 @@ import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { addPane, setActivePane, updatePaneTitle } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -20,7 +21,7 @@ import { fetchSessionWindow } from '@/store/sessionsThunks'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { collectBusySessionKeys } from '@/lib/pane-activity'
 import { selectPrimaryTerminalIdForTab } from '@/store/selectors/paneTerminalSelectors'
-import type { ChatSessionState } from '@/store/agentChatTypes'
+import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 
 const EMPTY_TERMINALS: BackgroundTerminal[] = []
@@ -28,7 +29,7 @@ const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
-const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
+const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 
 function sameSessionRef(
@@ -322,7 +323,7 @@ export default function Sidebar({
     claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
     opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
     paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
-    agentChatSessions: state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS,
+    freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
   }), shallowEqual)
   const busySessionKeySet = useMemo(() => new Set(busySessionKeys), [busySessionKeys])
 
@@ -358,11 +359,12 @@ export default function Sidebar({
       return
     }
 
-    // Resolve provider settings for agent-chat panes
+    // Resolve provider settings for fresh-agent panes
     const sessionType = item.sessionType || provider
-    const agentConfig = getAgentChatProviderConfig(sessionType)
-    const providerSettings = agentConfig
-      ? state.settings.settings.agentChat?.providers?.[agentConfig.name]
+    const freshAgentType = resolveFreshAgentType(sessionType)
+    const freshAgentProviderConfig = getFreshAgentProviderConfig(sessionType)
+    const freshAgentProviderSettings = freshAgentType || freshAgentProviderConfig
+      ? state.settings.settings.freshAgent?.providers?.[sessionType]
       : undefined
 
     // 2. Fallback: no active tab or active tab has no layout → create new tab
@@ -412,7 +414,7 @@ export default function Sidebar({
         sessionType,
         sessionId: item.sessionId,
         cwd: item.cwd,
-        agentChatProviderSettings: providerSettings,
+        freshAgentProviderSettings,
         liveTerminal: runningTerminalId && localServerInstanceId
           ? { terminalId: runningTerminalId, serverInstanceId: localServerInstanceId }
           : undefined,

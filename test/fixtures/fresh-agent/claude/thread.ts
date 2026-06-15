@@ -1,4 +1,4 @@
-import type { RestoreResolution } from '../../../../../server/agent-timeline/ledger.js'
+import type { ClaudeFreshAgentHistoryRestoreResolution } from '../../../../../server/fresh-agent/history/claude/history-ledger.js'
 import type { SdkSessionState } from '../../../../../server/sdk-bridge-types.js'
 import type { ChatMessage } from '../../../../../server/session-history-loader.js'
 
@@ -69,7 +69,7 @@ export function makeClaudeLiveSession(overrides: Partial<SdkSessionState> = {}):
   }
 }
 
-export function makeClaudeRestoreResolution(): Extract<RestoreResolution, { kind: 'resolved' }> {
+export function makeClaudeRestoreResolution(): Extract<ClaudeFreshAgentHistoryRestoreResolution, { kind: 'resolved' }> {
   return {
     kind: 'resolved',
     queryId: 'sdk-claude-1',

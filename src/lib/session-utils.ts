@@ -101,9 +101,6 @@ function extractSessionLocatorLiveHandleHint(content: PaneContent): boolean {
   if (content.kind === 'terminal') {
     return isNonEmptyString(content.terminalId)
   }
-  if (content.kind === 'agent-chat') {
-    return isNonEmptyString(content.sessionId)
-  }
   return false
 }
 
@@ -121,12 +118,6 @@ function extractSessionLocators(content: PaneContent): Array<{
     locators.push(explicit)
   }
 
-  if (content.kind === 'agent-chat') {
-    const sessionId = content.resumeSessionId
-    if (!sessionId || !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)
-    locators.push({ provider: 'claude', sessionId })
-    return dedupeBy(locators, locatorIdentity)
-  }
   if (content.kind === 'fresh-agent') {
     const sessionId = content.resumeSessionId
     const provider = resolveFreshAgentType(content.sessionType)?.runtimeProvider ?? content.provider
@@ -379,7 +370,7 @@ export function findTabIdForSession(
 
 /**
  * Find the tab and pane that contain a specific session.
- * Walks all tabs' pane trees looking for a pane (terminal, agent-chat, or fresh-agent) matching the provider + sessionId.
+ * Walks all tabs' pane trees looking for a terminal or fresh-agent pane matching the provider + sessionId.
  * Falls back to tab-level resumeSessionId when no layout exists (early boot/rehydration).
  */
 export function findPaneForSession(

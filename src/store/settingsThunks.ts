@@ -21,7 +21,7 @@ function isServerSettings(value: unknown): value is ServerSettings {
     && isRecord(value.sidebar)
     && isRecord(value.codingCli)
     && isRecord(value.editor)
-    && isRecord(value.agentChat)
+    && isRecord(value.freshAgent)
     && isRecord(value.network)
   )
 }
@@ -44,7 +44,7 @@ function normalizeCodingCliProviderPatchForApi(
   return normalizedProviderPatch
 }
 
-function normalizeAgentChatProviderPatchForApi(
+function normalizeFreshAgentProviderPatchForApi(
   providerPatch: Record<string, unknown>,
 ): Record<string, unknown> {
   const normalizedProviderPatch = { ...providerPatch }
@@ -72,7 +72,7 @@ function normalizeAgentProviderDefaultsPatchForApiSection(section: unknown): unk
     providers: Object.fromEntries(
       Object.entries(section.providers).map(([providerName, providerPatch]) => [
         providerName,
-        isRecord(providerPatch) ? normalizeAgentChatProviderPatchForApi(providerPatch) : providerPatch,
+        isRecord(providerPatch) ? normalizeFreshAgentProviderPatchForApi(providerPatch) : providerPatch,
       ]),
     ),
   }
@@ -96,15 +96,11 @@ function removeUndefinedProperties(value: unknown): unknown {
 export function normalizeServerSettingsPatchForApi(patch: ServerSettingsPatch): ServerSettingsPatch | Record<string, unknown> {
   const patchRecord = isRecord(patch) ? patch : {}
   const hadFreshAgent = Object.prototype.hasOwnProperty.call(patchRecord, 'freshAgent')
-  const hadAgentChat = Object.prototype.hasOwnProperty.call(patchRecord, 'agentChat')
   const normalizedPatch = isRecord(patch)
-    ? { ...stripLocalSettings(patch) }
+    ? { ...stripLocalSettings(patch, { migrateLegacyFreshAgentAlias: false }) }
     : {}
   if (!hadFreshAgent) {
     delete normalizedPatch.freshAgent
-  }
-  if (!hadAgentChat) {
-    delete normalizedPatch.agentChat
   }
 
   if (Object.prototype.hasOwnProperty.call(normalizedPatch, 'defaultCwd') && normalizedPatch.defaultCwd == null) {
@@ -124,9 +120,6 @@ export function normalizeServerSettingsPatchForApi(patch: ServerSettingsPatch): 
 
   if (Object.prototype.hasOwnProperty.call(normalizedPatch, 'freshAgent')) {
     normalizedPatch.freshAgent = normalizeAgentProviderDefaultsPatchForApiSection(normalizedPatch.freshAgent) as any
-  }
-  if (Object.prototype.hasOwnProperty.call(normalizedPatch, 'agentChat')) {
-    normalizedPatch.agentChat = normalizeAgentProviderDefaultsPatchForApiSection(normalizedPatch.agentChat) as any
   }
 
   return removeUndefinedProperties(normalizedPatch) as ServerSettingsPatch | Record<string, unknown>

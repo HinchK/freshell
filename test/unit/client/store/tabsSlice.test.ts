@@ -780,6 +780,59 @@ describe('tabsSlice', () => {
       })
     })
 
+    it('opens a Claude history row as a fresh-agent pane with resumeSessionId', async () => {
+      const store = createOpenSessionStore()
+
+      await store.dispatch(openSessionTab({
+        sessionId: VALID_CLAUDE_SESSION_ID,
+        title: 'Existing Freshclaude session',
+        cwd: '/repo',
+        provider: 'claude',
+        sessionType: 'freshclaude',
+      }))
+
+      const state = store.getState()
+      const tab = state.tabs.tabs.find((candidate) => candidate.title === 'Existing Freshclaude session')
+      expect(tab).toBeTruthy()
+      expect(tab?.sessionRef).toEqual({ provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID })
+
+      const layout = state.panes.layouts[tab!.id]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      })
+    })
+
+    it('opens non-Claude fresh-agent sessions with sessionRef instead of resumeSessionId', async () => {
+      const store = createOpenSessionStore()
+
+      await store.dispatch(openSessionTab({
+        sessionId: 'opencode-session-1',
+        cwd: '/repo',
+        provider: 'opencode',
+        sessionType: 'freshopencode',
+      }))
+
+      const state = store.getState()
+      const tab = state.tabs.tabs.find((candidate) => candidate.title === 'repo')
+      expect(tab).toBeTruthy()
+      expect(tab?.sessionRef).toEqual({ provider: 'opencode', sessionId: 'opencode-session-1' })
+
+      const layout = state.panes.layouts[tab!.id]
+      expect(layout.type).toBe('leaf')
+      expect(layout.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'opencode-session-1' },
+      })
+      expect(layout.content).not.toHaveProperty('resumeSessionId')
+    })
+
     it('persists session metadata on newly opened tabs for fallback filtering and restored session type', async () => {
       const store = configureStore({
         reducer: {
@@ -956,7 +1009,7 @@ describe('tabsSlice', () => {
       expect(store.getState().tabs.activeTabId).toBe('local-fallback')
     })
 
-    it('updates title of existing tab for agent-chat session when reopened with new title', async () => {
+    it('updates title of existing tab for fresh-agent session when reopened with new title', async () => {
       const store = createOpenSessionStore('srv-local')
 
       store.dispatch(addTab({
@@ -971,7 +1024,7 @@ describe('tabsSlice', () => {
       store.dispatch(initLayout({
         tabId: 'agent-tab',
         content: {
-          kind: 'agent-chat',
+          kind: 'fresh-agent',
           provider: 'freshclaude',
           sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
         },

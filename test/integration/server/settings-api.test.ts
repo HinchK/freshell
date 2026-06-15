@@ -114,7 +114,7 @@ describe('Settings API Integration', () => {
             },
           },
         },
-        agentChat: {
+        freshAgent: {
           defaultPlugins: ['fs', 'search'],
         },
       })
@@ -125,15 +125,16 @@ describe('Settings API Integration', () => {
     expect(res.body.sidebar.excludeFirstChatSubstrings).toEqual(['__AUTO__', 'canary'])
     expect(res.body.sidebar.excludeFirstChatMustStart).toBe(true)
     expect(res.body.codingCli.providers.codex.cwd).toBe('/workspace/codex')
-    expect(res.body.agentChat.defaultPlugins).toEqual(['fs', 'search'])
+    expect(res.body.freshAgent.defaultPlugins).toEqual(['fs', 'search'])
+    expect(res.body.agentChat).toBeUndefined()
   })
 
-  it('PATCH /api/settings stores tracked and exact agent-chat model selections with dynamic effort strings', async () => {
+  it('PATCH /api/settings stores tracked and exact fresh-agent model selections with dynamic effort strings', async () => {
     const tracked = await request(app)
       .patch('/api/settings')
       .set('x-auth-token', TEST_AUTH_TOKEN)
       .send({
-        agentChat: {
+        freshAgent: {
           providers: {
             freshclaude: {
               modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
@@ -144,16 +145,17 @@ describe('Settings API Integration', () => {
       })
 
     expect(tracked.status).toBe(200)
-    expect(tracked.body.agentChat.providers.freshclaude).toEqual({
+    expect(tracked.body.freshAgent.providers.freshclaude).toEqual({
       modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
       effort: 'ultra',
     })
+    expect(tracked.body.agentChat).toBeUndefined()
 
     const exact = await request(app)
       .patch('/api/settings')
       .set('x-auth-token', TEST_AUTH_TOKEN)
       .send({
-        agentChat: {
+        freshAgent: {
           providers: {
             kilroy: {
               modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
@@ -163,18 +165,34 @@ describe('Settings API Integration', () => {
       })
 
     expect(exact.status).toBe(200)
-    expect(exact.body.agentChat.providers.kilroy).toEqual({
+    expect(exact.body.freshAgent.providers.kilroy).toEqual({
       modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
     })
+    expect(exact.body.agentChat).toBeUndefined()
   })
 
-  it('PATCH /api/settings accepts freshAgent settings while preserving the legacy alias', async () => {
+  it('rejects live legacy agentChat settings patches', async () => {
+    await request(app)
+      .patch('/api/settings')
+      .set('x-auth-token', TEST_AUTH_TOKEN)
+      .send({
+        agentChat: {
+          enabled: true,
+          defaultPlugins: ['/tmp/plugin'],
+          providers: { freshcodex: { style: 'serif' } },
+        },
+      })
+      .expect(400)
+  })
+
+  it('returns only freshAgent settings after a canonical freshAgent patch', async () => {
     const res = await request(app)
       .patch('/api/settings')
       .set('x-auth-token', TEST_AUTH_TOKEN)
       .send({
         freshAgent: {
-          defaultPlugins: ['fs', 'search'],
+          enabled: true,
+          defaultPlugins: ['/tmp/plugin'],
           providers: {
             freshcodex: { style: 'serif' },
           },
@@ -182,10 +200,10 @@ describe('Settings API Integration', () => {
       })
 
     expect(res.status).toBe(200)
-    expect(res.body.freshAgent.defaultPlugins).toEqual(['fs', 'search'])
-    expect(res.body.agentChat.defaultPlugins).toEqual(['fs', 'search'])
+    expect(res.body.freshAgent.enabled).toBe(true)
+    expect(res.body.freshAgent.defaultPlugins).toEqual(['/tmp/plugin'])
     expect(res.body.freshAgent.providers.freshcodex).toEqual({ style: 'serif' })
-    expect(res.body.agentChat.providers.freshcodex).toEqual({ style: 'serif' })
+    expect(res.body.agentChat).toBeUndefined()
   })
 
   it('PATCH /api/settings preserves runtime CLI providers outside the built-in defaults', async () => {
@@ -274,12 +292,12 @@ describe('Settings API Integration', () => {
     expect(res.body.codingCli.providers.codex.sandbox).toBeUndefined()
   })
 
-  it('PATCH /api/settings accepts null and empty sentinels to clear agent-chat model selections and effort overrides', async () => {
+  it('PATCH /api/settings accepts null and empty sentinels to clear fresh-agent model selections and effort overrides', async () => {
     await request(app)
       .patch('/api/settings')
       .set('x-auth-token', TEST_AUTH_TOKEN)
       .send({
-        agentChat: {
+        freshAgent: {
           providers: {
             freshclaude: {
               modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
@@ -293,7 +311,7 @@ describe('Settings API Integration', () => {
       .patch('/api/settings')
       .set('x-auth-token', TEST_AUTH_TOKEN)
       .send({
-        agentChat: {
+        freshAgent: {
           providers: {
             freshclaude: {
               modelSelection: null,
@@ -304,12 +322,14 @@ describe('Settings API Integration', () => {
       })
 
     expect(res.status).toBe(200)
-    expect(res.body.agentChat.providers.freshclaude.modelSelection).toBeUndefined()
-    expect(res.body.agentChat.providers.freshclaude.effort).toBeUndefined()
+    expect(res.body.freshAgent.providers.freshclaude.modelSelection).toBeUndefined()
+    expect(res.body.freshAgent.providers.freshclaude.effort).toBeUndefined()
+    expect(res.body.agentChat).toBeUndefined()
 
     const stored = await configStore.getSettings()
-    expect(stored.agentChat.providers.freshclaude.modelSelection).toBeUndefined()
-    expect(stored.agentChat.providers.freshclaude.effort).toBeUndefined()
+    expect(stored.freshAgent.providers.freshclaude.modelSelection).toBeUndefined()
+    expect(stored.freshAgent.providers.freshclaude.effort).toBeUndefined()
+    expect('agentChat' in stored).toBe(false)
   })
 
   it('PATCH /api/settings rejects local-only settings fields', async () => {

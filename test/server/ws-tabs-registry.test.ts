@@ -127,19 +127,19 @@ describe('ws tabs registry protocol', () => {
     delete process.env.MAX_REGULAR_WS_MESSAGE_BYTES
   })
 
-  it('uses protocol version 6 and rejects version 5 clients with reload-required mismatch', async () => {
-    expect(WS_PROTOCOL_VERSION).toBe(6)
+  it('uses protocol version 7 and rejects version 6 clients with reload-required mismatch', async () => {
+    expect(WS_PROTOCOL_VERSION).toBe(7)
     await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
     await new Promise<void>((resolve) => ws.on('open', () => resolve()))
-    ws.send(JSON.stringify({ type: 'hello', token: 'tabs-sync-token', protocolVersion: 5 }))
+    ws.send(JSON.stringify({ type: 'hello', token: 'tabs-sync-token', protocolVersion: WS_PROTOCOL_VERSION - 1 }))
     const error = await waitForMessage(ws, (msg) => msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH')
-    expect(error.message).toMatch(/expected protocol version 6/i)
+    expect(error.message).toMatch(new RegExp(`expected protocol version ${WS_PROTOCOL_VERSION}`, 'i'))
     expect(error.message).toMatch(/reload/i)
     ws.close()
   })
 
-  it('accepts v6 push/query, returns same-device/devices, and rejects invalid retention', async () => {
+  it('accepts v7 push/query, returns same-device/devices, and rejects invalid retention', async () => {
     await startServer({ tabsRegistryStore: await createTabsRegistryStore(tempDir, { now: () => NOW }) })
     const ws = await connect()
 

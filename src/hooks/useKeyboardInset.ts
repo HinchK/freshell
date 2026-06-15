@@ -12,7 +12,7 @@ const KEYBOARD_INSET_ACTIVATION_PX = 80
  * `visualViewport` API. Returns 0 on desktop or when no keyboard is visible.
  *
  * Extracted from TerminalView for reuse across any component that needs
- * keyboard-aware layout (agent chat, search bars, etc.).
+ * keyboard-aware layout (fresh-agent, search bars, etc.).
  */
 export function useKeyboardInset(): number {
   const isMobile = useMobile()

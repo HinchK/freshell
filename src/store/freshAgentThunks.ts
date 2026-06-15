@@ -1,9 +1,9 @@
 import { createAsyncThunk } from '@reduxjs/toolkit'
 import { getFreshAgentTurnBody, getFreshAgentTurnPage } from '@/lib/api'
 import {
-  timelineLoadFailed,
-  timelineLoadStarted,
-  timelinePageReceived,
+  historyLoadFailed,
+  historyLoadStarted,
+  historyPageReceived,
   turnBodyReceived,
 } from './freshAgentSlice'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
@@ -23,8 +23,8 @@ export function _resetFreshAgentThunkControllers(): void {
   inFlightControllers.clear()
 }
 
-export const loadFreshAgentTimelineWindow = createAsyncThunk(
-  'freshAgent/loadTimelineWindow',
+export const loadFreshAgentThreadTurns = createAsyncThunk(
+  'freshAgent/loadThreadTurns',
   async (
     input: FreshAgentThreadThunkLocator & {
       revision: number
@@ -36,7 +36,7 @@ export const loadFreshAgentTimelineWindow = createAsyncThunk(
   ) => {
     const controller = new AbortController()
     inFlightControllers.add(controller)
-    dispatch(timelineLoadStarted(input))
+    dispatch(historyLoadStarted(input))
     try {
       const page = await getFreshAgentTurnPage(
         input.sessionType,
@@ -50,7 +50,7 @@ export const loadFreshAgentTimelineWindow = createAsyncThunk(
           signal: controller.signal,
         },
       )
-      dispatch(timelinePageReceived({
+      dispatch(historyPageReceived({
         ...input,
         turns: page.turns,
         nextCursor: page.nextCursor,
@@ -58,9 +58,9 @@ export const loadFreshAgentTimelineWindow = createAsyncThunk(
       }))
       return page
     } catch (error) {
-      dispatch(timelineLoadFailed({
+      dispatch(historyLoadFailed({
         ...input,
-        message: error instanceof Error ? error.message : 'Failed to load fresh-agent timeline',
+        message: error instanceof Error ? error.message : 'Failed to load fresh-agent history',
       }))
       throw error
     } finally {

@@ -278,7 +278,6 @@ describe('createContentForType with ext: prefix', () => {
       {
         codingCli: { enabledProviders: ['claude'] },
         freshAgent: { enabled: true },
-        agentChat: { enabled: true },
       },
       {
         status: 'ready',
@@ -343,7 +342,7 @@ describe('createContentForType with ext: prefix', () => {
     expect(Object.keys(paneContent).sort()).toEqual(['extensionName', 'kind', 'props'])
   })
 
-  it('creates agent chat content with default plugins from resolved settings', async () => {
+  it('creates fresh-agent content with default plugins from resolved settings', async () => {
     const node = createPickerNode('pane-1')
     const store = createStore(
       { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },
@@ -353,7 +352,7 @@ describe('createContentForType with ext: prefix', () => {
           enabledProviders: ['claude'],
           providers: { claude: { cwd: '/workspace/default' } },
         },
-        agentChat: {
+        freshAgent: {
           enabled: true,
           defaultPlugins: ['planner', 'sandbox'],
           providers: {
@@ -364,7 +363,6 @@ describe('createContentForType with ext: prefix', () => {
             },
           },
         },
-        freshAgent: { enabled: true },
       },
       {
         status: 'ready',
@@ -373,7 +371,8 @@ describe('createContentForType with ext: prefix', () => {
       },
     )
 
-    expect(store.getState().settings.settings.agentChat.defaultPlugins).toEqual(['planner', 'sandbox'])
+    expect(store.getState().settings.settings.freshAgent.defaultPlugins).toEqual(['planner', 'sandbox'])
+    expect('agentChat' in store.getState().settings.settings).toBe(false)
 
     render(
       <Provider store={store}>

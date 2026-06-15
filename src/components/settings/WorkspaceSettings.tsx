@@ -268,11 +268,10 @@ export default function WorkspaceSettings({
           description="Show Freshclaude, Freshcodex, Freshopencode, and feature-flagged fresh clients in the pane picker."
         >
           <Toggle
-            checked={settings.freshAgent?.enabled ?? settings.agentChat?.enabled ?? false}
+            checked={settings.freshAgent?.enabled ?? false}
             onChange={(checked) => {
               applyServerSetting({
                 freshAgent: { enabled: checked },
-                agentChat: { enabled: checked },
               })
             }}
             aria-label="Enable fresh clients (experimental)"
@@ -280,33 +279,30 @@ export default function WorkspaceSettings({
         </SettingsRow>
         <SettingsRow label="Show thinking">
           <Toggle
-            checked={settings.freshAgent?.showThinking ?? settings.agentChat?.showThinking ?? false}
+            checked={settings.freshAgent?.showThinking ?? false}
             onChange={(checked) => {
               applyLocalSetting({
                 freshAgent: { showThinking: checked },
-                agentChat: { showThinking: checked },
               })
             }}
           />
         </SettingsRow>
         <SettingsRow label="Show tools">
           <Toggle
-            checked={settings.freshAgent?.showTools ?? settings.agentChat?.showTools ?? false}
+            checked={settings.freshAgent?.showTools ?? false}
             onChange={(checked) => {
               applyLocalSetting({
                 freshAgent: { showTools: checked },
-                agentChat: { showTools: checked },
               })
             }}
           />
         </SettingsRow>
         <SettingsRow label="Show timecodes &amp; model">
           <Toggle
-            checked={settings.freshAgent?.showTimecodes ?? settings.agentChat?.showTimecodes ?? false}
+            checked={settings.freshAgent?.showTimecodes ?? false}
             onChange={(checked) => {
               applyLocalSetting({
                 freshAgent: { showTimecodes: checked },
-                agentChat: { showTimecodes: checked },
               })
             }}
           />

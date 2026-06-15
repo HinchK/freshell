@@ -1,6 +1,5 @@
 import type { PaneContent } from '@/store/paneTypes'
 import { getProviderLabel, isNonShellMode } from '@/lib/coding-cli-utils'
-import { getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
 import { getFreshAgentLabel } from '@/lib/fresh-agent-registry'
 import { basenameSegment } from '@shared/path-basename'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -19,11 +18,6 @@ export function derivePaneTitle(content: PaneContent, extensions?: ClientExtensi
     if (!content.filePath) return 'Editor'
     const parts = content.filePath.replace(/\\/g, '/').split('/')
     return parts[parts.length - 1] || 'Editor'
-  }
-
-  if (content.kind === 'agent-chat') {
-    const segment = content.initialCwd ? basenameSegment(content.initialCwd) : null
-    return segment ?? getAgentChatProviderLabel(content.provider)
   }
 
   if (content.kind === 'fresh-agent') {

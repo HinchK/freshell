@@ -1,0 +1,43 @@
+import type { CodingCliProviderName } from '@/lib/coding-cli-types'
+import type { FreshAgentModelSelection } from '@shared/fresh-agent-model-capabilities'
+import type { FreshAgentSessionType } from '@shared/fresh-agent'
+
+export type FreshAgentProviderName = Extract<FreshAgentSessionType, 'freshclaude' | 'kilroy'>
+
+export type FreshAgentProviderSettings = {
+  modelSelection?: FreshAgentModelSelection
+  defaultPermissionMode?: string
+  effort?: string
+}
+
+export interface FreshAgentProviderConfig {
+  /** Unique identifier for this fresh-agent provider */
+  name: FreshAgentProviderName
+  /** Display label in UI */
+  label: string
+  /** Underlying coding CLI provider used for directory preferences and CLI availability checks */
+  codingCliProvider: CodingCliProviderName
+  /** React component for the pane icon */
+  icon: React.ComponentType<{ className?: string }>
+  /** Stable provider-default track alias used when no selection is stored */
+  providerDefaultModelId: string
+  /** Default permission mode */
+  defaultPermissionMode: string
+  /** Which settings are visible in the settings popover */
+  settingsVisibility: {
+    model: boolean
+    permissionMode: boolean
+    effort: boolean
+    thinking: boolean
+    tools: boolean
+    timecodes: boolean
+  }
+  /** Keyboard shortcut in pane picker */
+  pickerShortcut: string
+  /** If true, show after CLI options in the picker instead of before */
+  pickerAfterCli?: boolean
+  /** If true, hide from pane picker unless corresponding feature flag is enabled */
+  hidden?: boolean
+  /** Feature flag name that unhides this provider (defaults to provider name) */
+  featureFlag?: string
+}

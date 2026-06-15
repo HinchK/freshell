@@ -17,7 +17,7 @@ import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
-import { handleFreshAgentTransportEvent, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
+import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import {
   normalizeFreshAgentEffort,
   normalizeFreshAgentModel,
@@ -311,15 +311,23 @@ export function FreshAgentView({
   ) ?? 16
   const providerDefaults = useAppSelector(
     (state) => state.settings.settings.freshAgent?.providers?.[paneContent.sessionType]
-      ?? state.settings.serverSettings?.freshAgent?.providers?.[paneContent.sessionType]
-      ?? state.settings.settings.agentChat?.providers?.[paneContent.sessionType]
-      ?? state.settings.serverSettings?.agentChat?.providers?.[paneContent.sessionType],
+      ?? state.settings.serverSettings?.freshAgent?.providers?.[paneContent.sessionType],
   )
-  const showTranscriptModel = useAppSelector(
-    (state) => state.settings.settings.freshAgent?.showTimecodes
-      ?? state.settings.settings.agentChat?.showTimecodes
+  const globalShowThinking = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.showThinking
       ?? false,
   )
+  const globalShowTools = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.showTools
+      ?? false,
+  )
+  const globalShowTimecodes = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.showTimecodes
+      ?? false,
+  )
+  const effectiveShowThinking = paneContent.showThinking ?? globalShowThinking
+  const effectiveShowTools = paneContent.showTools ?? globalShowTools
+  const effectiveShowTimecodes = paneContent.showTimecodes ?? globalShowTimecodes
   const activeStyle = normalizeFreshAgentStyle(
     paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
   )
@@ -336,7 +344,7 @@ export function FreshAgentView({
       sessionType: paneContent.sessionType,
       provider: paneContent.provider,
     })
-    return state.freshAgent.sessions[sessionKey] ?? state.agentChat.sessions[paneContent.sessionId]
+    return state.freshAgent.sessions[sessionKey]
   })
   // Provider-agnostic session meta: codex/opencode status and errors flow
   // through the freshAgent slice too, but the claudeSession selector above is
@@ -469,7 +477,10 @@ export function FreshAgentView({
 
   const sendFreshAgentMessage = useCallback((message: Record<string, unknown>) => {
     const suppressed = typeof window !== 'undefined'
-      && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true
+      && (
+        window.__FRESHELL_TEST_HARNESS__?.isAllFreshAgentNetworkEffectsSuppressed?.() === true
+        || window.__FRESHELL_TEST_HARNESS__?.isFreshAgentNetworkEffectsSuppressed?.(paneId) === true
+      )
     if (suppressed) {
       window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
       return
@@ -851,13 +862,6 @@ export function FreshAgentView({
         && message.sessionType === paneContent.sessionType
         && message.provider === paneContent.provider
       ) {
-        handleFreshAgentTransportEvent(dispatch, {
-          type: 'freshAgent.event',
-          sessionId: message.sessionId,
-          sessionType: message.sessionType,
-          provider: message.provider,
-          event: (message.event ?? {}) as Record<string, unknown>,
-        })
         setSnapshotRefreshNonce((value) => value + 1)
       }
       if (
@@ -1511,7 +1515,9 @@ export function FreshAgentView({
                 : turns}
               canFork={canFork}
               agentLabel={descriptor?.label}
-              showModel={showTranscriptModel}
+              showThinking={effectiveShowThinking}
+              showTools={effectiveShowTools}
+              showTimecodes={effectiveShowTimecodes}
               isStreaming={isBusy}
               onForkFromTurn={(turnId) => sendFork(turnId)}
               onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
@@ -1574,6 +1580,9 @@ export function FreshAgentView({
     descriptor?.icon,
     descriptor?.label,
     effectiveStatus,
+    effectiveShowThinking,
+    effectiveShowTimecodes,
+    effectiveShowTools,
     hasRestoreFailure,
     hidden,
     isBusy,
@@ -1588,7 +1597,6 @@ export function FreshAgentView({
     runShellCommand,
     sessionEnded,
     sessionErrorMessage,
-    showTranscriptModel,
     startNewConversation,
     runSlashCommand,
     sendFork,

@@ -21,7 +21,13 @@ import {
 
 describe('fresh-agent shared contract schemas', () => {
   it('parses Claude and Codex snapshots through one shared durable contract', () => {
-    expect(FreshAgentSnapshotSchema.parse(claudeContractSnapshot).sessionType).toBe('freshclaude')
+    const claudeSnapshot = FreshAgentSnapshotSchema.parse(claudeContractSnapshot)
+    expect(claudeSnapshot.sessionType).toBe('freshclaude')
+    expect(claudeSnapshot.extensions.claude).toMatchObject({
+      historySessionId: '00000000-0000-4000-8000-000000000111',
+      liveSessionId: 'sdk-claude-1',
+    })
+    expect(claudeSnapshot.extensions.claude).not.toHaveProperty('timelineSessionId')
     expect(FreshAgentSnapshotSchema.parse(codexContractSnapshot).sessionType).toBe('freshcodex')
   })
 

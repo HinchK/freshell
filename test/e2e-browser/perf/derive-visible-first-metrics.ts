@@ -18,6 +18,7 @@ export type DerivedMetricsInput = {
   focusedReadyMilestone: string
   allowedApiRouteIdsBeforeReady: readonly string[]
   allowedWsTypesBeforeReady: readonly string[]
+  allowedFreshAgentEventTypesBeforeReady?: readonly string[]
   browser: {
     milestones: Record<string, number>
     perfEvents?: Array<Record<string, unknown>>
@@ -67,14 +68,14 @@ function normalizeAuditPath(pathname: string): string | null {
     return '/api/sessions/:sessionId'
   }
 
-  const agentTimelineMatch = pathname.match(/^\/api\/agent-sessions\/[^/]+\/timeline$/)
-  if (agentTimelineMatch) {
-    return '/api/agent-sessions/:sessionId/timeline'
+  const freshAgentTurnsMatch = pathname.match(/^\/api\/fresh-agent\/threads\/[^/]+\/[^/]+\/[^/]+\/turns$/)
+  if (freshAgentTurnsMatch) {
+    return '/api/fresh-agent/threads/:sessionType/:provider/:threadId/turns'
   }
 
-  const agentTurnMatch = pathname.match(/^\/api\/agent-sessions\/[^/]+\/turns\/[^/]+$/)
-  if (agentTurnMatch) {
-    return '/api/agent-sessions/:sessionId/turns/:turnId'
+  const freshAgentTurnMatch = pathname.match(/^\/api\/fresh-agent\/threads\/[^/]+\/[^/]+\/[^/]+\/turns\/[^/]+$/)
+  if (freshAgentTurnMatch) {
+    return '/api/fresh-agent/threads/:sessionType/:provider/:threadId/turns/:turnId'
   }
 
   const terminalViewportMatch = pathname.match(/^\/api\/terminals\/[^/]+\/viewport$/)
@@ -117,6 +118,18 @@ export function classifyWsFrameType(rawPayload: string): string {
     return typeof parsed?.type === 'string' && parsed.type.trim() ? parsed.type : 'unknown'
   } catch {
     return 'unknown'
+  }
+}
+
+function classifyFreshAgentProviderEventType(rawPayload: string): string | null {
+  try {
+    const parsed = JSON.parse(rawPayload) as { type?: unknown; event?: { type?: unknown } }
+    if (parsed?.type !== 'freshAgent.event') return null
+    return typeof parsed.event?.type === 'string' && parsed.event.type.trim()
+      ? parsed.event.type
+      : 'unknown'
+  } catch {
+    return null
   }
 }
 
@@ -374,6 +387,7 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
   const focusedReadyMs = input.browser.milestones[input.focusedReadyMilestone]
   const allowedApiRoutes = new Set(input.allowedApiRouteIdsBeforeReady)
   const allowedWsTypes = new Set(input.allowedWsTypesBeforeReady)
+  const allowedFreshAgentEventTypes = new Set(input.allowedFreshAgentEventTypesBeforeReady ?? [])
   const replayFrames = replayWsFramesBeforeReady(input, focusedReadyMs)
   const stopResumeMetrics = resolveStopResumeMetrics(input)
   const terminalInputToFirstOutputMs = resolveTerminalInputToFirstOutputMs(input, focusedReadyMs)
@@ -412,7 +426,14 @@ export function deriveVisibleFirstMetrics(input: DerivedMetricsInput): VisibleFi
     wsFramesBeforeReady += 1
     wsBytesBeforeReady += bytes
 
-    if (!allowedWsTypes.has(frameType)) {
+    const freshAgentEventType = frameType === 'freshAgent.event'
+      ? classifyFreshAgentProviderEventType(frame.payload ?? '')
+      : null
+    const freshAgentEventAllowed = freshAgentEventType
+      ? allowedFreshAgentEventTypes.has(freshAgentEventType)
+      : true
+
+    if (!allowedWsTypes.has(frameType) || !freshAgentEventAllowed) {
       offscreenWsFramesBeforeReady += 1
       offscreenWsBytesBeforeReady += bytes
     }

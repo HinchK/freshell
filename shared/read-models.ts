@@ -4,7 +4,7 @@ import type { LocalSettingsPatch, ServerSettings } from './settings.js'
 export const MAX_BOOTSTRAP_PAYLOAD_BYTES = 12 * 1024
 export const MAX_REALTIME_MESSAGE_BYTES = 16 * 1024
 export const MAX_DIRECTORY_PAGE_ITEMS = 50
-export const MAX_AGENT_TIMELINE_ITEMS = 30
+export const MAX_FRESH_AGENT_THREAD_TURNS = 30
 export const MAX_TERMINAL_SCROLLBACK_PAGE_BYTES = 64 * 1024
 export const READ_MODEL_LANES = ['critical', 'visible', 'background'] as const
 export const ReadModelLaneSchema = z.enum(READ_MODEL_LANES)
@@ -74,18 +74,18 @@ export const TerminalDirectoryQuerySchema = z.object({
   limit: z.number().int().positive().max(MAX_DIRECTORY_PAGE_ITEMS).optional(),
 })
 
-export const AgentTimelinePageQuerySchema = z.object({
+export const FreshAgentThreadTurnsQuerySchema = z.object({
   cursor: z.string().min(1).optional(),
   priority: ReadModelPrioritySchema.optional(),
   revision: z.coerce.number().int().nonnegative(),
-  limit: z.number().int().positive().max(MAX_AGENT_TIMELINE_ITEMS).optional(),
+  limit: z.number().int().positive().max(MAX_FRESH_AGENT_THREAD_TURNS).optional(),
   includeBodies: z.union([
     z.boolean(),
     z.enum(['true', 'false']).transform((v) => v === 'true'),
   ]).optional(),
 })
 
-export const AgentTimelineTurnBodyQuerySchema = z.object({
+export const FreshAgentThreadTurnBodyQuerySchema = z.object({
   revision: z.coerce.number().int().nonnegative(),
 })
 
@@ -118,8 +118,8 @@ export type SessionDirectoryQuery = z.infer<typeof SessionDirectoryQuerySchema>
 export type SessionDirectoryItem = z.infer<typeof SessionDirectoryItemSchema>
 export type SessionDirectoryPage = z.infer<typeof SessionDirectoryPageSchema>
 export type TerminalDirectoryQuery = z.infer<typeof TerminalDirectoryQuerySchema>
-export type AgentTimelinePageQuery = z.infer<typeof AgentTimelinePageQuerySchema>
-export type AgentTimelineTurnBodyQuery = z.infer<typeof AgentTimelineTurnBodyQuerySchema>
+export type FreshAgentThreadTurnsQuery = z.infer<typeof FreshAgentThreadTurnsQuerySchema>
+export type FreshAgentThreadTurnBodyQuery = z.infer<typeof FreshAgentThreadTurnBodyQuerySchema>
 export type RestoreStaleRevisionResponse = z.infer<typeof RestoreStaleRevisionResponseSchema>
 export type FreshAgentStaleRevisionResponse = z.infer<typeof FreshAgentStaleRevisionResponseSchema>
 export type TerminalScrollbackQuery = z.infer<typeof TerminalScrollbackQuerySchema>

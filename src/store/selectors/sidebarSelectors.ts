@@ -1,9 +1,8 @@
 import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '../store'
 import type { BackgroundTerminal, CodingCliProviderName, WorktreeGrouping } from '../types'
-import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { collectSessionRefsFromTabs } from '@/lib/session-utils'
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { getSessionMetadata } from '@/lib/session-metadata'
 import { getProviderLabel, isNonShellMode } from '@/lib/coding-cli-utils'
@@ -355,22 +354,6 @@ export function buildSessionItems(
       paneLastInputAt,
     })
 
-    if (node.content.kind === 'agent-chat') {
-      const sessionRef = node.content.sessionRef
-      if (sessionRef?.provider !== 'claude' || !isValidClaudeSessionId(sessionRef.sessionId)) return
-      const metadata = getSessionMetadata(tab, 'claude', sessionRef.sessionId)
-      pushFallbackItem({
-        provider: 'claude',
-        sessionId: sessionRef.sessionId,
-        sessionType: node.content.provider || 'claude',
-        title: paneTitle || tab.title,
-        cwd: undefined,
-        timestamp: fallbackTimestamp,
-        metadata,
-      })
-      return
-    }
-
     if (node.content.kind === 'fresh-agent') {
       const sessionId = node.content.resumeSessionId
       const runtimeProvider = resolveFreshAgentType(node.content.sessionType)?.runtimeProvider ?? node.content.provider
@@ -568,7 +551,7 @@ function isExcludedByFirstUserMessage(
 
 function shouldHideAsNonInteractive(item: SidebarSessionItem, showNoninteractiveSessions: boolean): boolean {
   if (showNoninteractiveSessions || !item.isNonInteractive) return false
-  return !getAgentChatProviderConfig(item.sessionType)
+  return !getFreshAgentProviderConfig(item.sessionType)
 }
 
 export function filterSessionItemsByVisibility(

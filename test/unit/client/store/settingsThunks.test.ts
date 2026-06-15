@@ -401,15 +401,15 @@ describe('settingsThunks', () => {
     expect(store.getState().settings.settings.codingCli.providers.codex?.sandbox).toBeUndefined()
   })
 
-  it('preserves nested agent-chat clears by converting them into API clear sentinels', async () => {
+  it('preserves nested fresh-agent clears by converting them into API clear sentinels', async () => {
     const store = makeStore()
     const initialServerSettings = store.getState().settings.serverSettings
     store.dispatch(setServerSettings({
       ...initialServerSettings,
-      agentChat: {
-        ...initialServerSettings.agentChat,
+      freshAgent: {
+        ...initialServerSettings.freshAgent,
         providers: {
-          ...initialServerSettings.agentChat.providers,
+          ...initialServerSettings.freshAgent.providers,
           freshclaude: {
             modelSelection: { kind: 'tracked', modelId: 'tracked-fixture-claude-model' },
             effort: 'turbo',
@@ -421,7 +421,7 @@ describe('settingsThunks', () => {
     apiPatch.mockResolvedValue({})
 
     await store.dispatch(saveServerSettingsPatch({
-      agentChat: {
+      freshAgent: {
         providers: {
           freshclaude: {
             modelSelection: undefined,
@@ -432,7 +432,7 @@ describe('settingsThunks', () => {
     }))
 
     expect(apiPatch).toHaveBeenCalledWith('/api/settings', {
-      agentChat: {
+      freshAgent: {
         providers: {
           freshclaude: {
             modelSelection: null,
@@ -441,7 +441,8 @@ describe('settingsThunks', () => {
         },
       },
     })
-    expect(store.getState().settings.settings.agentChat.providers.freshclaude?.modelSelection).toBeUndefined()
-    expect(store.getState().settings.settings.agentChat.providers.freshclaude?.effort).toBeUndefined()
+    expect(store.getState().settings.settings.freshAgent.providers.freshclaude?.modelSelection).toBeUndefined()
+    expect(store.getState().settings.settings.freshAgent.providers.freshclaude?.effort).toBeUndefined()
+    expect('agentChat' in store.getState().settings.settings).toBe(false)
   })
 })

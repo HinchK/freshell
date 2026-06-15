@@ -3,16 +3,25 @@ import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/f
 import type { SessionRef } from '@shared/session-contract'
 import { consumeCancelledCreate } from '@/lib/create-cancellation'
 import {
+  addAssistantMessage,
+  addPermissionRequest,
+  addQuestionRequest,
+  appendStreamDelta,
   clearPendingCreateFailure,
   createFailed,
   markSessionLost,
+  removePermission,
+  removeSession,
   registerPendingCreate,
   sessionError,
   sessionCreated,
+  sessionExited,
   sessionInit,
   sessionMetadataReceived,
   sessionSnapshotReceived,
   setSessionStatus,
+  setStreaming,
+  turnResult,
 } from '@/store/freshAgentSlice'
 
 type FreshAgentCreatedMessage = {
@@ -41,10 +50,19 @@ type FreshAgentSessionMaterializedMessage = {
   sessionRef?: SessionRef
 }
 
+type FreshAgentKilledMessage = {
+  type: 'freshAgent.killed'
+  sessionId: string
+  sessionType: FreshAgentSessionType
+  provider: FreshAgentRuntimeProvider
+  success: boolean
+}
+
 type FreshAgentClientMessage =
   | FreshAgentCreatedMessage
   | FreshAgentCreateFailedMessage
   | FreshAgentSessionMaterializedMessage
+  | FreshAgentKilledMessage
 
 interface FreshAgentMessageSink {
   send: (msg: unknown) => void
@@ -113,6 +131,15 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
     }
     case 'freshAgent.session.materialized':
       return true
+    case 'freshAgent.killed': {
+      const killed = msg as FreshAgentKilledMessage
+      dispatch(removeSession({
+        sessionId: killed.sessionId,
+        sessionType: killed.sessionType,
+        provider: killed.provider,
+      }))
+      return true
+    }
     case 'freshAgent.event':
       return handleFreshAgentTransportEvent(dispatch, msg as FreshAgentEventMessage)
     default:
@@ -134,18 +161,18 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
   }
 
   switch (event.type) {
-    case 'sdk.session.snapshot':
+    case 'freshAgent.session.snapshot':
       dispatch(sessionSnapshotReceived({
         ...locator,
         latestTurnId: (event.latestTurnId as string | null | undefined) ?? null,
         status: event.status as never,
-        timelineSessionId: event.timelineSessionId as string | undefined,
+        historySessionId: event.timelineSessionId as string | undefined,
         revision: event.revision as number | undefined,
         streamingActive: event.streamingActive as boolean | undefined,
         streamingText: event.streamingText as string | undefined,
       }))
       return true
-    case 'sdk.session.init':
+    case 'freshAgent.session.init':
       dispatch(sessionInit({
         ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
@@ -154,7 +181,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         tools: event.tools as Array<{ name: string }> | undefined,
       }))
       return true
-    case 'sdk.session.metadata':
+    case 'freshAgent.session.metadata':
       dispatch(sessionMetadataReceived({
         ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
@@ -163,13 +190,78 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         tools: event.tools as Array<{ name: string }> | undefined,
       }))
       return true
-    case 'sdk.status':
+    case 'freshAgent.status':
       dispatch(setSessionStatus({
         ...locator,
         status: event.status as never,
       }))
       return true
-    case 'sdk.error':
+    case 'freshAgent.assistant':
+      dispatch(addAssistantMessage({
+        ...locator,
+        content: Array.isArray(event.content) ? event.content as Record<string, unknown>[] : [],
+        model: event.model as string | undefined,
+      }))
+      return true
+    case 'freshAgent.stream': {
+      const streamEvent = event.event as Record<string, unknown> | undefined
+      if (streamEvent?.type === 'content_block_start') {
+        dispatch(setStreaming({ ...locator, active: true }))
+      }
+      if (streamEvent?.type === 'content_block_delta') {
+        const delta = streamEvent.delta as Record<string, unknown> | undefined
+        if (delta?.type === 'text_delta') {
+          dispatch(appendStreamDelta({
+            ...locator,
+            text: delta.text as string,
+          }))
+        }
+      }
+      if (streamEvent?.type === 'content_block_stop') {
+        dispatch(setStreaming({ ...locator, active: false }))
+      }
+      return true
+    }
+    case 'freshAgent.result':
+      dispatch(turnResult({
+        ...locator,
+        costUsd: event.costUsd as number | undefined,
+        durationMs: event.durationMs as number | undefined,
+        usage: event.usage as { input_tokens?: number; output_tokens?: number } | undefined,
+      }))
+      return true
+    case 'freshAgent.permission.request': {
+      const tool = event.tool as { name?: string; input?: Record<string, unknown> } | undefined
+      dispatch(addPermissionRequest({
+        ...locator,
+        requestId: event.requestId as string,
+        toolName: tool?.name,
+        input: tool?.input,
+        providerRequest: {
+          subtype: event.subtype,
+          tool,
+        },
+      }))
+      return true
+    }
+    case 'freshAgent.permission.cancelled':
+      dispatch(removePermission({
+        ...locator,
+        requestId: event.requestId as string,
+      }))
+      return true
+    case 'freshAgent.question.request':
+      dispatch(addQuestionRequest({
+        ...locator,
+        requestId: event.requestId as string,
+        questions: event.questions as never,
+        providerRequest: event,
+      }))
+      return true
+    case 'freshAgent.exit':
+      dispatch(sessionExited(locator))
+      return true
+    case 'freshAgent.error':
       if (event.code === 'INVALID_SESSION_ID') {
         dispatch(markSessionLost(locator))
       } else {
@@ -179,6 +271,9 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
           message: (event.message as string) || (event.error as string) || 'Unknown error',
         }))
       }
+      return true
+    case 'freshAgent.killed':
+      dispatch(removeSession(locator))
       return true
     default:
       return false

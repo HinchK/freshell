@@ -57,8 +57,8 @@ import { SessionAssociationCoordinator } from './session-association-coordinator
 import { broadcastTerminalSessionAssociation } from './session-association-broadcast.js'
 import { collectAppliedSessionAssociations } from './session-association-updates.js'
 import { loadOrCreateServerInstanceId } from './instance-id.js'
-import { createAgentChatCapabilitiesRouter } from './agent-chat-capabilities-router.js'
-import { AgentChatCapabilityRegistry } from './agent-chat-capability-registry.js'
+import { createFreshAgentModelCapabilitiesRouter } from './fresh-agent/model-capabilities-router.js'
+import { FreshAgentModelCapabilityRegistry } from './fresh-agent/model-capability-registry.js'
 import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
 import { createAiRouter } from './ai-router.js'
@@ -73,14 +73,12 @@ import { createShellBootstrapRouter } from './shell-bootstrap-router.js'
 import { createHealthRouter } from './health-router.js'
 import { loadSessionHistory } from './session-history-loader.js'
 import { SessionContentCache } from './session-content-cache.js'
-import { createAgentTimelineService } from './agent-timeline/service.js'
-import { createAgentTimelineRouter } from './agent-timeline/router.js'
-import { createAgentHistorySource } from './agent-timeline/history-source.js'
+import { createClaudeFreshAgentHistorySource } from './fresh-agent/history/claude/history-source.js'
 import { createTerminalViewService } from './terminal-view/service.js'
 import { resolveStartupBanner } from './startup-banner.js'
 import { createFreshAgentProviderRegistry } from './fresh-agent/provider-registry.js'
 import { FreshAgentRuntimeManager } from './fresh-agent/runtime-manager.js'
-import { createFreshAgentRouter } from './fresh-agent/router.js'
+import { registerFreshAgentThreadRoutes } from './fresh-agent/register-routes.js'
 import { createClaudeFreshAgentAdapter } from './fresh-agent/adapters/claude/adapter.js'
 import { createCodexFreshAgentAdapter } from './fresh-agent/adapters/codex/adapter.js'
 import { createOpencodeFreshAgentAdapter } from './fresh-agent/adapters/opencode/adapter.js'
@@ -212,7 +210,7 @@ async function main() {
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
   await runCodexStartupReaper({ serverInstanceId })
-  const agentChatCapabilityRegistry = new AgentChatCapabilityRegistry()
+  const freshAgentModelCapabilityRegistry = new FreshAgentModelCapabilityRegistry()
 
   let sdkBridge: SdkBridge
 
@@ -302,7 +300,7 @@ async function main() {
       resolveFilePath: (id) => codingCliIndexer.getFilePathForSession(id),
       contentCache: sessionContentCache,
     })
-  const agentHistorySource = createAgentHistorySource({
+  const agentHistorySource = createClaudeFreshAgentHistorySource({
     loadSessionHistory: loadSessionHistoryWithCache,
     getLiveSessionBySdkSessionId: (sdkSessionId) => sdkBridge.getLiveSession(sdkSessionId),
     getLiveSessionByCliSessionId: (timelineSessionId) => sdkBridge.findLiveSessionByCliSessionId(timelineSessionId),
@@ -408,9 +406,9 @@ async function main() {
     codexLaunchPlanner,
     assertTerminalCreateAccepted,
   }))
-  app.use('/api', createFreshAgentRouter({
+  registerFreshAgentThreadRoutes(app, {
     runtimeManager: freshAgentRuntimeManager,
-  }))
+  })
 
   // --- Extension lifecycle broadcasts ---
   extensionManager.on('server.starting', ({ name }: { name: string }) => {
@@ -574,8 +572,8 @@ async function main() {
     applyDebugLogging,
     validCliProviders: allCliNames,
   }))
-  app.use('/api/agent-chat/capabilities', createAgentChatCapabilitiesRouter({
-    registry: agentChatCapabilityRegistry,
+  app.use('/api/fresh-agent/model-capabilities', createFreshAgentModelCapabilitiesRouter({
+    registry: freshAgentModelCapabilityRegistry,
   }))
 
   // --- Network management endpoints ---
@@ -607,12 +605,6 @@ async function main() {
     sessionMetadataStore,
     serverInstanceId,
     validCliProviders: allCliNames,
-  }))
-
-  app.use('/api', createAgentTimelineRouter({
-    service: createAgentTimelineService({
-      agentHistorySource,
-    }),
   }))
 
   app.use('/api', createProjectColorsRouter({ configStore, codingCliIndexer }))
@@ -658,6 +650,11 @@ async function main() {
   // --- API: port forwarding (for browser pane remote access) ---
   const portForwardManager = new PortForwardManager()
   app.use('/api/proxy', createProxyRouter({ portForwardManager }))
+
+  // Keep unmatched API requests from falling through to the production SPA fallback.
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'Not found' })
+  })
 
   // --- Static client in production ---
   const distRoot = path.resolve(__dirname, '..')

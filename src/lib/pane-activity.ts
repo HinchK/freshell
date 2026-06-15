@@ -1,23 +1,19 @@
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { resolveExactCodexActivity } from '@/lib/codex-activity-resolver'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
-import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type {
-  AgentChatPaneContent,
   FreshAgentPaneContent,
   PaneContent,
   PaneNode,
   TerminalPaneContent,
 } from '@/store/paneTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
-import { getPreferredResumeSessionId } from '@/store/persistControl'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { Tab } from '@/store/types'
 import type { CodexActivityRecord, ClaudeActivityRecord, OpencodeActivityRecord } from '@shared/ws-protocol'
 
-type PaneActivitySource = 'codex' | 'opencode' | 'claude-terminal' | 'agent-chat' | 'fresh-agent' | 'browser'
+type PaneActivitySource = 'codex' | 'opencode' | 'claude-terminal' | 'fresh-agent' | 'browser'
 
 export type PaneActivityProjection = {
   isBusy: boolean
@@ -32,22 +28,6 @@ const IDLE_PANE_ACTIVITY: PaneActivityProjection = {
 function isBrowserBusy(record: PaneRuntimeActivityRecord | undefined): boolean {
   return record?.source === 'browser'
     && (record.phase === 'loading' || record.phase === 'forwarding')
-}
-
-export function resolveAgentChatSessionKey(
-  content: AgentChatPaneContent,
-  session: ChatSessionState | undefined,
-): string | undefined {
-  const explicit = content.sessionRef
-  if (explicit?.provider && explicit.sessionId) {
-    return `${explicit.provider}:${explicit.sessionId}`
-  }
-
-  const provider = getAgentChatProviderConfig(content.provider)?.codingCliProvider
-  const sessionId = getPreferredResumeSessionId(session) ?? content.resumeSessionId
-  if (!provider || !sessionId) return undefined
-
-  return `${provider}:${sessionId}`
 }
 
 export function resolveFreshAgentSessionKey(
@@ -65,33 +45,12 @@ export function resolveFreshAgentSessionKey(
   return `${provider}:${sessionId}`
 }
 
-export function isAgentChatBusy(
-  content: AgentChatPaneContent,
-  session: ChatSessionState | undefined,
-): boolean {
-  // No live session => not busy. The persisted content.status (which can be a
-  // stale 'running'/'compacting' from before a reload) must NOT drive blue, or
-  // the pane flashes blue on restore until the session hydrates (~1-2s).
-  if (session == null) return false
-  const status = session.status
-  if (status === 'compacting') return true
-
-  const hasWaitingItems = session != null && (
-    Object.keys(session.pendingPermissions).length > 0
-    || Object.keys(session.pendingQuestions).length > 0
-  )
-  if (hasWaitingItems) return false
-
-  if (session?.streamingActive) return true
-  return status === 'running'
-}
-
 export function isFreshAgentBusy(
   content: FreshAgentPaneContent,
   session: FreshAgentSessionState | undefined,
 ): boolean {
-  // No live session => not busy (see isAgentChatBusy: avoids reload blue-flash
-  // from a stale persisted content.status).
+  // No live session => not busy. Persisted content.status can be stale after
+  // reload, so live session state is the source of truth for blue activity.
   if (session == null) return false
   const status = session.status
   if (status === 'compacting') return true
@@ -156,7 +115,6 @@ export function resolvePaneActivity(input: {
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
-  agentChatSessions: Record<string, ChatSessionState>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
 }): PaneActivityProjection {
   const runtimeActivity = input.paneRuntimeActivityByPaneId[input.paneId]
@@ -211,15 +169,6 @@ export function resolvePaneActivity(input: {
       : IDLE_PANE_ACTIVITY
   }
 
-  if (input.content.kind === 'agent-chat') {
-    const session = input.content.sessionId
-      ? input.agentChatSessions[input.content.sessionId]
-      : undefined
-    return isAgentChatBusy(input.content, session)
-      ? { isBusy: true, source: 'agent-chat' }
-      : IDLE_PANE_ACTIVITY
-  }
-
   if (input.content.kind === 'fresh-agent') {
     const session = input.content.sessionId
       ? input.freshAgentSessions?.[makeFreshAgentSessionKey({
@@ -243,7 +192,6 @@ export function getBusyPaneIdsForTab(input: {
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
-  agentChatSessions: Record<string, ChatSessionState>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
 }): string[] {
   const layout = input.paneLayouts[input.tab.id]
@@ -260,7 +208,6 @@ export function getBusyPaneIdsForTab(input: {
       opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
       claudeActivityByTerminalId: input.claudeActivityByTerminalId,
       paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
-      agentChatSessions: input.agentChatSessions,
       freshAgentSessions: input.freshAgentSessions,
     }).isBusy
       ? [input.tab.id]
@@ -278,7 +225,6 @@ export function getBusyPaneIdsForTab(input: {
       opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
       claudeActivityByTerminalId: input.claudeActivityByTerminalId,
       paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
-      agentChatSessions: input.agentChatSessions,
       freshAgentSessions: input.freshAgentSessions,
     }).isBusy)
     .map((entry) => entry.paneId)
@@ -291,7 +237,6 @@ export function collectBusySessionKeys(input: {
   opencodeActivityByTerminalId: Record<string, OpencodeActivityRecord>
   claudeActivityByTerminalId: Record<string, ClaudeActivityRecord>
   paneRuntimeActivityByPaneId: Record<string, PaneRuntimeActivityRecord>
-  agentChatSessions: Record<string, ChatSessionState>
   freshAgentSessions?: Record<string, FreshAgentSessionState>
 }): string[] {
   const busySessionKeys = new Set<string>()
@@ -311,7 +256,6 @@ export function collectBusySessionKeys(input: {
         opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
         claudeActivityByTerminalId: input.claudeActivityByTerminalId,
         paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
-        agentChatSessions: input.agentChatSessions,
         freshAgentSessions: input.freshAgentSessions,
       }).isBusy
       if (!busy) continue
@@ -332,20 +276,12 @@ export function collectBusySessionKeys(input: {
         opencodeActivityByTerminalId: input.opencodeActivityByTerminalId,
         claudeActivityByTerminalId: input.claudeActivityByTerminalId,
         paneRuntimeActivityByPaneId: input.paneRuntimeActivityByPaneId,
-        agentChatSessions: input.agentChatSessions,
         freshAgentSessions: input.freshAgentSessions,
       }).isBusy
       if (!busy) continue
 
-      const sessionKey = entry.content.kind === 'agent-chat'
-        ? resolveAgentChatSessionKey(
-          entry.content,
-          entry.content.sessionId
-            ? input.agentChatSessions[entry.content.sessionId]
-            : undefined,
-        )
-        : entry.content.kind === 'fresh-agent'
-          ? resolveFreshAgentSessionKey(
+      const sessionKey = entry.content.kind === 'fresh-agent'
+        ? resolveFreshAgentSessionKey(
             entry.content,
             entry.content.sessionId
               ? input.freshAgentSessions?.[makeFreshAgentSessionKey({

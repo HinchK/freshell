@@ -803,7 +803,7 @@ describe('State Edge Cases', () => {
           editor: {
             externalEditor: 'auto',
           },
-          agentChat: {
+          freshAgent: {
             defaultPlugins: ['fs'],
             providers: {},
           },
@@ -851,11 +851,6 @@ describe('State Edge Cases', () => {
           editor: {
             ...defaultSettings.editor,
             externalEditor: 'auto',
-          },
-          agentChat: {
-            ...defaultSettings.agentChat,
-            defaultPlugins: ['fs'],
-            providers: {},
           },
           freshAgent: {
             ...defaultSettings.freshAgent,

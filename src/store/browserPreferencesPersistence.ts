@@ -133,7 +133,6 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
   assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showTimecodes')
   if (Object.keys(freshAgent).length > 0) {
     patch.freshAgent = freshAgent
-    patch.agentChat = freshAgent
   }
 
   const notifications: LocalSettingsPatch['notifications'] = {}

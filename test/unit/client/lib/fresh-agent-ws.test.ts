@@ -2,7 +2,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
-import { cancelCreate, _resetCancelledCreates } from '@/lib/sdk-message-handler'
+import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
+
+function createFreshAgentStore() {
+  return configureStore({
+    reducer: {
+      freshAgent: freshAgentReducer,
+    },
+  })
+}
 
 describe('fresh-agent-ws', () => {
   beforeEach(() => {
@@ -10,11 +18,7 @@ describe('fresh-agent-ws', () => {
   })
 
   it('registers resumed creates with history hydration and handles freshAgent.created', () => {
-    const store = configureStore({
-      reducer: {
-        freshAgent: freshAgentReducer,
-      },
-    })
+    const store = createFreshAgentStore()
 
     registerFreshAgentCreate(store.dispatch, 'req-1', {
       resumeSessionId: 'thread-1',
@@ -37,11 +41,7 @@ describe('fresh-agent-ws', () => {
   })
 
   it('kills a late freshAgent.created session when its create request was cancelled', () => {
-    const store = configureStore({
-      reducer: {
-        freshAgent: freshAgentReducer,
-      },
-    })
+    const store = createFreshAgentStore()
     const ws = { send: vi.fn() }
 
     registerFreshAgentCreate(store.dispatch, 'req-orphan', {
@@ -69,11 +69,7 @@ describe('fresh-agent-ws', () => {
   })
 
   it('handles freshAgent.create.failed', () => {
-    const store = configureStore({
-      reducer: {
-        freshAgent: freshAgentReducer,
-      },
-    })
+    const store = createFreshAgentStore()
 
     const handled = handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.create.failed',
@@ -92,11 +88,7 @@ describe('fresh-agent-ws', () => {
   })
 
   it('recognizes freshAgent.session.materialized as a handled fresh-agent message', () => {
-    const store = configureStore({
-      reducer: {
-        freshAgent: freshAgentReducer,
-      },
-    })
+    const store = createFreshAgentStore()
 
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.session.materialized',
@@ -109,11 +101,7 @@ describe('fresh-agent-ws', () => {
   })
 
   it('projects Claude freshAgent.event snapshot and lost-session transport updates into fresh-agent session state', () => {
-    const store = configureStore({
-      reducer: {
-        freshAgent: freshAgentReducer,
-      },
-    })
+    const store = createFreshAgentStore()
 
     expect(handleFreshAgentMessage(store.dispatch, {
       type: 'freshAgent.event',
@@ -121,7 +109,7 @@ describe('fresh-agent-ws', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       event: {
-        type: 'sdk.session.snapshot',
+        type: 'freshAgent.session.snapshot',
         sessionId: 'claude-thread-1',
         latestTurnId: 'turn-1',
         status: 'idle',
@@ -136,7 +124,7 @@ describe('fresh-agent-ws', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       event: {
-        type: 'sdk.error',
+        type: 'freshAgent.error',
         sessionId: 'claude-thread-1',
         code: 'INVALID_SESSION_ID',
         message: 'Session missing on server',
@@ -145,10 +133,176 @@ describe('fresh-agent-ws', () => {
 
     expect(store.getState().freshAgent.sessions['freshclaude:claude:claude-thread-1']).toEqual(expect.objectContaining({
       latestTurnId: 'turn-1',
-      timelineSessionId: 'cli-session-1',
-      timelineRevision: 7,
+      historySessionId: 'cli-session-1',
+      historyRevision: 7,
       lost: true,
       historyLoaded: false,
     }))
+  })
+
+  it('does not handle top-level legacy SDK websocket messages', () => {
+    const store = createFreshAgentStore()
+
+    expect(handleFreshAgentMessage(store.dispatch, {
+      type: 'sdk.session.snapshot',
+      sessionId: 'stale-thread-1',
+      latestTurnId: 'turn-stale',
+      status: 'idle',
+      timelineSessionId: '00000000-0000-4000-8000-000000000001',
+      revision: 3,
+    })).toBe(false)
+
+    expect(store.getState().freshAgent.sessions['freshclaude:claude:stale-thread-1']).toBeUndefined()
+  })
+
+  it('projects every fresh-agent provider event carried by freshAgent.event into fresh-agent state', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-thread-parity'
+    const key = `freshclaude:claude:${sessionId}`
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { sessionId, ...event },
+    })
+
+    expect(sendEvent({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'idle', revision: 1 })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.session.init', cliSessionId: 'cli-1', model: 'claude-opus-4-6', cwd: '/repo' })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.session.metadata', cliSessionId: 'cli-2', model: 'claude-sonnet-4-6', tools: [{ name: 'Bash' }] })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.status', status: 'running' })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.stream', event: { type: 'content_block_start' } })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.stream', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } } })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.stream', event: { type: 'content_block_stop' } })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.assistant',
+      model: 'claude-sonnet-4-6',
+      content: [{ type: 'text', text: 'final answer' }],
+    })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.result', costUsd: 0.02, usage: { input_tokens: 10, output_tokens: 5 } })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.permission.request',
+      requestId: 'perm-1',
+      subtype: 'tool',
+      tool: { name: 'Bash', input: { command: 'npm test' } },
+    })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key].pendingPermissions['perm-1']).toMatchObject({
+      toolName: 'Bash',
+      input: { command: 'npm test' },
+    })
+    expect(sendEvent({ type: 'freshAgent.permission.cancelled', requestId: 'perm-1' })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.question.request',
+      requestId: 'question-1',
+      questions: [{ question: 'Continue?', options: [{ label: 'Yes', description: 'Proceed' }] }],
+    })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.error', code: 'SDK_WARNING', message: 'recoverable' })).toBe(true)
+
+    const session = store.getState().freshAgent.sessions[key]
+    expect(session).toMatchObject({
+      cliSessionId: 'cli-2',
+      model: 'claude-sonnet-4-6',
+      streamingText: '',
+      streamingActive: false,
+      totalCostUsd: 0.02,
+      totalInputTokens: 10,
+      totalOutputTokens: 5,
+      lastError: 'recoverable',
+    })
+    expect(session.turns.at(-1)).toMatchObject({
+      role: 'assistant',
+      model: 'claude-sonnet-4-6',
+      summary: 'final answer',
+    })
+    expect(session.pendingPermissions).toEqual({})
+    expect(session.pendingQuestions['question-1']).toMatchObject({
+      questions: [{ question: 'Continue?' }],
+    })
+
+    expect(sendEvent({ type: 'freshAgent.exit', exitCode: 0 })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key].status).toBe('exited')
+    expect(sendEvent({ type: 'freshAgent.killed' })).toBe(true)
+    expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
+  })
+
+  it('does not let delayed metadata downgrade newer snapshot identity', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-thread-metadata-order'
+    const key = `freshclaude:claude:${sessionId}`
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { sessionId, ...event },
+    })
+
+    expect(sendEvent({
+      type: 'freshAgent.session.snapshot',
+      latestTurnId: 'turn-new',
+      status: 'idle',
+      timelineSessionId: 'cli-new',
+      revision: 5,
+    })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.session.metadata',
+      cliSessionId: 'cli-old',
+      model: 'claude-sonnet-4-6',
+      cwd: '/repo',
+    })).toBe(true)
+
+    const session = store.getState().freshAgent.sessions[key]
+    expect(session.cliSessionId).toBeUndefined()
+    expect(session).toMatchObject({
+      historySessionId: 'cli-new',
+      historyRevision: 5,
+      model: 'claude-sonnet-4-6',
+      cwd: '/repo',
+    })
+  })
+
+  it('deduplicates repeated permission and question requests by request id', () => {
+    const store = createFreshAgentStore()
+    const sessionId = 'claude-thread-interactive-dedupe'
+    const key = `freshclaude:claude:${sessionId}`
+    const sendEvent = (event: Record<string, unknown>) => handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { sessionId, ...event },
+    })
+
+    expect(sendEvent({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'idle', revision: 1 })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.permission.request',
+      requestId: 'perm-repeat',
+      subtype: 'tool',
+      tool: { name: 'Bash', input: { command: 'pwd' } },
+    })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.permission.request',
+      requestId: 'perm-repeat',
+      subtype: 'tool',
+      tool: { name: 'Bash', input: { command: 'ls' } },
+    })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.question.request',
+      requestId: 'question-repeat',
+      questions: [{ question: 'Continue?', header: 'Confirm', options: [], multiSelect: false }],
+    })).toBe(true)
+    expect(sendEvent({
+      type: 'freshAgent.question.request',
+      requestId: 'question-repeat',
+      questions: [{ question: 'Proceed?', header: 'Confirm', options: [], multiSelect: false }],
+    })).toBe(true)
+
+    const session = store.getState().freshAgent.sessions[key]
+    expect(Object.keys(session.pendingPermissions)).toEqual(['perm-repeat'])
+    expect(session.pendingPermissions['perm-repeat']).toMatchObject({
+      input: { command: 'ls' },
+    })
+    expect(Object.keys(session.pendingQuestions)).toEqual(['question-repeat'])
+    expect(session.pendingQuestions['question-repeat'].questions[0].question).toBe('Proceed?')
   })
 })

@@ -1,9 +1,8 @@
 import type { TerminalStatus, TabMode, ShellType } from './types'
-import type { AgentChatProviderName } from '@/lib/agent-chat-types'
 import {
-  AgentChatModelSelectionSchema,
-  type AgentChatModelSelection,
-} from '@shared/agent-chat-capabilities'
+  FreshAgentModelSelectionSchema,
+  type FreshAgentModelSelection,
+} from '@shared/fresh-agent-model-capabilities'
 import type { SessionLocator as SharedSessionLocator } from '@shared/ws-protocol'
 import type { RestoreError } from '@shared/session-contract'
 import type { CodexDurabilityRef } from '@shared/codex-durability'
@@ -12,15 +11,15 @@ import type { FreshAgentStyle } from '@shared/settings'
 
 export type SessionLocator = SharedSessionLocator
 
-export function isAgentChatModelSelection(value: unknown): value is AgentChatModelSelection {
-  return AgentChatModelSelectionSchema.safeParse(value).success
+export function isFreshAgentModelSelection(value: unknown): value is FreshAgentModelSelection {
+  return FreshAgentModelSelectionSchema.safeParse(value).success
 }
 
-export function normalizeAgentChatModelSelection(
+export function normalizeFreshAgentModelSelection(
   value: unknown,
   legacyModel?: unknown,
-): AgentChatModelSelection | undefined {
-  const parsed = AgentChatModelSelectionSchema.safeParse(value)
+): FreshAgentModelSelection | undefined {
+  const parsed = FreshAgentModelSelectionSchema.safeParse(value)
   if (parsed.success) {
     return parsed.data
   }
@@ -35,7 +34,7 @@ export function normalizeAgentChatModelSelection(
   return undefined
 }
 
-export function normalizeAgentChatEffortOverride(value: unknown): string | undefined {
+export function normalizeFreshAgentEffortOverride(value: unknown): string | undefined {
   if (typeof value !== 'string') {
     return undefined
   }
@@ -118,7 +117,7 @@ export type PickerPaneContent = {
 /** SDK session statuses — richer than TerminalStatus to reflect Claude Code lifecycle */
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited' | 'create-failed'
 
-export type AgentChatCreateError = {
+export type FreshAgentCreateError = {
   code: string
   message: string
   retryable?: boolean
@@ -138,8 +137,8 @@ export type FreshAgentPaneContent = {
   /** Explicit restore failure when no canonical durable target exists. */
   restoreError?: RestoreError
   initialCwd?: string
-  createError?: AgentChatCreateError
-  modelSelection?: AgentChatModelSelection
+  createError?: FreshAgentCreateError
+  modelSelection?: FreshAgentModelSelection
   model?: string
   permissionMode?: string
   sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access'
@@ -148,43 +147,9 @@ export type FreshAgentPaneContent = {
   /** Visual style for this pane; missing legacy panes resolve from provider defaults, then sans. */
   style?: FreshAgentStyle
   settingsDismissed?: boolean
-}
-
-/**
- * Agent chat pane — rich chat UI powered by a configurable provider.
- */
-export type AgentChatPaneContent = {
-  kind: 'agent-chat'
-  /** Which agent chat provider this pane uses */
-  provider: AgentChatProviderName
-  /** SDK session ID (undefined until created) */
-  sessionId?: string
-  /** Idempotency key for sdk.create */
-  createRequestId: string
-  /** Current status — uses SdkSessionStatus, not TerminalStatus */
-  status: SdkSessionStatus
-  /** Claude session to resume */
-  resumeSessionId?: string
-  /** Portable session reference for cross-device tab snapshots */
-  sessionRef?: SessionLocator
-  /** Runtime-only server locality for same-server matching; never part of canonical durable identity. */
-  serverInstanceId?: string
-  /** Explicit restore failure when no canonical durable target exists. */
-  restoreError?: RestoreError
-  /** Working directory */
-  initialCwd?: string
-  /** Request-scoped create failure promoted into pane-local visible state. */
-  createError?: AgentChatCreateError
-  /** Stored selection strategy; omit to use the provider-default track. */
-  modelSelection?: AgentChatModelSelection
-  /** Permission mode (default from provider config) */
-  permissionMode?: string
-  /** Explicit effort override; omit to use the model default behavior. */
-  effort?: string
-  /** Plugin paths to load into this session (absolute paths to plugin directories) */
-  plugins?: string[]
-  /** Whether the user has dismissed the first-launch settings popover */
-  settingsDismissed?: boolean
+  showThinking?: boolean
+  showTools?: boolean
+  showTimecodes?: boolean
 }
 
 /**
@@ -200,7 +165,7 @@ export type ExtensionPaneContent = {
  * Union type for all pane content types.
  */
 export type PaneContent = TerminalPaneContent | BrowserPaneContent | EditorPaneContent
-  | PickerPaneContent | FreshAgentPaneContent | AgentChatPaneContent | ExtensionPaneContent
+  | PickerPaneContent | FreshAgentPaneContent | ExtensionPaneContent
 
 /**
  * Input type for creating terminal panes.
@@ -217,19 +182,6 @@ export type TerminalPaneInput = Omit<TerminalPaneContent, 'createRequestId' | 's
  */
 export type EditorPaneInput = EditorPaneContent
 
-/**
- * Input type for splitPane/initLayout actions.
- * Accepts either full content or partial terminal input.
- */
-/**
- * Input type for Agent Chat panes.
- * Lifecycle fields (createRequestId, status) are optional - reducer generates defaults.
- */
-export type AgentChatPaneInput = Omit<AgentChatPaneContent, 'createRequestId' | 'status'> & {
-  createRequestId?: string
-  status?: SdkSessionStatus
-}
-
 export type FreshAgentPaneInput = Omit<FreshAgentPaneContent, 'createRequestId' | 'status'> & {
   createRequestId?: string
   status?: SdkSessionStatus
@@ -241,8 +193,12 @@ export type FreshAgentPaneInput = Omit<FreshAgentPaneContent, 'createRequestId' 
  */
 export type ExtensionPaneInput = ExtensionPaneContent
 
-export type PaneContentInput = TerminalPaneInput | BrowserPaneInput | EditorPaneInput
-  | PickerPaneContent | FreshAgentPaneInput | AgentChatPaneInput | ExtensionPaneInput
+export type LivePaneContentInput = TerminalPaneInput | BrowserPaneInput | EditorPaneInput
+  | PickerPaneContent | FreshAgentPaneInput | ExtensionPaneInput
+
+export type LegacyPaneContentInput = Record<string, unknown>
+
+export type PaneContentInput = LivePaneContentInput | LegacyPaneContentInput
 
 export type PaneRefreshTarget =
   | { kind: 'terminal'; createRequestId: string }

@@ -52,11 +52,6 @@ type TerminalCreateClientMessage = {
   requestId: string
 }
 
-type SdkCreateClientMessage = {
-  type: 'sdk.create'
-  requestId: string
-}
-
 type FreshAgentCreateClientMessage = {
   type: 'freshAgent.create'
   requestId: string
@@ -67,7 +62,7 @@ type TerminalAttachClientMessage = {
   terminalId: string
 }
 
-type CreateClientMessage = TerminalCreateClientMessage | SdkCreateClientMessage | FreshAgentCreateClientMessage
+type CreateClientMessage = TerminalCreateClientMessage | FreshAgentCreateClientMessage
 
 type InFlightCreate = {
   message: CreateClientMessage
@@ -88,7 +83,7 @@ function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage
 function isCreateMessage(msg: unknown): msg is CreateClientMessage {
   if (!msg || typeof msg !== 'object') return false
   const candidate = msg as { type?: unknown; requestId?: unknown }
-  return (candidate.type === 'terminal.create' || candidate.type === 'sdk.create' || candidate.type === 'freshAgent.create')
+  return (candidate.type === 'terminal.create' || candidate.type === 'freshAgent.create')
     && typeof candidate.requestId === 'string'
     && candidate.requestId.length > 0
 }
@@ -136,6 +131,12 @@ export class WsClient {
   private clearTrackedCreate(requestId: string): void {
     this.inFlightCreates.delete(requestId)
     this.preReadyCreateQueue.delete(requestId)
+  }
+
+  private clearQueuedMessagesAfterProtocolMismatch(): void {
+    this.pendingMessages = []
+    this.inFlightCreates.clear()
+    this.preReadyCreateQueue.clear()
   }
 
   cancelCreate(requestId: string): void {
@@ -215,8 +216,6 @@ export class WsClient {
 
     if (
       msg.type === 'terminal.created'
-      || msg.type === 'sdk.created'
-      || msg.type === 'sdk.create.failed'
       || msg.type === 'freshAgent.created'
       || msg.type === 'freshAgent.create.failed'
     ) {
@@ -235,6 +234,7 @@ export class WsClient {
 
     if (msg.type === 'error' && msg.code === 'PROTOCOL_MISMATCH') {
       this.clearReadyTimeout()
+      this.clearQueuedMessagesAfterProtocolMismatch()
       this.intentionalClose = true
       return
     }

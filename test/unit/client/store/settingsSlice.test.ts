@@ -69,18 +69,17 @@ describe('settingsSlice', () => {
         scrollback: 12000,
       },
       agentChat: {
-        ...initialState.serverSettings.agentChat,
         defaultPlugins: ['fs'],
       },
     }
 
-    const state = settingsReducer(initialState, setServerSettings(nextServerSettings))
+    const state = settingsReducer(initialState, setServerSettings(nextServerSettings as never))
 
     expect(state.loaded).toBe(true)
     expect(state.serverSettings.defaultCwd).toBe('/workspace')
     expect(state.serverSettings.terminal.scrollback).toBe(12000)
     expect(state.serverSettings.freshAgent.defaultPlugins).toEqual([])
-    expect(state.serverSettings.agentChat.defaultPlugins).toEqual([])
+    expect('agentChat' in state.serverSettings).toBe(false)
     expect(state.settings).toEqual({
       ...defaultSettings,
       defaultCwd: '/workspace',
@@ -92,11 +91,8 @@ describe('settingsSlice', () => {
         ...defaultSettings.freshAgent,
         defaultPlugins: [],
       },
-      agentChat: {
-        ...defaultSettings.agentChat,
-        defaultPlugins: [],
-      },
     })
+    expect('agentChat' in state.settings).toBe(false)
   })
 
   it('previewServerSettingsPatch only applies server-backed fields', async () => {

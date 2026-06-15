@@ -29,7 +29,8 @@ import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/p
 import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { buildResumeContent } from '@/lib/session-type-utils'
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
 import { resolvePaneActivity } from '@/lib/pane-activity'
@@ -42,7 +43,6 @@ import { createLogger } from '@/lib/client-logger'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
-import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { ContextId } from './context-menu-constants'
@@ -52,13 +52,13 @@ import { ContextIds } from './context-menu-constants'
 import { buildMenuItems } from './menu-defs'
 import { copyDataset, isTextInputLike, parseContextTarget } from './context-menu-utils'
 import {
-  copyAgentChatCodeBlock,
-  copyAgentChatToolInput,
-  copyAgentChatToolOutput,
-  copyAgentChatDiffNew,
-  copyAgentChatDiffOld,
-  copyAgentChatFilePath,
-} from './agent-chat-copy'
+  copyFreshAgentCodeBlock,
+  copyFreshAgentToolInput,
+  copyFreshAgentToolOutput,
+  copyFreshAgentDiffNew,
+  copyFreshAgentDiffOld,
+  copyFreshAgentFilePath,
+} from './fresh-agent-copy'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { nanoid } from 'nanoid'
 
@@ -66,7 +66,6 @@ const CONTEXT_MENU_KEYS = ['ContextMenu']
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
 const EMPTY_FEATURE_FLAGS: Record<string, boolean> = {}
-const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
@@ -118,7 +117,7 @@ function resolveContextId(value: string | undefined): ContextId {
 }
 
 function hasWaitingPrompt(
-  session: Pick<ChatSessionState | FreshAgentSessionState, 'pendingPermissions' | 'pendingQuestions'> | undefined,
+  session: Pick<FreshAgentSessionState, 'pendingPermissions' | 'pendingQuestions'> | undefined,
 ): boolean {
   if (!session) return false
   return Object.keys(session.pendingPermissions).length > 0
@@ -158,7 +157,6 @@ export function ContextMenuProvider({
   const appSettings = useAppSelector((s) => s.settings.settings)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLastInputAt = useAppSelector((s) => s.tabRecency?.paneLastInputAt ?? EMPTY_PANE_LAST_INPUT_AT)
-  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
   const codexActivityByTerminalId = useAppSelector((s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID)
   const claudeActivityByTerminalId = useAppSelector((s) => s.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID)
@@ -448,9 +446,10 @@ export function ContextMenuProvider({
     const mode = (provider || session.provider || 'claude') as CodingCliProviderName
     const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
       || session.sessionType || mode
-    const agentConfig = getAgentChatProviderConfig(sessionType)
-    const providerSettings = agentConfig
-      ? appSettings.agentChat?.providers?.[agentConfig.name]
+    const freshAgentType = resolveFreshAgentType(sessionType)
+    const freshAgentProviderConfig = getFreshAgentProviderConfig(sessionType)
+    const freshAgentProviderSettings = freshAgentType || freshAgentProviderConfig
+      ? appSettings.freshAgent?.providers?.[sessionType]
       : undefined
     dispatch(addPane({
       tabId: activeTabId,
@@ -458,7 +457,7 @@ export function ContextMenuProvider({
         sessionType,
         sessionId: session.sessionId,
         cwd: session.cwd,
-        agentChatProviderSettings: providerSettings,
+        freshAgentProviderSettings,
       }),
     }))
     persistSessionMetadataOnTab(activeTabId, session, sessionType)
@@ -795,13 +794,10 @@ export function ContextMenuProvider({
           opencodeActivityByTerminalId,
           claudeActivityByTerminalId,
           paneRuntimeActivityByPaneId,
-          agentChatSessions,
           freshAgentSessions,
         })
         let hasWaitingItems = false
-        if (entry.content.kind === 'agent-chat' && entry.content.sessionId) {
-          hasWaitingItems = hasWaitingPrompt(agentChatSessions[entry.content.sessionId])
-        } else if (entry.content.kind === 'fresh-agent' && entry.content.sessionId) {
+        if (entry.content.kind === 'fresh-agent' && entry.content.sessionId) {
           const sessionKey = makeFreshAgentSessionKey({
             sessionType: entry.content.sessionType,
             provider: entry.content.provider,
@@ -818,7 +814,6 @@ export function ContextMenuProvider({
 
     return result
   }, [
-    agentChatSessions,
     claudeActivityByTerminalId,
     codexActivityByTerminalId,
     freshAgentSessions,
@@ -845,13 +840,10 @@ export function ContextMenuProvider({
         opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
         claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
         paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
-        agentChatSessions: state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS,
         freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
       })
       let hasWaitingItems = false
-      if (content.kind === 'agent-chat' && content.sessionId) {
-        hasWaitingItems = hasWaitingPrompt((state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)[content.sessionId])
-      } else if (content.kind === 'fresh-agent' && content.sessionId) {
+      if (content.kind === 'fresh-agent' && content.sessionId) {
         const sessionKey = makeFreshAgentSessionKey({
           sessionType: content.sessionType,
           provider: content.provider,
@@ -876,7 +868,7 @@ export function ContextMenuProvider({
         tab,
         content,
         target,
-        providerSettings: state.settings.settings.agentChat?.providers?.[target.targetSessionType],
+        providerSettings: state.settings.settings.freshAgent?.providers?.[target.targetSessionType],
       }
     }
 
@@ -936,7 +928,7 @@ export function ContextMenuProvider({
         sessionType: latest.target.targetSessionType,
         sessionId: latest.target.sessionId,
         cwd: latest.target.cwd,
-        agentChatProviderSettings: latest.providerSettings,
+        freshAgentProviderSettings: latest.providerSettings,
       }),
     }))
 
@@ -1225,12 +1217,12 @@ export function ContextMenuProvider({
         copyTerminalCwd,
         copyMessageText,
         copyMessageCode,
-        copyAgentChatCodeBlock: copyAgentChatCodeBlock,
-        copyAgentChatToolInput: copyAgentChatToolInput,
-        copyAgentChatToolOutput: copyAgentChatToolOutput,
-        copyAgentChatDiffNew: copyAgentChatDiffNew,
-        copyAgentChatDiffOld: copyAgentChatDiffOld,
-        copyAgentChatFilePath: copyAgentChatFilePath,
+        copyFreshAgentCodeBlock,
+        copyFreshAgentToolInput,
+        copyFreshAgentToolOutput,
+        copyFreshAgentDiffNew,
+        copyFreshAgentDiffOld,
+        copyFreshAgentFilePath,
         openUrlInPane,
         openUrlInTab,
         openUrlInBrowser,

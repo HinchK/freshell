@@ -2,6 +2,7 @@ import type { Store } from '@reduxjs/toolkit'
 import type { RootState } from './store'
 import type { WsClient } from '@/lib/ws-client'
 import type { RegistryTabRecord } from './tabRegistryTypes'
+import { normalizeRegistryTabRecord } from './tabRegistryTypes'
 import {
   clearTabRegistryLocalClosed,
   setTabRegistryLoading,
@@ -135,6 +136,12 @@ function recordFingerprint(record: RegistryTabRecord): string {
     panes: record.panes,
     closedAt: record.closedAt,
   })
+}
+
+export function normalizeTabRegistryRecordsForSync(records: RegistryTabRecord[] | undefined): RegistryTabRecord[] {
+  return (records || [])
+    .map((record) => normalizeRegistryTabRecord(record))
+    .filter((record): record is RegistryTabRecord => !!record)
 }
 
 function nextRecordVersion(record: RegistryTabRecord, revisions: RevisionState, now: number): { revision: number; updatedAt: number } {
@@ -443,10 +450,10 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
         devices?: Array<{ deviceId: string; deviceLabel: string; lastSeenAt: number }>
       }
       store.dispatch(setTabRegistrySnapshot({
-        localOpen: data.localOpen || [],
-        sameDeviceOpen: data.sameDeviceOpen || [],
-        remoteOpen: data.remoteOpen || [],
-        closed: data.closed || [],
+        localOpen: normalizeTabRegistryRecordsForSync(data.localOpen),
+        sameDeviceOpen: normalizeTabRegistryRecordsForSync(data.sameDeviceOpen),
+        remoteOpen: normalizeTabRegistryRecordsForSync(data.remoteOpen),
+        closed: normalizeTabRegistryRecordsForSync(data.closed),
         devices: data.devices || [],
       }))
       return

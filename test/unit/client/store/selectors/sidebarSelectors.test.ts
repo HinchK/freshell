@@ -170,7 +170,7 @@ describe('sidebarSelectors', () => {
       const projects = [
         makeProject([
           { sessionId: 'sess-a', provider: 'claude' },
-          { sessionId: 'sess-b', provider: 'claude', sessionType: 'agent-chat' },
+          { sessionId: 'sess-b', provider: 'claude', sessionType: 'freshclaude' },
         ]),
       ]
 
@@ -178,7 +178,7 @@ describe('sidebarSelectors', () => {
 
       expect(items).toHaveLength(2)
       expect(items[0].sessionType).toBe('claude')
-      expect(items[1].sessionType).toBe('agent-chat')
+      expect(items[1].sessionType).toBe('freshclaude')
     })
 
     it('keeps hasTab correct for layout-backed and no-layout fallback sessions', () => {
@@ -234,8 +234,9 @@ describe('sidebarSelectors', () => {
                 type: 'leaf',
                 id: 'pane-claude',
                 content: {
-                  kind: 'agent-chat',
-                  provider: 'freshclaude',
+                  kind: 'fresh-agent',
+                  sessionType: 'freshclaude',
+                  provider: 'claude',
                   status: 'idle',
                   createRequestId: 'req-claude',
                   resumeSessionId: validClaudeSessionId,

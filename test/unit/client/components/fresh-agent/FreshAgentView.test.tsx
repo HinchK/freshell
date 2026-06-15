@@ -4,15 +4,14 @@ import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
-import freshAgentReducer from '@/store/freshAgentSlice'
-import agentChatReducer from '@/store/agentChatSlice'
+import freshAgentReducer, { sessionInit, setSessionStatus } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { initLayout, requestPaneRefresh, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
-import { sessionInit, setSessionStatus } from '@/store/agentChatSlice'
 import { updateTab } from '@/store/tabsSlice'
+import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -38,10 +37,6 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => wsMock,
 }))
 
-vi.mock('@/components/agent-chat/AgentChatView', () => ({
-  default: ({ paneContent }: { paneContent: { provider: string } }) => <div>agent:{paneContent.provider}</div>,
-}))
-
 vi.mock('@/lib/api', async () => {
   const actual = await vi.importActual<typeof import('@/lib/api')>('@/lib/api')
   return {
@@ -62,7 +57,6 @@ function createStore(tabTitleSetByUser = false) {
       panes: panesReducer,
       settings: settingsReducer,
       freshAgent: freshAgentReducer,
-      agentChat: agentChatReducer,
       tabs: tabsReducer,
     },
     preloadedState: {
@@ -187,7 +181,7 @@ afterEach(() => {
 })
 
 describe('FreshAgentView', () => {
-  it('renders freshclaude in the shared shell and answers approvals/questions over fresh-agent WS', async () => {
+  it('renders freshclaude capability prompts in the shared shell and answers approvals/questions over fresh-agent WS', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
       status: 'running',
@@ -259,6 +253,67 @@ describe('FreshAgentView', () => {
       requestId: 'question-1',
       answers: { 'How should Claude proceed?': 'Continue' },
     })
+  })
+
+  it('honors pane display overrides ahead of global fresh-agent settings', async () => {
+    const store = createStore()
+    store.dispatch(updateSettingsLocal({
+      freshAgent: {
+        showThinking: false,
+        showTools: false,
+        showTimecodes: false,
+      },
+    }))
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'Display summary',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [{
+        id: 'turn-display',
+        turnId: 'turn-display',
+        role: 'assistant',
+        timestamp: '2026-06-15T12:34:56.000Z',
+        model: 'claude-opus-4-6',
+        summary: 'used tools',
+        items: [
+          { id: 'think-display', kind: 'thinking', text: 'pane-level thinking' },
+          {
+            id: 'tool-display',
+            kind: 'tool_use',
+            toolUseId: 'call-display',
+            name: 'Bash',
+            input: { command: 'npm run display-check' },
+          },
+        ],
+      }],
+    })
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            createRequestId: 'req-display',
+            sessionId: CLAUDE_THREAD_ID,
+            status: 'connected',
+            showThinking: true,
+            showTools: true,
+            showTimecodes: true,
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('npm run display-check')).toBeInTheDocument()
+    })
+    expect(screen.getByRole('button', { name: 'Thinking' })).toBeInTheDocument()
+    expect(screen.getByText('claude-opus-4-6')).toBeInTheDocument()
+    expect(screen.getByText(new Date('2026-06-15T12:34:56.000Z').toLocaleTimeString())).toBeInTheDocument()
   })
 
   it('shows the provider watermark behind the workspace and redirects pane typing into the composer', async () => {
@@ -518,6 +573,42 @@ describe('FreshAgentView', () => {
     expect(await screen.findByText('Codex turn')).toBeInTheDocument()
   })
 
+  it('restores a fresh-agent split pane remount without creating a replacement session', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-split-restore',
+        sessionId: 'thread-split-restore',
+        status: 'idle',
+      },
+    }))
+
+    const first = render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await screen.findByRole('textbox', { name: 'Chat message input' })
+    first.unmount()
+    wsMock.send.mockClear()
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await screen.findByRole('textbox', { name: 'Chat message input' })
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith('freshcodex', 'codex', 'thread-split-restore', expect.any(Object))
+    expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
+  })
+
   it('acquires a session id for a new non-Claude fresh-agent pane after freshAgent.created', async () => {
     const store = createStore()
     store.dispatch(initLayout({
@@ -767,6 +858,103 @@ describe('FreshAgentView', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
     expect(sentFreshAgentMessages('freshAgent.send').at(-1)).toMatchObject({
       sessionId: 'ses_real_materialized_1',
+    })
+  })
+
+  it('does not double-project non-idempotent freshAgent.event messages when App and view both receive them', async () => {
+    const store = createStore()
+    const sessionId = 'thread-single-projection-owner'
+    const sessionKey = `freshcodex:codex:${sessionId}`
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: sessionId,
+      revision: 1,
+      latestTurnId: null,
+      status: 'idle',
+      summary: 'Empty thread',
+      capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+      pendingApprovals: [],
+      pendingQuestions: [],
+      worktrees: [],
+      diffs: [],
+      childThreads: [],
+      turns: [],
+      extensions: {},
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-single-projection-owner',
+        sessionId,
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(onMessage).toBeTypeOf('function')
+    })
+
+    const deliverThroughAppAndMountedView = (event: Record<string, unknown>) => {
+      const message = {
+        type: 'freshAgent.event',
+        sessionId,
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        event: { sessionId, ...event },
+      }
+      let handled = false
+      act(() => {
+        handled = handleFreshAgentMessage(store.dispatch, message)
+        onMessage?.(message)
+      })
+      expect(handled).toBe(true)
+    }
+
+    deliverThroughAppAndMountedView({
+      type: 'freshAgent.stream',
+      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } },
+    })
+    expect(store.getState().freshAgent.sessions[sessionKey].streamingText).toBe('partial')
+
+    deliverThroughAppAndMountedView({
+      type: 'freshAgent.assistant',
+      model: 'codex-5',
+      content: [{ type: 'text', text: 'Final answer' }],
+    })
+    const assistantSession = store.getState().freshAgent.sessions[sessionKey]
+    expect(assistantSession.turns).toHaveLength(1)
+    expect(assistantSession.turns[0]).toMatchObject({
+      role: 'assistant',
+      model: 'codex-5',
+      summary: 'Final answer',
+    })
+
+    deliverThroughAppAndMountedView({
+      type: 'freshAgent.result',
+      costUsd: 0.07,
+      usage: { input_tokens: 11, output_tokens: 13 },
+    })
+    expect(store.getState().freshAgent.sessions[sessionKey]).toMatchObject({
+      totalCostUsd: 0.07,
+      totalInputTokens: 11,
+      totalOutputTokens: 13,
     })
   })
 
@@ -1871,7 +2059,7 @@ describe('FreshAgentView', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         event: {
-          type: 'sdk.session.snapshot',
+          type: 'freshAgent.session.snapshot',
           sessionId: 'thread-partial-refresh',
           latestTurnId: 'turn-new-user',
           status: 'running',
@@ -1970,7 +2158,7 @@ describe('FreshAgentView', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         event: {
-          type: 'sdk.session.snapshot',
+          type: 'freshAgent.session.snapshot',
           sessionId: 'thread-authoritative-refresh',
           latestTurnId: 'turn-authoritative-user',
           status: 'idle',
@@ -2061,7 +2249,7 @@ describe('FreshAgentView', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         event: {
-          type: 'sdk.session.snapshot',
+          type: 'freshAgent.session.snapshot',
           sessionId: 'thread-stale-revision',
           latestTurnId: 'turn-stale',
           status: 'running',
@@ -2894,10 +3082,12 @@ describe('FreshAgentView', () => {
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-1'))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       cliSessionId: 'cli-abc',
       model: 'claude-opus-4-6',
     }))
-    store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-1', sessionType: 'freshclaude', provider: 'claude', status: 'idle' }))
 
     const paneContent = {
       kind: 'fresh-agent' as const,
@@ -2943,10 +3133,12 @@ describe('FreshAgentView', () => {
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-1'))
     store.dispatch(sessionInit({
       sessionId: 'sess-1',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       cliSessionId: 'cli-abc',
       model: 'claude-opus-4-6',
     }))
-    store.dispatch(setSessionStatus({ sessionId: 'sess-1', status: 'idle' }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-1', sessionType: 'freshclaude', provider: 'claude', status: 'idle' }))
     store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Existing title', setByUser: false }))
 
     const paneContent = {
@@ -2991,9 +3183,11 @@ describe('FreshAgentView', () => {
     apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new TypeError('Failed to parse URL from /api/fresh-agent/threads/claude/sess-live-only'))
     store.dispatch(sessionInit({
       sessionId: 'sess-live-only',
+      sessionType: 'freshclaude',
+      provider: 'claude',
       model: 'claude-opus-4-6',
     }))
-    store.dispatch(setSessionStatus({ sessionId: 'sess-live-only', status: 'idle' }))
+    store.dispatch(setSessionStatus({ sessionId: 'sess-live-only', sessionType: 'freshclaude', provider: 'claude', status: 'idle' }))
     store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Existing live-only pane title', setByUser: false }))
     store.dispatch(updateTab({ id: 'tab-1', updates: { title: 'Existing live-only tab title' } }))
 
@@ -3060,21 +3254,23 @@ describe('FreshAgentView', () => {
     const onMessage = wsMock.onMessage.mock.calls[0]?.[0]
     expect(onMessage).toBeTypeOf('function')
 
-    act(() => {
-      onMessage({
-        type: 'freshAgent.event',
+    const snapshotMessage = {
+      type: 'freshAgent.event',
+      sessionId: 'dead-session-id',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: {
+        type: 'freshAgent.session.snapshot',
         sessionId: 'dead-session-id',
-        sessionType: 'freshclaude',
-        provider: 'claude',
-        event: {
-          type: 'sdk.session.snapshot',
-          sessionId: 'dead-session-id',
-          latestTurnId: 'turn-1',
-          status: 'idle',
-          timelineSessionId: durableSessionId,
-          revision: 2,
-        },
-      })
+        latestTurnId: 'turn-1',
+        status: 'idle',
+        timelineSessionId: durableSessionId,
+        revision: 2,
+      },
+    }
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, snapshotMessage)
+      onMessage(snapshotMessage)
     })
 
     await waitFor(() => {
@@ -3085,19 +3281,21 @@ describe('FreshAgentView', () => {
     })
     expect(screen.queryByText(/failed to parse url/i)).not.toBeInTheDocument()
 
-    act(() => {
-      onMessage({
-        type: 'freshAgent.event',
+    const lostMessage = {
+      type: 'freshAgent.event',
+      sessionId: 'dead-session-id',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: {
+        type: 'freshAgent.error',
         sessionId: 'dead-session-id',
-        sessionType: 'freshclaude',
-        provider: 'claude',
-        event: {
-          type: 'sdk.error',
-          sessionId: 'dead-session-id',
-          code: 'INVALID_SESSION_ID',
-          message: 'Session no longer exists',
-        },
-      })
+        code: 'INVALID_SESSION_ID',
+        message: 'Session no longer exists',
+      },
+    }
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, lostMessage)
+      onMessage(lostMessage)
     })
 
     await waitFor(() => {

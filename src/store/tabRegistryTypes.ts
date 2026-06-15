@@ -3,6 +3,7 @@ export {
   RegistryPaneKindSchema,
   RegistryPaneSnapshotSchema,
   TabRegistryRecordSchema,
+  normalizeRegistryTabRecord,
 } from '../../server/tabs-registry/types'
 
 export type {

@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Check, ChevronRight, Loader2, X } from 'lucide-react'
-import DiffView from '@/components/agent-chat/DiffView'
-import { getToolPreview } from '@/components/agent-chat/tool-preview'
+import DiffView from '@/components/fresh-agent/shared/DiffView'
+import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import { LazyMarkdown } from '@/components/markdown/LazyMarkdown'
 import type { FreshAgentTranscriptItem } from '@shared/fresh-agent-contract'
 import { cn } from '@/lib/utils'
@@ -222,7 +222,7 @@ export function itemToToolDisplay(item: FreshAgentTranscriptItem): FreshAgentToo
 
 /**
  * Render visible item text. Assistant-authored text renders as markdown
- * (matching agent-chat's MessageBubble); user text and thinking stay plain
+ * (matching the fresh-agent message bubble); user text and thinking stay plain
  * so literal input is never re-interpreted. The plain <p> doubles as the
  * Suspense fallback so content is readable while the renderer chunk loads.
  */

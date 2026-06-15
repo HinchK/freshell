@@ -83,7 +83,7 @@ test.describe('Pane Activity Indicator', () => {
     const cliSessionId = '22222222-2222-4222-8222-222222222222'
 
     await page.evaluate((currentPaneId: string) => {
-      window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
+      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(currentPaneId, true)
     }, paneId)
 
     await page.evaluate(({ currentTabId, currentPaneId, currentSessionId, currentCliSessionId }) => {

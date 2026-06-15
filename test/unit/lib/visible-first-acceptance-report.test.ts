@@ -24,7 +24,7 @@ describe('evaluateVisibleFirstAcceptanceReport', () => {
       ],
       auditScenarios: [
         {
-          scenarioId: 'agent-chat-cold-boot',
+          scenarioId: 'fresh-agent-cold-boot',
           allowedApiRouteIdsBeforeReady: ['/api/bootstrap', '/api/sessions'],
           allowedWsTypesBeforeReady: ['hello', 'ready', 'sdk.history'],
         },
@@ -41,12 +41,12 @@ describe('evaluateVisibleFirstAcceptanceReport', () => {
       wsOwnershipViolations: ['src/components/OverviewView.tsx'],
       auditScenarioViolations: [
         {
-          scenarioId: 'agent-chat-cold-boot',
+          scenarioId: 'fresh-agent-cold-boot',
           field: 'allowedApiRouteIdsBeforeReady',
           offenders: ['/api/sessions'],
         },
         {
-          scenarioId: 'agent-chat-cold-boot',
+          scenarioId: 'fresh-agent-cold-boot',
           field: 'allowedWsTypesBeforeReady',
           offenders: ['sdk.history'],
         },

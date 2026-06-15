@@ -23,7 +23,7 @@ function findPaneContent(node: PaneNode | undefined, paneId: string): PaneConten
  * A user rename must reach the server-authoritative session override so the
  * left sidebar (which renders the server session title) stays aligned with the
  * tab/pane. Coding-CLI terminal panes cascade via the terminals API; SDK panes
- * (fresh-agent / agent-chat) write the session override directly. Shell panes
+ * (fresh-agent) write the session override directly. Shell panes
  * and browser panes stay Redux-only. Fire-and-forget: the Redux rename already
  * applied, so server failures must not block the UI.
  */
@@ -37,7 +37,7 @@ function syncRenameToServer(content: PaneContent | null, title: string): void {
     }
     return
   }
-  if (content.kind === 'fresh-agent' || content.kind === 'agent-chat') {
+  if (content.kind === 'fresh-agent') {
     if (content.sessionId) {
       const compositeKey = `${content.provider}:${content.sessionId}`
       void api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride: title }).catch(() => {})

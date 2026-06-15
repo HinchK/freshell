@@ -19,7 +19,7 @@ export function getTabDirectoryPreference(root: PaneNode): TabDirectoryPreferenc
   function walk(node: PaneNode): void {
     if (node.type === 'leaf') {
       const content = node.content
-      if (content.kind === 'terminal' || content.kind === 'agent-chat' || content.kind === 'fresh-agent') {
+      if (content.kind === 'terminal' || content.kind === 'fresh-agent') {
         const cwd = content.initialCwd?.trim()
         if (cwd) {
           counts.set(cwd, (counts.get(cwd) ?? 0) + 1)

@@ -10,19 +10,19 @@ import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
 import type { SessionLocator } from '@/store/paneTypes'
 import {
-  AgentChatCapabilitiesResponseSchema,
-  type AgentChatCapabilitiesResponse,
-} from '@shared/agent-chat-capabilities'
+  type FreshAgentModelCapabilitiesResponse,
+} from '@shared/fresh-agent-model-capabilities'
+import { parseFreshAgentModelCapabilitiesResponse } from '@/lib/fresh-agent-model-capabilities'
 import {
-  AgentTimelinePageQuerySchema,
-  AgentTimelineTurnBodyQuerySchema,
+  FreshAgentThreadTurnBodyQuerySchema,
+  FreshAgentThreadTurnsQuerySchema,
   SessionDirectoryPageSchema,
   SessionDirectoryQuerySchema,
   TerminalDirectoryQuerySchema,
   TerminalScrollbackQuerySchema,
   TerminalSearchQuerySchema,
-  type AgentTimelinePageQuery,
-  type AgentTimelineTurnBodyQuery,
+  type FreshAgentThreadTurnBodyQuery,
+  type FreshAgentThreadTurnsQuery,
   type SessionDirectoryItem as ReadModelSessionDirectoryItem,
   type SessionDirectoryPage as ReadModelSessionDirectoryPage,
   type SessionDirectoryQuery,
@@ -54,18 +54,21 @@ function getApiErrorMessage(data: unknown, fallback: string): string {
   return fallback
 }
 
-function getTypedCapabilityFailure(error: unknown): AgentChatCapabilitiesResponse | undefined {
+function getTypedCapabilityFailure(error: unknown): FreshAgentModelCapabilitiesResponse | undefined {
   if (!error || typeof error !== 'object' || !('details' in error)) {
     return undefined
   }
 
-  const parsed = AgentChatCapabilitiesResponseSchema.safeParse(
-    (error as { details?: unknown }).details,
-  )
-  if (!parsed.success || parsed.data.ok) {
+  let parsed: FreshAgentModelCapabilitiesResponse
+  try {
+    parsed = parseFreshAgentModelCapabilitiesResponse((error as { details?: unknown }).details)
+  } catch {
     return undefined
   }
-  return parsed.data
+  if (parsed.ok) {
+    return undefined
+  }
+  return parsed
 }
 
 export function isApiUnauthorizedError(error: unknown): error is ApiError {
@@ -197,13 +200,13 @@ export async function getBootstrap(options: ApiRequestOptions = {}): Promise<any
   return api.get('/api/bootstrap', options)
 }
 
-export async function getAgentChatCapabilities(
-  provider: string,
+export async function getFreshAgentModelCapabilities(
+  sessionType: string,
   options: ApiRequestOptions = {},
-): Promise<AgentChatCapabilitiesResponse> {
+): Promise<FreshAgentModelCapabilitiesResponse> {
   try {
-    return AgentChatCapabilitiesResponseSchema.parse(
-      await api.get(`/api/agent-chat/capabilities/${encodeURIComponent(provider)}`, options),
+    return parseFreshAgentModelCapabilitiesResponse(
+      await api.get(`/api/fresh-agent/model-capabilities/${encodeURIComponent(sessionType)}`, options),
     )
   } catch (error) {
     const typedFailure = getTypedCapabilityFailure(error)
@@ -214,13 +217,13 @@ export async function getAgentChatCapabilities(
   }
 }
 
-export async function refreshAgentChatCapabilities(
-  provider: string,
+export async function refreshFreshAgentModelCapabilities(
+  sessionType: string,
   options: ApiRequestOptions = {},
-): Promise<AgentChatCapabilitiesResponse> {
+): Promise<FreshAgentModelCapabilitiesResponse> {
   try {
-    return AgentChatCapabilitiesResponseSchema.parse(
-      await api.post(`/api/agent-chat/capabilities/${encodeURIComponent(provider)}/refresh`, {}, options),
+    return parseFreshAgentModelCapabilitiesResponse(
+      await api.post(`/api/fresh-agent/model-capabilities/${encodeURIComponent(sessionType)}/refresh`, {}, options),
     )
   } catch (error) {
     const typedFailure = getTypedCapabilityFailure(error)
@@ -268,14 +271,14 @@ export async function getTerminalDirectoryPage(
   )
 }
 
-export async function getAgentTimelinePage(
+export async function getFreshAgentThreadTurns(
   sessionId: string,
-  query: AgentTimelinePageQuery,
+  query: FreshAgentThreadTurnsQuery,
   options: ApiRequestOptions = {},
 ): Promise<any> {
-  const parsed = AgentTimelinePageQuerySchema.parse(query)
+  const parsed = FreshAgentThreadTurnsQuerySchema.parse(query)
   return api.get(
-    `/api/agent-sessions/${encodeURIComponent(sessionId)}/timeline${buildQueryString([
+    `/api/fresh-agent/threads/freshclaude/claude/${encodeURIComponent(sessionId)}/turns${buildQueryString([
       ['cursor', parsed.cursor],
       ['priority', parsed.priority],
       ['revision', parsed.revision],
@@ -286,16 +289,16 @@ export async function getAgentTimelinePage(
   )
 }
 
-export async function getAgentTurnBody(
+export async function getFreshAgentThreadTurnBody(
   sessionId: string,
   turnId: string,
-  query: AgentTimelineTurnBodyQuery & { signal?: AbortSignal },
+  query: FreshAgentThreadTurnBodyQuery & { signal?: AbortSignal },
   options: ApiRequestOptions = {},
 ): Promise<any> {
-  const parsed = AgentTimelineTurnBodyQuerySchema.parse(query)
+  const parsed = FreshAgentThreadTurnBodyQuerySchema.parse(query)
   const signal = query.signal ?? options.signal
   return api.get(
-    `/api/agent-sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
+    `/api/fresh-agent/threads/freshclaude/claude/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}${buildQueryString([
       ['revision', parsed.revision],
     ])}`,
     { ...options, signal },

@@ -5,7 +5,7 @@ import { cn } from '@/lib/utils'
 import { useAppSelector } from '@/store/hooks'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { getCliProviderConfigs, type CodingCliProviderConfig } from '@/lib/coding-cli-utils'
-import { getVisibleAgentChatConfigs, type AgentChatProviderName } from '@/lib/agent-chat-utils'
+import { getVisibleFreshAgentConfigs, type FreshAgentProviderName } from '@/lib/fresh-agent-provider-utils'
 import { FRESH_AGENT_REGISTRY } from '@/lib/fresh-agent-registry'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
@@ -13,7 +13,7 @@ import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import type { FreshAgentSessionType } from '@shared/fresh-agent'
 
-export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | AgentChatProviderName | FreshAgentSessionType | CodingCliProviderName | `ext:${string}`
+export type PanePickerType = 'shell' | 'cmd' | 'powershell' | 'wsl' | 'browser' | 'editor' | FreshAgentProviderName | FreshAgentSessionType | CodingCliProviderName | `ext:${string}`
 
 type IconComponent = ComponentType<{ className?: string } & SVGProps<SVGSVGElement>>
 
@@ -102,7 +102,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
   const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? EMPTY_ENABLED_PROVIDERS)
   const disabledExtensions = useAppSelector((s) => s.settings?.settings?.extensions?.disabled ?? EMPTY_ENABLED_PROVIDERS)
   const freshClientsEnabled = useAppSelector((s) => (
-    s.settings?.settings?.freshAgent?.enabled ?? s.settings?.settings?.agentChat?.enabled ?? false
+    s.settings?.settings?.freshAgent?.enabled ?? false
   ))
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 
@@ -116,9 +116,9 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
     // Shell options depend on platform
     const shellOptions = isWindowsLike(platform) ? windowsShellOptions : [shellOption]
 
-    // Agent chat options: only show if underlying CLI is available, enabled, and not hidden by feature flag
-    const visibleAgentChatConfigs = freshClientsEnabled ? getVisibleAgentChatConfigs(featureFlags) : []
-    const agentChatOptions: PickerOption[] = visibleAgentChatConfigs
+    // Fresh-agent provider options: only show if underlying CLI is available, enabled, and not hidden by feature flag
+    const visibleFreshAgentConfigs = freshClientsEnabled ? getVisibleFreshAgentConfigs(featureFlags) : []
+    const freshAgentProviderOptions: PickerOption[] = visibleFreshAgentConfigs
       .filter((config) => availableClis[config.codingCliProvider] && enabledProviders.includes(config.codingCliProvider) && !disabledExtensions.includes(config.codingCliProvider))
       .map((config) => ({
         type: config.name as PanePickerType,
@@ -129,7 +129,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
       }))
     const otherFreshAgentOptions: PickerOption[] = freshClientsEnabled
       ? FRESH_AGENT_REGISTRY
-          .filter((entry) => !visibleAgentChatConfigs.some((config) => config.name === entry.sessionType))
+          .filter((entry) => !visibleFreshAgentConfigs.some((config) => config.name === entry.sessionType))
           .filter((entry) => !entry.disabled)
           .filter((entry) => !entry.hidden || featureFlags[entry.featureFlag ?? entry.sessionType] === true)
           .filter((entry) => availableClis[entry.runtimeProvider] && enabledProviders.includes(entry.runtimeProvider) && !disabledExtensions.includes(entry.runtimeProvider))
@@ -142,9 +142,9 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
           }))
       : []
 
-    const allFreshAgentOptions = [...agentChatOptions, ...otherFreshAgentOptions]
-    const agentChatBefore = allFreshAgentOptions.filter((o) => !o.afterCli)
-    const agentChatAfter = allFreshAgentOptions.filter((o) => o.afterCli)
+    const allFreshAgentOptions = [...freshAgentProviderOptions, ...otherFreshAgentOptions]
+    const freshAgentOptionsBeforeCli = allFreshAgentOptions.filter((o) => !o.afterCli)
+    const freshAgentOptionsAfterCli = allFreshAgentOptions.filter((o) => o.afterCli)
 
     // Extension options from the registry (exclude CLI extensions and disabled extensions)
     const extensionOptions: PickerOption[] = extensionEntries
@@ -156,8 +156,8 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
         shortcut: ext.picker?.shortcut ?? '',
       }))
 
-    // Order: agent chat (before), CLIs, agent chat (after), Editor, Browser, Shell(s), Extensions
-    return [...agentChatBefore, ...cliOptions, ...agentChatAfter, ...nonShellOptions, ...shellOptions, ...extensionOptions]
+    // Order: fresh-agent clients (before), CLIs, fresh-agent clients (after), Editor, Browser, Shell(s), Extensions
+    return [...freshAgentOptionsBeforeCli, ...cliOptions, ...freshAgentOptionsAfterCli, ...nonShellOptions, ...shellOptions, ...extensionOptions]
   }, [platform, availableClis, featureFlags, enabledProviders, disabledExtensions, freshClientsEnabled, extensionEntries])
 
   const [focusedIndex, setFocusedIndex] = useState<number | null>(null)

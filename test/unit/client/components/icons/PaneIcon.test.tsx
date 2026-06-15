@@ -16,6 +16,18 @@ vi.mock('@/components/icons/provider-icons', () => ({
   ),
 }))
 
+vi.mock('@/lib/fresh-agent-registry', () => ({
+  resolveFreshAgentType: (sessionType: string) => {
+    if (sessionType === 'freshclaude') {
+      return { icon: (props: any) => <svg data-testid="freshclaude-icon" {...props} /> }
+    }
+    if (sessionType === 'kilroy') {
+      return { icon: (props: any) => <svg data-testid="kilroy-icon" {...props} /> }
+    }
+    return undefined
+  },
+}))
+
 // Mock lucide-react
 vi.mock('lucide-react', () => ({
   Terminal: (props: any) => <svg data-testid="terminal-icon" {...props} />,
@@ -88,30 +100,49 @@ describe('PaneIcon', () => {
     expect(screen.getByTestId('file-text-icon')).toBeInTheDocument()
   })
 
-  it('renders an icon for freshclaude agent-chat panes', () => {
-    const { container } = render(
+  it('renders the Freshclaude icon for fresh-agent panes', () => {
+    render(
       <PaneIcon
         content={{
-          kind: 'agent-chat', provider: 'freshclaude',
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
           createRequestId: 'req-1',
           status: 'idle',
         }}
       />
     )
-    expect(container.querySelector('svg')).toBeInTheDocument()
+    expect(screen.getByTestId('freshclaude-icon')).toBeInTheDocument()
   })
 
-  it('renders an icon for kilroy agent-chat panes', () => {
-    const { container } = render(
+  it('renders the Kilroy icon for fresh-agent panes', () => {
+    render(
       <PaneIcon
         content={{
-          kind: 'agent-chat', provider: 'kilroy',
+          kind: 'fresh-agent',
+          sessionType: 'kilroy',
+          provider: 'claude',
           createRequestId: 'req-1',
           status: 'idle',
         }}
       />
     )
-    expect(container.querySelector('svg')).toBeInTheDocument()
+    expect(screen.getByTestId('kilroy-icon')).toBeInTheDocument()
+  })
+
+  it('falls back to layout-grid for unregistered fresh-agent session types', () => {
+    render(
+      <PaneIcon
+        content={{
+          kind: 'fresh-agent',
+          sessionType: 'unregistered-agent' as any,
+          provider: 'claude',
+          createRequestId: 'req-1',
+          status: 'idle',
+        }}
+      />
+    )
+    expect(screen.getByTestId('layout-grid-icon')).toBeInTheDocument()
   })
 
   it('renders layout-grid icon for picker panes', () => {

@@ -62,12 +62,12 @@ describe('buildResumeContent', () => {
     expect(content.effort).toBeUndefined()
   })
 
-  it('returns freshopencode resume content without a Freshell permission mode', () => {
+  it('keeps freshAgentProviderSettings from adding a Freshopencode permission mode', () => {
     const content = buildResumeContent({
       sessionType: 'freshopencode',
       sessionId: 'ses_opencode_123',
       cwd: '/home/user/project',
-      agentChatProviderSettings: {
+      freshAgentProviderSettings: {
         defaultPermissionMode: 'bypassPermissions',
       },
     })
@@ -76,7 +76,7 @@ describe('buildResumeContent', () => {
     if (content.kind !== 'fresh-agent') throw new Error('expected fresh-agent')
     expect(content.sessionType).toBe('freshopencode')
     expect(content.provider).toBe('opencode')
-    expect(content.resumeSessionId).toBe('ses_opencode_123')
+    expect(content.resumeSessionId).toBeUndefined()
     expect(content.sessionRef).toEqual({
       provider: 'opencode',
       sessionId: 'ses_opencode_123',
@@ -188,11 +188,11 @@ describe('buildResumeContent', () => {
     expect('terminalId' in content).toBe(false)
   })
 
-  it('uses provider settings when provided', () => {
+  it('applies freshAgentProviderSettings to fresh-agent resume content', () => {
     const content = buildResumeContent({
       sessionType: 'freshclaude',
       sessionId: 'abc-123',
-      agentChatProviderSettings: {
+      freshAgentProviderSettings: {
         modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
         defaultPermissionMode: 'default',
         effort: 'turbo',

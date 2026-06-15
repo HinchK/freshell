@@ -1,6 +1,5 @@
-import { isAgentChatModelSelection, normalizeAgentChatEffortOverride, type PaneNode } from './paneTypes'
+import { isFreshAgentModelSelection, type PaneNode } from './paneTypes'
 import { CodexDurabilityRefSchema } from '@shared/codex-durability'
-import { getFreshAgentThinkingOptions, normalizeFreshAgentModel } from '@/lib/fresh-agent-models'
 import { isFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -65,18 +64,6 @@ function isPaneContentShape(content: unknown): boolean {
       const sessionType = isFreshAgentSessionType(content.sessionType) ? content.sessionType : undefined
       const runtimeProvider = sessionType ? resolveFreshAgentRuntimeProvider(sessionType) : undefined
       const providerValid = typeof content.provider === 'string' && runtimeProvider === content.provider
-      const model = sessionType && runtimeProvider && providerValid
-        ? normalizeFreshAgentModel(
-          sessionType,
-          runtimeProvider,
-          typeof content.model === 'string' ? content.model : undefined,
-        )
-        : undefined
-      const thinkingOptions = sessionType && runtimeProvider && providerValid
-        ? getFreshAgentThinkingOptions(sessionType, runtimeProvider, model)
-        : []
-      const isFreshAgentEffortValid = content.effort === undefined
-        || thinkingOptions.some((option) => option.value === content.effort)
       const hasSessionRef = content.sessionRef !== undefined
         && (typeof content.sessionRef === 'object' || !!(content.sessionRef as object))
       const hasRestoreError = content.restoreError !== undefined
@@ -89,34 +76,22 @@ function isPaneContentShape(content: unknown): boolean {
         && isOptionalString(content.initialCwd)
         && isOptionalString(content.model)
         && isOptionalString(content.permissionMode)
-        && (content.modelSelection === undefined || isAgentChatModelSelection(content.modelSelection))
+        && (content.modelSelection === undefined || isFreshAgentModelSelection(content.modelSelection))
         && (content.sandbox === undefined
           || content.sandbox === 'read-only'
           || content.sandbox === 'workspace-write'
           || content.sandbox === 'danger-full-access')
-        && isFreshAgentEffortValid
+        && isOptionalString(content.effort)
         && isSessionRefShape(content.sessionRef)
         && isRestoreErrorShape(content.restoreError)
         && !(hasSessionRef && hasRestoreError)
         && (content.plugins === undefined
           || (Array.isArray(content.plugins) && content.plugins.every((plugin) => typeof plugin === 'string')))
         && (content.settingsDismissed === undefined || typeof content.settingsDismissed === 'boolean')
+        && (content.showThinking === undefined || typeof content.showThinking === 'boolean')
+        && (content.showTools === undefined || typeof content.showTools === 'boolean')
+        && (content.showTimecodes === undefined || typeof content.showTimecodes === 'boolean')
     }
-    case 'agent-chat':
-      return typeof content.provider === 'string'
-        && typeof content.createRequestId === 'string'
-        && typeof content.status === 'string'
-        && isOptionalString(content.sessionId)
-        && isOptionalString(content.resumeSessionId)
-        && isSessionRefShape(content.sessionRef)
-        && isRestoreErrorShape(content.restoreError)
-        && isOptionalString(content.initialCwd)
-        && (content.modelSelection === undefined || isAgentChatModelSelection(content.modelSelection))
-        && isOptionalString(content.permissionMode)
-        && (content.effort === undefined || normalizeAgentChatEffortOverride(content.effort) !== undefined)
-        && (content.plugins === undefined
-          || (Array.isArray(content.plugins) && content.plugins.every((plugin) => typeof plugin === 'string')))
-        && (content.settingsDismissed === undefined || typeof content.settingsDismissed === 'boolean')
     case 'extension':
       return typeof content.extensionName === 'string'
         && isRecord(content.props)
@@ -161,4 +136,8 @@ export function isWellFormedPaneTree(node: unknown): node is PaneNode {
   }
   if (!isPaneSplitNodeShape(node)) return false
   return isWellFormedPaneTree(node.children[0]) && isWellFormedPaneTree(node.children[1])
+}
+
+export function validatePaneTree(node: unknown): { valid: boolean } {
+  return { valid: isWellFormedPaneTree(node) }
 }

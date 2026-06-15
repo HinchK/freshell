@@ -15,9 +15,6 @@ async function enableClaudeAndCodex(page: any) {
       freshAgent: {
         enabled: true,
       },
-      agentChat: {
-        enabled: true,
-      },
     }
     harness?.dispatch({
       type: 'settings/previewServerSettingsPatch',
@@ -41,7 +38,7 @@ async function suppressFreshAgentNetworkForActivePane(page: any) {
     const tabId = state?.tabs?.activeTabId
     const paneId = tabId ? state?.panes?.activePane?.[tabId] : null
     if (paneId) {
-      harness?.setAgentChatNetworkEffectsSuppressed(paneId, true)
+      harness?.setFreshAgentNetworkEffectsSuppressed(paneId, true)
     }
   })
 }
@@ -271,6 +268,7 @@ test.describe('Fresh Agent', () => {
             resumeSessionId: 'style-thread',
             status: 'idle',
             settingsDismissed: true,
+            showThinking: true,
           },
         },
       })
@@ -644,7 +642,7 @@ test.describe('Fresh Agent', () => {
     await page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
         type: 'settings/updateSettingsLocal',
-        payload: { terminal: { fontSize: 20 }, freshAgent: { fontScale: 2 }, agentChat: { fontScale: 2 } },
+        payload: { terminal: { fontSize: 20 }, freshAgent: { fontScale: 2 } },
       })
     })
     await expect.poll(readTranscriptFontSize).toBe('20px')
@@ -700,7 +698,7 @@ test.describe('Fresh Agent', () => {
     }, tabId!)
     expect(activePaneId).toBeTruthy()
     await page.evaluate((currentPaneId: string) => {
-      window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
+      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(currentPaneId, true)
     }, activePaneId)
     await page.getByRole('button', { name: /^Freshcodex$/i }).click()
     await page.getByRole('option').first().click()

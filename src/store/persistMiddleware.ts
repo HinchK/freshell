@@ -5,12 +5,20 @@ import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { isWellFormedPaneTree } from './paneTreeValidation.js'
-import { PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw } from './persistedState.js'
+import {
+  LAYOUT_FRESH_AGENT_BACKUP_KEY,
+  LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+  LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY,
+  PANES_SCHEMA_VERSION,
+  LAYOUT_SCHEMA_VERSION,
+  parsePersistedLayoutRaw,
+  readRecoverablePersistedLayoutRaw,
+} from './persistedState.js'
 import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
-import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from './paneTypes'
+import { normalizeFreshAgentEffortOverride, normalizeFreshAgentModelSelection } from './paneTypes'
 import {
   loadPersistedTabRecency,
   mergeTabRecencyStatesByMax,
@@ -94,7 +102,7 @@ export function loadPersistedLayout(): typeof cachedPersistedLayout {
   if (cachedPersistedLayout !== undefined) return cachedPersistedLayout
 
   try {
-    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    const raw = readRecoverablePersistedLayoutRaw(localStorage)
     if (raw) {
       const layoutParsed = parsePersistedLayoutRaw(raw)
       if (layoutParsed) {
@@ -143,27 +151,19 @@ function migratePaneContent(content: any): any {
     return content
   }
   content = migrateLegacyFreshAgentContent(content)
-  if (content.kind === 'agent-chat') {
-    const { model: _legacyModel, ...rest } = content
-    return {
-      ...rest,
-      modelSelection: normalizeAgentChatModelSelection(content.modelSelection, content.model),
-      effort: normalizeAgentChatEffortOverride(content.effort),
-    }
-  }
   if (content.kind === 'fresh-agent') {
     const { model: legacyModel, modelSelection: legacyModelSelection, ...rest } = content
     if (content.provider === 'codex') {
       return {
         ...rest,
         ...(typeof legacyModel === 'string' ? { model: legacyModel } : {}),
-        effort: normalizeAgentChatEffortOverride(content.effort),
+        effort: normalizeFreshAgentEffortOverride(content.effort),
       }
     }
     return {
       ...rest,
-      modelSelection: normalizeAgentChatModelSelection(legacyModelSelection, legacyModel),
-      effort: normalizeAgentChatEffortOverride(content.effort),
+      modelSelection: normalizeFreshAgentModelSelection(legacyModelSelection, legacyModel),
+      effort: normalizeFreshAgentEffortOverride(content.effort),
     }
   }
   if (content.kind === 'browser') {
@@ -201,7 +201,7 @@ function stripEditorContent(content: any): any {
 
 function stripTransientSessionFields(content: any): any {
   if (!content || typeof content !== 'object') return content
-  if (content.kind !== 'terminal' && content.kind !== 'agent-chat' && content.kind !== 'fresh-agent') return content
+  if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return content
 
   const sessionRef = sanitizeSessionRef(content.sessionRef)
   const {
@@ -375,7 +375,7 @@ function migratePanesData(parsed: any): any | null {
     // Version 2 -> 3: add paneTitles (already defaulted to {} above)
     // No additional migration needed, just ensure the field exists
 
-    // Version 4 -> 5: drop claude-chat panes (renamed to agent-chat; no data migration)
+    // Version 4 -> 5: drop claude-chat panes.
     if (currentVersion < 5) {
       const droppedLayouts: Record<string, any> = {}
       for (const [tabId, node] of Object.entries(layouts)) {
@@ -393,7 +393,7 @@ function migratePanesData(parsed: any): any | null {
       layouts = migratedLayouts
     }
 
-    // Version 6 -> 7: migrate agent-chat model/effort persistence to selection strategies.
+    // Version 6 -> 7: migrate fresh-agent model/effort persistence to selection strategies.
     if (currentVersion < 7) {
       const migratedLayouts: Record<string, any> = {}
       for (const [tabId, node] of Object.entries(layouts)) {
@@ -502,6 +502,9 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
 
         const raw = JSON.stringify(layoutPayload)
         localStorage.setItem(LAYOUT_STORAGE_KEY, raw)
+        localStorage.removeItem(LAYOUT_FRESH_AGENT_BACKUP_KEY)
+        localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
+        localStorage.removeItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
         broadcastPersistedRaw(LAYOUT_STORAGE_KEY, raw)
       }
 

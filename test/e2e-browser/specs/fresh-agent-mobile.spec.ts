@@ -11,7 +11,7 @@ test.describe('Fresh Agent Mobile', () => {
     const paneId = layout.id as string
 
     await page.evaluate((currentPaneId: string) => {
-      window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
+      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(currentPaneId, true)
     }, paneId)
 
     const sessionId = '55555555-5555-4555-8555-555555555555'

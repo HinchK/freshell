@@ -7,13 +7,12 @@ import Pane from './Pane'
 import PaneDivider from './PaneDivider'
 import TerminalView from '../TerminalView'
 import BrowserPane from './BrowserPane'
-import AgentChatView from '../agent-chat/AgentChatView'
 import FreshAgentView from '../fresh-agent/FreshAgentView'
 import ExtensionPane from './ExtensionPane'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
-import { isAgentChatProviderName, getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { isFreshAgentProviderName, getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
@@ -34,18 +33,16 @@ import { snap1D, collectCollinearSnapTargets, convertThresholdToLocal } from '@/
 import { nanoid } from 'nanoid'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
-import type { ChatSessionState, PendingAgentCreate } from '@/store/agentChatTypes'
 import type { FreshAgentPendingCreate, FreshAgentSessionState } from '@/store/freshAgentTypes'
-import type { AgentChatPaneContent } from '@/store/paneTypes'
-import { normalizeAgentChatEffortOverride, normalizeAgentChatModelSelection } from '@/store/paneTypes'
+import type { FreshAgentPaneContent } from '@/store/paneTypes'
+import { normalizeFreshAgentEffortOverride, normalizeFreshAgentModelSelection } from '@/store/paneTypes'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
-import { clearPendingCreate, removeSession } from '@/store/agentChatSlice'
 import {
   clearPendingCreate as clearFreshAgentPendingCreate,
   removeSession as removeFreshAgentSession,
 } from '@/store/freshAgentSlice'
 import { DEFAULT_FRESH_AGENT_STYLE } from '@shared/settings'
-import { cancelCreate } from '@/lib/sdk-message-handler'
+import { cancelCreate } from '@/lib/create-cancellation'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import type { ProjectGroup, CodingCliSession } from '@/store/types'
@@ -60,14 +57,12 @@ import type { SessionLocator } from '@shared/ws-protocol'
 const EMPTY_PANE_TITLES: Record<string, string> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
-const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
 const EMPTY_ATTENTION_BY_PANE: Record<string, boolean> = {}
-const EMPTY_PENDING_CREATES: Record<string, PendingAgentCreate> = {}
 const EMPTY_FRESH_AGENT_PENDING_CREATES: Record<string, FreshAgentPendingCreate> = {}
 const EMPTY_EXTENSION_ENTRIES: ClientExtensionEntry[] = []
 const EditorPane = lazy(() => withChunkErrorRecovery(import('./EditorPane')))
@@ -145,12 +140,12 @@ function findIndexedSessionById(
 
 function resolveFreshClaudeRuntimeMeta(
   indexedProjects: ProjectGroup[],
-  content: AgentChatPaneContent,
-  session: ChatSessionState | undefined,
+  content: FreshAgentPaneContent,
+  session: FreshAgentSessionState | undefined,
 ): PaneRuntimeMeta | undefined {
-  if (content.provider !== 'freshclaude') return undefined
+  if (content.provider !== 'claude') return undefined
 
-  const provider = getAgentChatProviderConfig(content.provider)?.codingCliProvider
+  const provider = content.provider
   const indexedSessionId = getPreferredResumeSessionId(session) ?? content.resumeSessionId
   if (!provider || !indexedSessionId) return undefined
 
@@ -177,7 +172,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
   )
   const indexedProjects = useAppSelector((s) => s.sessions?.projects ?? EMPTY_PROJECTS)
-  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
   const codexActivityByTerminalId = useAppSelector(
     (s) => s.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID
@@ -201,7 +195,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const containerRef = useRef<HTMLDivElement>(null)
   const ws = useMemo(() => getWsClient(), [])
   const snapThreshold = useAppSelector((s) => s.settings?.settings?.panes?.snapThreshold ?? 2)
-  const sdkPendingCreates = useAppSelector((s) => s.agentChat?.pendingCreates ?? EMPTY_PENDING_CREATES)
   const freshAgentPendingCreates = useAppSelector(
     (s) => s.freshAgent?.pendingCreates ?? EMPTY_FRESH_AGENT_PENDING_CREATES
   )
@@ -291,26 +284,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         terminalId: content.terminalId,
       })
     }
-    // Clean up agent-chat resources
-    if (content.kind === 'agent-chat') {
-      clearDraft(paneId)
-      const pendingCreate = sdkPendingCreates[content.createRequestId]
-      const pendingSessionId = pendingCreate?.sessionId
-      const sessionId = content.sessionId || pendingSessionId
-      if (sessionId) {
-        ws.send({ type: 'sdk.kill', sessionId })
-      } else {
-        // No sessionId yet — sdk.created hasn't arrived. Mark the createRequestId as
-        // cancelled so the message handler will kill the orphan when it does arrive.
-        cancelCreate(content.createRequestId)
-        ws.cancelCreate(content.createRequestId)
-      }
-      // Clean up Redux state for orphaned pending creates
-      if (!content.sessionId && pendingSessionId) {
-        dispatch(removeSession({ sessionId: pendingSessionId }))
-        dispatch(clearPendingCreate({ requestId: content.createRequestId }))
-      }
-    }
     if (content.kind === 'fresh-agent') {
       clearDraft(paneId)
       const pendingCreate = freshAgentPendingCreates[content.createRequestId]
@@ -339,7 +312,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Extension panes: V1 leaves server extensions running until freshell shutdown.
     // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
-  }, [dispatch, freshAgentPendingCreates, sdkPendingCreates, tabId, ws])
+  }, [dispatch, freshAgentPendingCreates, tabId, ws])
 
   const handleFocus = useCallback((paneId: string) => {
     // Decision 1: visiting any pane of the tab (a click into it) dismisses the
@@ -417,7 +390,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     const paneTitle = getPaneDisplayTitle(node.content, explicitTitle, extensionEntries)
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
-      : (node.content.kind === 'agent-chat' || node.content.kind === 'fresh-agent')
+      : node.content.kind === 'fresh-agent'
         ? (node.content.status === 'exited' ? 'exited' : 'running')
         : 'running'
     const isRenaming = renamingPaneId === node.id
@@ -453,27 +426,24 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           provider: paneProvider,
           initialCwd: paneInitialCwd,
         })
-        : (node.content.kind === 'agent-chat' || node.content.kind === 'fresh-agent')
+        : node.content.kind === 'fresh-agent'
           ? (
-            node.content.kind === 'agent-chat'
-            || (node.content.kind === 'fresh-agent' && node.content.provider === 'claude')
+            node.content.provider === 'claude'
           )
             ? resolveFreshClaudeRuntimeMeta(
               indexedProjects,
-              node.content.kind === 'fresh-agent'
-                ? {
-                    ...node.content,
-                    kind: 'agent-chat',
-                    provider: 'freshclaude',
-                    effort: normalizeFreshAgentEffort(
-                      node.content.sessionType,
-                      node.content.provider,
-                      node.content.model,
-                      node.content.effort,
-                    ),
-                  }
-                : node.content,
-              node.content.sessionId ? agentChatSessions[node.content.sessionId] : undefined,
+              {
+                ...node.content,
+                effort: normalizeFreshAgentEffort(
+                  node.content.sessionType,
+                  node.content.provider,
+                  node.content.model,
+                  node.content.effort,
+                ),
+              },
+              node.content.sessionId
+                ? freshAgentSessions[`${node.content.sessionType}:${node.content.provider}:${node.content.sessionId}`]
+                : undefined,
             )
             : undefined
         : undefined
@@ -494,7 +464,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       claudeActivityByTerminalId,
       opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
-      agentChatSessions,
       freshAgentSessions,
     }).isBusy
 
@@ -580,12 +549,7 @@ function PickerWrapper({
 }) {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
-  const agentChatSettings = useAppSelector(
-    (s) => s.settings?.settings?.freshAgent
-      ?? s.settings?.settings?.agentChat
-      ?? s.settings?.serverSettings?.freshAgent
-      ?? s.settings?.serverSettings?.agentChat
-  )
+  const freshAgentSettings = useAppSelector((s) => s.settings?.settings?.freshAgent ?? s.settings?.serverSettings?.freshAgent)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
   const tabPref = useMemo(
@@ -600,8 +564,8 @@ function PickerWrapper({
   const getRuntimeSettingsKey = useCallback((providerType: PanePickerType): CodingCliProviderName => {
     const freshAgentType = resolveFreshAgentType(providerType)
     if (freshAgentType) return freshAgentType.runtimeProvider as CodingCliProviderName
-    const agentConfig = getAgentChatProviderConfig(providerType)
-    return (agentConfig ? agentConfig.codingCliProvider : providerType) as CodingCliProviderName
+    const freshAgentProviderConfig = getFreshAgentProviderConfig(providerType)
+    return (freshAgentProviderConfig ? freshAgentProviderConfig.codingCliProvider : providerType) as CodingCliProviderName
   }, [])
 
   const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
@@ -616,10 +580,10 @@ function PickerWrapper({
 
     const freshAgentType = resolveFreshAgentType(type)
     if (freshAgentType) {
-      const providerConfig = freshAgentType.runtimeProvider === 'claude' && isAgentChatProviderName(type)
-        ? getAgentChatProviderConfig(type)
+      const providerConfig = freshAgentType.runtimeProvider === 'claude' && isFreshAgentProviderName(type)
+        ? getFreshAgentProviderConfig(type)
         : undefined
-      const providerSettings = agentChatSettings?.providers?.[type]
+      const providerSettings = freshAgentSettings?.providers?.[type]
       const providerDefaultModel = typeof providerSettings?.modelSelection?.modelId === 'string'
         ? providerSettings.modelSelection.modelId
         : undefined
@@ -643,7 +607,7 @@ function PickerWrapper({
         provider: freshAgentType.runtimeProvider,
         createRequestId: nanoid(),
         status: 'creating',
-        modelSelection: normalizeAgentChatModelSelection(providerSettings?.modelSelection),
+        modelSelection: normalizeFreshAgentModelSelection(providerSettings?.modelSelection),
         model,
         ...(permissionMode ? { permissionMode } : {}),
         sandbox: freshAgentType.runtimeProvider === 'codex'
@@ -653,9 +617,9 @@ function PickerWrapper({
           freshAgentType.sessionType,
           freshAgentType.runtimeProvider,
           model,
-          normalizeAgentChatEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
+          normalizeFreshAgentEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
         ) ?? freshAgentType.defaultEffort,
-        plugins: freshAgentType.runtimeProvider === 'claude' ? agentChatSettings?.defaultPlugins : undefined,
+        plugins: freshAgentType.runtimeProvider === 'claude' ? freshAgentSettings?.defaultPlugins : undefined,
         style: providerSettings?.style ?? DEFAULT_FRESH_AGENT_STYLE,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
@@ -725,7 +689,7 @@ function PickerWrapper({
       default:
         throw new Error(`Unsupported pane type: ${String(type)}`)
     }
-  }, [agentChatSettings, extensionEntries, settings?.codingCli?.providers])
+  }, [freshAgentSettings, extensionEntries, settings?.codingCli?.providers])
 
   const handleSelect = useCallback((type: PanePickerType) => {
     if (resolveFreshAgentType(type)) {
@@ -764,9 +728,9 @@ function PickerWrapper({
 
   if (step.step === 'directory') {
     const providerType = step.providerType
-    const agentConfig = getAgentChatProviderConfig(providerType)
+    const freshAgentProviderConfig = getFreshAgentProviderConfig(providerType)
     const freshAgentType = resolveFreshAgentType(providerType)
-    const providerLabel = agentConfig ? agentConfig.label : getProviderLabel(providerType, extensionEntries)
+    const providerLabel = freshAgentProviderConfig ? freshAgentProviderConfig.label : getProviderLabel(providerType, extensionEntries)
     const settingsKey = getRuntimeSettingsKey(providerType)
     const globalDefault = settings?.codingCli?.providers?.[settingsKey]?.cwd
     const defaultCwd = tabPref.defaultCwd ?? globalDefault
@@ -848,19 +812,6 @@ function renderContent(
             wordWrap={content.wordWrap}
           />
         </Suspense>
-      </ErrorBoundary>
-    )
-  }
-
-  if (content.kind === 'agent-chat') {
-    return (
-      <ErrorBoundary key={paneId} label="Chat">
-        <AgentChatView
-          tabId={tabId}
-          paneId={paneId}
-          paneContent={content}
-          hidden={hidden}
-        />
       </ErrorBoundary>
     )
   }

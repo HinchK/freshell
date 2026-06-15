@@ -22,7 +22,7 @@ import panesReducer, {
   clearPaneRenameRequest,
   toggleZoom,
   clearDeadTerminals,
-  restartAgentChatCreate,
+  restartFreshAgentCreate,
   PanesState,
 } from '../../../../src/store/panesSlice'
 import type { PaneNode, PaneContent, TerminalPaneContent, BrowserPaneContent, EditorPaneContent, ExtensionPaneContent } from '../../../../src/store/paneTypes'
@@ -382,7 +382,7 @@ describe('panesSlice', () => {
       })
     })
 
-    it('does not synthesize a portable sessionRef from a named legacy resume alias', () => {
+    it('turns a named legacy resume alias into a fresh-agent restore error', () => {
       const state = panesReducer(
         initialState,
         initLayout({
@@ -400,9 +400,65 @@ describe('panesSlice', () => {
         kind: 'fresh-agent',
         sessionType: 'freshclaude',
         provider: 'claude',
-        resumeSessionId: 'named-resume',
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
       })
       expect(leaf.content.sessionRef).toBeUndefined()
+      expect(leaf.content.resumeSessionId).toBeUndefined()
+    })
+
+    it('does not recompute sessionRef for a bad legacy alias with a canonical resumeSessionId', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'agent-chat',
+            provider: 'freshclaude',
+            sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+            resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          },
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+      })
+      expect(leaf.content.sessionRef).toBeUndefined()
+      expect(leaf.content.resumeSessionId).toBeUndefined()
+    })
+
+    it('turns an existing fresh-agent bad Claude sessionRef into a restore error', () => {
+      const state = panesReducer(
+        initialState,
+        initLayout({
+          tabId: 'tab-1',
+          content: {
+            kind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            provider: 'claude',
+            sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+            resumeSessionId: VALID_CLAUDE_SESSION_ID,
+            initialCwd: '/repo',
+            showTools: true,
+          },
+        }),
+      )
+
+      const leaf = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(leaf.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+        initialCwd: '/repo',
+        showTools: true,
+      })
+      expect(leaf.content.sessionRef).toBeUndefined()
+      expect(leaf.content.resumeSessionId).toBeUndefined()
     })
 
     it('preserves fresh-agent style through content initialization and merge updates', () => {
@@ -456,7 +512,7 @@ describe('panesSlice', () => {
     })
   })
 
-  describe('restartAgentChatCreate', () => {
+  describe('restartFreshAgentCreate', () => {
     it('moves a fresh-agent pane into stable create-failed state until an explicit retry restarts it', () => {
       const state = panesReducer(
         stateWithLeaf('pane-agent', {
@@ -471,7 +527,7 @@ describe('panesSlice', () => {
             retryable: true,
           },
         } as any),
-        restartAgentChatCreate({ tabId: 'tab-1', paneId: 'pane-agent' }),
+        restartFreshAgentCreate({ tabId: 'tab-1', paneId: 'pane-agent' }),
       )
 
       const layout = state.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
@@ -4013,6 +4069,62 @@ describe('panesSlice', () => {
         }
       }
       expect(result.activePane['tab-2']).toBe('pane-a')
+    })
+
+    it('strips stale fresh-agent runtime identity while preserving durable resume options', () => {
+      const layout: PaneNode = {
+        type: 'leaf',
+        id: 'pane-agent',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          sessionId: 'stale-live-session',
+          createRequestId: 'stale-create',
+          status: 'running',
+          serverInstanceId: 'stale-server',
+          createError: { code: 'STALE', message: 'stale', retryable: true },
+          sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+          initialCwd: '/repo',
+          modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+          permissionMode: 'acceptEdits',
+          effort: 'high',
+          showThinking: false,
+          showTools: true,
+          showTimecodes: true,
+        },
+      } as PaneNode
+
+      const result = panesReducer(
+        initialState,
+        restoreLayout({ tabId: 'tab-agent', layout, paneTitles: { 'pane-agent': 'Agent' } }),
+      )
+
+      const restoredLayout = result.layouts['tab-agent']
+      expect(restoredLayout.type).toBe('leaf')
+      if (restoredLayout.type !== 'leaf' || restoredLayout.content.kind !== 'fresh-agent') {
+        throw new Error('expected restored fresh-agent leaf')
+      }
+      expect(restoredLayout.content.sessionId).toBeUndefined()
+      expect(restoredLayout.content.createRequestId).not.toBe('stale-create')
+      expect(restoredLayout.content.status).toBe('creating')
+      expect(restoredLayout.content.serverInstanceId).toBeUndefined()
+      expect(restoredLayout.content.createError).toBeUndefined()
+      expect(restoredLayout.content).toMatchObject({
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        initialCwd: '/repo',
+        modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+        permissionMode: 'acceptEdits',
+        effort: 'high',
+        showThinking: false,
+        showTools: true,
+        showTimecodes: true,
+      })
     })
 
     it('does not overwrite an existing layout', () => {

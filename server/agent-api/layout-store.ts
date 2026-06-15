@@ -1,6 +1,7 @@
 import type { SessionLocator } from '../../shared/ws-protocol.js'
 import { nanoid } from 'nanoid'
 import { resolveTarget } from './target-resolver.js'
+import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentNode } from '../../shared/fresh-agent.js'
 
 type UiSnapshot = {
   tabs: Array<{ id: string; title?: string; fallbackSessionRef?: SessionLocator }>
@@ -23,6 +24,25 @@ type PaneSnapshot = {
   kind?: string
   terminalId?: string
   paneContent?: PaneContentSnapshot
+}
+
+function normalizePaneContentSnapshot(content: any): any {
+  if (!content || typeof content !== 'object') return content
+  return migrateLegacyFreshAgentContent(content)
+}
+
+function normalizeLayouts(layouts: Record<string, any>): Record<string, any> {
+  return Object.fromEntries(
+    Object.entries(layouts || {}).map(([tabId, node]) => [tabId, migrateLegacyFreshAgentNode(node)]),
+  )
+}
+
+function cloneSnapshot<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T
+}
+
+function emptySnapshot(): UiSnapshot {
+  return { tabs: [], layouts: {}, activePane: {}, activeTabId: null, paneTitles: {}, paneTitleSetByUser: {} }
 }
 
 export class LayoutStore {
@@ -89,17 +109,6 @@ export class LayoutStore {
       }
     }
 
-    if (content.kind === 'agent-chat') {
-      switch (content.provider) {
-        case 'claude':
-          return 'Claude'
-        case 'codex':
-          return 'Codex'
-        default:
-          return 'Agent'
-      }
-    }
-
     if (content.kind === 'fresh-agent') {
       switch (content.sessionType) {
         case 'freshclaude':
@@ -156,10 +165,13 @@ export class LayoutStore {
   }
 
   updateFromUi(snapshot: UiSnapshot, connectionId: string) {
-    this.snapshot = snapshot
+    this.snapshot = {
+      ...snapshot,
+      layouts: normalizeLayouts(snapshot.layouts || {}),
+    }
     this.sourceConnectionId = connectionId
-    for (const tab of snapshot.tabs) {
-      const leaves = this.collectLeaves(snapshot.layouts?.[tab.id], [])
+    for (const tab of this.snapshot.tabs) {
+      const leaves = this.collectLeaves(this.snapshot.layouts?.[tab.id], [])
       for (const leaf of leaves) {
         this.seedPaneTitle(tab.id, leaf.id, leaf.content)
       }
@@ -172,6 +184,27 @@ export class LayoutStore {
 
   getActiveTabId() {
     return this.snapshot?.activeTabId || null
+  }
+
+  getNormalizedSnapshot(tabId?: string): UiSnapshot {
+    if (!this.snapshot) {
+      return emptySnapshot()
+    }
+
+    if (!tabId) return cloneSnapshot(this.snapshot)
+
+    const tab = this.snapshot.tabs.find((item) => item.id === tabId)
+    return cloneSnapshot({
+      tabs: tab ? [tab] : [],
+      activeTabId: tab ? tab.id : null,
+      layouts: this.snapshot.layouts?.[tabId] ? { [tabId]: this.snapshot.layouts[tabId] } : {},
+      activePane: this.snapshot.activePane?.[tabId] ? { [tabId]: this.snapshot.activePane[tabId] } : {},
+      paneTitles: this.snapshot.paneTitles?.[tabId] ? { [tabId]: this.snapshot.paneTitles[tabId] } : {},
+      paneTitleSetByUser: this.snapshot.paneTitleSetByUser?.[tabId]
+        ? { [tabId]: this.snapshot.paneTitleSetByUser[tabId] }
+        : {},
+      timestamp: this.snapshot.timestamp,
+    })
   }
 
   private ensureSnapshot(): UiSnapshot {
@@ -648,13 +681,13 @@ export class LayoutStore {
     if (!root) return { message: 'tab not found' as const }
     const update = (node: any): any => {
       if (node.type === 'leaf') {
-        if (node.id === paneId) return { ...node, content }
+        if (node.id === paneId) return { ...node, content: normalizePaneContentSnapshot(content) }
         return node
       }
       return { ...node, children: [update(node.children[0]), update(node.children[1])] }
     }
     this.snapshot.layouts[tabId] = update(root)
-    this.seedPaneTitle(tabId, paneId, content)
+    this.seedPaneTitle(tabId, paneId, normalizePaneContentSnapshot(content))
     return { tabId, paneId }
   }
 }

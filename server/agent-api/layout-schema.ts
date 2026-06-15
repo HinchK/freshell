@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { SessionLocatorSchema } from '../../shared/ws-protocol.js'
+import { migrateLegacyFreshAgentNode } from '../../shared/fresh-agent.js'
 
 const FreshAgentContentSchema = z.object({
   kind: z.literal('fresh-agent'),
@@ -24,7 +25,7 @@ const FreshAgentContentSchema = z.object({
   { message: 'sessionRef and restoreError are mutually exclusive' },
 )
 
-const PaneNodeSchema: z.ZodType<any> = z.lazy(() => z.union([
+const RawPaneNodeSchema: z.ZodType<any> = z.lazy(() => z.union([
   z.object({
     type: z.literal('leaf'),
     id: z.string(),
@@ -60,22 +61,6 @@ const PaneNodeSchema: z.ZodType<any> = z.lazy(() => z.union([
       }).passthrough(),
       FreshAgentContentSchema,
       z.object({
-        kind: z.literal('agent-chat'),
-        provider: z.string(),
-        createRequestId: z.string(),
-        status: z.string(),
-        sessionId: z.string().optional(),
-        resumeSessionId: z.string().optional(),
-        sessionRef: SessionLocatorSchema.optional(),
-        restoreError: z.object({ code: z.string(), reason: z.string() }).optional(),
-        initialCwd: z.string().optional(),
-        modelSelection: z.object({ kind: z.string(), modelId: z.string() }).optional().or(z.null()),
-        permissionMode: z.string().optional(),
-        effort: z.string().optional(),
-        plugins: z.array(z.string()).optional(),
-        settingsDismissed: z.boolean().optional(),
-      }).passthrough(),
-      z.object({
         kind: z.literal('extension'),
         extensionName: z.string(),
         props: z.record(z.string(), z.any()),
@@ -88,9 +73,11 @@ const PaneNodeSchema: z.ZodType<any> = z.lazy(() => z.union([
     id: z.string(),
     direction: z.enum(['horizontal', 'vertical']),
     sizes: z.tuple([z.number(), z.number()]),
-    children: z.tuple([PaneNodeSchema, PaneNodeSchema]),
+    children: z.tuple([RawPaneNodeSchema, RawPaneNodeSchema]),
   }),
 ]))
+
+const PaneNodeSchema = z.preprocess(migrateLegacyFreshAgentNode, RawPaneNodeSchema)
 
 export const UiLayoutSyncSchema = z.object({
   type: z.literal('ui.layout.sync'),

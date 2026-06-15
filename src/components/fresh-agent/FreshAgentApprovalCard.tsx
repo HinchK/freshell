@@ -1,4 +1,4 @@
-import DiffView from '@/components/agent-chat/DiffView'
+import DiffView from '@/components/fresh-agent/shared/DiffView'
 import type { FreshAgentPendingApproval } from '@shared/fresh-agent-contract'
 
 /**

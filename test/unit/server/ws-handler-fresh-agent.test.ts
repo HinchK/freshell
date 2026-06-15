@@ -20,7 +20,6 @@ const TEST_AUTH_TOKEN = 'testtoken-testtoken'
 function makeUserConfig(freshClientsEnabled: boolean) {
   const settings = createDefaultServerSettings({ loggingDebug: false })
   settings.freshAgent.enabled = freshClientsEnabled
-  settings.agentChat.enabled = freshClientsEnabled
   return {
     version: 1 as const,
     settings,
@@ -739,7 +738,7 @@ describe('WsHandler fresh-agent routing', () => {
           sessionType: 'freshcodex',
           provider: 'codex',
           event: {
-            type: 'sdk.error',
+            type: 'freshAgent.error',
             sessionId: 'codex-session-no-subscribe',
             code: 'FRESH_AGENT_SUBSCRIBE_FAILED',
             message: 'Codex app-server lifecycle subscription failed',

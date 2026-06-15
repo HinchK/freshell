@@ -16,13 +16,14 @@ import type { SessionRepairService } from './session-scanner/service.js'
 import type { SessionScanResult, SessionRepairResult } from './session-scanner/types.js'
 import { isValidClaudeSessionId } from './claude-session-id.js'
 import type { SdkBridge } from './sdk-bridge.js'
-import { createAgentHistorySource, type AgentHistorySource } from './agent-timeline/history-source.js'
+import {
+  createClaudeFreshAgentHistorySource,
+  type ClaudeFreshAgentHistorySource,
+} from './fresh-agent/history/claude/history-source.js'
 import type {
   ClaudeActivityRecord,
   CodexActivityRecord,
   OpencodeActivityRecord,
-  SdkServerMessage,
-  SdkSessionStatus,
   TerminalTurnCompletionSnapshot,
   TerminalTurnCompleteMessage,
 } from '../shared/ws-protocol.js'
@@ -32,7 +33,6 @@ import { TerminalStreamBroker } from './terminal-stream/broker.js'
 import { isTerminalStreamAttachRequestIdWithinSerializedBudget } from './terminal-stream/serialized-budget.js'
 import { buildSidebarOpenSessionKeys, type SidebarSessionLocator } from './sidebar-session-selection.js'
 import { loadSessionHistory } from './session-history-loader.js'
-import type { SdkCreatedSession, SdkSessionState } from './sdk-bridge-types.js'
 import { TabRegistryRecordBaseSchema, TabRegistryRecordSchema } from './tabs-registry/types.js'
 import type { TabsRegistryStore } from './tabs-registry/store.js'
 import type { ServerSettings } from '../shared/settings.js'
@@ -74,15 +74,6 @@ import {
   TerminalKillSchema,
   CodingCliInputSchema,
   CodingCliKillSchema,
-  SdkCreateSchema,
-  SdkSendSchema,
-  SdkPermissionRespondSchema,
-  SdkQuestionRespondSchema,
-  SdkInterruptSchema,
-  SdkKillSchema,
-  SdkAttachSchema,
-  SdkSetModelSchema,
-  SdkSetPermissionModeSchema,
   FreshAgentCreateSchema,
   FreshAgentAttachSchema,
   FreshAgentSendSchema,
@@ -97,6 +88,7 @@ import {
 } from '../shared/ws-protocol.js'
 import { LiveTerminalHandleSchema, type RestoreError } from '../shared/session-contract.js'
 import { CODEX_DURABILITY_SCHEMA_VERSION, CodexDurabilityRefSchema } from '../shared/codex-durability.js'
+import { migrateLegacyFreshAgentContent } from '../shared/fresh-agent.js'
 import { UiLayoutSyncSchema } from './agent-api/layout-schema.js'
 import type { LayoutStore } from './agent-api/layout-store.js'
 import {
@@ -104,6 +96,10 @@ import {
   resolveCodexCreateRestoreDecision,
 } from './coding-cli/codex-app-server/restore-decision.js'
 import { sendJsonMessage } from './ws-send.js'
+import {
+  makeFreshAgentProviderErrorEvent,
+  normalizeFreshAgentProviderEvent,
+} from './fresh-agent/sdk-events.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -183,7 +179,7 @@ export type WsHandlerOptions = {
   claudeActivityListProvider?: () => ClaudeActivityRecord[]
   codexLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   claudeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
-  agentHistorySource?: AgentHistorySource
+  agentHistorySource?: ClaudeFreshAgentHistorySource
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   opencodeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
@@ -330,31 +326,25 @@ function normalizeTerminalInventoryForClient(value: unknown): unknown {
 }
 
 function extractSessionLocatorsFromUiContent(content: Record<string, unknown>): SidebarSessionLocator[] {
+  const normalizedContent = migrateLegacyFreshAgentContent(content) as Record<string, unknown>
   const locators: SidebarSessionLocator[] = []
 
-  const explicit = normalizeUiSessionLocator(content.sessionRef)
+  const explicit = normalizeUiSessionLocator(normalizedContent.sessionRef)
   if (explicit) {
     locators.push(explicit)
   }
 
-  const kind = content.kind
-  if (kind === 'agent-chat') {
-    if (isNonEmptyString(content.resumeSessionId)) {
-      locators.push({ provider: 'claude', sessionId: content.resumeSessionId })
-    }
-    return locators
-  }
-
+  const kind = normalizedContent.kind
   if (kind !== 'terminal') return locators
 
-  const mode = CodingCliProviderSchema.safeParse(content.mode)
-  if (!mode.success || !isNonEmptyString(content.resumeSessionId)) {
+  const mode = CodingCliProviderSchema.safeParse(normalizedContent.mode)
+  if (!mode.success || !isNonEmptyString(normalizedContent.resumeSessionId)) {
     return locators
   }
 
   locators.push({
     provider: mode.data,
-    sessionId: content.resumeSessionId,
+    sessionId: normalizedContent.resumeSessionId,
   })
   return locators
 }
@@ -443,10 +433,8 @@ type ClientState = {
   terminalCreateTimestamps: number[]
   codingCliSessions: Set<string>
   codingCliSubscriptions: Map<string, () => void>
-  sdkSessions: Set<string>
-  sdkSubscriptions: Map<string, () => void>
-  sdkSessionTargets: Map<string, string>
   freshAgentSubscriptions: Map<string, FreshAgentSubscriptionEntry>
+  freshAgentAuthorizations: Set<string>
   wsErrorLogs: Map<string, WsErrorLogEntry>
   interestedSessions: Set<string>
   sidebarOpenSessionKeys: Set<string>
@@ -510,14 +498,11 @@ export class WsHandler {
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
   private extensionManager?: ExtensionManager
-  private agentHistorySource?: AgentHistorySource
+  private agentHistorySource?: ClaudeFreshAgentHistorySource
   private freshAgentRuntimeManager?: FreshAgentRuntimeManagerLike
   private terminalStreamBroker: TerminalStreamBroker
   private terminalCreateLocks = new Map<string, Promise<void>>()
   private createdTerminalByRequestId = new Map<string, string>()
-  private sdkCreateLocks = new Map<string, Promise<void>>()
-  private createdSdkSessionByRequestId = new Map<string, string>()
-  private sdkSessionByCreateOwnerKey = new Map<string, string>()
   private freshAgentCreateLocks = new Map<string, Promise<void>>()
   private createdFreshAgentByRequestId = new Map<string, FreshAgentCreatedRecord>()
   private screenshotRequests = new Map<string, PendingScreenshot>()
@@ -573,7 +558,7 @@ export class WsHandler {
     this.extensionManager = options.extensionManager
     this.freshAgentRuntimeManager = options.freshAgentRuntimeManager
     this.agentHistorySource = options.agentHistorySource ?? (this.sdkBridge
-      ? createAgentHistorySource({
+      ? createClaudeFreshAgentHistorySource({
         loadSessionHistory,
         getLiveSessionBySdkSessionId: (sdkSessionId) => this.sdkBridge?.getLiveSession(sdkSessionId),
         getLiveSessionByCliSessionId: (timelineSessionId) => this.sdkBridge?.findLiveSessionByCliSessionId(timelineSessionId),
@@ -671,15 +656,6 @@ export class WsHandler {
       FreshAgentQuestionRespondSchema,
       FreshAgentKillSchema,
       FreshAgentForkSchema,
-      SdkCreateSchema,
-      SdkSendSchema,
-      SdkPermissionRespondSchema,
-      SdkQuestionRespondSchema,
-      SdkInterruptSchema,
-      SdkKillSchema,
-      SdkAttachSchema,
-      SdkSetModelSchema,
-      SdkSetPermissionModeSchema,
       UiLayoutSyncSchema,
       UiScreenshotResultSchema,
     ])
@@ -903,23 +879,6 @@ export class WsHandler {
     return current
   }
 
-  private withSdkCreateLock(key: string, task: () => Promise<void>): Promise<void> {
-    const previous = this.sdkCreateLocks.get(key) ?? Promise.resolve()
-
-    let current: Promise<void>
-    current = previous
-      .catch(() => undefined)
-      .then(task)
-      .finally(() => {
-        if (this.sdkCreateLocks.get(key) === current) {
-          this.sdkCreateLocks.delete(key)
-        }
-      })
-
-    this.sdkCreateLocks.set(key, current)
-    return current
-  }
-
   private withFreshAgentCreateLock(key: string, task: () => Promise<void>): Promise<void> {
     const previous = this.freshAgentCreateLocks.get(key) ?? Promise.resolve()
 
@@ -937,202 +896,12 @@ export class WsHandler {
     return current
   }
 
-  private async resolveSdkCreateOwnership(
-    requestId: string,
-    resumeSessionId?: string,
-  ): Promise<{
-    lockKey: string
-    ownerKey?: string
-    normalizedResumeSessionId?: string
-  }> {
-    if (!resumeSessionId) {
-      return {
-        lockKey: `request:${requestId}`,
-      }
-    }
-
-    const directSessionById = this.sdkBridge?.getLiveSession(resumeSessionId)
-    const directLiveSession = this.sdkSessionMatchesLookup(directSessionById, resumeSessionId)
-      ? directSessionById
-      : this.sdkBridge?.findLiveSessionByCliSessionId?.(resumeSessionId)
-
-    let normalizedResumeOwner = directLiveSession?.cliSessionId
-      ?? directLiveSession?.resumeSessionId
-      ?? directLiveSession?.sessionId
-      ?? resumeSessionId
-    let normalizedResumeSessionId = directLiveSession?.cliSessionId
-
-    try {
-      const resolved = await this.agentHistorySource?.resolve(
-        resumeSessionId,
-        directLiveSession ? { liveSessionOverride: directLiveSession } : undefined,
-      ) ?? null
-      if (resolved?.kind === 'resolved') {
-        normalizedResumeOwner = resolved.timelineSessionId ?? resolved.liveSessionId ?? normalizedResumeOwner
-        normalizedResumeSessionId = resolved.timelineSessionId ?? normalizedResumeSessionId
-      }
-    } catch {
-      // Ownership normalization is advisory-only. Create-time restore semantics
-      // still come from the later snapshot/restore path.
-    }
-
-    const ownerKey = `resume:${normalizedResumeOwner}`
-    return {
-      lockKey: ownerKey,
-      ownerKey,
-      normalizedResumeSessionId,
-    }
-  }
-
-  private rememberCreatedSdkSession(requestId: string, sessionId: string): void {
-    this.createdSdkSessionByRequestId.set(requestId, sessionId)
-  }
-
-  private rememberSdkOwnerSession(ownerKey: string, sessionId: string): void {
-    this.sdkSessionByCreateOwnerKey.set(ownerKey, sessionId)
-  }
-
-  private compareAndDeleteCreatedSdkSession(requestId: string, sessionId: string): void {
-    if (this.createdSdkSessionByRequestId.get(requestId) === sessionId) {
-      this.createdSdkSessionByRequestId.delete(requestId)
-    }
-  }
-
-  private compareAndDeleteSdkOwnerSession(ownerKey: string, sessionId: string): void {
-    if (this.sdkSessionByCreateOwnerKey.get(ownerKey) === sessionId) {
-      this.sdkSessionByCreateOwnerKey.delete(ownerKey)
-    }
-  }
-
-  private clearSdkCreateCachesForSession(sessionId: string): void {
-    for (const [requestId, cachedSessionId] of this.createdSdkSessionByRequestId.entries()) {
-      if (cachedSessionId === sessionId) {
-        this.createdSdkSessionByRequestId.delete(requestId)
-      }
-    }
-    for (const [ownerKey, cachedSessionId] of this.sdkSessionByCreateOwnerKey.entries()) {
-      if (cachedSessionId === sessionId) {
-        this.sdkSessionByCreateOwnerKey.delete(ownerKey)
-      }
-    }
-  }
-
   private clearFreshAgentCreateCachesForSession(sessionId: string): void {
     for (const [requestId, cached] of this.createdFreshAgentByRequestId.entries()) {
       if (cached.sessionId === sessionId) {
         this.createdFreshAgentByRequestId.delete(requestId)
       }
     }
-  }
-
-  private resolveCreatedSdkSession(requestId: string): SdkSessionState | undefined {
-    const cachedSessionId = this.createdSdkSessionByRequestId.get(requestId)
-    if (!cachedSessionId) return undefined
-    const liveSession = this.sdkBridge?.getLiveSession(cachedSessionId)
-    if (liveSession) return liveSession
-    this.createdSdkSessionByRequestId.delete(requestId)
-    return undefined
-  }
-
-  private resolveSdkOwnerSession(ownerKey: string): SdkSessionState | undefined {
-    const cachedSessionId = this.sdkSessionByCreateOwnerKey.get(ownerKey)
-    if (!cachedSessionId) return undefined
-    const liveSession = this.sdkBridge?.getLiveSession(cachedSessionId)
-    if (liveSession) return liveSession
-    this.sdkSessionByCreateOwnerKey.delete(ownerKey)
-    return undefined
-  }
-
-  private async resolveLiveSdkSessionForCreate(
-    resumeSessionId: string | undefined,
-    ownerKey?: string,
-    normalizedResumeSessionId?: string,
-  ): Promise<SdkSessionState | undefined> {
-    if (!resumeSessionId || !this.sdkBridge) return undefined
-    const sdkBridge = this.sdkBridge
-    const cachedOwnerSession = ownerKey ? this.resolveSdkOwnerSession(ownerKey) : undefined
-    if (cachedOwnerSession) return cachedOwnerSession
-
-    const directLiveSession = sdkBridge.getLiveSession(resumeSessionId)
-    if (this.sdkSessionMatchesLookup(directLiveSession, resumeSessionId)) {
-      return directLiveSession
-    }
-
-    const normalizedOwnerKeySessionId = ownerKey?.startsWith('resume:')
-      ? ownerKey.slice('resume:'.length)
-      : undefined
-    const normalizedResumeLookupId = normalizedOwnerKeySessionId ?? normalizedResumeSessionId
-
-    const resolvedLiveSession = sdkBridge.findLiveSessionByCliSessionId?.(normalizedResumeLookupId ?? resumeSessionId)
-    if (this.sdkSessionMatchesLookup(resolvedLiveSession, normalizedResumeLookupId ?? resumeSessionId)) {
-      return resolvedLiveSession
-    }
-
-    try {
-      const resolveHistoryLiveSession = async (
-        historyQueryId: string,
-        ledgerLookupId: string,
-      ): Promise<SdkSessionState | undefined> => {
-        const resolvedHistory = await this.agentHistorySource?.resolve(historyQueryId) ?? null
-        if (resolvedHistory?.kind !== 'resolved' || !resolvedHistory.liveSessionId) {
-          return undefined
-        }
-
-        const restoredLiveSession = sdkBridge.getLiveSession(resolvedHistory.liveSessionId)
-        if (
-          this.sdkSessionMatchesLookup(restoredLiveSession, resolvedHistory.liveSessionId)
-          && this.sdkSessionMatchesLookup(restoredLiveSession, resolvedHistory.timelineSessionId ?? ledgerLookupId)
-        ) {
-          return restoredLiveSession
-        }
-
-        const restoredTimelineSession = resolvedHistory.timelineSessionId
-          ? sdkBridge.findLiveSessionByCliSessionId?.(resolvedHistory.timelineSessionId)
-          : undefined
-        if (this.sdkSessionMatchesLookup(restoredTimelineSession, resolvedHistory.timelineSessionId ?? ledgerLookupId)) {
-          return restoredTimelineSession
-        }
-
-        return undefined
-      }
-
-      const restoredFromResumeAlias = await resolveHistoryLiveSession(resumeSessionId, resumeSessionId)
-      if (restoredFromResumeAlias) {
-        return restoredFromResumeAlias
-      }
-
-      if (normalizedResumeSessionId && normalizedResumeSessionId !== resumeSessionId) {
-        const restoredFromNormalizedIdentity = await resolveHistoryLiveSession(
-          normalizedResumeSessionId,
-          normalizedResumeSessionId,
-        )
-        if (restoredFromNormalizedIdentity) {
-          return restoredFromNormalizedIdentity
-        }
-      }
-    } catch {
-      // Create-time restore semantics still come from the later snapshot/restore path.
-    }
-    return undefined
-  }
-
-  private sdkSessionMatchesLookup(session: SdkSessionState | undefined, lookupId: string): session is SdkSessionState {
-    if (!session) return false
-    return session.sessionId === lookupId
-      || session.cliSessionId === lookupId
-      || session.resumeSessionId === lookupId
-  }
-
-  private createSdkCreateFailure(
-    code: string,
-    message: string,
-    retryable = true,
-  ): Error & { sdkCreateFailure: { code: string; message: string; retryable: boolean } } {
-    const error = new Error(message) as Error & {
-      sdkCreateFailure: { code: string; message: string; retryable: boolean }
-    }
-    error.sdkCreateFailure = { code, message, retryable }
-    return error
   }
 
   private findTargetUiSocket(
@@ -1254,10 +1023,8 @@ export class WsHandler {
       terminalCreateTimestamps: [],
       codingCliSessions: new Set(),
       codingCliSubscriptions: new Map(),
-      sdkSessions: new Set(),
-      sdkSubscriptions: new Map(),
-      sdkSessionTargets: new Map(),
       freshAgentSubscriptions: new Map(),
+      freshAgentAuthorizations: new Set(),
       wsErrorLogs: new Map(),
       interestedSessions: new Set(),
       sidebarOpenSessionKeys: new Set(),
@@ -1307,10 +1074,6 @@ export class WsHandler {
       off()
     }
     state.codingCliSubscriptions.clear()
-    for (const off of state.sdkSubscriptions.values()) {
-      off()
-    }
-    state.sdkSubscriptions.clear()
     this.cancelAllFreshAgentSubscriptions(state)
     this.flushWsErrorLogSummaries(state, 'connection_close')
 
@@ -1355,8 +1118,29 @@ export class WsHandler {
       sessionId: locator.sessionId,
       sessionType: locator.sessionType,
       provider: locator.provider,
-      event,
+      event: normalizeFreshAgentProviderEvent(event),
     }
+  }
+
+  private authorizeFreshAgentSession(state: ClientState, locator: FreshAgentLocator): void {
+    state.freshAgentAuthorizations.add(this.freshAgentKey(locator))
+  }
+
+  private isFreshAgentAuthorized(state: ClientState, locator: FreshAgentLocator): boolean {
+    return state.freshAgentAuthorizations.has(this.freshAgentKey(locator))
+  }
+
+  private requireFreshAgentAuthorization(
+    ws: LiveWebSocket,
+    state: ClientState,
+    locator: FreshAgentLocator,
+  ): boolean {
+    if (this.isFreshAgentAuthorized(state, locator)) return true
+    this.sendError(ws, {
+      code: 'UNAUTHORIZED',
+      message: 'Not authorized for this Fresh Agent session',
+    })
+    return false
   }
 
   private freshAgentUnavailableMessage() {
@@ -1364,15 +1148,15 @@ export class WsHandler {
   }
 
   private freshClientsEnabled(settings?: ServerSettings): boolean {
-    return settings?.freshAgent?.enabled ?? settings?.agentChat?.enabled ?? false
+    return settings?.freshAgent?.enabled ?? false
   }
 
   private sendFreshAgentSubscriptionError(ws: LiveWebSocket, locator: FreshAgentLocator, error: unknown): void {
     this.safeSend(ws, this.freshAgentEventMessage(locator, {
-      type: 'sdk.error',
-      sessionId: locator.sessionId,
-      code: 'FRESH_AGENT_SUBSCRIBE_FAILED',
-      message: errorMessage(error),
+      ...makeFreshAgentProviderErrorEvent(locator.sessionId, {
+        code: 'FRESH_AGENT_SUBSCRIBE_FAILED',
+        message: errorMessage(error),
+      }),
     }))
   }
 
@@ -1577,333 +1361,6 @@ export class WsHandler {
       terminalId: params.terminalId,
       timestamp: nowIso(),
     })
-  }
-
-  private async sendSdkSessionSnapshot(
-    ws: LiveWebSocket,
-    opts: {
-      sessionId: string
-      status: SdkSessionStatus
-      historyQueryId: string
-      liveSession?: SdkSessionState
-      resolvedHistory?: Awaited<ReturnType<AgentHistorySource['resolve']>>
-    },
-  ) {
-    let resolved = opts.resolvedHistory ?? null
-    if (!resolved) {
-      resolved = await this.agentHistorySource?.resolve(
-        opts.historyQueryId,
-        opts.liveSession ? { liveSessionOverride: opts.liveSession } : undefined,
-      ) ?? null
-    }
-    if (resolved?.kind === 'fatal' || resolved?.kind === 'missing') {
-      return resolved
-    }
-    const resolvedHistory = resolved?.kind === 'resolved' ? resolved : null
-    this.send(ws, {
-      type: 'sdk.session.snapshot',
-      sessionId: opts.sessionId,
-      latestTurnId: resolvedHistory?.latestTurnId ?? null,
-      status: opts.status,
-      revision: resolvedHistory?.revision ?? 0,
-      ...(resolvedHistory?.timelineSessionId ? { timelineSessionId: resolvedHistory.timelineSessionId } : {}),
-      ...(opts.liveSession ? {
-        streamingActive: opts.liveSession.streamingActive,
-        streamingText: opts.liveSession.streamingText,
-      } : {}),
-    } satisfies SdkServerMessage)
-    return resolved
-  }
-
-  private sendSdkRestoreError(ws: LiveWebSocket, sessionId: string, error: unknown) {
-    log.warn({
-      err: error instanceof Error ? error : new Error(String(error)),
-      sessionId,
-    }, 'sdk restore history resolution failed')
-    recordSessionLifecycleEvent({
-      kind: 'client_restore_unavailable',
-      sessionId,
-      connectionId: ws.connectionId || 'unknown',
-      reason: 'restore_internal',
-      hasSessionRef: true,
-    })
-    this.send(ws, {
-      type: 'sdk.error',
-      sessionId,
-      code: 'RESTORE_INTERNAL',
-      message: 'Failed to restore SDK session history',
-    } as SdkServerMessage)
-  }
-
-  private teardownSdkRestoreState(sessionId: string, recoverable: boolean): void {
-    this.clearSdkCreateCachesForSession(sessionId)
-    this.agentHistorySource?.teardownLiveSession(sessionId, { recoverable })
-  }
-
-  private sendSdkCreateFailed(
-    ws: LiveWebSocket,
-    requestId: string,
-    params: { code: string; message: string; retryable?: boolean },
-  ) {
-    this.send(ws, {
-      type: 'sdk.create.failed',
-      requestId,
-      code: params.code,
-      message: params.message,
-      retryable: params.retryable ?? true,
-    } as SdkServerMessage)
-  }
-
-  private transactionalCreateMessage(msg: SdkServerMessage, clientSessionId: string): SdkServerMessage {
-    const rewritten = this.rewriteSdkMessageSessionId(msg, clientSessionId)
-    if (rewritten.type !== 'sdk.session.init') {
-      return rewritten
-    }
-    return {
-      type: 'sdk.session.metadata',
-      sessionId: rewritten.sessionId,
-      cliSessionId: rewritten.cliSessionId,
-      model: rewritten.model,
-      cwd: rewritten.cwd,
-      tools: rewritten.tools,
-    } satisfies SdkServerMessage
-  }
-
-  private markDeliveredInteractiveRequest(
-    message: SdkServerMessage,
-    delivered: {
-      permissionRequestIds: Set<string>
-      questionRequestIds: Set<string>
-    },
-  ): boolean {
-    if (message.type === 'sdk.permission.request') {
-      if (delivered.permissionRequestIds.has(message.requestId)) {
-        return false
-      }
-      delivered.permissionRequestIds.add(message.requestId)
-    }
-    if (message.type === 'sdk.question.request') {
-      if (delivered.questionRequestIds.has(message.requestId)) {
-        return false
-      }
-      delivered.questionRequestIds.add(message.requestId)
-    }
-    return true
-  }
-
-  private replayPendingInteractiveRequests(
-    ws: LiveWebSocket,
-    clientSessionId: string,
-    session: Pick<SdkSessionState, 'pendingPermissions' | 'pendingQuestions'>,
-    delivered: {
-      permissionRequestIds: Set<string>
-      questionRequestIds: Set<string>
-    },
-  ): void {
-    for (const [requestId, perm] of session.pendingPermissions) {
-      const message = {
-        type: 'sdk.permission.request',
-        sessionId: clientSessionId,
-        requestId,
-        subtype: 'can_use_tool',
-        tool: { name: perm.toolName, input: perm.input },
-        toolUseID: perm.toolUseID,
-        suggestions: perm.suggestions,
-        blockedPath: perm.blockedPath,
-        decisionReason: perm.decisionReason,
-      } satisfies SdkServerMessage
-      if (!this.markDeliveredInteractiveRequest(message, delivered)) {
-        continue
-      }
-      this.safeSend(ws, message)
-    }
-
-    for (const [requestId, q] of session.pendingQuestions) {
-      const message = {
-        type: 'sdk.question.request',
-        sessionId: clientSessionId,
-        requestId,
-        questions: q.questions,
-      } satisfies SdkServerMessage
-      if (!this.markDeliveredInteractiveRequest(message, delivered)) {
-        continue
-      }
-      this.safeSend(ws, message)
-    }
-  }
-
-  private flushTransactionalCreateReplay(
-    ws: LiveWebSocket,
-    clientSessionId: string,
-    queuedMessages: Array<{ message: SdkServerMessage; sequence: number }>,
-    watermark: number,
-    delivered: {
-      permissionRequestIds: Set<string>
-      questionRequestIds: Set<string>
-    },
-  ): SdkServerMessage[] {
-    const delayedMetadata: SdkServerMessage[] = []
-    for (const queued of queuedMessages) {
-      const transformed = this.transactionalCreateMessage(queued.message, clientSessionId)
-      if (transformed.type === 'sdk.session.metadata') {
-        delayedMetadata.push(transformed)
-        continue
-      }
-      if (queued.sequence <= watermark) {
-        continue
-      }
-      if (!this.markDeliveredInteractiveRequest(transformed, delivered)) {
-        continue
-      }
-      this.safeSend(ws, transformed)
-    }
-    return delayedMetadata
-  }
-
-  private resolveSdkSessionTarget(state: ClientState, clientSessionId: string): string {
-    return state.sdkSessionTargets.get(clientSessionId) ?? clientSessionId
-  }
-
-  private rewriteSdkMessageSessionId(msg: SdkServerMessage, clientSessionId: string): SdkServerMessage {
-    if (!('sessionId' in msg) || typeof msg.sessionId !== 'string' || msg.sessionId === clientSessionId) {
-      return msg
-    }
-    return {
-      ...msg,
-      sessionId: clientSessionId,
-    } satisfies SdkServerMessage
-  }
-
-  private registerClientSdkSession(
-    state: ClientState,
-    clientSessionId: string,
-    targetSessionId: string,
-    off?: () => void,
-  ): void {
-    state.sdkSessions.add(clientSessionId)
-    state.sdkSessionTargets.set(clientSessionId, targetSessionId)
-    if (off) {
-      state.sdkSubscriptions.set(clientSessionId, off)
-    }
-  }
-
-  private clearClientSdkSession(state: ClientState, clientSessionId: string): void {
-    state.sdkSessions.delete(clientSessionId)
-    state.sdkSessionTargets.delete(clientSessionId)
-    const off = state.sdkSubscriptions.get(clientSessionId)
-    if (off) {
-      off()
-      state.sdkSubscriptions.delete(clientSessionId)
-    }
-  }
-
-  private async replayReusedSdkCreate(
-    ws: LiveWebSocket,
-    state: ClientState,
-    requestId: string,
-    liveSession: SdkSessionState,
-  ): Promise<void> {
-    if (!this.sdkBridge) {
-      throw this.createSdkCreateFailure('INTERNAL_ERROR', 'SDK bridge not enabled')
-    }
-
-    const deliveredInteractiveRequests = {
-      permissionRequestIds: new Set<string>(),
-      questionRequestIds: new Set<string>(),
-    }
-    const queuedMessages: Array<{ message: SdkServerMessage; sequence: number }> = []
-    let createReadyForLiveForward = false
-    let createSubscriptionOff: (() => void) | undefined
-
-    const replayState = this.sdkBridge.captureReplayState?.(liveSession.sessionId) ?? null
-    let replayDrain: ReturnType<SdkBridge['drainReplayBuffer']> | null = null
-    if (replayState) {
-      const createSubscription = this.sdkBridge.subscribe(
-        liveSession.sessionId,
-        (message: SdkServerMessage, meta?: { sequence: number }) => {
-          if (!createReadyForLiveForward) {
-            queuedMessages.push({ message, sequence: meta?.sequence ?? 0 })
-            return
-          }
-          const transformed = this.transactionalCreateMessage(message, liveSession.sessionId)
-          if (!this.markDeliveredInteractiveRequest(transformed, deliveredInteractiveRequests)) {
-            return
-          }
-          this.safeSend(ws, transformed)
-        },
-        { skipReplayBuffer: true },
-      )
-      if (!createSubscription) {
-        throw this.createSdkCreateFailure('RESTORE_INTERNAL', 'SDK session subscription failed during create')
-      }
-      createSubscriptionOff = createSubscription.off
-      replayDrain = this.sdkBridge.drainReplayBuffer?.(liveSession.sessionId) ?? null
-      if (!replayDrain) {
-        createSubscription.off()
-        throw this.createSdkCreateFailure('RESTORE_INTERNAL', 'SDK create replay drain unavailable')
-      }
-    }
-
-    this.send(ws, { type: 'sdk.created', requestId, sessionId: liveSession.sessionId })
-    const snapshotResult = await this.sendSdkSessionSnapshot(ws, {
-      sessionId: liveSession.sessionId,
-      status: replayState?.session.status ?? liveSession.status,
-      historyQueryId: liveSession.sessionId,
-      liveSession: replayState?.session ?? liveSession,
-    })
-    if (snapshotResult?.kind === 'fatal') {
-      createSubscriptionOff?.()
-      throw this.createSdkCreateFailure(snapshotResult.code, snapshotResult.message)
-    }
-    if (snapshotResult?.kind === 'missing') {
-      createSubscriptionOff?.()
-      throw this.createSdkCreateFailure('RESTORE_NOT_FOUND', 'SDK session history not found')
-    }
-
-    this.clearClientSdkSession(state, liveSession.sessionId)
-    this.registerClientSdkSession(state, liveSession.sessionId, liveSession.sessionId, createSubscriptionOff)
-    createSubscriptionOff = undefined
-
-    this.send(ws, {
-      type: 'sdk.session.init',
-      sessionId: liveSession.sessionId,
-      model: replayState?.session.model ?? liveSession.model,
-      cwd: replayState?.session.cwd ?? liveSession.cwd,
-      tools: replayState?.session.tools ?? liveSession.tools ?? [],
-    })
-
-    this.replayPendingInteractiveRequests(
-      ws,
-      liveSession.sessionId,
-      replayState?.session ?? liveSession,
-      deliveredInteractiveRequests,
-    )
-
-    if (replayState && replayDrain && state.sdkSubscriptions.has(liveSession.sessionId)) {
-      const delayedMetadata = [
-        ...this.flushTransactionalCreateReplay(
-          ws,
-          liveSession.sessionId,
-          replayDrain.bufferedMessages,
-          replayState.watermark,
-          deliveredInteractiveRequests,
-        ),
-      ]
-      while (queuedMessages.length > 0) {
-        const replayBatch = queuedMessages.splice(0, queuedMessages.length)
-        delayedMetadata.push(...this.flushTransactionalCreateReplay(
-          ws,
-          liveSession.sessionId,
-          replayBatch,
-          replayState.watermark,
-          deliveredInteractiveRequests,
-        ))
-      }
-      for (const metadata of delayedMetadata) {
-        this.safeSend(ws, metadata)
-      }
-      createReadyForLiveForward = true
-    }
   }
 
   /**
@@ -3558,6 +3015,11 @@ export class WsHandler {
         await this.withFreshAgentCreateLock(m.requestId, async () => {
           const cached = this.createdFreshAgentByRequestId.get(m.requestId)
           if (cached) {
+            this.authorizeFreshAgentSession(state, {
+              sessionId: cached.sessionId,
+              sessionType: cached.sessionType,
+              provider: cached.runtimeProvider,
+            })
             this.send(ws, {
               type: 'freshAgent.created',
               requestId: m.requestId,
@@ -3613,6 +3075,11 @@ export class WsHandler {
               ...(result.sessionRef ? { sessionRef: result.sessionRef } : {}),
             }
             this.createdFreshAgentByRequestId.set(m.requestId, record)
+            this.authorizeFreshAgentSession(state, {
+              sessionId: record.sessionId,
+              sessionType: record.sessionType,
+              provider: record.runtimeProvider,
+            })
             this.send(ws, {
               type: 'freshAgent.created',
               requestId: m.requestId,
@@ -3654,6 +3121,7 @@ export class WsHandler {
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
         try {
           await Promise.resolve(manager.attach(locator))
+          this.authorizeFreshAgentSession(state, locator)
           this.ensureFreshAgentSubscription(ws, state, locator)
         } catch (error) {
           log.warn({
@@ -3672,9 +3140,15 @@ export class WsHandler {
           return
         }
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           const result = await manager.send(locator, { text: m.text, images: m.images, settings: m.settings })
           if (result?.sessionId && result.sessionId !== m.sessionId) {
+            this.authorizeFreshAgentSession(state, {
+              sessionId: result.sessionId,
+              sessionType: m.sessionType,
+              provider: m.provider,
+            })
             this.ensureFreshAgentSubscription(ws, state, {
               sessionId: result.sessionId,
               sessionType: m.sessionType,
@@ -3702,6 +3176,7 @@ export class WsHandler {
           return
         }
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           await manager.interrupt(locator)
         } catch (error) {
@@ -3717,6 +3192,7 @@ export class WsHandler {
           return
         }
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           await manager.compact(locator, { instructions: m.instructions })
         } catch (error) {
@@ -3732,6 +3208,7 @@ export class WsHandler {
           return
         }
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           await manager.resolveApproval(locator, m.requestId, m.decision)
         } catch (error) {
@@ -3747,6 +3224,7 @@ export class WsHandler {
           return
         }
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           await manager.answerQuestion(locator, m.requestId, m.answers)
         } catch (error) {
@@ -3762,6 +3240,7 @@ export class WsHandler {
           return
         }
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           const forked = await manager.fork(locator, m.input)
           const forkedRecord = forked && typeof forked === 'object' ? forked as Record<string, unknown> : {}
@@ -3769,6 +3248,11 @@ export class WsHandler {
             ? forkedRecord.threadId
             : (typeof forkedRecord.sessionId === 'string' ? forkedRecord.sessionId : undefined)
           if (forkedSessionId) {
+            this.authorizeFreshAgentSession(state, {
+              sessionId: forkedSessionId,
+              sessionType: m.sessionType,
+              provider: m.provider,
+            })
             this.send(ws, {
               type: 'freshAgent.forked',
               requestId: m.requestId,
@@ -3798,10 +3282,12 @@ export class WsHandler {
           return
         }
         const locator = { sessionId: m.sessionId, sessionType: m.sessionType, provider: m.provider }
+        if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         this.cancelFreshAgentSubscription(state, locator)
         try {
           const success = await manager.kill(locator)
           this.clearFreshAgentCreateCachesForSession(m.sessionId)
+          state.freshAgentAuthorizations.delete(this.freshAgentKey(locator))
           this.send(ws, {
             type: 'freshAgent.killed',
             sessionId: m.sessionId,
@@ -3811,537 +3297,6 @@ export class WsHandler {
           })
         } catch (error) {
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
-        }
-        return
-      }
-
-      case 'sdk.create': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled', requestId: m.requestId })
-          return
-        }
-        const sdkBridge = this.sdkBridge
-        const ownership = await this.resolveSdkCreateOwnership(m.requestId, m.resumeSessionId)
-        await this.withSdkCreateLock(ownership.lockKey, async () => {
-          let session: SdkCreatedSession | undefined
-          let reusedSessionId: string | undefined
-          let createdFreshSession = false
-          let releaseCreateSubscription: (() => void) | undefined
-          const queuedMessages: Array<{ message: SdkServerMessage; sequence: number }> = []
-          let createReadyForLiveForward = false
-          const deliveredInteractiveRequests = {
-            permissionRequestIds: new Set<string>(),
-            questionRequestIds: new Set<string>(),
-          }
-          try {
-            const requestCachedSession = this.resolveCreatedSdkSession(m.requestId)
-            if (requestCachedSession) {
-              reusedSessionId = requestCachedSession.sessionId
-              await this.replayReusedSdkCreate(ws, state, m.requestId, requestCachedSession)
-              return
-            }
-
-            const ownerCachedSession = ownership.ownerKey
-              ? this.resolveSdkOwnerSession(ownership.ownerKey)
-              : undefined
-            if (ownerCachedSession) {
-              reusedSessionId = ownerCachedSession.sessionId
-              this.rememberCreatedSdkSession(m.requestId, ownerCachedSession.sessionId)
-              await this.replayReusedSdkCreate(ws, state, m.requestId, ownerCachedSession)
-              return
-            }
-
-            const liveSession = await this.resolveLiveSdkSessionForCreate(
-              m.resumeSessionId,
-              ownership.ownerKey,
-              ownership.normalizedResumeSessionId,
-            )
-            if (liveSession) {
-              reusedSessionId = liveSession.sessionId
-              this.rememberCreatedSdkSession(m.requestId, liveSession.sessionId)
-              if (ownership.ownerKey) {
-                this.rememberSdkOwnerSession(ownership.ownerKey, liveSession.sessionId)
-              }
-              await this.replayReusedSdkCreate(ws, state, m.requestId, liveSession)
-              return
-            }
-
-            session = await sdkBridge.createSession({
-              cwd: m.cwd,
-              resumeSessionId: m.resumeSessionId,
-              model: m.model,
-              permissionMode: m.permissionMode,
-              effort: m.effort,
-              plugins: m.plugins,
-            })
-            createdFreshSession = true
-            this.rememberCreatedSdkSession(m.requestId, session.sessionId)
-            if (ownership.ownerKey) {
-              this.rememberSdkOwnerSession(ownership.ownerKey, session.sessionId)
-            }
-
-            const replayState = session.replayGate.drain()
-            if (!replayState) {
-              throw this.createSdkCreateFailure('RESTORE_INTERNAL', 'SDK create replay drain unavailable')
-            }
-
-            const createSubscription = sdkBridge.subscribe(
-              session.sessionId,
-              (message: SdkServerMessage, meta?: { sequence: number }) => {
-                if (!createReadyForLiveForward) {
-                  queuedMessages.push({ message, sequence: meta?.sequence ?? 0 })
-                  return
-                }
-                const transformed = this.transactionalCreateMessage(message, session!.sessionId)
-                if (!this.markDeliveredInteractiveRequest(transformed, deliveredInteractiveRequests)) {
-                  return
-                }
-                this.safeSend(ws, transformed)
-              },
-              { skipReplayBuffer: true },
-            )
-            if (!createSubscription) {
-              throw this.createSdkCreateFailure('RESTORE_INTERNAL', 'SDK session subscription failed during create')
-            }
-            releaseCreateSubscription = createSubscription.off
-
-            const replayedDuringSnapshot = session.replayGate.drain()
-            if (!replayedDuringSnapshot) {
-              throw this.createSdkCreateFailure('RESTORE_INTERNAL', 'SDK create replay drain unavailable')
-            }
-
-            const resolvedHistory = await this.agentHistorySource?.resolve(session.sessionId, {
-              liveSessionOverride: replayState.session,
-            }) ?? null
-            const failedRestore = resolvedHistory && typeof resolvedHistory === 'object' && (
-              (resolvedHistory as { kind?: unknown }).kind === 'fatal'
-              || (resolvedHistory as { kind?: unknown }).kind === 'missing'
-            )
-              ? resolvedHistory as unknown as { kind: 'fatal' | 'missing'; code: string; message?: string }
-              : null
-            if (failedRestore) {
-              throw this.createSdkCreateFailure(
-                failedRestore.code,
-                failedRestore.kind === 'missing'
-                  ? 'SDK session history not found'
-                  : (failedRestore.message ?? 'Failed to restore SDK session history'),
-              )
-            }
-
-            this.registerClientSdkSession(state, session.sessionId, session.sessionId, createSubscription.off)
-            releaseCreateSubscription = undefined
-
-            // Send sdk.created only after coherent restore state exists.
-            this.send(ws, { type: 'sdk.created', requestId: m.requestId, sessionId: session.sessionId })
-            await this.sendSdkSessionSnapshot(ws, {
-              sessionId: session.sessionId,
-              status: replayState.session.status,
-              historyQueryId: session.sessionId,
-              liveSession: replayState.session,
-              ...(resolvedHistory ? { resolvedHistory } : {}),
-            })
-
-            // Send preliminary sdk.session.init so the client can start interacting.
-            // The SDK subprocess only emits system/init after the first user message,
-            // which deadlocks with the UI waiting for init before showing the input.
-            // This breaks the deadlock using the info we already have from create options.
-            // When system/init arrives (after first user message), session info updates.
-            this.send(ws, {
-              type: 'sdk.session.init',
-              sessionId: session.sessionId,
-              model: session.model,
-              cwd: session.cwd,
-              tools: [],
-            })
-
-            this.replayPendingInteractiveRequests(
-              ws,
-              session.sessionId,
-              replayState.session,
-              deliveredInteractiveRequests,
-            )
-
-            const delayedMetadata = [
-              ...this.flushTransactionalCreateReplay(
-                ws,
-                session.sessionId,
-                replayState.bufferedMessages,
-                replayState.watermark,
-                deliveredInteractiveRequests,
-              ),
-              ...this.flushTransactionalCreateReplay(
-                ws,
-                session.sessionId,
-                replayedDuringSnapshot.bufferedMessages,
-                replayState.watermark,
-                deliveredInteractiveRequests,
-              ),
-            ]
-            while (queuedMessages.length > 0) {
-              const replayBatch = queuedMessages.splice(0, queuedMessages.length)
-              delayedMetadata.push(...this.flushTransactionalCreateReplay(
-                ws,
-                session.sessionId,
-                replayBatch,
-                replayState.watermark,
-                deliveredInteractiveRequests,
-              ))
-            }
-            for (const metadata of delayedMetadata) {
-              this.safeSend(ws, metadata)
-            }
-            createReadyForLiveForward = true
-
-            if (m.cwd?.trim()) {
-              void configStore.pushRecentDirectory(m.cwd.trim()).catch((err) => {
-                log.warn({ err, cwd: m.cwd }, 'Failed to record recent directory for SDK session')
-              })
-            }
-          } catch (err: any) {
-            log.warn({ err }, 'sdk.create failed')
-            if (releaseCreateSubscription) {
-              releaseCreateSubscription()
-              releaseCreateSubscription = undefined
-            }
-            const failure = err?.sdkCreateFailure ?? {
-              code: 'RESTORE_INTERNAL',
-              message: err?.message || 'Failed to create SDK session',
-              retryable: true,
-            }
-            const failedSessionId = session?.sessionId ?? reusedSessionId
-            if (failedSessionId) {
-              this.clearClientSdkSession(state, failedSessionId)
-              this.compareAndDeleteCreatedSdkSession(m.requestId, failedSessionId)
-              if (createdFreshSession) {
-                if (ownership.ownerKey) {
-                  this.compareAndDeleteSdkOwnerSession(ownership.ownerKey, failedSessionId)
-                }
-                sdkBridge.killSession(failedSessionId)
-                this.teardownSdkRestoreState(failedSessionId, false)
-              }
-            }
-            this.sendSdkCreateFailed(ws, m.requestId, failure)
-          }
-        })
-        return
-      }
-
-      case 'sdk.send': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
-          return
-        }
-        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
-          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
-          return
-        }
-        const ok = this.sdkBridge.sendUserMessage(this.resolveSdkSessionTarget(state, m.sessionId), m.text, m.images)
-        if (!ok) {
-          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
-        }
-        return
-      }
-
-      case 'sdk.permission.respond': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
-          return
-        }
-        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
-          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
-          return
-        }
-        const decision: import('./sdk-bridge-types.js').PermissionResult = m.behavior === 'allow'
-          ? {
-              behavior: 'allow',
-              updatedInput: m.updatedInput ?? {},
-              ...(m.updatedPermissions && { updatedPermissions: m.updatedPermissions as import('./sdk-bridge-types.js').PermissionUpdate[] }),
-            }
-          : { behavior: 'deny', message: m.message || 'Denied by user', ...(m.interrupt !== undefined && { interrupt: m.interrupt }) }
-        const ok = this.sdkBridge.respondPermission(this.resolveSdkSessionTarget(state, m.sessionId), m.requestId, decision)
-        if (!ok) {
-          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session not found' })
-        }
-        return
-      }
-
-      case 'sdk.question.respond': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
-          return
-        }
-        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
-          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
-          return
-        }
-        const ok = this.sdkBridge.respondQuestion(this.resolveSdkSessionTarget(state, m.sessionId), m.requestId, m.answers)
-        if (!ok) {
-          this.sendError(ws, { code: 'INVALID_SESSION_ID', message: 'SDK session or question not found' })
-        }
-        return
-      }
-
-      case 'sdk.interrupt': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
-          return
-        }
-        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
-          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
-          return
-        }
-        this.sdkBridge.interrupt(this.resolveSdkSessionTarget(state, m.sessionId))
-        return
-      }
-
-      case 'sdk.kill': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
-          return
-        }
-        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
-          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
-          return
-        }
-        const targetSessionId = this.resolveSdkSessionTarget(state, m.sessionId)
-        const killed = this.sdkBridge.killSession(targetSessionId)
-        this.teardownSdkRestoreState(targetSessionId, false)
-        this.clearClientSdkSession(state, m.sessionId)
-        this.send(ws, { type: 'sdk.killed', sessionId: m.sessionId, success: killed })
-        return
-      }
-
-      case 'sdk.set-model': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
-          return
-        }
-        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
-          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
-          return
-        }
-        this.sdkBridge.setModel(this.resolveSdkSessionTarget(state, m.sessionId), m.model)
-        return
-      }
-
-      case 'sdk.set-permission-mode': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
-          return
-        }
-        if (!state.sdkSessions.has(m.sessionId) && !state.sdkSubscriptions.has(m.sessionId)) {
-          this.sendError(ws, { code: 'UNAUTHORIZED', message: 'Not subscribed to this SDK session' })
-          return
-        }
-        this.sdkBridge.setPermissionMode(this.resolveSdkSessionTarget(state, m.sessionId), m.permissionMode)
-        return
-      }
-
-      case 'sdk.attach': {
-        if (!this.sdkBridge) {
-          this.sendError(ws, { code: 'INTERNAL_ERROR', message: 'SDK bridge not enabled' })
-          return
-        }
-        const historyQueryId = m.resumeSessionId ?? m.sessionId
-        const directSession = this.sdkBridge.getLiveSession(m.sessionId)
-        let resolved: Awaited<ReturnType<AgentHistorySource['resolve']>> | null = null
-        if (!directSession) {
-          try {
-            resolved = await this.agentHistorySource?.resolve(historyQueryId) ?? null
-          } catch (err) {
-            this.sendSdkRestoreError(ws, m.sessionId, err)
-            return
-          }
-        }
-        const liveSessionAlias = resolved?.kind === 'resolved'
-          ? resolved.timelineSessionId ?? historyQueryId
-          : historyQueryId
-        const liveSession = directSession
-          ?? (resolved?.kind === 'resolved' && resolved.liveSessionId ? this.sdkBridge.getLiveSession(resolved.liveSessionId) : undefined)
-          ?? this.sdkBridge.findLiveSessionByCliSessionId?.(liveSessionAlias)
-        if (!liveSession) {
-          if (resolved?.kind === 'fatal') {
-            this.send(ws, {
-              type: 'sdk.error',
-              sessionId: m.sessionId,
-              code: resolved.code,
-              message: resolved.message,
-            } as SdkServerMessage)
-            return
-          }
-          if (resolved?.kind === 'resolved') {
-            await this.sendSdkSessionSnapshot(ws, {
-              sessionId: m.sessionId,
-              status: 'idle',
-              historyQueryId,
-              resolvedHistory: resolved,
-            })
-            // Durable-only restore can recover transcript state, but there is no live
-            // SDK target left to own follow-up sends. Surface the restored history and
-            // then immediately trigger the client's lost-session recovery path.
-            this.send(ws, {
-              type: 'sdk.error',
-              sessionId: m.sessionId,
-              code: 'INVALID_SESSION_ID',
-              message: 'SDK session not found',
-            } as SdkServerMessage)
-            return
-          }
-          if (resolved?.kind === 'missing') {
-            recordSessionLifecycleEvent({
-              kind: 'client_restore_unavailable',
-              sessionId: m.sessionId,
-              connectionId: ws.connectionId || 'unknown',
-              reason: 'restore_not_found',
-              hasSessionRef: true,
-            })
-            this.send(ws, {
-              type: 'sdk.error',
-              sessionId: m.sessionId,
-              code: 'RESTORE_NOT_FOUND',
-              message: 'SDK session history not found',
-            } as SdkServerMessage)
-            return
-          }
-          // INVALID_SESSION_ID is reserved for the case where a known live session
-          // disappeared and the client should trigger lost-session recovery.
-          this.send(ws, {
-            type: 'sdk.error',
-            sessionId: m.sessionId,
-            code: 'INVALID_SESSION_ID',
-            message: 'SDK session not found',
-          } as SdkServerMessage)
-          return
-        }
-
-        const deliveredInteractiveRequests = {
-          permissionRequestIds: new Set<string>(),
-          questionRequestIds: new Set<string>(),
-        }
-        const queuedAttachMessages: Array<{ message: SdkServerMessage; sequence: number }> = []
-        let attachReadyForLiveForward = false
-        let attachSubscriptionOff: (() => void) | undefined
-        const attachReplayState = this.sdkBridge.captureReplayState?.(liveSession.sessionId) ?? null
-        let attachReplayDrain: ReturnType<SdkBridge['drainReplayBuffer']> | null = null
-        if (attachReplayState) {
-          const attachSubscription = this.sdkBridge.subscribe(
-            liveSession.sessionId,
-            (message: SdkServerMessage, meta?: { sequence: number }) => {
-              if (!attachReadyForLiveForward) {
-                queuedAttachMessages.push({ message, sequence: meta?.sequence ?? 0 })
-                return
-              }
-              const transformed = this.transactionalCreateMessage(message, m.sessionId)
-              if (!this.markDeliveredInteractiveRequest(transformed, deliveredInteractiveRequests)) {
-                return
-              }
-              this.safeSend(ws, transformed)
-            },
-            { skipReplayBuffer: true },
-          )
-          if (attachSubscription) {
-            attachSubscriptionOff = attachSubscription.off
-            attachReplayDrain = this.sdkBridge.drainReplayBuffer?.(liveSession.sessionId) ?? null
-            if (!attachReplayDrain) {
-              attachSubscription.off()
-              this.send(ws, {
-                type: 'sdk.error',
-                sessionId: m.sessionId,
-                code: 'INVALID_SESSION_ID',
-                message: 'SDK session not found',
-              } as SdkServerMessage)
-              return
-            }
-          }
-        }
-
-        try {
-          const snapshotResult = await this.sendSdkSessionSnapshot(ws, {
-            sessionId: m.sessionId,
-            status: attachReplayState?.session.status ?? liveSession.status,
-            historyQueryId,
-            liveSession: attachReplayState?.session ?? liveSession,
-            ...(resolved ? { resolvedHistory: resolved } : {}),
-          })
-          if (snapshotResult?.kind === 'fatal') {
-            attachSubscriptionOff?.()
-            this.send(ws, {
-              type: 'sdk.error',
-              sessionId: m.sessionId,
-              code: snapshotResult.code,
-              message: snapshotResult.message,
-            } as SdkServerMessage)
-            return
-          }
-          if (snapshotResult?.kind === 'missing') {
-            attachSubscriptionOff?.()
-            recordSessionLifecycleEvent({
-              kind: 'client_restore_unavailable',
-              sessionId: m.sessionId,
-              connectionId: ws.connectionId || 'unknown',
-              reason: 'restore_not_found',
-              hasSessionRef: true,
-            })
-            this.send(ws, {
-              type: 'sdk.error',
-              sessionId: m.sessionId,
-              code: 'RESTORE_NOT_FOUND',
-              message: 'SDK session history not found',
-            } as SdkServerMessage)
-            return
-          }
-        } catch (err) {
-          attachSubscriptionOff?.()
-          this.sendSdkRestoreError(ws, m.sessionId, err)
-          return
-        }
-
-        // Treat a successful attach as ownership of the client-visible session id.
-        // Follow-up SDK commands must route through the resolved live target even if
-        // stream subscription bookkeeping is unavailable or deferred.
-        this.clearClientSdkSession(state, m.sessionId)
-        this.registerClientSdkSession(state, m.sessionId, liveSession.sessionId, attachSubscriptionOff)
-        attachSubscriptionOff = undefined
-
-        // Send current status
-        this.send(ws, {
-          type: 'sdk.status',
-          sessionId: m.sessionId,
-          status: attachReplayState?.session.status ?? liveSession.status,
-        })
-
-        if (attachReplayState && attachReplayDrain && state.sdkSubscriptions.has(m.sessionId)) {
-          this.replayPendingInteractiveRequests(
-            ws,
-            m.sessionId,
-            attachReplayState.session,
-            deliveredInteractiveRequests,
-          )
-          const delayedMetadata = [
-            ...this.flushTransactionalCreateReplay(
-              ws,
-              m.sessionId,
-              attachReplayDrain.bufferedMessages,
-              attachReplayState.watermark,
-              deliveredInteractiveRequests,
-            ),
-          ]
-          while (queuedAttachMessages.length > 0) {
-            const replayBatch = queuedAttachMessages.splice(0, queuedAttachMessages.length)
-            delayedMetadata.push(...this.flushTransactionalCreateReplay(
-              ws,
-              m.sessionId,
-              replayBatch,
-              attachReplayState.watermark,
-              deliveredInteractiveRequests,
-            ))
-          }
-          for (const metadata of delayedMetadata) {
-            this.safeSend(ws, metadata)
-          }
-          attachReadyForLiveForward = true
-        } else {
-          this.replayPendingInteractiveRequests(ws, m.sessionId, liveSession, deliveredInteractiveRequests)
         }
         return
       }

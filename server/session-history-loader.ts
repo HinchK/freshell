@@ -8,7 +8,10 @@ import fsp from 'fs/promises'
 import path from 'path'
 import { getClaudeHome } from './claude-home.js'
 import type { ContentBlock } from '../shared/ws-protocol.js'
-import { synthesizeDeterministicMessageId, createDurableMessageFingerprint } from './agent-timeline/ledger.js'
+import {
+  synthesizeClaudeFreshAgentDeterministicMessageId,
+  createClaudeFreshAgentDurableMessageFingerprint,
+} from './fresh-agent/history/claude/history-ledger.js'
 
 export interface ChatMessage {
   role: 'user' | 'assistant'
@@ -105,10 +108,10 @@ export function extractChatMessagesFromJsonl(content: string): ChatMessage[] {
 
     // Generate deterministic messageId if not present
     if (!newMessage.messageId) {
-      const fingerprint = createDurableMessageFingerprint(newMessage)
+      const fingerprint = createClaudeFreshAgentDurableMessageFingerprint(newMessage)
       const occurrence = fingerprintOccurrences.get(fingerprint) ?? 0
       fingerprintOccurrences.set(fingerprint, occurrence + 1)
-      newMessage.messageId = synthesizeDeterministicMessageId(newMessage, occurrence)
+      newMessage.messageId = synthesizeClaudeFreshAgentDeterministicMessageId(newMessage, occurrence)
     }
 
     // Coalesce consecutive tool-only assistant messages

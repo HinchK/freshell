@@ -60,9 +60,7 @@ export function FreshAgentSettingsButton({
   const dispatch = useAppDispatch()
   const providerDefaults = useAppSelector(
     (state) => state.settings.settings.freshAgent?.providers?.[paneContent.sessionType]
-      ?? state.settings.serverSettings?.freshAgent?.providers?.[paneContent.sessionType]
-      ?? state.settings.settings.agentChat?.providers?.[paneContent.sessionType]
-      ?? state.settings.serverSettings?.agentChat?.providers?.[paneContent.sessionType],
+      ?? state.settings.serverSettings?.freshAgent?.providers?.[paneContent.sessionType],
   )
   const [open, setOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)

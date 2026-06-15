@@ -41,16 +41,6 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         viewMode: content.viewMode,
         wordWrap: content.wordWrap,
       }
-    case 'agent-chat':
-      return {
-        provider: content.provider,
-        sessionRef: content.sessionRef,
-        initialCwd: content.initialCwd,
-        modelSelection: content.modelSelection,
-        permissionMode: content.permissionMode,
-        effort: content.effort,
-        plugins: content.plugins,
-      }
     case 'fresh-agent':
       return {
         provider: content.provider,
@@ -64,6 +54,11 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
         effort: content.effort,
         plugins: content.plugins,
         ...(content.style ? { style: content.style } : {}),
+        ...(content.restoreError ? { restoreError: content.restoreError } : {}),
+        settingsDismissed: content.settingsDismissed,
+        showThinking: content.showThinking,
+        showTools: content.showTools,
+        showTimecodes: content.showTimecodes,
       }
     case 'extension':
       return {
