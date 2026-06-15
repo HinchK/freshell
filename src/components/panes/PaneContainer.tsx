@@ -42,7 +42,7 @@ import {
   removeSession as removeFreshAgentSession,
 } from '@/store/freshAgentSlice'
 import { DEFAULT_FRESH_AGENT_STYLE } from '@shared/settings'
-import { cancelCreate } from '@/lib/sdk-message-handler'
+import { cancelCreate } from '@/lib/create-cancellation'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import type { ProjectGroup, CodingCliSession } from '@/store/types'

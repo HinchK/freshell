@@ -394,74 +394,6 @@ export const CodingCliKillSchema = z.object({
   sessionId: z.string().min(1),
 })
 
-// SDK browser→server schemas
-export const SdkCreateSchema = z.object({
-  type: z.literal('sdk.create'),
-  requestId: z.string().min(1),
-  cwd: z.string().optional(),
-  resumeSessionId: z.string().optional(),
-  model: z.string().optional(),
-  permissionMode: z.string().optional(),
-  effort: z.string().trim().min(1).optional(),
-  plugins: z.array(z.string()).optional(),
-})
-
-export const SdkSendSchema = z.object({
-  type: z.literal('sdk.send'),
-  sessionId: z.string().min(1),
-  text: z.string().min(1),
-  images: z.array(z.object({
-    mediaType: z.string(),
-    data: z.string(),
-  })).optional(),
-})
-
-export const SdkPermissionRespondSchema = z.object({
-  type: z.literal('sdk.permission.respond'),
-  sessionId: z.string().min(1),
-  requestId: z.string().min(1),
-  behavior: z.enum(['allow', 'deny']),
-  updatedInput: z.record(z.string(), z.unknown()).optional(),
-  updatedPermissions: z.array(z.unknown()).optional(),
-  message: z.string().optional(),
-  interrupt: z.boolean().optional(),
-})
-
-export const SdkInterruptSchema = z.object({
-  type: z.literal('sdk.interrupt'),
-  sessionId: z.string().min(1),
-})
-
-export const SdkKillSchema = z.object({
-  type: z.literal('sdk.kill'),
-  sessionId: z.string().min(1),
-})
-
-export const SdkAttachSchema = z.object({
-  type: z.literal('sdk.attach'),
-  sessionId: z.string().min(1),
-  resumeSessionId: z.string().min(1).optional(),
-})
-
-export const SdkSetModelSchema = z.object({
-  type: z.literal('sdk.set-model'),
-  sessionId: z.string().min(1),
-  model: z.string().min(1),
-})
-
-export const SdkSetPermissionModeSchema = z.object({
-  type: z.literal('sdk.set-permission-mode'),
-  sessionId: z.string().min(1),
-  permissionMode: z.string().min(1),
-})
-
-export const SdkQuestionRespondSchema = z.object({
-  type: z.literal('sdk.question.respond'),
-  sessionId: z.string().min(1),
-  requestId: z.string().min(1),
-  answers: z.record(z.string(), z.string()),
-})
-
 export const FreshAgentCreateSchema = z.object({
   type: z.literal('freshAgent.create'),
   requestId: z.string().min(1),
@@ -569,15 +501,6 @@ export const BrowserSdkMessageSchema = z.discriminatedUnion('type', [
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,
   FreshAgentForkSchema,
-  SdkCreateSchema,
-  SdkSendSchema,
-  SdkPermissionRespondSchema,
-  SdkQuestionRespondSchema,
-  SdkInterruptSchema,
-  SdkKillSchema,
-  SdkAttachSchema,
-  SdkSetModelSchema,
-  SdkSetPermissionModeSchema,
 ])
 
 export type BrowserSdkMessage = z.infer<typeof BrowserSdkMessageSchema>
@@ -612,15 +535,6 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   FreshAgentQuestionRespondSchema,
   FreshAgentKillSchema,
   FreshAgentForkSchema,
-  SdkCreateSchema,
-  SdkSendSchema,
-  SdkPermissionRespondSchema,
-  SdkQuestionRespondSchema,
-  SdkInterruptSchema,
-  SdkKillSchema,
-  SdkAttachSchema,
-  SdkSetModelSchema,
-  SdkSetPermissionModeSchema,
 ])
 
 export type ClientMessage = z.infer<typeof ClientMessageSchema>
@@ -929,7 +843,7 @@ export type CodingCliWsMessage =
   | CodingCliExitMessage
   | CodingCliStderrMessage
 
-// -- SDK server→client messages --
+// -- Fresh Agent server→client messages --
 
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
 export type SdkRestoreFailureCode =
@@ -946,38 +860,6 @@ export type FreshAgentServerMessage =
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
-
-export type SdkServerMessage =
-  | { type: 'sdk.created'; requestId: string; sessionId: string }
-  | {
-    type: 'sdk.create.failed'
-    requestId: string
-    code: SdkRestoreFailureCode
-    message: string
-    retryable?: boolean
-  }
-  | {
-    type: 'sdk.session.snapshot'
-    sessionId: string
-    latestTurnId: string | null
-    status: SdkSessionStatus
-    timelineSessionId?: string
-    revision: number
-    streamingActive?: boolean
-    streamingText?: string
-  }
-  | { type: 'sdk.session.init'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
-  | { type: 'sdk.session.metadata'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
-  | { type: 'sdk.assistant'; sessionId: string; content: ContentBlock[]; model?: string; usage?: Usage }
-  | { type: 'sdk.stream'; sessionId: string; event: unknown; parentToolUseId?: string | null }
-  | { type: 'sdk.result'; sessionId: string; result?: string; durationMs?: number; costUsd?: number; usage?: Usage }
-  | { type: 'sdk.permission.request'; sessionId: string; requestId: string; subtype: string; tool?: { name: string; input?: Record<string, unknown> }; toolUseID?: string; suggestions?: unknown[]; blockedPath?: string; decisionReason?: string }
-  | { type: 'sdk.permission.cancelled'; sessionId: string; requestId: string }
-  | { type: 'sdk.status'; sessionId: string; status: SdkSessionStatus }
-  | { type: 'sdk.error'; sessionId: string; message: string; code?: string }
-  | { type: 'sdk.exit'; sessionId: string; exitCode?: number }
-  | { type: 'sdk.killed'; sessionId: string; success: boolean }
-  | { type: 'sdk.question.request'; sessionId: string; requestId: string; questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }> }
 
 // -- Extensions --
 
@@ -1071,7 +953,6 @@ export type ServerMessage =
   | CodingCliStderrMessage
   | CodingCliKilledMessage
   | FreshAgentServerMessage
-  | SdkServerMessage
   | ExtensionRegistryMessage
   | ExtensionServerStartingMessage
   | ExtensionServerReadyMessage

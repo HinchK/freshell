@@ -1,5 +1,5 @@
-// Re-export shared protocol types for backward compatibility.
-// All Zod schemas and message types now live in shared/ws-protocol.ts.
+// Re-export content block schemas shared by the SDK bridge and Fresh Agent
+// adapters. Browser-facing SDK websocket schemas intentionally do not live here.
 export {
   TextBlockSchema,
   ThinkingBlockSchema,
@@ -7,24 +7,11 @@ export {
   ToolResultBlockSchema,
   ContentBlockSchema,
   UsageSchema,
-  SdkCreateSchema,
-  SdkSendSchema,
-  SdkPermissionRespondSchema,
-  SdkQuestionRespondSchema,
-  SdkInterruptSchema,
-  SdkKillSchema,
-  SdkAttachSchema,
-  SdkSetModelSchema,
-  SdkSetPermissionModeSchema,
-  BrowserSdkMessageSchema,
 } from '../shared/ws-protocol.js'
 
 export type {
   ContentBlock,
   Usage,
-  BrowserSdkMessage,
-  SdkServerMessage,
-  SdkSessionStatus,
 } from '../shared/ws-protocol.js'
 
 // ── SDK type re-exports (from @anthropic-ai/claude-agent-sdk) ──
@@ -51,7 +38,47 @@ export type {
 } from '@anthropic-ai/claude-agent-sdk'
 
 import type { PermissionUpdate, PermissionResult } from '@anthropic-ai/claude-agent-sdk'
-import type { ContentBlock, SdkServerMessage, SdkSessionStatus } from '../shared/ws-protocol.js'
+import type { ContentBlock, Usage } from '../shared/ws-protocol.js'
+
+export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited'
+export type SdkRestoreFailureCode =
+  | 'RESTORE_NOT_FOUND'
+  | 'RESTORE_UNAVAILABLE'
+  | 'RESTORE_INTERNAL'
+  | 'RESTORE_DIVERGED'
+  | 'RESTORE_STALE_REVISION'
+
+export type SdkServerMessage =
+  | { type: 'sdk.created'; requestId: string; sessionId: string }
+  | {
+    type: 'sdk.create.failed'
+    requestId: string
+    code: SdkRestoreFailureCode | string
+    message: string
+    retryable?: boolean
+  }
+  | {
+    type: 'sdk.session.snapshot'
+    sessionId: string
+    latestTurnId: string | null
+    status: SdkSessionStatus
+    timelineSessionId?: string
+    revision: number
+    streamingActive?: boolean
+    streamingText?: string
+  }
+  | { type: 'sdk.session.init'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
+  | { type: 'sdk.session.metadata'; sessionId: string; cliSessionId?: string; model?: string; cwd?: string; tools?: Array<{ name: string }> }
+  | { type: 'sdk.assistant'; sessionId: string; content: ContentBlock[]; model?: string; usage?: Usage }
+  | { type: 'sdk.stream'; sessionId: string; event: unknown; parentToolUseId?: string | null }
+  | { type: 'sdk.result'; sessionId: string; result?: string; durationMs?: number; costUsd?: number; usage?: Usage }
+  | { type: 'sdk.permission.request'; sessionId: string; requestId: string; subtype: string; tool?: { name: string; input?: Record<string, unknown> }; toolUseID?: string; suggestions?: unknown[]; blockedPath?: string; decisionReason?: string }
+  | { type: 'sdk.permission.cancelled'; sessionId: string; requestId: string }
+  | { type: 'sdk.status'; sessionId: string; status: SdkSessionStatus }
+  | { type: 'sdk.error'; sessionId: string; message: string; code?: string }
+  | { type: 'sdk.exit'; sessionId: string; exitCode?: number }
+  | { type: 'sdk.killed'; sessionId: string; success: boolean }
+  | { type: 'sdk.question.request'; sessionId: string; requestId: string; questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }> }
 
 // ── SDK Session State (server-side, in-memory) ──
 

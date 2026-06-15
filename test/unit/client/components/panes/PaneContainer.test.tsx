@@ -96,7 +96,7 @@ vi.mock('@/store/settingsThunks', () => ({
   saveServerSettingsPatch: (patch: unknown) => saveServerSettingsPatchSpy(patch),
 }))
 
-vi.mock('@/lib/sdk-message-handler', () => ({
+vi.mock('@/lib/create-cancellation', () => ({
   cancelCreate: (requestId: string) => cancelCreateSpy(requestId),
 }))
 

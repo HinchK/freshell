@@ -67,7 +67,6 @@ import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, 
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
 import { applyServerCompletion } from '@/store/turnCompletionThunks'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
-import { handleSdkMessage } from '@/lib/sdk-message-handler'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { createLogger } from '@/lib/client-logger'
 import { hasDismissedAutoSetupWizard, markAutoSetupWizardDismissed } from '@/lib/setup-wizard-dismissal'
@@ -1118,8 +1117,6 @@ export default function App() {
         }
 
         handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)
-        // SDK message handling (freshclaude compatibility surface)
-        handleSdkMessage(dispatch, msg as Record<string, unknown>, ws)
       })
 
       cleanup = () => {

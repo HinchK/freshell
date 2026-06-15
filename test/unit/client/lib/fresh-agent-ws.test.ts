@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
-import { cancelCreate, handleSdkMessage, _resetCancelledCreates } from '@/lib/sdk-message-handler'
+import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
 
 function createFreshAgentStore() {
   return configureStore({
@@ -109,7 +109,7 @@ describe('fresh-agent-ws', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       event: {
-        type: 'sdk.session.snapshot',
+        type: 'freshAgent.session.snapshot',
         sessionId: 'claude-thread-1',
         latestTurnId: 'turn-1',
         status: 'idle',
@@ -124,7 +124,7 @@ describe('fresh-agent-ws', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       event: {
-        type: 'sdk.error',
+        type: 'freshAgent.error',
         sessionId: 'claude-thread-1',
         code: 'INVALID_SESSION_ID',
         message: 'Session missing on server',
@@ -140,29 +140,22 @@ describe('fresh-agent-ws', () => {
     }))
   })
 
-  it('keeps the stale sdk.* websocket protocol compatible with freshclaude reload state', () => {
+  it('does not handle top-level legacy SDK websocket messages', () => {
     const store = createFreshAgentStore()
 
-    expect(handleSdkMessage(store.dispatch, {
+    expect(handleFreshAgentMessage(store.dispatch, {
       type: 'sdk.session.snapshot',
       sessionId: 'stale-thread-1',
       latestTurnId: 'turn-stale',
       status: 'idle',
       timelineSessionId: '00000000-0000-4000-8000-000000000001',
       revision: 3,
-    })).toBe(true)
+    })).toBe(false)
 
-    expect(store.getState().freshAgent.sessions['freshclaude:claude:stale-thread-1']).toMatchObject({
-      sessionId: 'stale-thread-1',
-      sessionType: 'freshclaude',
-      provider: 'claude',
-      latestTurnId: 'turn-stale',
-      historySessionId: '00000000-0000-4000-8000-000000000001',
-      historyRevision: 3,
-    })
+    expect(store.getState().freshAgent.sessions['freshclaude:claude:stale-thread-1']).toBeUndefined()
   })
 
-  it('projects every old sdk.* server event carried by freshAgent.event into fresh-agent state', () => {
+  it('projects every fresh-agent provider event carried by freshAgent.event into fresh-agent state', () => {
     const store = createFreshAgentStore()
     const sessionId = 'claude-thread-parity'
     const key = `freshclaude:claude:${sessionId}`
@@ -174,21 +167,21 @@ describe('fresh-agent-ws', () => {
       event: { sessionId, ...event },
     })
 
-    expect(sendEvent({ type: 'sdk.session.snapshot', latestTurnId: null, status: 'idle', revision: 1 })).toBe(true)
-    expect(sendEvent({ type: 'sdk.session.init', cliSessionId: 'cli-1', model: 'claude-opus-4-6', cwd: '/repo' })).toBe(true)
-    expect(sendEvent({ type: 'sdk.session.metadata', cliSessionId: 'cli-2', model: 'claude-sonnet-4-6', tools: [{ name: 'Bash' }] })).toBe(true)
-    expect(sendEvent({ type: 'sdk.status', status: 'running' })).toBe(true)
-    expect(sendEvent({ type: 'sdk.stream', event: { type: 'content_block_start' } })).toBe(true)
-    expect(sendEvent({ type: 'sdk.stream', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } } })).toBe(true)
-    expect(sendEvent({ type: 'sdk.stream', event: { type: 'content_block_stop' } })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.session.snapshot', latestTurnId: null, status: 'idle', revision: 1 })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.session.init', cliSessionId: 'cli-1', model: 'claude-opus-4-6', cwd: '/repo' })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.session.metadata', cliSessionId: 'cli-2', model: 'claude-sonnet-4-6', tools: [{ name: 'Bash' }] })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.status', status: 'running' })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.stream', event: { type: 'content_block_start' } })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.stream', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } } })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.stream', event: { type: 'content_block_stop' } })).toBe(true)
     expect(sendEvent({
-      type: 'sdk.assistant',
+      type: 'freshAgent.assistant',
       model: 'claude-sonnet-4-6',
       content: [{ type: 'text', text: 'final answer' }],
     })).toBe(true)
-    expect(sendEvent({ type: 'sdk.result', costUsd: 0.02, usage: { input_tokens: 10, output_tokens: 5 } })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.result', costUsd: 0.02, usage: { input_tokens: 10, output_tokens: 5 } })).toBe(true)
     expect(sendEvent({
-      type: 'sdk.permission.request',
+      type: 'freshAgent.permission.request',
       requestId: 'perm-1',
       subtype: 'tool',
       tool: { name: 'Bash', input: { command: 'npm test' } },
@@ -197,13 +190,13 @@ describe('fresh-agent-ws', () => {
       toolName: 'Bash',
       input: { command: 'npm test' },
     })
-    expect(sendEvent({ type: 'sdk.permission.cancelled', requestId: 'perm-1' })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.permission.cancelled', requestId: 'perm-1' })).toBe(true)
     expect(sendEvent({
-      type: 'sdk.question.request',
+      type: 'freshAgent.question.request',
       requestId: 'question-1',
       questions: [{ question: 'Continue?', options: [{ label: 'Yes', description: 'Proceed' }] }],
     })).toBe(true)
-    expect(sendEvent({ type: 'sdk.error', code: 'SDK_WARNING', message: 'recoverable' })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.error', code: 'SDK_WARNING', message: 'recoverable' })).toBe(true)
 
     const session = store.getState().freshAgent.sessions[key]
     expect(session).toMatchObject({
@@ -226,9 +219,9 @@ describe('fresh-agent-ws', () => {
       questions: [{ question: 'Continue?' }],
     })
 
-    expect(sendEvent({ type: 'sdk.exit', exitCode: 0 })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.exit', exitCode: 0 })).toBe(true)
     expect(store.getState().freshAgent.sessions[key].status).toBe('exited')
-    expect(sendEvent({ type: 'sdk.killed' })).toBe(true)
+    expect(sendEvent({ type: 'freshAgent.killed' })).toBe(true)
     expect(store.getState().freshAgent.sessions[key]).toBeUndefined()
   })
 })

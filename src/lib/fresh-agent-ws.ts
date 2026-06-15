@@ -50,10 +50,19 @@ type FreshAgentSessionMaterializedMessage = {
   sessionRef?: SessionRef
 }
 
+type FreshAgentKilledMessage = {
+  type: 'freshAgent.killed'
+  sessionId: string
+  sessionType: FreshAgentSessionType
+  provider: FreshAgentRuntimeProvider
+  success: boolean
+}
+
 type FreshAgentClientMessage =
   | FreshAgentCreatedMessage
   | FreshAgentCreateFailedMessage
   | FreshAgentSessionMaterializedMessage
+  | FreshAgentKilledMessage
 
 interface FreshAgentMessageSink {
   send: (msg: unknown) => void
@@ -122,6 +131,15 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
     }
     case 'freshAgent.session.materialized':
       return true
+    case 'freshAgent.killed': {
+      const killed = msg as FreshAgentKilledMessage
+      dispatch(removeSession({
+        sessionId: killed.sessionId,
+        sessionType: killed.sessionType,
+        provider: killed.provider,
+      }))
+      return true
+    }
     case 'freshAgent.event':
       return handleFreshAgentTransportEvent(dispatch, msg as FreshAgentEventMessage)
     default:
@@ -143,7 +161,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
   }
 
   switch (event.type) {
-    case 'sdk.session.snapshot':
+    case 'freshAgent.session.snapshot':
       dispatch(sessionSnapshotReceived({
         ...locator,
         latestTurnId: (event.latestTurnId as string | null | undefined) ?? null,
@@ -154,7 +172,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         streamingText: event.streamingText as string | undefined,
       }))
       return true
-    case 'sdk.session.init':
+    case 'freshAgent.session.init':
       dispatch(sessionInit({
         ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
@@ -163,7 +181,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         tools: event.tools as Array<{ name: string }> | undefined,
       }))
       return true
-    case 'sdk.session.metadata':
+    case 'freshAgent.session.metadata':
       dispatch(sessionMetadataReceived({
         ...locator,
         cliSessionId: event.cliSessionId as string | undefined,
@@ -172,20 +190,20 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         tools: event.tools as Array<{ name: string }> | undefined,
       }))
       return true
-    case 'sdk.status':
+    case 'freshAgent.status':
       dispatch(setSessionStatus({
         ...locator,
         status: event.status as never,
       }))
       return true
-    case 'sdk.assistant':
+    case 'freshAgent.assistant':
       dispatch(addAssistantMessage({
         ...locator,
         content: Array.isArray(event.content) ? event.content as Record<string, unknown>[] : [],
         model: event.model as string | undefined,
       }))
       return true
-    case 'sdk.stream': {
+    case 'freshAgent.stream': {
       const streamEvent = event.event as Record<string, unknown> | undefined
       if (streamEvent?.type === 'content_block_start') {
         dispatch(setStreaming({ ...locator, active: true }))
@@ -204,7 +222,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }
       return true
     }
-    case 'sdk.result':
+    case 'freshAgent.result':
       dispatch(turnResult({
         ...locator,
         costUsd: event.costUsd as number | undefined,
@@ -212,7 +230,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         usage: event.usage as { input_tokens?: number; output_tokens?: number } | undefined,
       }))
       return true
-    case 'sdk.permission.request': {
+    case 'freshAgent.permission.request': {
       const tool = event.tool as { name?: string; input?: Record<string, unknown> } | undefined
       dispatch(addPermissionRequest({
         ...locator,
@@ -226,13 +244,13 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }))
       return true
     }
-    case 'sdk.permission.cancelled':
+    case 'freshAgent.permission.cancelled':
       dispatch(removePermission({
         ...locator,
         requestId: event.requestId as string,
       }))
       return true
-    case 'sdk.question.request':
+    case 'freshAgent.question.request':
       dispatch(addQuestionRequest({
         ...locator,
         requestId: event.requestId as string,
@@ -240,10 +258,10 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         providerRequest: event,
       }))
       return true
-    case 'sdk.exit':
+    case 'freshAgent.exit':
       dispatch(sessionExited(locator))
       return true
-    case 'sdk.error':
+    case 'freshAgent.error':
       if (event.code === 'INVALID_SESSION_ID') {
         dispatch(markSessionLost(locator))
       } else {
@@ -254,7 +272,7 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         }))
       }
       return true
-    case 'sdk.killed':
+    case 'freshAgent.killed':
       dispatch(removeSession(locator))
       return true
     default:

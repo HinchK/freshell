@@ -928,13 +928,13 @@ describe('FreshAgentView', () => {
     }
 
     deliverThroughAppAndMountedView({
-      type: 'sdk.stream',
+      type: 'freshAgent.stream',
       event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } },
     })
     expect(store.getState().freshAgent.sessions[sessionKey].streamingText).toBe('partial')
 
     deliverThroughAppAndMountedView({
-      type: 'sdk.assistant',
+      type: 'freshAgent.assistant',
       model: 'codex-5',
       content: [{ type: 'text', text: 'Final answer' }],
     })
@@ -947,7 +947,7 @@ describe('FreshAgentView', () => {
     })
 
     deliverThroughAppAndMountedView({
-      type: 'sdk.result',
+      type: 'freshAgent.result',
       costUsd: 0.07,
       usage: { input_tokens: 11, output_tokens: 13 },
     })
@@ -2059,7 +2059,7 @@ describe('FreshAgentView', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         event: {
-          type: 'sdk.session.snapshot',
+          type: 'freshAgent.session.snapshot',
           sessionId: 'thread-partial-refresh',
           latestTurnId: 'turn-new-user',
           status: 'running',
@@ -2158,7 +2158,7 @@ describe('FreshAgentView', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         event: {
-          type: 'sdk.session.snapshot',
+          type: 'freshAgent.session.snapshot',
           sessionId: 'thread-authoritative-refresh',
           latestTurnId: 'turn-authoritative-user',
           status: 'idle',
@@ -2249,7 +2249,7 @@ describe('FreshAgentView', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         event: {
-          type: 'sdk.session.snapshot',
+          type: 'freshAgent.session.snapshot',
           sessionId: 'thread-stale-revision',
           latestTurnId: 'turn-stale',
           status: 'running',
@@ -3260,7 +3260,7 @@ describe('FreshAgentView', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       event: {
-        type: 'sdk.session.snapshot',
+        type: 'freshAgent.session.snapshot',
         sessionId: 'dead-session-id',
         latestTurnId: 'turn-1',
         status: 'idle',
@@ -3287,7 +3287,7 @@ describe('FreshAgentView', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       event: {
-        type: 'sdk.error',
+        type: 'freshAgent.error',
         sessionId: 'dead-session-id',
         code: 'INVALID_SESSION_ID',
         message: 'Session no longer exists',

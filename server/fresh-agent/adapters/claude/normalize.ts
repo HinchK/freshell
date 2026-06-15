@@ -4,7 +4,7 @@ import type {
   ClaudeFreshAgentHistoryTurn,
 } from '../../history/claude/history-types.js'
 import type { QuestionDefinition, SdkSessionState } from '../../../sdk-bridge-types.js'
-import type { SdkSessionStatus } from '../../../../shared/ws-protocol.js'
+import type { SdkSessionStatus } from '../../../sdk-bridge-types.js'
 import type { ContentBlock } from '../../../../shared/ws-protocol.js'
 import {
   FreshAgentSnapshotSchema,

@@ -738,7 +738,7 @@ describe('WsHandler fresh-agent routing', () => {
           sessionType: 'freshcodex',
           provider: 'codex',
           event: {
-            type: 'sdk.error',
+            type: 'freshAgent.error',
             sessionId: 'codex-session-no-subscribe',
             code: 'FRESH_AGENT_SUBSCRIBE_FAILED',
             message: 'Codex app-server lifecycle subscription failed',
