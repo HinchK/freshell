@@ -106,6 +106,7 @@ The load-bearing review falsified several assumptions in the first plan. The imp
   - `test/unit/client/store/panesSlice.test.ts`
   - `test/unit/client/store/crossTabSync.test.ts`
   - `test/unit/client/components/TabsView.test.tsx`
+  - `test/e2e/tabs-view-flow.test.tsx`
   - `test/e2e/codex-wrong-thread-resume.test.tsx`
 
 ## Identity Rule
@@ -152,7 +153,7 @@ Cover these cases:
 - Codex candidate-only durability does not match expected identity for side effects.
 - Codex durable state with a mismatched `resumeSessionId` does not match.
 - Provider mismatch fails.
-- Mismatch payload includes expected and actual canonical identities when actual exists.
+- A helper such as `buildSessionIdentityMismatchDetails(record, expectedSessionRef)` returns the mismatch payload fields: `expectedSessionRef` and `actualSessionRef` when `buildTerminalSessionRef(record)` can prove an actual canonical identity.
 
 - [ ] **Step 2: Run failing test**
 
@@ -164,7 +165,7 @@ Expected: FAIL because the helper does not exist.
 
 - [ ] **Step 3: Implement helper**
 
-The helper must call `buildTerminalSessionRef(record)` rather than duplicating Codex candidate/durability rules. That keeps side-effect identity aligned with the registry's canonical binding behavior.
+The helper must call `buildTerminalSessionRef(record)` rather than duplicating Codex candidate/durability rules. That keeps side-effect identity aligned with the registry's canonical binding behavior. Export a concrete mismatch-detail builder from this module so `ws-handler.ts`, broker, and REST paths do not each hand-roll expected/actual payload construction.
 
 - [ ] **Step 4: Run tests**
 
@@ -633,11 +634,12 @@ It must:
 On `SESSION_IDENTITY_MISMATCH`:
 
 - validate `msg.expectedSessionRef`
-- generate new request id
+- confirm the pane still owns `staleTerminalId` and has no repair already pending for that stale terminal; if the check fails, return before creating a new request id
+- generate new request id only after the guard passes
 - mark it as restore via `addTerminalRestoreRequestId(newRequestId)`
-- update `requestIdRef.current`
 - clear terminal refs/checkpoints for the stale terminal
 - dispatch reducer
+- update `requestIdRef.current` only after dispatching a repair that still applies
 - do not manually call `sendCreate`; let the create effect run from `createRequestId`
 
 - [ ] **Step 5: Run focused tests**
@@ -666,6 +668,7 @@ git commit -m "fix: repair stale Codex runtime plumbing"
 - Test: `test/unit/client/store/panesSlice.test.ts`
 - Test: `test/unit/client/components/TabsView.test.tsx`
 - Test: `test/unit/client/store/crossTabSync.test.ts`
+- Test: `test/e2e/tabs-view-flow.test.tsx`
 
 - [ ] **Step 1: Write failing tab-registry tests**
 
@@ -674,6 +677,7 @@ Cover:
 - A registry record with `sessionRef: thread-new` and same-server `liveTerminal: term-old` does not hydrate `terminalId: term-old` unless the live handle is proven/declared matching.
 - A registry record without `sessionRef` may still use liveTerminal for non-Codex live-only behavior.
 - `tab-registry-snapshot` still publishes `liveTerminal` for UI discovery, but consumers treat it as runtime plumbing.
+- Update the existing `tabs-view-flow` case `opens same-server tab copies with an explicit live terminal handle` so a copied pane with canonical `sessionRef` does not copy `terminalId` from an unproven same-server `liveTerminal`; it should rely on canonical restore/create instead.
 
 - [ ] **Step 2: Write failing cross-tab tests**
 
@@ -690,6 +694,7 @@ npm run test:vitest -- \
   test/unit/client/store/panesSlice.test.ts \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/store/crossTabSync.test.ts \
+  test/e2e/tabs-view-flow.test.tsx \
   --run
 ```
 
@@ -714,6 +719,7 @@ npm run test:vitest -- \
   test/unit/client/store/panesSlice.test.ts \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/store/crossTabSync.test.ts \
+  test/e2e/tabs-view-flow.test.tsx \
   --run
 ```
 
@@ -722,7 +728,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/components/TabsView.tsx src/store/panesSlice.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/crossTabSync.test.ts
+git add src/components/TabsView.tsx src/store/panesSlice.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/crossTabSync.test.ts test/e2e/tabs-view-flow.test.tsx
 git commit -m "fix: keep canonical Codex identity across tab sync"
 ```
 
@@ -803,6 +809,7 @@ FRESHELL_TEST_SUMMARY="codex identity focused client" npm run test:vitest -- \
   test/unit/client/store/panesSlice.test.ts \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/store/crossTabSync.test.ts \
+  test/e2e/tabs-view-flow.test.tsx \
   test/e2e/codex-wrong-thread-resume.test.tsx \
   --run
 ```
