@@ -90,7 +90,7 @@ The load-bearing review falsified several assumptions in the first plan. The imp
   - Refuse conflicting `terminal.session.associated` updates for panes that already have a different canonical `sessionRef`.
   - Provide an atomic reducer for Codex identity mismatch repair.
 
-- Modify `src/lib/tab-registry-snapshot.ts`, `src/components/TabsView.tsx`, and cross-tab merge code in `src/store/panesSlice.ts`
+- Modify `src/components/TabsView.tsx` and cross-tab merge code in `src/store/panesSlice.ts`; inspect `src/lib/tab-registry-snapshot.ts` to preserve its output contract unless explicit server-validated live-handle proof metadata is added.
   - Preserve canonical `sessionRef` over live runtime fields.
   - Discard or quarantine same-server `liveTerminal` handles when they are paired with a canonical `sessionRef` that has not been server-validated.
 
@@ -103,6 +103,7 @@ The load-bearing review falsified several assumptions in the first plan. The imp
   - `test/unit/client/components/terminal-view-utils.test.ts`
   - `test/unit/client/components/TerminalView.codex-identity.test.tsx`
   - `test/unit/client/lib/terminal-session-association.test.ts`
+  - `test/unit/client/store/panesSlice.test.ts`
   - `test/unit/client/store/crossTabSync.test.ts`
   - `test/unit/client/components/TabsView.test.tsx`
   - `test/e2e/codex-wrong-thread-resume.test.tsx`
@@ -112,10 +113,7 @@ The load-bearing review falsified several assumptions in the first plan. The imp
 Use this rule for side-effecting operations:
 
 ```ts
-type SessionLocator = {
-  provider: string
-  sessionId: string
-}
+import type { SessionLocator } from '../shared/ws-protocol.js'
 
 function canonicalActualSessionRef(record: TerminalRecord): SessionLocator | undefined {
   return buildTerminalSessionRef(record)
@@ -451,6 +449,7 @@ Add helpers that:
 - Return `undefined` for Codex durability-only content.
 - Include outbound `liveTerminal` only when no canonical `sessionRef` exists, or when the caller explicitly allows a live handle after server validation.
 - Build attach/input/resize payloads with `expectedSessionRef` whenever canonical identity exists.
+- Update the existing `getCreateSessionStateFromRef` expectation that currently returns both `sessionRef` and `liveTerminal`; the new assertion must prove a canonical `sessionRef` suppresses unproven outbound `liveTerminal`.
 
 - [ ] **Step 2: Run failing helper tests**
 
@@ -661,9 +660,10 @@ git commit -m "fix: repair stale Codex runtime plumbing"
 ## Task 9: Harden Tab Registry And Cross-Tab Sync
 
 **Files:**
-- Modify: `src/lib/tab-registry-snapshot.ts`
+- Inspect: `src/lib/tab-registry-snapshot.ts`
 - Modify: `src/components/TabsView.tsx`
 - Modify: `src/store/panesSlice.ts`
+- Test: `test/unit/client/store/panesSlice.test.ts`
 - Test: `test/unit/client/components/TabsView.test.tsx`
 - Test: `test/unit/client/store/crossTabSync.test.ts`
 
@@ -687,6 +687,7 @@ Cover:
 
 ```bash
 npm run test:vitest -- \
+  test/unit/client/store/panesSlice.test.ts \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/store/crossTabSync.test.ts \
   --run
@@ -710,6 +711,7 @@ In cross-tab merge:
 
 ```bash
 npm run test:vitest -- \
+  test/unit/client/store/panesSlice.test.ts \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/store/crossTabSync.test.ts \
   --run
@@ -720,7 +722,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/lib/tab-registry-snapshot.ts src/components/TabsView.tsx src/store/panesSlice.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/crossTabSync.test.ts
+git add src/components/TabsView.tsx src/store/panesSlice.ts test/unit/client/store/panesSlice.test.ts test/unit/client/components/TabsView.test.tsx test/unit/client/store/crossTabSync.test.ts
 git commit -m "fix: keep canonical Codex identity across tab sync"
 ```
 
@@ -798,6 +800,7 @@ FRESHELL_TEST_SUMMARY="codex identity focused client" npm run test:vitest -- \
   test/unit/client/components/terminal-view-utils.test.ts \
   test/unit/client/components/TerminalView.codex-identity.test.tsx \
   test/unit/client/lib/terminal-session-association.test.ts \
+  test/unit/client/store/panesSlice.test.ts \
   test/unit/client/components/TabsView.test.tsx \
   test/unit/client/store/crossTabSync.test.ts \
   test/e2e/codex-wrong-thread-resume.test.tsx \
@@ -838,5 +841,5 @@ git commit -m "fix: enforce Codex thread identity invariant"
 - Load-bearing fixes: Every falsified load-bearing assumption now changes a task: side-effect gates move inside operation owners, create reuse is centralized, REST/MCP/CLI paths are in scope, broadcasts are identity-aware, and tab-registry/cross-tab sync drops stale runtime fields.
 - Non-legacy approach: The plan still ignores heuristic recovery. When canonical `sessionRef` is absent, Freshell refuses to guess.
 - Test shape: Tests protect the incident behavior directly: input/replay must not reach the old thread, stale runtime plumbing must be cleared, and restore/create must target the expected Codex `sessionRef`.
-- PR callout: Removing `proof_failed_attach_live_candidate` intentionally reduces Codex live-terminal reuse when rollout proof fails, because resuming the wrong thread is worse than a fresh/restore-unavailable path. The eventual PR description should make this behavior change explicit.
+- PR callout: Removing `proof_failed_attach_live_candidate` intentionally reduces Codex live-terminal reuse when rollout proof fails, because resuming the wrong thread is worse than a fresh/restore-unavailable path. Omitting unproven outbound `liveTerminal` when canonical `sessionRef` exists also disables the same-server live-handle fast path across providers; reuse should happen through server-side canonical lookup instead. The eventual PR description should make both behavior changes explicit.
 - Known implementation adjustment: Helper and fixture names must follow the repo's existing test harnesses. Preserve the behavior and assertion shape when adapting names.
