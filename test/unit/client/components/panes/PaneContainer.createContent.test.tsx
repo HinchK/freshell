@@ -342,7 +342,7 @@ describe('createContentForType with ext: prefix', () => {
     expect(Object.keys(paneContent).sort()).toEqual(['extensionName', 'kind', 'props'])
   })
 
-  it('creates agent chat content with default plugins from resolved settings', async () => {
+  it('creates fresh-agent content with default plugins from resolved settings', async () => {
     const node = createPickerNode('pane-1')
     const store = createStore(
       { layouts: { 'tab-1': node }, activePane: { 'tab-1': 'pane-1' } },

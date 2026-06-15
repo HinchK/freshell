@@ -120,7 +120,7 @@ describe('visible-first read-model helpers', () => {
     )
   })
 
-  it('agent chat helpers target only the new route family and forward AbortSignal', async () => {
+  it('fresh-agent helpers target only the new route family and forward AbortSignal', async () => {
     const signal = new AbortController().signal
     mockFetch
       .mockResolvedValueOnce(mockJson({ items: [], nextCursor: null }))

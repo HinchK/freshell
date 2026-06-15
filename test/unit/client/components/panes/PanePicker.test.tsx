@@ -295,6 +295,20 @@ describe('PanePicker', () => {
       expect(screen.getByRole('button', { name: 'Freshopencode' })).toBeInTheDocument()
     })
 
+    it('shows fresh client labels without old wording', () => {
+      renderPicker({
+        availableClis: { claude: true, codex: true, opencode: true },
+        enabledProviders: ['claude', 'codex', 'opencode'],
+        extensions: [...defaultCliExtensions, mockOpencodeExt],
+        freshClientsEnabled: true,
+      })
+
+      expect(screen.getByRole('button', { name: 'Freshclaude' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Freshcodex' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Freshopencode' })).toBeInTheDocument()
+      expect(document.body.textContent).not.toMatch(/agent[-\s]?chat/i)
+    })
+
     it('shows only non-CLI options when no CLIs are available', () => {
       renderPicker({ availableClis: {} })
       expect(screen.queryByRole('button', { name: 'Claude CLI' })).not.toBeInTheDocument()

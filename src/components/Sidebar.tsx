@@ -9,7 +9,8 @@ import { openSessionTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { addPane, setActivePane, updatePaneTitle } from '@/store/panesSlice'
 import { findPaneForSession } from '@/lib/session-utils'
 import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type-utils'
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
@@ -360,9 +361,10 @@ export default function Sidebar({
 
     // Resolve provider settings for fresh-agent panes
     const sessionType = item.sessionType || provider
-    const agentConfig = getAgentChatProviderConfig(sessionType)
-    const providerSettings = agentConfig
-      ? state.settings.settings.freshAgent?.providers?.[agentConfig.name]
+    const freshAgentType = resolveFreshAgentType(sessionType)
+    const freshAgentProviderConfig = getFreshAgentProviderConfig(sessionType)
+    const freshAgentProviderSettings = freshAgentType || freshAgentProviderConfig
+      ? state.settings.settings.freshAgent?.providers?.[sessionType]
       : undefined
 
     // 2. Fallback: no active tab or active tab has no layout → create new tab
@@ -412,7 +414,7 @@ export default function Sidebar({
         sessionType,
         sessionId: item.sessionId,
         cwd: item.cwd,
-        agentChatProviderSettings: providerSettings,
+        freshAgentProviderSettings,
         liveTerminal: runningTerminalId && localServerInstanceId
           ? { terminalId: runningTerminalId, serverInstanceId: localServerInstanceId }
           : undefined,

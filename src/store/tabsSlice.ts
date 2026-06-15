@@ -8,7 +8,8 @@ import { findTabIdForSession } from '@/lib/session-utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { basenameSegment } from '@shared/path-basename'
 import { buildResumeContent } from '@/lib/session-type-utils'
-import { isAgentChatProviderName, getAgentChatProviderConfig, getAgentChatProviderLabel } from '@/lib/agent-chat-utils'
+import { getFreshAgentProviderConfig, getFreshAgentProviderLabel } from '@/lib/fresh-agent-provider-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { recordClosedTabSnapshot, pushReopenEntry, popReopenEntry } from './tabRegistrySlice'
 import { clearDraft } from '@/lib/draft-store'
 import {
@@ -577,9 +578,10 @@ export const openSessionTab = createAsyncThunk(
     const state = getState() as RootState
     const localServerInstanceId = (state as Partial<RootState>).connection?.serverInstanceId
     const extensions = (state as Partial<RootState>).extensions?.entries ?? []
-    const agentConfig = getAgentChatProviderConfig(resolvedSessionType)
-    const providerSettings = agentConfig
-      ? state.settings?.settings.freshAgent?.providers?.[agentConfig.name]
+    const freshAgentType = resolveFreshAgentType(resolvedSessionType)
+    const freshAgentProviderConfig = getFreshAgentProviderConfig(resolvedSessionType)
+    const freshAgentProviderSettings = freshAgentType || freshAgentProviderConfig
+      ? state.settings?.settings.freshAgent?.providers?.[resolvedSessionType]
       : undefined
     const sessionMetadataInput = {
       sessionType: resolvedSessionType,
@@ -595,7 +597,7 @@ export const openSessionTab = createAsyncThunk(
       sessionType: resolvedSessionType,
       sessionId,
       cwd,
-      agentChatProviderSettings: providerSettings,
+      freshAgentProviderSettings,
     })
 
     const updateExistingTabMetadata = (tab: Tab | undefined) => {
@@ -674,7 +676,7 @@ export const openSessionTab = createAsyncThunk(
           return
         }
       }
-      // Running terminals are always terminal panes (agent-chat uses SDK, not PTY)
+      // Running terminals are always terminal panes (fresh-agent uses SDK, not PTY)
       const tabId = nanoid()
       dispatch(addTab({
         id: tabId,
@@ -747,13 +749,13 @@ export const openSessionTab = createAsyncThunk(
       }
     }
 
-    // For chat sessions, create a tab then immediately set up the resolved layout
+    // For fresh-agent sessions, create a tab then immediately set up the resolved layout
     // so TabContent's fallback initLayout (which always creates terminal panes) doesn't win
-    if (isAgentChatProviderName(resolvedSessionType)) {
+    if (desiredResumeContent.kind === 'fresh-agent') {
       const tabId = nanoid()
       dispatch(addTab({
         id: tabId,
-        title: title || (cwd ? basenameSegment(cwd) : null) || getAgentChatProviderLabel(resolvedSessionType),
+        title: title || (cwd ? basenameSegment(cwd) : null) || freshAgentType?.label || getFreshAgentProviderLabel(resolvedSessionType),
         mode: resolvedProvider,
         codingCliProvider: resolvedProvider,
         initialCwd: cwd,

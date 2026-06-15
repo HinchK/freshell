@@ -71,7 +71,7 @@ type SessionIdentityState = {
   cliSessionId?: string
 } | undefined
 
-type LegacyAgentChatPersistedIdentityContent = Record<string, unknown> & {
+type LegacyFreshAgentPersistedIdentityContent = Record<string, unknown> & {
   provider?: string
   resumeSessionId?: string
   sessionRef?: SessionRef
@@ -204,18 +204,18 @@ export function mergeSessionMetadataForPreferredResumeId({
   return nextSessionMetadataByKey
 }
 
-export function buildAgentChatPersistedIdentityUpdate({
+export function buildFreshAgentPersistedIdentityUpdate({
   session,
   paneContent,
   currentTab,
   metadataProvider,
 }: {
   session: SessionIdentityState
-  paneContent: LegacyAgentChatPersistedIdentityContent
+  paneContent: LegacyFreshAgentPersistedIdentityContent
   currentTab?: Tab
   metadataProvider?: CodingCliProviderName
 }): {
-  paneUpdates?: Partial<LegacyAgentChatPersistedIdentityContent>
+  paneUpdates?: Partial<LegacyFreshAgentPersistedIdentityContent>
   tabUpdates?: Partial<Tab>
   shouldFlush: boolean
 } | null {

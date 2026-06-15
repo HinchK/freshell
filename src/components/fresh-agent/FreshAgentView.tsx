@@ -477,7 +477,7 @@ export function FreshAgentView({
 
   const sendFreshAgentMessage = useCallback((message: Record<string, unknown>) => {
     const suppressed = typeof window !== 'undefined'
-      && window.__FRESHELL_TEST_HARNESS__?.isAgentChatNetworkEffectsSuppressed?.(paneId) === true
+      && window.__FRESHELL_TEST_HARNESS__?.isFreshAgentNetworkEffectsSuppressed?.(paneId) === true
     if (suppressed) {
       window.__FRESHELL_TEST_HARNESS__?.recordSentWsMessage?.(message)
       return

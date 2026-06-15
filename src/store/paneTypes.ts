@@ -117,7 +117,7 @@ export type PickerPaneContent = {
 /** SDK session statuses — richer than TerminalStatus to reflect Claude Code lifecycle */
 export type SdkSessionStatus = 'creating' | 'starting' | 'connected' | 'running' | 'idle' | 'compacting' | 'exited' | 'create-failed'
 
-export type AgentChatCreateError = {
+export type FreshAgentCreateError = {
   code: string
   message: string
   retryable?: boolean
@@ -137,7 +137,7 @@ export type FreshAgentPaneContent = {
   /** Explicit restore failure when no canonical durable target exists. */
   restoreError?: RestoreError
   initialCwd?: string
-  createError?: AgentChatCreateError
+  createError?: FreshAgentCreateError
   modelSelection?: FreshAgentModelSelection
   model?: string
   permissionMode?: string

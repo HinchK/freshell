@@ -22,7 +22,7 @@ function deriveLeafSessionRef(
   if (content.kind === 'fresh-agent') {
     const explicit = sanitizeSessionRef(content.sessionRef)
     if (explicit) return explicit
-    if (isValidClaudeSessionId(content.resumeSessionId)) {
+    if (content.provider === 'claude' && isValidClaudeSessionId(content.resumeSessionId)) {
       return sanitizeSessionRef({
         provider: 'claude',
         sessionId: content.resumeSessionId,

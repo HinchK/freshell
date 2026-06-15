@@ -1,9 +1,9 @@
 import type { ComponentType } from 'react'
 import { PROVIDER_ICONS, DefaultProviderIcon } from '@/components/icons/provider-icons'
 import { isNonShellMode, getProviderLabel } from '@/lib/coding-cli-utils'
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
-import type { AgentChatProviderName, AgentChatProviderSettings } from '@/lib/agent-chat-types'
+import type { FreshAgentProviderName, FreshAgentProviderSettings } from '@/lib/fresh-agent-provider-types'
 import type { CodingCliProviderName } from '@/store/types'
 import type { FreshAgentPaneInput, TerminalPaneInput } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
@@ -27,12 +27,12 @@ export function resolveSessionTypeConfig(sessionType: string, extensions?: Clien
     }
   }
 
-  // 1. Check agent-chat providers first (they have explicit configs)
-  const agentConfig = getAgentChatProviderConfig(sessionType)
-  if (agentConfig) {
+  // 1. Check fresh-agent providers first (they have explicit configs)
+  const freshAgentProviderConfig = getFreshAgentProviderConfig(sessionType)
+  if (freshAgentProviderConfig) {
     return {
-      icon: agentConfig.icon,
-      label: agentConfig.label,
+      icon: freshAgentProviderConfig.icon,
+      label: freshAgentProviderConfig.label,
     }
   }
 
@@ -85,14 +85,14 @@ export function getPairedSessionTypeTarget(
 
 /**
  * Build the correct PaneContentInput for resuming a session based on its sessionType.
- * Fresh-agent sessions (freshclaude, kilroy) → kind: 'fresh-agent'
+ * Fresh-agent sessions → kind: 'fresh-agent'
  * Terminal sessions (claude, codex) → kind: 'terminal'
  */
 export function buildResumeContent(opts: {
   sessionType: string
   sessionId: string
   cwd?: string
-  agentChatProviderSettings?: AgentChatProviderSettings
+  freshAgentProviderSettings?: FreshAgentProviderSettings
   liveTerminal?: {
     terminalId: string
     serverInstanceId: string
@@ -100,16 +100,16 @@ export function buildResumeContent(opts: {
 }): TerminalPaneInput | FreshAgentPaneInput {
   const freshAgentType = resolveFreshAgentType(opts.sessionType)
   if (freshAgentType) {
-    const agentConfig = getAgentChatProviderConfig(opts.sessionType)
-    const ps = opts.agentChatProviderSettings
+    const freshAgentProviderConfig = getFreshAgentProviderConfig(opts.sessionType)
+    const ps = opts.freshAgentProviderSettings
     const permissionMode = freshAgentType.settingsVisibility.permissionMode === false
       ? undefined
-      : ps?.defaultPermissionMode ?? agentConfig?.defaultPermissionMode ?? freshAgentType.defaultPermissionMode
+      : ps?.defaultPermissionMode ?? freshAgentProviderConfig?.defaultPermissionMode ?? freshAgentType.defaultPermissionMode
     return {
       kind: 'fresh-agent',
       sessionType: freshAgentType.sessionType,
       provider: freshAgentType.runtimeProvider,
-      resumeSessionId: opts.sessionId,
+      ...(freshAgentType.runtimeProvider === 'claude' ? { resumeSessionId: opts.sessionId } : {}),
       sessionRef: {
         provider: freshAgentType.runtimeProvider,
         sessionId: opts.sessionId,
@@ -122,17 +122,21 @@ export function buildResumeContent(opts: {
     }
   }
 
-  const agentConfig = getAgentChatProviderConfig(opts.sessionType)
-  if (agentConfig) {
-    const ps = opts.agentChatProviderSettings
+  const freshAgentProviderConfig = getFreshAgentProviderConfig(opts.sessionType)
+  if (freshAgentProviderConfig) {
+    const ps = opts.freshAgentProviderSettings
     return {
       kind: 'fresh-agent',
-      sessionType: agentConfig.name as AgentChatProviderName,
+      sessionType: freshAgentProviderConfig.name as FreshAgentProviderName,
       provider: 'claude',
       resumeSessionId: opts.sessionId,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: opts.sessionId,
+      },
       initialCwd: opts.cwd,
       modelSelection: ps?.modelSelection,
-      permissionMode: ps?.defaultPermissionMode ?? agentConfig.defaultPermissionMode,
+      permissionMode: ps?.defaultPermissionMode ?? freshAgentProviderConfig.defaultPermissionMode,
       effort: ps?.effort,
     }
   }

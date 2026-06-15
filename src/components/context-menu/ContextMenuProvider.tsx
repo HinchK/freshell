@@ -29,7 +29,8 @@ import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/p
 import { buildResumeCommand, type ResumeCommandProvider } from '@/lib/coding-cli-utils'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { buildResumeContent } from '@/lib/session-type-utils'
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
+import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
 import { resolvePaneActivity } from '@/lib/pane-activity'
@@ -445,9 +446,10 @@ export function ContextMenuProvider({
     const mode = (provider || session.provider || 'claude') as CodingCliProviderName
     const sessionType = (target?.kind === 'sidebar-session' ? target.sessionType : undefined)
       || session.sessionType || mode
-    const agentConfig = getAgentChatProviderConfig(sessionType)
-    const providerSettings = agentConfig
-      ? appSettings.freshAgent?.providers?.[agentConfig.name]
+    const freshAgentType = resolveFreshAgentType(sessionType)
+    const freshAgentProviderConfig = getFreshAgentProviderConfig(sessionType)
+    const freshAgentProviderSettings = freshAgentType || freshAgentProviderConfig
+      ? appSettings.freshAgent?.providers?.[sessionType]
       : undefined
     dispatch(addPane({
       tabId: activeTabId,
@@ -455,7 +457,7 @@ export function ContextMenuProvider({
         sessionType,
         sessionId: session.sessionId,
         cwd: session.cwd,
-        agentChatProviderSettings: providerSettings,
+        freshAgentProviderSettings,
       }),
     }))
     persistSessionMetadataOnTab(activeTabId, session, sessionType)
@@ -926,7 +928,7 @@ export function ContextMenuProvider({
         sessionType: latest.target.targetSessionType,
         sessionId: latest.target.sessionId,
         cwd: latest.target.cwd,
-        agentChatProviderSettings: latest.providerSettings,
+        freshAgentProviderSettings: latest.providerSettings,
       }),
     }))
 

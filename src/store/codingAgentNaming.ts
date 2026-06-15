@@ -5,7 +5,7 @@ import { updateTab } from './tabsSlice'
 import type { AppDispatch, RootState } from './store'
 
 /**
- * Finalize the name of a coding-agent SDK session (fresh-agent / agent-chat)
+ * Finalize the name of a coding-agent SDK session (fresh-agent)
  * from its first user message.
  *
  * The server is the single writer of the session title override (which drives

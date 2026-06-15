@@ -145,7 +145,7 @@ function normalizePaneContent(
       sessionId: input.sessionId,
       createRequestId: input.createRequestId || nanoid(),
       status: input.status || 'creating',
-      resumeSessionId: input.resumeSessionId,
+      ...(typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {}),
       ...(sessionRef ? { sessionRef } : {}),
       serverInstanceId: typeof input.serverInstanceId === 'string' ? input.serverInstanceId : undefined,
       ...('restoreError' in durableState && durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
@@ -554,7 +554,7 @@ function mergeTerminalState(
   if (!incomingValid) return localValid ? local : null
   if (!localValid) return incoming
 
-  // If both leaves, apply smart merge for terminal and agent-chat content
+  // If both leaves, apply smart merge for terminal and fresh-agent content
   if (incoming.type === 'leaf' && local.type === 'leaf') {
     if (incoming.content?.kind === 'terminal' && local.content?.kind === 'terminal') {
       if (incoming.content.createRequestId === local.content.createRequestId) {

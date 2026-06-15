@@ -370,7 +370,7 @@ export function findTabIdForSession(
 
 /**
  * Find the tab and pane that contain a specific session.
- * Walks all tabs' pane trees looking for a pane (terminal, agent-chat, or fresh-agent) matching the provider + sessionId.
+ * Walks all tabs' pane trees looking for a terminal or fresh-agent pane matching the provider + sessionId.
  * Falls back to tab-level resumeSessionId when no layout exists (early boot/rehydration).
  */
 export function findPaneForSession(

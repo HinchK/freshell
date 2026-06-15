@@ -1,14 +1,14 @@
-import type { AgentChatProviderName, AgentChatProviderConfig } from './agent-chat-types'
+import type { FreshAgentProviderName, FreshAgentProviderConfig } from './fresh-agent-provider-types'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 
-export type { AgentChatProviderName, AgentChatProviderConfig }
+export type { FreshAgentProviderName, FreshAgentProviderConfig }
 
-export const AGENT_CHAT_PROVIDERS: AgentChatProviderName[] = [
+export const FRESH_AGENT_PROVIDERS: FreshAgentProviderName[] = [
   'freshclaude',
   'kilroy',
 ]
 
-export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
+export const FRESH_AGENT_PROVIDER_CONFIGS: FreshAgentProviderConfig[] = [
   {
     name: 'freshclaude',
     ...(() => {
@@ -50,24 +50,24 @@ export const AGENT_CHAT_PROVIDER_CONFIGS: AgentChatProviderConfig[] = [
   },
 ]
 
-export function isAgentChatProviderName(value?: string): value is AgentChatProviderName {
+export function isFreshAgentProviderName(value?: string): value is FreshAgentProviderName {
   if (!value) return false
-  return AGENT_CHAT_PROVIDERS.includes(value as AgentChatProviderName)
+  return FRESH_AGENT_PROVIDERS.includes(value as FreshAgentProviderName)
 }
 
-export function getAgentChatProviderConfig(name?: string): AgentChatProviderConfig | undefined {
+export function getFreshAgentProviderConfig(name?: string): FreshAgentProviderConfig | undefined {
   if (!name) return undefined
-  return AGENT_CHAT_PROVIDER_CONFIGS.find((c) => c.name === name)
+  return FRESH_AGENT_PROVIDER_CONFIGS.find((c) => c.name === name)
 }
 
-export function getAgentChatProviderLabel(name?: string): string {
-  const config = getAgentChatProviderConfig(name)
-  return config?.label ?? 'Agent Chat'
+export function getFreshAgentProviderLabel(name?: string): string {
+  const config = getFreshAgentProviderConfig(name)
+  return config?.label ?? 'Fresh Agent'
 }
 
 /** Returns provider configs visible in the pane picker, filtering out hidden providers unless their feature flag is enabled. */
-export function getVisibleAgentChatConfigs(featureFlags: Record<string, boolean>): AgentChatProviderConfig[] {
-  return AGENT_CHAT_PROVIDER_CONFIGS.filter((config) => {
+export function getVisibleFreshAgentConfigs(featureFlags: Record<string, boolean>): FreshAgentProviderConfig[] {
+  return FRESH_AGENT_PROVIDER_CONFIGS.filter((config) => {
     if (!config.hidden) return true
     const flag = config.featureFlag ?? config.name
     return featureFlags[flag] === true

@@ -1,30 +1,30 @@
 import { describe, it, expect } from 'vitest'
 import {
-  AGENT_CHAT_PROVIDER_CONFIGS,
-  AGENT_CHAT_PROVIDERS,
-  isAgentChatProviderName,
-  getAgentChatProviderConfig,
-  getAgentChatProviderLabel,
-  getVisibleAgentChatConfigs,
-} from '@/lib/agent-chat-utils'
+  FRESH_AGENT_PROVIDER_CONFIGS,
+  FRESH_AGENT_PROVIDERS,
+  isFreshAgentProviderName,
+  getFreshAgentProviderConfig,
+  getFreshAgentProviderLabel,
+  getVisibleFreshAgentConfigs,
+} from '@/lib/fresh-agent-provider-utils'
 
-describe('agent-chat-utils', () => {
+describe('fresh-agent-provider-utils', () => {
   it('exports at least one provider', () => {
-    expect(AGENT_CHAT_PROVIDERS.length).toBeGreaterThan(0)
-    expect(AGENT_CHAT_PROVIDER_CONFIGS.length).toBeGreaterThan(0)
+    expect(FRESH_AGENT_PROVIDERS.length).toBeGreaterThan(0)
+    expect(FRESH_AGENT_PROVIDER_CONFIGS.length).toBeGreaterThan(0)
   })
 
   it('freshclaude is a valid provider', () => {
-    expect(isAgentChatProviderName('freshclaude')).toBe(true)
+    expect(isFreshAgentProviderName('freshclaude')).toBe(true)
   })
 
   it('rejects unknown provider names', () => {
-    expect(isAgentChatProviderName('unknown')).toBe(false)
-    expect(isAgentChatProviderName(undefined)).toBe(false)
+    expect(isFreshAgentProviderName('unknown')).toBe(false)
+    expect(isFreshAgentProviderName(undefined)).toBe(false)
   })
 
   it('returns config for freshclaude', () => {
-    const config = getAgentChatProviderConfig('freshclaude')
+    const config = getFreshAgentProviderConfig('freshclaude')
     expect(config).toBeDefined()
     expect(config!.label).toBe('Freshclaude')
     expect(config!.providerDefaultModelId).toBe('opus')
@@ -33,23 +33,23 @@ describe('agent-chat-utils', () => {
   })
 
   it('returns undefined for unknown provider', () => {
-    expect(getAgentChatProviderConfig('nope')).toBeUndefined()
+    expect(getFreshAgentProviderConfig('nope')).toBeUndefined()
   })
 
   it('returns label for known provider', () => {
-    expect(getAgentChatProviderLabel('freshclaude')).toBe('Freshclaude')
+    expect(getFreshAgentProviderLabel('freshclaude')).toBe('Freshclaude')
   })
 
   it('returns fallback label for unknown provider', () => {
-    expect(getAgentChatProviderLabel('nope')).toBe('Agent Chat')
+    expect(getFreshAgentProviderLabel('nope')).toBe('Fresh Agent')
   })
 
   it('kilroy is a valid provider', () => {
-    expect(isAgentChatProviderName('kilroy')).toBe(true)
+    expect(isFreshAgentProviderName('kilroy')).toBe(true)
   })
 
   it('returns config for kilroy', () => {
-    const config = getAgentChatProviderConfig('kilroy')
+    const config = getFreshAgentProviderConfig('kilroy')
     expect(config).toBeDefined()
     expect(config!.name).toBe('kilroy')
     expect(config!.label).toBe('Kilroy')
@@ -61,41 +61,41 @@ describe('agent-chat-utils', () => {
   })
 
   it('returns label for kilroy provider', () => {
-    expect(getAgentChatProviderLabel('kilroy')).toBe('Kilroy')
+    expect(getFreshAgentProviderLabel('kilroy')).toBe('Kilroy')
   })
 
   it('all providers have unique picker shortcuts', () => {
-    const shortcuts = AGENT_CHAT_PROVIDER_CONFIGS.map((c) => c.pickerShortcut)
+    const shortcuts = FRESH_AGENT_PROVIDER_CONFIGS.map((c) => c.pickerShortcut)
     expect(new Set(shortcuts).size).toBe(shortcuts.length)
   })
 
   it('kilroy config has hidden flag set to true', () => {
-    const config = getAgentChatProviderConfig('kilroy')
+    const config = getFreshAgentProviderConfig('kilroy')
     expect(config!.hidden).toBe(true)
   })
 
   it('freshclaude config does not have hidden flag', () => {
-    const config = getAgentChatProviderConfig('freshclaude')
+    const config = getFreshAgentProviderConfig('freshclaude')
     expect(config!.hidden).toBeUndefined()
   })
 
-  describe('getVisibleAgentChatConfigs', () => {
+  describe('getVisibleFreshAgentConfigs', () => {
     it('excludes hidden providers when no feature flags are set', () => {
-      const visible = getVisibleAgentChatConfigs({})
+      const visible = getVisibleFreshAgentConfigs({})
       const names = visible.map((c) => c.name)
       expect(names).toContain('freshclaude')
       expect(names).not.toContain('kilroy')
     })
 
     it('includes hidden providers when their feature flag is true', () => {
-      const visible = getVisibleAgentChatConfigs({ kilroy: true })
+      const visible = getVisibleFreshAgentConfigs({ kilroy: true })
       const names = visible.map((c) => c.name)
       expect(names).toContain('freshclaude')
       expect(names).toContain('kilroy')
     })
 
     it('still excludes hidden providers when their feature flag is false', () => {
-      const visible = getVisibleAgentChatConfigs({ kilroy: false })
+      const visible = getVisibleFreshAgentConfigs({ kilroy: false })
       const names = visible.map((c) => c.name)
       expect(names).toContain('freshclaude')
       expect(names).not.toContain('kilroy')

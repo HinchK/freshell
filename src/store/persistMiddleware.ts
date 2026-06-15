@@ -375,7 +375,7 @@ function migratePanesData(parsed: any): any | null {
     // Version 2 -> 3: add paneTitles (already defaulted to {} above)
     // No additional migration needed, just ensure the field exists
 
-    // Version 4 -> 5: drop claude-chat panes (renamed to agent-chat; no data migration)
+    // Version 4 -> 5: drop claude-chat panes.
     if (currentVersion < 5) {
       const droppedLayouts: Record<string, any> = {}
       for (const [tabId, node] of Object.entries(layouts)) {
@@ -393,7 +393,7 @@ function migratePanesData(parsed: any): any | null {
       layouts = migratedLayouts
     }
 
-    // Version 6 -> 7: migrate agent-chat model/effort persistence to selection strategies.
+    // Version 6 -> 7: migrate fresh-agent model/effort persistence to selection strategies.
     if (currentVersion < 7) {
       const migratedLayouts: Record<string, any> = {}
       for (const [tabId, node] of Object.entries(layouts)) {

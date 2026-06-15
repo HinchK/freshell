@@ -3,7 +3,7 @@ import type { RootState } from '../store'
 import type { BackgroundTerminal, CodingCliProviderName, WorktreeGrouping } from '../types'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { collectSessionRefsFromTabs } from '@/lib/session-utils'
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { getSessionMetadata } from '@/lib/session-metadata'
 import { getProviderLabel, isNonShellMode } from '@/lib/coding-cli-utils'
@@ -552,7 +552,7 @@ function isExcludedByFirstUserMessage(
 
 function shouldHideAsNonInteractive(item: SidebarSessionItem, showNoninteractiveSessions: boolean): boolean {
   if (showNoninteractiveSessions || !item.isNonInteractive) return false
-  return !getAgentChatProviderConfig(item.sessionType)
+  return !getFreshAgentProviderConfig(item.sessionType)
 }
 
 export function filterSessionItemsByVisibility(

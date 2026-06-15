@@ -2,17 +2,17 @@ import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 import type { FreshAgentModelSelection } from '@shared/fresh-agent-model-capabilities'
 import type { FreshAgentSessionType } from '@shared/fresh-agent'
 
-export type AgentChatProviderName = Extract<FreshAgentSessionType, 'freshclaude' | 'kilroy'>
+export type FreshAgentProviderName = Extract<FreshAgentSessionType, 'freshclaude' | 'kilroy'>
 
-export type AgentChatProviderSettings = {
+export type FreshAgentProviderSettings = {
   modelSelection?: FreshAgentModelSelection
   defaultPermissionMode?: string
   effort?: string
 }
 
-export interface AgentChatProviderConfig {
-  /** Unique identifier for this agent chat provider */
-  name: AgentChatProviderName
+export interface FreshAgentProviderConfig {
+  /** Unique identifier for this fresh-agent provider */
+  name: FreshAgentProviderName
   /** Display label in UI */
   label: string
   /** Underlying coding CLI provider used for directory preferences and CLI availability checks */

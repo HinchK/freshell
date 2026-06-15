@@ -121,7 +121,7 @@ test.describe('Mobile Viewport', () => {
 
     // Suppress network effects and inject fresh-agent pane content via Redux
     await page.evaluate((currentPaneId: string) => {
-      window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
+      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(currentPaneId, true)
     }, paneId)
 
     const sessionId = '44444444-4444-4444-8444-444444444444'
@@ -204,7 +204,7 @@ test.describe('Mobile Viewport', () => {
 
     // Suppress network effects
     await page.evaluate((currentPaneId: string) => {
-      window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
+      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(currentPaneId, true)
     }, paneId)
 
     const sessionId = '55555555-5555-4555-8555-555555555555'

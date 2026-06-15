@@ -222,7 +222,7 @@ export function itemToToolDisplay(item: FreshAgentTranscriptItem): FreshAgentToo
 
 /**
  * Render visible item text. Assistant-authored text renders as markdown
- * (matching agent-chat's MessageBubble); user text and thinking stay plain
+ * (matching the fresh-agent message bubble); user text and thinking stay plain
  * so literal input is never re-interpreted. The plain <p> doubles as the
  * Suspense fallback so content is readable while the renderer chunk loads.
  */

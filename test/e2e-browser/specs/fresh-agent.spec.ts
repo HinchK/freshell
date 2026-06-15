@@ -38,7 +38,7 @@ async function suppressFreshAgentNetworkForActivePane(page: any) {
     const tabId = state?.tabs?.activeTabId
     const paneId = tabId ? state?.panes?.activePane?.[tabId] : null
     if (paneId) {
-      harness?.setAgentChatNetworkEffectsSuppressed(paneId, true)
+      harness?.setFreshAgentNetworkEffectsSuppressed(paneId, true)
     }
   })
 }
@@ -697,7 +697,7 @@ test.describe('Fresh Agent', () => {
     }, tabId!)
     expect(activePaneId).toBeTruthy()
     await page.evaluate((currentPaneId: string) => {
-      window.__FRESHELL_TEST_HARNESS__?.setAgentChatNetworkEffectsSuppressed(currentPaneId, true)
+      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(currentPaneId, true)
     }, activePaneId)
     await page.getByRole('button', { name: /^Freshcodex$/i }).click()
     await page.getByRole('option').first().click()

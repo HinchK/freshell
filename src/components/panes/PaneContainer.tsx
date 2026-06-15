@@ -12,7 +12,7 @@ import ExtensionPane from './ExtensionPane'
 import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
-import { isAgentChatProviderName, getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
+import { isFreshAgentProviderName, getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
@@ -549,10 +549,7 @@ function PickerWrapper({
 }) {
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
-  const agentChatSettings = useAppSelector(
-    (s) => s.settings?.settings?.freshAgent
-      ?? s.settings?.serverSettings?.freshAgent
-  )
+  const freshAgentSettings = useAppSelector((s) => s.settings?.settings?.freshAgent ?? s.settings?.serverSettings?.freshAgent)
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
   const tabPref = useMemo(
@@ -567,8 +564,8 @@ function PickerWrapper({
   const getRuntimeSettingsKey = useCallback((providerType: PanePickerType): CodingCliProviderName => {
     const freshAgentType = resolveFreshAgentType(providerType)
     if (freshAgentType) return freshAgentType.runtimeProvider as CodingCliProviderName
-    const agentConfig = getAgentChatProviderConfig(providerType)
-    return (agentConfig ? agentConfig.codingCliProvider : providerType) as CodingCliProviderName
+    const freshAgentProviderConfig = getFreshAgentProviderConfig(providerType)
+    return (freshAgentProviderConfig ? freshAgentProviderConfig.codingCliProvider : providerType) as CodingCliProviderName
   }, [])
 
   const createContentForType = useCallback((type: PanePickerType, cwd?: string): PaneContent => {
@@ -583,10 +580,10 @@ function PickerWrapper({
 
     const freshAgentType = resolveFreshAgentType(type)
     if (freshAgentType) {
-      const providerConfig = freshAgentType.runtimeProvider === 'claude' && isAgentChatProviderName(type)
-        ? getAgentChatProviderConfig(type)
+      const providerConfig = freshAgentType.runtimeProvider === 'claude' && isFreshAgentProviderName(type)
+        ? getFreshAgentProviderConfig(type)
         : undefined
-      const providerSettings = agentChatSettings?.providers?.[type]
+      const providerSettings = freshAgentSettings?.providers?.[type]
       const providerDefaultModel = typeof providerSettings?.modelSelection?.modelId === 'string'
         ? providerSettings.modelSelection.modelId
         : undefined
@@ -622,7 +619,7 @@ function PickerWrapper({
           model,
           normalizeFreshAgentEffortOverride(providerSettings?.effort) ?? freshAgentType.defaultEffort,
         ) ?? freshAgentType.defaultEffort,
-        plugins: freshAgentType.runtimeProvider === 'claude' ? agentChatSettings?.defaultPlugins : undefined,
+        plugins: freshAgentType.runtimeProvider === 'claude' ? freshAgentSettings?.defaultPlugins : undefined,
         style: providerSettings?.style ?? DEFAULT_FRESH_AGENT_STYLE,
         ...(cwd ? { initialCwd: cwd } : {}),
       }
@@ -692,7 +689,7 @@ function PickerWrapper({
       default:
         throw new Error(`Unsupported pane type: ${String(type)}`)
     }
-  }, [agentChatSettings, extensionEntries, settings?.codingCli?.providers])
+  }, [freshAgentSettings, extensionEntries, settings?.codingCli?.providers])
 
   const handleSelect = useCallback((type: PanePickerType) => {
     if (resolveFreshAgentType(type)) {
@@ -731,9 +728,9 @@ function PickerWrapper({
 
   if (step.step === 'directory') {
     const providerType = step.providerType
-    const agentConfig = getAgentChatProviderConfig(providerType)
+    const freshAgentProviderConfig = getFreshAgentProviderConfig(providerType)
     const freshAgentType = resolveFreshAgentType(providerType)
-    const providerLabel = agentConfig ? agentConfig.label : getProviderLabel(providerType, extensionEntries)
+    const providerLabel = freshAgentProviderConfig ? freshAgentProviderConfig.label : getProviderLabel(providerType, extensionEntries)
     const settingsKey = getRuntimeSettingsKey(providerType)
     const globalDefault = settings?.codingCli?.providers?.[settingsKey]?.cwd
     const defaultCwd = tabPref.defaultCwd ?? globalDefault
