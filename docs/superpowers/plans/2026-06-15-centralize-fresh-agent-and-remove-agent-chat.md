@@ -27,13 +27,22 @@ Everything else named `agent-chat`, `agentChat`, `AgentChat`, or top-level clien
 The load-bearing pass found several assumptions that were false in the first draft. The implementation must satisfy these corrections before deleting the old surfaces:
 
 - **Pane migration must cover every ingress.** Normalize or reject legacy `agent-chat` pane content in local persisted state, storage migration, tab reopen/closed-tab snapshots, cross-tab sync, `ui.layout.sync`, server `agent-api` layout schemas/stores, MCP/tooling layout inputs, and any tab registry path. A migration helper must never return live `kind: "agent-chat"` content after a migration boundary. If a legacy pane cannot be mapped, return a `fresh-agent` pane with `restoreError: buildRestoreError('invalid_legacy_restore_target')` instead of a blank or legacy pane.
+- **Tab registry is a live pane-content ingress, not display-only metadata.** Normalize legacy `agent-chat` records in `src/lib/tab-registry-snapshot.ts`, `src/store/tabRegistrySync.ts`, `src/store/tabRegistrySlice.ts`, `server/tabs-registry/types.ts`, and `server/tabs-registry/store.ts`. Pulling or reopening a tab-registry record must never reintroduce `kind: "agent-chat"`.
 - **Legacy pane shapes are broader than `provider: "freshclaude"`.** Tests must cover `provider: "freshclaude"`, `provider: "kilroy"`, old `provider: "claude"`, missing provider, missing identity, canonical Claude IDs, non-canonical aliases, `cliSessionId`/`timelineSessionId`, and split trees. Old `provider: "claude"` should migrate to `sessionType: "freshclaude"` and `provider: "claude"` when the durable identity is valid; otherwise it should become a restore-error fresh-agent pane.
-- **Storage migration must be recoverable.** Before rewriting `freshell.layout.v3`, write a versioned backup key and use a commit marker so quota/partial-write failures leave the previous layout readable. Use the real storage key and shape in tests. Bump the WebSocket protocol/version guard so stale loaded bundles fail closed and reload instead of sending removed top-level `sdk.*` messages.
+- **Legacy Claude `sessionRef` cannot bypass canonical-ID validation.** `migrateLegacyFreshAgentContent` must validate legacy `agent-chat.sessionRef` the same way it validates `resumeSessionId`, `cliSessionId`, and `timelineSessionId`. A `sessionRef: { provider: "claude", sessionId: "named-alias" }` is not a durable restore target and must become a restore-error fresh-agent pane.
+- **Legacy pane display overrides must be preserved or explicitly retired with tests.** Existing `agent-chat` panes may carry `showThinking`, `showTools`, or `showTimecodes`. The migration must either preserve these as fresh-agent pane overrides that `FreshAgentView` honors, or intentionally retire them with a test proving global fresh-agent settings still determine the visible behavior.
+- **Storage migration must be recoverable.** Before rewriting `freshell.layout.v3`, write a versioned backup key and use a commit marker so quota/partial-write failures leave the previous layout readable. The required order is: write backup, write migrated layout, write marker, then mark the storage version. Recovery must run before any slice parses layout and before cleanup can remove backup keys. Use the real storage key and shape in tests. Add failure-injection tests for backup write failure, migrated-layout write failure, missing marker after reload, stale marker, and multi-tab interleaving. Add a synthetic large-layout migration test with an explicit pane-count/depth bound; if the synchronous path cannot meet the bound, change the design before implementation.
 - **Settings migration is load-only.** `agentChat` is accepted only while loading stored config/local/browser preference seeds. Live `PATCH /api/settings` must accept `freshAgent` only and reject or drop top-level `agentChat` without mirroring it into responses. When both aliases exist in stored settings, `freshAgent` wins, provider entries are field-merged, and explicit empty arrays such as `freshAgent.defaultPlugins: []` must be preserved.
-- **History ownership is fresh-agent-owned, not adapter-private.** Durable Claude history should move to an adapter-neutral fresh-agent history namespace such as `server/fresh-agent/history/claude/*`, because `sdk-bridge`, `ws-handler`, and `session-history-loader` still need clean server-side access. Fresh-agent routes must preserve the old timeline error semantics before `/api/agent-sessions/*` is removed.
-- **Public `sdk.*` removal requires more than renaming five events.** Split internal SDK bridge event types from the public browser protocol, map every UI-relevant event (`assistant`, `stream`, `result`, `permission`, `question`, `status`, `error`, `exit`, `killed`, cancellation, snapshot/init/metadata), port create/attach replay and restore gates, and add per-connection fresh-agent subscription/ownership checks before deleting top-level `sdk.*`.
-- **Old tests are a coverage inventory, not disposable trash.** Legacy agent-chat tests for restore races, session-lost recovery, input history, mobile approvals/questions, capability settings, tool coalescing, markdown/XSS, and activity state must be converted to fresh-agent coverage or explicitly superseded by stronger fresh-agent tests before deletion.
-- **Browser smoke must use the real harness.** Seed available fresh clients and storage through the existing e2e-browser harness, mock fresh-agent history/capability routes, suppress real provider side effects where needed, and use `freshell.layout.v3` rather than a made-up storage key.
+- **Stored settings migration must use one canonical helper.** Replace `normalizeFreshAgentCompatSettings` and every alias-merging path with `migrateLegacyFreshAgentSettingsInput`. Browser preference persistence must write only `freshAgent`. Internal direct `configStore.patchSettings` callers must ignore or reject `agentChat` the same way the HTTP route does.
+- **History ownership is fresh-agent-owned, not adapter-private.** Durable Claude history should move to an adapter-neutral fresh-agent history namespace such as `server/fresh-agent/history/claude/*`, because `sdk-bridge`, `ws-handler`, and `session-history-loader` still need clean server-side access. Fresh-agent routes must preserve the old timeline error codes and semantics before `/api/agent-sessions/*` is removed: `RESTORE_NOT_FOUND`, `RESTORE_UNAVAILABLE`, `RESTORE_DIVERGED`, `RESTORE_STALE_REVISION`, required revision, cursor revision mismatch, `includeBodies`, turn body lookup, recent-first ordering, and default/max limits.
+- **Public `sdk.*` removal requires more than renaming five events.** Split internal SDK bridge event types from the public browser protocol, map every UI-relevant event (`assistant`, `stream`, `result`, `permission`, `question`, `status`, `error`, `exit`, `killed`, cancellation, snapshot/init/metadata), make the no-op fresh-agent reducers mutate real state, port create/attach replay and restore gates, and add per-connection fresh-agent authorization checks before deleting top-level `sdk.*`. Create/attach must grant mutation rights deliberately; subscription alone is not enough unless tests prove subscription is mandatory and reliable for every mutating path.
+- **Codex/OpenCode event parity must be explicit.** If Codex or OpenCode are snapshot/status-only live providers, state that as the contract and prove snapshot refresh covers their UI needs. Otherwise, normalize their live adapter events to fresh-agent event names before they reach the browser.
+- **WebSocket protocol removal must bump and enforce the version.** Bump `WS_PROTOCOL_VERSION` in the same change that removes public `sdk.*`. A stale loaded bundle must fail closed before it can flush queued `sdk.*` or legacy `ui.layout.sync` messages, and the client must actively reload or present a non-reconnecting hard-stop state that cannot silently continue with stale code.
+- **Old tests are a coverage inventory, not disposable trash.** Legacy agent-chat tests for restore races, session-lost recovery, input history, mobile approvals/questions, capability settings, tool coalescing, markdown/XSS, activity state, scroll/new-message badge behavior, mobile keyboard layout, status text, tool block/strip rendering, and context-menu copy actions must be converted to fresh-agent coverage or explicitly superseded by stronger fresh-agent tests before deletion.
+- **Architecture guard must be path-aware.** A raw regex for `sdk\.` either misses removed public events or blocks legitimate internal SDK bridge modules. The guard must scan `src`, `server`, and `shared` with allowlisted internal server SDK files and explicit migration-boundary names. Rename or allow `migrateLegacyAgentChatDurableState`; do not leave it as an accidental guard failure.
+- **Model/settings capabilities are distinct from runtime capabilities.** Existing `FreshAgentCapabilitiesSchema` means runtime booleans such as `send` and `interrupt`. The old `/api/agent-chat/capabilities` model catalog must move to a separately named fresh-agent model/settings capability contract and route, not reuse that runtime schema name.
+- **Browser smoke must use the real harness safely.** Seed available fresh clients and storage through the existing e2e-browser harness, mock fresh-agent history/model-capability routes, suppress real provider side effects before the first React render, and use `freshell.layout.v3` rather than a made-up storage key. Storage-restored panes must not be able to send `freshAgent.create` or `freshAgent.attach` before suppression is installed.
+- **Manual smoke must be process-group safe.** Start the worktree dev server in its own process group, record the group leader PID, verify `/proc/<pid>/cwd` is this worktree before stopping, and kill only that process group. Do not rely on killing the `npm run dev` wrapper PID alone.
 
 ## File Structure
 
@@ -63,16 +72,16 @@ The load-bearing pass found several assumptions that were false in the first dra
   - Remove legacy client/server `sdk.*` messages and define fresh-agent transport event payloads.
 - Modify: `server/ws-handler.ts`
   - Remove client-facing `sdk.*` handlers and translate Claude SDK bridge events into fresh-agent transport event names before sending.
-- Rename/modify: `shared/agent-chat-capabilities.ts` -> `shared/fresh-agent-capabilities.ts`
-  - Fresh-agent provider capability contracts.
-- Rename/modify: `src/lib/agent-chat-capabilities.ts` -> `src/lib/fresh-agent-capabilities.ts`
-  - Client capability cache helpers against `/api/fresh-agent/capabilities`.
-- Rename/modify: `server/agent-chat-capability-registry.ts` -> `server/fresh-agent/capability-registry.ts`
-  - Server capability cache registry.
-- Rename/modify: `server/agent-chat-capabilities-router.ts` -> `server/fresh-agent/capabilities-router.ts`
-  - Mount at `/api/fresh-agent/capabilities`.
+- Rename/modify: `shared/agent-chat-capabilities.ts` -> `shared/fresh-agent-model-capabilities.ts`
+  - Fresh-agent model/settings capability contracts. Do not reuse `FreshAgentCapabilitiesSchema`, which is already the runtime-command capability contract.
+- Rename/modify: `src/lib/agent-chat-capabilities.ts` -> `src/lib/fresh-agent-model-capabilities.ts`
+  - Client model/settings capability cache helpers against `/api/fresh-agent/model-capabilities`.
+- Rename/modify: `server/agent-chat-capability-registry.ts` -> `server/fresh-agent/model-capability-registry.ts`
+  - Server model/settings capability cache registry.
+- Rename/modify: `server/agent-chat-capabilities-router.ts` -> `server/fresh-agent/model-capabilities-router.ts`
+  - Mount at `/api/fresh-agent/model-capabilities`.
 - Modify: `server/index.ts`
-  - Remove `/api/agent-chat/capabilities` and `/api/agent-sessions/*`; mount fresh-agent capabilities route.
+  - Remove `/api/agent-chat/capabilities` and `/api/agent-sessions/*`; mount fresh-agent model-capabilities route.
 - Move/modify: `server/agent-timeline/history-source.ts` -> `server/fresh-agent/history/claude/history-source.ts`
 - Move/modify: `server/agent-timeline/ledger.ts` -> `server/fresh-agent/history/claude/history-ledger.ts`
 - Move/modify: `server/agent-timeline/service.ts` -> `server/fresh-agent/history/claude/history-service.ts`
@@ -84,12 +93,18 @@ The load-bearing pass found several assumptions that were false in the first dra
   - Import moved Claude history service/types.
 - Modify: `server/sdk-bridge.ts`, `server/session-history-loader.ts`, `server/ws-handler.ts`
   - Import moved Claude history source/ledger helpers.
-- Modify: `shared/settings.ts`, `server/config-store.ts`, `server/settings-router.ts`
+- Modify: `shared/settings.ts`, `server/config-store.ts`, `server/settings-router.ts`, `src/lib/browser-preferences.ts`, `src/store/settingsSlice.ts`
   - Return fresh-agent settings as canonical. Accept `freshAgent` only on live settings APIs. Read old `agentChat` only during stored config/local/browser-seed load migration; never mirror it into responses.
 - Modify: `src/components/settings/WorkspaceSettings.tsx`, `src/components/fresh-agent/FreshAgentSettingsButton.tsx`, `src/components/fresh-agent/FreshAgentView.tsx`, `src/components/panes/PanePicker.tsx`, `src/components/panes/PaneContainer.tsx`, `src/components/Sidebar.tsx`, `src/components/TabBar.tsx`, `src/components/MobileTabStrip.tsx`, `src/hooks/useAgentSessionTurnCompletion.ts`, `src/lib/pane-activity.ts`, `src/lib/session-type-utils.ts`, `src/lib/session-utils.ts`, `src/lib/derivePaneTitle.ts`, `src/lib/deriveTabName.ts`, `src/lib/coding-agent-detection.ts`, `src/lib/tab-directory-preference.ts`, `src/lib/tab-fallback-identity.ts`, `src/store/panesSlice.ts`, `src/store/tabsSlice.ts`, `src/store/persistMiddleware.ts`, `src/store/persistedState.ts`, `src/store/storage-migration.ts`, `src/store/paneTreeValidation.ts`
   - Remove live `agent-chat` branches and selectors; keep fresh-agent migration helpers only where persisted unknown input enters.
+- Modify: `src/lib/tab-registry-snapshot.ts`, `src/store/tabRegistrySync.ts`, `src/store/tabRegistrySlice.ts`, `server/tabs-registry/types.ts`, `server/tabs-registry/store.ts`
+  - Normalize tab-registry snapshots and records so pulling/reopening a remote tab cannot reintroduce `agent-chat` pane content.
 - Modify: `server/agent-api/layout-schema.ts`, `server/agent-api/layout-store.ts`, `shared/ws-protocol.ts`
   - Normalize or reject legacy `agent-chat` content on remote/server layout sync before storage or broadcast.
+- Modify: `src/lib/ws-client.ts`
+  - Bump protocol/version handling and actively reload or hard-stop stale bundles before queued removed messages can flush.
+- Modify: `src/lib/test-harness.ts`, `src/components/fresh-agent/FreshAgentView.tsx`
+  - Add pre-render global fresh-agent side-effect suppression for e2e-browser migration smoke.
 - Modify tests under `test/unit`, `test/integration`, `test/e2e`, and `test/e2e-browser`
   - Delete legacy-only agent-chat tests or convert their user-story coverage to fresh-agent tests.
 - Create: `test/unit/architecture/fresh-agent-only-runtime.test.ts`
@@ -214,6 +229,8 @@ git commit -m "Move transcript widgets into fresh-agent"
 - Modify: `shared/settings.ts:1250-1420`
 - Modify: `server/config-store.ts:270-330`
 - Modify: `server/settings-router.ts:70-80`
+- Modify: `src/lib/browser-preferences.ts`
+- Modify: `src/store/settingsSlice.ts`
 - Modify: `src/components/settings/WorkspaceSettings.tsx:265-310`
 - Modify: `src/components/fresh-agent/FreshAgentSettingsButton.tsx:55-75`
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx:300-325`
@@ -230,6 +247,8 @@ Use this contract throughout the task:
 - Provider settings are field-merged per provider, not shallow-replaced by the whole provider object.
 - `freshAgent.defaultPlugins: []` is an explicit canonical value and must override any non-empty legacy `agentChat.defaultPlugins`.
 - Server responses, Redux state, browser-local resolved settings, and persisted browser preferences must expose only `freshAgent`.
+- `server/config-store.ts` must delete or replace `normalizeFreshAgentCompatSettings`; that helper currently loses explicit empty plugin arrays and shallow-replaces provider records.
+- `mergeServerSettings`, `configStore.patchSettings`, `settingsSlice`, and browser preference save/load code must not mirror `agentChat` back into memory or storage.
 
 - [ ] **Step 1: Rewrite settings tests to require fresh-agent canonical output**
 
@@ -342,7 +361,9 @@ it('returns only freshAgent settings after a canonical freshAgent patch', async 
 })
 ```
 
-In `test/unit/server/config-store.fresh-agent-settings.test.ts`, add a stored-config migration test that writes a raw config containing both aliases, `agentChat.providers.freshcodex.effort`, `freshAgent.providers.freshcodex.style`, `agentChat.defaultPlugins: ['/legacy/plugin']`, and `freshAgent.defaultPlugins: []`. Assert the loaded config has only `freshAgent`, preserves the explicit empty plugin list, and field-merges provider settings to `{ style: 'serif', effort: 'high' }`.
+In `test/unit/server/config-store.fresh-agent-settings.test.ts`, add a stored-config migration test that writes a raw config containing both aliases, `agentChat.providers.freshcodex.effort`, `freshAgent.providers.freshcodex.style`, `agentChat.defaultPlugins: ['/legacy/plugin']`, and `freshAgent.defaultPlugins: []`. Assert the loaded config has only `freshAgent`, preserves the explicit empty plugin list, and field-merges provider settings to `{ style: 'serif', effort: 'high' }`. Add a second test proving the old `normalizeFreshAgentCompatSettings` behavior cannot survive: a canonical empty plugin array and canonical provider partial must not be overwritten by legacy values.
+
+In `test/unit/client/browser-preferences.fresh-agent-settings.test.ts`, add coverage that browser-local settings seeded with `agentChat` load as `freshAgent`, and that saving browser preferences writes only `freshAgent` with no `agentChat` alias.
 
 - [ ] **Step 2: Run focused settings tests and verify they fail**
 
@@ -398,7 +419,7 @@ to:
 sanitized.freshAgent = freshAgent
 ```
 
-Update `server/config-store.ts` load migration to call `migrateLegacyFreshAgentSettingsInput` before `mergeServerSettings`, then drop `agentChat` from the loaded settings object. Do not mirror `agentChat` back into the saved config.
+Update `server/config-store.ts` load migration to call `migrateLegacyFreshAgentSettingsInput` before `mergeServerSettings`, then drop `agentChat` from the loaded settings object. Remove or stop using `normalizeFreshAgentCompatSettings`; do not keep a second alias merge path. Do not mirror `agentChat` back into the saved config.
 
 Update `server/settings-router.ts` so a live HTTP PATCH with a top-level `agentChat` key returns `400` before lower-level sanitization:
 
@@ -417,10 +438,13 @@ const freshAgentPatch = normalizedPatch.freshAgent as Partial<ServerSettings['fr
 
 and remove the returned `agentChat` property entirely.
 
+Update `configStore.patchSettings` so internal callers cannot persist `agentChat` through a non-HTTP path. Either sanitize it with the same live-patch helper as the route or explicitly reject it with a structured warning/error.
+
 Update `resolveLocalSettings` so it uses:
 
 ```ts
-const freshAgentPatch = patch?.freshAgent ?? (patch as Record<string, unknown> | undefined)?.agentChat as LocalSettingsPatch['freshAgent'] | undefined
+const freshAgentPatch = patch?.freshAgent
+  ?? ((patch as Record<string, unknown> | undefined)?.agentChat as LocalSettingsPatch['freshAgent'] | undefined)
 ```
 
 and returns only:
@@ -428,6 +452,8 @@ and returns only:
 ```ts
 freshAgent: normalizeLocalFreshAgent(mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch)),
 ```
+
+Update `src/lib/browser-preferences.ts` and `src/store/settingsSlice.ts` so legacy browser seeds are migrated on read, but every write and every Redux state shape uses only `freshAgent`.
 
 - [ ] **Step 4: Update UI settings reads and writes**
 
@@ -495,7 +521,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add shared/settings.ts server/config-store.ts server/settings-router.ts src/components/settings/WorkspaceSettings.tsx src/components/fresh-agent/FreshAgentSettingsButton.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/shared/settings.test.ts test/unit/server/config-store.fresh-agent-settings.test.ts test/integration/server/settings-api.test.ts
+git add shared/settings.ts server/config-store.ts server/settings-router.ts src/lib/browser-preferences.ts src/store/settingsSlice.ts src/components/settings/WorkspaceSettings.tsx src/components/fresh-agent/FreshAgentSettingsButton.tsx src/components/fresh-agent/FreshAgentView.tsx test/unit/shared/settings.test.ts test/unit/server/config-store.fresh-agent-settings.test.ts test/unit/client/browser-preferences.fresh-agent-settings.test.ts test/integration/server/settings-api.test.ts
 git commit -m "Make fresh-agent settings canonical"
 ```
 
@@ -512,6 +538,11 @@ git commit -m "Make fresh-agent settings canonical"
 - Modify: `src/store/panesSlice.ts:127-170`
 - Modify: `src/store/paneTreeValidation.ts:95-112`
 - Modify: `src/components/TabsView.tsx:150-205`
+- Modify: `src/lib/tab-registry-snapshot.ts`
+- Modify: `src/store/tabRegistrySync.ts`
+- Modify: `src/store/tabRegistrySlice.ts`
+- Modify: `server/tabs-registry/types.ts`
+- Modify: `server/tabs-registry/store.ts`
 - Modify: `server/agent-api/layout-schema.ts`
 - Modify: `server/agent-api/layout-store.ts`
 - Modify: `shared/ws-protocol.ts`
@@ -520,6 +551,8 @@ git commit -m "Make fresh-agent settings canonical"
 - Test: `test/unit/server/agent-api/layout-store.fresh-agent.test.ts`
 - Test: `test/unit/client/store/storage-migration.fresh-agent.test.ts`
 - Test: `test/unit/client/store/persisted-state.fresh-agent.test.ts`
+- Test: `test/unit/client/tab-registry-fresh-agent-migration.test.ts`
+- Test: `test/unit/server/tabs-registry/fresh-agent-migration.test.ts`
 
 - [ ] **Step 1: Write the failing pane migration tests**
 
@@ -607,12 +640,57 @@ describe('fresh-agent pane migration', () => {
       restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
     })
   })
+
+  it('rejects non-canonical Claude sessionRef aliases in legacy agent-chat records', () => {
+    const migrated = migrateLegacyFreshAgentContent({
+      kind: 'agent-chat',
+      provider: 'claude',
+      createRequestId: 'req-alias',
+      status: 'idle',
+      sessionRef: { provider: 'claude', sessionId: 'named-alias' },
+    })
+
+    expect(migrated).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+    })
+    expect((migrated as { sessionRef?: unknown }).sessionRef).toBeUndefined()
+  })
+
+  it('preserves or intentionally retires legacy display overrides', () => {
+    const migrated = migrateLegacyFreshAgentContent({
+      kind: 'agent-chat',
+      provider: 'freshclaude',
+      createRequestId: 'req-display',
+      status: 'idle',
+      showThinking: false,
+      showTools: true,
+      showTimecodes: true,
+      resumeSessionId: '00000000-0000-4000-8000-000000000456',
+    })
+
+    expect(migrated).toMatchObject({
+      kind: 'fresh-agent',
+      showThinking: false,
+      showTools: true,
+      showTimecodes: true,
+    })
+  })
 })
 ```
 
 In `test/unit/server/agent-layout-schema.test.ts` and `test/unit/server/agent-api/layout-store.fresh-agent.test.ts`, add coverage that `ui.layout.sync` and `LayoutStore.updateFromUi()` normalize split trees containing legacy `agent-chat` leaves before storing or broadcasting. Include a nested split with one `agent-chat` leaf and one terminal leaf, and assert the stored layout contains no `kind: "agent-chat"`.
 
 In `test/unit/client/store/storage-migration.fresh-agent.test.ts` and `test/unit/client/store/persisted-state.fresh-agent.test.ts`, add coverage for the real `freshell.layout.v3` shape and legacy pane records with `freshclaude`, `kilroy`, old `claude`, missing provider, missing identity, canonical Claude IDs, non-canonical aliases, `cliSessionId`, and `timelineSessionId`.
+
+Create `test/unit/client/tab-registry-fresh-agent-migration.test.ts` and `test/unit/server/tabs-registry/fresh-agent-migration.test.ts`. Cover:
+
+- `src/lib/tab-registry-snapshot.ts` serializes fresh-agent records, not `agent-chat`.
+- `src/store/tabRegistrySync.ts` and `src/store/tabRegistrySlice.ts` normalize pulled records before they can reach `initLayout`.
+- `server/tabs-registry/types.ts` and `server/tabs-registry/store.ts` accept stale persisted `agent-chat` records only as migration input and store fresh-agent output.
+- Reopening a registry tab with an old `agent-chat` leaf produces a fresh-agent pane or a fresh-agent restore-error pane.
 
 - [ ] **Step 2: Run the focused migration test and verify it fails**
 
@@ -648,11 +726,13 @@ const sessionType = normalizeFreshAgentSessionType(input.provider)
   ?? (input.provider === 'claude' ? 'freshclaude' : undefined)
 const provider = resolveFreshAgentRuntimeProvider(sessionType)
   ?? (input.provider === 'claude' ? 'claude' : undefined)
-const durableState = migrateLegacyAgentChatDurableState({
+const durableState = migrateLegacyFreshAgentDurableState({
   provider,
   sessionRef: input.sessionRef,
   resumeSessionId: input.resumeSessionId ?? input.timelineSessionId ?? input.cliSessionId,
+  rejectNonCanonicalClaudeSessionRef: true,
 })
+const hasUsableIdentity = !!durableState.sessionRef || !!input.sessionId
 
 return {
   ...input,
@@ -661,11 +741,13 @@ return {
   provider: provider ?? 'claude',
   sessionRef: durableState.sessionRef,
   restoreError: durableState.restoreError
-    ?? (!sessionType || !provider ? buildRestoreError('invalid_legacy_restore_target') : undefined),
+    ?? (!sessionType || !provider || !hasUsableIdentity ? buildRestoreError('invalid_legacy_restore_target') : undefined),
 }
 ```
 
-If the legacy pane has neither a usable `sessionRef` nor a canonical durable id, preserve display metadata such as `initialCwd`, `modelSelection`, `permissionMode`, `effort`, `plugins`, and `settingsDismissed`, but attach `restoreError: buildRestoreError('invalid_legacy_restore_target')` so the user sees a recoverable fresh-agent pane instead of a blank pane.
+Add `migrateLegacyFreshAgentDurableState` instead of calling `migrateLegacyAgentChatDurableState` directly from pane migration. It must validate legacy `sessionRef` values, not only `resumeSessionId`/`cliSessionId`/`timelineSessionId`. If the legacy pane has neither a usable `sessionRef`, a canonical durable id, nor a live `sessionId`, preserve display metadata such as `initialCwd`, `modelSelection`, `permissionMode`, `effort`, `plugins`, `settingsDismissed`, `showThinking`, `showTools`, and `showTimecodes`, but attach `restoreError: buildRestoreError('invalid_legacy_restore_target')` so the user sees a recoverable fresh-agent pane instead of a blank pane.
+
+If the implementation intentionally retires `showThinking`, `showTools`, or `showTimecodes` as per-pane overrides, replace the preservation assertion above with tests proving fresh-agent global settings control those views after migration. Do not silently drop them.
 
 - [ ] **Step 5: Remove live `agent-chat` branches from pane normalization**
 
@@ -697,6 +779,9 @@ if (input.kind === 'fresh-agent') {
     plugins: input.plugins,
     ...(style ? { style } : {}),
     settingsDismissed: input.settingsDismissed,
+    showThinking: typeof input.showThinking === 'boolean' ? input.showThinking : undefined,
+    showTools: typeof input.showTools === 'boolean' ? input.showTools : undefined,
+    showTimecodes: typeof input.showTimecodes === 'boolean' ? input.showTimecodes : undefined,
   }
 }
 ```
@@ -711,16 +796,26 @@ In `server/agent-api/layout-schema.ts`, remove `agent-chat` from the accepted st
 
 In `shared/ws-protocol.ts`, keep `UiLayoutSyncSchema.layouts` permissive enough for stale clients, but ensure the server normalizes `m.layouts` before storing or rebroadcasting. Do not reject stale layout sync messages before the normalizer has a chance to convert them.
 
+Normalize tab-registry ingress in the same step:
+
+- `src/lib/tab-registry-snapshot.ts` must emit fresh-agent pane snapshots.
+- `src/store/tabRegistrySync.ts` must normalize incoming registry records before dispatching them.
+- `src/store/tabRegistrySlice.ts` must reject or normalize any reducer payload containing `kind: "agent-chat"`.
+- `server/tabs-registry/types.ts` may parse legacy records only through a preprocess/migration schema.
+- `server/tabs-registry/store.ts` must normalize before persistence and before serving records back to clients.
+
 - [ ] **Step 8: Add recoverable localStorage migration safeguards**
 
-In `src/store/storage-migration.ts` and `src/store/persistedState.ts`, use the real layout storage key `freshell.layout.v3`. Before rewriting it, write a backup key such as `freshell.layout.v3.backup-before-fresh-agent-centralization` and a commit marker. If the write fails, leave the original key untouched and log a structured warning. If the commit marker is absent on the next load, prefer the original value or backup instead of a partially migrated value.
+In `src/store/storage-migration.ts` and `src/store/persistedState.ts`, use the real layout storage key `freshell.layout.v3`. Before rewriting it, write a backup key such as `freshell.layout.v3.backup-before-fresh-agent-centralization` and a commit marker. If the backup write fails, abort before touching the original key and log a structured warning. If the migrated-layout write fails, leave the original key untouched. Write the commit marker only after the migrated layout write succeeds. If the commit marker is absent on the next load, prefer the original value or backup instead of a partially migrated value.
+
+Add a synthetic layout-size test using a generated layout with at least 100 tabs, 1,000 leaves, and depth at the supported maximum. Set a generous CI-safe timing budget, for example 500 ms in the Vitest/jsdom environment. If that budget is not reliable, replace synchronous startup migration with a lazy or chunked design before proceeding.
 
 - [ ] **Step 9: Run pane tests**
 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/fresh-agent-pane-migration.test.ts test/unit/server/agent-layout-schema.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/panesSlice.test.ts --run
+npm run test:vitest -- test/unit/client/fresh-agent-pane-migration.test.ts test/unit/server/agent-layout-schema.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/tab-registry-fresh-agent-migration.test.ts test/unit/server/tabs-registry/fresh-agent-migration.test.ts test/unit/client/panesSlice.test.ts --run
 ```
 
 Expected: PASS.
@@ -728,7 +823,7 @@ Expected: PASS.
 - [ ] **Step 10: Commit**
 
 ```bash
-git add shared/fresh-agent.ts shared/ws-protocol.ts src/store/paneTypes.ts src/store/panesSlice.ts src/store/paneTreeValidation.ts src/store/persistedState.ts src/store/storage-migration.ts src/store/persistMiddleware.ts src/components/TabsView.tsx server/agent-api/layout-schema.ts server/agent-api/layout-store.ts test/unit/client/fresh-agent-pane-migration.test.ts test/unit/server/agent-layout-schema.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts
+git add shared/fresh-agent.ts shared/ws-protocol.ts src/store/paneTypes.ts src/store/panesSlice.ts src/store/paneTreeValidation.ts src/store/persistedState.ts src/store/storage-migration.ts src/store/persistMiddleware.ts src/components/TabsView.tsx src/lib/tab-registry-snapshot.ts src/store/tabRegistrySync.ts src/store/tabRegistrySlice.ts server/tabs-registry/types.ts server/tabs-registry/store.ts server/agent-api/layout-schema.ts server/agent-api/layout-store.ts test/unit/client/fresh-agent-pane-migration.test.ts test/unit/server/agent-layout-schema.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/tab-registry-fresh-agent-migration.test.ts test/unit/server/tabs-registry/fresh-agent-migration.test.ts
 git commit -m "Remove live agent-chat pane type"
 ```
 
@@ -813,21 +908,38 @@ Expected: FAIL because `store.getState()` still includes `agentChat`.
 Create `test/unit/client/fresh-agent-legacy-behavior-coverage.test.ts` or a markdown checklist in the implementation notes for the branch that maps old agent-chat tests to fresh-agent replacements. The executable tests are preferred; the mapping must include:
 
 ```text
-agentChatSlice restore/history hydration -> freshAgentSlice + freshAgentThunks restore tests
-sdk-message-handler session lost -> fresh-agent-ws INVALID_SESSION_ID tests
-AgentChatView reload/split restore races -> FreshAgentView reload/split restore tests
-ChatComposer draft/history/tab-shortcuts/mobile keyboard -> FreshAgentComposer tests
-MessageBubble markdown/XSS/tool/toggle behavior -> FreshAgentTranscript and item-card tests
-PermissionBanner/QuestionBanner mobile touch targets -> FreshAgentApprovalCard/FreshAgentQuestionBanner mobile tests
-AgentChatSettings capability/model/effort/default persistence -> FreshAgentSettingsButton tests
-tool coalescing -> FreshAgentTranscript activity-strip tests
-agent-chat context menu/input history e2e -> fresh-agent context menu/input history e2e
+test/unit/client/agentChatSlice.test.ts -> freshAgentSlice + freshAgentThunks restore/history/stream/result/permission tests
+test/unit/client/sdk-message-handler.test.ts -> fresh-agent-ws event parity tests for every old sdk.* server event
+test/unit/client/ws-client-sdk.test.ts -> fresh-agent websocket client contract tests and stale-protocol reload tests
+test/unit/client/components/agent-chat/AgentChatView.reload.test.tsx -> FreshAgentView reload restore tests
+test/unit/client/components/agent-chat/AgentChatView.session-lost.test.tsx -> FreshAgentView INVALID_SESSION_ID/session-lost recovery tests
+test/unit/client/components/agent-chat/AgentChatView.split-pane.test.tsx -> FreshAgentView split-pane restore tests
+test/unit/client/components/agent-chat/AgentChatView.behavior.test.tsx -> FreshAgentView settings/setup/provider-default behavior tests
+test/unit/client/components/agent-chat/AgentChatView.mobile-keyboard.test.tsx -> FreshAgentComposer/FreshAgentView mobile keyboard inset tests
+test/unit/client/components/agent-chat/AgentChatView.scrollToBottom.test.tsx -> FreshAgentTranscript scroll-to-bottom and new-message badge tests
+test/unit/client/components/agent-chat/AgentChatView.status.test.tsx -> FreshAgentView pending-answer/running/status-text tests
+test/unit/client/components/agent-chat/ChatComposer.test.tsx -> FreshAgentComposer draft/history/tab-shortcut/mobile keyboard tests
+test/unit/client/components/agent-chat/MessageBubble.test.tsx -> FreshAgentTranscript and item-card markdown/XSS/tool/toggle tests
+test/unit/client/components/agent-chat/PermissionBanner.test.tsx -> FreshAgentApprovalCard mobile and desktop touch-target tests
+test/unit/client/components/agent-chat/QuestionBanner.test.tsx -> FreshAgentQuestionBanner mobile and desktop touch-target tests
+test/unit/client/components/agent-chat/AgentChatSettings.test.tsx -> FreshAgentSettingsButton capability/model/effort/default persistence tests
+test/unit/client/components/agent-chat/ToolBlock.test.tsx -> FreshAgentItemCard tool input/output/copy-target tests
+test/unit/client/components/agent-chat/ToolStrip.test.tsx -> FreshAgentTranscript activity-strip/tool-coalescing tests
+test/unit/client/components/context-menu/agent-chat-actions.test.ts -> fresh-agent context-menu copy helper tests
+test/unit/client/components/context-menu/menu-defs.test.ts -> fresh-agent context target menu-definition tests
+test/e2e/agent-chat-context-menu-flow.test.tsx -> fresh-agent context-menu e2e flow
+test/e2e/agent-chat-polish-flow.test.tsx -> fresh-agent polish e2e flow
+test/e2e/agent-chat-capability-settings-flow.test.tsx -> fresh-agent model-capability/settings e2e flow
+test/e2e/agent-chat-restore-flow.test.tsx -> fresh-agent restore e2e flow
+test/e2e/tool-coalesce.test.tsx -> fresh-agent tool coalescing e2e flow
 ```
 
 Do not `git rm` a legacy test file until either:
 
 - its user-story behavior has an equivalent fresh-agent test that fails before the port and passes after it, or
 - the behavior is intentionally obsolete and the architecture guard or browser smoke proves the new behavior.
+
+The coverage test/checklist must fail if any file under `test/unit/client/components/agent-chat`, `test/unit/client/agentChatSlice.test.ts`, `test/unit/client/sdk-message-handler.test.ts`, `test/unit/client/ws-client-sdk.test.ts`, `test/unit/client/components/context-menu/*agent-chat*`, or `test/e2e/agent-chat-*.tsx` is missing from the matrix. Category-only mapping is not sufficient.
 
 - [ ] **Step 4: Remove `agentChat` reducer from root store**
 
@@ -906,7 +1018,7 @@ git rm test/unit/client/agentChatSlice.test.ts test/unit/client/ws-client-sdk.te
 Run the converted fresh-agent coverage, not just the existing narrow tests:
 
 ```bash
-npm run test:vitest -- test/unit/client/fresh-agent-legacy-behavior-coverage.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx test/unit/client/components/fresh-agent/FreshAgentApprovalCard.test.tsx test/unit/client/components/fresh-agent/FreshAgentQuestionBanner.test.tsx test/unit/client/lib/fresh-agent-ws.test.ts --run
+npm run test:vitest -- test/unit/client/fresh-agent-legacy-behavior-coverage.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx test/unit/client/components/fresh-agent/FreshAgentApprovalCard.test.tsx test/unit/client/components/fresh-agent/FreshAgentQuestionBanner.test.tsx test/unit/client/components/fresh-agent/FreshAgentItemCard.test.tsx test/unit/client/components/context-menu/fresh-agent-actions.test.ts test/unit/client/components/context-menu/menu-defs.test.ts test/unit/client/lib/fresh-agent-ws.test.ts --run
 ```
 
 - [ ] **Step 9: Run client typecheck and focused UI tests**
@@ -915,7 +1027,7 @@ Run:
 
 ```bash
 npm run typecheck:client
-npm run test:vitest -- test/unit/client/fresh-agent-only-ui-state.test.ts test/unit/client/fresh-agent-legacy-behavior-coverage.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx --run
+npm run test:vitest -- test/unit/client/fresh-agent-only-ui-state.test.ts test/unit/client/fresh-agent-legacy-behavior-coverage.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx test/unit/client/components/fresh-agent/FreshAgentItemCard.test.tsx test/unit/client/components/context-menu/fresh-agent-actions.test.ts --run
 ```
 
 Expected: PASS.
@@ -929,44 +1041,81 @@ git commit -m "Remove legacy agent-chat UI state"
 
 ---
 
-### Task 5: Rename Capabilities To Fresh-Agent And Remove `/api/agent-chat/capabilities`
+### Task 5: Move Model Capabilities To Fresh-Agent And Remove `/api/agent-chat/capabilities`
 
 **Files:**
-- Move: `shared/agent-chat-capabilities.ts` -> `shared/fresh-agent-capabilities.ts`
-- Move: `src/lib/agent-chat-capabilities.ts` -> `src/lib/fresh-agent-capabilities.ts`
-- Move: `server/agent-chat-capability-registry.ts` -> `server/fresh-agent/capability-registry.ts`
-- Move: `server/agent-chat-capabilities-router.ts` -> `server/fresh-agent/capabilities-router.ts`
+- Move: `shared/agent-chat-capabilities.ts` -> `shared/fresh-agent-model-capabilities.ts`
+- Move: `src/lib/agent-chat-capabilities.ts` -> `src/lib/fresh-agent-model-capabilities.ts`
+- Move: `server/agent-chat-capability-registry.ts` -> `server/fresh-agent/model-capability-registry.ts`
+- Move: `server/agent-chat-capabilities-router.ts` -> `server/fresh-agent/model-capabilities-router.ts`
 - Modify: `src/components/fresh-agent/FreshAgentSettingsButton.tsx`
 - Modify: `src/components/panes/PaneContainer.tsx`
 - Modify: `src/store/tabsSlice.ts`
 - Modify: `src/lib/api.ts`
 - Modify: `server/index.ts`
-- Test: `test/integration/server/fresh-agent-capabilities-router.test.ts`
-- Test: `test/unit/server/fresh-agent/capability-registry.test.ts`
+- Test: `test/integration/server/fresh-agent-model-capabilities-router.test.ts`
+- Test: `test/unit/server/fresh-agent/model-capability-registry.test.ts`
 - Delete: `test/integration/server/agent-chat-capabilities-router.test.ts`
 - Delete: `test/unit/server/agent-chat-capability-registry.test.ts`
 
-- [ ] **Step 1: Write the failing fresh-agent capabilities route test**
+- [ ] **Step 0: Keep model/settings capabilities separate from runtime capabilities**
 
-Create `test/integration/server/fresh-agent-capabilities-router.test.ts` by adapting the existing agent-chat capabilities router test to this route:
+Do not reuse `FreshAgentCapabilitiesSchema` from `shared/fresh-agent-contract.ts`; that schema already describes runtime command support such as `send`, `interrupt`, and approvals. The moved agent-chat capability route is a model/settings catalog for model options, effort levels, cache status, and errors.
+
+Use these canonical names:
+
+```text
+FreshAgentModelCapabilities
+FreshAgentModelCapabilitiesResponse
+FreshAgentModelCapabilitiesState
+FreshAgentModelCapabilityRegistry
+createFreshAgentModelCapabilitiesRouter
+parseFreshAgentModelCapabilitiesResponse
+```
+
+Expose this route family:
+
+```text
+GET  /api/fresh-agent/model-capabilities/:sessionType
+POST /api/fresh-agent/model-capabilities/:sessionType/refresh
+```
+
+The response should include both `sessionType` and `runtimeProvider`. `freshclaude` and `kilroy` may share the Claude model catalog, but `freshcodex` and `freshopencode` must have explicit provider-specific behavior: either a real model catalog or an `ok: false`/`unavailable` response with a documented code. Do not silently reuse Claude data for non-Claude providers.
+
+- [ ] **Step 1: Write the failing fresh-agent model-capabilities route test**
+
+Create `test/integration/server/fresh-agent-model-capabilities-router.test.ts` by adapting the existing agent-chat capabilities router test to this route:
 
 ```ts
 import express from 'express'
 import request from 'supertest'
 import { describe, expect, it } from 'vitest'
-import { createFreshAgentCapabilitiesRouter } from '../../../server/fresh-agent/capabilities-router.js'
-import { FreshAgentCapabilityRegistry } from '../../../server/fresh-agent/capability-registry.js'
+import { createFreshAgentModelCapabilitiesRouter } from '../../../server/fresh-agent/model-capabilities-router.js'
+import { FreshAgentModelCapabilityRegistry } from '../../../server/fresh-agent/model-capability-registry.js'
 
-describe('fresh-agent capabilities router', () => {
-  it('serves capabilities from /api/fresh-agent/capabilities/:provider', async () => {
+describe('fresh-agent model capabilities router', () => {
+  it('serves model capabilities from /api/fresh-agent/model-capabilities/:sessionType', async () => {
     const app = express()
-    const registry = new FreshAgentCapabilityRegistry()
-    app.use('/api/fresh-agent/capabilities', createFreshAgentCapabilitiesRouter({ registry }))
+    const registry = new FreshAgentModelCapabilityRegistry()
+    app.use('/api/fresh-agent/model-capabilities', createFreshAgentModelCapabilitiesRouter({ registry }))
 
-    const res = await request(app).get('/api/fresh-agent/capabilities/freshclaude').expect(200)
+    const res = await request(app).get('/api/fresh-agent/model-capabilities/freshclaude').expect(200)
 
-    expect(res.body.provider).toBe('freshclaude')
+    expect(res.body.sessionType).toBe('freshclaude')
+    expect(res.body.runtimeProvider).toBe('claude')
     expect(res.body.status).toMatch(/fresh|cached|unavailable/)
+  })
+
+  it('does not reuse Claude model data for non-Claude fresh-agent session types', async () => {
+    const app = express()
+    const registry = new FreshAgentModelCapabilityRegistry()
+    app.use('/api/fresh-agent/model-capabilities', createFreshAgentModelCapabilitiesRouter({ registry }))
+
+    const res = await request(app).get('/api/fresh-agent/model-capabilities/freshopencode').expect(200)
+
+    expect(res.body.sessionType).toBe('freshopencode')
+    expect(res.body.runtimeProvider).toBe('opencode')
+    expect(res.body.provider).not.toBe('freshclaude')
   })
 })
 ```
@@ -976,45 +1125,47 @@ describe('fresh-agent capabilities router', () => {
 Run:
 
 ```bash
-npm run test:vitest -- test/integration/server/fresh-agent-capabilities-router.test.ts --run
+npm run test:vitest -- test/integration/server/fresh-agent-model-capabilities-router.test.ts --run
 ```
 
-Expected: FAIL because `server/fresh-agent/capabilities-router.js` does not exist.
+Expected: FAIL because `server/fresh-agent/model-capabilities-router.js` does not exist.
 
 - [ ] **Step 3: Move capability modules**
 
 Run:
 
 ```bash
-git mv shared/agent-chat-capabilities.ts shared/fresh-agent-capabilities.ts
-git mv src/lib/agent-chat-capabilities.ts src/lib/fresh-agent-capabilities.ts
-git mv server/agent-chat-capability-registry.ts server/fresh-agent/capability-registry.ts
-git mv server/agent-chat-capabilities-router.ts server/fresh-agent/capabilities-router.ts
+git mv shared/agent-chat-capabilities.ts shared/fresh-agent-model-capabilities.ts
+git mv src/lib/agent-chat-capabilities.ts src/lib/fresh-agent-model-capabilities.ts
+git mv server/agent-chat-capability-registry.ts server/fresh-agent/model-capability-registry.ts
+git mv server/agent-chat-capabilities-router.ts server/fresh-agent/model-capabilities-router.ts
 ```
 
 Rename exported symbols:
 
 ```ts
-AgentChatCapabilityRegistry -> FreshAgentCapabilityRegistry
-createAgentChatCapabilitiesRouter -> createFreshAgentCapabilitiesRouter
-AgentChatProviderCapabilities -> FreshAgentProviderCapabilities
-AgentChatProviderCapabilitiesState -> FreshAgentProviderCapabilitiesState
+AgentChatCapabilityRegistry -> FreshAgentModelCapabilityRegistry
+createAgentChatCapabilitiesRouter -> createFreshAgentModelCapabilitiesRouter
+AgentChatProviderCapabilities -> FreshAgentModelCapabilities
+AgentChatProviderCapabilitiesState -> FreshAgentModelCapabilitiesState
 ```
+
+Keep `shared/fresh-agent-contract.ts` runtime `FreshAgentCapabilitiesSchema` unchanged except for import updates elsewhere.
 
 - [ ] **Step 4: Update API route helpers**
 
 In `src/lib/api.ts`, replace legacy capability helper URLs with:
 
 ```ts
-export async function getFreshAgentCapabilities(provider: string, options?: ApiRequestOptions) {
-  return parseFreshAgentProviderCapabilities(
-    await api.get(`/api/fresh-agent/capabilities/${encodeURIComponent(provider)}`, options),
+export async function getFreshAgentModelCapabilities(sessionType: string, options?: ApiRequestOptions) {
+  return parseFreshAgentModelCapabilitiesResponse(
+    await api.get(`/api/fresh-agent/model-capabilities/${encodeURIComponent(sessionType)}`, options),
   )
 }
 
-export async function refreshFreshAgentCapabilities(provider: string, options?: ApiRequestOptions) {
-  return parseFreshAgentProviderCapabilities(
-    await api.post(`/api/fresh-agent/capabilities/${encodeURIComponent(provider)}/refresh`, {}, options),
+export async function refreshFreshAgentModelCapabilities(sessionType: string, options?: ApiRequestOptions) {
+  return parseFreshAgentModelCapabilitiesResponse(
+    await api.post(`/api/fresh-agent/model-capabilities/${encodeURIComponent(sessionType)}/refresh`, {}, options),
   )
 }
 ```
@@ -1032,15 +1183,15 @@ app.use('/api/agent-chat/capabilities', createAgentChatCapabilitiesRouter({
 with:
 
 ```ts
-app.use('/api/fresh-agent/capabilities', createFreshAgentCapabilitiesRouter({
-  registry: freshAgentCapabilityRegistry,
+app.use('/api/fresh-agent/model-capabilities', createFreshAgentModelCapabilitiesRouter({
+  registry: freshAgentModelCapabilityRegistry,
 }))
 ```
 
 Rename the local registry variable:
 
 ```ts
-const freshAgentCapabilityRegistry = new FreshAgentCapabilityRegistry()
+const freshAgentModelCapabilityRegistry = new FreshAgentModelCapabilityRegistry()
 ```
 
 - [ ] **Step 6: Delete legacy capability tests**
@@ -1056,7 +1207,7 @@ git rm test/integration/server/agent-chat-capabilities-router.test.ts test/unit/
 Run:
 
 ```bash
-npm run test:vitest -- test/integration/server/fresh-agent-capabilities-router.test.ts test/unit/server/fresh-agent/capability-registry.test.ts --run
+npm run test:vitest -- test/integration/server/fresh-agent-model-capabilities-router.test.ts test/unit/server/fresh-agent/model-capability-registry.test.ts --run
 ```
 
 Expected: PASS.
@@ -1103,9 +1254,11 @@ missing revision for paged/turn body reads -> HTTP 400
 cursor revision mismatch -> HTTP 409
 includeBodies=true -> bodies keyed by turnId
 turn body route -> one full turn body or 404
+recent-first ordering -> same chronological contract as AgentTimelineService
+default/max limits -> same defaults and caps as AgentTimelineService
 ```
 
-The response shape does not need to be byte-compatible with `/api/agent-sessions/*`, but the meaning must be covered by fresh-agent tests before the old route is deleted.
+The response shape does not need to be byte-compatible with `/api/agent-sessions/*`, but error bodies must keep the `RESTORE_*` codes above so existing UI branches and tests can distinguish not-found, unavailable, diverged, and stale-revision states. The meaning, ordering, cursor, limits, and error-code contract must be covered by fresh-agent tests before the old route is deleted.
 
 - [ ] **Step 1: Write the failing route-parity integration test**
 
@@ -1136,7 +1289,7 @@ describe('fresh-agent route centralization', () => {
 })
 ```
 
-Add a second test in the same file for `GET /api/fresh-agent/threads/:sessionType/:provider/:threadId/turns?includeBodies=true&revision=...` and `/turns/:turnId`, asserting `nextCursor`, `revision`, `turns`, and `bodies` semantics.
+For each response above, assert the body `code` is the legacy `RESTORE_*` code, not a generic fresh-agent or HTTP error code. Add a second test in the same file for `GET /api/fresh-agent/threads/:sessionType/:provider/:threadId/turns?includeBodies=true&revision=...` and `/turns/:turnId`, asserting `nextCursor`, `revision`, `turns`, `bodies`, recent-first order, missing revision `400`, cursor revision mismatch `409`, and default/max limit semantics.
 
 - [ ] **Step 2: Run the route-parity test and verify it fails on missing fresh history error mapping**
 
@@ -1208,7 +1361,9 @@ In `server/sdk-bridge.ts`, `server/session-history-loader.ts`, and `server/ws-ha
 
 - [ ] **Step 6: Port old timeline error mapping into fresh-agent route/runtime**
 
-In `server/fresh-agent/router.ts` and `server/fresh-agent/runtime-manager.ts`, map the moved Claude history errors to the same HTTP meanings listed in Step 0. Keep the fresh-agent response shape (`turns`, `bodies`, `threadId`, `sessionType`, `provider`) but preserve revision, cursor, includeBodies, turn-body, and stale-revision behavior.
+In `server/fresh-agent/router.ts` and `server/fresh-agent/runtime-manager.ts`, map the moved Claude history errors to the same HTTP meanings and `RESTORE_*` body codes listed in Step 0. Keep the fresh-agent response shape (`turns`, `bodies`, `threadId`, `sessionType`, `provider`) but preserve revision, cursor, includeBodies, turn-body, recent-first order, default/max limits, and stale-revision behavior.
+
+The moved `server/fresh-agent/history/claude/*` modules must stay adapter-neutral. Add an architecture assertion or import scan proving these modules do not import `server/fresh-agent/router`, `server/fresh-agent/runtime-manager`, or `server/fresh-agent/adapters/claude`.
 
 - [ ] **Step 7: Remove legacy route mount**
 
@@ -1265,7 +1420,9 @@ git commit -m "Move Claude history under fresh-agent"
 - Modify: `server/sdk-bridge-types.ts`
 - Modify: `src/App.tsx:60-72`
 - Modify: `src/App.tsx:1119-1123`
+- Modify: `src/lib/ws-client.ts`
 - Modify: `src/lib/fresh-agent-ws.ts:1-186`
+- Modify: `src/store/freshAgentSlice.ts`
 - Delete: `src/lib/sdk-message-handler.ts`
 - Modify: `server/ws-handler.ts`
 - Test: `test/unit/client/fresh-agent-ws.test.ts`
@@ -1297,6 +1454,8 @@ export type FreshAgentProviderEvent =
 ```
 
 `server/sdk-bridge.ts` may continue to emit its internal SDK-shaped events temporarily, but `server/ws-handler.ts` must normalize them to `FreshAgentProviderEvent` before sending to the browser. After this task, no browser-facing type or handler should require top-level `SdkServerMessage`.
+
+Bump `WS_PROTOCOL_VERSION` in this task. Add a client test proving a stale bundle that receives `PROTOCOL_MISMATCH` does not flush queued `sdk.*`, `freshAgent.*`, or `ui.layout.sync` messages. The client must either call the existing reload path automatically or enter an intentional, non-reconnecting hard-stop state with clear reload UI.
 
 - [ ] **Step 1: Write the fresh-agent transport client test**
 
@@ -1362,7 +1521,7 @@ Run:
 npm run test:vitest -- test/unit/client/fresh-agent-ws.test.ts --run
 ```
 
-Expected: FAIL because `freshAgent.session.snapshot` is not handled yet and `App` still imports `sdk-message-handler`.
+Expected: FAIL because `freshAgent.session.snapshot` is not handled yet, `freshAgentSlice` still has no-op live-event reducers, and `App` still imports `sdk-message-handler`.
 
 - [ ] **Step 3: Update fresh-agent event names**
 
@@ -1384,7 +1543,7 @@ case 'freshAgent.exit':
 case 'freshAgent.killed':
 ```
 
-Map them to the existing `freshAgentSlice` actions or add missing fresh-agent actions before deleting `sdk-message-handler`. The tests must prove assistant text, streamed text, result/cost, permission/question prompts, cancellation, exit, killed, and lost-session errors still update fresh-agent state.
+Map them to the existing `freshAgentSlice` actions or add missing fresh-agent actions before deleting `sdk-message-handler`. The existing no-op reducers for user/assistant messages, streaming, and turn results must become real state updates or be replaced by real reducers. The tests must prove assistant text, streamed text, result/cost/usage, permission/question prompts, cancellation, exit, killed, duplicate interactive request de-dupe, and lost-session errors still update fresh-agent state.
 
 - [ ] **Step 4: Remove top-level SDK handling from `App`**
 
@@ -1461,6 +1620,8 @@ to:
 event: normalizeFreshAgentProviderEvent(event),
 ```
 
+Add Codex and OpenCode adapter tests. If their live event contract remains snapshot/status-only, write that down in the tests and assert snapshots/status reach the UI after normalization. Otherwise normalize every emitted live event to `freshAgent.*` names before it leaves `server/ws-handler.ts`.
+
 - [ ] **Step 6: Port lifecycle and ownership guarantees to fresh-agent**
 
 Before deleting the top-level SDK handlers in `server/ws-handler.ts`, port the guarantees currently covered by `test/unit/server/ws-handler-sdk.test.ts`:
@@ -1469,10 +1630,12 @@ Before deleting the top-level SDK handlers in `server/ws-handler.ts`, port the g
 - create/attach must drain the replay gate/watermark before success when durable history is involved.
 - delayed metadata must not downgrade a newer snapshot.
 - duplicate interactive requests must not produce duplicate permission/question UI.
-- `freshAgent.send`, `freshAgent.interrupt`, `freshAgent.approval.respond`, `freshAgent.question.respond`, `freshAgent.kill`, and setting changes must require the current WebSocket to own or be subscribed to the fresh-agent session.
+- `freshAgent.send`, `freshAgent.interrupt`, `freshAgent.compact`, `freshAgent.approval.respond`, `freshAgent.question.respond`, `freshAgent.fork`, `freshAgent.kill`, and setting changes must require the current WebSocket to own or be explicitly authorized for the fresh-agent session.
 - image attachments, plugins, model/modelSelection, effort, permission decisions, question answers, interrupts, kills, compact, and fork payloads must have adapter-specific parity tests.
 
 Create `test/unit/server/ws-handler-fresh-agent-lifecycle-parity.test.ts` by porting the relevant old SDK tests, and create `test/unit/server/ws-handler-fresh-agent-ownership.test.ts` for unauthorized mutating commands. These must fail before the server changes and pass before Step 7.
+
+Implement an explicit authorization model, for example `state.freshAgentAuthorizedSessions`, separate from event subscription bookkeeping. `freshAgent.create` and successful `freshAgent.attach` must grant authorization to the current connection. A connection that never created, attached, or was explicitly subscribed with mutation rights must receive an unauthorized error for every mutating command. Multi-client attach/recover flows must prove each attached client can still mutate the session it attached to.
 
 - [ ] **Step 7: Remove legacy top-level `sdk.*` message schemas and handlers**
 
@@ -1509,6 +1672,8 @@ sdk.killed
 
 In `server/ws-handler.ts`, delete the switch cases that handle those top-level client messages. Keep SDK bridge internals used by the Claude fresh-agent adapter.
 
+In `shared/ws-protocol.ts`, remove every browser-facing `sdk.*` variant, not only `sdk.create`, `sdk.send`, and `sdk.attach`. The architecture guard in Task 9 must catch `sdk.kill`, `sdk.permission.respond`, `sdk.question.respond`, `sdk.session.*`, and any other public `sdk.*` reintroduction.
+
 - [ ] **Step 8: Delete legacy client handler**
 
 Run:
@@ -1524,7 +1689,7 @@ Run:
 
 ```bash
 npm run typecheck
-npm run test:vitest -- test/unit/client/fresh-agent-ws.test.ts test/unit/server/ws-fresh-agent-contract.test.ts test/unit/server/ws-handler-fresh-agent-lifecycle-parity.test.ts test/unit/server/ws-handler-fresh-agent-ownership.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --run
+npm run test:vitest -- test/unit/client/fresh-agent-ws.test.ts test/unit/client/ws-client-protocol-reload.test.ts test/unit/server/ws-fresh-agent-contract.test.ts test/unit/server/ws-handler-fresh-agent-lifecycle-parity.test.ts test/unit/server/ws-handler-fresh-agent-ownership.test.ts test/unit/server/fresh-agent/codex-adapter.test.ts test/unit/server/fresh-agent/opencode-adapter.test.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx --run
 ```
 
 Expected: PASS.
@@ -1532,7 +1697,7 @@ Expected: PASS.
 - [ ] **Step 10: Commit**
 
 ```bash
-git add shared/ws-protocol.ts server/fresh-agent/sdk-events.ts server/sdk-bridge-types.ts src/App.tsx src/lib/fresh-agent-ws.ts server/ws-handler.ts test src/lib
+git add shared/ws-protocol.ts server/fresh-agent/sdk-events.ts server/sdk-bridge-types.ts src/App.tsx src/lib/ws-client.ts src/lib/fresh-agent-ws.ts src/store/freshAgentSlice.ts server/ws-handler.ts test src/lib
 git commit -m "Remove legacy sdk websocket surface"
 ```
 
@@ -1547,6 +1712,7 @@ git commit -m "Remove legacy sdk websocket surface"
 - Modify: `src/lib/session-type-utils.ts:1-135`
 - Modify: `src/lib/agent-chat-utils.ts` -> `src/lib/fresh-agent-provider-utils.ts`
 - Modify: `src/lib/agent-chat-types.ts` -> `src/lib/fresh-agent-provider-types.ts`
+- Modify: `src/lib/tab-fallback-identity.ts`
 - Modify: `src/store/selectors/sidebarSelectors.ts`
 - Modify: `src/components/context-menu/menu-defs.ts`
 - Modify: `server/mcp/freshell-tool.ts`
@@ -1594,6 +1760,29 @@ it('reopens Claude agent sessions as fresh-agent panes', () => {
     resumeSessionId: '00000000-0000-4000-8000-000000000111',
     initialCwd: '/repo',
   })
+})
+```
+
+Add non-Claude reopen coverage in the same file:
+
+```ts
+it('reopens non-Claude fresh-agent sessions with explicit sessionRef instead of Claude fallback inference', () => {
+  const state = tabsReducer(initialTabsState, reopenSession({
+    provider: 'opencode',
+    sessionId: 'opencode-thread-1',
+    sessionType: 'freshopencode',
+    cwd: '/repo',
+  }))
+
+  const activeTab = state.tabs.find((tab) => tab.id === state.activeTabId)
+  const content = activeTab?.layout?.type === 'leaf' ? activeTab.layout.content : undefined
+  expect(content).toMatchObject({
+    kind: 'fresh-agent',
+    sessionType: 'freshopencode',
+    provider: 'opencode',
+    sessionRef: { provider: 'opencode', sessionId: 'opencode-thread-1' },
+  })
+  expect(content).not.toMatchObject({ resumeSessionId: 'opencode-thread-1' })
 })
 ```
 
@@ -1662,6 +1851,8 @@ In `server/mcp/freshell-tool.ts`, replace the pane-kind sentence with:
 - Pane kinds: terminal, editor, browser, fresh-agent (Claude/Codex/OpenCode/etc.), picker (transient).
 ```
 
+In `src/lib/tab-fallback-identity.ts`, remove Claude-only inference for non-Claude fresh-agent panes. Freshcodex and Freshopencode reopen/sidebar/fallback paths must carry `sessionRef` explicitly.
+
 - [ ] **Step 6: Run focused tests**
 
 Run:
@@ -1710,15 +1901,33 @@ function rg(pattern: string, paths: string[]): string {
 
 describe('fresh-agent-only runtime architecture', () => {
   it('has no live agent-chat runtime imports, routes, pane kinds, or Redux state', () => {
-    const output = rg(
-      String.raw`agent-chat|agentChat|AgentChat|sdk\.create|sdk\.send|sdk\.attach|/api/agent-chat|/api/agent-sessions|createAgentTimelineRouter`,
-      ['src', 'server', 'shared'],
-    )
+    const forbidden = String.raw`agent-chat|agentChat|AgentChat|/api/agent-chat|/api/agent-sessions|createAgentTimelineRouter`
+    const legacyAgentOutput = rg(forbidden, ['src', 'server', 'shared'])
       .split('\n')
       .filter(Boolean)
       .filter((line) => !line.includes('migrateLegacyFreshAgentContent'))
+      .filter((line) => !line.includes('migrateLegacyFreshAgentDurableState'))
+      .filter((line) => !line.includes('migrateLegacyAgentChatDurableState'))
       .filter((line) => !line.includes('legacy agentChat input'))
       .filter((line) => !line.includes('readLegacyAgentChatInput'))
+
+    expect(legacyAgentOutput).toEqual([])
+  })
+
+  it('keeps sdk-prefixed events server-internal only', () => {
+    const allowedSdkInternalPaths = [
+      'server/sdk-bridge.ts:',
+      'server/sdk-bridge-types.ts:',
+      'server/fresh-agent/sdk-events.ts:',
+      'server/fresh-agent/adapters/claude/',
+      'server/fresh-agent/adapters/codex/',
+      'server/fresh-agent/adapters/opencode/',
+      'test/unit/server/',
+    ]
+    const output = rg(String.raw`sdk\.`, ['src', 'server', 'shared'])
+      .split('\n')
+      .filter(Boolean)
+      .filter((line) => !allowedSdkInternalPaths.some((path) => line.includes(path)))
 
     expect(output).toEqual([])
   })
@@ -1726,6 +1935,7 @@ describe('fresh-agent-only runtime architecture', () => {
 ```
 
 This is an architecture contract, not a copy test: it prevents the deleted runtime surface from being reintroduced.
+The implementation may rename `migrateLegacyAgentChatDurableState` to `migrateLegacyFreshAgentDurableState` instead of allowlisting it. If it stays, the allowlist must be explicit so the old name cannot hide unrelated live runtime references.
 
 - [ ] **Step 2: Run the guard and verify it fails before cleanup is complete**
 
@@ -1769,6 +1979,9 @@ git commit -m "Guard fresh-agent-only runtime architecture"
 **Files:**
 - Create: `test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts`
 - Modify: `test/e2e-browser/helpers/test-server.ts` only if route mocks need fresh-agent capabilities support
+- Modify: `test/e2e-browser/helpers/test-harness.ts` if a remote layout-sync helper is needed
+- Modify: `src/lib/test-harness.ts`
+- Modify: `src/components/fresh-agent/FreshAgentView.tsx`
 
 - [ ] **Step 1: Add harness-backed browser smoke tests**
 
@@ -1778,7 +1991,7 @@ The spec must include these tests:
 
 1. **Fresh pane creation with no legacy UI or routes**
    - Seed available fresh clients through the e2e-browser harness.
-   - Mock `/api/fresh-agent/capabilities/**` and `/api/fresh-agent/threads/**`.
+   - Mock `/api/fresh-agent/model-capabilities/**` and `/api/fresh-agent/threads/**`.
    - Open Freshclaude, Freshcodex, and Freshopencode panes.
    - Assert `[data-context="fresh-agent"]` is visible for each pane and `[data-context="agent-chat"]` has count `0`.
    - Capture requests and assert none include `/api/agent-chat` or `/api/agent-sessions`.
@@ -1787,20 +2000,25 @@ The spec must include these tests:
    - Seed `window.localStorage` with the real key `freshell.layout.v3`.
    - Use the real persisted shape: `{ version: 3, tabs: [...], panes: { layouts: { [tabId]: node }, activePane: { [tabId]: paneId } } }`.
    - Put a legacy `kind: "agent-chat"` leaf in a nested split tree, including one old `provider: "claude"` record with a canonical Claude `resumeSessionId`.
+   - Install global fresh-agent network suppression with `page.addInitScript` before navigation, not a per-pane flag set after render.
    - Load the app and assert every migrated pane renders as fresh-agent, localStorage no longer contains `kind: "agent-chat"`, and no blank screen appears.
+   - Assert no `freshAgent.create` or `freshAgent.attach` websocket message is sent before the suppression hook is active.
 
 3. **Remote/server layout normalization**
    - Use the harness to send or simulate a `ui.layout.sync` payload containing an `agent-chat` leaf.
    - Assert the server-stored/broadcast layout normalizes to fresh-agent before the page renders it.
+   - If the current harness only exposes low-level websocket send primitives, add a helper with a clear name such as `sendLegacyLayoutSyncForMigrationSmoke`.
 
 4. **Settings and route removal**
    - `PATCH /api/settings` with `freshAgent` succeeds and returns no `agentChat`.
    - `PATCH /api/settings` with top-level `agentChat` returns `400`.
    - `/api/agent-chat/capabilities/*` and `/api/agent-sessions/*` return `404`.
-   - `/api/fresh-agent/capabilities/*` and `/api/fresh-agent/threads/*` remain reachable.
+   - `/api/fresh-agent/model-capabilities/*` and `/api/fresh-agent/threads/*` remain reachable.
    - Opening Settings shows "Fresh agent" and no "agent chat" copy.
 
 If a lower-level Redux harness dispatch is needed, keep it in this smoke file with one short comment explaining why the browser path cannot create that state directly.
+
+Add a global test harness switch in `src/lib/test-harness.ts`, for example `suppressAllFreshAgentNetworkEffects`, and check it in `FreshAgentView` before any create/attach effect can send over the websocket. Per-pane suppression remains useful for existing tests, but the migration smoke must use the global pre-render suppression path.
 
 - [ ] **Step 2: Run the new browser smoke test and verify it fails before implementation is complete**
 
@@ -1825,7 +2043,7 @@ Expected: PASS.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts test/e2e-browser/helpers/test-server.ts
+git add test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts test/e2e-browser/helpers/test-server.ts test/e2e-browser/helpers/test-harness.ts src/lib/test-harness.ts src/components/fresh-agent/FreshAgentView.tsx
 git commit -m "Add fresh-agent centralization smoke coverage"
 ```
 
@@ -1843,14 +2061,18 @@ git commit -m "Add fresh-agent centralization smoke coverage"
 Run:
 
 ```bash
-rg -n "agent-chat|agentChat|AgentChat|/api/agent-chat|/api/agent-sessions|sdk\\.create|sdk\\.send|sdk\\.attach|createAgentTimelineRouter" src server shared docs/index.html README.md
+rg -n "agent-chat|agentChat|AgentChat|/api/agent-chat|/api/agent-sessions|createAgentTimelineRouter" src server shared docs/index.html README.md
+rg -n "sdk\\." src shared
 ```
 
 Expected: no production-source hits except explicit one-time migration helper names:
 
 ```text
 migrateLegacyFreshAgentContent
+migrateLegacyFreshAgentDurableState
+migrateLegacyAgentChatDurableState
 migrateLegacyFreshAgentSettingsInput
+LegacyAgentChatSettingsInput
 readLegacyAgentChatInput
 legacy agentChat input
 ```
@@ -1860,7 +2082,7 @@ legacy agentChat input
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentItemCard.test.tsx test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx test/unit/client/fresh-agent-pane-migration.test.ts test/unit/client/fresh-agent-only-ui-state.test.ts test/unit/client/fresh-agent-legacy-behavior-coverage.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/shared/settings.test.ts test/unit/architecture/fresh-agent-only-runtime.test.ts --run
+npm run test:vitest -- test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx test/unit/client/components/fresh-agent/FreshAgentItemCard.test.tsx test/unit/client/components/fresh-agent/FreshAgentComposer.test.tsx test/unit/client/fresh-agent-pane-migration.test.ts test/unit/client/fresh-agent-only-ui-state.test.ts test/unit/client/fresh-agent-legacy-behavior-coverage.test.ts test/unit/client/store/storage-migration.fresh-agent.test.ts test/unit/client/store/persisted-state.fresh-agent.test.ts test/unit/client/tab-registry-fresh-agent-migration.test.ts test/unit/shared/settings.test.ts test/unit/architecture/fresh-agent-only-runtime.test.ts --run
 ```
 
 Expected: PASS.
@@ -1870,7 +2092,7 @@ Expected: PASS.
 Run:
 
 ```bash
-npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/claude-history-source.test.ts test/unit/server/fresh-agent/claude-history-include-bodies.test.ts test/unit/server/fresh-agent/claude-restore-contract.test.ts test/unit/server/fresh-agent/claude-adapter.test.ts test/unit/server/fresh-agent/codex-adapter.test.ts test/unit/server/fresh-agent/opencode-adapter.test.ts test/unit/server/ws-handler-fresh-agent-lifecycle-parity.test.ts test/unit/server/ws-handler-fresh-agent-ownership.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/integration/server/fresh-agent-capabilities-router.test.ts test/integration/server/fresh-agent-claude-history-route-parity.test.ts test/integration/server/fresh-agent-removes-legacy-routes.test.ts test/integration/server/settings-api.test.ts --run
+npm run test:vitest -- --config vitest.server.config.ts test/unit/server/fresh-agent/claude-history-source.test.ts test/unit/server/fresh-agent/claude-history-include-bodies.test.ts test/unit/server/fresh-agent/claude-restore-contract.test.ts test/unit/server/fresh-agent/claude-adapter.test.ts test/unit/server/fresh-agent/codex-adapter.test.ts test/unit/server/fresh-agent/opencode-adapter.test.ts test/unit/server/ws-handler-fresh-agent-lifecycle-parity.test.ts test/unit/server/ws-handler-fresh-agent-ownership.test.ts test/unit/server/agent-api/layout-store.fresh-agent.test.ts test/unit/server/tabs-registry/fresh-agent-migration.test.ts test/integration/server/fresh-agent-model-capabilities-router.test.ts test/integration/server/fresh-agent-claude-history-route-parity.test.ts test/integration/server/fresh-agent-removes-legacy-routes.test.ts test/integration/server/settings-api.test.ts --run
 ```
 
 Expected: PASS.
@@ -1912,7 +2134,7 @@ Expected: PASS.
 Start a disposable server from this worktree only:
 
 ```bash
-PORT=3388 VITE_PORT=5188 npm run dev > /tmp/freshell-agent-cleanup-3388.log 2>&1 & echo $! > /tmp/freshell-agent-cleanup-3388.pid
+setsid bash -lc 'PORT=3388 VITE_PORT=5188 npm run dev' > /tmp/freshell-agent-cleanup-3388.log 2>&1 & echo $! > /tmp/freshell-agent-cleanup-3388.pid
 ```
 
 Open it in Windows Chrome from WSL:
@@ -1932,10 +2154,20 @@ Exercise these flows manually:
 6. Open Settings. Confirm the section is named "Fresh agent" and the response body from /api/settings has freshAgent but no agentChat.
 ```
 
-Stop only the recorded worktree server:
+Before stopping, verify the recorded PID belongs to this worktree and is its own process group leader:
 
 ```bash
-kill "$(cat /tmp/freshell-agent-cleanup-3388.pid)" && rm -f /tmp/freshell-agent-cleanup-3388.pid
+pid="$(cat /tmp/freshell-agent-cleanup-3388.pid)"
+ps -fp "$pid"
+test "$(readlink -f "/proc/$pid/cwd")" = "/home/dan/code/freshell/.worktrees/agent-infrastructure-cleanup"
+test "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid"
+```
+
+Stop only that worktree process group:
+
+```bash
+pid="$(cat /tmp/freshell-agent-cleanup-3388.pid)"
+kill -- "-$pid" && rm -f /tmp/freshell-agent-cleanup-3388.pid
 ```
 
 - [ ] **Step 8: Commit final sweep**
@@ -1949,10 +2181,10 @@ git commit -m "Complete fresh-agent centralization cleanup"
 
 ## Self-Review
 
-**Spec coverage:** The user asked to do the migration at once, with no old clients preserved, and to include a comprehensive migration plus thorough smoke test. Tasks 1-9 remove old live code paths in one branch after proving migration ingress coverage, settings precedence, history route parity, WebSocket event/lifecycle/ownership parity, and legacy behavior test conversion. Task 10 adds harness-backed browser smoke for freshclaude, freshcodex, freshopencode, settings, real persisted-layout migration, remote layout sync normalization, route removal, and absence of legacy UI. Task 11 verifies scans, focused tests, full suite, build, browser e2e, and manual smoke.
+**Spec coverage:** The user asked to do the migration at once, with no old clients preserved, and to include a comprehensive migration plus thorough smoke test. Tasks 1-9 remove old live code paths in one branch after proving migration ingress coverage, tab-registry normalization, settings precedence, history route parity, WebSocket event/lifecycle/ownership parity, model-capability routing, and legacy behavior test conversion. Task 10 adds harness-backed browser smoke for freshclaude, freshcodex, freshopencode, settings, real persisted-layout migration, remote layout sync normalization, route removal, pre-render side-effect suppression, and absence of legacy UI. Task 11 verifies scans, focused tests, full suite, build, browser e2e, and process-group-safe manual smoke.
 
-**Load-bearing review summary:** The first draft had false assumptions around settings aliasing, route ownership, WebSocket parity, pane ingress coverage, and browser smoke realism. This revision fixes those by adding explicit migration contracts, conflict precedence rules, server layout normalization, recoverable storage migration, fresh-agent route parity tests, full event mapping, per-connection ownership checks, and a behavior coverage map before deleting old tests.
+**Load-bearing review summary:** The first draft had false assumptions around settings aliasing, route ownership, WebSocket parity, pane ingress coverage, storage recovery/volume, architecture guard coverage, test conversion completeness, capability naming, and browser smoke realism. This revision fixes those by adding explicit migration contracts, tab-registry normalization, config/browser-preference migration, conflict precedence rules, server layout normalization, recoverable storage migration with failure-injection and large-layout tests, fresh-agent route parity tests, full event mapping, per-connection ownership checks, a path-aware architecture guard, a file-complete behavior coverage matrix before deleting old tests, a separate model-capabilities route, and process-safe browser/manual smoke requirements.
 
 **Placeholder scan:** The plan contains no forbidden placeholder language and no open-ended edge-case instructions. Each implementation task lists exact files, test code or exact commands, and the expected result.
 
-**Type consistency:** Canonical names are `freshAgent` for settings, `fresh-agent` for pane kind and route namespace, `FreshAgentCapabilityRegistry` for capabilities, and `ClaudeFreshAgentHistoryService` for moved Claude history under `server/fresh-agent/history/claude`. The only allowed legacy identifiers after implementation are migration-boundary names: `migrateLegacyFreshAgentContent`, `migrateLegacyFreshAgentSettingsInput`, `readLegacyAgentChatInput`, and explanatory test strings for legacy input conversion.
+**Type consistency:** Canonical names are `freshAgent` for settings, `fresh-agent` for pane kind and route namespace, `FreshAgentModelCapabilityRegistry` for model/settings capabilities, runtime `FreshAgentCapabilitiesSchema` for command booleans, and `ClaudeFreshAgentHistoryService` for moved Claude history under `server/fresh-agent/history/claude`. The only allowed legacy identifiers after implementation are migration-boundary names such as `migrateLegacyFreshAgentContent`, `migrateLegacyFreshAgentDurableState`, `migrateLegacyAgentChatDurableState` if not renamed, `migrateLegacyFreshAgentSettingsInput`, `LegacyAgentChatSettingsInput`, `readLegacyAgentChatInput`, and explanatory test strings for legacy input conversion.
