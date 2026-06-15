@@ -4,7 +4,7 @@ import fsp from 'fs/promises'
 import path from 'path'
 import { z } from 'zod'
 import { getFreshellConfigDir } from '../freshell-home.js'
-import { TabRegistryRecordSchema, type RegistryTabRecord } from './types.js'
+import { TabRegistryRecordSchema, normalizeRegistryTabRecord, type RegistryTabRecord } from './types.js'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const MINUTE_MS = 60 * 1000
@@ -362,6 +362,10 @@ function sortByClosedDesc(a: RegistryTabRecord, b: RegistryTabRecord): number {
   const aClosedAt = a.closedAt ?? a.updatedAt
   const bClosedAt = b.closedAt ?? b.updatedAt
   return bClosedAt - aClosedAt
+}
+
+function normalizeServedRecords(records: RegistryTabRecord[]): RegistryTabRecord[] {
+  return records.map((record) => normalizeRegistryTabRecord(record) ?? record)
 }
 
 function clientSnapshotKey(deviceId: string, clientInstanceId: string): string {
@@ -1283,10 +1287,10 @@ export class TabsRegistryStore {
     }
 
     return {
-      localOpen: localOpen.sort(sortByUpdatedDesc),
-      sameDeviceOpen: sameDeviceOpen.sort(sortByUpdatedDesc),
-      remoteOpen: remoteOpen.sort(sortByUpdatedDesc),
-      closed: closed.sort(sortByClosedDesc),
+      localOpen: normalizeServedRecords(localOpen).sort(sortByUpdatedDesc),
+      sameDeviceOpen: normalizeServedRecords(sameDeviceOpen).sort(sortByUpdatedDesc),
+      remoteOpen: normalizeServedRecords(remoteOpen).sort(sortByUpdatedDesc),
+      closed: normalizeServedRecords(closed).sort(sortByClosedDesc),
       devices: this.listDevices(),
     }
   }

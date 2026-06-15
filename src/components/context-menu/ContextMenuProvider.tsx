@@ -799,9 +799,7 @@ export function ContextMenuProvider({
           freshAgentSessions,
         })
         let hasWaitingItems = false
-        if (entry.content.kind === 'agent-chat' && entry.content.sessionId) {
-          hasWaitingItems = hasWaitingPrompt(agentChatSessions[entry.content.sessionId])
-        } else if (entry.content.kind === 'fresh-agent' && entry.content.sessionId) {
+        if (entry.content.kind === 'fresh-agent' && entry.content.sessionId) {
           const sessionKey = makeFreshAgentSessionKey({
             sessionType: entry.content.sessionType,
             provider: entry.content.provider,
@@ -849,9 +847,7 @@ export function ContextMenuProvider({
         freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
       })
       let hasWaitingItems = false
-      if (content.kind === 'agent-chat' && content.sessionId) {
-        hasWaitingItems = hasWaitingPrompt((state.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)[content.sessionId])
-      } else if (content.kind === 'fresh-agent' && content.sessionId) {
+      if (content.kind === 'fresh-agent' && content.sessionId) {
         const sessionKey = makeFreshAgentSessionKey({
           sessionType: content.sessionType,
           provider: content.provider,

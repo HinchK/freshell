@@ -92,7 +92,7 @@ function buildCanonicalClaudeSessionRef(localContent: any, localResumeSessionId:
   }
 
   if (
-    (localContent?.kind === 'agent-chat' || localContent?.kind === 'fresh-agent')
+    localContent?.kind === 'fresh-agent'
     || (localContent?.kind === 'terminal' && localContent?.mode === 'claude')
   ) {
     return {
@@ -114,7 +114,6 @@ function protectCanonicalPaneResumeIdentity(remoteNode: unknown, localLayout: un
       if (
         (
           candidate.content?.kind === 'terminal'
-          || candidate.content?.kind === 'agent-chat'
           || candidate.content?.kind === 'fresh-agent'
         )
         && shouldPreserveLocalCanonicalResumeSessionId(localResumeSessionId, remoteResumeSessionId)

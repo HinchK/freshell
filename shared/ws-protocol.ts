@@ -352,6 +352,7 @@ export const UiLayoutSyncSchema = z.object({
   layouts: z.record(z.string(), z.unknown()),
   activePane: z.record(z.string(), z.string()),
   paneTitles: z.record(z.string(), z.record(z.string(), z.string())).optional(),
+  paneTitleSetByUser: z.record(z.string(), z.record(z.string(), z.boolean())).optional(),
   timestamp: z.number(),
 })
 

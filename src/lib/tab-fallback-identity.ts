@@ -19,16 +19,6 @@ function deriveLeafSessionRef(
     }).sessionRef
   }
 
-  if (content.kind === 'agent-chat') {
-    const explicit = sanitizeSessionRef(content.sessionRef)
-    if (explicit) return explicit
-    if (!isValidClaudeSessionId(content.resumeSessionId)) return undefined
-    return sanitizeSessionRef({
-      provider: 'claude',
-      sessionId: content.resumeSessionId,
-    })
-  }
-
   if (content.kind === 'fresh-agent') {
     const explicit = sanitizeSessionRef(content.sessionRef)
     if (explicit) return explicit

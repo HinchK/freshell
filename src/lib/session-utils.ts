@@ -101,9 +101,6 @@ function extractSessionLocatorLiveHandleHint(content: PaneContent): boolean {
   if (content.kind === 'terminal') {
     return isNonEmptyString(content.terminalId)
   }
-  if (content.kind === 'agent-chat') {
-    return isNonEmptyString(content.sessionId)
-  }
   return false
 }
 
@@ -121,12 +118,6 @@ function extractSessionLocators(content: PaneContent): Array<{
     locators.push(explicit)
   }
 
-  if (content.kind === 'agent-chat') {
-    const sessionId = content.resumeSessionId
-    if (!sessionId || !isValidClaudeSessionId(sessionId)) return dedupeBy(locators, locatorIdentity)
-    locators.push({ provider: 'claude', sessionId })
-    return dedupeBy(locators, locatorIdentity)
-  }
   if (content.kind === 'fresh-agent') {
     const sessionId = content.resumeSessionId
     const provider = resolveFreshAgentType(content.sessionType)?.runtimeProvider ?? content.provider

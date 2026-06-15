@@ -355,22 +355,6 @@ export function buildSessionItems(
       paneLastInputAt,
     })
 
-    if (node.content.kind === 'agent-chat') {
-      const sessionRef = node.content.sessionRef
-      if (sessionRef?.provider !== 'claude' || !isValidClaudeSessionId(sessionRef.sessionId)) return
-      const metadata = getSessionMetadata(tab, 'claude', sessionRef.sessionId)
-      pushFallbackItem({
-        provider: 'claude',
-        sessionId: sessionRef.sessionId,
-        sessionType: node.content.provider || 'claude',
-        title: paneTitle || tab.title,
-        cwd: undefined,
-        timestamp: fallbackTimestamp,
-        metadata,
-      })
-      return
-    }
-
     if (node.content.kind === 'fresh-agent') {
       const sessionId = node.content.resumeSessionId
       const runtimeProvider = resolveFreshAgentType(node.content.sessionType)?.runtimeProvider ?? node.content.provider

@@ -1,7 +1,6 @@
 import { Terminal, Globe, FileText, LayoutGrid } from 'lucide-react'
 import { ProviderIcon } from '@/components/icons/provider-icons'
 import { isNonShellMode } from '@/lib/coding-cli-utils'
-import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { PaneContent } from '@/store/paneTypes'
 
@@ -24,15 +23,6 @@ export default function PaneIcon({ content, className }: PaneIconProps) {
 
   if (content.kind === 'editor') {
     return <FileText className={className} />
-  }
-
-  if (content.kind === 'agent-chat') {
-    const config = getAgentChatProviderConfig(content.provider)
-    if (config) {
-      const Icon = config.icon
-      return <Icon className={className} />
-    }
-    return <LayoutGrid className={className} />
   }
 
   if (content.kind === 'fresh-agent') {

@@ -1,3 +1,11 @@
+import {
+  buildRestoreError,
+  isCanonicalClaudeSessionId,
+  sanitizeSessionRef,
+  type RestoreError,
+  type SessionRef,
+} from './session-contract.js'
+
 export type FreshAgentSessionType = 'freshclaude' | 'freshcodex' | 'kilroy' | 'freshopencode'
 
 export type FreshAgentRuntimeProvider = 'claude' | 'codex' | 'opencode'
@@ -20,14 +28,24 @@ export type FreshAgentCompatibilityShape = {
   createRequestId?: unknown
   status?: unknown
   resumeSessionId?: unknown
+  timelineSessionId?: unknown
+  cliSessionId?: unknown
   sessionRef?: unknown
+  serverInstanceId?: unknown
+  restoreError?: unknown
   initialCwd?: unknown
   createError?: unknown
+  modelSelection?: unknown
   model?: unknown
   permissionMode?: unknown
+  sandbox?: unknown
   effort?: unknown
   plugins?: unknown
+  style?: unknown
   settingsDismissed?: unknown
+  showThinking?: unknown
+  showTools?: unknown
+  showTimecodes?: unknown
 }
 
 export type FreshAgentDescriptor = {
@@ -101,6 +119,56 @@ export function normalizeFreshAgentSessionType(
   return isFreshAgentSessionType(value) ? value : undefined
 }
 
+export function migrateLegacyFreshAgentDurableState({
+  provider,
+  sessionRef,
+  resumeSessionId,
+  rejectNonCanonicalClaudeSessionRef = false,
+}: {
+  provider?: FreshAgentRuntimeProvider
+  sessionRef?: unknown
+  resumeSessionId?: string
+  rejectNonCanonicalClaudeSessionRef?: boolean
+}): {
+  sessionRef?: SessionRef
+  restoreError?: RestoreError
+} {
+  const explicitSessionRef = sanitizeSessionRef(sessionRef)
+  if (explicitSessionRef) {
+    if (
+      rejectNonCanonicalClaudeSessionRef
+      && explicitSessionRef.provider === 'claude'
+      && !isCanonicalClaudeSessionId(explicitSessionRef.sessionId)
+    ) {
+      return { restoreError: buildRestoreError('invalid_legacy_restore_target') }
+    }
+    return { sessionRef: explicitSessionRef }
+  }
+
+  if (!provider || !resumeSessionId) {
+    return {}
+  }
+
+  if (provider === 'claude') {
+    if (isCanonicalClaudeSessionId(resumeSessionId)) {
+      return {
+        sessionRef: {
+          provider,
+          sessionId: resumeSessionId,
+        },
+      }
+    }
+    return { restoreError: buildRestoreError('invalid_legacy_restore_target') }
+  }
+
+  return {
+    sessionRef: {
+      provider,
+      sessionId: resumeSessionId,
+    },
+  }
+}
+
 export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibilityShape>(
   input: T,
 ): T | (Omit<T, 'kind' | 'provider'> & {
@@ -137,16 +205,33 @@ export function migrateLegacyFreshAgentContent<T extends FreshAgentCompatibility
   }
 
   const sessionType = normalizeFreshAgentSessionType(input.provider)
+    ?? (input.provider === 'claude' ? 'freshclaude' : undefined)
   const provider = resolveFreshAgentRuntimeProvider(sessionType)
-  if (!sessionType || !provider) {
-    return input
-  }
+    ?? (input.provider === 'claude' ? 'claude' : undefined)
+  const resumeSessionId = typeof input.resumeSessionId === 'string'
+    ? input.resumeSessionId
+    : (typeof input.timelineSessionId === 'string'
+        ? input.timelineSessionId
+        : (typeof input.cliSessionId === 'string' ? input.cliSessionId : undefined))
+  const durableState = migrateLegacyFreshAgentDurableState({
+    provider,
+    sessionRef: input.sessionRef,
+    resumeSessionId,
+    rejectNonCanonicalClaudeSessionRef: true,
+  })
+  const hasUsableIdentity = !!durableState.sessionRef
+    || (typeof input.sessionId === 'string' && input.sessionId.length > 0)
 
   return {
     ...input,
     kind: 'fresh-agent',
-    provider,
-    sessionType,
+    sessionType: sessionType ?? 'freshclaude',
+    provider: provider ?? 'claude',
+    sessionRef: durableState.sessionRef,
+    restoreError: durableState.restoreError
+      ?? (!sessionType || !provider || !hasUsableIdentity
+        ? buildRestoreError('invalid_legacy_restore_target')
+        : undefined),
   }
 }
 

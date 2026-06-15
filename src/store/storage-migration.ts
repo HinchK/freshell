@@ -14,16 +14,24 @@
 
 import { createLogger } from '@/lib/client-logger'
 import { clearAuthCookie } from '@/lib/auth'
-import { LAYOUT_SCHEMA_VERSION, PANES_SCHEMA_VERSION, migrateV2ToV3 } from './persistedState'
+import {
+  LAYOUT_FRESH_AGENT_BACKUP_KEY,
+  LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+  LAYOUT_FRESH_AGENT_MIGRATION_ID,
+  LAYOUT_SCHEMA_VERSION,
+  PANES_SCHEMA_VERSION,
+  hashPersistedLayoutRaw,
+  migrateV2ToV3,
+  readRecoverablePersistedLayoutRaw,
+} from './persistedState'
 import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY } from './storage-keys'
 import {
   buildRestoreError,
-  migrateLegacyAgentChatDurableState,
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
 } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
-import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
+import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
 
 const log = createLogger('StorageMigration')
 
@@ -33,6 +41,17 @@ const AUTH_STORAGE_KEY = 'freshell.auth-token'
 const LEGACY_BROWSER_PREFERENCE_KEYS = [
   'freshell.terminal.fontFamily.v1',
 ] as const
+
+type PersistedLayoutMigrationResult = 'none' | 'migrated' | 'failed'
+
+function warnStructured(event: string, details: Record<string, unknown>): void {
+  log.warn(JSON.stringify({
+    severity: 'warn',
+    component: 'storage-migration',
+    event,
+    ...details,
+  }))
+}
 
 function readStorageVersion(): number {
   const stored = localStorage.getItem(STORAGE_VERSION_KEY)
@@ -138,33 +157,20 @@ function normalizeLayoutNode(node: unknown): unknown {
       }
     }
 
-    if (content.kind === 'agent-chat') {
-      const durableState = migrateLegacyAgentChatDurableState({
-        sessionRef: content.sessionRef,
-        cliSessionId: typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined,
-        timelineSessionId: typeof content.timelineSessionId === 'string' ? content.timelineSessionId : undefined,
-        resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
-      })
-      const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
-      return {
-        ...candidate,
-        content: {
-          ...rest,
-          ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
-          ...(durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
-        },
-      }
-    }
-
     if (content.kind === 'fresh-agent') {
-      const durableState = content.provider === 'claude'
-        ? migrateLegacyAgentChatDurableState({
-            sessionRef: content.sessionRef,
-            cliSessionId: typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined,
-            timelineSessionId: typeof content.timelineSessionId === 'string' ? content.timelineSessionId : undefined,
-            resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
-          })
-        : { sessionRef: sanitizeSessionRef(content.sessionRef) }
+      const provider = content.provider === 'claude' || content.provider === 'codex' || content.provider === 'opencode'
+        ? content.provider
+        : undefined
+      const durableState = migrateLegacyFreshAgentDurableState({
+        provider,
+        sessionRef: content.sessionRef,
+        resumeSessionId: typeof content.resumeSessionId === 'string'
+          ? content.resumeSessionId
+          : (typeof content.timelineSessionId === 'string'
+              ? content.timelineSessionId
+              : (typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined)),
+        rejectNonCanonicalClaudeSessionRef: true,
+      })
       const { sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
       return {
         ...candidate,
@@ -202,19 +208,70 @@ function normalizeLayoutNode(node: unknown): unknown {
   return node
 }
 
-function migratePersistedLayout(): boolean {
-  const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
-  if (!raw) return false
+function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: string, expectedCurrentRaw: string): boolean {
+  try {
+    localStorage.setItem(LAYOUT_FRESH_AGENT_BACKUP_KEY, originalRaw)
+  } catch (error) {
+    warnStructured('fresh_agent_layout_backup_write_failed', {
+      key: LAYOUT_FRESH_AGENT_BACKUP_KEY,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return false
+  }
+
+  const currentRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+  if (currentRaw !== expectedCurrentRaw) {
+    warnStructured('fresh_agent_layout_interleaving_write_detected', {
+      key: LAYOUT_STORAGE_KEY,
+    })
+    return false
+  }
+
+  try {
+    localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
+    localStorage.setItem(LAYOUT_STORAGE_KEY, migratedRaw)
+  } catch (error) {
+    warnStructured('fresh_agent_layout_write_failed', {
+      key: LAYOUT_STORAGE_KEY,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return false
+  }
+
+  try {
+    localStorage.setItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY, JSON.stringify({
+      version: 1,
+      migration: LAYOUT_FRESH_AGENT_MIGRATION_ID,
+      backupKey: LAYOUT_FRESH_AGENT_BACKUP_KEY,
+      originalHash: hashPersistedLayoutRaw(originalRaw),
+      migratedHash: hashPersistedLayoutRaw(migratedRaw),
+      committedAt: Date.now(),
+    }))
+  } catch (error) {
+    warnStructured('fresh_agent_layout_commit_marker_write_failed', {
+      key: LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return false
+  }
+
+  return true
+}
+
+function migratePersistedLayout(): PersistedLayoutMigrationResult {
+  const expectedCurrentRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+  const raw = readRecoverablePersistedLayoutRaw()
+  if (!raw) return 'none'
 
   let parsed: any
   try {
     parsed = JSON.parse(raw)
   } catch {
-    return false
+    return 'none'
   }
 
   if (!parsed || typeof parsed !== 'object' || !parsed.tabs || !parsed.panes) {
-    return false
+    return 'none'
   }
 
   const nextTabs = Array.isArray(parsed.tabs.tabs)
@@ -226,7 +283,7 @@ function migratePersistedLayout(): boolean {
     )
     : {}
 
-  localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify({
+  const migratedRaw = JSON.stringify({
     persistedAt: typeof parsed.persistedAt === 'number' ? parsed.persistedAt : Date.now(),
     version: LAYOUT_SCHEMA_VERSION,
     tabs: {
@@ -242,17 +299,19 @@ function migratePersistedLayout(): boolean {
       paneTitleSetByUser: parsed.panes.paneTitleSetByUser ?? {},
     },
     tombstones: Array.isArray(parsed.tombstones) ? parsed.tombstones : [],
-  }))
-  return true
+  })
+
+  return writeMigratedLayoutWithRecovery(raw, migratedRaw, expectedCurrentRaw ?? raw) ? 'migrated' : 'failed'
 }
 
-function preservePersistedLayout(): boolean {
-  if (migratePersistedLayout()) {
-    return true
+function preservePersistedLayout(): PersistedLayoutMigrationResult {
+  const migrated = migratePersistedLayout()
+  if (migrated !== 'none') {
+    return migrated
   }
 
   if (!migrateV2ToV3()) {
-    return false
+    return 'none'
   }
 
   return migratePersistedLayout()
@@ -265,10 +324,18 @@ export function runStorageMigration(): void {
 
     const preservedAuthToken = localStorage.getItem(AUTH_STORAGE_KEY)
     const migratedLayout = preservePersistedLayout()
+    if (migratedLayout === 'failed') {
+      warnStructured('fresh_agent_layout_migration_aborted', {
+        key: LAYOUT_STORAGE_KEY,
+      })
+      return
+    }
     clearFreshellKeysExcept([
       AUTH_STORAGE_KEY,
       BROWSER_PREFERENCES_STORAGE_KEY,
       LAYOUT_STORAGE_KEY,
+      LAYOUT_FRESH_AGENT_BACKUP_KEY,
+      LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
       ...LEGACY_BROWSER_PREFERENCE_KEYS,
     ])
 
@@ -281,7 +348,7 @@ export function runStorageMigration(): void {
     localStorage.setItem(STORAGE_VERSION_KEY, String(STORAGE_VERSION))
     log.info(
       `Migrated localStorage (version ${currentVersion} → ${STORAGE_VERSION}) ` +
-      `${migratedLayout ? 'while preserving restorable layout state.' : 'without preserved layout state.'}`
+      `${migratedLayout === 'migrated' ? 'while preserving restorable layout state.' : 'without preserved layout state.'}`
     )
   } catch (err) {
     log.warn('Storage migration failed:', err)

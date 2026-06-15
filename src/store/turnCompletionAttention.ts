@@ -1,15 +1,15 @@
 // Reverse lookup: map a turn-completion sessionKey (`provider:sessionId`) to the
-// tab/pane that owns the SDK session (fresh-agent or legacy agent-chat).
+// tab/pane that owns the SDK session (fresh-agent).
 //
 // This is the SDK-pane analogue of selectTabPaneByTerminalId (which only matches
 // terminal-kind panes). The sessionKey here is the `provider:sessionId` form
-// produced by resolveFreshAgentSessionKey/resolveAgentChatSessionKey — NOT the
+// produced by resolveFreshAgentSessionKey — NOT the
 // fresh-agent slice-lookup key (makeFreshAgentSessionKey). See the plan's
 // "TWO KEY NAMESPACES" note.
 
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { collectPaneEntries } from '@/lib/pane-utils'
-import { resolveAgentChatSessionKey, resolveFreshAgentSessionKey } from '@/lib/pane-activity'
+import { resolveFreshAgentSessionKey } from '@/lib/pane-activity'
 import { clearPaneAttention, clearTabAttention } from './turnCompletionSlice'
 import type { AppDispatch, RootState } from './store'
 
@@ -33,13 +33,6 @@ export function selectPaneBySessionKey(
           })]
           : undefined
         if (resolveFreshAgentSessionKey(content, session) === sessionKey) {
-          return { tabId, paneId: entry.paneId }
-        }
-      } else if (content.kind === 'agent-chat') {
-        const session = content.sessionId
-          ? state.agentChat?.sessions?.[content.sessionId]
-          : undefined
-        if (resolveAgentChatSessionKey(content, session) === sessionKey) {
           return { tabId, paneId: entry.paneId }
         }
       }
@@ -69,4 +62,3 @@ export function dismissTabGreen(tabId: string) {
     }
   }
 }
-

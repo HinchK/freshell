@@ -2,17 +2,19 @@ import { z } from 'zod'
 import { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY } from './storage-keys'
 import {
   buildRestoreError,
-  migrateLegacyAgentChatDurableState,
   migrateLegacyTerminalDurableState,
   sanitizeSessionRef,
 } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
-import { migrateLegacyFreshAgentContent } from '@shared/fresh-agent'
+import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
 
 export { LAYOUT_STORAGE_KEY, TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
 export const TABS_SCHEMA_VERSION = 2
 export const PANES_SCHEMA_VERSION = 7
+export const LAYOUT_FRESH_AGENT_BACKUP_KEY = `${LAYOUT_STORAGE_KEY}.backup-before-fresh-agent-centralization`
+export const LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY = `${LAYOUT_STORAGE_KEY}.fresh-agent-centralization-commit`
+export const LAYOUT_FRESH_AGENT_MIGRATION_ID = 'fresh-agent-centralization'
 
 const zTabMode = z.enum(['shell', 'claude', 'codex', 'opencode', 'gemini', 'kimi'])
 const zCodingCliProvider = z.enum(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
@@ -192,41 +194,20 @@ function normalizeTerminalContent(content: Record<string, unknown>): Record<stri
   }
 }
 
-function normalizeAgentChatContent(content: Record<string, unknown>): Record<string, unknown> {
-  const durableState = migrateLegacyAgentChatDurableState({
-    sessionRef: content.sessionRef,
-    cliSessionId: typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined,
-    timelineSessionId: typeof content.timelineSessionId === 'string' ? content.timelineSessionId : undefined,
-    resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
-  })
-  const existingRestoreError = (
-    content.restoreError
-    && typeof content.restoreError === 'object'
-    && (content.restoreError as any).code === 'RESTORE_UNAVAILABLE'
-    && typeof (content.restoreError as any).reason === 'string'
-  )
-    ? content.restoreError
-    : undefined
-  const { resumeSessionId: _resumeSessionId, sessionRef: _legacySessionRef, restoreError: _legacyRestoreError, ...rest } = content
-
-  return {
-    ...rest,
-    ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
-    ...((durableState.restoreError ?? existingRestoreError)
-      ? { restoreError: durableState.restoreError ?? existingRestoreError }
-      : {}),
-  }
-}
-
 function normalizeFreshAgentContent(content: Record<string, unknown>): Record<string, unknown> {
-  const durableState = content.provider === 'claude'
-    ? migrateLegacyAgentChatDurableState({
-        sessionRef: content.sessionRef,
-        cliSessionId: typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined,
-        timelineSessionId: typeof content.timelineSessionId === 'string' ? content.timelineSessionId : undefined,
-        resumeSessionId: typeof content.resumeSessionId === 'string' ? content.resumeSessionId : undefined,
-      })
-    : { sessionRef: sanitizeSessionRef(content.sessionRef) }
+  const provider = content.provider === 'claude' || content.provider === 'codex' || content.provider === 'opencode'
+    ? content.provider
+    : undefined
+  const durableState = migrateLegacyFreshAgentDurableState({
+    provider,
+    sessionRef: content.sessionRef,
+    resumeSessionId: typeof content.resumeSessionId === 'string'
+      ? content.resumeSessionId
+      : (typeof content.timelineSessionId === 'string'
+          ? content.timelineSessionId
+          : (typeof content.cliSessionId === 'string' ? content.cliSessionId : undefined)),
+    rejectNonCanonicalClaudeSessionRef: true,
+  })
   const existingRestoreError = (
     content.restoreError
     && typeof content.restoreError === 'object'
@@ -255,8 +236,6 @@ function normalizePersistedNode(node: unknown): unknown {
     let nextContent = content
     if (content.kind === 'terminal') {
       nextContent = normalizeTerminalContent(content)
-    } else if (content.kind === 'agent-chat') {
-      nextContent = normalizeAgentChatContent(content)
     } else if (content.kind === 'fresh-agent') {
       nextContent = normalizeFreshAgentContent(content)
     } else if ('sessionRef' in content) {
@@ -333,6 +312,61 @@ export type ParsedPersistedLayout = {
   panes: ParsedPersistedPanes
   tombstones: Array<{ id: string; deletedAt: number }>
   persistedAt?: number
+}
+
+export type LayoutFreshAgentCommitMarker = {
+  version: 1
+  migration: typeof LAYOUT_FRESH_AGENT_MIGRATION_ID
+  backupKey: typeof LAYOUT_FRESH_AGENT_BACKUP_KEY
+  originalHash: string
+  migratedHash: string
+  committedAt: number
+}
+
+export function hashPersistedLayoutRaw(raw: string): string {
+  let hash = 0x811c9dc5
+  for (let index = 0; index < raw.length; index += 1) {
+    hash ^= raw.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+  return `${raw.length}:${hash.toString(16).padStart(8, '0')}`
+}
+
+export function parseLayoutFreshAgentCommitMarker(raw: string | null): LayoutFreshAgentCommitMarker | null {
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as Partial<LayoutFreshAgentCommitMarker>
+    if (
+      parsed?.version !== 1
+      || parsed.migration !== LAYOUT_FRESH_AGENT_MIGRATION_ID
+      || parsed.backupKey !== LAYOUT_FRESH_AGENT_BACKUP_KEY
+      || typeof parsed.originalHash !== 'string'
+      || typeof parsed.migratedHash !== 'string'
+      || typeof parsed.committedAt !== 'number'
+    ) {
+      return null
+    }
+    return parsed as LayoutFreshAgentCommitMarker
+  } catch {
+    return null
+  }
+}
+
+export function readRecoverablePersistedLayoutRaw(storage: Pick<Storage, 'getItem'> = localStorage): string | null {
+  const raw = storage.getItem(LAYOUT_STORAGE_KEY)
+  const backup = storage.getItem(LAYOUT_FRESH_AGENT_BACKUP_KEY)
+  const markerRaw = storage.getItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
+
+  if (!raw) return backup
+  if (!backup) return raw
+
+  const marker = parseLayoutFreshAgentCommitMarker(markerRaw)
+  if (!markerRaw) return backup
+  if (marker && marker.migratedHash === hashPersistedLayoutRaw(raw)) {
+    return raw
+  }
+
+  return parsePersistedLayoutRaw(raw) ? raw : backup
 }
 
 export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | null {

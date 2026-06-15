@@ -35,10 +35,6 @@ function matchesDesiredResumeContentKind(
   content: PaneContent,
   desiredResumeContent: ReturnType<typeof buildResumeContent>,
 ): boolean {
-  if (desiredResumeContent.kind === 'agent-chat') {
-    return content.kind === 'agent-chat' && content.provider === desiredResumeContent.provider
-  }
-
   if (desiredResumeContent.kind === 'fresh-agent') {
     return content.kind === 'fresh-agent'
       && content.sessionType === desiredResumeContent.sessionType
@@ -632,10 +628,6 @@ export const openSessionTab = createAsyncThunk(
             && content.mode === resolvedProvider
             && content.resumeSessionId === sessionId
           ) || (
-            content.kind === 'agent-chat'
-            && resolvedProvider === 'claude'
-            && content.resumeSessionId === sessionId
-          ) || (
             content.kind === 'fresh-agent'
             && content.provider === resolvedProvider
             && content.resumeSessionId === sessionId
@@ -736,7 +728,6 @@ export const openSessionTab = createAsyncThunk(
                   && sessionRef.sessionId === sessionId
                 const matchesImplicitRef = (
                   (content.kind === 'terminal' && content.mode === resolvedProvider && content.resumeSessionId === sessionId) ||
-                  (content.kind === 'agent-chat' && resolvedProvider === 'claude' && content.resumeSessionId === sessionId) ||
                   (content.kind === 'fresh-agent' && content.provider === resolvedProvider && content.resumeSessionId === sessionId)
                 )
                 if (matchesExplicitRef || matchesImplicitRef) {

@@ -3,30 +3,24 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import {
-  isAgentChatBusy,
   isFreshAgentBusy,
-  resolveAgentChatSessionKey,
   resolveFreshAgentSessionKey,
 } from '@/lib/pane-activity'
 import { recordTurnComplete } from '@/store/turnCompletionSlice'
-import type { ChatSessionState } from '@/store/agentChatTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
-const EMPTY_AGENT_CHAT_SESSIONS: Record<string, ChatSessionState> = {}
 
 type SessionEdgeState = { wasBusy: boolean; hadPending: boolean }
 
-function hasWaitingItems(
-  session: FreshAgentSessionState | ChatSessionState | undefined,
-): boolean {
+function hasWaitingItems(session: FreshAgentSessionState | undefined): boolean {
   if (!session) return false
   return Object.keys(session.pendingPermissions).length > 0
     || Object.keys(session.pendingQuestions).length > 0
 }
 
 /**
- * Bridges SDK-driven panes (fresh-agent + legacy agent-chat) into the existing
+ * Bridges SDK-driven fresh-agent panes into the existing
  * GREEN/SOUND pipeline. Watches each SDK pane's busy/pending edges and fires
  * recordTurnComplete on:
  *  - a real busy -> idle transition (turn complete), and
@@ -42,7 +36,6 @@ export function useAgentSessionTurnCompletion(): void {
   const dispatch = useAppDispatch()
   const layouts = useAppSelector((s) => s.panes?.layouts)
   const freshAgentSessions = useAppSelector((s) => s.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)
-  const agentChatSessions = useAppSelector((s) => s.agentChat?.sessions ?? EMPTY_AGENT_CHAT_SESSIONS)
   const prevRef = useRef<Map<string, SessionEdgeState>>(new Map())
 
   useEffect(() => {
@@ -67,11 +60,6 @@ export function useAgentSessionTurnCompletion(): void {
             : undefined
           sessionKey = resolveFreshAgentSessionKey(content, session)
           isBusy = isFreshAgentBusy(content, session)
-          hasPending = hasWaitingItems(session)
-        } else if (content.kind === 'agent-chat') {
-          const session = content.sessionId ? agentChatSessions[content.sessionId] : undefined
-          sessionKey = resolveAgentChatSessionKey(content, session)
-          isBusy = isAgentChatBusy(content, session)
           hasPending = hasWaitingItems(session)
         } else {
           continue
@@ -115,5 +103,5 @@ export function useAgentSessionTurnCompletion(): void {
     for (const key of prevRef.current.keys()) {
       if (!seen.has(key)) prevRef.current.delete(key)
     }
-  }, [layouts, freshAgentSessions, agentChatSessions, dispatch])
+  }, [layouts, freshAgentSessions, dispatch])
 }

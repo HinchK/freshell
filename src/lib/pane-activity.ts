@@ -211,15 +211,6 @@ export function resolvePaneActivity(input: {
       : IDLE_PANE_ACTIVITY
   }
 
-  if (input.content.kind === 'agent-chat') {
-    const session = input.content.sessionId
-      ? input.agentChatSessions[input.content.sessionId]
-      : undefined
-    return isAgentChatBusy(input.content, session)
-      ? { isBusy: true, source: 'agent-chat' }
-      : IDLE_PANE_ACTIVITY
-  }
-
   if (input.content.kind === 'fresh-agent') {
     const session = input.content.sessionId
       ? input.freshAgentSessions?.[makeFreshAgentSessionKey({
@@ -337,15 +328,8 @@ export function collectBusySessionKeys(input: {
       }).isBusy
       if (!busy) continue
 
-      const sessionKey = entry.content.kind === 'agent-chat'
-        ? resolveAgentChatSessionKey(
-          entry.content,
-          entry.content.sessionId
-            ? input.agentChatSessions[entry.content.sessionId]
-            : undefined,
-        )
-        : entry.content.kind === 'fresh-agent'
-          ? resolveFreshAgentSessionKey(
+      const sessionKey = entry.content.kind === 'fresh-agent'
+        ? resolveFreshAgentSessionKey(
             entry.content,
             entry.content.sessionId
               ? input.freshAgentSessions?.[makeFreshAgentSessionKey({

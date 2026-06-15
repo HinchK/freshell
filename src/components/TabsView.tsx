@@ -16,7 +16,7 @@ import {
 } from 'lucide-react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient } from '@/lib/ws-client'
-import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
+import { RegistryPaneSnapshotSchema, type RegistryPaneSnapshot, type RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { addTab, setActiveTab } from '@/store/tabsSlice'
 import { addPane, initLayout } from '@/store/panesSlice'
 import { setTabRegistryLoading, setTabRegistrySearchRangeDays } from '@/store/tabRegistrySlice'
@@ -34,8 +34,7 @@ import {
   type SessionLocator,
 } from '@/store/paneTypes'
 import type { CodingCliProviderName, TabMode } from '@/store/types'
-import type { AgentChatProviderName } from '@/lib/agent-chat-types'
-import { migrateLegacyAgentChatDurableState } from '@shared/session-contract'
+import { RestoreErrorSchema } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { normalizeFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
@@ -104,11 +103,17 @@ function parseLiveTerminalHandle(
   }
 }
 
-function sanitizePaneSnapshot(
+function normalizePaneSnapshot(snapshot: RegistryPaneSnapshot): RegistryPaneSnapshot {
+  const parsed = RegistryPaneSnapshotSchema.safeParse(snapshot)
+  return parsed.success ? parsed.data : snapshot
+}
+
+export function sanitizePaneSnapshot(
   record: RegistryTabRecord,
-  snapshot: RegistryPaneSnapshot,
+  rawSnapshot: RegistryPaneSnapshot,
   localServerInstanceId?: string,
 ): PaneContentInput {
+  const snapshot = normalizePaneSnapshot(rawSnapshot)
   const payload = snapshot.payload || {}
   const sameServer = !!localServerInstanceId && record.serverInstanceId === localServerInstanceId
   if (snapshot.kind === 'terminal') {
@@ -147,27 +152,6 @@ function sanitizePaneSnapshot(
       wordWrap: payload.wordWrap !== false,
     }
   }
-  if (snapshot.kind === 'agent-chat') {
-    const durableState = migrateLegacyAgentChatDurableState({
-      sessionRef: payload.sessionRef,
-      cliSessionId: typeof payload.cliSessionId === 'string' ? payload.cliSessionId : undefined,
-      timelineSessionId: typeof payload.timelineSessionId === 'string' ? payload.timelineSessionId : undefined,
-      resumeSessionId: typeof payload.resumeSessionId === 'string' ? payload.resumeSessionId : undefined,
-    })
-    return {
-      kind: 'agent-chat',
-      provider: ((payload.provider as string | undefined) || 'freshclaude') as AgentChatProviderName,
-      sessionId: sameServer && typeof payload.sessionId === 'string' ? payload.sessionId : undefined,
-      ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
-      ...(durableState.restoreError ? { restoreError: durableState.restoreError } : {}),
-      serverInstanceId: record.serverInstanceId,
-      initialCwd: payload.initialCwd as string | undefined,
-      modelSelection: normalizeAgentChatModelSelection(payload.modelSelection, payload.model),
-      permissionMode: payload.permissionMode as string | undefined,
-      effort: normalizeAgentChatEffortOverride(payload.effort),
-      plugins: payload.plugins as string[] | undefined,
-    }
-  }
   if (snapshot.kind === 'fresh-agent') {
     const sessionType = normalizeFreshAgentSessionType(payload.sessionType)
       ?? normalizeFreshAgentSessionType(payload.provider)
@@ -188,12 +172,15 @@ function sanitizePaneSnapshot(
       fallbackSessionId: resumeSessionId,
     })
     const style = normalizeFreshAgentStyleOverride(payload.style)
+    const restoreError = RestoreErrorSchema.safeParse(payload.restoreError)
     return {
       kind: 'fresh-agent',
       sessionType,
       provider,
+      sessionId: sameServer && typeof payload.sessionId === 'string' ? payload.sessionId : undefined,
       resumeSessionId,
       ...(sessionRef ? { sessionRef } : {}),
+      ...(restoreError.success && !sessionRef ? { restoreError: restoreError.data } : {}),
       serverInstanceId: record.serverInstanceId,
       initialCwd: payload.initialCwd as string | undefined,
       model: payload.model as string | undefined,
@@ -203,6 +190,10 @@ function sanitizePaneSnapshot(
       effort: normalizeAgentChatEffortOverride(payload.effort),
       plugins: payload.plugins as string[] | undefined,
       ...(style ? { style } : {}),
+      settingsDismissed: typeof payload.settingsDismissed === 'boolean' ? payload.settingsDismissed : undefined,
+      showThinking: typeof payload.showThinking === 'boolean' ? payload.showThinking : undefined,
+      showTools: typeof payload.showTools === 'boolean' ? payload.showTools : undefined,
+      showTimecodes: typeof payload.showTimecodes === 'boolean' ? payload.showTimecodes : undefined,
     }
   }
   if (snapshot.kind === 'extension') {
@@ -222,7 +213,6 @@ function deriveModeFromRecord(record: RegistryTabRecord): TabMode {
     if (typeof mode === 'string') return mode as TabMode
     return 'shell'
   }
-  if (firstKind === 'agent-chat') return 'claude'
   if (firstKind === 'fresh-agent') {
     const provider = record.panes[0]?.payload?.provider
     if (typeof provider === 'string' && isNonShellMode(provider)) return provider as TabMode
@@ -235,7 +225,7 @@ function paneKindIcon(kind: RegistryPaneSnapshot['kind']): LucideIcon {
   if (kind === 'terminal') return TerminalSquare
   if (kind === 'browser') return Globe
   if (kind === 'editor') return FileCode2
-  if (kind === 'agent-chat' || kind === 'fresh-agent') return Bot
+  if (kind === 'fresh-agent') return Bot
   return Square
 }
 
@@ -243,7 +233,7 @@ function paneKindColorClass(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'terminal') return 'text-foreground/50'
   if (kind === 'browser') return 'text-blue-500'
   if (kind === 'editor') return 'text-emerald-500'
-  if (kind === 'agent-chat' || kind === 'fresh-agent' || kind === 'claude-chat') return 'text-amber-500'
+  if (kind === 'fresh-agent' || kind === 'claude-chat') return 'text-amber-500'
   if (kind === 'extension') return 'text-purple-500'
   return 'text-muted-foreground'
 }
@@ -252,7 +242,7 @@ function paneKindLabel(kind: RegistryPaneSnapshot['kind']): string {
   if (kind === 'terminal') return 'Terminal'
   if (kind === 'browser') return 'Browser'
   if (kind === 'editor') return 'Editor'
-  if (kind === 'agent-chat' || kind === 'fresh-agent' || kind === 'claude-chat') return 'Agent'
+  if (kind === 'fresh-agent' || kind === 'claude-chat') return 'Agent'
   if (kind === 'extension') return 'Extension'
   return kind
 }

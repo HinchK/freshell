@@ -1,5 +1,6 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
 import type { RegistryTabRecord } from './tabRegistryTypes'
+import { normalizeRegistryTabRecord } from './tabRegistryTypes'
 import type { Tab } from './types'
 import type { PaneNode } from './paneTypes'
 import { getClosedTabRetentionDaysPreference } from '@/lib/browser-preferences'
@@ -222,6 +223,12 @@ export interface ClosedTabEntry {
 
 const REOPEN_STACK_MAX = 20
 
+function normalizeRegistryRecords(records: RegistryTabRecord[] | undefined): RegistryTabRecord[] {
+  return (records || [])
+    .map((record) => normalizeRegistryTabRecord(record))
+    .filter((record): record is RegistryTabRecord => !!record)
+}
+
 export interface TabRegistryState {
   deviceId: string
   deviceLabel: string
@@ -306,10 +313,10 @@ export const tabRegistrySlice = createSlice({
         devices?: Array<{ deviceId: string; deviceLabel: string; lastSeenAt: number }>
       }>,
     ) => {
-      state.localOpen = action.payload.localOpen || []
-      state.sameDeviceOpen = action.payload.sameDeviceOpen || []
-      state.remoteOpen = action.payload.remoteOpen || []
-      state.closed = action.payload.closed || []
+      state.localOpen = normalizeRegistryRecords(action.payload.localOpen)
+      state.sameDeviceOpen = normalizeRegistryRecords(action.payload.sameDeviceOpen)
+      state.remoteOpen = normalizeRegistryRecords(action.payload.remoteOpen)
+      state.closed = normalizeRegistryRecords(action.payload.closed)
       state.devices = action.payload.devices || []
       state.lastSnapshotAt = Date.now()
       state.syncError = undefined
@@ -319,7 +326,10 @@ export const tabRegistrySlice = createSlice({
       state.syncError = action.payload
     },
     recordClosedTabSnapshot: (state, action: PayloadAction<RegistryTabRecord>) => {
-      state.localClosed[action.payload.tabKey] = action.payload
+      const normalized = normalizeRegistryTabRecord(action.payload)
+      if (normalized) {
+        state.localClosed[normalized.tabKey] = normalized
+      }
     },
     clearTabRegistryLocalClosed: (state) => {
       state.localClosed = {}

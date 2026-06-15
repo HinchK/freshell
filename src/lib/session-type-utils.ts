@@ -5,7 +5,7 @@ import { getAgentChatProviderConfig } from '@/lib/agent-chat-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { AgentChatProviderName, AgentChatProviderSettings } from '@/lib/agent-chat-types'
 import type { CodingCliProviderName } from '@/store/types'
-import type { FreshAgentPaneInput, AgentChatPaneInput, TerminalPaneInput } from '@/store/paneTypes'
+import type { FreshAgentPaneInput, TerminalPaneInput } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import {
   getPairedPublicSessionType,
@@ -85,7 +85,7 @@ export function getPairedSessionTypeTarget(
 
 /**
  * Build the correct PaneContentInput for resuming a session based on its sessionType.
- * Agent-chat sessions (freshclaude, kilroy) → kind: 'agent-chat'
+ * Fresh-agent sessions (freshclaude, kilroy) → kind: 'fresh-agent'
  * Terminal sessions (claude, codex) → kind: 'terminal'
  */
 export function buildResumeContent(opts: {
@@ -97,7 +97,7 @@ export function buildResumeContent(opts: {
     terminalId: string
     serverInstanceId: string
   }
-}): TerminalPaneInput | FreshAgentPaneInput | AgentChatPaneInput {
+}): TerminalPaneInput | FreshAgentPaneInput {
   const freshAgentType = resolveFreshAgentType(opts.sessionType)
   if (freshAgentType) {
     const agentConfig = getAgentChatProviderConfig(opts.sessionType)

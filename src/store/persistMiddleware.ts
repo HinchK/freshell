@@ -5,7 +5,14 @@ import type { Tab } from './types'
 import { nanoid } from 'nanoid'
 import { broadcastPersistedRaw } from './persistBroadcast'
 import { isWellFormedPaneTree } from './paneTreeValidation.js'
-import { PANES_SCHEMA_VERSION, LAYOUT_SCHEMA_VERSION, parsePersistedLayoutRaw } from './persistedState.js'
+import {
+  LAYOUT_FRESH_AGENT_BACKUP_KEY,
+  LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+  PANES_SCHEMA_VERSION,
+  LAYOUT_SCHEMA_VERSION,
+  parsePersistedLayoutRaw,
+  readRecoverablePersistedLayoutRaw,
+} from './persistedState.js'
 import { LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { flushPersistedLayoutNow } from './persistControl'
@@ -94,7 +101,7 @@ export function loadPersistedLayout(): typeof cachedPersistedLayout {
   if (cachedPersistedLayout !== undefined) return cachedPersistedLayout
 
   try {
-    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    const raw = readRecoverablePersistedLayoutRaw(localStorage)
     if (raw) {
       const layoutParsed = parsePersistedLayoutRaw(raw)
       if (layoutParsed) {
@@ -143,14 +150,6 @@ function migratePaneContent(content: any): any {
     return content
   }
   content = migrateLegacyFreshAgentContent(content)
-  if (content.kind === 'agent-chat') {
-    const { model: _legacyModel, ...rest } = content
-    return {
-      ...rest,
-      modelSelection: normalizeAgentChatModelSelection(content.modelSelection, content.model),
-      effort: normalizeAgentChatEffortOverride(content.effort),
-    }
-  }
   if (content.kind === 'fresh-agent') {
     const { model: legacyModel, modelSelection: legacyModelSelection, ...rest } = content
     if (content.provider === 'codex') {
@@ -201,7 +200,7 @@ function stripEditorContent(content: any): any {
 
 function stripTransientSessionFields(content: any): any {
   if (!content || typeof content !== 'object') return content
-  if (content.kind !== 'terminal' && content.kind !== 'agent-chat' && content.kind !== 'fresh-agent') return content
+  if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return content
 
   const sessionRef = sanitizeSessionRef(content.sessionRef)
   const {
@@ -502,6 +501,8 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
 
         const raw = JSON.stringify(layoutPayload)
         localStorage.setItem(LAYOUT_STORAGE_KEY, raw)
+        localStorage.removeItem(LAYOUT_FRESH_AGENT_BACKUP_KEY)
+        localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
         broadcastPersistedRaw(LAYOUT_STORAGE_KEY, raw)
       }
 
