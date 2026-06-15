@@ -1,7 +1,6 @@
 import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '../store'
 import type { BackgroundTerminal, CodingCliProviderName, WorktreeGrouping } from '../types'
-import { isValidClaudeSessionId } from '@/lib/claude-session-id'
 import { collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'

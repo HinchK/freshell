@@ -651,9 +651,8 @@ async function main() {
   const portForwardManager = new PortForwardManager()
   app.use('/api/proxy', createProxyRouter({ portForwardManager }))
 
-  // Legacy fresh-agent predecessor APIs are intentionally not served. Keep
-  // removed /api prefixes from falling through to the production SPA fallback.
-  app.use(['/api/agent-chat', '/api/agent-sessions'], (_req, res) => {
+  // Keep unmatched API requests from falling through to the production SPA fallback.
+  app.use('/api', (_req, res) => {
     res.status(404).json({ error: 'Not found' })
   })
 
