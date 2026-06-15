@@ -1,4 +1,4 @@
-import { MAX_AGENT_TIMELINE_ITEMS } from '../../../../shared/read-models.js'
+import { MAX_FRESH_AGENT_THREAD_TURNS } from '../../../../shared/read-models.js'
 import type { ChatMessage } from '../../../session-history-loader.js'
 import type { ClaudeFreshAgentHistorySource } from './history-source.js'
 import type { ClaudeFreshAgentHistoryCanonicalTurn, ClaudeFreshAgentHistoryRestoreResolution } from './history-ledger.js'
@@ -11,7 +11,7 @@ import type {
 } from './history-types.js'
 
 const DEFAULT_TIMELINE_LIMIT = 20
-const MAX_TIMELINE_LIMIT = MAX_AGENT_TIMELINE_ITEMS
+const MAX_TIMELINE_LIMIT = MAX_FRESH_AGENT_THREAD_TURNS
 
 type TimelineCursorPayload = {
   offset: number

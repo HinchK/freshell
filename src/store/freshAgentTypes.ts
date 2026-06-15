@@ -13,8 +13,8 @@ import type {
 export type { FreshAgentRequestId }
 export type FreshAgentPermissionRequest = FreshAgentPendingApproval
 export type FreshAgentQuestionRequest = FreshAgentPendingQuestion
-export type FreshAgentTimelineItem = FreshAgentTurn
-export type FreshAgentTimelineTurn = FreshAgentTurn
+export type FreshAgentThreadItem = FreshAgentTurn
+export type FreshAgentThreadTurn = FreshAgentTurn
 export type FreshAgentContentBlock = FreshAgentTurn['items'][number]
 export type FreshAgentMessage = FreshAgentTurn
 

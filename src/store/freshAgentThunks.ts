@@ -23,8 +23,8 @@ export function _resetFreshAgentThunkControllers(): void {
   inFlightControllers.clear()
 }
 
-export const loadFreshAgentTimelineWindow = createAsyncThunk(
-  'freshAgent/loadTimelineWindow',
+export const loadFreshAgentThreadTurns = createAsyncThunk(
+  'freshAgent/loadThreadTurns',
   async (
     input: FreshAgentThreadThunkLocator & {
       revision: number
