@@ -4,7 +4,7 @@ import {
   type ClaudeFreshAgentHistoryService,
 } from '../../history/claude/history-service.js'
 import type { ClaudeFreshAgentHistorySource } from '../../history/claude/history-source.js'
-import { synthesizeLiveMessageId, type RestoreResolution } from '../../history/claude/history-ledger.js'
+import { synthesizeClaudeFreshAgentLiveMessageId, type ClaudeFreshAgentHistoryRestoreResolution } from '../../history/claude/history-ledger.js'
 import type { SdkBridge } from '../../../sdk-bridge.js'
 import type { SdkSessionState } from '../../../sdk-bridge-types.js'
 import { logger } from '../../../logger.js'
@@ -60,11 +60,11 @@ function mapMissingResult(ok: boolean, message: string): void {
   }
 }
 
-function buildLiveOnlyResolution(threadId: string, liveSession: SdkSessionState): Extract<RestoreResolution, { kind: 'resolved' }> {
+function buildLiveOnlyResolution(threadId: string, liveSession: SdkSessionState): Extract<ClaudeFreshAgentHistoryRestoreResolution, { kind: 'resolved' }> {
   const turns = liveSession.messages.map((message, index) => {
     const messageId = typeof message.messageId === 'string' && message.messageId.trim().length > 0
       ? message.messageId
-      : synthesizeLiveMessageId(liveSession.sessionId, index)
+      : synthesizeClaudeFreshAgentLiveMessageId(liveSession.sessionId, index)
     return {
       turnId: `turn:${messageId}`,
       messageId,

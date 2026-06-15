@@ -1,4 +1,4 @@
-import type { RestoreResolution } from '../../history/claude/history-ledger.js'
+import type { ClaudeFreshAgentHistoryRestoreResolution } from '../../history/claude/history-ledger.js'
 import type {
   ClaudeFreshAgentHistoryPage,
   ClaudeFreshAgentHistoryTurn,
@@ -78,7 +78,7 @@ export type FreshAgentClaudeSnapshot = {
       timelineSessionId?: string
       liveSessionId?: string
       cliSessionId?: string
-      readiness?: RestoreResolution extends infer T ? T extends { kind: 'resolved'; readiness: infer R } ? R : never : never
+      readiness?: ClaudeFreshAgentHistoryRestoreResolution extends infer T ? T extends { kind: 'resolved'; readiness: infer R } ? R : never : never
     }
   }
 }
@@ -164,7 +164,7 @@ function normalizePendingQuestions(liveSession?: SdkSessionState): FreshAgentPen
 
 export function normalizeClaudeThreadSnapshot(input: {
   threadId: string
-  resolved: Extract<RestoreResolution, { kind: 'resolved' }>
+  resolved: Extract<ClaudeFreshAgentHistoryRestoreResolution, { kind: 'resolved' }>
   liveSession?: SdkSessionState
   status: SdkSessionStatus
 }): FreshAgentClaudeSnapshot {

@@ -1,13 +1,13 @@
 import type { SdkSessionState } from '../../../sdk-bridge-types.js'
 import type { ChatMessage } from '../../../session-history-loader.js'
-import { createRestoreLedgerManager, type RestoreResolution } from './history-ledger.js'
+import { createClaudeFreshAgentRestoreLedgerManager, type ClaudeFreshAgentHistoryRestoreResolution } from './history-ledger.js'
 
 export type ClaudeFreshAgentHistoryResolveOptions = {
   liveSessionOverride?: SdkSessionState
 }
 
 export type ClaudeFreshAgentHistorySource = {
-  resolve: (queryId: string, options?: ClaudeFreshAgentHistoryResolveOptions) => Promise<RestoreResolution>
+  resolve: (queryId: string, options?: ClaudeFreshAgentHistoryResolveOptions) => Promise<ClaudeFreshAgentHistoryRestoreResolution>
   teardownLiveSession: (sessionId: string, options: { recoverable: boolean }) => void
   syncLiveSession?: (liveSession: SdkSessionState) => Promise<void>
 }
@@ -22,5 +22,5 @@ export type ClaudeFreshAgentHistorySourceDeps = {
 export function createClaudeFreshAgentHistorySource(
   deps: ClaudeFreshAgentHistorySourceDeps,
 ): ClaudeFreshAgentHistorySource {
-  return createRestoreLedgerManager(deps)
+  return createClaudeFreshAgentRestoreLedgerManager(deps)
 }

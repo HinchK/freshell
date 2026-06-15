@@ -1,8 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it, vi } from 'vitest'
 import {
-  createDurableMessageFingerprint,
-  createRestoreLedgerManager,
+  createClaudeFreshAgentDurableMessageFingerprint,
+  createClaudeFreshAgentRestoreLedgerManager,
 } from '../../../../server/fresh-agent/history/claude/history-ledger.js'
 import type { SdkSessionState } from '../../../../server/sdk-bridge-types.js'
 import type { ChatMessage } from '../../../../server/session-history-loader.js'
@@ -41,7 +41,7 @@ function makeSession(
 
 describe('restore ledger manager', () => {
   it('returns typed missing outcomes with explicit restore codes', async () => {
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory: vi.fn().mockResolvedValue(null),
       getLiveSessionBySdkSessionId: () => undefined,
       getLiveSessionByCliSessionId: () => undefined,
@@ -73,7 +73,7 @@ describe('restore ledger manager', () => {
       return null
     })
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: (queryId) => (
@@ -155,7 +155,7 @@ describe('restore ledger manager', () => {
       .mockResolvedValueOnce(durableBacklog)
       .mockResolvedValue(durableBacklog)
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
@@ -223,7 +223,7 @@ describe('restore ledger manager', () => {
       sessionId === canonicalSessionId ? durableMessages : null
     ))
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: () => undefined,
       getLiveSessionByCliSessionId: () => undefined,
@@ -265,7 +265,7 @@ describe('restore ledger manager', () => {
       .mockResolvedValueOnce(secondDurableBacklog)
       .mockResolvedValue(secondDurableBacklog)
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
@@ -313,7 +313,7 @@ describe('restore ledger manager', () => {
       .mockResolvedValueOnce(firstDurable)
       .mockResolvedValueOnce(rewrittenDurable)
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: () => undefined,
       getLiveSessionByCliSessionId: () => undefined,
@@ -339,11 +339,11 @@ describe('restore ledger manager', () => {
       model: 'claude',
     }
 
-    expect(createDurableMessageFingerprint({
+    expect(createClaudeFreshAgentDurableMessageFingerprint({
       ...baseMessage,
       parentId: 'parent-a',
       referenceId: 'ref-a',
-    })).not.toBe(createDurableMessageFingerprint({
+    })).not.toBe(createClaudeFreshAgentDurableMessageFingerprint({
       ...baseMessage,
       parentId: 'parent-b',
       referenceId: 'ref-b',
@@ -363,7 +363,7 @@ describe('restore ledger manager', () => {
       .mockResolvedValueOnce(firstDurable)
       .mockResolvedValueOnce(expandedDurable)
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: () => undefined,
       getLiveSessionByCliSessionId: () => undefined,
@@ -387,7 +387,7 @@ describe('restore ledger manager', () => {
       messages: [makeMessage('user', 'ephemeral', { messageId: 'live-msg-1' })],
     })
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory: vi.fn().mockResolvedValue(null),
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: () => undefined,
@@ -429,7 +429,7 @@ describe('restore ledger manager', () => {
       makeMessage('user', 'durable prompt', { messageId: 'durable-msg-1' }),
     ])
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: (id) => (
         liveAvailable && id === liveSession.sessionId ? liveSession : undefined
@@ -474,7 +474,7 @@ describe('restore ledger manager', () => {
       messages: [makeMessage('user', 'hello')],
     })
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory: vi.fn(async (sessionId: string) => (
         sessionId === canonicalSessionId
           ? [makeMessage('user', 'hello', { messageId: 'durable-hello' })]
@@ -525,7 +525,7 @@ describe('restore ledger manager', () => {
       return null
     })
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: (queryId) => {
@@ -560,7 +560,7 @@ describe('restore ledger manager', () => {
       messages: [makeMessage('user', 'alpha')],
     })
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory: vi.fn().mockResolvedValue([
         makeMessage('user', 'alpha', { messageId: 'durable-alpha' }),
       ]),
@@ -606,7 +606,7 @@ describe('restore ledger manager', () => {
       .mockResolvedValueOnce(durableAfterCatchup)
       .mockResolvedValue(durableAfterCatchup)
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: (queryId) => (queryId === canonicalSessionId ? liveSession : undefined),
@@ -674,7 +674,7 @@ describe('restore ledger manager', () => {
       ],
     })
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory: vi.fn().mockResolvedValue(null),
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: () => undefined,
@@ -705,7 +705,7 @@ describe('restore ledger manager', () => {
       ],
     })
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory: vi.fn().mockResolvedValue([
         makeMessage('user', 'hello', { messageId: 'durable-hello-0' }),
       ]),
@@ -739,7 +739,7 @@ describe('restore ledger manager', () => {
       ],
     })
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory: vi.fn().mockResolvedValue([
         makeMessage('user', 'hello', { messageId: 'durable-stable-hello' }),
         makeMessage('assistant', 'world', { messageId: 'durable-stable-world' }),
@@ -784,7 +784,7 @@ describe('restore ledger manager', () => {
       return null
     })
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory,
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: (queryId) => (queryId === liveSession.cliSessionId ? liveSession : undefined),
@@ -826,7 +826,7 @@ describe('restore ledger manager', () => {
       messages: [makeMessage('user', 'hello', { messageId: 'live-msg-1' })],
     })
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory: vi.fn().mockResolvedValue([
         makeMessage('user', 'hello', { messageId: 'durable-msg-1' }),
       ]),
@@ -870,7 +870,7 @@ describe('restore ledger manager', () => {
     })
     const logDivergence = vi.fn()
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory: vi.fn().mockResolvedValue([durablePrompt, durableReply]),
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: (queryId) => (queryId === liveSession.cliSessionId ? liveSession : undefined),
@@ -903,7 +903,7 @@ describe('restore ledger manager', () => {
     })
     const logDivergence = vi.fn()
 
-    const manager = createRestoreLedgerManager({
+    const manager = createClaudeFreshAgentRestoreLedgerManager({
       loadSessionHistory: vi.fn().mockResolvedValue([durablePrompt, durableReply]),
       getLiveSessionBySdkSessionId: (queryId) => (queryId === liveSession.sessionId ? liveSession : undefined),
       getLiveSessionByCliSessionId: (queryId) => (queryId === liveSession.cliSessionId ? liveSession : undefined),

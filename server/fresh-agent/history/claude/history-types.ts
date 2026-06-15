@@ -1,5 +1,5 @@
 import type { ChatMessage } from '../../../session-history-loader.js'
-import type { CanonicalTurn } from './history-ledger.js'
+import type { ClaudeFreshAgentHistoryCanonicalTurn } from './history-ledger.js'
 import type {
   AgentTimelinePageQuery as SharedAgentTimelinePageQuery,
   AgentTimelineTurnBodyQuery as SharedAgentTimelineTurnBodyQuery,
@@ -12,7 +12,7 @@ export type ClaudeFreshAgentHistoryItem = {
   turnId: string
   messageId: string
   ordinal: number
-  source: CanonicalTurn['source']
+  source: ClaudeFreshAgentHistoryCanonicalTurn['source']
   sessionId: string
   role: ChatMessage['role']
   summary: string
@@ -34,6 +34,6 @@ export type ClaudeFreshAgentHistoryTurn = {
   turnId: string
   messageId: string
   ordinal: number
-  source: CanonicalTurn['source']
+  source: ClaudeFreshAgentHistoryCanonicalTurn['source']
   message: ChatMessage
 }

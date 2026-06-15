@@ -16,7 +16,7 @@ import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-ag
 import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
 import { sanitizeFreshAgentPluginPaths } from '../shared/fresh-agent-plugins.js'
 import { logger } from './logger.js'
-import { synthesizeLiveMessageId } from './fresh-agent/history/claude/history-ledger.js'
+import { synthesizeClaudeFreshAgentLiveMessageId } from './fresh-agent/history/claude/history-ledger.js'
 import type { ClaudeFreshAgentHistorySource } from './fresh-agent/history/claude/history-source.js'
 import type {
   SdkSessionState,
@@ -132,7 +132,7 @@ export class SdkBridge extends EventEmitter {
     if (typeof message.messageId === 'string' && message.messageId.trim().length > 0) {
       return message.messageId
     }
-    return synthesizeLiveMessageId(state.sessionId, state.messages.length)
+    return synthesizeClaudeFreshAgentLiveMessageId(state.sessionId, state.messages.length)
   }
 
   private syncRestoreLedger(state: SdkSessionState): void {

@@ -4,45 +4,45 @@ import type { SdkSessionState } from '../../../sdk-bridge-types.js'
 import type { ChatMessage } from '../../../session-history-loader.js'
 import type { ClaudeFreshAgentHistoryResolveOptions } from './history-source.js'
 
-export type CanonicalTurnSource = 'durable' | 'live'
-export type LedgerReadiness = 'durable_only' | 'live_only' | 'merged'
-export type RestoreFatalCode = 'RESTORE_UNAVAILABLE' | 'RESTORE_INTERNAL' | 'RESTORE_DIVERGED'
+export type ClaudeFreshAgentHistoryTurnSource = 'durable' | 'live'
+export type ClaudeFreshAgentHistoryLedgerReadiness = 'durable_only' | 'live_only' | 'merged'
+export type ClaudeFreshAgentHistoryRestoreFatalCode = 'RESTORE_UNAVAILABLE' | 'RESTORE_INTERNAL' | 'RESTORE_DIVERGED'
 
-export type CanonicalTurn = {
+export type ClaudeFreshAgentHistoryCanonicalTurn = {
   turnId: string
   messageId: string
   ordinal: number
-  source: CanonicalTurnSource
+  source: ClaudeFreshAgentHistoryTurnSource
   message: ChatMessage
 }
 
-export type RestoreResolution =
+export type ClaudeFreshAgentHistoryRestoreResolution =
   | { kind: 'missing'; code: 'RESTORE_NOT_FOUND' }
-  | { kind: 'fatal'; code: RestoreFatalCode; message: string }
+  | { kind: 'fatal'; code: ClaudeFreshAgentHistoryRestoreFatalCode; message: string }
   | {
     kind: 'resolved'
     queryId: string
     liveSessionId?: string
     timelineSessionId?: string
-    readiness: LedgerReadiness
+    readiness: ClaudeFreshAgentHistoryLedgerReadiness
     revision: number
     latestTurnId: string | null
-    turns: CanonicalTurn[]
+    turns: ClaudeFreshAgentHistoryCanonicalTurn[]
   }
 
-export type RestoreLedgerManagerDeps = {
+export type ClaudeFreshAgentHistoryLedgerManagerDeps = {
   loadSessionHistory: (sessionId: string) => Promise<ChatMessage[] | null>
   getLiveSessionBySdkSessionId: (sdkSessionId: string) => SdkSessionState | undefined
   getLiveSessionByCliSessionId: (timelineSessionId: string) => SdkSessionState | undefined
   logDivergence?: (details: { queryId: string; reason: string; liveSessionId?: string; timelineSessionId?: string }) => void
 }
 
-type InternalTurn = CanonicalTurn & {
+type InternalTurn = ClaudeFreshAgentHistoryCanonicalTurn & {
   fingerprint: string
   syntheticMessageId: boolean
 }
 
-type ResolvedRestore = Extract<RestoreResolution, { kind: 'resolved' }>
+type ResolvedRestore = Extract<ClaudeFreshAgentHistoryRestoreResolution, { kind: 'resolved' }>
 
 type LedgerRecord = {
   ledgerId: string
@@ -122,7 +122,7 @@ function fingerprintBlock(block: ChatMessage['content'][number]): unknown {
   }
 }
 
-export function createDurableMessageFingerprint(
+export function createClaudeFreshAgentDurableMessageFingerprint(
   message: Pick<ChatMessage, 'role' | 'content' | 'model' | 'parentId' | 'referenceId'>,
 ): string {
   return stableStringify({
@@ -134,16 +134,16 @@ export function createDurableMessageFingerprint(
   })
 }
 
-export function synthesizeDeterministicMessageId(
+export function synthesizeClaudeFreshAgentDeterministicMessageId(
   message: Pick<ChatMessage, 'role' | 'content' | 'model' | 'parentId' | 'referenceId'>,
   occurrenceIndex: number,
 ): string {
-  const fingerprint = createDurableMessageFingerprint(message)
+  const fingerprint = createClaudeFreshAgentDurableMessageFingerprint(message)
   const digest = createHash('sha256').update(fingerprint).digest('hex').slice(0, 16)
   return `durable:${digest}:${occurrenceIndex}`
 }
 
-export function synthesizeLiveMessageId(sessionId: string, ordinal: number): string {
+export function synthesizeClaudeFreshAgentLiveMessageId(sessionId: string, ordinal: number): string {
   const normalizedSessionId = sessionId.trim().length > 0 ? sessionId : 'session'
   return `live:${normalizedSessionId}:${ordinal}`
 }
@@ -157,18 +157,18 @@ function resolveTimelineSessionId(queryId: string, liveSession?: SdkSessionState
 
 function buildCanonicalTurns(
   messages: ChatMessage[],
-  source: CanonicalTurnSource,
+  source: ClaudeFreshAgentHistoryTurnSource,
   options?: { liveSessionId?: string },
 ): InternalTurn[] {
   const occurrences = new Map<string, number>()
   return messages.map((message, index) => {
-    const fingerprint = createDurableMessageFingerprint(message)
+    const fingerprint = createClaudeFreshAgentDurableMessageFingerprint(message)
     const occurrenceIndex = occurrences.get(fingerprint) ?? 0
     occurrences.set(fingerprint, occurrenceIndex + 1)
     const messageId = message.messageId ?? (
       source === 'live'
-        ? synthesizeLiveMessageId(options?.liveSessionId ?? 'session', index)
-        : synthesizeDeterministicMessageId(message, occurrenceIndex)
+        ? synthesizeClaudeFreshAgentLiveMessageId(options?.liveSessionId ?? 'session', index)
+        : synthesizeClaudeFreshAgentDeterministicMessageId(message, occurrenceIndex)
     )
     return {
       turnId: `turn:${messageId}`,
@@ -185,7 +185,7 @@ function buildCanonicalTurns(
   })
 }
 
-function buildSignature(resolution: Extract<RestoreResolution, { kind: 'resolved' }>): string {
+function buildSignature(resolution: Extract<ClaudeFreshAgentHistoryRestoreResolution, { kind: 'resolved' }>): string {
   return stableStringify({
     timelineSessionId: resolution.timelineSessionId,
     liveSessionId: resolution.liveSessionId,
@@ -194,12 +194,12 @@ function buildSignature(resolution: Extract<RestoreResolution, { kind: 'resolved
       turnId: turn.turnId,
       messageId: turn.messageId,
       source: turn.source,
-      fingerprint: createDurableMessageFingerprint(turn.message),
+      fingerprint: createClaudeFreshAgentDurableMessageFingerprint(turn.message),
     })),
   })
 }
 
-function mapFatalError(error: unknown): Extract<RestoreResolution, { kind: 'fatal' }> {
+function mapFatalError(error: unknown): Extract<ClaudeFreshAgentHistoryRestoreResolution, { kind: 'fatal' }> {
   const candidate = error as { code?: unknown; message?: unknown }
   const code = candidate?.code
   if (code === 'RESTORE_UNAVAILABLE' || code === 'RESTORE_INTERNAL' || code === 'RESTORE_DIVERGED') {
@@ -220,7 +220,7 @@ function mapFatalError(error: unknown): Extract<RestoreResolution, { kind: 'fata
   }
 }
 
-function normalizeOrdinals(turns: InternalTurn[]): CanonicalTurn[] {
+function normalizeOrdinals(turns: InternalTurn[]): ClaudeFreshAgentHistoryCanonicalTurn[] {
   return turns.map((turn, index) => ({
     turnId: turn.turnId,
     messageId: turn.messageId,
@@ -258,7 +258,7 @@ function mergeTurns(
   durableTurns: InternalTurn[],
   liveTurns: InternalTurn[],
   compatibilityCandidateIds?: ReadonlySet<string>,
-): { kind: 'ok'; turns: CanonicalTurn[]; unmatchedLiveMessageIds: string[] } | { kind: 'diverged' } {
+): { kind: 'ok'; turns: ClaudeFreshAgentHistoryCanonicalTurn[]; unmatchedLiveMessageIds: string[] } | { kind: 'diverged' } {
   if (durableTurns.length === 0) {
     return {
       kind: 'ok',
@@ -316,7 +316,7 @@ function isCanonicalDurableSessionId(sessionId: string | undefined): sessionId i
   return typeof sessionId === 'string' && isValidClaudeSessionId(sessionId)
 }
 
-export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
+export function createClaudeFreshAgentRestoreLedgerManager(deps: ClaudeFreshAgentHistoryLedgerManagerDeps) {
   const ledgers = new Map<string, LedgerRecord>()
   const ledgerIdByAlias = new Map<string, string>()
   const tombstonedLiveAliases = new Set<string>()
@@ -452,7 +452,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
       }
     }
 
-    const readiness: LedgerReadiness = durableTurns.length > 0 && liveTurns.length > 0
+    const readiness: ClaudeFreshAgentHistoryLedgerReadiness = durableTurns.length > 0 && liveTurns.length > 0
       ? 'merged'
       : durableTurns.length > 0
         ? 'durable_only'
@@ -501,7 +501,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
       : new Set<string>()
   }
 
-  async function buildDurableOnlyResolution(queryId: string, timelineSessionId: string): Promise<RestoreResolution> {
+  async function buildDurableOnlyResolution(queryId: string, timelineSessionId: string): Promise<ClaudeFreshAgentHistoryRestoreResolution> {
     const existing = findLedgerRecord([timelineSessionId])
     const ledger = existing ?? createLedgerRecord(timelineSessionId)
     await hydrateDurableHistory(ledger, timelineSessionId)
@@ -586,7 +586,7 @@ export function createRestoreLedgerManager(deps: RestoreLedgerManagerDeps) {
       await syncLiveSession(liveSession, { refreshDurableHistory: false })
     },
 
-    async resolve(queryId: string, options?: ClaudeFreshAgentHistoryResolveOptions): Promise<RestoreResolution> {
+    async resolve(queryId: string, options?: ClaudeFreshAgentHistoryResolveOptions): Promise<ClaudeFreshAgentHistoryRestoreResolution> {
       try {
         const existing = findLedgerRecord([queryId])
         const liveSessionCandidate = options?.liveSessionOverride ?? (

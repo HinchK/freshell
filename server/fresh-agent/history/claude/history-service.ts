@@ -1,7 +1,7 @@
 import { MAX_AGENT_TIMELINE_ITEMS } from '../../../../shared/read-models.js'
 import type { ChatMessage } from '../../../session-history-loader.js'
 import type { ClaudeFreshAgentHistorySource } from './history-source.js'
-import type { CanonicalTurn, RestoreResolution } from './history-ledger.js'
+import type { ClaudeFreshAgentHistoryCanonicalTurn, ClaudeFreshAgentHistoryRestoreResolution } from './history-ledger.js'
 import type {
   ClaudeFreshAgentHistoryItem,
   ClaudeFreshAgentHistoryPage,
@@ -18,13 +18,13 @@ type TimelineCursorPayload = {
   revision: number
 }
 
-type TimelineMessageRecord = CanonicalTurn & { sessionId: string }
+type TimelineMessageRecord = ClaudeFreshAgentHistoryCanonicalTurn & { sessionId: string }
 
 export type ClaudeFreshAgentHistorySnapshot = {
   sessionId: string
   latestTurnId: string | null
   revision: number
-  turns: CanonicalTurn[]
+  turns: ClaudeFreshAgentHistoryCanonicalTurn[]
 }
 
 export type ClaudeFreshAgentHistoryService = {
@@ -37,7 +37,7 @@ export type ClaudeFreshAgentHistoryServiceDeps = {
   agentHistorySource: ClaudeFreshAgentHistorySource
 }
 
-export class ClaudeFreshAgentStaleHistoryRevisionError extends Error {
+export class ClaudeFreshAgentHistoryStaleRevisionError extends Error {
   code = 'RESTORE_STALE_REVISION' as const
 
   constructor(public readonly requestedRevision: number, public readonly actualRevision: number) {
@@ -91,7 +91,7 @@ function summarizeMessage(message: ChatMessage): string {
   return ''
 }
 
-function buildTimeline(turns: CanonicalTurn[], sessionId: string): TimelineMessageRecord[] {
+function buildTimeline(turns: ClaudeFreshAgentHistoryCanonicalTurn[], sessionId: string): TimelineMessageRecord[] {
   return turns
     .map((turn) => ({
       ...turn,
@@ -127,7 +127,7 @@ export function createClaudeFreshAgentHistoryService(
     return buildResolvedTimeline(queryId, resolved)
   }
 
-  function buildResolvedTimeline(queryId: string, resolved: RestoreResolution): { sessionId: string, latestTurnId: string | null, revision: number, records: TimelineMessageRecord[] } {
+  function buildResolvedTimeline(queryId: string, resolved: ClaudeFreshAgentHistoryRestoreResolution): { sessionId: string, latestTurnId: string | null, revision: number, records: TimelineMessageRecord[] } {
     if (resolved.kind === 'missing') {
       throw new ClaudeFreshAgentHistoryResolutionError(resolved.code, 'Restore session not found')
     }
@@ -149,7 +149,7 @@ export function createClaudeFreshAgentHistoryService(
       const timeline = await loadTimeline(sessionId)
       throwIfAborted(signal)
       if (revision != null && revision !== timeline.revision) {
-        throw new ClaudeFreshAgentStaleHistoryRevisionError(revision, timeline.revision)
+        throw new ClaudeFreshAgentHistoryStaleRevisionError(revision, timeline.revision)
       }
       return {
         sessionId: timeline.sessionId,
@@ -179,10 +179,10 @@ export function createClaudeFreshAgentHistoryService(
       const timeline = await loadTimeline(query.sessionId)
       throwIfAborted(query.signal)
       if (query.revision !== timeline.revision) {
-        throw new ClaudeFreshAgentStaleHistoryRevisionError(query.revision, timeline.revision)
+        throw new ClaudeFreshAgentHistoryStaleRevisionError(query.revision, timeline.revision)
       }
       if (cursor && cursor.revision !== timeline.revision) {
-        throw new ClaudeFreshAgentStaleHistoryRevisionError(cursor.revision, timeline.revision)
+        throw new ClaudeFreshAgentHistoryStaleRevisionError(cursor.revision, timeline.revision)
       }
       const pageItems = timeline.records.slice(offset, offset + limit)
       const nextOffset = offset + pageItems.length
@@ -219,7 +219,7 @@ export function createClaudeFreshAgentHistoryService(
       }
       const timeline = await loadTimeline(sessionId)
       if (revision !== timeline.revision) {
-        throw new ClaudeFreshAgentStaleHistoryRevisionError(revision, timeline.revision)
+        throw new ClaudeFreshAgentHistoryStaleRevisionError(revision, timeline.revision)
       }
       const match = timeline.records.find((record) => record.turnId === turnId)
       if (!match) return null
