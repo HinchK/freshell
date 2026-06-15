@@ -133,7 +133,7 @@ describe('TabsView', () => {
     expect(tabs.some((t) => t.title === 'remote open')).toBe(true)
   })
 
-  it('rehydrates remote agent-chat panes with selection strategies', () => {
+  it('rehydrates remote fresh-agent panes with selection strategies', () => {
     const store = configureStore({
       reducer: {
         tabs: tabsReducer,
@@ -165,9 +165,10 @@ describe('TabsView', () => {
         titleSetByUser: false,
         panes: [{
           paneId: 'pane-agent',
-          kind: 'agent-chat',
+          kind: 'fresh-agent',
           payload: {
-            provider: 'freshclaude',
+            sessionType: 'freshclaude',
+            provider: 'claude',
             resumeSessionId: '00000000-0000-4000-8000-000000000444',
             sessionRef: {
               provider: 'claude',
@@ -201,7 +202,7 @@ describe('TabsView', () => {
       kind: 'fresh-agent',
       sessionType: 'freshclaude',
       provider: 'claude',
-      resumeSessionId: undefined,
+      resumeSessionId: '00000000-0000-4000-8000-000000000444',
       sessionRef: {
         provider: 'claude',
         sessionId: '00000000-0000-4000-8000-000000000444',
@@ -403,7 +404,7 @@ describe('TabsView', () => {
         panes: [
           { paneId: 'p1', kind: 'terminal', payload: {} },
           { paneId: 'p2', kind: 'browser', payload: {} },
-          { paneId: 'p3', kind: 'agent-chat', payload: {} },
+          { paneId: 'p3', kind: 'fresh-agent', payload: { sessionType: 'freshclaude', provider: 'claude' } },
         ],
       }],
       closed: [],
