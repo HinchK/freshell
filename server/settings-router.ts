@@ -69,8 +69,8 @@ export const normalizeSettingsPatch = (patch: Record<string, any>) => {
     }
   }
 
-  if (patch.agentChat?.providers && typeof patch.agentChat.providers === 'object') {
-    for (const providerPatch of Object.values(patch.agentChat.providers)) {
+  if (patch.freshAgent?.providers && typeof patch.freshAgent.providers === 'object') {
+    for (const providerPatch of Object.values(patch.freshAgent.providers)) {
       if (!providerPatch || typeof providerPatch !== 'object' || Array.isArray(providerPatch)) {
         continue
       }
@@ -124,6 +124,11 @@ export function createSettingsRouter(deps: SettingsRouterDeps): Router {
   })
 
   const handleSettingsPatch = async (req: any, res: any) => {
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'agentChat')) {
+      res.status(400).json({ error: 'agentChat settings have been migrated; use freshAgent' })
+      return
+    }
+
     const parsed = settingsPatchSchema.safeParse(stripDeprecatedSettingsPatchAliases(req.body || {}))
     if (!parsed.success) {
       return res.status(400).json({ error: 'Invalid request', details: parsed.error.issues })

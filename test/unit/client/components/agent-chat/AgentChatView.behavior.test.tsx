@@ -334,7 +334,7 @@ describe('AgentChatView tool blocks expanded by default', () => {
   })
 
   it('all tool blocks start expanded when showTools is true', () => {
-    const store = makeStore({ agentChat: { ...defaultSettings.agentChat, showTools: true } })
+    const store = makeStore({ freshAgent: { ...defaultSettings.freshAgent, showTools: true } })
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
     // Create a turn with 5 completed tools
     addTurns(store, 1, 5)
@@ -411,7 +411,7 @@ describe('AgentChatView settings auto-open (#110)', () => {
   })
 
   it('does not open settings on new pane when global initialSetupDone is true', () => {
-    const store = makeStore({ agentChat: { ...defaultSettings.agentChat, initialSetupDone: true, providers: {} } })
+    const store = makeStore({ freshAgent: { ...defaultSettings.freshAgent, initialSetupDone: true, providers: {} } })
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
 
     // Fresh pane (no settingsDismissed), but global flag is set
@@ -452,7 +452,7 @@ describe('AgentChatView settings auto-open (#110)', () => {
 
   it('auto-focuses composer when global initialSetupDone skips settings', () => {
     vi.useFakeTimers()
-    const store = makeStore({ agentChat: { ...defaultSettings.agentChat, initialSetupDone: true, providers: {} } })
+    const store = makeStore({ freshAgent: { ...defaultSettings.freshAgent, initialSetupDone: true, providers: {} } })
     store.dispatch(sessionCreated({ requestId: 'req-1', sessionId: 'sess-1' }))
 
     render(
@@ -516,20 +516,20 @@ describe('AgentChatView settings auto-open (#110)', () => {
       model: 'claude-sonnet-4-6',
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(1, {
-      agentChat: { providers: { freshclaude: { modelSelection: { kind: 'tracked', modelId: 'claude-sonnet-4-6' } } } },
+      freshAgent: { providers: { freshclaude: { modelSelection: { kind: 'tracked', modelId: 'claude-sonnet-4-6' } } } },
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(2, {
-      agentChat: { providers: { freshclaude: { defaultPermissionMode: 'default' } } },
+      freshAgent: { providers: { freshclaude: { defaultPermissionMode: 'default' } } },
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(3, {
-      agentChat: { providers: { freshclaude: { effort: 'medium' } } },
+      freshAgent: { providers: { freshclaude: { effort: 'medium' } } },
     })
   })
 
   it('clears unsupported effort overrides from pane state and persisted defaults when switching to a model that does not support them', async () => {
     const store = makeStore({
-      agentChat: {
-        ...defaultSettings.agentChat,
+      freshAgent: {
+        ...defaultSettings.freshAgent,
         providers: {
           freshclaude: {
             modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
@@ -597,17 +597,17 @@ describe('AgentChatView settings auto-open (#110)', () => {
       expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(2)
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(1, {
-      agentChat: { providers: { freshclaude: { modelSelection: { kind: 'tracked', modelId: 'claude-haiku-4-5-20251001' } } } },
+      freshAgent: { providers: { freshclaude: { modelSelection: { kind: 'tracked', modelId: 'claude-haiku-4-5-20251001' } } } },
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(2, {
-      agentChat: { providers: { freshclaude: { effort: undefined } } },
+      freshAgent: { providers: { freshclaude: { effort: undefined } } },
     })
   })
 
   it('does not clear persisted defaults when a stale pane snapshot switches to a model that does not support its local effort', async () => {
     const store = makeStore({
-      agentChat: {
-        ...defaultSettings.agentChat,
+      freshAgent: {
+        ...defaultSettings.freshAgent,
         providers: {
           freshclaude: {
             effort: 'turbo',
@@ -682,14 +682,14 @@ describe('AgentChatView settings auto-open (#110)', () => {
       expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(1)
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
-      agentChat: { providers: { freshclaude: { modelSelection: { kind: 'tracked', modelId: 'haiku' } } } },
+      freshAgent: { providers: { freshclaude: { modelSelection: { kind: 'tracked', modelId: 'haiku' } } } },
     })
   })
 
   it('clears persisted provider defaults when create-time cleanup drops an unsupported provider-default effort', async () => {
     const store = makeStore({
-      agentChat: {
-        ...defaultSettings.agentChat,
+      freshAgent: {
+        ...defaultSettings.freshAgent,
         providers: {
           freshclaude: {
             effort: 'turbo',
@@ -742,14 +742,14 @@ describe('AgentChatView settings auto-open (#110)', () => {
       expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(1)
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
-      agentChat: { providers: { freshclaude: { effort: undefined } } },
+      freshAgent: { providers: { freshclaude: { effort: undefined } } },
     })
   })
 
   it('does not rewrite provider defaults when create-time cleanup drops an unsupported pane-local effort', async () => {
     const store = makeStore({
-      agentChat: {
-        ...defaultSettings.agentChat,
+      freshAgent: {
+        ...defaultSettings.freshAgent,
         providers: {
           freshclaude: {
             effort: 'turbo',
@@ -812,8 +812,8 @@ describe('AgentChatView settings auto-open (#110)', () => {
 
   it('clears persisted defaults when passive cleanup drops an unsupported provider-default effort', async () => {
     const store = makeStore({
-      agentChat: {
-        ...defaultSettings.agentChat,
+      freshAgent: {
+        ...defaultSettings.freshAgent,
         providers: {
           freshclaude: {
             effort: 'turbo',
@@ -859,14 +859,14 @@ describe('AgentChatView settings auto-open (#110)', () => {
       expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(1)
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
-      agentChat: { providers: { freshclaude: { effort: undefined } } },
+      freshAgent: { providers: { freshclaude: { effort: undefined } } },
     })
   })
 
   it('does not rewrite provider defaults when passive cleanup drops an unsupported pane-local effort', () => {
     const store = makeStore({
-      agentChat: {
-        ...defaultSettings.agentChat,
+      freshAgent: {
+        ...defaultSettings.freshAgent,
         providers: {
           freshclaude: {
             effort: 'turbo',
@@ -933,7 +933,7 @@ describe('AgentChatView settings auto-open (#110)', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
 
     expect(saveServerSettingsPatchSpy).toHaveBeenCalledWith({
-      agentChat: { initialSetupDone: true },
+      freshAgent: { initialSetupDone: true },
     })
     expect(screen.queryByRole('dialog', { name: 'Agent chat settings' })).not.toBeInTheDocument()
   })

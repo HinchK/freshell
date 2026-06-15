@@ -8,7 +8,7 @@ export function isLegacyFreshellOrchestrationPluginPath(value: string): boolean 
     || normalized.endsWith('/.claude/plugins/freshell-orchestration')
 }
 
-export function sanitizeAgentChatPluginPaths(paths: readonly string[] | undefined): string[] {
+export function sanitizeFreshAgentPluginPaths(paths: readonly string[] | undefined): string[] {
   if (!paths) return []
   return paths
     .filter((value): value is string => typeof value === 'string')

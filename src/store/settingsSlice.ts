@@ -39,7 +39,7 @@ function normalizeServerPatch(value: unknown): ServerSettingsPatch {
   if (!isRecord(value)) {
     return {}
   }
-  return stripLocalSettings(value) as ServerSettingsPatch
+  return stripLocalSettings(value, { migrateLegacyFreshAgentAlias: false }) as ServerSettingsPatch
 }
 
 function normalizeLocalPatch(value: unknown): LocalSettingsPatch {

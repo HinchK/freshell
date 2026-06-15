@@ -831,11 +831,12 @@ describe('legacy agent-chat display settings migration', () => {
     expect(content.showTimecodes).toBeUndefined()
 
     const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
-    expect(bp.settings.agentChat).toEqual({
+    expect(bp.settings.freshAgent).toEqual({
       showThinking: true,
       showTools: true,
       showTimecodes: true,
     })
+    expect(bp.settings.agentChat).toBeUndefined()
   })
 
   it('migrates legacy display settings from panes inside splits', async () => {
@@ -886,7 +887,8 @@ describe('legacy agent-chat display settings migration', () => {
     expect(split.children[1].content.showTools).toBeUndefined()
 
     const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
-    expect(bp.settings.agentChat.showTools).toBe(true)
+    expect(bp.settings.freshAgent.showTools).toBe(true)
+    expect(bp.settings.agentChat).toBeUndefined()
   })
 
   it('does not touch panes that have no legacy fields', async () => {
@@ -955,7 +957,8 @@ describe('legacy agent-chat display settings migration', () => {
     const bp = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
     expect(bp.settings.theme).toBe('dark')
     expect(bp.tabs.closedTabRetentionDays).toBe(30)
-    expect(bp.settings.agentChat.showThinking).toBe(true)
+    expect(bp.settings.freshAgent.showThinking).toBe(true)
+    expect(bp.settings.agentChat).toBeUndefined()
   })
 })
 

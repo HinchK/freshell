@@ -114,10 +114,10 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
   const providerDefaultModelId = providerConfig?.providerDefaultModelId ?? 'opus'
   const defaultPermissionMode = providerConfig?.defaultPermissionMode ?? 'bypassPermissions'
   const localSettings = useAppSelector((state) => state.settings.settings)
-  const providerSettings = localSettings.agentChat?.providers?.[paneContent.provider]
-  const defaultShowThinking = localSettings.agentChat.showThinking
-  const defaultShowTools = localSettings.agentChat.showTools
-  const defaultShowTimecodes = localSettings.agentChat.showTimecodes
+  const providerSettings = localSettings.freshAgent?.providers?.[paneContent.provider]
+  const defaultShowThinking = localSettings.freshAgent.showThinking
+  const defaultShowTools = localSettings.freshAgent.showTools
+  const defaultShowTimecodes = localSettings.freshAgent.showTimecodes
   const providerLabel = providerConfig?.label ?? 'Agent Chat'
   const createSentRef = useRef(false)
   const attachSentRef = useRef(false)
@@ -183,7 +183,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     [paneContent.modelSelection, providerCapabilities, providerDefaultModelId],
   )
   const settingsLoaded = useAppSelector((s) => s.settings.loaded)
-  const initialSetupDone = useAppSelector((s) => s.settings.settings.agentChat?.initialSetupDone ?? false)
+  const initialSetupDone = useAppSelector((s) => s.settings.settings.freshAgent?.initialSetupDone ?? false)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const surfaceVisibleMarkedRef = useRef(false)
   const sessionRef = useRef(session)
@@ -238,7 +238,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     }
 
     void dispatch(saveServerSettingsPatch({
-      agentChat: {
+      freshAgent: {
         providers: {
           [paneContent.provider]: {
             effort: undefined,
@@ -865,7 +865,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     }
 
     if (Object.keys(localChanges).length > 0) {
-      dispatch(updateSettingsLocal({ agentChat: localChanges }))
+      dispatch(updateSettingsLocal({ freshAgent: localChanges }))
     }
 
     const pc = paneContentRef.current
@@ -890,7 +890,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
     // Persist as defaults
     if (hasModelChange) {
       void dispatch(saveServerSettingsPatch({
-        agentChat: {
+        freshAgent: {
           providers: {
             [paneContent.provider]: {
               modelSelection: nextModelSelection,
@@ -902,7 +902,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
     if (hasPermissionModeChange && changes.permissionMode) {
       void dispatch(saveServerSettingsPatch({
-        agentChat: {
+        freshAgent: {
           providers: {
             [paneContent.provider]: {
               defaultPermissionMode: changes.permissionMode as string,
@@ -914,7 +914,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
 
     if (hasEffortChange) {
       void dispatch(saveServerSettingsPatch({
-        agentChat: {
+        freshAgent: {
           providers: {
             [paneContent.provider]: {
               effort: nextEffort,
@@ -983,7 +983,7 @@ export default function AgentChatView({ tabId, paneId, paneContent, hidden }: Ag
       paneId,
       content: { ...paneContentRef.current, settingsDismissed: true },
     }))
-    void dispatch(saveServerSettingsPatch({ agentChat: { initialSetupDone: true } }))
+    void dispatch(saveServerSettingsPatch({ freshAgent: { initialSetupDone: true } }))
     composerRef.current?.focus()
   }, [tabId, paneId, dispatch])
 

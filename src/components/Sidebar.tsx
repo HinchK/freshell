@@ -362,7 +362,7 @@ export default function Sidebar({
     const sessionType = item.sessionType || provider
     const agentConfig = getAgentChatProviderConfig(sessionType)
     const providerSettings = agentConfig
-      ? state.settings.settings.agentChat?.providers?.[agentConfig.name]
+      ? state.settings.settings.freshAgent?.providers?.[agentConfig.name]
       : undefined
 
     // 2. Fallback: no active tab or active tab has no layout → create new tab

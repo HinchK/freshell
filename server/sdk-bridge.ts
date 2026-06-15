@@ -14,7 +14,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import type { PermissionResult, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk'
 import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
-import { sanitizeAgentChatPluginPaths } from '../shared/agent-chat-plugins.js'
+import { sanitizeFreshAgentPluginPaths } from '../shared/fresh-agent-plugins.js'
 import { logger } from './logger.js'
 import { synthesizeLiveMessageId } from './agent-timeline/ledger.js'
 import type { AgentHistorySource } from './agent-timeline/history-source.js'
@@ -96,7 +96,7 @@ export function createClaudeSdkOptions(input: ClaudeSdkOptionsInput): SdkOptions
   }
 
   if (input.plugins !== undefined) {
-    options.plugins = sanitizeAgentChatPluginPaths(input.plugins)
+    options.plugins = sanitizeFreshAgentPluginPaths(input.plugins)
       .map((pluginPath) => ({ type: 'local' as const, path: pluginPath }))
   }
 
@@ -168,7 +168,7 @@ export class SdkBridge extends EventEmitter {
       cwd: options.cwd,
       model: options.model,
       permissionMode: options.permissionMode,
-      plugins: options.plugins ? sanitizeAgentChatPluginPaths(options.plugins) : undefined,
+      plugins: options.plugins ? sanitizeFreshAgentPluginPaths(options.plugins) : undefined,
       status: 'starting',
       createdAt: Date.now(),
       messages: [],

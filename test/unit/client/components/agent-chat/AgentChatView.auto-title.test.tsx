@@ -58,7 +58,7 @@ function makeStore() {
       settings: {
         settings: {
           ...defaultSettings,
-          agentChat: { ...defaultSettings.agentChat, initialSetupDone: true },
+          freshAgent: { ...defaultSettings.freshAgent, initialSetupDone: true },
         } as any,
         loaded: true,
         lastSavedAt: 0,

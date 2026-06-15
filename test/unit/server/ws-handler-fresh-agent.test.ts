@@ -20,7 +20,6 @@ const TEST_AUTH_TOKEN = 'testtoken-testtoken'
 function makeUserConfig(freshClientsEnabled: boolean) {
   const settings = createDefaultServerSettings({ loggingDebug: false })
   settings.freshAgent.enabled = freshClientsEnabled
-  settings.agentChat.enabled = freshClientsEnabled
   return {
     version: 1 as const,
     settings,

@@ -102,7 +102,7 @@ export default function PanePicker({ onSelect, onCancel, isOnlyPane, tabId, pane
   const enabledProviders = useAppSelector((s) => s.settings?.settings?.codingCli?.enabledProviders ?? EMPTY_ENABLED_PROVIDERS)
   const disabledExtensions = useAppSelector((s) => s.settings?.settings?.extensions?.disabled ?? EMPTY_ENABLED_PROVIDERS)
   const freshClientsEnabled = useAppSelector((s) => (
-    s.settings?.settings?.freshAgent?.enabled ?? s.settings?.settings?.agentChat?.enabled ?? false
+    s.settings?.settings?.freshAgent?.enabled ?? false
   ))
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
 

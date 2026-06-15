@@ -583,7 +583,7 @@ export const openSessionTab = createAsyncThunk(
     const extensions = (state as Partial<RootState>).extensions?.entries ?? []
     const agentConfig = getAgentChatProviderConfig(resolvedSessionType)
     const providerSettings = agentConfig
-      ? state.settings?.settings.agentChat?.providers?.[agentConfig.name]
+      ? state.settings?.settings.freshAgent?.providers?.[agentConfig.name]
       : undefined
     const sessionMetadataInput = {
       sessionType: resolvedSessionType,

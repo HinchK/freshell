@@ -15,9 +15,6 @@ async function enableClaudeAndCodex(page: any) {
       freshAgent: {
         enabled: true,
       },
-      agentChat: {
-        enabled: true,
-      },
     }
     harness?.dispatch({
       type: 'settings/previewServerSettingsPatch',
@@ -644,7 +641,7 @@ test.describe('Fresh Agent', () => {
     await page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
         type: 'settings/updateSettingsLocal',
-        payload: { terminal: { fontSize: 20 }, freshAgent: { fontScale: 2 }, agentChat: { fontScale: 2 } },
+        payload: { terminal: { fontSize: 20 }, freshAgent: { fontScale: 2 } },
       })
     })
     await expect.poll(readTranscriptFontSize).toBe('20px')

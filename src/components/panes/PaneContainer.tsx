@@ -582,9 +582,7 @@ function PickerWrapper({
   const settings = useAppSelector((s) => s.settings?.settings)
   const agentChatSettings = useAppSelector(
     (s) => s.settings?.settings?.freshAgent
-      ?? s.settings?.settings?.agentChat
       ?? s.settings?.serverSettings?.freshAgent
-      ?? s.settings?.serverSettings?.agentChat
   )
   const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])

@@ -297,7 +297,7 @@ function migrateLegacyAgentChatDisplaySettings(state: PanesState): PanesState {
 
   patchBrowserPreferencesRecord({
     settings: {
-      agentChat: {
+      freshAgent: {
         ...(legacy.showThinking ? { showThinking: true } : {}),
         ...(legacy.showTools ? { showTools: true } : {}),
         ...(legacy.showTimecodes ? { showTimecodes: true } : {}),

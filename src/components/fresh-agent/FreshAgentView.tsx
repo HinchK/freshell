@@ -311,13 +311,10 @@ export function FreshAgentView({
   ) ?? 16
   const providerDefaults = useAppSelector(
     (state) => state.settings.settings.freshAgent?.providers?.[paneContent.sessionType]
-      ?? state.settings.serverSettings?.freshAgent?.providers?.[paneContent.sessionType]
-      ?? state.settings.settings.agentChat?.providers?.[paneContent.sessionType]
-      ?? state.settings.serverSettings?.agentChat?.providers?.[paneContent.sessionType],
+      ?? state.settings.serverSettings?.freshAgent?.providers?.[paneContent.sessionType],
   )
   const showTranscriptModel = useAppSelector(
     (state) => state.settings.settings.freshAgent?.showTimecodes
-      ?? state.settings.settings.agentChat?.showTimecodes
       ?? false,
   )
   const activeStyle = normalizeFreshAgentStyle(
@@ -336,7 +333,7 @@ export function FreshAgentView({
       sessionType: paneContent.sessionType,
       provider: paneContent.provider,
     })
-    return state.freshAgent.sessions[sessionKey] ?? state.agentChat.sessions[paneContent.sessionId]
+    return state.freshAgent.sessions[sessionKey]
   })
   // Provider-agnostic session meta: codex/opencode status and errors flow
   // through the freshAgent slice too, but the claudeSession selector above is

@@ -5,6 +5,7 @@ import {
   composeResolvedSettings,
   createDefaultServerSettings,
   extractLegacyLocalSettingsSeed,
+  migrateLegacyFreshAgentSettingsInput,
   mergeServerSettings,
   resolveLocalSettings,
   stripLocalSettings,
@@ -15,19 +16,19 @@ describe('shared settings contract', () => {
     const parsed = buildServerSettingsPatchSchema().parse({
       defaultCwd: '/workspace',
       terminal: { scrollback: 12000 },
-      agentChat: { defaultPlugins: ['fs', 'search'] },
+      freshAgent: { defaultPlugins: ['fs', 'search'] },
     })
 
     expect(parsed).toEqual({
       defaultCwd: '/workspace',
       terminal: { scrollback: 12000 },
-      agentChat: { defaultPlugins: ['fs', 'search'] },
+      freshAgent: { defaultPlugins: ['fs', 'search'] },
     })
   })
 
-  it('accepts tracked and exact agent-chat model selections with dynamic effort strings', () => {
+  it('accepts tracked and exact fresh-agent model selections with dynamic effort strings', () => {
     const parsed = buildServerSettingsPatchSchema().parse({
-      agentChat: {
+      freshAgent: {
         providers: {
           freshclaude: {
             modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
@@ -41,11 +42,11 @@ describe('shared settings contract', () => {
       },
     })
 
-    expect(parsed.agentChat?.providers?.freshclaude).toEqual({
+    expect(parsed.freshAgent?.providers?.freshclaude).toEqual({
       modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
       effort: 'ultra',
     })
-    expect(parsed.agentChat?.providers?.kilroy).toEqual({
+    expect(parsed.freshAgent?.providers?.kilroy).toEqual({
       modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
       defaultPermissionMode: 'plan',
     })
@@ -55,7 +56,7 @@ describe('shared settings contract', () => {
     const schema = buildServerSettingsPatchSchema()
 
     expect(schema.safeParse({
-      agentChat: {
+      freshAgent: {
         providers: {
           freshclaude: {
             defaultPermissionMode: 'plan',
@@ -65,7 +66,7 @@ describe('shared settings contract', () => {
       },
     }).success).toBe(true)
     expect(schema.safeParse({
-      agentChat: {
+      freshAgent: {
         providers: {
           freshclaude: {
             effort: '',
@@ -98,7 +99,6 @@ describe('shared settings contract', () => {
     const defaults = createDefaultServerSettings({ loggingDebug: false })
 
     expect(defaults.freshAgent.enabled).toBe(false)
-    expect(defaults.agentChat.enabled).toBe(false)
 
     const parsed = buildServerSettingsPatchSchema().parse({
       freshAgent: { enabled: true },
@@ -109,38 +109,77 @@ describe('shared settings contract', () => {
       freshAgent: { enabled: true },
     })
     expect(merged.freshAgent.enabled).toBe(true)
-    expect(merged.agentChat.enabled).toBe(true)
+    expect('agentChat' in merged).toBe(false)
   })
 
-  it('merges freshAgent and agentChat alias patches before sanitizing', () => {
+  it('migrates stored legacy agentChat input to canonical freshAgent settings', () => {
+    const parsed = migrateLegacyFreshAgentSettingsInput({
+      agentChat: {
+        enabled: true,
+        defaultPlugins: ['/tmp/plugin'],
+        providers: {
+          freshcodex: { style: 'serif', effort: 'high' },
+        },
+      },
+    } as never)
+
+    expect(parsed).toEqual({
+      freshAgent: {
+        enabled: true,
+        defaultPlugins: ['/tmp/plugin'],
+        providers: {
+          freshcodex: { style: 'serif', effort: 'high' },
+        },
+      },
+    })
+    expect('agentChat' in parsed).toBe(false)
+  })
+
+  it('merges server settings into freshAgent without mirroring agentChat', () => {
     const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
       freshAgent: {
         enabled: true,
         providers: {
-          freshclaude: { effort: 'max' },
-        },
-      },
-      agentChat: {
-        defaultPlugins: ['planner'],
-        providers: {
-          freshclaude: {
-            modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
-          },
+          freshclaude: { defaultPermissionMode: 'acceptEdits' },
         },
       },
     })
 
-    expect(merged.freshAgent).toMatchObject({
-      enabled: true,
-      defaultPlugins: ['planner'],
-      providers: {
-        freshclaude: {
-          modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
-          effort: 'max',
+    expect(merged.freshAgent.enabled).toBe(true)
+    expect(merged.freshAgent.providers.freshclaude).toEqual({ defaultPermissionMode: 'acceptEdits' })
+    expect('agentChat' in merged).toBe(false)
+  })
+
+  it('resolves browser-local fresh-agent settings without exposing agentChat', () => {
+    const resolved = resolveLocalSettings({
+      agentChat: { showTools: true, showThinking: true, fontScale: 1.25 },
+    } as never)
+
+    expect(resolved.freshAgent.showTools).toBe(true)
+    expect(resolved.freshAgent.showThinking).toBe(true)
+    expect(resolved.freshAgent.fontScale).toBe(1.25)
+    expect('agentChat' in resolved).toBe(false)
+  })
+
+  it('gives canonical freshAgent stored values precedence over legacy agentChat values', () => {
+    const parsed = migrateLegacyFreshAgentSettingsInput({
+      agentChat: {
+        defaultPlugins: ['/legacy/plugin'],
+        providers: {
+          freshcodex: { style: 'sans', effort: 'high' },
         },
       },
-    })
-    expect(merged.agentChat).toEqual(merged.freshAgent)
+      freshAgent: {
+        defaultPlugins: [],
+        providers: {
+          freshcodex: { style: 'serif' },
+        },
+      },
+    } as never)
+
+    expect(parsed.freshAgent.defaultPlugins).toEqual([])
+    expect(parsed.freshAgent.providers?.freshcodex).toEqual({ style: 'serif', effort: 'high' })
+    expect('agentChat' in parsed).toBe(false)
   })
 
   it('accepts fresh-agent provider style defaults and keeps them per session type', () => {
@@ -167,7 +206,6 @@ describe('shared settings contract', () => {
 
     expect(merged.freshAgent.providers.freshcodex?.style).toBe('serif')
     expect(merged.freshAgent.providers.freshclaude?.style).toBe('sans')
-    expect(merged.agentChat.providers).toEqual(merged.freshAgent.providers)
   })
 
   it('rejects invalid fresh-agent provider style defaults', () => {
@@ -201,9 +239,10 @@ describe('shared settings contract', () => {
     expect(schema.safeParse({ sidebar: { sortMode: 'activity' } }).success).toBe(false)
     expect(schema.safeParse({ sidebar: { showSubagents: true } }).success).toBe(false)
     expect(schema.safeParse({ sidebar: { ignoreCodexSubagents: true } }).success).toBe(false)
-    expect(schema.safeParse({ agentChat: { showThinking: true } }).success).toBe(false)
-    expect(schema.safeParse({ agentChat: { showTools: true } }).success).toBe(false)
-    expect(schema.safeParse({ agentChat: { showTimecodes: true } }).success).toBe(false)
+    expect(schema.safeParse({ freshAgent: { showThinking: true } }).success).toBe(false)
+    expect(schema.safeParse({ freshAgent: { showTools: true } }).success).toBe(false)
+    expect(schema.safeParse({ freshAgent: { showTimecodes: true } }).success).toBe(false)
+    expect(schema.safeParse({ agentChat: { defaultPlugins: ['fs'] } }).success).toBe(false)
   })
 
   it('defaults local sort mode to activity', () => {
@@ -227,12 +266,13 @@ describe('shared settings contract', () => {
     expect(resolved.terminal.scrollback).toBe(10000)
     expect(resolved.safety.autoKillIdleMinutes).toBe(15)
     expect(resolved.sidebar.sortMode).toBe('project')
-    expect(resolved.agentChat.defaultPlugins).toEqual([])
+    expect(resolved.freshAgent.defaultPlugins).toEqual([])
+    expect('agentChat' in resolved).toBe(false)
   })
 
-  it('strips the removed Freshell orchestration plugin path from agent chat defaults', () => {
+  it('strips the removed Freshell orchestration plugin path from fresh-agent defaults', () => {
     const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
-      agentChat: {
+      freshAgent: {
         defaultPlugins: [
           '/worktree/.claude/plugins/freshell-orchestration',
           '/custom/plugins/local-tools',
@@ -240,23 +280,23 @@ describe('shared settings contract', () => {
       },
     })
 
-    expect(merged.agentChat.defaultPlugins).toEqual(['/custom/plugins/local-tools'])
+    expect(merged.freshAgent.defaultPlugins).toEqual(['/custom/plugins/local-tools'])
   })
 
   it('migrates legacy defaultModel/defaultEffort values into exact selections and explicit effort overrides', () => {
     const merged = mergeServerSettings(createDefaultServerSettings({ loggingDebug: false }), {
-      agentChat: {
+      freshAgent: {
         providers: {
           freshclaude: {
-            defaultModel: 'claude-opus-4-6',
+            defaultModel: 'fixture-claude-model',
             defaultEffort: 'high',
           } as any,
         },
       },
     })
 
-    expect(merged.agentChat.providers.freshclaude).toEqual({
-      modelSelection: { kind: 'exact', modelId: 'claude-opus-4-6' },
+    expect(merged.freshAgent.providers.freshclaude).toEqual({
+      modelSelection: { kind: 'exact', modelId: 'fixture-claude-model' },
       effort: 'high',
     })
   })
@@ -330,7 +370,7 @@ describe('shared settings contract', () => {
         showSubagents: true,
         ignoreCodexSubagents: false,
       },
-      agentChat: {
+      freshAgent: {
         showThinking: true,
         showTools: true,
       },
@@ -423,9 +463,6 @@ describe('shared settings contract', () => {
         excludeFirstChatSubstrings: ['ignore'],
         excludeFirstChatMustStart: true,
       },
-      agentChat: {
-        defaultPlugins: ['fs'],
-      },
       freshAgent: {
         defaultPlugins: ['fs'],
       },
@@ -478,19 +515,18 @@ describe('shared settings contract', () => {
     it('keeps the legacy fresh-agent font scale default for old stored settings', () => {
       const resolved = resolveLocalSettings(undefined)
       expect(resolved.freshAgent.fontScale).toBe(1.5)
-      expect(resolved.agentChat.fontScale).toBe(1.5)
     })
 
-    it('resolves a configured legacy fresh-agent font scale and mirrors it to agentChat', () => {
+    it('resolves a configured fresh-agent font scale without mirroring agentChat', () => {
       const resolved = resolveLocalSettings({ freshAgent: { fontScale: 1.75 } })
       expect(resolved.freshAgent.fontScale).toBe(1.75)
-      expect(resolved.agentChat.fontScale).toBe(1.75)
+      expect('agentChat' in resolved).toBe(false)
     })
 
     it('accepts the legacy fresh-agent font scale through the agentChat alias', () => {
-      const resolved = resolveLocalSettings({ agentChat: { fontScale: 1.25 } })
+      const resolved = resolveLocalSettings({ agentChat: { fontScale: 1.25 } } as never)
       expect(resolved.freshAgent.fontScale).toBe(1.25)
-      expect(resolved.agentChat.fontScale).toBe(1.25)
+      expect('agentChat' in resolved).toBe(false)
     })
 
     it('clamps an out-of-range legacy fresh-agent font scale into the supported range', () => {
@@ -517,7 +553,7 @@ describe('shared settings contract', () => {
     it('clamps the legacy fresh-agent font scale when extracting a local seed', () => {
       expect(
         extractLegacyLocalSettingsSeed({ agentChat: { fontScale: 9 } } as Record<string, unknown>),
-      ).toEqual({ agentChat: { fontScale: 2 } })
+      ).toEqual({ freshAgent: { fontScale: 2 } })
     })
   })
 })

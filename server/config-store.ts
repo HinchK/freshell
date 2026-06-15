@@ -5,6 +5,7 @@ import { getFreshellConfigDir } from './freshell-home.js'
 import {
   createDefaultServerSettings,
   extractLegacyLocalSettingsSeed,
+  migrateLegacyFreshAgentSettingsInput,
   mergeLocalSettings,
   mergeServerSettings,
   stripLocalSettings,
@@ -271,62 +272,19 @@ function migrateLegacyFreshClaudeSettings(rawSettings: Record<string, unknown>):
   }
 
   const migrated = { ...rawSettings }
-  const existingAgentChat = isRecord(migrated.agentChat) ? { ...migrated.agentChat } : {}
-  const existingProviders = isRecord(existingAgentChat.providers) ? { ...existingAgentChat.providers } : {}
+  const existingFreshAgent = isRecord(migrated.freshAgent) ? { ...migrated.freshAgent } : {}
+  const existingProviders = isRecord(existingFreshAgent.providers) ? { ...existingFreshAgent.providers } : {}
 
   existingProviders.freshclaude = {
     ...rawSettings.freshclaude,
     ...(isRecord(existingProviders.freshclaude) ? existingProviders.freshclaude : {}),
   }
 
-  existingAgentChat.providers = existingProviders
-  migrated.agentChat = existingAgentChat
+  existingFreshAgent.providers = existingProviders
+  migrated.freshAgent = existingFreshAgent
   delete migrated.freshclaude
 
   return migrated
-}
-
-function normalizeFreshAgentCompatSettings(rawSettings: Record<string, unknown>): Record<string, unknown> {
-  const freshAgent = isRecord(rawSettings.freshAgent) ? rawSettings.freshAgent : undefined
-  const agentChat = isRecord(rawSettings.agentChat) ? rawSettings.agentChat : undefined
-
-  if (!freshAgent && !agentChat) {
-    return rawSettings
-  }
-
-  const merged: Record<string, unknown> = {
-    ...(agentChat || {}),
-    ...(freshAgent || {}),
-  }
-
-  const freshPlugins = Array.isArray(freshAgent?.defaultPlugins) ? freshAgent.defaultPlugins : undefined
-  const agentPlugins = Array.isArray(agentChat?.defaultPlugins) ? agentChat.defaultPlugins : undefined
-  if ((freshPlugins?.length ?? 0) > 0) {
-    merged.defaultPlugins = freshPlugins
-  } else if (agentPlugins) {
-    merged.defaultPlugins = agentPlugins
-  }
-
-  const freshProviders = isRecord(freshAgent?.providers) ? freshAgent.providers : undefined
-  const agentProviders = isRecord(agentChat?.providers) ? agentChat.providers : undefined
-  if (freshProviders || agentProviders) {
-    merged.providers = {
-      ...(agentProviders || {}),
-      ...(freshProviders || {}),
-    }
-  }
-
-  if (typeof freshAgent?.initialSetupDone === 'boolean') {
-    merged.initialSetupDone = freshAgent.initialSetupDone
-  } else if (typeof agentChat?.initialSetupDone === 'boolean') {
-    merged.initialSetupDone = agentChat.initialSetupDone
-  }
-
-  return {
-    ...rawSettings,
-    freshAgent: merged,
-    agentChat: merged,
-  }
 }
 
 export class ConfigStore {
@@ -354,9 +312,14 @@ export class ConfigStore {
     this.lastReadError = error
     if (existing) {
       this.lastReadError = undefined
-      const rawSettings = normalizeFreshAgentCompatSettings(migrateLegacyFreshClaudeSettings(
+      const rawSettings = migrateLegacyFreshClaudeSettings(
         isRecord(existing.settings) ? { ...existing.settings } : {},
-      ))
+      )
+      const migratedSettings = {
+        ...rawSettings,
+        ...migrateLegacyFreshAgentSettingsInput(rawSettings),
+      }
+      delete (migratedSettings as Record<string, unknown>).agentChat
       const extractedLegacyLocalSettingsSeed = extractLegacyLocalSettingsSeed(rawSettings)
       const storedLegacyLocalSettingsSeed = isRecord(existing.legacyLocalSettingsSeed)
         ? extractLegacyLocalSettingsSeed(existing.legacyLocalSettingsSeed)
@@ -366,7 +329,7 @@ export class ConfigStore {
         : extractedLegacyLocalSettingsSeed
       const settings = mergeServerSettings(
         createDefaultServerSettings({ loggingDebug: resolveDefaultLoggingDebug(process.env) }),
-        stripLocalSettings(rawSettings) as AppSettingsPatch,
+        stripLocalSettings(migratedSettings) as AppSettingsPatch,
       )
       const normalized: UserConfig = {
         ...existing,
@@ -461,6 +424,18 @@ export class ConfigStore {
   }
 
   async patchSettings(patch: AppSettingsPatch): Promise<AppSettings> {
+    if (
+      isRecord(patch)
+      && Object.prototype.hasOwnProperty.call(patch, 'agentChat')
+    ) {
+      const error = new Error('agentChat settings have been migrated; use freshAgent')
+      logger.warn(
+        { event: 'legacy_agent_chat_settings_patch_rejected' },
+        'Rejected legacy agentChat settings patch',
+      )
+      throw error
+    }
+
     return this.writeMutex.acquire(async () => {
       const cfg = await this.loadForWrite()
       const updated: UserConfig = {

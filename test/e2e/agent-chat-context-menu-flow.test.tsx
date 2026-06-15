@@ -46,8 +46,8 @@ function makeStore() {
     preloadedState: {
       settings: {
         serverSettings: defaultSettings,
-        localSettings: { ...defaultLocalSettings, agentChat: { showThinking: false, showTools: true, showTimecodes: false } },
-        settings: { ...defaultSettings, agentChat: { ...defaultSettings.agentChat, showTools: true } },
+        localSettings: { ...defaultLocalSettings, freshAgent: { ...defaultLocalSettings.freshAgent, showThinking: false, showTools: true, showTimecodes: false } },
+        settings: { ...defaultSettings, freshAgent: { ...defaultSettings.freshAgent, showTools: true } },
         loaded: false,
       },
     },

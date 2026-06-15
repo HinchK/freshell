@@ -53,7 +53,6 @@ function createSetupHome(sharedOpencodeDataDir: string) {
           },
         },
         freshAgent: { enabled: true },
-        agentChat: { enabled: true },
       },
     }, null, 2))
   }
@@ -99,7 +98,6 @@ async function enableFreshOpencode(page: Page): Promise<void> {
       payload: {
         codingCli: { enabledProviders: ['opencode'] },
         freshAgent: { enabled: true },
-        agentChat: { enabled: true },
       },
     })
   })

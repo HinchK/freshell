@@ -550,8 +550,8 @@ describe('pane activity indicator flow (e2e)', () => {
     const { store } = renderHarness({
       pane,
       settingsOverrides: {
-        agentChat: {
-          ...defaultSettings.agentChat,
+        freshAgent: {
+          ...defaultSettings.freshAgent,
           providers: {
             freshclaude: {
               modelSelection: { kind: 'tracked', modelId: 'opus[1m]' },
@@ -661,7 +661,7 @@ describe('pane activity indicator flow (e2e)', () => {
     await waitFor(() => {
       expect(saveServerSettingsPatchSpy).toHaveBeenCalledTimes(2)
       expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(1, {
-        agentChat: {
+        freshAgent: {
           providers: {
             freshclaude: {
               modelSelection: { kind: 'tracked', modelId: 'haiku' },
@@ -671,7 +671,7 @@ describe('pane activity indicator flow (e2e)', () => {
       })
     })
     expect(saveServerSettingsPatchSpy).toHaveBeenNthCalledWith(2, {
-      agentChat: {
+      freshAgent: {
         providers: {
           freshclaude: {
             effort: undefined,

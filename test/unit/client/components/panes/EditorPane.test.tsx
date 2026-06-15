@@ -96,7 +96,7 @@ const createMockStore = (overrides?: { theme?: string }) =>
               codingCli: { theme: 'auto' },
               tabs: {},
               logging: {},
-              agentChat: { providers: {} },
+              freshAgent: { providers: {} },
             },
           },
         }

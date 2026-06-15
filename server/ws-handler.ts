@@ -1364,7 +1364,7 @@ export class WsHandler {
   }
 
   private freshClientsEnabled(settings?: ServerSettings): boolean {
-    return settings?.freshAgent?.enabled ?? settings?.agentChat?.enabled ?? false
+    return settings?.freshAgent?.enabled ?? false
   }
 
   private sendFreshAgentSubscriptionError(ws: LiveWebSocket, locator: FreshAgentLocator, error: unknown): void {

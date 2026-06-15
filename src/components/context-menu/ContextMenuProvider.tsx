@@ -450,7 +450,7 @@ export function ContextMenuProvider({
       || session.sessionType || mode
     const agentConfig = getAgentChatProviderConfig(sessionType)
     const providerSettings = agentConfig
-      ? appSettings.agentChat?.providers?.[agentConfig.name]
+      ? appSettings.freshAgent?.providers?.[agentConfig.name]
       : undefined
     dispatch(addPane({
       tabId: activeTabId,
@@ -876,7 +876,7 @@ export function ContextMenuProvider({
         tab,
         content,
         target,
-        providerSettings: state.settings.settings.agentChat?.providers?.[target.targetSessionType],
+        providerSettings: state.settings.settings.freshAgent?.providers?.[target.targetSessionType],
       }
     }
 

@@ -82,7 +82,7 @@ describe('SettingsView fresh agent settings', () => {
     fireEvent.click(getToggle('Enable fresh clients (experimental)'))
 
     expect(store.getState().settings.settings.freshAgent.enabled).toBe(true)
-    expect(store.getState().settings.settings.agentChat.enabled).toBe(true)
+    expect('agentChat' in store.getState().settings.settings).toBe(false)
 
     await act(async () => {
       await Promise.resolve()
@@ -90,7 +90,6 @@ describe('SettingsView fresh agent settings', () => {
 
     expect(api.patch).toHaveBeenCalledWith('/api/settings', {
       freshAgent: { enabled: true },
-      agentChat: { enabled: true },
     })
   })
 
@@ -102,7 +101,7 @@ describe('SettingsView fresh agent settings', () => {
     fireEvent.click(getToggle('Show thinking'))
 
     expect(store.getState().settings.settings.freshAgent.showThinking).toBe(true)
-    expect(store.getState().settings.settings.agentChat.showThinking).toBe(true)
+    expect('agentChat' in store.getState().settings.settings).toBe(false)
   })
 
   it('toggling Show tools updates the store to true', () => {
@@ -113,7 +112,7 @@ describe('SettingsView fresh agent settings', () => {
     fireEvent.click(getToggle('Show tools'))
 
     expect(store.getState().settings.settings.freshAgent.showTools).toBe(true)
-    expect(store.getState().settings.settings.agentChat.showTools).toBe(true)
+    expect('agentChat' in store.getState().settings.settings).toBe(false)
   })
 
   it('toggling Show timecodes updates the store to true', () => {
@@ -124,7 +123,7 @@ describe('SettingsView fresh agent settings', () => {
     fireEvent.click(getToggle('Show timecodes & model'))
 
     expect(store.getState().settings.settings.freshAgent.showTimecodes).toBe(true)
-    expect(store.getState().settings.settings.agentChat.showTimecodes).toBe(true)
+    expect('agentChat' in store.getState().settings.settings).toBe(false)
   })
 
   it('does not render a separate Fresh agent font size dropdown', () => {
@@ -138,7 +137,7 @@ describe('SettingsView fresh agent settings', () => {
 
   it('toggling off a previously-on setting sets it to false', () => {
     const store = createSettingsViewStore({
-      settings: { freshAgent: { showThinking: true }, agentChat: { showThinking: true } },
+      settings: { freshAgent: { showThinking: true } },
     })
     renderSettingsView(store)
     switchSettingsTab('Workspace')
@@ -146,7 +145,7 @@ describe('SettingsView fresh agent settings', () => {
     fireEvent.click(getToggle('Show thinking'))
 
     expect(store.getState().settings.settings.freshAgent.showThinking).toBe(false)
-    expect(store.getState().settings.settings.agentChat.showThinking).toBe(false)
+    expect('agentChat' in store.getState().settings.settings).toBe(false)
   })
 
   it('fresh agent setting changes are local-only (no api.patch call)', async () => {
