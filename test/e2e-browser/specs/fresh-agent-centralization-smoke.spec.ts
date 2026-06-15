@@ -13,6 +13,15 @@ type PaneNode = {
   children?: PaneNode[]
 }
 
+type LayoutSnapshot = {
+  tabs: Array<{ id: string; title?: string }>
+  activeTabId?: string | null
+  layouts: Record<string, PaneNode>
+  activePane: Record<string, string>
+  paneTitles?: Record<string, Record<string, string>>
+  paneTitleSetByUser?: Record<string, Record<string, boolean>>
+}
+
 function freshAgentSnapshot(sessionType: string, provider: string, threadId: string) {
   return {
     sessionType,
@@ -229,20 +238,6 @@ async function sendLegacyLayoutSync(page: Page) {
   }, legacyLayoutPayload())
 }
 
-function normalizedRemoteFreshAgentPaneContent() {
-  return {
-    kind: 'fresh-agent',
-    sessionType: 'freshclaude',
-    provider: 'claude',
-    createRequestId: 'req-remote-rendered-agent',
-    sessionId: CANONICAL_CLAUDE_SESSION_ID,
-    resumeSessionId: CANONICAL_CLAUDE_SESSION_ID,
-    sessionRef: { provider: 'claude', sessionId: CANONICAL_CLAUDE_SESSION_ID },
-    status: 'idle',
-    settingsDismissed: true,
-  }
-}
-
 async function fetchWithAuth(serverInfo: TestServerInfo, path: string, init: RequestInit = {}) {
   return fetch(`${serverInfo.baseUrl}${path}`, {
     ...init,
@@ -252,6 +247,94 @@ async function fetchWithAuth(serverInfo: TestServerInfo, path: string, init: Req
       ...(init.headers ?? {}),
     },
   })
+}
+
+async function fetchNormalizedLayoutProducedByLegacySync(serverInfo: TestServerInfo, tabId: string): Promise<LayoutSnapshot> {
+  await expect.poll(async () => {
+    const response = await fetchWithAuth(serverInfo, `/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`)
+    const body = await response.json()
+    const layout = body?.data?.layouts?.[tabId] as PaneNode | undefined
+    return collectLeaves(layout).map((leaf) => ({
+      id: leaf.id,
+      kind: leaf.content?.kind,
+      createRequestId: leaf.content?.createRequestId,
+    }))
+  }).toEqual(expect.arrayContaining([
+    { id: 'pane-legacy-agent', kind: 'fresh-agent', createRequestId: 'req-legacy-agent' },
+    { id: 'pane-legacy-agent-nested', kind: 'fresh-agent', createRequestId: 'req-legacy-agent-nested' },
+    { id: 'pane-shell', kind: 'terminal', createRequestId: 'req-shell' },
+  ]))
+
+  const response = await fetchWithAuth(serverInfo, `/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`)
+  expect(response.status).toBe(200)
+  const body = await response.json()
+  const snapshot = body.data as LayoutSnapshot
+  const serialized = JSON.stringify(snapshot)
+  expect(snapshot.tabs).toEqual([expect.objectContaining({ id: tabId, title: 'Remote legacy' })])
+  expect(snapshot.activePane).toMatchObject({ [tabId]: 'pane-legacy-agent' })
+  expect(serialized).toContain('"fresh-agent"')
+  expect(serialized).not.toContain('"agent-chat"')
+
+  const leaves = collectLeaves(snapshot.layouts[tabId])
+  const rootFreshAgent = leaves.find((leaf) => leaf.id === 'pane-legacy-agent')
+  const nestedFreshAgent = leaves.find((leaf) => leaf.id === 'pane-legacy-agent-nested')
+  expect(rootFreshAgent?.content).toMatchObject({
+    kind: 'fresh-agent',
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    createRequestId: 'req-legacy-agent',
+    sessionRef: { provider: 'claude', sessionId: CANONICAL_CLAUDE_SESSION_ID },
+  })
+  expect(nestedFreshAgent?.content).toMatchObject({
+    kind: 'fresh-agent',
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    createRequestId: 'req-legacy-agent-nested',
+    sessionRef: { provider: 'claude', sessionId: CANONICAL_CLAUDE_SESSION_ID },
+  })
+  return snapshot
+}
+
+async function renderNormalizedLegacySyncSnapshot(page: Page, snapshot: LayoutSnapshot, tabId: string) {
+  await page.evaluate(({ snapshot, tabId }) => {
+    const harness = window.__FRESHELL_TEST_HARNESS__
+    if (!harness) throw new Error('Freshell test harness unavailable')
+
+    const layout = snapshot.layouts[tabId]
+    const collectLeaves = (node: any): Array<{ id: string; content?: { kind?: string } }> => {
+      if (!node) return []
+      if (node.type === 'leaf') return [node]
+      return (node.children ?? []).flatMap((child: any) => collectLeaves(child))
+    }
+
+    for (const leaf of collectLeaves(layout)) {
+      if (leaf.content?.kind === 'fresh-agent') {
+        harness.setFreshAgentNetworkEffectsSuppressed(leaf.id, true)
+      }
+    }
+
+    const tab = snapshot.tabs.find((item) => item.id === tabId)
+    if (!tab) throw new Error(`Missing normalized tab ${tabId}`)
+
+    harness.dispatch({
+      type: 'tabs/addTab',
+      payload: { id: tab.id, title: tab.title ?? tab.id, status: 'running' },
+    })
+    // The harness cannot receive an echoed ui.layout.sync, so this applies the exact
+    // server-normalized snapshot produced by the legacy sync before selecting the tab.
+    const current = harness.getState().panes
+    harness.dispatch({
+      type: 'panes/hydratePanes',
+      payload: {
+        ...current,
+        layouts: { ...current.layouts, [tabId]: layout },
+        activePane: { ...current.activePane, [tabId]: snapshot.activePane[tabId] },
+        paneTitles: { ...current.paneTitles, ...(snapshot.paneTitles ?? {}) },
+        paneTitleSetByUser: { ...current.paneTitleSetByUser, ...(snapshot.paneTitleSetByUser ?? {}) },
+      },
+    })
+    harness.dispatch({ type: 'tabs/setActiveTab', payload: tabId })
+  }, { snapshot, tabId })
 }
 
 test.describe('Fresh-agent centralization smoke', () => {
@@ -340,34 +423,26 @@ test.describe('Fresh-agent centralization smoke', () => {
       message: expect.stringContaining('pane kind "fresh-agent"'),
     })
 
-    const remoteRenderTabId = 'tab-remote-rendered'
-    const remoteRenderPaneId = 'pane-remote-rendered-agent'
-    await page.evaluate((paneId) => {
-      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed(paneId, true)
-    }, remoteRenderPaneId)
-    await harness.receiveWsMessage({
-      type: 'ui.command',
-      command: 'tab.create',
-      payload: {
-        id: remoteRenderTabId,
-        title: 'Remote normalized legacy',
-        paneId: remoteRenderPaneId,
-        paneContent: normalizedRemoteFreshAgentPaneContent(),
-      },
-    })
-    await harness.receiveWsMessage({
-      type: 'ui.command',
-      command: 'tab.select',
-      payload: { id: remoteRenderTabId },
-    })
+    const normalizedLegacySyncSnapshot = await fetchNormalizedLayoutProducedByLegacySync(serverInfo, 'tab-remote-legacy')
+    await renderNormalizedLegacySyncSnapshot(page, normalizedLegacySyncSnapshot, 'tab-remote-legacy')
 
-    await expect(page.locator('[data-context="fresh-agent"]')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('[data-context="fresh-agent"]')).toHaveCount(2, { timeout: 10_000 })
     await expect(page.locator('[data-context="agent-chat"]')).toHaveCount(0)
 
     const browserState = await harness.getState()
-    const renderedLayout = browserState.panes.layouts[remoteRenderTabId]
+    const renderedLayout = browserState.panes.layouts['tab-remote-legacy']
     expect(JSON.stringify(renderedLayout)).toContain('"fresh-agent"')
     expect(JSON.stringify(renderedLayout)).not.toContain('"agent-chat"')
+    expect(collectLeaves(renderedLayout)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'pane-legacy-agent',
+        content: expect.objectContaining({ createRequestId: 'req-legacy-agent' }),
+      }),
+      expect.objectContaining({
+        id: 'pane-legacy-agent-nested',
+        content: expect.objectContaining({ createRequestId: 'req-legacy-agent-nested' }),
+      }),
+    ]))
   })
 
   test('keeps fresh-agent settings and routes while legacy settings and routes are removed', async ({ freshellPage: _freshellPage, page, serverInfo }) => {

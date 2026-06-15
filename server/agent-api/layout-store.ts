@@ -178,6 +178,27 @@ export class LayoutStore {
     return this.snapshot?.activeTabId || null
   }
 
+  getNormalizedSnapshot(tabId?: string): UiSnapshot {
+    if (!this.snapshot) {
+      return { tabs: [], layouts: {}, activePane: {}, activeTabId: null }
+    }
+
+    if (!tabId) return this.snapshot
+
+    const tab = this.snapshot.tabs.find((item) => item.id === tabId)
+    return {
+      tabs: tab ? [tab] : [],
+      activeTabId: tab ? tab.id : null,
+      layouts: this.snapshot.layouts?.[tabId] ? { [tabId]: this.snapshot.layouts[tabId] } : {},
+      activePane: this.snapshot.activePane?.[tabId] ? { [tabId]: this.snapshot.activePane[tabId] } : {},
+      paneTitles: this.snapshot.paneTitles?.[tabId] ? { [tabId]: this.snapshot.paneTitles[tabId] } : {},
+      paneTitleSetByUser: this.snapshot.paneTitleSetByUser?.[tabId]
+        ? { [tabId]: this.snapshot.paneTitleSetByUser[tabId] }
+        : {},
+      timestamp: this.snapshot.timestamp,
+    }
+  }
+
   private ensureSnapshot(): UiSnapshot {
     if (!this.snapshot) {
       this.snapshot = { tabs: [], layouts: {}, activePane: {}, activeTabId: null }

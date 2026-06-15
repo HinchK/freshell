@@ -662,6 +662,19 @@ export function createAgentApiRouter({
     res.json(ok({ tabs, activeTabId }))
   })
 
+  router.get('/layout/snapshot', (req, res) => {
+    const tabId = typeof req.query.tabId === 'string' ? req.query.tabId : undefined
+    const snapshot = layoutStore.getNormalizedSnapshot?.(tabId) || {
+      tabs: [],
+      activeTabId: null,
+      layouts: {},
+      activePane: {},
+      paneTitles: {},
+      paneTitleSetByUser: {},
+    }
+    res.json(ok(snapshot))
+  })
+
   router.get('/panes', (req, res) => {
     const tabId = req.query.tabId as string | undefined
     const panes = layoutStore.listPanes?.(tabId) || []
