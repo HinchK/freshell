@@ -102,4 +102,77 @@ describe('config-store fresh-agent settings compatibility', () => {
     expect(settings.freshAgent.providers.freshcodex).toEqual({ style: 'serif', effort: 'high' })
     expect('agentChat' in settings).toBe(false)
   })
+
+  it('gives legacy agentChat provider fields precedence over flat legacy freshclaude values', async () => {
+    await writeConfigWithSettings({
+      freshclaude: {
+        modelSelection: { kind: 'tracked', modelId: 'flat-claude-model' },
+        effort: 'flat-effort',
+        defaultPermissionMode: 'flat-permission',
+        style: 'serif',
+      },
+      agentChat: {
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'tracked', modelId: 'agent-chat-model' },
+            effort: 'agent-chat-effort',
+            defaultPermissionMode: 'agent-chat-permission',
+          },
+        },
+      },
+    })
+
+    const settings = await new ConfigStore().getSettings()
+
+    expect(settings.freshAgent.providers.freshclaude).toEqual({
+      modelSelection: { kind: 'tracked', modelId: 'agent-chat-model' },
+      effort: 'agent-chat-effort',
+      defaultPermissionMode: 'agent-chat-permission',
+      style: 'serif',
+    })
+    expect('agentChat' in settings).toBe(false)
+    expect('freshclaude' in settings).toBe(false)
+  })
+
+  it('gives canonical freshAgent provider fields precedence while preserving lower-priority legacy fields', async () => {
+    await writeConfigWithSettings({
+      freshclaude: {
+        modelSelection: { kind: 'tracked', modelId: 'flat-claude-model' },
+        effort: 'flat-effort',
+        defaultPermissionMode: 'flat-permission',
+        style: 'serif',
+      },
+      agentChat: {
+        defaultPlugins: ['/legacy/plugin'],
+        providers: {
+          freshclaude: {
+            modelSelection: { kind: 'tracked', modelId: 'agent-chat-model' },
+            effort: 'agent-chat-effort',
+            defaultPermissionMode: 'agent-chat-permission',
+          },
+        },
+      },
+      freshAgent: {
+        defaultPlugins: [],
+        providers: {
+          freshclaude: {
+            defaultPermissionMode: 'canonical-permission',
+            style: 'sans',
+          },
+        },
+      },
+    })
+
+    const settings = await new ConfigStore().getSettings()
+
+    expect(settings.freshAgent.defaultPlugins).toEqual([])
+    expect(settings.freshAgent.providers.freshclaude).toEqual({
+      modelSelection: { kind: 'tracked', modelId: 'agent-chat-model' },
+      effort: 'agent-chat-effort',
+      defaultPermissionMode: 'canonical-permission',
+      style: 'sans',
+    })
+    expect('agentChat' in settings).toBe(false)
+    expect('freshclaude' in settings).toBe(false)
+  })
 })

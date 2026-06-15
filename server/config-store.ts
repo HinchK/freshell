@@ -272,16 +272,17 @@ function migrateLegacyFreshClaudeSettings(rawSettings: Record<string, unknown>):
   }
 
   const migrated = { ...rawSettings }
-  const existingFreshAgent = isRecord(migrated.freshAgent) ? { ...migrated.freshAgent } : {}
-  const existingProviders = isRecord(existingFreshAgent.providers) ? { ...existingFreshAgent.providers } : {}
+  const existingAgentChat = isRecord(migrated.agentChat) ? { ...migrated.agentChat } : {}
+  const existingProviders = isRecord(existingAgentChat.providers) ? { ...existingAgentChat.providers } : {}
+  const existingFreshClaudeProvider = existingProviders.freshclaude
 
   existingProviders.freshclaude = {
     ...rawSettings.freshclaude,
-    ...(isRecord(existingProviders.freshclaude) ? existingProviders.freshclaude : {}),
+    ...(isRecord(existingFreshClaudeProvider) ? existingFreshClaudeProvider : {}),
   }
 
-  existingFreshAgent.providers = existingProviders
-  migrated.freshAgent = existingFreshAgent
+  existingAgentChat.providers = existingProviders
+  migrated.agentChat = existingAgentChat
   delete migrated.freshclaude
 
   return migrated
