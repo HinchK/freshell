@@ -268,6 +268,7 @@ test.describe('Fresh Agent', () => {
             resumeSessionId: 'style-thread',
             status: 'idle',
             settingsDismissed: true,
+            showThinking: true,
           },
         },
       })

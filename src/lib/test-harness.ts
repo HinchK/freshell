@@ -10,6 +10,9 @@ export interface FreshellTestHarness {
   forceDisconnect: () => void
   sendWsMessage: (msg: unknown) => void
   receiveWsMessage?: (msg: ServerMessage) => void
+  suppressAllFreshAgentNetworkEffects?: boolean
+  setSuppressAllFreshAgentNetworkEffects: (suppressed: boolean) => void
+  isAllFreshAgentNetworkEffectsSuppressed: () => boolean
   setFreshAgentNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
   isFreshAgentNetworkEffectsSuppressed: (paneId: string) => boolean
   setTerminalNetworkEffectsSuppressed: (paneId: string, suppressed: boolean) => void
@@ -61,6 +64,8 @@ export function installTestHarness(
   // TerminalView registers/unregisters accessors as xterm instances mount/unmount.
   const terminalBuffers = new Map<string, () => string>()
   const suppressedFreshAgentPaneIds = new Set<string>()
+  let suppressAllFreshAgentNetworkEffects = window.__FRESHELL_TEST_HARNESS__?.suppressAllFreshAgentNetworkEffects === true
+    || (window as { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ === true
   const suppressedTerminalPaneIds = new Set<string>()
   const sentWsMessages: unknown[] = []
   const recordSentWsMessage = (msg: unknown) => {
@@ -80,6 +85,14 @@ export function installTestHarness(
     forceDisconnect: forceWsDisconnect,
     sendWsMessage: sendWsMessage,
     receiveWsMessage: resolvedReceiveWsMessage,
+    get suppressAllFreshAgentNetworkEffects() {
+      return suppressAllFreshAgentNetworkEffects
+    },
+    setSuppressAllFreshAgentNetworkEffects: (suppressed: boolean) => {
+      suppressAllFreshAgentNetworkEffects = suppressed
+      ;(window as { __FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__?: boolean }).__FRESHELL_SUPPRESS_ALL_FRESH_AGENT_NETWORK_EFFECTS__ = suppressed
+    },
+    isAllFreshAgentNetworkEffectsSuppressed: () => suppressAllFreshAgentNetworkEffects,
     getTerminalBuffer: (terminalId?: string) => {
       if (terminalId) {
         const accessor = terminalBuffers.get(terminalId)
