@@ -212,6 +212,17 @@ describe('OpencodeServeManager fan-out', () => {
     expect((manager as any).sessionEmitters.get('ses_a')?.listenerCount('event') ?? 0).toBe(0)
   })
 
+  it('onceIdle resolves on session.status with idle for that session', async () => {
+    let push!: (e: any) => void
+    const { manager } = makeManager({
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+    })
+    await manager.ensureStarted()
+    const idle = manager.onceIdle('ses_a', 1000)
+    push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'idle' } } })
+    await expect(idle).resolves.toBeUndefined()
+  })
+
   it('onceIdle rejects on timeout', async () => {
     const { manager } = makeManager({ connectEventStream: () => () => {} })
     await manager.ensureStarted()
