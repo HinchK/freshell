@@ -8,12 +8,12 @@ import { FreshAgentLostSessionError } from '../../server/fresh-agent/runtime-man
 
 function makeApp(overrides: { freshAgentRuntimeManager?: any } = {}) {
   const layoutStore = new LayoutStore()
-  const wsHandler = { broadcastUiCommand: vi.fn() }
+  const wsHandler = { broadcastUiCommand: vi.fn(), broadcast: vi.fn() }
   const freshAgentRuntimeManager = overrides.freshAgentRuntimeManager ?? {
     create: vi.fn(async () => ({ sessionId: 'freshopencode-abc', sessionType: 'freshopencode', runtimeProvider: 'opencode', sessionRef: { provider: 'opencode', sessionId: 'freshopencode-abc' } })),
     send: vi.fn(async () => undefined),
     attach: vi.fn(async () => ({ sessionId: 'ses_real_1' })),
-    getSnapshot: vi.fn(async () => ({ turns: [] })),
+    getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
   }
   const app = express()
   app.use(express.json())
@@ -68,7 +68,7 @@ describe('agent-api fresh-agent: create', () => {
       create: vi.fn(async () => { throw new Error('sidecar failed to start') }),
       send: vi.fn(async () => undefined),
       attach: vi.fn(async () => ({ sessionId: 'ses_real_1' })),
-      getSnapshot: vi.fn(async () => ({ turns: [] })),
+      getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
     }
     const { app, layoutStore } = makeApp({ freshAgentRuntimeManager })
     const tabsBefore = layoutStore.getNormalizedSnapshot().tabs.length
@@ -82,7 +82,7 @@ describe('agent-api fresh-agent: create', () => {
       create: vi.fn(async () => { throw new Error('sidecar failed to start') }),
       send: vi.fn(async () => undefined),
       attach: vi.fn(async () => ({ sessionId: 'ses_real_1' })),
-      getSnapshot: vi.fn(async () => ({ turns: [] })),
+      getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
     }
     const { app, layoutStore } = makeApp({ freshAgentRuntimeManager })
     const { paneId: basePaneId } = layoutStore.createTab({ title: 'base' })
@@ -97,7 +97,7 @@ describe('agent-api fresh-agent: create', () => {
       create: vi.fn(async () => { throw new Error('sidecar failed to start') }),
       send: vi.fn(async () => undefined),
       attach: vi.fn(async () => ({ sessionId: 'ses_real_1' })),
-      getSnapshot: vi.fn(async () => ({ turns: [] })),
+      getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
     }
     const { app, layoutStore } = makeApp({ freshAgentRuntimeManager })
     const { paneId: basePaneId } = layoutStore.createTab({ title: 'base' })
@@ -129,7 +129,7 @@ describe('agent-api fresh-agent: send-keys', () => {
     const attach = vi.fn(async () => ({ sessionId: 'ses_real_1' }))
     const { app } = makeApp({ freshAgentRuntimeManager: {
       create: vi.fn(async () => ({ sessionId: 'ses_real_1', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
-      send, attach, getSnapshot: vi.fn(async () => ({ turns: [] })),
+      send, attach,       getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
     } })
     const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
     const res = await request(app).post(`/api/panes/${created.body.data.paneId}/send-keys`).send({ data: 'hi' })
@@ -171,5 +171,51 @@ describe('agent-api fresh-agent: wait-for', () => {
     const res = await request(app).get(`/api/panes/${created.body.data.paneId}/wait-for?timeout=2`)
     expect(res.status).toBe(200)
     expect(res.body.data).toMatchObject({ matched: true, reason: 'idle' })
+  })
+
+  it('surfaces a lost session error instead of timing out', async () => {
+    const { FreshAgentLostSessionError } = await import('../../server/fresh-agent/runtime-manager.js')
+    const { app } = makeApp({ freshAgentRuntimeManager: {
+      create: vi.fn(async () => ({ sessionId: 'freshopencode-abc', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
+      send: vi.fn(), attach: vi.fn(),
+      getSnapshot: vi.fn(async () => { throw new FreshAgentLostSessionError('session gone') }),
+    } })
+    const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
+    const res = await request(app).get(`/api/panes/${created.body.data.paneId}/wait-for?timeout=1`)
+    expect(res.status).toBe(404)
+  })
+})
+
+describe('agent-api fresh-agent: materialization', () => {
+  it('persists a materialized OpenCode session into the pane and broadcasts it', async () => {
+    const freshAgentRuntimeManager = {
+      create: vi.fn(async () => ({ sessionId: 'freshopencode-abc', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
+      send: vi.fn(async () => ({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })),
+      attach: vi.fn(),
+      getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
+    }
+    const { app, layoutStore, wsHandler } = makeApp({ freshAgentRuntimeManager })
+    const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
+    const paneId = created.body.data.paneId
+    const res = await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'ok' })
+    expect(res.status).toBe(200)
+    expect(res.body.data).toMatchObject({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
+    const snap = layoutStore.getPaneSnapshot(paneId)
+    expect(snap?.paneContent?.sessionId).toBe('ses_real_1')
+    expect(snap?.paneContent?.sessionRef).toEqual({ provider: 'opencode', sessionId: 'ses_real_1' })
+    expect(wsHandler.broadcast).toHaveBeenCalledWith(expect.objectContaining({ type: 'freshAgent.session.materialized', sessionId: 'ses_real_1' }))
+  })
+
+  it('returns 404 for a lost session on send-keys', async () => {
+    const { FreshAgentLostSessionError } = await import('../../server/fresh-agent/runtime-manager.js')
+    const { app } = makeApp({ freshAgentRuntimeManager: {
+      create: vi.fn(async () => ({ sessionId: 'freshopencode-abc', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
+      send: vi.fn(async () => { throw new FreshAgentLostSessionError('session gone') }),
+      attach: vi.fn(),
+      getSnapshot: vi.fn(async () => ({ status: 'idle', turns: [] })),
+    } })
+    const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
+    const res = await request(app).post(`/api/panes/${created.body.data.paneId}/send-keys`).send({ data: 'hi' })
+    expect(res.status).toBe(404)
   })
 })

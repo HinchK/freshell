@@ -29,6 +29,14 @@ import type {
   FreshAgentSessionLocator,
   FreshAgentThreadLocator,
 } from '../fresh-agent/runtime-adapter.js'
+import {
+  FreshAgentContractValidationError,
+  FreshAgentLostSessionError,
+  FreshAgentRuntimeUnavailableError,
+  FreshAgentSessionLocatorMismatchError,
+  FreshAgentStaleThreadRevisionError,
+  FreshAgentUnsupportedCapabilityError,
+} from '../fresh-agent/runtime-manager.js'
 
 const truthy = (value: unknown) => value === true || value === 'true' || value === '1' || value === 'yes'
 const SYNCABLE_TERMINAL_MODES = new Set(['claude', 'codex', 'opencode', 'gemini', 'kimi'])
@@ -43,15 +51,52 @@ class AgentRouteInputError extends Error {
 }
 
 function agentRouteErrorStatus(error: unknown): number {
-  return error instanceof CodexLaunchConfigError
+  if (error instanceof CodexLaunchConfigError
     || error instanceof AgentRouteInputError
-    || error instanceof UnknownTerminalModeError
-    ? 400
-    : 500
+    || error instanceof UnknownTerminalModeError) {
+    return 400
+  }
+  if (error instanceof FreshAgentLostSessionError) return 404
+  if (error instanceof FreshAgentUnsupportedCapabilityError
+    || error instanceof FreshAgentSessionLocatorMismatchError
+    || error instanceof FreshAgentStaleThreadRevisionError) {
+    return 409
+  }
+  if (error instanceof FreshAgentRuntimeUnavailableError) return 503
+  if (error instanceof FreshAgentContractValidationError) return 502
+  return 500
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function freshAgentErrorStatus(error: unknown): number {
+  if (error instanceof FreshAgentLostSessionError) return 404
+  if (error instanceof FreshAgentUnsupportedCapabilityError
+    || error instanceof FreshAgentSessionLocatorMismatchError
+    || error instanceof FreshAgentStaleThreadRevisionError) {
+    return 409
+  }
+  if (error instanceof FreshAgentRuntimeUnavailableError) return 503
+  if (error instanceof FreshAgentContractValidationError) return 502
+  return 500
+}
+
+const FRESH_AGENT_SEND_IDLE_TIMEOUT_MS = 600_000
+
+async function waitForFreshAgentIdle(
+  runtimeManager: NonNullable<FreshAgentRuntimeManagerLike>,
+  locator: { sessionType: string; provider: string; threadId: string },
+  deadline: number,
+): Promise<{ status: string; deadlineMissed: boolean }> {
+  while (Date.now() < deadline) {
+    const snap = await runtimeManager.getSnapshot(locator as FreshAgentThreadLocator)
+    const status = snap?.status
+    if (status === 'idle') return { status, deadlineMissed: false }
+    await new Promise((r) => setTimeout(r, 200))
+  }
+  return { status: 'unknown', deadlineMissed: true }
 }
 
 function combineWithCleanupError(primary: unknown, cleanupError: unknown): Error {
@@ -895,7 +940,9 @@ export function createAgentApiRouter({
         try {
           const snap = await freshAgentRuntimeManager.getSnapshot({ sessionType: c.sessionType, provider: c.provider, threadId: c.sessionId })
           status = snap?.status
-        } catch { /* session may not be materialized yet */ }
+        } catch (err) {
+          return res.status(freshAgentErrorStatus(err)).json(fail(errorMessage(err)))
+        }
         if (status === 'idle') return res.json(ok({ matched: true, reason: 'idle' }, 'session idle'))
         if (Date.now() >= deadline) return res.json(approx({ matched: false }, 'timeout'))
         await new Promise((r) => setTimeout(r, 200))
@@ -1593,6 +1640,7 @@ export function createAgentApiRouter({
       if (!freshAgentRuntimeManager) return res.status(503).json(fail('fresh-agent runtime not available on this server'))
       const locator = { sessionId: c.sessionId as string, sessionType: c.sessionType as string, provider: c.provider as string } as FreshAgentSessionLocator
       const runSend = () => freshAgentRuntimeManager.send(locator, { text })
+      const snapshotLocator = { sessionType: c.sessionType as string, provider: c.provider as string, threadId: c.sessionId as string }
       try {
         let result
         try {
@@ -1605,7 +1653,38 @@ export function createAgentApiRouter({
             throw err
           }
         }
-        return res.json(ok({ paneId, sessionId: result?.sessionId ?? locator.sessionId, sessionRef: result?.sessionRef }, 'prompt sent'))
+
+        // Block until the turn completes. OpenCode's send already awaits idle;
+        // Claude/Codex return when the turn starts, so we poll until idle.
+        const rawTimeout = req.body?.timeout
+        const timeoutSec = typeof rawTimeout === 'number' && Number.isFinite(rawTimeout) ? rawTimeout : (typeof rawTimeout === 'string' ? Number(rawTimeout) : Number.NaN)
+        const deadline = Date.now() + (Number.isFinite(timeoutSec) ? timeoutSec * 1000 : FRESH_AGENT_SEND_IDLE_TIMEOUT_MS)
+        const idle = await waitForFreshAgentIdle(freshAgentRuntimeManager, snapshotLocator, deadline)
+        if (idle.deadlineMissed) {
+          return res.json(approx({ paneId, sessionId: result?.sessionId ?? locator.sessionId, sessionRef: result?.sessionRef, status: idle.status }, 'prompt sent; turn did not complete within deadline'))
+        }
+
+        const finalSessionId = result?.sessionId ?? locator.sessionId
+        const finalSessionRef = result?.sessionRef
+
+        // Persist a materialized durable session back into the pane so reloads
+        // don't fall back to fragile legacy resolution.
+        if (finalSessionRef && finalSessionId !== locator.sessionId && faSnapshot.tabId) {
+          const updatedContent = { ...c, sessionId: finalSessionId, sessionRef: finalSessionRef, resumeSessionId: finalSessionId }
+          layoutStore.attachPaneContent(faSnapshot.tabId, paneId, updatedContent)
+          wsHandler?.broadcast?.({
+            type: 'freshAgent.session.materialized',
+            tabId: faSnapshot.tabId,
+            paneId,
+            sessionType: c.sessionType,
+            provider: c.provider,
+            previousSessionId: locator.sessionId,
+            sessionId: finalSessionId,
+            sessionRef: finalSessionRef,
+          })
+        }
+
+        return res.json(ok({ paneId, sessionId: finalSessionId, sessionRef: finalSessionRef, status: idle.status }, 'prompt sent'))
       } catch (err: any) {
         return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent send failed'))
       }
