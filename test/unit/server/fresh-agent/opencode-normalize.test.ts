@@ -199,6 +199,29 @@ describe('OpenCode fresh-agent normalization', () => {
     expect(turn.items[0]?.text).toBe('"nested" quotes')
   })
 
+  it('strips leaked <think> and <thinking> tags and their content from text parts', () => {
+    const turn = normalizeOpencodeTurn({
+      info: { id: 'msg-think-tags', role: 'assistant' },
+      parts: [
+        {
+          id: 'part-think',
+          type: 'text',
+          text: 'Before <think>Internal plan\\n1 tool used</think> and after.',
+        },
+        {
+          id: 'part-thinking',
+          type: 'text',
+          text: 'Intro <thinking reason="plan">I could change all instances.</thinking> done.',
+        },
+      ],
+    }, 0)
+
+    expect(turn.items).toEqual([
+      { id: 'part-think', kind: 'text', text: 'Before  and after.' },
+      { id: 'part-thinking', kind: 'text', text: 'Intro  done.' },
+    ])
+  })
+
   it('carries turn-page nextCursor explicitly and keeps export fallback compatibility', () => {
     const explicit = normalizeOpencodeTurnPage({
       threadId: 'ses-page',
