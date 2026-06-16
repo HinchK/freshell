@@ -321,6 +321,7 @@ async function main() {
   const codexFreshAgentRuntime = {
     shutdown: async () => {
       await codexFreshAgentAdapter.shutdown?.()
+      await opencodeFreshAgentAdapter.shutdown?.()
     },
   }
   const freshAgentRuntimeManager = new FreshAgentRuntimeManager({
