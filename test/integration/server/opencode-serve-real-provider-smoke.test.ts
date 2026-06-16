@@ -39,89 +39,105 @@ describeReal(
   },
 )
 
-describeReal('orchestration system smoke (Kimi k2.7)', () => {
-  let manager: OpencodeServeManager | undefined
-  let runtimeManager: FreshAgentRuntimeManager
-  let app: express.Express
-  let kimiAvailable = false
-  let ktest: typeof it = it
+let manager: OpencodeServeManager | undefined
+let runtimeManager: FreshAgentRuntimeManager | undefined
+let app: express.Express | undefined
+let kimiAvailable = false
 
-  beforeAll(async () => {
-    manager = new OpencodeServeManager()
-    const { baseUrl } = await manager.ensureStarted()
+if (opencode.resolvedPath) {
+  // Top-level setup lets us avoid registering tests when the provider or the
+  // target model is not available. Skipped tests are reported as skipped, not
+  // vacuously passing.
+  try {
+    const probe = new OpencodeServeManager()
+    const { baseUrl } = await probe.ensureStarted()
     const providers = await fetch(`${baseUrl}/config/providers`).then((r) => r.json() as any).catch(() => ({}))
     kimiAvailable = JSON.stringify(providers).includes('umans-kimi-k2.7')
-    ktest = kimiAvailable ? it : it.skip
-    const adapter = createOpencodeFreshAgentAdapter({ serveManager: manager })
-    runtimeManager = new FreshAgentRuntimeManager({
-      registry: createFreshAgentProviderRegistry([
-        { sessionType: 'freshopencode', runtimeProvider: 'opencode', adapter },
-      ]),
-    })
-    app = express()
-    app.use(express.json())
-    app.use('/api', createAgentApiRouter({
-      layoutStore: new LayoutStore(),
-      registry: { get: () => undefined, create: () => { throw new Error('no terminals in smoke') } },
-      wsHandler: { broadcastUiCommand: () => {} },
-      freshAgentRuntimeManager: runtimeManager,
-    }))
-  }, 60_000)
+    if (kimiAvailable) {
+      manager = probe
+      const adapter = createOpencodeFreshAgentAdapter({ serveManager: manager })
+      runtimeManager = new FreshAgentRuntimeManager({
+        registry: createFreshAgentProviderRegistry([
+          { sessionType: 'freshopencode', runtimeProvider: 'opencode', adapter },
+        ]),
+      })
+      app = express()
+      app.use(express.json())
+      app.use('/api', createAgentApiRouter({
+        layoutStore: new LayoutStore(),
+        registry: { get: () => undefined, create: () => { throw new Error('no terminals in smoke') } },
+        wsHandler: { broadcastUiCommand: () => {} },
+        freshAgentRuntimeManager: runtimeManager,
+      }))
+    } else {
+      await probe.shutdown()
+    }
+  } catch {
+    await manager?.shutdown().catch(() => {})
+    manager = undefined
+    runtimeManager = undefined
+    app = undefined
+    kimiAvailable = false
+  }
+}
 
+const describeRealKimi = kimiAvailable ? describe.sequential : describe.skip
+
+describeRealKimi('orchestration system smoke (Kimi k2.7)', () => {
   afterAll(async () => {
     await manager?.shutdown()
   })
 
-  ktest('creates a freshopencode pane, runs a Kimi turn, and captures the assistant reply', async () => {
-    const created = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
+  it('creates a freshopencode pane, runs a Kimi turn, and captures the assistant reply', async () => {
+    const created = await request(app!).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
     expect(created.status).toBe(200)
     const paneId = created.body.data.paneId
     expect(created.body.data.sessionId).toMatch(/^freshopencode-/)
 
-    const send = await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Reply with exactly this token and nothing else: smoke-ok' })
+    const send = await request(app!).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Reply with exactly this token and nothing else: smoke-ok' })
     expect(send.status).toBe(200)
     expect(send.body.data.sessionId).toMatch(/^ses_/) // materialized to a durable id
 
-    const capture = await request(app).get(`/api/panes/${paneId}/capture`)
+    const capture = await request(app!).get(`/api/panes/${paneId}/capture`)
     expect(capture.status).toBe(200)
     expect(capture.text.toLowerCase()).toContain('smoke-ok')
   }, 90_000)
 
-  ktest('continues the same session across a second turn (materialized id stable)', async () => {
-    const created = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
+  it('continues the same session across a second turn (materialized id stable)', async () => {
+    const created = await request(app!).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
     const paneId = created.body.data.paneId
-    const first = await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Remember the word: pineapple. Reply ok.' })
+    const first = await request(app!).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Remember the word: pineapple. Reply ok.' })
     const sessionId = first.body.data.sessionId
-    const second = await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'What word did I ask you to remember? Reply with just that word.' })
+    const second = await request(app!).post(`/api/panes/${paneId}/send-keys`).send({ data: 'What word did I ask you to remember? Reply with just that word.' })
     expect(second.body.data.sessionId).toBe(sessionId)
-    const capture = await request(app).get(`/api/panes/${paneId}/capture`)
+    const capture = await request(app!).get(`/api/panes/${paneId}/capture`)
     expect(capture.text.toLowerCase()).toContain('pineapple')
   }, 120_000)
 
-  ktest('paginates history via the cursor after multiple turns', async () => {
-    const created = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
+  it('paginates history via the cursor after multiple turns', async () => {
+    const created = await request(app!).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
     const paneId = created.body.data.paneId
-    const content = (await request(app).post('/api/tabs').send({ agent: 'opencode' })).body.data // noop second pane to ensure isolation
+    const content = (await request(app!).post('/api/tabs').send({ agent: 'opencode' })).body.data // noop second pane to ensure isolation
     void content
-    await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Say 1' })
-    await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Say 2' })
-    const sessionId = (await request(app).get(`/api/panes/${paneId}/capture`)).status === 200
-      ? (await runtimeManager.getSnapshot({ sessionType: 'freshopencode', provider: 'opencode', threadId: (created.body.data.sessionId) })).sessionId
+    await request(app!).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Say 1' })
+    await request(app!).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Say 2' })
+    const sessionId = (await request(app!).get(`/api/panes/${paneId}/capture`)).status === 200
+      ? (await runtimeManager!.getSnapshot({ sessionType: 'freshopencode', provider: 'opencode', threadId: (created.body.data.sessionId) })).sessionId
       : created.body.data.sessionId
-    const page1 = await runtimeManager.getTurnPage({ sessionType: 'freshopencode', provider: 'opencode', threadId: sessionId, limit: 1, revision: 0 })
+    const page1 = await runtimeManager!.getTurnPage({ sessionType: 'freshopencode', provider: 'opencode', threadId: sessionId, limit: 1, revision: 0 })
     expect(page1.turns.length).toBe(1)
     if (page1.nextCursor) {
-      const page2 = await runtimeManager.getTurnPage({ sessionType: 'freshopencode', provider: 'opencode', threadId: sessionId, cursor: page1.nextCursor, limit: 1, revision: 0 })
+      const page2 = await runtimeManager!.getTurnPage({ sessionType: 'freshopencode', provider: 'opencode', threadId: sessionId, cursor: page1.nextCursor, limit: 1, revision: 0 })
       expect(page2.turns.length).toBe(1)
       expect(page2.turns[0].turnId).not.toBe(page1.turns[0].turnId)
     }
   }, 120_000)
 
-  ktest('forks a materialized session into a child session', async () => {
-    const created = await request(app).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
+  it('forks a materialized session into a child session', async () => {
+    const created = await request(app!).post('/api/tabs').send({ agent: 'opencode', cwd: process.cwd(), model: KIMI, effort: 'low' })
     const paneId = created.body.data.paneId
-    await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Say ok' })
-    const forked: any = await runtimeManager.fork({ sessionType: 'freshopencode', provider: 'opencode', sessionId: created.body.data.sessionId })
+    await request(app!).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Say ok' })
+    const forked: any = await runtimeManager!.fork({ sessionType: 'freshopencode', provider: 'opencode', sessionId: created.body.data.sessionId })
     expect(forked?.sessionId).toMatch(/^ses_/)
   }, 90_000)
 })

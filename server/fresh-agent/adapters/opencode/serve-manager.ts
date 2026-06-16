@@ -48,6 +48,8 @@ export class OpencodeServeManager {
   private readonly sessionEmitters = new Map<string, EventEmitter>()
   private running: RunningServe | undefined
   private startPromise: Promise<RunningServe> | undefined
+  private startAbort: AbortController | undefined
+  private shutdownRequested = false
 
   constructor(options: OpencodeServeManagerOptions = {}) {
     this.command = options.command ?? 'opencode'
@@ -59,6 +61,9 @@ export class OpencodeServeManager {
   }
 
   async ensureStarted(): Promise<{ baseUrl: string }> {
+    if (this.shutdownRequested) {
+      throw new Error('opencode serve manager is shutting down')
+    }
     if (this.running) return { baseUrl: this.running.baseUrl }
     if (!this.startPromise) {
       this.startPromise = this.start().catch((err) => {
@@ -71,23 +76,28 @@ export class OpencodeServeManager {
   }
 
   private async start(): Promise<RunningServe> {
-    const endpoint = await this.allocatePort()
-    const baseUrl = `http://${endpoint.hostname}:${endpoint.port}`
-    const ownershipId = randomUUID()
-    const child = this.spawnFn(
-      this.command,
-      ['serve', '--hostname', endpoint.hostname, '--port', String(endpoint.port)],
-      { env: { ...process.env, [OWNERSHIP_ENV]: ownershipId }, stdio: ['ignore', 'pipe', 'pipe'] },
-    ) as unknown as ChildProcessWithoutNullStreams
-    // Drain stdout/stderr so the child's pipe buffers never back-pressure
-    // and stall the serve process. Diagnostics are captured below before health.
-    child.stdout?.on('data', () => {})
-    child.stderr?.on('data', () => {})
-    child.on('error', (err) => this.log.error({ err }, 'opencode serve process error'))
+    const startAbort = new AbortController()
+    this.startAbort = startAbort
+    const startSignal = startAbort.signal
+    let child: ChildProcessWithoutNullStreams | undefined
+    try {
+      const endpoint = await this.allocatePort()
+      const baseUrl = `http://${endpoint.hostname}:${endpoint.port}`
+      const ownershipId = randomUUID()
+      child = this.spawnFn(
+        this.command,
+        ['serve', '--hostname', endpoint.hostname, '--port', String(endpoint.port)],
+        { env: { ...process.env, [OWNERSHIP_ENV]: ownershipId }, stdio: ['ignore', 'pipe', 'pipe'] },
+      ) as unknown as ChildProcessWithoutNullStreams
+      // Drain stdout/stderr so the child's pipe buffers never back-pressure
+      // and stall the serve process. Diagnostics are captured below before health.
+      child.stdout?.on('data', () => {})
+      child.stderr?.on('data', () => {})
+      child.on('error', (err) => this.log.error({ err }, 'opencode serve process error'))
     child.on('close', (code) => {
       this.log.warn({ code }, 'opencode serve exited')
-      const running = this.running
-      if (running?.child === child) {
+      if (this.running && this.running.child === child) {
+        const running = this.running
         this.running = undefined
         this.startPromise = undefined
         try { running.stopEventStream() } catch { /* ignore */ }
@@ -96,47 +106,70 @@ export class OpencodeServeManager {
       }
     })
 
-    await this.waitForHealth(baseUrl, child)
+      await this.waitForHealth(baseUrl, child, startSignal)
 
-    const stopEventStream = this.connectEventStream
-      ? this.connectEventStream(`${baseUrl}/event`, {
-          onEvent: (e) => this.dispatchEvent(e),
-          onError: (err) => this.log.warn({ err }, 'opencode serve event stream error'),
-        })
-      : this.startDefaultEventStream(baseUrl)
+      if (this.shutdownRequested || startSignal.aborted) {
+        this.stopChild(child)
+        throw new Error('opencode serve startup was aborted')
+      }
 
-    const running: RunningServe = { baseUrl, ownershipId, child, stopEventStream }
-    this.running = running
-    return running
+      const stopEventStream = this.connectEventStream
+        ? this.connectEventStream(`${baseUrl}/event`, {
+            onEvent: (e) => this.dispatchEvent(e),
+            onError: (err) => this.log.warn({ err }, 'opencode serve event stream error'),
+          })
+        : this.startDefaultEventStream(baseUrl)
+
+      const running: RunningServe = { baseUrl, ownershipId, child, stopEventStream }
+      this.running = running
+      return running
+    } catch (err) {
+      if (child) this.stopChild(child)
+      this.startPromise = undefined
+      throw err
+    } finally {
+      if (this.startAbort === startAbort) this.startAbort = undefined
+    }
   }
 
-  private async waitForHealth(baseUrl: string, child: ChildProcessWithoutNullStreams): Promise<void> {
-    const stopChild = () => {
-      if (!child.killed) {
-        try { child.kill() } catch { /* already gone */ }
-      }
+  private stopChild(child: ChildProcessWithoutNullStreams): void {
+    if (!child.killed) {
+      try { child.kill() } catch { /* already gone */ }
     }
+  }
+
+  private async waitForHealth(baseUrl: string, child: ChildProcessWithoutNullStreams, signal: AbortSignal): Promise<void> {
+    const stopChild = () => { this.stopChild(child) }
     const deadline = Date.now() + this.healthTimeoutMs
     let stderr = ''
-    child.stderr?.on('data', (chunk) => { stderr += String(chunk) })
-    while (Date.now() < deadline) {
-      if (/ServeError|Failed to start server|EADDRINUSE/i.test(stderr)) {
-        stopChild()
-        throw new Error(`opencode serve failed to start on ${baseUrl}: ${stderr.trim()}`)
-      }
-      try {
-        const res = await this.fetchFn(`${baseUrl}/global/health`, { method: 'GET' })
-        if (res.ok) {
-          const body = await res.json().catch(() => ({}))
-          if (isHealthyResponse(body)) return
+    const onStderr = (chunk: Buffer | string) => { stderr += String(chunk) }
+    child.stderr?.on('data', onStderr)
+    try {
+      while (Date.now() < deadline) {
+        if (signal.aborted) {
+          stopChild()
+          throw new Error('opencode serve startup was aborted')
         }
-      } catch {
-        // not up yet
+        if (/ServeError|Failed to start server|EADDRINUSE/i.test(stderr)) {
+          stopChild()
+          throw new Error(`opencode serve failed to start on ${baseUrl}: ${stderr.trim()}`)
+        }
+        try {
+          const res = await this.fetchFn(`${baseUrl}/global/health`, { method: 'GET' })
+          if (res.ok) {
+            const body = await res.json().catch(() => ({}))
+            if (isHealthyResponse(body)) return
+          }
+        } catch {
+          // not up yet
+        }
+        await new Promise((r) => setTimeout(r, 150))
       }
-      await new Promise((r) => setTimeout(r, 150))
+      stopChild()
+      throw new Error(`opencode serve did not become healthy within ${this.healthTimeoutMs}ms`)
+    } finally {
+      child.stderr?.off('data', onStderr)
     }
-    stopChild()
-    throw new Error(`opencode serve did not become healthy within ${this.healthTimeoutMs}ms`)
   }
 
   // ── HTTP client ────────────────────────────────────────────────────────
@@ -289,16 +322,19 @@ export class OpencodeServeManager {
           while ((idx = buf.indexOf('\n\n')) >= 0) {
             const block = buf.slice(0, idx)
             buf = buf.slice(idx + 2)
+            const dataLines: string[] = []
             for (const line of block.split('\n')) {
               const trimmed = line.replace(/\r$/, '')
+              if (!trimmed || trimmed.startsWith(':')) continue
               if (!trimmed.startsWith('data:')) continue
-              const data = trimmed.slice(5).trim()
-              if (!data) continue
-              try {
-                const parsed = parseServeEvent(JSON.parse(data))
-                if (parsed) this.dispatchEvent(parsed)
-              } catch { /* ignore malformed frame */ }
+              dataLines.push(trimmed.slice(5).trimStart())
             }
+            if (dataLines.length === 0) continue
+            const data = dataLines.join('\n')
+            try {
+              const parsed = parseServeEvent(JSON.parse(data))
+              if (parsed) this.dispatchEvent(parsed)
+            } catch { /* ignore malformed frame */ }
           }
         }
       } catch (err) {
@@ -311,6 +347,16 @@ export class OpencodeServeManager {
   }
 
   async shutdown(): Promise<void> {
+    this.shutdownRequested = true
+    this.startAbort?.abort()
+
+    // Reap any in-flight start() so it terminates its child and any start
+    // promise settles before we touch the running sidecar.
+    if (this.startPromise) {
+      try { await this.startPromise } catch { /* ignore startup errors */ }
+      this.startPromise = undefined
+    }
+
     const running = this.running
     this.running = undefined
     this.startPromise = undefined

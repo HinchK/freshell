@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
+import { ReadableStream } from 'node:stream/web'
 import { describe, expect, it, vi } from 'vitest'
 import { parseServeEvent as parseEvt } from '../../../../server/fresh-agent/adapters/opencode/serve-events.js'
 import { OpencodeServeManager } from '../../../../server/fresh-agent/adapters/opencode/serve-manager.js'
@@ -79,6 +80,27 @@ describe('OpencodeServeManager lifecycle', () => {
     const { manager, child } = makeManager({ fetchFn: fetchFn as any, healthTimeoutMs: 30 })
     await expect(manager.ensureStarted()).rejects.toThrow(/opencode serve did not become healthy within 30ms/)
     expect(child.kill).toHaveBeenCalled()
+  })
+
+  it('removes the diagnostic stderr listener once health resolves', async () => {
+    const { manager, child } = makeManager({ healthTimeoutMs: 500 })
+    await manager.ensureStarted()
+    // The permanent drain listener remains; the temporary diagnostic listener
+    // added during waitForHealth must have been removed.
+    expect(child.stderr.listenerCount('data')).toBe(1)
+  })
+
+  it('aborts an in-flight startup when shutdown is called and reaps the child', async () => {
+    const fetchFn = vi.fn(async () => jsonResponse({ healthy: false }, { status: 503 }))
+    const { manager, child } = makeManager({ fetchFn: fetchFn as any, healthTimeoutMs: 60_000 })
+    const started = manager.ensureStarted()
+    await new Promise((r) => setTimeout(r, 10))
+    const shutdown = manager.shutdown()
+    await expect(started).rejects.toThrow(/opencode serve startup was aborted|opencode serve did not become healthy/)
+    await shutdown
+    expect(child.kill).toHaveBeenCalled()
+    expect((manager as any).running).toBeUndefined()
+    expect((manager as any).startPromise).toBeUndefined()
   })
 })
 
@@ -231,5 +253,46 @@ describe('OpencodeServeManager fan-out', () => {
     expect(child.kill).toHaveBeenCalled()
     expect((manager as any).sessionEmitters.size).toBe(0)
     expect((manager as any).running).toBeUndefined()
+  })
+
+  it('parses multi-line SSE data blocks by joining data: lines', async () => {
+    let enqueue: ((chunk: Uint8Array) => void) | undefined
+    let closeStream: (() => void) | undefined
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        enqueue = (chunk) => c.enqueue(chunk)
+        closeStream = () => c.close()
+      },
+    })
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/event')) {
+        return { ok: true, status: 200, body } as any
+      }
+      return jsonResponse({})
+    })
+    const manager = new OpencodeServeManager({
+      spawnFn: () => fakeChild() as any,
+      fetchFn: fetchFn as any,
+      allocatePort: async () => ({ hostname: '127.0.0.1', port: 47999 }),
+      healthTimeoutMs: 1000,
+    })
+    await manager.ensureStarted()
+    const seen: any[] = []
+    manager.subscribe('ses_multiline', (e) => seen.push(e))
+    // Send a block where the JSON payload is split across several data: lines
+    // so the parser has to join the lines before JSON.parse.
+    const block = [
+      'data: {',
+      'data:   "type": "session.idle",',
+      'data:   "properties": {"sessionID":"ses_multiline"}',
+      'data: }',
+      '',
+      '',
+    ].join('\n')
+    enqueue?.(new TextEncoder().encode(block))
+    await new Promise((r) => setTimeout(r, 50))
+    closeStream?.()
+    expect(seen.map((e) => e.kind)).toEqual(['session.idle'])
   })
 })

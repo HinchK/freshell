@@ -23,6 +23,7 @@ import { renderCapture } from './capture.js'
 import { waitForMatch } from './wait-for.js'
 import { resolveScreenshotOutputPath } from './screenshot-path.js'
 import { sanitizeSessionRef } from '../../shared/session-contract.js'
+import type { LayoutStore } from './layout-store.js'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '../../shared/fresh-agent.js'
 import type {
   FreshAgentSessionLocator,
@@ -1171,14 +1172,25 @@ export function createAgentApiRouter({
       const paneId = resolved.paneId || rawPaneId
       if (typeof req.body?.agent === 'string') {
         const direction: 'horizontal' | 'vertical' = req.body?.direction || 'horizontal'
+        let snapshotBefore: ReturnType<LayoutStore['getNormalizedSnapshot']> | undefined
         const handled = await createFreshAgentPane(
           res,
           () => {
+            snapshotBefore = layoutStore.getNormalizedSnapshot()
             const result = layoutStore.splitPane({ paneId, direction })
-            if (!result?.tabId || !result?.newPaneId) return undefined
+            if (!result?.tabId || !result?.newPaneId) {
+              snapshotBefore = undefined
+              return undefined
+            }
             return { tabId: result.tabId, paneId: result.newPaneId }
           },
-          ({ paneId: newPaneId }) => { layoutStore.closePane(newPaneId) },
+          () => {
+            if (snapshotBefore) {
+              layoutStore.updateFromUi(snapshotBefore, 'fresh-agent-split-rollback')
+            } else if (typeof layoutStore.closePane === 'function') {
+              try { layoutStore.closePane(paneId) } catch { /* ignore */ }
+            }
+          },
           ({ tabId, paneId: newPaneId, paneContent }) => {
             wsHandler?.broadcastUiCommand({ command: 'pane.split', payload: { tabId, paneId, direction, newPaneId, newContent: paneContent } })
           },

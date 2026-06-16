@@ -91,6 +91,23 @@ describe('agent-api fresh-agent: create', () => {
     expect(res.status).toBe(500)
     expect(layoutStore.listPanes().length).toBe(panesBefore)
   })
+
+  it('rolls back a fresh-agent split without corrupting existing neighbor panes', async () => {
+    const freshAgentRuntimeManager = {
+      create: vi.fn(async () => { throw new Error('sidecar failed to start') }),
+      send: vi.fn(async () => undefined),
+      attach: vi.fn(async () => ({ sessionId: 'ses_real_1' })),
+      getSnapshot: vi.fn(async () => ({ turns: [] })),
+    }
+    const { app, layoutStore } = makeApp({ freshAgentRuntimeManager })
+    const { paneId: basePaneId } = layoutStore.createTab({ title: 'base' })
+    // Create an existing neighbor so a naive closePane rollback would rebuild the grid.
+    const neighbor = layoutStore.splitPane({ paneId: basePaneId, direction: 'horizontal' })
+    const before = layoutStore.getNormalizedSnapshot()
+    const res = await request(app).post(`/api/panes/${neighbor.newPaneId}/split`).send({ agent: 'opencode' })
+    expect(res.status).toBe(500)
+    expect(layoutStore.getNormalizedSnapshot()).toEqual(before)
+  })
 })
 
 describe('agent-api fresh-agent: send-keys', () => {

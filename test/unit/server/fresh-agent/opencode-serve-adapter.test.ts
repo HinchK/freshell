@@ -222,11 +222,21 @@ describe('OpenCode serve adapter: control', () => {
     expect(manager.compact).toHaveBeenCalledWith('ses_real_1')
   })
 
-  it('fork returns the child session id', async () => {
-    const { adapter } = await materialized()
+  it('fork registers child state so the child session can be sent/subscribed', async () => {
+    const { manager, adapter } = await materialized()
     await expect(adapter.fork?.('freshopencode-req-c')).resolves.toEqual({
       sessionId: 'ses_child_1', sessionRef: { provider: 'opencode', sessionId: 'ses_child_1' },
     })
+    const events: unknown[] = []
+    const off = adapter.subscribe?.('ses_child_1', (e) => events.push(e)) ?? (() => {})
+    try {
+      await adapter.send?.('ses_child_1', { text: 'child turn' })
+      expect(manager.promptAsync).toHaveBeenCalledWith('ses_child_1', expect.objectContaining({ parts: [{ type: 'text', text: 'child turn' }] }))
+      manager._emit('ses_child_1', { kind: 'session.idle', sessionId: 'ses_child_1', raw: { type: 'session.idle', properties: { sessionID: 'ses_child_1' } } })
+      expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'ses_child_1', status: 'idle' })
+    } finally {
+      off()
+    }
   })
 
   it('shutdown delegates to the serve manager', async () => {
