@@ -62,3 +62,33 @@ describe('agent-api fresh-agent: create', () => {
     expect(res.status).toBe(503)
   })
 })
+
+describe('agent-api fresh-agent: send-keys', () => {
+  it('routes send-keys to the runtime manager for a fresh-agent pane and blocks until the turn returns', async () => {
+    const { app, freshAgentRuntimeManager } = makeApp()
+    const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
+    const paneId = created.body.data.paneId
+    const res = await request(app).post(`/api/panes/${paneId}/send-keys`).send({ data: 'Reply with: ok' })
+    expect(res.status).toBe(200)
+    expect(res.body.data).toMatchObject({ sessionId: 'freshopencode-abc' })
+    expect(freshAgentRuntimeManager.send).toHaveBeenCalledWith(
+      { sessionId: 'freshopencode-abc', sessionType: 'freshopencode', provider: 'opencode' },
+      { text: 'Reply with: ok' },
+    )
+  })
+
+  it('attaches on a lost session before retrying send (cross-process orchestration)', async () => {
+    const lost = Object.assign(new Error('not tracked'), { name: 'FreshAgentLostSessionError' })
+    const send = vi.fn().mockRejectedValueOnce(lost).mockResolvedValueOnce({ sessionId: 'ses_real_1' })
+    const attach = vi.fn(async () => ({ sessionId: 'ses_real_1' }))
+    const { app } = makeApp({ freshAgentRuntimeManager: {
+      create: vi.fn(async () => ({ sessionId: 'ses_real_1', sessionType: 'freshopencode', runtimeProvider: 'opencode' })),
+      send, attach, getSnapshot: vi.fn(async () => ({ turns: [] })),
+    } })
+    const created = await request(app).post('/api/tabs').send({ agent: 'opencode' })
+    const res = await request(app).post(`/api/panes/${created.body.data.paneId}/send-keys`).send({ data: 'hi' })
+    expect(res.status).toBe(200)
+    expect(attach).toHaveBeenCalledWith({ sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode' })
+    expect(send).toHaveBeenCalledTimes(2)
+  })
+})

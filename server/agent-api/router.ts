@@ -1519,6 +1519,31 @@ export function createAgentApiRouter({
     const resolved = resolvePaneTarget(req.params.id)
     if (rejectPaneTargetError(res, resolved)) return
     const paneId = resolved.paneId || req.params.id
+    const faSnapshot = layoutStore.getPaneSnapshot?.(paneId)
+    if (faSnapshot?.kind === 'fresh-agent') {
+      const c = faSnapshot.paneContent || {}
+      const text = String(req.body?.data ?? req.body?.keys ?? req.body?.text ?? '')
+      if (!text) return res.status(400).json(fail('text is required'))
+      if (!freshAgentRuntimeManager) return res.status(503).json(fail('fresh-agent runtime not available on this server'))
+      const locator = { sessionId: c.sessionId as string, sessionType: c.sessionType as string, provider: c.provider as string } as FreshAgentSessionLocator
+      const runSend = () => freshAgentRuntimeManager.send(locator, { text })
+      try {
+        let result
+        try {
+          result = await runSend()
+        } catch (err: any) {
+          if (err?.name === 'FreshAgentLostSessionError' && freshAgentRuntimeManager.attach) {
+            await freshAgentRuntimeManager.attach(locator)
+            result = await runSend()
+          } else {
+            throw err
+          }
+        }
+        return res.json(ok({ paneId, sessionId: result?.sessionId ?? locator.sessionId, sessionRef: result?.sessionRef }, 'prompt sent'))
+      } catch (err: any) {
+        return res.status(agentRouteErrorStatus(err)).json(fail(err?.message || 'fresh-agent send failed'))
+      }
+    }
     const payload = req.body || {}
     const data = payload.data ?? payload.keys ?? payload.text ?? ''
     const paneSnapshot = layoutStore.getPaneSnapshot?.(paneId)
