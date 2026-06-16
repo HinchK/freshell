@@ -77,8 +77,12 @@ export class OpencodeServeManager {
     const child = this.spawnFn(
       this.command,
       ['serve', '--hostname', endpoint.hostname, '--port', String(endpoint.port)],
-      { env: { ...process.env, [OWNERSHIP_ENV]: ownershipId } },
-    ) as ChildProcessWithoutNullStreams
+      { env: { ...process.env, [OWNERSHIP_ENV]: ownershipId }, stdio: ['ignore', 'pipe', 'pipe'] },
+    ) as unknown as ChildProcessWithoutNullStreams
+    // Drain stdout/stderr so the child's pipe buffers never back-pressure
+    // and stall the serve process. Diagnostics are captured below before health.
+    child.stdout?.on('data', () => {})
+    child.stderr?.on('data', () => {})
     child.on('error', (err) => this.log.error({ err }, 'opencode serve process error'))
     child.on('close', (code) => {
       this.log.warn({ code }, 'opencode serve exited')
