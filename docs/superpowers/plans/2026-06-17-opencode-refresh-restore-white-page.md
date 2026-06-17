@@ -168,7 +168,7 @@ Do not broaden the behavior to `replay_budget_exceeded`, non-OpenCode modes, or 
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx --run -t "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output|recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output|background hydrates an untrusted hidden running pane with a viewport attach"
+npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx --run -t "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output|recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output|background hydrates a trusted hidden reconnect from rendered high-water with background priority"
 ```
 
 Expected: PASS. This confirms hidden OpenCode gaps repair, the visible repair still works, and hidden background hydration still uses the queue.
@@ -232,7 +232,7 @@ Expected: PASS.
 Run:
 
 ```bash
-npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx --run -t "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output|recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output|background hydrates an untrusted hidden running pane with a viewport attach"
+npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.tsx --run -t "recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output|recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output|background hydrates a trusted hidden reconnect from rendered high-water with background priority"
 ```
 
 Expected: PASS.
