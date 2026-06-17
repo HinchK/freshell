@@ -23,7 +23,7 @@
 - Browser refresh of a hidden OpenCode tab commonly restores an existing live `terminalId`, not a new hidden `terminal.created` path.
 - A hidden `terminal.created` immediate attach would bypass the hydration queue's visible-first, single-active-pane policy, so the fix should not add that behavior.
 - `terminal.attach` with an expected session is only safe when the client/session association matches server ownership. The existing restored path already reconciles session ownership before attach.
-- The e2e regression must assert rendered terminal buffer content after reveal; session id and stdin checks alone do not catch a white terminal surface.
+- The e2e regression must force `replay_window_exceeded` by overflowing the replay ring, then assert the restored hidden OpenCode pane is relaunched with a new terminal id and rendered terminal buffer content after reveal. Session id and stdin checks alone do not catch a white terminal surface.
 
 ---
 
@@ -126,15 +126,28 @@ it('recreates a hidden restored OpenCode pane when background viewport hydration
     })
   })
 
+  let replacementRequestId: string | undefined
   await waitFor(() => {
     const layout = store.getState().panes.layouts[tabId]
     expect(layout?.type).toBe('leaf')
     if (layout?.type !== 'leaf' || layout.content.kind !== 'terminal') {
       throw new Error('expected terminal pane')
     }
+    expect(layout.content.terminalId).toBeUndefined()
     expect(layout.content.status).toBe('creating')
     expect(layout.content.sessionRef).toEqual(sessionRef)
-    expect(layout.content.createRequestId).not.toBe('req-opencode-hidden-gap')
+    replacementRequestId = layout.content.createRequestId
+    expect(replacementRequestId).not.toBe('req-opencode-hidden-gap')
+  })
+
+  await waitFor(() => {
+    expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'terminal.create',
+      requestId: replacementRequestId,
+      mode: 'opencode',
+      sessionRef,
+      restore: true,
+    }))
   })
 })
 ```
@@ -179,26 +192,83 @@ Expected: PASS. This confirms hidden OpenCode gaps repair, the visible repair st
 - Modify: `test/e2e-browser/specs/opencode-restart-recovery.spec.ts:614-765`
 
 **Interfaces:**
-- Consumes: existing `recovers a hidden OpenCode sessionRef when association lands while the browser is closed` scenario and `TestHarness.getTerminalBuffer`.
-- Produces: an assertion that a restored hidden OpenCode pane has rendered terminal output after reveal, not only a valid session id.
+- Consumes: existing `recovers a hidden OpenCode sessionRef when association lands while the browser is closed` scenario, per-test server env overrides, `waitForRestoreLaunches`, and `TestHarness.getTerminalBuffer`.
+- Produces: assertions that a forced hidden `replay_window_exceeded` gap relaunches OpenCode on a new terminal id and renders terminal output after reveal.
 
-- [ ] **Step 1: Write the e2e assertion**
+- [ ] **Step 1: Allow per-test replay-ring sizing**
 
-In `recovers a hidden OpenCode sessionRef when association lands while the browser is closed`, after revealing the OpenCode tab and asserting the restored `terminalId` and `sessionRef`, add a buffer assertion:
+Extend this spec-local helper input:
 
 ```ts
-await expect.poll(async () => {
-  const buffer = await restoreHarness.getTerminalBuffer(afterRefresh.terminalId)
-  return buffer?.trim() ?? ''
-}, {
-  timeout: 30_000,
-  message: 'expected restored hidden OpenCode pane to render terminal content after reveal',
-}).not.toBe('')
+function createServerOptions(input: {
+  binDir: string
+  auditLogPath: string
+  logsDir: string
+  sharedOpencodeDataDir: string
+  fakeOpencodeSessionEventGatePath?: string
+  port?: number
+  token?: string
+  env?: Record<string, string>
+}) {
 ```
 
-This uses the fake OpenCode fixture's startup output and stdin echo as the rendered signal.
+and spread `input.env` into the returned `env` object after the existing defaults:
 
-- [ ] **Step 2: Run the e2e-browser scenario**
+```ts
+      FRESHELL_LOG_DIR: input.logsDir,
+      ...(input.env ?? {}),
+```
+
+This keeps other tests unchanged while letting this scenario lower the coding CLI replay ring.
+
+- [ ] **Step 2: Force the hidden replay-window gap**
+
+In `recovers a hidden OpenCode sessionRef when association lands while the browser is closed`, pass a small scrollback/replay budget into `createServerOptions`:
+
+```ts
+env: {
+  MAX_SCROLLBACK_CHARS: String(64 * 1024),
+  CODING_CLI_MIN_REPLAY_RING_MAX_BYTES: String(64 * 1024),
+},
+```
+
+After `expectedSessionId` is known and before the existing `hidden-before-refresh` input, send a large payload:
+
+```ts
+await sendInputToTerminals(page, [beforeAssociation], `hidden-overflow-${'x'.repeat(96 * 1024)}`)
+```
+
+Then keep the existing smaller `hidden-before-refresh` send and audit wait. The large fake OpenCode stdin echo overflows the reduced ring; the smaller input gives the existing audit a compact stable marker.
+
+- [ ] **Step 3: Stop requiring the stale hidden terminal id before reveal**
+
+In the restored-page hidden wait, keep the assertions for active shell tab, OpenCode tab sessionRef, content mode, and content sessionRef, but remove `content.terminalId === expectedTerminalId`. Once the hidden background queue repairs the gap, the content may already be creating or running with a replacement terminal id before the user clicks the tab.
+
+- [ ] **Step 4: Assert relaunch and rendered output after reveal**
+
+After revealing the OpenCode tab and calling `waitForOpenCodeSessions`, change the terminal id assertion from equality to replacement:
+
+```ts
+expect(afterRefresh.terminalId).toBeTruthy()
+expect(afterRefresh.terminalId).not.toBe(beforeAssociation.terminalId)
+```
+
+Then assert a restore launch occurred and the replacement terminal rendered fake OpenCode output:
+
+```ts
+await waitForRestoreLaunches(auditLogPath, [expectedSessionId])
+await expect.poll(async () => {
+  const buffer = await restoreHarness.getTerminalBuffer(afterRefresh.terminalId)
+  return buffer ?? ''
+}, {
+  timeout: 30_000,
+  message: 'expected restored hidden OpenCode pane to render terminal content after replay-window repair',
+}).toContain(`fake opencode ready root=${expectedSessionId}`)
+```
+
+Keep the existing `hidden-after-refresh` stdin audit after these assertions.
+
+- [ ] **Step 5: Run the e2e-browser scenario**
 
 Run:
 
@@ -208,7 +278,7 @@ npm run test:e2e:chromium -- test/e2e-browser/specs/opencode-restart-recovery.sp
 
 Expected after Task 1: PASS.
 
-- [ ] **Step 3: Run OpenCode restart recovery browser coverage**
+- [ ] **Step 6: Run OpenCode restart recovery browser coverage**
 
 Run:
 
@@ -218,16 +288,25 @@ npm run test:e2e:chromium -- test/e2e-browser/specs/opencode-restart-recovery.sp
 
 Expected: PASS.
 
-### Task 3: Final Verification
+### Task 3: Commit And Final Verification
 
 **Files:**
-- Verify only.
+- Commit and verify only.
 
 **Interfaces:**
-- Consumes: committed implementation work.
+- Consumes: completed Task 1 and Task 2 implementation work.
 - Produces: evidence that the branch is ready for final review.
 
-- [ ] **Step 1: Run targeted unit coverage**
+- [ ] **Step 1: Commit the focused change**
+
+Run:
+
+```bash
+git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e-browser/specs/opencode-restart-recovery.spec.ts docs/superpowers/plans/2026-06-17-opencode-refresh-restore-white-page.md
+git commit -m "fix: repair hidden opencode refresh hydration"
+```
+
+- [ ] **Step 2: Run targeted unit coverage**
 
 Run:
 
@@ -237,7 +316,7 @@ npm run test:vitest -- test/unit/client/components/TerminalView.lifecycle.test.t
 
 Expected: PASS.
 
-- [ ] **Step 2: Run targeted browser coverage**
+- [ ] **Step 3: Run targeted browser coverage**
 
 Run:
 
@@ -247,7 +326,7 @@ npm run test:e2e:chromium -- test/e2e-browser/specs/opencode-restart-recovery.sp
 
 Expected: PASS.
 
-- [ ] **Step 3: Run repo-supported verification**
+- [ ] **Step 4: Run repo-supported verification**
 
 Run:
 
@@ -257,14 +336,10 @@ npm run check
 
 Expected: PASS.
 
-- [ ] **Step 4: Commit the focused change**
+- [ ] **Step 5: Commit any fixes needed after verification**
 
-Run:
+If verification requires edits, make the smallest fix, rerun the covering test, then amend or add a focused follow-up commit. Do not leave the branch dirty.
 
-```bash
-git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/e2e-browser/specs/opencode-restart-recovery.spec.ts docs/superpowers/plans/2026-06-17-opencode-refresh-restore-white-page.md
-git commit -m "fix: repair hidden opencode refresh hydration"
-```
 
 ## Self-Review
 
