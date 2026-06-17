@@ -197,7 +197,37 @@ Expected: PASS. This confirms hidden OpenCode gaps repair, the visible repair st
 
 - [ ] **Step 1: Allow per-test replay-ring sizing**
 
-Extend this spec-local helper input:
+Extend this spec-local setup helper so a test can seed terminal scrollback in the isolated home:
+
+```ts
+function createSetupHome(
+  sharedOpencodeDataDir: string,
+  options: { terminalScrollback?: number } = {},
+) {
+  return async (homeDir: string): Promise<void> => {
+    const xdgShare = path.join(homeDir, '.local', 'share')
+    const freshellDir = path.join(homeDir, '.freshell')
+    const opencodeLink = path.join(xdgShare, 'opencode')
+    await fsp.mkdir(xdgShare, { recursive: true })
+    await fsp.mkdir(freshellDir, { recursive: true })
+    await fsp.mkdir(sharedOpencodeDataDir, { recursive: true })
+    await fsp.rm(opencodeLink, { recursive: true, force: true }).catch(() => {})
+    await fsp.symlink(sharedOpencodeDataDir, opencodeLink, 'dir')
+    if (typeof options.terminalScrollback === 'number') {
+      await fsp.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
+        version: 1,
+        settings: {
+          terminal: { scrollback: options.terminalScrollback },
+        },
+      }, null, 2))
+    }
+  }
+}
+```
+
+`TestServer` later calls `ensureSetupWizardBypassConfig`, which preserves this setup-provided `settings.terminal.scrollback` while adding the network bootstrap fields.
+
+Then extend `createServerOptions` input:
 
 ```ts
 function createServerOptions(input: {
@@ -208,26 +238,33 @@ function createServerOptions(input: {
   fakeOpencodeSessionEventGatePath?: string
   port?: number
   token?: string
+  terminalScrollback?: number
   env?: Record<string, string>
 }) {
 ```
 
-and spread `input.env` into the returned `env` object after the existing defaults:
+Pass the scrollback option into `setupHome`, and spread `input.env` into the returned `env` object after the existing defaults:
+
+```ts
+    setupHome: createSetupHome(input.sharedOpencodeDataDir, {
+      terminalScrollback: input.terminalScrollback,
+    }),
+```
 
 ```ts
       FRESHELL_LOG_DIR: input.logsDir,
       ...(input.env ?? {}),
 ```
 
-This keeps other tests unchanged while letting this scenario lower the coding CLI replay ring.
+This keeps other tests unchanged while letting this scenario lower the real replay ring: `terminal.scrollback: 200` computes below the registry's 64 KiB floor, and `CODING_CLI_MIN_REPLAY_RING_MAX_BYTES=64 KiB` prevents the OpenCode floor from raising it back to the default 32 MiB.
 
 - [ ] **Step 2: Force the hidden replay-window gap**
 
 In `recovers a hidden OpenCode sessionRef when association lands while the browser is closed`, pass a small scrollback/replay budget into `createServerOptions`:
 
 ```ts
+terminalScrollback: 200,
 env: {
-  MAX_SCROLLBACK_CHARS: String(64 * 1024),
   CODING_CLI_MIN_REPLAY_RING_MAX_BYTES: String(64 * 1024),
 },
 ```
