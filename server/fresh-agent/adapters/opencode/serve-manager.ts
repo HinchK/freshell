@@ -511,6 +511,7 @@ export class OpencodeServeManager {
           }
           idleStatusPolls = 0
         } catch (err) {
+          idleStatusPolls = 0
           this.log.warn({ err, sessionId }, 'OpenCode idle status fallback failed')
         } finally {
           pollInFlight = false

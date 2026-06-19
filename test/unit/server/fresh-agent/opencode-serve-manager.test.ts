@@ -605,6 +605,56 @@ describe('OpencodeServeManager fan-out', () => {
     await expect(idle).rejects.toThrow(/idle/i)
   })
 
+  it('onceIdle requires a fresh consecutive idle/absent pair after a status-map poll failure', async () => {
+    let push!: (e: any) => void
+    let statusCalls = 0
+    let allowFifthPoll!: () => void
+    let noteFifthPollStarted!: () => void
+    const fifthPollGate = new Promise<void>((resolve) => {
+      allowFifthPoll = resolve
+    })
+    const fifthPollStarted = new Promise<void>((resolve) => {
+      noteFifthPollStarted = resolve
+    })
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) {
+        statusCalls += 1
+        if (statusCalls === 1) return jsonResponse({ ses_a: { type: 'busy' } })
+        if (statusCalls === 2) return jsonResponse({})
+        if (statusCalls === 3) throw new Error('status map unavailable')
+        if (statusCalls === 4) return jsonResponse({})
+        if (statusCalls === 5) {
+          noteFifthPollStarted()
+          await fifthPollGate
+          return jsonResponse({})
+        }
+        return jsonResponse({})
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_a', 100)
+    push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'busy' } } })
+
+    await fifthPollStarted
+    const pending = await Promise.race([
+      idle.then(() => 'resolved', () => 'rejected'),
+      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 15)),
+    ])
+    expect(pending).toBe('pending')
+
+    allowFifthPoll()
+    await expect(idle).resolves.toBeUndefined()
+    expect(statusCalls).toBe(5)
+  }, 1000)
+
   it('onceIdle rejects on timeout', async () => {
     const { manager } = makeManager({ connectEventStream: () => () => {} })
     await manager.ensureStarted()
