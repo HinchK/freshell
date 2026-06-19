@@ -1,7 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { createCodexFreshAgentAdapter as createRawCodexFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/codex/adapter.js'
-import { FreshAgentStaleThreadRevisionError } from '../../../../server/fresh-agent/runtime-manager.js'
+import {
+  FreshAgentInvalidDisplayIdError,
+  FreshAgentInvalidTurnCursorError,
+  FreshAgentStaleThreadRevisionError,
+  FreshAgentTurnNotFoundError,
+} from '../../../../server/fresh-agent/runtime-manager.js'
 
 const DISPLAY_SECRET = 'task-3-persisted-display-secret'
 
@@ -68,6 +73,157 @@ function makeMixedCodexTurn(id: string) {
 }
 
 describe('Codex fresh-agent adapter', () => {
+  it('paginates Codex history by display rows within a split provider turn', async () => {
+    const firstTurn = makeMixedCodexTurn('turn-1')
+    const secondTurn = makeCodexTurn('turn-2')
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn()
+        .mockResolvedValueOnce({ revision: 7, nextCursor: 'provider-after-turn-1', turns: [firstTurn] })
+        .mockResolvedValueOnce({ revision: 7, nextCursor: null, turns: [secondTurn] }),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const firstPage: any = await adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 7, limit: 1 })
+
+    expect(firstPage.turns).toHaveLength(1)
+    expect(firstPage.turns[0]).toMatchObject({ role: 'user', summary: 'Review the diff.' })
+    expect(firstPage.nextCursor).toMatch(/^codex-cursor:v1:[A-Za-z0-9_-]+$/)
+    expect(firstPage.nextCursor).not.toContain('provider-after-turn-1')
+    expect(firstPage.nextCursor).not.toContain('turn-1')
+    expect(() => JSON.parse(Buffer.from(firstPage.nextCursor.split(':').at(-1) ?? '', 'base64url').toString('utf8'))).toThrow()
+
+    const secondPage: any = await adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 7, limit: 1, cursor: firstPage.nextCursor })
+
+    expect(secondPage.turns).toHaveLength(1)
+    expect(secondPage.turns[0]).toMatchObject({ role: 'assistant', summary: 'Checking changes' })
+    expect(secondPage.turns[0].turnId).not.toBe(firstPage.turns[0].turnId)
+    expect(runtime.listThreadTurns).toHaveBeenCalledTimes(1)
+
+    const thirdPage: any = await adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 7, limit: 1, cursor: secondPage.nextCursor })
+
+    expect(thirdPage.turns).toHaveLength(1)
+    expect(thirdPage.turns[0]).toMatchObject({ role: 'assistant', summary: 'Codex summary' })
+    expect(thirdPage.nextCursor).toBeNull()
+    expect(runtime.listThreadTurns).toHaveBeenCalledTimes(2)
+    expect(runtime.listThreadTurns).toHaveBeenNthCalledWith(1, {
+      threadId: 'thread-new-1',
+      limit: 1,
+      itemsView: 'full',
+    })
+    expect(runtime.listThreadTurns).toHaveBeenNthCalledWith(2, {
+      threadId: 'thread-new-1',
+      cursor: 'provider-after-turn-1',
+      limit: 1,
+      itemsView: 'full',
+    })
+  })
+
+  it('applies includeBodies to display-row limited pages with display turn body keys', async () => {
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn().mockResolvedValue({
+        revision: 7,
+        nextCursor: 'provider-after-turn-1',
+        turns: [makeMixedCodexTurn('turn-1')],
+      }),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const page: any = await adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 7, limit: 1, includeBodies: true })
+
+    expect(page.turns).toHaveLength(1)
+    expect(Object.keys(page.bodies)).toEqual([page.turns[0].turnId])
+    expect(page.bodies[page.turns[0].turnId]).toMatchObject({ role: 'user' })
+    expect(page.bodies).not.toHaveProperty('turn-1')
+  })
+
+  it('rejects malformed, cross-thread, expired, and stale-revision display cursors with typed errors', async () => {
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn().mockResolvedValue({
+        revision: 7,
+        nextCursor: 'provider-after-turn-1',
+        turns: [makeMixedCodexTurn('turn-1')],
+      }),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const firstPage: any = await adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 7, limit: 1 })
+
+    await expect(adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 7, limit: 1, cursor: 'not-a-codex-cursor' })).rejects.toBeInstanceOf(FreshAgentInvalidTurnCursorError)
+
+    await expect(adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'other-thread',
+    }, { revision: 7, limit: 1, cursor: firstPage.nextCursor })).rejects.toBeInstanceOf(FreshAgentInvalidTurnCursorError)
+
+    await expect(adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 8, limit: 1, cursor: firstPage.nextCursor })).rejects.toBeInstanceOf(FreshAgentStaleThreadRevisionError)
+
+    await adapter.shutdown?.()
+    await expect(adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 7, limit: 1, cursor: firstPage.nextCursor })).rejects.toBeInstanceOf(FreshAgentInvalidTurnCursorError)
+  })
+
+  it('throws a typed invalid display id error for malformed Codex display body ids', async () => {
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    await expect(adapter.getTurnBody?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+      turnId: 'codex-display:v1:not-a-valid-envelope',
+    }, 7)).rejects.toBeInstanceOf(FreshAgentInvalidDisplayIdError)
+    expect(runtime.readThreadTurn).not.toHaveBeenCalled()
+  })
+
   it('allocates separate runtimes for fresh Codex threads in different cwd values', async () => {
     const runtimes = ['/repo/one', '/repo/two'].map((cwd, index) => ({
       startThread: vi.fn().mockImplementation(async (input) => {
@@ -299,7 +455,7 @@ describe('Codex fresh-agent adapter', () => {
       provider: 'codex',
       threadId: 'thread-new-1',
       turnId: 'codex-display:v1:not-a-valid-envelope',
-    }, 7)).resolves.toBeNull()
+    }, 7)).rejects.toBeInstanceOf(FreshAgentInvalidDisplayIdError)
     expect(runtime.readThreadTurn).not.toHaveBeenCalled()
 
     await expect(adapter.getTurnBody?.({
@@ -307,7 +463,7 @@ describe('Codex fresh-agent adapter', () => {
       provider: 'codex',
       threadId: 'thread-new-1',
       turnId: 'codex-display:v1:abcdefghijklmnopqrstu1',
-    }, 7)).resolves.toBeNull()
+    }, 7)).rejects.toBeInstanceOf(FreshAgentTurnNotFoundError)
     expect(runtime.readThreadTurn).not.toHaveBeenCalled()
   })
 

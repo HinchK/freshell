@@ -11,6 +11,10 @@ import {
   FreshAgentRuntimeUnavailableError,
   FreshAgentStaleThreadRevisionError,
   FreshAgentUnsupportedCapabilityError,
+  FreshAgentInvalidDisplayIdError,
+  FreshAgentInvalidTurnCursorError,
+  FreshAgentTurnNotFoundError,
+  FreshAgentAmbiguousTurnBodyError,
   FreshAgentLostSessionError,
   FreshAgentSessionLocatorMismatchError,
   FreshAgentContractValidationError,
@@ -113,6 +117,18 @@ export function createFreshAgentRouter(deps: {
         code: error.code,
         currentRevision: error.currentRevision,
       })
+    }
+    if (error instanceof FreshAgentInvalidDisplayIdError) {
+      return res.status(400).json({ error: error.message, code: error.code })
+    }
+    if (error instanceof FreshAgentInvalidTurnCursorError) {
+      return res.status(400).json({ error: error.message, code: error.code })
+    }
+    if (error instanceof FreshAgentAmbiguousTurnBodyError) {
+      return res.status(409).json({ error: error.message, code: error.ambiguousCode })
+    }
+    if (error instanceof FreshAgentTurnNotFoundError) {
+      return res.status(404).json({ error: error.message, code: error.code })
     }
     if (error instanceof FreshAgentRuntimeUnavailableError) {
       return res.status(503).json({ error: error.message, code: error.code })

@@ -38,7 +38,20 @@ export class FreshAgentUnsupportedCapabilityError extends Error {
   readonly code = 'FRESH_AGENT_UNSUPPORTED_CAPABILITY' as const
 }
 
+export class FreshAgentInvalidDisplayIdError extends Error {
+  readonly code = 'INVALID_DISPLAY_ID' as const
+}
+
+export class FreshAgentInvalidTurnCursorError extends Error {
+  readonly code = 'INVALID_TURN_CURSOR' as const
+}
+
+export class FreshAgentTurnNotFoundError extends Error {
+  readonly code = 'TURN_NOT_FOUND' as const
+}
+
 export class FreshAgentAmbiguousTurnBodyError extends FreshAgentUnsupportedCapabilityError {
+  readonly ambiguousCode = 'AMBIGUOUS_NATIVE_TURN_ID' as const
 }
 
 export class FreshAgentLostSessionError extends Error {

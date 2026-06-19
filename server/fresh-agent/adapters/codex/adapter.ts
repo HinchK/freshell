@@ -1,9 +1,14 @@
+import { randomBytes } from 'node:crypto'
+
 import type { FreshAgentCreateRequest, FreshAgentInputImage, FreshAgentRuntimeAdapter } from '../../runtime-adapter.js'
 import type { FreshAgentTurn } from '../../../../shared/fresh-agent-contract.js'
 import { FreshAgentTurnPageSchema } from '../../../../shared/fresh-agent-contract.js'
 import {
   FreshAgentAmbiguousTurnBodyError,
+  FreshAgentInvalidDisplayIdError,
+  FreshAgentInvalidTurnCursorError,
   FreshAgentStaleThreadRevisionError,
+  FreshAgentTurnNotFoundError,
 } from '../../runtime-manager.js'
 import type {
   CodexThreadForkParams,
@@ -78,6 +83,17 @@ type DisplayIndexEntry = {
   rawTurn: Record<string, unknown>
 }
 
+type CodexDisplayCursorEntry = {
+  threadId: string
+  revision: number
+  providerCursor: string | null
+  drainingProviderTurnId?: string
+  nextDisplayOffset: number
+  rawTurn?: Record<string, unknown>
+  order: 'provider-default'
+  expiresAt: number
+}
+
 type SubmittedInputRecord = {
   requestId: string
   providerTurnId: string
@@ -87,6 +103,9 @@ type SubmittedInputRecord = {
 }
 
 const DISPLAY_INDEX_MAX_REVISIONS = 32
+const DISPLAY_CURSOR_PREFIX = 'codex-cursor:v1:'
+const DISPLAY_CURSOR_TTL_MS = 5 * 60 * 1000
+const DISPLAY_CURSOR_MAX_ENTRIES = 512
 const SUBMITTED_INPUT_TTL_MS = 30 * 60 * 1000
 
 function toCodexApprovalPolicy(value: string | undefined) {
@@ -158,6 +177,11 @@ function submittedInputKey(providerTurnId: string, requestId: string): string {
 
 function displayIndexKey(threadId: string, revision: number): string {
   return `${threadId}\u0000${revision}`
+}
+
+function readDisplayCursorHandle(cursor: string): string | null {
+  const pattern = new RegExp(`^${DISPLAY_CURSOR_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([A-Za-z0-9_-]{22})$`)
+  return cursor.match(pattern)?.[1] ?? null
 }
 
 function stripCodexDisplayMetadata(turn: FreshAgentTurn): FreshAgentTurn {
@@ -269,6 +293,7 @@ export function createCodexFreshAgentAdapter(deps: {
   const runtimeResumeGenerationByThread = new Map<string, number>()
   const modelByTurnByThread = new Map<string, Map<string, string>>()
   const displayIndexByRevision = new Map<string, Map<string, DisplayIndexEntry>>()
+  const displayCursorByHandle = new Map<string, CodexDisplayCursorEntry>()
   const submittedInputsByThread = new Map<string, Map<string, SubmittedInputRecord>>()
   const submittedAliasByThread = new Map<string, Map<string, string>>()
 
@@ -278,6 +303,57 @@ export function createCodexFreshAgentAdapter(deps: {
       if (!oldestKey) return
       displayIndexByRevision.delete(oldestKey)
     }
+  }
+
+  const pruneDisplayCursors = () => {
+    const now = Date.now()
+    for (const [handle, entry] of displayCursorByHandle) {
+      if (entry.expiresAt <= now) {
+        displayCursorByHandle.delete(handle)
+      }
+    }
+    while (displayCursorByHandle.size > DISPLAY_CURSOR_MAX_ENTRIES) {
+      const oldestHandle = displayCursorByHandle.keys().next().value
+      if (!oldestHandle) return
+      displayCursorByHandle.delete(oldestHandle)
+    }
+  }
+
+  const createDisplayCursor = (entry: Omit<CodexDisplayCursorEntry, 'expiresAt'>): string => {
+    pruneDisplayCursors()
+    let handle = randomBytes(16).toString('base64url')
+    while (displayCursorByHandle.has(handle)) {
+      handle = randomBytes(16).toString('base64url')
+    }
+    displayCursorByHandle.set(handle, {
+      ...entry,
+      expiresAt: Date.now() + DISPLAY_CURSOR_TTL_MS,
+    })
+    pruneDisplayCursors()
+    return `${DISPLAY_CURSOR_PREFIX}${handle}`
+  }
+
+  const resolveDisplayCursor = (input: {
+    cursor: string
+    threadId: string
+    revision: number
+  }): CodexDisplayCursorEntry => {
+    pruneDisplayCursors()
+    const handle = readDisplayCursorHandle(input.cursor)
+    if (!handle) {
+      throw new FreshAgentInvalidTurnCursorError('Invalid Codex display cursor.')
+    }
+    const entry = displayCursorByHandle.get(handle)
+    if (!entry) {
+      throw new FreshAgentInvalidTurnCursorError('Invalid or expired Codex display cursor.')
+    }
+    if (entry.threadId !== input.threadId) {
+      throw new FreshAgentInvalidTurnCursorError('Codex display cursor does not belong to this thread.')
+    }
+    if (entry.revision !== input.revision) {
+      throw new FreshAgentStaleThreadRevisionError(entry.revision)
+    }
+    return entry
   }
 
   const pruneSubmittedInputs = (threadId: string) => {
@@ -374,12 +450,12 @@ export function createCodexFreshAgentAdapter(deps: {
     pruneDisplayIndex()
   }
 
-  const normalizeRawTurns = (input: {
+  const normalizeSingleRawTurn = (input: {
     threadId: string
     revision: number
-    rawTurns: Record<string, unknown>[]
-  }): FreshAgentTurn[] => input.rawTurns.flatMap((rawTurn) => {
-    const preparedTurn = prepareRawTurnForNormalization(input.threadId, rawTurn)
+    rawTurn: Record<string, unknown>
+  }) => {
+    const preparedTurn = prepareRawTurnForNormalization(input.threadId, input.rawTurn)
     const normalized = normalizeCodexDisplayTurns(preparedTurn, 0, {
       threadId: input.threadId,
       secret: displayIdSecret,
@@ -394,8 +470,22 @@ export function createCodexFreshAgentAdapter(deps: {
       rawTurn: preparedTurn,
       displayRows: normalized.displayRows,
     })
-    return normalized.turns.map(stripCodexDisplayMetadata)
-  }).map((turn, index) => ({
+    return {
+      rawTurn: preparedTurn,
+      providerTurnId: String(preparedTurn.id ?? ''),
+      turns: normalized.turns.map(stripCodexDisplayMetadata),
+    }
+  }
+
+  const normalizeRawTurns = (input: {
+    threadId: string
+    revision: number
+    rawTurns: Record<string, unknown>[]
+  }): FreshAgentTurn[] => input.rawTurns.flatMap((rawTurn) => normalizeSingleRawTurn({
+    threadId: input.threadId,
+    revision: input.revision,
+    rawTurn,
+  }).turns).map((turn, index) => ({
     ...turn,
     ordinal: index,
   }))
@@ -418,6 +508,124 @@ export function createCodexFreshAgentAdapter(deps: {
       nextCursor: input.rawPage.nextCursor ?? null,
       backwardsCursor: input.rawPage.backwardsCursor ?? null,
       turns,
+      bodies: Object.fromEntries(turns.map((turn) => [turn.turnId, turn])),
+    })
+  }
+
+  const normalizeDisplayTurnPage = async (input: {
+    runtime: CodexRuntimePort
+    threadId: string
+    revision: number
+    cursor?: string
+    limit?: number
+  }) => {
+    const limit = input.limit ?? 30
+    const turns: FreshAgentTurn[] = []
+    let providerCursor: string | null | undefined
+    let backwardsCursor: string | null | undefined
+
+    const appendTurnRows = (rawTurn: Record<string, unknown>, offset: number, providerCursorAfterTurn: string | null) => {
+      const normalized = normalizeSingleRawTurn({
+        threadId: input.threadId,
+        revision: input.revision,
+        rawTurn,
+      })
+      const availableRows = normalized.turns.slice(offset)
+      const remainingSlots = limit - turns.length
+      const selectedRows = availableRows.slice(0, remainingSlots)
+      turns.push(...selectedRows)
+      const nextDisplayOffset = offset + selectedRows.length
+      if (nextDisplayOffset < normalized.turns.length) {
+        return createDisplayCursor({
+          threadId: input.threadId,
+          revision: input.revision,
+          providerCursor: providerCursorAfterTurn,
+          drainingProviderTurnId: normalized.providerTurnId,
+          nextDisplayOffset,
+          rawTurn: normalized.rawTurn,
+          order: 'provider-default',
+        })
+      }
+      if (providerCursorAfterTurn && turns.length >= limit) {
+        return createDisplayCursor({
+          threadId: input.threadId,
+          revision: input.revision,
+          providerCursor: providerCursorAfterTurn,
+          nextDisplayOffset: 0,
+          order: 'provider-default',
+        })
+      }
+      return null
+    }
+
+    if (input.cursor) {
+      const cursor = resolveDisplayCursor({
+        cursor: input.cursor,
+        threadId: input.threadId,
+        revision: input.revision,
+      })
+      providerCursor = cursor.providerCursor
+      if (cursor.rawTurn) {
+        const nextCursor = appendTurnRows(cursor.rawTurn, cursor.nextDisplayOffset, cursor.providerCursor)
+        if (turns.length >= limit || nextCursor) {
+          return FreshAgentTurnPageSchema.parse({
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            threadId: input.threadId,
+            revision: input.revision,
+            nextCursor,
+            backwardsCursor: null,
+            turns: turns.map((turn, index) => ({ ...turn, ordinal: index })),
+            bodies: Object.fromEntries(turns.map((turn) => [turn.turnId, turn])),
+          })
+        }
+      }
+    }
+
+    while (turns.length < limit) {
+      const rawPage = await input.runtime.listThreadTurns({
+        threadId: input.threadId,
+        ...(providerCursor ? { cursor: providerCursor } : {}),
+        limit: 1,
+        itemsView: 'full',
+      })
+      const pageRevision = Number(rawPage.revision ?? input.revision)
+      if (pageRevision !== input.revision) {
+        throw new FreshAgentStaleThreadRevisionError(pageRevision)
+      }
+      backwardsCursor = typeof rawPage.backwardsCursor === 'string' ? rawPage.backwardsCursor : backwardsCursor
+      const rawTurns = readRawTurns(rawPage.turns)
+      providerCursor = typeof rawPage.nextCursor === 'string' && rawPage.nextCursor.length > 0
+        ? rawPage.nextCursor
+        : null
+      if (rawTurns.length === 0) {
+        if (providerCursor) continue
+        break
+      }
+      const nextCursor = appendTurnRows(rawTurns[0], 0, providerCursor)
+      if (turns.length >= limit || nextCursor) {
+        return FreshAgentTurnPageSchema.parse({
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          threadId: input.threadId,
+          revision: input.revision,
+          nextCursor,
+          backwardsCursor: backwardsCursor ?? null,
+          turns: turns.map((turn, index) => ({ ...turn, ordinal: index })),
+          bodies: Object.fromEntries(turns.map((turn) => [turn.turnId, turn])),
+        })
+      }
+      if (!providerCursor) break
+    }
+
+    return FreshAgentTurnPageSchema.parse({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: input.threadId,
+      revision: input.revision,
+      nextCursor: null,
+      backwardsCursor: backwardsCursor ?? null,
+      turns: turns.map((turn, index) => ({ ...turn, ordinal: index })),
       bodies: Object.fromEntries(turns.map((turn) => [turn.turnId, turn])),
     })
   }
@@ -454,6 +662,11 @@ export function createCodexFreshAgentAdapter(deps: {
     for (const key of [...displayIndexByRevision.keys()]) {
       if (key.startsWith(`${threadId}\u0000`)) {
         displayIndexByRevision.delete(key)
+      }
+    }
+    for (const [handle, entry] of displayCursorByHandle) {
+      if (entry.threadId === threadId) {
+        displayCursorByHandle.delete(handle)
       }
     }
   }
@@ -844,16 +1057,12 @@ export function createCodexFreshAgentAdapter(deps: {
         thread.threadId,
         settingsFromLocator(thread) ?? settingsByThread.get(thread.threadId),
       )
-      const rawPage = await runtime.listThreadTurns({
+      return normalizeDisplayTurnPage({
+        runtime,
         threadId: thread.threadId,
+        revision: Number(query.revision ?? 0),
         cursor: typeof query.cursor === 'string' ? query.cursor : undefined,
         limit: typeof query.limit === 'number' ? query.limit : undefined,
-        itemsView: 'full',
-      })
-      return normalizeRawPage({
-        threadId: thread.threadId,
-        revision: Number(rawPage.revision ?? query.revision ?? 0),
-        rawPage,
       })
     },
 
@@ -863,13 +1072,15 @@ export function createCodexFreshAgentAdapter(deps: {
         settingsFromLocator(thread) ?? settingsByThread.get(thread.threadId),
       )
       if (thread.turnId.startsWith('codex-display:') && !parseCodexDisplayIdHandle(thread.turnId)) {
-        return null
+        throw new FreshAgentInvalidDisplayIdError('Invalid Codex display turn id.')
       }
       const displayHandle = parseCodexDisplayIdHandle(thread.turnId)
       if (displayHandle) {
         const entry = findDisplayIndexEntry(thread.threadId, revision, thread.turnId)
           ?? await rescanDisplayIndex(runtime, thread.threadId, revision, thread.turnId)
-        if (!entry) return null
+        if (!entry) {
+          throw new FreshAgentTurnNotFoundError('Codex display turn was not found in the requested thread revision.')
+        }
         const rawTurn = await runtime.readThreadTurn({
           threadId: thread.threadId,
           turnId: entry.providerTurnId,
@@ -887,7 +1098,7 @@ export function createCodexFreshAgentAdapter(deps: {
           })
         } catch (error) {
           if (error instanceof CodexDisplayTurnNotFoundError) {
-            return null
+            throw new FreshAgentTurnNotFoundError('Codex display turn was not found in the requested thread revision.')
           }
           throw error
         }
@@ -950,6 +1161,7 @@ export function createCodexFreshAgentAdapter(deps: {
       settingsByThread.clear()
       modelByTurnByThread.clear()
       displayIndexByRevision.clear()
+      displayCursorByHandle.clear()
       submittedInputsByThread.clear()
       submittedAliasByThread.clear()
       await Promise.all(runtimes.map((runtime) => runtime.shutdown?.()))
