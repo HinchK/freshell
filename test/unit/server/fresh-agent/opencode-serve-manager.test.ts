@@ -535,6 +535,76 @@ describe('OpencodeServeManager fan-out', () => {
     await expect(idle).rejects.toThrow(/idle/i)
   })
 
+  it('onceIdle resolves when status-map activity drops out of the OpenCode status map', async () => {
+    let statusCalls = 0
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) {
+        statusCalls += 1
+        return statusCalls === 1
+          ? jsonResponse({ ses_a: { type: 'busy' } })
+          : jsonResponse({})
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_a', 1000)
+
+    await expect(idle).resolves.toBeUndefined()
+    expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/session/status', expect.anything())
+    expect((manager as any).sessionEmitters.get('ses_a')?.listenerCount('event') ?? 0).toBe(0)
+  })
+
+  it('onceIdle does not resolve from status-map absence before observed OpenCode activity', async () => {
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) return jsonResponse({})
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    await expect(manager.onceIdle('ses_a', 30)).rejects.toThrow(/idle/i)
+  })
+
+  it('onceIdle does not resolve from a single busy signal plus one empty status-map poll', async () => {
+    let push!: (e: any) => void
+    let statusCalls = 0
+    const fetchFn = vi.fn(async (url: string) => {
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url.endsWith('/session/status')) {
+        statusCalls += 1
+        if (statusCalls === 1) return jsonResponse({})
+        throw new Error('status map unavailable')
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      connectEventStream: (_url, h) => { push = (e) => h.onEvent(parseEvt(e)); return () => {} },
+      idlePollMs: 5,
+    })
+    await manager.ensureStarted()
+
+    const idle = manager.onceIdle('ses_a', 40)
+    push({ type: 'session.status', properties: { sessionID: 'ses_a', status: { type: 'busy' } } })
+
+    const pending = await Promise.race([
+      idle.then(() => 'resolved', () => 'rejected'),
+      new Promise<'pending'>((resolve) => setTimeout(() => resolve('pending'), 15)),
+    ])
+    expect(pending).toBe('pending')
+    await expect(idle).rejects.toThrow(/idle/i)
+  })
+
   it('onceIdle rejects on timeout', async () => {
     const { manager } = makeManager({ connectEventStream: () => () => {} })
     await manager.ensureStarted()
