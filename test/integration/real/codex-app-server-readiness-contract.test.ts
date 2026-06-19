@@ -244,9 +244,11 @@ function displayTurnIncludesText(turn: { items?: Array<Record<string, unknown>> 
   return (turn.items ?? []).some((item) => item.kind === 'text' && typeof item.text === 'string' && item.text.includes(needle))
 }
 
-function comparableDisplayTurn<T extends { ordinal?: number }>(turn: T): Omit<T, 'ordinal'> {
-  const { ordinal: _ordinal, ...rest } = turn
-  return rest
+function comparableDisplayTurn(turn: Record<string, unknown>): Record<string, unknown> {
+  const comparableKeys = ['id', 'turnId', 'messageId', 'source', 'role', 'timestamp', 'model', 'summary', 'items'] as const
+  return Object.fromEntries(comparableKeys
+    .filter((key) => key in turn)
+    .map((key) => [key, turn[key]]))
 }
 
 async function waitForSessionArtifact(codexHome: string, threadId: string, timeoutMs = 60_000): Promise<string> {
