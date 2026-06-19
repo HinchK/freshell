@@ -1604,6 +1604,7 @@ export function FreshAgentView({
                 ? [...turns, {
                     id: `__local-echo:${localEcho.requestId}`,
                     turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
+                    requestId: localEcho.requestId,
                     role: 'user',
                     summary: localEcho.text,
                     items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],

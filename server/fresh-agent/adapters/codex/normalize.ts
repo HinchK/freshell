@@ -173,7 +173,7 @@ function summarizeFreshAgentItems(items: FreshAgentTranscriptItem[]): string {
       case 'thinking':
         return item.text.slice(0, 140)
       case 'reasoning':
-        return (item.text ?? item.summary.join('\n') ?? item.content.join('\n')).slice(0, 140)
+        return (item.text ?? (item.summary.join('\n') || item.content.join('\n'))).slice(0, 140)
       case 'command':
         return item.command.slice(0, 140)
       case 'file_change':
@@ -704,46 +704,6 @@ export function normalizeCodexTurn(
     summary: '',
     items: [],
   }
-}
-
-export function normalizeCodexTurnPage(input: {
-  threadId: string
-  revision: number
-  rawPage: { turns?: unknown[]; nextCursor?: string | null; backwardsCursor?: string | null }
-  model?: string
-  modelByTurn?: Map<string, string>
-  secret?: string
-  submittedRequestIdByProviderTurnId?: ReadonlyMap<string, string | number>
-}) {
-  const turns = (Array.isArray(input.rawPage.turns) ? input.rawPage.turns : [])
-    .filter((turn): turn is Record<string, unknown> => !!turn && typeof turn === 'object' && !Array.isArray(turn))
-    .flatMap((turn) => normalizeCodexDisplayTurns(turn, 0, {
-      threadId: input.threadId,
-      secret: input.secret,
-      submittedRequestIdByProviderTurnId: input.submittedRequestIdByProviderTurnId,
-      model: (typeof turn.id === 'string' ? input.modelByTurn?.get(turn.id) : undefined) ?? input.model,
-    }).turns)
-    .map((turn, index) => {
-      const { syntheticKind: _syntheticKind, requestId: _requestId, ...parsedTurn } = turn as FreshAgentTurn & {
-        syntheticKind?: CodexDisplaySyntheticKind
-        requestId?: string | number
-      }
-      return {
-        ...parsedTurn,
-        ordinal: index,
-      }
-    })
-
-  return FreshAgentTurnPageSchema.parse({
-    sessionType: 'freshcodex',
-    provider: 'codex',
-    threadId: input.threadId,
-    revision: input.revision,
-    nextCursor: input.rawPage.nextCursor ?? null,
-    backwardsCursor: input.rawPage.backwardsCursor ?? null,
-    turns,
-    bodies: Object.fromEntries(turns.map((turn) => [turn.turnId, turn])),
-  })
 }
 
 export function normalizeCodexTurnBody(input: {
