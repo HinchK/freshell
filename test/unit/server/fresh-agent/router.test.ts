@@ -49,6 +49,20 @@ function makeMixedCodexTurn(id: string) {
   }
 }
 
+function makeCodexTurn(id: string) {
+  return {
+    id,
+    status: 'completed',
+    items: [{
+      type: 'agentMessage',
+      id: `${id}:item-1`,
+      text: 'Codex summary',
+      phase: null,
+      memoryCitation: null,
+    }],
+  }
+}
+
 describe('fresh-agent router', () => {
   it('returns 409 for stale thread revisions instead of mixing bodies from different revisions', async () => {
     const manager = {
@@ -132,6 +146,13 @@ describe('fresh-agent router', () => {
       revision: 7,
     })
     expect(JSON.stringify(body.body)).not.toContain('providerTurnId')
+
+    runtime.readThreadTurn.mockResolvedValueOnce(makeCodexTurn('turn-1'))
+    const unprovableBody = await request(app)
+      .get(`/api/fresh-agent/threads/freshcodex/codex/thread-new-1/turns/${encodeURIComponent(secondPage.body.turns[0].turnId)}?revision=7`)
+      .expect(409)
+    expect(unprovableBody.body.code).toBe('UNPROVABLE_THREAD_REVISION')
+    expect(unprovableBody.body.requestedRevision).toBe(7)
 
     const malformedCursor = await request(app)
       .get('/api/fresh-agent/threads/freshcodex/codex/thread-new-1/turns?revision=7&cursor=bad-cursor')

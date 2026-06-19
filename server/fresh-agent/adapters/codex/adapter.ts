@@ -8,6 +8,7 @@ import {
   FreshAgentInvalidDisplayIdError,
   FreshAgentInvalidTurnCursorError,
   FreshAgentStaleThreadRevisionError,
+  FreshAgentUnprovableThreadRevisionError,
   FreshAgentTurnNotFoundError,
 } from '../../runtime-manager.js'
 import type {
@@ -640,17 +641,26 @@ export function createCodexFreshAgentAdapter(deps: {
     revision: number,
     displayTurnId: string,
   ): Promise<DisplayIndexEntry | null> => {
-    const rawPage = await runtime.listThreadTurns({
-      threadId,
-      limit: 100,
-      itemsView: 'full',
-    })
-    const currentRevision = Number(rawPage.revision ?? revision)
-    normalizeRawPage({ threadId, revision: currentRevision, rawPage })
-    if (currentRevision !== revision) {
-      throw new FreshAgentStaleThreadRevisionError(currentRevision)
-    }
-    return findDisplayIndexEntry(threadId, revision, displayTurnId) ?? null
+    let cursor: string | undefined
+    do {
+      const rawPage = await runtime.listThreadTurns({
+        threadId,
+        ...(cursor ? { cursor } : {}),
+        limit: 100,
+        itemsView: 'full',
+      })
+      const currentRevision = Number(rawPage.revision ?? revision)
+      normalizeRawPage({ threadId, revision: currentRevision, rawPage })
+      if (currentRevision !== revision) {
+        throw new FreshAgentStaleThreadRevisionError(currentRevision)
+      }
+      const entry = findDisplayIndexEntry(threadId, revision, displayTurnId)
+      if (entry) return entry
+      cursor = typeof rawPage.nextCursor === 'string' && rawPage.nextCursor.length > 0
+        ? rawPage.nextCursor
+        : undefined
+    } while (cursor)
+    return null
   }
 
   const clearThreadState = (threadId: string) => {
@@ -1098,7 +1108,7 @@ export function createCodexFreshAgentAdapter(deps: {
           })
         } catch (error) {
           if (error instanceof CodexDisplayTurnNotFoundError) {
-            throw new FreshAgentTurnNotFoundError('Codex display turn was not found in the requested thread revision.')
+            throw new FreshAgentUnprovableThreadRevisionError(revision)
           }
           throw error
         }

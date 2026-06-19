@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from 'vitest'
 
 import { createCodexFreshAgentAdapter as createRawCodexFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/codex/adapter.js'
+import { createCodexDisplayId } from '../../../../server/fresh-agent/adapters/codex/normalize.js'
 import {
   FreshAgentInvalidDisplayIdError,
   FreshAgentInvalidTurnCursorError,
   FreshAgentStaleThreadRevisionError,
+  FreshAgentUnprovableThreadRevisionError,
   FreshAgentTurnNotFoundError,
 } from '../../../../server/fresh-agent/runtime-manager.js'
 
@@ -222,6 +224,86 @@ describe('Codex fresh-agent adapter', () => {
       turnId: 'codex-display:v1:not-a-valid-envelope',
     }, 7)).rejects.toBeInstanceOf(FreshAgentInvalidDisplayIdError)
     expect(runtime.readThreadTurn).not.toHaveBeenCalled()
+  })
+
+  it('returns unprovable revision when an indexed display body no longer matches the provider turn body', async () => {
+    const durableTurn = makeMixedCodexTurn('turn-1')
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn().mockResolvedValue({
+        revision: 7,
+        nextCursor: null,
+        turns: [durableTurn],
+      }),
+      readThreadTurn: vi.fn().mockResolvedValue(makeCodexTurn('turn-1')),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const page: any = await adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 7, limit: 1 })
+
+    await expect(adapter.getTurnBody?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+      turnId: page.turns[0].turnId,
+    }, 7)).rejects.toBeInstanceOf(FreshAgentUnprovableThreadRevisionError)
+  })
+
+  it('rescans display indexes through provider pagination before returning an exact miss', async () => {
+    const targetTurn = makeMixedCodexTurn('turn-target')
+    const targetDisplayTurnId = createCodexDisplayId({
+      secret: DISPLAY_SECRET,
+      threadId: 'thread-new-1',
+      providerTurnId: 'turn-target',
+      role: 'user',
+      itemIds: ['turn-target:user'],
+      partIndexes: [0],
+    })
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn()
+        .mockResolvedValueOnce({
+          revision: 7,
+          nextCursor: 'provider-page-2',
+          turns: [makeCodexTurn('turn-before-target')],
+        })
+        .mockResolvedValueOnce({
+          revision: 7,
+          nextCursor: null,
+          turns: [targetTurn],
+        }),
+      readThreadTurn: vi.fn().mockResolvedValue(targetTurn),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    await expect(adapter.getTurnBody?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+      turnId: targetDisplayTurnId,
+    }, 7)).resolves.toMatchObject({
+      turnId: targetDisplayTurnId,
+      role: 'user',
+      summary: 'Review the diff.',
+    })
+    expect(runtime.listThreadTurns).toHaveBeenNthCalledWith(1, {
+      threadId: 'thread-new-1',
+      limit: 100,
+      itemsView: 'full',
+    })
+    expect(runtime.listThreadTurns).toHaveBeenNthCalledWith(2, {
+      threadId: 'thread-new-1',
+      cursor: 'provider-page-2',
+      limit: 100,
+      itemsView: 'full',
+    })
   })
 
   it('allocates separate runtimes for fresh Codex threads in different cwd values', async () => {

@@ -10,6 +10,7 @@ import {
   FreshAgentRuntimeManager,
   FreshAgentRuntimeUnavailableError,
   FreshAgentStaleThreadRevisionError,
+  FreshAgentUnprovableThreadRevisionError,
   FreshAgentUnsupportedCapabilityError,
   FreshAgentInvalidDisplayIdError,
   FreshAgentInvalidTurnCursorError,
@@ -116,6 +117,13 @@ export function createFreshAgentRouter(deps: {
         error: 'Stale thread revision',
         code: error.code,
         currentRevision: error.currentRevision,
+      })
+    }
+    if (error instanceof FreshAgentUnprovableThreadRevisionError) {
+      return res.status(409).json({
+        error: error.message,
+        code: error.code,
+        requestedRevision: error.requestedRevision,
       })
     }
     if (error instanceof FreshAgentInvalidDisplayIdError) {

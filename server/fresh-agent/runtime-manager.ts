@@ -34,6 +34,14 @@ export class FreshAgentStaleThreadRevisionError extends Error {
   }
 }
 
+export class FreshAgentUnprovableThreadRevisionError extends Error {
+  readonly code = 'UNPROVABLE_THREAD_REVISION' as const
+
+  constructor(readonly requestedRevision: number) {
+    super('Fresh-agent thread revision could not be proven from the current provider body')
+  }
+}
+
 export class FreshAgentUnsupportedCapabilityError extends Error {
   readonly code = 'FRESH_AGENT_UNSUPPORTED_CAPABILITY' as const
 }
