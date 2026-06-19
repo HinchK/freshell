@@ -581,6 +581,7 @@ export function createCodexFreshAgentAdapter(deps: {
       return normalizeCodexTurnBody({
         threadId: thread.threadId,
         revision,
+        requestedTurnId: thread.turnId,
         rawTurn,
         model: typeof rawTurn.id === 'string'
           ? modelByTurnByThread.get(thread.threadId)?.get(rawTurn.id)

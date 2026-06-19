@@ -37,12 +37,18 @@ type CodexThreadItemVariant = (typeof CodexThreadItemTypeSchema.options)[number]
 
 const CODEX_DISPLAY_ID_PREFIX = 'codex-display:v1:'
 const CODEX_DISPLAY_HANDLE_LENGTH = 22
-const DEFAULT_CODEX_DISPLAY_SECRET = 'codex-display-default-secret'
 
 export class CodexDisplayProtocolError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'CodexDisplayProtocolError'
+  }
+}
+
+export class CodexDisplayConfigError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CodexDisplayConfigError'
   }
 }
 
@@ -117,6 +123,13 @@ function normalizeToolStatus(status: unknown): 'running' | 'completed' | 'failed
 
 function assertNever(value: never): never {
   throw new CodexDisplayProtocolError(`Unsupported Codex thread item type: ${String(value)}`)
+}
+
+function readRequiredCodexDisplaySecret(secret: string | undefined): string {
+  if (typeof secret === 'string' && secret.trim().length > 0) {
+    return secret
+  }
+  throw new CodexDisplayConfigError('Codex display-turn normalization requires a non-empty adapter-supplied display-id secret.')
 }
 
 function readCodexThreadItemType(item: Record<string, unknown>): CodexThreadItemVariant {
@@ -579,7 +592,7 @@ export function normalizeCodexDisplayTurns(
 ): { turns: FreshAgentTurn[]; displayRows: CodexDisplayRow[] } {
   const providerTurnId = String(rawTurn.id ?? `turn:${ordinal}`)
   const threadId = options.threadId ?? providerTurnId
-  const secret = options.secret ?? DEFAULT_CODEX_DISPLAY_SECRET
+  const secret = readRequiredCodexDisplaySecret(options.secret)
   const model = typeof rawTurn.model === 'string' && rawTurn.model.length > 0
     ? rawTurn.model
     : options.model
@@ -729,7 +742,7 @@ export function normalizeCodexTurnPage(input: {
 export function normalizeCodexTurnBody(input: {
   threadId: string
   revision: number
-  requestedTurnId?: string
+  requestedTurnId: string
   rawTurn: Record<string, unknown>
   model?: string
   secret?: string
@@ -741,12 +754,10 @@ export function normalizeCodexTurnBody(input: {
     secret: input.secret,
     submittedRequestIdByProviderTurnId: input.submittedRequestIdByProviderTurnId,
   })
-  const selectedTurn = input.requestedTurnId
-    ? turns.find((turn) => turn.turnId === input.requestedTurnId)
-    : turns[0]
+  const selectedTurn = turns.find((turn) => turn.turnId === input.requestedTurnId)
   if (!selectedTurn) {
     throw new CodexDisplayTurnNotFoundError(
-      `Codex display turn ${input.requestedTurnId ?? '(missing requested turn id)'} was not found in provider turn ${String(input.rawTurn.id ?? 'unknown')}.`,
+      `Codex display turn ${input.requestedTurnId} was not found in provider turn ${String(input.rawTurn.id ?? 'unknown')}.`,
     )
   }
   const { syntheticKind: _syntheticKind, requestId: _requestId, ...turn } = selectedTurn as FreshAgentTurn & {

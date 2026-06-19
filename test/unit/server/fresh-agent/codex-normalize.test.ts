@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import { CodexThreadItemTypeSchema } from '../../../../server/coding-cli/codex-app-server/protocol.js'
 import {
+  CodexDisplayConfigError,
   createCodexDisplayId,
   normalizeCodexDisplayTurns,
   normalizeCodexThreadSnapshot,
@@ -95,7 +96,7 @@ describe('Codex fresh-agent normalization', () => {
           text: 'Done',
         },
       ],
-    })
+    }, 0, { secret: DISPLAY_SECRET })
 
     expect(turn).toMatchObject({
       model: 'gpt-5.4-mini',
@@ -116,7 +117,7 @@ describe('Codex fresh-agent normalization', () => {
           text: 'Done',
         },
       ],
-    }, 0, { model: 'gpt-5.4-mini' })
+    }, 0, { model: 'gpt-5.4-mini', secret: DISPLAY_SECRET })
 
     expect(turn.model).toBe('gpt-5.4-mini')
   })
@@ -196,6 +197,33 @@ describe('Codex fresh-agent normalization', () => {
     expect(decodedHandle).not.toContain('provider-item-987')
     expect(decodedHandle).not.toContain('printenv SECRET_TOKEN')
     expect(decodedHandle).not.toContain('cursor:opaque-payload')
+  })
+
+  it('fails display normalization when the adapter does not supply a non-empty secret', () => {
+    expect(() => normalizeCodexDisplayTurns({
+      id: 'turn-missing-secret',
+      status: 'completed',
+      items: [{
+        id: 'item-user',
+        type: 'userMessage',
+        content: [{ type: 'text', text: 'Prompt' }],
+      }],
+    }, 0, {
+      threadId: THREAD_ID,
+      secret: '',
+    })).toThrow(CodexDisplayConfigError)
+
+    expect(() => normalizeCodexDisplayTurns({
+      id: 'turn-missing-secret',
+      status: 'completed',
+      items: [{
+        id: 'item-user',
+        type: 'userMessage',
+        content: [{ type: 'text', text: 'Prompt' }],
+      }],
+    }, 0, {
+      threadId: THREAD_ID,
+    })).toThrow(/non-empty.*secret/i)
   })
 
   it('preserves existing display ids when unrelated rows are inserted later in the provider turn', () => {
@@ -507,5 +535,44 @@ describe('Codex fresh-agent normalization', () => {
       model: 'gpt-5.4-mini',
       secret: DISPLAY_SECRET,
     })).toThrow(/not found/i)
+
+    expect(() => normalizeCodexTurnBody({
+      threadId: THREAD_ID,
+      revision: 9,
+      requestedTurnId: '',
+      rawTurn,
+      model: 'gpt-5.4-mini',
+      secret: DISPLAY_SECRET,
+    })).toThrow(/not found/i)
+
+    expect(() => normalizeCodexTurnBody({
+      threadId: THREAD_ID,
+      revision: 9,
+      requestedTurnId: undefined as unknown as string,
+      rawTurn,
+      model: 'gpt-5.4-mini',
+      secret: DISPLAY_SECRET,
+    })).toThrow(/not found/i)
+  })
+
+  it('fails body normalization when the adapter does not supply a non-empty secret', () => {
+    const rawTurn = {
+      id: 'turn-body-secret',
+      status: 'completed',
+      items: [{
+        id: 'item-user',
+        type: 'userMessage',
+        content: [{ type: 'text', text: 'Review the diff.' }],
+      }],
+    }
+
+    expect(() => normalizeCodexTurnBody({
+      threadId: THREAD_ID,
+      revision: 9,
+      requestedTurnId: 'codex-display:v1:missingsecret0000',
+      rawTurn,
+      model: 'gpt-5.4-mini',
+      secret: '',
+    })).toThrow(CodexDisplayConfigError)
   })
 })
