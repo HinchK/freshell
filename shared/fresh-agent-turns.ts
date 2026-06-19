@@ -1,15 +1,15 @@
 import type { FreshAgentSnapshot, FreshAgentTurn } from './fresh-agent-contract.js'
 
 export function getFreshAgentDisplayTurnKey(turn: Pick<FreshAgentTurn, 'turnId' | 'id'>): string {
-  return turn.turnId || turn.id
+  return turn.turnId ?? turn.id
 }
 
 export function freshAgentTurnText(turn: Pick<FreshAgentTurn, 'summary' | 'items'>): string {
-  const text = turn.items
+  const textItems = turn.items
     .filter((item): item is { kind: 'text'; text: string } => item.kind === 'text')
     .map((item) => item.text)
-    .join(' ')
-  return text || turn.summary
+  const text = textItems.join(' ')
+  return textItems.length > 0 ? text : turn.summary
 }
 
 function normalizeTurnRole(role: unknown): string | undefined {

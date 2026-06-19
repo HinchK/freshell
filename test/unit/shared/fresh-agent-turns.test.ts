@@ -14,7 +14,7 @@ describe('fresh-agent display turn helpers', () => {
   })
 
   it('falls back to id when turnId is missing', () => {
-    expect(getFreshAgentDisplayTurnKey({ turnId: '', id: 'id-fallback' })).toBe('id-fallback')
+    expect(getFreshAgentDisplayTurnKey({ turnId: undefined as unknown as string, id: 'id-fallback' })).toBe('id-fallback')
   })
 
   it('joins text items and falls back to summary when no text item exists', () => {
@@ -31,6 +31,11 @@ describe('fresh-agent display turn helpers', () => {
       summary: 'fallback text',
       items: [{ id: 'x', kind: 'thinking', text: 'ignored' }],
     })).toBe('fallback text')
+
+    expect(freshAgentTurnText({
+      summary: 'fallback text',
+      items: [{ id: 'y', kind: 'text', text: '' }],
+    })).toBe('')
   })
 
   it('returns true only for normalized user turns', () => {
