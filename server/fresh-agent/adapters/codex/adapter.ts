@@ -568,7 +568,7 @@ export function createCodexFreshAgentAdapter(deps: {
       providerCursor = cursor.providerCursor
       if (cursor.rawTurn) {
         const nextCursor = appendTurnRows(cursor.rawTurn, cursor.nextDisplayOffset, cursor.providerCursor)
-        if (turns.length >= limit || nextCursor) {
+        if (turns.length >= limit || nextCursor || !cursor.providerCursor) {
           return FreshAgentTurnPageSchema.parse({
             sessionType: 'freshcodex',
             provider: 'codex',

@@ -136,6 +136,41 @@ describe('Codex fresh-agent adapter', () => {
     })
   })
 
+  it('does not refetch from the beginning after draining a final cached provider turn with a larger page limit', async () => {
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn().mockResolvedValue({
+        revision: 7,
+        nextCursor: null,
+        turns: [makeMixedCodexTurn('turn-1')],
+      }),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const firstPage: any = await adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 7, limit: 1 })
+    expect(firstPage.turns).toHaveLength(1)
+    expect(firstPage.turns[0]).toMatchObject({ role: 'user' })
+
+    const secondPage: any = await adapter.getTurnPage?.({
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      threadId: 'thread-new-1',
+    }, { revision: 7, limit: 30, cursor: firstPage.nextCursor })
+
+    expect(secondPage.turns).toHaveLength(1)
+    expect(secondPage.turns[0]).toMatchObject({ role: 'assistant' })
+    expect(secondPage.turns.map((turn: any) => turn.turnId)).not.toContain(firstPage.turns[0].turnId)
+    expect(secondPage.nextCursor).toBeNull()
+    expect(runtime.listThreadTurns).toHaveBeenCalledTimes(1)
+  })
+
   it('applies includeBodies to display-row limited pages with display turn body keys', async () => {
     const runtime = {
       startThread: vi.fn(),
