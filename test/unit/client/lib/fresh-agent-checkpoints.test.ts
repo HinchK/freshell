@@ -83,6 +83,17 @@ describe('pickCheckpointForTurn', () => {
     expect(pickCheckpointForTurn(checkpoints, [newer, older], newer)).toBeNull()
   })
 
+  it('does not count direct-id checkpoints when indexing legacy label-only matches', () => {
+    const older = userTurn('old-native', 'fix the bug', 'display-old')
+    const newer = userTurn('new-native', 'fix the bug', 'display-new')
+    const checkpoints: CheckpointEntry[] = [
+      { id: 'sha-new', ts: 200, label: 'fix the bug' },
+      { id: 'sha-old', ts: 100, label: 'fix the bug', turnId: 'display-old' },
+    ]
+
+    expect(pickCheckpointForTurn(checkpoints, [older, newer], newer)?.id).toBe('sha-new')
+  })
+
   it('matches a user turn to its checkpoint by label', () => {
     const turns = [userTurn('t1', 'add a test'), assistantTurn('t2')]
     expect(pickCheckpointForTurn(CHECKPOINTS, turns, turns[0])?.id).toBe('sha-2')

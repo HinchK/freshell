@@ -544,6 +544,9 @@ export function FreshAgentView({
         requestId,
         turnId: next.submittedTurnId,
       }))
+      .then(() => {
+        pendingSendMetadataRef.current.delete(requestId)
+      })
       .catch(() => {
         const latest = pendingSendMetadataRef.current.get(requestId)
         if (latest) {

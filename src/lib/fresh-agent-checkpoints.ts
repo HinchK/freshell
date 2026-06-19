@@ -14,6 +14,15 @@ function turnLabel(turn: FreshAgentTurn): string {
   return checkpointLabelForText(freshAgentTurnText(turn) || '')
 }
 
+function hasDirectCheckpoint(checkpoints: readonly CheckpointEntry[], turn: FreshAgentTurn): boolean {
+  const turnId = getFreshAgentDisplayTurnKey(turn)
+  if (checkpoints.some((entry) => entry.turnId === turnId)) return true
+  const requestId = (turn as FreshAgentTurn & { requestId?: unknown }).requestId
+  return typeof requestId === 'string'
+    && requestId.length > 0
+    && checkpoints.some((entry) => entry.requestId === requestId)
+}
+
 /**
  * Match a user turn to its checkpoint. Checkpoints are created at send time
  * with the outgoing text as label, so the k-th user turn bearing a given label
@@ -44,6 +53,7 @@ export function pickCheckpointForTurn(
     if (turn.role !== 'user') continue
     if (turnLabel(turn) === label) {
       if (turn.id === target.id) break
+      if (hasDirectCheckpoint(checkpoints, turn)) continue
       ordinal += 1
     }
   }
