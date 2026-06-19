@@ -390,19 +390,14 @@ export function FreshAgentView({
   // through the freshAgent slice too, but the claudeSession selector above is
   // claude-only — without this, a dead codex/opencode process left the pane
   // looking healthy (blank pane, enabled composer).
-  const agentSessionMeta = useAppSelector((state) => {
+  const agentSession = useAppSelector((state) => {
     if (!paneContent.sessionId) return undefined
     const sessionKey = makeFreshAgentSessionKey({
       sessionId: paneContent.sessionId,
       sessionType: paneContent.sessionType,
       provider: paneContent.provider,
     })
-    const session = state.freshAgent.sessions[sessionKey]
-    if (!session) return undefined
-    return {
-      status: session.status as string | undefined,
-      lastError: (session as { lastError?: string }).lastError,
-    }
+    return state.freshAgent.sessions[sessionKey]
   })
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
@@ -1217,10 +1212,10 @@ export function FreshAgentView({
 
   const effectiveStatus = paneContent.provider === 'claude'
     ? (claudeSessionStatus ?? paneContent.status)
-    : (agentSessionMeta?.status ?? paneContent.status)
+    : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
-  const sessionErrorMessage = agentSessionMeta?.lastError ?? null
+  const sessionErrorMessage = (agentSession as { lastError?: string } | undefined)?.lastError ?? null
 
   useEffect(() => {
     if (hidden) return
