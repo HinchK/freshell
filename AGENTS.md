@@ -15,6 +15,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Before creating a new worktree, ensure the repo-supported test suite is green on the intended base. If the suite is not green, pause before creating the worktree and notify the user with the failing command and failure summary.
 - New behavior changes start on a worktree branch from `origin/main` and are submitted as PRs targeting `main`.
 - Do not create or open a PR until the user explicitly approves PR creation for that branch/change. Preparing a branch, committing locally, and pushing the branch is fine; stop before `gh pr create` or any equivalent PR creation step unless approval is explicit.
+- Use `dan@danshapiro.com` when using `gh`.
 - Everything goes through a PR — never push behavior changes directly to `origin/main`.
 - Merge PRs once their required checks pass, then bring `origin/main` down to local `main`. Self-merging your own PRs is the norm. The only exception is a PR the user has said needs someone else to approve it first — leave those unmerged.
 - Many agents may be working in the worktree at the same time. If you see activity from other agents (for example test runs or file changes), respect it.
