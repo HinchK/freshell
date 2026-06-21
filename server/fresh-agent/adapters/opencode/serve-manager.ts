@@ -123,13 +123,21 @@ export class OpencodeServeManager {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
   }
 
+  private emitLostForAllSessions(): void {
+    const emitters = Array.from(this.sessionEmitters.entries())
+    this.sessionEmitters.clear()
+    for (const [sessionId, emitter] of emitters) {
+      emitter.emit('lost', new OpencodeServeLostError(sessionId))
+    }
+  }
+
   private discardRunning(reason: string): void {
     const running = this.running
     if (!running) return
     this.running = undefined
     this.startPromise = undefined
     try { running.stopEventStream() } catch { /* ignore */ }
-    this.sessionEmitters.clear()
+    this.emitLostForAllSessions()
     this.log.warn({ reason }, 'discarding opencode serve sidecar')
     void killOwnedProcesses(running.child, running.ownershipId, this.log)
   }
@@ -217,7 +225,7 @@ export class OpencodeServeManager {
           this.startPromise = undefined
           try { running.stopEventStream() } catch { /* ignore */ }
           void killOwnedProcesses(running.child, running.ownershipId, this.log)
-          this.sessionEmitters.clear()
+          this.emitLostForAllSessions()
         }
       })
 
@@ -358,7 +366,15 @@ export class OpencodeServeManager {
     if (query.before) params.set('before', query.before)
     const qs = params.toString()
     const requestPath = withRoute(`/session/${encodeURIComponent(id)}/message${qs ? `?${qs}` : ''}`, route)
-    const res = await this.fetchWithRequestTimeout(`${base}${requestPath}`, `/session/${encodeURIComponent(id)}/message`, { method: 'GET' })
+    let res: Response
+    try {
+      res = await this.fetchWithRequestTimeout(`${base}${requestPath}`, `/session/${encodeURIComponent(id)}/message`, { method: 'GET' })
+    } catch (error) {
+      if (error instanceof OpencodeServeRequestTimeoutError) {
+        this.discardRunning('request_timeout')
+      }
+      throw error
+    }
     if (!res.ok) {
       const text = await res.text().catch(() => '')
       throw new Error(`opencode serve GET messages → ${res.status} ${text}`)
@@ -565,8 +581,8 @@ export class OpencodeServeManager {
     this.startPromise = undefined
     if (!running) return
     try { running.stopEventStream() } catch { /* ignore */ }
+    this.emitLostForAllSessions()
     await killOwnedProcesses(running.child, running.ownershipId, this.log)
-    this.sessionEmitters.clear()
   }
 
   /** @internal test/inspection accessor */
