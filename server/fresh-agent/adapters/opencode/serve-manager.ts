@@ -69,6 +69,14 @@ type ServeRoute = {
   cwd?: string
 }
 
+function withRoute(requestPath: string, route: ServeRoute = {}): string {
+  const cwd = typeof route.cwd === 'string' && route.cwd.trim().length > 0 ? route.cwd : undefined
+  if (!cwd) return requestPath
+  const url = new URL(requestPath, 'http://freshell.local')
+  url.searchParams.set('directory', cwd)
+  return `${url.pathname}${url.search}`
+}
+
 class OpencodeServeRequestTimeoutError extends Error {
   constructor(method: string, requestPath: string, timeoutMs: number) {
     super(`opencode serve ${method} ${requestPath} timed out after ${timeoutMs}ms`)
@@ -309,25 +317,24 @@ export class OpencodeServeManager {
     }
   }
 
-  private async getSessionStatusMap(init?: RequestInit): Promise<OpencodeStatusMap> {
-    return this.json<OpencodeStatusMap>('/session/status', { method: 'GET', ...init })
+  private async getSessionStatusMap(route: ServeRoute = {}, init?: RequestInit): Promise<OpencodeStatusMap> {
+    return this.json<OpencodeStatusMap>(withRoute('/session/status', route), { method: 'GET', ...init })
   }
 
   async createSession(input: { title?: string; parentID?: string; directory?: string } = {}): Promise<{ id: string; directory?: string; title?: string }> {
-    const body: { title?: string; parentID?: string; directory?: string } = {}
+    const body: { title?: string; parentID?: string } = {}
     if (input.title !== undefined) body.title = input.title
     if (input.parentID !== undefined) body.parentID = input.parentID
-    if (input.directory !== undefined) body.directory = input.directory
-    return this.json('/session', {
+    return this.json(withRoute('/session', { cwd: input.directory }), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     })
   }
 
-  async getSession(id: string, _route: ServeRoute = {}): Promise<Record<string, any>> {
+  async getSession(id: string, route: ServeRoute = {}): Promise<Record<string, any>> {
     return this.json<Record<string, any>>(
-      `/session/${encodeURIComponent(id)}`,
+      withRoute(`/session/${encodeURIComponent(id)}`, route),
       { method: 'GET' },
     )
   }
@@ -335,23 +342,23 @@ export class OpencodeServeManager {
   async promptAsync(
     id: string,
     body: { parts: Array<Record<string, unknown>>; model?: { providerID: string; modelID: string }; variant?: string; agent?: string },
-    _route: ServeRoute = {},
+    route: ServeRoute = {},
   ): Promise<void> {
-    await this.json(`/session/${encodeURIComponent(id)}/prompt_async`, {
+    await this.json(withRoute(`/session/${encodeURIComponent(id)}/prompt_async`, route), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     })
   }
 
-  async listMessages(id: string, query: { limit?: number; before?: string }, _route: ServeRoute = {}): Promise<OpencodeServeMessagePage> {
+  async listMessages(id: string, query: { limit?: number; before?: string }, route: ServeRoute = {}): Promise<OpencodeServeMessagePage> {
     const base = await this.requireBase()
     const params = new URLSearchParams()
     if (typeof query.limit === 'number') params.set('limit', String(query.limit))
     if (query.before) params.set('before', query.before)
     const qs = params.toString()
-    const url = `${base}/session/${encodeURIComponent(id)}/message${qs ? `?${qs}` : ''}`
-    const res = await this.fetchWithRequestTimeout(url, `/session/${encodeURIComponent(id)}/message`, { method: 'GET' })
+    const requestPath = withRoute(`/session/${encodeURIComponent(id)}/message${qs ? `?${qs}` : ''}`, route)
+    const res = await this.fetchWithRequestTimeout(`${base}${requestPath}`, `/session/${encodeURIComponent(id)}/message`, { method: 'GET' })
     if (!res.ok) {
       const text = await res.text().catch(() => '')
       throw new Error(`opencode serve GET messages → ${res.status} ${text}`)
@@ -361,28 +368,28 @@ export class OpencodeServeManager {
     return { messages: Array.isArray(messages) ? messages : [], nextCursor }
   }
 
-  async getMessage(id: string, messageId: string, _route: ServeRoute = {}): Promise<OpencodeServeMessage | null> {
+  async getMessage(id: string, messageId: string, route: ServeRoute = {}): Promise<OpencodeServeMessage | null> {
     return this.json<OpencodeServeMessage | null>(
-      `/session/${encodeURIComponent(id)}/message/${encodeURIComponent(messageId)}`,
+      withRoute(`/session/${encodeURIComponent(id)}/message/${encodeURIComponent(messageId)}`, route),
       { method: 'GET', notFoundValue: null },
     )
   }
 
-  async abort(id: string, _route: ServeRoute = {}): Promise<void> {
-    await this.json(`/session/${encodeURIComponent(id)}/abort`, { method: 'POST' })
+  async abort(id: string, route: ServeRoute = {}): Promise<void> {
+    await this.json(withRoute(`/session/${encodeURIComponent(id)}/abort`, route), { method: 'POST' })
   }
 
-  async compact(id: string, body?: { instructions?: string }, _route: ServeRoute = {}): Promise<void> {
-    await this.json(`/session/${encodeURIComponent(id)}/summarize`, {
+  async compact(id: string, body?: { instructions?: string }, route: ServeRoute = {}): Promise<void> {
+    await this.json(withRoute(`/session/${encodeURIComponent(id)}/summarize`, route), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body ?? {}),
     })
   }
 
-  async fork(id: string, _route: ServeRoute = {}): Promise<{ id: string; directory?: string }> {
+  async fork(id: string, route: ServeRoute = {}): Promise<{ id: string; directory?: string }> {
     return this.json<{ id: string; directory?: string }>(
-      `/session/${encodeURIComponent(id)}/fork`,
+      withRoute(`/session/${encodeURIComponent(id)}/fork`, route),
       { method: 'POST' },
     )
   }
@@ -409,7 +416,7 @@ export class OpencodeServeManager {
     return () => emitter.off('event', listener)
   }
 
-  onceIdle(sessionId: string, timeoutMs: number): Promise<void> {
+  onceIdle(sessionId: string, timeoutMs: number, route: ServeRoute = {}): Promise<void> {
     return new Promise((resolve, reject) => {
       const emitter = this.emitterFor(sessionId)
       let settled = false
@@ -444,7 +451,7 @@ export class OpencodeServeManager {
         if (settled || pollInFlight) return
         pollInFlight = true
         try {
-          const statuses = await this.getSessionStatusMap()
+          const statuses = await this.getSessionStatusMap(route)
           const status = statuses[sessionId]
           if (status && isRunningStatusType(status.type)) {
             markActivity()

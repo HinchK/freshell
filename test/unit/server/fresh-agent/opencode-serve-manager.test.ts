@@ -58,12 +58,12 @@ describe('OpencodeServeManager lifecycle', () => {
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/global/health', expect.anything())
   })
 
-  it('posts the requested session directory without changing the serve process cwd', async () => {
+  it('routes the requested session directory without changing the serve process cwd', async () => {
     const calls: Array<{ url: string; init: any }> = []
     const fetchFn = vi.fn(async (url: string, init: any) => {
       calls.push({ url, init })
       if (url.endsWith('/global/health')) return jsonResponse({ healthy: true, version: '1.17.8' })
-      if (url.endsWith('/session') && init?.method === 'POST') {
+      if (url === 'http://127.0.0.1:47999/session?directory=%2Fproject-x' && init?.method === 'POST') {
         return jsonResponse({ id: 'ses_project_x', directory: '/project-x', title: 'Project X' })
       }
       return jsonResponse({})
@@ -81,13 +81,34 @@ describe('OpencodeServeManager lifecycle', () => {
       }),
     )
     expect(spawnFn.mock.calls[0]?.[2]).not.toHaveProperty('cwd')
-    expect(calls.find((call) => call.url.endsWith('/session'))).toMatchObject({
-      url: 'http://127.0.0.1:47999/session',
+    const createCall = calls.find((call) => call.url.includes('/session?'))!
+    expect(createCall).toMatchObject({
+      url: 'http://127.0.0.1:47999/session?directory=%2Fproject-x',
       init: expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ directory: '/project-x' }),
+        body: JSON.stringify({}),
       }),
     })
+    expect(JSON.parse(createCall.init.body)).not.toHaveProperty('directory')
+  })
+
+  it('URL-encodes routed cwd values without putting cwd in the body', async () => {
+    const calls: Array<{ url: string; init: any }> = []
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init })
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true, version: '1.17.8' })
+      if (url === 'http://127.0.0.1:47999/session?directory=%2Frepo+with+space%2Fa%3Fb' && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_spaced', directory: '/repo with space/a?b' })
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({ fetchFn: fetchFn as any })
+
+    await manager.createSession({ directory: '/repo with space/a?b' })
+
+    const createCall = calls.find((call) => call.url.includes('/session?'))!
+    expect(createCall.url).toBe('http://127.0.0.1:47999/session?directory=%2Frepo+with+space%2Fa%3Fb')
+    expect(JSON.parse(createCall.init.body)).not.toHaveProperty('directory')
   })
 
   it('reuses one serve process for sessions created in different directories', async () => {
@@ -95,9 +116,11 @@ describe('OpencodeServeManager lifecycle', () => {
     const spawnFn = vi.fn().mockReturnValue(child)
     const fetchFn = vi.fn(async (url: string, init: any) => {
       if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
-      if (url === 'http://127.0.0.1:47999/session' && init?.method === 'POST') {
-        const body = JSON.parse(init.body)
-        return jsonResponse({ id: body.directory === '/project-a' ? 'ses_a' : 'ses_b', directory: body.directory })
+      if (url === 'http://127.0.0.1:47999/session?directory=%2Fproject-a' && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_a', directory: '/project-a' })
+      }
+      if (url === 'http://127.0.0.1:47999/session?directory=%2Fproject-b' && init?.method === 'POST') {
+        return jsonResponse({ id: 'ses_b', directory: '/project-b' })
       }
       return jsonResponse({})
     })
@@ -274,7 +297,7 @@ describe('OpencodeServeManager HTTP client', () => {
       if (url === 'http://127.0.0.1:47999/session/ses_known' && init?.method === 'GET') {
         return jsonResponse({ id: 'ses_known', directory: '/project-a', title: 'Known' })
       }
-      if (url === 'http://127.0.0.1:47999/session/ses_known/summarize' && init?.method === 'POST') {
+      if (url === 'http://127.0.0.1:47999/session/ses_known/summarize?directory=%2Fproject-a' && init?.method === 'POST') {
         return jsonResponse({}, { status: 204 })
       }
       return jsonResponse({}, { status: 404 })
@@ -292,8 +315,8 @@ describe('OpencodeServeManager HTTP client', () => {
 
     expect(spawnFn).toHaveBeenCalledTimes(1)
     expect(spawnFn.mock.calls[0]?.[2]).not.toHaveProperty('cwd')
-    expect(calls.find((call) => call.url.endsWith('/summarize'))).toMatchObject({
-      url: 'http://127.0.0.1:47999/session/ses_known/summarize',
+    expect(calls.find((call) => call.url.includes('/summarize?'))).toMatchObject({
+      url: 'http://127.0.0.1:47999/session/ses_known/summarize?directory=%2Fproject-a',
       init: expect.objectContaining({
         method: 'POST',
         body: JSON.stringify({ instructions: 'keep it short' }),
@@ -350,7 +373,7 @@ describe('OpencodeServeManager HTTP client', () => {
     const fetchFn = vi.fn(async (url: string, init: any) => {
       calls.push({ url, init })
       if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
-      if (url === 'http://127.0.0.1:47999/session/ses_parent/fork' && init?.method === 'POST') {
+      if (url === 'http://127.0.0.1:47999/session/ses_parent/fork?directory=%2Fparent' && init?.method === 'POST') {
         return jsonResponse({ id: 'ses_child' })
       }
       if (url === 'http://127.0.0.1:47999/session/ses_child/summarize' && init?.method === 'POST') {
@@ -390,7 +413,7 @@ describe('OpencodeServeManager HTTP client', () => {
     const spawnFn = vi.fn().mockReturnValue(child)
     const fetchFn = vi.fn(async (url: string, init: any) => {
       if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
-      if (url === 'http://127.0.0.1:47999/session' && init?.method === 'POST') {
+      if (url === 'http://127.0.0.1:47999/session?directory=%2Fproject-a' && init?.method === 'POST') {
         return jsonResponse({ id: 'ses_project', directory: '/project-a' })
       }
       if (url === 'http://127.0.0.1:47999/session/ses_unknown' && init?.method === 'GET') {
@@ -412,6 +435,37 @@ describe('OpencodeServeManager HTTP client', () => {
     expect(spawnFn).toHaveBeenCalledTimes(1)
     expect(spawnFn.mock.calls[0]?.[2]).not.toHaveProperty('cwd')
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/session/ses_unknown', expect.anything())
+  })
+
+  it('routes every route-aware endpoint by cwd query', async () => {
+    const calls: Array<{ url: string; init: any }> = []
+    const fetchFn = vi.fn(async (url: string, init: any) => {
+      calls.push({ url, init })
+      if (url === 'http://127.0.0.1:47999/global/health') return jsonResponse({ healthy: true })
+      if (url.includes('/message/msg_1')) return jsonResponse({ info: { id: 'msg_1' }, parts: [] })
+      if (url.includes('/message')) return jsonResponse([], { headers: { 'x-next-cursor': 'CUR2' } })
+      if (url.includes('/fork')) return jsonResponse({ id: 'ses_child', directory: '/project-a' })
+      if (url.includes('/session/ses_a')) return jsonResponse({ id: 'ses_a', directory: '/project-a' })
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({ fetchFn: fetchFn as any })
+
+    await manager.getSession('ses_a', { cwd: '/project-a' })
+    await manager.promptAsync('ses_a', { parts: [{ type: 'text', text: 'hi' }] }, { cwd: '/project-a' })
+    await manager.listMessages('ses_a', { limit: 2, before: 'CUR' }, { cwd: '/project-a' })
+    await manager.getMessage('ses_a', 'msg_1', { cwd: '/project-a' })
+    await manager.abort('ses_a', { cwd: '/project-a' })
+    await manager.compact('ses_a', { instructions: 'short' }, { cwd: '/project-a' })
+    await manager.fork('ses_a', { cwd: '/project-a' })
+
+    const urls = calls.map((call) => call.url)
+    expect(urls).toContain('http://127.0.0.1:47999/session/ses_a?directory=%2Fproject-a')
+    expect(urls).toContain('http://127.0.0.1:47999/session/ses_a/prompt_async?directory=%2Fproject-a')
+    expect(urls).toContain('http://127.0.0.1:47999/session/ses_a/message?limit=2&before=CUR&directory=%2Fproject-a')
+    expect(urls).toContain('http://127.0.0.1:47999/session/ses_a/message/msg_1?directory=%2Fproject-a')
+    expect(urls).toContain('http://127.0.0.1:47999/session/ses_a/abort?directory=%2Fproject-a')
+    expect(urls).toContain('http://127.0.0.1:47999/session/ses_a/summarize?directory=%2Fproject-a')
+    expect(urls).toContain('http://127.0.0.1:47999/session/ses_a/fork?directory=%2Fproject-a')
   })
 })
 
@@ -504,6 +558,33 @@ describe('OpencodeServeManager fan-out', () => {
     await expect(idle).resolves.toBeUndefined()
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/session/status', expect.anything())
     expect((manager as any).sessionEmitters.get('ses_a')?.listenerCount('event') ?? 0).toBe(0)
+  })
+
+  it('routes onceIdle status polling through the session cwd', async () => {
+    const urls: string[] = []
+    let statusCalls = 0
+    const fetchFn = vi.fn(async (url: string) => {
+      urls.push(url)
+      if (url.endsWith('/global/health')) return jsonResponse({ healthy: true })
+      if (url === 'http://127.0.0.1:47999/session/status?directory=%2Fproject-a') {
+        statusCalls += 1
+        return statusCalls === 1
+          ? jsonResponse({ ses_a: { type: 'busy' } })
+          : jsonResponse({ ses_a: { type: 'idle' } })
+      }
+      if (url === 'http://127.0.0.1:47999/session/status') {
+        throw new Error('status poll must include routed cwd')
+      }
+      return jsonResponse({})
+    })
+    const { manager } = makeManager({
+      fetchFn: fetchFn as any,
+      idlePollMs: 5,
+    })
+
+    await expect(manager.onceIdle('ses_a', 1000, { cwd: '/project-a' })).resolves.toBeUndefined()
+
+    expect(urls).toContain('http://127.0.0.1:47999/session/status?directory=%2Fproject-a')
   })
 
   it('onceIdle does not resolve from status-map absence before observed OpenCode activity', async () => {
