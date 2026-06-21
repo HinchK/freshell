@@ -2667,6 +2667,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   useEffect(() => {
     if (suppressNetworkEffects) return
     if (!isTerminal || !terminalContent) return
+    if (shouldWaitForProviderBehavior) return
     const termCandidate = termRef.current
     if (!termCandidate) return
     const term = termCandidate
@@ -3370,7 +3371,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const isUnrecoverableOpenCodeViewportHydrate = msg.reason === 'replay_window_exceeded'
             && currentAttachRef.current?.intent === 'viewport_hydrate'
             && currentAttachRef.current.sinceSeq === 0
-            && !hiddenRef.current
             && contentRef.current?.mode === 'opencode'
             && contentRef.current.sessionRef?.provider === 'opencode'
           if (isUnrecoverableOpenCodeViewportHydrate && beginOpenCodeReplacementAfterExit(tid)) {
@@ -4214,6 +4214,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     isTerminal,
     paneId,
     suppressNetworkEffects,
+    shouldWaitForProviderBehavior,
     terminalContent?.createRequestId,
     updateContent,
     ws,
