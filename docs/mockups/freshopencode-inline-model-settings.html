@@ -1,0 +1,903 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Freshopencode Inline Model Settings Mockup</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101014;
+      --panel: #17191f;
+      --panel-2: #20242d;
+      --panel-3: #252b35;
+      --text: #f2f3f5;
+      --muted: #a7adb7;
+      --subtle: #747c88;
+      --border: #343a45;
+      --accent: #4fb38a;
+      --accent-soft: rgba(79, 179, 138, 0.16);
+      --focus: #79c7ff;
+      --shadow: 0 24px 80px rgba(0, 0, 0, 0.48);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 28rem),
+        var(--bg);
+      color: var(--text);
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    button {
+      border: 0;
+      color: inherit;
+      cursor: pointer;
+    }
+
+    .page {
+      width: min(1120px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 40px 0;
+    }
+
+    .frame {
+      display: grid;
+      grid-template-columns: minmax(260px, 330px) minmax(0, 1fr);
+      min-height: 690px;
+      border: 1px solid #2d313b;
+      background: #0d0e12;
+      box-shadow: var(--shadow);
+    }
+
+    .sidebar {
+      border-right: 1px solid #2d313b;
+      background: #14151a;
+      padding: 14px 12px;
+    }
+
+    .tabbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 34px;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 5px;
+      background: #232732;
+      color: var(--accent);
+      font-size: 13px;
+    }
+
+    .icon-button {
+      display: inline-grid;
+      place-items: center;
+      width: 28px;
+      height: 28px;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--muted);
+    }
+
+    .icon-button:hover,
+    .icon-button:focus-visible {
+      background: #232732;
+      color: var(--text);
+      outline: none;
+    }
+
+    .session-list {
+      display: grid;
+      gap: 4px;
+    }
+
+    .session-row {
+      display: grid;
+      grid-template-columns: 8px minmax(0, 1fr);
+      align-items: center;
+      min-height: 36px;
+      gap: 9px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      color: var(--muted);
+    }
+
+    .session-row.active {
+      background: #20232c;
+      color: var(--text);
+    }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: var(--subtle);
+    }
+
+    .dot.busy {
+      background: #58a6ff;
+    }
+
+    .session-title,
+    .pane-meta,
+    .model-id,
+    .result-id {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .session-title {
+      font-size: 13px;
+    }
+
+    .workspace {
+      min-width: 0;
+      background: #101115;
+    }
+
+    .pane-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 42px;
+      border-bottom: 1px solid #2d313b;
+      padding: 0 10px 0 12px;
+      background: #15171d;
+    }
+
+    .pane-title {
+      display: flex;
+      align-items: center;
+      min-width: 0;
+      gap: 9px;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .provider-icon {
+      width: 18px;
+      height: 18px;
+      border-radius: 4px;
+      background: #263027;
+      object-fit: contain;
+      padding: 2px;
+    }
+
+    .pane-meta {
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
+    }
+
+    .settings-anchor {
+      position: relative;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .settings-popover {
+      position: absolute;
+      top: 34px;
+      right: 0;
+      z-index: 20;
+      width: min(390px, calc(100vw - 48px));
+      max-height: min(600px, calc(100vh - 96px));
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: 10px;
+    }
+
+    .settings-stack {
+      display: grid;
+      gap: 12px;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field-label {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      color: #d8dde5;
+      font-size: 12px;
+      font-weight: 650;
+    }
+
+    .count {
+      color: var(--subtle);
+      font-size: 11px;
+      font-weight: 500;
+    }
+
+    .select-like,
+    .search-input {
+      width: 100%;
+      min-height: 36px;
+      border: 1px solid #303541;
+      border-radius: 7px;
+      background: #111217;
+      color: var(--text);
+    }
+
+    .select-like {
+      padding: 0 10px;
+    }
+
+    .model-id,
+    .result-id {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+    }
+
+    .provider-badge,
+    .variant {
+      flex: none;
+      border: 1px solid #3c424d;
+      border-radius: 999px;
+      background: #1b1e26;
+      color: #c4cad3;
+      font-size: 10.5px;
+      font-weight: 650;
+    }
+
+    .recent-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+    }
+
+    .recent-heading,
+    .source-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      color: var(--subtle);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .recent-button {
+      min-width: 0;
+      min-height: 36px;
+      border: 1px solid #343a46;
+      border-radius: 7px;
+      background: var(--panel-2);
+      padding: 6px 8px;
+      text-align: left;
+    }
+
+    .recent-button:hover,
+    .recent-button:focus-visible,
+    .result:hover,
+    .result.focused {
+      border-color: var(--focus);
+      background: #263040;
+      outline: none;
+    }
+
+    .recent-button.active {
+      border-color: rgba(79, 179, 138, 0.62);
+      background: var(--accent-soft);
+    }
+
+    .recent-button:nth-child(n + 5) {
+      display: none;
+    }
+
+    .recent-name {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .recent-provider {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: 11px;
+    }
+
+    .search-wrap {
+      position: relative;
+    }
+
+    .search-symbol {
+      position: absolute;
+      left: 11px;
+      top: 50%;
+      transform: translateY(-50%);
+      color: var(--subtle);
+      font-size: 13px;
+      pointer-events: none;
+    }
+
+    .search-input {
+      padding: 0 12px 0 33px;
+      outline: none;
+    }
+
+    .search-input:focus {
+      border-color: var(--focus);
+    }
+
+    .model-actions {
+      display: block;
+    }
+
+    .results {
+      display: none;
+      gap: 4px;
+      max-height: 116px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .search-modal.open .results {
+      display: grid;
+    }
+
+    .source-heading {
+      padding: 7px 2px 1px;
+    }
+
+    .result {
+      width: 100%;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      min-height: 48px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      background: transparent;
+      padding: 7px 8px;
+      text-align: left;
+    }
+
+    .result.selected {
+      border-color: rgba(79, 179, 138, 0.5);
+      background: var(--accent-soft);
+    }
+
+    .result-main {
+      min-width: 0;
+    }
+
+    .result-title {
+      display: flex;
+      min-width: 0;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 2px;
+    }
+
+    .result-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-size: 12.5px;
+      font-weight: 700;
+    }
+
+    .provider-badge {
+      max-width: 118px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      padding: 1px 7px;
+    }
+
+    .result-side {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .variant {
+      padding: 2px 7px;
+    }
+
+    .check {
+      width: 18px;
+      color: var(--accent);
+      text-align: center;
+      font-weight: 800;
+    }
+
+    .empty {
+      padding: 20px 12px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 12px;
+    }
+
+    .search-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 60;
+      display: none;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 80px 16px 24px;
+      background: rgba(5, 6, 8, 0.56);
+    }
+
+    .search-modal.open {
+      display: flex;
+    }
+
+    .search-dialog {
+      width: min(560px, 100%);
+      max-height: min(680px, calc(100vh - 104px));
+      overflow: hidden;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .search-dialog-head {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      padding: 10px;
+      border-bottom: 1px solid #2f3440;
+      background: #191b22;
+    }
+
+    .dialog-close {
+      display: inline-grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 7px;
+      background: var(--panel-2);
+      color: var(--muted);
+    }
+
+    .dialog-close:hover,
+    .dialog-close:focus-visible {
+      background: #2c3240;
+      color: var(--text);
+      outline: none;
+    }
+
+    .search-dialog .results {
+      max-height: min(484px, calc(100vh - 204px));
+      padding: 8px 8px 10px;
+    }
+
+    .surface {
+      min-height: 647px;
+      padding: 18px;
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 280px),
+        #0f1014;
+    }
+
+    .transcript {
+      max-width: 780px;
+      margin: 0 auto;
+      display: grid;
+      gap: 12px;
+    }
+
+    .turn {
+      border: 1px solid #2b3039;
+      border-radius: 8px;
+      background: #171920;
+      padding: 14px;
+    }
+
+    .turn-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+
+    .turn p {
+      margin: 0;
+      color: #dde2e8;
+      font-size: 14px;
+      line-height: 1.55;
+    }
+
+    @media (max-width: 820px) {
+      .page {
+        width: min(100vw - 20px, 620px);
+        padding: 16px 0;
+      }
+
+      .frame {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        display: none;
+      }
+
+      .surface {
+        padding: 12px;
+      }
+
+      .settings-popover {
+        width: min(390px, calc(100vw - 28px));
+      }
+    }
+
+    @media (max-width: 480px) {
+      .pane-meta {
+        display: none;
+      }
+
+      .recent-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .recent-button:nth-child(n + 4) {
+        display: none;
+      }
+
+      .result {
+        grid-template-columns: minmax(0, 1fr);
+        align-items: start;
+      }
+
+      .result-side {
+        justify-content: space-between;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <div class="frame">
+      <aside class="sidebar" aria-label="Sessions">
+        <div class="tabbar">
+          <div class="brand"><span class="brand-mark">F</span><span>Freshell</span></div>
+          <button class="icon-button" type="button" aria-label="New tab">+</button>
+        </div>
+        <div class="session-list">
+          <div class="session-row active"><span class="dot busy"></span><span class="session-title">Freshopencode · Model picker work</span></div>
+          <div class="session-row"><span class="dot"></span><span class="session-title">Freshcodex · Settings polish</span></div>
+          <div class="session-row"><span class="dot"></span><span class="session-title">Shell · release checks</span></div>
+        </div>
+      </aside>
+
+      <section class="workspace" aria-label="Freshopencode pane">
+        <header class="pane-header">
+          <div class="pane-title">
+            <img class="provider-icon" src="../../assets/icons/opencode.svg" alt="">
+            <span>Freshopencode</span>
+            <span class="pane-meta" id="paneModelText">DeepSeek V4 Flash · opencode-go</span>
+          </div>
+          <div class="settings-anchor">
+            <button class="icon-button" type="button" aria-label="Agent settings" aria-expanded="true">⚙</button>
+            <div class="settings-popover" role="dialog" aria-label="Agent settings">
+              <div class="settings-stack">
+                <label class="field">
+                  <span class="field-label">Style</span>
+                  <select class="select-like" aria-label="Style">
+                    <option>Sans</option>
+                    <option>Mono</option>
+                    <option>Serif</option>
+                  </select>
+                </label>
+
+                <label class="field">
+                  <span class="field-label">Thinking</span>
+                  <select class="select-like" aria-label="Thinking">
+                    <option>max</option>
+                    <option>high</option>
+                    <option>medium</option>
+                    <option>low</option>
+                    <option>minimal</option>
+                  </select>
+                </label>
+
+                <section class="field model-field" id="modelField" aria-label="Model">
+                  <div class="field-label">
+                    <span>Model</span>
+                    <span class="count" id="enabledCount">14 enabled</span>
+                  </div>
+
+                  <div class="recent-heading">
+                    <span>Recent</span>
+                    <span>last used</span>
+                  </div>
+                  <div class="recent-grid" id="recentGrid"></div>
+
+                  <div class="model-actions">
+                    <div class="search-wrap">
+                      <span class="search-symbol">⌕</span>
+                      <input class="search-input" id="searchEntry" type="search" autocomplete="off" placeholder="Search enabled models" aria-label="Open Freshopencode model search">
+                    </div>
+                  </div>
+                </section>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <div class="surface">
+          <div class="transcript">
+            <article class="turn">
+              <div class="turn-head"><span>User</span><span>11:38 AM</span></div>
+              <p>Expose enabled Opencode models without making the common settings path slower or deeper.</p>
+            </article>
+            <article class="turn">
+              <div class="turn-head"><span>Assistant · DeepSeek V4 Flash</span><span>11:39 AM</span></div>
+              <p>The settings popover can keep model selection inline: recent choices are one click away, while search handles the full enabled catalog only when needed.</p>
+            </article>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <div class="search-modal" id="searchModal" aria-hidden="true">
+    <section class="search-dialog" role="dialog" aria-modal="true" aria-label="Freshopencode model search">
+      <div class="search-dialog-head">
+        <div class="search-wrap">
+          <span class="search-symbol">⌕</span>
+          <input class="search-input" id="searchInput" type="search" autocomplete="off" placeholder="Search enabled models" aria-label="Search enabled Freshopencode models">
+        </div>
+        <button class="dialog-close" id="closeSearch" type="button" aria-label="Close model search">×</button>
+      </div>
+      <div class="results" id="resultList" role="listbox" aria-label="Enabled Freshopencode models"></div>
+    </section>
+  </div>
+
+  <script>
+    const models = [
+      { id: 'opencode-go/deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'opencode-go', variant: 'max' },
+      { id: 'opencode-go/glm-5.2', name: 'GLM 5.2', provider: 'opencode-go', variant: 'max' },
+      { id: 'openrouter/glm-5.2', name: 'GLM 5.2', provider: 'openrouter', variant: 'high' },
+      { id: 'umans-ai-coding-plan/umans-kimi-k2.7', name: 'Kimi k2.7', provider: 'umans-ai-coding-plan', variant: 'max' },
+      { id: 'opencode-go/deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'opencode-go', variant: 'max' },
+      { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash', provider: 'deepseek', variant: 'high' },
+      { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro', provider: 'deepseek', variant: 'high' },
+      { id: 'opencode/openai-gpt-5.2', name: 'GPT 5.2', provider: 'opencode', variant: 'high' },
+      { id: 'anthropic/claude-opus-4-6', name: 'Claude Opus 4.6', provider: 'anthropic', variant: 'high' },
+      { id: 'anthropic/claude-sonnet-4-5', name: 'Claude Sonnet 4.5', provider: 'anthropic', variant: 'high' },
+      { id: 'google/gemini-3-pro', name: 'Gemini 3 Pro', provider: 'google', variant: 'high' },
+      { id: 'opencode/minimax-m2.1', name: 'MiniMax M2.1', provider: 'opencode', variant: 'high' },
+      { id: 'groq/qwen3-coder-plus', name: 'Qwen3 Coder Plus', provider: 'groq', variant: 'medium' },
+      { id: 'glm-vast/glm-5.2-reap', name: 'GLM 5.2 REAP', provider: 'glm-vast', variant: 'max' },
+    ];
+
+    let selectedId = 'opencode-go/deepseek-v4-flash';
+    let focusedIndex = 0;
+    let filtered = [...models];
+    let recent = [
+      'opencode-go/deepseek-v4-flash',
+      'opencode-go/glm-5.2',
+      'openrouter/glm-5.2',
+      'umans-ai-coding-plan/umans-kimi-k2.7',
+      'opencode-go/deepseek-v4-pro',
+    ];
+
+    const searchEntry = document.getElementById('searchEntry');
+    const searchModal = document.getElementById('searchModal');
+    const searchInput = document.getElementById('searchInput');
+    const closeSearch = document.getElementById('closeSearch');
+    const resultList = document.getElementById('resultList');
+    const recentGrid = document.getElementById('recentGrid');
+    const paneModelText = document.getElementById('paneModelText');
+    document.getElementById('enabledCount').textContent = `${models.length} enabled`;
+
+    function findModel(id) {
+      return models.find((model) => model.id === id);
+    }
+
+    function modelSearchText(model) {
+      return `${model.name} ${model.id} ${model.provider}`.toLowerCase();
+    }
+
+    function compareModels(a, b) {
+      return a.name.localeCompare(b.name)
+        || a.id.localeCompare(b.id);
+    }
+
+    function sortForResults(list) {
+      return [...list].sort((a, b) => (
+        a.provider.localeCompare(b.provider)
+          || compareModels(a, b)
+      ));
+    }
+
+    function choose(id) {
+      const model = findModel(id);
+      if (!model) return;
+      selectedId = id;
+      recent = [id, ...recent.filter((entry) => entry !== id)].slice(0, 5);
+      paneModelText.textContent = `${model.name} · ${model.provider}`;
+      renderRecent();
+      filterModels();
+      closeSearchModal();
+    }
+
+    function renderRecent() {
+      recentGrid.textContent = '';
+      for (const id of recent) {
+        const model = findModel(id);
+        if (!model) continue;
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = `recent-button${id === selectedId ? ' active' : ''}`;
+        button.setAttribute('aria-label', `${model.name}, ${model.provider}`);
+        button.innerHTML = '<span class="recent-name"></span><span class="recent-provider"></span>';
+        button.querySelector('.recent-name').textContent = model.name;
+        button.querySelector('.recent-provider').textContent = model.provider;
+        button.addEventListener('click', () => choose(id));
+        recentGrid.append(button);
+      }
+    }
+
+    function renderResults() {
+      resultList.textContent = '';
+      if (filtered.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'empty';
+        empty.textContent = 'No enabled models match this search.';
+        resultList.append(empty);
+        return;
+      }
+
+      const providerCounts = new Map();
+      for (const model of filtered) {
+        providerCounts.set(model.provider, (providerCounts.get(model.provider) ?? 0) + 1);
+      }
+
+      let previousProvider = '';
+      for (const [index, model] of filtered.entries()) {
+        if (model.provider !== previousProvider) {
+          previousProvider = model.provider;
+          const sourceHeading = document.createElement('div');
+          sourceHeading.className = 'source-heading';
+          sourceHeading.setAttribute('role', 'presentation');
+          const sourceName = document.createElement('span');
+          const sourceCount = document.createElement('span');
+          sourceName.textContent = model.provider;
+          sourceCount.textContent = `${providerCounts.get(model.provider) ?? 0}`;
+          sourceHeading.append(sourceName, sourceCount);
+          resultList.append(sourceHeading);
+        }
+
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = [
+          'result',
+          model.id === selectedId ? 'selected' : '',
+          index === focusedIndex ? 'focused' : '',
+        ].filter(Boolean).join(' ');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', model.id === selectedId ? 'true' : 'false');
+        row.innerHTML = `
+          <span class="result-main">
+            <span class="result-title">
+              <span class="result-name"></span>
+              <span class="provider-badge"></span>
+            </span>
+            <span class="result-id"></span>
+          </span>
+          <span class="result-side">
+            <span class="variant"></span>
+            <span class="check">${model.id === selectedId ? '✓' : ''}</span>
+          </span>
+        `;
+        row.querySelector('.result-name').textContent = model.name;
+        row.querySelector('.provider-badge').textContent = model.provider;
+        row.querySelector('.result-id').textContent = model.id;
+        row.querySelector('.variant').textContent = model.variant;
+        row.addEventListener('mouseenter', () => {
+          focusedIndex = index;
+          renderResults();
+        });
+        row.addEventListener('click', () => choose(model.id));
+        resultList.append(row);
+      }
+    }
+
+    function filterModels() {
+      const query = searchInput.value.trim().toLowerCase();
+      const source = query ? models.filter((model) => modelSearchText(model).includes(query)) : models;
+      filtered = sortForResults(source);
+      focusedIndex = Math.min(focusedIndex, Math.max(filtered.length - 1, 0));
+      renderResults();
+    }
+
+    function openSearchModal() {
+      searchModal.classList.add('open');
+      searchModal.setAttribute('aria-hidden', 'false');
+      filterModels();
+      requestAnimationFrame(() => searchInput.focus());
+    }
+
+    function closeSearchModal() {
+      if (!searchModal.classList.contains('open')) return;
+      searchModal.classList.remove('open');
+      searchModal.setAttribute('aria-hidden', 'true');
+    }
+
+    searchEntry.addEventListener('focus', openSearchModal);
+    searchEntry.addEventListener('click', openSearchModal);
+    searchInput.addEventListener('input', filterModels);
+    searchInput.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        focusedIndex = Math.min(focusedIndex + 1, Math.max(filtered.length - 1, 0));
+        renderResults();
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        focusedIndex = Math.max(focusedIndex - 1, 0);
+        renderResults();
+      } else if (event.key === 'Enter' && filtered[focusedIndex]) {
+        event.preventDefault();
+        choose(filtered[focusedIndex].id);
+      } else if (event.key === 'Escape') {
+        event.preventDefault();
+        closeSearchModal();
+      }
+    });
+    closeSearch.addEventListener('click', closeSearchModal);
+    searchModal.addEventListener('mousedown', (event) => {
+      if (event.target === searchModal) closeSearchModal();
+    });
+
+    renderRecent();
+    filterModels();
+  </script>
+</body>
+</html>

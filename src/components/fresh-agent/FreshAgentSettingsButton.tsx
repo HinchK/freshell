@@ -11,6 +11,7 @@ import {
   normalizeFreshAgentModel,
   resolveFreshAgentType,
 } from '@/lib/fresh-agent-registry'
+import { getFreshAgentModelCapabilities } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import {
   DEFAULT_FRESH_AGENT_STYLE,
@@ -18,13 +19,31 @@ import {
   normalizeFreshAgentStyle,
   type FreshAgentStyle,
 } from '@shared/settings'
+import { FreshOpencodeModelSettings } from './FreshOpencodeModelSettings'
+import type {
+  FreshAgentModelCapabilitiesResponse,
+} from '@shared/fresh-agent-model-capabilities'
 
-function getEffectiveFreshAgentModel(content: FreshAgentPaneContent): string | undefined {
-  return normalizeFreshAgentModel(content.sessionType, content.provider, content.model)
+function resolveEffectiveFreshAgentModel(
+  content: FreshAgentPaneContent,
+  providerDefaults?: { modelSelection?: { modelId: string } },
+): string | undefined {
+  const configuredModel = content.model
+    ?? content.modelSelection?.modelId
+    ?? providerDefaults?.modelSelection?.modelId
+  return normalizeFreshAgentModel(content.sessionType, content.provider, configuredModel)
 }
 
-function getEffectiveFreshAgentEffort(content: FreshAgentPaneContent): string | undefined {
-  return normalizeFreshAgentEffort(content.sessionType, content.provider, getEffectiveFreshAgentModel(content), content.effort)
+function getEffectiveFreshAgentEffort(
+  content: FreshAgentPaneContent,
+  providerDefaults?: { modelSelection?: { modelId: string } },
+): string | undefined {
+  return normalizeFreshAgentEffort(
+    content.sessionType,
+    content.provider,
+    resolveEffectiveFreshAgentModel(content, providerDefaults),
+    content.effort,
+  )
 }
 
 type PermissionModeOption = { value: string; label: string; description?: string }
@@ -65,12 +84,22 @@ export function FreshAgentSettingsButton({
   const [open, setOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
+  const [opencodeCapabilities, setOpencodeCapabilities] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
 
-  const activeModel = getEffectiveFreshAgentModel(paneContent)
+  const activeModel = resolveEffectiveFreshAgentModel(paneContent, providerDefaults)
   const modelOptions = FRESH_AGENT_MODEL_OPTIONS_BY_SESSION_TYPE[paneContent.sessionType] ?? []
   const modelValue = activeModel ?? ''
-  const thinkingOptions = getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
-  const thinkingValue = getEffectiveFreshAgentEffort(paneContent) ?? ''
+  const isFreshopencode = paneContent.sessionType === 'freshopencode'
+
+  // For freshopencode, fetch capabilities so the Thinking dropdown can derive
+  // effort options from the live model's supported effort levels.
+  const catalogModel = isFreshopencode && opencodeCapabilities?.ok
+    ? opencodeCapabilities.models.find((m) => m.id === activeModel)
+    : undefined
+  const thinkingOptions = catalogModel
+    ? catalogModel.supportedEffortLevels.map((value) => ({ value, label: value }))
+    : getFreshAgentThinkingOptions(paneContent.sessionType, paneContent.provider, activeModel)
+  const thinkingValue = getEffectiveFreshAgentEffort(paneContent, providerDefaults) ?? ''
   const descriptor = resolveFreshAgentType(paneContent.sessionType)
   const permissionModeVisible = descriptor?.settingsVisibility.permissionMode === true
   const permissionModes = permissionModeVisible
@@ -99,6 +128,17 @@ export function FreshAgentSettingsButton({
       },
     }))
   }, [dispatch, paneContent.sessionType])
+
+  // Fetch live capabilities when the popover opens so the Thinking dropdown
+  // reflects the selected model's supported effort levels, not the static list.
+  useEffect(() => {
+    if (!open || !isFreshopencode) return
+    let cancelled = false
+    void getFreshAgentModelCapabilities('freshopencode', { cwd: paneContent.initialCwd })
+      .then((result) => { if (!cancelled) setOpencodeCapabilities(result) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [open, isFreshopencode, paneContent.initialCwd])
 
   useEffect(() => {
     if (!open) return
@@ -173,7 +213,7 @@ export function FreshAgentSettingsButton({
               </select>
             </label>
 
-            {modelOptions.length > 0 ? (
+            {!isFreshopencode && modelOptions.length > 0 ? (
               <fieldset className="space-y-1">
                 <legend className="font-medium">Model</legend>
                 <div className="space-y-1" role="radiogroup" aria-label="Model">
@@ -242,6 +282,14 @@ export function FreshAgentSettingsButton({
                   ))}
                 </select>
               </label>
+            ) : null}
+
+            {isFreshopencode ? (
+              <FreshOpencodeModelSettings
+                tabId={tabId}
+                paneId={paneId}
+                paneContent={paneContent}
+              />
             ) : null}
 
             {permissionModes.length > 0 ? (
