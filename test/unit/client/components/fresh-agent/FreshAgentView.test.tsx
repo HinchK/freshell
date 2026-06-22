@@ -8,7 +8,7 @@ import freshAgentReducer, { sessionInit, setSessionStatus } from '@/store/freshA
 import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
-import { initLayout, requestPaneRefresh, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
+import { initLayout, requestPaneRefresh, setActivePane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
@@ -184,6 +184,9 @@ beforeEach(() => {
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
   wsMock.onMessage.mockImplementation(() => () => {})
+  window.sessionStorage.clear()
+  window.localStorage.removeItem('fresh-agent-prompt-history:freshcodex')
+  window.localStorage.removeItem('fresh-agent-prompt-history:freshclaude')
   apiMock.getFreshAgentThreadSnapshot.mockReset()
   apiMock.getFreshAgentModelCapabilities.mockReset()
   apiMock.post.mockReset()
@@ -4268,6 +4271,110 @@ describe('FreshAgentView transcript font size', () => {
       const textbox = screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
       fireEvent(root, createEvent.keyDown(root, { key: 'h' }))
       expect(textbox.value).toBe('h')
+    })
+  })
+
+  describe('composer focus on pane activation (0bc6)', () => {
+    async function flushFrames() {
+      await act(async () => {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+      })
+    }
+
+    function renderFocusPane(options?: { sessionId?: string; status?: string }) {
+      const store = createStore()
+      const sessionId = options && 'sessionId' in options ? options.sessionId : 'thread-focus-0bc6'
+      render(
+        <Provider store={store}>
+          <FreshAgentView
+            tabId="tab-1"
+            paneId="pane-1"
+            paneContent={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              createRequestId: 'req-focus-0bc6',
+              sessionId,
+              status: options?.status ?? 'idle',
+            }}
+          />
+        </Provider>,
+      )
+      return { store }
+    }
+
+    it('focuses the composer exactly once when the pane becomes the active pane of the active tab', async () => {
+      const { store } = renderFocusPane()
+      const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox).not.toBeDisabled())
+      await flushFrames()
+      const focusSpy = vi.spyOn(textbox, 'focus')
+
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+
+      await waitFor(() => expect(focusSpy).toHaveBeenCalledTimes(1))
+      expect(document.activeElement).toBe(textbox)
+    })
+
+    it('does not re-focus the composer when it already has focus on activation', async () => {
+      const { store } = renderFocusPane()
+      const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox).not.toBeDisabled())
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await waitFor(() => expect(document.activeElement).toBe(textbox))
+
+      const focusSpy = vi.spyOn(textbox, 'focus')
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-other' }))
+      })
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await flushFrames()
+
+      expect(focusSpy).not.toHaveBeenCalled()
+      expect(document.activeElement).toBe(textbox)
+    })
+
+    it('does not steal focus from another editable element inside the pane on activation', async () => {
+      const { store } = renderFocusPane()
+      const textbox = await screen.findByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      await waitFor(() => expect(textbox).not.toBeDisabled())
+      const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
+      const other = document.createElement('input')
+      other.setAttribute('aria-label', 'Other editable')
+      root.appendChild(other)
+      other.focus()
+      expect(document.activeElement).toBe(other)
+
+      const focusSpy = vi.spyOn(textbox, 'focus')
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+      await flushFrames()
+
+      expect(focusSpy).not.toHaveBeenCalled()
+      expect(document.activeElement).toBe(other)
+      root.removeChild(other)
+    })
+
+    it('leaves focus on the pane root when the composer is disabled on activation', async () => {
+      const { store } = renderFocusPane({ sessionId: undefined, status: 'creating' })
+      const root = await waitFor(() => document.querySelector('[data-context="fresh-agent"]') as HTMLElement)
+      const textbox = screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      expect(textbox).toBeDisabled()
+      const focusSpy = vi.spyOn(textbox, 'focus')
+
+      act(() => {
+        store.dispatch(setActivePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+      })
+
+      await waitFor(() => expect(document.activeElement).toBe(root))
+      expect(focusSpy).not.toHaveBeenCalled()
     })
   })
 })

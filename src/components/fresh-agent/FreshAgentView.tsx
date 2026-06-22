@@ -473,6 +473,9 @@ export function FreshAgentView({
     return state.freshAgent.sessions[sessionKey]
   })
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
+  const activeTabId = useAppSelector((state) => state.tabs.activeTabId)
+  const activePaneId = useAppSelector((state) => state.panes.activePane[tabId])
+  const isActivePane = !hidden && activeTabId === tabId && activePaneId === paneId
   const [snapshot, setSnapshot] = useState<FreshAgentSnapshot | null>(null)
   const snapshotRef = useRef<FreshAgentSnapshot | null>(null)
   const commitSnapshot = useCallback((next: FreshAgentSnapshot | null) => {
@@ -504,6 +507,7 @@ export function FreshAgentView({
   const paneContentRef = useRef(paneContent)
   const composerRef = useRef<FreshAgentComposerHandle | null>(null)
   const transcriptRef = useRef<FreshAgentTranscriptHandle | null>(null)
+  const paneRootRef = useRef<HTMLDivElement | null>(null)
   paneContentRef.current = paneContent
   const setLocalEcho = useCallback((next: LocalEcho | null) => {
     setLocalEchoState(next)
@@ -1316,15 +1320,36 @@ export function FreshAgentView({
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
   const sessionErrorMessage = (agentSession as { lastError?: string } | undefined)?.lastError ?? null
+  // sessionEnded gates everything: a stale snapshot can still claim
+  // capabilities.send after the provider process died.
+  const canSend = !sessionEnded && (snapshot?.capabilities?.send === true || (
+    paneContent.provider === 'claude'
+    && Boolean(paneContent.sessionId)
+    && !isRestoring
+    && !hasRestoreFailure
+    && !['creating', 'starting', 'create-failed', 'exited'].includes(effectiveStatus)
+  ))
+  // Providers report capabilities.send=false WHILE BUSY — that must not
+  // disable the composer, or queueing becomes unreachable for codex and
+  // opencode (live-test finding). Disabled = no session, ended, or truly
+  // read-only when idle.
+  const composerDisabled = !paneContent.sessionId || sessionEnded || (!canSend && !isBusy)
 
   useEffect(() => {
-    if (hidden) return
+    if (!isActivePane) return
     const frame = requestAnimationFrame(() => {
-      if (isEditableTarget(document.activeElement)) return
+      const active = document.activeElement
+      if (active instanceof HTMLElement
+        && paneRootRef.current?.contains(active)
+        && isEditableTarget(active)) return
+      if (composerDisabled) {
+        paneRootRef.current?.focus()
+        return
+      }
       composerRef.current?.focus()
     })
     return () => cancelAnimationFrame(frame)
-  }, [effectiveStatus, hidden, paneContent.sessionId])
+  }, [isActivePane, composerDisabled])
 
   // Fallback poll while the agent is (or claims to be) working: if a
   // transport event is missed, the pane self-heals within a few seconds
@@ -1514,26 +1539,12 @@ export function FreshAgentView({
       || childThreads.length > 0
       || Boolean(codexReview)
       || Boolean(codexFork)
-    // sessionEnded gates everything: a stale snapshot can still claim
-    // capabilities.send after the provider process died.
-    const canSend = !sessionEnded && (snapshot?.capabilities?.send === true || (
-      paneContent.provider === 'claude'
-      && Boolean(paneContent.sessionId)
-      && !isRestoring
-      && !hasRestoreFailure
-      && !['creating', 'starting', 'create-failed', 'exited'].includes(effectiveStatus)
-    ))
     const canInterrupt = isBusy && (snapshot?.capabilities?.interrupt === true || (
       paneContent.provider === 'claude'
       && Boolean(paneContent.sessionId)
       && ['connected', 'running', 'compacting'].includes(effectiveStatus)
     ))
     const canFork = snapshot?.capabilities?.fork === true
-    // Providers report capabilities.send=false WHILE BUSY — that must not
-    // disable the composer, or queueing becomes unreachable for codex and
-    // opencode (live-test finding). Disabled = no session, ended, or truly
-    // read-only when idle.
-    const composerDisabled = !paneContent.sessionId || sessionEnded || (!canSend && !isBusy)
     const questionAgentLabel = getQuestionAgentLabel(paneContent, descriptor?.label)
     const visibleRestoreFailure = paneContent.provider === 'claude'
       ? claudeSession?.restoreFailureMessage
@@ -1588,6 +1599,8 @@ export function FreshAgentView({
 
     return (
       <div
+        ref={paneRootRef}
+        tabIndex={-1}
         className={cn(
           'fresh-agent-pane relative flex h-full min-h-0 flex-col overflow-hidden',
           `fresh-agent-style-${activeStyle}`,
@@ -1751,7 +1764,6 @@ export function FreshAgentView({
               historyKey={`fresh-agent-prompt-history:${paneContent.sessionType}`}
               cwd={paneContent.initialCwd}
               provider={paneContent.provider}
-              focusOnReady={!hidden}
               thinking={isBusy}
               queuedMessages={queuedMessages}
               onCancelQueued={(index) => {
@@ -1786,16 +1798,16 @@ export function FreshAgentView({
       </div>
     )
   }, [
+    canSend,
     claudeSession?.restoreFailureMessage,
     activeStyle,
+    composerDisabled,
     descriptor?.icon,
     descriptor?.label,
     effectiveStatus,
     effectiveShowThinking,
     effectiveShowTimecodes,
     effectiveShowTools,
-    hasRestoreFailure,
-    hidden,
     isBusy,
     isRestoring,
     loadError,
