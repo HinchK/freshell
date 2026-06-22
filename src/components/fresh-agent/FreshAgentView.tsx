@@ -48,7 +48,7 @@ import { finalizeCodingAgentSessionName } from '@/store/codingAgentNaming'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import { FreshAgentApprovalCard } from './FreshAgentApprovalCard'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
-import { FreshAgentTranscript } from './FreshAgentTranscript'
+import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAgentTranscript'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
 import { FreshAgentDiffPanel } from './FreshAgentDiffPanel'
 import { FreshAgentSidebar } from './FreshAgentSidebar'
@@ -353,6 +353,59 @@ function isPlainTextKey(event: ReactKeyboardEvent<HTMLElement>): boolean {
     && !event.altKey
 }
 
+function isInteractiveTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false
+  return Boolean(target.closest(
+    'input, textarea, select, button, a[href], [contenteditable=""], [contenteditable="true"], [role="button"], [role="menuitem"]',
+  ))
+}
+
+function isTranscriptNavigationKey(event: ReactKeyboardEvent<HTMLElement>): boolean {
+  if (event.ctrlKey || event.metaKey || event.altKey) return false
+  switch (event.key) {
+    case 'ArrowUp':
+    case 'ArrowDown':
+    case 'PageUp':
+    case 'PageDown':
+    case 'Home':
+    case 'End':
+      return true
+    default:
+      return false
+  }
+}
+
+function scrollTranscriptByKey(
+  event: ReactKeyboardEvent<HTMLElement>,
+  handle: FreshAgentTranscriptHandle | null,
+): boolean {
+  if (!handle) return false
+  switch (event.key) {
+    case 'ArrowDown':
+      handle.scrollByLine(1)
+      break
+    case 'ArrowUp':
+      handle.scrollByLine(-1)
+      break
+    case 'PageDown':
+      handle.scrollByPage(1)
+      break
+    case 'PageUp':
+      handle.scrollByPage(-1)
+      break
+    case 'Home':
+      handle.scrollToTop()
+      break
+    case 'End':
+      handle.scrollToBottom()
+      break
+    default:
+      return false
+  }
+  event.preventDefault()
+  return true
+}
+
 export function FreshAgentView({
   tabId,
   paneId,
@@ -450,6 +503,7 @@ export function FreshAgentView({
   ), [paneContent.sessionType, snapshot?.capabilities])
   const paneContentRef = useRef(paneContent)
   const composerRef = useRef<FreshAgentComposerHandle | null>(null)
+  const transcriptRef = useRef<FreshAgentTranscriptHandle | null>(null)
   paneContentRef.current = paneContent
   const setLocalEcho = useCallback((next: LocalEcho | null) => {
     setLocalEchoState(next)
@@ -1496,6 +1550,10 @@ export function FreshAgentView({
     }
     const handlePaneKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
       if (event.defaultPrevented) return
+      if (isTranscriptNavigationKey(event) && !isInteractiveTarget(event.target)) {
+        scrollTranscriptByKey(event, transcriptRef.current)
+        return
+      }
       if (isEditableTarget(event.target)) return
       if (!isPlainTextKey(event)) return
       event.preventDefault()
@@ -1655,6 +1713,7 @@ export function FreshAgentView({
               />
             </div>
             <FreshAgentTranscript
+              ref={transcriptRef}
               turns={localEcho
                 ? [...turns, {
                     id: `__local-echo:${localEcho.requestId}`,

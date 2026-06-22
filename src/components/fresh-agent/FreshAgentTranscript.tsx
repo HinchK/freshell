@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, ChevronUp, Loader2, X } from 'lucide-react'
 import SlotReel from '@/components/fresh-agent/shared/SlotReel'
 import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
@@ -544,18 +544,22 @@ function FreshAgentTurnArticle({
   )
 }
 
-export function FreshAgentTranscript({
-  turns,
-  canFork = false,
-  agentLabel,
-  showModel = false,
-  showThinking = true,
-  showTools = false,
-  showTimecodes,
-  isStreaming = false,
-  onForkFromTurn,
-  onRewindToTurn,
-}: {
+const AT_BOTTOM_THRESHOLD = 24
+const TRANSCRIPT_LINE_HEIGHT = 40
+const TRANSCRIPT_PAGE_OVERLAP = 40
+
+function computeAtBottom(node: HTMLElement): boolean {
+  return node.scrollHeight - node.scrollTop - node.clientHeight < AT_BOTTOM_THRESHOLD
+}
+
+export type FreshAgentTranscriptHandle = {
+  scrollByLine: (direction: 1 | -1) => void
+  scrollByPage: (direction: 1 | -1) => void
+  scrollToTop: () => void
+  scrollToBottom: () => void
+}
+
+export type FreshAgentTranscriptProps = {
   turns: FreshAgentTurn[]
   canFork?: boolean
   agentLabel?: string
@@ -566,7 +570,20 @@ export function FreshAgentTranscript({
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
-}) {
+}
+
+export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
+  turns,
+  canFork = false,
+  agentLabel,
+  showModel = false,
+  showThinking = true,
+  showTools = false,
+  showTimecodes,
+  isStreaming = false,
+  onForkFromTurn,
+  onRewindToTurn,
+}, ref) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
   const [newMessages, setNewMessages] = useState(0)
@@ -655,6 +672,35 @@ export function FreshAgentTranscript({
     onOpenActions: coarsePointer ? handleOpenActions : undefined,
   }), [canFork, coarsePointer, handleOpenActions, handleTurnContextMenu, onForkFromTurn, onRewindToTurn])
 
+  useImperativeHandle(ref, () => ({
+    scrollByLine: (direction) => {
+      const node = scrollerRef.current
+      if (!node) return
+      node.scrollTop += direction * TRANSCRIPT_LINE_HEIGHT
+      setAtBottom(computeAtBottom(node))
+    },
+    scrollByPage: (direction) => {
+      const node = scrollerRef.current
+      if (!node) return
+      const delta = Math.max(1, node.clientHeight - TRANSCRIPT_PAGE_OVERLAP)
+      node.scrollTop += direction * delta
+      setAtBottom(computeAtBottom(node))
+    },
+    scrollToTop: () => {
+      const node = scrollerRef.current
+      if (!node) return
+      node.scrollTop = 0
+      setAtBottom(computeAtBottom(node))
+    },
+    scrollToBottom: () => {
+      const node = scrollerRef.current
+      if (!node) return
+      node.scrollTop = node.scrollHeight
+      setAtBottom(true)
+      setNewMessages(0)
+    },
+  }), [])
+
   useEffect(() => {
     const node = scrollerRef.current
     if (!node) return
@@ -678,7 +724,7 @@ export function FreshAgentTranscript({
         data-context="fresh-agent-transcript"
         onScroll={(event) => {
           const node = event.currentTarget
-          setAtBottom(node.scrollHeight - node.scrollTop - node.clientHeight < 24)
+          setAtBottom(computeAtBottom(node))
           recomputeGlom()
         }}
       >
@@ -744,6 +790,6 @@ export function FreshAgentTranscript({
       ) : null}
     </div>
   )
-}
+})
 
 export default memo(FreshAgentTranscript)

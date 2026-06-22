@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, fireEvent, cleanup, act } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent, createEvent, cleanup, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
@@ -4137,5 +4137,137 @@ describe('FreshAgentView transcript font size', () => {
     })
 
     expect(root.style.getPropertyValue('--fresh-transcript-font-size')).toBe('20px')
+  })
+
+  describe('transcript keyboard scroll (faz3)', () => {
+    async function setupScrollablePane(initialScrollTop = 500) {
+      const store = createStore()
+      apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: false },
+        turns: [
+          { id: 'turn-0', role: 'user', items: [{ id: 'item-0', kind: 'text', text: 'User message' }] },
+          { id: 'turn-1', role: 'assistant', items: [{ id: 'item-1', kind: 'text', text: 'Assistant reply' }] },
+        ],
+      })
+      render(
+        <Provider store={store}>
+          <FreshAgentView
+            tabId="tab-1"
+            paneId="pane-1"
+            paneContent={{
+              kind: 'fresh-agent',
+              sessionType: 'freshcodex',
+              provider: 'codex',
+              createRequestId: 'req-scroll-test',
+              sessionId: 'thread-scroll-test',
+              status: 'idle',
+            }}
+          />
+        </Provider>,
+      )
+      await waitFor(() => expect(screen.getByText('Assistant reply')).toBeInTheDocument())
+      const root = document.querySelector('[data-context="fresh-agent"]') as HTMLElement
+      const scroller = document.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 200 })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 })
+      scroller.scrollTop = initialScrollTop
+      fireEvent.scroll(scroller)
+      return { root, scroller }
+    }
+
+    it('scrolls down by one line on ArrowDown when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const event = createEvent.keyDown(root, { key: 'ArrowDown' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(540)
+    })
+
+    it('scrolls up by one line on ArrowUp when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const event = createEvent.keyDown(root, { key: 'ArrowUp' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(460)
+    })
+
+    it('scrolls down by one page on PageDown when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(100)
+      const event = createEvent.keyDown(root, { key: 'PageDown' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(260)
+    })
+
+    it('scrolls up by one page on PageUp when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const event = createEvent.keyDown(root, { key: 'PageUp' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(340)
+    })
+
+    it('jumps to top on Home when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const event = createEvent.keyDown(root, { key: 'Home' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(0)
+    })
+
+    it('jumps to bottom on End when the pane root has focus', async () => {
+      const { root, scroller } = await setupScrollablePane(500)
+      const event = createEvent.keyDown(root, { key: 'End' })
+      fireEvent(root, event)
+      expect(event.defaultPrevented).toBe(true)
+      expect(scroller.scrollTop).toBe(1000)
+    })
+
+    it('does not scroll or preventDefault when the composer textarea has focus', async () => {
+      const { scroller } = await setupScrollablePane(500)
+      const textbox = screen.getByRole('textbox', { name: 'Chat message input' })
+      const before = scroller.scrollTop
+      for (const key of ['ArrowDown', 'ArrowUp', 'PageDown', 'PageUp', 'Home', 'End']) {
+        const event = createEvent.keyDown(textbox, { key })
+        fireEvent(textbox, event)
+        expect(event.defaultPrevented).toBe(false)
+        expect(scroller.scrollTop).toBe(before)
+      }
+    })
+
+    it('dismisses the scroll-to-bottom button after pressing End', async () => {
+      const { root } = await setupScrollablePane(500)
+      expect(screen.getByRole('button', { name: 'Scroll to bottom' })).toBeInTheDocument()
+      fireEvent(root, createEvent.keyDown(root, { key: 'End' }))
+      await waitFor(() => {
+        expect(screen.queryByRole('button', { name: 'Scroll to bottom' })).not.toBeInTheDocument()
+      })
+    })
+
+    it('shows the scroll-to-bottom button after pressing Home', async () => {
+      const { root } = await setupScrollablePane(800)
+      expect(screen.queryByRole('button', { name: 'Scroll to bottom' })).not.toBeInTheDocument()
+      fireEvent(root, createEvent.keyDown(root, { key: 'Home' }))
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Scroll to bottom' })).toBeInTheDocument()
+      })
+    })
+
+    it('shows the scroll-to-bottom button after pressing PageUp', async () => {
+      const { root } = await setupScrollablePane(800)
+      expect(screen.queryByRole('button', { name: 'Scroll to bottom' })).not.toBeInTheDocument()
+      fireEvent(root, createEvent.keyDown(root, { key: 'PageUp' }))
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Scroll to bottom' })).toBeInTheDocument()
+      })
+    })
+
+    it('does not regress the plain-text key funnel into the composer', async () => {
+      const { root } = await setupScrollablePane(500)
+      const textbox = screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+      fireEvent(root, createEvent.keyDown(root, { key: 'h' }))
+      expect(textbox.value).toBe('h')
+    })
   })
 })
