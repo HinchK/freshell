@@ -91,6 +91,7 @@ type SessionRecord = {
   runtimeProvider: FreshAgentRuntimeProvider
   adapter: FreshAgentRuntimeAdapter
   freshOpenCodeRouteCwd?: string
+  freshOpenCodeProviderOwnedNoRoute?: boolean
 }
 
 export class FreshAgentRuntimeManager {
@@ -112,11 +113,14 @@ export class FreshAgentRuntimeManager {
       sessionType: input.sessionType,
       provider: registration.runtimeProvider,
       sessionId: created.sessionId,
-    }), {
+    }), this.recordForSession({
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
       adapter: registration.adapter,
-    })
+      sessionId: created.sessionId,
+      cwd: input.cwd,
+      providerOwned: true,
+    }))
     return {
       sessionId: created.sessionId,
       sessionType: input.sessionType,
@@ -132,12 +136,14 @@ export class FreshAgentRuntimeManager {
       : { sessionId: input.sessionId }
     const sessionId = attached.sessionId
 
-    this.sessions.set(this.key({ ...input, sessionId }), {
+    this.sessions.set(this.key({ ...input, sessionId }), this.recordForSession({
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
       adapter: registration.adapter,
-      freshOpenCodeRouteCwd: this.canRecoverFreshOpenCode({ ...input, sessionId }) ? input.cwd : undefined,
-    })
+      sessionId,
+      cwd: input.cwd,
+      providerOwned: false,
+    }))
 
     return {
       sessionId,
@@ -157,11 +163,14 @@ export class FreshAgentRuntimeManager {
       sessionType: input.sessionType,
       provider: registration.runtimeProvider,
       sessionId: resumed.sessionId,
-    }), {
+    }), this.recordForSession({
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
       adapter: registration.adapter,
-    })
+      sessionId: resumed.sessionId,
+      cwd: input.cwd,
+      providerOwned: false,
+    }))
     return {
       sessionId: resumed.sessionId,
       sessionType: input.sessionType,
@@ -199,7 +208,14 @@ export class FreshAgentRuntimeManager {
         sessionType: locator.sessionType,
         provider: record.runtimeProvider,
         sessionId: result.sessionId,
-      }), record)
+      }), this.recordForSession({
+        sessionType: record.sessionType,
+        runtimeProvider: record.runtimeProvider,
+        adapter: record.adapter,
+        sessionId: result.sessionId,
+        cwd: this.routeCwd(locator) ?? this.routeCwd(input.settings) ?? record.freshOpenCodeRouteCwd,
+        providerOwned: true,
+      }))
     }
     if (result?.requestId) {
       return result
@@ -260,7 +276,13 @@ export class FreshAgentRuntimeManager {
         sessionType: locator.sessionType,
         provider: record.runtimeProvider,
         sessionId: childSessionId,
-      }), record)
+      }), this.recordForSession({
+        sessionType: record.sessionType,
+        runtimeProvider: record.runtimeProvider,
+        adapter: record.adapter,
+        sessionId: childSessionId,
+        providerOwned: Boolean(record.freshOpenCodeProviderOwnedNoRoute && !record.freshOpenCodeRouteCwd),
+      }))
     }
     return forked
   }
@@ -386,8 +408,38 @@ export class FreshAgentRuntimeManager {
     return locator.sessionType === 'freshopencode'
       && locator.provider === 'opencode'
       && locator.sessionId.startsWith('ses_')
-      && typeof locator.cwd === 'string'
-      && locator.cwd.trim().length > 0
+      && this.routeCwd(locator) !== undefined
+  }
+
+  private isDurableFreshOpenCode(locator: Pick<FreshAgentSessionLocator, 'sessionId' | 'sessionType' | 'provider'>): boolean {
+    return locator.sessionType === 'freshopencode'
+      && locator.provider === 'opencode'
+      && locator.sessionId.startsWith('ses_')
+  }
+
+  private routeCwd(input?: { cwd?: string }): string | undefined {
+    return typeof input?.cwd === 'string' && input.cwd.trim().length > 0 ? input.cwd : undefined
+  }
+
+  private recordForSession(input: {
+    sessionType: FreshAgentSessionType
+    runtimeProvider: FreshAgentRuntimeProvider
+    adapter: FreshAgentRuntimeAdapter
+    sessionId: string
+    cwd?: string
+    providerOwned: boolean
+  }): SessionRecord {
+    const base: SessionRecord = {
+      sessionType: input.sessionType,
+      runtimeProvider: input.runtimeProvider,
+      adapter: input.adapter,
+    }
+    const provider = input.runtimeProvider
+    const locator = { sessionType: input.sessionType, provider, sessionId: input.sessionId }
+    if (!this.isDurableFreshOpenCode(locator)) return base
+    const cwd = this.routeCwd(input)
+    if (cwd) return { ...base, freshOpenCodeRouteCwd: cwd }
+    return input.providerOwned ? { ...base, freshOpenCodeProviderOwnedNoRoute: true } : base
   }
 
   private async requireOrRecoverSession(locator: FreshAgentSessionLocator): Promise<SessionRecord> {
@@ -411,6 +463,12 @@ export class FreshAgentRuntimeManager {
           }
           return await this.singleflightFreshOpenCodeAttach(locator, existing)
         }
+      } else if (this.isDurableFreshOpenCode(locator)
+        && !existing.freshOpenCodeRouteCwd
+        && !existing.freshOpenCodeProviderOwnedNoRoute) {
+        throw new FreshAgentLostSessionError(
+          `Fresh-agent session ${locator.sessionType}/${locator.provider}/${locator.sessionId} requires a cwd before mutation`,
+        )
       }
       return existing
     }
@@ -453,6 +511,7 @@ export class FreshAgentRuntimeManager {
 
     const promise = Promise.resolve(record.adapter.attach(locator)).then(() => {
       record.freshOpenCodeRouteCwd = locator.cwd
+      record.freshOpenCodeProviderOwnedNoRoute = false
       this.sessions.set(key, record)
       return record
     })

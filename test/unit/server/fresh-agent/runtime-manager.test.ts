@@ -253,6 +253,36 @@ describe('FreshAgentRuntimeManager', () => {
     expect(opencodeAdapter.send).toHaveBeenNthCalledWith(3, 'ses_real_1', { text: 'via real id' })
   })
 
+  it('rejects a tracked recovered durable FreshOpenCode session without cwd before mutation', async () => {
+    const opencodeAdapter = {
+      create: vi.fn(),
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_recovered_no_route' }),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await manager.attach({
+      sessionId: 'ses_recovered_no_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })
+
+    await expect(manager.send({
+      sessionId: 'ses_recovered_no_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    }, { text: 'must not send' })).rejects.toThrow(/cwd|route|not tracked|not available/i)
+
+    expect(opencodeAdapter.send).not.toHaveBeenCalled()
+  })
+
   it('hydrates adapter state when attaching a restored session before send and compact', async () => {
     const opencodeAdapter = {
       create: vi.fn().mockResolvedValue({ sessionId: 'opencode-created-1' }),
@@ -519,6 +549,58 @@ describe('FreshAgentRuntimeManager', () => {
       provider: 'opencode',
       cwd: '/repo/two',
     }, { text: 'mismatch' })).rejects.toThrow('/repo/one')
+  })
+
+  it('keeps forked FreshOpenCode child route state independent from the parent', async () => {
+    const opencodeAdapter = {
+      create: vi.fn(),
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_parent' }),
+      fork: vi.fn().mockResolvedValue({ sessionId: 'ses_child' }),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const registry = createFreshAgentProviderRegistry([
+      {
+        sessionType: 'freshopencode',
+        runtimeProvider: 'opencode',
+        adapter: opencodeAdapter as any,
+      },
+    ])
+    const manager = new FreshAgentRuntimeManager({ registry })
+
+    await manager.fork({
+      sessionId: 'ses_parent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/parent',
+    })
+
+    await manager.send({
+      sessionId: 'ses_child',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/child',
+    }, { text: 'child route' })
+    await manager.send({
+      sessionId: 'ses_parent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/parent',
+    }, { text: 'parent route' })
+
+    expect(opencodeAdapter.attach).toHaveBeenCalledWith({
+      sessionId: 'ses_parent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/parent',
+    })
+    expect(opencodeAdapter.attach).toHaveBeenCalledWith({
+      sessionId: 'ses_child',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/child',
+    })
+    expect(opencodeAdapter.send).toHaveBeenCalledWith('ses_child', { text: 'child route' })
+    expect(opencodeAdapter.send).toHaveBeenCalledWith('ses_parent', { text: 'parent route' })
   })
 
   it('routes freshAgent.kill through the tracked adapter and removes the session', async () => {
