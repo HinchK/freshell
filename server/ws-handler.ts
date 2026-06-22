@@ -1464,6 +1464,7 @@ export class WsHandler {
       message: string
       requestId?: string
       terminalId?: string
+      terminalExitCode?: number
       expectedSessionRef?: { provider: string; sessionId: string }
       actualSessionRef?: { provider: string; sessionId: string }
     },
@@ -1475,6 +1476,7 @@ export class WsHandler {
       message: params.message,
       requestId: params.requestId,
       terminalId: params.terminalId,
+      ...(typeof params.terminalExitCode === 'number' ? { terminalExitCode: params.terminalExitCode } : {}),
       expectedSessionRef: params.expectedSessionRef,
       actualSessionRef: params.actualSessionRef,
       timestamp: nowIso(),
@@ -2453,6 +2455,7 @@ export class WsHandler {
             message: formatExitedTerminalAttachMessage(record),
             requestId: m.attachRequestId,
             terminalId: m.terminalId,
+            terminalExitCode: record.exitCode,
           })
           return
         }
@@ -2542,6 +2545,7 @@ export class WsHandler {
               message: formatExitedTerminalAttachMessage(latestRecord),
               requestId: m.attachRequestId,
               terminalId: m.terminalId,
+              terminalExitCode: latestRecord.exitCode,
             })
             return
           }

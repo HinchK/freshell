@@ -569,6 +569,7 @@ export type ErrorMessage = {
   message: string
   requestId?: string
   terminalId?: string
+  terminalExitCode?: number
   expectedSessionRef?: SessionLocator
   actualSessionRef?: SessionLocator
   timestamp: string
