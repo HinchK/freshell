@@ -217,7 +217,7 @@ Call `ensureMutableRoute(state)` inside `materializeOrSend` after a real id exis
 
 When `createSession()` materializes a new session, set `state.providerCreatedInThisAdapter = true` after assigning the real id. This marks the session as safe for mutation in this server process only when no cwd was supplied, because Freshell just created it through this adapter. If a cwd is present later, do not use the provider-created shortcut; validate that cwd against `getSession()` before mutation. If `createSession()` also returns a directory and `state.cwd` is assigned, set `state.routeValidatedCwd = await canonicalizePath(state.cwd)`.
 
-Update existing adapter tests that attach/resume a recovered real session and then mutate it to have `manager.getSession` return a matching `directory`, or pass `canonicalizePath: async (value) => value` where fake paths are used. Keep freshly-created no-cwd sessions sendable; those tests should continue to assert no route argument is sent. Keep existing read-only history tests no-cwd-compatible; change only the old no-cwd recovered attach sendable assertion to expect mutation rejection.
+Update existing adapter tests that attach/resume a recovered real session and then mutate it to have `manager.getSession` return a matching `directory`, or pass `canonicalizePath: async (value) => value` anywhere fake absolute paths such as `/repo` are used. This includes the existing create/materialize test, because the default implementation uses `realpath()` and `/repo` does not exist in the test environment. Keep freshly-created no-cwd sessions sendable; those tests should continue to assert no route argument is sent. Keep existing read-only history tests no-cwd-compatible; change only the old no-cwd recovered attach sendable assertion to expect mutation rejection.
 
 Run: `npm run test:vitest -- --run test/unit/server/fresh-agent/opencode-serve-adapter.test.ts`
 Expected: PASS for the new route validation tests.
@@ -259,7 +259,7 @@ it('marks recovered durable sessions running only when OpenCode status is busy o
 })
 ```
 
-Implement a `reconcileStatus(state)` helper that maps `busy` and `retry` to `running`, maps `idle` to `idle`, and leaves failures/unknowns as non-running. Log a structured warning on failure; do not throw after route validation succeeds.
+Implement a `reconcileStatus(state)` helper that first checks whether `serveManager.getSessionStatus` is a function, maps `busy` and `retry` to `running`, maps `idle` to `idle`, and leaves failures/unknowns as non-running. Wrap the call so missing fake methods, transport errors, and malformed responses are logged as structured warnings and never thrown after route validation succeeds.
 Call it after real-session `attach()` and `resume()` remember local state. This is a read-only best-effort status query; it must not make a no-cwd read-only attach fail.
 
 Run: `npm run test:vitest -- --run test/unit/server/fresh-agent/opencode-serve-adapter.test.ts test/unit/server/fresh-agent/opencode-serve-manager.test.ts`
@@ -524,7 +524,7 @@ Expected: PASS.
 **Interfaces:**
 - Produces: all Fresh Agent mutation messages can carry `cwd?: string`; `freshAgent.attach` can carry `sessionRef`.
 - Produces: same-socket mutations wait for pending attach only when session id, provider, type, and cwd match.
-- Produces: cwd mismatch on a raced or already-authorized mutation fails closed instead of reusing a weaker session-id-only authorization.
+- Produces: cwd mismatch on a raced or already-authorized durable FreshOpenCode `ses_*` mutation fails closed instead of reusing a weaker session-id-only authorization.
 - Produces: `freshAgent.send.accepted` includes `sessionId`, `sessionType`, and `provider`.
 
 - [ ] **Step 1: Write failing protocol/server tests**
@@ -601,6 +601,12 @@ Add a sibling test that attaches `ses_race` with `cwd: '/repo/a'`, races a `fres
 - `runtimeManager.send` is not called.
 - An `UNAUTHORIZED` or locator-mismatch error is sent for the raced request.
 - The authorized `/repo/a` locator remains usable.
+
+Update the existing `ws-handler-fresh-agent.test.ts` create/send ownership test so:
+- `freshAgent.send` expects a cwd-bearing locator when the message has `settings.cwd`.
+- interrupt, approval, question, fork, and kill assertions keep no-cwd locators unless their test messages include `cwd`.
+- `freshAgent.send.accepted` expectation includes `sessionId`, `sessionType`, and `provider`.
+- A session created without cwd for a non-FreshOpenCode provider can still send with `settings.cwd`; route-aware authorization is FreshOpenCode durable-session protection, not a global ban on cwd-bearing sends.
 
 Run: `npm run test:vitest -- --run test/unit/server/ws-handler-fresh-agent-ownership.test.ts test/unit/server/ws-handler-fresh-agent.test.ts`
 Expected: FAIL because send is unauthorized while attach is pending and accepted lacks locator fields.
@@ -682,19 +688,30 @@ freshAgentAuthorizations: new Map(),
 pendingFreshAgentAttachByKey: new Map(),
 ```
 
-Replace the current `Set<string>` authorization with the map above. Keep subscriptions keyed by `freshAgentKey(locator)`, because subscriptions are a stream fanout concern. Use a route-aware key for authorization and pending attach:
+Replace the current `Set<string>` authorization with the map above. Keep subscriptions keyed by `freshAgentKey(locator)`, because subscriptions are a stream fanout concern. Use a route-aware key only for durable FreshOpenCode mutations where a cwd is present; otherwise keep the current session-id authorization key so normal create-to-send flows for Codex/Claude/placeholders stay authorized:
 
 ```ts
-private freshAgentRouteKey(locator: FreshAgentLocator): string {
+private requiresFreshOpenCodeRouteAuthorization(locator: FreshAgentLocator): boolean {
+  return locator.sessionType === 'freshopencode'
+    && locator.provider === 'opencode'
+    && locator.sessionId.startsWith('ses_')
+    && typeof locator.cwd === 'string'
+    && locator.cwd.trim().length > 0
+}
+
+private freshAgentAuthorizationKey(locator: FreshAgentLocator): string {
+  if (!this.requiresFreshOpenCodeRouteAuthorization(locator)) return this.freshAgentKey(locator)
   const cwd = typeof locator.cwd === 'string' && locator.cwd.trim().length > 0 ? locator.cwd : ''
   return `${this.freshAgentKey(locator)}:${cwd}`
 }
 ```
 
+When `freshAgent.create` succeeds, authorize the created record with `cwd: m.cwd` when present and keep that cwd in any cached created record used for duplicate request replay. When a placeholder send materializes a durable `ses_*`, authorize and subscribe to the materialized locator with the same cwd as the send locator when one exists. This keeps a newly-created FreshOpenCode pane's first follow-up send authorized after materialization.
+
 In `freshAgent.attach`:
 - Build locator with cwd.
 - Create `attachPromise` before awaiting manager attach.
-- Store it by `freshAgentRouteKey(locator)` with its cwd.
+- Store it by `freshAgentAuthorizationKey(locator)` with its cwd.
 - On success, authorize and subscribe.
 - On failure, send an error and do not authorize.
 - In `finally`, delete only the same promise.
@@ -709,7 +726,7 @@ private async waitForFreshAgentAuthorization(
   requestId?: string,
 ): Promise<boolean> {
   if (this.isFreshAgentAuthorized(state, locator)) return true
-  const pending = state.pendingFreshAgentAttachByKey.get(this.freshAgentRouteKey(locator))
+  const pending = state.pendingFreshAgentAttachByKey.get(this.freshAgentAuthorizationKey(locator))
   if (pending) {
     await pending.promise.catch(() => undefined)
     if (this.isFreshAgentAuthorized(state, locator)) return true
@@ -723,7 +740,7 @@ private async waitForFreshAgentAuthorization(
 }
 ```
 
-`authorizeFreshAgentSession` and `isFreshAgentAuthorized` must use `freshAgentRouteKey(locator)`. This means an attach without cwd authorizes only no-cwd mutations; it does not authorize a cwd-bearing recovered mutation. Use `waitForFreshAgentAuthorization` for `send`; use it for other async mutation cases where tests are added. Keep failed attach from authorizing.
+`authorizeFreshAgentSession` and `isFreshAgentAuthorized` must use `freshAgentAuthorizationKey(locator)`. This means a durable FreshOpenCode `ses_*` attach without cwd authorizes only no-cwd durable mutations; it does not authorize a cwd-bearing recovered mutation. Non-FreshOpenCode providers and FreshOpenCode placeholders continue to use the existing session-id key. Use `waitForFreshAgentAuthorization` for `send`; use it for other async mutation cases where tests are added. Keep failed attach from authorizing.
 
 Run: `npm run test:vitest -- --run test/unit/server/ws-handler-fresh-agent-ownership.test.ts test/unit/server/ws-handler-fresh-agent.test.ts`
 Expected: PASS.
@@ -1021,7 +1038,7 @@ expect(replayPayloads.some((payload) => payload.streamId === ready.streamId)).to
 ```
 
 Run: `npm run test:vitest -- --run test/unit/server/ws-handler-backpressure.test.ts`
-Expected: FAIL because current code can emit multiple stream changes inside one raw append.
+Expected: FAIL because current code can emit multiple stream changes inside one raw append. If the existing 200KB fixture only crosses the retention boundary once and does not fail RED, increase the single raw append size or reduce the test broker retention limit until the pre-fix code produces more than one `terminal.stream.changed` for that one append; keep the assertion on externally observed WebSocket messages, not broker internals.
 
 - [ ] **Step 2: Coalesce retention handling per append**
 
@@ -1093,7 +1110,26 @@ Expected: PASS.
 - [ ] **Step 4: Commit the implementation**
 
 ```bash
-git add shared/ws-protocol.ts src/components/fresh-agent/FreshAgentView.tsx src/lib/fresh-agent-ws.ts src/store server test docs/superpowers/plans/2026-06-22-freshopencode-restart-recovery.md
+git add \
+  shared/ws-protocol.ts \
+  server/ws-handler.ts \
+  server/fresh-agent/runtime-manager.ts \
+  server/fresh-agent/adapters/opencode/adapter.ts \
+  server/fresh-agent/adapters/opencode/serve-manager.ts \
+  server/terminal-stream/broker.ts \
+  src/components/fresh-agent/FreshAgentView.tsx \
+  src/lib/fresh-agent-ws.ts \
+  test/unit/server/fresh-agent/opencode-serve-adapter.test.ts \
+  test/unit/server/fresh-agent/opencode-serve-manager.test.ts \
+  test/unit/server/fresh-agent/runtime-manager.test.ts \
+  test/unit/server/ws-handler-fresh-agent.test.ts \
+  test/unit/server/ws-handler-fresh-agent-ownership.test.ts \
+  test/unit/client/components/fresh-agent/FreshAgentView.test.tsx \
+  test/unit/client/store/tabRegistrySync.test.ts \
+  test/unit/server/ws-handler-backpressure.test.ts \
+  test/e2e-browser/fixtures/fake-opencode.cjs \
+  test/e2e-browser/specs/freshopencode-restart-recovery.spec.ts \
+  docs/superpowers/plans/2026-06-22-freshopencode-restart-recovery.md
 git commit -m "fix: recover FreshOpenCode sessions safely after restart"
 ```
 
