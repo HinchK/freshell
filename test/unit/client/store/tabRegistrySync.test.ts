@@ -219,6 +219,7 @@ describe('tabRegistrySync', () => {
               status: 'running',
               resumeSessionId: 'freshopencode-req-sync',
               sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-sync' },
+              initialCwd: '/repo/sync',
             },
           },
         },
@@ -232,6 +233,7 @@ describe('tabRegistrySync', () => {
       provider: 'opencode',
       sessionId: 'freshopencode-req-sync',
     })
+    expect(ws.sendTabsSyncPush.mock.calls[0][0].records[0].panes[0].payload.initialCwd).toBe('/repo/sync')
 
     ws.sendTabsSyncPush.mockClear()
     state = {
@@ -251,6 +253,7 @@ describe('tabRegistrySync', () => {
               status: 'running',
               resumeSessionId: 'ses_sync_1',
               sessionRef: { provider: 'opencode', sessionId: 'ses_sync_1' },
+              initialCwd: '/repo/sync',
             },
           },
         },
@@ -264,6 +267,7 @@ describe('tabRegistrySync', () => {
       provider: 'opencode',
       sessionId: 'ses_sync_1',
     })
+    expect(pushedPane.payload.initialCwd).toBe('/repo/sync')
     expect(pushedPane.payload).not.toHaveProperty('sessionId')
     expect(pushedPane.payload).not.toHaveProperty('resumeSessionId')
 
