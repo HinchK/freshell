@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, ChevronRight, Loader2 } from 'lucide-react'
+import { ChevronDown, ChevronRight, ChevronUp, Loader2 } from 'lucide-react'
 import SlotReel from '@/components/fresh-agent/shared/SlotReel'
 import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import { cn } from '@/lib/utils'
@@ -415,6 +415,7 @@ function FreshAgentTurnArticle({
   continuation,
   liveActivityBlockId,
   displayOptions,
+  index,
 }: {
   turn: FreshAgentTurn
   actions: TurnActionProps
@@ -425,6 +426,7 @@ function FreshAgentTurnArticle({
   continuation: boolean
   liveActivityBlockId: string | null
   displayOptions: TranscriptDisplayOptions
+  index: number
 }) {
   const isUser = turn.role === 'user'
   const blocks = buildBlocks(turn.items, displayOptions)
@@ -446,6 +448,7 @@ function FreshAgentTurnArticle({
         continuation && 'mt-1.5',
       )}
       data-turn-role={turn.role}
+      data-turn-index={index}
       data-turn-continuation={continuation ? 'true' : 'false'}
       aria-label={`${turnLabel} transcript turn`}
       onContextMenu={(event) => {
@@ -535,6 +538,7 @@ export function FreshAgentTranscript({
   const [newMessages, setNewMessages] = useState(0)
   const [contextMenu, setContextMenu] = useState<FreshAgentTurnContextMenuState>(null)
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
+  const [glomTarget, setGlomTarget] = useState<{ index: number; text: string } | null>(null)
   const coarsePointer = useCoarsePointer()
   const resolvedShowTimecodes = showTimecodes ?? showModel
   const displayOptions = useMemo<TranscriptDisplayOptions>(() => ({
@@ -568,6 +572,39 @@ export function FreshAgentTranscript({
     }).join('|')
   ), [displayTurns])
 
+  const recomputeGlom = useCallback(() => {
+    const scroller = scrollerRef.current
+    if (!scroller) {
+      setGlomTarget(null)
+      return
+    }
+    const scrollerTop = scroller.getBoundingClientRect().top
+    const userTurnEls = scroller.querySelectorAll<HTMLElement>('[data-turn-role="user"]')
+    let target: { index: number; text: string } | null = null
+    userTurnEls.forEach((el) => {
+      if (el.getBoundingClientRect().top < scrollerTop) {
+        const indexAttr = el.getAttribute('data-turn-index')
+        if (indexAttr == null) return
+        const index = Number(indexAttr)
+        if (Number.isNaN(index)) return
+        const turn = displayTurns[index]
+        if (!turn) return
+        const text = turnPlainText(turn)
+        if (!text) return
+        target = { index, text }
+      }
+    })
+    setGlomTarget(target)
+  }, [displayTurns])
+
+  const handleGlomClick = useCallback(() => {
+    if (!glomTarget) return
+    const scroller = scrollerRef.current
+    if (!scroller) return
+    const el = scroller.querySelector<HTMLElement>(`[data-turn-index="${glomTarget.index}"]`)
+    el?.scrollIntoView?.({ block: 'start' })
+  }, [glomTarget])
+
   const handleTurnContextMenu = useCallback((event: React.MouseEvent, turn: FreshAgentTurn) => {
     setContextMenu({ x: event.clientX, y: event.clientY, turn })
   }, [])
@@ -595,6 +632,10 @@ export function FreshAgentTranscript({
     }
   }, [atBottom, transcriptSignature])
 
+  useEffect(() => {
+    recomputeGlom()
+  }, [recomputeGlom, transcriptSignature])
+
   return (
     <div className="relative min-h-0 flex-1">
       <div
@@ -604,6 +645,7 @@ export function FreshAgentTranscript({
         onScroll={(event) => {
           const node = event.currentTarget
           setAtBottom(node.scrollHeight - node.scrollTop - node.clientHeight < 24)
+          recomputeGlom()
         }}
       >
         {displayTurns.map((turn, index) => (
@@ -618,9 +660,22 @@ export function FreshAgentTranscript({
             continuation={index > 0 && displayTurns[index - 1]?.role === turn.role}
             liveActivityBlockId={liveActivityBlockId}
             displayOptions={displayOptions}
+            index={index}
           />
         ))}
       </div>
+      {glomTarget ? (
+        <button
+          type="button"
+          className="fresh-agent-glom-chip absolute left-3 right-3 top-0 z-20 flex items-center gap-1.5 overflow-hidden border-b border-border bg-background/95 px-2 py-1 text-[11px] text-muted-foreground shadow-sm backdrop-blur"
+          onClick={handleGlomClick}
+          aria-label={`Jump to your message: ${glomTarget.text}`}
+          title={glomTarget.text}
+        >
+          <ChevronUp className="h-3 w-3 shrink-0" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate">{glomTarget.text}</span>
+        </button>
+      ) : null}
       <FreshAgentTurnContextMenu
         state={contextMenu}
         canFork={canFork}

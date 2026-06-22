@@ -749,6 +749,184 @@ describe('FreshAgentTranscript', () => {
     expect(screen.queryByText(/hidden internals/)).not.toBeInTheDocument()
   })
 
+  describe('user turn glom chip', () => {
+    const TRANSCRIPT = [
+      {
+        id: 'u1',
+        role: 'user' as const,
+        summary: 'First user message here',
+        items: [{ id: 'i1', kind: 'text' as const, text: 'First user message here' }],
+      },
+      {
+        id: 'a1',
+        role: 'assistant' as const,
+        summary: 'reply 1',
+        items: [{ id: 'i2', kind: 'text' as const, text: 'A'.repeat(200) }],
+      },
+      {
+        id: 'u2',
+        role: 'user' as const,
+        summary: 'Second user message here',
+        items: [{ id: 'i3', kind: 'text' as const, text: 'Second user message here' }],
+      },
+      {
+        id: 'a2',
+        role: 'assistant' as const,
+        summary: 'reply 2',
+        items: [{ id: 'i4', kind: 'text' as const, text: 'B'.repeat(200) }],
+      },
+      {
+        id: 'u3',
+        role: 'user' as const,
+        summary: 'Third user message here',
+        items: [{ id: 'i5', kind: 'text' as const, text: 'Third user message here' }],
+      },
+      {
+        id: 'a3',
+        role: 'assistant' as const,
+        summary: 'reply 3',
+        items: [{ id: 'i6', kind: 'text' as const, text: 'C'.repeat(200) }],
+      },
+    ]
+
+    function mockScroll(scroller: HTMLElement, scrollTop: number, scrollHeight: number, clientHeight: number) {
+      Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => clientHeight })
+      Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => scrollHeight })
+      scroller.scrollTop = scrollTop
+    }
+
+    function mockRect(el: Element, top: number) {
+      el.getBoundingClientRect = () => ({
+        top,
+        bottom: top + 50,
+        left: 0,
+        right: 800,
+        width: 800,
+        height: 50,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      })
+    }
+
+    function setupScrolledTranscript() {
+      const utils = render(<FreshAgentTranscript turns={TRANSCRIPT} />)
+      const scroller = utils.container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      mockScroll(scroller, 400, 1000, 200)
+      const userTurns = utils.container.querySelectorAll('[data-turn-role="user"]')
+      mockRect(scroller, 0)
+      mockRect(userTurns[0], -400)
+      mockRect(userTurns[1], -100)
+      mockRect(userTurns[2], 50)
+      fireEvent.scroll(scroller)
+      return { ...utils, scroller, userTurns }
+    }
+
+    it('shows the most-recent offscreen-above user turn when scrolled', () => {
+      setupScrolledTranscript()
+
+      const chip = screen.getByRole('button', { name: /Jump to your message/ })
+      expect(chip).toBeInTheDocument()
+      expect(chip).toHaveTextContent('Second user message here')
+      expect(chip).toHaveAttribute('title', 'Second user message here')
+      const chipText = chip.querySelector('span')
+      expect(chipText).toHaveClass('truncate')
+    })
+
+    it('does not render the chip when no user turns are above the viewport', () => {
+      const { container } = render(<FreshAgentTranscript turns={TRANSCRIPT} />)
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      mockScroll(scroller, 0, 1000, 200)
+      const userTurns = container.querySelectorAll('[data-turn-role="user"]')
+      mockRect(scroller, 0)
+      mockRect(userTurns[0], 10)
+      mockRect(userTurns[1], 100)
+      mockRect(userTurns[2], 200)
+      fireEvent.scroll(scroller)
+
+      expect(screen.queryByRole('button', { name: /Jump to your message/ })).not.toBeInTheDocument()
+    })
+
+    it('clicking the chip scrolls the target user turn into view and leaves autoscroll paused', () => {
+      const { userTurns } = setupScrolledTranscript()
+      const scrollIntoViewSpy = vi.fn()
+      userTurns[1].scrollIntoView = scrollIntoViewSpy
+
+      const chip = screen.getByRole('button', { name: /Jump to your message/ })
+      fireEvent.click(chip)
+
+      expect(scrollIntoViewSpy).toHaveBeenCalledWith({ block: 'start' })
+      expect(screen.getByRole('button', { name: 'Scroll to bottom' })).toBeInTheDocument()
+    })
+
+    it('does not resnap to bottom when new agent output arrives after clicking the chip', () => {
+      const { scroller, rerender: rerenderFn } = setupScrolledTranscript()
+      const chip = screen.getByRole('button', { name: /Jump to your message/ })
+      fireEvent.click(chip)
+
+      const scrollTopBefore = scroller.scrollTop
+
+      rerenderFn(
+        <FreshAgentTranscript
+          turns={[...TRANSCRIPT, {
+            id: 'a4',
+            role: 'assistant' as const,
+            summary: 'new output',
+            items: [{ id: 'i7', kind: 'text' as const, text: 'D'.repeat(200) }],
+          }]}
+        />,
+      )
+
+      expect(scroller.scrollTop).toBe(scrollTopBefore)
+    })
+
+    it('is a button with aria-label containing the full text and a title tooltip', () => {
+      setupScrolledTranscript()
+
+      const chip = screen.getByRole('button', { name: /Jump to your message/ })
+      expect(chip.tagName).toBe('BUTTON')
+      expect(chip).toHaveAttribute('aria-label', 'Jump to your message: Second user message here')
+      expect(chip).toHaveAttribute('title', 'Second user message here')
+    })
+
+    it('coexists with the scroll-to-bottom button without overlapping', () => {
+      setupScrolledTranscript()
+
+      const chip = screen.getByRole('button', { name: /Jump to your message/ })
+      const scrollBottom = screen.getByRole('button', { name: 'Scroll to bottom' })
+      expect(chip).toBeInTheDocument()
+      expect(scrollBottom).toBeInTheDocument()
+      expect(chip.className).toContain('top-0')
+      expect(scrollBottom.className).toContain('bottom-')
+    })
+
+    it('recomputes the glom target when transcript content changes', () => {
+      const { container, rerender: rerenderFn } = render(<FreshAgentTranscript turns={TRANSCRIPT} />)
+      const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+      mockScroll(scroller, 0, 1000, 200)
+      const userTurns = container.querySelectorAll('[data-turn-role="user"]')
+      mockRect(scroller, 0)
+      mockRect(userTurns[0], 10)
+      mockRect(userTurns[1], 100)
+      mockRect(userTurns[2], 200)
+      fireEvent.scroll(scroller)
+      expect(screen.queryByRole('button', { name: /Jump to your message/ })).not.toBeInTheDocument()
+
+      mockRect(userTurns[0], -100)
+      rerenderFn(<FreshAgentTranscript
+        turns={[...TRANSCRIPT, {
+          id: 'a4',
+          role: 'assistant' as const,
+          summary: 'more',
+          items: [{ id: 'i7', kind: 'text' as const, text: 'more output' }],
+        }]}
+      />)
+
+      const chip = screen.getByRole('button', { name: /Jump to your message/ })
+      expect(chip).toHaveTextContent('First user message here')
+    })
+  })
+
   describe('turn actions', () => {
     const TURNS = [
       {
