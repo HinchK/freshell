@@ -702,6 +702,7 @@ export type TerminalInputBlockedMessage = {
 export type TerminalsChangedMessage = {
   type: 'terminals.changed'
   revision: number
+  recoverableTerminalIds?: string[]
 }
 
 export type TerminalMetaUpdatedMessage = z.infer<typeof TerminalMetaUpdatedSchema>
