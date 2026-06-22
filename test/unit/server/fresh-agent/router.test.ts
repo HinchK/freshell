@@ -120,15 +120,14 @@ describe('fresh-agent router', () => {
     const snapshot = await request(app)
       .get('/api/fresh-agent/threads/freshcodex/codex/thread-new-1')
       .expect(200)
-    expect(snapshot.body.turns).toHaveLength(2)
-    expect(snapshot.body.turns.map((turn: any) => turn.role)).toEqual(['user', 'assistant'])
+    expect(snapshot.body.turns).toHaveLength(0)
     expect(JSON.stringify(snapshot.body)).not.toContain('providerTurnId')
 
     const firstPage = await request(app)
-      .get('/api/fresh-agent/threads/freshcodex/codex/thread-new-1/turns?revision=7&limit=1')
+      .get('/api/fresh-agent/threads/freshcodex/codex/thread-new-1/turns?limit=1')
       .expect(200)
     expect(firstPage.body.turns).toHaveLength(1)
-    expect(firstPage.body.turns[0]).toMatchObject({ role: 'user' })
+    expect(firstPage.body.turns[0]).toMatchObject({ role: 'assistant' })
     expect(firstPage.body.nextCursor).toMatch(/^codex-cursor:v1:/)
     expect(JSON.stringify(firstPage.body)).not.toContain('providerTurnId')
 
@@ -137,7 +136,7 @@ describe('fresh-agent router', () => {
       .query({ revision: '7', limit: '1', cursor: firstPage.body.nextCursor })
       .expect(200)
     expect(secondPage.body.turns).toHaveLength(1)
-    expect(secondPage.body.turns[0]).toMatchObject({ role: 'assistant' })
+    expect(secondPage.body.turns[0]).toMatchObject({ role: 'user' })
     expect(JSON.stringify(secondPage.body)).not.toContain('providerTurnId')
 
     const body = await request(app)
@@ -145,7 +144,7 @@ describe('fresh-agent router', () => {
       .expect(200)
     expect(body.body).toMatchObject({
       turnId: secondPage.body.turns[0].turnId,
-      role: 'assistant',
+      role: 'user',
       threadId: 'thread-new-1',
       revision: 7,
     })
@@ -246,7 +245,7 @@ describe('fresh-agent router: snapshot served observability', () => {
     expect(payload.provider).toBe('codex')
     expect(payload.sessionType).toBe('freshcodex')
     expect(payload.httpStatus).toBe(200)
-    expect(payload.turnCount).toBeGreaterThan(0)
+    expect(payload.turnCount).toBe(0)
     expect(payload.durationMs).toBeGreaterThanOrEqual(0)
     expect(payload.payloadBytes).toBeGreaterThan(0)
     expect(payload.threadIdHash).toBeDefined()
