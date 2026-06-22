@@ -19,8 +19,10 @@ type FakeAuditEvent = {
   sessionId?: string
   routeDirectory?: string
   expectedDirectory?: string
+  bodyDirectory?: string
   directory?: string
   prompt?: string
+  status?: string
   reason?: string
   count?: number
   messageId?: string
@@ -161,6 +163,19 @@ async function waitForMaterializedSession(page: Page): Promise<FreshOpencodePane
   return state
 }
 
+async function waitForSettledPane(page: Page, sessionId: string): Promise<void> {
+  await expect.poll(async () => {
+    const state = await getFreshOpencodePaneState(page)
+    return {
+      sessionId: state.sessionId,
+      status: state.status,
+    }
+  }, { timeout: 30_000 }).toEqual({
+    sessionId,
+    status: 'idle',
+  })
+}
+
 async function waitForPromptRoute(input: {
   auditLogPath: string
   sessionId: string
@@ -193,10 +208,12 @@ async function expectAuditedRouteUse(input: {
   auditLogPath: string
   sessionId: string
   routeDirectory: string
+  afterEventCount?: number
 }): Promise<void> {
   await expect.poll(async () => {
     const events = await readAuditEvents(input.auditLogPath)
-    const matching = (eventName: string) => events.some((event) =>
+    const search = events.slice(input.afterEventCount ?? 0)
+    const matching = (eventName: string) => search.some((event) =>
       event.event === eventName
       && event.sessionId === input.sessionId
       && event.routeDirectory === input.routeDirectory
@@ -205,17 +222,30 @@ async function expectAuditedRouteUse(input: {
       sessionGet: matching('session_get'),
       promptAsync: matching('prompt_async'),
       messageList: matching('message_list'),
-      status: events.some((event) =>
+      status: search.some((event) =>
         event.event === 'status'
         && event.routeDirectory === input.routeDirectory
       ),
-      rejected: events.some((event) => event.event === 'route_rejected'),
+      busy: search.some((event) =>
+        event.event === 'session_status_emitted'
+        && event.sessionId === input.sessionId
+        && event.status === 'busy'
+        && event.routeDirectory === input.routeDirectory
+      ),
+      idle: search.some((event) =>
+        event.event === 'session_idle_emitted'
+        && event.sessionId === input.sessionId
+        && event.routeDirectory === input.routeDirectory
+      ),
+      rejected: search.some((event) => event.event === 'route_rejected'),
     }
   }, { timeout: 30_000 }).toEqual({
     sessionGet: true,
     promptAsync: true,
     messageList: true,
     status: true,
+    busy: true,
+    idle: true,
     rejected: false,
   })
 }
@@ -285,6 +315,34 @@ async function assertBadRouteMutationIsRejected(input: {
   }, { timeout: 5_000 }).toBe(true)
 }
 
+async function assertConflictingCreateDirectoryIsRejected(input: {
+  auditLogPath: string
+  baseUrl: string
+  goodCwd: string
+  badCwd: string
+}): Promise<void> {
+  const response = await fetch(
+    `${input.baseUrl}/session?directory=${encodeURIComponent(input.goodCwd)}`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ directory: input.badCwd, title: 'bad create route' }),
+    },
+  )
+  expect(response.status).toBe(409)
+
+  await expect.poll(async () => {
+    const events = await readAuditEvents(input.auditLogPath)
+    return events.some((event) =>
+      event.event === 'route_rejected'
+      && event.routeDirectory === input.goodCwd
+      && event.expectedDirectory === input.goodCwd
+      && event.bodyDirectory === input.badCwd
+      && event.reason === 'mismatched_body_directory'
+    )
+  }, { timeout: 5_000 }).toBe(true)
+}
+
 test.describe('Freshopencode restart recovery', () => {
   test.setTimeout(180_000)
 
@@ -324,6 +382,7 @@ test.describe('Freshopencode restart recovery', () => {
       const beforeRestart = await waitForMaterializedSession(page)
       expect(beforeRestart.initialCwd).toBe(cwd)
       const sessionId = beforeRestart.sessionId!
+      await waitForSettledPane(page, sessionId)
       await waitForPromptRoute({
         auditLogPath,
         sessionId,
@@ -368,7 +427,13 @@ test.describe('Freshopencode restart recovery', () => {
         prompt: followUpPrompt,
         afterEventCount: eventCountBeforeRestart,
       })
-      await expectAuditedRouteUse({ auditLogPath, sessionId, routeDirectory: cwd })
+      await waitForSettledPane(page, sessionId)
+      await expectAuditedRouteUse({
+        auditLogPath,
+        sessionId,
+        routeDirectory: cwd,
+        afterEventCount: eventCountBeforeRestart,
+      })
 
       const launch = await latestServeLaunchForPid(auditLogPath, followUpAudit.pid!)
       const sidecarBaseUrl = `http://${launch.hostname}:${launch.port}`
@@ -376,6 +441,12 @@ test.describe('Freshopencode restart recovery', () => {
         auditLogPath,
         baseUrl: sidecarBaseUrl,
         sessionId,
+        goodCwd: cwd,
+        badCwd,
+      })
+      await assertConflictingCreateDirectoryIsRejected({
+        auditLogPath,
+        baseUrl: sidecarBaseUrl,
         goodCwd: cwd,
         badCwd,
       })

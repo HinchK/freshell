@@ -423,10 +423,58 @@ process.stdin.on('data', (data) => {
 })
 
 const eventClients = new Set()
+const sessionStatuses = new Map()
 
 function sendJson(res, statusCode, body, headers = {}) {
   res.writeHead(statusCode, { 'content-type': 'application/json', ...headers })
   res.end(JSON.stringify(body))
+}
+
+function currentSessionStatus(sessionId) {
+  return sessionStatuses.get(sessionId) || 'idle'
+}
+
+function broadcastServeEvent(payload) {
+  const frame = `data: ${JSON.stringify(payload)}\n\n`
+  for (const client of Array.from(eventClients)) {
+    if (client.destroyed) {
+      eventClients.delete(client)
+      continue
+    }
+    client.write(frame)
+  }
+}
+
+function emitSessionStatus(sessionId, statusType, extra = {}) {
+  sessionStatuses.set(sessionId, statusType)
+  appendAudit({
+    event: 'session_status_emitted',
+    sessionId,
+    status: statusType,
+    ...extra,
+  })
+  broadcastServeEvent({
+    type: 'session.status',
+    properties: {
+      sessionID: sessionId,
+      status: { type: statusType },
+    },
+  })
+}
+
+function emitSessionIdle(sessionId, extra = {}) {
+  sessionStatuses.set(sessionId, 'idle')
+  appendAudit({
+    event: 'session_idle_emitted',
+    sessionId,
+    ...extra,
+  })
+  broadcastServeEvent({
+    type: 'session.idle',
+    properties: {
+      sessionID: sessionId,
+    },
+  })
 }
 
 function rejectRoute(res, input) {
@@ -438,6 +486,7 @@ function rejectRoute(res, input) {
     sessionId: input.sessionId,
     routeDirectory: input.routeDirectory,
     expectedDirectory: input.expectedDirectory,
+    bodyDirectory: input.bodyDirectory,
     reason: input.reason,
   })
   sendJson(res, input.statusCode ?? 409, {
@@ -641,14 +690,14 @@ const server = http.createServer(async (req, res) => {
           return
         }
         for (const row of rows) {
-          statuses[row.id] = { type: 'idle' }
+          statuses[row.id] = { type: currentSessionStatus(row.id) }
         }
       } finally {
         db.close()
       }
     } else {
-      statuses[rootSessionId] = { type: 'idle' }
-      statuses[childSessionId] = { type: 'idle' }
+      statuses[rootSessionId] = { type: currentSessionStatus(rootSessionId) }
+      statuses[childSessionId] = { type: currentSessionStatus(childSessionId) }
     }
     appendAudit({
       event: 'status',
@@ -727,8 +776,17 @@ const server = http.createServer(async (req, res) => {
     if (action === 'prompt_async' && req.method === 'POST') {
       const body = parseJsonText(await readRequestBody(req)) || {}
       const parts = Array.isArray(body.parts) ? body.parts : []
+      emitSessionStatus(sessionId, 'busy', {
+        routeDirectory: directory,
+        directory: session.directory,
+      })
       const appended = appendPromptMessages({ sessionId, parts })
       if (!appended) {
+        emitSessionIdle(sessionId, {
+          routeDirectory: directory,
+          directory: session.directory,
+          reason: 'append_failed',
+        })
         sendJson(res, 404, { error: 'session not found', sessionId })
         return
       }
@@ -740,6 +798,13 @@ const server = http.createServer(async (req, res) => {
         prompt: appended.promptText,
       })
       sendJson(res, 200, { ok: true })
+      setTimeout(() => {
+        emitSessionIdle(sessionId, {
+          routeDirectory: directory,
+          directory: session.directory,
+          prompt: appended.promptText,
+        })
+      }, 25).unref?.()
       return
     }
 
@@ -833,6 +898,26 @@ const server = http.createServer(async (req, res) => {
           })
           return
         }
+        if (
+          requireDirectoryRoute
+          && queryDirectory
+          && typeof input.directory === 'string'
+          && input.directory.length > 0
+          && normalizeDirectoryForComparison(input.directory) !== normalizeDirectoryForComparison(queryDirectory)
+        ) {
+          rejectRoute(res, {
+            routeEvent: 'session_create',
+            method: req.method,
+            pathname: url.pathname,
+            sessionId,
+            routeDirectory: queryDirectory,
+            expectedDirectory: queryDirectory,
+            bodyDirectory: input.directory,
+            reason: 'mismatched_body_directory',
+            statusCode: 409,
+          })
+          return
+        }
         const directory = typeof queryDirectory === 'string' && queryDirectory.length > 0
           ? queryDirectory
           : typeof input.directory === 'string' && input.directory.length > 0
@@ -864,6 +949,7 @@ const server = http.createServer(async (req, res) => {
           directory,
           title,
         })
+        sessionStatuses.set(sessionId, 'idle')
         sendJson(res, 200, { id: sessionId, directory, title })
       } catch (error) {
         sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
