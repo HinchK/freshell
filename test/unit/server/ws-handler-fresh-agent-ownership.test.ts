@@ -200,6 +200,97 @@ describe('WsHandler fresh-agent ownership', () => {
     }
   })
 
+  it('keeps a no-cwd durable FreshOpenCode attach read-only', async () => {
+    const runtimeManager = {
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_readonly', runtimeProvider: 'opencode' }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const { ws, messages } = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_readonly',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_readonly' },
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.attach).toHaveBeenCalledWith({
+          sessionId: 'ses_readonly',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_readonly' },
+        })
+        expect(runtimeManager.subscribe).toHaveBeenCalledWith({
+          sessionId: 'ses_readonly',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+        }, expect.any(Function))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        requestId: 'send-readonly',
+        sessionId: 'ses_readonly',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        text: 'must not send',
+      }))
+
+      await vi.waitFor(() => {
+        expect(messages).toContainEqual(expect.objectContaining({
+          type: 'error',
+          code: 'UNAUTHORIZED',
+          requestId: 'send-readonly',
+        }))
+      })
+      expect(runtimeManager.send).not.toHaveBeenCalled()
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('reports a synchronous Fresh Agent attach failure', async () => {
+    const runtimeManager = {
+      attach: vi.fn(() => {
+        throw new Error('attach exploded')
+      }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const { ws, messages } = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_sync_throw',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/safe',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_sync_throw' },
+      }))
+
+      await vi.waitFor(() => {
+        expect(messages).toContainEqual(expect.objectContaining({
+          type: 'error',
+          code: 'INTERNAL_ERROR',
+          message: 'attach exploded',
+        }))
+      })
+      expect(runtimeManager.subscribe).not.toHaveBeenCalled()
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
   it('waits for same-socket attach before sending a raced FreshOpenCode prompt', async () => {
     const attach = createDeferred<{ sessionId: string; runtimeProvider: string }>()
     const runtimeManager = {

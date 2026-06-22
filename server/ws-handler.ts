@@ -1201,18 +1201,28 @@ export class WsHandler {
     return `${locator.sessionType}:${locator.provider}:${locator.sessionId}`
   }
 
-  private requiresFreshOpenCodeRouteAuthorization(locator: FreshAgentLocator): boolean {
+  private isDurableFreshOpenCodeLocator(locator: FreshAgentLocator): boolean {
     return locator.sessionType === 'freshopencode'
       && locator.provider === 'opencode'
       && locator.sessionId.startsWith('ses_')
-      && typeof locator.cwd === 'string'
+  }
+
+  private hasFreshAgentRoute(locator: FreshAgentLocator): boolean {
+    return typeof locator.cwd === 'string'
       && locator.cwd.trim().length > 0
+  }
+
+  private requiresFreshOpenCodeRouteAuthorization(locator: FreshAgentLocator): boolean {
+    return this.isDurableFreshOpenCodeLocator(locator)
+  }
+
+  private canAuthorizeFreshAgentSession(locator: FreshAgentLocator): boolean {
+    return !this.requiresFreshOpenCodeRouteAuthorization(locator) || this.hasFreshAgentRoute(locator)
   }
 
   private freshAgentAuthorizationKey(locator: FreshAgentLocator): string {
     if (!this.requiresFreshOpenCodeRouteAuthorization(locator)) return this.freshAgentKey(locator)
-    const cwd = typeof locator.cwd === 'string' && locator.cwd.trim().length > 0 ? locator.cwd : ''
-    return `${this.freshAgentKey(locator)}:${cwd}`
+    return `${this.freshAgentKey(locator)}:${this.hasFreshAgentRoute(locator) ? locator.cwd : ''}`
   }
 
   private freshAgentLocatorFromMessage(m: {
@@ -1266,10 +1276,12 @@ export class WsHandler {
   }
 
   private authorizeFreshAgentSession(state: ClientState, locator: FreshAgentLocator): void {
+    if (!this.canAuthorizeFreshAgentSession(locator)) return
     state.freshAgentAuthorizations.set(this.freshAgentAuthorizationKey(locator), { ...locator })
   }
 
   private isFreshAgentAuthorized(state: ClientState, locator: FreshAgentLocator): boolean {
+    if (!this.canAuthorizeFreshAgentSession(locator)) return false
     return state.freshAgentAuthorizations.has(this.freshAgentAuthorizationKey(locator))
   }
 
@@ -3364,10 +3376,11 @@ export class WsHandler {
         const locator = this.freshAgentLocatorFromMessage(m)
         const authorizationKey = this.freshAgentAuthorizationKey(locator)
         let pendingEntry: PendingFreshAgentAttachEntry
-        const attachPromise = Promise.resolve(manager.attach({
-          ...locator,
-          ...(m.sessionRef ? { sessionRef: m.sessionRef } : {}),
-        }))
+        const attachPromise = Promise.resolve()
+          .then(() => manager.attach({
+            ...locator,
+            ...(m.sessionRef ? { sessionRef: m.sessionRef } : {}),
+          }))
           .then(() => {
             if (this.clientStates.get(ws) !== state) return
             const current = state.pendingFreshAgentAttachByKey.get(authorizationKey)

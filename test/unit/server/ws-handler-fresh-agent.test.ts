@@ -659,12 +659,14 @@ describe('WsHandler fresh-agent routing', () => {
       ws.on('message', (data) => {
         seenMessages.push(JSON.parse(data.toString()))
       })
+      const cwd = '/repo/stale-replay'
 
       const createMessage = {
         type: 'freshAgent.create',
         requestId: 'req-stale-replay',
         sessionType: 'freshopencode',
         provider: 'opencode',
+        cwd,
       }
 
       ws.send(JSON.stringify(createMessage))
@@ -682,6 +684,7 @@ describe('WsHandler fresh-agent routing', () => {
         sessionId: 'freshopencode-req-stale-1',
         sessionType: 'freshopencode',
         provider: 'opencode',
+        cwd,
         text: 'materialize',
       }))
 
@@ -700,6 +703,7 @@ describe('WsHandler fresh-agent routing', () => {
         sessionId: 'ses_stale_1',
         sessionType: 'freshopencode',
         provider: 'opencode',
+        cwd,
       }))
 
       await vi.waitFor(() => {
@@ -707,6 +711,7 @@ describe('WsHandler fresh-agent routing', () => {
           sessionId: 'ses_stale_1',
           sessionType: 'freshopencode',
           provider: 'opencode',
+          cwd,
         })
       })
 
