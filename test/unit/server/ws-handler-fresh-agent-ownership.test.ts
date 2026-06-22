@@ -256,6 +256,96 @@ describe('WsHandler fresh-agent ownership', () => {
     }
   })
 
+  it('keeps routed authorization when a read-only FreshOpenCode subscription later materializes', async () => {
+    let listener: ((event: unknown) => void) | undefined
+    const runtimeManager = {
+      attach: vi.fn().mockResolvedValue({ sessionId: 'ses_upgrade', runtimeProvider: 'opencode' }),
+      subscribe: vi.fn().mockImplementation(async (_locator: unknown, next: (event: unknown) => void) => {
+        listener = next
+        return () => undefined
+      }),
+      send: vi.fn().mockResolvedValue(undefined),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const { ws, messages } = await connectAndAuth(server)
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_upgrade',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_upgrade' },
+      }))
+
+      await vi.waitFor(() => expect(listener).toBeTypeOf('function'))
+      expect(runtimeManager.subscribe).toHaveBeenCalledTimes(1)
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_upgrade',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/upgraded',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_upgrade' },
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.attach).toHaveBeenCalledWith({
+          sessionId: 'ses_upgrade',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          cwd: '/repo/upgraded',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_upgrade' },
+        })
+      })
+      expect(runtimeManager.subscribe).toHaveBeenCalledTimes(1)
+
+      listener?.({
+        type: 'freshAgent.session.materialized',
+        previousSessionId: 'ses_upgrade',
+        sessionId: 'ses_upgraded_materialized',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_upgraded_materialized' },
+      })
+
+      await vi.waitFor(() => {
+        expect(messages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.session.materialized',
+          previousSessionId: 'ses_upgrade',
+          sessionId: 'ses_upgraded_materialized',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+        }))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        requestId: 'send-after-upgrade-materialize',
+        sessionId: 'ses_upgraded_materialized',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/upgraded',
+        text: 'still authorized',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.send).toHaveBeenCalledWith({
+          sessionId: 'ses_upgraded_materialized',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          cwd: '/repo/upgraded',
+        }, expect.objectContaining({
+          requestId: 'send-after-upgrade-materialize',
+          text: 'still authorized',
+        }))
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
   it('reports a synchronous Fresh Agent attach failure', async () => {
     const runtimeManager = {
       attach: vi.fn(() => {

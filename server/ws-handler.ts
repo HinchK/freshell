@@ -163,6 +163,7 @@ type FreshAgentCreatedRecord = {
 
 type FreshAgentSubscriptionEntry = {
   active: boolean
+  locator: FreshAgentLocator
   off?: () => void
   pending?: Promise<void>
 }
@@ -1442,17 +1443,21 @@ export class WsHandler {
     const existing = state.freshAgentSubscriptions.get(key)
     if (existing) {
       existing.active = true
+      if (this.hasFreshAgentRoute(locator)) {
+        existing.locator = { ...locator }
+      }
       return
     }
 
-    const entry: FreshAgentSubscriptionEntry = { active: true }
+    const entry: FreshAgentSubscriptionEntry = { active: true, locator: { ...locator } }
     state.freshAgentSubscriptions.set(key, entry)
 
     const listener = (event: unknown) => {
       if (!entry.active) return
-      const materialized = this.freshAgentMaterializedMessage(locator, event)
+      const currentLocator = entry.locator
+      const materialized = this.freshAgentMaterializedMessage(currentLocator, event)
       if (materialized) {
-        this.materializeFreshAgentSession(ws, state, locator, {
+        this.materializeFreshAgentSession(ws, state, currentLocator, {
           previousSessionId: materialized.previousSessionId,
           sessionId: materialized.sessionId,
           sessionRef: materialized.sessionRef,
@@ -1460,7 +1465,7 @@ export class WsHandler {
         this.safeSend(ws, materialized)
         return
       }
-      this.safeSend(ws, this.freshAgentEventMessage(locator, event))
+      this.safeSend(ws, this.freshAgentEventMessage(currentLocator, event))
     }
 
     entry.pending = Promise.resolve()
