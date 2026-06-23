@@ -25,6 +25,7 @@ import {
   parseCodexDisplayIdHandle,
 } from './normalize.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
+import { nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
 
 type CodexThreadLifecycleEvent =
   | {
@@ -65,6 +66,9 @@ type CodexRuntimePort = {
   interruptTurn?: (input: CodexTurnInterruptParams) => Promise<void>
   shutdown?: () => Promise<void>
   onThreadLifecycle?: (handler: (event: CodexThreadLifecycleEvent) => void) => () => void
+  onTurnCompleted?: (
+    handler: (event: { threadId: string; turnId?: string; params: Record<string, unknown> }) => void,
+  ) => () => void
   readThread: (input: { threadId: string; includeTurns?: boolean }) => Promise<Record<string, any>>
   listThreadTurns: (input: {
     threadId: string
@@ -286,6 +290,9 @@ export function createCodexFreshAgentAdapter(deps: {
   }
   const displayIdSecret = deps.displayIdSecret
   const activeTurnByThread = new Map<string, string>()
+  // Per-thread (not per-subscription) so the monotonic turn-complete clamp survives a WS
+  // reconnect, matching how Claude/OpenCode keep it on session state.
+  const lastTurnCompleteAtByThread = new Map<string, number>()
   const settingsByThread = new Map<string, Partial<FreshAgentCreateRequest>>()
   const runtimeByThread = new Map<string, CodexRuntimePort>()
   const threadIdsByRuntime = new Map<CodexRuntimePort, Set<string>>()
@@ -665,6 +672,7 @@ export function createCodexFreshAgentAdapter(deps: {
 
   const clearThreadState = (threadId: string) => {
     activeTurnByThread.delete(threadId)
+    lastTurnCompleteAtByThread.delete(threadId)
     settingsByThread.delete(threadId)
     modelByTurnByThread.delete(threadId)
     submittedInputsByThread.delete(threadId)
@@ -867,7 +875,7 @@ export function createCodexFreshAgentAdapter(deps: {
       if (!runtime.onThreadLifecycle) {
         throw new Error('Codex app-server runtime does not support thread lifecycle subscriptions.')
       }
-      return runtime.onThreadLifecycle((event) => {
+      const offLifecycle = runtime.onThreadLifecycle((event) => {
         if (event.kind === 'thread_started') {
           if (event.thread.id !== sessionId) return
           listener(makeCodexStatusEvent(sessionId, event.thread.status, event.thread.updatedAt))
@@ -891,6 +899,29 @@ export function createCodexFreshAgentAdapter(deps: {
         }
         listener(makeCodexStatusEvent(sessionId, event.status))
       })
+
+      // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. The
+      // app-server fires turn/completed for interrupts too, carrying the authoritative
+      // outcome inline at params.turn.status, so we chime only for a positive
+      // completion ('completed') and never on interrupt/failure.
+      const offTurnCompleted = runtime.onTurnCompleted?.((event) => {
+        if (event.threadId !== sessionId) return
+        // turn/completed fires for interrupts/failures too, so chime only on a positive
+        // completion. The authoritative status appears either inline at params.turn.status
+        // (codex-cli 0.142.0, probed live) or flat at params.status (the shape the
+        // app-server client tests model); accept either so neither version silently fails.
+        const params = event.params as { status?: unknown; turn?: { status?: unknown } } | undefined
+        const status = params?.turn?.status ?? params?.status
+        if (status !== 'completed') return
+        const at = nextMonotonicTurnCompleteAt(lastTurnCompleteAtByThread.get(sessionId), Date.now())
+        lastTurnCompleteAtByThread.set(sessionId, at)
+        listener({ type: 'sdk.turn.complete', sessionId, at })
+      })
+
+      return () => {
+        offLifecycle()
+        offTurnCompleted?.()
+      }
     },
 
     async send(sessionId, input) {
@@ -1174,6 +1205,7 @@ export function createCodexFreshAgentAdapter(deps: {
       displayCursorByHandle.clear()
       submittedInputsByThread.clear()
       submittedAliasByThread.clear()
+      lastTurnCompleteAtByThread.clear()
       await Promise.all(runtimes.map((runtime) => runtime.shutdown?.()))
     },
   }

@@ -1,0 +1,208 @@
+# Server-authoritative fresh-agent turn completion
+
+## Problem
+
+Fresh-agent panes (freshclaude, kilroy, freshcodex, freshopencode) drove the
+GREEN / needs-attention highlight and the idle chime by **re-deriving the
+turn-complete edge on the client** — `useAgentSessionTurnCompletion` watched the
+Redux busy *level* (`isFreshAgentBusy`) and fired `recordTurnComplete` on a
+busy→idle transition.
+
+Differentiating a level to recover an edge is inherently fragile: it must observe
+both sides, in order, exactly once, with no bounce. That produced the three
+reported symptoms:
+
+- **Premature / flicker chimes** — a transient idle blip (snapshot clobber,
+  stream gap) read as a completed turn.
+- **Missed chimes** — a fast turn whose busy onset was never observed, or a turn
+  that completed while the client was differentiating stale snapshot levels.
+- **Wrong color** — green derived from a level that disagreed with the real
+  outcome (e.g. an interrupt looks just like a completion at the level).
+
+Terminal-mode CLIs do not have this problem: they use a **server-authoritative
+discrete completion event** (`terminal.turn.complete`). Fresh-agent panes had no
+server completion event at all.
+
+## Approach
+
+Give fresh-agent panes the same server-authoritative model: each provider adapter
+emits a **discrete `freshAgent.turn.complete` edge only on a positive
+completion**, and the client folds it into the existing GREEN/SOUND pipeline.
+Delete the client-side busy→idle derivation.
+
+### Server emit points (positive completion only)
+
+Validated empirically against the real binaries before implementing:
+
+- **freshclaude / kilroy** (`server/sdk-bridge.ts`): the SDK `result` message with
+  `subtype === 'success'`. In streaming-input mode an interrupt sends a
+  `control_response` ACK and yields **no** result message; kill → `sdk.exit`;
+  stream error → `sdk.error` + `sdk.status idle`. So `subtype === 'success'` is a
+  clean, unambiguous positive edge.
+- **freshopencode** (`server/fresh-agent/adapters/opencode/adapter.ts`): the
+  success-only `emitStatus(state, 'idle')` path after `await idle` resolves, gated on
+  per-session `turnAborted` **and** `turnErrored` flags. `onceIdle` resolves on *any* idle
+  — including the idle that an interrupt's abort triggers (it does **not** reject) and the
+  idle that follows an *errored* turn — and it never inspects the error. OpenCode surfaces a
+  failed turn out-of-band as a `session.error` SSE event (mapped to `sdk.error`) and then
+  goes idle, so the success path cannot infer success from "reached idle" alone. `interrupt()`
+  sets `turnAborted` before aborting, and `bindServeStream` sets `turnErrored` when it relays
+  an `sdk.error`; the send suppresses its chime if either is set when idle resolves. Each new
+  turn resets both flags, and a *failed* abort clears `turnAborted` again (the turn was not
+  actually stopped, so its genuine completion must still chime). This makes OpenCode's
+  positive-completion check the analogue of Claude's `subtype === 'success'` and Codex's
+  `status === 'completed'`. The catch path (sidecar loss / timeout) and the serve SSE idle
+  relay also never chime. `/compact` takes the same await-idle + emit path with the same
+  abort/error gate (it is a user-visible turn and chimed before the client busy→idle
+  derivation was removed; Claude `/compact` is a normal turn and already chimes).
+- **freshcodex** (`server/fresh-agent/adapters/codex/adapter.ts`): the app-server
+  `turn/completed` notification. **Empirical finding:** `turn/completed` fires for
+  interrupts too, and carries the authoritative outcome inline at
+  `params.turn.status` (`'completed' | 'interrupted' | 'failed'`). We register
+  `onTurnCompleted` in `subscribe` and chime only on a positive completion — no extra
+  read-back round-trip. The authoritative status appears either inline at
+  `params.turn.status` (codex-cli 0.142.0, probed live) **or** flat at `params.status`
+  (the shape the app-server client tests model), so we read
+  `params.turn?.status ?? params.status` and require `=== 'completed'`; either shape is
+  detected and interrupts/failures at either location are excluded. The protocol schema
+  (`CodexTurnCompletedNotificationSchema`) declares both the inline `turn.status` and the
+  flat `status` contract.
+
+### Transport
+
+Adapters emit `sdk.turn.complete { sessionId, at }`;
+`normalizeFreshAgentProviderEvent` maps it to `freshAgent.turn.complete`. It rides
+the existing `freshAgent.event` envelope, so it inherits per-client authorization,
+the subscription lifecycle, and the materialization locator remap for free (the
+envelope re-stamps the real `sessionId`, so opencode's placeholder-id emit arrives
+correctly keyed).
+
+### Client
+
+`handleFreshAgentTransportEvent` routes `freshAgent.turn.complete` to a new
+`applyFreshAgentCompletion` thunk, which resolves the owning tab/pane from the
+`provider:sessionId` session key and dispatches `recordTurnComplete`. The handler
+**requires a finite numeric `at`** and drops (logs) a malformed event rather than
+fabricating a client `Date.now()`: every server emit site stamps a monotonic `at`, so a
+missing/non-numeric `at` is a contract violation, and a fabricated client timestamp could
+collide with or regress against the server clock and swallow a real later completion.
+
+**Identity matching (the runtime-handle gotcha).** The server keys the event by the
+runtime handle it subscribed with (`provider:content.sessionId`). For Claude/kilroy
+that runtime handle is the bridge `nanoid`, which differs from the durable Claude
+UUID persisted in `content.sessionRef` — and `resolveFreshAgentSessionKey` *prefers*
+`sessionRef`. So `findFreshAgentPaneBySessionKey` matches the event against the
+runtime handle **and** the resolved (sessionRef-preferred) key; matching only the
+latter silently dropped every chime on restored Claude sessions. OpenCode and Codex
+keep `content.sessionId === sessionRef.sessionId`, so they were unaffected (which is
+why the original OpenCode-only test missed it).
+
+**Dedupe regime: `at`-monotonic (no `completionSeq`).** A wall-clock `at` avoids the
+counter "restart-swallow": a per-session counter resets to 0 on restart while the
+client's dedupe state survives, so a resumed *durable* fresh-agent session (same
+`sessionId` after a deploy) would swallow real completions. Terminals dodge that by
+getting a fresh `nanoid` terminalId on restart; fresh-agent sessions keep their durable
+id, so the counter approach is unsafe here. The discrete edge is never re-derived from a
+snapshot level, so a reconnect cannot re-green, and a replayed/stale event with an
+older-or-equal `at` is dropped.
+
+Wall-clock `at` is *not* unconditionally monotonic across a restart, though: the
+per-session clamp below can push `at` above real wall time (a large backward clock step
+keeps `at` ahead until wall time recovers), and a fresh process then stamps a lower `at`.
+To close that residual restart-swallow, the client **clears the per-terminal `at`
+baselines on a real server restart** (`resetCompletionDedupeBaselines`, dispatched from
+the bootId-change branch in `App.tsx`). This is safe precisely because the discrete edge
+is never re-derived from a snapshot and a fresh process replays nothing — so there is no
+stale completion to re-green, and the first genuine post-restart completion is accepted.
+A plain reconnect (same `bootId`) keeps the baselines, preserving replay dedupe.
+
+**Server-side per-session monotonic clamp.** Raw `Date.now()` is not a reliable
+per-turn identity: two genuine completions can land in the same millisecond, and the
+system clock can step backwards (NTP correction) — both would make a real later
+completion look `<= last` and be dropped as a replay, recreating the missed-chime
+class. So each emit site clamps its session's `at` to be strictly greater than the
+previous one via the shared `nextMonotonicTurnCompleteAt` helper. This guarantees
+distinct turns never collide or regress *within a process*. It does **not** by itself
+guarantee monotonicity across a restart (the clamp can push `at` ahead of real wall
+time, and a fresh process may stamp a lower value) — the client-side baseline reset
+described above closes that gap.
+
+The clamp state must live on **per-session** server state, never per-subscription:
+the client store's dedupe survives a WS reconnect, but fresh-agent subscriptions are
+torn down and recreated on reconnect. So `sdk-bridge` keeps it on `SdkSessionState`,
+the opencode adapter on `OpencodeSessionState`, and the codex adapter on a per-thread
+`lastTurnCompleteAtByThread` map (not the `subscribe()` closure) — otherwise a same-ms
+or backward-clock completion right after a reconnect would be dropped for codex.
+
+### What was deleted
+
+`useAgentSessionTurnCompletion` no longer derives turn completion from the busy
+level. It retains only the "waiting-for-approval" edge (a 0→≥1 pending
+permission/question transition), which is a distinct attention concern. That edge
+records under a **distinct dedupe namespace** (`provider:sessionId#waiting`): it is
+stamped with the *client* clock, and for opencode/codex it would otherwise share the
+server completion's `provider:sessionId` entry — letting an approval stamped ahead of
+the server clock (common on a remote client) swallow the real completion via the
+monotonic `at <= last` guard.
+
+## Spike findings (empirical, real binaries)
+
+- **Claude SDK** (`@anthropic-ai/claude-agent-sdk` 2.1.186): result subtype enum is
+  `success | error_during_execution | error_max_turns | error_max_budget_usd |
+  error_max_structured_output_retries`. Interrupt in streaming-input mode yields no
+  result. One result per user turn (no `parent_tool_use_id` on results).
+- **Codex app-server** (codex-cli 0.142.0, probed live): `turn/completed` params
+  are `{ threadId, turn: { id, status, error, startedAt, completedAt, durationMs } }`
+  — status is inline. Interrupt produces `turn/completed` with
+  `turn.status === 'interrupted'` (no separate `turn/aborted`). The runtime exposes
+  `onExit` (not yet wired into the freshcodex adapter — a separate stuck-blue gap).
+- **OpenCode**: single success-only completion point already existed; owns an
+  explicit `ses_` id, immune to ambiguous-ownership.
+
+## Test coverage
+
+- Unit: transport normalize; claude bridge (success emits, non-success does not);
+  opencode (exactly one on success, none on abort); codex adapter (only
+  `turn.status === 'completed'`, scoped to the subscribed thread); client thunk +
+  transport routing + `at`-monotonic dedupe; hook no longer fires on busy→idle.
+- Unit (review follow-ups, round 1): client routes a Claude completion keyed by the
+  runtime handle when the pane carries a durable `sessionRef` (identity match);
+  `nextMonotonicTurnCompleteAt` clamps same-ms/backward-clock; each emit site
+  (claude/opencode/codex) stamps a strictly-increasing `at` across successive
+  same-millisecond completions.
+- Unit (review follow-ups, round 2): opencode does not chime on an interrupt even
+  though `onceIdle` resolves, and resumes chiming on the next clean turn; codex chimes
+  on a flat `params.status` completion and skips a flat `interrupted`; the
+  waiting-for-approval edge does not swallow a later server completion (separate dedupe
+  namespace).
+- Unit (review follow-ups, round 3): codex keeps the monotonic `at` clamp per thread
+  across a re-subscribe (WS reconnect), not per subscription.
+- Unit (review follow-ups, round 4): opencode still chimes when an interrupt's abort
+  request fails and the turn then completes normally; `resetCompletionDedupeBaselines`
+  clears the per-terminal `at` baseline (so a lower post-restart `at` re-fires) while
+  preserving unacknowledged attention.
+- Unit (review follow-ups, round 5): opencode `/compact` emits a server-authoritative
+  completion edge on success (it previously greened via the removed client busy→idle
+  derivation).
+- Unit (review follow-ups, round 6): codex `shutdown()` clears the per-thread
+  turn-complete clock too (a reused-in-process adapter must not clamp a fresh
+  completion against a stale pre-shutdown timestamp), matching every other per-thread
+  map it already clears. Round 6 also corrected the `turn-complete-clock` helper
+  comment, which had overstated the clamp as guaranteeing cross-restart monotonicity
+  (it does not — the client baseline reset is what closes that gap).
+- Unit (review follow-ups, round 7): opencode does **not** chime when a turn reports
+  `session.error` and then goes idle (false-success gap — onceIdle resolves on the
+  post-error idle without inspecting the error), and resumes chiming on the next clean
+  turn (the error flag resets per turn like the abort flag); the client drops a malformed
+  `freshAgent.turn.complete` without a finite numeric `at` instead of fabricating a client
+  `Date.now()`.
+- e2e: WS `freshAgent.turn.complete` → `handleFreshAgentMessage` →
+  `applyFreshAgentCompletion` → `useTurnCompletionNotifications` chimes once +
+  highlights, ignores replays, re-chimes on the next real turn.
+
+## Deliberately out of scope (follow-ups)
+
+- freshcodex `onExit` self-heal for a crashed sidecar (stuck-blue gap).
+- snapshot status-clobber / provider-agnostic `statusSeq` for BLUE correctness.
+- Centralizing GREEN/BLUE render precedence across TabItem / PaneHeader / Sidebar.
+- Making the waiting-for-approval edge server-authoritative too (delete the hook).

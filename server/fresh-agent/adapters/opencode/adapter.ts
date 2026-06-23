@@ -8,6 +8,7 @@ import type {
   FreshAgentThreadLocator,
 } from '../../runtime-adapter.js'
 import { FreshAgentLostSessionError } from '../../runtime-manager.js'
+import { nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
 import { logger } from '../../../logger.js'
 import { defaultOpencodeDataHome } from '../../../coding-cli/providers/opencode.js'
@@ -45,6 +46,18 @@ type OpencodeSessionState = {
   events: EventEmitter
   sendQueue: Promise<unknown>
   unsubscribeServe?: () => void
+  /** Last emitted turn-complete `at`, kept per session so the edge stays strictly monotonic. */
+  lastTurnCompleteAt?: number
+  /** Set by interrupt() so the in-flight send suppresses its chime when idle resolves. */
+  turnAborted?: boolean
+  /**
+   * Set when the serve stream relays a `session.error` during the in-flight turn, so the
+   * success path suppresses its chime. onceIdle resolves on the idle that follows an
+   * errored turn without inspecting the error, so a positive completion must independently
+   * confirm the turn did not error — the OpenCode analogue of Claude's `subtype === 'success'`
+   * and Codex's `status === 'completed'`.
+   */
+  turnErrored?: boolean
 }
 
 type CreateOpencodeFreshAgentAdapterOptions = {
@@ -208,16 +221,34 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
   async function compactForState(state: OpencodeSessionState, input?: { instructions?: string }): Promise<void> {
     if (!state.realSessionId) return
     await ensureMutableRoute(state)
+    const realId = state.realSessionId
     const route = cwdRoute(state.cwd)
-    if (route) {
-      await serveManager.compact(state.realSessionId, input, route)
-      return
+    // Compact is a user-visible turn: it must green/chime on completion like a send. Set up
+    // the idle waiter before issuing the request so we don't miss the idle, and gate the
+    // chime on turnAborted/turnErrored so an interrupt or error during compact does not
+    // falsely complete.
+    state.turnAborted = false
+    state.turnErrored = false
+    emitStatus(state, 'running')
+    const idle = route
+      ? serveManager.onceIdle(realId, turnTimeoutMs, route)
+      : serveManager.onceIdle(realId, turnTimeoutMs)
+    void idle.catch(() => {})
+    try {
+      if (route) await serveManager.compact(realId, input, route)
+      else if (input) await serveManager.compact(realId, input)
+      else await serveManager.compact(realId)
+      await idle
+      emitStatus(state, 'idle')
+      if (!state.turnAborted && !state.turnErrored) {
+        const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
+        state.lastTurnCompleteAt = completionAt
+        state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
+      }
+    } catch (error) {
+      emitStatus(state, 'idle')
+      throw error
     }
-    if (input) {
-      await serveManager.compact(state.realSessionId, input)
-      return
-    }
-    await serveManager.compact(state.realSessionId)
   }
 
   async function forkForState(state: OpencodeSessionState): Promise<{ id: string; directory?: string }> {
@@ -239,6 +270,11 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     state.unsubscribeServe = serveManager.subscribe(state.realSessionId, (parsed) => {
       const mapped = serveEventToSdk(parsed, state.placeholderId)
       if (mapped) {
+        if (mapped.type === 'sdk.error') {
+          // A turn error means the in-flight turn did not positively complete; the
+          // success path consults this when onceIdle later resolves on the post-error idle.
+          state.turnErrored = true
+        }
         if (mapped.type === 'sdk.session.snapshot') {
           const status: 'running' | 'idle' = mapped.status === 'idle' ? 'idle' : 'running'
           state.status = status
@@ -288,6 +324,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     const effort = normalized?.effort ?? state.effort
     const effectiveCwd = normalized?.cwd ?? state.cwd
 
+    // A fresh turn starts un-aborted and un-errored; interrupt() flips turnAborted while we
+    // are parked on idle, and the serve stream flips turnErrored if the turn reports an error.
+    state.turnAborted = false
+    state.turnErrored = false
     emitStatus(state, 'running')
     try {
       if (!state.realSessionId) {
@@ -324,6 +364,16 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       state.model = modelStr ?? state.model
       state.effort = effort
       emitStatus(state, 'idle')
+      // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. onceIdle
+      // resolves on ANY idle — including the idle an interrupt's abort triggers or the idle
+      // that follows an errored turn — so a positive completion requires that the turn was
+      // neither interrupted nor errored. (The catch below for abort/interrupt/sidecar loss
+      // and the serve SSE idle relay also never chime.)
+      if (!state.turnAborted && !state.turnErrored) {
+        const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
+        state.lastTurnCompleteAt = completionAt
+        state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
+      }
       return sendResult(state.realSessionId)
     } catch (error) {
       emitStatus(state, 'idle')
@@ -461,7 +511,17 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
 
     async interrupt(sessionId) {
       const state = requireState(sessionId)
-      await abortForState(state)
+      // Mark before aborting so the in-flight send (parked on onceIdle) sees the abort and
+      // suppresses its turn-complete chime when the abort-triggered idle resolves it.
+      state.turnAborted = true
+      try {
+        await abortForState(state)
+      } catch (error) {
+        // The abort never landed, so the turn may still complete normally — clear the flag
+        // so a genuine completion is not silently swallowed.
+        state.turnAborted = false
+        throw error
+      }
       emitStatus(state, 'idle')
     },
 

@@ -17,6 +17,7 @@ import { buildMcpServerCommandArgs } from './mcp/config-writer.js'
 import { sanitizeFreshAgentPluginPaths } from '../shared/fresh-agent-plugins.js'
 import { logger } from './logger.js'
 import { synthesizeClaudeFreshAgentLiveMessageId } from './fresh-agent/history/claude/history-ledger.js'
+import { nextMonotonicTurnCompleteAt } from './fresh-agent/turn-complete-clock.js'
 import type { ClaudeFreshAgentHistorySource } from './fresh-agent/history/claude/history-source.js'
 import type {
   SdkSessionState,
@@ -461,6 +462,19 @@ export class SdkBridge extends EventEmitter {
           costUsd: rMsg.total_cost_usd,
           usage,
         })
+        // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline.
+        // Only a positively-completed turn ('success') chimes; interrupts yield no
+        // result message at all, and tool-only/error turns surface a non-success
+        // subtype, so this never fires green on an aborted or errored turn.
+        if (rMsg.subtype === 'success') {
+          const at = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
+          state.lastTurnCompleteAt = at
+          this.broadcastToSession(sessionId, {
+            type: 'sdk.turn.complete',
+            sessionId,
+            at,
+          })
+        }
         break
       }
 
