@@ -40,16 +40,21 @@ Validated empirically against the real binaries before implementing:
   stream error → `sdk.error` + `sdk.status idle`. So `subtype === 'success'` is a
   clean, unambiguous positive edge.
 - **freshopencode** (`server/fresh-agent/adapters/opencode/adapter.ts`): the
-  success-only `emitStatus(state, 'idle')` path after `await idle` resolves, gated on a
-  per-session `turnAborted` flag. `onceIdle` resolves on *any* idle — including the
-  idle that an interrupt's abort triggers (it does **not** reject) — so `interrupt()`
-  sets `turnAborted` before aborting and the send suppresses its chime when that idle
-  resolves; each new turn resets the flag, and a *failed* abort clears it again (the turn
-  was not actually stopped, so its genuine completion must still chime). The catch path
-  (sidecar loss / timeout) and the serve SSE idle relay also never chime. `/compact`
-  takes the same await-idle + emit path (it is a user-visible turn and chimed before the
-  client busy→idle derivation was removed; Claude `/compact` is a normal turn and already
-  chimes).
+  success-only `emitStatus(state, 'idle')` path after `await idle` resolves, gated on
+  per-session `turnAborted` **and** `turnErrored` flags. `onceIdle` resolves on *any* idle
+  — including the idle that an interrupt's abort triggers (it does **not** reject) and the
+  idle that follows an *errored* turn — and it never inspects the error. OpenCode surfaces a
+  failed turn out-of-band as a `session.error` SSE event (mapped to `sdk.error`) and then
+  goes idle, so the success path cannot infer success from "reached idle" alone. `interrupt()`
+  sets `turnAborted` before aborting, and `bindServeStream` sets `turnErrored` when it relays
+  an `sdk.error`; the send suppresses its chime if either is set when idle resolves. Each new
+  turn resets both flags, and a *failed* abort clears `turnAborted` again (the turn was not
+  actually stopped, so its genuine completion must still chime). This makes OpenCode's
+  positive-completion check the analogue of Claude's `subtype === 'success'` and Codex's
+  `status === 'completed'`. The catch path (sidecar loss / timeout) and the serve SSE idle
+  relay also never chime. `/compact` takes the same await-idle + emit path with the same
+  abort/error gate (it is a user-visible turn and chimed before the client busy→idle
+  derivation was removed; Claude `/compact` is a normal turn and already chimes).
 - **freshcodex** (`server/fresh-agent/adapters/codex/adapter.ts`): the app-server
   `turn/completed` notification. **Empirical finding:** `turn/completed` fires for
   interrupts too, and carries the authoritative outcome inline at
@@ -76,7 +81,11 @@ correctly keyed).
 
 `handleFreshAgentTransportEvent` routes `freshAgent.turn.complete` to a new
 `applyFreshAgentCompletion` thunk, which resolves the owning tab/pane from the
-`provider:sessionId` session key and dispatches `recordTurnComplete`.
+`provider:sessionId` session key and dispatches `recordTurnComplete`. The handler
+**requires a finite numeric `at`** and drops (logs) a malformed event rather than
+fabricating a client `Date.now()`: every server emit site stamps a monotonic `at`, so a
+missing/non-numeric `at` is a contract violation, and a fabricated client timestamp could
+collide with or regress against the server clock and swallow a real later completion.
 
 **Identity matching (the runtime-handle gotcha).** The server keys the event by the
 runtime handle it subscribed with (`provider:content.sessionId`). For Claude/kilroy
@@ -181,6 +190,12 @@ monotonic `at <= last` guard.
   map it already clears. Round 6 also corrected the `turn-complete-clock` helper
   comment, which had overstated the clamp as guaranteeing cross-restart monotonicity
   (it does not — the client baseline reset is what closes that gap).
+- Unit (review follow-ups, round 7): opencode does **not** chime when a turn reports
+  `session.error` and then goes idle (false-success gap — onceIdle resolves on the
+  post-error idle without inspecting the error), and resumes chiming on the next clean
+  turn (the error flag resets per turn like the abort flag); the client drops a malformed
+  `freshAgent.turn.complete` without a finite numeric `at` instead of fabricating a client
+  `Date.now()`.
 - e2e: WS `freshAgent.turn.complete` → `handleFreshAgentMessage` →
   `applyFreshAgentCompletion` → `useTurnCompletionNotifications` chimes once +
   highlights, ignores replays, re-chimes on the next real turn.

@@ -50,6 +50,14 @@ type OpencodeSessionState = {
   lastTurnCompleteAt?: number
   /** Set by interrupt() so the in-flight send suppresses its chime when idle resolves. */
   turnAborted?: boolean
+  /**
+   * Set when the serve stream relays a `session.error` during the in-flight turn, so the
+   * success path suppresses its chime. onceIdle resolves on the idle that follows an
+   * errored turn without inspecting the error, so a positive completion must independently
+   * confirm the turn did not error — the OpenCode analogue of Claude's `subtype === 'success'`
+   * and Codex's `status === 'completed'`.
+   */
+  turnErrored?: boolean
 }
 
 type CreateOpencodeFreshAgentAdapterOptions = {
@@ -217,8 +225,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     const route = cwdRoute(state.cwd)
     // Compact is a user-visible turn: it must green/chime on completion like a send. Set up
     // the idle waiter before issuing the request so we don't miss the idle, and gate the
-    // chime on turnAborted so an interrupt during compact does not falsely complete.
+    // chime on turnAborted/turnErrored so an interrupt or error during compact does not
+    // falsely complete.
     state.turnAborted = false
+    state.turnErrored = false
     emitStatus(state, 'running')
     const idle = route
       ? serveManager.onceIdle(realId, turnTimeoutMs, route)
@@ -230,7 +240,7 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       else await serveManager.compact(realId)
       await idle
       emitStatus(state, 'idle')
-      if (!state.turnAborted) {
+      if (!state.turnAborted && !state.turnErrored) {
         const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
         state.lastTurnCompleteAt = completionAt
         state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
@@ -260,6 +270,11 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     state.unsubscribeServe = serveManager.subscribe(state.realSessionId, (parsed) => {
       const mapped = serveEventToSdk(parsed, state.placeholderId)
       if (mapped) {
+        if (mapped.type === 'sdk.error') {
+          // A turn error means the in-flight turn did not positively complete; the
+          // success path consults this when onceIdle later resolves on the post-error idle.
+          state.turnErrored = true
+        }
         if (mapped.type === 'sdk.session.snapshot') {
           const status: 'running' | 'idle' = mapped.status === 'idle' ? 'idle' : 'running'
           state.status = status
@@ -309,8 +324,10 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     const effort = normalized?.effort ?? state.effort
     const effectiveCwd = normalized?.cwd ?? state.cwd
 
-    // A fresh turn starts un-aborted; interrupt() flips this while we are parked on idle.
+    // A fresh turn starts un-aborted and un-errored; interrupt() flips turnAborted while we
+    // are parked on idle, and the serve stream flips turnErrored if the turn reports an error.
     state.turnAborted = false
+    state.turnErrored = false
     emitStatus(state, 'running')
     try {
       if (!state.realSessionId) {
@@ -348,10 +365,11 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       state.effort = effort
       emitStatus(state, 'idle')
       // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. onceIdle
-      // resolves on ANY idle — including the idle an interrupt's abort triggers — so a
-      // positive completion requires that the turn was NOT interrupted. (The catch below
-      // for abort/interrupt/sidecar loss and the serve SSE idle relay also never chime.)
-      if (!state.turnAborted) {
+      // resolves on ANY idle — including the idle an interrupt's abort triggers or the idle
+      // that follows an errored turn — so a positive completion requires that the turn was
+      // neither interrupted nor errored. (The catch below for abort/interrupt/sidecar loss
+      // and the serve SSE idle relay also never chime.)
+      if (!state.turnAborted && !state.turnErrored) {
         const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
         state.lastTurnCompleteAt = completionAt
         state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })

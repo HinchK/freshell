@@ -70,6 +70,35 @@ describe('server-authoritative fresh-agent turn completion (client)', () => {
     expect(store.getState().turnCompletion.pendingEvents).toHaveLength(2)
   })
 
+  it('drops a malformed completion without a numeric at instead of fabricating Date.now()', () => {
+    // The server always stamps a monotonic numeric `at` (every emit site uses
+    // nextMonotonicTurnCompleteAt). A completion without one is malformed; fabricating a
+    // client Date.now() would inject a timestamp that can collide with or regress against
+    // the server clock — swallowing a real later completion or spuriously greening. Drop it.
+    const store = makeStore()
+    store.dispatch(setSessionStatus({ sessionId: SESSION_ID, sessionType: 'freshopencode', provider: 'opencode', status: 'idle' }))
+
+    const handled = handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: SESSION_ID,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: { type: 'freshAgent.turn.complete', sessionId: SESSION_ID } as never,
+    })
+    expect(handled).toBe(true)
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+
+    // A non-finite at (e.g. NaN from a bad parse) is likewise dropped.
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: SESSION_ID,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: { type: 'freshAgent.turn.complete', sessionId: SESSION_ID, at: Number.NaN } as never,
+    })
+    expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+  })
+
   it('ignores a completion for a session that owns no live pane', () => {
     const store = makeStore()
     const handled = handleFreshAgentMessage(store.dispatch, {
