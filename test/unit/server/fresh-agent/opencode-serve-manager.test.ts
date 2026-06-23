@@ -58,6 +58,26 @@ describe('OpencodeServeManager lifecycle', () => {
     expect(fetchFn).toHaveBeenCalledWith('http://127.0.0.1:47999/global/health', expect.anything())
   })
 
+  it('honors the OPENCODE_CMD env var to override the serve binary (parity with CODEX_CMD/CLAUDE_CMD)', async () => {
+    const { manager, spawnFn } = makeManager({ env: { OPENCODE_CMD: '/custom/opencode-bin' } })
+    await manager.ensureStarted()
+    expect(spawnFn).toHaveBeenCalledWith(
+      '/custom/opencode-bin',
+      ['serve', '--hostname', '127.0.0.1', '--port', '47999'],
+      expect.objectContaining({ env: expect.objectContaining({ FRESHELL_OPENCODE_SIDECAR_ID: expect.any(String) }) }),
+    )
+  })
+
+  it('falls back to the default opencode command when OPENCODE_CMD is unset', async () => {
+    const { manager, spawnFn } = makeManager({ env: {} })
+    await manager.ensureStarted()
+    expect(spawnFn).toHaveBeenCalledWith(
+      'opencode',
+      ['serve', '--hostname', '127.0.0.1', '--port', '47999'],
+      expect.objectContaining({ env: expect.objectContaining({ FRESHELL_OPENCODE_SIDECAR_ID: expect.any(String) }) }),
+    )
+  })
+
   it('routes the requested session directory without changing the serve process cwd', async () => {
     const calls: Array<{ url: string; init: any }> = []
     const fetchFn = vi.fn(async (url: string, init: any) => {

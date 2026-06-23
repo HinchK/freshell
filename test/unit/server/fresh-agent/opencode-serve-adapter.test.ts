@@ -420,6 +420,35 @@ describe('OpenCode serve adapter: create + send', () => {
     )
   })
 
+  it('treats a session absent from the status map as idle (no malformed warning)', async () => {
+    loggerMocks.logger.warn.mockClear()
+    const manager = makeFakeManager()
+    // The opencode /session/status map only reports active (busy/retry) sessions;
+    // an idle session is absent (undefined). This must NOT be treated as malformed
+    // (it matches the serve manager's onceIdle semantics).
+    manager.getSessionStatus = vi.fn(async () => undefined)
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionId: 'ses_idle_absent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_idle_absent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'idle' })
+    expect(manager.getSessionStatus).toHaveBeenCalledWith('ses_idle_absent', { cwd: '/repo/safe' })
+    expect(loggerMocks.logger.warn).not.toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'malformed_session_status' }),
+      expect.any(String),
+    )
+  })
+
   it('keeps recovered sessions idle and warns when getSessionStatus is missing', async () => {
     loggerMocks.logger.warn.mockClear()
     const manager = makeFakeManager()

@@ -158,7 +158,11 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
     }
     try {
       const status = await getSessionStatus.call(serveManager, realId, cwdRoute(state.cwd) ?? {})
-      if (!status || typeof status !== 'object' || Array.isArray(status) || typeof status.type !== 'string') {
+      // The opencode /session/status map only reports active (busy/retry) sessions,
+      // so an idle session is absent (undefined). Treat a missing entry as idle —
+      // matching the serve manager's onceIdle semantics — rather than malformed.
+      if (status == null) return
+      if (typeof status !== 'object' || Array.isArray(status) || typeof status.type !== 'string') {
         log.warn({
           ...logContext,
           reason: 'malformed_session_status',

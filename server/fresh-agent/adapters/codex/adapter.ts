@@ -65,6 +65,7 @@ type CodexRuntimePort = {
   interruptTurn?: (input: CodexTurnInterruptParams) => Promise<void>
   shutdown?: () => Promise<void>
   onThreadLifecycle?: (handler: (event: CodexThreadLifecycleEvent) => void) => () => void
+  onTurnCompleted?: (handler: (event: { threadId: string; turnId?: string; params: Record<string, unknown> }) => void) => () => void
   readThread: (input: { threadId: string; includeTurns?: boolean }) => Promise<Record<string, any>>
   listThreadTurns: (input: {
     threadId: string
@@ -867,7 +868,7 @@ export function createCodexFreshAgentAdapter(deps: {
       if (!runtime.onThreadLifecycle) {
         throw new Error('Codex app-server runtime does not support thread lifecycle subscriptions.')
       }
-      return runtime.onThreadLifecycle((event) => {
+      const offLifecycle = runtime.onThreadLifecycle((event) => {
         if (event.kind === 'thread_started') {
           if (event.thread.id !== sessionId) return
           listener(makeCodexStatusEvent(sessionId, event.thread.status, event.thread.updatedAt))
@@ -891,6 +892,20 @@ export function createCodexFreshAgentAdapter(deps: {
         }
         listener(makeCodexStatusEvent(sessionId, event.status))
       })
+      // thread_status_changed(idle) can fire BEFORE the completed assistant turn
+      // is committed to the app-server's thread history, leaving the client with
+      // an empty transcript. onTurnCompleted fires after the turn is committed, so
+      // emit another snapshot-invalidating event here to make the client re-fetch
+      // the committed transcript (parity with freshopencode's post-idle emit).
+      const offTurnCompleted = runtime.onTurnCompleted?.((event) => {
+        if (event.threadId !== sessionId) return
+        activeTurnByThread.delete(sessionId)
+        listener(makeCodexStatusEvent(sessionId, 'idle'))
+      })
+      return () => {
+        offLifecycle()
+        offTurnCompleted?.()
+      }
     },
 
     async send(sessionId, input) {
