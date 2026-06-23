@@ -18,6 +18,7 @@ import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '
 import { clearPendingCreateFailure } from '@/store/freshAgentSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
+import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import {
   normalizeFreshAgentEffort,
   normalizeFreshAgentModel,
@@ -55,6 +56,15 @@ import { FreshAgentSidebar } from './FreshAgentSidebar'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
+const SNAPSHOT_REFRESH_COALESCE_MS = 50
+const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
+  'freshAgent.session.changed',
+  'freshAgent.session.snapshot',
+  'freshAgent.result',
+  'freshAgent.permission.request',
+  'freshAgent.permission.cancelled',
+  'freshAgent.question.request',
+])
 const log = createLogger('FreshAgentView')
 
 function getSnapshotIdentity(snapshot: FreshAgentSnapshot): string | null {
@@ -97,7 +107,6 @@ function localEchoLanded(
     return turns.some((turn) => (
       turn.role === 'user'
       && getFreshAgentDisplayTurnKey(turn) === submittedTurnId
-      && freshAgentTurnText(turn).includes(needle)
     ))
   }
   if (pending && !pending.legacyAccepted) return false
@@ -109,6 +118,17 @@ function localEchoLanded(
 
 function isSnapshotInFlight(snapshot: FreshAgentSnapshot): boolean {
   return snapshot.status === 'running' || snapshot.status === 'compacting'
+}
+
+function shouldClearStaleLocalEcho(
+  snapshot: FreshAgentSnapshot,
+  echo: LocalEcho,
+  pending?: PendingSendMetadata,
+): boolean {
+  if (isSnapshotInFlight(snapshot)) return false
+  const accepted = Boolean(echo.submittedTurnId || pending?.submittedTurnId || pending?.legacyAccepted)
+  if (!accepted) return false
+  return !localEchoLanded(snapshot.turns, echo, pending)
 }
 
 function mergeSnapshotForDisplay(
@@ -248,6 +268,18 @@ function persistDurableFreshAgentFlavor(message: {
   })
 }
 
+function buildFreshAgentAttachMessage(content: FreshAgentPaneContent, cwd?: string) {
+  return {
+    type: 'freshAgent.attach',
+    sessionId: content.sessionId,
+    sessionType: content.sessionType,
+    provider: content.provider,
+    ...(content.resumeSessionId ? { resumeSessionId: content.resumeSessionId } : {}),
+    ...(content.sessionRef ? { sessionRef: content.sessionRef } : {}),
+    ...(cwd ? { cwd } : {}),
+  } as const
+}
+
 function buildLegacyRestoreContext(tab: { title?: string; createdAt?: number; updatedAt?: number } | undefined) {
   if (!tab) return undefined
   const title = typeof tab.title === 'string' && tab.title.trim().length > 0
@@ -318,6 +350,50 @@ function getRestoreErrorMessage(reason: RestoreErrorReason): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function readMessageEventType(message: Record<string, unknown>): string | undefined {
+  const event = isRecord(message.event) ? message.event : undefined
+  return typeof event?.type === 'string' ? event.type : undefined
+}
+
+function isSnapshotInvalidatingFreshAgentEvent(message: Record<string, unknown>): boolean {
+  if (message.type !== 'freshAgent.event') return false
+  const eventType = readMessageEventType(message)
+  return Boolean(eventType && SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS.has(eventType))
+}
+
+function locatorMatchesPane(
+  message: Record<string, unknown>,
+  content: FreshAgentPaneContent,
+  knownCwd?: string,
+): boolean {
+  if (typeof message.sessionType === 'string' && message.sessionType !== content.sessionType) return false
+  if (typeof message.provider === 'string' && message.provider !== content.provider) return false
+
+  const event = isRecord(message.event) ? message.event : undefined
+  const locatorSessionId = typeof message.sessionId === 'string'
+    ? message.sessionId
+    : (typeof event?.sessionId === 'string' ? event.sessionId : undefined)
+  if (locatorSessionId) {
+    const validSessionIds = new Set<string>()
+    if (content.sessionId) validSessionIds.add(content.sessionId)
+    if (content.resumeSessionId) validSessionIds.add(content.resumeSessionId)
+    if (content.sessionRef?.provider === content.provider) validSessionIds.add(content.sessionRef.sessionId)
+    if (!validSessionIds.has(locatorSessionId)) return false
+  }
+
+  const locatorCwd = typeof message.cwd === 'string'
+    ? message.cwd
+    : (typeof event?.cwd === 'string' ? event.cwd : undefined)
+  if (locatorCwd) {
+    const validCwds = new Set<string>()
+    if (content.initialCwd) validCwds.add(content.initialCwd)
+    if (knownCwd) validCwds.add(knownCwd)
+    if (!validCwds.has(locatorCwd)) return false
+  }
+
+  return true
 }
 
 function readCodexReview(value: unknown): { id?: string; status?: string } | undefined {
@@ -472,6 +548,9 @@ export function FreshAgentView({
     })
     return state.freshAgent.sessions[sessionKey]
   })
+  const freshOpenCodeRouteCwd = getFreshOpenCodeRouteCwd(paneContent, { sessionCwd: agentSession?.cwd })
+  const freshOpenCodeRouteCwdRef = useRef(freshOpenCodeRouteCwd)
+  freshOpenCodeRouteCwdRef.current = freshOpenCodeRouteCwd
   const refreshRequest = useAppSelector((state) => state.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
   const activeTabId = useAppSelector((state) => state.tabs.activeTabId)
   const activePaneId = useAppSelector((state) => state.panes.activePane[tabId])
@@ -484,6 +563,7 @@ export function FreshAgentView({
   }, [])
   const [loadError, setLoadError] = useState<string | null>(null)
   const [snapshotRefreshNonce, setSnapshotRefreshNonce] = useState(0)
+  const snapshotRefreshTimerRef = useRef<number | null>(null)
   const [queuedMessages, setQueuedMessages] = useState<string[]>([])
   // Transient, self-clearing banner for action feedback (rewind, shell errors).
   const [notice, setNotice] = useState<string | null>(null)
@@ -621,6 +701,21 @@ export function FreshAgentView({
     ws.send(message as never)
   }, [paneId, ws])
 
+  const scheduleSnapshotRefresh = useCallback(() => {
+    if (snapshotRefreshTimerRef.current !== null) return
+    snapshotRefreshTimerRef.current = window.setTimeout(() => {
+      snapshotRefreshTimerRef.current = null
+      setSnapshotRefreshNonce((value) => value + 1)
+    }, SNAPSHOT_REFRESH_COALESCE_MS)
+  }, [])
+
+  useEffect(() => () => {
+    if (snapshotRefreshTimerRef.current !== null) {
+      window.clearTimeout(snapshotRefreshTimerRef.current)
+      snapshotRefreshTimerRef.current = null
+    }
+  }, [])
+
   const recordPendingSendMetadata = useCallback((requestId: string, patch: PendingSendMetadata) => {
     const current = pendingSendMetadataRef.current.get(requestId) ?? {}
     const next: PendingSendMetadata = { ...current, ...patch }
@@ -754,11 +849,13 @@ export function FreshAgentView({
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current
     if (current.sessionId) {
+      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
       sendFreshAgentMessage({
         type: 'freshAgent.kill',
         sessionId: current.sessionId,
         sessionType: current.sessionType,
         provider: current.provider,
+        ...(cwd ? { cwd } : {}),
       })
     }
     commitSnapshot(null)
@@ -787,6 +884,7 @@ export function FreshAgentView({
   const sendFork = useCallback((atTurnId?: string) => {
     const current = paneContentRef.current
     if (!current.sessionId) return
+    const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     // The freshAgent.forked broadcast is matched on createRequestId +
     // parentSessionId by the listener below, which repoints this pane at
     // the forked session. atTurnId is best-effort: providers that can't
@@ -797,6 +895,7 @@ export function FreshAgentView({
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
+      ...(cwd ? { cwd } : {}),
       ...(atTurnId ? { input: { atTurnId } } : {}),
     })
   }, [sendFreshAgentMessage])
@@ -809,11 +908,13 @@ export function FreshAgentView({
     }
     if (command.action === 'compact') {
       if (!current.sessionId) return
+      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
       sendFreshAgentMessage({
         type: 'freshAgent.compact',
         sessionId: current.sessionId,
         sessionType: current.sessionType,
         provider: current.provider,
+        ...(cwd ? { cwd } : {}),
         ...(args ? { instructions: args } : {}),
       })
       return
@@ -834,14 +935,8 @@ export function FreshAgentView({
     setLoadError(null)
 
     if (current.sessionId) {
-      sendFreshAgentMessage({
-        type: 'freshAgent.attach',
-        sessionId: current.sessionId,
-        sessionType: current.sessionType,
-        provider: current.provider,
-        resumeSessionId: current.resumeSessionId,
-        cwd: current.initialCwd,
-      })
+      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+      sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
       setSnapshotRefreshNonce((value) => value + 1)
     } else if (!hidden && (current.status === 'creating' || current.status === 'starting')) {
       createSentRef.current = true
@@ -850,6 +945,7 @@ export function FreshAgentView({
         provider: current.provider,
         resumeSessionId: current.resumeSessionId,
         sessionRef: current.sessionRef,
+        cwd: current.initialCwd,
       })
       sendFreshAgentMessage(buildCreateMessage(current))
     }
@@ -915,6 +1011,7 @@ export function FreshAgentView({
       provider: paneContent.provider,
       resumeSessionId: paneContent.resumeSessionId,
       sessionRef: paneContent.sessionRef,
+      cwd: paneContent.initialCwd,
     })
     sendFreshAgentMessage(buildCreateMessage(paneContent))
   }, [
@@ -947,15 +1044,30 @@ export function FreshAgentView({
 
   useEffect(() => {
     if (!paneContent.sessionId || hidden) return
-    sendFreshAgentMessage({
-      type: 'freshAgent.attach',
-      sessionId: paneContent.sessionId,
-      sessionType: paneContent.sessionType,
-      provider: paneContent.provider,
-      resumeSessionId: paneContent.resumeSessionId,
-      cwd: paneContent.initialCwd,
+    sendFreshAgentMessage(buildFreshAgentAttachMessage(paneContent, freshOpenCodeRouteCwd))
+  }, [
+    freshOpenCodeRouteCwd,
+    hidden,
+    paneContent.provider,
+    paneContent.resumeSessionId,
+    paneContent.sessionId,
+    paneContent.sessionRef?.provider,
+    paneContent.sessionRef?.sessionId,
+    paneContent.sessionType,
+    sendFreshAgentMessage,
+  ])
+
+  useEffect(() => {
+    if (hidden || !paneContent.sessionId) return
+    if (typeof ws.onReconnect !== 'function') return
+    return ws.onReconnect(() => {
+      const current = paneContentRef.current
+      if (!current.sessionId) return
+      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+      sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
+      scheduleSnapshotRefresh()
     })
-  }, [hidden, paneContent.initialCwd, paneContent.provider, paneContent.resumeSessionId, paneContent.sessionId, paneContent.sessionType])
+  }, [hidden, paneContent.sessionId, scheduleSnapshotRefresh, sendFreshAgentMessage, ws])
 
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
@@ -1027,27 +1139,31 @@ export function FreshAgentView({
         message.type === 'freshAgent.send.accepted'
         && typeof message.requestId === 'string'
       ) {
+        const current = paneContentRef.current
+        const echo = localEchoRef.current
+        const ownsRequest = pendingSendMetadataRef.current.has(message.requestId)
+          || echo?.requestId === message.requestId
+        if (!ownsRequest || !locatorMatchesPane(message, current, freshOpenCodeRouteCwdRef.current)) {
+          return
+        }
         const submittedTurnId = typeof message.submittedTurnId === 'string'
           ? message.submittedTurnId
           : undefined
         if (submittedTurnId) {
           recordPendingSendMetadata(message.requestId, { submittedTurnId })
-          const echo = localEchoRef.current
           if (echo?.requestId === message.requestId) {
             setLocalEcho({ ...echo, submittedTurnId })
           }
         } else {
           recordPendingSendMetadata(message.requestId, { legacyAccepted: true })
         }
-        setSnapshotRefreshNonce((value) => value + 1)
+        scheduleSnapshotRefresh()
       }
       if (
-        message.type === 'freshAgent.event'
-        && message.sessionId === paneContent.sessionId
-        && message.sessionType === paneContent.sessionType
-        && message.provider === paneContent.provider
+        isSnapshotInvalidatingFreshAgentEvent(message)
+        && locatorMatchesPane(message, paneContentRef.current, freshOpenCodeRouteCwdRef.current)
       ) {
-        setSnapshotRefreshNonce((value) => value + 1)
+        scheduleSnapshotRefresh()
       }
       if (
         message.type === 'freshAgent.forked'
@@ -1058,11 +1174,13 @@ export function FreshAgentView({
         && typeof message.sessionId === 'string'
       ) {
         if (message.sessionId !== paneContent.sessionId) {
+          const cwd = getFreshOpenCodeRouteCwd(paneContent, { sessionCwd: agentSession?.cwd })
           sendFreshAgentMessage({
             type: 'freshAgent.kill',
             sessionId: paneContent.sessionId,
             sessionType: paneContent.sessionType,
             provider: paneContent.provider,
+            ...(cwd ? { cwd } : {}),
           })
         }
         commitSnapshot(null)
@@ -1086,7 +1204,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, sendFreshAgentMessage, tabId, ws])
+  }, [agentSession?.cwd, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, scheduleSnapshotRefresh, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -1121,14 +1239,19 @@ export function FreshAgentView({
           autoTitleSentRef.current = true
         }
         const displaySnapshot = mergeSnapshotForDisplay(snapshotRef.current, resolved)
+        const snapshotAccepted = displaySnapshot !== snapshotRef.current
         commitSnapshot(displaySnapshot)
         setSnapshotAutoTitleIdentity(snapshotIdentity)
         const echo = localEchoRef.current
+        const echoPendingMetadata = echo ? pendingSendMetadataRef.current.get(echo.requestId) : undefined
         const landedEcho = echo
-          ? localEchoLanded(displaySnapshot.turns, echo, pendingSendMetadataRef.current.get(echo.requestId))
+          ? localEchoLanded(displaySnapshot.turns, echo, echoPendingMetadata)
+          : false
+        const staleEcho = echo
+          ? snapshotAccepted && shouldClearStaleLocalEcho(displaySnapshot, echo, echoPendingMetadata)
           : false
         if (echo) {
-          if (landedEcho) setLocalEcho(null)
+          if (landedEcho || staleEcho) setLocalEcho(null)
         }
         const fresh = paneContentRef.current
         const nextStatus = (resolved.status as FreshAgentPaneContent['status']) ?? fresh.status
@@ -1159,7 +1282,7 @@ export function FreshAgentView({
             sessionRef: nextSessionRef,
             status: nextStatus,
             resumeSessionId: nextResumeSessionId,
-            pendingLocalEcho: landedEcho ? undefined : fresh.pendingLocalEcho,
+            pendingLocalEcho: landedEcho || staleEcho ? undefined : fresh.pendingLocalEcho,
           },
         }))
       })
@@ -1374,6 +1497,7 @@ export function FreshAgentView({
     const current = paneContentRef.current
     if (!current.sessionId) return
     const requestId = nanoid()
+    const routeCwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     recordPendingSendMetadata(requestId, {})
     // Checkpoint the working tree before the agent acts on this message, so
     // "rewind code to here" on this turn restores the pre-turn state. Fire and
@@ -1417,6 +1541,7 @@ export function FreshAgentView({
       sessionId: current.sessionId,
       sessionType: current.sessionType,
       provider: current.provider,
+      ...(routeCwd ? { cwd: routeCwd } : {}),
       text,
       settings: {
         ...(current.initialCwd ? { cwd: current.initialCwd } : {}),
@@ -1456,6 +1581,7 @@ export function FreshAgentView({
     if (!pendingApprovalsFromSnapshot || pendingApprovalsFromSnapshot.length === 0) return
     const current = paneContentRef.current
     if (!current.sessionId) return
+    const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     for (const approval of pendingApprovalsFromSnapshot) {
       if (approval.toolName && alwaysAllowToolsRef.current.has(approval.toolName)) {
         sendFreshAgentMessage({
@@ -1463,6 +1589,7 @@ export function FreshAgentView({
           sessionId: current.sessionId,
           sessionType: current.sessionType,
           provider: current.provider,
+          ...(cwd ? { cwd } : {}),
           requestId: approval.requestId,
           decision: { behavior: 'allow', updatedInput: {} },
         })
@@ -1580,6 +1707,7 @@ export function FreshAgentView({
         sessionId: paneContent.sessionId,
         sessionType: paneContent.sessionType,
         provider: paneContent.provider,
+        ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
       })
     }
     const respondToApproval = (requestId: string | number, allow: boolean) => {
@@ -1590,6 +1718,7 @@ export function FreshAgentView({
         sessionId: paneContent.sessionId,
         sessionType: paneContent.sessionType,
         provider: paneContent.provider,
+        ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
         requestId,
         decision: allow
           ? { behavior: 'allow', updatedInput: {} }
@@ -1712,6 +1841,7 @@ export function FreshAgentView({
                       sessionId: paneContent.sessionId,
                       sessionType: paneContent.sessionType,
                       provider: paneContent.provider,
+                      ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
                       requestId: question.requestId,
                       answers,
                     })

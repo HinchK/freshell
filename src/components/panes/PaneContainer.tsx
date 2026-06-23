@@ -43,6 +43,7 @@ import {
 } from '@/store/freshAgentSlice'
 import { DEFAULT_FRESH_AGENT_STYLE } from '@shared/settings'
 import { cancelCreate } from '@/lib/create-cancellation'
+import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
 import type { ProjectGroup, CodingCliSession } from '@/store/types'
@@ -290,11 +291,13 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       const pendingSessionId = pendingCreate?.sessionId
       const sessionId = content.sessionId || pendingSessionId
       if (sessionId) {
+        const cwd = getFreshOpenCodeRouteCwd(content, { freshAgentSessions, sessionId })
         ws.send({
           type: 'freshAgent.kill',
           sessionId,
           sessionType: content.sessionType,
           provider: content.provider,
+          ...(cwd ? { cwd } : {}),
         })
       } else {
         cancelCreate(content.createRequestId)
@@ -312,7 +315,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Extension panes: V1 leaves server extensions running until freshell shutdown.
     // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
-  }, [dispatch, freshAgentPendingCreates, tabId, ws])
+  }, [dispatch, freshAgentPendingCreates, freshAgentSessions, tabId, ws])
 
   const handleFocus = useCallback((paneId: string) => {
     // Decision 1: visiting any pane of the tab (a click into it) dismisses the

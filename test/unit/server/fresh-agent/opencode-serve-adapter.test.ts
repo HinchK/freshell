@@ -5,10 +5,24 @@ const observabilityMocks = vi.hoisted(() => ({
   recordFreshAgentObservabilityEvent: vi.fn(),
 }))
 
+const loggerMocks = vi.hoisted(() => {
+  const logger = {
+    child: vi.fn(),
+    warn: vi.fn(),
+    info: vi.fn(),
+    debug: vi.fn(),
+    error: vi.fn(),
+  }
+  logger.child.mockReturnValue(logger)
+  return { logger }
+})
+
 vi.mock('../../../../server/fresh-agent/observability.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../../server/fresh-agent/observability.js')>()
   return { ...actual, recordFreshAgentObservabilityEvent: observabilityMocks.recordFreshAgentObservabilityEvent }
 })
+
+vi.mock('../../../../server/logger.js', () => ({ logger: loggerMocks.logger }))
 
 import { createOpencodeFreshAgentAdapter } from '../../../../server/fresh-agent/adapters/opencode/adapter.js'
 
@@ -40,7 +54,13 @@ function makeFakeManager() {
     promptAsync: vi.fn(async () => undefined),
     listMessages: vi.fn(async () => ({ messages: [], nextCursor: null })),
     getMessage: vi.fn(async () => null),
-    getSession: vi.fn(async () => ({ id: 'ses_real_1', title: 'T', time: { updated: 5 } })),
+    getSession: vi.fn(async (id: string, route?: { cwd?: string }) => ({
+      id,
+      ...(route?.cwd ? { directory: route.cwd } : {}),
+      title: 'T',
+      time: { updated: 5 },
+    })),
+    getSessionStatus: vi.fn(async () => undefined),
     abort: vi.fn(async () => undefined),
     compact: vi.fn(async () => undefined),
     fork: vi.fn(async (): Promise<{ id: string; directory?: string }> => ({ id: 'ses_child_1' })),
@@ -60,6 +80,7 @@ function makeAdapter(manager: FakeManager, overrides: Partial<Parameters<typeof 
   return createOpencodeFreshAgentAdapter({
     serveManager: manager as any,
     validateCwd: async () => undefined,
+    canonicalizePath: async (value: string) => value,
     ...overrides,
   })
 }
@@ -222,6 +243,7 @@ describe('OpenCode serve adapter: create + send', () => {
     })
     await adapter.send?.('ses_attached_send', { text: 'continue' })
 
+    expect(manager.getSession).toHaveBeenCalledWith('ses_attached_send', { cwd: '/repo/restored-worktree' })
     expect(manager.promptAsync).toHaveBeenCalledWith(
       'ses_attached_send',
       { parts: [{ type: 'text', text: 'continue' }] },
@@ -229,21 +251,247 @@ describe('OpenCode serve adapter: create + send', () => {
     )
   })
 
-  it('keeps attached no-cwd sessions sendable without a route argument', async () => {
+  it('does not validate a placeholder attach before first materialization', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    await adapter.create({ requestId: 'placeholder-attach', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo/placeholder' })
+    await expect(adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'freshopencode-placeholder-attach',
+      cwd: '/repo/placeholder',
+    })).resolves.toEqual({
+      sessionId: 'freshopencode-placeholder-attach',
+      sessionRef: { provider: 'opencode', sessionId: 'freshopencode-placeholder-attach' },
+    })
+    expect(manager.getSession).not.toHaveBeenCalled()
+
+    await adapter.send?.('freshopencode-placeholder-attach', { text: 'materialize' })
+    expect(manager.createSession).toHaveBeenCalledWith({ directory: '/repo/placeholder' })
+  })
+
+  it('keeps no-cwd recovered durable sessions readable but not sendable', async () => {
+    const manager = makeFakeManager()
+    manager.getSession.mockResolvedValueOnce({
+      id: 'ses_no_cwd',
+      time: { updated: 10 },
+    })
+    manager.listMessages.mockResolvedValueOnce({ messages: [], nextCursor: null })
+    const adapter = makeAdapter(manager)
+
+    await expect(adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_no_cwd',
+    })).resolves.toEqual({
+      sessionId: 'ses_no_cwd',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_no_cwd' },
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_no_cwd',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })).resolves.toEqual(expect.objectContaining({ threadId: 'ses_no_cwd' }))
+
+    await expect(adapter.send?.('ses_no_cwd', { text: 'must not send' })).rejects.toThrow(/cwd/i)
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+  })
+
+  it('validates a recovered durable session directory before mutating it', async () => {
+    const manager = makeFakeManager()
+    manager.getSession.mockResolvedValueOnce({
+      id: 'ses_recovered',
+      directory: '/repo/safe',
+      time: { updated: 10 },
+    })
+    const adapter = makeAdapter(manager, { canonicalizePath: async (value: string) => value } as any)
+
+    await expect(adapter.attach?.({
+      sessionId: 'ses_recovered',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toEqual({
+      sessionId: 'ses_recovered',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_recovered' },
+    })
+
+    await adapter.send?.('ses_recovered', { text: 'continue' })
+    expect(manager.getSession).toHaveBeenCalledWith('ses_recovered', { cwd: '/repo/safe' })
+    expect(manager.promptAsync).toHaveBeenCalledWith(
+      'ses_recovered',
+      expect.objectContaining({ parts: [{ type: 'text', text: 'continue' }] }),
+      { cwd: '/repo/safe' },
+    )
+  })
+
+  it('rejects recovered durable session attach when OpenCode reports a different directory', async () => {
+    const manager = makeFakeManager()
+    manager.getSession.mockResolvedValueOnce({
+      id: 'ses_wrong',
+      directory: '/repo/other',
+      time: { updated: 10 },
+    })
+    const adapter = makeAdapter(manager, { canonicalizePath: async (value: string) => value } as any)
+
+    await expect(adapter.attach?.({
+      sessionId: 'ses_wrong',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).rejects.toThrow(/belongs to|directory/i)
+    expect(manager.promptAsync).not.toHaveBeenCalled()
+  })
+
+  it('rejects kill for no-cwd recovered durable sessions', async () => {
     const manager = makeFakeManager()
     const adapter = makeAdapter(manager)
 
     await adapter.attach?.({
+      sessionId: 'ses_kill_no_cwd',
       sessionType: 'freshopencode',
       provider: 'opencode',
-      sessionId: 'ses_attached_nocwd',
     })
-    await adapter.send?.('ses_attached_nocwd', { text: 'continue' })
 
-    expect(manager.promptAsync).toHaveBeenCalledWith(
-      'ses_attached_nocwd',
-      { parts: [{ type: 'text', text: 'continue' }] },
+    await expect(adapter.kill?.('ses_kill_no_cwd')).rejects.toThrow(/cwd/i)
+  })
+
+  it('marks recovered durable sessions running only when OpenCode status is busy or retry', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'busy' }))
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionId: 'ses_busy',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+    const snapshot = await adapter.getSnapshot?.({
+      threadId: 'ses_busy',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    }) as any
+
+    expect(snapshot.status).toBe('running')
+    expect(manager.getSessionStatus).toHaveBeenCalledWith('ses_busy', { cwd: '/repo/safe' })
+  })
+
+  it('resets an existing attached session back to idle when status reconciliation is malformed', async () => {
+    loggerMocks.logger.warn.mockClear()
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn()
+      .mockResolvedValueOnce({ type: 'busy' })
+      .mockResolvedValueOnce({ nope: 'bad' })
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionId: 'ses_cached',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_cached',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'running' })
+
+    await adapter.attach?.({
+      sessionId: 'ses_cached',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_cached',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'idle' })
+    expect(loggerMocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'malformed_session_status' }),
+      'opencode status reconciliation received malformed status',
     )
+  })
+
+  it('keeps recovered sessions idle and warns when getSessionStatus is missing', async () => {
+    loggerMocks.logger.warn.mockClear()
+    const manager = makeFakeManager()
+    delete (manager as Partial<FakeManager>).getSessionStatus
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionId: 'ses_no_helper',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_no_helper',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'idle' })
+    expect(loggerMocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'missing_get_session_status' }),
+      'opencode status reconciliation skipped',
+    )
+  })
+
+  it('keeps resumed sessions idle when getSessionStatus throws and still does not fail resume', async () => {
+    loggerMocks.logger.warn.mockClear()
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => { throw new Error('status failed') })
+    const adapter = makeAdapter(manager)
+
+    await expect(adapter.resume?.({
+      resumeSessionId: 'ses_resume_throw',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toEqual({
+      sessionId: 'ses_resume_throw',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_resume_throw' },
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_resume_throw',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'idle' })
+    expect(loggerMocks.logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'get_session_status_failed' }),
+      'opencode status reconciliation failed',
+    )
+  })
+
+  it('marks resumed durable sessions running when OpenCode reports retry', async () => {
+    const manager = makeFakeManager()
+    manager.getSessionStatus = vi.fn(async () => ({ type: 'retry' }))
+    const adapter = makeAdapter(manager)
+
+    await adapter.resume?.({
+      resumeSessionId: 'ses_resume_retry',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })
+
+    await expect(adapter.getSnapshot?.({
+      threadId: 'ses_resume_retry',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/safe',
+    })).resolves.toMatchObject({ status: 'running' })
+    expect(manager.getSessionStatus).toHaveBeenCalledWith('ses_resume_retry', { cwd: '/repo/safe' })
   })
 
   it('recovers from a failed send and still processes later sends', async () => {
@@ -362,7 +610,7 @@ describe('OpenCode serve adapter: history reads', () => {
 
   it('getSnapshot assembles HTTP messages into the normalized transcript', async () => {
     const manager = makeFakeManager()
-    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', title: 'Kimi chat', time: { updated: 12 } }))
+    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', directory: '/repo/history', title: 'Kimi chat', time: { updated: 12 } }))
     manager.listMessages = vi.fn(async () => ({ messages, nextCursor: null }))
     const adapter = makeAdapter(manager)
     await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
@@ -417,7 +665,7 @@ describe('OpenCode serve adapter: history reads', () => {
 
   it('reports fork capability true and approvals/questions false', async () => {
     const manager = makeFakeManager()
-    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', time: { updated: 1 } }))
+    manager.getSession = vi.fn(async () => ({ id: 'ses_real_1', directory: '/repo/history', time: { updated: 1 } }))
     manager.listMessages = vi.fn(async () => ({ messages: [], nextCursor: null }))
     const adapter = makeAdapter(manager)
     await adapter.attach?.({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_real_1', cwd: '/repo/history' })
@@ -439,6 +687,27 @@ describe('OpenCode serve adapter: control', () => {
     const { manager, adapter } = await materialized()
     await adapter.interrupt?.('freshopencode-req-c')
     expect(manager.abort).toHaveBeenCalledWith('ses_real_1')
+  })
+
+  it('rejects interrupt for no-cwd recovered durable sessions', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+
+    await adapter.attach?.({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: 'ses_interrupt_no_cwd',
+    })
+
+    await expect(adapter.interrupt?.('ses_interrupt_no_cwd')).rejects.toThrow(/cwd/i)
+    expect(manager.abort).not.toHaveBeenCalled()
+  })
+
+  it('rejects interrupt when OpenCode abort fails', async () => {
+    const { manager, adapter } = await materialized()
+    manager.abort.mockRejectedValueOnce(new Error('abort failed upstream'))
+
+    await expect(adapter.interrupt?.('freshopencode-req-c')).rejects.toThrow('abort failed upstream')
   })
 
   it('compact calls the dedicated compact endpoint', async () => {
@@ -483,6 +752,7 @@ describe('OpenCode serve adapter: control', () => {
     })
     await adapter.send?.('ses_child_1', { text: 'child continue' })
 
+    expect(manager.getSession).toHaveBeenCalledWith('ses_known_cwd', { cwd: '/repo/control' })
     expect(manager.abort).toHaveBeenCalledWith('ses_known_cwd', { cwd: '/repo/control' })
     expect(manager.compact).toHaveBeenCalledWith('ses_known_cwd', { instructions: 'trim' }, { cwd: '/repo/control' })
     expect(manager.fork).toHaveBeenCalledWith('ses_known_cwd', { cwd: '/repo/control' })

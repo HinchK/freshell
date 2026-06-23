@@ -20,6 +20,7 @@ const CLAUDE_RESTORE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440001'
 const wsMock = vi.hoisted(() => ({
   send: vi.fn(),
   onMessage: vi.fn(() => () => {}),
+  onReconnect: vi.fn(() => () => {}),
 }))
 
 const apiMock = vi.hoisted(() => ({
@@ -183,7 +184,9 @@ function freshopencodeSnapshot(text: string, revision: number) {
 beforeEach(() => {
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
+  wsMock.onReconnect.mockReset()
   wsMock.onMessage.mockImplementation(() => () => {})
+  wsMock.onReconnect.mockImplementation(() => () => {})
   window.sessionStorage.clear()
   window.localStorage.removeItem('fresh-agent-prompt-history:freshcodex')
   window.localStorage.removeItem('fresh-agent-prompt-history:freshclaude')
@@ -326,6 +329,73 @@ describe('FreshAgentView', () => {
       provider: 'claude',
       requestId: 'question-1',
       answers: { 'How should Claude proceed?': 'Continue' },
+    })
+  })
+
+  it('routes FreshOpenCode approval and question responses through the pane cwd', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'running',
+      summary: 'OpenCode summary',
+      capabilities: { send: true, interrupt: true, approvals: true, questions: true, fork: true },
+      pendingApprovals: [{
+        requestId: 'approval-route',
+        toolName: 'Bash',
+        input: { command: 'pwd' },
+      }],
+      pendingQuestions: [{
+        requestId: 'question-route',
+        questions: [{
+          header: 'Next step',
+          question: 'Continue?',
+          options: [{ label: 'Yes', description: 'Proceed' }],
+          multiSelect: false,
+        }],
+      }],
+      turns: [],
+    })
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-route-responses',
+            sessionId: 'ses_route_responses',
+            initialCwd: '/repo/route-aware',
+            status: 'running',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert', { name: /permission request for bash/i })).toBeInTheDocument()
+    })
+    fireEvent.click(screen.getByRole('button', { name: /allow tool use/i }))
+    fireEvent.click(screen.getByRole('button', { name: 'Yes' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.approval.respond',
+      sessionId: 'ses_route_responses',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+      requestId: 'approval-route',
+      decision: { behavior: 'allow', updatedInput: {} },
+    })
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.question.respond',
+      sessionId: 'ses_route_responses',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+      requestId: 'question-route',
+      answers: { 'Continue?': 'Yes' },
     })
   })
 
@@ -553,6 +623,43 @@ describe('FreshAgentView', () => {
     )
 
     expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+  })
+
+  it('routes FreshOpenCode interrupt through the pane cwd', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'running',
+      capabilities: { send: false, interrupt: true, fork: true },
+      turns: [],
+    })
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshopencode',
+            provider: 'opencode',
+            createRequestId: 'req-stop-route',
+            sessionId: 'ses_stop_route',
+            initialCwd: '/repo/route-aware',
+            status: 'running',
+          }}
+        />
+      </Provider>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Stop' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.interrupt',
+      sessionId: 'ses_stop_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+    })
   })
 
   it('marks the fresh-agent body with pane and session flavor context metadata', async () => {
@@ -1213,6 +1320,66 @@ describe('FreshAgentView', () => {
     })
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+  })
+
+  it('attaches materialized FreshOpenCode panes with durable route metadata on mount and reconnect', async () => {
+    const store = createStore()
+    let reconnectHandler: (() => void) | undefined
+    wsMock.onReconnect.mockImplementation((handler: () => void) => {
+      reconnectHandler = handler
+      return () => {}
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-attach-route',
+        sessionId: 'ses_attach_route',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_attach_route' },
+        resumeSessionId: 'ses_attach_route',
+        initialCwd: '/repo/route-aware',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(wsMock.send).toHaveBeenCalledWith({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_attach_route',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        resumeSessionId: 'ses_attach_route',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_attach_route' },
+        cwd: '/repo/route-aware',
+      })
+    })
+    expect(reconnectHandler).toBeTypeOf('function')
+
+    wsMock.send.mockClear()
+    act(() => {
+      reconnectHandler?.()
+    })
+
+    await waitFor(() => {
+      expect(wsMock.send).toHaveBeenCalledWith({
+        type: 'freshAgent.attach',
+        sessionId: 'ses_attach_route',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        resumeSessionId: 'ses_attach_route',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_attach_route' },
+        cwd: '/repo/route-aware',
+      })
+    })
   })
 
   it('sends through fresh-agent WS actions with pane settings when available', async () => {
@@ -2946,6 +3113,7 @@ describe('FreshAgentView', () => {
         provider: 'opencode',
         createRequestId: 'req-compact',
         sessionId: 'freshopencode-req-compact',
+        initialCwd: '/repo/route-aware',
         status: 'idle',
       },
     }))
@@ -2969,7 +3137,96 @@ describe('FreshAgentView', () => {
       sessionId: 'freshopencode-req-compact',
       sessionType: 'freshopencode',
       provider: 'opencode',
+      cwd: '/repo/route-aware',
       instructions: 'keep implementation notes',
+    })
+  })
+
+  it('routes FreshOpenCode new-conversation kill through the pane cwd', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-new-route',
+        sessionId: 'ses_new_route',
+        initialCwd: '/repo/route-aware',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled())
+    wsMock.send.mockClear()
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: '/new' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.kill',
+      sessionId: 'ses_new_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+    })
+  })
+
+  it('routes FreshOpenCode forks through the pane cwd', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'OpenCode summary',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [
+        {
+          id: 'turn-route-fork',
+          turnId: 'turn-route-fork',
+          role: 'assistant',
+          summary: 'Ready to fork',
+          items: [{ id: 'item-route-fork', kind: 'text', text: 'Ready to fork' }],
+        },
+      ],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-fork-route',
+        sessionId: 'ses_fork_route',
+        initialCwd: '/repo/route-aware',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Fork conversation from here' }))
+
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.fork',
+      requestId: 'req-fork-route',
+      sessionId: 'ses_fork_route',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/route-aware',
+      input: { atTurnId: 'turn-route-fork' },
     })
   })
 
@@ -3281,6 +3538,7 @@ describe('FreshAgentView', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         resumeSessionId: 'thread-refresh',
+        sessionRef: { provider: 'codex', sessionId: 'thread-refresh' },
       })
     })
     await waitFor(() => {
@@ -3348,6 +3606,473 @@ describe('FreshAgentView', () => {
       sessionId: 'ses_late_change',
       status: 'idle',
     })
+  })
+
+  it('coalesces owned snapshot invalidations and ignores non-owner or non-snapshot events', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_scoped_refresh',
+        status: 'idle',
+        summary: 'initial',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_scoped_refresh',
+        status: 'idle',
+        summary: 'updated',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-scoped-user',
+            turnId: 'turn-scoped-user',
+            role: 'user',
+            summary: 'Refresh this pane',
+            items: [{ id: 'item-scoped-user', kind: 'text', text: 'Refresh this pane' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-scoped-refresh',
+        sessionId: 'ses_scoped_refresh',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_scoped_refresh' },
+        resumeSessionId: 'ses_scoped_refresh',
+        initialCwd: '/repo/scoped-refresh',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Refresh this pane' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
+
+    expect(wsHandler).toBeTypeOf('function')
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId: 'foreign-request',
+        submittedTurnId: 'foreign-turn',
+        sessionId: 'ses_scoped_refresh',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/scoped-refresh',
+      })
+      wsHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        submittedTurnId: 'wrong-route-turn',
+        sessionId: 'ses_scoped_refresh',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/other-pane',
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_scoped_refresh',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.stream',
+          sessionId: 'ses_scoped_refresh',
+          event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'partial' } },
+        },
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_scoped_refresh',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.status',
+          sessionId: 'ses_scoped_refresh',
+          status: 'running',
+        },
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_scoped_refresh',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.metadata',
+          sessionId: 'ses_scoped_refresh',
+          cwd: '/repo/scoped-refresh',
+        },
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_other_pane',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.changed',
+          sessionId: 'ses_other_pane',
+        },
+      })
+    })
+
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        submittedTurnId: 'turn-scoped-user',
+        sessionId: 'ses_scoped_refresh',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/scoped-refresh',
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_scoped_refresh',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.changed',
+          sessionId: 'ses_scoped_refresh',
+        },
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_scoped_refresh',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.permission.request',
+          sessionId: 'ses_scoped_refresh',
+          requestId: 'permission-scoped',
+          tool: { name: 'Bash', input: { command: 'pwd' } },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  it('coalesces real async accepted and snapshot events delivered close together', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_async_coalesce',
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_async_coalesce',
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-async-user',
+            turnId: 'turn-async-user',
+            role: 'user',
+            summary: 'Async burst prompt',
+            items: [{ id: 'item-async-user', kind: 'text', text: 'Async burst prompt' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-async-coalesce',
+        sessionId: 'ses_async_coalesce',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_async_coalesce' },
+        resumeSessionId: 'ses_async_coalesce',
+        initialCwd: '/repo/async-coalesce',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Async burst prompt' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        submittedTurnId: 'turn-async-user',
+        sessionId: 'ses_async_coalesce',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd: '/repo/async-coalesce',
+      })
+    })
+    await new Promise<void>((resolve) => setTimeout(resolve, 10))
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_async_coalesce',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.snapshot',
+          sessionId: 'ses_async_coalesce',
+          status: 'idle',
+          latestTurnId: 'turn-async-user',
+          revision: 2,
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    })
+  })
+
+  it('clears stale local echo after an idle recovered snapshot without the submitted turn', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_stale_echo',
+        status: 'idle',
+        summary: 'initial',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_stale_echo',
+        status: 'idle',
+        summary: 'recovered',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-existing-assistant',
+            turnId: 'turn-existing-assistant',
+            role: 'assistant',
+            summary: 'Recovered idle snapshot',
+            items: [{ id: 'item-existing-assistant', kind: 'text', text: 'Recovered idle snapshot' }],
+          },
+        ],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-stale-echo',
+        sessionId: 'ses_stale_echo',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_stale_echo' },
+        resumeSessionId: 'ses_stale_echo',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Orphan prompt' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
+    expect(screen.getByText('Orphan prompt')).toBeInTheDocument()
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        submittedTurnId: 'turn-orphan-user',
+        sessionId: 'ses_stale_echo',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_stale_echo',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.snapshot',
+          sessionId: 'ses_stale_echo',
+          status: 'idle',
+          latestTurnId: 'turn-existing-assistant',
+          revision: 2,
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('Recovered idle snapshot')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('Orphan prompt')).not.toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+  })
+
+  it('keeps local echo when an older snapshot response is ignored after send acceptance', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_older_echo',
+        revision: 8,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [
+          {
+            id: 'turn-existing',
+            turnId: 'turn-existing',
+            role: 'assistant',
+            summary: 'Existing answer',
+            items: [{ id: 'item-existing', kind: 'text', text: 'Existing answer' }],
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        threadId: 'ses_older_echo',
+        revision: 7,
+        status: 'idle',
+        capabilities: { send: true, interrupt: true, fork: true },
+        turns: [],
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-older-echo',
+        sessionId: 'ses_older_echo',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_older_echo' },
+        resumeSessionId: 'ses_older_echo',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Existing answer')).toBeInTheDocument()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'Keep this echo' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
+    expect(screen.getByText('Keep this echo')).toBeInTheDocument()
+
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        submittedTurnId: 'turn-keep-echo',
+        sessionId: 'ses_older_echo',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      })
+      wsHandler?.({
+        type: 'freshAgent.event',
+        sessionId: 'ses_older_echo',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        event: {
+          type: 'freshAgent.session.snapshot',
+          sessionId: 'ses_older_echo',
+          status: 'idle',
+          latestTurnId: 'turn-existing',
+          revision: 7,
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    })
+    expect(screen.getByText('Keep this echo')).toBeInTheDocument()
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toEqual(expect.objectContaining({
+      requestId,
+      submittedTurnId: 'turn-keep-echo',
+      text: 'Keep this echo',
+    }))
   })
 
   it('normalizes obsolete Freshcodex models to the default radio option', async () => {

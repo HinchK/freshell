@@ -135,6 +135,16 @@ function countMessages(db, sessionId) {
   return Number(row?.count ?? 0)
 }
 
+function sessionRow(db, sessionId) {
+  return db.prepare('SELECT * FROM session WHERE id = ?').get(sessionId)
+}
+
+function sessionRowsForDirectory(db, directory) {
+  const rows = db.prepare('SELECT * FROM session').all()
+  const expected = normalizeDirectoryForComparison(directory)
+  return rows.filter((row) => normalizeDirectoryForComparison(row.directory) === expected)
+}
+
 function insertTextMessage(db, input) {
   db.prepare(`
       INSERT OR REPLACE INTO message (id, session_id, time_created, time_updated, data)
@@ -246,6 +256,31 @@ function parseJsonText(value) {
   return JSON.parse(value)
 }
 
+function readRequestBody(req) {
+  return new Promise((resolve) => {
+    let bodyText = ''
+    req.setEncoding('utf8')
+    req.on('data', (chunk) => {
+      bodyText += chunk
+    })
+    req.on('end', () => resolve(bodyText))
+  })
+}
+
+function normalizeDirectoryForComparison(directory) {
+  if (typeof directory !== 'string' || directory.length === 0) return ''
+  try {
+    return fs.realpathSync(directory)
+  } catch {
+    return path.resolve(directory)
+  }
+}
+
+function routeDirectory(url) {
+  const value = url.searchParams.get('directory')
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
 function readExport(sessionId) {
   const db = openDatabase()
   try {
@@ -353,6 +388,7 @@ const hostname = argValue('--hostname') || '127.0.0.1'
 const port = Number(argValue('--port'))
 const sessionArg = argValue('--session')
 const sessionEventGatePath = process.env.FAKE_OPENCODE_SESSION_EVENT_GATE_PATH
+const requireDirectoryRoute = process.env.FAKE_OPENCODE_REQUIRE_DIRECTORY_ROUTE === '1'
 
 if (!Number.isInteger(port) || port <= 0 || port > 65535) {
   process.stdout.write('fake opencode: no server port requested\n')
@@ -387,6 +423,190 @@ process.stdin.on('data', (data) => {
 })
 
 const eventClients = new Set()
+const sessionStatuses = new Map()
+
+function sendJson(res, statusCode, body, headers = {}) {
+  res.writeHead(statusCode, { 'content-type': 'application/json', ...headers })
+  res.end(JSON.stringify(body))
+}
+
+function currentSessionStatus(sessionId) {
+  return sessionStatuses.get(sessionId) || 'idle'
+}
+
+function broadcastServeEvent(payload) {
+  const frame = `data: ${JSON.stringify(payload)}\n\n`
+  for (const client of Array.from(eventClients)) {
+    if (client.destroyed) {
+      eventClients.delete(client)
+      continue
+    }
+    client.write(frame)
+  }
+}
+
+function emitSessionStatus(sessionId, statusType, extra = {}) {
+  sessionStatuses.set(sessionId, statusType)
+  appendAudit({
+    event: 'session_status_emitted',
+    sessionId,
+    status: statusType,
+    ...extra,
+  })
+  broadcastServeEvent({
+    type: 'session.status',
+    properties: {
+      sessionID: sessionId,
+      status: { type: statusType },
+    },
+  })
+}
+
+function emitSessionIdle(sessionId, extra = {}) {
+  sessionStatuses.set(sessionId, 'idle')
+  appendAudit({
+    event: 'session_idle_emitted',
+    sessionId,
+    ...extra,
+  })
+  broadcastServeEvent({
+    type: 'session.idle',
+    properties: {
+      sessionID: sessionId,
+    },
+  })
+}
+
+function rejectRoute(res, input) {
+  appendAudit({
+    event: 'route_rejected',
+    routeEvent: input.routeEvent,
+    method: input.method,
+    pathname: input.pathname,
+    sessionId: input.sessionId,
+    routeDirectory: input.routeDirectory,
+    expectedDirectory: input.expectedDirectory,
+    bodyDirectory: input.bodyDirectory,
+    reason: input.reason,
+  })
+  sendJson(res, input.statusCode ?? 409, {
+    error: input.reason,
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+  })
+  return false
+}
+
+function validateRouteForSession(res, input) {
+  if (!requireDirectoryRoute) return true
+  if (!input.routeDirectory) {
+    return rejectRoute(res, {
+      ...input,
+      reason: 'missing_directory_route',
+      statusCode: 400,
+    })
+  }
+  if (!input.expectedDirectory) return true
+  if (normalizeDirectoryForComparison(input.routeDirectory) !== normalizeDirectoryForComparison(input.expectedDirectory)) {
+    return rejectRoute(res, {
+      ...input,
+      reason: 'mismatched_directory_route',
+      statusCode: 409,
+    })
+  }
+  return true
+}
+
+function messagesForSession(db, sessionId, input = {}) {
+  let rows = db.prepare(`
+    SELECT id, session_id, time_created, time_updated, data
+    FROM message
+    WHERE session_id = ?
+    ORDER BY time_created DESC, id DESC
+  `).all(sessionId)
+  if (input.before) {
+    const beforeIndex = rows.findIndex((row) => row.id === input.before)
+    if (beforeIndex >= 0) rows = rows.slice(beforeIndex + 1)
+  }
+  const limit = Number.isInteger(input.limit) && input.limit > 0 ? input.limit : rows.length
+  const page = rows.slice(0, limit)
+  const nextCursor = rows.length > limit ? page[page.length - 1]?.id : undefined
+  return {
+    messages: page.reverse().map((message) => {
+      const partRows = db.prepare(`
+        SELECT id, message_id, session_id, time_created, time_updated, data
+        FROM part
+        WHERE session_id = ? AND message_id = ?
+        ORDER BY id ASC
+      `).all(sessionId, message.id)
+      return {
+        info: {
+          ...(parseJsonText(message.data) ?? {}),
+          id: message.id,
+          sessionID: message.session_id,
+          time: { created: message.time_created, updated: message.time_updated },
+        },
+        parts: partRows.map((part) => ({
+          ...(parseJsonText(part.data) ?? {}),
+          id: part.id,
+          sessionID: part.session_id,
+          messageID: part.message_id,
+          time: { created: part.time_created, updated: part.time_updated },
+        })),
+      }
+    }),
+    nextCursor,
+  }
+}
+
+function readSessionInfo(session) {
+  return {
+    id: session.id,
+    directory: session.directory,
+    title: session.title,
+    parentID: session.parent_id ?? undefined,
+    model: parseJsonText(session.model),
+    time: { created: session.time_created, updated: session.time_updated },
+  }
+}
+
+function appendPromptMessages(input) {
+  const db = openDatabase()
+  try {
+    ensureSchema(db)
+    const existing = sessionRow(db, input.sessionId)
+    if (!existing) return undefined
+    const sequence = countMessages(db, input.sessionId) + 1
+    const userTime = Date.now()
+    const assistantTime = userTime + 1
+    const promptText = input.parts
+      .map((part) => typeof part?.text === 'string' ? part.text : '')
+      .filter(Boolean)
+      .join('\n')
+    const responseText = process.env.FAKE_OPENCODE_RESPONSE_TEXT || `Fake OpenCode response: ${promptText}`
+    const userMessageId = `${input.sessionId}_msg_${sequence}_user`
+    const assistantMessageId = `${input.sessionId}_msg_${sequence + 1}_assistant`
+    insertTextMessage(db, {
+      sessionId: input.sessionId,
+      messageId: userMessageId,
+      partId: `${userMessageId}_part_text`,
+      role: 'user',
+      text: promptText,
+      now: userTime,
+    })
+    insertTextMessage(db, {
+      sessionId: input.sessionId,
+      messageId: assistantMessageId,
+      partId: `${assistantMessageId}_part_text`,
+      role: 'assistant',
+      text: responseText,
+      now: assistantTime,
+    })
+    db.prepare('UPDATE session SET time_updated = ? WHERE id = ?').run(assistantTime, input.sessionId)
+    return { promptText, responseText, userMessageId, assistantMessageId, assistantTime }
+  } finally {
+    db.close()
+  }
+}
 
 function emitSessionEvents(res) {
   if (res.destroyed) return
@@ -431,7 +651,7 @@ function scheduleSessionEvents(res) {
   setTimeout(() => emitSessionEvents(res), 100)
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${hostname}:${port}`)
   if (url.pathname === '/global/health') {
     res.writeHead(200, { 'content-type': 'application/json' })
@@ -440,20 +660,57 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === '/session/status') {
+    const directory = routeDirectory(url)
+    if (requireDirectoryRoute && !directory) {
+      rejectRoute(res, {
+        routeEvent: 'status',
+        method: req.method,
+        pathname: url.pathname,
+        routeDirectory: directory,
+        reason: 'missing_directory_route',
+        statusCode: 400,
+      })
+      return
+    }
+    const statuses = {}
+    if (directory) {
+      const db = openDatabase()
+      try {
+        ensureSchema(db)
+        const rows = sessionRowsForDirectory(db, directory)
+        if (requireDirectoryRoute && rows.length === 0) {
+          rejectRoute(res, {
+            routeEvent: 'status',
+            method: req.method,
+            pathname: url.pathname,
+            routeDirectory: directory,
+            reason: 'unknown_directory_route',
+            statusCode: 409,
+          })
+          return
+        }
+        for (const row of rows) {
+          statuses[row.id] = { type: currentSessionStatus(row.id) }
+        }
+      } finally {
+        db.close()
+      }
+    } else {
+      statuses[rootSessionId] = { type: currentSessionStatus(rootSessionId) }
+      statuses[childSessionId] = { type: currentSessionStatus(childSessionId) }
+    }
     appendAudit({
       event: 'status',
       rootSessionId,
       childSessionId,
+      routeDirectory: directory,
+      sessionIds: Object.keys(statuses),
     })
-    res.writeHead(200, { 'content-type': 'application/json' })
-    res.end(JSON.stringify({
-      [rootSessionId]: { type: 'busy' },
-      [childSessionId]: { type: 'busy' },
-    }))
+    sendJson(res, 200, statuses)
     return
   }
 
-  if (url.pathname === '/event') {
+  if (url.pathname === '/event' || url.pathname === '/global/event') {
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache',
@@ -468,12 +725,151 @@ const server = http.createServer((req, res) => {
     return
   }
 
+  const sessionRouteMatch = url.pathname.match(/^\/session\/([^/]+)(?:\/(.*))?$/)
+  if (sessionRouteMatch) {
+    const sessionId = decodeURIComponent(sessionRouteMatch[1])
+    const action = sessionRouteMatch[2] ?? ''
+    const directory = routeDirectory(url)
+    const db = openDatabase()
+    let session
+    try {
+      ensureSchema(db)
+      session = sessionRow(db, sessionId)
+    } finally {
+      db.close()
+    }
+    if (!session) {
+      sendJson(res, 404, { error: 'session not found', sessionId })
+      return
+    }
+    const routeEvent = action === ''
+      ? 'session_get'
+      : action === 'prompt_async'
+        ? 'prompt_async'
+        : action === 'message'
+          ? 'message_list'
+          : action.startsWith('message/')
+            ? 'message_get'
+            : action
+    if (!validateRouteForSession(res, {
+      routeEvent,
+      method: req.method,
+      pathname: url.pathname,
+      sessionId,
+      routeDirectory: directory,
+      expectedDirectory: session.directory,
+    })) {
+      return
+    }
+
+    if (action === '' && req.method === 'GET') {
+      appendAudit({
+        event: 'session_get',
+        sessionId,
+        routeDirectory: directory,
+        directory: session.directory,
+      })
+      sendJson(res, 200, readSessionInfo(session))
+      return
+    }
+
+    if (action === 'prompt_async' && req.method === 'POST') {
+      const body = parseJsonText(await readRequestBody(req)) || {}
+      const parts = Array.isArray(body.parts) ? body.parts : []
+      emitSessionStatus(sessionId, 'busy', {
+        routeDirectory: directory,
+        directory: session.directory,
+      })
+      const appended = appendPromptMessages({ sessionId, parts })
+      if (!appended) {
+        emitSessionIdle(sessionId, {
+          routeDirectory: directory,
+          directory: session.directory,
+          reason: 'append_failed',
+        })
+        sendJson(res, 404, { error: 'session not found', sessionId })
+        return
+      }
+      appendAudit({
+        event: 'prompt_async',
+        sessionId,
+        routeDirectory: directory,
+        directory: session.directory,
+        prompt: appended.promptText,
+      })
+      sendJson(res, 200, { ok: true })
+      setTimeout(() => {
+        emitSessionIdle(sessionId, {
+          routeDirectory: directory,
+          directory: session.directory,
+          prompt: appended.promptText,
+        })
+      }, 25).unref?.()
+      return
+    }
+
+    if (action === 'message' && req.method === 'GET') {
+      const limitRaw = url.searchParams.get('limit')
+      const limit = limitRaw ? Number(limitRaw) : undefined
+      const before = url.searchParams.get('before') || undefined
+      const messageDb = openDatabase()
+      try {
+        ensureSchema(messageDb)
+        const page = messagesForSession(messageDb, sessionId, { limit, before })
+        appendAudit({
+          event: 'message_list',
+          sessionId,
+          routeDirectory: directory,
+          directory: session.directory,
+          limit,
+          before,
+          count: page.messages.length,
+        })
+        const headers = page.nextCursor ? { 'x-next-cursor': page.nextCursor } : {}
+        sendJson(res, 200, page.messages, headers)
+      } finally {
+        messageDb.close()
+      }
+      return
+    }
+
+    if (action.startsWith('message/') && req.method === 'GET') {
+      const messageId = decodeURIComponent(action.slice('message/'.length))
+      const messageDb = openDatabase()
+      try {
+        ensureSchema(messageDb)
+        const page = messagesForSession(messageDb, sessionId)
+        const message = page.messages.find((candidate) => candidate.info.id === messageId)
+        appendAudit({
+          event: 'message_get',
+          sessionId,
+          messageId,
+          routeDirectory: directory,
+          directory: session.directory,
+          found: Boolean(message),
+        })
+        if (!message) {
+          sendJson(res, 404, { error: 'message not found', sessionId, messageId })
+          return
+        }
+        sendJson(res, 200, message)
+      } finally {
+        messageDb.close()
+      }
+      return
+    }
+
+    sendJson(res, 404, { error: 'not found' })
+    return
+  }
+
   if (url.pathname === '/session') {
     if (req.method === 'POST') {
       appendAudit({
         event: 'session_create_requested',
         rootSessionId,
         childSessionId,
+        routeDirectory: routeDirectory(url),
       })
       if (process.env.FAKE_OPENCODE_HANG_SESSION_CREATE === '1') {
         req.on('close', () => {
@@ -485,16 +881,46 @@ const server = http.createServer((req, res) => {
         })
         return
       }
-      let bodyText = ''
-      req.setEncoding('utf8')
-      req.on('data', (chunk) => {
-        bodyText += chunk
-      })
-      req.on('end', () => {
-        const input = parseJsonText(bodyText) || {}
+      try {
+        const input = parseJsonText(await readRequestBody(req)) || {}
         const now = Date.now()
         const sessionId = `ses_http_${now}_${process.pid}`
-        const directory = typeof input.directory === 'string' && input.directory.length > 0
+        const queryDirectory = routeDirectory(url)
+        if (requireDirectoryRoute && !queryDirectory) {
+          rejectRoute(res, {
+            routeEvent: 'session_create',
+            method: req.method,
+            pathname: url.pathname,
+            sessionId,
+            routeDirectory: queryDirectory,
+            reason: 'missing_directory_route',
+            statusCode: 400,
+          })
+          return
+        }
+        if (
+          requireDirectoryRoute
+          && queryDirectory
+          && typeof input.directory === 'string'
+          && input.directory.length > 0
+          && normalizeDirectoryForComparison(input.directory) !== normalizeDirectoryForComparison(queryDirectory)
+        ) {
+          rejectRoute(res, {
+            routeEvent: 'session_create',
+            method: req.method,
+            pathname: url.pathname,
+            sessionId,
+            routeDirectory: queryDirectory,
+            expectedDirectory: queryDirectory,
+            bodyDirectory: input.directory,
+            reason: 'mismatched_body_directory',
+            statusCode: 409,
+          })
+          return
+        }
+        const directory = typeof queryDirectory === 'string' && queryDirectory.length > 0
+          ? queryDirectory
+          : typeof input.directory === 'string' && input.directory.length > 0
           ? input.directory
           : serverProjectDirectory()
         const title = typeof input.title === 'string' && input.title.length > 0
@@ -516,9 +942,18 @@ const server = http.createServer((req, res) => {
         } finally {
           db.close()
         }
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ id: sessionId, directory, title }))
-      })
+        appendAudit({
+          event: 'session_created',
+          sessionId,
+          routeDirectory: queryDirectory,
+          directory,
+          title,
+        })
+        sessionStatuses.set(sessionId, 'idle')
+        sendJson(res, 200, { id: sessionId, directory, title })
+      } catch (error) {
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+      }
       return
     }
     res.writeHead(200, { 'content-type': 'application/json' })

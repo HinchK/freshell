@@ -90,10 +90,13 @@ type SessionRecord = {
   sessionType: FreshAgentSessionType
   runtimeProvider: FreshAgentRuntimeProvider
   adapter: FreshAgentRuntimeAdapter
+  freshOpenCodeRouteCwd?: string
+  freshOpenCodeProviderOwnedNoRoute?: boolean
 }
 
 export class FreshAgentRuntimeManager {
   private readonly sessions = new Map<string, SessionRecord>()
+  private readonly freshOpencodeRecoveries = new Map<string, { cwd: string; promise: Promise<SessionRecord> }>()
 
   constructor(private readonly options: FreshAgentRuntimeManagerOptions) {}
 
@@ -103,18 +106,22 @@ export class FreshAgentRuntimeManager {
       ?? (input.sessionRef?.provider === registration.runtimeProvider ? input.sessionRef.sessionId : undefined)
     const createInput = resumeSessionId ? { ...input, resumeSessionId } : input
 
-    const created = resumeSessionId && registration.adapter.resume
-      ? await registration.adapter.resume(createInput)
+    const usedResume = Boolean(resumeSessionId && registration.adapter.resume)
+    const created = usedResume
+      ? await registration.adapter.resume!(createInput)
       : await registration.adapter.create(createInput)
     this.sessions.set(this.key({
       sessionType: input.sessionType,
       provider: registration.runtimeProvider,
       sessionId: created.sessionId,
-    }), {
+    }), this.recordForSession({
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
       adapter: registration.adapter,
-    })
+      sessionId: created.sessionId,
+      cwd: input.cwd,
+      providerOwned: !usedResume,
+    }))
     return {
       sessionId: created.sessionId,
       sessionType: input.sessionType,
@@ -125,16 +132,43 @@ export class FreshAgentRuntimeManager {
 
   async attach(input: FreshAgentSessionLocator): Promise<FreshAgentCreateResult> {
     const registration = this.requireRegistration(input.sessionType, input.provider)
+    const key = this.key(input)
+    const existing = this.sessions.get(key)
+    if (existing) {
+      if (existing.sessionType !== input.sessionType || existing.runtimeProvider !== registration.runtimeProvider) {
+        throw new FreshAgentSessionLocatorMismatchError(
+          `Fresh-agent session ${input.sessionId} is tracked as ${existing.sessionType}/${existing.runtimeProvider}, not ${input.sessionType}/${registration.runtimeProvider}`,
+        )
+      }
+      const cwd = this.routeCwd(input)
+      if (this.isDurableFreshOpenCode({
+        sessionType: input.sessionType,
+        provider: registration.runtimeProvider,
+        sessionId: input.sessionId,
+      }) && cwd && existing.freshOpenCodeRouteCwd && existing.freshOpenCodeRouteCwd !== cwd) {
+        throw new FreshAgentSessionLocatorMismatchError(
+          `Fresh-agent session ${input.sessionId} is tracked for ${existing.freshOpenCodeRouteCwd}, not ${cwd}`,
+        )
+      }
+    }
     const attached = registration.adapter.attach
       ? await registration.adapter.attach(input)
       : { sessionId: input.sessionId }
     const sessionId = attached.sessionId
+    const attachedKey = this.key({ ...input, sessionId })
 
-    this.sessions.set(this.key({ ...input, sessionId }), {
-      sessionType: input.sessionType,
-      runtimeProvider: registration.runtimeProvider,
-      adapter: registration.adapter,
-    })
+    if (existing && attachedKey === key && !this.routeCwd(input)) {
+      this.sessions.set(attachedKey, existing)
+    } else {
+      this.sessions.set(attachedKey, this.recordForSession({
+        sessionType: input.sessionType,
+        runtimeProvider: registration.runtimeProvider,
+        adapter: registration.adapter,
+        sessionId,
+        cwd: input.cwd,
+        providerOwned: false,
+      }))
+    }
 
     return {
       sessionId,
@@ -154,11 +188,14 @@ export class FreshAgentRuntimeManager {
       sessionType: input.sessionType,
       provider: registration.runtimeProvider,
       sessionId: resumed.sessionId,
-    }), {
+    }), this.recordForSession({
       sessionType: input.sessionType,
       runtimeProvider: registration.runtimeProvider,
       adapter: registration.adapter,
-    })
+      sessionId: resumed.sessionId,
+      cwd: input.cwd,
+      providerOwned: false,
+    }))
     return {
       sessionId: resumed.sessionId,
       sessionType: input.sessionType,
@@ -179,7 +216,7 @@ export class FreshAgentRuntimeManager {
     locator: FreshAgentSessionLocator,
     input: { requestId?: string; text: string; images?: FreshAgentInputImage[]; settings?: FreshAgentCreateRequest },
   ): Promise<FreshAgentSendResult> {
-    const record = this.requireSession(locator)
+    const record = await this.requireOrRecoverSession(locator)
     if (!record.adapter.send) {
       throw new FreshAgentUnsupportedCapabilityError(`Send is not supported for ${record.sessionType}`)
     }
@@ -196,7 +233,14 @@ export class FreshAgentRuntimeManager {
         sessionType: locator.sessionType,
         provider: record.runtimeProvider,
         sessionId: result.sessionId,
-      }), record)
+      }), this.recordForSession({
+        sessionType: record.sessionType,
+        runtimeProvider: record.runtimeProvider,
+        adapter: record.adapter,
+        sessionId: result.sessionId,
+        cwd: this.routeCwd(locator) ?? this.routeCwd(input.settings) ?? record.freshOpenCodeRouteCwd,
+        providerOwned: true,
+      }))
     }
     if (result?.requestId) {
       return result
@@ -211,7 +255,7 @@ export class FreshAgentRuntimeManager {
   }
 
   async interrupt(locator: FreshAgentSessionLocator) {
-    const record = this.requireSession(locator)
+    const record = await this.requireOrRecoverSession(locator)
     if (!record.adapter.interrupt) {
       throw new FreshAgentUnsupportedCapabilityError(`Interrupt is not supported for ${record.sessionType}`)
     }
@@ -219,7 +263,7 @@ export class FreshAgentRuntimeManager {
   }
 
   async compact(locator: FreshAgentSessionLocator, input?: { instructions?: string }) {
-    const record = this.requireSession(locator)
+    const record = await this.requireOrRecoverSession(locator)
     if (!record.adapter.compact) {
       throw new FreshAgentUnsupportedCapabilityError(`Compact is not supported for ${record.sessionType}`)
     }
@@ -227,7 +271,7 @@ export class FreshAgentRuntimeManager {
   }
 
   async kill(locator: FreshAgentSessionLocator): Promise<boolean> {
-    const record = this.requireSession(locator)
+    const record = await this.requireOrRecoverSession(locator)
     try {
       if (record.adapter.kill) {
         return await record.adapter.kill(locator.sessionId)
@@ -239,7 +283,7 @@ export class FreshAgentRuntimeManager {
   }
 
   async fork(locator: FreshAgentSessionLocator, input?: Record<string, unknown>) {
-    const record = this.requireSession(locator)
+    const record = await this.requireOrRecoverSession(locator)
     if (!record.adapter.fork) {
       throw new FreshAgentUnsupportedCapabilityError(`Fork is not supported for ${record.sessionType}`)
     }
@@ -257,13 +301,19 @@ export class FreshAgentRuntimeManager {
         sessionType: locator.sessionType,
         provider: record.runtimeProvider,
         sessionId: childSessionId,
-      }), record)
+      }), this.recordForSession({
+        sessionType: record.sessionType,
+        runtimeProvider: record.runtimeProvider,
+        adapter: record.adapter,
+        sessionId: childSessionId,
+        providerOwned: true,
+      }))
     }
     return forked
   }
 
   async answerQuestion(locator: FreshAgentSessionLocator, requestId: FreshAgentRequestId, answers: Record<string, string>) {
-    const record = this.requireSession(locator)
+    const record = await this.requireOrRecoverSession(locator)
     if (!record.adapter.answerQuestion) {
       throw new FreshAgentUnsupportedCapabilityError(`Questions are not supported for ${record.sessionType}`)
     }
@@ -271,7 +321,7 @@ export class FreshAgentRuntimeManager {
   }
 
   async resolveApproval(locator: FreshAgentSessionLocator, requestId: FreshAgentRequestId, decision: Record<string, unknown>) {
-    const record = this.requireSession(locator)
+    const record = await this.requireOrRecoverSession(locator)
     if (!record.adapter.resolveApproval) {
       throw new FreshAgentUnsupportedCapabilityError(`Approvals are not supported for ${record.sessionType}`)
     }
@@ -375,6 +425,128 @@ export class FreshAgentRuntimeManager {
 
   private key(locator: FreshAgentSessionLocator): string {
     return makeFreshAgentSessionKey(locator)
+  }
+
+  private canRecoverFreshOpenCode(
+    locator: FreshAgentSessionLocator,
+  ): locator is FreshAgentSessionLocator & { cwd: string } {
+    return locator.sessionType === 'freshopencode'
+      && locator.provider === 'opencode'
+      && locator.sessionId.startsWith('ses_')
+      && this.routeCwd(locator) !== undefined
+  }
+
+  private isDurableFreshOpenCode(locator: Pick<FreshAgentSessionLocator, 'sessionId' | 'sessionType' | 'provider'>): boolean {
+    return locator.sessionType === 'freshopencode'
+      && locator.provider === 'opencode'
+      && locator.sessionId.startsWith('ses_')
+  }
+
+  private routeCwd(input?: { cwd?: string }): string | undefined {
+    return typeof input?.cwd === 'string' && input.cwd.trim().length > 0 ? input.cwd : undefined
+  }
+
+  private recordForSession(input: {
+    sessionType: FreshAgentSessionType
+    runtimeProvider: FreshAgentRuntimeProvider
+    adapter: FreshAgentRuntimeAdapter
+    sessionId: string
+    cwd?: string
+    providerOwned: boolean
+  }): SessionRecord {
+    const base: SessionRecord = {
+      sessionType: input.sessionType,
+      runtimeProvider: input.runtimeProvider,
+      adapter: input.adapter,
+    }
+    const provider = input.runtimeProvider
+    const locator = { sessionType: input.sessionType, provider, sessionId: input.sessionId }
+    if (!this.isDurableFreshOpenCode(locator)) return base
+    const cwd = this.routeCwd(input)
+    if (cwd) return { ...base, freshOpenCodeRouteCwd: cwd }
+    return input.providerOwned ? { ...base, freshOpenCodeProviderOwnedNoRoute: true } : base
+  }
+
+  private async requireOrRecoverSession(locator: FreshAgentSessionLocator): Promise<SessionRecord> {
+    const key = this.key(locator)
+    const existing = this.sessions.get(key)
+    if (existing) {
+      if (existing.sessionType !== locator.sessionType || existing.runtimeProvider !== locator.provider) {
+        throw new FreshAgentSessionLocatorMismatchError(
+          `Fresh-agent session ${locator.sessionId} is tracked as ${existing.sessionType}/${existing.runtimeProvider}, not ${locator.sessionType}/${locator.provider}`,
+        )
+      }
+      if (this.canRecoverFreshOpenCode(locator)) {
+        if (existing.freshOpenCodeRouteCwd && existing.freshOpenCodeRouteCwd !== locator.cwd) {
+          throw new FreshAgentSessionLocatorMismatchError(
+            `Fresh-agent session ${locator.sessionId} is tracked for ${existing.freshOpenCodeRouteCwd}, not ${locator.cwd}`,
+          )
+        }
+        if (!existing.freshOpenCodeRouteCwd) {
+          if (!existing.adapter.attach) {
+            return existing
+          }
+          return await this.singleflightFreshOpenCodeAttach(locator, existing)
+        }
+      } else if (this.isDurableFreshOpenCode(locator)
+        && !existing.freshOpenCodeProviderOwnedNoRoute) {
+        throw new FreshAgentLostSessionError(
+          `Fresh-agent session ${locator.sessionType}/${locator.provider}/${locator.sessionId} requires a cwd before mutation`,
+        )
+      }
+      return existing
+    }
+    if (!this.canRecoverFreshOpenCode(locator)) {
+      return this.requireSession(locator)
+    }
+    const registration = this.requireRegistration(locator.sessionType, locator.provider)
+    if (!registration.adapter.attach) {
+      return this.requireSession(locator)
+    }
+    return await this.singleflightFreshOpenCodeAttach(locator)
+  }
+
+  private async singleflightFreshOpenCodeAttach(
+    locator: FreshAgentSessionLocator & { cwd: string },
+    existingRecord?: SessionRecord,
+  ): Promise<SessionRecord> {
+    const key = this.key(locator)
+    const pending = this.freshOpencodeRecoveries.get(key)
+    if (pending) {
+      if (pending.cwd !== locator.cwd) {
+        throw new FreshAgentSessionLocatorMismatchError(
+          `Fresh-agent session ${locator.sessionId} is already being recovered for ${pending.cwd}, not ${locator.cwd}`,
+        )
+      }
+      return await pending.promise
+    }
+
+    const record: SessionRecord = existingRecord ?? (() => {
+      const registration = this.requireRegistration(locator.sessionType, locator.provider)
+      return {
+        sessionType: locator.sessionType,
+        runtimeProvider: registration.runtimeProvider,
+        adapter: registration.adapter,
+      }
+    })()
+    if (!record.adapter.attach) {
+      return record
+    }
+
+    const promise = Promise.resolve(record.adapter.attach(locator)).then(() => {
+      record.freshOpenCodeRouteCwd = locator.cwd
+      record.freshOpenCodeProviderOwnedNoRoute = false
+      this.sessions.set(key, record)
+      return record
+    })
+    this.freshOpencodeRecoveries.set(key, { cwd: locator.cwd, promise })
+    try {
+      return await promise
+    } finally {
+      if (this.freshOpencodeRecoveries.get(key)?.promise === promise) {
+        this.freshOpencodeRecoveries.delete(key)
+      }
+    }
   }
 
   private requireSession(locator: FreshAgentSessionLocator): SessionRecord {

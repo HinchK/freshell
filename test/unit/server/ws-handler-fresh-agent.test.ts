@@ -442,7 +442,10 @@ describe('WsHandler fresh-agent routing', () => {
 
       await vi.waitFor(() => {
         const locator = { sessionId: 'codex-session-2', sessionType: 'freshcodex', provider: 'codex' }
-        expect(runtimeManager.send).toHaveBeenCalledWith(locator, {
+        expect(runtimeManager.send).toHaveBeenCalledWith({
+          ...locator,
+          cwd: '/repo',
+        }, {
           requestId: 'send-req-1',
           text: 'Ship it',
           images: undefined,
@@ -460,6 +463,9 @@ describe('WsHandler fresh-agent routing', () => {
         expect(seenMessages).toContainEqual(expect.objectContaining({
           type: 'freshAgent.send.accepted',
           requestId: 'send-req-1',
+          sessionId: 'codex-session-2',
+          sessionType: 'freshcodex',
+          provider: 'codex',
           submittedTurnId: 'display-user-1',
         }))
         expect(seenMessages).toContainEqual(expect.objectContaining({
@@ -469,6 +475,75 @@ describe('WsHandler fresh-agent routing', () => {
           sessionId: 'forked-session',
           sessionType: 'freshcodex',
           provider: 'codex',
+        }))
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('allows non-FreshOpenCode sessions created without cwd to send with settings.cwd', async () => {
+    const runtimeManager = {
+      create: vi.fn().mockResolvedValue({
+        sessionId: 'codex-session-cwd-upgrade',
+        sessionType: 'freshcodex',
+        runtimeProvider: 'codex',
+      }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      send: vi.fn().mockResolvedValue({ submittedTurnId: 'turn-1' }),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.create',
+        requestId: 'req-cwd-upgrade',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.create).toHaveBeenCalled()
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        requestId: 'send-cwd-upgrade',
+        sessionId: 'codex-session-cwd-upgrade',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        text: 'continue',
+        settings: { cwd: '/repo/allowed' },
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.send).toHaveBeenCalledWith({
+          sessionId: 'codex-session-cwd-upgrade',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          cwd: '/repo/allowed',
+        }, {
+          requestId: 'send-cwd-upgrade',
+          text: 'continue',
+          images: undefined,
+          settings: { cwd: '/repo/allowed' },
+        })
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.send.accepted',
+          requestId: 'send-cwd-upgrade',
+          sessionId: 'codex-session-cwd-upgrade',
+          sessionType: 'freshcodex',
+          provider: 'codex',
+          cwd: '/repo/allowed',
+          submittedTurnId: 'turn-1',
         }))
       })
     } finally {
@@ -525,6 +600,7 @@ describe('WsHandler fresh-agent routing', () => {
 
       ws.send(JSON.stringify({
         type: 'freshAgent.send',
+        requestId: 'send-materialize',
         sessionId: 'freshopencode-req-1',
         sessionType: 'freshopencode',
         provider: 'opencode',
@@ -533,6 +609,7 @@ describe('WsHandler fresh-agent routing', () => {
 
       await vi.waitFor(() => {
         expect(runtimeManager.send).toHaveBeenCalledWith(placeholderLocator, {
+          requestId: 'send-materialize',
           text: 'Ship it',
           images: undefined,
           settings: undefined,
@@ -547,6 +624,124 @@ describe('WsHandler fresh-agent routing', () => {
           provider: 'opencode',
           sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' },
         })
+        expect(seenMessages).toContainEqual({
+          type: 'freshAgent.send.accepted',
+          requestId: 'send-materialize',
+          sessionId: 'ses_real_1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+        })
+      })
+    } finally {
+      handler.close()
+      registry.shutdown()
+      await new Promise<void>((resolve) => server.close(() => resolve()))
+    }
+  })
+
+  it('does not replay stale placeholder create state after a materialized durable session is killed', async () => {
+    const runtimeManager = {
+      create: vi.fn()
+        .mockResolvedValueOnce({
+          sessionId: 'freshopencode-req-stale-1',
+          sessionType: 'freshopencode',
+          runtimeProvider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-stale-1' },
+        })
+        .mockResolvedValueOnce({
+          sessionId: 'freshopencode-req-stale-2',
+          sessionType: 'freshopencode',
+          runtimeProvider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-stale-2' },
+        }),
+      subscribe: vi.fn().mockResolvedValue(() => undefined),
+      send: vi.fn().mockResolvedValue({
+        sessionId: 'ses_stale_1',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_stale_1' },
+      }),
+      kill: vi.fn().mockResolvedValue(true),
+    }
+    const { server, registry, handler } = await createServer({ freshAgentRuntimeManager: runtimeManager })
+
+    try {
+      const ws = await connectAndAuth(server)
+      const seenMessages: any[] = []
+      ws.on('message', (data) => {
+        seenMessages.push(JSON.parse(data.toString()))
+      })
+      const cwd = '/repo/stale-replay'
+
+      const createMessage = {
+        type: 'freshAgent.create',
+        requestId: 'req-stale-replay',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd,
+      }
+
+      ws.send(JSON.stringify(createMessage))
+
+      await vi.waitFor(() => {
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.created',
+          requestId: 'req-stale-replay',
+          sessionId: 'freshopencode-req-stale-1',
+        }))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.send',
+        sessionId: 'freshopencode-req-stale-1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd,
+        text: 'materialize',
+      }))
+
+      await vi.waitFor(() => {
+        expect(seenMessages).toContainEqual(expect.objectContaining({
+          type: 'freshAgent.session.materialized',
+          previousSessionId: 'freshopencode-req-stale-1',
+          sessionId: 'ses_stale_1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+        }))
+      })
+
+      ws.send(JSON.stringify({
+        type: 'freshAgent.kill',
+        sessionId: 'ses_stale_1',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        cwd,
+      }))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.kill).toHaveBeenCalledWith({
+          sessionId: 'ses_stale_1',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          cwd,
+        })
+      })
+
+      ws.send(JSON.stringify(createMessage))
+
+      await vi.waitFor(() => {
+        expect(runtimeManager.create).toHaveBeenCalledTimes(2)
+        const created = seenMessages.filter((message) => (
+          message.type === 'freshAgent.created'
+          && message.requestId === 'req-stale-replay'
+        ))
+        expect(created).toHaveLength(2)
+        expect(created[1]).toEqual(expect.objectContaining({
+          requestId: 'req-stale-replay',
+          sessionId: 'freshopencode-req-stale-2',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          runtimeProvider: 'opencode',
+          sessionRef: { provider: 'opencode', sessionId: 'freshopencode-req-stale-2' },
+        }))
       })
     } finally {
       handler.close()
