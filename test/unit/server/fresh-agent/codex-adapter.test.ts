@@ -1238,6 +1238,53 @@ describe('Codex fresh-agent adapter', () => {
     }
   })
 
+  it('resets the per-thread turn-complete clock on shutdown (not just on reconnect)', async () => {
+    // shutdown() must clear *all* per-thread state, including the turn-complete clock,
+    // so a reused-in-process adapter never clamps a fresh completion against a stale
+    // pre-shutdown timestamp. (A plain reconnect deliberately keeps the clock — see the
+    // test above — but a full shutdown is a clean slate.)
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn((handler) => {
+        turnCompletedHandler = handler
+        return vi.fn()
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    // Injected (non-owned) runtime survives shutdown(), so the post-shutdown resubscribe
+    // reuses it and we can observe the clock starting fresh.
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const nowSpy = vi.spyOn(Date, 'now')
+    try {
+      nowSpy.mockReturnValue(9000)
+      const firstListener = vi.fn()
+      await adapter.subscribe?.('thread-new-1', firstListener)
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 't1', status: 'completed' } } })
+
+      await adapter.shutdown?.()
+
+      // Reuse the same thread id after shutdown, with an *earlier* wall clock.
+      nowSpy.mockReturnValue(5000)
+      const secondListener = vi.fn()
+      await adapter.subscribe?.('thread-new-1', secondListener)
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 't2', status: 'completed' } } })
+
+      const firstAt = firstListener.mock.calls.map(([e]) => e).find((e) => e?.type === 'sdk.turn.complete')?.at
+      const secondAt = secondListener.mock.calls.map(([e]) => e).find((e) => e?.type === 'sdk.turn.complete')?.at
+      expect(firstAt).toBe(9000)
+      // Without the shutdown reset, the stale 9000 would clamp this to 9001.
+      expect(secondAt).toBe(5000)
+    } finally {
+      nowSpy.mockRestore()
+    }
+  })
+
   it('lazily resumes a Codex runtime before subscribing to a persisted thread after server reload', async () => {
     let lifecycleHandler: ((event: any) => void) | undefined
     const off = vi.fn()

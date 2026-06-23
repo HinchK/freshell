@@ -175,6 +175,12 @@ monotonic `at <= last` guard.
 - Unit (review follow-ups, round 5): opencode `/compact` emits a server-authoritative
   completion edge on success (it previously greened via the removed client busy→idle
   derivation).
+- Unit (review follow-ups, round 6): codex `shutdown()` clears the per-thread
+  turn-complete clock too (a reused-in-process adapter must not clamp a fresh
+  completion against a stale pre-shutdown timestamp), matching every other per-thread
+  map it already clears. Round 6 also corrected the `turn-complete-clock` helper
+  comment, which had overstated the clamp as guaranteeing cross-restart monotonicity
+  (it does not — the client baseline reset is what closes that gap).
 - e2e: WS `freshAgent.turn.complete` → `handleFreshAgentMessage` →
   `applyFreshAgentCompletion` → `useTurnCompletionNotifications` chimes once +
   highlights, ignores replays, re-chimes on the next real turn.

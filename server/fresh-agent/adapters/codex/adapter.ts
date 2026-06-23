@@ -1205,6 +1205,7 @@ export function createCodexFreshAgentAdapter(deps: {
       displayCursorByHandle.clear()
       submittedInputsByThread.clear()
       submittedAliasByThread.clear()
+      lastTurnCompleteAtByThread.clear()
       await Promise.all(runtimes.map((runtime) => runtime.shutdown?.()))
     },
   }
