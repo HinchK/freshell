@@ -1132,6 +1132,40 @@ describe('Codex fresh-agent adapter', () => {
     expect(offTurnCompleted).toHaveBeenCalledTimes(1)
   })
 
+  it('stamps a strictly-increasing at on successive completed turns even within the same millisecond', async () => {
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn((handler) => {
+        turnCompletedHandler = handler
+        return vi.fn()
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const listener = vi.fn()
+    await adapter.subscribe?.('thread-new-1', listener)
+
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(7000)
+    try {
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 'turn-1', status: 'completed' } } })
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 'turn-2', status: 'completed' } } })
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    const ats = listener.mock.calls
+      .map(([event]) => event)
+      .filter((event) => event?.type === 'sdk.turn.complete')
+      .map((event) => event.at)
+    expect(ats).toHaveLength(2)
+    expect(ats[1]).toBeGreaterThan(ats[0])
+  })
+
   it('lazily resumes a Codex runtime before subscribing to a persisted thread after server reload', async () => {
     let lifecycleHandler: ((event: any) => void) | undefined
     const off = vi.fn()

@@ -25,6 +25,7 @@ import {
   parseCodexDisplayIdHandle,
 } from './normalize.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
+import { nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
 
 type CodexThreadLifecycleEvent =
   | {
@@ -899,11 +900,14 @@ export function createCodexFreshAgentAdapter(deps: {
       // app-server fires turn/completed for interrupts too, carrying the authoritative
       // outcome inline at params.turn.status, so we chime only for a positive
       // completion ('completed') and never on interrupt/failure.
+      let lastTurnCompleteAt: number | undefined
       const offTurnCompleted = runtime.onTurnCompleted?.((event) => {
         if (event.threadId !== sessionId) return
         const turn = event.params?.turn as { status?: unknown } | undefined
         if (turn?.status !== 'completed') return
-        listener({ type: 'sdk.turn.complete', sessionId, at: Date.now() })
+        const at = nextMonotonicTurnCompleteAt(lastTurnCompleteAt, Date.now())
+        lastTurnCompleteAt = at
+        listener({ type: 'sdk.turn.complete', sessionId, at })
       })
 
       return () => {

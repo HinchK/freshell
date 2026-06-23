@@ -340,6 +340,36 @@ describe('SdkBridge', () => {
       expect(order.indexOf('sdk.turn.complete')).toBeGreaterThan(order.indexOf('sdk.result'))
     })
 
+    it('stamps a strictly-increasing at on successive completions even within the same millisecond', async () => {
+      mockKeepStreamOpen = true
+      const success = {
+        type: 'result' as const,
+        subtype: 'success' as const,
+        duration_ms: 1,
+        is_error: false,
+        num_turns: 1,
+        session_id: 'cli-123',
+        uuid: 'test-uuid',
+      }
+      mockMessages.push({ ...success }, { ...success })
+      const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(1000)
+      try {
+        const session = await bridge.createSession({ cwd: '/tmp' })
+        const received: any[] = []
+        bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+
+        await new Promise(resolve => setTimeout(resolve, 100))
+
+        const ats = received.filter(m => m.type === 'sdk.turn.complete').map(m => m.at)
+        expect(ats).toHaveLength(2)
+        // Same wall-clock ms for both, but the per-session clamp keeps them distinct so
+        // the client never drops the second turn as a replay.
+        expect(ats[1]).toBeGreaterThan(ats[0])
+      } finally {
+        nowSpy.mockRestore()
+      }
+    })
+
     it('does NOT emit sdk.turn.complete when a turn ends with a non-success result subtype', async () => {
       mockKeepStreamOpen = true
       mockMessages.push({

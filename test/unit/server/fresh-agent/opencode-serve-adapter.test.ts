@@ -151,6 +151,26 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(typeof completions[0].at).toBe('number')
   })
 
+  it('stamps a strictly-increasing at across successive completions even at the same wall-clock ms', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-mono', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-mono', (e) => events.push(e))
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(5000)
+    try {
+      await adapter.send?.('freshopencode-req-mono', { text: 'one' })
+      await adapter.send?.('freshopencode-req-mono', { text: 'two' })
+    } finally {
+      nowSpy.mockRestore()
+    }
+    const ats = events
+      .filter((e): e is { type: string; at: number } => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+      .map((e) => e.at)
+    expect(ats).toHaveLength(2)
+    expect(ats[1]).toBeGreaterThan(ats[0])
+  })
+
   it('does NOT emit sdk.turn.complete when a send aborts (onceIdle rejects)', async () => {
     const manager = makeFakeManager()
     manager.onceIdle = vi.fn(() => Promise.reject(new Error('opencode serve sidecar was lost.')))

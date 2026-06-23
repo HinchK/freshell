@@ -67,6 +67,16 @@ correctly keyed).
 `applyFreshAgentCompletion` thunk, which resolves the owning tab/pane from the
 `provider:sessionId` session key and dispatches `recordTurnComplete`.
 
+**Identity matching (the runtime-handle gotcha).** The server keys the event by the
+runtime handle it subscribed with (`provider:content.sessionId`). For Claude/kilroy
+that runtime handle is the bridge `nanoid`, which differs from the durable Claude
+UUID persisted in `content.sessionRef` — and `resolveFreshAgentSessionKey` *prefers*
+`sessionRef`. So `findFreshAgentPaneBySessionKey` matches the event against the
+runtime handle **and** the resolved (sessionRef-preferred) key; matching only the
+latter silently dropped every chime on restored Claude sessions. OpenCode and Codex
+keep `content.sessionId === sessionRef.sessionId`, so they were unaffected (which is
+why the original OpenCode-only test missed it).
+
 **Dedupe regime: `at`-monotonic (no `completionSeq`).** This is the key
 restart-safety decision. A wall-clock `at` is inherently monotonic across a server
 restart, so a resumed *durable* fresh-agent session (same `sessionId` after a
@@ -77,6 +87,17 @@ resets to 0 on restart while the client's persisted `lastApplied` survives
 counter approach is unsafe here. The discrete edge is never re-derived from a
 snapshot level, so a reconnect cannot re-green, and a replayed/stale event with an
 older-or-equal `at` is dropped.
+
+**Server-side per-session monotonic clamp.** Raw `Date.now()` is not a reliable
+per-turn identity: two genuine completions can land in the same millisecond, and the
+system clock can step backwards (NTP correction) — both would make a real later
+completion look `<= last` and be dropped as a replay, recreating the missed-chime
+class. So each emit site (`sdk-bridge`, opencode adapter, codex subscription) clamps
+its session's `at` to be strictly greater than the previous one via the shared
+`nextMonotonicTurnCompleteAt` helper. This keeps the wall-clock-seeded value (so
+restart monotonicity still holds — a new process's `Date.now()` is already past any
+pre-restart `at`) while guaranteeing distinct turns never collide or regress within a
+process.
 
 ### What was deleted
 
@@ -104,6 +125,11 @@ permission/question transition), which is a distinct attention concern.
   opencode (exactly one on success, none on abort); codex adapter (only
   `turn.status === 'completed'`, scoped to the subscribed thread); client thunk +
   transport routing + `at`-monotonic dedupe; hook no longer fires on busy→idle.
+- Unit (review follow-ups): client routes a Claude completion keyed by the runtime
+  handle when the pane carries a durable `sessionRef` (identity match);
+  `nextMonotonicTurnCompleteAt` clamps same-ms/backward-clock; each emit site
+  (claude/opencode/codex) stamps a strictly-increasing `at` across successive
+  same-millisecond completions.
 - e2e: WS `freshAgent.turn.complete` → `handleFreshAgentMessage` →
   `applyFreshAgentCompletion` → `useTurnCompletionNotifications` chimes once +
   highlights, ignores replays, re-chimes on the next real turn.

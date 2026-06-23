@@ -126,6 +126,8 @@ export interface SdkSessionState {
   costUsd: number
   totalInputTokens: number
   totalOutputTokens: number
+  /** Last emitted turn-complete `at`, kept per session so the edge stays strictly monotonic. */
+  lastTurnCompleteAt?: number
 }
 
 export interface SdkReplayState {

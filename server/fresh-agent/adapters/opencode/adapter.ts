@@ -8,6 +8,7 @@ import type {
   FreshAgentThreadLocator,
 } from '../../runtime-adapter.js'
 import { FreshAgentLostSessionError } from '../../runtime-manager.js'
+import { nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
 import { logger } from '../../../logger.js'
 import { defaultOpencodeDataHome } from '../../../coding-cli/providers/opencode.js'
@@ -45,6 +46,8 @@ type OpencodeSessionState = {
   events: EventEmitter
   sendQueue: Promise<unknown>
   unsubscribeServe?: () => void
+  /** Last emitted turn-complete `at`, kept per session so the edge stays strictly monotonic. */
+  lastTurnCompleteAt?: number
 }
 
 type CreateOpencodeFreshAgentAdapterOptions = {
@@ -327,7 +330,9 @@ export function createOpencodeFreshAgentAdapter(options: CreateOpencodeFreshAgen
       // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline. This is
       // the ONLY positive-completion path: the catch below (abort/interrupt/sidecar
       // loss) and the serve SSE idle relay deliberately do not chime.
-      state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: Date.now() })
+      const completionAt = nextMonotonicTurnCompleteAt(state.lastTurnCompleteAt, Date.now())
+      state.lastTurnCompleteAt = completionAt
+      state.events.emit('event', { type: 'sdk.turn.complete', sessionId: state.placeholderId, at: completionAt })
       return sendResult(state.realSessionId)
     } catch (error) {
       emitStatus(state, 'idle')

@@ -82,4 +82,47 @@ describe('server-authoritative fresh-agent turn completion (client)', () => {
     expect(handled).toBe(true)
     expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
   })
+
+  it('routes a Claude completion keyed by the runtime handle even when the pane carries a durable sessionRef', () => {
+    // A RESTORED Claude/kilroy pane looks like this: the resumed bridge session gets a
+    // fresh runtime handle (content.sessionId), while the persisted durable Claude UUID
+    // lives in content.sessionRef. The server keys the completion event by the runtime
+    // handle it subscribed with, so the lookup must match the runtime handle and not only
+    // the sessionRef-preferred key (which would silently drop the chime).
+    const RUNTIME_ID = 'claude-runtime-nanoid'
+    const DURABLE_ID = '11111111-2222-4333-8444-555555555555'
+    const claudeLeaf: PaneNode = {
+      type: 'leaf',
+      id: 'pane-claude',
+      content: {
+        kind: 'fresh-agent',
+        createRequestId: 'cr-claude',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        sessionId: RUNTIME_ID,
+        sessionRef: { provider: 'claude', sessionId: DURABLE_ID },
+      } as never,
+    }
+    const store = configureStore({
+      reducer: {
+        panes: () => ({ layouts: { 'tab-claude': claudeLeaf }, activePane: {} }) as never,
+        tabs: () => ({ activeTabId: 'tab-claude' }) as never,
+        freshAgent: freshAgentReducer,
+        turnCompletion: turnCompletionReducer,
+      },
+    })
+
+    const handled = handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.event',
+      sessionId: RUNTIME_ID,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { type: 'freshAgent.turn.complete', sessionId: RUNTIME_ID, at: 1000 },
+    })
+    expect(handled).toBe(true)
+
+    const events = store.getState().turnCompletion.pendingEvents
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({ tabId: 'tab-claude', paneId: 'pane-claude', terminalId: `claude:${RUNTIME_ID}` })
+  })
 })

@@ -85,7 +85,13 @@ function findFreshAgentPaneBySessionKey(
           sessionId: content.sessionId,
         })]
         : undefined
-      if (resolveFreshAgentSessionKey(content, session) === sessionKey) {
+      // The server keys the completion event by the runtime handle it subscribed with
+      // (`provider:content.sessionId`). For Claude/kilroy that runtime handle differs
+      // from the durable Claude UUID carried in content.sessionRef, which
+      // resolveFreshAgentSessionKey prefers — so we must match the runtime handle too,
+      // or restored Claude sessions would silently drop every chime.
+      const runtimeKey = content.sessionId ? `${content.provider}:${content.sessionId}` : undefined
+      if (runtimeKey === sessionKey || resolveFreshAgentSessionKey(content, session) === sessionKey) {
         return { tabId, paneId: entry.paneId }
       }
     }
