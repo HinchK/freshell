@@ -165,6 +165,181 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-3', status: 'idle' })
   })
 
+  it('emits exactly one server-authoritative sdk.turn.complete on a successful send', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-tc', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-tc', (e) => events.push(e))
+    await adapter.send?.('freshopencode-req-tc', { text: 'go' })
+    // A second idle snapshot relayed from the serve SSE must NOT produce a second completion.
+    manager._emit('ses_real_1', { kind: 'session.idle', sessionId: 'ses_real_1', raw: { type: 'session.idle', properties: { sessionID: 'ses_real_1' } } })
+
+    const completions = events.filter((e): e is { type: string; sessionId: string; at: number } =>
+      !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(1)
+    expect(completions[0].sessionId).toBe('freshopencode-req-tc')
+    expect(typeof completions[0].at).toBe('number')
+  })
+
+  it('stamps a strictly-increasing at across successive completions even at the same wall-clock ms', async () => {
+    const manager = makeFakeManager()
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-mono', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-mono', (e) => events.push(e))
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(5000)
+    try {
+      await adapter.send?.('freshopencode-req-mono', { text: 'one' })
+      await adapter.send?.('freshopencode-req-mono', { text: 'two' })
+    } finally {
+      nowSpy.mockRestore()
+    }
+    const ats = events
+      .filter((e): e is { type: string; at: number } => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+      .map((e) => e.at)
+    expect(ats).toHaveLength(2)
+    expect(ats[1]).toBeGreaterThan(ats[0])
+  })
+
+  it('does NOT emit sdk.turn.complete when the in-flight turn is interrupted, even though onceIdle resolves on the abort-triggered idle', async () => {
+    // interrupt() aborts the turn; the sidecar then emits session.idle, which RESOLVES
+    // onceIdle (it does not reject). Without tracking the abort, the success path would
+    // fire a false chime/green for an interrupted turn.
+    const manager = makeFakeManager()
+    let resolveIdle: (() => void) | undefined
+    manager.onceIdle = vi.fn(() => new Promise<void>((resolve) => { resolveIdle = resolve }))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-int', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-int', (e) => events.push(e))
+
+    const sendPromise = adapter.send?.('freshopencode-req-int', { text: 'go' })
+    await vi.waitFor(() => expect(manager.onceIdle).toHaveBeenCalled())
+
+    await adapter.interrupt?.('freshopencode-req-int')
+    resolveIdle?.()
+    await sendPromise
+
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(0)
+    // The interrupt still returns the pane to idle (clears blue) — it just must not chime.
+    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-int', status: 'idle' })
+  })
+
+  it('resumes chiming on the next completed turn after an interrupt', async () => {
+    const manager = makeFakeManager()
+    let resolveIdle: (() => void) | undefined
+    manager.onceIdle = vi.fn(() => new Promise<void>((resolve) => { resolveIdle = resolve }))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-int2', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-int2', (e) => events.push(e))
+
+    const interrupted = adapter.send?.('freshopencode-req-int2', { text: 'one' })
+    await vi.waitFor(() => expect(manager.onceIdle).toHaveBeenCalledTimes(1))
+    await adapter.interrupt?.('freshopencode-req-int2')
+    resolveIdle?.()
+    await interrupted
+
+    // A subsequent clean turn (no interrupt) must chime again — the abort flag must not stick.
+    manager.onceIdle = vi.fn(async () => undefined)
+    await adapter.send?.('freshopencode-req-int2', { text: 'two' })
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(1)
+  })
+
+  it('still chimes when an interrupt abort request fails and the turn then completes normally', async () => {
+    // If the abort POST fails, the turn was NOT actually interrupted and may complete
+    // normally. The abort flag must not stick, or a real completion gets no green/sound.
+    const manager = makeFakeManager()
+    let resolveIdle: (() => void) | undefined
+    manager.onceIdle = vi.fn(() => new Promise<void>((resolve) => { resolveIdle = resolve }))
+    manager.abort = vi.fn(async () => { throw new Error('abort failed') })
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-af', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-af', (e) => events.push(e))
+
+    const sendPromise = adapter.send?.('freshopencode-req-af', { text: 'go' })
+    await vi.waitFor(() => expect(manager.onceIdle).toHaveBeenCalled())
+
+    await expect(adapter.interrupt?.('freshopencode-req-af')).rejects.toThrow('abort failed')
+    // Abort failed → the turn proceeds and completes normally.
+    resolveIdle?.()
+    await sendPromise
+
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(1)
+  })
+
+  it('does NOT emit sdk.turn.complete when the turn reports session.error before going idle', async () => {
+    // OpenCode surfaces a failed turn via an out-of-band `session.error` SSE event and
+    // then lets the session go idle. onceIdle resolves on that idle (it never inspects the
+    // error), so the success path must independently know the turn errored — otherwise a
+    // failed turn falsely greens/chimes as a positive completion. This is the OpenCode
+    // analogue of Claude's `subtype === 'success'` and Codex's `status === 'completed'`.
+    const manager = makeFakeManager()
+    let resolveIdle: (() => void) | undefined
+    manager.onceIdle = vi.fn(() => new Promise<void>((resolve) => { resolveIdle = resolve }))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-err', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-err', (e) => events.push(e))
+
+    const sendPromise = adapter.send?.('freshopencode-req-err', { text: 'go' })
+    await vi.waitFor(() => expect(manager.onceIdle).toHaveBeenCalled())
+
+    // The turn errors (relayed as sdk.error) and then the session goes idle.
+    manager._emit('ses_real_1', { kind: 'session.error', sessionId: 'ses_real_1', properties: { error: { message: 'provider boom' } } })
+    resolveIdle?.()
+    await sendPromise
+
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(0)
+    // The error is still surfaced, and the pane still returns to idle (clears blue).
+    expect(events.some((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.error')).toBe(true)
+    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-err', status: 'idle' })
+  })
+
+  it('resumes chiming on the next clean turn after an errored turn', async () => {
+    // The error flag must reset per turn, exactly like the abort flag — a single failed
+    // turn must not permanently suppress completion chimes.
+    const manager = makeFakeManager()
+    let resolveIdle: (() => void) | undefined
+    manager.onceIdle = vi.fn(() => new Promise<void>((resolve) => { resolveIdle = resolve }))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-err2', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-err2', (e) => events.push(e))
+
+    const errored = adapter.send?.('freshopencode-req-err2', { text: 'one' })
+    await vi.waitFor(() => expect(manager.onceIdle).toHaveBeenCalledTimes(1))
+    manager._emit('ses_real_1', { kind: 'session.error', sessionId: 'ses_real_1', properties: { error: { message: 'boom' } } })
+    resolveIdle?.()
+    await errored
+
+    // A subsequent clean turn (no error) must chime again — the error flag must not stick.
+    manager.onceIdle = vi.fn(async () => undefined)
+    await adapter.send?.('freshopencode-req-err2', { text: 'two' })
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(1)
+  })
+
+  it('does NOT emit sdk.turn.complete when a send aborts (onceIdle rejects)', async () => {
+    const manager = makeFakeManager()
+    manager.onceIdle = vi.fn(() => Promise.reject(new Error('opencode serve sidecar was lost.')))
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-abort', sessionType: 'freshopencode', provider: 'opencode' })
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-abort', (e) => events.push(e))
+    await expect(adapter.send?.('freshopencode-req-abort', { text: 'go' })).rejects.toThrow()
+
+    // The catch path still returns the pane to idle (clearing blue) but must not chime.
+    expect(events).toContainEqual({ type: 'sdk.session.snapshot', sessionId: 'freshopencode-req-abort', status: 'idle' })
+    expect(events.find((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')).toBeUndefined()
+  })
+
   it('emits running before first-send session materialization resolves', async () => {
     const manager = makeFakeManager()
     const createSession = createDeferred<{ id: string; directory?: string; title?: string }>()
@@ -774,6 +949,17 @@ describe('OpenCode serve adapter: control', () => {
     const { manager, adapter } = await materialized()
     await adapter.compact?.('freshopencode-req-c')
     expect(manager.compact).toHaveBeenCalledWith('ses_real_1')
+  })
+
+  it('emits a server-authoritative sdk.turn.complete on a successful compact', async () => {
+    // Removing the client busy->idle derivation left compact (a user-visible /compact
+    // command) with no completion edge; like a normal send it must green/chime when done.
+    const { adapter } = await materialized()
+    const events: unknown[] = []
+    adapter.subscribe?.('freshopencode-req-c', (e) => events.push(e))
+    await adapter.compact?.('freshopencode-req-c', { instructions: 'trim' })
+    const completions = events.filter((e) => !!e && typeof e === 'object' && (e as { type?: unknown }).type === 'sdk.turn.complete')
+    expect(completions).toHaveLength(1)
   })
 
   it('fork registers child state so the child session can be sent/subscribed', async () => {

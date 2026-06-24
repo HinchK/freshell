@@ -1080,6 +1080,58 @@ describe('Codex fresh-agent adapter', () => {
     expect(off).toHaveBeenCalledTimes(1)
   })
 
+  it('emits a server-authoritative sdk.turn.complete only for a completed turn on the subscribed thread', async () => {
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const offLifecycle = vi.fn()
+    const offTurnCompleted = vi.fn()
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => offLifecycle),
+      onTurnCompleted: vi.fn((handler) => {
+        turnCompletedHandler = handler
+        return offTurnCompleted
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const listener = vi.fn()
+
+    const unsubscribe = await adapter.subscribe?.('thread-new-1', listener)
+    expect(runtime.onTurnCompleted).toHaveBeenCalledWith(expect.any(Function))
+
+    // Real codex turn/completed carries the authoritative status inline at params.turn.status.
+    // A completed turn on a different thread is ignored.
+    turnCompletedHandler?.({
+      threadId: 'other-thread',
+      params: { threadId: 'other-thread', turn: { id: 'turn-x', status: 'completed' } },
+    })
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+
+    // An interrupted turn on the subscribed thread must NOT chime.
+    turnCompletedHandler?.({
+      threadId: 'thread-new-1',
+      params: { threadId: 'thread-new-1', turn: { id: 'turn-1', status: 'interrupted' } },
+    })
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+
+    // A completed turn on the subscribed thread chimes exactly once.
+    turnCompletedHandler?.({
+      threadId: 'thread-new-1',
+      params: { threadId: 'thread-new-1', turn: { id: 'turn-2', status: 'completed' } },
+    })
+    const completeCalls = listener.mock.calls.filter(([event]) => event?.type === 'sdk.turn.complete')
+    expect(completeCalls).toHaveLength(1)
+    expect(completeCalls[0][0]).toMatchObject({ type: 'sdk.turn.complete', sessionId: 'thread-new-1' })
+    expect(typeof completeCalls[0][0].at).toBe('number')
+
+    unsubscribe?.()
+    expect(offLifecycle).toHaveBeenCalledTimes(1)
+    expect(offTurnCompleted).toHaveBeenCalledTimes(1)
+  })
+
   it('emits a snapshot event after a codex turn completes so the client re-fetches the committed transcript', async () => {
     let lifecycleHandler: ((event: any) => void) | undefined
     let turnCompletedHandler: ((event: any) => void) | undefined
@@ -1139,6 +1191,159 @@ describe('Codex fresh-agent adapter', () => {
     unsubscribe?.()
     expect(offLifecycle).toHaveBeenCalledTimes(1)
     expect(offTurnCompleted).toHaveBeenCalledTimes(1)
+  })
+
+  it('chimes for a flat params.status completion shape and skips a flat interrupted', async () => {
+    // The app-server client passes the notification params straight through, and the
+    // repo's own client tests model turn/completed as a FLAT { threadId, turnId, status }
+    // (status at params.status, not params.turn.status). Freshcodex must detect that shape
+    // too, or green/sound silently never fires.
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn((handler) => {
+        turnCompletedHandler = handler
+        return vi.fn()
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const listener = vi.fn()
+    await adapter.subscribe?.('thread-new-1', listener)
+
+    turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turnId: 'turn-1', status: 'interrupted' } })
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+
+    turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turnId: 'turn-2', status: 'completed' } })
+    const completeCalls = listener.mock.calls.filter(([event]) => event?.type === 'sdk.turn.complete')
+    expect(completeCalls).toHaveLength(1)
+    expect(completeCalls[0][0]).toMatchObject({ type: 'sdk.turn.complete', sessionId: 'thread-new-1' })
+  })
+
+  it('stamps a strictly-increasing at on successive completed turns even within the same millisecond', async () => {
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn((handler) => {
+        turnCompletedHandler = handler
+        return vi.fn()
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const listener = vi.fn()
+    await adapter.subscribe?.('thread-new-1', listener)
+
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(7000)
+    try {
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 'turn-1', status: 'completed' } } })
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 'turn-2', status: 'completed' } } })
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    const ats = listener.mock.calls
+      .map(([event]) => event)
+      .filter((event) => event?.type === 'sdk.turn.complete')
+      .map((event) => event.at)
+    expect(ats).toHaveLength(2)
+    expect(ats[1]).toBeGreaterThan(ats[0])
+  })
+
+  it('keeps the turn-complete clock monotonic per thread across a re-subscribe (WS reconnect)', async () => {
+    // WS fresh-agent subscriptions are torn down and recreated on reconnect, but the
+    // client store's dedupe state survives. The monotonic `at` clamp must therefore live
+    // on per-thread adapter state (like Claude/OpenCode session state), not the subscribe
+    // closure, or a same-ms / backward-clock completion right after a reconnect is dropped.
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn((handler) => {
+        turnCompletedHandler = handler
+        return vi.fn()
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(9000)
+    try {
+      const firstListener = vi.fn()
+      const unsub1 = await adapter.subscribe?.('thread-new-1', firstListener)
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 't1', status: 'completed' } } })
+      unsub1?.()
+
+      // Reconnect: a brand-new subscription to the same thread, same wall-clock ms.
+      const secondListener = vi.fn()
+      await adapter.subscribe?.('thread-new-1', secondListener)
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 't2', status: 'completed' } } })
+
+      const firstAt = firstListener.mock.calls.map(([e]) => e).find((e) => e?.type === 'sdk.turn.complete')?.at
+      const secondAt = secondListener.mock.calls.map(([e]) => e).find((e) => e?.type === 'sdk.turn.complete')?.at
+      expect(firstAt).toBe(9000)
+      expect(secondAt).toBeGreaterThan(firstAt)
+    } finally {
+      nowSpy.mockRestore()
+    }
+  })
+
+  it('resets the per-thread turn-complete clock on shutdown (not just on reconnect)', async () => {
+    // shutdown() must clear *all* per-thread state, including the turn-complete clock,
+    // so a reused-in-process adapter never clamps a fresh completion against a stale
+    // pre-shutdown timestamp. (A plain reconnect deliberately keeps the clock — see the
+    // test above — but a full shutdown is a clean slate.)
+    let turnCompletedHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn((handler) => {
+        turnCompletedHandler = handler
+        return vi.fn()
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    // Injected (non-owned) runtime survives shutdown(), so the post-shutdown resubscribe
+    // reuses it and we can observe the clock starting fresh.
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+
+    const nowSpy = vi.spyOn(Date, 'now')
+    try {
+      nowSpy.mockReturnValue(9000)
+      const firstListener = vi.fn()
+      await adapter.subscribe?.('thread-new-1', firstListener)
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 't1', status: 'completed' } } })
+
+      await adapter.shutdown?.()
+
+      // Reuse the same thread id after shutdown, with an *earlier* wall clock.
+      nowSpy.mockReturnValue(5000)
+      const secondListener = vi.fn()
+      await adapter.subscribe?.('thread-new-1', secondListener)
+      turnCompletedHandler?.({ threadId: 'thread-new-1', params: { threadId: 'thread-new-1', turn: { id: 't2', status: 'completed' } } })
+
+      const firstAt = firstListener.mock.calls.map(([e]) => e).find((e) => e?.type === 'sdk.turn.complete')?.at
+      const secondAt = secondListener.mock.calls.map(([e]) => e).find((e) => e?.type === 'sdk.turn.complete')?.at
+      expect(firstAt).toBe(9000)
+      // Without the shutdown reset, the stale 9000 would clamp this to 9001.
+      expect(secondAt).toBe(5000)
+    } finally {
+      nowSpy.mockRestore()
+    }
   })
 
   it('lazily resumes a Codex runtime before subscribing to a persisted thread after server reload', async () => {

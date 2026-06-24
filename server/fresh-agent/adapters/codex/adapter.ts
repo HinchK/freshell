@@ -25,6 +25,7 @@ import {
   parseCodexDisplayIdHandle,
 } from './normalize.js'
 import { normalizeFreshAgentEffort, normalizeFreshAgentModel } from '../../../../shared/fresh-agent-models.js'
+import { nextMonotonicTurnCompleteAt } from '../../turn-complete-clock.js'
 
 type CodexThreadLifecycleEvent =
   | {
@@ -65,7 +66,9 @@ type CodexRuntimePort = {
   interruptTurn?: (input: CodexTurnInterruptParams) => Promise<void>
   shutdown?: () => Promise<void>
   onThreadLifecycle?: (handler: (event: CodexThreadLifecycleEvent) => void) => () => void
-  onTurnCompleted?: (handler: (event: { threadId: string; turnId?: string; params: Record<string, unknown> }) => void) => () => void
+  onTurnCompleted?: (
+    handler: (event: { threadId: string; turnId?: string; params: Record<string, unknown> }) => void,
+  ) => () => void
   readThread: (input: { threadId: string; includeTurns?: boolean }) => Promise<Record<string, any>>
   listThreadTurns: (input: {
     threadId: string
@@ -287,6 +290,9 @@ export function createCodexFreshAgentAdapter(deps: {
   }
   const displayIdSecret = deps.displayIdSecret
   const activeTurnByThread = new Map<string, string>()
+  // Per-thread (not per-subscription) so the monotonic turn-complete clamp survives a WS
+  // reconnect, matching how Claude/OpenCode keep it on session state.
+  const lastTurnCompleteAtByThread = new Map<string, number>()
   const settingsByThread = new Map<string, Partial<FreshAgentCreateRequest>>()
   const runtimeByThread = new Map<string, CodexRuntimePort>()
   const threadIdsByRuntime = new Map<CodexRuntimePort, Set<string>>()
@@ -666,6 +672,7 @@ export function createCodexFreshAgentAdapter(deps: {
 
   const clearThreadState = (threadId: string) => {
     activeTurnByThread.delete(threadId)
+    lastTurnCompleteAtByThread.delete(threadId)
     settingsByThread.delete(threadId)
     modelByTurnByThread.delete(threadId)
     submittedInputsByThread.delete(threadId)
@@ -892,15 +899,29 @@ export function createCodexFreshAgentAdapter(deps: {
         }
         listener(makeCodexStatusEvent(sessionId, event.status))
       })
-      // thread_status_changed(idle) can fire BEFORE the completed assistant turn
-      // is committed to the app-server's thread history, leaving the client with
-      // an empty transcript. onTurnCompleted fires after the turn is committed, so
-      // emit another snapshot-invalidating event here to make the client re-fetch
-      // the committed transcript (parity with freshopencode's post-idle emit).
+
+      // onTurnCompleted fires after the turn is committed to the app-server's
+      // thread history. thread_status_changed(idle) can fire BEFORE that commit,
+      // leaving the client with an empty transcript. Emit an idle snapshot here
+      // to make the client re-fetch the committed transcript (parity with
+      // freshopencode's post-idle emit).
       const offTurnCompleted = runtime.onTurnCompleted?.((event) => {
         if (event.threadId !== sessionId) return
         activeTurnByThread.delete(sessionId)
         listener(makeCodexStatusEvent(sessionId, 'idle'))
+
+        // Server-authoritative turn-complete edge for the GREEN/SOUND pipeline.
+        // turn/completed fires for interrupts/failures too, so chime only on a
+        // positive completion. The authoritative status appears either inline at
+        // params.turn.status (codex-cli 0.142.0, probed live) or flat at
+        // params.status (the shape the app-server client tests model); accept
+        // either so neither version silently fails.
+        const params = event.params as { status?: unknown; turn?: { status?: unknown } } | undefined
+        const status = params?.turn?.status ?? params?.status
+        if (status !== 'completed') return
+        const at = nextMonotonicTurnCompleteAt(lastTurnCompleteAtByThread.get(sessionId), Date.now())
+        lastTurnCompleteAtByThread.set(sessionId, at)
+        listener({ type: 'sdk.turn.complete', sessionId, at })
       })
       return () => {
         offLifecycle()
@@ -1189,6 +1210,7 @@ export function createCodexFreshAgentAdapter(deps: {
       displayCursorByHandle.clear()
       submittedInputsByThread.clear()
       submittedAliasByThread.clear()
+      lastTurnCompleteAtByThread.clear()
       await Promise.all(runtimes.map((runtime) => runtime.shutdown?.()))
     },
   }

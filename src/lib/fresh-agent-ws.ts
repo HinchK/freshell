@@ -1,9 +1,11 @@
 import type { AppDispatch } from '@/store/store'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
+import { createLogger } from '@/lib/client-logger'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
+import { applyFreshAgentCompletion } from '@/store/turnCompletionThunks'
 import {
   addAssistantMessage,
   addPermissionRequest,
@@ -26,6 +28,8 @@ import {
   setStreaming,
   turnResult,
 } from '@/store/freshAgentSlice'
+
+const log = createLogger('fresh-agent-ws')
 
 type FreshAgentCreatedMessage = {
   type: 'freshAgent.created'
@@ -226,6 +230,21 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
         status: event.status as never,
       }))
       return true
+    case 'freshAgent.turn.complete': {
+      // The server always stamps a monotonic numeric `at`. Drop a malformed event rather
+      // than fabricating a client `Date.now()`, which could collide with or regress against
+      // the server clock and swallow a real later completion (or spuriously green).
+      if (typeof event.at !== 'number' || !Number.isFinite(event.at)) {
+        log.warn('dropping malformed freshAgent.turn.complete without a numeric at', { sessionId, at: event.at })
+        return true
+      }
+      dispatch(applyFreshAgentCompletion({
+        provider: locator.provider,
+        sessionId,
+        at: event.at,
+      }))
+      return true
+    }
     case 'freshAgent.assistant':
       dispatch(addAssistantMessage({
         ...locator,
