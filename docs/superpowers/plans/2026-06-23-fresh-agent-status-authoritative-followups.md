@@ -46,7 +46,9 @@
 
 **Why:** The freshcodex adapter subscribes only to `onThreadLifecycle` and `onTurnCompleted`. If the codex app-server process exits or its client disconnects mid-turn WITHOUT a `thread_closed`/`thread_status_changed`, the adapter emits nothing and the pane stays BLUE forever. The real runtime (`CodexAppServerRuntime`) already exposes `onExit(handler)` (gated on `!shutdownRequested`, so a normal `adapter.shutdown()`/`kill()` does NOT fire it), but `CodexRuntimePort` hides it so the adapter can't call it.
 
-**Scope decision — subscription-scoped is correct and complete (validated):** The handler is registered inside `subscribe()`, so it only fires while a client is actively subscribed. This is the right scope because BLUE is only *shown* when a client is subscribed — there is no stuck-BLUE to clear during an offline window. The remaining concern ("a sidecar exit while offline leaves a stale `runtimeByThread` entry, and the next `ensureRuntime()` returns a dead runtime") is NOT a real bug: the child-exit handler nulls the runtime's `child`/`ready`/`ensureReadyPromise`/`readyCwd` (`runtime.ts:1220-1225`), and EVERY runtime operation calls `ensureReady()`, which sees `ready === null` and lazily restarts the child via `startRuntime` (`runtime.ts:744-769`). So on reconnect, `ensureRuntime()` returns the cached runtime and its next `resumeThread` transparently restarts it — the exact path the existing test "lazily resumes a Codex runtime before subscribing to a persisted thread after server reload" already covers. Reuse self-heals; no scope expansion (runtime-lifetime `onExit`) is needed. When the handler DOES fire (online), it additionally calls `releaseRuntime` so the next send allocates a fresh runtime — a clean equivalent of the lazy-restart path.
+**Scope decision — subscription-scoped is correct and complete (validated):** The handler is registered inside `subscribe()`, so it only fires while a client is actively subscribed. This is the right scope because BLUE is only *shown* when a client is subscribed — there is no stuck-BLUE to clear during an offline window. The remaining concern ("a sidecar exit while offline leaves a stale `runtimeByThread` entry, and the next `ensureRuntime()` returns a dead runtime") is NOT a real bug: the child-exit handler nulls the runtime's `child`/`ready`/`ensureReadyPromise`/`readyCwd` (`runtime.ts:1220-1225`), and EVERY runtime operation calls `ensureReady()`, which sees `ready === null` and lazily restarts the child via `startRuntime` (`runtime.ts:744-769`). So on reconnect, `ensureRuntime()` returns the cached runtime and its next `resumeThread` transparently restarts it — the exact path the existing test "lazily resumes a Codex runtime before subscribing to a persisted thread after server reload" already covers. Reuse self-heals; no scope expansion (runtime-lifetime `onExit`) is needed.
+
+**CRITICAL — do NOT call `releaseRuntime`/`clearThreadState` from the `onExit` handler (recovery correctness):** A crash/disconnect is RECOVERABLE, unlike `thread_closed` (terminal). The handler must emit `sdk.status: 'exited'` ONLY and leave the runtime mapping intact. If it released the runtime, the mapping would be deleted, so the next `send()` would allocate a FRESH runtime that the still-registered subscription is NOT bound to (`ws-handler` skips re-subscription for an existing key) — orphaning all post-recovery lifecycle/turn-complete events (the pane would clear BLUE once, then go silent on the recovered turn). Leaving the runtime mapped means the next `send()` reuses the SAME runtime object (lazy-restart via `ensureReady`), and this subscription's handlers — bound to that object — keep delivering events. This mirrors the offline case exactly, plus the immediate BLUE clear.
 
 **Files:**
 - Modify: `server/fresh-agent/adapters/codex/adapter.ts:49-80` (port type) and `:873-925` (`subscribe`)
@@ -94,16 +96,20 @@ it('self-heals to exited (no chime) when the codex sidecar exits mid-turn', asyn
   expect(offExit).toHaveBeenCalledTimes(1)
 })
 
-it('releases the dead owned runtime on sidecar exit so a later send allocates a fresh one', async () => {
-  // Proves the self-heal CLEANUP (clearThreadState + releaseRuntime), not just the status
-  // emit: a broken impl that leaves the dead runtime mapped would pass the status assertion
-  // but leak the runtime and fail later sends/resumes. Mirrors the runtimeFactory +
-  // vi.waitFor(shutdown) pattern used by the thread_closed/resume tests (~lines 1288-1333).
+it('preserves the runtime on sidecar exit so recovery reuses the SAME subscribed runtime', async () => {
+  // A crash is RECOVERABLE: onExit must NOT release the runtime. Releasing it deletes the
+  // runtimeByThread mapping, so the next send() allocates a FRESH runtime this still-registered
+  // subscription is not bound to (ws-handler skips re-subscription for an existing key),
+  // orphaning post-recovery lifecycle/turn-complete events. Prove the fix: shutdown is NOT
+  // called on a crash, the next send reuses the SAME runtime (factory called once), and the
+  // subscription's lifecycle handler still delivers events to the listener after the crash.
   let exitHandler: ((error?: Error, source?: string) => void) | undefined
+  let lifecycleHandler: ((event: any) => void) | undefined
   const runtime = {
     startThread: vi.fn().mockResolvedValue({ threadId: 'thread-new-1', wsUrl: 'ws://127.0.0.1:43123' }),
-    resumeThread: vi.fn().mockResolvedValue({ threadId: 'thread-new-1', wsUrl: 'ws://127.0.0.1:43123' }),
-    onThreadLifecycle: vi.fn(() => vi.fn()),
+    resumeThread: vi.fn(),
+    startTurn: vi.fn().mockResolvedValue({ turnId: 'turn-1' }),
+    onThreadLifecycle: vi.fn((handler: (event: any) => void) => { lifecycleHandler = handler; return vi.fn() }),
     onTurnCompleted: vi.fn(() => vi.fn()),
     onExit: vi.fn((handler: (error?: Error, source?: string) => void) => { exitHandler = handler; return vi.fn() }),
     readThread: vi.fn(),
@@ -114,18 +120,24 @@ it('releases the dead owned runtime on sidecar exit so a later send allocates a 
   const runtimeFactory = vi.fn(() => runtime)
   const adapter = createCodexFreshAgentAdapter({ runtimeFactory: runtimeFactory as any })
   const listener = vi.fn()
-  // Allocate an owned runtime for this thread (create or resume path) before subscribing.
-  await adapter.create?.({ sessionType: 'freshcodex', cwd: '/tmp' } as any) // or the file's existing create helper
+  await adapter.create({ requestId: 'req-1', sessionType: 'freshcodex', cwd: '/tmp' })
   await adapter.subscribe?.('thread-new-1', listener)
+  expect(runtimeFactory).toHaveBeenCalledTimes(1)
 
   exitHandler?.(undefined, 'app_server_exit')
+  expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-new-1', status: 'exited' })
+  expect(runtime.shutdown).not.toHaveBeenCalled() // recovery, not teardown
 
-  // releaseRuntime() shuts down the owned runtime once it has no remaining threads.
-  await vi.waitFor(() => expect(runtime.shutdown).toHaveBeenCalledTimes(1))
+  await adapter.send?.('thread-new-1', { requestId: 'send-2', text: 'retry' })
+  expect(runtimeFactory).toHaveBeenCalledTimes(1) // SAME runtime reused
+  expect(runtime.startTurn).toHaveBeenCalledTimes(1)
+
+  lifecycleHandler?.({ kind: 'thread_status_changed', threadId: 'thread-new-1', status: { type: 'active', activeFlags: [] } })
+  expect(listener).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
 })
 ```
 
-> Implementer note: bind the runtime-allocation step to whatever create/resume helper the test file already uses to obtain an OWNED runtime (the `runtimeFactory` ownership path is exercised by the existing tests at ~1288-1333 and ~1492-1563). The assertion that matters is `runtime.shutdown` being called exactly once after `onExit` — proof that `releaseRuntime(sessionId)` ran. If the create helper shape differs, model the owned-runtime setup on the existing "keeps a shared fork runtime alive until all sibling threads are released" test.
+> The assertion that matters: after `onExit`, `runtime.shutdown` is NOT called and the next `send()` does NOT call `runtimeFactory` again (the SAME runtime is reused), and the still-bound lifecycle handler delivers post-recovery events. The buggy `releaseRuntime`-in-onExit version fails BOTH (shutdown called; factory called twice) — a genuine RED.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -149,14 +161,16 @@ In `server/fresh-agent/adapters/codex/adapter.ts`, inside the `CodexRuntimePort`
 In `subscribe()` (`adapter.ts:873-925`), after the `offTurnCompleted` registration (line ~919) and before the teardown `return`, add a handler that mirrors `thread_closed` for THIS subscription's `sessionId` (the runtime's `onExit` fires once per runtime, with no threadId; each subscription emits only for its own `sessionId`):
 
 ```ts
-      // Self-heal: if the codex app-server process exits or its client disconnects
-      // (not a graceful adapter.shutdown()/kill() — the runtime gates onExit on
-      // !shutdownRequested), the pane would otherwise stick BLUE forever. Emit the
-      // same terminal status thread_closed emits so BLUE clears, with NO turn-complete
-      // edge (a crash is not a positive completion → must not chime green).
       const offExit = runtime.onExit?.(() => {
-        clearThreadState(sessionId)
-        void releaseRuntime(sessionId).catch(() => undefined)
+        // A crash/disconnect is RECOVERABLE — unlike thread_closed (terminal), the user may
+        // send again on this same pane/subscription. Do NOT release the runtime here: that
+        // would delete the runtimeByThread mapping, so the next send() allocates a FRESH
+        // runtime this still-registered subscription is NOT bound to (ws-handler skips
+        // re-subscription for an existing key), orphaning its lifecycle/turn-complete events.
+        // Leave the runtime mapped — its next operation lazily restarts the child via
+        // ensureReady(), and this subscription's handlers (bound to the same runtime object)
+        // keep delivering events. Just emit the terminal status to clear BLUE (no chime; a
+        // crash is not a positive completion).
         listener({ type: 'sdk.status', sessionId, status: 'exited' })
       })
 ```
@@ -183,7 +197,7 @@ Expected: PASS (all existing tests still green; existing fakes that omit `onExit
 
 - [ ] **Step 7: Refactor**
 
-Review: the new handler reuses `clearThreadState`/`releaseRuntime` exactly as `thread_closed` does (so the dead runtime is forgotten and a later `send` allocates a fresh one). No duplication to extract. Confirm the comment explains the no-chime invariant. Keep as-is if clean.
+Review: the handler emits `sdk.status: 'exited'` ONLY — deliberately NOT `clearThreadState`/`releaseRuntime` (those belong to the terminal `thread_closed` path; calling them here would break recovery, see the CRITICAL note above). Confirm the comment explains both the no-chime invariant and the no-release-for-recovery invariant. Keep as-is if clean.
 
 - [ ] **Step 8: Commit**
 

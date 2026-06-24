@@ -933,8 +933,15 @@ export function createCodexFreshAgentAdapter(deps: {
       // same terminal status thread_closed emits so BLUE clears, with NO turn-complete
       // edge (a crash is not a positive completion → must not chime green).
       const offExit = runtime.onExit?.(() => {
-        clearThreadState(sessionId)
-        void releaseRuntime(sessionId).catch(() => undefined)
+        // A crash/disconnect is RECOVERABLE — unlike thread_closed (terminal), the user may
+        // send again on this same pane/subscription. Do NOT release the runtime here: that
+        // would delete the runtimeByThread mapping, so the next send() allocates a FRESH
+        // runtime this still-registered subscription is NOT bound to (ws-handler skips
+        // re-subscription for an existing key), orphaning its lifecycle/turn-complete events.
+        // Leave the runtime mapped — its next operation lazily restarts the child via
+        // ensureReady(), and this subscription's handlers (bound to the same runtime object)
+        // keep delivering events. Just emit the terminal status to clear BLUE (no chime; a
+        // crash is not a positive completion).
         listener({ type: 'sdk.status', sessionId, status: 'exited' })
       })
 
