@@ -124,11 +124,11 @@ describe('OpenCode serve adapter: create + send', () => {
     // (promptAsync called => past emitMaterialized, before onceIdle resolves).
     await vi.waitFor(() => expect(manager.promptAsync).toHaveBeenCalledWith('ses_real_1', expect.anything(), expect.anything()))
 
-    // Concurrently attach the real id while the send is still in-flight. This is the
-    // materialization race: emitMaterialized fires mid-send before the runtime
-    // manager registers the real id, so subscribe recovers via attach. attach MUST
-    // find the already-remembered state (existing-branch) and NOT bind a second
-    // serve stream — which would happen if remember() ran AFTER emitMaterialized.
+    // Concurrently attach the real id while the send is still in-flight. attach
+    // MUST find the already-remembered state (existing-branch) and NOT bind a
+    // second serve stream. This pins concurrent attach idempotency: exactly one
+    // serve subscription for the real id, regardless of when attach arrives
+    // during the send lifecycle.
     const attached = await adapter.attach?.({
       sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo',
     })
