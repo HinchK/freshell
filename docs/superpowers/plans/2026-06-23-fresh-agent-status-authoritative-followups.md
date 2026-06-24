@@ -91,7 +91,39 @@ it('self-heals to exited (no chime) when the codex sidecar exits mid-turn', asyn
   unsubscribe?.()
   expect(offExit).toHaveBeenCalledTimes(1)
 })
+
+it('releases the dead owned runtime on sidecar exit so a later send allocates a fresh one', async () => {
+  // Proves the self-heal CLEANUP (clearThreadState + releaseRuntime), not just the status
+  // emit: a broken impl that leaves the dead runtime mapped would pass the status assertion
+  // but leak the runtime and fail later sends/resumes. Mirrors the runtimeFactory +
+  // vi.waitFor(shutdown) pattern used by the thread_closed/resume tests (~lines 1288-1333).
+  let exitHandler: ((error?: Error, source?: string) => void) | undefined
+  const runtime = {
+    startThread: vi.fn().mockResolvedValue({ threadId: 'thread-new-1', wsUrl: 'ws://127.0.0.1:43123' }),
+    resumeThread: vi.fn().mockResolvedValue({ threadId: 'thread-new-1', wsUrl: 'ws://127.0.0.1:43123' }),
+    onThreadLifecycle: vi.fn(() => vi.fn()),
+    onTurnCompleted: vi.fn(() => vi.fn()),
+    onExit: vi.fn((handler: (error?: Error, source?: string) => void) => { exitHandler = handler; return vi.fn() }),
+    readThread: vi.fn(),
+    listThreadTurns: vi.fn(),
+    readThreadTurn: vi.fn(),
+    shutdown: vi.fn().mockResolvedValue(undefined),
+  }
+  const runtimeFactory = vi.fn(() => runtime)
+  const adapter = createCodexFreshAgentAdapter({ runtimeFactory: runtimeFactory as any })
+  const listener = vi.fn()
+  // Allocate an owned runtime for this thread (create or resume path) before subscribing.
+  await adapter.create?.({ sessionType: 'freshcodex', cwd: '/tmp' } as any) // or the file's existing create helper
+  await adapter.subscribe?.('thread-new-1', listener)
+
+  exitHandler?.(undefined, 'app_server_exit')
+
+  // releaseRuntime() shuts down the owned runtime once it has no remaining threads.
+  await vi.waitFor(() => expect(runtime.shutdown).toHaveBeenCalledTimes(1))
+})
 ```
+
+> Implementer note: bind the runtime-allocation step to whatever create/resume helper the test file already uses to obtain an OWNED runtime (the `runtimeFactory` ownership path is exercised by the existing tests at ~1288-1333 and ~1492-1563). The assertion that matters is `runtime.shutdown` being called exactly once after `onExit` — proof that `releaseRuntime(sessionId)` ran. If the create helper shape differs, model the owned-runtime setup on the existing "keeps a shared fork runtime alive until all sibling threads are released" test.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -314,6 +346,35 @@ it('emits sdk.turn.waiting on a 0->1 AskUserQuestion edge too (not just permissi
   const qMsg = received.find((m) => m.type === 'sdk.question.request')
   bridge.respondQuestion(session.sessionId, qMsg.requestId, { 'Which option?': 'A' })
   await q
+})
+
+it('treats permissions and questions as ONE combined waiting set (no cross-type re-chime)', async () => {
+  // The edge is 0->1 over the COMBINED pending set (permissions OR questions). An impl that
+  // checks only one map per handler would double-chime when a question lands while a
+  // permission is pending (or vice versa). Prove both cross-type directions.
+  mockKeepStreamOpen = true
+  const session = await bridge.createSession({ cwd: '/tmp', permissionMode: 'default' })
+  const received: any[] = []
+  bridge.subscribe(session.sessionId, (msg) => received.push(msg))
+  await new Promise((r) => setTimeout(r, 50))
+  const waiting = () => received.filter((m) => m.type === 'sdk.turn.waiting')
+
+  // Permission first (0->1) -> one waiting edge.
+  const p = mockCanUseTool('Bash', { command: 'ls' }, { signal: new AbortController().signal, toolUseID: 'tool-1' })
+  await new Promise((r) => setTimeout(r, 50))
+  expect(waiting()).toHaveLength(1)
+
+  // Question while the permission is still pending -> NO new waiting edge (combined set already >=1).
+  const questions = [{ question: 'Which?', header: 'H', options: [{ label: 'A', description: 'A' }], multiSelect: false }]
+  const q = mockCanUseTool('AskUserQuestion', { questions }, { signal: new AbortController().signal, toolUseID: 'tool-q' })
+  await new Promise((r) => setTimeout(r, 50))
+  expect(waiting()).toHaveLength(1)
+
+  const perm = received.find((m) => m.type === 'sdk.permission.request')
+  const qMsg = received.find((m) => m.type === 'sdk.question.request')
+  bridge.respondPermission(session.sessionId, perm.requestId, { behavior: 'allow', updatedInput: {} })
+  bridge.respondQuestion(session.sessionId, qMsg.requestId, { Which: 'A' })
+  await Promise.all([p, q])
 })
 ```
 
@@ -592,15 +653,18 @@ git rm src/hooks/useAgentSessionTurnCompletion.ts test/unit/client/hooks/useAgen
 
 (The meaningful behaviors from that test — waiting fires green on the 0→1 edge, and the `#waiting` namespace isolation — are now covered server-side in `sdk-bridge.test.ts` and client-side in `fresh-agent-turn-complete.test.ts` from Tasks B2/B3.)
 
-- [ ] **Step 4: Typecheck + targeted client suite**
+- [ ] **Step 4: Typecheck (client) + targeted client suite**
 
-Run: `npm run build:server >/dev/null 2>&1 && echo TS_SERVER_OK` (or `npx tsc --noEmit -p tsconfig.json`) and `npm run test:vitest -- run test/unit/client/`
-Expected: typecheck clean (no dangling import), client unit suite green.
+MANDATORY: use the CLIENT typecheck — `npm run build:server` only runs `tsc -p tsconfig.server.json` and will NOT catch a dangling React-hook import in `src/App.tsx`.
+Run: `npm run typecheck:client` (= `tsc -p tsconfig.json --noEmit`) and `npm run test:vitest -- run test/unit/client/`
+Expected: typecheck clean (no dangling import — this is the step that proves the deletion is complete), client unit suite green.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit (exact paths only — multi-agent worktree, no `git add -A`)**
+
+The two deletions were already staged by `git rm` in Step 3; stage only the App.tsx edit:
 
 ```bash
-git add -A
+git add src/App.tsx
 git commit -m "refactor(fresh-agent): delete useAgentSessionTurnCompletion (waiting now server-authoritative)"
 ```
 
@@ -657,10 +721,10 @@ Expected: FAIL before B1–B3 are wired (the client router has no `freshAgent.tu
 Run: `npm run test:vitest -- run test/e2e/fresh-agent-turn-complete-notification.test.tsx`
 Expected: PASS (existing opencode completion tests unaffected by the added Claude pane/test).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Commit (exact path only — multi-agent worktree, no `git add -A`)**
 
 ```bash
-git add -A
+git add test/e2e/fresh-agent-turn-complete-notification.test.tsx
 git commit -m "test(fresh-agent): e2e for server-pushed waiting edge (chimes once, sets attention)"
 ```
 
