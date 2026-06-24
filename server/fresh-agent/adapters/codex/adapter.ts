@@ -69,6 +69,9 @@ type CodexRuntimePort = {
   onTurnCompleted?: (
     handler: (event: { threadId: string; turnId?: string; params: Record<string, unknown> }) => void,
   ) => () => void
+  onExit?: (
+    handler: (error?: Error, source?: 'app_server_exit' | 'app_server_client_disconnect') => void,
+  ) => () => void
   readThread: (input: { threadId: string; includeTurns?: boolean }) => Promise<Record<string, any>>
   listThreadTurns: (input: {
     threadId: string
@@ -923,9 +926,22 @@ export function createCodexFreshAgentAdapter(deps: {
         lastTurnCompleteAtByThread.set(sessionId, at)
         listener({ type: 'sdk.turn.complete', sessionId, at })
       })
+
+      // Self-heal: if the codex app-server process exits or its client disconnects
+      // (not a graceful adapter.shutdown()/kill() — the runtime gates onExit on
+      // !shutdownRequested), the pane would otherwise stick BLUE forever. Emit the
+      // same terminal status thread_closed emits so BLUE clears, with NO turn-complete
+      // edge (a crash is not a positive completion → must not chime green).
+      const offExit = runtime.onExit?.(() => {
+        clearThreadState(sessionId)
+        void releaseRuntime(sessionId).catch(() => undefined)
+        listener({ type: 'sdk.status', sessionId, status: 'exited' })
+      })
+
       return () => {
         offLifecycle()
         offTurnCompleted?.()
+        offExit?.()
       }
     },
 

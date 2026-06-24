@@ -1658,4 +1658,71 @@ describe('Codex fresh-agent adapter', () => {
       excludeTurns: true,
     })
   })
+
+  it('self-heals to exited (no chime) when the codex sidecar exits mid-turn', async () => {
+    let exitHandler: ((error?: Error, source?: string) => void) | undefined
+    const offExit = vi.fn()
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn(() => vi.fn()),
+      onExit: vi.fn((handler: (error?: Error, source?: string) => void) => {
+        exitHandler = handler
+        return offExit
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const listener = vi.fn()
+    const unsubscribe = await adapter.subscribe?.('thread-new-1', listener)
+
+    expect(runtime.onExit).toHaveBeenCalledTimes(1)
+
+    exitHandler?.(undefined, 'app_server_exit')
+
+    expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-new-1', status: 'exited' })
+    // A crash is NOT a positive completion: it clears BLUE but must never chime green.
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+
+    // Teardown unsubscribes the exit handler too.
+    unsubscribe?.()
+    expect(offExit).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases the dead owned runtime on sidecar exit so a later send allocates a fresh one', async () => {
+    // Proves the self-heal CLEANUP (clearThreadState + releaseRuntime), not just the status
+    // emit: a broken impl that leaves the dead runtime mapped would pass the status assertion
+    // but leak the runtime and fail later sends/resumes. Mirrors the runtimeFactory +
+    // vi.waitFor(shutdown) pattern used by the thread_closed/resume tests (~lines 1288-1333).
+    let exitHandler: ((error?: Error, source?: string) => void) | undefined
+    const runtime = {
+      startThread: vi.fn().mockResolvedValue({ threadId: 'thread-new-1', wsUrl: 'ws://127.0.0.1:43123' }),
+      resumeThread: vi.fn().mockResolvedValue({ threadId: 'thread-new-1', wsUrl: 'ws://127.0.0.1:43123' }),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn(() => vi.fn()),
+      onExit: vi.fn((handler: (error?: Error, source?: string) => void) => { exitHandler = handler; return vi.fn() }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+    }
+    const runtimeFactory = vi.fn(() => runtime)
+    const adapter = createCodexFreshAgentAdapter({ runtimeFactory: runtimeFactory as any })
+    const listener = vi.fn()
+    // Allocate an owned runtime for this thread (create path) before subscribing.
+    await adapter.create({
+      requestId: 'req-1',
+      sessionType: 'freshcodex',
+      cwd: '/tmp',
+    })
+    await adapter.subscribe?.('thread-new-1', listener)
+
+    exitHandler?.(undefined, 'app_server_exit')
+
+    // releaseRuntime() shuts down the owned runtime once it has no remaining threads.
+    await vi.waitFor(() => expect(runtime.shutdown).toHaveBeenCalledTimes(1))
+  })
 })
