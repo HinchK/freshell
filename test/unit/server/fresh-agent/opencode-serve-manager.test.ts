@@ -32,6 +32,9 @@ function makeManager(overrides: Partial<Parameters<typeof OpencodeServeManager>[
     return jsonResponse({})
   })
   const manager = new OpencodeServeManager({
+    // Isolate from host process.env so tests asserting the 'opencode' default
+    // command don't break when a developer has OPENCODE_CMD set in their shell.
+    env: {},
     spawnFn: spawnFn as any,
     fetchFn: fetchFn as any,
     allocatePort: async () => ({ hostname: '127.0.0.1', port: 47999 }),
@@ -145,6 +148,7 @@ describe('OpencodeServeManager lifecycle', () => {
       return jsonResponse({})
     })
     const manager = new OpencodeServeManager({
+      env: {},
       spawnFn: spawnFn as any,
       fetchFn: fetchFn as any,
       allocatePort: vi.fn().mockResolvedValue({ hostname: '127.0.0.1', port: 47999 }),
@@ -455,6 +459,7 @@ describe('OpencodeServeManager HTTP client', () => {
       return jsonResponse({}, { status: 404 })
     })
     const manager = new OpencodeServeManager({
+      env: {},
       spawnFn: spawnFn as any,
       fetchFn: fetchFn as any,
       allocatePort: vi.fn()

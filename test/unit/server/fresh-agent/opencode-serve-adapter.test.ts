@@ -110,6 +110,37 @@ describe('OpenCode serve adapter: create + send', () => {
     expect(manager.onceIdle).toHaveBeenCalledWith('ses_real_1', expect.any(Number), { cwd: '/repo' })
   })
 
+  it('attach during an in-flight send reuses the materialized state (no duplicate serve subscription)', async () => {
+    const idle = createDeferred<void>()
+    const manager = makeFakeManager()
+    manager.onceIdle = vi.fn(() => idle.promise)
+    const adapter = makeAdapter(manager)
+    await adapter.create({ requestId: 'req-race', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo' })
+
+    // Start the send: it materializes (remember + bindServeStream subscribes once),
+    // emits freshAgent.session.materialized, then parks at `await idle`.
+    const sendPromise = adapter.send?.('freshopencode-req-race', { text: 'go' })
+    // Wait until materialization is done and the send is in-flight at await idle
+    // (promptAsync called => past emitMaterialized, before onceIdle resolves).
+    await vi.waitFor(() => expect(manager.promptAsync).toHaveBeenCalledWith('ses_real_1', expect.anything(), expect.anything()))
+
+    // Concurrently attach the real id while the send is still in-flight. This is the
+    // materialization race: emitMaterialized fires mid-send before the runtime
+    // manager registers the real id, so subscribe recovers via attach. attach MUST
+    // find the already-remembered state (existing-branch) and NOT bind a second
+    // serve stream — which would happen if remember() ran AFTER emitMaterialized.
+    const attached = await adapter.attach?.({
+      sessionId: 'ses_real_1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo',
+    })
+    expect(attached).toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
+    expect(manager.subscribe).toHaveBeenCalledTimes(1)
+    expect(manager.subscribe).toHaveBeenCalledWith('ses_real_1', expect.any(Function))
+
+    // The in-flight send still completes with the correct result once idle resolves.
+    idle.resolve()
+    await expect(sendPromise).resolves.toEqual({ sessionId: 'ses_real_1', sessionRef: { provider: 'opencode', sessionId: 'ses_real_1' } })
+  })
+
   it('continues a materialized session on later sends without re-creating it', async () => {
     const manager = makeFakeManager()
     const adapter = makeAdapter(manager)

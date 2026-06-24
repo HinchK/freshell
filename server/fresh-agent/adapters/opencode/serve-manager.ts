@@ -113,7 +113,7 @@ export class OpencodeServeManager {
 
   constructor(options: OpencodeServeManagerOptions = {}) {
     this.env = options.env ?? process.env
-    this.command = options.command ?? this.env.OPENCODE_CMD ?? 'opencode'
+    this.command = options.command ?? (this.env.OPENCODE_CMD || 'opencode')
     this.spawnFn = options.spawnFn ?? spawn
     this.fetchFn = options.fetchFn ?? fetch
     this.allocatePort = options.allocatePort ?? allocateLocalhostPort
