@@ -21,4 +21,9 @@ describe('normalizeFreshAgentProviderEvent', () => {
     const event = { type: 'freshAgent.turn.complete', sessionId: 'ses_123', at: 5 }
     expect(normalizeFreshAgentProviderEvent(event)).toBe(event)
   })
+
+  it('normalizes sdk.turn.waiting to freshAgent.turn.waiting preserving at', () => {
+    expect(normalizeFreshAgentProviderEvent({ type: 'sdk.turn.waiting', sessionId: 's1', at: 42 }))
+      .toEqual({ type: 'freshAgent.turn.waiting', sessionId: 's1', at: 42 })
+  })
 })
