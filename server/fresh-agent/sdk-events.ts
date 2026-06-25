@@ -33,6 +33,7 @@ export type FreshAgentProviderEvent =
   | { type: 'freshAgent.question.request'; sessionId: string; requestId: string; questions: Array<{ question: string; header: string; options: Array<{ label: string; description: string }>; multiSelect: boolean }> }
   | { type: 'freshAgent.status'; sessionId: string; status: SdkSessionStatus }
   | { type: 'freshAgent.turn.complete'; sessionId: string; at: number }
+  | { type: 'freshAgent.turn.waiting'; sessionId: string; at: number }
   | { type: 'freshAgent.error'; sessionId: string; message: string; code?: string }
   | { type: 'freshAgent.exit'; sessionId: string; exitCode?: number }
   | { type: 'freshAgent.killed'; sessionId: string; success?: boolean }
@@ -69,6 +70,8 @@ export function normalizeFreshAgentProviderEvent(event: unknown): unknown {
       return { ...providerEvent, type: 'freshAgent.status' } as FreshAgentProviderEvent
     case 'sdk.turn.complete':
       return { ...providerEvent, type: 'freshAgent.turn.complete' } as FreshAgentProviderEvent
+    case 'sdk.turn.waiting':
+      return { ...providerEvent, type: 'freshAgent.turn.waiting' } as FreshAgentProviderEvent
     case 'sdk.error':
       return { ...providerEvent, type: 'freshAgent.error' } as FreshAgentProviderEvent
     case 'sdk.exit':

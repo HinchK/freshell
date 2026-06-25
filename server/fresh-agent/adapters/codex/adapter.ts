@@ -69,6 +69,9 @@ type CodexRuntimePort = {
   onTurnCompleted?: (
     handler: (event: { threadId: string; turnId?: string; params: Record<string, unknown> }) => void,
   ) => () => void
+  onExit?: (
+    handler: (error?: Error, source?: 'app_server_exit' | 'app_server_client_disconnect') => void,
+  ) => () => void
   readThread: (input: { threadId: string; includeTurns?: boolean }) => Promise<Record<string, any>>
   listThreadTurns: (input: {
     threadId: string
@@ -923,9 +926,29 @@ export function createCodexFreshAgentAdapter(deps: {
         lastTurnCompleteAtByThread.set(sessionId, at)
         listener({ type: 'sdk.turn.complete', sessionId, at })
       })
+
+      // Self-heal: if the codex app-server process exits or its client disconnects
+      // (not a graceful adapter.shutdown()/kill() — the runtime gates onExit on
+      // !shutdownRequested), the pane would otherwise stick BLUE forever. Emit the
+      // same terminal status thread_closed emits so BLUE clears, with NO turn-complete
+      // edge (a crash is not a positive completion → must not chime green).
+      const offExit = runtime.onExit?.(() => {
+        // A crash/disconnect is RECOVERABLE — unlike thread_closed (terminal), the user may
+        // send again on this same pane/subscription. Do NOT release the runtime here: that
+        // would delete the runtimeByThread mapping, so the next send() allocates a FRESH
+        // runtime this still-registered subscription is NOT bound to (ws-handler skips
+        // re-subscription for an existing key), orphaning its lifecycle/turn-complete events.
+        // Leave the runtime mapped — its next operation lazily restarts the child via
+        // ensureReady(), and this subscription's handlers (bound to the same runtime object)
+        // keep delivering events. Just emit the terminal status to clear BLUE (no chime; a
+        // crash is not a positive completion).
+        listener({ type: 'sdk.status', sessionId, status: 'exited' })
+      })
+
       return () => {
         offLifecycle()
         offTurnCompleted?.()
+        offExit?.()
       }
     },
 

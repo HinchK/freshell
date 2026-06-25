@@ -76,6 +76,7 @@ export type SdkServerMessage =
   | { type: 'sdk.permission.cancelled'; sessionId: string; requestId: string }
   | { type: 'sdk.status'; sessionId: string; status: SdkSessionStatus }
   | { type: 'sdk.turn.complete'; sessionId: string; at: number }
+  | { type: 'sdk.turn.waiting'; sessionId: string; at: number }
   | { type: 'sdk.error'; sessionId: string; message: string; code?: string }
   | { type: 'sdk.exit'; sessionId: string; exitCode?: number }
   | { type: 'sdk.killed'; sessionId: string; success: boolean }
@@ -128,6 +129,8 @@ export interface SdkSessionState {
   totalOutputTokens: number
   /** Last emitted turn-complete `at`, kept per session so the edge stays strictly monotonic. */
   lastTurnCompleteAt?: number
+  /** Last emitted turn-waiting `at`, kept per session so the waiting edge stays strictly monotonic, independent of the completion edge. */
+  lastWaitingAt?: number
 }
 
 export interface SdkReplayState {

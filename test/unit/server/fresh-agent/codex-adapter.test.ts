@@ -1658,4 +1658,83 @@ describe('Codex fresh-agent adapter', () => {
       excludeTurns: true,
     })
   })
+
+  it('self-heals to exited (no chime) when the codex sidecar exits mid-turn', async () => {
+    let exitHandler: ((error?: Error, source?: string) => void) | undefined
+    const offExit = vi.fn()
+    const runtime = {
+      startThread: vi.fn(),
+      resumeThread: vi.fn(),
+      onThreadLifecycle: vi.fn(() => vi.fn()),
+      onTurnCompleted: vi.fn(() => vi.fn()),
+      onExit: vi.fn((handler: (error?: Error, source?: string) => void) => {
+        exitHandler = handler
+        return offExit
+      }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+    }
+    const adapter = createCodexFreshAgentAdapter({ runtime: runtime as any })
+    const listener = vi.fn()
+    const unsubscribe = await adapter.subscribe?.('thread-new-1', listener)
+
+    expect(runtime.onExit).toHaveBeenCalledTimes(1)
+
+    exitHandler?.(undefined, 'app_server_exit')
+
+    expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-new-1', status: 'exited' })
+    // A crash is NOT a positive completion: it clears BLUE but must never chime green.
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+
+    // Teardown unsubscribes the exit handler too.
+    unsubscribe?.()
+    expect(offExit).toHaveBeenCalledTimes(1)
+  })
+
+  it('preserves the runtime on sidecar exit so recovery reuses the SAME subscribed runtime', async () => {
+    // A crash is RECOVERABLE (unlike thread_closed): onExit must NOT release the runtime.
+    // Releasing it deletes the runtimeByThread mapping, so the next send() would allocate a
+    // FRESH runtime this still-registered subscription is not bound to (ws-handler skips
+    // re-subscription for an existing key), orphaning post-recovery lifecycle/turn-complete
+    // events. Prove the fix: shutdown is NOT called on a crash, the next send reuses the SAME
+    // runtime (factory called exactly once), and the subscription's lifecycle handler still
+    // delivers events to the listener after the crash.
+    let exitHandler: ((error?: Error, source?: string) => void) | undefined
+    let lifecycleHandler: ((event: any) => void) | undefined
+    const runtime = {
+      startThread: vi.fn().mockResolvedValue({ threadId: 'thread-new-1', wsUrl: 'ws://127.0.0.1:43123' }),
+      resumeThread: vi.fn(),
+      startTurn: vi.fn().mockResolvedValue({ turnId: 'turn-1' }),
+      onThreadLifecycle: vi.fn((handler: (event: any) => void) => { lifecycleHandler = handler; return vi.fn() }),
+      onTurnCompleted: vi.fn(() => vi.fn()),
+      onExit: vi.fn((handler: (error?: Error, source?: string) => void) => { exitHandler = handler; return vi.fn() }),
+      readThread: vi.fn(),
+      listThreadTurns: vi.fn(),
+      readThreadTurn: vi.fn(),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+    }
+    const runtimeFactory = vi.fn(() => runtime)
+    const adapter = createCodexFreshAgentAdapter({ runtimeFactory: runtimeFactory as any })
+    const listener = vi.fn()
+    await adapter.create({ requestId: 'req-1', sessionType: 'freshcodex', cwd: '/tmp' })
+    await adapter.subscribe?.('thread-new-1', listener)
+    expect(runtimeFactory).toHaveBeenCalledTimes(1)
+
+    // Sidecar crashes mid-turn.
+    exitHandler?.(undefined, 'app_server_exit')
+    expect(listener).toHaveBeenCalledWith({ type: 'sdk.status', sessionId: 'thread-new-1', status: 'exited' })
+    expect(listener).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'sdk.turn.complete' }))
+    // Recovery, not teardown: a crash must NOT release/shutdown the runtime.
+    expect(runtime.shutdown).not.toHaveBeenCalled()
+
+    // A subsequent send reuses the SAME runtime — no fresh allocation the subscription isn't bound to.
+    await adapter.send?.('thread-new-1', { requestId: 'send-2', text: 'retry' })
+    expect(runtimeFactory).toHaveBeenCalledTimes(1)
+    expect(runtime.startTurn).toHaveBeenCalledTimes(1)
+
+    // The subscription's lifecycle handler still delivers post-recovery events to the listener.
+    lifecycleHandler?.({ kind: 'thread_status_changed', threadId: 'thread-new-1', status: { type: 'active', activeFlags: [] } })
+    expect(listener).toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
+  })
 })
