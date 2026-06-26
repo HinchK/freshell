@@ -48,7 +48,7 @@
 - Produces: `FreshAgentSessionState.statusVersion`, a monotonic in-memory status freshness counter that increments on every reducer-driven status write, including same-value writes.
 - Produces: an accepted freshcodex REST snapshot updates only `freshAgent.sessions[makeFreshAgentSessionKey(...)]status` unless any same-session pane present in `state.panes.layouts` has unresolved local echo that makes an idle snapshot unsafe to apply, or the global session status version changed while the REST request was in flight.
 
-- [ ] **Step 1: Write the failing status-version reducer tests**
+- [x] **Step 1: Write the failing status-version reducer tests**
 
 In `test/unit/client/store/freshAgentSlice.test.ts`, add focused reducer tests proving:
 
@@ -58,7 +58,7 @@ In `test/unit/client/store/freshAgentSlice.test.ts`, add focused reducer tests p
 
 These tests are intentionally not string-copy tests. They protect the ordering contract used by `FreshAgentView`: a status event with the same string value must still be observable as newer than an older REST request.
 
-- [ ] **Step 2: Write the failing component regression tests**
+- [x] **Step 2: Write the failing component regression tests**
 
 In `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, add these tests near the existing snapshot refresh tests. Wrap external store dispatches that must trigger React re-renders, and deferred snapshot resolution, in `act(...)` using the local test-file pattern. Do not rely on unwrapped `store.dispatch(...)` to update `agentSessionStatusVersionRef.current` before the REST promise continuation runs.
 
@@ -263,7 +263,7 @@ In `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`, add these 
   })
 ```
 
-- [ ] **Step 3: Run the focused tests to verify RED**
+- [x] **Step 3: Run the focused tests to verify RED**
 
 Run:
 
@@ -274,7 +274,7 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentVie
 
 Expected: FAIL because the slice has no `statusVersion`, and because the pane content becomes idle but `freshAgent.sessions[freshcodex:codex:<sessionId>].status` remains `running`, so the 3-second fallback poll keeps firing.
 
-- [ ] **Step 4: Add status freshness tracking**
+- [x] **Step 4: Add status freshness tracking**
 
 In `src/store/freshAgentTypes.ts`, add:
 
@@ -300,7 +300,7 @@ For `materializeSession`, which builds a migrated session through object spread 
 Do not persist the version outside Redux state or derive it from wall clock time. This guard is an in-memory ordering token for races within one client runtime.
 If existing reducer tests deep-equal full session objects, update the expected object to include `statusVersion` rather than weakening the assertion. Do not delete coverage to accommodate the new field.
 
-- [ ] **Step 5: Implement the reconciliation**
+- [x] **Step 5: Implement the reconciliation**
 
 In `src/components/fresh-agent/FreshAgentView.tsx`, change the fresh-agent slice import:
 
@@ -390,7 +390,7 @@ Do not add `hasUnresolvedLocalEchoForSession` to the snapshot-loading `useEffect
 
 Keep the `if (...)` condition inline as shown rather than moving it into a separate `shouldReconcileSessionStatus` boolean. TypeScript needs the direct `sessionStatus && nextSessionId` guard to narrow `status` to `FreshAgentSessionStatus` and `sessionId` to `string` for `setSessionStatus(...)`.
 
-- [ ] **Step 5a: Keep idle reconciliation blocked while local echo is unresolved**
+- [x] **Step 5a: Keep idle reconciliation blocked while local echo is unresolved**
 
 The guard must not dispatch idle when all of these are true:
 
@@ -416,7 +416,7 @@ agentSessionStatusVersionRef.current !== requestAgentSessionStatusVersion
 
 Do not use status-string equality as the freshness guard; same-value `running` updates must still block an older REST `idle` response.
 
-- [ ] **Step 6: Run the focused tests to verify GREEN**
+- [x] **Step 6: Run the focused tests to verify GREEN**
 
 Run:
 
@@ -427,7 +427,7 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentVie
 
 Expected: PASS.
 
-- [ ] **Step 7: Run nearby client tests**
+- [x] **Step 7: Run nearby client tests**
 
 Run:
 
@@ -437,7 +437,7 @@ npm run test:vitest -- run test/unit/client/lib/fresh-agent-ws.test.ts test/unit
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit Task 1**
+- [x] **Step 8: Commit Task 1**
 
 Run:
 
