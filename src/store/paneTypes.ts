@@ -42,15 +42,18 @@ export function normalizeFreshAgentPaneModelSelection(args: {
   modelSelection?: unknown
   legacyModel?: unknown
 }): FreshAgentModelSelection | undefined {
-  const selection = normalizeFreshAgentModelSelection(args.modelSelection, args.legacyModel)
+  const explicitSelection = normalizeFreshAgentModelSelection(args.modelSelection)
+  if (explicitSelection) return explicitSelection
+
   if (
     args.sessionType === 'freshopencode'
     && args.provider === 'opencode'
-    && selection?.modelId === LEGACY_FRESHOPENCODE_DEFAULT_MODEL
+    && typeof args.legacyModel === 'string'
+    && args.legacyModel.trim() === LEGACY_FRESHOPENCODE_DEFAULT_MODEL
   ) {
     return undefined
   }
-  return selection
+  return normalizeFreshAgentModelSelection(undefined, args.legacyModel)
 }
 
 export function normalizeFreshAgentEffortOverride(value: unknown): string | undefined {

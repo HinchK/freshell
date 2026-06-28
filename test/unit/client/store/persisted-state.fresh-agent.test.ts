@@ -230,7 +230,7 @@ describe('persistedState fresh-agent migration', () => {
     expect(content.resumeSessionId).toBeUndefined()
   })
 
-  it('drops stale Freshopencode DeepSeek pane selections during persisted layout parsing', () => {
+  it('drops stale Freshopencode DeepSeek legacy model defaults during persisted layout parsing', () => {
     const parsed = parsePersistedLayoutRaw(layoutRaw({
       'tab-1': leaf('pane-freshopencode', {
         kind: 'fresh-agent',
@@ -238,7 +238,7 @@ describe('persistedState fresh-agent migration', () => {
         provider: 'opencode',
         createRequestId: 'req-opencode',
         status: 'idle',
-        modelSelection: { kind: 'exact', modelId: 'opencode-go/deepseek-v4-flash' },
+        model: 'opencode-go/deepseek-v4-flash',
         effort: 'max',
       }),
     }))
@@ -251,6 +251,30 @@ describe('persistedState fresh-agent migration', () => {
       effort: 'max',
     })
     expect(content.modelSelection).toBeUndefined()
+  })
+
+  it('preserves explicit Freshopencode DeepSeek selections during persisted layout parsing', () => {
+    const parsed = parsePersistedLayoutRaw(layoutRaw({
+      'tab-1': leaf('pane-freshopencode', {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-opencode',
+        status: 'idle',
+        model: 'opencode-go/deepseek-v4-flash',
+        modelSelection: { kind: 'exact', modelId: 'opencode-go/deepseek-v4-flash' },
+        effort: 'max',
+      }),
+    }))
+
+    const content = collectLeafContents(parsed!.panes.layouts['tab-1'])[0]
+    expect(content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      effort: 'max',
+      modelSelection: { kind: 'exact', modelId: 'opencode-go/deepseek-v4-flash' },
+    })
   })
 
   it('prefers the backup when a pending fresh-agent migration matches the current raw layout without a commit marker', () => {
