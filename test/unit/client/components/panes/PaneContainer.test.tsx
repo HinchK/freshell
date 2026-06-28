@@ -1868,7 +1868,7 @@ describe('PaneContainer', () => {
           expect(paneContent.sessionType).toBe('freshopencode')
           expect(paneContent.provider).toBe('opencode')
           expect(paneContent.initialCwd).toBe('/home/user/freshopencode-project')
-          expect(paneContent.model).toBe('opencode-go/deepseek-v4-flash')
+          expect(paneContent.model).toBe('opencode-go/glm-5.2')
           expect(paneContent.effort).toBe('max')
           expect(paneContent.permissionMode).toBeUndefined()
         }
