@@ -703,6 +703,65 @@ describe('runStartup', () => {
     }))
   })
 
+  it('logs main_window_initial_load_failed through the main-process logger with the authenticated load URL', async () => {
+    const mockWindow = createMockWindowWithWebContents()
+    const error = new Error('initial load failed')
+    ;(mockWindow.loadURL as ReturnType<typeof vi.fn>).mockRejectedValue(error)
+    const logger = { log: vi.fn() }
+    const ctx = createDefaultContext({
+      createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+      mainProcessLogger: logger,
+      rendererRecoveryVerifier: vi.fn().mockResolvedValue(undefined),
+      readEnvToken: vi.fn().mockResolvedValue('token-abc'),
+    })
+
+    const result = await runStartup(ctx)
+    expect(result.type).toBe('main')
+    await Promise.resolve()
+
+    expect(logger.log).toHaveBeenCalledWith({
+      severity: 'error',
+      event: 'main_window_initial_load_failed',
+      serverUrl: 'http://localhost:3001',
+      loadUrl: 'http://localhost:3001?token=token-abc',
+      error,
+    })
+  })
+
+  it('logs a sanitized fallback error when the initial load fails without a main-process logger', async () => {
+    const mockWindow = createMockWindow()
+    const error = new Error('failed to load http://localhost:3001?token=token-abc')
+    ;(mockWindow.loadURL as ReturnType<typeof vi.fn>).mockRejectedValue(error)
+    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const ctx = createDefaultContext({
+      createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
+      readEnvToken: vi.fn().mockResolvedValue('token-abc'),
+    })
+
+    const result = await runStartup(ctx)
+    expect(result.type).toBe('main')
+    await Promise.resolve()
+
+    expect(consoleErrorSpy).toHaveBeenCalledTimes(1)
+    const [payload] = consoleErrorSpy.mock.calls[0] ?? []
+    expect(typeof payload).toBe('string')
+    expect(payload).toContain('"event":"main_window_initial_load_failed"')
+    expect(payload).toContain('"serverUrl":"http://localhost:3001"')
+    expect(payload).not.toContain('token=')
+    expect(payload).not.toContain('token-abc')
+
+    const parsed = JSON.parse(payload as string) as Record<string, unknown>
+    expect(parsed).toMatchObject({
+      severity: 'error',
+      component: 'electron-startup',
+      event: 'main_window_initial_load_failed',
+      serverUrl: 'http://localhost:3001',
+    })
+    expect(parsed).not.toHaveProperty('loadUrl')
+
+    consoleErrorSpy.mockRestore()
+  })
+
   describe('hotkey quake-style toggle', () => {
     it('shows and focuses window when hidden', async () => {
       const mockWindow = createMockWindow()

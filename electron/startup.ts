@@ -123,6 +123,14 @@ async function checkRemoteAuthenticated(
   }
 }
 
+function sanitizeStartupFallbackErrorMessage(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err)
+  return message.replace(
+    /([?&]?(?:token|authorization|password|secret)=)[^\s&]+/gi,
+    '[REDACTED]',
+  )
+}
+
 async function loadMainWindow(
   ctx: StartupContext,
   serverUrl: string,
@@ -168,8 +176,7 @@ async function loadMainWindow(
       component: 'electron-startup',
       event: 'main_window_initial_load_failed',
       serverUrl,
-      loadUrl,
-      error: err instanceof Error ? err.message : String(err),
+      error: sanitizeStartupFallbackErrorMessage(err),
     }))
   })
 
