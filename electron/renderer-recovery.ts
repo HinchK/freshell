@@ -72,6 +72,7 @@ export function registerRendererRecovery(options: RendererRecoveryOptions): void
   let consecutiveFailures = 0
   let unresponsiveTimer: ReturnType<typeof globalThis.setTimeout> | undefined
   let scheduledRecoveryTimer: ReturnType<typeof globalThis.setTimeout> | undefined
+  let scheduledRecoveryRequest: RecoveryRequest | undefined
   let attemptTimestamps: number[] = []
 
   const webContents = window.webContents
@@ -86,6 +87,16 @@ export function registerRendererRecovery(options: RendererRecoveryOptions): void
 
     clearTimeout(unresponsiveTimer)
     unresponsiveTimer = undefined
+  }
+
+  const clearScheduledRecoveryTimer = () => {
+    if (!scheduledRecoveryTimer) {
+      return
+    }
+
+    clearTimeout(scheduledRecoveryTimer)
+    scheduledRecoveryTimer = undefined
+    scheduledRecoveryRequest = undefined
   }
 
   const pruneAttempts = (now: number) => {
@@ -225,8 +236,9 @@ export function registerRendererRecovery(options: RendererRecoveryOptions): void
       return
     }
 
+    scheduledRecoveryRequest = request
     scheduledRecoveryTimer = scheduleTimeout(() => {
-      scheduledRecoveryTimer = undefined
+      clearScheduledRecoveryTimer()
       startRecovery(request)
     }, delayMs)
   }
@@ -307,6 +319,9 @@ export function registerRendererRecovery(options: RendererRecoveryOptions): void
 
   webContents.on('responsive', () => {
     clearUnresponsiveTimer()
+    if (scheduledRecoveryRequest?.trigger === 'unresponsive') {
+      clearScheduledRecoveryTimer()
+    }
     logWithContext({
       severity: 'info',
       event: 'main_window_responsive',

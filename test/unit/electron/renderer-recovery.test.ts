@@ -86,6 +86,23 @@ describe('registerRendererRecovery', () => {
     }))
   })
 
+  it('shows and focuses the window after recovery succeeds', async () => {
+    registerRendererRecovery({
+      window,
+      loadUrl,
+      serverUrl,
+      logger,
+      setTimeout,
+      clearTimeout,
+    })
+
+    window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 133 })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(window.show).toHaveBeenCalledTimes(1)
+    expect(window.focus).toHaveBeenCalledTimes(1)
+  })
+
   it('recovers clean renderer exits while the main window is expected to stay alive', async () => {
     registerRendererRecovery({
       window,
@@ -148,6 +165,108 @@ describe('registerRendererRecovery', () => {
     await vi.advanceTimersByTimeAsync(15_000)
     expect(window.webContents.forcefullyCrashRenderer).toHaveBeenCalledTimes(1)
     expect(window.webContents.reload).toHaveBeenCalledTimes(1)
+  })
+
+  it('backs off before retrying after a failed recovery', async () => {
+    const verifyRecovered = vi.fn()
+      .mockRejectedValueOnce(new Error('recovery failed'))
+      .mockResolvedValueOnce(undefined)
+
+    registerRendererRecovery({
+      window,
+      loadUrl,
+      serverUrl,
+      logger,
+      setTimeout,
+      clearTimeout,
+      verifyRecovered,
+    })
+
+    window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 133 })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(window.webContents.reload).toHaveBeenCalledTimes(1)
+
+    window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 133 })
+    await vi.advanceTimersByTimeAsync(249)
+    expect(window.webContents.reload).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(1)
+    expect(window.webContents.reload).toHaveBeenCalledTimes(2)
+  })
+
+  it('cancels queued unresponsive backoff recovery when the renderer becomes responsive', async () => {
+    const verifyRecovered = vi.fn().mockRejectedValueOnce(new Error('recovery failed'))
+
+    registerRendererRecovery({
+      window,
+      loadUrl,
+      serverUrl,
+      logger,
+      setTimeout,
+      clearTimeout,
+      verifyRecovered,
+    })
+
+    window.webContents.emit('unresponsive')
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(window.webContents.forcefullyCrashRenderer).toHaveBeenCalledTimes(1)
+    expect(window.webContents.reload).toHaveBeenCalledTimes(1)
+
+    window.webContents.emit('unresponsive')
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(window.webContents.reload).toHaveBeenCalledTimes(1)
+
+    window.webContents.emit('responsive')
+    await vi.advanceTimersByTimeAsync(250)
+
+    expect(window.webContents.forcefullyCrashRenderer).toHaveBeenCalledTimes(1)
+    expect(window.webContents.reload).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls back to loadURL and logs when reload is unavailable', async () => {
+    Reflect.deleteProperty(window.webContents, 'reload')
+
+    registerRendererRecovery({
+      window,
+      loadUrl,
+      serverUrl,
+      logger,
+      setTimeout,
+      clearTimeout,
+    })
+
+    window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 133 })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(window.loadURL).toHaveBeenCalledWith(loadUrl)
+    expect(logger.log).toHaveBeenCalledWith(expect.objectContaining({
+      severity: 'warn',
+      event: 'main_window_recovery_reload_unavailable',
+      trigger: 'render-process-gone',
+    }))
+  })
+
+  it('falls back to loadURL and logs when webContents is destroyed before reload', async () => {
+    window.webContents.isDestroyed.mockReturnValue(true)
+
+    registerRendererRecovery({
+      window,
+      loadUrl,
+      serverUrl,
+      logger,
+      setTimeout,
+      clearTimeout,
+    })
+
+    window.webContents.emit('render-process-gone', {}, { reason: 'crashed', exitCode: 133 })
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(window.loadURL).toHaveBeenCalledWith(loadUrl)
+    expect(logger.log).toHaveBeenCalledWith(expect.objectContaining({
+      severity: 'warn',
+      event: 'main_window_recovery_reload_unavailable',
+      trigger: 'render-process-gone',
+    }))
   })
 
   it('stops retrying after the crash-loop circuit breaker opens', async () => {
