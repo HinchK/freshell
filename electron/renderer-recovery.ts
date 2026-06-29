@@ -1,4 +1,4 @@
-import type { ElectronMainLogger } from './main-process-logger.js'
+import type { ElectronMainLogEntry, ElectronMainLogger } from './main-process-logger.js'
 
 export interface RecoverableBrowserWindow {
   loadURL(url: string): Promise<void>
@@ -103,7 +103,7 @@ export function registerRendererRecovery(options: RendererRecoveryOptions): void
     attemptTimestamps = attemptTimestamps.filter((timestamp) => now - timestamp < CIRCUIT_WINDOW_MS)
   }
 
-  const logWithContext = (entry: Record<string, unknown>) => {
+  const logWithContext = (entry: ElectronMainLogEntry) => {
     logger.log({
       serverUrl,
       loadUrl,
