@@ -1,7 +1,7 @@
 import path from 'path'
 import { buildLocalProbeUrls, discoverLocalServers, normalizeServerUrl } from './launch-discovery.js'
 import { chooseLaunchAction } from './launch-policy.js'
-import type { ElectronMainLogger } from './main-process-logger.js'
+import { redactUrlForLog, type ElectronMainLogger } from './main-process-logger.js'
 import { registerRendererRecovery, type RecoverableWebContents } from './renderer-recovery.js'
 import { resolveCandidateToken } from './token-resolver.js'
 import type { DesktopConfig, ForcedLaunch, LaunchServerCandidate } from './types.js'
@@ -175,7 +175,7 @@ async function loadMainWindow(
       severity: 'error',
       component: 'electron-startup',
       event: 'main_window_initial_load_failed',
-      serverUrl,
+      serverUrl: redactUrlForLog(serverUrl),
       error: sanitizeStartupFallbackErrorMessage(err),
     }))
   })

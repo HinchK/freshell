@@ -730,12 +730,25 @@ describe('runStartup', () => {
 
   it('logs a sanitized fallback error when the initial load fails without a main-process logger', async () => {
     const mockWindow = createMockWindow()
-    const error = new Error('failed to load http://localhost:3001?token=token-abc')
+    const error = new Error('failed to load http://remote.example:3001/?token=saved-remote-token&workspace=main')
     ;(mockWindow.loadURL as ReturnType<typeof vi.fn>).mockRejectedValue(error)
     const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     const ctx = createDefaultContext({
+      desktopConfig: {
+        serverMode: 'remote',
+        port: 3001,
+        remoteUrl: 'http://remote.example:3001/?token=saved-remote-token&workspace=main',
+        remoteToken: 'token-abc',
+        knownServers: [],
+        alwaysAskOnLaunch: false,
+        globalHotkey: 'CommandOrControl+`',
+        startOnLogin: false,
+        minimizeToTray: true,
+        setupCompleted: true,
+      },
       createBrowserWindow: vi.fn().mockReturnValue(mockWindow),
-      readEnvToken: vi.fn().mockResolvedValue('token-abc'),
+      fetchHealthCheck: vi.fn().mockResolvedValue(true),
+      fetchAuthenticated: vi.fn().mockResolvedValue(true),
     })
 
     const result = await runStartup(ctx)
@@ -746,16 +759,16 @@ describe('runStartup', () => {
     const [payload] = consoleErrorSpy.mock.calls[0] ?? []
     expect(typeof payload).toBe('string')
     expect(payload).toContain('"event":"main_window_initial_load_failed"')
-    expect(payload).toContain('"serverUrl":"http://localhost:3001"')
-    expect(payload).not.toContain('token=')
+    expect(payload).not.toContain('token=saved-remote-token')
     expect(payload).not.toContain('token-abc')
+    expect(payload).not.toContain('saved-remote-token')
 
     const parsed = JSON.parse(payload as string) as Record<string, unknown>
     expect(parsed).toMatchObject({
       severity: 'error',
       component: 'electron-startup',
       event: 'main_window_initial_load_failed',
-      serverUrl: 'http://localhost:3001',
+      serverUrl: 'http://remote.example:3001/?token=%5BREDACTED%5D&workspace=main',
     })
     expect(parsed).not.toHaveProperty('loadUrl')
 
