@@ -129,6 +129,57 @@ test.describe('Fresh Agent', () => {
     await expect(page.getByRole('button', { name: /^Freshcodex$/i })).toBeVisible()
   })
 
+  test('fresh-agent header keeps identity visible in a narrow split pane', async ({ freshellPage, page, harness, terminal }) => {
+    await page.setViewportSize({ width: 320, height: 760 })
+    await terminal.waitForTerminal()
+
+    const tabId = await harness.getActiveTabId()
+    expect(tabId).toBeTruthy()
+    const layout = await harness.getPaneLayout(tabId!)
+    expect(layout?.type).toBe('leaf')
+    const paneId = layout.id as string
+
+    await page.evaluate(({ currentTabId, currentPaneId }) => {
+      window.__FRESHELL_TEST_HARNESS__?.setFreshAgentNetworkEffectsSuppressed('pane-narrow-freshcodex', true)
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'panes/splitPane',
+        payload: {
+          tabId: currentTabId,
+          paneId: currentPaneId,
+          direction: 'horizontal',
+          newPaneId: 'pane-narrow-freshcodex',
+          newContent: {
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-narrow-freshcodex',
+            sessionId: 'narrow-freshcodex-session',
+            resumeSessionId: 'narrow-freshcodex-session',
+            status: 'idle',
+            initialCwd: '/home/user/code/freshell',
+            settingsDismissed: true,
+          },
+        },
+      })
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'panes/resizePanes',
+        payload: {
+          tabId: currentTabId,
+          splitId: window.__FRESHELL_TEST_HARNESS__?.getState().panes.layouts[currentTabId].id,
+          sizes: [50, 50],
+        },
+      })
+    }, { currentTabId: tabId!, currentPaneId: paneId })
+
+    const freshcodexPane = page.locator('[data-context="pane"][data-pane-id="pane-narrow-freshcodex"]')
+    await expect(freshcodexPane).toBeVisible({ timeout: 10_000 })
+    const header = freshcodexPane.getByRole('banner', { name: 'Pane: freshell' })
+    await expect(header).toBeVisible()
+
+    await expect(header.getByText('freshcodex', { exact: true })).toBeVisible()
+    await expect(header.getByText('freshell', { exact: true })).toBeVisible()
+  })
+
   test('freshclaude settings use FreshAgent model defaults and create payload', async ({ freshellPage: _freshellPage, page, harness, terminal }) => {
     await terminal.waitForTerminal()
     await enableClaudeAndCodex(page)

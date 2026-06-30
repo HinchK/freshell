@@ -15,6 +15,71 @@ html {
   font-size: calc(100% * var(--ui-scale, 1.25));
 }
 
+.pane-header {
+  container-type: inline-size;
+  overflow: hidden;
+}
+
+.pane-header-fresh-agent-title {
+  flex: 1 1 auto;
+}
+
+.pane-header-fresh-agent-identity {
+  max-width: 8rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-header-fresh-agent-detail {
+  flex: 1 1 auto;
+}
+
+.pane-header-fresh-agent-meta {
+  min-width: min-content;
+}
+
+@container (max-width: 280px) {
+  .pane-header--fresh-agent .pane-header-actions {
+    gap: 0.25rem;
+  }
+
+  .pane-header--fresh-agent .pane-header-fresh-agent-optional-action {
+    display: none;
+  }
+
+  .pane-header--fresh-agent .pane-header-fresh-agent-title {
+    gap: 0.35rem;
+  }
+}
+
+@container (max-width: 180px) {
+  .pane-header--fresh-agent .pane-header-fresh-agent-title {
+    gap: 0.2rem;
+  }
+
+  .pane-header--fresh-agent .pane-header-fresh-agent-identity,
+  .pane-header--fresh-agent .pane-header-fresh-agent-detail {
+    font-size: 0.68rem;
+  }
+
+  .pane-header--fresh-agent .pane-header-actions button {
+    height: 1rem;
+    width: 1rem;
+  }
+
+  .pane-header--fresh-agent .pane-header-actions svg {
+    height: 0.75rem;
+    width: 0.75rem;
+  }
+}
+
+@container (max-width: 120px) {
+  .pane-header--fresh-agent .pane-header-fresh-agent-meta {
+    display: none;
+  }
+}
+
 /* Fresh-agent panes use their real pane geometry. Transcript copy inherits the
    terminal font-size setting, while chrome, rails, buttons, and textarea layout
    keep normal responsive UI sizing on desktop and phone. */

@@ -79,7 +79,7 @@ export default function PaneHeader({
         e.stopPropagation()
         onRefresh()
       }}
-      className="inline-flex h-6 w-6 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4"
+      className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4"
       title="Refresh pane"
       aria-label="Refresh pane"
     >
@@ -97,7 +97,8 @@ export default function PaneHeader({
   return (
     <div
       className={cn(
-        'flex items-center gap-2 h-[2.625rem] sm:h-7 px-2 text-sm border-b border-border shrink-0',
+        'pane-header flex h-[2.625rem] shrink-0 items-center border-b border-border text-sm sm:h-7',
+        isFreshAgentPane ? 'pane-header--fresh-agent gap-1.5 px-1.5' : 'gap-2 px-2',
         needsAttention
           ? 'bg-emerald-50 border-l-2 border-l-emerald-500 dark:bg-emerald-900/30'
           : isActive ? 'bg-muted' : 'bg-muted/50 text-muted-foreground'
@@ -116,11 +117,14 @@ export default function PaneHeader({
         />
       ) : null}
 
-      <div className="min-w-0 flex flex-1 items-center gap-1.5">
+      <div className={cn(
+        'min-w-0 flex flex-1 items-center gap-1.5',
+        isFreshAgentPane && 'pane-header-fresh-agent-title',
+      )}>
         {isFreshAgentPane && !isRenaming ? (
           <span
             className={cn(
-              'shrink-0 text-sm',
+              'pane-header-fresh-agent-identity shrink-0 text-sm',
               busy && status === 'running' ? 'text-blue-500' : 'text-muted-foreground',
             )}
             title={`${content.sessionType} session`}
@@ -143,14 +147,14 @@ export default function PaneHeader({
         ) : isFreshAgentPane ? (
           <>
             {freshAgentTitleLabel ? (
-              <span className="block min-w-0 truncate" title={title}>
+              <span className="pane-header-fresh-agent-detail block min-w-0 truncate" title={title}>
                 {freshAgentTitleLabel}
               </span>
             ) : null}
             {freshAgentMetaLabel ? (
               <span
                 className={cn(
-                  'block min-w-0 truncate',
+                  'pane-header-fresh-agent-detail pane-header-fresh-agent-meta block min-w-0 truncate',
                   freshAgentTitleLabel ? 'text-muted-foreground' : undefined,
                 )}
                 title={metaTooltip || freshAgentMetaLabel}
@@ -166,7 +170,10 @@ export default function PaneHeader({
         )}
       </div>
 
-      <div className="ml-auto flex h-full items-center gap-2">
+      <div className={cn(
+        'pane-header-actions ml-auto flex h-full shrink-0 items-center',
+        isFreshAgentPane ? 'gap-1.5' : 'gap-2',
+      )}>
         {!isFreshAgentPane && metaLabel && (
           <span
             className="max-w-[18rem] truncate text-xs text-muted-foreground text-right"
@@ -193,14 +200,20 @@ export default function PaneHeader({
         {!isFreshAgentPane ? refreshButton : null}
 
         {isFreshAgentPane ? (
-          <FreshAgentSettingsButton
-            tabId={tabId}
-            paneId={paneId}
-            paneContent={content}
-          />
+          <div className="pane-header-fresh-agent-optional-action">
+            <FreshAgentSettingsButton
+              tabId={tabId}
+              paneId={paneId}
+              paneContent={content}
+            />
+          </div>
         ) : null}
 
-        {isFreshAgentPane ? refreshButton : null}
+        {isFreshAgentPane && refreshButton ? (
+          <div className="pane-header-fresh-agent-optional-action">
+            {refreshButton}
+          </div>
+        ) : null}
 
         {onToggleZoom && (
           <button
@@ -208,7 +221,10 @@ export default function PaneHeader({
               e.stopPropagation()
               onToggleZoom()
             }}
-            className="inline-flex h-6 w-6 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4"
+            className={cn(
+              'inline-flex h-6 w-6 shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4',
+              isFreshAgentPane && 'pane-header-fresh-agent-optional-action',
+            )}
             title={isZoomed ? 'Restore pane' : 'Maximize pane'}
             aria-label={isZoomed ? 'Restore pane' : 'Maximize pane'}
           >
@@ -224,7 +240,7 @@ export default function PaneHeader({
             e.stopPropagation()
             onClose()
           }}
-          className="inline-flex h-6 w-6 items-center justify-center rounded opacity-60 hover:opacity-100 hover:bg-background/50 transition-opacity sm:h-4 sm:w-4"
+          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 hover:bg-background/50 transition-opacity sm:h-4 sm:w-4"
           title="Close pane"
           aria-label="Close pane"
         >
