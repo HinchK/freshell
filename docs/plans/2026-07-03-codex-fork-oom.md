@@ -41,7 +41,7 @@ No user decision is required now. The next proofs are implementable locally with
   - Covers top-level id/method extraction, late top-level id after huge result, nested id safety, escaped strings, binary buffers, arrays/batches, malformed JSON, and large payload allocation behavior.
 
 - Modify: `server/coding-cli/codex-app-server/remote-proxy.ts`
-  - Preserve raw data and explicit `isBinary` on held and forwarded frames.
+  - Preserve raw `WebSocket.RawData` and explicit `isBinary` on held and forwarded frames; never convert an oversized text frame to a UTF-16 string just to forward it.
   - Use the envelope scanner for request/response attribution before bounded parsing.
   - Force `thread/fork.params.excludeTurns = true` for terminal requests.
   - Reject oversized `thread/fork` requests instead of forwarding them unmodified.
@@ -68,6 +68,7 @@ No user decision is required now. The next proofs are implementable locally with
 - If the TUI sends `excludeTurns: false`, upstream still receives `excludeTurns: true`.
 - If a `thread/fork` request is too large to parse and rewrite safely, Freshell returns a JSON-RPC error to the TUI using the scanned id when available and does not forward the request upstream.
 - The proxy must never run full `JSON.parse` on frames larger than the configured parse caps.
+- The proxy must never call `raw.toString()` on an oversized frame. All UTF-8 decoding must happen behind a byte cap.
 - Text frames must be forwarded as text frames and binary frames as binary frames.
 - Held `turn/start` frames must preserve their original frame type and release only after `markCandidatePersisted()`.
 - `pendingMethods` must use only top-level JSON-RPC ids. Nested `id` fields in `params`, `result`, `thread`, or `turns` must never clear or set pending methods.
@@ -259,6 +260,7 @@ Add tests proving:
 - a large upstream response with top-level id after `result` is forwarded raw and clears `pendingMethods`
 - nested `result.id` does not clear `pendingMethods`
 - text upstream frames are forwarded as text and binary frames as binary
+- an oversized text upstream frame is forwarded without calling `toString()` on that large raw buffer
 - oversized `turn/start` is held without full `JSON.parse` and released after `markCandidatePersisted()`
 
 - [ ] **Step 2: Run tests to verify red**
@@ -282,7 +284,7 @@ type ProxyFrame = {
 }
 
 function createFrame(raw: WebSocket.RawData, isBinary: boolean): ProxyFrame {
-  return { data: isBinary ? raw : raw.toString(), isBinary }
+  return { data: raw, isBinary }
 }
 
 function frameByteLength(raw: WebSocket.RawData | string): number {
@@ -292,17 +294,27 @@ function frameByteLength(raw: WebSocket.RawData | string): number {
   return raw.byteLength
 }
 
+function rawDataToBuffer(raw: WebSocket.RawData): Buffer {
+  if (Buffer.isBuffer(raw)) return raw
+  if (Array.isArray(raw)) return Buffer.concat(raw)
+  return Buffer.from(raw)
+}
+
+function rawDataToUtf8(raw: WebSocket.RawData): string {
+  return rawDataToBuffer(raw).toString('utf8')
+}
+
 function parseJsonIfWithin(raw: WebSocket.RawData, maxBytes: number): unknown {
   if (frameByteLength(raw) > maxBytes) return undefined
   try {
-    return JSON.parse(raw.toString())
+    return JSON.parse(rawDataToUtf8(raw))
   } catch {
     return undefined
   }
 }
 ```
 
-Change `PendingTurnStart.raw` to `frame: ProxyFrame`. Change `sendIfOpen` to accept `ProxyFrame | WebSocket.RawData | string` and call `socket.send(frame.data, { binary: frame.isBinary })` for frames.
+Change `PendingTurnStart.raw` to `frame: ProxyFrame`. Change `sendIfOpen` to accept `ProxyFrame | WebSocket.RawData | string` and call `socket.send(frame.data, { binary: frame.isBinary })` for frames. For original text frames, pass the original `raw` buffer/array buffer/buffer chunks with `{ binary: false }`; do not normalize text frames to strings unless they are below a parse/rewrite cap. Only rewritten `thread/fork` requests and JSON-RPC proxy-generated errors/successes should be sent as strings.
 
 - [ ] **Step 4: Use the scanner for attribution**
 
@@ -469,6 +481,7 @@ Use `vi.spyOn(JSON, 'parse')`, send a `thread/fork` request, then have upstream 
 - the TUI receives exactly the same raw response
 - the response frame is text, not binary
 - `JSON.parse` is not called with that large response
+- `Buffer.prototype.toString` is not called for a buffer with the large response byte length while the proxy handles that response
 
 - [ ] **Step 2: Add oversized side-effect repair tests**
 
