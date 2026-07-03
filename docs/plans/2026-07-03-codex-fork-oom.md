@@ -91,7 +91,7 @@ No user decision is required for this revision. The remaining proofs are local a
   - Regression coverage for fork candidate handoff replacing the old durable identity while ordinary mismatched startup candidates remain ignored.
 
 - Create: `test/unit/server/coding-cli/codex-app-server/remote-proxy-large-forward-child.ts`
-  - Constrained-heap stress fixture proving the actual proxy forwards large non-state frames below `MAX_RAW_FORWARD_BYTES` without full-parse or full-stringify and fail-closes frames above the cap.
+  - Constrained-heap stress fixture proving the actual proxy forwards both a large stateful `thread/fork` response after bounded candidate extraction and large non-state frames below `MAX_RAW_FORWARD_BYTES` without full-parse or full-stringify, and fail-closes frames above the cap.
 
 - Create: `test/integration/real/codex-remote-fork-contract.test.ts`
   - Opt-in real terminal Codex TUI `/fork` contract using `codex --remote`, `node-pty`, an isolated `CODEX_HOME`, `CODEX_MANAGED_REMOTE_CONFIG_ARGS`, and a controlled WebSocket app-server.
@@ -506,16 +506,20 @@ Create a fixture that:
 - starts a controlled upstream WebSocket server
 - starts `CodexRemoteProxy` with `requireCandidatePersistence: false`
 - connects a TUI WebSocket to the proxy
-- sends a `thread/fork` request
-- has upstream send a large non-state response whose top-level id appears after a large `result`
-- asserts the TUI receives the same byte length
-- exits non-zero if the process OOMs, times out, parses the body, or loses the response
+- supports separate modes for:
+  - a large stateful `thread/fork` response whose top-level id appears after `result.thread.turns`
+  - a large non-state response whose top-level id appears after a large `result`
+  - an above-cap non-state response
+- for the `thread/fork` mode, sends a `thread/fork` request, has upstream assert the rewritten request contains `excludeTurns: true`, then sends a large response with `result.thread.id`, `result.thread.path`, `result.thread.ephemeral`, and a huge `result.thread.turns` decoy before the top-level id
+- for the non-state modes, sends a request with a method outside `STATEFUL_RESPONSE_METHODS` such as `model/list`, then has upstream send the large or above-cap response with the matching top-level id after the large `result`
+- asserts the TUI receives the same byte length for both below-cap success modes and that the proxy emits `thread_fork_response` for the stateful fork mode
+- exits non-zero if the process OOMs, times out, parses the body, loses the response, fails to recover the fork candidate, or incorrectly forwards the above-cap frame
 
-Use a payload at the limit boundary, not merely a conveniently large sample. Build a text JSON-RPC response buffer with total byte length `MAX_RAW_FORWARD_BYTES - 1024` so the successful path proves the actual configured cap. Generate it from `Buffer` chunks instead of constructing a huge JS string, have the upstream send it as a text WebSocket frame with `{ binary: false }`, and assert the client receives `isBinary === false`.
+Use payloads at the limit boundary, not merely convenient large samples. Build text JSON-RPC response buffers with total byte length `MAX_RAW_FORWARD_BYTES - 1024` so both successful paths prove the actual configured cap. Generate them from `Buffer` chunks instead of constructing huge JS strings, have the upstream send them as text WebSocket frames with `{ binary: false }`, and assert the client receives `isBinary === false`.
 
-- [ ] **Step 2: Add the parent Vitest case**
+- [ ] **Step 2: Add the parent Vitest cases**
 
-Launch the fixture with a constrained heap:
+Launch the fixture once for the stateful fork-response mode and once for the non-state raw-forward mode with a constrained heap:
 
 ```ts
 await execFileAsync(process.execPath, [
@@ -529,7 +533,7 @@ await execFileAsync(process.execPath, [
 })
 ```
 
-- [ ] **Step 3: Run the stress test**
+- [ ] **Step 3: Run the stress tests**
 
 Run:
 
@@ -537,9 +541,9 @@ Run:
 npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "constrained heap"
 ```
 
-Expected before the raw-forward path is complete: FAIL by child OOM, timeout, or explicit assertion. Expected after Task 4 implementation is complete: PASS and report the forwarded byte length, `isBinary === false`, and an RSS/heap sample that confirms the proxy did not materialize the payload as a parsed JS object.
+Expected before the bounded extractor and raw-forward paths are complete: FAIL by child OOM, timeout, missing `thread_fork_response`, or explicit assertion. Expected after Task 4 implementation is complete: PASS and report the forwarded byte length, `isBinary === false`, and an RSS/heap sample for both success modes confirming the proxy did not materialize the payload as a parsed JS object.
 
-If this fails at the 64 MiB boundary after the no-parse path is implemented, do not weaken the test. Lower `MAX_RAW_FORWARD_BYTES` to the highest passing boundary found by the child fixture, update both boundary tests, and document the measured RSS/heap output in the implementation report.
+If either success mode fails at the 64 MiB boundary after the no-parse path is implemented, do not weaken the test. Lower `MAX_RAW_FORWARD_BYTES` to the highest boundary where both success modes pass, update all boundary tests, and document the measured RSS/heap output in the implementation report.
 
 - [ ] **Step 4: Add the above-cap child-process case**
 
