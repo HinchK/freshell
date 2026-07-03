@@ -19,6 +19,7 @@ The clean steady-state design is a small proxy-level protocol guard:
 - For terminal Codex `thread/fork`, Freshell always forwards `params.excludeTurns = true`. If the TUI sends `excludeTurns: false`, Freshell overrides it. If `params` is missing or invalid, Freshell still forwards an object containing `excludeTurns: true`; Codex remains responsible for returning the normal validation error for missing required fields such as `threadId`.
 - For upstream responses, Freshell avoids full `JSON.parse` unless the message is small enough and belongs to behavior the proxy owns: candidate capture from `thread/start`, turn/lifecycle/fs notifications, and duplicate completed-turn interrupt bookkeeping. Regular responses such as `thread/fork` are forwarded without full parse.
 - Text-vs-binary frame semantics must be preserved. Avoid `raw.toString()` for uninspected large text frames by sending raw bytes with `binary: false` when the original frame was text.
+- Bounded JSON-RPC envelope inspection must only read top-level `id` and `method` fields. Do not use broad regex searches over the prefix; large Codex payloads commonly contain nested `id` fields in `thread.turns`, and treating those as response IDs can corrupt `pendingMethods`.
 
 Important compatibility trade-off: the terminal Codex client will no longer receive the full `turns` array inside the immediate `thread/fork` result. That is intentional. The fork should remain server-side and the response still carries the forked thread metadata. If the Codex TUI needs turns later, it should fetch them through read/list APIs instead of receiving all history in the fork response.
 
@@ -52,6 +53,7 @@ No user decision is required. The user approved implementing the safer behavior,
 - The proxy must continue to capture restore candidates from `thread/start` responses and `thread/started` notifications.
 - The proxy must continue to emit `turn/started`, `turn/completed`, fs-change, and thread lifecycle events from notifications.
 - The proxy must not fully parse large upstream responses that it does not need to inspect, especially `thread/fork` responses.
+- Bounded upstream inspection must never use nested payload fields as JSON-RPC envelope fields. If a large response has `result.thread.turns[0].id` before the top-level response `id`, the proxy must forward it without clearing unrelated pending methods.
 - Frame direction and type must remain correct: text frames stay text frames, binary frames stay binary frames.
 - Logging should remain structured and should include method/id where bounded envelope inspection can identify them. Logs must not include full response bodies.
 
@@ -345,37 +347,135 @@ function rawPrefix(raw: WebSocket.RawData, maxBytes: number): string {
 function inspectJsonRpcEnvelope(raw: WebSocket.RawData, isBinary: boolean): { id?: JsonRpcId; method?: string } {
   if (isBinary) return {}
   const prefix = rawPrefix(raw, MAX_JSON_RPC_ENVELOPE_BYTES)
-  return {
-    id: readJsonRpcIdFromPrefix(prefix),
-    method: readJsonRpcMethodFromPrefix(prefix),
-  }
+  return readTopLevelJsonRpcEnvelope(prefix)
 }
 
-function readJsonRpcIdFromPrefix(prefix: string): JsonRpcId | undefined {
-  const match = prefix.match(/"id"\s*:\s*(?:"([^"\\]*(?:\\.[^"\\]*)*)"|(-?\d+(?:\.\d+)?))/)
-  if (!match) return undefined
-  if (match[1] !== undefined) {
-    try {
-      return JSON.parse(`"${match[1]}"`)
-    } catch {
-      return undefined
+function readTopLevelJsonRpcEnvelope(prefix: string): { id?: JsonRpcId; method?: string } {
+  const envelope: { id?: JsonRpcId; method?: string } = {}
+  let index = skipWhitespace(prefix, 0)
+  if (prefix[index] !== '{') return envelope
+  index += 1
+
+  while (index < prefix.length) {
+    index = skipWhitespace(prefix, index)
+    if (prefix[index] === '}') return envelope
+
+    const key = readJsonStringAt(prefix, index)
+    if (!key) return envelope
+    index = skipWhitespace(prefix, key.end)
+    if (prefix[index] !== ':') return envelope
+    index = skipWhitespace(prefix, index + 1)
+
+    if (key.value === 'id') {
+      const id = readJsonRpcIdAt(prefix, index)
+      if (id.matched) envelope.id = id.value
+      index = id.end
+    } else if (key.value === 'method') {
+      const method = readJsonStringAt(prefix, index)
+      if (method) {
+        envelope.method = method.value
+        index = method.end
+      } else {
+        const next = skipJsonValue(prefix, index)
+        if (next === undefined) return envelope
+        index = next
+      }
+    } else {
+      const next = skipJsonValue(prefix, index)
+      if (next === undefined) return envelope
+      index = next
     }
+
+    index = skipWhitespace(prefix, index)
+    if (prefix[index] === ',') {
+      index += 1
+      continue
+    }
+    if (prefix[index] === '}') return envelope
+    return envelope
   }
-  if (match[2] !== undefined) {
-    const value = Number(match[2])
-    return Number.isFinite(value) ? value : undefined
+
+  return envelope
+}
+
+function readJsonRpcIdAt(input: string, start: number): { matched: true; value: JsonRpcId; end: number } | { matched: false; end: number } {
+  const stringValue = readJsonStringAt(input, start)
+  if (stringValue) return { matched: true, value: stringValue.value, end: stringValue.end }
+
+  const numeric = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(input.slice(start))
+  if (!numeric) return { matched: false, end: start }
+  const value = Number(numeric[0])
+  return Number.isFinite(value)
+    ? { matched: true, value, end: start + numeric[0].length }
+    : { matched: false, end: start }
+}
+
+function readJsonStringAt(input: string, start: number): { value: string; end: number } | undefined {
+  if (input[start] !== '"') return undefined
+  let escaped = false
+  for (let index = start + 1; index < input.length; index += 1) {
+    const char = input[index]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (char === '\\') {
+      escaped = true
+      continue
+    }
+    if (char === '"') {
+      try {
+        const value = JSON.parse(input.slice(start, index + 1))
+        return typeof value === 'string' ? { value, end: index + 1 } : undefined
+      } catch {
+        return undefined
+      }
+    }
   }
   return undefined
 }
 
-function readJsonRpcMethodFromPrefix(prefix: string): string | undefined {
-  const match = prefix.match(/"method"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"/)
-  if (!match) return undefined
-  try {
-    return JSON.parse(`"${match[1]}"`)
-  } catch {
+function skipJsonValue(input: string, start: number): number | undefined {
+  const first = input[start]
+  if (first === '"') return readJsonStringAt(input, start)?.end
+  if (first === '{' || first === '[') {
+    let depth = 0
+    let inString = false
+    let escaped = false
+    for (let index = start; index < input.length; index += 1) {
+      const char = input[index]
+      if (inString) {
+        if (escaped) {
+          escaped = false
+        } else if (char === '\\') {
+          escaped = true
+        } else if (char === '"') {
+          inString = false
+        }
+        continue
+      }
+      if (char === '"') {
+        inString = true
+      } else if (char === '{' || char === '[') {
+        depth += 1
+      } else if (char === '}' || char === ']') {
+        depth -= 1
+        if (depth === 0) return index + 1
+      }
+    }
     return undefined
   }
+  let index = start
+  while (index < input.length && input[index] !== ',' && input[index] !== '}' && input[index] !== ']') {
+    index += 1
+  }
+  return index > start ? index : undefined
+}
+
+function skipWhitespace(input: string, start: number): number {
+  let index = start
+  while (/\s/.test(input[index] ?? '')) index += 1
+  return index
 }
 
 function parseJsonIfSmall(raw: WebSocket.RawData, isBinary: boolean): unknown {
@@ -426,7 +526,7 @@ Tighten helper names and types:
 
 - `ProxyFrame` should be used for all proxy forwarding paths, including held `turn/start` records.
 - `sendJsonRpcError` and `sendJsonRpcSuccess` may keep sending strings, or may wrap them as `ProxyFrame`; either is acceptable if tests pass and frame type remains text.
-- Avoid parsing bounded regex matches for IDs using broad object parsing. Parsing the tiny JSON string literal used to unescape an id/method is acceptable because it is bounded to the prefix match, not the full payload.
+- Avoid broad regex searches over raw response prefixes. Parsing a tiny JSON string literal while scanning a top-level key/value is acceptable because it is bounded and cannot match nested payload fields.
 - If a large notification cannot be parsed, forward it and skip proxy side-effects rather than risking OOM. Add a debug or warn log only if it is useful and does not spam.
 
 Run:
@@ -453,13 +553,76 @@ git commit -m "fix: avoid parsing large codex proxy responses"
 
 - [ ] **Step 1: Identify or write the failing test**
 
+First add a regression test that protects the bounded envelope scanner from treating nested payload IDs as top-level JSON-RPC IDs. This test may already pass before Task 2 because the current proxy fully parses responses; it is still required because it fails against the tempting but incorrect prefix-regex implementation.
+
+```ts
+  it('does not treat nested response body ids as JSON-RPC envelope ids', async () => {
+    const upstream = await startUpstream()
+    const proxy = await startProxy(upstream.wsUrl, { requireCandidatePersistence: false })
+    const candidates: unknown[] = []
+    proxy.onCandidate((candidate) => candidates.push(candidate))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({ id: 'pending-thread-start', method: 'thread/start', params: {} }))
+    await waitForCondition(() => {
+      expect(upstream.messages).toHaveLength(1)
+    })
+
+    const confusingLargeResponse = JSON.stringify({
+      result: {
+        thread: {
+          id: 'fork-thread',
+          turns: [
+            { id: 'pending-thread-start', items: [{ type: 'text', text: 'nested id should not be used' }] },
+            ...Array.from({ length: 2_000 }, (_, index) => ({
+              id: `turn-${index}`,
+              items: [{ type: 'text', text: `large response body ${index}` }],
+            })),
+          ],
+        },
+      },
+      id: 'unrelated-large-response',
+    })
+    for (const socket of upstream.sockets) {
+      socket.send(confusingLargeResponse)
+    }
+    await nextRawMessageFrame(tui)
+
+    for (const socket of upstream.sockets) {
+      socket.send(JSON.stringify({
+        id: 'pending-thread-start',
+        result: {
+          thread: {
+            id: 'thread-1',
+            path: '/tmp/codex/rollout.jsonl',
+            ephemeral: false,
+          },
+        },
+      }))
+    }
+
+    await waitForCondition(() => {
+      expect(candidates).toEqual([
+        {
+          source: 'thread_start_response',
+          thread: {
+            id: 'thread-1',
+            path: '/tmp/codex/rollout.jsonl',
+            ephemeral: false,
+          },
+        },
+      ])
+    })
+  })
+```
+
 Run the existing tests that protect proxy-owned parsing behavior:
 
 ```bash
 npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "captures a fresh candidate|captures a candidate|emits turn/completed|acks duplicate"
 ```
 
-Expected before implementation may be PASS or may expose a regression from Task 2. If all pass, add no tautological tests. If any fail, treat the existing failing behavior as the red test for this task.
+Expected before implementation may be PASS or may expose a regression from Task 2. If all pass, add no tautological tests beyond the nested-id regression above. If any fail, treat the existing failing behavior as the red test for this task.
 
 - [ ] **Step 2: Run test to verify failure if needed**
 
@@ -468,6 +631,14 @@ If Task 2 broke candidate capture or notifications, keep the failing command and
 - `captures a fresh candidate from the thread/start response and forwards the response` fails because `thread/start` response was no longer parsed.
 - `emits turn/completed notifications` fails because notifications were no longer parsed.
 - `acks duplicate turn/interrupt after the turn already completed` fails because completed-turn bookkeeping was no longer updated.
+
+Also run the nested-id regression directly after implementing bounded envelope inspection:
+
+```bash
+npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "does not treat nested response body ids"
+```
+
+Expected: PASS. If it fails, the bounded envelope inspector is probably matching nested payload fields rather than only top-level JSON-RPC fields.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -489,7 +660,7 @@ Do not parse non-`thread/start` responses. Do not add special parsing for `threa
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "captures a fresh candidate|captures a candidate|emits turn/completed|acks duplicate"
+npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "captures a fresh candidate|captures a candidate|emits turn/completed|acks duplicate|does not treat nested response body ids"
 ```
 
 Expected: PASS.
