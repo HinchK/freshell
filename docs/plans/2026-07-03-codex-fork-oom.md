@@ -266,7 +266,9 @@ Add the regression test:
     const frame = await rawFrame
     expect(frame.isBinary).toBe(false)
     expect(frame.raw.toString()).toBe(response)
-    expect(parseSpy).not.toHaveBeenCalled()
+    const parsedPayloads = parseSpy.mock.calls.map(([payload]) => typeof payload === 'string' ? payload : String(payload))
+    expect(parsedPayloads).not.toContain(response)
+    expect(parsedPayloads.every((payload) => payload.length < 256)).toBe(true)
     parseSpy.mockRestore()
   })
 ```
@@ -526,7 +528,7 @@ Tighten helper names and types:
 
 - `ProxyFrame` should be used for all proxy forwarding paths, including held `turn/start` records.
 - `sendJsonRpcError` and `sendJsonRpcSuccess` may keep sending strings, or may wrap them as `ProxyFrame`; either is acceptable if tests pass and frame type remains text.
-- Avoid broad regex searches over raw response prefixes. Parsing a tiny JSON string literal while scanning a top-level key/value is acceptable because it is bounded and cannot match nested payload fields.
+- Avoid broad regex searches over raw response prefixes. Parsing a tiny JSON string literal while scanning a top-level key/value is acceptable because it is bounded and cannot match nested payload fields. The fork-response regression must assert that the full response body was not passed to `JSON.parse`, not that `JSON.parse` was never called for bounded scanner internals.
 - If a large notification cannot be parsed, forward it and skip proxy side-effects rather than risking OOM. Add a debug or warn log only if it is useful and does not spam.
 
 Run:
@@ -570,10 +572,10 @@ First add a regression test that protects the bounded envelope scanner from trea
 
     const confusingLargeResponse = JSON.stringify({
       result: {
+        id: 'pending-thread-start',
         thread: {
           id: 'fork-thread',
           turns: [
-            { id: 'pending-thread-start', items: [{ type: 'text', text: 'nested id should not be used' }] },
             ...Array.from({ length: 2_000 }, (_, index) => ({
               id: `turn-${index}`,
               items: [{ type: 'text', text: `large response body ${index}` }],
@@ -615,6 +617,8 @@ First add a regression test that protects the bounded envelope scanner from trea
     })
   })
 ```
+
+The first nested `id` in this fixture must intentionally equal the pending `thread/start` request id while the real top-level response id appears after the large `result`. A broad prefix regex would clear the pending `thread/start` entry incorrectly; a top-level envelope reader should either identify only true top-level fields or return no id for this truncated prefix.
 
 Run the existing tests that protect proxy-owned parsing behavior:
 
