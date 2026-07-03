@@ -32,6 +32,15 @@ Plan revision evidence changed the implementation direction:
   - With `excludeTurns: true` against a materialized parent, the real app-server `thread/fork` response carries the child durable path at `result.thread.path`; no `rolloutPath` or `rollout_path` alias is needed.
   - The real terminal TUI rejects a compact fork response that omits `result.thread.turns` with `thread/fork response decode error: missing field turns`.
   - The real terminal TUI accepts the same compact fork response when the proxy/app-server response includes `result.thread.turns: []`.
+- The load-bearing review before landing added and ran stronger contracts:
+  - The real interactive terminal TUI path accepts a typed `/fork` command, emits `thread/fork` for the current parent thread, accepts a compact response with `turns: []`, stays alive, and does not refetch parent history through `thread/turns/list` or parent `thread/read` with turns.
+  - The real app-server child path returned by `result.thread.path` is readable in the Freshell sidecar namespace. After one child turn, existing `proofCodexRollout()` succeeds against that path and child id.
+  - Real child `turn/started` and `turn/completed` notifications arrive after the matching `thread/fork` response, so staging the child candidate at the response is sufficient for observed Codex 0.142.5 ordering.
+  - `ws` 8.19 enforces configured `maxPayload` for fragmented and permessage-deflate messages before application message handlers run; implementation must still pass `maxPayload: MAX_RAW_FORWARD_BYTES` explicitly to both the proxy `WebSocketServer` and upstream `WebSocket` client because the current code inherits 100 MiB defaults.
+- The same load-bearing review falsified two plan assumptions in the current code:
+  - `bindSession()` releases the existing binding, clears `resumeSessionId`, and emits `terminal.session.unbound` before binding the new session. Fork commit needs a no-unbound binding swap, not `bindSession()` as-is.
+  - `replaceCodexDurabilityStoreRecord()` deletes before writing. Fork commit needs write-new-before-retire semantics through an atomic temp-file rename, not delete-then-write.
+  - Current `proxy_close`/`proxy_error` from a durable Codex sidecar enters generic durable recovery keyed by the old `resumeSessionId`. Fork handoff needs a fork-specific failure path that closes/fails the live terminal while preserving the old durable record; it must not recover the old parent into a UI that has already moved to the child.
 
 Use this policy instead:
 
@@ -59,8 +68,9 @@ Use this policy instead:
 - A fork handoff has these required states, whether represented as a transient `TerminalRecord` subobject or equivalent code: `fork_handoff_staged`, `fork_turn_in_progress_unproven`, `fork_proof_checking`, `fork_durable_committed`, and `fork_handoff_failed`. In the staged/proof states, the old `resumeSessionId`, old session binding, and old durable store record remain authoritative for restore/recovery.
 - The proxy-side `fork_handoff` gate starts before forwarding the matching `thread/fork` response to the TUI. TerminalRegistry may call `markCandidatePersisted()` only after it has staged the fork candidate and can attribute fork-thread events to that staged candidate. This releases queued post-fork traffic; it does not mean the fork is durable.
 - During a fork handoff gate, queue bounded, raw-frame-preserving post-fork stateful client traffic, not only `turn/start`. At minimum this includes `turn/start`, `turn/steer`, `turn/interrupt`, nested `thread/fork`, `thread/compact/start`, and other thread-mutating methods. Queue or fail closed stateful upstream notifications attributable to the fork thread until the staged candidate is installed. Allow only the rewritten `thread/fork` request, the matching `thread/fork` response after candidate extraction and gate setup, and clearly non-state/global traffic under the raw-forward cap.
-- Do not call `releaseBinding()`, clear `resumeSessionId`, replace the old durable identity, or broadcast `terminal.session.associated` when the fork candidate is merely staged. On proof success, commit atomically: rebind from the old durable thread to the proven fork thread, set `resumeSessionId` and `durableThreadId` to the fork id, write the new durable record, clear staged handoff/proof state, unwatch stale rollout paths, and then broadcast the new session association. There must be no externally visible unbound interval.
-- On invalid candidate, persistence failure, timeout, queue overflow, or proof failure, preserve the old durable binding and store record, fail/close the proxy before accepting more post-fork traffic, and do not let the terminal continue under an untracked fork identity.
+- During a fork handoff gate, unknown methods and any schema-inventory method that is not explicitly classified safe must fail closed instead of raw-forwarding. The safe-pass allowlist should be small and documented in tests; thread/turn mutators, command execution/write/resize/terminate, plugin install/share mutations, skills config writes, realtime thread methods, and hook prompts are not safe-pass traffic.
+- Do not call `releaseBinding()`, clear `resumeSessionId`, replace the old durable identity, or broadcast `terminal.session.associated` when the fork candidate is merely staged. On proof success, commit with fork-specific primitives: first write the child durable record by temp-file rename without deleting the old record first, then swap the binding authority from old parent to child in one synchronous critical section without emitting `terminal.session.unbound`, then set `resumeSessionId` and `durableThreadId` to the fork id, clear staged handoff/proof state, unwatch stale rollout paths, and broadcast the new session association. There must be no externally visible unbound interval.
+- On invalid candidate, persistence failure, timeout, queue overflow, proof failure, proxy loss, or sidecar loss while a fork handoff is active, preserve the old durable binding and store record for later restore, fail/close the live proxy or terminal before accepting more post-fork traffic, and do not start generic durable recovery of the old parent into the live terminal.
 - Raw-forward oversized non-state frames only up to a raw-forward limit that is proven at the limit boundary by a constrained-heap child-process stress test using the actual proxy. Treat that limit as an operational memory-safety cap, not as proof that larger frames are invalid. Frames above it fail closed in both client-to-upstream and upstream-to-client directions to preserve the Freshell server.
 - The opt-in real app-server fork-shape and real terminal TUI fork contracts have now run in this workspace with `codex` 0.142.5 plus local auth/config. Implementation may rely on `result.thread.path` for fork candidate extraction and must preserve TUI compatibility by injecting `turns: []` into compact fork responses forwarded to the TUI.
 
@@ -100,10 +110,17 @@ No user decision is required for this revision. The remaining proof before compl
 - Modify: `shared/codex-durability.ts`
   - Add `thread_fork_response` as a valid Codex candidate source.
 
+- Modify: `server/session-binding-authority.ts`
+  - Add a synchronous same-terminal session swap primitive used by fork commit so the old binding is not externally unbound between parent and child.
+
+- Modify: `server/coding-cli/codex-app-server/durability-store.ts`
+  - Add a write-replacement path for fork commits that uses the existing temp-file + rename write discipline and never deletes the terminal's old durable record before the child durable record is safely written.
+
 - Modify: `server/terminal-registry.ts`
   - Add deliberate staged Codex fork identity handoff handling for candidates whose source is `thread_fork_response`.
   - Keep the old durable binding authoritative until fork rollout proof commits the handoff.
   - Preserve existing initial-candidate mismatch protection for non-fork candidates.
+  - Use fork-specific proxy/lifecycle failure handling while a handoff is active; do not route these failures into old-parent durable recovery.
 
 - Modify: `test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts`
   - Regression coverage for fork rewriting, fork response candidate emission, large valid client forwarding, stateful side-effect recovery, fail-closed unrecoverable state frames, raw forwarding, frame type preservation, pending id attribution, and duplicate interrupt behavior.
@@ -147,17 +164,18 @@ No user decision is required for this revision. The remaining proof before compl
 - A `thread/fork` response with a valid deterministic rollout path is an intentional Codex terminal identity handoff, but it is staged first. Persist the staged fork candidate in transient TerminalRegistry state, make registry event matching accept the staged fork candidate, and release the proxy's fork gate only after that state is installed. Do not call `releaseBinding()`, clear `resumeSessionId`, replace the old durable identity, or broadcast `terminal.session.associated` until rollout proof for the forked thread succeeds.
 - The required fork handoff lifecycle is: `fork_handoff_staged` after a valid candidate is installed; `fork_turn_in_progress_unproven` after a fork-thread `turn/started`; `fork_proof_checking` after fork-thread completion or rollout-path change triggers proof; `fork_durable_committed` only after proof succeeds; and `fork_handoff_failed` for invalid candidate, persistence failure, timeout, queue overflow, proxy loss, or proof failure. These names may be represented as explicit enum values or equivalent structured state, but tests must prove each transition.
 - During `fork_handoff_staged`, `fork_turn_in_progress_unproven`, and `fork_proof_checking`, the old durable binding remains the restore/recovery identity. The old `resumeSessionId` must remain set and the old durable store record must remain recoverable.
-- On fork proof success, commit the handoff atomically: rebind from the old durable thread to the proven fork thread, set `resumeSessionId` and `durableThreadId` to the fork id, clear staged proof state, unwatch stale rollout paths, write the new durable record, and then broadcast the new session association. There must be no externally visible unbound interval.
-- On invalid candidate, persistence failure, timeout, queue overflow, proxy loss, or proof failure, preserve the old durable binding and store record, fail/close the proxy before accepting further post-fork traffic, and do not let the terminal continue under an untracked fork identity.
+- On fork proof success, commit the handoff with write-new-before-retire ordering: validate the child proof, write the child durable record through an atomic temp-file rename without deleting the old terminal record first, swap the session binding from parent to child without emitting `terminal.session.unbound`, set `resumeSessionId` and `durableThreadId` to the fork id, clear staged proof state, unwatch stale rollout paths, and then broadcast the new session association. There must be no externally visible unbound interval.
+- On invalid candidate, persistence failure, timeout, queue overflow, proxy loss, sidecar loss, or proof failure, preserve the old durable binding and store record, fail/close the live proxy or terminal before accepting further post-fork traffic, and do not let the terminal continue under an untracked fork identity.
+- `proxy_close`, `proxy_error`, and lifecycle-loss events that arrive while `record.codexForkHandoff` is active must be fork-specific failures. They must not call `startCodexDurableRecovery()` for the old parent terminal. The old durable record remains available for a future explicit restore, but the live terminal must close or become failed because its TUI may have already moved to the child.
 - Once a `thread/fork` response candidate is observed, the proxy must not forward subsequent stateful post-fork client requests until the staged fork candidate is persisted or rejected. This closes the race where post-fork turns arrive before TerminalRegistry can attribute them to the staged fork candidate.
-- Stateful post-fork traffic is broader than `turn/start`: queue bounded raw frames for `turn/start`, `turn/steer`, `turn/interrupt`, nested `thread/fork`, `thread/compact/start`, rollback/inject/name/metadata/archive-style thread mutations, and any other request that can mutate or advance the fork thread. Reject nested forks while a handoff is active.
-- Stateful upstream notifications attributable to the fork thread must be queued or fail closed until the staged fork candidate is installed. Non-state/global traffic under the raw-forward cap may pass only when it cannot mutate or advance the fork thread.
+- Stateful post-fork traffic is broader than `turn/start`: queue bounded raw frames for `turn/start`, `turn/steer`, `turn/interrupt`, rollback/inject/name/metadata/archive-style thread mutations, and other known request methods that can mutate or advance the fork thread. Reject nested forks while a handoff is active. Unknown client methods and methods not explicitly proven safe during `fork_handoff` fail closed.
+- Stateful upstream notifications attributable to the fork thread must be queued or fail closed until the staged fork candidate is installed. Non-state/global traffic under the raw-forward cap may pass only when it cannot mutate or advance the fork thread and is in the explicit safe-pass allowlist.
 - `requireCandidatePersistence: false` means "do not wait for a fresh startup identity before first user input." It must not disable `fork_handoff` gates, because resumed terminals can still fork into a new durable thread.
 - `markCandidatePersisted()` releases held `turn/start` frames for startup capture and releases bounded held post-fork traffic for fork handoff gates. The proxy should log the gate reason so timeout and release behavior can be diagnosed without logging frame bodies.
 - A `thread_fork_response` candidate without a deterministic absolute rollout path must not keep the terminal running under an untracked fork identity. The registry keeps the old store record untouched, but the proxy times out or fails the fork handoff gate and emits `proxy_error`/socket closure before user input is accepted on the untracked fork.
 - A mismatched candidate from `thread_start_response` or `thread_started_notification` after an initial candidate is already persisted remains ignored; fork handoff must not weaken the startup-race protection.
 - `fs/changed` extraction may collapse an oversized `changedPaths` array to `[]` only after extracting the watch id. This is conservative because terminal registry treats an empty changed path list as a durability proof request rather than as "no change."
-- Any frame whose byte length exceeds `MAX_RAW_FORWARD_BYTES` fails closed in both directions before forwarding, regardless of method or statefulness. `ws` `maxPayload` rejections and application-level cap rejections must normalize to structured `proxy_error` repair signaling.
+- Any frame whose byte length exceeds `MAX_RAW_FORWARD_BYTES` fails closed in both directions before forwarding, regardless of method or statefulness. The proxy must configure both its local `WebSocketServer` and upstream `WebSocket` client with `maxPayload: MAX_RAW_FORWARD_BYTES`; `ws` `maxPayload` rejections and application-level cap rejections must normalize to structured `proxy_error` repair signaling. Set `perMessageDeflate: false` on the upstream client unless a later contract proves compression is needed.
 - Raw forwarding for non-state frames is allowed only under `MAX_RAW_FORWARD_BYTES` after the constrained-heap stress test passes against the actual proxy implementation; above-cap frames fail closed regardless of direction.
 - The configured `MAX_RAW_FORWARD_BYTES` is valid only after an opt-in/final-gate child-process stress test proves the actual `CodexRemoteProxy`, under `node --max-old-space-size=128`, forwards `MAX_RAW_FORWARD_BYTES - 1024` text frames for both large `thread/fork` response extraction and non-state raw forwarding, rejects `MAX_RAW_FORWARD_BYTES + 1024`, preserves `isBinary === false`, and reports heap/RSS/external memory. If it fails, lower the cap to the highest passing boundary and update tests/spec.
 - Logs remain structured and must not include full request or response bodies.
@@ -187,10 +205,15 @@ export const MAX_IDENTITY_GATE_HELD_BYTES = MAX_RAW_FORWARD_BYTES
 - `server/terminal-registry.ts` currently drops fork-like identity changes: `persistCodexCandidateSerial` returns immediately when `record.resumeSessionId` exists and logs/ignores mismatched candidates when `record.codexDurability.candidate` already exists.
 - `server/terminal-registry.ts` already has some primitives needed for a narrow handoff: `buildCodexDurabilityRef`, `replaceCodexDurabilityStoreRecord`, `unwatchCodexRollout`, `armCodexRolloutWatch`, and the existing rollout proof path that binds only after proof success. It must not use `releaseBinding(..., 'rebind', ...)` until proof success, because `releaseBinding()` clears `resumeSessionId`.
 - `node_modules/ws/lib/websocket-server.js` and `node_modules/ws/lib/websocket.js` show the default `maxPayload` is 100 MiB. `node_modules/ws/lib/receiver.js` shows payload-length enforcement before emission and text messages emitted as `Buffer` objects.
+- Load-bearing validation for `ws` 8.19 confirmed configured `maxPayload` is enforced before application `message` handlers for both fragmented and permessage-deflate payloads. Local source evidence: `receiver.js` accumulates fragmented payload length before emission and checks decompressed message length after permessage-deflate; a tiny loopback probe confirmed oversized fragmented/compressed messages did not call handlers. The proxy must still set `maxPayload` explicitly because current `remote-proxy.ts` inherits 100 MiB defaults on both the local server and upstream client.
 - A disposable raw WebSocket proxy experiment under `node --max-old-space-size=128` forwarded 64 MiB text JSON frames as buffers without full parse/stringify. The actual implementation must reproduce this through the Task 6 child-process fixture before depending on the cap.
 - `codex --version` reports `codex-cli 0.142.5` in this workspace, and both `~/.codex/auth.json` and `~/.codex/config.toml` exist. Both opt-in real contracts ran locally:
-  - `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-app-server-fork-shape-contract.test.ts --config vitest.server.config.ts` passed after adding one minimal parent turn; the initial no-turn version failed with `no rollout found for thread id ...`.
-  - `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-remote-fork-contract.test.ts --config vitest.server.config.ts` passed with a fake app-server response that includes `result.thread.turns: []`; the same contract failed when `turns` was omitted with `thread/fork response decode error: missing field turns`.
+  - `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-app-server-fork-shape-contract.test.ts --config vitest.server.config.ts` passed after adding one minimal parent turn; the initial no-turn version failed with `no rollout found for thread id ...`. The strengthened version also starts one child turn, observes child `turn/started`/`turn/completed` after the fork response, and proves the child rollout file with `proofCodexRollout()`.
+  - `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-remote-fork-contract.test.ts --config vitest.server.config.ts` passed with a fake app-server response that includes `result.thread.turns: []`; the same contract failed when `turns` was omitted with `thread/fork response decode error: missing field turns`. The strengthened version also types `/fork` in an interactive TUI session, captures `thread/fork`, and verifies the TUI does not refetch parent history after compact fork.
+- Load-bearing source inspection falsified unsafe reuse of current binding/store/failure primitives:
+  - `bindSession()` releases the old binding and emits `terminal.session.unbound` before rebinding. Fork commit requires a no-unbound same-terminal binding swap.
+  - `replaceCodexDurabilityStoreRecord()` deletes the old record before writing. Fork commit requires a write-new-before-retire durable replacement path.
+  - Generic `proxy_close`/`proxy_error` currently routes to durable recovery keyed by `resumeSessionId`. Fork handoff needs a fork-specific failure path that closes/fails the live terminal rather than recovering the old parent under a child-moved TUI.
 - Pre-implementation red tests are installed and intentionally failing until production code is implemented:
   - `npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/json-rpc-envelope.test.ts --config vitest.server.config.ts` fails 8 tests on the scanner placeholder.
   - `npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/json-rpc-side-effects.test.ts --config vitest.server.config.ts` fails 9 tests on request rewrite, fork candidate extraction, and TUI response-normalization placeholders.
@@ -223,6 +246,8 @@ The test must:
   - `ephemeral !== true`
   - if more than one path-like field exists (`path`, `rolloutPath`, `rollout_path`), all present path-like fields agree exactly after normalization
   - `turns` may be absent or present when `excludeTurns: true`; this app-server proof does not decide the TUI-facing response shape
+- start one child `turn/start` against the forked thread id, wait for child `turn/started` and `turn/completed`, and assert those child notifications occur after the matching `thread/fork` response
+- run `proofCodexRollout({ rolloutPath: result.thread.path, candidateThreadId: result.thread.id })` and assert it succeeds with `rolloutProofId === result.thread.id`
 
 Record the proven wire field name in the test description and implementation comments as `result.thread.path`. The production extractor must use `path` unless this contract is updated with evidence for a different real shape.
 
@@ -234,7 +259,7 @@ Run:
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-app-server-fork-shape-contract.test.ts --config vitest.server.config.ts
 ```
 
-Expected: PASS in this workspace because `codex` and local auth/config are available. This passed and proved `result.thread.path`. If a future run uses an unplanned field, has no deterministic absolute path, marks the fork ephemeral, or returns the same id as the parent, stop and revise this plan before implementing extraction or handoff logic.
+Expected: PASS in this workspace because `codex` and local auth/config are available. This passed and proved `result.thread.path`, readable child rollout proof, and child turn notifications after the fork response. If a future run uses an unplanned field, has no deterministic absolute path, marks the fork ephemeral, returns the same id as the parent, emits child-thread state before the fork response, or cannot prove the child rollout file with `proofCodexRollout()`, stop and revise this plan before implementing extraction or handoff logic.
 
 - [x] **Step 3: Run the default skipped contract path**
 
@@ -530,7 +555,7 @@ In `handleUpstreamMessage`:
 - scan top-level id and method
 - if scanned id matches a pending method, capture and delete that pending method
 - if frame bytes exceed `MAX_RAW_FORWARD_BYTES`, fail closed before forwarding
-- ensure the proxy-side `WebSocketServer` and upstream `WebSocket` client set `maxPayload: MAX_RAW_FORWARD_BYTES` so `ws` rejects above-cap messages before application handlers receive them where possible, and normalize both paths to the same `proxy_error` repair signal
+- ensure the proxy-side `WebSocketServer` and upstream `WebSocket` client set `maxPayload: MAX_RAW_FORWARD_BYTES` so `ws` rejects above-cap messages before application handlers receive them where possible, set upstream `perMessageDeflate: false` unless a later contract proves compression is required, and normalize both paths to the same `proxy_error` repair signal
 - if the root scanner reports an array/batch, fail closed before forwarding; do not clear pending ids and do not attempt batch side effects in this plan
 - if frame bytes are under `MAX_FULL_PARSE_BYTES`, keep existing full-parse/Zod behavior
 - if frame is large and stateful, call the matching bounded extractor and emit the same side effects as the existing parsed path
@@ -581,6 +606,8 @@ git commit -m "fix: recover codex proxy side effects from large frames"
 
 **Files:**
 - Modify: `shared/codex-durability.ts`
+- Modify: `server/session-binding-authority.ts`
+- Modify: `server/coding-cli/codex-app-server/durability-store.ts`
 - Modify: `server/terminal-registry.ts`
 - Modify: `test/unit/server/terminal-registry.codex-sidecar.test.ts`
 - Modify: `test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts`
@@ -598,9 +625,12 @@ Add tests proving:
 - after a forked-thread `turn/completed`, the transient handoff enters `fork_proof_checking` and runs rollout proof against the staged fork candidate
 - the forked thread is not broadcast as `terminal.session.associated` until the normal rollout proof succeeds
 - after rollout proof success, the terminal atomically rebinds from the old durable thread to the forked thread, sets `resumeSessionId` and `durableThreadId` to the fork id, writes the new durable store record, clears staged handoff state, unwatches stale rollout paths, and broadcasts the new session association without an externally visible unbound interval
+- fork commit does not emit `terminal.session.unbound` for the old parent and uses a same-terminal binding swap instead of `bindSession()`'s release-then-bind path
+- fork commit writes the child durable record through a temp-file rename without deleting the old terminal durability record first; a write failure leaves the old durable record intact
 - ordinary mismatched `thread_start_response` and `thread_started_notification` candidates after initial persistence are still ignored and keep the existing warning behavior
 - invalid fork candidates without an absolute rollout path, with `path: null`, with `ephemeral: true`, with a same-as-parent child id, or with conflicting path aliases do not unbind the old durable identity and do not call `markCandidatePersisted()`, so the proxy's fork handoff gate fails closed instead of allowing untracked post-fork input
 - fork proof failure preserves the old durable binding and old store record, clears or marks the staged handoff as `fork_handoff_failed`, and closes/fails the proxy before more post-fork traffic is accepted
+- `proxy_close`, `proxy_error`, and lifecycle-loss events while `record.codexForkHandoff` is active do not start old-parent durable recovery; they preserve the old durable store record and close/fail the live terminal
 - an immediate post-fork `turn/started` or `turn/completed` notification that arrives before `markCandidatePersisted()` is not the success path; the proxy-level gate must be the mechanism that prevents this race by holding the initiating `turn/start`
 
 - [ ] **Step 2: Run tests to verify red**
@@ -618,6 +648,8 @@ Expected: FAIL because `thread_fork_response` is not a valid candidate source an
 Implement the handoff as a narrow source-specific path:
 
 - add `thread_fork_response` to `CodexCandidateSourceSchema`
+- add a `SessionBindingAuthority` same-terminal swap primitive, for example `swapTerminalSession({ terminalId, provider, fromSessionId, toSessionId })`, that fails if the old binding does not match or the child session is owned by another terminal, and updates `bySession`/`byTerminal` synchronously without emitting terminal events by itself
+- add a Codex durability store replacement method for fork commit that bypasses the candidate-mismatch guard only after proof success, writes the new record through the existing temp-file + rename path, and never deletes the old record before the new record is safely renamed into place
 - extend `CodexRemoteProxyCandidate['source']` with `thread_fork_response`
 - emit `thread_fork_response` from `remote-proxy.ts` for small and large `thread/fork` responses after matching the pending top-level response id
 - in `persistCodexCandidateSerial`, keep the existing mismatched-candidate ignore path for non-fork sources
@@ -628,8 +660,9 @@ Implement the handoff as a narrow source-specific path:
 - call `record.codexSidecar?.markCandidatePersisted?.()` only after the valid staged fork handoff is installed on the running terminal record; this releases proxy-held post-fork traffic after Freshell can attribute its turn events to the staged fork candidate
 - route forked-thread `turn/started`, `turn/completed`, and `fs/changed` proof triggers through the staged handoff state instead of mutating the old durable record
 - do not mark the forked thread durable or send `terminal.session.associated` until the fork rollout proof succeeds
-- on fork proof success, commit under a single registry critical section: update binding authority from the old session to the proven fork session, set `resumeSessionId` and `durableThreadId`, write the new durable record with `source: 'thread_fork_response'`, clear staged state, unwatch stale rollout paths, and then broadcast durability/session association
+- on fork proof success, commit under a single registry critical section: write the new durable record with `source: 'thread_fork_response'` through the no-delete replacement path, swap binding authority from the old session to the proven fork session without emitting `terminal.session.unbound`, set `resumeSessionId` and `durableThreadId`, clear staged state, unwatch stale rollout paths, and then broadcast durability/session association
 - if the fork candidate is invalid or proof fails, log and preserve the existing durable identity, do not acknowledge the proxy gate for invalid candidates, and close/fail the proxy rather than allowing future turns to run under stale identity
+- while `record.codexForkHandoff` is active, handle proxy/lifecycle loss through a fork-specific failure path that does not call `startCodexDurableRecovery()` for the old parent
 
 - [ ] **Step 4: Run focused tests to verify green**
 
@@ -644,7 +677,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add shared/codex-durability.ts server/terminal-registry.ts test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts
+git add shared/codex-durability.ts server/session-binding-authority.ts server/coding-cli/codex-app-server/durability-store.ts server/terminal-registry.ts test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts
 git commit -m "fix: preserve codex terminal identity after fork"
 ```
 
@@ -771,6 +804,7 @@ The test must:
 - respond with a minimal fork result that includes `turns: []` plus a deterministic forked thread id and rollout path under `path`
 - assert the TUI stays alive long enough to accept a follow-up harmless key or exit command
 - keep this as a direct TUI compatibility contract. Freshell proxy rewrite, `thread_fork_response` emission, and TerminalRegistry durability handoff remain covered by the focused red tests in Tasks 4 and 5.
+- add a second controlled fake-app-server case that launches an interactive `codex --remote <app-server.wsUrl> ... --no-alt-screen` session, waits for `thread/start`, types `/fork` followed by newline submission, captures `thread/fork`, responds with compact `turns: []`, and asserts the TUI does not request parent `thread/turns/list` or parent `thread/read` with turns after the fork response
 
 - [x] **Step 2: Run the contract opt-in**
 
@@ -780,7 +814,7 @@ Run:
 FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- run test/integration/real/codex-remote-fork-contract.test.ts --config vitest.server.config.ts
 ```
 
-Expected: PASS in this workspace because `codex` and local auth/config are available. This passed with `result.thread.turns: []`; the same contract failed when the compact fork response omitted `turns` with `thread/fork response decode error: missing field turns`. A future protocol failure is a blocker and means the production approach must be revised before continuing. If a future execution environment lacks `codex` or credentials, stop and report `USER_DECISION_REQUIRED` for the missing real-provider proof instead of treating the opt-in contract as optional completion evidence.
+Expected: PASS in this workspace because `codex` and local auth/config are available. This passed with `result.thread.turns: []`; the same contract failed when the compact fork response omitted `turns` with `thread/fork response decode error: missing field turns`. The interactive `/fork` case also passed and did not refetch parent history after compact fork. A future protocol failure is a blocker and means the production approach must be revised before continuing. If a future execution environment lacks `codex` or credentials, stop and report `USER_DECISION_REQUIRED` for the missing real-provider proof instead of treating the opt-in contract as optional completion evidence.
 
 - [x] **Step 3: Run the default skipped contract path**
 
@@ -893,10 +927,14 @@ git commit -m "chore: finalize codex fork oom fix"
 - The real app-server fork-shape contract proves the fork response path field before production extraction depends on it.
 - Terminal fork responses stage a fork candidate while preserving the old durable binding and old store record until rollout proof succeeds.
 - Terminal fork proof success commits the handoff atomically to the forked thread and only then broadcasts the new session association.
+- Fork proof success does not emit `terminal.session.unbound` for the old parent and does not delete the old durability file before the child durable record is safely written.
+- Fork handoff proxy/lifecycle failure closes or fails the live terminal without starting old-parent durable recovery while the TUI may have moved to the child.
 - Immediate post-fork stateful client requests are held until the staged fork identity is persisted, including for resumed terminals whose startup identity capture was disabled with `requireCandidatePersistence: false`.
 - Invalid fork candidates do not unbind the old durable identity and do not allow the terminal to continue accepting untracked post-fork input.
+- Unknown or unclassified methods during a fork handoff fail closed unless explicitly proven safe by the allowlist tests.
 - Root-array/batch JSON-RPC frames fail closed instead of being raw-forwarded as non-state traffic.
 - Frames above `MAX_RAW_FORWARD_BYTES` fail closed instead of risking server OOM.
+- The proxy sets `ws` `maxPayload` explicitly on both local and upstream sockets.
 - The proxy preserves text/binary WebSocket frame semantics.
 - Pending method attribution is based only on top-level JSON-RPC ids, including ids after large results.
 - Large state-bearing frames either produce the same Freshell-owned side effects as small frames or fail closed with recovery; none are silently ignored.

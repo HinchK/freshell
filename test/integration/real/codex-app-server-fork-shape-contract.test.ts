@@ -18,6 +18,7 @@ import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
 import WebSocket from 'ws'
 
+import { proofCodexRollout } from '../../../server/coding-cli/codex-app-server/durability-proof.js'
 import { CodexAppServerRuntime } from '../../../server/coding-cli/codex-app-server/runtime.js'
 
 type ProbeAvailability = {
@@ -34,13 +35,19 @@ type JsonRpcEnvelope = {
 }
 
 type PendingJsonRpcRequest = {
+  method: string
   reject: (error: Error) => void
   resolve: (value: JsonRpcEnvelope) => void
   timeout: NodeJS.Timeout
 }
 
+type JsonRpcTraceEvent =
+  | { kind: 'notification'; method: string; params?: Record<string, unknown> }
+  | { kind: 'response'; method: string; id: string | number }
+
 type RawJsonRpcClient = {
   close: () => Promise<void>
+  events: () => JsonRpcTraceEvent[]
   notify: (method: string, params?: Record<string, unknown>) => void
   requestEnvelope: (method: string, params: Record<string, unknown>) => Promise<JsonRpcEnvelope>
   waitForNotification: (
@@ -113,23 +120,27 @@ async function connectRawJsonRpcClient(wsUrl: string, requestTimeoutMs = 60_000)
 
   let nextId = 1
   const notifications: Array<{ method: string; params?: Record<string, unknown> }> = []
+  const events: JsonRpcTraceEvent[] = []
   const pending = new Map<string | number, PendingJsonRpcRequest>()
 
   socket.on('message', (raw) => {
     const envelope = JSON.parse(raw.toString()) as JsonRpcEnvelope
     if (envelope.id === undefined) {
       if (typeof envelope.method === 'string') {
-        notifications.push({
+        const notification = {
           method: envelope.method,
           ...(envelope.params && typeof envelope.params === 'object' && !Array.isArray(envelope.params)
             ? { params: envelope.params as Record<string, unknown> }
             : {}),
-        })
+        }
+        notifications.push(notification)
+        events.push({ kind: 'notification', ...notification })
       }
       return
     }
     const request = pending.get(envelope.id)
     if (!request) return
+    events.push({ kind: 'response', method: request.method, id: envelope.id })
     pending.delete(envelope.id)
     clearTimeout(request.timeout)
     if (envelope.error) {
@@ -158,6 +169,7 @@ async function connectRawJsonRpcClient(wsUrl: string, requestTimeoutMs = 60_000)
         socket.close()
       })
     },
+    events: () => [...events],
     notify: (method, params = {}) => {
       socket.send(JSON.stringify({ method, params }))
     },
@@ -168,7 +180,7 @@ async function connectRawJsonRpcClient(wsUrl: string, requestTimeoutMs = 60_000)
         pending.delete(id)
         reject(new Error(`Codex app-server did not respond to ${method} within ${requestTimeoutMs}ms.`))
       }, requestTimeoutMs)
-      pending.set(id, { reject, resolve, timeout })
+      pending.set(id, { method, reject, resolve, timeout })
       socket.send(JSON.stringify({ id, method, params }))
     }),
     waitForNotification: async (predicate, timeoutMs = 120_000) => {
@@ -281,6 +293,52 @@ describeCodex(`real Codex app-server fork-shape contract${codexProbe.ready ? '' 
       expect(pathFields).toEqual(expect.arrayContaining([{ field: 'path', value: childThread.path as string }]))
       const normalized = new Set(pathFields.map((field) => path.normalize(field.value)))
       expect(normalized.size).toBe(1)
+
+      const forkResponseIndex = client.events().findIndex((event) => (
+        event.kind === 'response' && event.method === 'thread/fork' && event.id === fork.id
+      ))
+      expect(forkResponseIndex).toBeGreaterThanOrEqual(0)
+      expect(client.events().findIndex((event, index) => (
+        index < forkResponseIndex
+        && event.kind === 'notification'
+        && event.params?.threadId === childThreadId
+      ))).toBe(-1)
+
+      const childTurnNonce = `freshell-fork-child-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+      const childTurnStart = await client.requestEnvelope('turn/start', {
+        threadId: childThreadId,
+        input: [{ type: 'text', text: `Reply with exactly: ${childTurnNonce}` }],
+        cwd: process.cwd(),
+      })
+      expect(childTurnStart.id).toBe(5)
+      await client.waitForNotification(
+        (notification) => notification.method === 'turn/completed'
+          && notification.params?.threadId === childThreadId,
+      )
+
+      const childStartedIndex = client.events().findIndex((event) => (
+        event.kind === 'notification'
+        && event.method === 'turn/started'
+        && event.params?.threadId === childThreadId
+      ))
+      const childCompletedIndex = client.events().findIndex((event) => (
+        event.kind === 'notification'
+        && event.method === 'turn/completed'
+        && event.params?.threadId === childThreadId
+      ))
+      expect(childStartedIndex).toBeGreaterThan(forkResponseIndex)
+      expect(childCompletedIndex).toBeGreaterThan(childStartedIndex)
+
+      const proof = await proofCodexRollout({
+        candidateThreadId: childThreadId,
+        rolloutPath: childThread.path as string,
+      })
+      expect(proof).toEqual({
+        ok: true,
+        candidateThreadId: childThreadId,
+        rolloutPath: childThread.path,
+        rolloutProofId: childThreadId,
+      })
     } finally {
       await client?.close().catch(() => undefined)
       await runtime.shutdown().catch(() => undefined)

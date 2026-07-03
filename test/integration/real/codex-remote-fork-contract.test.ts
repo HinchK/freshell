@@ -11,8 +11,10 @@
 //
 import fsp from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
+import { execFile } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
+import { promisify } from 'node:util'
 
 import { describe, expect, it } from 'vitest'
 import WebSocket, { WebSocketServer } from 'ws'
@@ -21,12 +23,12 @@ import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from '../../../server/coding-cli/cod
 import { allocateLocalhostPort } from '../../../server/local-port.js'
 import {
   ProbeWorkspace,
-  resolveProviderBinaries,
   seedCodexHome,
   type TrackedPtyProcess,
 } from '../../helpers/coding-cli/real-session-contract-harness.js'
 
 type ProviderProbeAvailability = {
+  codexPath?: string
   ready: boolean
   reason?: string
 }
@@ -42,8 +44,14 @@ type CapturedRequest = {
   params: Record<string, unknown>
 }
 
-const providerBinaries = await resolveProviderBinaries(['codex'] as const)
-const codexBinary = providerBinaries.codex
+function isUnsafeParentHistoryRequest(request: CapturedRequest, parentThreadId: string): boolean {
+  if (request.params.threadId !== parentThreadId) return false
+  if (request.method === 'thread/turns/list') return true
+  if (request.method !== 'thread/read') return false
+  return request.params.includeTurns !== false
+}
+
+const execFileAsync = promisify(execFile)
 
 async function pathExists(targetPath: string): Promise<boolean> {
   try {
@@ -55,7 +63,20 @@ async function pathExists(targetPath: string): Promise<boolean> {
 }
 
 async function codexAvailability(): Promise<ProviderProbeAvailability> {
-  if (!codexBinary.resolvedPath) {
+  let codexPath: string
+  try {
+    const { stdout } = await execFileAsync('bash', ['-lc', 'command -v -- codex'], {
+      timeout: 15_000,
+    })
+    codexPath = stdout.trim().split(/\r?\n/)[0] ?? ''
+  } catch {
+    return {
+      ready: false,
+      reason: 'Skipping Codex remote fork contract: codex is not on PATH.',
+    }
+  }
+
+  if (!codexPath) {
     return {
       ready: false,
       reason: 'Skipping Codex remote fork contract: codex is not on PATH.',
@@ -71,7 +92,7 @@ async function codexAvailability(): Promise<ProviderProbeAvailability> {
       reason: `Skipping Codex remote fork contract: missing ${missing.join(' and ')}.`,
     }
   }
-  return { ready: true }
+  return { codexPath, ready: true }
 }
 
 async function waitFor<T>(
@@ -147,7 +168,7 @@ const describeCodex = (codexProbe.ready && realProviderContractsEnabled) ? descr
 
 describeCodex(`real Codex TUI remote fork contract${codexProbe.ready ? '' : ` (${codexProbe.reason})`}${realProviderContractsEnabled ? '' : ' (opt-in: FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1)'}`, () => {
   it('continues after a compact thread/fork response with an empty turns array', async () => {
-    const codexPath = codexBinary.resolvedPath
+    const codexPath = codexProbe.codexPath
     if (!codexPath) throw new Error(codexProbe.reason ?? 'Codex binary unavailable.')
 
     const workspace = await ProbeWorkspace.create('codex-remote-fork')
@@ -365,6 +386,246 @@ describeCodex(`real Codex TUI remote fork contract${codexProbe.ready ? '' : ` ($
           `PTY output: ${remote.output().slice(-4000)}`,
         ].join('\n'))
       })
+    } finally {
+      await remote?.stop().catch(() => undefined)
+      await new Promise<void>((resolve) => wss.close(() => resolve()))
+      await workspace.cleanup().catch(() => undefined)
+    }
+  }, 90_000)
+
+  it('sends interactive slash-command fork traffic without refetching parent history', async () => {
+    const codexPath = codexProbe.codexPath
+    if (!codexPath) throw new Error(codexProbe.reason ?? 'Codex binary unavailable.')
+
+    const workspace = await ProbeWorkspace.create('codex-remote-interactive-fork')
+    const endpoint = await allocateLocalhostPort()
+    const wsUrl = `ws://${endpoint.hostname}:${endpoint.port}`
+    const requests: CapturedRequest[] = []
+    const unsafeParentHistoryRequestsAfterFork: CapturedRequest[] = []
+    const parentThreadId = randomUUID()
+    const childThreadId = randomUUID()
+    const parentRolloutPath = workspace.inTemp('.codex', 'sessions', '2026', '07', '03', 'rollout-parent.jsonl')
+    const childRolloutPath = workspace.inTemp('.codex', 'sessions', '2026', '07', '03', 'rollout-child.jsonl')
+    let forkResponseSent = false
+    let remote: TrackedPtyProcess | undefined
+    const wss = new WebSocketServer({ host: endpoint.hostname, port: endpoint.port })
+
+    try {
+      await seedCodexHome(workspace)
+      wss.on('connection', (socket) => {
+        socket.on('message', (raw) => {
+          let message: JsonRpcMessage
+          try {
+            message = JSON.parse(raw.toString()) as JsonRpcMessage
+          } catch {
+            return
+          }
+          if (typeof message.method !== 'string') return
+
+          const request = { method: message.method, params: message.params ?? {} }
+          requests.push(request)
+          if (forkResponseSent && isUnsafeParentHistoryRequest(request, parentThreadId)) {
+            unsafeParentHistoryRequestsAfterFork.push(request)
+          }
+
+          if (message.method === 'initialize') {
+            sendResult(socket, message.id, {
+              userAgent: 'freshell-remote-interactive-fork-contract/1.0.0',
+              codexHome: workspace.inTemp('.codex'),
+              platformFamily: 'unix',
+              platformOs: process.platform,
+            })
+            return
+          }
+
+          if (message.method === 'account/read') {
+            sendResult(socket, message.id, {
+              requiresOpenaiAuth: false,
+              account: {
+                type: 'chatgpt',
+                email: 'probe@example.com',
+                planType: 'plus',
+              },
+            })
+            return
+          }
+
+          if (message.method === 'model/list') {
+            sendResult(socket, message.id, {
+              data: [{
+                id: 'gpt-5-codex',
+                model: 'gpt-5-codex',
+                displayName: 'GPT-5 Codex',
+                description: 'Probe model',
+                hidden: false,
+                isDefault: true,
+                defaultReasoningEffort: 'medium',
+                supportedReasoningEfforts: [],
+                inputModalities: ['text'],
+                additionalSpeedTiers: [],
+                supportsPersonality: false,
+                availabilityNux: null,
+                upgrade: null,
+                upgradeInfo: null,
+              }],
+              nextCursor: null,
+            })
+            return
+          }
+
+          if (message.method === 'hooks/list') {
+            sendResult(socket, message.id, { data: [] })
+            return
+          }
+
+          if (message.method === 'skills/list') {
+            sendResult(socket, message.id, { data: [] })
+            return
+          }
+
+          if (message.method === 'plugin/list') {
+            sendResult(socket, message.id, { data: [] })
+            return
+          }
+
+          if (message.method === 'command/exec') {
+            sendResult(socket, message.id, {
+              exitCode: 0,
+              stdout: 'codex-fork-oom\n',
+              stderr: '',
+            })
+            return
+          }
+
+          if (message.method === 'thread/start') {
+            sendResult(socket, message.id, {
+              thread: threadPayload(parentThreadId, parentRolloutPath),
+              cwd: process.cwd(),
+              model: 'gpt-5-codex',
+              modelProvider: 'openai',
+              instructionSources: [],
+              approvalPolicy: 'never',
+              approvalsReviewer: 'user',
+              sandbox: { type: 'dangerFullAccess' },
+            })
+            return
+          }
+
+          if (message.method === 'thread/fork') {
+            sendResult(socket, message.id, {
+              thread: {
+                ...threadPayload(childThreadId, childRolloutPath),
+                turns: [],
+              },
+              cwd: process.cwd(),
+              model: 'gpt-5-codex',
+              modelProvider: 'openai',
+              instructionSources: [],
+              approvalPolicy: 'never',
+              approvalsReviewer: 'user',
+              sandbox: { type: 'dangerFullAccess' },
+            })
+            forkResponseSent = true
+            sendNotification(socket, 'thread/status/changed', {
+              threadId: childThreadId,
+              status: { type: 'idle' },
+            })
+            return
+          }
+
+          if (message.method === 'turn/start') {
+            sendResult(socket, message.id, {
+              turn: {
+                id: 'turn-child-1',
+                items: [],
+                status: 'completed',
+              },
+            })
+            sendNotification(socket, 'turn/started', {
+              threadId: message.params?.threadId,
+              turnId: 'turn-child-1',
+            })
+            sendNotification(socket, 'turn/completed', {
+              threadId: message.params?.threadId,
+              turnId: 'turn-child-1',
+              status: 'completed',
+              turn: {
+                id: 'turn-child-1',
+                items: [],
+                status: 'completed',
+              },
+            })
+            return
+          }
+
+          if (message.method === 'thread/read') {
+            const requestedThreadId = typeof message.params?.threadId === 'string'
+              ? message.params.threadId
+              : childThreadId
+            sendResult(socket, message.id, {
+              thread: threadPayload(
+                requestedThreadId,
+                requestedThreadId === childThreadId ? childRolloutPath : parentRolloutPath,
+              ),
+            })
+            return
+          }
+
+          if (message.method === 'thread/turns/list') {
+            sendResult(socket, message.id, {
+              turns: [],
+              data: [],
+              nextCursor: null,
+              backwardsCursor: null,
+              revision: 1,
+            })
+            return
+          }
+
+          sendResult(socket, message.id, {})
+        })
+      })
+
+      remote = workspace.spawnPty(codexPath, [
+        '--remote',
+        wsUrl,
+        ...CODEX_MANAGED_REMOTE_CONFIG_ARGS,
+        '--no-alt-screen',
+      ], {
+        env: {
+          CODEX_HOME: workspace.inTemp('.codex'),
+        },
+      })
+
+      await waitFor('Codex TUI thread/start', () => (
+        requests.find((request) => request.method === 'thread/start')
+      ), 30_000)
+      await new Promise((resolve) => setTimeout(resolve, 500))
+      remote.write('/fork')
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      remote.write('\n')
+
+      await waitFor('interactive Codex TUI thread/fork', () => (
+        requests.find((request) => request.method === 'thread/fork')
+      ), 5_000).catch(async () => {
+        remote.write('\r')
+        return waitFor('interactive Codex TUI thread/fork after carriage-return fallback', () => (
+          requests.find((request) => request.method === 'thread/fork')
+        ), 30_000)
+      }).catch((error) => {
+        throw new Error([
+          error instanceof Error ? error.message : String(error),
+          `Requests: ${JSON.stringify(requests.map((request) => ({ method: request.method, params: request.params })), null, 2)}`,
+          `PTY output: ${remote.output().slice(-4000)}`,
+        ].join('\n'))
+      })
+
+      const forkRequest = requests.find((request) => request.method === 'thread/fork')
+      expect(forkRequest?.params).toMatchObject({
+        threadId: parentThreadId,
+      })
+      await waitForStillRunning(remote, 1_000)
+      expect(unsafeParentHistoryRequestsAfterFork).toEqual([])
     } finally {
       await remote?.stop().catch(() => undefined)
       await new Promise<void>((resolve) => wss.close(() => resolve()))
