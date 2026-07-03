@@ -39,7 +39,7 @@ Use this policy instead:
   - `thread/closed`: `params.threadId`
   - `thread/status/changed`: `params.threadId`, `params.status.type`
 - If a stateful upstream frame cannot be fully parsed and the required bounded side-effect extractor also cannot recover the owned fields, fail closed with structured logging, `proxy_error` or candidate-capture failure as appropriate, and socket closure. Do not forward it as a successful normal frame.
-- Raw-forward oversized non-state upstream frames only up to a raw-forward limit that is proven by a constrained-heap child-process stress test. Treat that limit as an operational memory-safety cap, not as proof that larger frames are invalid. Frames above it fail closed to preserve the Freshell server.
+- Raw-forward oversized non-state upstream frames only up to a raw-forward limit that is proven at the limit boundary by a constrained-heap child-process stress test. Treat that limit as an operational memory-safety cap, not as proof that larger frames are invalid. Frames above it fail closed to preserve the Freshell server.
 - The opt-in real terminal TUI `/fork` contract is required before completion. If the installed Codex TUI cannot continue after receiving a compact fork response without `thread.turns`, stop and revise the production approach.
 
 No user decision is required for this revision. The remaining proofs are local automated tests and the opt-in real Codex contract.
@@ -409,7 +409,7 @@ Create a fixture that:
 - asserts the TUI receives the same byte length
 - exits non-zero if the process OOMs, times out, parses the body, or loses the response
 
-Use a payload large enough to catch accidental full parsing, for example 24 MiB, and below `MAX_RAW_FORWARD_BYTES`.
+Use a payload at the limit boundary, not merely a conveniently large sample. Build a text JSON-RPC response buffer with total byte length `MAX_RAW_FORWARD_BYTES - 1024` so the successful path proves the actual configured cap. Generate it from `Buffer` chunks instead of constructing a huge JS string, and have the upstream send it as a text WebSocket frame with `{ binary: false }`.
 
 - [ ] **Step 2: Add the parent Vitest case**
 
@@ -435,9 +435,13 @@ Run:
 npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "constrained heap"
 ```
 
-Expected before the raw-forward path is complete: FAIL by child OOM, timeout, or explicit assertion. Expected after Task 4 implementation is complete: PASS.
+Expected before the raw-forward path is complete: FAIL by child OOM, timeout, or explicit assertion. Expected after Task 4 implementation is complete: PASS and report the forwarded byte length, `isBinary === false`, and an RSS/heap sample that confirms the proxy did not materialize the payload as a parsed JS object.
 
-- [ ] **Step 4: Run focused tests**
+- [ ] **Step 4: Add the above-cap child-process case**
+
+Extend the child fixture or add a sibling mode that sends a non-state upstream frame with total byte length `MAX_RAW_FORWARD_BYTES + 1024`, again generated from `Buffer` chunks. Assert the proxy fail-closes the frame and emits `proxy_error` instead of forwarding it to the TUI.
+
+- [ ] **Step 5: Run focused tests**
 
 Run:
 
@@ -447,7 +451,7 @@ npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/json-rpc
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add test/unit/server/coding-cli/codex-app-server/remote-proxy-large-forward-child.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts server/coding-cli/codex-app-server/remote-proxy.ts
