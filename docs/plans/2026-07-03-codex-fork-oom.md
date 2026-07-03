@@ -46,7 +46,7 @@ Use this policy instead:
 
 - Never full-parse a frame solely to route or attribute it. Use a byte-level top-level JSON-RPC scanner for `id` and `method`.
 - Support exactly one JSON-RPC object per WebSocket frame. Root arrays/batches are unsupported until a live Codex contract proves they are required; do not raw-forward them as non-state traffic because a batch could contain `thread/fork` or stateful frames that Freshell must transform or observe.
-- Do not reject all large client frames. Large valid `initialize`, `thread/start`, `thread/resume`, `turn/start`, or other requests below `MAX_RAW_FORWARD_BYTES` should raw-forward unless the proxy must transform them. Frames above the cap fail closed in either direction because the cap is the server memory-safety boundary, not an upstream-only policy.
+- Do not reject all large client frames. Large valid `initialize`, `thread/start`, `thread/resume`, `turn/start`, or other requests below the active raw-forward cap should raw-forward unless the proxy must transform them. Frames above the active cap fail closed in either direction because the cap is the server memory-safety boundary, not an upstream-only policy.
 - Always transform terminal `thread/fork` requests to include `params.excludeTurns: true`. Implement this as a byte-level JSON object rewrite, not as `JSON.parse` plus `JSON.stringify`, so a large but valid fork request does not require materializing params as JS objects.
 - If a `thread/fork` request is malformed enough that the rewriter cannot safely force `excludeTurns: true`, return a JSON-RPC error and do not forward it. Forwarding an un-compacted fork request reintroduces the crash class.
 - Hold startup `turn/start` before initial candidate persistence using only the scanned top-level method and id. Do not require parsing `turn/start.params`.
@@ -81,6 +81,7 @@ No user decision is required for this revision. The remaining proof before compl
 - Create: `server/coding-cli/codex-app-server/json-rpc-envelope.ts`
   - Byte-level scanner for top-level JSON-RPC `id` and `method`.
   - Does not call `JSON.parse` or full-frame `toString()`.
+  - Exports default policy constants; `MAX_RAW_FORWARD_BYTES` is the production default cap, while tests may pass a lower active cap to the proxy.
 
 - Create: `server/coding-cli/codex-app-server/json-rpc-side-effects.ts`
   - Byte-level bounded extractors for the small fields Freshell owns in large stateful upstream frames.
@@ -97,6 +98,7 @@ No user decision is required for this revision. The remaining proof before compl
 
 - Modify: `server/coding-cli/codex-app-server/remote-proxy.ts`
   - Preserve raw frame data and text/binary framing.
+  - Add `maxRawForwardBytes?: number` to `CodexRemoteProxyOptions`; resolve `activeRawForwardBytes = options.maxRawForwardBytes ?? MAX_RAW_FORWARD_BYTES` and use that active cap for application-level size checks, `ws` `maxPayload`, identity-gate held-byte limits, and stress fixture assertions.
   - Generalize candidate persistence from a one-time startup boolean into a source-aware identity gate for `initial_capture` and `fork_handoff`; `requireCandidatePersistence: false` disables only the startup `initial_capture` gate, not later fork handoff gates.
   - After emitting a valid-looking `thread_fork_response` candidate, hold bounded stateful post-fork client requests until TerminalRegistry acknowledges staged persistence through `markCandidatePersisted()`.
   - Fail closed if a fork handoff gate times out or TerminalRegistry never acknowledges it; do not silently forward post-fork user input against the old durable identity.
@@ -150,7 +152,7 @@ No user decision is required for this revision. The remaining proof before compl
 - If the TUI sends `excludeTurns: false` or `excludeTurns: null`, upstream receives `excludeTurns: true`.
 - If the TUI omits `params`, upstream receives a params object containing `excludeTurns: true`.
 - Upstream compact `thread/fork` responses may omit `result.thread.turns`; the TUI-facing response must include `result.thread.turns: []`. Codex 0.142.5 rejects a missing `turns` field during fork bootstrap.
-- A large valid non-fork client request below `MAX_RAW_FORWARD_BYTES` is not rejected merely because of size.
+- A large valid non-fork client request below the active raw-forward cap is not rejected merely because of size.
 - Raw-forwarding means forwarding the original frame bytes with the original WebSocket `isBinary` flag. Held identity-gate frames preserve their original raw bytes and original text/binary framing until candidate persistence releases them. Rewritten `thread/fork` frames preserve framing and all original bytes except the minimal `params.excludeTurns: true` mutation.
 - Duplicate `turn/interrupt` acks remain best-effort. They are synthesized only when the proxy can safely identify `threadId` and `turnId`; otherwise the request forwards to upstream.
 - The proxy must never run full `JSON.parse`, full-frame `raw.toString()`, or full-frame `JSON.stringify()` on large frames. `JSON.stringify` is allowed only for small proxy-generated errors/acks, never to reconstruct a forwarded frame.
@@ -175,8 +177,8 @@ No user decision is required for this revision. The remaining proof before compl
 - A `thread_fork_response` candidate without a deterministic absolute rollout path must not keep the terminal running under an untracked fork identity. The registry keeps the old store record untouched, but the proxy times out or fails the fork handoff gate and emits `proxy_error`/socket closure before user input is accepted on the untracked fork.
 - A mismatched candidate from `thread_start_response` or `thread_started_notification` after an initial candidate is already persisted remains ignored; fork handoff must not weaken the startup-race protection.
 - `fs/changed` extraction may collapse an oversized `changedPaths` array to `[]` only after extracting the watch id. This is conservative because terminal registry treats an empty changed path list as a durability proof request rather than as "no change."
-- Any frame whose byte length exceeds `MAX_RAW_FORWARD_BYTES` fails closed in both directions before forwarding, regardless of method or statefulness. The proxy must configure both its local `WebSocketServer` and upstream `WebSocket` client with `maxPayload: MAX_RAW_FORWARD_BYTES`; `ws` `maxPayload` rejections and application-level cap rejections must normalize to structured `proxy_error` repair signaling. Set `perMessageDeflate: false` on the upstream client unless a later contract proves compression is needed.
-- Raw forwarding for non-state frames is allowed only under `MAX_RAW_FORWARD_BYTES` after the constrained-heap stress test passes against the actual proxy implementation; above-cap frames fail closed regardless of direction.
+- Any frame whose byte length exceeds the active raw-forward cap fails closed in both directions before forwarding, regardless of method or statefulness. The proxy must configure both its local `WebSocketServer` and upstream `WebSocket` client with `maxPayload` set to the active cap; `ws` `maxPayload` rejections and application-level cap rejections must normalize to structured `proxy_error` repair signaling. Set `perMessageDeflate: false` on the upstream client unless a later contract proves compression is needed.
+- Raw forwarding for non-state frames is allowed only under the active raw-forward cap after the constrained-heap stress test passes against the actual proxy implementation; above-cap frames fail closed regardless of direction.
 - The configured `MAX_RAW_FORWARD_BYTES` is valid only after an opt-in/final-gate child-process stress test proves the actual `CodexRemoteProxy`, under `node --max-old-space-size=128`, forwards `MAX_RAW_FORWARD_BYTES - 1024` text frames for both large `thread/fork` response extraction and non-state raw forwarding, rejects `MAX_RAW_FORWARD_BYTES + 1024`, preserves `isBinary === false`, and reports heap/RSS/external memory. If it fails, lower the cap to the highest passing boundary and update tests/spec.
 - Logs remain structured and must not include full request or response bodies.
 
@@ -192,7 +194,7 @@ export const MAX_IDENTITY_GATE_HELD_FRAMES = 16
 export const MAX_IDENTITY_GATE_HELD_BYTES = MAX_RAW_FORWARD_BYTES
 ```
 
-`MAX_FULL_PARSE_BYTES` is only a threshold for choosing between existing Zod-backed full parsing and bounded extraction. It is not a validity limit and must not cause otherwise valid client requests below `MAX_RAW_FORWARD_BYTES` to be rejected. `MAX_RAW_FORWARD_BYTES` is an operational server memory-safety cap for frames Freshell does not own in either direction; keep 64 MiB only if the constrained-heap actual-proxy fixture in Task 6 passes at `MAX_RAW_FORWARD_BYTES - 1024`, otherwise lower the constant to the highest passing boundary and update the above-cap tests to match. `MAX_SCANNED_TOKEN_BYTES` limits individual key/string token accumulation in scanners and rewriters, not whole-frame size. The identity-gate queue limits prevent fork handoff from becoming an unbounded memory buffer; overflow is a fork handoff failure that preserves the old durable binding and closes the proxy.
+`MAX_FULL_PARSE_BYTES` is only a threshold for choosing between existing Zod-backed full parsing and bounded extraction. It is not a validity limit and must not cause otherwise valid client requests below the active raw-forward cap to be rejected. `MAX_RAW_FORWARD_BYTES` is the production default operational server memory-safety cap for frames Freshell does not own in either direction. `CodexRemoteProxy` must resolve an active cap from `options.maxRawForwardBytes ?? MAX_RAW_FORWARD_BYTES`; every fail-closed size check, `ws` `maxPayload`, held-byte limit, and stress fixture assertion must use that active cap. Keep the production default at 64 MiB only if the constrained-heap actual-proxy fixture in Task 6 passes at `MAX_RAW_FORWARD_BYTES - 1024`, otherwise lower the constant to the highest passing boundary and update the above-cap tests to match. `MAX_SCANNED_TOKEN_BYTES` limits individual key/string token accumulation in scanners and rewriters, not whole-frame size. The identity-gate queue limits prevent fork handoff from becoming an unbounded memory buffer; overflow is a fork handoff failure that preserves the old durable binding and closes the proxy.
 
 ## Proven Inputs For This Plan
 
@@ -203,7 +205,7 @@ export const MAX_IDENTITY_GATE_HELD_BYTES = MAX_RAW_FORWARD_BYTES
 - `server/fresh-agent/adapters/codex/adapter.ts` already sends `excludeTurns: true` for fresh-agent forks.
 - `shared/codex-durability.ts` currently omits `thread_fork_response` from `CodexCandidateSourceSchema`.
 - `server/terminal-registry.ts` currently drops fork-like identity changes: `persistCodexCandidateSerial` returns immediately when `record.resumeSessionId` exists and logs/ignores mismatched candidates when `record.codexDurability.candidate` already exists.
-- `server/terminal-registry.ts` already has some primitives needed for a narrow handoff: `buildCodexDurabilityRef`, `replaceCodexDurabilityStoreRecord`, `unwatchCodexRollout`, `armCodexRolloutWatch`, and the existing rollout proof path that binds only after proof success. It must not use `releaseBinding(..., 'rebind', ...)` until proof success, because `releaseBinding()` clears `resumeSessionId`.
+- `server/terminal-registry.ts` already has some primitives needed for a narrow handoff: `buildCodexDurabilityRef`, `unwatchCodexRollout`, `armCodexRolloutWatch`, and the existing rollout proof path that binds only after proof success. It must not use `releaseBinding(..., 'rebind', ...)` until proof success, because `releaseBinding()` clears `resumeSessionId`. It also must not use the current `replaceCodexDurabilityStoreRecord()` for fork commit, because that helper deletes before writing.
 - `node_modules/ws/lib/websocket-server.js` and `node_modules/ws/lib/websocket.js` show the default `maxPayload` is 100 MiB. `node_modules/ws/lib/receiver.js` shows payload-length enforcement before emission and text messages emitted as `Buffer` objects.
 - Load-bearing validation for `ws` 8.19 confirmed configured `maxPayload` is enforced before application `message` handlers for both fragmented and permessage-deflate payloads. Local source evidence: `receiver.js` accumulates fragmented payload length before emission and checks decompressed message length after permessage-deflate; a tiny loopback probe confirmed oversized fragmented/compressed messages did not call handlers. The proxy must still set `maxPayload` explicitly because current `remote-proxy.ts` inherits 100 MiB defaults on both the local server and upstream client.
 - A disposable raw WebSocket proxy experiment under `node --max-old-space-size=128` forwarded 64 MiB text JSON frames as buffers without full parse/stringify. The actual implementation must reproduce this through the Task 6 child-process fixture before depending on the cap.
@@ -311,7 +313,7 @@ Run:
 npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/json-rpc-envelope.test.ts --config vitest.server.config.ts
 ```
 
-Expected: FAIL because the scanner module does not exist.
+Expected: FAIL because the scanner module currently contains placeholder exports only.
 
 - [ ] **Step 3: Implement the scanner**
 
@@ -351,7 +353,7 @@ git commit -m "test: cover codex json rpc envelope scanning"
 
 - [ ] **Step 1: Write failing fork rewrite tests**
 
-Add tests proving `rewriteThreadForkExcludeTurns(raw)`:
+Add tests proving `rewriteThreadForkRequestExcludeTurns(raw)`:
 
 - changes `excludeTurns: false` to `true`
 - changes `excludeTurns: null` to `true`
@@ -483,15 +485,16 @@ In `remote-proxy.ts`:
 
 - introduce a `ProxyFrame` type carrying original raw data plus explicit text/binary framing
 - replace the single `candidatePersisted` boolean with a small identity-gate state, for example `{ reason: 'initial_capture' | 'fork_handoff'; timer?: NodeJS.Timeout; heldFrames: ProxyFrame[]; heldBytes: number } | undefined`; initialize it only for `initial_capture` when `requireCandidatePersistence` is true, but allow `thread/fork` responses to create a `fork_handoff` gate regardless of that option
+- preserve existing startup update-prompt behavior while replacing the boolean gate: `pauseCandidateCapture()`, `resumeCandidateCapture()`, `candidateCapturePaused`, and the startup candidate-capture timer must continue to pause/resume only the `initial_capture` gate and must not pause an active `fork_handoff` gate
 - make `sendIfOpen` preserve text/binary framing with `socket.send(data, { binary })`
 - use `scanJsonRpcEnvelope(raw)` for method and id
 - store `pendingMethods` from scanned top-level id and method only after deciding the request will be forwarded
 - hold startup `turn/start` by scanned method/id without parsing params whenever an `initial_capture` gate is active
 - hold bounded fork-thread stateful client requests whenever a `fork_handoff` gate is active; reject nested `thread/fork` and fail closed on queue overflow
 - fail closed for root-array/batch frames instead of raw-forwarding
-- call `rewriteThreadForkExcludeTurns(raw, isBinary)` for `thread/fork`; forward the rewritten frame on success and send a JSON-RPC error on failure
+- call `rewriteThreadForkRequestExcludeTurns(raw, isBinary)` for `thread/fork`; forward the rewritten frame on success and send a JSON-RPC error on failure
 - keep small-frame duplicate interrupt ack behavior through existing Zod parsing under `MAX_FULL_PARSE_BYTES`
-- forward large non-fork requests raw when they are below `MAX_RAW_FORWARD_BYTES`
+- forward large non-fork requests raw when they are below the active raw-forward cap
 - fail closed above-cap client frames with structured logging and `proxy_error`
 
 - [ ] **Step 4: Run focused tests to verify green**
@@ -535,7 +538,7 @@ Add tests proving:
 - large `thread/closed` and `thread/status/changed` notifications recover lifecycle/lifecycle-loss side effects before forwarding
 - unrecoverable large stateful upstream frames close both sockets and emit candidate-capture failure or `proxy_error`, depending on lifecycle state
 - small stateful frames still use the current Zod-backed behavior
-- frames above `MAX_RAW_FORWARD_BYTES` fail closed even when non-state, for both client and upstream frames
+- frames above the active raw-forward cap fail closed even when non-state, for both client and upstream frames
 
 - [ ] **Step 2: Run tests to verify red**
 
@@ -554,8 +557,8 @@ In `handleUpstreamMessage`:
 - create a `ProxyFrame` from original raw data and frame type
 - scan top-level id and method
 - if scanned id matches a pending method, capture and delete that pending method
-- if frame bytes exceed `MAX_RAW_FORWARD_BYTES`, fail closed before forwarding
-- ensure the proxy-side `WebSocketServer` and upstream `WebSocket` client set `maxPayload: MAX_RAW_FORWARD_BYTES` so `ws` rejects above-cap messages before application handlers receive them where possible, set upstream `perMessageDeflate: false` unless a later contract proves compression is required, and normalize both paths to the same `proxy_error` repair signal
+- if frame bytes exceed the active raw-forward cap, fail closed before forwarding
+- ensure the proxy-side `WebSocketServer` and upstream `WebSocket` client set `maxPayload` to the active raw-forward cap so `ws` rejects above-cap messages before application handlers receive them where possible, set upstream `perMessageDeflate: false` unless a later contract proves compression is required, and normalize both paths to the same `proxy_error` repair signal
 - if the root scanner reports an array/batch, fail closed before forwarding; do not clear pending ids and do not attempt batch side effects in this plan
 - if frame bytes are under `MAX_FULL_PARSE_BYTES`, keep existing full-parse/Zod behavior
 - if frame is large and stateful, call the matching bounded extractor and emit the same side effects as the existing parsed path
@@ -658,6 +661,7 @@ Implement the handoff as a narrow source-specific path:
 - do not call `releaseBinding()`, do not clear `resumeSessionId`, and do not replace the old durable store record when staging the fork candidate
 - make `codexCandidateMatches` and fork proof routing accept `record.codexForkHandoff.candidateThreadId` while preserving old durable recovery through `resumeSessionId`
 - call `record.codexSidecar?.markCandidatePersisted?.()` only after the valid staged fork handoff is installed on the running terminal record; this releases proxy-held post-fork traffic after Freshell can attribute its turn events to the staged fork candidate
+- update rollout-watch helpers so fork handoff watches use `record.codexForkHandoff.candidate.rolloutPath` while the old durable record remains in `record.codexDurability`; do not rely on `record.codexDurability.candidate` for fork watch path lookup during staged/proof states
 - route forked-thread `turn/started`, `turn/completed`, and `fs/changed` proof triggers through the staged handoff state instead of mutating the old durable record
 - do not mark the forked thread durable or send `terminal.session.associated` until the fork rollout proof succeeds
 - on fork proof success, commit under a single registry critical section: write the new durable record with `source: 'thread_fork_response'` through the no-delete replacement path, swap binding authority from the old session to the proven fork session without emitting `terminal.session.unbound`, set `resumeSessionId` and `durableThreadId`, clear staged state, unwatch stale rollout paths, and then broadcast durability/session association
@@ -698,11 +702,11 @@ Create a fixture that:
   - a large stateful `thread/fork` response whose top-level id appears after `result.thread.turns`
   - a large non-state response whose top-level id appears after a large `result`
   - an above-cap non-state response
-- accepts a cap argument so ordinary tests can run the exact code path with a small cap override, while the final gate runs at the real `MAX_RAW_FORWARD_BYTES`
+- accepts a cap argument and passes it to `new CodexRemoteProxy({ maxRawForwardBytes: activeCap, ... })` so ordinary tests run the exact production code path with a small active cap, while the final gate runs at the real `MAX_RAW_FORWARD_BYTES`
 - for the `thread/fork` mode, sends a `thread/fork` request, has upstream assert the rewritten request contains `excludeTurns: true`, then sends a large response with `result.thread.id`, `result.thread.path`, `result.thread.ephemeral`, and a huge nested decoy before the top-level id; the TUI-facing response still receives `result.thread.turns: []`
 - subscribe to `proxy.onCandidate`, assert the `thread_fork_response` candidate, and call `proxy.markCandidatePersisted()` in the child fixture before sending any follow-up `turn/start` traffic; this proves the fork gate can be released without depending on TerminalRegistry in the stress fixture
 - for the non-state modes, sends a request with a method outside `STATEFUL_RESPONSE_METHODS` such as `model/list`, then has upstream send the large or above-cap response with the matching top-level id after the large `result`
-- asserts the TUI receives the same byte length for both below-cap success modes and that the proxy emits `thread_fork_response` for the stateful fork mode
+- asserts, per below-cap success mode, that the TUI receives the complete expected frame for that mode without truncation/corruption and that the proxy emits `thread_fork_response` for the stateful fork mode
 - exits non-zero if the process OOMs, times out, parses the body, loses the response, fails to recover the fork candidate, or incorrectly forwards the above-cap frame
 
 Use payloads at the active cap boundary, not merely convenient large samples. Build text JSON-RPC response buffers with total byte length `activeCap - 1024` so both successful paths prove the configured path. Generate them from `Buffer` chunks instead of constructing huge JS strings, have the upstream send them as text WebSocket frames with `{ binary: false }`, and assert the client receives `isBinary === false`.
@@ -753,7 +757,7 @@ Run:
 npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "constrained heap"
 ```
 
-Expected before the bounded extractor and raw-forward paths are complete: FAIL by child OOM, timeout, missing `thread_fork_response`, or explicit assertion. Expected after Task 4 implementation is complete: PASS using the small cap override and report the forwarded byte length, `isBinary === false`, and an RSS/heap sample for both success modes confirming the proxy did not materialize the payload as a parsed JS object.
+Expected before the bounded extractor and raw-forward paths are complete: FAIL by child OOM, timeout, missing `thread_fork_response`, or explicit assertion. Expected after Task 4 implementation is complete: PASS using the small active-cap override and report the forwarded byte length and `isBinary === false` for both success modes. Treat the small-cap RSS/heap sample as diagnostic only; the no-materialization proof comes from the opt-in full-boundary 64 MiB stress gate.
 
 - [ ] **Step 5: Run the opt-in full-boundary final gate**
 
