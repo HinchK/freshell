@@ -15,6 +15,19 @@ export type UnbindResult =
   | { ok: true; key: SessionCompositeKey }
   | { ok: false; reason: 'not_bound' }
 
+export type SwapTerminalSessionInput = {
+  provider: CodingCliProviderName
+  terminalId: string
+  fromSessionId: string
+  toSessionId: string
+}
+
+export type SwapTerminalSessionResult =
+  | { ok: true; fromKey: SessionCompositeKey; toKey: SessionCompositeKey }
+  | { ok: false; reason: 'terminal_not_bound' }
+  | { ok: false; reason: 'from_session_mismatch'; existing: SessionCompositeKey }
+  | { ok: false; reason: 'target_session_already_owned'; owner: string }
+
 export class SessionBindingAuthority {
   private bySession = new Map<SessionCompositeKey, string>()
   private byTerminal = new Map<string, SessionCompositeKey>()
@@ -34,6 +47,28 @@ export class SessionBindingAuthority {
     this.bySession.set(key, input.terminalId)
     this.byTerminal.set(input.terminalId, key)
     return { ok: true, key }
+  }
+
+  swapTerminalSession(input: SwapTerminalSessionInput): SwapTerminalSessionResult {
+    const fromKey = makeSessionKey(input.provider, input.fromSessionId)
+    const toKey = makeSessionKey(input.provider, input.toSessionId)
+    const existing = this.byTerminal.get(input.terminalId)
+    if (!existing) return { ok: false, reason: 'terminal_not_bound' }
+    if (existing !== fromKey) {
+      return { ok: false, reason: 'from_session_mismatch', existing }
+    }
+
+    const targetOwner = this.bySession.get(toKey)
+    if (targetOwner && targetOwner !== input.terminalId) {
+      return { ok: false, reason: 'target_session_already_owned', owner: targetOwner }
+    }
+
+    if (fromKey !== toKey && this.bySession.get(fromKey) === input.terminalId) {
+      this.bySession.delete(fromKey)
+    }
+    this.bySession.set(toKey, input.terminalId)
+    this.byTerminal.set(input.terminalId, toKey)
+    return { ok: true, fromKey, toKey }
   }
 
   ownerForSession(provider: CodingCliProviderName, sessionId: string): string | undefined {

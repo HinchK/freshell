@@ -1773,7 +1773,7 @@ describe('CodexRemoteProxy', () => {
     expect(repairTriggers).toContainEqual({ kind: 'candidate_capture_timeout' })
   })
 
-  it('stages fork response candidates and holds post-fork stateful traffic until persistence is acknowledged', async () => {
+  it('emits thread_fork_response candidates and holds post-fork stateful traffic until persistence is acknowledged', async () => {
     const upstream = await startUpstream((socket, message) => {
       if (message.method === 'thread/fork') {
         socket.send(JSON.stringify({

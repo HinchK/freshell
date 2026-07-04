@@ -101,6 +101,15 @@ export class CodexDurabilityStore {
       }
     }
 
+    return this.writeParsedRecord(parsed)
+  }
+
+  async writeReplacingCandidate(record: CodexDurabilityStoreRecord): Promise<CodexDurabilityStoreRecord> {
+    const parsed = CodexDurabilityStoreRecordSchema.parse(record)
+    return this.writeParsedRecord(parsed)
+  }
+
+  private async writeParsedRecord(parsed: CodexDurabilityStoreRecord): Promise<CodexDurabilityStoreRecord> {
     await this.fsImpl.mkdir(this.dir, { recursive: true })
     const filePath = this.recordPath(parsed.terminalId)
     const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`
