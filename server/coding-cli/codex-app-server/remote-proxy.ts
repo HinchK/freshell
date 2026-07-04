@@ -367,21 +367,6 @@ export class CodexRemoteProxy {
       }, 'Codex remote proxy received client request')
     }
 
-    const parsed = frame.byteLength <= MAX_FULL_PARSE_BYTES ? parseJsonFrame(frame) : undefined
-    const completedTurnInterrupt = this.completedTurnInterrupt(parsed)
-    if (id !== undefined && completedTurnInterrupt) {
-      log.info({
-        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
-        upstreamWsUrl: this.upstreamWsUrl,
-        method,
-        id,
-        threadId: completedTurnInterrupt.threadId,
-        turnId: completedTurnInterrupt.turnId,
-      }, 'Codex remote proxy acknowledged interrupt for completed turn')
-      this.sendJsonRpcSuccess(connection.client, id, {})
-      return
-    }
-
     if (method === 'thread/fork') {
       this.handleThreadForkRequest(connection, frame, id)
       return
@@ -395,6 +380,23 @@ export class CodexRemoteProxy {
     if (this.identityGate?.reason === 'fork_handoff' && method && FORK_HANDOFF_STATEFUL_CLIENT_METHODS.has(method)) {
       this.holdIdentityGateFrame(connection, frame, { id, method })
       return
+    }
+
+    if (method === 'turn/interrupt') {
+      const parsed = frame.byteLength <= MAX_FULL_PARSE_BYTES ? parseJsonFrame(frame) : undefined
+      const completedTurnInterrupt = this.completedTurnInterrupt(parsed)
+      if (id !== undefined && completedTurnInterrupt) {
+        log.info({
+          proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+          upstreamWsUrl: this.upstreamWsUrl,
+          method,
+          id,
+          threadId: completedTurnInterrupt.threadId,
+          turnId: completedTurnInterrupt.turnId,
+        }, 'Codex remote proxy acknowledged interrupt for completed turn')
+        this.sendJsonRpcSuccess(connection.client, id, {})
+        return
+      }
     }
 
     this.forwardClientFrame(connection, frame, { id, method })
@@ -582,6 +584,13 @@ export class CodexRemoteProxy {
       gate.heldFrames.length >= MAX_HELD_IDENTITY_GATE_FRAMES ||
       nextHeldBytes > this.maxRawForwardBytes
     ) {
+      gate.heldFrames.push({
+        connection,
+        frame,
+        id: request.id,
+        method: request.method,
+      })
+      gate.heldBytes = nextHeldBytes
       this.failIdentityGate(
         gate,
         identityGateOverflowMessage(gate.reason),

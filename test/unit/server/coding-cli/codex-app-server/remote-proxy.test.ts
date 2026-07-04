@@ -353,6 +353,44 @@ describe('CodexRemoteProxy', () => {
     })
   })
 
+  it('holds malformed huge-param turn/start frames without parsing params while initial_capture is pending', async () => {
+    const upstream = await startUpstream()
+    const proxy = await startProxy(upstream.wsUrl, {
+      candidateCaptureTimeoutMs: 1_000,
+    })
+    const tui = await connect(proxy.wsUrl)
+    const rawTurnStart = JSON.stringify({
+      id: 78,
+      method: 'turn/start',
+      params: {
+        threadId: 42,
+        padding: 'x'.repeat(64 * 1024),
+      },
+    })
+    const originalParse: typeof JSON.parse = JSON.parse
+    const parseSpy = vi.spyOn(JSON, 'parse').mockImplementation(((text, reviver) => {
+      if (text === rawTurnStart) {
+        throw new Error('turn/start params should not be parsed while initial_capture is pending')
+      }
+      return originalParse(text, reviver)
+    }) as typeof JSON.parse)
+
+    tui.send(rawTurnStart)
+    await delay(25)
+
+    expect(parseSpy.mock.calls.some(([text]) => text === rawTurnStart)).toBe(false)
+    expect(upstream.messages).toEqual([])
+
+    parseSpy.mockRestore()
+    proxy.markCandidatePersisted()
+
+    await vi.waitFor(() => expect(upstream.frames).toHaveLength(1))
+    expect(upstream.frames[0]).toMatchObject({
+      text: rawTurnStart,
+      isBinary: false,
+    })
+  })
+
   it('raw-forwards a large valid non-fork request below the active cap', async () => {
     const upstream = await startUpstream()
     const proxy = await startProxy(upstream.wsUrl, {
@@ -507,6 +545,44 @@ describe('CodexRemoteProxy', () => {
       text: rawTurnStart,
       isBinary: false,
     })
+  })
+
+  it('fails the overflow-causing fork_handoff turn/start request with an error and closes that client', async () => {
+    const upstream = await startUpstream()
+    const proxy = await startProxy(upstream.wsUrl, {
+      maxRawForwardBytes: 512,
+      requireCandidatePersistence: false,
+    })
+    ;(proxy as any).identityGate = {
+      reason: 'fork_handoff',
+      heldFrames: [],
+      heldBytes: 0,
+    }
+    const firstTui = await connect(proxy.wsUrl)
+    const overflowTui = await connect(proxy.wsUrl)
+    const overflowResponse = nextMessage(overflowTui)
+    const overflowClosed = socketClosed(overflowTui)
+
+    firstTui.send(JSON.stringify({
+      id: 79,
+      method: 'turn/start',
+      params: { threadId: 'thread-child', input: 'x'.repeat(260) },
+    }))
+    await delay(25)
+    expect(upstream.messages).toEqual([])
+
+    overflowTui.send(JSON.stringify({
+      id: 80,
+      method: 'turn/start',
+      params: { threadId: 'thread-child', input: 'x'.repeat(260) },
+    }))
+
+    await expect(overflowResponse).resolves.toMatchObject({
+      id: 80,
+      error: { message: expect.stringContaining('fork handoff') },
+    })
+    await expect(overflowClosed).resolves.toBeUndefined()
+    expect(upstream.messages).toEqual([])
   })
 
   it('fails held turn/start and closes sockets when candidate persistence times out', async () => {
