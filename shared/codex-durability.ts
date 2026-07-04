@@ -18,6 +18,7 @@ export type CodexDurabilityStateName = z.infer<typeof CodexDurabilityStateNameSc
 export const CodexCandidateSourceSchema = z.enum([
   'thread_start_response',
   'thread_started_notification',
+  'thread_fork_response',
   'restored_client_state',
   'durable_resume',
 ])
