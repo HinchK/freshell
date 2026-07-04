@@ -1080,6 +1080,12 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
     const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
     try {
       const store = new CodexDurabilityStore({ dir: durabilityDir })
+      const replacementSidecar = createFakeSidecar()
+      const planCreate = vi.fn(async () => ({
+        sessionId: 'thread-parent',
+        remote: { wsUrl: 'ws://127.0.0.1:43124' },
+        sidecar: replacementSidecar,
+      }))
       const registry = new TerminalRegistry(undefined, undefined, undefined, {
         codexDurabilityStore: store,
         serverInstanceId: 'srv-test',
@@ -1092,6 +1098,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
           codexAppServer: {
             wsUrl: 'ws://127.0.0.1:43123',
             sidecar,
+            recovery: { planCreate, retryDelayMs: 0 },
           },
         } as any,
       })
@@ -1135,11 +1142,83 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         durableThreadId: 'thread-parent',
       })
       expect(record.codexForkHandoff).toBeUndefined()
+      expect(record.codexForkHandoffPending).toMatchObject({
+        state: 'failed',
+      })
       await expect(store.read(term.terminalId)).resolves.toMatchObject({
         state: 'durable',
         durableThreadId: 'thread-parent',
       })
       expect(unboundEvents).toEqual([])
+
+      sidecar.emitRepairTrigger({ kind: 'proxy_error', error: new Error('invalid fork closed proxy') })
+      sidecar.emitRepairTrigger({ kind: 'proxy_close' })
+      await new Promise((resolve) => setImmediate(resolve))
+
+      expect(planCreate).not.toHaveBeenCalled()
+      expect(record.resumeSessionId).toBe('thread-parent')
+      await expect(store.read(term.terminalId)).resolves.toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-parent',
+      })
+    } finally {
+      await removeTempDir(durabilityDir)
+    }
+  })
+
+  it('treats proxy-classified fork handoff errors without candidates as failed fork handoffs', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    try {
+      const store = new CodexDurabilityStore({ dir: durabilityDir })
+      const replacementSidecar = createFakeSidecar()
+      const planCreate = vi.fn(async () => ({
+        sessionId: 'thread-parent',
+        remote: { wsUrl: 'ws://127.0.0.1:43124' },
+        sidecar: replacementSidecar,
+      }))
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        resumeSessionId: 'thread-parent',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+            recovery: { planCreate, retryDelayMs: 0 },
+          },
+        } as any,
+      })
+      await store.write({
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: 'thread-parent',
+        terminalId: term.terminalId,
+        serverInstanceId: 'srv-test',
+        updatedAt: 100,
+      })
+
+      sidecar.emitRepairTrigger({
+        kind: 'proxy_error',
+        scope: 'fork_handoff',
+        error: new Error('proxy rejected invalid thread/fork response'),
+      })
+      await new Promise((resolve) => setImmediate(resolve))
+
+      const record = registry.get(term.terminalId)! as any
+      expect(planCreate).not.toHaveBeenCalled()
+      expect(record.resumeSessionId).toBe('thread-parent')
+      expect(record.codexForkHandoffPending).toMatchObject({
+        state: 'failed',
+        reason: 'fork_proxy_error',
+      })
+      await expect(store.read(term.terminalId)).resolves.toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-parent',
+      })
     } finally {
       await removeTempDir(durabilityDir)
     }

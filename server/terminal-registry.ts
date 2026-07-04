@@ -2007,8 +2007,8 @@ export class TerminalRegistry extends EventEmitter {
     return !!record.codexForkHandoff && record.codexForkHandoff.state !== 'fork_handoff_failed'
   }
 
-  private hasCodexForkHandoffInFlight(record: TerminalRecord): boolean {
-    return this.isCodexForkHandoffActive(record) || record.codexForkHandoffPending?.state === 'pending'
+  private shouldBlockCodexRecoveryForForkHandoff(record: TerminalRecord): boolean {
+    return !!record.codexForkHandoff || !!record.codexForkHandoffPending
   }
 
   private isCodexForkThread(record: TerminalRecord, threadId: string | undefined): boolean {
@@ -2057,6 +2057,40 @@ export class TerminalRegistry extends EventEmitter {
       `fork-handoff-pending-failed:${pending.startedAt}`,
       () => sidecar.shutdown(),
       'Codex pending fork handoff sidecar shutdown failed',
+    ).catch(() => undefined)
+  }
+
+  private failCodexForkHandoffBeforeCandidate(record: TerminalRecord, reason: string): void {
+    if (record.codexForkHandoffPending?.state === 'failed') return
+    if (record.codexForkHandoffPending?.state === 'pending') {
+      this.failCodexForkHandoffPending(record, reason)
+      return
+    }
+    if (this.isCodexForkHandoffActive(record)) {
+      this.markCodexForkHandoffFailed(record, reason)
+      return
+    }
+    if (
+      record.mode !== 'codex'
+      || record.status !== 'running'
+      || !record.resumeSessionId
+      || record.codexDurability?.state !== 'durable'
+    ) {
+      return
+    }
+    const startedAt = Date.now()
+    record.codexForkHandoffPending = {
+      state: 'failed',
+      startedAt,
+      reason,
+    }
+    const sidecar = record.codexSidecar
+    if (!sidecar?.shutdown) return
+    void this.trackSidecarShutdown(
+      record.terminalId,
+      `fork-handoff-before-candidate-failed:${startedAt}`,
+      () => sidecar.shutdown(),
+      'Codex fork handoff sidecar shutdown failed before candidate staging',
     ).catch(() => undefined)
   }
 
@@ -2307,7 +2341,7 @@ export class TerminalRegistry extends EventEmitter {
 
     const forkCandidate = this.buildCodexForkHandoffCandidate(record, candidate, capturedAt)
     if (!forkCandidate) {
-      this.clearCodexForkHandoffPending(record)
+      this.failCodexForkHandoffBeforeCandidate(record, 'invalid_fork_candidate')
       logger.warn({
         terminalId: record.terminalId,
         threadId: candidate.thread.id,
@@ -3034,6 +3068,18 @@ export class TerminalRegistry extends EventEmitter {
       return
     }
 
+    const eventScope = typeof event === 'object' && event !== null && 'scope' in event
+      ? (event as { scope?: unknown }).scope
+      : undefined
+    if (eventScope === 'fork_handoff') {
+      this.failCodexForkHandoffBeforeCandidate(record, 'fork_proxy_error')
+      logger.warn(
+        { terminalId, event },
+        'Codex app-server reported proxy loss during fork handoff before candidate staging; preserving parent durable identity',
+      )
+      return
+    }
+
     if (record.codexForkHandoffPending?.state === 'pending') {
       this.failCodexForkHandoffPending(record, 'fork_lifecycle_loss')
       logger.warn(
@@ -3107,7 +3153,7 @@ export class TerminalRegistry extends EventEmitter {
     record: TerminalRecord,
     trigger: { source: 'lifecycle_loss'; event: unknown } | { source: 'pty_exit'; exitCode: number; signal?: number },
   ): boolean {
-    if (this.hasCodexForkHandoffInFlight(record)) {
+    if (this.shouldBlockCodexRecoveryForForkHandoff(record)) {
       if (record.codexForkHandoffPending?.state === 'pending') {
         this.failCodexForkHandoffPending(record, `fork_${trigger.source}`)
       } else if (this.isCodexForkHandoffActive(record)) {

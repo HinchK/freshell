@@ -34,7 +34,7 @@ export type CodexRemoteProxyCandidate = {
 }
 
 export type CodexRemoteProxyRepairTrigger =
-  | { kind: 'proxy_close' | 'proxy_error' | 'candidate_capture_timeout'; error?: Error }
+  | { kind: 'proxy_close' | 'proxy_error' | 'candidate_capture_timeout'; error?: Error; scope?: 'fork_handoff' }
   | { kind: 'fs_changed'; watchId: string; changedPaths: string[] }
 
 type JsonRpcId = string | number
@@ -1021,7 +1021,11 @@ export class CodexRemoteProxy {
       return
     }
 
-    this.emitRepairTrigger({ kind: 'proxy_error', error: new Error(message) })
+    this.emitRepairTrigger({
+      kind: 'proxy_error',
+      error: new Error(message),
+      ...(method === 'thread/fork' ? { scope: 'fork_handoff' as const } : {}),
+    })
     connection.client.close()
     connection.upstream.close()
   }

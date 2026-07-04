@@ -1845,4 +1845,41 @@ describe('CodexRemoteProxy', () => {
       params: { threadId: 'thread-child' },
     })
   })
+
+  it('emits fork handoff proxy_error when invalid thread_fork_response is rejected before candidate emission', async () => {
+    const upstream = await startUpstream((socket, message) => {
+      if (message.method !== 'thread/fork') return
+      socket.send(JSON.stringify({
+        id: message.id,
+        result: {
+          thread: {
+            id: 'thread-parent',
+            path: '/tmp/codex/invalid-fork-same-parent.jsonl',
+            ephemeral: false,
+          },
+        },
+      }))
+    })
+    const proxy = await startProxy(upstream.wsUrl, {
+      requireCandidatePersistence: false,
+    })
+    const repairTriggers: unknown[] = []
+    const candidates: unknown[] = []
+    proxy.onRepairTrigger((event) => repairTriggers.push(event))
+    proxy.onCandidate((candidate) => candidates.push(candidate))
+    const tui = await connect(proxy.wsUrl)
+
+    tui.send(JSON.stringify({
+      id: 43,
+      method: 'thread/fork',
+      params: { threadId: 'thread-parent', excludeTurns: false },
+    }))
+
+    await expectSocketClosedWithin(tui, 100)
+    expect(candidates).toEqual([])
+    expect(repairTriggers).toContainEqual(expect.objectContaining({
+      kind: 'proxy_error',
+      scope: 'fork_handoff',
+    }))
+  })
 })
