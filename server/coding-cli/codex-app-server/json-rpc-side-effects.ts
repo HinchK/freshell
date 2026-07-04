@@ -173,6 +173,7 @@ type ContainerFrame =
 const utf8Decoder = new TextDecoder('utf-8')
 const MAX_SMALL_PARSE_BYTES = 16 * 1024
 const MAX_FS_CHANGED_PATHS_BYTES = 16 * 1024
+const TURN_STATUSES = new Set(['completed', 'interrupted', 'failed', 'inProgress'])
 
 const BYTE_TAB = 0x09
 const BYTE_LF = 0x0a
@@ -638,7 +639,7 @@ function extractNullableString(raw: Buffer, entries: ObjectEntry[], key: string)
   if (!entry) return { ok: true, value: null }
   if (entry.valueKind === 'string') return decodeStringEntry(raw, entry)
   if (literalEquals(raw, entry, 'null')) return { ok: true, value: null }
-  return { ok: true, value: null }
+  return failure('unsupported_shape')
 }
 
 function extractOptionalBoolean(raw: Buffer, entries: ObjectEntry[], key: string): ScanResult<boolean | undefined> {
@@ -646,7 +647,7 @@ function extractOptionalBoolean(raw: Buffer, entries: ObjectEntry[], key: string
   if (!entry) return { ok: true, value: undefined }
   if (literalEquals(raw, entry, 'true')) return { ok: true, value: true }
   if (literalEquals(raw, entry, 'false')) return { ok: true, value: false }
-  return { ok: true, value: undefined }
+  return failure('unsupported_shape')
 }
 
 function extractTurnCompletedStatus(raw: Buffer, paramsEntries: ObjectEntry[]): ScanResult<string | undefined> {
@@ -658,9 +659,17 @@ function extractTurnCompletedStatus(raw: Buffer, paramsEntries: ObjectEntry[]): 
     if (hasAnyDuplicateKey(turnObject.object.entries, ['status'])) return failure('unsafe_duplicate_key')
     const turnStatus = extractOptionalString(raw, turnObject.object.entries, 'status')
     if (!turnStatus.ok) return turnStatus
-    if (turnStatus.value !== undefined) return turnStatus
+    if (turnStatus.value !== undefined) return validateTurnStatus(turnStatus.value)
   }
-  return extractOptionalString(raw, paramsEntries, 'status')
+  const status = extractOptionalString(raw, paramsEntries, 'status')
+  if (!status.ok || status.value === undefined) return status
+  return validateTurnStatus(status.value)
+}
+
+function validateTurnStatus(status: string): ScanResult<string> {
+  return TURN_STATUSES.has(status)
+    ? { ok: true, value: status }
+    : failure('unsupported_shape')
 }
 
 function extractThreadStatus(raw: Buffer, paramsEntries: ObjectEntry[]): ScanResult<{ type: string } & Record<string, unknown>> {

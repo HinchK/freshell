@@ -405,6 +405,40 @@ describe('bounded side-effect extractors', () => {
     })
   })
 
+  it('rejects turn/completed side effects with malformed status values', () => {
+    for (const status of ['completed', 'interrupted', 'failed', 'inProgress']) {
+      expect(extractTurnNotificationEvent(JSON.stringify({
+        method: 'turn/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: `turn-${status}`,
+          status,
+        },
+      }))).toEqual({
+        ok: true,
+        event: {
+          kind: 'turn_completed',
+          threadId: 'thread-1',
+          turnId: `turn-${status}`,
+          status,
+        },
+      })
+    }
+
+    for (const params of [
+      { threadId: 'thread-1', turnId: 'turn-flat', status: 'bogus' },
+      { threadId: 'thread-1', turnId: 'turn-nested', turn: { id: 'turn-nested', status: 'bogus' } },
+    ]) {
+      expect(extractTurnNotificationEvent(JSON.stringify({
+        method: 'turn/completed',
+        params,
+      }))).toEqual({
+        ok: false,
+        reason: 'unsupported_shape',
+      })
+    }
+  })
+
   it('extracts thread/closed and thread/status/changed lifecycle metadata', () => {
     const closedRaw = JSON.stringify({
       params: { threadId: 'thread-1', nested: { threadId: 'decoy' } },
@@ -518,8 +552,10 @@ describe('bounded side-effect extractors', () => {
     const baseThread = { id: 'thread-child', path: rolloutPath, ephemeral: false }
     const cases: Array<[Record<string, unknown>, string]> = [
       [{ ...baseThread, path: null }, 'missing_rollout_path'],
+      [{ ...baseThread, path: 7 }, 'unsupported_shape'],
       [{ ...baseThread, path: 'relative/rollout.jsonl' }, 'relative_rollout_path'],
       [{ ...baseThread, ephemeral: true }, 'ephemeral_thread'],
+      [{ ...baseThread, ephemeral: 'true' }, 'unsupported_shape'],
       [{ ...baseThread, id: 'thread-parent' }, 'same_as_parent'],
       [{ ...baseThread, rolloutPath: `${rolloutPath}.other` }, 'path_alias_conflict'],
     ]
@@ -543,11 +579,20 @@ describe('bounded side-effect extractors', () => {
       provenForkPathField: 'path',
     })).toEqual({ ok: false, reason: 'batch_unsupported' })
 
-    expect(extractForkResponseCandidate('{"id":12,"result":{"thread":{"id":"thread-child","path":"/tmp/a.jsonl","path":"/tmp/b.jsonl"}}}', {
-      parentThreadId: 'thread-parent',
-      pendingForkRequestIds: new Set<string | number>([12]),
-      provenForkPathField: 'path',
-    })).toEqual({ ok: false, reason: 'unsafe_duplicate_key' })
+    for (const raw of [
+      '{"id":12,"id":13,"result":{"thread":{"id":"thread-child","path":"/tmp/a.jsonl"}}}',
+      '{"id":12,"result":{"thread":{"id":"thread-child","path":"/tmp/a.jsonl"}},"result":{"thread":{"id":"thread-child","path":"/tmp/b.jsonl"}}}',
+      '{"id":12,"result":{"thread":{"id":"thread-child","path":"/tmp/a.jsonl"},"thread":{"id":"thread-child","path":"/tmp/b.jsonl"}}}',
+      '{"id":12,"result":{"thread":{"id":"thread-child","id":"thread-other","path":"/tmp/a.jsonl"}}}',
+      '{"id":12,"result":{"thread":{"id":"thread-child","path":"/tmp/a.jsonl","path":"/tmp/b.jsonl"}}}',
+      '{"id":12,"result":{"thread":{"id":"thread-child","path":"/tmp/a.jsonl","ephemeral":false,"ephemeral":true}}}',
+    ]) {
+      expect(extractForkResponseCandidate(raw, {
+        parentThreadId: 'thread-parent',
+        pendingForkRequestIds: new Set<string | number>([12]),
+        provenForkPathField: 'path',
+      })).toEqual({ ok: false, reason: 'unsafe_duplicate_key' })
+    }
 
     const raw = JSON.stringify({
       result: createOperationResult(createThread('thread-child', {
