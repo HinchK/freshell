@@ -280,11 +280,18 @@ type LightweightFileMeta = {
   lastActivityAt?: number
 }
 
+type LightweightMetaOptions = {
+  generatedTitleExtractor?: (obj: unknown) => string | undefined
+}
+
 /**
  * Read just the head and tail of a session file to extract sidebar-ready metadata.
  * Head gives sessionId, cwd, title; tail gives lastActivityAt for correct sort ordering.
  */
-async function readLightweightMeta(filePath: string): Promise<LightweightFileMeta> {
+async function readLightweightMeta(
+  filePath: string,
+  options: LightweightMetaOptions = {},
+): Promise<LightweightFileMeta> {
   try {
     const stat = await fsp.stat(filePath)
     const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
@@ -309,11 +316,18 @@ async function readLightweightMeta(filePath: string): Promise<LightweightFileMet
       let sessionId: string | undefined
       let cwd: string | undefined
       let title: string | undefined
+      let titleSource: ParsedSessionTitleSource | undefined
       let createdAt: number | undefined
 
       for (const line of headLines) {
         let obj: any
         try { obj = JSON.parse(line) } catch { continue }
+
+        const generatedTitle = options.generatedTitleExtractor?.(obj)
+        if (generatedTitle) {
+          title = generatedTitle
+          titleSource = 'provider-generated'
+        }
 
         if (!sessionId) {
           sessionId = obj?.sessionId || obj?.session_id
@@ -358,26 +372,33 @@ async function readLightweightMeta(filePath: string): Promise<LightweightFileMet
             }
           }
         }
-        if (sessionId && cwd && title && createdAt) break
       }
 
       // Parse tail backwards for lastActivityAt (skip timestampless records like file-history-snapshot)
       let lastActivityAt: number | undefined
       if (tailBuf) {
         const tailLines = tailBuf.toString('utf8').split('\n').filter(Boolean)
+        let tailGeneratedTitleFound = false
         for (let i = tailLines.length - 1; i >= 0; i--) {
           try {
             const obj = JSON.parse(tailLines[i])
-            if (obj?.timestamp) {
+            const generatedTitle = options.generatedTitleExtractor?.(obj)
+            if (generatedTitle && !tailGeneratedTitleFound) {
+              title = generatedTitle
+              titleSource = 'provider-generated'
+              tailGeneratedTitleFound = true
+            }
+            if (!lastActivityAt && obj?.timestamp) {
               const parsed = typeof obj.timestamp === 'number' ? obj.timestamp : Date.parse(obj.timestamp)
-              if (Number.isFinite(parsed)) { lastActivityAt = parsed; break }
+              if (Number.isFinite(parsed)) lastActivityAt = parsed
             }
           } catch { /* skip malformed lines */ }
+          if (lastActivityAt && (!options.generatedTitleExtractor || tailGeneratedTitleFound)) break
         }
       }
       if (!lastActivityAt) lastActivityAt = createdAt
 
-      return { filePath, mtimeMs, size, sessionId, cwd, title, createdAt, lastActivityAt }
+      return { filePath, mtimeMs, size, sessionId, cwd, title, titleSource, createdAt, lastActivityAt }
     } finally {
       await fd.close()
     }
@@ -1181,7 +1202,11 @@ export class CodingCliSessionIndexer {
     for (let i = 0; i < allFiles.length; i += LIGHTWEIGHT_SCAN_CONCURRENCY) {
       const batch = allFiles.slice(i, i + LIGHTWEIGHT_SCAN_CONCURRENCY)
       const results = await Promise.all(batch.map(({ provider, filePath }) =>
-        readLightweightMeta(filePath).then((meta) => ({ provider, meta })),
+        readLightweightMeta(filePath, {
+          generatedTitleExtractor: provider.name === 'claude'
+            ? extractClaudeGeneratedTitleFromJsonlObject
+            : undefined,
+        }).then((meta) => ({ provider, meta })),
       ))
       metas.push(...results)
     }
@@ -1218,6 +1243,7 @@ export class CodingCliSessionIndexer {
         mtimeMs: meta.mtimeMs,
         size: meta.size,
         baseSession,
+        titleSource: meta.titleSource,
         lightweight: true,
       })
       this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), meta.filePath)
