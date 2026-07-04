@@ -65,6 +65,7 @@ Use this policy instead:
 - Treat `thread/fork` response candidates as intentional staged handoffs, not immediate rebinds. Preserve the existing startup-race protection for ordinary mismatched `thread_start_response` and `thread_started_notification` candidates.
 - A `thread_fork_response` candidate is valid only when it is matched by top-level JSON-RPC id to a forwarded `thread/fork` request, uses `result.thread.id`, uses the same response thread's `path`, has a nonempty absolute path, has `ephemeral !== true`, and the child thread id differs from the old durable/resume/request parent id. If multiple path-like fields are present, they must agree exactly after normalization; disagreement, missing/null/relative path, same-as-parent id, or `ephemeral: true` makes the candidate invalid.
 - Because current Codex TUI requires `thread.turns` in fork operation responses, the proxy must normalize the TUI-facing `thread/fork` response to include `result.thread.turns: []` when upstream omitted it due to `excludeTurns: true`. This response normalization must be bounded and must not re-expand or fetch historical turns.
+- This deliberately changes terminal Codex `/fork` display behavior: the forked TUI starts with an empty visible conversation/turn list even though Codex server-side model context is preserved by the fork. The real TUI contract proves the route stays alive and does not refetch parent history. This is the accepted safety tradeoff for preventing the OOM crash; do not rehydrate parent turns in Freshell as part of this fix.
 - A fork handoff has these required states, whether represented as a transient `TerminalRecord` subobject or equivalent code: `fork_handoff_staged`, `fork_turn_in_progress_unproven`, `fork_proof_checking`, `fork_durable_committed`, and `fork_handoff_failed`. In the staged/proof states, the old `resumeSessionId`, old session binding, and old durable store record remain authoritative for restore/recovery.
 - The proxy-side `fork_handoff` gate starts before forwarding the matching `thread/fork` response to the TUI. TerminalRegistry may call `markCandidatePersisted()` only after it has staged the fork candidate and can attribute fork-thread events to that staged candidate. This releases queued post-fork traffic; it does not mean the fork is durable.
 - During a fork handoff gate, queue bounded, raw-frame-preserving post-fork stateful client traffic, not only `turn/start`. At minimum this includes `turn/start`, `turn/steer`, `turn/interrupt`, nested `thread/fork`, `thread/compact/start`, and other thread-mutating methods. Queue or fail closed stateful upstream notifications attributable to the fork thread until the staged candidate is installed. Allow only the rewritten `thread/fork` request, the matching `thread/fork` response after candidate extraction and gate setup, and clearly non-state/global traffic under the raw-forward cap.
@@ -187,9 +188,12 @@ No user decision is required for this revision. The remaining proof before compl
 Use exported named constants where tests need to assert policy:
 
 ```ts
+// server/coding-cli/codex-app-server/json-rpc-envelope.ts
 export const MAX_FULL_PARSE_BYTES = 1 * 1024 * 1024
 export const MAX_RAW_FORWARD_BYTES = 64 * 1024 * 1024
 export const MAX_SCANNED_TOKEN_BYTES = 8 * 1024
+
+// server/coding-cli/codex-app-server/remote-proxy.ts
 export const MAX_IDENTITY_GATE_HELD_FRAMES = 16
 export const MAX_IDENTITY_GATE_HELD_BYTES = MAX_RAW_FORWARD_BYTES
 ```
@@ -275,10 +279,7 @@ Expected: PASS with the test skipped when the opt-in env var is absent.
 
 - [x] **Step 4: Commit pre-implementation evidence**
 
-```bash
-git add test/integration/real/codex-app-server-fork-shape-contract.test.ts
-git commit -m "test: add codex fork oom preimplementation contracts"
-```
+Completed in commit `83338c81` and strengthened in commit `37a4071b`.
 
 ### Task 1: Add A Tested JSON-RPC Envelope Scanner
 
@@ -474,7 +475,7 @@ Add tests proving:
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "frame|large valid|above-cap|thread/fork|turn/start|turn/interrupt"
+npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "frame|large valid|above-cap|thread/fork|turn/start|turn/interrupt|root array|batch"
 ```
 
 Expected: FAIL because the current proxy full-parses and stringifies every frame.
@@ -502,10 +503,10 @@ In `remote-proxy.ts`:
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/json-rpc-envelope.test.ts test/unit/server/coding-cli/codex-app-server/json-rpc-side-effects.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts
+npm run test:vitest -- run test/unit/server/coding-cli/codex-app-server/json-rpc-envelope.test.ts test/unit/server/coding-cli/codex-app-server/json-rpc-side-effects.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "scanJsonRpcEnvelope|rewriteThreadForkRequestExcludeTurns|extractForkResponseCandidate|normalizeThreadForkResponseForTui|frame|large valid|above-cap|thread/fork requests|turn/start|turn/interrupt|root array|batch"
 ```
 
-Expected: PASS.
+Expected: PASS for Task 1, Task 2, and the Task 3 proxy scope only. Do not include the already-committed post-fork response candidate/gate test in this Task 3 green gate; that test remains red until Task 4 implements upstream `thread/fork` response handling.
 
 - [ ] **Step 5: Commit**
 
@@ -641,7 +642,7 @@ Add tests proving:
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "fork.*identity|thread_fork_response|mismatched Codex restore identity"
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "fork.*identity|fork handoff|child rollout proof|thread_fork_response|mismatched Codex restore identity"
 ```
 
 Expected: FAIL because `thread_fork_response` is not a valid candidate source and terminal registry currently ignores all mismatched candidates after initial persistence.
@@ -673,7 +674,7 @@ Implement the handoff as a narrow source-specific path:
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "fork.*identity|thread_fork_response|mismatched Codex restore identity"
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts --config vitest.server.config.ts --testNamePattern "fork.*identity|fork handoff|child rollout proof|thread_fork_response|mismatched Codex restore identity"
 ```
 
 Expected: PASS.
@@ -832,10 +833,7 @@ Expected: PASS with the test skipped when the opt-in env var is absent.
 
 - [x] **Step 4: Commit pre-implementation evidence**
 
-```bash
-git add test/integration/real/codex-remote-fork-contract.test.ts
-git commit -m "test: add codex fork oom preimplementation contracts"
-```
+Completed in commit `83338c81` and strengthened in commit `37a4071b`.
 
 ### Task 8: Final Verification
 
@@ -857,7 +855,7 @@ Expected: PASS.
 Run:
 
 ```bash
-npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts --config vitest.server.config.ts --testNamePattern "fork.*identity|mismatched Codex restore identity"
+npm run test:vitest -- run test/unit/server/terminal-registry.codex-sidecar.test.ts --config vitest.server.config.ts --testNamePattern "fork.*identity|fork handoff|child rollout proof|mismatched Codex restore identity"
 ```
 
 Expected: PASS.
