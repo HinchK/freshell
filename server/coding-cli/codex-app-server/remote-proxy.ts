@@ -10,6 +10,12 @@ import {
 } from './protocol.js'
 import type { CodexThreadLifecycleEvent, CodexThreadLifecycleLossEvent, CodexTurnEvent } from './client.js'
 import { logger } from '../../logger.js'
+import {
+  MAX_FULL_PARSE_BYTES,
+  MAX_RAW_FORWARD_BYTES,
+  scanJsonRpcEnvelope,
+} from './json-rpc-envelope.js'
+import { rewriteThreadForkRequestExcludeTurns } from './json-rpc-side-effects.js'
 
 const log = logger.child({ component: 'codex-remote-proxy' })
 
@@ -24,18 +30,33 @@ export type CodexRemoteProxyRepairTrigger =
 
 type JsonRpcId = string | number
 
-type PendingTurnStart = {
-  raw: WebSocket.RawData | string
-  client: WebSocket
-  upstream: WebSocket
+type ProxyFrame = {
+  data: WebSocket.RawData | string
+  binary: boolean
+  byteLength: number
+}
+
+type HeldProxyFrame = {
+  connection: ProxyConnection
+  frame: ProxyFrame
   id?: JsonRpcId
-  timer: NodeJS.Timeout
+  method?: string
+}
+
+type IdentityGateReason = 'initial_capture' | 'fork_handoff'
+
+type IdentityGate = {
+  reason: IdentityGateReason
+  heldFrames: HeldProxyFrame[]
+  heldBytes: number
+  requestTimer?: NodeJS.Timeout
 }
 
 type ProxyConnection = {
   client: WebSocket
   upstream: WebSocket
   pendingMethods: Map<JsonRpcId, string>
+  pendingForkRequests: Map<JsonRpcId, { parentThreadId?: string }>
 }
 
 type CodexRemoteProxyOptions = {
@@ -44,11 +65,17 @@ type CodexRemoteProxyOptions = {
   requestHoldTimeoutMs?: number
   candidateCaptureTimeoutMs?: number
   requireCandidatePersistence?: boolean
+  maxRawForwardBytes?: number
 }
 
 const DEFAULT_REQUEST_HOLD_TIMEOUT_MS = 5_000
 const DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS = 45_000
 const MAX_COMPLETED_TURN_KEYS = 256
+const MAX_HELD_IDENTITY_GATE_FRAMES = 32
+const FORK_HANDOFF_STATEFUL_CLIENT_METHODS = new Set([
+  'turn/start',
+  'turn/interrupt',
+])
 
 export class CodexRemoteProxy {
   private readonly upstreamWsUrl: string
@@ -56,13 +83,13 @@ export class CodexRemoteProxy {
   private readonly requestHoldTimeoutMs: number
   private readonly candidateCaptureTimeoutMs: number
   private readonly requireCandidatePersistence: boolean
+  private readonly maxRawForwardBytes: number
   private server: WebSocketServer | null = null
   private endpoint: LoopbackServerEndpoint | null = null
-  private candidatePersisted = false
+  private identityGate: IdentityGate | undefined
   private candidateCaptureFailed = false
   private candidateCapturePaused = false
   private candidateCaptureTimer: NodeJS.Timeout | null = null
-  private readonly pendingTurnStarts = new Set<PendingTurnStart>()
   private readonly connections = new Set<ProxyConnection>()
   private readonly candidateHandlers = new Set<(candidate: CodexRemoteProxyCandidate) => void>()
   private readonly turnStartedHandlers = new Set<(event: CodexTurnEvent) => void>()
@@ -79,7 +106,8 @@ export class CodexRemoteProxy {
     this.requestHoldTimeoutMs = options.requestHoldTimeoutMs ?? DEFAULT_REQUEST_HOLD_TIMEOUT_MS
     this.candidateCaptureTimeoutMs = options.candidateCaptureTimeoutMs ?? DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS
     this.requireCandidatePersistence = options.requireCandidatePersistence ?? true
-    this.candidatePersisted = !this.requireCandidatePersistence
+    this.maxRawForwardBytes = options.maxRawForwardBytes ?? MAX_RAW_FORWARD_BYTES
+    this.identityGate = this.requireCandidatePersistence ? this.createIdentityGate('initial_capture') : undefined
   }
 
   get wsUrl(): string {
@@ -106,16 +134,27 @@ export class CodexRemoteProxy {
       wsUrl: this.wsUrl,
       upstreamWsUrl: this.upstreamWsUrl,
       requireCandidatePersistence: this.requireCandidatePersistence,
+      maxRawForwardBytes: this.maxRawForwardBytes,
     }, 'Codex remote proxy listening')
     return { wsUrl: this.wsUrl }
   }
 
   async close(): Promise<void> {
     this.clearCandidateCaptureTimer()
-    for (const pending of [...this.pendingTurnStarts]) {
-      this.failHeldTurnStart(pending, 'Codex remote proxy is closing before restore identity persistence completed.')
+    const gate = this.identityGate
+    if (gate) {
+      this.identityGate = undefined
+      this.clearIdentityGateRequestTimer(gate)
+      for (const held of gate.heldFrames) {
+        this.sendJsonRpcError(
+          held.connection.client,
+          held.id,
+          'Codex remote proxy is closing before restore identity persistence completed.',
+        )
+      }
     }
     for (const connection of [...this.connections]) {
+      connection.pendingForkRequests.clear()
       connection.client.close()
       connection.upstream.close()
     }
@@ -127,42 +166,41 @@ export class CodexRemoteProxy {
   }
 
   markCandidatePersisted(): void {
-    if (this.candidatePersisted) return
-    if (this.candidateCaptureFailed) return
-    this.candidatePersisted = true
-    this.clearCandidateCaptureTimer()
-    for (const pending of [...this.pendingTurnStarts]) {
-      this.releaseHeldTurnStart(pending)
+    const gate = this.identityGate
+    if (!gate) return
+    if (gate.reason === 'initial_capture' && this.candidateCaptureFailed) return
+    this.identityGate = undefined
+    this.clearIdentityGateRequestTimer(gate)
+    if (gate.reason === 'initial_capture') {
+      this.clearCandidateCaptureTimer()
+    }
+    for (const held of gate.heldFrames) {
+      this.forwardClientFrame(held.connection, held.frame, {
+        id: held.id,
+        method: held.method,
+      })
     }
   }
 
   failCandidateCapture(message = 'Freshell could not persist Codex restore identity before accepting user input.'): void {
-    if (!this.requireCandidatePersistence) return
-    if (this.candidateCaptureFailed || this.candidatePersisted) return
+    if (this.identityGate?.reason !== 'initial_capture') return
+    if (this.candidateCaptureFailed) return
     this.candidateCaptureFailed = true
     this.clearCandidateCaptureTimer()
-    this.emitRepairTrigger({ kind: 'candidate_capture_timeout' })
-    for (const pending of [...this.pendingTurnStarts]) {
-      this.failHeldTurnStart(pending, message)
-    }
-    for (const connection of [...this.connections]) {
-      this.sendJsonRpcError(connection.client, undefined, message)
-      connection.client.close()
-      connection.upstream.close()
-    }
+    this.failIdentityGate(this.identityGate, message, { closeAllConnections: true })
   }
 
   pauseCandidateCapture(reason: string): void {
-    if (!this.requireCandidatePersistence) return
-    if (this.candidatePersisted || this.candidateCaptureFailed) return
+    if (this.identityGate?.reason !== 'initial_capture') return
+    if (this.candidateCaptureFailed) return
     this.candidateCapturePaused = true
     this.clearCandidateCaptureTimer()
     log.info({ reason }, 'Paused Codex restore identity candidate-capture timeout')
   }
 
   resumeCandidateCapture(reason: string): void {
-    if (!this.requireCandidatePersistence) return
-    if (this.candidatePersisted || this.candidateCaptureFailed) return
+    if (this.identityGate?.reason !== 'initial_capture') return
+    if (this.candidateCaptureFailed) return
     this.candidateCapturePaused = false
     this.ensureCandidateCaptureTimer()
     log.info({ reason }, 'Resumed Codex restore identity candidate-capture timeout')
@@ -209,6 +247,7 @@ export class CodexRemoteProxy {
       client,
       upstream,
       pendingMethods: new Map(),
+      pendingForkRequests: new Map(),
     }
     this.connections.add(connection)
     if (this.requireCandidatePersistence) {
@@ -232,6 +271,7 @@ export class CodexRemoteProxy {
 
     const closeBoth = () => {
       this.connections.delete(connection)
+      connection.pendingForkRequests.clear()
       client.close()
       upstream.close()
     }
@@ -277,10 +317,47 @@ export class CodexRemoteProxy {
   }
 
   private handleClientMessage(connection: ProxyConnection, raw: WebSocket.RawData, isBinary: boolean): void {
-    const forward = framePayload(raw, isBinary)
-    const parsed = parseJson(raw)
-    const method = parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>).method : undefined
-    const id = jsonRpcId(parsed)
+    const frame = createProxyFrame(raw, isBinary)
+    const sizeEnvelope = frame.byteLength <= MAX_FULL_PARSE_BYTES
+      ? scanJsonRpcEnvelope(frame.data)
+      : undefined
+    if (frame.byteLength > this.maxRawForwardBytes) {
+      const id = sizeEnvelope?.ok ? sizeEnvelope.id : undefined
+      log.warn({
+        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+        upstreamWsUrl: this.upstreamWsUrl,
+        frameBytes: frame.byteLength,
+        maxRawForwardBytes: this.maxRawForwardBytes,
+        id,
+      }, 'Codex remote proxy rejected oversized client frame')
+      this.rejectClientFrame(
+        connection,
+        id,
+        'Codex remote proxy rejected a JSON-RPC frame because it is too large.',
+        { close: true, repairKind: 'proxy_error' },
+      )
+      return
+    }
+
+    const envelope = sizeEnvelope ?? scanJsonRpcEnvelope(frame.data)
+    if (!envelope.ok) {
+      log.warn({
+        proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
+        upstreamWsUrl: this.upstreamWsUrl,
+        reason: envelope.reason,
+        frameBytes: frame.byteLength,
+      }, 'Codex remote proxy rejected unsupported client JSON-RPC frame')
+      this.rejectClientFrame(
+        connection,
+        undefined,
+        clientEnvelopeFailureMessage(envelope.reason),
+        { close: true, repairKind: 'proxy_error' },
+      )
+      return
+    }
+
+    const method = envelope.method
+    const id = envelope.id
     if (typeof method === 'string') {
       log.debug({
         proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
@@ -290,6 +367,7 @@ export class CodexRemoteProxy {
       }, 'Codex remote proxy received client request')
     }
 
+    const parsed = frame.byteLength <= MAX_FULL_PARSE_BYTES ? parseJsonFrame(frame) : undefined
     const completedTurnInterrupt = this.completedTurnInterrupt(parsed)
     if (id !== undefined && completedTurnInterrupt) {
       log.info({
@@ -304,25 +382,35 @@ export class CodexRemoteProxy {
       return
     }
 
-    if (id !== undefined && typeof method === 'string') {
-      connection.pendingMethods.set(id, method)
-    }
-
-    if (this.requireCandidatePersistence && method === 'turn/start' && !this.candidatePersisted) {
-      this.holdTurnStart(connection, forward, id)
+    if (method === 'thread/fork') {
+      this.handleThreadForkRequest(connection, frame, id)
       return
     }
 
-    sendIfOpen(connection.upstream, forward)
+    if (this.identityGate?.reason === 'initial_capture' && method === 'turn/start') {
+      this.holdIdentityGateFrame(connection, frame, { id, method })
+      return
+    }
+
+    if (this.identityGate?.reason === 'fork_handoff' && method && FORK_HANDOFF_STATEFUL_CLIENT_METHODS.has(method)) {
+      this.holdIdentityGateFrame(connection, frame, { id, method })
+      return
+    }
+
+    this.forwardClientFrame(connection, frame, { id, method })
   }
 
   private handleUpstreamMessage(connection: ProxyConnection, raw: WebSocket.RawData, isBinary: boolean): void {
-    const forward = framePayload(raw, isBinary)
-    const parsed = parseJson(raw)
-    const id = jsonRpcId(parsed)
+    const frame = createProxyFrame(raw, isBinary)
+    const envelope = scanJsonRpcEnvelope(frame.data)
+    const parsed = frame.byteLength <= MAX_FULL_PARSE_BYTES ? parseJsonFrame(frame) : undefined
+    const id = envelope.ok ? envelope.id : jsonRpcId(parsed)
     if (id !== undefined) {
       const method = connection.pendingMethods.get(id)
       connection.pendingMethods.delete(id)
+      if (method === 'thread/fork') {
+        connection.pendingForkRequests.delete(id)
+      }
       log.debug({
         proxyWsUrl: this.endpoint ? this.wsUrl : undefined,
         upstreamWsUrl: this.upstreamWsUrl,
@@ -333,7 +421,9 @@ export class CodexRemoteProxy {
         this.maybeEmitThreadStartResponseCandidate(parsed)
       }
     } else {
-      const method = parsed && typeof parsed === 'object'
+      const method = envelope.ok
+        ? envelope.method
+        : parsed && typeof parsed === 'object'
         ? (parsed as Record<string, unknown>).method
         : undefined
       if (typeof method === 'string') {
@@ -345,7 +435,7 @@ export class CodexRemoteProxy {
       }
       this.handleUpstreamNotification(parsed)
     }
-    sendIfOpen(connection.client, forward)
+    sendFrameIfOpen(connection.client, frame)
   }
 
   private maybeEmitThreadStartResponseCandidate(parsed: unknown): void {
@@ -425,36 +515,161 @@ export class CodexRemoteProxy {
     }
   }
 
-  private holdTurnStart(connection: ProxyConnection, raw: WebSocket.RawData | string, id?: JsonRpcId): void {
-    const pending: PendingTurnStart = {
-      raw,
-      client: connection.client,
-      upstream: connection.upstream,
-      id,
-      timer: setTimeout(() => {
-        this.failHeldTurnStart(
-          pending,
-          'Freshell could not persist Codex restore identity before accepting user input.',
-        )
-      }, this.requestHoldTimeoutMs),
+  private handleThreadForkRequest(connection: ProxyConnection, frame: ProxyFrame, id: JsonRpcId | undefined): void {
+    if (this.identityGate?.reason === 'fork_handoff') {
+      this.rejectClientFrame(
+        connection,
+        id,
+        'Codex remote proxy rejected nested thread/fork while a fork handoff is waiting for persistence.',
+        { close: true, repairKind: 'proxy_error' },
+      )
+      return
     }
-    pending.timer.unref?.()
-    this.pendingTurnStarts.add(pending)
+
+    const rewritten = rewriteThreadForkRequestExcludeTurns(frame.data)
+    if (!rewritten.ok) {
+      this.rejectClientFrame(
+        connection,
+        id,
+        `Codex remote proxy could not safely rewrite thread/fork request: ${rewritten.reason}.`,
+      )
+      return
+    }
+
+    const rewrittenFrame = createProxyFrame(rewritten.raw, frame.binary)
+    if (rewrittenFrame.byteLength > this.maxRawForwardBytes) {
+      this.rejectClientFrame(
+        connection,
+        id,
+        'Codex remote proxy rejected a rewritten thread/fork request because it is too large.',
+        { close: true, repairKind: 'proxy_error' },
+      )
+      return
+    }
+
+    if (id !== undefined) {
+      connection.pendingForkRequests.set(id, {
+        parentThreadId: extractThreadForkParentThreadId(frame),
+      })
+    }
+    this.forwardClientFrame(connection, rewrittenFrame, { id, method: 'thread/fork' })
   }
 
-  private releaseHeldTurnStart(pending: PendingTurnStart): void {
-    if (!this.pendingTurnStarts.delete(pending)) return
-    clearTimeout(pending.timer)
-    sendIfOpen(pending.upstream, pending.raw)
+  private forwardClientFrame(
+    connection: ProxyConnection,
+    frame: ProxyFrame,
+    request: { id?: JsonRpcId; method?: string },
+  ): void {
+    if (request.id !== undefined && typeof request.method === 'string') {
+      connection.pendingMethods.set(request.id, request.method)
+    }
+    sendFrameIfOpen(connection.upstream, frame)
   }
 
-  private failHeldTurnStart(pending: PendingTurnStart, message: string): void {
-    if (!this.pendingTurnStarts.delete(pending)) return
-    clearTimeout(pending.timer)
-    this.emitRepairTrigger({ kind: 'candidate_capture_timeout' })
-    this.sendJsonRpcError(pending.client, pending.id, message)
-    pending.client.close()
-    pending.upstream.close()
+  private holdIdentityGateFrame(
+    connection: ProxyConnection,
+    frame: ProxyFrame,
+    request: { id?: JsonRpcId; method?: string },
+  ): void {
+    const gate = this.identityGate
+    if (!gate) {
+      this.forwardClientFrame(connection, frame, request)
+      return
+    }
+
+    const nextHeldBytes = gate.heldBytes + frame.byteLength
+    if (
+      gate.heldFrames.length >= MAX_HELD_IDENTITY_GATE_FRAMES ||
+      nextHeldBytes > this.maxRawForwardBytes
+    ) {
+      this.failIdentityGate(
+        gate,
+        identityGateOverflowMessage(gate.reason),
+        { closeAllConnections: gate.reason === 'initial_capture' },
+      )
+      return
+    }
+
+    gate.heldFrames.push({
+      connection,
+      frame,
+      id: request.id,
+      method: request.method,
+    })
+    gate.heldBytes = nextHeldBytes
+    if (!gate.requestTimer) {
+      gate.requestTimer = setTimeout(() => {
+        this.failIdentityGate(
+          gate,
+          identityGateTimeoutMessage(gate.reason),
+          { closeAllConnections: gate.reason === 'initial_capture' },
+        )
+      }, this.requestHoldTimeoutMs)
+      gate.requestTimer.unref?.()
+    }
+  }
+
+  private failIdentityGate(
+    gate: IdentityGate,
+    message: string,
+    options: { closeAllConnections: boolean },
+  ): void {
+    if (this.identityGate !== gate) return
+    this.identityGate = undefined
+    this.clearIdentityGateRequestTimer(gate)
+    if (gate.reason === 'initial_capture') {
+      this.candidateCaptureFailed = true
+      this.clearCandidateCaptureTimer()
+      this.emitRepairTrigger({ kind: 'candidate_capture_timeout' })
+    } else {
+      this.emitRepairTrigger({ kind: 'proxy_error', error: new Error(message) })
+    }
+
+    const connectionsToClose = options.closeAllConnections
+      ? new Set(this.connections)
+      : new Set(gate.heldFrames.map((held) => held.connection))
+    const sentConnectionErrors = new Set<ProxyConnection>()
+    for (const held of gate.heldFrames) {
+      this.sendJsonRpcError(held.connection.client, held.id, message)
+      sentConnectionErrors.add(held.connection)
+    }
+    for (const connection of connectionsToClose) {
+      if (!sentConnectionErrors.has(connection)) {
+        this.sendJsonRpcError(connection.client, undefined, message)
+      }
+      connection.client.close()
+      connection.upstream.close()
+    }
+  }
+
+  private rejectClientFrame(
+    connection: ProxyConnection,
+    id: JsonRpcId | undefined,
+    message: string,
+    options: { close?: boolean; repairKind?: 'proxy_error' } = {},
+  ): void {
+    this.sendJsonRpcError(connection.client, id, message)
+    if (options.repairKind === 'proxy_error') {
+      this.emitRepairTrigger({ kind: 'proxy_error', error: new Error(message) })
+    }
+    if (options.close) {
+      connection.client.close()
+      connection.upstream.close()
+    }
+  }
+
+  private createIdentityGate(reason: IdentityGateReason): IdentityGate {
+    return {
+      reason,
+      heldFrames: [],
+      heldBytes: 0,
+    }
+  }
+
+  private clearIdentityGateRequestTimer(gate: IdentityGate): void {
+    if (!gate.requestTimer) return
+    clearTimeout(gate.requestTimer)
+    gate.requestTimer = undefined
   }
 
   private sendJsonRpcError(client: WebSocket, id: JsonRpcId | undefined, message: string): void {
@@ -465,16 +680,16 @@ export class CodexRemoteProxy {
         code: -32000,
         message,
       },
-    }))
+    }), false)
   }
 
   private sendJsonRpcSuccess(client: WebSocket, id: JsonRpcId, result: Record<string, never>): void {
-    sendIfOpen(client, JSON.stringify({ id, result }))
+    sendIfOpen(client, JSON.stringify({ id, result }), false)
   }
 
   private ensureCandidateCaptureTimer(): void {
-    if (!this.requireCandidatePersistence) return
-    if (this.candidatePersisted || this.candidateCaptureFailed || this.candidateCapturePaused || this.candidateCaptureTimer) return
+    if (this.identityGate?.reason !== 'initial_capture') return
+    if (this.candidateCaptureFailed || this.candidateCapturePaused || this.candidateCaptureTimer) return
     this.candidateCaptureTimer = setTimeout(() => {
       this.failCandidateCapture('Freshell timed out before Codex restore identity was captured.')
     }, this.candidateCaptureTimeoutMs)
@@ -562,9 +777,17 @@ export class CodexRemoteProxy {
   }
 }
 
-function parseJson(raw: WebSocket.RawData): unknown {
+function createProxyFrame(data: WebSocket.RawData | string, binary: boolean): ProxyFrame {
+  return {
+    data,
+    binary,
+    byteLength: frameByteLength(data),
+  }
+}
+
+function parseJsonFrame(frame: ProxyFrame): unknown {
   try {
-    return JSON.parse(raw.toString())
+    return JSON.parse(rawDataToBuffer(frame.data).toString())
   } catch {
     return undefined
   }
@@ -576,18 +799,365 @@ function jsonRpcId(parsed: unknown): JsonRpcId | undefined {
   return typeof id === 'string' || typeof id === 'number' ? id : undefined
 }
 
-function framePayload(raw: WebSocket.RawData, isBinary: boolean): WebSocket.RawData | string {
-  return isBinary ? raw : raw.toString()
+function sendFrameIfOpen(socket: WebSocket, frame: ProxyFrame): void {
+  sendIfOpen(socket, frame.data, frame.binary)
 }
 
-function sendIfOpen(socket: WebSocket, data: WebSocket.RawData | string): void {
+function sendIfOpen(socket: WebSocket, data: WebSocket.RawData | string, binary: boolean): void {
   if (socket.readyState === WebSocket.OPEN) {
-    socket.send(data)
+    socket.send(data, { binary })
   } else if (socket.readyState === WebSocket.CONNECTING) {
     socket.once('open', () => {
-      if (socket.readyState === WebSocket.OPEN) socket.send(data)
+      if (socket.readyState === WebSocket.OPEN) socket.send(data, { binary })
     })
   }
+}
+
+function frameByteLength(data: WebSocket.RawData | string): number {
+  if (typeof data === 'string') return Buffer.byteLength(data)
+  if (Buffer.isBuffer(data)) return data.byteLength
+  if (Array.isArray(data)) return data.reduce((total, chunk) => total + chunk.byteLength, 0)
+  return data.byteLength
+}
+
+function rawDataToBuffer(data: WebSocket.RawData | string): Buffer {
+  if (typeof data === 'string') return Buffer.from(data)
+  if (Buffer.isBuffer(data)) return data
+  if (Array.isArray(data)) return Buffer.concat(data.map((part) => Buffer.from(part)))
+  return Buffer.from(data)
+}
+
+function extractThreadForkParentThreadId(frame: ProxyFrame): string | undefined {
+  if (frame.byteLength <= MAX_FULL_PARSE_BYTES) {
+    const parsed = parseJsonFrame(frame)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+    const params = (parsed as Record<string, unknown>).params
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return undefined
+    const threadId = (params as Record<string, unknown>).threadId
+    return typeof threadId === 'string' && threadId.length > 0 ? threadId : undefined
+  }
+
+  const raw = rawDataToBuffer(frame.data)
+  const params = findJsonObjectMember(raw, 0, 'params')
+  if (!params || raw[params.valueStart] !== BYTE_OPEN_BRACE) return undefined
+  const threadId = findJsonObjectMember(raw, params.valueStart, 'threadId')
+  if (!threadId || raw[threadId.valueStart] !== BYTE_QUOTE) return undefined
+  return decodeJsonString(raw, threadId.valueStart, threadId.valueEnd)
+}
+
+function clientEnvelopeFailureMessage(reason: string): string {
+  if (reason === 'batch_unsupported') {
+    return 'Codex remote proxy rejected a JSON-RPC batch frame.'
+  }
+  return `Codex remote proxy rejected an unsupported JSON-RPC frame: ${reason}.`
+}
+
+function identityGateTimeoutMessage(reason: IdentityGateReason): string {
+  if (reason === 'fork_handoff') {
+    return 'Freshell could not persist Codex fork handoff identity before accepting user input.'
+  }
+  return 'Freshell could not persist Codex restore identity before accepting user input.'
+}
+
+function identityGateOverflowMessage(reason: IdentityGateReason): string {
+  if (reason === 'fork_handoff') {
+    return 'Freshell could not persist Codex fork handoff identity because the held request queue overflowed.'
+  }
+  return 'Freshell could not persist Codex restore identity because the held request queue overflowed.'
+}
+
+type JsonObjectMember = {
+  valueStart: number
+  valueEnd: number
+}
+
+const BYTE_TAB = 0x09
+const BYTE_LF = 0x0a
+const BYTE_CR = 0x0d
+const BYTE_SPACE = 0x20
+const BYTE_QUOTE = 0x22
+const BYTE_MINUS = 0x2d
+const BYTE_COMMA = 0x2c
+const BYTE_DOT = 0x2e
+const BYTE_COLON = 0x3a
+const BYTE_BACKSLASH = 0x5c
+const BYTE_OPEN_BRACKET = 0x5b
+const BYTE_CLOSE_BRACKET = 0x5d
+const BYTE_OPEN_BRACE = 0x7b
+const BYTE_CLOSE_BRACE = 0x7d
+
+function findJsonObjectMember(raw: Buffer, objectStart: number, key: string): JsonObjectMember | undefined {
+  let index = skipJsonWhitespace(raw, objectStart)
+  if (raw[index] !== BYTE_OPEN_BRACE) return undefined
+  index = skipJsonWhitespace(raw, index + 1)
+  if (raw[index] === BYTE_CLOSE_BRACE) return undefined
+
+  while (index < raw.length) {
+    const keyBounds = scanJsonString(raw, index)
+    if (!keyBounds) return undefined
+    const decodedKey = decodeJsonString(raw, index, keyBounds.next)
+    if (decodedKey === undefined) return undefined
+
+    index = skipJsonWhitespace(raw, keyBounds.next)
+    if (raw[index] !== BYTE_COLON) return undefined
+    const valueStart = skipJsonWhitespace(raw, index + 1)
+    const valueEnd = skipJsonValue(raw, valueStart)
+    if (valueEnd === undefined) return undefined
+    if (decodedKey === key) {
+      return { valueStart, valueEnd }
+    }
+
+    index = skipJsonWhitespace(raw, valueEnd)
+    if (raw[index] === BYTE_COMMA) {
+      index = skipJsonWhitespace(raw, index + 1)
+      continue
+    }
+    if (raw[index] === BYTE_CLOSE_BRACE) return undefined
+    return undefined
+  }
+
+  return undefined
+}
+
+function skipJsonValue(raw: Buffer, start: number): number | undefined {
+  let index = skipJsonWhitespace(raw, start)
+  const first = raw[index]
+  if (first === undefined) return undefined
+  if (first === BYTE_QUOTE) return scanJsonString(raw, index)?.next
+  if (first === BYTE_MINUS || isJsonDigit(first)) return scanJsonNumber(raw, index)
+  if (jsonLiteralAt(raw, index, 'true')) return index + 4
+  if (jsonLiteralAt(raw, index, 'false')) return index + 5
+  if (jsonLiteralAt(raw, index, 'null')) return index + 4
+  if (first !== BYTE_OPEN_BRACE && first !== BYTE_OPEN_BRACKET) return undefined
+
+  const stack: Array<{ type: 'array' | 'object'; state: 'keyOrEnd' | 'key' | 'colon' | 'valueOrEnd' | 'value' | 'commaOrEnd' }> = [
+    first === BYTE_OPEN_BRACE
+      ? { type: 'object', state: 'keyOrEnd' }
+      : { type: 'array', state: 'valueOrEnd' },
+  ]
+  index += 1
+
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1]!
+    index = skipJsonWhitespace(raw, index)
+    const byte = raw[index]
+    if (byte === undefined) return undefined
+
+    if (frame.type === 'object') {
+      if (frame.state === 'keyOrEnd') {
+        if (byte === BYTE_CLOSE_BRACE) {
+          stack.pop()
+          index += 1
+          markJsonContainerValueComplete(stack)
+        } else {
+          frame.state = 'key'
+        }
+        continue
+      }
+      if (frame.state === 'key') {
+        const key = scanJsonString(raw, index)
+        if (!key) return undefined
+        index = key.next
+        frame.state = 'colon'
+        continue
+      }
+      if (frame.state === 'colon') {
+        if (byte !== BYTE_COLON) return undefined
+        index += 1
+        frame.state = 'value'
+        continue
+      }
+      if (frame.state === 'value') {
+        const next = consumeJsonContainerValue(raw, index, stack)
+        if (next === undefined) return undefined
+        index = next
+        continue
+      }
+      if (byte === BYTE_COMMA) {
+        index += 1
+        frame.state = 'key'
+        continue
+      }
+      if (byte === BYTE_CLOSE_BRACE) {
+        stack.pop()
+        index += 1
+        markJsonContainerValueComplete(stack)
+        continue
+      }
+      return undefined
+    }
+
+    if (frame.state === 'valueOrEnd') {
+      if (byte === BYTE_CLOSE_BRACKET) {
+        stack.pop()
+        index += 1
+        markJsonContainerValueComplete(stack)
+      } else {
+        frame.state = 'value'
+      }
+      continue
+    }
+    if (frame.state === 'value') {
+      const next = consumeJsonContainerValue(raw, index, stack)
+      if (next === undefined) return undefined
+      index = next
+      continue
+    }
+    if (byte === BYTE_COMMA) {
+      index += 1
+      frame.state = 'value'
+      continue
+    }
+    if (byte === BYTE_CLOSE_BRACKET) {
+      stack.pop()
+      index += 1
+      markJsonContainerValueComplete(stack)
+      continue
+    }
+    return undefined
+  }
+
+  return index
+}
+
+function consumeJsonContainerValue(
+  raw: Buffer,
+  start: number,
+  stack: Array<{ type: 'array' | 'object'; state: 'keyOrEnd' | 'key' | 'colon' | 'valueOrEnd' | 'value' | 'commaOrEnd' }>,
+): number | undefined {
+  const index = skipJsonWhitespace(raw, start)
+  const first = raw[index]
+  if (first === undefined) return undefined
+  if (first === BYTE_OPEN_BRACE) {
+    stack.push({ type: 'object', state: 'keyOrEnd' })
+    return index + 1
+  }
+  if (first === BYTE_OPEN_BRACKET) {
+    stack.push({ type: 'array', state: 'valueOrEnd' })
+    return index + 1
+  }
+  const next = skipJsonValue(raw, index)
+  if (next === undefined) return undefined
+  markJsonContainerValueComplete(stack)
+  return next
+}
+
+function markJsonContainerValueComplete(
+  stack: Array<{ type: 'array' | 'object'; state: 'keyOrEnd' | 'key' | 'colon' | 'valueOrEnd' | 'value' | 'commaOrEnd' }>,
+): void {
+  const parent = stack[stack.length - 1]
+  if (parent) parent.state = 'commaOrEnd'
+}
+
+function scanJsonString(raw: Buffer, start: number): { next: number } | undefined {
+  if (raw[start] !== BYTE_QUOTE) return undefined
+  let index = start + 1
+  while (index < raw.length) {
+    const byte = raw[index]!
+    if (byte === BYTE_QUOTE) return { next: index + 1 }
+    if (byte < 0x20) return undefined
+    if (byte === BYTE_BACKSLASH) {
+      if (index + 1 >= raw.length) return undefined
+      const escaped = raw[index + 1]!
+      if (
+        escaped === BYTE_QUOTE ||
+        escaped === BYTE_BACKSLASH ||
+        escaped === 0x2f ||
+        escaped === 0x62 ||
+        escaped === 0x66 ||
+        escaped === 0x6e ||
+        escaped === 0x72 ||
+        escaped === 0x74
+      ) {
+        index += 2
+        continue
+      }
+      if (escaped === 0x75) {
+        if (index + 5 >= raw.length) return undefined
+        for (let offset = index + 2; offset <= index + 5; offset += 1) {
+          if (!isJsonHex(raw[offset]!)) return undefined
+        }
+        index += 6
+        continue
+      }
+      return undefined
+    }
+    index += 1
+  }
+  return undefined
+}
+
+function scanJsonNumber(raw: Buffer, start: number): number | undefined {
+  let index = start
+  if (raw[index] === BYTE_MINUS) index += 1
+  if (index >= raw.length) return undefined
+  if (raw[index] === 0x30) {
+    index += 1
+  } else if (isJsonDigitOneToNine(raw[index]!)) {
+    index += 1
+    while (index < raw.length && isJsonDigit(raw[index]!)) index += 1
+  } else {
+    return undefined
+  }
+  if (raw[index] === BYTE_DOT) {
+    index += 1
+    if (index >= raw.length || !isJsonDigit(raw[index]!)) return undefined
+    while (index < raw.length && isJsonDigit(raw[index]!)) index += 1
+  }
+  if (raw[index] === 0x65 || raw[index] === 0x45) {
+    index += 1
+    if (raw[index] === 0x2b || raw[index] === BYTE_MINUS) index += 1
+    if (index >= raw.length || !isJsonDigit(raw[index]!)) return undefined
+    while (index < raw.length && isJsonDigit(raw[index]!)) index += 1
+  }
+  return index
+}
+
+function decodeJsonString(raw: Buffer, start: number, end: number): string | undefined {
+  if (end - start > 8 * 1024) return undefined
+  try {
+    const decoded = JSON.parse(raw.subarray(start, end).toString()) as unknown
+    return typeof decoded === 'string' ? decoded : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function skipJsonWhitespace(raw: Buffer, start: number): number {
+  let index = start
+  while (
+    raw[index] === BYTE_SPACE ||
+    raw[index] === BYTE_TAB ||
+    raw[index] === BYTE_LF ||
+    raw[index] === BYTE_CR
+  ) {
+    index += 1
+  }
+  return index
+}
+
+function jsonLiteralAt(raw: Buffer, start: number, literal: 'false' | 'null' | 'true'): boolean {
+  if (start + literal.length > raw.length) return false
+  for (let offset = 0; offset < literal.length; offset += 1) {
+    if (raw[start + offset] !== literal.charCodeAt(offset)) return false
+  }
+  return true
+}
+
+function isJsonDigit(byte: number): boolean {
+  return byte >= 0x30 && byte <= 0x39
+}
+
+function isJsonDigitOneToNine(byte: number): boolean {
+  return byte >= 0x31 && byte <= 0x39
+}
+
+function isJsonHex(byte: number): boolean {
+  return (
+    (byte >= 0x30 && byte <= 0x39) ||
+    (byte >= 0x41 && byte <= 0x46) ||
+    (byte >= 0x61 && byte <= 0x66)
+  )
 }
 
 function turnKey(threadId: string, turnId: string): string {
