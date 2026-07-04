@@ -8,8 +8,9 @@ import { getPerfConfig, startPerfTimer } from '../perf-logger.js'
 import { configStore, SessionOverride } from '../config-store.js'
 import { extractTitleFromMessage } from '../title-utils.js'
 import type { CodingCliProvider } from './provider.js'
-import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ProjectGroup } from './types.js'
+import { makeSessionKey, type CodingCliSession, type CodingCliProviderName, type ParsedSessionTitleSource, type ProjectGroup } from './types.js'
 import { sanitizeCodexTaskEventsForTruncatedSnippet } from './providers/codex.js'
+import { extractClaudeGeneratedTitleFromJsonlObject } from './providers/claude-title.js'
 import { extractUserAuthoredText, resolveGitCheckoutRoot, resolveGitRepoRoot } from './utils.js'
 import { diffProjects } from '../sessions-sync/diff.js'
 import type { SessionMetadataStore, SessionMetadataEntry } from '../session-metadata-store.js'
@@ -114,6 +115,53 @@ export async function scanFileForUserTextMessages(filePath: string): Promise<boo
   return false
 }
 
+async function scanFileForClaudeGeneratedTitle(filePath: string): Promise<string | undefined> {
+  try {
+    const fd = await fsp.open(filePath, 'r')
+    try {
+      const stat = await fd.stat()
+      const chunkSize = 64 * 1024
+      const buf = Buffer.alloc(chunkSize)
+      let position = 0
+      let pending = ''
+      let latestTitle: string | undefined
+
+      while (position < stat.size) {
+        const { bytesRead } = await fd.read(buf, 0, Math.min(chunkSize, stat.size - position), position)
+        if (bytesRead <= 0) break
+        position += bytesRead
+        pending += buf.subarray(0, bytesRead).toString('utf8')
+        const lines = pending.split(/\r?\n/)
+        pending = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line) continue
+          try {
+            const title = extractClaudeGeneratedTitleFromJsonlObject(JSON.parse(line), 200)
+            if (title) latestTitle = title
+          } catch {
+            // Skip malformed session lines.
+          }
+        }
+      }
+
+      if (pending) {
+        try {
+          latestTitle = extractClaudeGeneratedTitleFromJsonlObject(JSON.parse(pending), 200) ?? latestTitle
+        } catch {
+          // Skip malformed trailing lines.
+        }
+      }
+
+      return latestTitle
+    } finally {
+      await fd.close()
+    }
+  } catch {
+    return undefined
+  }
+}
+
 function isPathWithin(basePath: string, targetPath: string): boolean {
   const relative = path.relative(basePath, targetPath)
   return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
@@ -153,11 +201,17 @@ export function isSubagentSession(filePath: string): boolean {
   return normalized.includes('/.claude/') || normalized.includes('\\.claude\\')
 }
 
-function applyOverride(session: CodingCliSession, ov: SessionOverride | undefined): CodingCliSession | null {
+function applyOverride(
+  session: CodingCliSession,
+  ov: SessionOverride | undefined,
+  titleSource?: ParsedSessionTitleSource,
+): CodingCliSession | null {
   if (ov?.deleted) return null
+  const shouldApplyTitleOverride = !!ov?.titleOverride
+    && !(titleSource === 'provider-generated' && (ov.titleSource === 'dir' || ov.titleSource === 'first-message'))
   return {
     ...session,
-    title: ov?.titleOverride || session.title,
+    title: shouldApplyTitleOverride ? ov.titleOverride : session.title,
     summary: ov?.summaryOverride || session.summary,
     createdAt: ov?.createdAtOverride ?? session.createdAt,
     archived: ov?.archived ?? session.archived ?? false,
@@ -221,6 +275,7 @@ type LightweightFileMeta = {
   sessionId?: string
   cwd?: string
   title?: string
+  titleSource?: ParsedSessionTitleSource
   createdAt?: number
   lastActivityAt?: number
 }
@@ -336,6 +391,7 @@ type CachedSessionEntry = {
   mtimeMs: number
   size: number
   baseSession: CodingCliSession | null
+  titleSource?: ParsedSessionTitleSource
   /** True when populated by a lightweight scan and not yet fully enriched. */
   lightweight?: boolean
 }
@@ -831,6 +887,13 @@ export class CodingCliSessionIndexer {
         tailMeta?.codexTaskEvents,
       )
     }
+    if (snippet.truncated && provider.name === 'claude' && meta.titleSource !== 'provider-generated') {
+      const generatedTitle = await scanFileForClaudeGeneratedTitle(filePath)
+      if (generatedTitle) {
+        meta.title = generatedTitle
+        meta.titleSource = 'provider-generated'
+      }
+    }
     if (!meta.cwd) {
       this.fileCache.set(cacheKey, {
         provider: provider.name,
@@ -849,6 +912,12 @@ export class CodingCliSessionIndexer {
     const storedTitle = normalizeTitle(sessionMetadata[metaKey]?.derivedTitle)
     const parsedTitle = normalizeTitle(meta.title)
     const resolvedTitle = resolveSessionTitle(parsedTitle, sameSession ? previous?.title : undefined, storedTitle)
+    let resolvedTitleSource: ParsedSessionTitleSource | undefined
+    if (parsedTitle) {
+      resolvedTitleSource = meta.titleSource
+    } else if (sameSession && previous?.title) {
+      resolvedTitleSource = cached?.titleSource
+    }
     const appendOnlyReparse = sameSession && size >= (cached?.size ?? 0)
     const createdAt = appendOnlyReparse
       ? minDefined(previous?.createdAt, meta.createdAt)
@@ -892,6 +961,7 @@ export class CodingCliSessionIndexer {
       mtimeMs,
       size,
       baseSession,
+      titleSource: resolvedTitleSource,
     })
     this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), filePath)
   }
@@ -1020,7 +1090,7 @@ export class CodingCliSessionIndexer {
           }
         }
       }
-      const merged = applyOverride(cached.baseSession, ov)
+      const merged = applyOverride(cached.baseSession, ov, cached.titleSource)
       if (!merged) continue
       const metaKey = makeSessionKey(merged.provider, merged.sessionId)
       const meta = sessionMetadata[metaKey]

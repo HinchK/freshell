@@ -2001,6 +2001,127 @@ describe('CodingCliSessionIndexer', () => {
       expect(olderSession?.title).toBe('Sticky old title')
     })
 
+    it('lets a provider-generated parsed title beat a first-message automatic override', async () => {
+      const fileA = path.join(tempDir, 'session-provider-title.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {
+          [makeSessionKey('claude', 'session-provider-title')]: {
+            titleOverride: 'Prompt fallback title',
+            titleSource: 'first-message',
+          },
+        },
+        settings: { codingCli: { enabledProviders: ['claude'], providers: {} } },
+      })
+
+      const provider = makeProvider([fileA], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          title: 'Auth Redirect Fix',
+          titleSource: 'provider-generated',
+        }),
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Auth Redirect Fix')
+    })
+
+    it('keeps a finalized ai override ahead of a provider-generated parsed title', async () => {
+      const fileA = path.join(tempDir, 'session-ai-title.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {
+          [makeSessionKey('claude', 'session-ai-title')]: {
+            titleOverride: 'Gemini Generated Title',
+            titleSource: 'ai',
+          },
+        },
+        settings: { codingCli: { enabledProviders: ['claude'], providers: {} } },
+      })
+
+      const provider = makeProvider([fileA], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          title: 'Auth Redirect Fix',
+          titleSource: 'provider-generated',
+        }),
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Gemini Generated Title')
+    })
+
+    it('keeps an explicit user override ahead of a provider-generated parsed title', async () => {
+      const fileA = path.join(tempDir, 'session-user-title.jsonl')
+      await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a' }) + '\n')
+
+      vi.mocked(configStore.snapshot).mockResolvedValue({
+        sessionOverrides: {
+          [makeSessionKey('claude', 'session-user-title')]: {
+            titleOverride: 'My Rename',
+            titleSource: 'user',
+          },
+        },
+        settings: { codingCli: { enabledProviders: ['claude'], providers: {} } },
+      })
+
+      const provider = makeProvider([fileA], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          title: 'Auth Redirect Fix',
+          titleSource: 'provider-generated',
+        }),
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('My Rename')
+    })
+
+    it('finds a Claude generated title in the middle of a truncated full-enrichment file', async () => {
+      const fileA = path.join(tempDir, 'large-claude-summary.jsonl')
+      const beforeSummary = Array.from({ length: 150 }, (_, i) =>
+        JSON.stringify({ type: 'noise', payload: `${i}:${'x'.repeat(1024)}` }),
+      )
+      const afterSummary = Array.from({ length: 180 }, (_, i) =>
+        JSON.stringify({ type: 'noise', payload: `${i}:${'y'.repeat(1024)}` }),
+      )
+      await fsp.writeFile(fileA, [
+        JSON.stringify({
+          type: 'system',
+          subtype: 'init',
+          session_id: 'large-claude-summary',
+          cwd: '/project/a',
+          timestamp: '2026-01-01T09:00:00.000Z',
+        }),
+        JSON.stringify({
+          type: 'user',
+          message: { role: 'user', content: 'Prompt fallback title' },
+          timestamp: '2026-01-01T09:01:00.000Z',
+        }),
+        ...beforeSummary,
+        JSON.stringify({ type: 'summary', summary: 'Auth Redirect Fix' }),
+        ...afterSummary,
+      ].join('\n'))
+
+      const { parseSessionContent } = await import('../../../../server/coding-cli/providers/claude')
+      const provider = makeProvider([fileA], {
+        parseSessionFile: async (content) => parseSessionContent(content),
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.title).toBe('Auth Redirect Fix')
+    })
+
     it('persists a newly parsed non-empty title to the metadata store', async () => {
       const fileA = path.join(tempDir, 'session-b.jsonl')
       await fsp.writeFile(fileA, JSON.stringify({ cwd: '/project/a', title: 'Fresh title' }) + '\n')
