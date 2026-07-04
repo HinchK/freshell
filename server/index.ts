@@ -26,6 +26,7 @@ import { createOpencodeActivityIntegration } from './coding-cli/opencode-activit
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
 import { opencodeProvider } from './coding-cli/providers/opencode.js'
+import { amplifierProvider } from './coding-cli/providers/amplifier.js'
 import { makeSessionKey, type CodingCliProviderName, type CodingCliSession } from './coding-cli/types.js'
 import { computeSessionTitleSync } from './auto-title.js'
 import { generateAiSessionTitle } from './ai-title.js'
@@ -198,7 +199,7 @@ async function main() {
   }))
   app.use('/api', createClientLogsRouter())
 
-  const codingCliProviders = [claudeProvider, codexProvider, opencodeProvider]
+  const codingCliProviders = [claudeProvider, codexProvider, opencodeProvider, amplifierProvider]
   const freshellConfigDir = getFreshellConfigDir()
   const sessionMetadataStore = new SessionMetadataStore(freshellConfigDir)
   const codingCliIndexer = new CodingCliSessionIndexer(codingCliProviders, {}, sessionMetadataStore)

@@ -71,6 +71,23 @@ export function GeminiIcon(props: IconProps) {
   )
 }
 
+export function AmplifierIcon(props: IconProps) {
+  // Stylized "A" mark (amplify). Solid glyph with a triangular counter + crossbar.
+  return (
+    <svg
+      xmlns="http://www.w3.org/2000/svg"
+      viewBox="0 0 24 24"
+      fill="currentColor"
+      {...props}
+    >
+      <path
+        fillRule="evenodd"
+        d="M12 3 L22 21 L17.2 21 L15.5 17.4 L8.5 17.4 L6.8 21 L2 21 Z M12 9 L15.5 15 L8.5 15 Z"
+      />
+    </svg>
+  )
+}
+
 export function FreshclaudeIcon(props: IconProps) {
   return (
     <svg
@@ -142,6 +159,7 @@ export const PROVIDER_ICONS: Record<CodingCliProviderName, React.ComponentType<I
   kimi: KimiIcon,
   opencode: OpencodeIcon,
   gemini: GeminiIcon,
+  amplifier: AmplifierIcon,
 }
 
 export function ProviderIcon({
