@@ -545,6 +545,12 @@ type CodexForkHandoff = {
   lastProofFailure?: CodexProofFailure
 }
 
+type CodexForkHandoffPending = {
+  state: 'pending' | 'failed'
+  startedAt: number
+  reason?: string
+}
+
 export type TerminalRecord = {
   terminalId: string
   title: string
@@ -608,6 +614,7 @@ export type TerminalRecord = {
   codexRolloutWatch?: { watchId: string; rolloutPath: string }
   codexDurability?: CodexDurabilityRef
   codexForkHandoff?: CodexForkHandoff
+  codexForkHandoffPending?: CodexForkHandoffPending
   codexDurabilityProof?: {
     inFlight?: Promise<void>
     rerunRequested?: boolean
@@ -2000,10 +2007,57 @@ export class TerminalRegistry extends EventEmitter {
     return !!record.codexForkHandoff && record.codexForkHandoff.state !== 'fork_handoff_failed'
   }
 
+  private hasCodexForkHandoffInFlight(record: TerminalRecord): boolean {
+    return this.isCodexForkHandoffActive(record) || record.codexForkHandoffPending?.state === 'pending'
+  }
+
   private isCodexForkThread(record: TerminalRecord, threadId: string | undefined): boolean {
     return !!threadId
       && this.isCodexForkHandoffActive(record)
       && record.codexForkHandoff?.candidate.candidateThreadId === threadId
+  }
+
+  private markCodexForkHandoffPending(terminalId: string): void {
+    const record = this.terminals.get(terminalId)
+    if (
+      !record
+      || record.status !== 'running'
+      || record.mode !== 'codex'
+      || record.codexForkHandoff
+      || record.codexForkHandoffPending
+      || !record.resumeSessionId
+      || record.codexDurability?.state !== 'durable'
+    ) {
+      return
+    }
+    record.codexForkHandoffPending = {
+      state: 'pending',
+      startedAt: Date.now(),
+    }
+  }
+
+  private clearCodexForkHandoffPending(record: TerminalRecord): void {
+    if (record.codexForkHandoffPending?.state === 'pending') {
+      record.codexForkHandoffPending = undefined
+    }
+  }
+
+  private failCodexForkHandoffPending(record: TerminalRecord, reason: string): void {
+    const pending = record.codexForkHandoffPending
+    if (!pending) return
+    record.codexForkHandoffPending = {
+      ...pending,
+      state: 'failed',
+      reason,
+    }
+    const sidecar = record.codexSidecar
+    if (!sidecar?.shutdown || record.status !== 'running') return
+    void this.trackSidecarShutdown(
+      record.terminalId,
+      `fork-handoff-pending-failed:${pending.startedAt}`,
+      () => sidecar.shutdown(),
+      'Codex pending fork handoff sidecar shutdown failed',
+    ).catch(() => undefined)
   }
 
   private codexCandidateMatches(record: TerminalRecord, threadId: string | undefined): boolean {
@@ -2142,6 +2196,50 @@ export class TerminalRegistry extends EventEmitter {
     return storedDurability
   }
 
+  private buildCodexDurabilityStoreRecord(
+    record: TerminalRecord,
+    durability: CodexDurabilityRef,
+    updatedAt = Date.now(),
+  ): CodexDurabilityStoreRecord {
+    return {
+      ...durability,
+      terminalId: record.terminalId,
+      ...(record.envContext?.tabId ? { tabId: record.envContext.tabId } : {}),
+      ...(record.envContext?.paneId ? { paneId: record.envContext.paneId } : {}),
+      serverInstanceId: this.serverInstanceId,
+      updatedAt,
+    }
+  }
+
+  private async restoreCodexForkParentDurabilityStore(
+    record: TerminalRecord,
+    handoff: CodexForkHandoff,
+    parentRecord: CodexDurabilityStoreRecord | undefined,
+    reason: string,
+  ): Promise<void> {
+    const restoreRecord = parentRecord ?? (handoff.oldDurability
+      ? this.buildCodexDurabilityStoreRecord(record, handoff.oldDurability)
+      : undefined)
+    if (!restoreRecord) return
+    try {
+      await this.codexDurabilityStore.writeReplacingCandidate(restoreRecord)
+      logger.warn({
+        terminalId: record.terminalId,
+        reason,
+        oldSessionId: handoff.oldResumeSessionId,
+        childSessionId: handoff.candidate.candidateThreadId,
+      }, 'Restored parent Codex durability record after failed fork handoff commit')
+    } catch (err) {
+      logger.error({
+        err,
+        terminalId: record.terminalId,
+        reason,
+        oldSessionId: handoff.oldResumeSessionId,
+        childSessionId: handoff.candidate.candidateThreadId,
+      }, 'Failed to restore parent Codex durability record after failed fork handoff commit')
+    }
+  }
+
   private isCurrentRunningTerminalRecord(record: TerminalRecord): boolean {
     return this.terminals.get(record.terminalId) === record && record.status === 'running'
   }
@@ -2177,6 +2275,9 @@ export class TerminalRegistry extends EventEmitter {
   }
 
   private async persistCodexCandidate(terminalId: string, candidate: CodexRemoteProxyCandidate): Promise<void> {
+    if (candidate.source === 'thread_fork_response') {
+      this.markCodexForkHandoffPending(terminalId)
+    }
     const previous = this.codexCandidatePersistenceQueues.get(terminalId) ?? Promise.resolve()
     const next = previous
       .catch(() => undefined)
@@ -2195,8 +2296,18 @@ export class TerminalRegistry extends EventEmitter {
     candidate: CodexRemoteProxyCandidate,
     capturedAt: number,
   ): Promise<void> {
+    if (record.codexForkHandoffPending?.state === 'failed') {
+      logger.warn({
+        terminalId: record.terminalId,
+        threadId: candidate.thread.id,
+        reason: record.codexForkHandoffPending.reason,
+      }, 'Ignoring Codex fork handoff identity candidate after pending handoff failure')
+      return
+    }
+
     const forkCandidate = this.buildCodexForkHandoffCandidate(record, candidate, capturedAt)
     if (!forkCandidate) {
+      this.clearCodexForkHandoffPending(record)
       logger.warn({
         terminalId: record.terminalId,
         threadId: candidate.thread.id,
@@ -2217,6 +2328,7 @@ export class TerminalRegistry extends EventEmitter {
         record.codexSidecar?.markCandidatePersisted?.()
         return
       }
+      this.clearCodexForkHandoffPending(record)
       logger.warn({
         terminalId: record.terminalId,
         existingThreadId: existing.candidateThreadId,
@@ -2226,7 +2338,10 @@ export class TerminalRegistry extends EventEmitter {
     }
 
     const oldResumeSessionId = record.resumeSessionId
-    if (!oldResumeSessionId) return
+    if (!oldResumeSessionId) {
+      this.clearCodexForkHandoffPending(record)
+      return
+    }
     record.codexForkHandoff = {
       state: 'fork_handoff_staged',
       candidate: forkCandidate,
@@ -2234,6 +2349,7 @@ export class TerminalRegistry extends EventEmitter {
       ...(record.codexDurability ? { oldDurability: record.codexDurability } : {}),
       stagedAt: capturedAt,
     }
+    this.clearCodexForkHandoffPending(record)
     this.armCodexRolloutWatch(record, forkCandidate)
     record.codexSidecar?.markCandidatePersisted?.()
     logger.info({
@@ -2579,8 +2695,13 @@ export class TerminalRegistry extends EventEmitter {
       durableThreadId,
     }
 
+    let parentRecord: CodexDurabilityStoreRecord | undefined
     let stored: CodexDurabilityRef
     try {
+      parentRecord = await this.codexDurabilityStore.read(record.terminalId)
+      if (!this.isCurrentRunningTerminalRecord(record) || record.codexForkHandoff !== handoff) {
+        return
+      }
       stored = await this.writeCodexForkCommitDurability(record, durable, checkedAt)
     } catch (err) {
       logger.error({
@@ -2592,7 +2713,10 @@ export class TerminalRegistry extends EventEmitter {
       return
     }
 
-    if (!this.isCurrentRunningTerminalRecord(record) || record.codexForkHandoff !== handoff) return
+    if (!this.isCurrentRunningTerminalRecord(record) || record.codexForkHandoff !== handoff) {
+      await this.restoreCodexForkParentDurabilityStore(record, handoff, parentRecord, 'fork_post_write_record_changed')
+      return
+    }
 
     const swapped = this.bindingAuthority.swapTerminalSession({
       provider: 'codex',
@@ -2606,6 +2730,7 @@ export class TerminalRegistry extends EventEmitter {
         childSessionId: durableThreadId,
         reason: swapped.reason,
       }, 'Codex fork handoff proof succeeded but same-terminal binding swap failed')
+      await this.restoreCodexForkParentDurabilityStore(record, handoff, parentRecord, `fork_binding_swap_failed:${swapped.reason}`)
       this.markCodexForkHandoffFailed(record, `fork_binding_swap_failed:${swapped.reason}`)
       return
     }
@@ -2909,6 +3034,19 @@ export class TerminalRegistry extends EventEmitter {
       return
     }
 
+    if (record.codexForkHandoffPending?.state === 'pending') {
+      this.failCodexForkHandoffPending(record, 'fork_lifecycle_loss')
+      logger.warn(
+        { terminalId, event },
+        'Codex app-server reported lifecycle loss while fork handoff candidate persistence was pending; preserving parent durable identity',
+      )
+      return
+    }
+
+    if (record.codexForkHandoffPending?.state === 'failed') {
+      return
+    }
+
     if (record.codexForkHandoff) {
       if (this.isCodexForkHandoffActive(record)) {
         this.markCodexForkHandoffFailed(record, 'fork_lifecycle_loss')
@@ -2969,6 +3107,19 @@ export class TerminalRegistry extends EventEmitter {
     record: TerminalRecord,
     trigger: { source: 'lifecycle_loss'; event: unknown } | { source: 'pty_exit'; exitCode: number; signal?: number },
   ): boolean {
+    if (this.hasCodexForkHandoffInFlight(record)) {
+      if (record.codexForkHandoffPending?.state === 'pending') {
+        this.failCodexForkHandoffPending(record, `fork_${trigger.source}`)
+      } else if (this.isCodexForkHandoffActive(record)) {
+        this.markCodexForkHandoffFailed(record, `fork_${trigger.source}`)
+      }
+      logger.warn(
+        { terminalId: record.terminalId, trigger },
+        'Skipping old-parent Codex durable recovery while fork handoff is in flight',
+      )
+      return false
+    }
+
     if (
       record.mode !== 'codex'
       || record.status !== 'running'

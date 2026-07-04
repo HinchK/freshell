@@ -1008,10 +1008,18 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
         bufferedAmount: 0,
         send: vi.fn((message: string) => sent.push(JSON.parse(message))),
       } as any)
+      const parentRolloutPath = path.join(durabilityDir, 'parent.jsonl')
       await store.write({
         schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
         state: 'durable',
         durableThreadId: 'thread-parent',
+        candidate: {
+          provider: 'codex',
+          candidateThreadId: 'thread-parent',
+          rolloutPath: parentRolloutPath,
+          source: 'thread_start_response',
+          capturedAt: 50,
+        },
         terminalId: term.terminalId,
         serverInstanceId: 'srv-test',
         updatedAt: 100,
@@ -1052,6 +1060,11 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       await expect(store.read(term.terminalId)).resolves.toMatchObject({
         state: 'durable',
         durableThreadId: 'thread-child',
+        candidate: {
+          candidateThreadId: 'thread-child',
+          rolloutPath: forkRolloutPath,
+          source: 'thread_fork_response',
+        },
       })
       expect(sent).toContainEqual(expect.objectContaining({
         type: 'terminal.session.associated',
@@ -1197,6 +1210,149 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       await new Promise((resolve) => setImmediate(resolve))
       expect(planCreate).not.toHaveBeenCalled()
     } finally {
+      await removeTempDir(durabilityDir)
+    }
+  })
+
+  it('blocks old-parent recovery when proxy_error races before fork handoff staging', async () => {
+    const registry = new TerminalRegistry()
+    const previousCandidatePersistence = deferred()
+    const replacementSidecar = createFakeSidecar()
+    const planCreate = vi.fn(async () => ({
+      sessionId: 'thread-parent',
+      remote: { wsUrl: 'ws://127.0.0.1:43124' },
+      sidecar: replacementSidecar,
+    }))
+    const sidecar = createFakeSidecar()
+    const term = registry.create({
+      mode: 'codex',
+      resumeSessionId: 'thread-parent',
+      providerSettings: {
+        codexAppServer: {
+          wsUrl: 'ws://127.0.0.1:43123',
+          sidecar,
+          recovery: { planCreate, retryDelayMs: 0 },
+        },
+      } as any,
+    })
+    ;(registry as any).codexCandidatePersistenceQueues.set(term.terminalId, previousCandidatePersistence.promise)
+
+    sidecar.emitCandidate({
+      source: 'thread_fork_response',
+      thread: {
+        id: 'thread-child-race',
+        path: '/tmp/freshell-codex-race-child.jsonl',
+        ephemeral: false,
+      },
+    })
+    sidecar.emitRepairTrigger({ kind: 'proxy_error', error: new Error('proxy closed before staging') })
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(planCreate).not.toHaveBeenCalled()
+    expect(sidecar.markCandidatePersisted).not.toHaveBeenCalled()
+    expect(registry.get(term.terminalId)?.resumeSessionId).toBe('thread-parent')
+    expect((registry.get(term.terminalId) as any).codexForkHandoff).toBeUndefined()
+
+    previousCandidatePersistence.resolve()
+    await new Promise((resolve) => setImmediate(resolve))
+
+    expect(planCreate).not.toHaveBeenCalled()
+    expect(sidecar.markCandidatePersisted).not.toHaveBeenCalled()
+    expect((registry.get(term.terminalId) as any).codexForkHandoff).toBeUndefined()
+  })
+
+  it('preserves parent durable record when fork handoff binding swap fails after child write', async () => {
+    const durabilityDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-durability-'))
+    const childWriteStarted = deferred()
+    const releaseChildWrite = deferred()
+    const fsImpl = {
+      mkdir: fsp.mkdir,
+      readdir: fsp.readdir,
+      readFile: fsp.readFile,
+      unlink: fsp.unlink,
+      writeFile: fsp.writeFile,
+      rename: vi.fn(async (from: Parameters<typeof fsp.rename>[0], to: Parameters<typeof fsp.rename>[1]) => {
+        const raw = await fsp.readFile(from, 'utf8')
+        if (raw.includes('thread-child-owned-after-write')) {
+          childWriteStarted.resolve()
+          await releaseChildWrite.promise
+        }
+        await fsp.rename(from, to)
+      }),
+    }
+    try {
+      const store = new CodexDurabilityStore({ dir: durabilityDir, fsImpl })
+      const registry = new TerminalRegistry(undefined, undefined, undefined, {
+        codexDurabilityStore: store,
+        serverInstanceId: 'srv-test',
+      })
+      const sidecar = createFakeSidecar()
+      const term = registry.create({
+        mode: 'codex',
+        resumeSessionId: 'thread-parent',
+        providerSettings: {
+          codexAppServer: {
+            wsUrl: 'ws://127.0.0.1:43123',
+            sidecar,
+          },
+        } as any,
+      })
+      const parentRolloutPath = path.join(durabilityDir, 'parent.jsonl')
+      await store.write({
+        schemaVersion: CODEX_DURABILITY_SCHEMA_VERSION,
+        state: 'durable',
+        durableThreadId: 'thread-parent',
+        candidate: {
+          provider: 'codex',
+          candidateThreadId: 'thread-parent',
+          rolloutPath: parentRolloutPath,
+          source: 'thread_start_response',
+          capturedAt: 50,
+        },
+        terminalId: term.terminalId,
+        serverInstanceId: 'srv-test',
+        updatedAt: 100,
+      })
+
+      const childRolloutPath = path.join(durabilityDir, 'child-owned.jsonl')
+      await fsp.writeFile(
+        childRolloutPath,
+        `${JSON.stringify({ type: 'session_meta', payload: { id: 'thread-child-owned-after-write' } })}\n`,
+      )
+      sidecar.emitCandidate({
+        source: 'thread_fork_response',
+        thread: {
+          id: 'thread-child-owned-after-write',
+          path: childRolloutPath,
+          ephemeral: false,
+        },
+      })
+      await vi.waitFor(() => expect(sidecar.markCandidatePersisted).toHaveBeenCalledTimes(1))
+
+      sidecar.emitTurnCompleted({ threadId: 'thread-child-owned-after-write', turnId: 'turn-child-1', params: {} })
+      await childWriteStarted.promise
+
+      const owner = registry.create({
+        mode: 'codex',
+        resumeSessionId: 'thread-child-owned-after-write',
+      })
+      releaseChildWrite.resolve()
+
+      await vi.waitFor(() => expect((registry.get(term.terminalId) as any).codexForkHandoff).toMatchObject({
+        state: 'fork_handoff_failed',
+      }))
+      expect(registry.get(term.terminalId)?.resumeSessionId).toBe('thread-parent')
+      expect(registry.getSessionOwner('codex', 'thread-child-owned-after-write')).toBe(owner.terminalId)
+      await expect(store.read(term.terminalId)).resolves.toMatchObject({
+        state: 'durable',
+        durableThreadId: 'thread-parent',
+        candidate: {
+          candidateThreadId: 'thread-parent',
+          rolloutPath: parentRolloutPath,
+        },
+      })
+    } finally {
+      releaseChildWrite.resolve()
       await removeTempDir(durabilityDir)
     }
   })
