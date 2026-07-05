@@ -160,6 +160,50 @@ async function fetchPanes(tabId?: string): Promise<PaneSummary[]> {
   return (obj.panes || []) as PaneSummary[]
 }
 
+// The session directory endpoint caps each page at 50 items and returns a
+// `nextCursor` to fetch the next page. We follow the cursor and aggregate, but
+// bound the number of pages so a huge history can't blow up the token budget.
+// 6 pages ~= 300 most-recent sessions.
+const SESSION_DIRECTORY_MAX_PAGES = 6
+
+/**
+ * Fetch `/api/session-directory?<baseQuery>` and follow `nextCursor` up to
+ * `maxPages`, concatenating `items` from every page.
+ *
+ * Returns `truncated: true` only when it stopped because it hit `maxPages`
+ * while the server still had a non-null `nextCursor` (i.e. more sessions exist
+ * beyond what we returned).
+ */
+async function fetchAllSessionDirectoryPages(
+  c: ApiClient,
+  baseQuery: string,
+  maxPages = SESSION_DIRECTORY_MAX_PAGES,
+): Promise<{ items: unknown[]; truncated: boolean; pages: number }> {
+  const items: unknown[] = []
+  let cursor: string | null = null
+  let pages = 0
+  let truncated = false
+
+  for (;;) {
+    const url = cursor
+      ? `/api/session-directory?${baseQuery}&cursor=${encodeURIComponent(cursor)}`
+      : `/api/session-directory?${baseQuery}`
+    const page = unwrapData(await c.get(url)) as { items?: unknown[]; nextCursor?: string | null } | undefined
+    pages++
+    if (Array.isArray(page?.items)) items.push(...page.items)
+
+    const nextCursor = page?.nextCursor ?? null
+    if (!nextCursor) break // No more pages -- fully drained.
+    if (pages >= maxPages) {
+      truncated = true // More pages remain but we hit the bounded cap.
+      break
+    }
+    cursor = nextCursor
+  }
+
+  return { items, truncated, pages }
+}
+
 async function resolveTabTarget(target?: string): Promise<{ tab?: TabSummary; message?: string }> {
   const { tabs, activeTabId } = await fetchTabs()
   if (!tabs.length) return { message: 'no tabs' }
@@ -850,11 +894,17 @@ async function routeAction(
     }
 
     // -- Session --
-    case 'list-sessions':
-      return c.get('/api/session-directory?priority=visible')
+    // Both actions follow the server's `nextCursor` and aggregate pages so
+    // sessions beyond the first (50-item) page stay visible. `truncated` flags
+    // when the bounded page cap was hit while more pages remained.
+    case 'list-sessions': {
+      const { items, truncated } = await fetchAllSessionDirectoryPages(c, 'priority=visible')
+      return { items, count: items.length, truncated }
+    }
     case 'search-sessions': {
       const query = requireParam(params, 'query')
-      return c.get(`/api/session-directory?priority=visible&query=${encodeURIComponent(query)}`)
+      const { items, truncated } = await fetchAllSessionDirectoryPages(c, `priority=visible&query=${encodeURIComponent(query)}`)
+      return { items, count: items.length, truncated }
     }
 
     // -- Info --
