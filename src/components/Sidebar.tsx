@@ -28,6 +28,7 @@ const EMPTY_TERMINALS: BackgroundTerminal[] = []
 const EMPTY_LAYOUTS: Record<string, never> = {}
 const EMPTY_CODEX_ACTIVITY_BY_ID = {}
 const EMPTY_CLAUDE_ACTIVITY_BY_ID = {}
+const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
@@ -321,6 +322,7 @@ export default function Sidebar({
     paneLayouts: state.panes?.layouts ?? EMPTY_LAYOUTS,
     codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
     claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
+    amplifierActivityByTerminalId: state.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID,
     opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
     paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
     freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,

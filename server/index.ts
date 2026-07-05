@@ -22,6 +22,7 @@ import { CodingCliSessionIndexer } from './coding-cli/session-indexer.js'
 import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
 import { wireClaudeActivityTracker } from './coding-cli/claude-activity-wiring.js'
+import { wireAmplifierActivityTracker } from './coding-cli/amplifier-activity-wiring.js'
 import { createOpencodeActivityIntegration } from './coding-cli/opencode-activity-integration.js'
 import { claudeProvider } from './coding-cli/providers/claude.js'
 import { codexProvider } from './coding-cli/providers/codex.js'
@@ -214,6 +215,7 @@ async function main() {
   const layoutStore = new LayoutStore()
   const codexActivity = wireCodexActivityTracker({ registry, codingCliIndexer })
   const claudeActivity = wireClaudeActivityTracker({ registry })
+  const amplifierActivity = wireAmplifierActivityTracker({ registry })
   const opencodeActivity = createOpencodeActivityIntegration({ registry, opencodeProvider })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
@@ -389,6 +391,8 @@ async function main() {
       codexLatestTurnCompletionsProvider: () => codexActivity.tracker.listLatestCompletions(),
       claudeActivityListProvider: () => claudeActivity.tracker.list(),
       claudeLatestTurnCompletionsProvider: () => claudeActivity.tracker.listLatestCompletions(),
+      amplifierActivityListProvider: () => amplifierActivity.tracker.list(),
+      amplifierLatestTurnCompletionsProvider: () => amplifierActivity.tracker.listLatestCompletions(),
       agentHistorySource,
       opencodeActivityListProvider: () => opencodeActivity.tracker.list(),
       opencodeLatestTurnCompletionsProvider: () => opencodeActivity.tracker.listLatestCompletions(),
@@ -467,6 +471,18 @@ async function main() {
   claudeActivity.tracker.on('turn.complete', (payload) => {
     wsHandler.broadcastTerminalTurnComplete({
       provider: 'claude',
+      terminalId: payload.terminalId,
+      at: payload.at,
+      completionSeq: payload.completionSeq,
+      ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+    })
+  })
+  amplifierActivity.tracker.on('changed', (payload) => {
+    wsHandler.broadcastAmplifierActivityUpdated(payload)
+  })
+  amplifierActivity.tracker.on('turn.complete', (payload) => {
+    wsHandler.broadcastTerminalTurnComplete({
+      provider: 'amplifier',
       terminalId: payload.terminalId,
       at: payload.at,
       completionSeq: payload.completionSeq,
@@ -1036,6 +1052,7 @@ async function main() {
     // 9b. Stop Codex activity tracker listeners and sweep timer
     codexActivity.dispose()
     claudeActivity.dispose()
+    amplifierActivity.dispose()
     opencodeActivity.dispose()
 
     // 10. Stop session repair service

@@ -22,6 +22,7 @@ import {
 } from './fresh-agent/history/claude/history-source.js'
 import type {
   ClaudeActivityRecord,
+  AmplifierActivityRecord,
   CodexActivityRecord,
   OpencodeActivityRecord,
   TerminalTurnCompletionSnapshot,
@@ -60,6 +61,9 @@ import {
   ClaudeActivityListResponseSchema,
   ClaudeActivityListSchema,
   ClaudeActivityUpdatedSchema,
+  AmplifierActivityListResponseSchema,
+  AmplifierActivityListSchema,
+  AmplifierActivityUpdatedSchema,
   CodexActivityListResponseSchema,
   CodexActivityListSchema,
   CodexActivityUpdatedSchema,
@@ -207,8 +211,10 @@ export type WsHandlerOptions = {
   extensionManager?: ExtensionManager
   codexActivityListProvider?: () => CodexActivityRecord[]
   claudeActivityListProvider?: () => ClaudeActivityRecord[]
+  amplifierActivityListProvider?: () => AmplifierActivityRecord[]
   codexLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   claudeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
+  amplifierLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   agentHistorySource?: ClaudeFreshAgentHistorySource
   opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   opencodeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
@@ -542,9 +548,11 @@ export class WsHandler {
   private terminalMetaListProvider?: () => TerminalMeta[]
   private codexActivityListProvider?: () => CodexActivityRecord[]
   private claudeActivityListProvider?: () => ClaudeActivityRecord[]
+  private amplifierActivityListProvider?: () => AmplifierActivityRecord[]
   private opencodeActivityListProvider?: () => OpencodeActivityRecord[]
   private codexLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   private claudeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
+  private amplifierLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   private opencodeLatestTurnCompletionsProvider?: () => TerminalTurnCompletionSnapshot[]
   private tabsRegistryStore?: TabsRegistryStore
   private layoutStore?: LayoutStore
@@ -607,9 +615,11 @@ export class WsHandler {
     this.terminalMetaListProvider = options.terminalMetaListProvider
     this.codexActivityListProvider = options.codexActivityListProvider
     this.claudeActivityListProvider = options.claudeActivityListProvider
+    this.amplifierActivityListProvider = options.amplifierActivityListProvider
     this.opencodeActivityListProvider = options.opencodeActivityListProvider
     this.codexLatestTurnCompletionsProvider = options.codexLatestTurnCompletionsProvider
     this.claudeLatestTurnCompletionsProvider = options.claudeLatestTurnCompletionsProvider
+    this.amplifierLatestTurnCompletionsProvider = options.amplifierLatestTurnCompletionsProvider
     this.opencodeLatestTurnCompletionsProvider = options.opencodeLatestTurnCompletionsProvider
     this.tabsRegistryStore = options.tabsRegistryStore
     this.layoutStore = options.layoutStore
@@ -698,6 +708,7 @@ export class WsHandler {
       TerminalKillSchema,
       CodexActivityListSchema,
       ClaudeActivityListSchema,
+      AmplifierActivityListSchema,
       OpencodeActivityListSchema,
       TabsSyncPushSchema,
       TabsSyncQuerySchema,
@@ -3055,6 +3066,28 @@ export class WsHandler {
         return
       }
 
+      case 'amplifier.activity.list': {
+        const terminals = this.amplifierActivityListProvider ? this.amplifierActivityListProvider() : []
+        const latestTurnCompletions = this.amplifierLatestTurnCompletionsProvider ? this.amplifierLatestTurnCompletionsProvider() : []
+        const response = AmplifierActivityListResponseSchema.safeParse({
+          type: 'amplifier.activity.list.response',
+          requestId: m.requestId,
+          terminals,
+          latestTurnCompletions,
+        })
+        if (!response.success) {
+          log.warn({ issues: response.error.issues }, 'Invalid amplifier.activity.list.response payload')
+          this.sendError(ws, {
+            code: 'INTERNAL_ERROR',
+            message: 'Amplifier activity unavailable',
+            requestId: m.requestId,
+          })
+          return
+        }
+        this.send(ws, response.data)
+        return
+      }
+
       case 'tabs.sync.push': {
         if (!this.tabsRegistryStore) {
           this.sendError(ws, {
@@ -3733,6 +3766,21 @@ export class WsHandler {
 
     if (!parsed.success) {
       log.warn({ issues: parsed.error.issues }, 'Invalid claude.activity.updated payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
+  }
+
+  broadcastAmplifierActivityUpdated(msg: { upsert?: AmplifierActivityRecord[]; remove?: string[] }): void {
+    const parsed = AmplifierActivityUpdatedSchema.safeParse({
+      type: 'amplifier.activity.updated',
+      upsert: msg.upsert || [],
+      remove: msg.remove || [],
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid amplifier.activity.updated payload')
       return
     }
 
