@@ -664,6 +664,46 @@ describe('executeAction -- session', () => {
     expect(path).toContain('priority=visible')
     expect(path).toContain('query=test')
   })
+
+  it('list-sessions follows nextCursor and aggregates items across pages', async () => {
+    mockClient.get
+      .mockResolvedValueOnce({ items: [{ sessionId: 'a' }, { sessionId: 'b' }], nextCursor: 'c1' })
+      .mockResolvedValueOnce({ items: [{ sessionId: 'c' }], nextCursor: null })
+
+    const result = await executeAction('list-sessions')
+
+    // Aggregated across both pages: a, b, c
+    expect(result.items.map((i: { sessionId: string }) => i.sessionId)).toEqual(['a', 'b', 'c'])
+    expect(result.count).toBe(3)
+    expect(result.truncated).toBe(false)
+    // The second request must carry the cursor returned by the first page.
+    expect(mockClient.get).toHaveBeenCalledTimes(2)
+    expect(mockClient.get.mock.calls[1][0]).toContain('cursor=c1')
+  })
+
+  it('list-sessions stops at the bounded page cap and reports truncated', async () => {
+    // Server always hands back another cursor -> pagination must stop at maxPages.
+    mockClient.get.mockResolvedValue({ items: [{ sessionId: 'x' }], nextCursor: 'more' })
+
+    const result = await executeAction('list-sessions')
+
+    const MAX_PAGES = 6
+    expect(mockClient.get).toHaveBeenCalledTimes(MAX_PAGES)
+    expect(result.truncated).toBe(true)
+  })
+
+  it('search-sessions passes the query and follows the cursor across pages', async () => {
+    mockClient.get
+      .mockResolvedValueOnce({ items: [{ sessionId: 'a' }], nextCursor: 'c1' })
+      .mockResolvedValueOnce({ items: [{ sessionId: 'b' }], nextCursor: null })
+
+    const result = await executeAction('search-sessions', { query: 'hello' })
+
+    // First call carries the query; the follow-up call carries the cursor.
+    expect(mockClient.get.mock.calls[0][0]).toContain('query=hello')
+    expect(mockClient.get.mock.calls[1][0]).toContain('cursor=c1')
+    expect(result.items.map((i: { sessionId: string }) => i.sessionId)).toEqual(['a', 'b'])
+  })
 })
 
 describe('executeAction -- meta', () => {
