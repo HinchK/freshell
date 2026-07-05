@@ -179,6 +179,26 @@ export const amplifierProvider: CodingCliProvider = {
     return [this.homeDir]
   },
 
+  async getActivityMtimeMs(filePath: string): Promise<number | undefined> {
+    // Amplifier writes session activity to sibling sidecars next to metadata.json.
+    // metadata.json's own mtime lags real activity (it only changes on name/description
+    // updates), so recency and the re-parse gate must also consider these files.
+    // We only stat (never read) so the cost stays a couple of syscalls per session.
+    const dir = path.dirname(filePath)
+    const sidecars = ['transcript.jsonl', 'events.jsonl']
+    const mtimes = await Promise.all(
+      sidecars.map(async (name) => {
+        try {
+          const stat = await fsp.stat(path.join(dir, name))
+          return stat.mtimeMs || stat.mtime.getTime()
+        } catch {
+          return undefined
+        }
+      }),
+    )
+    return maxDefined(...mtimes)
+  },
+
   async listSessionFiles() {
     const projectsDir = path.join(this.homeDir, 'projects')
     const files = await walkMetadataFiles(projectsDir)

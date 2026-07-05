@@ -416,6 +416,13 @@ type CachedSessionEntry = {
   titleSource?: ParsedSessionTitleSource
   /** True when populated by a lightweight scan and not yet fully enriched. */
   lightweight?: boolean
+  /**
+   * Newest mtime (ms) among the session's activity sidecars (see
+   * CodingCliProvider.getActivityMtimeMs). Shared between the re-parse gate and the
+   * recency fold so a grown sidecar forces a re-parse even when the primary file is
+   * byte-identical. Undefined for providers that don't expose sidecar activity.
+   */
+  activityMtimeMs?: number
 }
 
 export type SessionIndexerOptions = {
@@ -880,9 +887,21 @@ export class CodingCliSessionIndexer {
 
     const mtimeMs = stat.mtimeMs || stat.mtime.getTime()
     const size = stat.size
+    // Newest activity-sidecar mtime (Amplifier transcript.jsonl / events.jsonl). Statted
+    // once here and reused by both the re-parse gate and the recency fold below. Only
+    // providers that opt in pay the extra stat cost; others leave it undefined.
+    const activityMtimeMs = provider.getActivityMtimeMs
+      ? await provider.getActivityMtimeMs(filePath)
+      : undefined
 
     const cached = this.fileCache.get(cacheKey)
-    if (cached && cached.mtimeMs === mtimeMs && cached.size === size && !cached.lightweight) {
+    if (
+      cached &&
+      cached.mtimeMs === mtimeMs &&
+      cached.size === size &&
+      cached.activityMtimeMs === activityMtimeMs &&
+      !cached.lightweight
+    ) {
       return
     }
 
@@ -922,6 +941,7 @@ export class CodingCliSessionIndexer {
         mtimeMs,
         size,
         baseSession: null,
+        activityMtimeMs,
       })
       return
     }
@@ -944,11 +964,15 @@ export class CodingCliSessionIndexer {
     const createdAt = appendOnlyReparse
       ? minDefined(previous?.createdAt, meta.createdAt)
       : (sameSession ? (meta.createdAt ?? previous?.createdAt) : meta.createdAt)
-    const lastActivityAt = appendOnlyReparse
+    let lastActivityAt = appendOnlyReparse
       ? (maxDefined(previous?.lastActivityAt, meta.lastActivityAt) ?? createdAt ?? 0)
       : (sameSession
           ? (meta.lastActivityAt ?? previous?.lastActivityAt ?? createdAt ?? 0)
           : (meta.lastActivityAt ?? createdAt ?? 0))
+    // Fold real file activity (newest sidecar mtime) into recency so a session that was
+    // active/resumed after its metadata timestamps still rises in the recency-sorted
+    // sidebar. maxDefined never regresses below the metadata-derived value.
+    lastActivityAt = maxDefined(lastActivityAt, activityMtimeMs) ?? lastActivityAt
 
     const checkoutRoot = meta.cwd ? await resolveGitCheckoutRoot(meta.cwd) : undefined
     const checkoutPath = checkoutRoot && checkoutRoot !== projectPath ? checkoutRoot : undefined
@@ -984,6 +1008,7 @@ export class CodingCliSessionIndexer {
       size,
       baseSession,
       titleSource: resolvedTitleSource,
+      activityMtimeMs,
     })
     this.sessionKeyToFilePath.set(makeSessionKey(provider.name, sessionId), filePath)
   }

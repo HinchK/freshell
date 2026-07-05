@@ -146,6 +146,71 @@ describe('amplifier-provider', () => {
     }
   })
 
+  describe('getActivityMtimeMs()', () => {
+    it('returns the newest sidecar mtime across transcript.jsonl and events.jsonl', async () => {
+      const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'amplifier-activity-'))
+      try {
+        const metadataPath = path.join(dir, 'metadata.json')
+        const transcriptPath = path.join(dir, 'transcript.jsonl')
+        const eventsPath = path.join(dir, 'events.jsonl')
+        await fsp.writeFile(metadataPath, JSON.stringify({ session_id: 's', working_dir: '/x' }))
+        await fsp.writeFile(transcriptPath, '{"role":"user","content":"hi"}\n')
+        await fsp.writeFile(eventsPath, '{"event":"noop"}\n')
+
+        // The transcript is the most recently written sidecar (session active until 20:44),
+        // while events.jsonl is older. getActivityMtimeMs must reflect the newest of the two.
+        const olderTime = new Date('2026-01-01T18:58:00.000Z')
+        const newerTime = new Date('2026-01-01T20:44:00.000Z')
+        await fsp.utimes(eventsPath, olderTime, olderTime)
+        await fsp.utimes(transcriptPath, newerTime, newerTime)
+
+        const transcriptMtimeMs = (await fsp.stat(transcriptPath)).mtimeMs
+        const eventsMtimeMs = (await fsp.stat(eventsPath)).mtimeMs
+        expect(typeof amplifierProvider.getActivityMtimeMs).toBe('function')
+
+        const result = await amplifierProvider.getActivityMtimeMs!(metadataPath)
+        expect(result).toBe(Math.max(transcriptMtimeMs, eventsMtimeMs))
+        expect(result).toBe(transcriptMtimeMs)
+      } finally {
+        await fsp.rm(dir, { recursive: true, force: true })
+      }
+    })
+
+    it('considers events.jsonl when it is the newest sidecar and transcript.jsonl is absent', async () => {
+      const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'amplifier-activity-'))
+      try {
+        const metadataPath = path.join(dir, 'metadata.json')
+        const eventsPath = path.join(dir, 'events.jsonl')
+        await fsp.writeFile(metadataPath, JSON.stringify({ session_id: 's', working_dir: '/x' }))
+        await fsp.writeFile(eventsPath, '{"event":"noop"}\n')
+
+        const eventTime = new Date('2026-01-01T20:44:00.000Z')
+        await fsp.utimes(eventsPath, eventTime, eventTime)
+        const eventsMtimeMs = (await fsp.stat(eventsPath)).mtimeMs
+
+        expect(typeof amplifierProvider.getActivityMtimeMs).toBe('function')
+        const result = await amplifierProvider.getActivityMtimeMs!(metadataPath)
+        expect(result).toBe(eventsMtimeMs)
+      } finally {
+        await fsp.rm(dir, { recursive: true, force: true })
+      }
+    })
+
+    it('returns undefined when no activity sidecars exist', async () => {
+      const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'amplifier-activity-'))
+      try {
+        const metadataPath = path.join(dir, 'metadata.json')
+        await fsp.writeFile(metadataPath, JSON.stringify({ session_id: 's', working_dir: '/x' }))
+
+        expect(typeof amplifierProvider.getActivityMtimeMs).toBe('function')
+        const result = await amplifierProvider.getActivityMtimeMs!(metadataPath)
+        expect(result).toBeUndefined()
+      } finally {
+        await fsp.rm(dir, { recursive: true, force: true })
+      }
+    })
+  })
+
   it('parseEvent maps a user line to message.user', () => {
     const events = amplifierProvider.parseEvent(JSON.stringify({ role: 'user', content: 'Hello there' }))
     expect(events).toHaveLength(1)

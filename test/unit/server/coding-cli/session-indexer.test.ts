@@ -60,6 +60,7 @@ type MakeProviderOptions = {
   resolveProjectPath?: CodingCliProvider['resolveProjectPath']
   extractSessionId?: CodingCliProvider['extractSessionId']
   getSessionRoots?: CodingCliProvider['getSessionRoots']
+  getActivityMtimeMs?: CodingCliProvider['getActivityMtimeMs']
 }
 
 function makeProvider(files: string[], options: MakeProviderOptions = {}): CodingCliProvider {
@@ -89,6 +90,7 @@ function makeProvider(files: string[], options: MakeProviderOptions = {}): Codin
     extractSessionId: options.extractSessionId ?? ((filePath) => path.basename(filePath, '.jsonl')),
     getSessionRoots: options.getSessionRoots ?? (() => [path.join(homeDir, 'sessions')]),
     getSessionWatchBases: options.getSessionWatchBases,
+    getActivityMtimeMs: options.getActivityMtimeMs,
     getCommand: () => 'claude',
     getStreamArgs: () => [],
     getResumeArgs: () => [],
@@ -610,6 +612,96 @@ describe('CodingCliSessionIndexer', () => {
     await indexer.refresh()
 
     expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(900)
+  })
+
+  describe('activity sidecar recency (getActivityMtimeMs)', () => {
+    it('folds the newest activity sidecar mtime into lastActivityAt', async () => {
+      const file = path.join(tempDir, 'session-activity.jsonl')
+      await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n')
+
+      const metadataLastActivityAt = 1_000
+      const activityMtimeMs = 5_000
+
+      const provider = makeProvider([file], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          sessionId: 'session-activity',
+          title: 'Deploy',
+          createdAt: 500,
+          lastActivityAt: metadataLastActivityAt,
+          messageCount: 1,
+        }),
+        getActivityMtimeMs: async () => activityMtimeMs,
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      const session = indexer.getProjects()[0]?.sessions[0]
+      expect(session?.lastActivityAt).toBe(Math.max(metadataLastActivityAt, activityMtimeMs))
+      expect(session?.lastActivityAt).toBe(activityMtimeMs)
+    })
+
+    it('never regresses lastActivityAt below the metadata-derived value', async () => {
+      const file = path.join(tempDir, 'session-activity-older.jsonl')
+      await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n')
+
+      const metadataLastActivityAt = 8_000
+      const staleActivityMtimeMs = 2_000
+
+      const provider = makeProvider([file], {
+        parseSessionFile: async () => ({
+          cwd: '/project/a',
+          sessionId: 'session-activity-older',
+          title: 'Deploy',
+          createdAt: 500,
+          lastActivityAt: metadataLastActivityAt,
+          messageCount: 1,
+        }),
+        getActivityMtimeMs: async () => staleActivityMtimeMs,
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      const session = indexer.getProjects()[0]?.sessions[0]
+      expect(session?.lastActivityAt).toBe(metadataLastActivityAt)
+    })
+
+    it('re-parses and advances lastActivityAt when the sidecar grows but metadata.json is byte-identical', async () => {
+      const file = path.join(tempDir, 'session-resumed.jsonl')
+      await fsp.writeFile(file, JSON.stringify({ cwd: '/project/a', title: 'Deploy' }) + '\n')
+
+      let activityMtimeMs = 5_000
+      const parseSessionFile = vi.fn(async () => ({
+        cwd: '/project/a',
+        sessionId: 'session-resumed',
+        title: 'Deploy',
+        createdAt: 500,
+        lastActivityAt: 1_000,
+        messageCount: 1,
+      }))
+
+      const provider = makeProvider([file], {
+        parseSessionFile,
+        getActivityMtimeMs: async () => activityMtimeMs,
+      })
+
+      const indexer = new CodingCliSessionIndexer([provider])
+      await indexer.refresh()
+
+      expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(5_000)
+      const callsAfterFirstRefresh = parseSessionFile.mock.calls.length
+
+      // metadata.json is left byte-identical (no writes, no utimes) so the mtime+size
+      // gate alone would skip re-parsing. Only the activity sidecar has advanced.
+      activityMtimeMs = 9_000
+      ;(indexer as any).markDirty(file)
+      await indexer.refresh()
+
+      expect(parseSessionFile.mock.calls.length).toBeGreaterThan(callsAfterFirstRefresh)
+      expect(indexer.getProjects()[0]?.sessions[0]?.lastActivityAt).toBe(9_000)
+    })
   })
 
   it('prefers ParsedSessionMeta.sessionId over filename', async () => {
