@@ -78,12 +78,18 @@ export function parseAmplifierMetadata(content: string): ParsedSessionMeta {
     createdAt,
   )
 
+  // Amplifier's `name` is an AI-generated session title. Mark it
+  // `provider-generated` so freshell's own auto-generated title overrides
+  // (dir/first-message/ai) yield to it; explicit user renames still win.
+  const name = typeof data.name === 'string' && data.name.trim() ? data.name.trim() : undefined
+
   return {
     sessionId: typeof data.session_id === 'string' ? data.session_id : undefined,
     cwd: typeof data.working_dir === 'string' ? data.working_dir : undefined,
     createdAt,
     lastActivityAt,
-    title: typeof data.name === 'string' && data.name.trim() ? data.name.trim() : undefined,
+    title: name,
+    titleSource: name ? 'provider-generated' : undefined,
     summary: typeof data.description === 'string' && data.description.trim() ? data.description.trim() : undefined,
     messageCount:
       typeof data.turn_count === 'number' && Number.isFinite(data.turn_count) ? data.turn_count : undefined,

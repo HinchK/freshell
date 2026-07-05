@@ -74,6 +74,20 @@ describe('amplifier-provider', () => {
     expect(parseAmplifierMetadata('not json')).toEqual({})
   })
 
+  it('marks the provider name as an authoritative provider-generated title', () => {
+    const meta = parseAmplifierMetadata(
+      JSON.stringify({ session_id: 's1', working_dir: '/x', name: 'Real Provider Name' }),
+    )
+    expect(meta.title).toBe('Real Provider Name')
+    expect(meta.titleSource).toBe('provider-generated')
+  })
+
+  it('leaves titleSource undefined when the session has no name', () => {
+    const meta = parseAmplifierMetadata(JSON.stringify({ session_id: 's1', working_dir: '/x' }))
+    expect(meta.title).toBeUndefined()
+    expect(meta.titleSource).toBeUndefined()
+  })
+
   it('extractSessionId returns the session_id from parsed metadata', () => {
     expect(
       amplifierProvider.extractSessionId('/whatever/sessions/abcd/metadata.json', { sessionId: 'sess-123' }),
