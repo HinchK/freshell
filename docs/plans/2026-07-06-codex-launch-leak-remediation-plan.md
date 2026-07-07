@@ -1,13 +1,26 @@
-# Codex Launch-Leak Remediation Plan — Stage 0a/0b + 1a/1c (v2)
+# Codex Launch-Leak Remediation Plan — Stage 0a/0b + 1a/1c (v2.1)
 
-**Date:** 2026-07-06 (v2, evening)
-**Target:** freshell `main @ 02f95b70` (TypeScript/Node server)
+**Date:** 2026-07-06 (v2.1, night)
+**Target:** freshell `main` (TypeScript/Node server). Anchors verified at `02f95b70`
+and re-verified at `9f3a5035` (only `providers/codex.ts` `parseTimestampMs` changed;
+no anchor impact). **Re-pin to current main before implementing.**
 **Status:** Plan — not yet implemented
-**v2 changes:** incorporates all findings from the 2026-07-06 adversarial review
-(factual fixes F1–F6, per-stage design flaws, gaps G1–G6) and the results of the
-log-dampening validation experiment run the same evening (§3). Terminology note:
-`RUST_LOG` is the log-level environment variable of the **codex binary** (OpenAI's
-CLI, which happens to be written in Rust). It is unrelated to any freshell code.
+**v2 changes:** folds in the first 2026-07-06 adversarial review (factual fixes
+F1–F6, per-stage design flaws, gaps G1–G6) and the log-dampening validation
+experiment run the same evening (§3).
+**v2.1 changes:** folds in the second-round adversarial review — §3 measurement
+rewritten to a prune-immune metric (blocking #1); 1c quarantine narrowed to
+confirmed-gone groups + quarantine rescan (blocking #2); composite `RUST_LOG`
+directive (#3); backoff/monitor given concrete homes (#4); `logs_2` backup via
+`VACUUM INTO` (#5); dampening-skip observability (#6); executable 1a acceptance
+scoping, specified hard-exit timeout, structural I3 assertion (#7–9); §8 ordering
+reconciled + DoD reclaim figure derived (#10); `id` schema check before the VACUUM
+oracle (#11); anchor drift corrected (WSL wrap `:1141-1149`; ~12 throwing-contract
+test sites; unreferenced alias).
+
+Terminology note: `RUST_LOG` is the log-level environment variable of the **codex
+binary** (OpenAI's CLI, which happens to be written in Rust). It is unrelated to any
+freshell code.
 
 **Scope:** the four near-term items (0a, 0b, 1a, 1c) plus a small observability
 line-item promoted into scope. Follow-ups — durable resume-TUI boot reaper ("1b")
@@ -35,9 +48,10 @@ measurement:
 2. **Log churn, not table growth, floods the WAL.** codex persists tracing rows into
    `logs_2.sqlite` and **bounds the table per process (~1,000 rows)** — inserts are
    continuously matched by prune deletes. The table stays small; the **WAL traffic
-   does not**. Measured on this machine (2026-07-06): the live pane population writes
-   **~22 MB/min** of WAL churn, ~99% `TRACE` rows with `target=log` (the Rust `log`
-   facade forwarding **inotify file-event spam**).
+   does not**. Measured on this machine (2026-07-06, prune-immune incremental
+   sampling): the live pane population writes **~22 MB/min** of WAL churn, ~99%
+   `TRACE` rows with `target=log` (the Rust `log` facade forwarding **inotify
+   file-event spam**).
 
 3. **The WAL can never reset.** A WAL reset/truncate requires that **no read
    transaction spans the checkpoint** (review F1: it is *not* "zero connections" —
@@ -89,64 +103,112 @@ documented log-level knob.
 ## 3. Stage 0-pre — Validate the dampening mechanism (BLOCKS 0a implementation)
 
 The v1 plan bet its sequencing on `RUST_LOG=error` gating codex's SQLite log sink.
-The review demanded validation first; the experiment was run 2026-07-06 evening.
+The first review demanded validation before implementation; an initial experiment was
+run 2026-07-06 evening.
 
-**Results so far (evidence, this machine, codex-cli 0.142.5):**
+### Results so far (evidence, this machine, codex-cli 0.142.5)
 
-| Test (idle TUI, 78 s, cwd=$HOME, pty) | Attributable rows written |
+| Test (idle TUI, 78 s, cwd=$HOME, pty) | Surviving attributable rows (post-prune **lower bound**) |
 |---|---|
 | Control — `RUST_LOG` unset | 1 |
-| Treatment — `RUST_LOG=error` | **1,013** (not silenced; more than control) |
-| Ambient — live pane population, no test proc | ~64k rows/min ≈ **22 MB/min** |
+| Treatment — `RUST_LOG=error` | ≥1,013 — **at the ~1,000-row prune ceiling** |
+| Ambient — live pane population, no test proc | ~64k rows/min ≈ **22 MB/min** (measured incrementally — prune-immune) |
+
+**Measurement caveat (second-review blocking #1, folded in):** codex prunes each
+process's rows to a ~1,000-row bound (§1.2), so an end-of-window
+`count(*) WHERE process_uuid=…` measures **survivors, not writes**. The treatment
+figure sits exactly at the prune ceiling — it means "wrote **at least** 1,013 rows,
+possibly far more." The control-vs-treatment numbers therefore support only the
+**qualitative** conclusion — plain `RUST_LOG=error` demonstrably does **not** silence
+the sink — and cannot quantify rates. The ambient 22 MB/min figure *was* measured
+prune-immune (incremental `max(id)`/`estimated_bytes` deltas over a sampling window)
+and stands.
 
 **Conclusions:**
-1. **Plain `RUST_LOG=error` is NOT validated** — initial evidence is negative.
+1. **Plain `RUST_LOG=error` is NOT validated** — evidence is negative.
 2. **An idle, freshly-launched TUI is not the firehose.** The firehose is the
    long-running pane population (insert+prune churn, `TRACE`/`target=log` inotify
-   events). Any acceptance test must use a representative long-running workload.
-3. The binary embeds a default filter string (`codex_cli=info,codex_core=info,…`) and
-   the sink schema (`feedback_log_body`, `bounded_feedback_logs`), so a filter layer
-   exists — the right directive just isn't confirmed yet.
+   events). Acceptance tests must use a representative long-running workload.
+3. The binary embeds a default filter string
+   (`codex_cli=info,codex_core=info,codex_login=info`) and the sink schema
+   (`feedback_log_body`, `bounded_feedback_logs`), so a filter layer exists — the
+   right directive just isn't confirmed yet.
 
-**Required protocol before 0a is implemented (no code until one candidate passes):**
-- Workload: a freshell-spawned codex pane pair (app-server + resume) left running
-  ≥15 min; attribute rows/bytes by `process_uuid`
-  (`SELECT count(*), sum(estimated_bytes) FROM logs WHERE process_uuid=… AND id>…`
-  on a `mode=ro` connection).
-- Candidates, in order:
-  1. `RUST_LOG='log=off'` (or `log=error`) — a **scoped directive** silencing the
-     `log`-facade target that carries ~99% of rows, without touching `codex_*` module
-     levels.
-  2. A codex `-c` config knob (the arg channel already exists:
-     `CODEX_MANAGED_REMOTE_CONFIG_ARGS`, `codex-managed-config.ts:1-4`); candidate
-     keys to probe: `log.level`, `tui.*` logging toggles.
+### Required protocol before 0a is implemented (no code until one candidate passes)
+
+- **Workload:** a freshell-spawned codex pane pair (app-server + resume) left running
+  ≥15 min under inotify-generating conditions (cwd=$HOME), control and treatment run
+  the same evening.
+- **Metric — prune-immune, one of (second-review #1):**
+  1. **Isolated-holder WAL-growth diff (preferred):** run the window when the test
+     pair are the **only** `logs_2.sqlite` holders (immediately after the 0b quiesce,
+     before restarting the servers — see §8 — or against a scratch `CODEX_HOME`).
+     Sample `stat -c%s logs_2.sqlite-wal` every 10 s; compare total growth,
+     control vs treatment.
+  2. **Incremental insert attribution:** poll `max(id)` every 1 s on a `mode=ro`
+     connection and accumulate new rows/`estimated_bytes` per test `process_uuid`
+     **as they appear**, counting inserts before pruning can delete them.
+- **Candidates, in order:**
+  1. **Composite directive** (second-review #3):
+     `RUST_LOG='codex_cli=info,codex_core=info,codex_login=info,log=off'`.
+     Any `RUST_LOG` value **replaces** the binary's embedded default filter, so a
+     bare `log=off` would silently reset every `codex_*` target — candidate strings
+     must be composites of the embedded default plus the `log=off` (or `log=error`)
+     suppression. **The §3 result record must capture the exact final directive
+     string.**
+  2. A codex `-c` config knob (candidate keys: `log.level`, `tui.*` logging toggles).
+     Plumbing caveat (second-review verification #4): the managed-args channel
+     (`CODEX_MANAGED_REMOTE_CONFIG_ARGS`, `codex-managed-config.ts:1-4`) reaches the
+     app-server spawn unconditionally, but the pty path pushes it **only when
+     `providerSettings.codexAppServer` is present** (`terminal-registry.ts:306`), and
+     spawn site 3 (`codex exec`, `providers/codex.ts:483-501`) has **no `-c` channel
+     at all** — the args-variant of 0a needs new plumbing for sites 2–3.
   3. If neither works: **0a is dropped**, the upstream ask is filed as the only
-     firehose fix, and this plan's protection reduces to 0b + observability + 1a/1c
-     (see §10 residual risk — recurrence to the cliff in days-to-weeks of heavy use,
-     now *detectable* instead of silent).
-- **Pass bar:** ≥90% reduction in the pane pair's attributable bytes over 15 min, and
+     firehose fix (the WAL-growth measurements from this protocol become the issue's
+     evidence), and this plan's protection reduces to 0b + observability + 1a/1c
+     (see §10 — recurrence in days-to-weeks of heavy use, now *detectable* instead of
+     silent).
+- **Pass bar:** ≥90% reduction in **measured write traffic** (WAL growth bytes, or
+  incrementally attributed insert bytes) vs the same-evening undampened control, and
   the pane still functions (turn completes, rollout file written).
 
 ## 4. Stage 0a — Codex spawn-env log dampening (conditional on §3)
 
 ### Change
 
-One shared helper; the value comes from whichever candidate §3 validated.
+One shared helper; the value is whatever §3 validated.
 
 ```ts
 // server/coding-cli/codex-log-dampening.ts  (new)
-export const CODEX_LOG_DIRECTIVE = 'log=off' // placeholder: whatever §3 validates
+// placeholder: exact composite string validated by §3
+export const CODEX_LOG_DIRECTIVE =
+  'codex_cli=info,codex_core=info,codex_login=info,log=off'
 
-export function withCodexLogDampening<T extends NodeJS.ProcessEnv>(env: T): T {
-  // Consult ONLY the env the child will actually see (review 0a-2: both call sites
-  // already spread process.env, so a separate process.env fallback is dead-or-wrong).
-  if (env.RUST_LOG !== undefined) return env // set — even '' — is an explicit choice
-  if (process.env.FRESHELL_CODEX_LOG_DAMPENING === '0') return env // kill switch
+export function withCodexLogDampening<T extends NodeJS.ProcessEnv>(
+  env: T,
+  onSkip?: (reason: string) => void,
+): T {
+  // Consult ONLY the env the child will actually see (both call sites spread
+  // process.env, so a separate process.env fallback is dead-or-wrong).
+  if (env.RUST_LOG !== undefined) {
+    onSkip?.('RUST_LOG preset') // set — even '' — is an explicit choice
+    return env
+  }
+  if (process.env.FRESHELL_CODEX_LOG_DAMPENING === '0') {
+    onSkip?.('kill switch')
+    return env
+  }
   return { ...env, RUST_LOG: CODEX_LOG_DIRECTIVE }
 }
 ```
 
-Call sites — **three**, not two (review G1):
+**Dampening-skip observability (second-review #6):** when the helper skips because
+`RUST_LOG` is preset (e.g. a developer shell exporting `RUST_LOG` for unrelated Rust
+work leaks into every codex child and silently disables dampening), emit one
+structured `warn` per boot (deduped) via the `onSkip` callback. Fail-open must not be
+fail-silent.
+
+Call sites — **three** (review G1):
 
 1. **App-server spawn** — `runtime.ts:1255-1259`:
    `env: withCodexLogDampening({ ...process.env, ...this.env, FRESHELL_CODEX_SIDECAR_ID: ownershipId })`.
@@ -161,34 +223,34 @@ Call sites — **three**, not two (review G1):
    `providers/codex.ts:479-501`), currently `env: { ...process.env }` with no
    dampening. Apply the same helper when the provider is codex.
 
-If §3 validated the `-c` knob instead of an env var, the helper becomes an args
-helper appended next to `CODEX_MANAGED_REMOTE_CONFIG_ARGS` (same three call sites;
-same guard semantics via an explicit opt-out env).
+If §3 validated the `-c` knob instead, the helper becomes an args helper — noting the
+plumbing gaps at sites 2–3 (§3 candidate 2 caveat).
 
-### Platform note (review G3)
+### Platform note (review G3; anchor corrected per second review)
 
-On a native-Windows host, `buildSpawnSpec` wraps codex in `wsl.exe …`
-(`terminal-registry.ts:1127-1139`); an env var set on the Windows-side process does
-not cross into WSL without `WSLENV`. The current deployment is WSL2-native (unaffected),
-but the helper's coverage claim is platform-conditional; add `WSLENV` plumbing or
-document Windows-host as out of scope.
+On a native-Windows host, `buildSpawnSpec` selects Windows-like handling at
+`terminal-registry.ts:1127-1139` and wraps codex in `wsl.exe …` at `:1141-1149`; an
+env var set on the Windows-side process does not cross into WSL without `WSLENV`. The
+current deployment is WSL2-native (unaffected), but the helper's coverage is
+platform-conditional; add `WSLENV` plumbing or document Windows-host as out of scope.
 
 ### Why safe
 
 - Additive env/args; no lifecycle change; no effect on pane count (I2) or boot (I4).
 - Only-if-unset guard: a developer's explicit `RUST_LOG` (any value, including empty)
-  is never overridden.
+  is never overridden — and the skip is logged (see above).
 - Dampening gates codex's tracing sink only; sessions/goals/memories/thread-graph are
   written by normal code paths, not tracing (I1).
 
 ### Acceptance test
 
-1. Repeat the §3 protocol (representative pane pair, 15 min, per-`process_uuid`
-   attribution) with the helper active: ≥90% byte reduction vs an undampened control
-   window run the same evening (controls for ambient variation).
-2. Unit tests: helper is a no-op when `RUST_LOG` is preset (any value incl. `''`) or
-   the kill switch is set; `FRESHELL_CODEX_SIDECAR_ID` and `this.env` overrides are
-   preserved; non-codex modes in `buildSpawnSpec` are untouched (review G5).
+1. Repeat the §3 protocol (representative pane pair, 15 min, prune-immune metric)
+   with the helper active: ≥90% write-traffic reduction vs an undampened control
+   window run the same evening.
+2. Unit tests: helper is a no-op (with `onSkip` fired) when `RUST_LOG` is preset
+   (any value incl. `''`) or the kill switch is set; `FRESHELL_CODEX_SIDECAR_ID` and
+   `this.env` overrides preserved; non-codex modes in `buildSpawnSpec` untouched
+   (review G5); the skip `warn` is emitted once per boot.
 3. Launch check: codex TUI reaches `Ready`; a turn completes; new rollout appears.
 
 ### Rollback
@@ -205,87 +267,99 @@ storm generation (upstream ask). **Severity: Low.**
 
 ## 5. Stage 0b — One-time lossless cleanup (maintenance-window runbook)
 
-**What this is (honest framing, review 0b-3):** a **declared maintenance window**
-that terminates **all codex processes, including live attached panes**. In-flight
-codex turns are lost (their transcripts up to that point are already on disk in
-rollout files). Long-term state is untouched. Get explicit operator acknowledgment
-before starting. This is the documented I3 carve-out (§2).
+**What this is (honest framing):** a **declared maintenance window** that terminates
+**all codex processes, including live attached panes**. In-flight codex turns are
+lost (their transcripts up to that point are already on disk in rollout files).
+Long-term state is untouched. Get explicit operator acknowledgment before starting.
+This is the documented I3 carve-out (§2).
 
-**Preconditions (review 0b-4, 0b-5):**
+**Preconditions:**
 - **Run from outside freshell** — an ssh/tmux/console session that is *not* a
-  freshell pane. (Otherwise the runbook's own server is in the operator's ancestry
-  and can never be paused/stopped — the ancestry deadlock.)
-- Check for supervisors/watchdogs (`systemd`, pm2, `tsx watch`) that would restart or
-  kill a paused server; prefer **gracefully stopping** the freshell servers for the
-  window (their existing `SIGTERM` teardown reaps their codex children for you,
-  `index.ts:1078-1145`) over `SIGSTOP`. Expect the window to last **minutes** (a
-  ~6 GB VACUUM), not seconds.
+  freshell pane (otherwise the runbook's own server is in the operator's ancestry and
+  can never be stopped — the ancestry deadlock).
+- Check for supervisors/watchdogs (`systemd`, pm2, `tsx watch`) that would restart a
+  stopped server mid-window. Expect the window to last **minutes** (a ~6 GB VACUUM),
+  not seconds.
 
 ### Runbook (ordered; each step gates the next)
 
-1. **Consistent backup + baseline (review F4/0b-1).** With writers still live, a
-   plain file copy is *not* guaranteed consistent. Use SQLite's online-consistent
-   mechanisms for the DB backups:
-   `sqlite3 ~/.codex/<db>.sqlite ".backup '<backup-dir>/<db>.sqlite'"` (or
-   `VACUUM INTO`) for each of `logs_2`, `state_5`, `goals_1`, `memories_1`; copy
-   `history.jsonl`, `auth.json`, `config.toml` normally. Verify
-   `PRAGMA integrity_check` = `ok` on every backup. Record **provisional** row counts
-   (final baselines are taken at step 4). Belt-and-braces: after step 3 (0 holders),
-   also take plain file copies (`.sqlite` + `-wal` + `-shm` together) — these are the
-   byte-identical restore set.
-2. **Announce + stop freshell servers (prod and dev — both hold the DB).** Graceful
-   `SIGTERM`; their teardown reaps their codex children. Then **reap stragglers**:
-   kill set from `lsof ~/.codex/logs_2.sqlite` filtered to codex cmdlines; dry-run
-   and print first; protected-PID guard (never the operator's own session ancestry);
-   **SIGTERM first, grace ≥10 s** (codex flushes rollout `.jsonl` appends on TERM —
-   review 0b-3), then SIGKILL survivors.
+1. **Consistent backup + provisional baseline (writers still live).**
+   - `logs_2.sqlite`: **use `VACUUM INTO '<backup-dir>/logs_2.sqlite'`** — SQLite's
+     online `.backup` restarts whenever another connection writes the source; at
+     ~22 MB/min across ~20 writers it may never converge (second-review #5).
+     `VACUUM INTO` takes a single consistent snapshot read.
+   - Low-churn DBs (`state_5`, `goals_1`, `memories_1`):
+     `sqlite3 <db> ".backup '<backup-dir>/<db>.sqlite'"` is fine.
+   - Copy `history.jsonl`, `auth.json`, `config.toml` normally.
+   - Verify `PRAGMA integrity_check` = `ok` on every backup. Record **provisional**
+     row counts (final baselines at step 4).
+2. **Announce + gracefully stop freshell servers (prod and dev — both hold the DB).**
+   `SIGTERM`; their existing teardown (`index.ts:1078-1145` →
+   `registry.shutdownGracefully`, `terminal-registry.ts:4891-4902`) reaps most codex
+   children. Then **reap stragglers** — kill set from `lsof ~/.codex/logs_2.sqlite`
+   filtered to codex cmdlines; dry-run and print first; protected-PID guard (never
+   the operator's own session ancestry); **SIGTERM first, grace ≥10 s** (codex
+   flushes rollout `.jsonl` appends on TERM), then SIGKILL survivors.
+   **This straggler kill is load-bearing, not belt-and-braces** (second review):
+   whether resume TUIs exit on SIGTERM/pty-close is an open question (§6 acceptance
+   4), so plan on stragglers existing.
 3. **Reach 0 holders.** `lsof ~/.codex/logs_2.sqlite` empty. Nothing may respawn
-   (servers are stopped — no SIGSTOP theatrics needed in the normal path).
-4. **Final baselines at 0 holders (review 0b-2).** Row counts: `sessions/` file
-   count, `goals_1.thread_goals`, `state_5.threads`, `state_5.thread_spawn_edges`,
-   `memories_1.*` (checkpoint `memories_1`'s WAL first before trusting counts), and
-   **`logs_2` `count(*)` + `max(id)`** (needed for the VACUUM equality check).
+   (servers are stopped). **Belt-and-braces:** now also take plain file copies
+   (`.sqlite` + `-wal` + `-shm` together) — the byte-identical restore set.
+4. **Final baselines at 0 holders.**
+   - **Schema check first (second-review #11):** verify the `logs` table declares
+     `id INTEGER PRIMARY KEY` (explicit rowid alias) — VACUUM preserves rowids only
+     for such tables; if it is an implicit rowid, drop the `max(id)` oracle and rely
+     on `count(*)` alone.
+   - Row counts: `sessions/` file count, `goals_1.thread_goals`, `state_5.threads`,
+     `state_5.thread_spawn_edges`, `memories_1.*` (checkpoint `memories_1`'s WAL
+     first before trusting counts), and **`logs_2` `count(*)` + `max(id)`** (for the
+     VACUUM equality check).
 5. **Checkpoint — never rm.** For each `~/.codex/*.sqlite` with a non-empty `-wal`:
    `PRAGMA busy_timeout=15000; PRAGMA wal_checkpoint(TRUNCATE);`
 6. **Compact.** Prefer `VACUUM INTO '<new-file>'` (original untouched; verify the new
-   file, then atomically swap; strictly safer — review 0b-6). Plain in-place `VACUUM`
-   is acceptable (crash mid-VACUUM rolls back transactionally). Requires 0 holders +
-   free disk ≈ DB size.
+   file, then atomically swap). Plain in-place `VACUUM` is acceptable (crash
+   mid-VACUUM rolls back transactionally). Requires 0 holders + free disk ≈ DB size.
 7. **Verify.**
    - `PRAGMA integrity_check` = `ok` on all live DBs.
-   - **`logs_2` row count and `max(id)` equal step 4 exactly** (VACUUM must not change
-     row population — this is the meaningful equality check).
+   - **`logs_2` `count(*)` (and `max(id)`, if step 4's schema check passed) equal
+     step 4 exactly** — VACUUM must not change row population.
    - All other counts **≥ step-4 baseline with any delta explained** (nothing should
      write during the window; an unexplained delta = stop and investigate).
    - `sessions/` file count unchanged; holders = 0; `logs_2.sqlite-wal` = 0 bytes.
-   - **Never auto-restore on a mismatch** (review 0b-2: a stale-backup restore would
-     itself destroy data). Mismatch = halt, investigate, decide manually.
+   - **Never auto-restore on a mismatch** (a stale-backup restore would itself
+     destroy data). Mismatch = halt, investigate, decide manually.
+   - Record **disk reclaimed ≈ prior WAL size + vacuumed dead pages** (measured
+     figure — second-review #10; do not assume a fixed "~2 GB").
 8. **Restart freshell servers**; restore-all respawns the (dampened, if 0a landed)
    generation; spot-check a codex pane reaches `Ready`.
 
+*(Optional: between steps 7 and 8 is the ideal window for the §3 isolated-holder
+WAL-growth measurement — the test pair are the only holders.)*
+
 ### Why safe
 
-DB backups are online-consistent (`.backup`/`VACUUM INTO`); the WAL is folded in via
-checkpoint, never deleted; VACUUM preserves all rows (checked by exact `logs_2`
-equality); baselines are taken at a quiesced moment so the oracle is coherent; no
-`sessions/` file is ever touched; restore is a manual decision, never automatic (I1).
+DB backups are snapshot-consistent (`VACUUM INTO`/`.backup` per churn level); the WAL
+is folded in via checkpoint, never deleted; VACUUM preserves all rows (checked by
+exact `logs_2` equality); baselines are taken at a quiesced moment so the oracle is
+coherent; no `sessions/` file is ever touched; restore is a manual decision, never
+automatic (I1).
 
 ### Rollback
 
-Restore the step-1 `.backup` set (consistent by construction) or the step-3 file
+Restore the step-1 snapshot backups (consistent by construction) or the step-3 file
 copies (byte-identical, taken at 0 holders).
 
 ### User-facing risk
 
 All codex panes terminate for the window (minutes); in-flight turns lost; panes
-restore from rollouts afterward. **Severity: Medium** (declared downtime), not "Low"
-(review 0b-5).
+restore from rollouts afterward. **Severity: Medium** (declared downtime).
 
 ---
 
 ## 6. Stage 1a — Exception/signal-safe teardown on server exit
 
-*(renamed from "crash-safe" — review 1a-1)*
+*(renamed from "crash-safe" — first review)*
 
 ### What `process.on('exit')` actually covers (honest enumeration)
 
@@ -305,11 +379,10 @@ of scope) — this stage narrows the orphan window; it does not close it.
    - app-server: pgid == `child.pid` (`processGroupId`, `runtime.ts:1291-1292`).
      Register on spawn. **Deregister only on confirmed group death** — after
      `teardownOwnedProcessGroup` returns `true` (`runtime.ts:692-734`), *not* at
-     wrapper exit (`:1533-1575`), which can leave live grandchildren untracked
-     (review 1a-2).
+     wrapper exit (`:1533-1575`), which can leave live grandchildren untracked.
    - resume pty: register `pty.pid` at both spawn sites (`terminal-registry.ts:1594`,
-     `:3694`). **Deregister on the pty's `exit` event**, not in `kill()` (`:4008` only
-     *sends* a signal — review 1a-2).
+     `:3694`). **Deregister on the pty's `exit` event**, not in `kill()` (`:4008`
+     only *sends* a signal).
 2. **Bindings** (installed once, near `index.ts:1147-1148`):
    - `process.on('exit', reapSync)` — synchronous best-effort
      `process.kill(-pgid, 'SIGKILL')` per still-registered group, try/catch'd.
@@ -317,20 +390,22 @@ of scope) — this stage narrows the orphan window; it does not close it.
      identity re-check (`/proc/<pid>/cmdline` contains codex) before signalling.
      **Residual pgid-reuse window:** the sync check-then-kill race is narrower than
      nothing but wider than the async reaper's fresh-classification
-     (`runtime.ts:698-711`); accepted at process-death time and documented
-     (review 1a-4).
+     (`runtime.ts:698-711`); accepted at process-death time and documented.
    - `process.on('SIGHUP', …)` — route into the existing graceful
-     `shutdown('SIGHUP')` (idempotent via `isShuttingDown`, `index.ts:1079`). Add a
-     **hard-exit timeout** to `shutdown()` so a throw from `joinCodexShutdownOwners`
-     (`:1102-1113` has no catch) cannot leave the process alive without ever reaching
-     `process.exit(0)` at `:1144` (review 1a-6).
+     `shutdown('SIGHUP')` (idempotent via `isShuttingDown`, `index.ts:1079`).
+   - **Hard-exit timeout (specified — second-review #9):** arm a **15 s** timer
+     (`.unref()`d) on `shutdown()` entry — **all three signals** (SIGTERM/SIGINT/
+     SIGHUP share the identical hang exposure at `:1102-1113`) — that calls
+     `process.exit(1)` if teardown hangs. Note: because `shutdown()` is invoked
+     un-awaited (`:1147-1148`), a *throw* from `joinCodexShutdownOwners` already dies
+     via unhandled rejection → `'exit'` → `reapSync`; the timer exists specifically
+     for the **hang** case.
    - `process.on('uncaughtExceptionMonitor', …)` — **observe/log only.** The default
      fatal behavior of `uncaughtException` is left in place; the fatal path then runs
      `'exit'` → `reapSync`.
-3. **Platform gating (review 1a-3):** negative-pid group kill and `/proc` checks are
-   POSIX/Linux; gate the registry's reap on POSIX and document Windows-host as out of
-   scope (consistent with the sidecar's existing Linux-only stance,
-   `assertUnixSidecarSupport`, `runtime.ts:360-364`).
+3. **Platform gating:** negative-pid group kill and `/proc` checks are POSIX/Linux;
+   gate the registry's reap on POSIX and document Windows-host as out of scope
+   (consistent with `assertUnixSidecarSupport`, `runtime.ts:360-364`).
 
 ### Why safe
 
@@ -339,20 +414,26 @@ nuke live panes (I3). At true termination the children's transport is dying anyw
 reaping prevents orphan accumulation. Guarded, synchronous, try/catch'd; cannot block
 boot (I4).
 
-### Acceptance tests (review F6, 1a-5)
+### Acceptance tests (made executable — second-review #7, #8)
 
-1. Dev server + ≥2 codex panes; terminate via `SIGHUP` and via normal exit →
-   **zero survivors from that instance**, scoped via the registry contents (or
-   matching `FRESHELL_CODEX_SIDECAR_ID` env in `/proc/<pid>/environ`) — *not* a bare
-   `pgrep` (prod + dev coexist).
-2. **Uncaught-exception test** (replaces v1's vacuous caught-exception test): throw an
-   uncaught exception → process dies → registered groups are gone. Separately assert
-   the I3 property at unit level: no code path signals a registered group while the
-   process is alive.
+1. Dev server + ≥2 codex panes. **Before termination, snapshot the registry** (a
+   structured log line, or a test-only endpoint, listing registered `{pid, pgid}`).
+   Terminate via `SIGHUP` and via normal exit → every snapshotted pid is gone.
+   Additionally scan surviving processes' `/proc/<pid>/environ` for
+   `FRESHELL_CODEX_SIDECAR_ID` (app-servers — `runtime.ts:1258`) **or**
+   `FRESHELL_TERMINAL_ID` (resume ptys — `terminal-registry.ts:1538`; ptys do **not**
+   carry the sidecar id) matching this instance → none found. (Bare `pgrep` cannot
+   scope to one instance — prod + dev coexist.)
+2. **Uncaught-exception test:** throw an uncaught exception → process dies →
+   snapshotted groups are gone. The I3 property is asserted **structurally** (not as
+   a universal negative): the group-kill primitive has exactly one caller
+   (`reapSync`), and `reapSync` is referenced only from the `'exit'` binding —
+   enforce with a unit/lint test on the module graph.
 3. `SIGKILL` the server → survivors expected; documented boundary (1b's job).
 4. **Empirical check:** verify whether the codex resume TUI exits on pty-master close
    (kernel SIGHUP). If codex ignores it, resume ptys outlive the server on paths 1a
-   doesn't cover — record the result; it sets 1b's priority (review 1a-5).
+   doesn't cover — record the result; it sets 1b's priority and 0b step 2's
+   straggler expectations.
 
 ### Rollback
 
@@ -368,7 +449,7 @@ None in steady state. SIGHUP now tears down a dev server left in a closing termi
 
 ## 7. Stage 1c — Startup reaper: complete fail-open + minimal observability
 
-### Change (review F2, 1c-1..4; G4, G6)
+### Change
 
 1. **Per-record isolation.** Wrap the *per-record* body of the reap loop
    (`runtime.ts:808-848`) in try/catch so an unreadable record file (`:811` —
@@ -378,55 +459,76 @@ None in steady state. SIGHUP now tears down a dev server left in a closing termi
    `:360-379`) as **degrade-and-continue** (log, skip reaping this boot), not aborts.
 2. **Backstop.** try/catch around the `runCodexStartupReaper` call at `index.ts:256`:
    log and continue. Boot must never die in the reaper (I4).
-3. **Quarantine — only for provably-dead or unparseable records (review 1c-2).**
-   - Owner PID **provably dead** (`isPidAlive` false) but group unkillable, or record
-     unparseable → move to `~/.freshell/codex-sidecars/quarantine/` (atomic rename;
-     preserve `0600` — records embed command lines and cwd's, review G6) with a
-     `{ reason, firstSeen, attempts }` note.
-   - Owner **alive but identity-mismatched** (`runtime.ts:826-831` — reachable via
-     transient `/proc` races) → **retry in place** with time-based backoff keyed on
-     `firstSeen`. Never quarantine a possibly-live sidecar's only tether — that would
-     mint a permanent, invisible DB holder (the exact leak this plan fights).
-   - Retry semantics are **time-based, not boot-count-based** (review 1c-3): the
-     shared `~/.freshell/codex-sidecars` dir serves prod + dev, and a dev server under
-     `tsx watch` can boot dozens of times an hour. On concurrent boots, rename-ENOENT
-     = the other instance won; treat as success.
-4. **Remove the fail-closed assert.** `assertCodexStartupReaperSucceeded`
-   (`runtime.ts:863-876`) is deleted/reduced to a warning aggregator. **Test impact
-   is a contract inversion, not an update** (review 1c-4): ~8 tests in
-   `test/unit/server/coding-cli/codex-app-server/runtime.test.ts` assert the throwing
-   contract, plus the exported alias `reapOrphanedCodexAppServerSidecarsOnStartup`
-   (`runtime.ts:861`) — rewrite them to assert no-throw + quarantine/backoff behavior.
-5. **Boot-time observability line (review G4 — promoted into scope, ~10 lines).** At
-   every boot (and hourly thereafter on a timer), log one structured line:
-   `codex-log-db: wal_bytes=<stat of logs_2.sqlite-wal> holders=<count via /proc fd scan> quarantined=<n>`
-   with a `warn` if `wal_bytes > 500 MB` or holders exceed a threshold. Read-only:
+3. **Quarantine — only for records whose process group is confirmed GONE, or
+   unparseable records (second-review blocking #2).**
+   - **Unparseable/corrupt record** → quarantine (nothing to retry against).
+   - **Owner dead + group confirmed gone** → normal happy path (record deleted).
+   - **Owner dead but group STILL ALIVE** (`teardownOwnedProcessGroup` returned
+     `false` — the group survived SIGTERM+SIGKILL, `runtime.ts:714-729`, e.g. a codex
+     process in D-state I/O against the bloated WAL — this incident's exact
+     signature) → **NEVER quarantine.** The record is the only tether to a live DB
+     holder; retry in place with backoff.
+   - **Owner alive but identity-mismatched** (`runtime.ts:826-831` — reachable via
+     transient `/proc` races) → retry in place with backoff.
+   - **Safety net:** each boot, the reaper also **rescans `quarantine/`** for records
+     whose pgid is still alive and promotes them back for retry (no permanent
+     invisible holder can hide there).
+   - Quarantine moves are atomic renames preserving `0600` (records embed command
+     lines and cwd's — review G6), with a `{ reason, firstSeen, attempts }` note.
+4. **Backoff state — concrete home (second-review #4).** Retry state lives in a
+   sidecar file **`<record>.reaper.json`** next to the ownership record (atomic
+   write, `0600`, `{ firstSeen, attempts, lastAttempt }`; `firstSeen` falls back to
+   the record's mtime). It is written only by the reaper, so it cannot race the
+   owning server's own record rewrites (`runtime.ts:1297-1300`). Semantics: the
+   per-boot reap attempt **always runs**; backoff gates only **log escalation**
+   (info→warn after N attempts) and the **hourly** re-attempt frequency (below) — it
+   never defers the boot-time decision. Time-based (keyed on `firstSeen`), so shared
+   prod+dev dirs and `tsx watch` restart storms cannot burn the budget; on concurrent
+   boots, rename-ENOENT = the other instance won (treat as success).
+5. **Observability — concrete home (second-review #4; review G4).** New module
+   **`server/coding-cli/codex-observability.ts`**, started from `index.ts` at boot:
+   emits one structured line at boot and then on an **hourly `setInterval(...).unref()`**
+   timer:
+   `codex-log-db: wal_bytes=<stat logs_2.sqlite-wal> holders=<count via /proc fd scan> quarantined=<n>`
+   with `warn` when `wal_bytes > 500 MB` or holders exceed a threshold. Read-only —
    `stat` + `/proc` fd scan; **never opens the SQLite DB, never signals anything.**
-   This converts every silent failure mode in this plan (0a ineffective, 1c orphan,
-   regrowth) into a detectable one.
+   This module also hosts the hourly retry of live-group records (step 3/4) and the
+   quarantine rescan trigger. Converts every silent failure mode in this plan (0a
+   ineffective, 1c lingering holder, regrowth) into a detectable one.
+6. **Remove the fail-closed assert.** `assertCodexStartupReaperSucceeded`
+   (`runtime.ts:863-876`) is deleted/reduced to a warning aggregator. **Test impact
+   is a contract inversion:** ~12 assertion sites in
+   `test/unit/server/coding-cli/codex-app-server/runtime.test.ts` (`:1440-1787`)
+   assert the throwing contract — rewrite to assert no-throw + quarantine/backoff
+   behavior. The exported alias `reapOrphanedCodexAppServerSidecarsOnStartup`
+   (`runtime.ts:861`) is referenced nowhere (including tests) — delete it.
 
 ### Why safe
 
 Fail-open at every layer (I4); reap decisions still require the same ownership proof
-(I3 unchanged); quarantine can no longer orphan a live sidecar's record; the monitor
-is observation-only.
+(I3 unchanged); quarantine can no longer hide a live process (confirmed-gone-only +
+rescan); the monitor is observation-only.
 
 ### Acceptance tests
 
-1. Seed an un-reapable-but-dead record → server boots; record quarantined `0600`;
-   warning logged.
+1. Seed a record for a dead owner whose group is gone but the record is stale →
+   server boots; record quarantined `0600`; warning logged.
 2. Seed an **unreadable** record file (chmod 000) → server boots; that record
    isolated; others still processed.
 3. Simulate `/proc` proof unavailable → server boots; reaping skipped with a warning.
-4. Seed an alive-but-mismatched record → retried in place with backoff; **not**
-   quarantined; still present next boot.
-5. Reapable orphan → still reaped exactly as before.
-6. Boot line appears with correct WAL size/holder count against fixtures; `warn`
+4. Seed an alive-but-mismatched record → retried in place with backoff state in
+   `<record>.reaper.json`; **not** quarantined; still present next boot.
+5. Seed an owner-dead-**group-alive** record (mock teardown returning `false`) →
+   **not** quarantined; retried; hourly timer re-attempts.
+6. Plant a quarantined record whose pgid is alive → rescan promotes it back for
+   retry.
+7. Reapable orphan → still reaped exactly as before.
+8. Boot line appears with correct WAL size/holder count against fixtures; `warn`
    fires above thresholds; verify the monitor holds no fd on the SQLite files.
 
 ### Rollback
 
-Restore the assert (one function); disable the boot line.
+Restore the assert (one function); disable the observability module.
 
 ### User-facing risk
 
@@ -435,7 +537,7 @@ boot. Strictly better availability. **Severity: Low, net-positive.**
 
 ---
 
-## 8. Deploy choreography (review G2)
+## 8. Deploy choreography (ordering reconciled — second-review #10)
 
 Deploying 0a/1a/1c requires restarting freshell — **prod and dev both** (both hold
 the DB). A restart is itself a pane-recycling event (graceful teardown + restore-all).
@@ -443,9 +545,12 @@ Sequence the whole rollout as **one declared window**:
 
 1. Merge 0a (if §3 validated) + 1a + 1c.
 2. Announce the maintenance window (§5 framing).
-3. Restart/stop both servers → run the **0b runbook** (servers stay stopped through
-   step 7) → restart both servers.
-4. Post-checks: pane reaches `Ready`; boot observability line shows
+3. **Run the 0b runbook from its step 1.** Note the ordering inside 0b: the
+   snapshot backups (step 1) happen **while writers are still live, before the
+   servers stop** (step 2); the servers then remain stopped through step 7.
+4. *(Optional)* run the §3 isolated-holder measurement in the 0 holders window.
+5. Restart both servers (0b step 8).
+6. Post-checks: pane reaches `Ready`; boot observability line shows
    `wal_bytes≈0, holders == 2×(open codex panes)`; over the next day, the hourly line
    shows WAL bounded (0a working) or growing (0a failed → §10).
 
@@ -454,7 +559,7 @@ Sequence the whole rollout as **one declared window**:
 ```
 §3 validation experiment  ──►  0a implementation (only if a candidate passes)
 1a, 1c                    ──►  independent; implement in parallel with §3
-merge (0a?, 1a, 1c)       ──►  §8 window: stop servers → 0b → restart
+merge (0a?, 1a, 1c)       ──►  §8 window: 0b (backups live → stop → clean → restart)
 boot/hourly observability ──►  ships inside 1c; watches everything afterward
 ```
 
@@ -469,39 +574,46 @@ boot/hourly observability ──►  ships inside 1c; watches everything afterwa
 - **Holders remain by design** (I2/I3): ~2 codex processes per open pane keep the DB
   open around the clock. This plan does not change that.
 - **If §3 validates a knob:** WAL churn ≈ 0; the cliff should not recur before
-  Stage 2 lands. Remaining exposure: the unvalidated-in-production knob (watched by
-  the hourly line) and codex-internal behavior changes on upgrade.
+  Stage 2 lands. Remaining exposure: the knob's behavior under codex upgrades
+  (watched by the hourly line).
 - **If §3 fails:** churn continues at ~22 MB/min of active use; the WAL re-approaches
   the cliff in **days-to-weeks**. The observability line makes this loudly visible
-  (500 MB warn threshold ≈ weeks of margin before the ~5 GB wedge), and 0b can be
-  re-run as a stopgap during any maintenance window. Stage 2 (shared app-server,
-  holders==1) becomes urgent and should be scheduled immediately.
+  (500 MB warn threshold ≈ weeks of margin before the ~5 GB wedge), 0b can be re-run
+  as a stopgap during any maintenance window, and the §3 measurements ship with the
+  upstream issue. Stage 2 (shared app-server, holders==1) becomes urgent.
 - 1a/1c reduce orphan accumulation and boot fragility but do not change WAL
   mechanics.
 
-## 11. Constraint traceability (corrected)
+## 11. Constraint traceability
 
 | Constraint | Honored by |
 |---|---|
-| I1 lossless | 0b: online-consistent backups, checkpoint/VACUUM only, exact `logs_2` row/`max(id)` equality check, **no auto-restore**; 1a/1c reap processes, never data; rollouts remain source of truth |
+| I1 lossless | 0b: snapshot-consistent backups (`VACUUM INTO` for the churning DB), checkpoint/VACUUM only, exact `logs_2` row/`max(id)` equality check (schema-verified), **no auto-restore**; 1a/1c reap processes, never data; rollouts remain source of truth |
 | I2 no cap | No stage limits panes; observability is read-only |
-| I3 no live-pane kills (steady state) | 1a binds `exit` (cannot fire on recoverable errors), monitor observe-only; 1c reaps only proven-dead owners, retries ambiguity in place; idle-reaper attached-pane skip untouched. **0b is the one declared, consented exception** (maintenance window, §5) — not claimed otherwise |
-| I4 no new won't-launch | 1c: per-record isolation + degrade-and-continue + backstop try/catch (covers `:800`, `:803-806`, `:811`, `:863-876`); 0a additive; 1a exit-path only, try/catch'd |
-| I5 telemetry tradeoff | 0a documented, only-if-unset (incl. `''`), kill switch (restart required — stated honestly) |
+| I3 no live-pane kills (steady state) | 1a binds `exit` (cannot fire on recoverable errors) with the structural single-caller assertion; monitor observe-only; 1c reaps only with the same ownership proof, retries ambiguity in place, and can no longer hide a live group in quarantine; idle-reaper attached-pane skip untouched. **0b is the one declared, consented exception** (maintenance window, §5) |
+| I4 no new won't-launch | 1c: per-record isolation + degrade-and-continue + backstop try/catch (covers `:800`, `:803-806`, `:811`, `:863-876`); 0a additive; 1a exit-path only, try/catch'd, hard-exit timer bounded |
+| I5 telemetry tradeoff | 0a documented, only-if-unset (incl. `''`), skip-logged, kill switch (restart required — stated honestly) |
 
 ## 12. Definition of done
 
-1. **§3:** a documented pass/fail result for each candidate; 0a proceeds only on a
-   pass (≥90% byte reduction on the representative workload).
+1. **§3:** a documented pass/fail per candidate using the prune-immune metric,
+   including the exact final directive string; 0a proceeds only on a pass (≥90%
+   write-traffic reduction on the representative workload).
 2. **0a (if implemented):** acceptance re-run post-deploy passes; unit tests green
    (incl. `''`-preset, kill switch, `this.env`, sidecar-id preservation, non-codex
-   modes untouched); TUI `Ready` + turn completes.
-3. **0b:** integrity `ok`; `logs_2` rows/`max(id)` exactly equal step-4 baseline;
-   other counts ≥ baseline with deltas explained; `sessions/` count unchanged;
-   holders 0 at completion; WAL 0 bytes; ~2 GB reclaimed; no auto-restore occurred.
-4. **1a:** SIGHUP/normal-exit → zero survivors (registry-scoped assertion);
-   uncaught-exception path reaps; pty-master-close behavior of codex recorded;
-   POSIX-gated; Windows documented out of scope.
-5. **1c:** all six acceptance tests pass, including the three formerly-fatal boot
-   paths; test-suite contract inversions completed; boot/hourly observability line
-   live with thresholds.
+   modes untouched, skip-warn emitted); TUI `Ready` + turn completes.
+3. **0b:** integrity `ok`; `logs_2` `count(*)` (and `max(id)` if schema-verified)
+   exactly equal step-4 baseline; other counts ≥ baseline with deltas explained;
+   `sessions/` count unchanged; holders 0 at completion; WAL 0 bytes; **disk
+   reclaimed ≈ prior WAL size + vacuumed dead pages (measured figure recorded)**;
+   no auto-restore occurred.
+4. **1a:** SIGHUP/normal-exit → zero survivors (registry-snapshot + environ-scan
+   assertion incl. `FRESHELL_TERMINAL_ID` for ptys); uncaught-exception path reaps;
+   structural single-caller assertion in place; 15 s hard-exit timer on all three
+   signals; pty-master-close behavior of codex recorded; POSIX-gated; Windows
+   documented out of scope.
+5. **1c:** all eight acceptance tests pass, including the three formerly-fatal boot
+   paths, the owner-dead-group-alive no-quarantine case, and the quarantine rescan;
+   test-suite contract inversions completed (~12 sites) and the unreferenced alias
+   deleted; boot/hourly observability line live with thresholds from
+   `codex-observability.ts`.
