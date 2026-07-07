@@ -8,7 +8,9 @@ import { logger } from '../logger.js'
 // Invariants (plan §2):
 // - I3: never signal an unregistered process. The group-kill primitive below has exactly ONE
 //   caller (`reapSync`), and `reapSync` is referenced only from the `'exit'` binding — both are
-//   enforced structurally by test/unit/server/coding-cli/codex-child-registry.test.ts.
+//   enforced structurally by test/unit/server/coding-cli/codex-child-registry.test.ts. The only
+//   other negative-pid syscall in this module is the signal-0 liveness probe, which delivers
+//   nothing by definition.
 // - I4: nothing here may throw out of an exit path or block boot. Every reap step is per-entry
 //   try/catch'd; registration is a Map write plus a best-effort /proc stat read.
 //
@@ -17,6 +19,12 @@ import { logger } from '../logger.js'
 // non-Linux platform) register/deregister still track entries, but `reapSync` does nothing.
 
 export type CodexChildKind = 'app-server' | 'resume-pty'
+
+export type CodexChildEnvMarker = {
+  /** Env var name injected into the child's environment at spawn (e.g. FRESHELL_TERMINAL_ID). */
+  name: string
+  value: string
+}
 
 export type CodexChildEntry = {
   /** Direct child pid (app-server wrapper pid, or the resume pty's pid). */
@@ -27,9 +35,17 @@ export type CodexChildEntry = {
   /**
    * /proc/<pid>/stat starttime (field 22, clock ticks since boot) captured at registration.
    * Registration is best-effort: undefined when the stat was unreadable/unparseable at register
-   * time, in which case reapSync falls back to the pgrp+cmdline identity checks for this entry.
+   * time, in which case reapSync routes the entry to the ownership-gated group scan (r2-1) —
+   * pgrp+cmdline alone are never trusted for a kill.
    */
   startTimeTicks?: number
+  /**
+   * R2-M1: ownership proof for the dead-pid group-scan fallback. The exact `NAME=VALUE` pair must
+   * be present in a group member's /proc environ before the fallback may conclude the registered
+   * pgid still hosts OUR codex child. Without a recorded marker the fallback never kills (fail
+   * closed): a recycled pgid can host the OTHER server instance's live codex pane.
+   */
+  envMarker?: CodexChildEnvMarker
 }
 
 export type CodexChildRegistryLogger = {
@@ -50,14 +66,27 @@ export type CodexChildProcessLike = {
   on: (event: string, listener: (...args: any[]) => void) => unknown
 }
 
+export type CodexGroupProbeResult = 'alive' | 'gone' | 'unknown'
+
 export type CodexChildRegistryDeps = {
   platform?: NodeJS.Platform
-  /** Sync read used for /proc/<pid>/stat and /proc/<pid>/cmdline identity checks. */
+  /** Sync read used for /proc/<pid>/stat identity checks (small, fixed-size content). */
   readFileSync?: (filePath: string) => Buffer
+  /**
+   * r2-3: bounded sync read used for /proc cmdline/environ on the exit path. Defaults to an
+   * openSync+readSync fixed-buffer read; when only readFileSync is injected (tests), a bounded
+   * wrapper is derived from it.
+   */
+  readFileBoundedSync?: (filePath: string, maxBytes: number) => { data: Buffer; truncated: boolean }
   /** Sync directory listing used only by the dead-pid group-membership fallback scan. */
   readdirSync?: (dirPath: string) => string[]
   /** The raw signal syscall. Only `killProcessGroupSync` may invoke it with a negative pid. */
   killSync?: (pid: number, signal: NodeJS.Signals) => void
+  /**
+   * Signal-0 group liveness probe (delivers NOTHING — error checking only, I3-safe). 'unknown'
+   * covers EPERM and any other non-ESRCH failure: the group may still have members we cannot see.
+   */
+  probeGroupSync?: (pgid: number) => CodexGroupProbeResult
   proc?: CodexChildProcessLike
   log?: CodexChildRegistryLogger
 }
@@ -65,12 +94,34 @@ export type CodexChildRegistryDeps = {
 export type CodexChildRegistry = {
   register: (entry: CodexChildEntry) => void
   deregister: (pid: number) => boolean
+  /**
+   * m8: deregister only when the signal-0 probe confirms the whole group is gone (ESRCH). On
+   * 'alive'/'unknown' (e.g. EPERM) the entry stays registered so exit-time reap still covers it.
+   * On non-Linux platforms (no negative-pid probe semantics guaranteed + reapSync is a no-op
+   * there) deregisters unconditionally.
+   */
+  deregisterIfGroupGone: (pid: number) => boolean
   snapshot: () => CodexChildEntry[]
+  /**
+   * r2-11: steady-state drain — ESRCH-probe every 'resume-pty' entry and deregister confirmed-gone
+   * groups. onExit-time deregistration keeps an entry when its group still had members (or the
+   * probe was inconclusive); if those members die later no event fires, so the hourly
+   * observability tick calls this. Probe-only (signal 0): never signals. Returns drained count.
+   */
+  probeResumePtyGroups: () => number
   reapSync: () => void
   installExitHandlers: (options: CodexChildExitHandlerOptions) => void
 }
 
+/** r2-3: hard byte bound for exit-path /proc cmdline/environ reads. */
+export const PROC_READ_MAX_BYTES = 4096
+
 type ProcStatInfo = { pgrp: number; startTimeTicks: number }
+
+type BoundedRead = { data: Buffer; truncated: boolean }
+
+/** pgid -> live member pids, built at most once per reap pass (r2-4). */
+type ProcGroupIndex = Map<number, number[]>
 
 /**
  * Parses pgrp (field 5) and starttime (field 22) of a `/proc/<pid>/stat` line; comm may contain
@@ -86,11 +137,75 @@ function parseProcStatInfo(stat: string): ProcStatInfo | null {
   return { pgrp, startTimeTicks }
 }
 
+/**
+ * r2-2: codex identity predicate over a NUL-separated /proc cmdline. Some argv token's basename
+ * must be exactly `codex` — argv[0] for the plain binary, any later token for node-wrapper
+ * launches like `node /x/bin/codex`. Substring matches are rejected: `vim codex-notes.md` or a
+ * path that merely contains "codex" (worktree/branch names) must never look like a codex process.
+ *
+ * r2-12 (accepted reap-completeness caveat): a codex binary invoked under a name whose argv
+ * contains no `codex` basename token (renamed copy, busybox-style symlink) is INVISIBLE to
+ * exit-time reap and to the observability holder count. That fails SAFE for I3 — we never signal
+ * what we cannot identify — but stays open for the leak; the async reaper's env-marker ownership
+ * proof (runtime.ts) is the durable backstop for such groups.
+ */
+export function cmdlineHasCodexToken(rawCmdline: string): boolean {
+  for (const token of rawCmdline.split('\0')) {
+    if (token.length === 0) continue
+    if (token.slice(token.lastIndexOf('/') + 1) === 'codex') return true
+  }
+  return false
+}
+
+/**
+ * r2-3: bounded synchronous /proc read for the exit path — openSync + readSync into a fixed
+ * buffer, never fs.readFileSync (a pathological cmdline/environ cannot balloon exit-time memory
+ * or latency). Reads one byte past maxBytes purely to detect truncation.
+ */
+function readProcFileBoundedSync(filePath: string, maxBytes: number): BoundedRead {
+  const fd = fs.openSync(filePath, 'r')
+  try {
+    const buffer = Buffer.allocUnsafe(maxBytes + 1)
+    let total = 0
+    while (total < buffer.length) {
+      const bytesRead = fs.readSync(fd, buffer, total, buffer.length - total, null)
+      if (bytesRead === 0) break
+      total += bytesRead
+    }
+    return { data: buffer.subarray(0, Math.min(total, maxBytes)), truncated: total > maxBytes }
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/**
+ * Default signal-0 group liveness probe. Signal 0 performs error checking only — the kernel
+ * delivers nothing, so this can never kill (I3-safe; the structural test pins the `0`).
+ */
+function defaultProbeGroupSync(pgid: number): CodexGroupProbeResult {
+  try {
+    process.kill(-pgid, 0)
+    return 'alive'
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH' ? 'gone' : 'unknown'
+  }
+}
+
 export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): CodexChildRegistry {
   const platform = deps.platform ?? process.platform
   const readFileSync = deps.readFileSync ?? ((filePath: string) => fs.readFileSync(filePath))
+  // r2-3: tests that inject only readFileSync get a bounded wrapper derived from it, so the same
+  // fake file map drives both read paths; production uses the fixed-buffer openSync read.
+  const readFileBoundedSync = deps.readFileBoundedSync
+    ?? (deps.readFileSync
+      ? (filePath: string, maxBytes: number): BoundedRead => {
+          const data = readFileSync(filePath)
+          return { data: data.subarray(0, maxBytes), truncated: data.length > maxBytes }
+        }
+      : readProcFileBoundedSync)
   const readdirSync = deps.readdirSync ?? ((dirPath: string) => fs.readdirSync(dirPath))
   const killSync = deps.killSync ?? ((pid: number, signal: NodeJS.Signals) => process.kill(pid, signal))
+  const probeGroupSync = deps.probeGroupSync ?? defaultProbeGroupSync
   const proc = deps.proc ?? (process as CodexChildProcessLike)
   const log = deps.log ?? logger.child({ component: 'codex-child-registry' })
 
@@ -106,8 +221,8 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
     }
     // Pin the pid's identity at registration (panel M1a): entries can outlive a recycled pid by
     // days, so the exit-time reap must be able to prove the pid still names the SAME process.
-    // Best-effort — an unreadable stat stores undefined and that entry falls back to the
-    // pgrp+cmdline checks alone.
+    // Best-effort — an unreadable stat stores undefined and that entry is routed to the
+    // ownership-gated group scan at reap time (r2-1).
     let startTimeTicks: number | undefined
     if (platform === 'linux') {
       try {
@@ -116,12 +231,21 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
         startTimeTicks = undefined
       }
     }
+    // R2-M1: only a well-formed NAME=VALUE marker is recorded; anything else is treated as "no
+    // ownership proof available", which fail-closes the dead-pid group fallback for this entry.
+    const envMarker =
+      entry.envMarker
+      && typeof entry.envMarker.name === 'string' && entry.envMarker.name.length > 0
+      && typeof entry.envMarker.value === 'string' && entry.envMarker.value.length > 0
+        ? { name: entry.envMarker.name, value: entry.envMarker.value }
+        : undefined
     // Double-registration of the same pid is safe: latest registration wins (plan §6 idempotency).
     children.set(entry.pid, {
       pid: entry.pid,
       pgid: entry.pgid,
       kind: entry.kind,
       ...(startTimeTicks !== undefined ? { startTimeTicks } : {}),
+      ...(envMarker ? { envMarker } : {}),
     })
   }
 
@@ -129,8 +253,35 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
     return children.delete(pid)
   }
 
+  function deregisterIfGroupGone(pid: number): boolean {
+    if (platform === 'linux') {
+      const pgid = children.get(pid)?.pgid ?? pid
+      if (probeGroupSync(pgid) !== 'gone') return false
+    }
+    return children.delete(pid)
+  }
+
   function snapshot(): CodexChildEntry[] {
     return [...children.values()].map((entry) => ({ ...entry }))
+  }
+
+  function probeResumePtyGroups(): number {
+    // Linux-only, like reapSync: negative-pid probe semantics are what the drain relies on, and
+    // exit-time reap (the thing stale entries would mislead) is a no-op elsewhere anyway.
+    if (platform !== 'linux') return 0
+    let drained = 0
+    for (const [pid, entry] of [...children]) {
+      if (entry.kind !== 'resume-pty') continue
+      try {
+        if (probeGroupSync(entry.pgid) === 'gone') {
+          children.delete(pid)
+          drained += 1
+        }
+      } catch {
+        // The probe seam must never break the observability tick.
+      }
+    }
+    return drained
   }
 
   /**
@@ -142,41 +293,82 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
   }
 
   /**
-   * Dead-pid fallback (panel M1b): the registered wrapper pid being gone does NOT mean the group
-   * is gone — live grandchildren (the actual DB holders) can survive it, and that is precisely the
-   * case the registry exists for. Bounded sync scan of /proc: kill only when a member of the
-   * registered pgid is provably a codex process; if members exist but none are codex the pgid was
-   * recycled — never signal it. Fully synchronous, per-pid try/catch'd.
+   * r2-4: one bounded /proc walk per reap pass, shared across all dead-pid entries — a single
+   * readdir plus one stat parse per pid, instead of a full rescan per entry. Returns null when
+   * /proc cannot be enumerated (callers fail towards not signalling, I3).
    */
-  function groupHasCodexMemberSync(pgid: number): boolean {
+  function buildProcGroupIndexSync(): ProcGroupIndex | null {
     let names: string[]
     try {
       names = readdirSync('/proc')
     } catch {
-      return false // cannot enumerate: fail towards not signalling (I3)
+      return null
     }
+    const index: ProcGroupIndex = new Map()
     for (const name of names) {
       if (!/^\d+$/.test(name)) continue
       try {
         const info = parseProcStatInfo(readFileSync(`/proc/${name}/stat`).toString('utf8'))
-        if (!info || info.pgrp !== pgid) continue
-        const cmdline = readFileSync(`/proc/${name}/cmdline`).toString('utf8')
-        if (cmdline.includes('codex')) return true
+        if (!info) continue
+        const members = index.get(info.pgrp)
+        if (members) {
+          members.push(Number(name))
+        } else {
+          index.set(info.pgrp, [Number(name)])
+        }
+      } catch {
+        continue // pid vanished mid-scan or unreadable
+      }
+    }
+    return index
+  }
+
+  /**
+   * Dead-pid fallback (panel M1b + R2-M1 ownership gate): the registered wrapper pid being gone
+   * does NOT mean the group is gone — live grandchildren (the actual DB holders) can survive it,
+   * and that is precisely the case the registry exists for. But pgid recycling means membership
+   * plus a codex-looking cmdline is NOT ownership proof (the recycled pgid could host the OTHER
+   * server instance's live codex pane). Kill only when a member of the registered pgid provably
+   * carries the exact env marker this registration injected at spawn. No marker recorded,
+   * unreadable environ, or a marker missing from a TRUNCATED environ read all fail closed.
+   * Fully synchronous, per-pid try/catch'd.
+   */
+  function groupHasOwnedCodexMemberSync(
+    entry: CodexChildEntry,
+    getGroupIndex: () => ProcGroupIndex | null,
+  ): boolean {
+    // R2-M1: without a recorded env marker there is no ownership proof to check — never kill.
+    if (!entry.envMarker) return false
+    const marker = `${entry.envMarker.name}=${entry.envMarker.value}`
+    const index = getGroupIndex()
+    if (!index) return false // cannot enumerate /proc: fail towards not signalling (I3)
+    const members = index.get(entry.pgid)
+    if (!members || members.length === 0) return false // group gone (or fully unreadable)
+    for (const pid of members) {
+      try {
+        // Cheap cmdline prefilter before the (larger) environ read.
+        const cmdline = readFileBoundedSync(`/proc/${pid}/cmdline`, PROC_READ_MAX_BYTES)
+        if (!cmdlineHasCodexToken(cmdline.data.toString('utf8'))) continue
+        // Ownership proof: the exact NAME=VALUE marker injected at spawn. A marker that is absent
+        // from a truncated read could live past the cutoff — that is absence of proof, not proof
+        // of absence, so it never justifies a kill (r2-3 fail-closed).
+        const environ = readFileBoundedSync(`/proc/${pid}/environ`, PROC_READ_MAX_BYTES)
+        if (environ.data.toString('utf8').split('\0').includes(marker)) return true
       } catch {
         continue // member vanished mid-scan or is unreadable: not proof either way
       }
     }
-    return false // no members (group gone) or only non-codex members (pgid recycled)
+    return false // no member carries our marker: never signal
   }
 
   /**
-   * Identity verdict for one registered entry (panel M1a). Kill only when EVERY provable check
-   * passes: recorded starttime matches exactly (when recorded), the pid is still in the registered
-   * process group, and its cmdline still looks like codex. Any mismatch means the entry is stale
-   * (pid recycled — possibly by the OTHER server instance's live codex pane) and must be skipped.
-   * A pid that is gone from /proc routes to the dead-pid group fallback above.
+   * Identity verdict for one registered entry (panel M1a). The live-pid fast path kills only when
+   * EVERY provable check passes: recorded starttime matches exactly, the pid is still in the
+   * registered process group, and its cmdline carries a codex token. Entries without a starttime
+   * pin (r2-1), dead pids, and zombie/unreadable-cmdline wrappers all route to the ownership-gated
+   * group scan above — pgrp+cmdline alone are never grounds to kill.
    */
-  function shouldKillEntrySync(entry: CodexChildEntry): boolean {
+  function shouldKillEntrySync(entry: CodexChildEntry, getGroupIndex: () => ProcGroupIndex | null): boolean {
     let statRaw: string | null
     try {
       statRaw = readFileSync(`/proc/${entry.pid}/stat`).toString('utf8')
@@ -185,26 +377,32 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
     }
     if (statRaw === null) {
       // Registered pid is dead; the group may still hold live codex grandchildren.
-      return groupHasCodexMemberSync(entry.pgid)
+      return groupHasOwnedCodexMemberSync(entry, getGroupIndex)
     }
     const info = parseProcStatInfo(statRaw)
     if (!info) return false // present but unprovable: never signal (I3)
-    if (entry.startTimeTicks !== undefined && info.startTimeTicks !== entry.startTimeTicks) {
+    if (entry.startTimeTicks === undefined) {
+      // r2-1: no identity pin was captured at registration, so the live-pid path cannot prove the
+      // pid was not recycled. Route to the ownership-gated group scan instead of trusting
+      // pgrp+cmdline alone.
+      return groupHasOwnedCodexMemberSync(entry, getGroupIndex)
+    }
+    if (info.startTimeTicks !== entry.startTimeTicks) {
       return false // pid recycled by a different process: stale entry
     }
     if (info.pgrp !== entry.pgid) return false // pid no longer in the registered group: stale entry
-    let cmdline: string
+    let cmdline: BoundedRead
     try {
-      cmdline = readFileSync(`/proc/${entry.pid}/cmdline`).toString('utf8')
+      cmdline = readFileBoundedSync(`/proc/${entry.pid}/cmdline`, PROC_READ_MAX_BYTES)
     } catch {
       // stat readable but cmdline not (e.g. zombie wrapper): treat as dead-pid, scan the group.
-      return groupHasCodexMemberSync(entry.pgid)
+      return groupHasOwnedCodexMemberSync(entry, getGroupIndex)
     }
-    if (cmdline.length === 0) {
+    if (cmdline.data.length === 0) {
       // Zombie wrapper (empty cmdline): the wrapper is dead but grandchildren may live.
-      return groupHasCodexMemberSync(entry.pgid)
+      return groupHasOwnedCodexMemberSync(entry, getGroupIndex)
     }
-    return cmdline.includes('codex')
+    return cmdlineHasCodexToken(cmdline.data.toString('utf8'))
   }
 
   /**
@@ -234,6 +432,14 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
       }
       if (ownPgid === null) return
 
+      // r2-4: the /proc group index for dead-pid fallbacks is built lazily, at most once per pass,
+      // and shared across every entry that needs the group scan.
+      let groupIndex: ProcGroupIndex | null | undefined
+      const getGroupIndex = (): ProcGroupIndex | null => {
+        if (groupIndex === undefined) groupIndex = buildProcGroupIndexSync()
+        return groupIndex
+      }
+
       for (const [pid, entry] of [...children]) {
         try {
           children.delete(pid)
@@ -241,7 +447,7 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
           // Guards (I3): only registered pgids; never -1/0/1, our own pid's group, or our own pgid.
           if (!Number.isInteger(pgid) || pgid <= 1) continue
           if (pgid === proc.pid || pgid === ownPgid) continue
-          if (!shouldKillEntrySync(entry)) continue
+          if (!shouldKillEntrySync(entry, getGroupIndex)) continue
 
           killProcessGroupSync(pgid)
         } catch {
@@ -272,14 +478,26 @@ export function createCodexChildRegistry(deps: CodexChildRegistryDeps = {}): Cod
     })
   }
 
-  return { register, deregister, snapshot, reapSync, installExitHandlers }
+  return {
+    register,
+    deregister,
+    deregisterIfGroupGone,
+    snapshot,
+    probeResumePtyGroups,
+    reapSync,
+    installExitHandlers,
+  }
 }
 
 const defaultRegistry = createCodexChildRegistry()
 
 export const registerCodexChild: CodexChildRegistry['register'] = defaultRegistry.register
 export const deregisterCodexChild: CodexChildRegistry['deregister'] = defaultRegistry.deregister
+export const deregisterCodexChildIfGroupGone: CodexChildRegistry['deregisterIfGroupGone'] =
+  defaultRegistry.deregisterIfGroupGone
 export const snapshotCodexChildren: CodexChildRegistry['snapshot'] = defaultRegistry.snapshot
+export const probeRegisteredResumePtyGroups: CodexChildRegistry['probeResumePtyGroups'] =
+  defaultRegistry.probeResumePtyGroups
 export const reapSync: CodexChildRegistry['reapSync'] = defaultRegistry.reapSync
 export const installCodexChildExitHandlers: CodexChildRegistry['installExitHandlers'] =
   defaultRegistry.installExitHandlers

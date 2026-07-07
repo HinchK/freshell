@@ -37,27 +37,16 @@ import type {
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from './coding-cli/codex-managed-config.js'
-import { deregisterCodexChild, registerCodexChild } from './coding-cli/codex-child-registry.js'
-
 // Stage 1a (plan §6, panel m8): a codex resume pty is a process-GROUP registration (pgid == pid),
 // and the pty leader exiting does not prove the group is gone — descendants (the actual codex log
-// DB holders) can survive it. Deregister only when a signal-0 probe of the group confirms ESRCH;
-// while any member survives the entry stays registered so exit-time reap can still cover it. On
-// non-Linux platforms (no negative-pid probe semantics guaranteed + reapSync is a no-op there)
-// keep the previous unconditional deregistration.
-function deregisterCodexPtyIfGroupGone(pid: number): void {
-  if (process.platform === 'linux') {
-    try {
-      process.kill(-pid, 0)
-      return // group still has members: keep it registered
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
-        return // could not confirm the group is gone (e.g. EPERM): keep it registered
-      }
-    }
-  }
-  deregisterCodexChild(pid)
-}
+// DB holders) can survive it. The registry helper deregisters only when a signal-0 probe of the
+// group confirms ESRCH; 'alive'/EPERM keep the entry registered so exit-time reap still covers it
+// (r2-13b: the logic lives in codex-child-registry.ts behind an injectable probe seam; non-Linux
+// platforms deregister unconditionally there).
+import {
+  deregisterCodexChildIfGroupGone as deregisterCodexPtyIfGroupGone,
+  registerCodexChild,
+} from './coding-cli/codex-child-registry.js'
 import type { CodexLaunchPlan, CodexLaunchSidecar } from './coding-cli/codex-app-server/launch-planner.js'
 import { isCodexSidecarTeardownError } from './coding-cli/codex-app-server/launch-planner.js'
 import {
@@ -1636,7 +1625,14 @@ export class TerminalRegistry extends EventEmitter {
     // track them for exit-time reaping. Deregistered on the pty's onExit below — kill() only
     // *sends* a signal, it does not confirm death. Codex panes only.
     if (opts.mode === 'codex' && ptyProc.pid) {
-      registerCodexChild({ pid: ptyProc.pid, pgid: ptyProc.pid, kind: 'resume-pty' })
+      registerCodexChild({
+        pid: ptyProc.pid,
+        pgid: ptyProc.pid,
+        kind: 'resume-pty',
+        // R2-M1: ownership proof for the registry's dead-pid group-scan fallback —
+        // buildTerminalBaseEnv already put FRESHELL_TERMINAL_ID=<terminalId> into the pty env.
+        envMarker: { name: 'FRESHELL_TERMINAL_ID', value: terminalId },
+      })
     }
 
     const title = getModeLabel(opts.mode)
@@ -3733,7 +3729,13 @@ export class TerminalRegistry extends EventEmitter {
     // Stage 1a (plan §6): recovery ptys are codex resume ptys by construction; same registry
     // contract as the primary spawn site (deregistered in the onExit handler).
     if (ptyProc.pid) {
-      registerCodexChild({ pid: ptyProc.pid, pgid: ptyProc.pid, kind: 'resume-pty' })
+      registerCodexChild({
+        pid: ptyProc.pid,
+        pgid: ptyProc.pid,
+        kind: 'resume-pty',
+        // R2-M1: same ownership proof as the primary spawn site (buildTerminalBaseEnv env).
+        envMarker: { name: 'FRESHELL_TERMINAL_ID', value: record.terminalId },
+      })
     }
     const candidate = { pty: ptyProc, mcpCwd, exited: false, exitCode: undefined as number | undefined }
     this.attachCodexRecoveryPtyHandlers(record, ptyProc, candidate)

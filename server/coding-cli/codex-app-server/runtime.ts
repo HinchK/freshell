@@ -208,7 +208,12 @@ export type ReapOrphanedSidecarsResult = {
 export type CodexReaperRetryState = {
   firstSeen: string
   attempts: number
-  lastAttempt: string
+  /**
+   * Absent for records that were only ever DEFERRED for budget (R2-M2: a deferral is not an
+   * attempt). A state without lastAttempt always tests as due, so the hourly unbudgeted tick
+   * picks deferred records up immediately.
+   */
+  lastAttempt?: string
 }
 
 const DEFAULT_STARTUP_ATTEMPT_LIMIT = 2
@@ -838,6 +843,8 @@ function parseMetadataRecord(raw: string, metadataPath: string): ParsedMetadataR
 const QUARANTINE_DIR_NAME = 'quarantine'
 const REAPER_RETRY_SIDECAR_SUFFIX = '.reaper.json'
 const QUARANTINE_NOTE_SUFFIX = '.note.json'
+/** r2-8: anchored match for atomicWriteJson's tmp naming -- `<file>.tmp-<pid>-<timestamp>`. */
+const ATOMIC_TMP_FILE_PATTERN = /\.tmp-\d+-\d+$/
 const HOUR_MS = 60 * 60 * 1000
 /**
  * Retry logging escalates from info to warn once a record has been PENDING this long (wall-time,
@@ -870,6 +877,8 @@ export function codexReaperRetryIntervalMs(pendingAgeMs: number): number {
 }
 
 export function isCodexReaperRetryDue(state: CodexReaperRetryState, nowMs: number = Date.now()): boolean {
+  // R2-M2: no lastAttempt means the record was deferred without ever being attempted -- always due.
+  if (state.lastAttempt === undefined) return true
   const firstSeenMs = Date.parse(state.firstSeen)
   const lastAttemptMs = Date.parse(state.lastAttempt)
   if (!Number.isFinite(firstSeenMs) || !Number.isFinite(lastAttemptMs)) return true
@@ -891,7 +900,7 @@ function isCodexReaperRetryState(value: unknown): value is CodexReaperRetryState
   const candidate = value as Partial<CodexReaperRetryState>
   return typeof candidate.firstSeen === 'string'
     && isNonNegativeInteger(candidate.attempts)
-    && typeof candidate.lastAttempt === 'string'
+    && (candidate.lastAttempt === undefined || typeof candidate.lastAttempt === 'string')
 }
 
 async function readCodexReaperRetryStateFile(sidecarPath: string): Promise<CodexReaperRetryState | null> {
@@ -924,9 +933,45 @@ async function recordCodexReaperRetryAttempt(metadataPath: string): Promise<Code
   try {
     await atomicWriteJson(sidecarPath, state)
   } catch (error) {
-    // Concurrent boots can race this write (rename-ENOENT = the other instance won). Backoff state
-    // is advisory; losing a write must never abort record processing.
-    logger.debug({ sidecarPath, err: error }, 'Codex startup reaper could not persist retry backoff state')
+    logReaperSidecarWriteFailure(sidecarPath, error)
+  }
+  return state
+}
+
+// r2-9: a PERSISTENTLY unwritable sidecar (e.g. a perms-skewed shared metadata dir) must be
+// visible, not debug-only -- but concurrent boots legitimately race this write (rename-ENOENT =
+// the other instance won) and restart storms must not spam. Warn once per sidecar path per
+// process, then drop to debug. Backoff state stays advisory: losing a write never aborts record
+// processing.
+const warnedReaperSidecarWritePaths = new Set<string>()
+
+function logReaperSidecarWriteFailure(sidecarPath: string, error: unknown): void {
+  if (warnedReaperSidecarWritePaths.has(sidecarPath)) {
+    logger.debug({ sidecarPath, err: error }, 'Codex reaper could not persist retry backoff state')
+    return
+  }
+  warnedReaperSidecarWritePaths.add(sidecarPath)
+  logger.warn({ sidecarPath, err: error }, 'Codex reaper could not persist retry backoff state')
+}
+
+// R2-M2: budget deferral must NOT consume the record's retry budget. Under a tsx-watch restart
+// cadence, counting deferrals as attempts advances lastAttempt on every boot, so tail records
+// would never test as "due" for the hourly UNBUDGETED tick -- permanent teardown starvation. This
+// only guarantees a sidecar exists (firstSeen anchors log escalation and future backoff); it
+// never creates or advances attempts/lastAttempt, so isCodexReaperRetryDue stays true.
+async function recordCodexReaperDeferral(metadataPath: string): Promise<CodexReaperRetryState> {
+  const sidecarPath = reaperRetrySidecarPath(metadataPath)
+  const existing = await readCodexReaperRetryStateFile(sidecarPath)
+  if (existing) return existing // preserve attempts and lastAttempt exactly as they were
+  const recordStat = await fsp.stat(metadataPath).catch(() => null)
+  const state: CodexReaperRetryState = {
+    firstSeen: recordStat ? recordStat.mtime.toISOString() : new Date().toISOString(),
+    attempts: 0,
+  }
+  try {
+    await atomicWriteJson(sidecarPath, state)
+  } catch (error) {
+    logReaperSidecarWriteFailure(sidecarPath, error)
   }
   return state
 }
@@ -985,8 +1030,13 @@ async function quarantineCodexOwnershipRecord(
     await fsp.rename(metadataPath, quarantinePath)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      // A concurrent boot handled the record first; drop the note we pre-wrote for it.
-      await fsp.unlink(`${quarantinePath}${QUARANTINE_NOTE_SUFFIX}`).catch(() => undefined)
+      // A concurrent boot handled the record first. r2-7: if the WINNER's rename landed at the
+      // quarantine path, the note there now describes the winner's record -- only unlink the note
+      // we pre-wrote when NO record sits at the quarantine path.
+      const winnerRecordPresent = await fsp.stat(quarantinePath).then(() => true, () => false)
+      if (!winnerRecordPresent) {
+        await fsp.unlink(`${quarantinePath}${QUARANTINE_NOTE_SUFFIX}`).catch(() => undefined)
+      }
       return null
     }
     throw error
@@ -995,6 +1045,27 @@ async function quarantineCodexOwnershipRecord(
   await fsp.unlink(reaperRetrySidecarPath(metadataPath)).catch(() => undefined)
   logger.warn({ metadataPath, quarantinePath, reason }, 'Codex startup reaper quarantined an ownership record')
   return quarantinePath
+}
+
+// r2-8: best-effort purge of atomic-write tmp files stranded by a crash mid-write; anything older
+// than an hour can never be renamed into place by its (dead) writer. Never throws.
+async function purgeStaleAtomicTmpFiles(dir: string): Promise<void> {
+  let entries: string[]
+  try {
+    entries = await fsp.readdir(dir)
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    if (!ATOMIC_TMP_FILE_PATTERN.test(entry)) continue
+    try {
+      const tmpPath = path.join(dir, entry)
+      const tmpStat = await fsp.stat(tmpPath)
+      if (Date.now() - tmpStat.mtimeMs >= HOUR_MS) await fsp.unlink(tmpPath)
+    } catch {
+      // best-effort cleanup only
+    }
+  }
 }
 
 // Safety net (second-review blocking #2): a quarantined record must never hide a live DB holder.
@@ -1078,16 +1149,35 @@ export async function hasDueCodexReaperRetries(metadataDir?: string, nowMs: numb
   }
   let due = false
   for (const entry of entries) {
-    if (!entry.endsWith(REAPER_RETRY_SIDECAR_SUFFIX)) continue
-    const sidecarPath = path.join(dir, entry)
-    const recordPath = sidecarPath.slice(0, -REAPER_RETRY_SIDECAR_SUFFIX.length)
-    const recordExists = await fsp.stat(recordPath).then(() => true, () => false)
-    if (!recordExists) {
-      await fsp.unlink(sidecarPath).catch(() => undefined)
+    if (entry.endsWith(REAPER_RETRY_SIDECAR_SUFFIX)) {
+      const sidecarPath = path.join(dir, entry)
+      const recordPath = sidecarPath.slice(0, -REAPER_RETRY_SIDECAR_SUFFIX.length)
+      const recordExists = await fsp.stat(recordPath).then(() => true, () => false)
+      if (!recordExists) {
+        await fsp.unlink(sidecarPath).catch(() => undefined)
+        continue
+      }
+      const state = await readCodexReaperRetryStateFile(sidecarPath)
+      if (!state || isCodexReaperRetryDue(state, nowMs)) due = true
       continue
     }
-    const state = await readCodexReaperRetryStateFile(sidecarPath)
-    if (!state || isCodexReaperRetryDue(state, nowMs)) due = true
+    // r2-6: a record orphaned AFTER boot has no backoff sidecar yet -- without this branch the
+    // hourly tick early-returns forever while the orphan sits there. Any plain .json ownership
+    // record whose ownerServerPid is not provably alive needs a reaper pass (which will tear it
+    // down or write backoff state). Cheap: one read + parse + signal-0 probe per such record.
+    if (!entry.endsWith('.json') || ATOMIC_TMP_FILE_PATTERN.test(entry)) continue
+    const recordPath = path.join(dir, entry)
+    const sidecarExists = await fsp.stat(reaperRetrySidecarPath(recordPath)).then(() => true, () => false)
+    if (sidecarExists) continue // due-ness governed by its sidecar, handled above
+    try {
+      const parsed: unknown = JSON.parse(await fsp.readFile(recordPath, 'utf8'))
+      const ownerServerPid = (parsed as { ownerServerPid?: unknown } | null)?.ownerServerPid
+      if (isPositiveInteger(ownerServerPid) && (await isPidAlive(ownerServerPid))) continue
+      due = true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue // unlinked mid-scan
+      due = true // unreadable/unparseable: the reaper owns the decision (retry or quarantine)
+    }
   }
   return due
 }
@@ -1108,7 +1198,10 @@ export async function reapOrphanedCodexAppServerSidecars(
     promotedFromQuarantine: [],
     reapingSkipped: false,
   }
-  const nowFn = options.nowFn ?? Date.now
+  // r2-5: the teardown budget measures ELAPSED time -- default to the monotonic clock so a
+  // wall-clock step (NTP, suspend/resume) cannot spuriously exhaust or extend the budget. An
+  // injected nowFn (tests) is used consistently for both the pass start and every check.
+  const nowFn = options.nowFn ?? (() => performance.now())
   const passStartedAt = nowFn()
 
   // Safety net first: promote quarantined records whose process group is still alive so this same
@@ -1119,6 +1212,10 @@ export async function reapOrphanedCodexAppServerSidecars(
   } catch (error) {
     logger.warn({ metadataDir, err: error }, 'Codex startup reaper quarantine rescan failed; continuing')
   }
+
+  // r2-8: stranded atomic-write tmp files land in quarantine/ too (notes and quarantined records
+  // are written atomically); sweep it with the same age gate the main-dir loop applies below.
+  await purgeStaleAtomicTmpFiles(quarantineDirPath(metadataDir))
 
   let procOwnershipProofChecked = false
   const ensureProcOwnershipProof = async () => {
@@ -1145,7 +1242,7 @@ export async function reapOrphanedCodexAppServerSidecars(
   for (const entry of entries) {
     // m9: purge atomic-write tmp files stranded by a crash mid-write; anything older than an hour
     // can never be renamed into place by its (dead) writer. Best-effort, never fatal.
-    if (entry.includes('.tmp-')) {
+    if (ATOMIC_TMP_FILE_PATTERN.test(entry)) {
       try {
         const tmpPath = path.join(metadataDir, entry)
         const tmpStat = await fsp.stat(tmpPath)
@@ -1262,7 +1359,9 @@ export async function reapOrphanedCodexAppServerSidecars(
       // the remaining records. They keep retry state (so they surface in the boot summary and the
       // hourly tick re-attempts them) and are marked deferred — never dropped.
       if (options.teardownBudgetMs !== undefined && nowFn() - passStartedAt > options.teardownBudgetMs) {
-        const state = await recordCodexReaperRetryAttempt(metadataPath)
+        // R2-M2: a deferral is not an attempt -- recordCodexReaperDeferral never bumps attempts
+        // nor advances lastAttempt, so the record stays due for the hourly unbudgeted tick.
+        const state = await recordCodexReaperDeferral(metadataPath)
         logCodexReaperRetry(
           {
             ownershipId: metadata.ownershipId,
@@ -1739,7 +1838,14 @@ export class CodexAppServerRuntime {
       // `detached: true`) for exit-time reaping. Deregistered only on CONFIRMED group death in
       // teardownOwnedProcessGroup — NOT at wrapper exit, which can leave live grandchildren.
       if (child.pid) {
-        registerCodexChild({ pid: child.pid, pgid: child.pid, kind: 'app-server' })
+        registerCodexChild({
+          pid: child.pid,
+          pgid: child.pid,
+          kind: 'app-server',
+          // R2-M1: ownership proof for the registry's dead-pid group-scan fallback -- the spawn
+          // env above injects FRESHELL_CODEX_SIDECAR_ID=<ownershipId> into the whole group.
+          envMarker: { name: 'FRESHELL_CODEX_SIDECAR_ID', value: ownershipId },
+        })
       }
 
       // Drain child stdio continuously so verbose app-server or MCP startup logs

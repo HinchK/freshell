@@ -3,6 +3,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { logger } from '../logger.js'
+import { cmdlineHasCodexToken, probeRegisteredResumePtyGroups } from './codex-child-registry.js'
 import {
   countCodexQuarantinedRecords,
   hasDueCodexReaperRetries,
@@ -129,7 +130,9 @@ export async function countCodexLogDbHolders(
       } catch {
         continue
       }
-      if (!cmdline.includes('codex')) continue
+      // r2-2: same argv-token predicate as the exit-path registry — a path merely containing
+      // "codex" (worktree names, notes files) must not count as a holder.
+      if (!cmdlineHasCodexToken(cmdline)) continue
       const fdDir = path.join(procRoot, pid, 'fd')
       let fds: string[]
       try {
@@ -207,6 +210,14 @@ export async function emitCodexLogDbStatus(
 // ownership-gated reaper, which may signal provably-owned process groups.
 export async function runCodexReaperMaintenanceTick(options: CodexReaperMaintenanceOptions): Promise<void> {
   const log = options.log ?? defaultLog
+  try {
+    // r2-11: steady-state drain of stale resume-pty registry entries (signal-0 probe only; never
+    // signals). onExit-time deregistration keeps an entry when its group still had members or the
+    // probe was inconclusive — if those members die later no event fires, so re-probe hourly here.
+    probeRegisteredResumePtyGroups()
+  } catch {
+    // best-effort; the registry probe must never block the maintenance tick
+  }
   try {
     const { promotedRecords } = await rescanCodexReaperQuarantine(options.metadataDir)
     const due = await hasDueCodexReaperRetries(options.metadataDir)

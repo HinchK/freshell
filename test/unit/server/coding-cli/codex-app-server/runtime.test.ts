@@ -1456,6 +1456,8 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     }
     expect(isCodexReaperRetryDue(state, now)).toBe(false)
     expect(isCodexReaperRetryDue({ ...state, lastAttempt: new Date(now - HOUR).toISOString() }, now)).toBe(true)
+    // R2-M2: a deferral-only sidecar carries no lastAttempt and is ALWAYS due.
+    expect(isCodexReaperRetryDue({ firstSeen: state.firstSeen, attempts: 0 }, now)).toBe(true)
   })
 
   it('escalates retry logging on wall-time pending age, not attempt count (M4)', () => {
@@ -1496,6 +1498,13 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     await writeOrphanRecord('a.json', 'budget-a')
     await writeOrphanRecord('b.json', 'budget-b')
     await writeOrphanRecord('c.json', 'budget-c')
+    // c already has REAL attempt history: a deferral must preserve it untouched (R2-M2).
+    const preservedState = {
+      firstSeen: new Date(Date.now() - 60_000).toISOString(),
+      attempts: 3,
+      lastAttempt: new Date(Date.now() - 30_000).toISOString(),
+    }
+    await fsp.writeFile(path.join(metadataDir, 'c.json.reaper.json'), JSON.stringify(preservedState), { mode: 0o600 })
 
     // Fake clock simulating a slow teardown: the pass starts at 0; the first record's budget check
     // sees 0ms elapsed (attempted), the second sees 4s (over the 3s budget), the third 8s.
@@ -1517,25 +1526,44 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     expect(result.deferredForBudget).toEqual(['budget-b', 'budget-c'])
     for (const name of ['b.json', 'c.json']) {
       await expect(fsp.stat(path.join(metadataDir, name))).resolves.toBeDefined()
-      const state = JSON.parse(await fsp.readFile(path.join(metadataDir, `${name}.reaper.json`), 'utf8'))
-      expect(state.attempts).toBe(1)
     }
+    // R2-M2: a deferral is NOT an attempt. b's freshly-created sidecar has attempts=0 and no
+    // lastAttempt, so the record remains immediately due for the hourly unbudgeted tick.
+    const deferredState = JSON.parse(await fsp.readFile(path.join(metadataDir, 'b.json.reaper.json'), 'utf8'))
+    expect(deferredState.attempts).toBe(0)
+    expect(deferredState.lastAttempt).toBeUndefined()
+    expect(isCodexReaperRetryDue(deferredState)).toBe(true)
+    // R2-M2: c's pre-existing sidecar is preserved exactly (no bump, no advance).
+    const preservedAfter = JSON.parse(await fsp.readFile(path.join(metadataDir, 'c.json.reaper.json'), 'utf8'))
+    expect(preservedAfter).toEqual(preservedState)
     await expect(fsp.stat(path.join(metadataDir, 'a.json'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('purges stranded atomic-write tmp files older than an hour (m9)', async () => {
+  it('purges stranded atomic-write tmp files older than an hour in the main dir AND quarantine/ (m9, r2-8)', async () => {
     const metadataDir = await makeTempDir()
+    const quarantineDir = path.join(metadataDir, 'quarantine')
+    await fsp.mkdir(quarantineDir, { recursive: true })
     const stalePath = path.join(metadataDir, 'dead.json.tmp-1234-5678')
     const freshPath = path.join(metadataDir, 'live.json.tmp-1234-9999')
+    // r2-8: '.tmp-' as a mere substring must NOT match — only atomicWriteJson's anchored
+    // `.tmp-<pid>-<timestamp>` suffix does.
+    const lookalikePath = path.join(metadataDir, 'note.tmp-draft')
+    const staleQuarantineTmp = path.join(quarantineDir, 'dead.json.note.json.tmp-1234-5678')
     await fsp.writeFile(stalePath, '{}')
     await fsp.writeFile(freshPath, '{}')
+    await fsp.writeFile(lookalikePath, '{}')
+    await fsp.writeFile(staleQuarantineTmp, '{}')
     const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000)
     await fsp.utimes(stalePath, twoHoursAgo, twoHoursAgo)
+    await fsp.utimes(lookalikePath, twoHoursAgo, twoHoursAgo)
+    await fsp.utimes(staleQuarantineTmp, twoHoursAgo, twoHoursAgo)
 
     await reapOrphanedCodexAppServerSidecars({ metadataDir, serverInstanceId: 'srv-current', terminateGraceMs: 1 })
 
     await expect(fsp.stat(stalePath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fsp.stat(staleQuarantineTmp)).rejects.toMatchObject({ code: 'ENOENT' })
     await expect(fsp.stat(freshPath)).resolves.toBeDefined()
+    await expect(fsp.stat(lookalikePath)).resolves.toBeDefined()
   })
 
   it('unlinks orphaned quarantine notes whose record file is absent (m3)', async () => {

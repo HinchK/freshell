@@ -5,11 +5,15 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { spawn } from 'node:child_process'
 import {
+  cmdlineHasCodexToken,
   createCodexChildRegistry,
+  deregisterCodexChild,
   snapshotCodexChildren,
   type CodexChildEntry,
   type CodexChildProcessLike,
+  type CodexGroupProbeResult,
 } from '../../../../server/coding-cli/codex-child-registry.js'
 import { CodexAppServerRuntime } from '../../../../server/coding-cli/codex-app-server/runtime.js'
 
@@ -50,6 +54,7 @@ function makeHarness(overrides: {
   ownPgid?: number | 'unreadable'
   procPid?: number
   files?: Record<string, string>
+  probeGroupSync?: (pgid: number) => CodexGroupProbeResult
 } = {}) {
   const procPid = overrides.procPid ?? 7_777
   const files = new Map<string, string>(Object.entries(overrides.files ?? {}))
@@ -85,6 +90,7 @@ function makeHarness(overrides: {
     readFileSync,
     readdirSync,
     killSync,
+    ...(overrides.probeGroupSync ? { probeGroupSync: overrides.probeGroupSync } : {}),
     proc,
     log,
   })
@@ -94,6 +100,11 @@ function makeHarness(overrides: {
 function entry(pid: number, kind: CodexChildEntry['kind'] = 'app-server', pgid = pid): CodexChildEntry {
   return { pid, pgid, kind }
 }
+
+// R2-M1 fixtures: the env-marker ownership proof recorded at registration and the exact
+// NAME=VALUE line the group scan must find in a member's /proc environ.
+const MARKER = { name: 'FRESHELL_TERMINAL_ID', value: 'term-1' }
+const MARKER_ENV = 'FRESHELL_TERMINAL_ID=term-1'
 
 describe('codex child registry', () => {
   describe('registration lifecycle', () => {
@@ -121,6 +132,17 @@ describe('codex child registry', () => {
 
       expect(registry.snapshot()).toEqual([
         { pid: 100, pgid: 100, kind: 'app-server', startTimeTicks: 777 },
+        { pid: 200, pgid: 200, kind: 'resume-pty' },
+      ])
+    })
+
+    it('records the env-marker ownership proof and drops malformed markers (R2-M1)', () => {
+      const { registry } = makeHarness()
+      registry.register({ ...entry(100), envMarker: MARKER })
+      registry.register({ ...entry(200, 'resume-pty'), envMarker: { name: '', value: 'x' } })
+
+      expect(registry.snapshot()).toEqual([
+        { pid: 100, pgid: 100, kind: 'app-server', envMarker: MARKER },
         { pid: 200, pgid: 200, kind: 'resume-pty' },
       ])
     })
@@ -176,13 +198,91 @@ describe('codex child registry', () => {
       expect(kills).toHaveLength(1)
     })
 
-    it('kills the group when the registered pid is dead but a live codex member remains (M1b)', () => {
+    it('kills the group when the registered pid is dead and a member carries the env marker (M1b + R2-M1)', () => {
       const { registry, kills, files } = makeHarness()
       // The registered wrapper (pid 200) is gone from /proc, but grandchild 250 still lives in
-      // pgid 200 and is provably codex — this is the D-state-holder case the registry exists for.
+      // pgid 200, looks like codex, AND provably carries the marker this registration injected at
+      // spawn — this is the D-state-holder case the registry exists for.
       files.set('/proc/250/stat', statLine(250, 200, 55))
       files.set('/proc/250/cmdline', '/usr/local/bin/codex\0app-server\0')
-      registry.register(entry(200, 'app-server'))
+      files.set('/proc/250/environ', `HOME=/root\0${MARKER_ENV}\0`)
+      registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
+
+      registry.reapSync()
+
+      expect(kills).toEqual([{ pid: -200, signal: 'SIGKILL' }])
+    })
+
+    it('never group-kills when no env marker was recorded, even with a codex member present (R2-M1)', () => {
+      const { registry, kills, files } = makeHarness()
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', '/usr/local/bin/codex\0app-server\0')
+      files.set('/proc/250/environ', `${MARKER_ENV}\0`)
+      registry.register(entry(200, 'app-server')) // no envMarker: no ownership proof exists
+
+      registry.reapSync()
+
+      expect(kills).toEqual([])
+    })
+
+    it('never group-kills when the codex member lacks the exact marker (R2-M1)', () => {
+      const { registry, kills, files } = makeHarness()
+      // pgid recycled: the member is a REAL codex process, but it belongs to someone else (e.g.
+      // the other server instance's live pane) — its environ carries a different marker value.
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', '/usr/local/bin/codex\0resume\0')
+      files.set('/proc/250/environ', 'FRESHELL_TERMINAL_ID=someone-else\0')
+      registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
+
+      registry.reapSync()
+
+      expect(kills).toEqual([])
+    })
+
+    it('never group-kills when the member environ is unreadable (R2-M1 fail-closed)', () => {
+      const { registry, kills, files } = makeHarness()
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', '/usr/local/bin/codex\0')
+      // no /proc/250/environ entry: the read throws (EACCES/ENOENT equivalent)
+      registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
+
+      registry.reapSync()
+
+      expect(kills).toEqual([])
+    })
+
+    it('never group-kills when the marker sits past the 4096-byte environ bound (r2-3 fail-closed)', () => {
+      const { registry, kills, files } = makeHarness()
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', '/usr/local/bin/codex\0')
+      files.set('/proc/250/environ', `FILLER=${'A'.repeat(5000)}\0${MARKER_ENV}\0`)
+      registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
+
+      registry.reapSync()
+
+      expect(kills).toEqual([])
+    })
+
+    it('group-kills when the marker is within the 4096-byte bound of a large environ (r2-3)', () => {
+      const { registry, kills, files } = makeHarness()
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', '/usr/local/bin/codex\0')
+      files.set('/proc/250/environ', `${MARKER_ENV}\0FILLER=${'A'.repeat(8000)}\0`)
+      registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
+
+      registry.reapSync()
+
+      expect(kills).toEqual([{ pid: -200, signal: 'SIGKILL' }])
+    })
+
+    it('routes zombie wrappers (empty cmdline) through the ownership-gated group scan (R2-M1)', () => {
+      const { registry, kills, files } = makeHarness()
+      files.set('/proc/200/stat', statLine(200, 200, 44))
+      registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
+      files.set('/proc/200/cmdline', '') // zombie: stat readable, cmdline empty
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', '/usr/local/bin/codex\0')
+      files.set('/proc/250/environ', `${MARKER_ENV}\0`)
 
       registry.reapSync()
 
@@ -193,7 +293,10 @@ describe('codex child registry', () => {
       const { registry, kills, files } = makeHarness()
       files.set('/proc/250/stat', statLine(250, 200, 55))
       files.set('/proc/250/cmdline', '/bin/bash\0')
-      registry.register(entry(200, 'app-server'))
+      // Even a (nonsensical) matching marker cannot rescue a non-codex member: the cmdline
+      // prefilter rejects it before the environ is consulted.
+      files.set('/proc/250/environ', `${MARKER_ENV}\0`)
+      registry.register({ ...entry(200, 'app-server'), envMarker: MARKER })
 
       registry.reapSync()
 
@@ -235,17 +338,51 @@ describe('codex child registry', () => {
       expect(kills).toEqual([])
     })
 
-    it('verifies pgrp+cmdline when no starttime was recorded at registration (fallback pin)', () => {
+    it('does not trust the live-pid path without a starttime pin: pgrp+cmdline alone never kill (r2-1)', () => {
       const { registry, kills, files } = makeHarness()
       // No stat available at register time (startTimeTicks undefined)...
-      registry.register(entry(100))
-      // ...but readable at reap time: pgrp matches and cmdline is codex, so the kill proceeds.
+      registry.register({ ...entry(100), envMarker: MARKER })
+      // ...readable at reap time with a codex cmdline — but the pin is missing, so the entry
+      // routes to the ownership-gated group scan, and no member carries the marker.
       files.set('/proc/100/stat', statLine(100, 100, 11))
       files.set('/proc/100/cmdline', 'codex\0')
 
       registry.reapSync()
 
+      expect(kills).toEqual([])
+    })
+
+    it('kills via the group scan when an unpinned live pid provably carries the marker (r2-1 + R2-M1)', () => {
+      const { registry, kills, files } = makeHarness()
+      registry.register({ ...entry(100), envMarker: MARKER })
+      files.set('/proc/100/stat', statLine(100, 100, 11))
+      files.set('/proc/100/cmdline', 'codex\0')
+      files.set('/proc/100/environ', `${MARKER_ENV}\0`)
+
+      registry.reapSync()
+
       expect(kills).toEqual([{ pid: -100, signal: 'SIGKILL' }])
+    })
+
+    it('builds the /proc group index once per pass across dead-pid entries (r2-4)', () => {
+      const { registry, kills, readdirSync, files } = makeHarness()
+      files.set('/proc/250/stat', statLine(250, 200, 55))
+      files.set('/proc/250/cmdline', 'codex\0')
+      files.set('/proc/250/environ', `${MARKER_ENV}\0`)
+      files.set('/proc/350/stat', statLine(350, 300, 66))
+      files.set('/proc/350/cmdline', 'codex\0')
+      files.set('/proc/350/environ', `${MARKER_ENV}\0`)
+      registry.register({ ...entry(200), envMarker: MARKER })
+      registry.register({ ...entry(300), envMarker: MARKER })
+
+      registry.reapSync()
+
+      expect(kills).toEqual([
+        { pid: -200, signal: 'SIGKILL' },
+        { pid: -300, signal: 'SIGKILL' },
+      ])
+      // One readdir for the whole pass, not one per dead-pid entry.
+      expect(readdirSync).toHaveBeenCalledTimes(1)
     })
 
     it('never signals our own process group or our own pid group', () => {
@@ -333,6 +470,87 @@ describe('codex child registry', () => {
     })
   })
 
+  describe('cmdlineHasCodexToken (r2-2)', () => {
+    it('accepts codex argv tokens by basename (plain binary, absolute path, node wrapper)', () => {
+      expect(cmdlineHasCodexToken('codex\0')).toBe(true)
+      expect(cmdlineHasCodexToken('/usr/bin/codex\0resume\0abc\0')).toBe(true)
+      expect(cmdlineHasCodexToken('node\0/x/bin/codex\0app-server\0')).toBe(true)
+    })
+
+    it('rejects substring and path-only matches', () => {
+      expect(cmdlineHasCodexToken('vim\0codex-notes.md\0')).toBe(false)
+      expect(cmdlineHasCodexToken('/home/dan/.worktrees/codex-launch-leak-plan/server/index.ts\0')).toBe(false)
+      expect(cmdlineHasCodexToken('/usr/bin/codex-tui\0')).toBe(false)
+      expect(cmdlineHasCodexToken('bash\0-c\0echo codex\0')).toBe(false)
+      expect(cmdlineHasCodexToken('')).toBe(false)
+    })
+  })
+
+  describe('deregisterIfGroupGone (m8, r2-13b)', () => {
+    it('keeps the entry on alive/unknown probes and deregisters only on a confirmed-gone group', () => {
+      const probeGroupSync = vi.fn((_pgid: number): CodexGroupProbeResult => 'alive')
+      const { registry } = makeHarness({ probeGroupSync })
+      registry.register(entry(100, 'resume-pty'))
+
+      expect(registry.deregisterIfGroupGone(100)).toBe(false) // alive: keep
+      expect(registry.snapshot()).toHaveLength(1)
+
+      probeGroupSync.mockReturnValueOnce('unknown') // e.g. EPERM: cannot confirm, keep
+      expect(registry.deregisterIfGroupGone(100)).toBe(false)
+      expect(registry.snapshot()).toHaveLength(1)
+
+      probeGroupSync.mockReturnValueOnce('gone')
+      expect(registry.deregisterIfGroupGone(100)).toBe(true)
+      expect(registry.snapshot()).toEqual([])
+      expect(probeGroupSync).toHaveBeenCalledWith(100)
+    })
+
+    it('deregisters unconditionally off Linux (no probe semantics there)', () => {
+      const probeGroupSync = vi.fn((_pgid: number): CodexGroupProbeResult => 'alive')
+      const { registry } = makeHarness({ platform: 'win32', probeGroupSync })
+      registry.register(entry(100, 'resume-pty'))
+
+      expect(registry.deregisterIfGroupGone(100)).toBe(true)
+      expect(probeGroupSync).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('probeResumePtyGroups (r2-11)', () => {
+    it('drains confirmed-gone resume-pty groups; never probes app-server entries', () => {
+      const gone = new Set([200])
+      const probeGroupSync = vi.fn((pgid: number): CodexGroupProbeResult => (gone.has(pgid) ? 'gone' : 'alive'))
+      const { registry } = makeHarness({ probeGroupSync })
+      registry.register(entry(100, 'resume-pty')) // alive -> kept
+      registry.register(entry(200, 'resume-pty')) // gone -> drained
+      registry.register(entry(300, 'app-server')) // app-server: owned by teardown, never probed
+
+      expect(registry.probeResumePtyGroups()).toBe(1)
+
+      expect(registry.snapshot().map((child) => child.pid)).toEqual([100, 300])
+      expect(probeGroupSync).toHaveBeenCalledTimes(2)
+      expect(probeGroupSync).not.toHaveBeenCalledWith(300)
+    })
+
+    it('keeps entries whose probe is inconclusive (unknown/EPERM)', () => {
+      const probeGroupSync = vi.fn((_pgid: number): CodexGroupProbeResult => 'unknown')
+      const { registry } = makeHarness({ probeGroupSync })
+      registry.register(entry(200, 'resume-pty'))
+
+      expect(registry.probeResumePtyGroups()).toBe(0)
+      expect(registry.snapshot()).toHaveLength(1)
+    })
+
+    it('is a no-op off Linux', () => {
+      const probeGroupSync = vi.fn((_pgid: number): CodexGroupProbeResult => 'gone')
+      const { registry } = makeHarness({ platform: 'darwin', probeGroupSync })
+      registry.register(entry(200, 'resume-pty'))
+
+      expect(registry.probeResumePtyGroups()).toBe(0)
+      expect(registry.snapshot()).toHaveLength(1)
+      expect(probeGroupSync).not.toHaveBeenCalled()
+    })
+  })
+
   describe('structural I3 assertion (plan §6 acceptance #2)', () => {
     const source = fs.readFileSync(REGISTRY_SOURCE_PATH, 'utf8')
 
@@ -340,7 +558,10 @@ describe('codex child registry', () => {
       // Exactly one negative-pid kill in the module, and it lives inside killProcessGroupSync.
       const negativeKills = source.match(/killSync\(\s*-/g) ?? []
       expect(negativeKills).toHaveLength(1)
-      expect(source.match(/process\.kill\(\s*-/g)).toBeNull()
+      // The ONLY other negative-pid syscall is the signal-0 liveness probe (r2-11/m8), which by
+      // definition delivers nothing — every process.kill(-...) in the module must pass signal 0.
+      const negativeProcessKills = source.match(/process\.kill\(\s*-[^)]*\)/g) ?? []
+      expect(negativeProcessKills).toEqual(['process.kill(-pgid, 0)'])
 
       const primitiveBody = source.slice(
         source.indexOf('function killProcessGroupSync'),
@@ -400,7 +621,9 @@ describe('codex child registry', () => {
   describe('wiring (source-level)', () => {
     it('runtime.ts registers at spawn and deregisters only on confirmed group death', () => {
       const runtimeSource = fs.readFileSync(path.join(SERVER_DIR, 'coding-cli', 'codex-app-server', 'runtime.ts'), 'utf8')
-      expect(runtimeSource).toContain("registerCodexChild({ pid: child.pid, pgid: child.pid, kind: 'app-server' })")
+      expect(runtimeSource).toMatch(
+        /registerCodexChild\(\{\s*pid: child\.pid,\s*pgid: child\.pid,\s*kind: 'app-server',[\s\S]{0,400}?envMarker: \{ name: 'FRESHELL_CODEX_SIDECAR_ID', value: ownershipId \},\s*\}\)/,
+      )
       // Deregistration is gated on teardownOwnedProcessGroup's confirmed-death result…
       expect(runtimeSource).toContain('if (confirmedGone) deregisterCodexChild(ownership.metadata.wrapperPid)')
       // …and the wrapper-exit handler does NOT deregister (grandchildren can outlive the wrapper).
@@ -421,9 +644,15 @@ describe('codex child registry', () => {
     it('terminal-registry.ts registers codex ptys at both spawn sites and deregisters only on confirmed group death', () => {
       const registrySource = fs.readFileSync(path.join(SERVER_DIR, 'terminal-registry.ts'), 'utf8')
       const registrations = registrySource.match(
-        /registerCodexChild\(\{ pid: ptyProc\.pid, pgid: ptyProc\.pid, kind: 'resume-pty' \}\)/g,
+        /registerCodexChild\(\{\s*pid: ptyProc\.pid,\s*pgid: ptyProc\.pid,\s*kind: 'resume-pty',/g,
       ) ?? []
       expect(registrations).toHaveLength(2)
+      // R2-M1: both spawn sites record the FRESHELL_TERMINAL_ID env marker (already present in
+      // the pty env via buildTerminalBaseEnv) as the group-scan ownership proof.
+      const markers = registrySource.match(
+        /envMarker: \{ name: 'FRESHELL_TERMINAL_ID', value: (?:terminalId|record\.terminalId) \}/g,
+      ) ?? []
+      expect(markers).toHaveLength(2)
       // The primary spawn site registers codex panes only.
       expect(registrySource).toContain("if (opts.mode === 'codex' && ptyProc.pid) {")
       // Both spawn-site onExit handlers route through the liveness-probing deregister helper (m8),
@@ -433,8 +662,9 @@ describe('codex child registry', () => {
       expect(deregistrations).toHaveLength(2)
       expect(registrySource).toContain("if (opts.mode === 'codex') deregisterCodexPtyIfGroupGone(ptyProc.pid)")
       expect(registrySource).toContain("if (record.mode === 'codex') deregisterCodexPtyIfGroupGone(ptyProc.pid)")
-      // m8: the helper only deregisters when the group is confirmed gone (ESRCH probe) on Linux.
-      expect(registrySource).toContain('process.kill(-pid, 0)')
+      // m8/r2-13b: the helper (now homed in codex-child-registry.ts behind an injectable probe
+      // seam) only deregisters when the group is confirmed gone; terminal-registry imports it.
+      expect(registrySource).toContain('deregisterCodexChildIfGroupGone as deregisterCodexPtyIfGroupGone')
       const killBody = registrySource.slice(
         registrySource.indexOf('kill(terminalId: string'),
         registrySource.indexOf('private markCodexRecoveryFinalClose'),
@@ -449,7 +679,12 @@ describe('codex child registry', () => {
       expect(indexSource).toContain('hardExitTimer.unref()')
       // M6: slow-but-healthy shutdowns get their connections severed; the force-exit line is also
       // written synchronously (async pino may not flush before exit); the happy path clears the timer.
-      expect(indexSource).toContain('server.closeAllConnections?.()')
+      expect(indexSource).toContain('server.closeIdleConnections?.()')
+      // r2-10: in-flight HTTP responses get a 3s unref()'d grace before closeAllConnections severs
+      // them, cleared as soon as the server finishes closing on its own.
+      expect(indexSource).toMatch(/setTimeout\(\(\) => \{\s*server\.closeAllConnections\?\.\(\)\s*\}, 3_000\)/)
+      expect(indexSource).toContain('closeAllConnectionsTimer.unref()')
+      expect(indexSource).toContain('void httpServerClosed.then(() => clearTimeout(closeAllConnectionsTimer))')
       expect(indexSource).toContain('process.stderr.write(')
       expect(indexSource).toContain('clearTimeout(hardExitTimer)')
       expect(indexSource).toContain("forcing exit")
@@ -473,6 +708,51 @@ describeWithLinuxProc('codex child registry runtime integration', () => {
       tempDirs.delete(dir)
       await fsp.rm(dir, { recursive: true, force: true })
     }))
+  })
+
+  it('deregisters a spawn-failed no-ownership child on its exit (m1, r2-13a)', async () => {
+    const metadataDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-child-registry-'))
+    tempDirs.add(metadataDir)
+    const fakePid = 3_999_999
+    const child = Object.assign(new EventEmitter(), {
+      pid: fakePid,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      stdout: null,
+      stderr: null,
+      kill: vi.fn(() => true),
+    })
+    const runtime = new CodexAppServerRuntime({
+      metadataDir,
+      startupAttemptLimit: 1,
+      portAllocator: async () => ({ hostname: '127.0.0.1', port: 1 }),
+      // The owner-identity read fails BEFORE any ownership record exists, so ownership teardown
+      // (the usual deregistration point) will never run for this child.
+      processIdentityReader: async () => null,
+      spawnProcess: (() => child) as unknown as typeof spawn,
+    })
+    runtimes.add(runtime)
+
+    await expect(runtime.ensureReady()).rejects.toThrow(/owner identity could not be completely read/)
+
+    try {
+      // Registered at spawn (with the R2-M1 env marker), SIGTERM'd by stopActiveChild, and still
+      // registered while the child has not exited — kill() only sends a signal.
+      expect(snapshotCodexChildren()).toContainEqual(expect.objectContaining({
+        pid: fakePid,
+        pgid: fakePid,
+        kind: 'app-server',
+        envMarker: expect.objectContaining({ name: 'FRESHELL_CODEX_SIDECAR_ID' }),
+      }))
+      expect(child.kill).toHaveBeenCalledWith('SIGTERM')
+
+      child.exitCode = 0
+      child.emit('exit', 0, null)
+
+      expect(snapshotCodexChildren().some((c) => c.pid === fakePid)).toBe(false)
+    } finally {
+      deregisterCodexChild(fakePid)
+    }
   })
 
   it('registers the app-server group at spawn and deregisters on confirmed teardown', async () => {

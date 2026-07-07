@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { spawn } from 'node:child_process'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import {
+  deregisterCodexChild,
+  registerCodexChild,
+  snapshotCodexChildren,
+} from '../../../../server/coding-cli/codex-child-registry.js'
 import {
   CODEX_LOG_DB_WAL_WARN_BYTES,
   countCodexLogDbHolders,
@@ -247,9 +253,13 @@ describeWithLinuxProc('codex-observability monitor', () => {
       '501': { fds: [dbPath] }, // codex, holds the db -> counted
       '502': { fds: [dbPath], cmdline: '/usr/bin/some-other-daemon\0' }, // non-codex holder -> skipped
       '503': { fds: [dbPath], cmdline: null }, // unreadable cmdline -> skipped
+      // r2-2: 'codex' as a mere path substring is NOT a codex process -> skipped
+      '504': { fds: [dbPath], cmdline: '/usr/bin/vim\0/home/dan/code/codex-launch-leak-plan/notes.md\0' },
+      // r2-2: node-wrapper launch (argv token basename 'codex') -> counted
+      '505': { fds: [dbPath], cmdline: 'node\0/opt/tools/bin/codex\0app-server\0' },
     })
 
-    expect(await countCodexLogDbHolders(dbPath, procRoot)).toBe(1)
+    expect(await countCodexLogDbHolders(dbPath, procRoot)).toBe(2)
   })
 
   it('skips the server process itself in the holder scan (M3)', async () => {
@@ -331,6 +341,52 @@ describeWithLinuxProc('codex-observability reaper maintenance tick', () => {
     const stateAfter = JSON.parse(await fsp.readFile(`${freshPath}.reaper.json`, 'utf8'))
     expect(stateAfter.attempts).toBe(1)
     expect(stateAfter.lastAttempt).toBe(freshState.lastAttempt)
+  })
+
+  it('detects a sidecar-less orphan record and reaps it on the tick (r2-6)', async () => {
+    const metadataDir = await makeTempDir()
+    // Orphaned AFTER boot: no .reaper.json sidecar exists, owner pid is dead, group is gone.
+    const orphanPath = path.join(metadataDir, 'orphan.json')
+    await fsp.writeFile(orphanPath, JSON.stringify(buildValidOwnershipRecord({ ownershipId: 'obs-orphan' })), { mode: 0o600 })
+    // Control: a sidecar-less record whose owner is provably ALIVE must not be touched.
+    const livePath = path.join(metadataDir, 'live-owner.json')
+    await fsp.writeFile(livePath, JSON.stringify(buildValidOwnershipRecord({
+      ownershipId: 'obs-live-owner',
+      ownerServerPid: process.pid,
+    })), { mode: 0o600 })
+
+    await runCodexReaperMaintenanceTick({ serverInstanceId: 'srv-tick', metadataDir, terminateGraceMs: 1 })
+
+    await expect(fsp.stat(orphanPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fsp.stat(livePath)).resolves.toBeDefined()
+  })
+
+  it('drains stale resume-pty registry entries on the tick (r2-11)', async () => {
+    // A REAL exited detached child: its group is confirmed gone (ESRCH), so the tick must drain it.
+    const deadChild = spawn(process.execPath, ['-e', ''], { detached: true, stdio: 'ignore' })
+    const deadPid = deadChild.pid!
+    await new Promise<void>((resolve) => deadChild.once('exit', () => resolve()))
+    // A REAL live detached group leader: the probe reports alive, so the entry must be kept.
+    const liveChild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { detached: true, stdio: 'ignore' })
+    liveChild.unref()
+    const livePid = liveChild.pid!
+    registerCodexChild({ pid: deadPid, pgid: deadPid, kind: 'resume-pty' })
+    registerCodexChild({ pid: livePid, pgid: livePid, kind: 'resume-pty' })
+    try {
+      await runCodexReaperMaintenanceTick({ serverInstanceId: 'srv-tick', metadataDir: await makeTempDir(), terminateGraceMs: 1 })
+
+      const pids = snapshotCodexChildren().map((child) => child.pid)
+      expect(pids).not.toContain(deadPid)
+      expect(pids).toContain(livePid)
+    } finally {
+      deregisterCodexChild(deadPid)
+      deregisterCodexChild(livePid)
+      try {
+        process.kill(-livePid, 'SIGKILL')
+      } catch {
+        // already gone
+      }
+    }
   })
 
   it('never throws when the metadata dir is missing', async () => {

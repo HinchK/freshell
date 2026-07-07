@@ -1134,9 +1134,16 @@ async function main() {
       })
     })
     // M6: server.close() only stops NEW connections — keep-alive/in-flight sockets would otherwise
-    // hold httpServerClosed open toward the hard-exit budget. Sever them now (Node >=18.2 API,
-    // optional-chained defensively).
-    server.closeAllConnections?.()
+    // hold httpServerClosed open toward the hard-exit budget. r2-10: close idle keep-alive sockets
+    // immediately, but give in-flight HTTP responses a 3s grace before severing everything (WS
+    // panes were already severed by wsHandler.close() above). Node >=18.2 APIs, optional-chained
+    // defensively; the timer is unref()'d and cleared if the server finishes closing first.
+    server.closeIdleConnections?.()
+    const closeAllConnectionsTimer = setTimeout(() => {
+      server.closeAllConnections?.()
+    }, 3_000)
+    closeAllConnectionsTimer.unref()
+    void httpServerClosed.then(() => clearTimeout(closeAllConnectionsTimer))
 
     // 3. Stop any coalesced sessions publish timers
     sessionsSync.shutdown()
