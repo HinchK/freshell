@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from '../codex-managed-config.js'
+import { deregisterCodexChild, registerCodexChild } from '../codex-child-registry.js'
 import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../local-port.js'
 import { logger } from '../../logger.js'
 import { resolveLaunchCwd, type LaunchCwdConversion } from '../../launch-cwd.js'
@@ -173,7 +174,25 @@ export type ReapOrphanedSidecarsResult = {
   reapedOwnershipIds: string[]
   ignoredLegacyRecords: string[]
   skippedActiveOwnershipIds: string[]
+  /** Records that hit an unexpected per-record error; retained in place and retried next pass. */
   failedOwnershipIds: string[]
+  /** Record files that could not be read (permissions, torn write); retained in place. */
+  unreadableRecords: string[]
+  /** Records moved to `<metadataDir>/quarantine/` (unparseable, or malformed with no provable live group). */
+  quarantinedRecords: string[]
+  /** Records retried in place with backoff state in `<record>.reaper.json` (never quarantined). */
+  retriedOwnershipIds: string[]
+  /** Quarantined records promoted back into the metadata dir because their process group is alive. */
+  promotedFromQuarantine: string[]
+  /** True when reaping was skipped this pass (metadata dir unreadable or /proc proof unavailable). */
+  reapingSkipped: boolean
+}
+
+/** Backoff state persisted by the reaper (and only the reaper) in `<record>.reaper.json`. */
+export type CodexReaperRetryState = {
+  firstSeen: string
+  attempts: number
+  lastAttempt: string
 }
 
 const DEFAULT_STARTUP_ATTEMPT_LIMIT = 2
@@ -693,6 +712,19 @@ async function teardownOwnedProcessGroup(
   ownership: ActiveOwnership,
   terminateGraceMs: number,
 ): Promise<boolean> {
+  const confirmedGone = await teardownOwnedProcessGroupCore(ownership, terminateGraceMs)
+  // Stage 1a (plan §6): deregister ONLY on confirmed group death (`true` also covers a provably
+  // foreign/reused PGID, which means our child is gone — it must leave the registry so exit-time
+  // reap can never signal the reused group). Wrapper exit does NOT deregister: live grandchildren
+  // keep the group registered until teardown proves it gone.
+  if (confirmedGone) deregisterCodexChild(ownership.metadata.wrapperPid)
+  return confirmedGone
+}
+
+async function teardownOwnedProcessGroupCore(
+  ownership: ActiveOwnership,
+  terminateGraceMs: number,
+): Promise<boolean> {
   const { metadata } = ownership
 
   // Gate the SIGTERM on a FRESH ownership classification rather than mere liveness: a PGID that was
@@ -736,6 +768,7 @@ async function teardownOwnedProcessGroup(
 type ParsedMetadataRecord =
   | { kind: 'valid'; metadata: CodexSidecarOwnershipMetadata }
   | { kind: 'legacy' }
+  | { kind: 'unparseable' }
   | { kind: 'malformedNewSchema'; ownershipId: string }
 
 function isWrapperIdentity(value: unknown): value is WrapperIdentity {
@@ -760,9 +793,11 @@ function parseMetadataRecord(raw: string, metadataPath: string): ParsedMetadataR
   try {
     parsed = JSON.parse(raw)
   } catch {
-    return { kind: 'legacy' }
+    // Not JSON at all: corrupt/torn write. There is nothing to retry against (no process group can
+    // even be extracted), so the reaper quarantines it instead of deleting it as legacy.
+    return { kind: 'unparseable' }
   }
-  if (!parsed || typeof parsed !== 'object') return { kind: 'legacy' }
+  if (!parsed || typeof parsed !== 'object') return { kind: 'unparseable' }
   const candidate = parsed as Partial<CodexSidecarOwnershipMetadata>
   if (candidate.schemaVersion !== OWNERSHIP_SCHEMA_VERSION) return { kind: 'legacy' }
   const ownershipId = typeof candidate.ownershipId === 'string' ? candidate.ownershipId : metadataPath
@@ -784,6 +819,229 @@ function parseMetadataRecord(raw: string, metadataPath: string): ParsedMetadataR
   return { kind: 'valid', metadata: candidate as CodexSidecarOwnershipMetadata }
 }
 
+const QUARANTINE_DIR_NAME = 'quarantine'
+const REAPER_RETRY_SIDECAR_SUFFIX = '.reaper.json'
+const QUARANTINE_NOTE_SUFFIX = '.note.json'
+const HOUR_MS = 60 * 60 * 1000
+/** Retry logging escalates from info to warn once a record has been re-attempted this many times. */
+export const CODEX_REAPER_LOG_ESCALATION_ATTEMPTS = 3
+
+function reaperRetrySidecarPath(metadataPath: string): string {
+  return `${metadataPath}${REAPER_RETRY_SIDECAR_SUFFIX}`
+}
+
+function quarantineDirPath(metadataDir: string): string {
+  return path.join(metadataDir, QUARANTINE_DIR_NAME)
+}
+
+// Retry cadence is time-based, keyed on how long the record has been pending (firstSeen) — never on
+// attempt counts — so shared prod+dev metadata dirs and `tsx watch` restart storms cannot burn the
+// backoff budget. The per-boot reap attempt always runs; this only gates the hourly re-attempts.
+export function codexReaperRetryIntervalMs(pendingAgeMs: number): number {
+  if (pendingAgeMs < 6 * HOUR_MS) return HOUR_MS
+  if (pendingAgeMs < 24 * HOUR_MS) return 3 * HOUR_MS
+  return 6 * HOUR_MS
+}
+
+export function isCodexReaperRetryDue(state: CodexReaperRetryState, nowMs: number = Date.now()): boolean {
+  const firstSeenMs = Date.parse(state.firstSeen)
+  const lastAttemptMs = Date.parse(state.lastAttempt)
+  if (!Number.isFinite(firstSeenMs) || !Number.isFinite(lastAttemptMs)) return true
+  return nowMs - lastAttemptMs >= codexReaperRetryIntervalMs(nowMs - firstSeenMs)
+}
+
+function isCodexReaperRetryState(value: unknown): value is CodexReaperRetryState {
+  if (!value || typeof value !== 'object') return false
+  const candidate = value as Partial<CodexReaperRetryState>
+  return typeof candidate.firstSeen === 'string'
+    && isNonNegativeInteger(candidate.attempts)
+    && typeof candidate.lastAttempt === 'string'
+}
+
+async function readCodexReaperRetryStateFile(sidecarPath: string): Promise<CodexReaperRetryState | null> {
+  try {
+    const raw = await fsp.readFile(sidecarPath, 'utf8')
+    const parsed: unknown = JSON.parse(raw)
+    return isCodexReaperRetryState(parsed) ? parsed : null
+  } catch {
+    return null
+  }
+}
+
+// Written only by the reaper, so it cannot race the owning server's own record rewrites. `firstSeen`
+// falls back to the record's mtime so the time-based backoff has a stable anchor for records that
+// predate their sidecar.
+async function recordCodexReaperRetryAttempt(metadataPath: string): Promise<CodexReaperRetryState> {
+  const sidecarPath = reaperRetrySidecarPath(metadataPath)
+  const existing = await readCodexReaperRetryStateFile(sidecarPath)
+  const now = new Date().toISOString()
+  let firstSeen = existing?.firstSeen
+  if (firstSeen === undefined) {
+    const recordStat = await fsp.stat(metadataPath).catch(() => null)
+    firstSeen = recordStat ? recordStat.mtime.toISOString() : now
+  }
+  const state: CodexReaperRetryState = {
+    firstSeen,
+    attempts: (existing?.attempts ?? 0) + 1,
+    lastAttempt: now,
+  }
+  try {
+    await atomicWriteJson(sidecarPath, state)
+  } catch (error) {
+    // Concurrent boots can race this write (rename-ENOENT = the other instance won). Backoff state
+    // is advisory; losing a write must never abort record processing.
+    logger.debug({ sidecarPath, err: error }, 'Codex startup reaper could not persist retry backoff state')
+  }
+  return state
+}
+
+function logCodexReaperRetry(
+  fields: Record<string, unknown>,
+  state: CodexReaperRetryState,
+  why: string,
+): void {
+  const payload = { ...fields, firstSeen: state.firstSeen, attempts: state.attempts, lastAttempt: state.lastAttempt }
+  const message = `Codex startup reaper left an ownership record in place for retry with backoff (${why})`
+  if (state.attempts >= CODEX_REAPER_LOG_ESCALATION_ATTEMPTS) {
+    logger.warn(payload, message)
+  } else {
+    logger.info(payload, message)
+  }
+}
+
+function extractProcessGroupIdBestEffort(raw: string): number | null {
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!parsed || typeof parsed !== 'object') return null
+    const candidate = (parsed as { processGroupId?: unknown }).processGroupId
+    return isPositiveInteger(candidate) ? candidate : null
+  } catch {
+    return null
+  }
+}
+
+// Quarantine is reserved for records the reaper can never act on: unparseable files, or malformed
+// records whose recorded process group cannot be proven alive (second-review blocking #2). Records
+// embed command lines and cwds, so the move preserves 0600. Rename-ENOENT means a concurrent boot
+// handled the record first; treat as success.
+async function quarantineCodexOwnershipRecord(
+  metadataDir: string,
+  metadataPath: string,
+  reason: string,
+): Promise<string | null> {
+  const retryState = await readCodexReaperRetryStateFile(reaperRetrySidecarPath(metadataPath))
+  const recordStat = await fsp.stat(metadataPath).catch(() => null)
+  if (!recordStat) return null
+  const quarantineDir = quarantineDirPath(metadataDir)
+  await fsp.mkdir(quarantineDir, { recursive: true })
+  const quarantinePath = path.join(quarantineDir, path.basename(metadataPath))
+  try {
+    await fsp.rename(metadataPath, quarantinePath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+  await fsp.chmod(quarantinePath, 0o600).catch(() => undefined)
+  await atomicWriteJson(`${quarantinePath}${QUARANTINE_NOTE_SUFFIX}`, {
+    reason,
+    firstSeen: retryState?.firstSeen ?? recordStat.mtime.toISOString(),
+    attempts: retryState?.attempts ?? 0,
+  }).catch((error) => {
+    logger.warn({ quarantinePath, err: error }, 'Codex startup reaper could not write a quarantine note')
+  })
+  await fsp.unlink(reaperRetrySidecarPath(metadataPath)).catch(() => undefined)
+  logger.warn({ metadataPath, quarantinePath, reason }, 'Codex startup reaper quarantined an ownership record')
+  return quarantinePath
+}
+
+// Safety net (second-review blocking #2): a quarantined record must never hide a live DB holder.
+// Every pass promotes quarantined records whose recorded process group is still alive back into the
+// metadata dir so the reaper retries them. Never throws.
+export async function rescanCodexReaperQuarantine(
+  metadataDir?: string,
+): Promise<{ promotedRecords: string[]; quarantinedCount: number }> {
+  const dir = metadataDir ?? defaultMetadataDir()
+  const quarantineDir = quarantineDirPath(dir)
+  const promotedRecords: string[] = []
+  let quarantinedCount = 0
+  let entries: string[]
+  try {
+    entries = await fsp.readdir(quarantineDir)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      logger.warn({ quarantineDir, err: error }, 'Codex reaper quarantine rescan could not read the quarantine directory')
+    }
+    return { promotedRecords, quarantinedCount }
+  }
+  for (const entry of entries) {
+    if (!entry.endsWith('.json') || entry.endsWith(QUARANTINE_NOTE_SUFFIX)) continue
+    quarantinedCount += 1
+    const quarantinePath = path.join(quarantineDir, entry)
+    try {
+      const raw = await fsp.readFile(quarantinePath, 'utf8')
+      const processGroupId = extractProcessGroupIdBestEffort(raw)
+      if (processGroupId === null) continue
+      if (await isProcessGroupGone(processGroupId)) continue
+      const restoredPath = path.join(dir, entry)
+      try {
+        await fsp.rename(quarantinePath, restoredPath)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue // concurrent rescan won
+        throw error
+      }
+      await fsp.chmod(restoredPath, 0o600).catch(() => undefined)
+      await fsp.unlink(`${quarantinePath}${QUARANTINE_NOTE_SUFFIX}`).catch(() => undefined)
+      quarantinedCount -= 1
+      promotedRecords.push(restoredPath)
+      logger.warn(
+        { quarantinePath, restoredPath, processGroupId },
+        'Codex reaper promoted a quarantined ownership record back for retry because its process group is still alive',
+      )
+    } catch (error) {
+      logger.warn({ quarantinePath, err: error }, 'Codex reaper quarantine rescan failed for a record; leaving it quarantined')
+    }
+  }
+  return { promotedRecords, quarantinedCount }
+}
+
+/** Read-only count of quarantined ownership records, for the codex-log-db observability line. */
+export async function countCodexQuarantinedRecords(metadataDir?: string): Promise<number> {
+  const dir = metadataDir ?? defaultMetadataDir()
+  try {
+    const entries = await fsp.readdir(quarantineDirPath(dir))
+    return entries.filter((entry) => entry.endsWith('.json') && !entry.endsWith(QUARANTINE_NOTE_SUFFIX)).length
+  } catch {
+    return 0
+  }
+}
+
+// Used by the hourly observability tick to gate re-running the reaper: the per-boot attempt always
+// runs, but hourly re-attempts follow the time-based backoff above. Sidecars orphaned by a
+// successful reap are cleaned up here so they cannot trigger reaper runs forever.
+export async function hasDueCodexReaperRetries(metadataDir?: string, nowMs: number = Date.now()): Promise<boolean> {
+  const dir = metadataDir ?? defaultMetadataDir()
+  let entries: string[]
+  try {
+    entries = await fsp.readdir(dir)
+  } catch {
+    return false
+  }
+  let due = false
+  for (const entry of entries) {
+    if (!entry.endsWith(REAPER_RETRY_SIDECAR_SUFFIX)) continue
+    const sidecarPath = path.join(dir, entry)
+    const recordPath = sidecarPath.slice(0, -REAPER_RETRY_SIDECAR_SUFFIX.length)
+    const recordExists = await fsp.stat(recordPath).then(() => true, () => false)
+    if (!recordExists) {
+      await fsp.unlink(sidecarPath).catch(() => undefined)
+      continue
+    }
+    const state = await readCodexReaperRetryStateFile(sidecarPath)
+    if (!state || isCodexReaperRetryDue(state, nowMs)) due = true
+  }
+  return due
+}
+
 export async function reapOrphanedCodexAppServerSidecars(
   options: ReapOrphanedSidecarsOptions,
 ): Promise<ReapOrphanedSidecarsResult> {
@@ -793,85 +1051,204 @@ export async function reapOrphanedCodexAppServerSidecars(
     ignoredLegacyRecords: [],
     skippedActiveOwnershipIds: [],
     failedOwnershipIds: [],
+    unreadableRecords: [],
+    quarantinedRecords: [],
+    retriedOwnershipIds: [],
+    promotedFromQuarantine: [],
+    reapingSkipped: false,
   }
+
+  // Safety net first: promote quarantined records whose process group is still alive so this same
+  // pass retries them (a quarantined record must never hide a live DB holder).
+  try {
+    const rescan = await rescanCodexReaperQuarantine(metadataDir)
+    result.promotedFromQuarantine.push(...rescan.promotedRecords)
+  } catch (error) {
+    logger.warn({ metadataDir, err: error }, 'Codex startup reaper quarantine rescan failed; continuing')
+  }
+
   let procOwnershipProofChecked = false
   const ensureProcOwnershipProof = async () => {
     if (procOwnershipProofChecked) return
     await assertProcOwnershipProofAvailable()
     procOwnershipProofChecked = true
   }
-  const entries = await fsp.readdir(metadataDir).catch((error) => {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
-    throw error
-  })
+
+  let entries: string[]
+  try {
+    entries = await fsp.readdir(metadataDir)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return result
+    // Degrade and continue (I4): without the record listing we skip reaping this pass instead of
+    // failing boot. Records stay in place for the hourly retry and the next boot.
+    result.reapingSkipped = true
+    logger.warn(
+      { metadataDir, err: error },
+      'Codex startup reaper could not read the sidecar metadata directory; skipping reaping this pass',
+    )
+    return result
+  }
 
   for (const entry of entries) {
-    if (!entry.endsWith('.json')) continue
+    if (!entry.endsWith('.json') || entry.endsWith(REAPER_RETRY_SIDECAR_SUFFIX)) continue
     const metadataPath = path.join(metadataDir, entry)
-    const raw = await fsp.readFile(metadataPath, 'utf8')
-    const parsed = parseMetadataRecord(raw, metadataPath)
-    if (parsed.kind === 'legacy') {
-      result.ignoredLegacyRecords.push(metadataPath)
-      await fsp.unlink(metadataPath).catch(() => undefined)
-      continue
-    }
-    if (parsed.kind === 'malformedNewSchema') {
-      result.failedOwnershipIds.push(parsed.ownershipId)
-      continue
-    }
-
-    await ensureProcOwnershipProof()
-    const metadata = parsed.metadata
-
-    if (await isPidAlive(metadata.ownerServerPid)) {
-      if (await isOwnerServerProcess(metadata)) {
-        result.skippedActiveOwnershipIds.push(metadata.ownershipId)
-      } else {
-        result.failedOwnershipIds.push(metadata.ownershipId)
+    let ownershipId: string | undefined
+    // Per-record isolation (I4): one bad record affects only itself, never the scan or the boot.
+    try {
+      let raw: string
+      try {
+        raw = await fsp.readFile(metadataPath, 'utf8')
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue // a concurrent boot handled it
+        result.unreadableRecords.push(metadataPath)
+        logger.warn(
+          { metadataPath, err: error },
+          'Codex startup reaper could not read an ownership record; leaving it in place (unreadable)',
+        )
+        continue
       }
-      continue
-    }
 
-    const currentProcessGroupId = await getProcessGroupId('self')
-    if (currentProcessGroupId !== null && metadata.processGroupId === currentProcessGroupId) {
-      result.skippedActiveOwnershipIds.push(metadata.ownershipId)
-      continue
-    }
+      const parsed = parseMetadataRecord(raw, metadataPath)
+      if (parsed.kind === 'legacy') {
+        result.ignoredLegacyRecords.push(metadataPath)
+        await fsp.unlink(metadataPath).catch(() => undefined)
+        continue
+      }
+      if (parsed.kind === 'unparseable') {
+        // Nothing to retry against: no process group can be extracted from a non-JSON record.
+        const quarantinePath = await quarantineCodexOwnershipRecord(metadataDir, metadataPath, 'unparseable-record')
+        if (quarantinePath) result.quarantinedRecords.push(quarantinePath)
+        continue
+      }
+      if (parsed.kind === 'malformedNewSchema') {
+        ownershipId = parsed.ownershipId
+        // Narrowed quarantine (second-review blocking #2): only quarantine when the recorded
+        // process group cannot be proven alive. A malformed record naming a live group is the only
+        // tether to a live DB holder — retry it in place instead, never quarantine it.
+        const processGroupId = extractProcessGroupIdBestEffort(raw)
+        if (processGroupId !== null && !(await isProcessGroupGone(processGroupId))) {
+          const state = await recordCodexReaperRetryAttempt(metadataPath)
+          logCodexReaperRetry(
+            { ownershipId: parsed.ownershipId, metadataPath, processGroupId },
+            state,
+            'malformed record with a live process group',
+          )
+          result.retriedOwnershipIds.push(parsed.ownershipId)
+        } else {
+          const quarantinePath = await quarantineCodexOwnershipRecord(metadataDir, metadataPath, 'malformed-record')
+          if (quarantinePath) result.quarantinedRecords.push(quarantinePath)
+        }
+        continue
+      }
 
-    const ownership: ActiveOwnership = { metadataDir, metadataPath, metadata }
-    const reaped = await teardownOwnedProcessGroup(ownership, options.terminateGraceMs ?? DEFAULT_TERMINATE_GRACE_MS)
-    if (reaped) {
-      result.reapedOwnershipIds.push(metadata.ownershipId)
-    } else {
-      result.failedOwnershipIds.push(metadata.ownershipId)
+      const metadata = parsed.metadata
+      ownershipId = metadata.ownershipId
+
+      try {
+        await ensureProcOwnershipProof()
+      } catch (error) {
+        // Degrade and continue (I4): without the /proc ownership proof no record can be classified
+        // safely (I3), so skip reaping this pass rather than abort boot.
+        result.reapingSkipped = true
+        logger.warn(
+          { metadataDir, err: error },
+          'Codex startup reaper has no usable /proc ownership proof; skipping reaping this pass',
+        )
+        break
+      }
+
+      if (await isPidAlive(metadata.ownerServerPid)) {
+        if (await isOwnerServerProcess(metadata)) {
+          result.skippedActiveOwnershipIds.push(metadata.ownershipId)
+        } else {
+          // Owner pid alive but identity-mismatched (pid reuse or a transient /proc race): retry in
+          // place with backoff — never quarantine a record we could not disprove.
+          const state = await recordCodexReaperRetryAttempt(metadataPath)
+          logCodexReaperRetry(
+            {
+              ownershipId: metadata.ownershipId,
+              metadataPath,
+              ownerServerPid: metadata.ownerServerPid,
+              processGroupId: metadata.processGroupId,
+            },
+            state,
+            'owner pid is alive without a matching identity',
+          )
+          result.retriedOwnershipIds.push(metadata.ownershipId)
+        }
+        continue
+      }
+
+      const currentProcessGroupId = await getProcessGroupId('self')
+      if (currentProcessGroupId !== null && metadata.processGroupId === currentProcessGroupId) {
+        result.skippedActiveOwnershipIds.push(metadata.ownershipId)
+        continue
+      }
+
+      const ownership: ActiveOwnership = { metadataDir, metadataPath, metadata }
+      const reaped = await teardownOwnedProcessGroup(ownership, options.terminateGraceMs ?? DEFAULT_TERMINATE_GRACE_MS)
+      if (reaped) {
+        result.reapedOwnershipIds.push(metadata.ownershipId)
+        await fsp.unlink(reaperRetrySidecarPath(metadataPath)).catch(() => undefined)
+      } else {
+        // Owner dead but the group survived SIGTERM+SIGKILL (e.g. a codex process in D-state I/O
+        // against a bloated WAL — this incident's exact signature), or ownership could not be
+        // verified. NEVER quarantine: this record is the only tether to a potentially live DB
+        // holder. Retry in place with backoff.
+        const state = await recordCodexReaperRetryAttempt(metadataPath)
+        logCodexReaperRetry(
+          {
+            ownershipId: metadata.ownershipId,
+            metadataPath,
+            wrapperPid: metadata.wrapperPid,
+            processGroupId: metadata.processGroupId,
+          },
+          state,
+          'process group survived teardown or ownership was not verified',
+        )
+        result.retriedOwnershipIds.push(metadata.ownershipId)
+      }
+    } catch (error) {
+      result.failedOwnershipIds.push(ownershipId ?? metadataPath)
+      logger.warn(
+        { metadataPath, ownershipId, err: error },
+        'Codex startup reaper failed to process an ownership record; leaving it in place for retry',
+      )
     }
   }
 
   return result
 }
 
+// Boot entry point. Reaping is best-effort: unresolved records are surfaced as a single warning
+// (below) instead of blocking startup — the fail-closed assertCodexStartupReaperSucceeded contract
+// was removed by Stage 1c (I4). The index.ts call site adds a final try/catch backstop.
 export async function runCodexStartupReaper(
   options: ReapOrphanedSidecarsOptions,
 ): Promise<ReapOrphanedSidecarsResult> {
   const result = await reapOrphanedCodexAppServerSidecars(options)
-  assertCodexStartupReaperSucceeded(result)
+  summarizeCodexStartupReaperResult(result)
   return result
 }
 
-export const reapOrphanedCodexAppServerSidecarsOnStartup = runCodexStartupReaper
-
-export function assertCodexStartupReaperSucceeded(result: ReapOrphanedSidecarsResult): void {
-  const failedOwnershipIds = [...new Set(result.failedOwnershipIds)]
-  if (failedOwnershipIds.length === 0) return
-
-  const reasons: string[] = []
-  reasons.push(
-    `failed to reap ${failedOwnershipIds.length} ownership record(s): ${failedOwnershipIds.join(', ')}`,
-  )
-
-  throw new Error(
-    `Codex app-server startup reaper blocked startup: ${reasons.join('; ')}. `
-    + 'Refusing to continue until failed ownership records are handled or verified gone.',
+// Warning aggregator (no throw): replaces the deleted fail-closed assert.
+function summarizeCodexStartupReaperResult(result: ReapOrphanedSidecarsResult): void {
+  const unresolved =
+    result.failedOwnershipIds.length
+    + result.unreadableRecords.length
+    + result.quarantinedRecords.length
+    + result.retriedOwnershipIds.length
+  if (!result.reapingSkipped && unresolved === 0) return
+  logger.warn(
+    {
+      reapingSkipped: result.reapingSkipped,
+      failedOwnershipIds: [...new Set(result.failedOwnershipIds)],
+      unreadableRecords: result.unreadableRecords,
+      quarantinedRecords: result.quarantinedRecords,
+      retriedOwnershipIds: [...new Set(result.retriedOwnershipIds)],
+      promotedFromQuarantine: result.promotedFromQuarantine,
+    },
+    'Codex startup reaper completed with unresolved ownership records; continuing boot (fail-open)',
   )
 }
 
@@ -1261,6 +1638,13 @@ export class CodexAppServerRuntime {
       })
       const childErrorPromise = this.watchChildError(child)
 
+      // Stage 1a (plan §6): track the sidecar's process group (pgid == wrapper pid, spawned
+      // `detached: true`) for exit-time reaping. Deregistered only on CONFIRMED group death in
+      // teardownOwnedProcessGroup — NOT at wrapper exit, which can leave live grandchildren.
+      if (child.pid) {
+        registerCodexChild({ pid: child.pid, pgid: child.pid, kind: 'app-server' })
+      }
+
       // Drain child stdio continuously so verbose app-server or MCP startup logs
       // cannot fill the pipe buffer and stall JSON-RPC request handling.
       child.stdout?.resume()
@@ -1612,6 +1996,9 @@ export class CodexAppServerRuntime {
 
     if (await isProcessGroupGone(ownership.metadata.processGroupId)) {
       await unlinkOwnershipMetadata(ownership)
+      // Stage 1a (plan §6): group death is confirmed here too — drop the registration so exit-time
+      // reap can never signal a reused pid/pgid.
+      deregisterCodexChild(ownership.metadata.wrapperPid)
       if (this.ownership === ownership) {
         this.ownership = null
       }

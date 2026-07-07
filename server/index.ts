@@ -94,6 +94,8 @@ import {
   runCodexStartupReaper,
 } from './coding-cli/codex-app-server/runtime.js'
 import { CodexLaunchPlanner } from './coding-cli/codex-app-server/launch-planner.js'
+import { startCodexObservability } from './coding-cli/codex-observability.js'
+import { installCodexChildExitHandlers, snapshotCodexChildren } from './coding-cli/codex-child-registry.js'
 import { registerStaticClientRoutes } from './static-client-routes.js'
 import { joinCodexShutdownOwners } from './shutdown-join.js'
 
@@ -253,7 +255,16 @@ async function main() {
   const opencodeActivity = createOpencodeActivityIntegration({ registry, opencodeProvider })
 
   const sessionRepairService = getSessionRepairService({ skipDiscovery: true })
-  await runCodexStartupReaper({ serverInstanceId })
+  try {
+    await runCodexStartupReaper({ serverInstanceId })
+  } catch (err) {
+    // I4: boot must never die in the reaper. Unresolved records are retried by the hourly
+    // observability tick and on the next boot.
+    log.warn({ err }, 'Codex startup reaper failed; continuing startup (fail-open)')
+  }
+  // Boot + hourly codex-log-db line (WAL size, holder count, quarantine count), hourly retry of
+  // pending reaper records, and the quarantine rescan trigger. Observation-only; unref()'d timer.
+  startCodexObservability({ serverInstanceId })
   const freshAgentModelCapabilityRegistry = new FreshAgentModelCapabilityRegistry()
 
   let sdkBridge: SdkBridge
@@ -1075,11 +1086,25 @@ async function main() {
 
   // Graceful shutdown handler
   let isShuttingDown = false
+  // Stage 1a (plan §6): hard-exit safety net for teardown HANGS. All three handled signals
+  // (SIGTERM/SIGINT/SIGHUP) share the same hang exposure in joinCodexShutdownOwners below. A
+  // *throw* from joinCodexShutdownOwners already dies on its own: shutdown() is invoked un-awaited,
+  // so the rejection is unhandled -> default-fatal -> 'exit' -> reapSync. The timer exists for the
+  // hang case, where teardown never settles and 'exit' would otherwise never fire.
+  const SHUTDOWN_HARD_EXIT_TIMEOUT_MS = 15_000
   const shutdown = async (signal: string) => {
     if (isShuttingDown) return
     isShuttingDown = true
 
-    log.info({ signal }, 'Shutting down...')
+    const hardExitTimer = setTimeout(() => {
+      log.error({ signal, timeoutMs: SHUTDOWN_HARD_EXIT_TIMEOUT_MS }, 'Shutdown hung; forcing process exit')
+      process.exit(1)
+    }, SHUTDOWN_HARD_EXIT_TIMEOUT_MS)
+    hardExitTimer.unref()
+
+    // The codexChildren snapshot is the pre-termination registry listing used by the Stage 1a
+    // acceptance tests (plan §6): every listed {pid, pgid} must be gone after exit.
+    log.info({ signal, codexChildren: snapshotCodexChildren() }, 'Shutting down...')
 
     // 1. Establish terminal creation admission barriers before waiting on terminal teardown.
     terminalCreateAdmissionOpen = false
@@ -1146,6 +1171,11 @@ async function main() {
 
   process.on('SIGTERM', () => shutdown('SIGTERM'))
   process.on('SIGINT', () => shutdown('SIGINT'))
+  // Stage 1a (plan §6): 'exit' -> reapSync (synchronous best-effort SIGKILL of still-registered
+  // codex process groups), SIGHUP -> the same graceful shutdown (idempotent via isShuttingDown),
+  // and uncaughtExceptionMonitor as observe-only (default fatal semantics untouched; the fatal
+  // path then runs 'exit' -> reapSync).
+  installCodexChildExitHandlers({ requestShutdown: (signal) => void shutdown(signal) })
 }
 
 main().catch((err) => {

@@ -37,6 +37,7 @@ import type {
 import { getOpencodeEnvOverrides, resolveOpencodeLaunchModel } from './opencode-launch.js'
 import { generateMcpInjection, cleanupMcpConfig } from './mcp/config-writer.js'
 import { CODEX_MANAGED_REMOTE_CONFIG_ARGS } from './coding-cli/codex-managed-config.js'
+import { deregisterCodexChild, registerCodexChild } from './coding-cli/codex-child-registry.js'
 import type { CodexLaunchPlan, CodexLaunchSidecar } from './coding-cli/codex-app-server/launch-planner.js'
 import { isCodexSidecarTeardownError } from './coding-cli/codex-app-server/launch-planner.js'
 import {
@@ -1611,6 +1612,13 @@ export class TerminalRegistry extends EventEmitter {
     }
     endSpawnTimer({ cwd: procCwd })
 
+    // Stage 1a (plan §6): codex resume ptys are spawned as session/group leaders (pgid == pid);
+    // track them for exit-time reaping. Deregistered on the pty's onExit below — kill() only
+    // *sends* a signal, it does not confirm death. Codex panes only.
+    if (opts.mode === 'codex' && ptyProc.pid) {
+      registerCodexChild({ pid: ptyProc.pid, pgid: ptyProc.pid, kind: 'resume-pty' })
+    }
+
     const title = getModeLabel(opts.mode)
 
     const initialCodexDurability: CodexDurabilityRef | undefined = opts.mode === 'codex' && resumeForBinding
@@ -1749,6 +1757,9 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     ptyProc.onExit((e) => {
+      // Stage 1a (plan §6): this pty process is gone — drop it from the codex child registry
+      // before any dispatch guards below. No-op for non-codex ptys and double exits.
+      deregisterCodexChild(ptyProc.pid)
       if (this.hasHandledPtyExit(record, ptyProc)) return
       this.markHandledPtyExit(record, ptyProc)
       if (!record.codexRecoveryFinalClose && record.codexRecoveryRetiringPty === ptyProc) {
@@ -3698,6 +3709,11 @@ export class TerminalRegistry extends EventEmitter {
       cwd: procCwd,
       env: env as any,
     })
+    // Stage 1a (plan §6): recovery ptys are codex resume ptys by construction; same registry
+    // contract as the primary spawn site (deregistered in the onExit handler).
+    if (ptyProc.pid) {
+      registerCodexChild({ pid: ptyProc.pid, pgid: ptyProc.pid, kind: 'resume-pty' })
+    }
     const candidate = { pty: ptyProc, mcpCwd, exited: false, exitCode: undefined as number | undefined }
     this.attachCodexRecoveryPtyHandlers(record, ptyProc, candidate)
     return candidate
@@ -3743,6 +3759,8 @@ export class TerminalRegistry extends EventEmitter {
     })
 
     ptyProc.onExit((event) => {
+      // Stage 1a (plan §6): the pty process is gone — deregister before any dispatch guards.
+      deregisterCodexChild(ptyProc.pid)
       if (this.hasHandledPtyExit(record, ptyProc)) return
       this.markHandledPtyExit(record, ptyProc)
       if (candidate) {

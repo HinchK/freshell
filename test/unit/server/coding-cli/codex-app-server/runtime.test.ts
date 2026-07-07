@@ -6,8 +6,9 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  assertCodexStartupReaperSucceeded,
   CodexAppServerRuntime,
+  codexReaperRetryIntervalMs,
+  isCodexReaperRetryDue,
   reapOrphanedCodexAppServerSidecars,
   runCodexStartupReaper,
 } from '../../../../../server/coding-cli/codex-app-server/runtime.js'
@@ -1436,41 +1437,21 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     await expect(fsp.stat(ready.metadataPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('treats unreaped new-schema ownership records as a startup-blocking reaper failure', () => {
-    expect(() => assertCodexStartupReaperSucceeded({
-      reapedOwnershipIds: [],
-      ignoredLegacyRecords: [],
-      skippedActiveOwnershipIds: [],
-      failedOwnershipIds: ['ownership-alpha', 'ownership-beta'],
-    })).toThrow(/startup reaper blocked startup.*failed to reap 2 ownership record.*ownership-alpha.*ownership-beta/i)
-  })
+  it('schedules hourly retries on a time-based backoff keyed on firstSeen, not attempts', () => {
+    const HOUR = 60 * 60 * 1000
+    expect(codexReaperRetryIntervalMs(0)).toBe(HOUR)
+    expect(codexReaperRetryIntervalMs(7 * HOUR)).toBe(3 * HOUR)
+    expect(codexReaperRetryIntervalMs(25 * HOUR)).toBe(6 * HOUR)
 
-  it('allows startup when ownership records still belong to live sidecar owners', () => {
-    expect(() => assertCodexStartupReaperSucceeded({
-      reapedOwnershipIds: [],
-      ignoredLegacyRecords: [],
-      skippedActiveOwnershipIds: ['active-owner'],
-      failedOwnershipIds: [],
-    })).not.toThrow()
-  })
-
-  it('reports failed reaps without treating live active owners as fatal', () => {
-    let thrown: Error | undefined
-
-    try {
-      assertCodexStartupReaperSucceeded({
-        reapedOwnershipIds: [],
-        ignoredLegacyRecords: [],
-        skippedActiveOwnershipIds: ['active-owner'],
-        failedOwnershipIds: ['failed-owner'],
-      })
-    } catch (error) {
-      thrown = error as Error
+    const now = Date.parse('2026-07-06T12:00:00.000Z')
+    const state = {
+      firstSeen: new Date(now - 2 * HOUR).toISOString(),
+      // High attempt counts (tsx-watch restart storms) must not burn the budget:
+      attempts: 50,
+      lastAttempt: new Date(now - 30 * 60 * 1000).toISOString(),
     }
-
-    expect(thrown).toBeDefined()
-    expect(thrown?.message).toContain('failed to reap 1 ownership record(s): failed-owner')
-    expect(thrown?.message).not.toContain('active-owner')
+    expect(isCodexReaperRetryDue(state, now)).toBe(false)
+    expect(isCodexReaperRetryDue({ ...state, lastAttempt: new Date(now - HOUR).toISOString() }, now)).toBe(true)
   })
 
   it('reports a skipped new-schema ownership record when the owner pid is live', async () => {
@@ -1492,12 +1473,11 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     })
 
     expect(result.skippedActiveOwnershipIds).toContain(ready.ownershipId)
-    expect(() => assertCodexStartupReaperSucceeded(result)).not.toThrow()
     await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
     expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
   })
 
-  it('does not treat a live reused owner pid as active without matching owner identity', async () => {
+  it('retries a live reused owner pid without matching identity in place with backoff, never quarantining', async () => {
     const metadataDir = await makeTempDir()
     const runtime = createRuntime({
       metadataDir,
@@ -1520,10 +1500,32 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     })
 
     expect(result.skippedActiveOwnershipIds).not.toContain(ready.ownershipId)
-    expect(result.failedOwnershipIds).toContain(ready.ownershipId)
-    expect(() => assertCodexStartupReaperSucceeded(result)).toThrow(new RegExp(ready.ownershipId))
+    expect(result.retriedOwnershipIds).toContain(ready.ownershipId)
+    expect(result.failedOwnershipIds).not.toContain(ready.ownershipId)
+    expect(result.quarantinedRecords).toEqual([])
     await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
     expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+
+    // Backoff state lives in <record>.reaper.json, written only by the reaper, mode 0600.
+    const sidecarPath = `${ready.metadataPath}.reaper.json`
+    const sidecarStat = await fsp.stat(sidecarPath)
+    expect(sidecarStat.mode & 0o777).toBe(0o600)
+    const state = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'))
+    expect(state.attempts).toBe(1)
+    expect(typeof state.firstSeen).toBe('string')
+    expect(typeof state.lastAttempt).toBe('string')
+
+    // Still present (and retried again) on the next pass: attempts increment, firstSeen is stable.
+    const second = await reapOrphanedCodexAppServerSidecars({
+      metadataDir,
+      serverInstanceId: 'srv-current',
+      terminateGraceMs: 1,
+    })
+    expect(second.retriedOwnershipIds).toContain(ready.ownershipId)
+    const stateAfter = JSON.parse(await fsp.readFile(sidecarPath, 'utf8'))
+    expect(stateAfter.attempts).toBe(2)
+    expect(stateAfter.firstSeen).toBe(state.firstSeen)
+    await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
   })
 
   it('reaps a stale ownership record whose process group was reused by a foreign process', async () => {
@@ -1562,7 +1564,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     }
   }, 20_000)
 
-  it('propagates thrown startup reaper failures instead of treating them as warning fallbacks', async () => {
+  it('degrades and continues when the metadata directory scan fails instead of blocking boot', async () => {
     const metadataDir = await makeTempDir()
     const originalReaddir = fsp.readdir.bind(fsp)
     const readdirSpy = vi.spyOn(fsp, 'readdir').mockImplementation(((target: any, options?: any) => {
@@ -1573,16 +1575,18 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     }) as typeof fsp.readdir)
 
     try {
-      await expect(runCodexStartupReaper({
+      const result = await runCodexStartupReaper({
         metadataDir,
         serverInstanceId: 'srv-current',
-      })).rejects.toThrow('simulated startup reaper metadata scan failure')
+      })
+      expect(result.reapingSkipped).toBe(true)
+      expect(result.reapedOwnershipIds).toEqual([])
     } finally {
       readdirSpy.mockRestore()
     }
   })
 
-  it('propagates startup reaper ownership verification failures', async () => {
+  it('isolates ownership verification failures to the affected record instead of blocking boot', async () => {
     const metadataDir = await makeTempDir()
     const runtime = createRuntime({
       metadataDir,
@@ -1610,17 +1614,21 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     }) as typeof fsp.readdir)
 
     try {
-      await expect(runCodexStartupReaper({
+      const result = await runCodexStartupReaper({
         metadataDir,
         serverInstanceId: 'srv-current',
         terminateGraceMs: 1,
-      })).rejects.toThrow('simulated ownership verification proc failure')
+      })
+      expect(result.failedOwnershipIds).toContain(ready.ownershipId)
+      expect(result.reapedOwnershipIds).not.toContain(ready.ownershipId)
+      await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
+      expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
     } finally {
       readdirSpy.mockRestore()
     }
   })
 
-  it('propagates startup reaper process-group signaling failures', async () => {
+  it('isolates process-group signaling failures to the affected record instead of blocking boot', async () => {
     const metadataDir = await makeTempDir()
     const runtime = createRuntime({
       metadataDir,
@@ -1639,18 +1647,20 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     }) as typeof process.kill)
 
     try {
-      await expect(runCodexStartupReaper({
+      const result = await runCodexStartupReaper({
         metadataDir,
         serverInstanceId: 'srv-current',
         terminateGraceMs: 1,
-      })).rejects.toThrow('simulated SIGTERM failure')
+      })
+      expect(result.failedOwnershipIds).toContain(ready.ownershipId)
+      await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
       expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
     } finally {
       killSpy.mockRestore()
     }
   })
 
-  it('propagates startup reaper wait-for-gone diagnostic failures', async () => {
+  it('isolates wait-for-gone diagnostic failures to the affected record instead of blocking boot', async () => {
     const metadataDir = await makeTempDir()
     const runtime = createRuntime({
       metadataDir,
@@ -1676,11 +1686,13 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     }) as typeof fsp.readdir)
 
     try {
-      await expect(runCodexStartupReaper({
+      const result = await runCodexStartupReaper({
         metadataDir,
         serverInstanceId: 'srv-current',
         terminateGraceMs: 1,
-      })).rejects.toThrow('simulated wait-for-gone process scan failure')
+      })
+      expect(result.failedOwnershipIds).toContain(ready.ownershipId)
+      await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
       expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
     } finally {
       readdirSpy.mockRestore()
@@ -1688,7 +1700,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     }
   })
 
-  it('propagates startup reaper metadata removal failures', async () => {
+  it('isolates metadata removal failures to the affected record instead of blocking boot', async () => {
     const metadataDir = await makeTempDir()
     const runtime = createRuntime({
       metadataDir,
@@ -1714,11 +1726,12 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     }) as typeof fsp.unlink)
 
     try {
-      await expect(runCodexStartupReaper({
+      const result = await runCodexStartupReaper({
         metadataDir,
         serverInstanceId: 'srv-current',
         terminateGraceMs: 1,
-      })).rejects.toThrow('simulated metadata removal failure')
+      })
+      expect(result.failedOwnershipIds).toContain(ready.ownershipId)
       await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
     } finally {
       unlinkSpy.mockRestore()
@@ -1743,7 +1756,7 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
     await expect(fsp.stat(legacyPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('retains malformed new-schema ownership records and reports them as startup-blocking failures', async () => {
+  it('quarantines malformed new-schema ownership records with no provable live process group', async () => {
     const metadataDir = await makeTempDir()
     const malformedPath = path.join(metadataDir, 'damaged-new-schema.json')
     await fsp.writeFile(malformedPath, JSON.stringify({
@@ -1758,13 +1771,39 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       serverInstanceId: 'srv-current',
     })
 
+    const quarantinePath = path.join(metadataDir, 'quarantine', 'damaged-new-schema.json')
     expect(result.ignoredLegacyRecords).not.toContain(malformedPath)
-    expect(result.failedOwnershipIds).toContain('damaged-ownership')
-    await expect(fsp.stat(malformedPath)).resolves.toBeDefined()
-    expect(() => assertCodexStartupReaperSucceeded(result)).toThrow(/damaged-ownership/)
+    expect(result.failedOwnershipIds).toEqual([])
+    expect(result.quarantinedRecords).toContain(quarantinePath)
+    await expect(fsp.stat(malformedPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    const quarantineStat = await fsp.stat(quarantinePath)
+    expect(quarantineStat.mode & 0o777).toBe(0o600)
+    const note = JSON.parse(await fsp.readFile(`${quarantinePath}.note.json`, 'utf8'))
+    expect(note.reason).toBe('malformed-record')
+    expect(typeof note.firstSeen).toBe('string')
+    expect(note.attempts).toBe(0)
   })
 
-  it('retains schema-v1 ownership records with invalid numeric ownership fields', async () => {
+  it('quarantines unparseable (non-JSON) ownership records instead of deleting them', async () => {
+    const metadataDir = await makeTempDir()
+    const corruptPath = path.join(metadataDir, 'torn-write.json')
+    await fsp.writeFile(corruptPath, '{"schemaVersion":1,"ownershipId":"torn', { mode: 0o600 })
+
+    const result = await reapOrphanedCodexAppServerSidecars({
+      metadataDir,
+      serverInstanceId: 'srv-current',
+    })
+
+    const quarantinePath = path.join(metadataDir, 'quarantine', 'torn-write.json')
+    expect(result.ignoredLegacyRecords).toEqual([])
+    expect(result.quarantinedRecords).toContain(quarantinePath)
+    await expect(fsp.stat(corruptPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fsp.stat(quarantinePath)).resolves.toBeDefined()
+    const note = JSON.parse(await fsp.readFile(`${quarantinePath}.note.json`, 'utf8'))
+    expect(note.reason).toBe('unparseable-record')
+  })
+
+  it('quarantines schema-v1 ownership records with invalid numeric ownership fields without signaling', async () => {
     const metadataDir = await makeTempDir()
     const runtime = createRuntime({
       metadataDir,
@@ -1780,11 +1819,151 @@ describeWithLinuxProc('CodexAppServerRuntime', () => {
       serverInstanceId: 'srv-current',
     })
 
+    const quarantinePath = path.join(metadataDir, 'quarantine', path.basename(ready.metadataPath))
     expect(result.reapedOwnershipIds).not.toContain(ready.ownershipId)
-    expect(result.failedOwnershipIds).toContain(ready.ownershipId)
-    await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
+    expect(result.quarantinedRecords).toContain(quarantinePath)
+    await expect(fsp.stat(ready.metadataPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fsp.stat(quarantinePath)).resolves.toBeDefined()
     expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
-    expect(() => assertCodexStartupReaperSucceeded(result)).toThrow(new RegExp(ready.ownershipId))
+  })
+
+  const itNonRoot = typeof process.getuid === 'function' && process.getuid() === 0 ? it.skip : it
+
+  itNonRoot('isolates an unreadable ownership record and still processes the others', async () => {
+    const metadataDir = await makeTempDir()
+    const runtime = createRuntime({
+      metadataDir,
+      serverInstanceId: 'srv-previous',
+    })
+    const ready = await runtime.ensureReady()
+    await markOwnershipRecordStale(ready.metadataPath)
+
+    const unreadablePath = path.join(metadataDir, 'aa-unreadable.json')
+    await fsp.writeFile(unreadablePath, '{"schemaVersion":1}', { mode: 0o000 })
+
+    const result = await runCodexStartupReaper({
+      metadataDir,
+      serverInstanceId: 'srv-current',
+    })
+
+    expect(result.unreadableRecords).toContain(unreadablePath)
+    expect(result.reapedOwnershipIds).toContain(ready.ownershipId)
+    await waitForProcessExit(ready.processPid)
+    await expect(fsp.stat(ready.metadataPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    await expect(fsp.stat(unreadablePath)).resolves.toBeDefined()
+  })
+
+  it('skips reaping with a warning when the /proc ownership proof is unavailable', async () => {
+    const metadataDir = await makeTempDir()
+    const runtime = createRuntime({
+      metadataDir,
+      serverInstanceId: 'srv-previous',
+    })
+    const ready = await runtime.ensureReady()
+    await markOwnershipRecordStale(ready.metadataPath)
+    const originalReaddir = fsp.readdir.bind(fsp)
+    const readdirSpy = vi.spyOn(fsp, 'readdir').mockImplementation(((target: any, options?: any) => {
+      if (String(target) === '/proc') {
+        return Promise.reject(new Error('simulated /proc unavailable'))
+      }
+      return originalReaddir(target, options as any) as any
+    }) as typeof fsp.readdir)
+
+    try {
+      const result = await runCodexStartupReaper({
+        metadataDir,
+        serverInstanceId: 'srv-current',
+        terminateGraceMs: 1,
+      })
+      expect(result.reapingSkipped).toBe(true)
+      expect(result.reapedOwnershipIds).toEqual([])
+      await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
+      expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+    } finally {
+      readdirSpy.mockRestore()
+    }
+  })
+
+  it('never quarantines an owner-dead record whose group survives teardown; retries it in place', async () => {
+    const metadataDir = await makeTempDir()
+    const runtime = createRuntime({
+      metadataDir,
+      serverInstanceId: 'srv-previous',
+    })
+    const ready = await runtime.ensureReady()
+    await markOwnershipRecordStale(ready.metadataPath)
+    const originalKill = process.kill
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(((pid: number, signal?: NodeJS.Signals | number) => {
+      // Swallow the teardown signals so the group "survives" SIGTERM+SIGKILL (D-state simulation —
+      // this incident's exact signature).
+      if (pid === -ready.processGroupId && (signal === 'SIGTERM' || signal === 'SIGKILL')) {
+        return true
+      }
+      return originalKill(pid, signal as any)
+    }) as typeof process.kill)
+
+    try {
+      const result = await reapOrphanedCodexAppServerSidecars({
+        metadataDir,
+        serverInstanceId: 'srv-current',
+        terminateGraceMs: 1,
+      })
+
+      expect(result.retriedOwnershipIds).toContain(ready.ownershipId)
+      expect(result.quarantinedRecords).toEqual([])
+      expect(result.reapedOwnershipIds).not.toContain(ready.ownershipId)
+      await expect(fsp.stat(ready.metadataPath)).resolves.toBeDefined()
+      await expect(
+        fsp.stat(path.join(metadataDir, 'quarantine', path.basename(ready.metadataPath))),
+      ).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await isProcessGroupAlive(ready.processGroupId)).toBe(true)
+      const state = JSON.parse(await fsp.readFile(`${ready.metadataPath}.reaper.json`, 'utf8'))
+      expect(state.attempts).toBe(1)
+    } finally {
+      killSpy.mockRestore()
+    }
+  })
+
+  it('promotes quarantined records whose process group is still alive back for retry', async () => {
+    const metadataDir = await makeTempDir()
+    const quarantineDir = path.join(metadataDir, 'quarantine')
+    await fsp.mkdir(quarantineDir, { recursive: true })
+    const record = {
+      schemaVersion: 1,
+      ownershipId: 'quarantined-live',
+      serverInstanceId: 'srv-previous',
+      ownerServerPid: 999_999_999,
+      terminalId: null,
+      generation: null,
+      wsUrl: 'ws://127.0.0.1:1',
+      wrapperPid: 999_999_998,
+      // Our own process group: provably alive without spawning anything.
+      processGroupId: await readCurrentProcessGroupId(),
+      wrapperIdentity: { commandLine: ['codex'], cwd: '/tmp', startTimeTicks: 1 },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }
+    const quarantinedPath = path.join(quarantineDir, 'quarantined-live.json')
+    await fsp.writeFile(quarantinedPath, JSON.stringify(record), { mode: 0o600 })
+    await fsp.writeFile(
+      `${quarantinedPath}.note.json`,
+      JSON.stringify({ reason: 'test-seed', firstSeen: record.createdAt, attempts: 1 }),
+      { mode: 0o600 },
+    )
+
+    const result = await reapOrphanedCodexAppServerSidecars({
+      metadataDir,
+      serverInstanceId: 'srv-current',
+    })
+
+    const restoredPath = path.join(metadataDir, 'quarantined-live.json')
+    expect(result.promotedFromQuarantine).toContain(restoredPath)
+    await expect(fsp.stat(restoredPath)).resolves.toBeDefined()
+    await expect(fsp.stat(quarantinedPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    // Promoted and re-processed the same pass: its group is our own, so it is skipped as active,
+    // not signaled and not re-quarantined.
+    expect(result.skippedActiveOwnershipIds).toContain('quarantined-live')
+    expect(result.quarantinedRecords).toEqual([])
   })
 
   it('does not reap new-schema records for the current process group', async () => {
