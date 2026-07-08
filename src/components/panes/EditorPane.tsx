@@ -171,6 +171,7 @@ export default function EditorPane({
     (err: unknown) => isTransientRequestFailure(err) || connectionStatusRef.current !== 'ready',
     []
   )
+  const editorFontSize = useAppSelector((s) => s.settings.settings.terminal?.fontSize) ?? 16
   const mountedRef = useRef(true)
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -1030,7 +1031,7 @@ export default function EditorPane({
             onChange={handleEditorChange}
             options={{
               minimap: { enabled: false },
-              fontSize: 14,
+              fontSize: editorFontSize,
               lineNumbers: 'on',
               scrollBeyondLastLine: false,
               automaticLayout: true,
