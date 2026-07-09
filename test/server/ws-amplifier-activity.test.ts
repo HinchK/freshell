@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest'
 import http from 'http'
+import { EventEmitter } from 'events'
 import WebSocket from 'ws'
 import { WS_PROTOCOL_VERSION } from '../../shared/ws-protocol'
 
@@ -222,5 +223,287 @@ describe('ws amplifier activity protocol', () => {
 
     authenticated.close()
     unauthenticated.close()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Events-driven integration over the wire (plan 2026-07-08 §9 Phase 2): real
+// tracker + wiring + integration composed exactly like server/index.ts, with
+// injected fs/watch fakes standing in for events.jsonl and chokidar.
+// ---------------------------------------------------------------------------
+
+const AMP_SCHEMA = '"schema": {"name": "amplifier.log", "ver": "1.0.0"}'
+
+function eventsLine(event: string): string {
+  return `{"ts": "${new Date().toISOString()}", "lvl": "INFO", ${AMP_SCHEMA}, `
+    + `"event": "${event}", "session_id": "session-ev", "data": {"parent_id": null}}\n`
+}
+
+function createFakeEventsFs() {
+  const files = new Map<string, Buffer>()
+  const statFailures = new Set<string>()
+  return {
+    fsImpl: {
+      async stat(path: string) {
+        if (statFailures.has(path)) throw new Error('EIO: injected stat failure')
+        const content = files.get(path)
+        if (!content) throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' })
+        return { size: content.length }
+      },
+      async open(path: string) {
+        return {
+          async read(buffer: Buffer, offset: number, length: number, position: number) {
+            const content = files.get(path) ?? Buffer.alloc(0)
+            const slice = content.subarray(position, position + length)
+            slice.copy(buffer, offset)
+            return { bytesRead: slice.length }
+          },
+          async close() {},
+        }
+      },
+    },
+    write(path: string, text: string) {
+      files.set(path, Buffer.from(text, 'utf8'))
+    },
+    append(path: string, text: string) {
+      files.set(path, Buffer.concat([files.get(path) ?? Buffer.alloc(0), Buffer.from(text, 'utf8')]))
+    },
+    failStat(path: string) {
+      statFailures.add(path)
+    },
+  }
+}
+
+type FakeEventsWatcher = {
+  watchedPath: string
+  closed: boolean
+  on(event: string, handler: (...args: any[]) => void): FakeEventsWatcher
+  close(): Promise<void>
+  fire(event: string, path: string): void
+}
+
+function createFakeWatchFactory() {
+  const watchers: FakeEventsWatcher[] = []
+  const factory = (watchedPath: string) => {
+    const handlers = new Map<string, Array<(...args: any[]) => void>>()
+    const watcher: FakeEventsWatcher = {
+      watchedPath,
+      closed: false,
+      on(event, handler) {
+        const list = handlers.get(event) ?? []
+        list.push(handler)
+        handlers.set(event, list)
+        return watcher
+      },
+      async close() {
+        watcher.closed = true
+      },
+      fire(event, path) {
+        for (const handler of handlers.get(event) ?? []) handler(path)
+      },
+    }
+    watchers.push(watcher)
+    return watcher
+  }
+  return { factory, watchers }
+}
+
+async function flushAsync(rounds = 10): Promise<void> {
+  for (let i = 0; i < rounds; i += 1) {
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('Timed out in waitUntil')
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+}
+
+class EventedFakeRegistry extends EventEmitter {
+  list() {
+    return []
+  }
+  get() { return null }
+  create() { throw new Error('not used') }
+  attach() { return null }
+  finishAttachSnapshot() {}
+  detach() { return false }
+  input() { return false }
+  resize() { return false }
+  kill() { return false }
+  findRunningClaudeTerminalBySession() { return undefined }
+}
+
+describe('ws amplifier events-driven activity', () => {
+  let server: http.Server
+  let port: number
+  let wsHandler: any
+  let registry: EventedFakeRegistry
+  let amplifierActivity: any
+  let integration: any
+  const fsStore = createFakeEventsFs()
+  const watch = createFakeWatchFactory()
+  const warn = vi.fn()
+  const eventsPathBySession: Record<string, string> = {
+    's-ev1': '/fake/amp/sessions/s-ev1/events.jsonl',
+    's-ev2': '/fake/amp/sessions/s-ev2/events.jsonl',
+  }
+
+  async function connect(): Promise<WebSocket> {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`)
+    await new Promise<void>((resolve) => ws.on('open', () => resolve()))
+    ws.send(JSON.stringify({ type: 'hello', token: 'amplifier-activity-token', protocolVersion: WS_PROTOCOL_VERSION }))
+    await waitForMessage(ws, (msg) => msg.type === 'ready')
+    return ws
+  }
+
+  beforeAll(async () => {
+    process.env.NODE_ENV = 'test'
+    process.env.AUTH_TOKEN = 'amplifier-activity-token'
+
+    const { WsHandler } = await import('../../server/ws-handler')
+    const { wireAmplifierActivityTracker } = await import('../../server/coding-cli/amplifier-activity-wiring')
+    const { createAmplifierActivityIntegration } = await import('../../server/coding-cli/amplifier-activity-integration')
+
+    registry = new EventedFakeRegistry()
+    amplifierActivity = wireAmplifierActivityTracker({ registry: registry as any })
+    integration = createAmplifierActivityIntegration({
+      registry: registry as any,
+      tracker: amplifierActivity.tracker,
+      resolveEventsPath: (sessionId: string) => eventsPathBySession[sessionId],
+      log: { warn },
+      watchImpl: watch.factory as any,
+      fsImpl: fsStore.fsImpl as any,
+    })
+
+    server = http.createServer((_req, res) => {
+      res.statusCode = 404
+      res.end()
+    })
+    wsHandler = new WsHandler(
+      server,
+      registry as any,
+      {
+        amplifierActivityListProvider: () => amplifierActivity.tracker.list(),
+        amplifierLatestTurnCompletionsProvider: () => amplifierActivity.tracker.listLatestCompletions(),
+      },
+    )
+    // Mirror server/index.ts composition: tracker events → WS broadcasts.
+    amplifierActivity.tracker.on('changed', (payload: any) => {
+      wsHandler.broadcastAmplifierActivityUpdated(payload)
+    })
+    amplifierActivity.tracker.on('turn.complete', (payload: any) => {
+      wsHandler.broadcastTerminalTurnComplete({
+        provider: 'amplifier',
+        terminalId: payload.terminalId,
+        at: payload.at,
+        completionSeq: payload.completionSeq,
+        ...(payload.sessionId ? { sessionId: payload.sessionId } : {}),
+      })
+    })
+    port = await listen(server)
+  })
+
+  afterAll(async () => {
+    await integration?.dispose?.()
+    amplifierActivity?.dispose?.()
+    wsHandler?.close?.()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  })
+
+  it('drives busy on prompt:submit and exactly one terminal.turn.complete on prompt:complete; naming records never re-busy', async () => {
+    const ws = await connect()
+
+    // Resume bind → EOF attach on the pre-existing events file (no replay).
+    fsStore.write(eventsPathBySession['s-ev1'], eventsLine('session:start') + eventsLine('session:config'))
+    registry.emit('terminal.session.bound', {
+      terminalId: 'term-ev1',
+      provider: 'amplifier',
+      sessionId: 's-ev1',
+      reason: 'resume',
+    })
+    await waitUntil(() => watch.watchers.some((w) => w.watchedPath === '/fake/amp/sessions/s-ev1'))
+    await flushAsync()
+
+    fsStore.append(eventsPathBySession['s-ev1'], eventsLine('prompt:submit'))
+    watch.watchers.find((w) => w.watchedPath === '/fake/amp/sessions/s-ev1')!.fire('change', eventsPathBySession['s-ev1'])
+    const busy = await waitForMessage(ws, (msg) =>
+      msg.type === 'amplifier.activity.updated'
+      && msg.upsert?.some((record: any) => record.terminalId === 'term-ev1' && record.phase === 'busy'))
+    expect(busy.upsert[0]).toMatchObject({ terminalId: 'term-ev1', sessionId: 's-ev1', phase: 'busy' })
+
+    fsStore.append(eventsPathBySession['s-ev1'], eventsLine('prompt:complete'))
+    watch.watchers.find((w) => w.watchedPath === '/fake/amp/sessions/s-ev1')!.fire('change', eventsPathBySession['s-ev1'])
+    const completed = await waitForMessage(ws, (msg) =>
+      msg.type === 'terminal.turn.complete' && msg.terminalId === 'term-ev1')
+    expect(completed).toMatchObject({
+      provider: 'amplifier',
+      terminalId: 'term-ev1',
+      sessionId: 's-ev1',
+      completionSeq: 1,
+    })
+
+    // Post-complete background naming events (E2): no re-busy, no second completion.
+    fsStore.append(eventsPathBySession['s-ev1'], eventsLine('llm:request') + eventsLine('provider:retry'))
+    watch.watchers.find((w) => w.watchedPath === '/fake/amp/sessions/s-ev1')!.fire('change', eventsPathBySession['s-ev1'])
+    await expect(expectNoMatchingMessage(ws, (msg) =>
+      (msg.type === 'amplifier.activity.updated'
+        && msg.upsert?.some((record: any) => record.terminalId === 'term-ev1' && record.phase === 'busy'))
+      || (msg.type === 'terminal.turn.complete' && msg.terminalId === 'term-ev1'))).resolves.toBeUndefined()
+
+    ws.close()
+  })
+
+  it('tailer failure mid-turn reverts the phase to idle with NO turn.complete (single degrade warn)', async () => {
+    const ws = await connect()
+
+    fsStore.write(eventsPathBySession['s-ev2'], eventsLine('session:start'))
+    registry.emit('terminal.session.bound', {
+      terminalId: 'term-ev2',
+      provider: 'amplifier',
+      sessionId: 's-ev2',
+      reason: 'resume',
+    })
+    await waitUntil(() => watch.watchers.some((w) => w.watchedPath === '/fake/amp/sessions/s-ev2'))
+    await flushAsync()
+
+    fsStore.append(eventsPathBySession['s-ev2'], eventsLine('prompt:submit'))
+    const watcher = watch.watchers.find((w) => w.watchedPath === '/fake/amp/sessions/s-ev2')!
+    watcher.fire('change', eventsPathBySession['s-ev2'])
+    await waitForMessage(ws, (msg) =>
+      msg.type === 'amplifier.activity.updated'
+      && msg.upsert?.some((record: any) => record.terminalId === 'term-ev2' && record.phase === 'busy'))
+
+    // Tailer error mid-turn → single degrade warn + silent idle reversion over
+    // the wire. Attach the idle listener BEFORE firing so the broadcast cannot
+    // race past it.
+    const idlePromise = waitForMessage(ws, (msg) =>
+      msg.type === 'amplifier.activity.updated'
+      && msg.upsert?.some((record: any) => record.terminalId === 'term-ev2' && record.phase === 'idle'))
+    fsStore.failStat(eventsPathBySession['s-ev2'])
+    watcher.fire('change', eventsPathBySession['s-ev2'])
+    await waitUntil(() => warn.mock.calls.some((call) =>
+      (call[0] as any)?.event === 'amplifier_events_lane_degraded' && (call[0] as any)?.terminalId === 'term-ev2'))
+    const idle = await idlePromise
+    expect(idle.upsert.find((record: any) => record.terminalId === 'term-ev2')).toMatchObject({ phase: 'idle' })
+    const degradeWarns = warn.mock.calls.filter((call) =>
+      (call[0] as any)?.event === 'amplifier_events_lane_degraded' && (call[0] as any)?.terminalId === 'term-ev2')
+    expect(degradeWarns).toHaveLength(1)
+
+    // NO timing fallback: PTY output after the degrade must not resurrect the
+    // turn or fabricate a completion (the removed heuristic fired ~2s after
+    // output-silence, so the window is held open past that).
+    registry.emit('terminal.output.raw', { terminalId: 'term-ev2', data: 'tool output', at: Date.now() })
+    await expect(expectNoMatchingMessage(ws, (msg) =>
+      (msg.type === 'terminal.turn.complete' && msg.terminalId === 'term-ev2')
+      || (msg.type === 'amplifier.activity.updated'
+        && msg.upsert?.some((record: any) => record.terminalId === 'term-ev2' && record.phase === 'busy')),
+    2600)).resolves.toBeUndefined()
+    expect(amplifierActivity.tracker.getActivity('term-ev2')?.phase).toBe('idle')
+
+    ws.close()
   })
 })
