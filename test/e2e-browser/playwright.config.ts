@@ -64,6 +64,11 @@ const MATRIX_SPECS = [
   /safe01-auth-matrix\.spec\.ts$/,
   /safe03-origin-matrix\.spec\.ts$/,
   /cfg03-backup-restore\.spec\.ts$/,
+  // Truly-idle alerting (terminal.idle): end-to-end blue -> green + one alert
+  // edge + tab shade -> activate clears. Legacy leg runs; the rust leg is
+  // test.fixme pending the rust terminal.idle emitter
+  // (feat/rust-terminal-activity-idle) so it flips on trivially.
+  /truly-idle-alerting\.spec\.ts$/,
   // AGENT-14 -- checkpoint create/list/metadata/restore driven through the
   // real "Rewind code to here" UI gesture (hover, click, confirm dialog,
   // POST restore, verify file bytes). Legacy is a true parity control: the
@@ -78,6 +83,9 @@ const RUST_ONLY_SPECS = [
   /snapshot-restore-rust\.spec\.ts$/,
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,
+  // COMPOUND-RESTART: drives RustServer.restartAbrupt() (SIGKILL + reboot),
+  // an owned-fixture capability the default/legacy seam does not implement.
+  /compound-restart-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -187,6 +195,11 @@ export default defineConfig({
         // CONTINUITY TRIO deliverable 3: deploy tab-diff ritual acceptance
         // (capture -> restart -> verify OK; identity loss fails loudly + remediates).
         /deploy-tab-diff-rust\.spec\.ts$/,
+        // COMPOUND-RESTART (state-sync resilience assessment §7's two
+        // never-tested modes): abrupt SIGKILL death + revival, and server +
+        // browser restarting together. Rust-only: requires the owned
+        // RustServer.restartAbrupt() fixture capability.
+        /compound-restart-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

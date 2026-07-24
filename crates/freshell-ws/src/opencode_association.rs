@@ -274,6 +274,7 @@ mod tests {
             amplifier_locator: None,
             opencode_locator: Some(StdArc::new(OpencodeLocator::new(data_home))),
             activity: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         };
         (state, rx)
     }
@@ -427,6 +428,7 @@ mod tests {
                 "t1".to_string(),
                 "stream-1".to_string(),
                 "opencode",
+                None,
                 None,
                 None,
                 None,

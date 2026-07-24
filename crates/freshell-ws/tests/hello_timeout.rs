@@ -88,6 +88,7 @@ async fn spawn_server(hello_timeout_ms: u64) -> String {
         amplifier_locator: None,
         opencode_locator: None,
         activity: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
     };
 
     let router = freshell_ws::router(state);
