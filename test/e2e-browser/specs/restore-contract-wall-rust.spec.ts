@@ -270,6 +270,52 @@ async function createTabViaRest(info: TestServerInfo, body: object): Promise<str
   return tabId as string
 }
 
+// --- opencode pane helpers (donor: opencode-terminal-restore-rust.spec.ts:104-146) ---
+
+/**
+ * Open a NEW pane via the picker and select the "OpenCode" provider option.
+ * The follow-up "Starting directory for OpenCode" combobox arrives pre-filled
+ * and focused; Enter accepts the current directory as-is.
+ */
+async function openOpencodePane(page: Page): Promise<void> {
+  const picker = await openPanePicker(page)
+  await picker.getByRole('button', { name: /^OpenCode$/i }).click({ force: true })
+  await page.getByRole('combobox', { name: /Starting directory for OpenCode/i }).press('Enter')
+}
+
+/**
+ * Open a new opencode pane (splitting the current terminal) and return the
+ * NEWLY-added opencode leaf -- identified by diffing the leaf set before vs
+ * after, since a fresh pane's terminalId isn't known until create completes.
+ */
+async function openOpencodePaneAndGetLeaf(
+  page: Page,
+  harness: TestHarness,
+  tabId: string,
+): Promise<any> {
+  const before = findLeavesByMode(await harness.getPaneLayout(tabId), 'opencode')
+  const beforeIds = new Set(before.map((leaf) => leaf.id))
+  await openOpencodePane(page)
+  await expect(page.locator('.xterm').last()).toBeVisible({ timeout: 15_000 })
+  return expect
+    .poll(async () => {
+      const layout = await harness.getPaneLayout(tabId)
+      const newLeaf = findLeavesByMode(layout, 'opencode').find((leaf) => !beforeIds.has(leaf.id))
+      return newLeaf?.content?.terminalId ? newLeaf : null
+    }, { timeout: 15_000 })
+    .not.toBeNull()
+    .then(async () => {
+      const layout = await harness.getPaneLayout(tabId)
+      return findLeavesByMode(layout, 'opencode').find((leaf) => !beforeIds.has(leaf.id))
+    })
+}
+
+/** Look up a single leaf by pane id in a tab's current layout. */
+async function findLeafById(harness: TestHarness, tabId: string, paneId: string): Promise<any> {
+  const layout = await harness.getPaneLayout(tabId)
+  return collectLeaves(layout).find((leaf) => leaf.id === paneId) ?? null
+}
+
 // ---------------------------------------------------------------------------
 // The wall
 // ---------------------------------------------------------------------------
@@ -561,6 +607,96 @@ test.describe('Restore Contract Wall (P0.1)', () => {
           const buffer = await harness.getTerminalBuffer(terminalIdAfter)
           const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
           return unwrapped.includes(`codex: resumed session ${CODEX_SESSION_ID}`)
+        }, { timeout: 20_000 })
+        .toBe(true)
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('opencode terminal: locator-resolved session resumes with --session after SIGKILL', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-opencode-term-'))
+    const argLogPath = path.join(sharedRoot, 'opencode-argv.jsonl')
+    const fakeOpencodePath = await installFakeCli(
+      FAKE_OPENCODE_TERMINAL_SOURCE,
+      'opencode',
+      path.join(sharedRoot, 'bin'),
+    )
+
+    const { server, harness } = await bootWall(page, {
+      env: {
+        OPENCODE_CMD: fakeOpencodePath,
+        FAKE_OPENCODE_TERMINAL_ARGV_LOG: argLogPath,
+      },
+      // NOTE: seedWallConfig only overwrites config.json -- it never touches
+      // <home>/.local/share/opencode/opencode.db, so the runtime-minted DB
+      // survives restartAbrupt()'s setupHome re-run. No symlink needed.
+      setupHome: seedWallConfig({ providers: ['opencode'] }),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
+      // Wait for the boot pane to become a REAL terminal before opening the
+      // pane picker, else openPanePicker races the boot picker's fade-out
+      // (donor: truly-idle-alerting.spec.ts:122; same guard as Contract B).
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      const leaf = await openOpencodePaneAndGetLeaf(page, harness, tabId)
+      const paneId: string = leaf.id
+      const terminalIdBefore: string = leaf.content.terminalId
+
+      // Mint the session: click the pane, type, press Enter (the fake writes
+      // the opencode.db row on its first stdin data event).
+      await page.locator('.xterm').last().click()
+      await page.keyboard.type('hello wall opencode')
+      await page.keyboard.press('Enter')
+
+      // Wait for the locator to associate (identity lands in sessionRef).
+      const associatedSessionId: string = await expect
+        .poll(async () => {
+          const l = await findLeafById(harness, tabId, paneId)
+          return l?.content?.sessionRef?.sessionId ?? l?.content?.resumeSessionId ?? null
+        }, { timeout: 20_000 })
+        .not.toBeNull()
+        .then(async () => {
+          const l = await findLeafById(harness, tabId, paneId)
+          return l?.content?.sessionRef?.sessionId ?? l?.content?.resumeSessionId
+        })
+      expect(associatedSessionId).toMatch(/^ses_e2e_/)
+
+      const argvCountBeforeKill = (await readArgvLog(argLogPath)).length
+
+      // --- SIGKILL + revive; live client recovers on its own reconnect. ---
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+
+      // CONTRACT §2.4: new terminalId, resumed via --session <id>.
+      await expect
+        .poll(async () => {
+          const l = await findLeafById(harness, tabId, paneId)
+          const tid = l?.content?.terminalId ?? null
+          return tid && tid !== terminalIdBefore ? tid : null
+        }, { timeout: 30_000 })
+        .not.toBeNull()
+      await expect
+        .poll(async () => {
+          const entries = await readArgvLog(argLogPath)
+          return entries
+            .slice(argvCountBeforeKill)
+            .some((e) => hasFlagPair(e.argv, '--session', associatedSessionId))
+        }, { timeout: 30_000 })
+        .toBe(true)
+      const leafAfter = await findLeafById(harness, tabId, paneId)
+      expect(leafAfter?.content?.status).not.toBe('error')
+      await expect
+        .poll(async () => {
+          const buffer = await harness.getTerminalBuffer(leafAfter?.content?.terminalId)
+          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
+          return unwrapped.includes(`opencode: resumed session ${associatedSessionId}`)
         }, { timeout: 20_000 })
         .toBe(true)
     } finally {
