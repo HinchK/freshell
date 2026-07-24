@@ -719,7 +719,14 @@ Expected: PASS (5 tests).
 
 - [ ] **Step 4: Write the failing integration tests (RED)**
 
-Append to `crates/freshell-ws/tests/attach_viewport_resize.rs` (after the existing three tests; the harness comes from Task 2's `common`; `WsMessage`, `SinkExt`, and `serde_json` usage mirrors the existing tests/helpers in this binary — copy the exact `ws.send(...)` style used inside `common::attach_with`):
+First, add these two imports to the top of `crates/freshell-ws/tests/attach_viewport_resize.rs` (Task 2 moved the harness — the only prior user of these symbols — into `common/mod.rs` and removed them from this file as unused, so they MUST be re-added here or the RED run fails with a compile error instead of the expected runtime failures):
+
+```rust
+use futures_util::SinkExt;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+```
+
+Then append the tests below (after the existing three tests; the harness comes from Task 2's `common`; the `ws.send(...)` style mirrors `common::attach_with` — copy it exactly):
 
 ```rust
 #[tokio::test]
