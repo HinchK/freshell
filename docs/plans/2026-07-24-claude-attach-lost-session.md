@@ -24,6 +24,11 @@
 - README.md is the only end-user markdown doc; this plan under `docs/plans/` is a working/agent doc.
 - The campaign plan doc `2026-07-24-restart-resilience-architecture-analysis.md` is UNTRACKED on main — do NOT commit it or copy it into the worktree.
 - Note on the campaign plan's "kill-server-while-busy e2e" proof gate: that gate applies **before building the follow-on slices** (§2.8 items 2-4), not inside this PR. This slice's own spec mandates Rust-level proof (unit + WS integration against the real dispatch), which is what this plan delivers. The server-restart case is exactly the "untracked session" case these tests pin (a restarted process tracks nothing).
+- **Validated findings & accepted residual risks** (load-bearing validation stage; full ledger in the workflow logs — evidence-verified, do not re-litigate during implementation, do NOT expand scope to address them):
+  - Safety of `tracked -> silence` is proven: the client's attach `sessionId` is always the server-issued placeholder id echoed in `freshAgent.created` (never swapped to the durable `cliSessionId`), and claude.rs inserts into the map *before* broadcasting `created` — so no live session can be declared lost on a transient WS reconnect.
+  - Real client attach frames (up to 7 fields, nested `sessionRef{provider,sessionId}`) deserialize fine — `Option` fields + no `deny_unknown_fields`; the 4-field test frames are valid.
+  - What "recovery" means in this slice: the lost frame un-wedges the pane; `triggerRecovery` re-creates with `resumeSessionId` only if the pane state holds a resumable claude id, otherwise it resets the pane to idle with `restoreError`. Both outcomes un-wedge; full-fidelity resume is the follow-on slices (§2.8.2-3).
+  - Accepted (pre-existing, shared with codex/opencode's identical lost frames; out of scope here): (a) the frozen client's `markSessionLost` throws instead of no-oping in a client/tab that lacks the session record (e.g. a freshly reloaded page), so reload-window recovery can no-op — a one-line client-side guard is the recommended follow-on and would fix codex too; (b) no cross-client dedupe — two tabs showing the same pane can race duplicate resume-creates; (c) hidden panes don't send attach, so lost-detection fires when a pane becomes visible.
 
 ---
 
@@ -47,7 +52,7 @@ Interfaces between tasks:
 - Modify: `crates/freshell-freshagent/src/claude.rs` (imports ~line 57; new code after `handle_send`/near `send_error` ~line 380; helper near `session_type_str` ~line 474; tests in the `#[cfg(test)] mod tests` starting ~line 694)
 
 **Interfaces:**
-- Consumes: existing `FreshClaudeState` fields (`sessions: Arc<TokioMutex<HashMap<String, ClaudeSession>>>`, `broadcast_tx`), existing private helpers `fn broadcast(&self, msg: &ServerMessage)` (claude.rs:~140) and `fn session_type_str(session_type: SessionType) -> &'static str` (claude.rs:~474), protocol types `FreshAgentAttach` (crates/freshell-protocol/src/client_messages.rs:490-502), `ServerMessage::FreshAgentEvent` / `FreshAgentEvent`.
+- Consumes: existing `FreshClaudeState` fields (`sessions: Arc<TokioMutex<HashMap<String, ClaudeSession>>>`, `broadcast_tx`), existing private helpers `fn broadcast(&self, msg: &ServerMessage)` (claude.rs:~148) and `fn session_type_str(session_type: SessionType) -> &'static str` (claude.rs:~474), protocol types `FreshAgentAttach` (crates/freshell-protocol/src/client_messages.rs:490-502), `ServerMessage::FreshAgentEvent` / `FreshAgentEvent`.
 - Produces: `pub async fn handle_attach(&self, msg: FreshAgentAttach)` — takes an owned `FreshAgentAttach`, returns `()`, all output on the broadcast bus. Task 2 calls it as `fresh_claude.handle_attach(attach).await`.
 
 - [ ] **Step 1: Add `FreshAgentAttach` to the protocol import**
@@ -274,10 +279,10 @@ git commit -m "feat(freshagent): claude/kilroy attach emits INVALID_SESSION_ID l
 
 - [ ] **Step 1: Write the failing integration test**
 
-Create `crates/freshell-ws/tests/freshagent_claude_attach.rs`. The WS integration harness is duplicated per test file by explicit repo convention (there is no shared `tests/common/`; see `freshagent_claude_kill_interrupt.rs:9-11`). Copy these blocks **verbatim** from `crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs` into the new file (they are self-contained and do not reference the fake sidecar):
+Create `crates/freshell-ws/tests/freshagent_claude_attach.rs`. The WS integration harness is duplicated per test file by repo convention (verified: there is no shared `tests/common/` directory; each `tests/*.rs` file carries its own harness copy, e.g. `freshagent_claude_kill_interrupt.rs`). Copy these blocks **verbatim** from `crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs` into the new file (they are self-contained and do not reference the fake sidecar):
 
 - `test_settings_value` — lines 145-163
-- `spawn_server` — lines 165-220 (constructs the full 24-field `WsState` literal; copy exactly, do not reorder fields)
+- `spawn_server` — lines 165-220 (constructs the full 26-field `WsState` literal; copy exactly, do not reorder fields)
 - the `TestWs` type alias — lines 222-223
 - `connect_and_complete_handshake` — lines 225-256
 - `send_json` — lines 258-262
