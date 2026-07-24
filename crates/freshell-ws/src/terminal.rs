@@ -59,9 +59,9 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    ClientMessage, ErrorCode, ErrorMsg, Pong, ServerMessage, Shell, TerminalAttach, TerminalCreate,
-    TerminalCreated, TerminalIdOnly, TerminalKill, TerminalMetaRecord, TerminalMetaUpdated,
-    TerminalResize,
+    ClientMessage, ErrorCode, ErrorMsg, Pong, ServerMessage, SessionLocator, Shell, TerminalAttach,
+    TerminalCreate, TerminalCreated, TerminalIdOnly, TerminalKill, TerminalMetaRecord,
+    TerminalMetaUpdated, TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -1761,6 +1761,30 @@ fn handle_attach(
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
 ) {
+    // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
+    // `attach.ready` from the shared identity registry (create-time
+    // resume ids AND locator-associated ids both live there); the
+    // registry crate is identity-agnostic, so it's resolved here.
+    let canonical_session_ref = state.identity.session_ref_for(&attach.terminal_id);
+
+    // TERM-07 (`broker.ts:358-397` parity): apply the attach-supplied viewport
+    // geometry to the PTY BEFORE attach/replay. The intent + pre-attach
+    // subscriber condition lives in `resize_for_attach`; the session-identity
+    // guard (Node `resizeIfSessionMatches`) lives here because this crate owns
+    // the identity registry. This MUST run before `registry.attach`: attach's
+    // subscriber insert would destroy the pre-attach evidence the condition
+    // needs, and resizing under attach's per-terminal lock would deadlock.
+    if attach_geometry_identity_ok(
+        attach.expected_session_ref.as_ref(),
+        canonical_session_ref.as_ref(),
+    ) {
+        let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
+        let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
+        state
+            .registry
+            .resize_for_attach(&attach.terminal_id, conn_id, attach.intent, cols, rows);
+    }
+
     state.registry.attach(
         &attach.terminal_id,
         conn_id,
@@ -1768,12 +1792,24 @@ fn handle_attach(
         attach.attach_request_id.clone(),
         attach.since_seq.unwrap_or(0),
         terminal_output_batch_v1,
-        // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
-        // `attach.ready` from the shared identity registry (create-time
-        // resume ids AND locator-associated ids both live there); the
-        // registry crate is identity-agnostic, so it's resolved here.
-        state.identity.session_ref_for(&attach.terminal_id),
+        canonical_session_ref,
     );
+}
+
+/// Node's `resizeIfSessionMatches` identity guard
+/// (`server/terminal-registry.ts:3890-3903` `buildSessionIdentityMismatchResult`):
+/// no guard when the client sent no `expectedSessionRef`; when it did, the
+/// resize applies only if the terminal's canonical session identity matches.
+/// A terminal with no canonical identity cannot match an explicit expectation.
+fn attach_geometry_identity_ok(
+    expected: Option<&SessionLocator>,
+    canonical: Option<&SessionLocator>,
+) -> bool {
+    match (expected, canonical) {
+        (None, _) => true,
+        (Some(e), Some(c)) => e == c,
+        (Some(_), None) => false,
+    }
 }
 
 /// `terminal.resize` — resize the shared PTY (`registry.resize`); no dedicated wire
@@ -2752,5 +2788,53 @@ mod terminal_meta_created_tests {
                 }],
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod attach_geometry_tests {
+    use super::attach_geometry_identity_ok;
+    use freshell_protocol::SessionLocator;
+
+    fn locator(provider: &str, session_id: &str) -> SessionLocator {
+        SessionLocator {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn no_expectation_always_ok() {
+        assert!(attach_geometry_identity_ok(None, None));
+        assert!(attach_geometry_identity_ok(
+            None,
+            Some(&locator("codex", "s1"))
+        ));
+    }
+
+    #[test]
+    fn matching_expectation_ok() {
+        let expected = locator("codex", "s1");
+        let canonical = locator("codex", "s1");
+        assert!(attach_geometry_identity_ok(
+            Some(&expected),
+            Some(&canonical)
+        ));
+    }
+
+    #[test]
+    fn differing_expectation_mismatch() {
+        let expected = locator("codex", "s1");
+        let canonical = locator("codex", "s2");
+        assert!(!attach_geometry_identity_ok(
+            Some(&expected),
+            Some(&canonical)
+        ));
+    }
+
+    #[test]
+    fn expectation_against_no_identity_mismatch() {
+        let expected = locator("codex", "s1");
+        assert!(!attach_geometry_identity_ok(Some(&expected), None));
     }
 }
