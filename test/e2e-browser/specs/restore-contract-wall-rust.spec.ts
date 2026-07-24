@@ -298,4 +298,133 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
+
+  test('claude terminal: pre-allocated session resumes with --resume after SIGKILL', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-claude-term-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const argLogPath = path.join(sharedRoot, 'claude-argv.jsonl')
+    const fakeClaudePath = await installFakeCli(
+      FAKE_CLAUDE_CLI_SOURCE,
+      'claude',
+      path.join(sharedRoot, 'bin'),
+    )
+
+    const { server, harness } = await bootWall(page, {
+      env: { CLAUDE_CMD: fakeClaudePath, FAKE_CLAUDE_ARGV_LOG: argLogPath },
+      setupHome: seedWallConfig({ providers: ['claude'] }),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
+
+      // Fresh claude pane via the PICKER (WS path) -> server pre-allocates
+      // --session-id (terminal.rs:969-982). REST would not (PF1,
+      // terminal_tabs.rs:756-768). Candidate dirs can be EMPTY on a clean
+      // isolated HOME (crates/freshell-server/src/files.rs:15-26 -- no $HOME
+      // fallback), so TYPE the cwd instead of clicking a suggestion (donor:
+      // freshopencode-restart-recovery.spec.ts:117-124).
+      const beforeIds = new Set(
+        findLeavesByMode(await harness.getPaneLayout(tabId), 'claude').map((l) => l.id),
+      )
+      // The boot picker commits its selection only after its fade-out
+      // transition (PanePicker onTransitionEnd -> onSelect), so wait for the
+      // boot pane to become a REAL terminal before opening the pane picker --
+      // otherwise openPanePicker early-returns the still-fading boot picker
+      // and the Claude click is swallowed when that pane turns into the shell
+      // (donor: truly-idle-alerting.spec.ts waits for .xterm after picking).
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      const picker = await openPanePicker(page)
+      await picker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
+      const dirInput = page.getByRole('combobox', { name: /Starting directory for Claude/i })
+      await expect(dirInput).toBeVisible({ timeout: 15_000 })
+      await dirInput.fill(projectDir)
+      await dirInput.press('Enter')
+
+      // The new claude pane is a SPLIT in the active tab -- track it by leaf id.
+      const claudeLeaf = await expect
+        .poll(async () => {
+          const layout = await harness.getPaneLayout(tabId)
+          const newLeaf = findLeavesByMode(layout, 'claude').find((l) => !beforeIds.has(l.id))
+          return newLeaf?.content?.terminalId ? newLeaf : null
+        }, { timeout: 20_000 })
+        .not.toBeNull()
+        .then(async () => {
+          const layout = await harness.getPaneLayout(tabId)
+          return findLeavesByMode(layout, 'claude').find((l) => !beforeIds.has(l.id))!
+        })
+      const paneId: string = claudeLeaf.id
+      const terminalIdBefore: string = claudeLeaf.content.terminalId
+      const claudeContent = async () => {
+        const layout = await harness.getPaneLayout(tabId)
+        return collectLeaves(layout).find((l) => l.id === paneId)?.content
+      }
+
+      // t=0 identity: the FIRST spawn already carries --session-id <uuid>.
+      const preallocatedId: string = await expect
+        .poll(async () => {
+          const entries = await readArgvLog(argLogPath)
+          const withId = entries.find((e) => e.argv.includes('--session-id'))
+          if (!withId) return null
+          return withId.argv[withId.argv.indexOf('--session-id') + 1] ?? null
+        }, { timeout: 20_000 })
+        .not.toBeNull()
+        .then(async () => {
+          const entries = await readArgvLog(argLogPath)
+          const withId = entries.find((e) => e.argv.includes('--session-id'))!
+          return withId.argv[withId.argv.indexOf('--session-id') + 1]!
+        })
+      expect(preallocatedId).toMatch(/^[0-9a-f-]{36}$/)
+
+      // Client persisted the identity ("restore info set quickly", §2.2).
+      // PANE-level content.sessionRef: the fold happens in the mounted pane's
+      // own terminal.created handler (TerminalView.tsx:3729-3742 ->
+      // panesSlice.ts:1705-1707), so assert on the leaf, never the tab.
+      await expect
+        .poll(async () => (await claudeContent())?.sessionRef?.sessionId ?? null, {
+          timeout: 20_000,
+        })
+        .toBe(preallocatedId)
+
+      const argvCountBeforeKill = (await readArgvLog(argLogPath)).length
+
+      // --- SIGKILL + revive; live client recovers on its own reconnect. ---
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+
+      // CONTRACT §2.2: new terminalId, resumed with --resume <preallocatedId>.
+      await expect
+        .poll(async () => {
+          const tid = (await claudeContent())?.terminalId ?? null
+          return tid && tid !== terminalIdBefore ? tid : null
+        }, { timeout: 30_000 })
+        .not.toBeNull()
+      await expect
+        .poll(async () => {
+          const entries = await readArgvLog(argLogPath)
+          return entries
+            .slice(argvCountBeforeKill)
+            .some((e) => hasFlagPair(e.argv, '--resume', preallocatedId))
+        }, { timeout: 30_000 })
+        .toBe(true)
+
+      const terminalIdAfter = (await claudeContent())?.terminalId
+      await expect
+        .poll(async () => {
+          const buffer = await harness.getTerminalBuffer(terminalIdAfter)
+          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
+          return unwrapped.includes(`claude: resumed session ${preallocatedId}`)
+        }, { timeout: 20_000 })
+        .toBe(true)
+      expect((await claudeContent())?.status).not.toBe('error')
+      expect((await claudeContent())?.sessionRef?.sessionId).toBe(preallocatedId)
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
 })
