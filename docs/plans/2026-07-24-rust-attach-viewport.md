@@ -209,10 +209,19 @@ And UPDATE the existing test `resize_updates_geometry_epoch_only_on_change` (~li
 
 (If the existing body asserts via internals rather than `geometry()`, still replace it with the above — `geometry()` exists from Task 1.)
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [ ] **Step 2: Run tests to verify the red drivers fail (and the pin passes)**
 
-Run: `cargo test -p freshell-terminal first_client_geometry` and `cargo test -p freshell-terminal resize_updates`
-Expected: the two new tests and the updated existing test FAIL with assertion errors (actual epoch 2 where 1 is expected) — today's `resize` bumps on the first change. This is the red state (no compile error: these tests only use APIs that already exist after Task 1).
+Run all three:
+- `cargo test -p freshell-terminal first_client_geometry`
+- `cargo test -p freshell-terminal resize_updates`
+- `cargo test -p freshell-terminal unchanged_first_geometry`
+
+Expected:
+- `first_client_geometry_records_without_epoch_bump` FAILS with an assertion error (actual epoch 2 where 1 is expected) — today's `resize` bumps on the first change. RED DRIVER.
+- `resize_updates_geometry_epoch_only_on_change` (updated body) FAILS the same way (epoch 2 where 1 is expected after the first record). RED DRIVER.
+- `unchanged_first_geometry_still_counts_as_recorded` PASSES even before the implementation: `resize("T",120,30)` hits the current unchanged-dims early return (epoch stays 1) and `resize("T",95,41)` bumps 1→2. It is NOT a red driver — it is a regression pin that would fail under a wrong implementation of this task (one that skips setting `has_client_geometry` on the unchanged-dims path, so the next change would not bump). Do not expect it to fail; do not skip it.
+
+This is the red state for the two drivers (no compile error: these tests only use APIs that already exist after Task 1).
 
 - [ ] **Step 3: Write minimal implementation**
 
