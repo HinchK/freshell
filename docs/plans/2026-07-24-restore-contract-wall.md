@@ -85,9 +85,14 @@ strip newlines (`buffer.replace(/\n/g, '')`) before substring matching
 (xterm line-wrap splits markers).
 
 **Resume argv shapes** (from `extensions/*/freshell.json`):
-claude `["--resume","<id>"]` (fresh create pre-allocates
-`["--session-id","<uuid>"]` at t=0); codex `["resume","<id>"]` (searched
-anywhere in argv, not position 0); opencode `["--session","<id>"]`.
+claude `["--resume","<id>"]` (a fresh create pre-allocates
+`["--session-id","<uuid>"]` at t=0 **ONLY on the WS/picker create path** —
+`crates/freshell-ws/src/terminal.rs:969-982`; the REST `POST /api/tabs`
+path never mints its own preallocated id — `LaunchIntent::Resume`,
+`crates/freshell-freshagent/src/terminal_tabs.rs:756-768` — so every fresh
+claude terminal pane in this plan is created via the picker, never REST);
+codex `["resume","<id>"]` (searched anywhere in argv, not position 0);
+opencode `["--session","<id>"]`.
 
 **Fresh-agent enablement is two-layered.** The Redux dispatches
 (`connection/setAvailableClis`, `settings/previewServerSettingsPatch`) are
@@ -116,13 +121,23 @@ MUST seed `.freshell/config.json` with `freshAgent: { enabled: true }` and
   `{"type":"create",requestId,cwd,model,permissionMode,effort,resumeSessionId}`,
   child MUST reply `{"type":"created","sessionId":"<id>"}` (45s budget), then
   emits `sdk.*` event lines which the server renames `sdk.X → freshAgent.X`.
-  The canonical protocol reference is the inline test fake
+  The CONTROL-FRAME reference is the inline test fake
   `FAKE_CLAUDE_SIDECAR_SOURCE` at `crates/freshell-freshagent/src/claude.rs:861-901`
-  and the fixture used by `crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs`.
-- **`freshAgent.attach` for claude is silently swallowed** —
-  `crates/freshell-ws/src/terminal.rs:534-553` matches
-  `Codex => …, Opencode => …, _ => {}`; no error frame of any kind. This is
-  why freshclaude restore is expected-red (plan item P0.2).
+  and the fixture used by `crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs`
+  — but it emits ONLY `created`, so the authoritative FIELD-shape references
+  are the real sidecar `crates/freshell-claude-sidecar/index.mjs:15-30` and
+  the client consumer `src/lib/fresh-agent-ws.ts:195-284` (see Task 7).
+- **freshclaude restore is expected-red (P0.2) for a LAYERED reason.** The
+  FIRST failure is that claude fresh-agent identity is never persisted: the
+  server sends no `sessionRef` for claude
+  (`crates/freshell-freshagent/src/claude.rs:94-96,247`) and the persist
+  middleware strips `sessionId` without a `serverInstanceId`
+  (`src/store/persistMiddleware.ts:245-266`), so post-reload the pane sends
+  neither attach nor create. Behind that, **`freshAgent.attach` for claude
+  is silently swallowed** — `crates/freshell-ws/src/terminal.rs:535-553`
+  matches `Codex => …, Opencode => …, _ => {}`; no error frame of any kind —
+  and the snapshot route 503s (`snapshot.rs:132-145`); both block rebind
+  once identity persistence lands.
 
 **CODEX_CMD / OPENCODE_CMD dual role.** Codex terminal mode uses the SAME
 `CODEX_CMD` as the app-server sidecar (terminal spawns via PTY: PATH-style
@@ -155,7 +170,7 @@ value in `.then()` (documented trap, `restore-matrix.spec.ts:1784-1793`).
 | browser + editor state | PASS | §2.9 / P1.7 |
 | the ruler (all panes at once) | **FAIL** | P0.1 (flips when P0.2–P1.13 land) |
 | SIGKILL-within-5s-of-pane-creation | **FAIL** | P1.8+P1.9 (D3) |
-| SIGKILL-inside-locator-window | **FAIL** | P1.8 pending markers (§2.4/§4.2) |
+| SIGKILL-inside-locator-window | **FAIL** (made deterministic by the fixture's `FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH` row gate, Task 10 Step 2) | P1.8 pending markers (§2.4/§4.2) |
 | two-clients-same-sessionRef → 1 PTY | **FAIL** | P1.7 multi-client single-flight (D8/§4.3) |
 | freshclaude busy-restart un-wedge | **FAIL** | P0.2 (§2.8.1) |
 | double-restart mid-recovery | observe | P1.7 (§4.3) |
@@ -175,7 +190,8 @@ failure (self-retiring wall).
 - Create: `test/e2e-browser/fixtures/fake-claude-cli.mjs` — argv-logging fake `claude` terminal CLI (fills the suite's known gap: no claude resume-argv proof exists today).
 - Create: `test/e2e-browser/fixtures/fake-claude-sidecar.mjs` — fake Claude SDK-bridge sidecar speaking the newline-JSON stdio protocol (enables LIVE freshclaude panes in e2e for the first time).
 - Create: `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` — the wall: shared helpers + 9 per-pane contract tests + the ruler + 6 named red tests.
-- Modify: `test/e2e-browser/playwright.config.ts` — add the spec to `RUST_ONLY_SPECS` (~lines 82-89) and to the `rust-chromium` project's `testMatch` (~lines 138-150).
+- Modify: `test/e2e-browser/playwright.config.ts` — add the spec to `RUST_ONLY_SPECS` (~lines 82-89) and to the `rust-chromium` project's `testMatch` (~lines 138-203).
+- Modify: `test/e2e-browser/fixtures/fake-opencode-terminal.mjs` — add the opt-in `FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH` determinism gate (Task 10 Step 2).
 
 Everything else (server, client, extensions) is read-only.
 
@@ -209,7 +225,7 @@ Everything else (server, client, extensions) is read-only.
 
 Open `test/e2e-browser/playwright.config.ts`. Find the `RUST_ONLY_SPECS`
 array (~lines 82-89; every match-all project `testIgnore`s these) and the
-`rust-chromium` project's `testMatch` array (~lines 138-150). Every existing
+`rust-chromium` project's `testMatch` array (~lines 138-203). Every existing
 entry carries a comment citing its plan doc — match that convention. Add to
 **both** arrays:
 
@@ -568,7 +584,7 @@ git commit -m "test(e2e): scaffold restore contract wall with shell terminal SIG
 - Modify: `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` (append test)
 
 **Interfaces:**
-- Consumes: `bootWall`, `seedWallConfig`, `installFakeCli`, `readArgvLog`, `hasFlagPair`, `waitForWsReady`, `selectShellIfPickerShowing`, `createTabViaRest`, `FAKE_CLAUDE_CLI_SOURCE` (Task 1).
+- Consumes: `bootWall`, `seedWallConfig`, `installFakeCli`, `readArgvLog`, `hasFlagPair`, `waitForWsReady`, `selectShellIfPickerShowing`, `collectLeaves`, `findLeavesByMode`, `FAKE_CLAUDE_CLI_SOURCE` (Task 1); `openPanePicker` from `../helpers/pane-picker.js`.
 - Produces: the fixture env contract `FAKE_CLAUDE_ARGV_LOG` (JSONL `{pid,t,argv}`) and buffer markers `claude: session <id> started` / `claude: resumed session <id>` — reused by Task 9.
 
 - [ ] **Step 1: Create the fixture, mirroring `fake-codex-cli.mjs`**
@@ -585,7 +601,9 @@ module style is proven to work under the repo's Node). Create
 // greppable marker, then stays "running" via stdin.resume().
 //
 // Real claude launch shapes (extensions/claude-code/freshell.json):
-//   fresh:  claude ... --session-id <uuid>   (server pre-allocates at t=0)
+//   fresh:  claude ... --session-id <uuid>   (pre-allocated at t=0 by the
+//           WS/picker create path ONLY, crates/freshell-ws/src/terminal.rs:969-982;
+//           REST POST /api/tabs never mints one, terminal_tabs.rs:756-768)
 //   resume: claude ... --resume <id>
 // Flags are searched anywhere in argv (resume args are appended LAST by the
 // launch builder), matching fake-codex-cli.mjs's rationale.
@@ -637,7 +655,17 @@ rejects the extensionless ESM file, rewrite the fixture in CJS
 - [ ] **Step 3: Append Contract B to the describe block**
 
 Per plan §2.2: fresh create pre-allocates `--session-id <uuid>` at t=0; after
-SIGKILL+restart the pane must relaunch with `--resume <that uuid>`.
+SIGKILL+restart the pane must relaunch with `--resume <that uuid>`. The
+creation path MUST be the pane picker (WS `terminal.create`): only the WS
+path pre-allocates the fresh-claude session id
+(`crates/freshell-ws/src/terminal.rs:969-982`); the REST `POST /api/tabs`
+path never mints one (`LaunchIntent::Resume`,
+`crates/freshell-freshagent/src/terminal_tabs.rs:756-768`). Poll the
+PANE-level `content.sessionRef` — the fold happens in the mounted pane's own
+`terminal.created` handler (`src/components/TerminalView.tsx:3729-3742` →
+`src/store/panesSlice.ts:1705-1707`), not at tab level. Per-provider
+post-kill argv shapes: claude `--resume <id>`, opencode `--session <id>`,
+codex `resume <id>`.
 
 ```ts
   test('claude terminal: pre-allocated session resumes with --resume after SIGKILL', async ({
@@ -655,15 +683,48 @@ SIGKILL+restart the pane must relaunch with `--resume <that uuid>`.
       path.join(sharedRoot, 'bin'),
     )
 
-    const { server, harness, info } = await bootWall(page, {
+    const { server, harness } = await bootWall(page, {
       env: { CLAUDE_CMD: fakeClaudePath, FAKE_CLAUDE_ARGV_LOG: argLogPath },
       setupHome: seedWallConfig({ providers: ['claude'] }),
     })
     try {
       await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
 
-      // Fresh claude pane (no sessionRef) -> server pre-allocates --session-id.
-      const tabId = await createTabViaRest(info, { mode: 'claude', cwd: projectDir })
+      // Fresh claude pane via the PICKER (WS path) -> server pre-allocates
+      // --session-id (terminal.rs:969-982). REST would not (PF1,
+      // terminal_tabs.rs:756-768). Candidate dirs can be EMPTY on a clean
+      // isolated HOME (crates/freshell-server/src/files.rs:15-26 -- no $HOME
+      // fallback), so TYPE the cwd instead of clicking a suggestion (donor:
+      // freshopencode-restart-recovery.spec.ts:117-124).
+      const beforeIds = new Set(
+        findLeavesByMode(await harness.getPaneLayout(tabId), 'claude').map((l) => l.id),
+      )
+      const picker = await openPanePicker(page)
+      await picker.getByRole('button', { name: /^Claude$/i }).click({ force: true })
+      const dirInput = page.getByRole('combobox', { name: /Starting directory for Claude/i })
+      await expect(dirInput).toBeVisible({ timeout: 15_000 })
+      await dirInput.fill(projectDir)
+      await dirInput.press('Enter')
+
+      // The new claude pane is a SPLIT in the active tab -- track it by leaf id.
+      const claudeLeaf = await expect
+        .poll(async () => {
+          const layout = await harness.getPaneLayout(tabId)
+          const newLeaf = findLeavesByMode(layout, 'claude').find((l) => !beforeIds.has(l.id))
+          return newLeaf?.content?.terminalId ? newLeaf : null
+        }, { timeout: 20_000 })
+        .not.toBeNull()
+        .then(async () => {
+          const layout = await harness.getPaneLayout(tabId)
+          return findLeavesByMode(layout, 'claude').find((l) => !beforeIds.has(l.id))!
+        })
+      const paneId: string = claudeLeaf.id
+      const terminalIdBefore: string = claudeLeaf.content.terminalId
+      const claudeContent = async () => {
+        const layout = await harness.getPaneLayout(tabId)
+        return collectLeaves(layout).find((l) => l.id === paneId)?.content
+      }
 
       // t=0 identity: the FIRST spawn already carries --session-id <uuid>.
       const preallocatedId: string = await expect
@@ -681,19 +742,14 @@ SIGKILL+restart the pane must relaunch with `--resume <that uuid>`.
         })
       expect(preallocatedId).toMatch(/^[0-9a-f-]{36}$/)
 
-      const terminalIdBefore: string = await expect
-        .poll(async () => (await harness.getPaneLayout(tabId))?.content?.terminalId ?? null, {
+      // Client persisted the identity ("restore info set quickly", §2.2).
+      // PANE-level content.sessionRef: the fold happens in the mounted pane's
+      // own terminal.created handler (TerminalView.tsx:3729-3742 ->
+      // panesSlice.ts:1705-1707), so assert on the leaf, never the tab.
+      await expect
+        .poll(async () => (await claudeContent())?.sessionRef?.sessionId ?? null, {
           timeout: 20_000,
         })
-        .not.toBeNull()
-        .then(async () => (await harness.getPaneLayout(tabId))?.content?.terminalId)
-
-      // Client persisted the identity ("restore info set quickly", §2.2).
-      await expect
-        .poll(async () => {
-          const content = (await harness.getPaneLayout(tabId))?.content
-          return content?.sessionRef?.sessionId ?? null
-        }, { timeout: 20_000 })
         .toBe(preallocatedId)
 
       const argvCountBeforeKill = (await readArgvLog(argLogPath)).length
@@ -705,7 +761,7 @@ SIGKILL+restart the pane must relaunch with `--resume <that uuid>`.
       // CONTRACT §2.2: new terminalId, resumed with --resume <preallocatedId>.
       await expect
         .poll(async () => {
-          const tid = (await harness.getPaneLayout(tabId))?.content?.terminalId ?? null
+          const tid = (await claudeContent())?.terminalId ?? null
           return tid && tid !== terminalIdBefore ? tid : null
         }, { timeout: 30_000 })
         .not.toBeNull()
@@ -718,7 +774,7 @@ SIGKILL+restart the pane must relaunch with `--resume <that uuid>`.
         }, { timeout: 30_000 })
         .toBe(true)
 
-      const terminalIdAfter = (await harness.getPaneLayout(tabId))?.content?.terminalId
+      const terminalIdAfter = (await claudeContent())?.terminalId
       await expect
         .poll(async () => {
           const buffer = await harness.getTerminalBuffer(terminalIdAfter)
@@ -726,10 +782,8 @@ SIGKILL+restart the pane must relaunch with `--resume <that uuid>`.
           return unwrapped.includes(`claude: resumed session ${preallocatedId}`)
         }, { timeout: 20_000 })
         .toBe(true)
-      expect((await harness.getPaneLayout(tabId))?.content?.status).not.toBe('error')
-      expect((await harness.getPaneLayout(tabId))?.content?.sessionRef?.sessionId).toBe(
-        preallocatedId,
-      )
+      expect((await claudeContent())?.status).not.toBe('error')
+      expect((await claudeContent())?.sessionRef?.sessionId).toBe(preallocatedId)
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
@@ -744,13 +798,14 @@ npx playwright test --config test/e2e-browser/playwright.config.ts \
   --project=rust-chromium restore-contract-wall -g "claude terminal"
 ```
 
-Expected: PASS (client held `sessionRef`; §2.2 says this path works). If the
-`--session-id` poll times out, check whether claude fresh-create pre-allocation
-requires the picker path instead of REST: fall back to creating via the pane
-picker (`picker.getByRole('button', { name: /^Claude$/i }).click({ force: true })`
-then `page.getByRole('combobox', { name: /Starting directory for Claude/i }).press('Enter')`)
-and keep every assertion identical. If still red with a faithful test, pin
-P0.4 (§2.2).
+Expected: PASS (client held `sessionRef`; §2.2 says this path works). The
+picker/WS path is the ONLY correct creation path here — do NOT "simplify" to
+`createTabViaRest`: the REST path never pre-allocates `--session-id`
+(`terminal_tabs.rs:756-768`), so the t=0 poll would time out by design. If
+the Claude picker button never shows, the `enabledProviders: ['claude']` seed
+or `CLAUDE_CMD` detection is the culprit (the picker requires availableClis +
+enabledProviders + not-disabled). If red with a faithful test, pin P0.4
+(§2.2).
 
 - [ ] **Step 5: Commit**
 
@@ -1136,6 +1191,11 @@ process.exit(result.status ?? 1)
 
 ```ts
 async function createFreshcodexPane(page: Page, harness: TestHarness): Promise<void> {
+  // setAvailableClis is client-only AND gets overwritten by the app
+  // bootstrap + /api/platform fetch (App.tsx:572,609). Callers reach this
+  // helper only after harness.waitForConnection(), which is what makes the
+  // dispatch land AFTER those overwrites (donor ordering:
+  // freshopencode-restart-recovery.spec.ts:100-115). Keep it that way.
   await page.evaluate(() => {
     ;(window as any).__FRESHELL_TEST_HARNESS__?.dispatch({
       type: 'connection/setAvailableClis',
@@ -1144,6 +1204,13 @@ async function createFreshcodexPane(page: Page, harness: TestHarness): Promise<v
   })
   const picker = await openPanePicker(page)
   await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+  // "First option" exists here only because selectShellIfPickerShowing
+  // already opened a shell whose live-terminal cwd becomes a candidate dir
+  // (/api/files/candidate-dirs returns [] on a truly clean boot -- no $HOME
+  // fallback, crates/freshell-server/src/files.rs:15-26). This mirrors the
+  // donor exactly (restore-double-restart.spec.ts:148-176); if no option
+  // renders, switch to the fill+Enter pattern used by
+  // createFreshopencodePane/createFreshclaudePane.
   await page.getByRole('option').first().click()
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
     timeout: 15_000,
@@ -1284,6 +1351,10 @@ git commit -m "test(e2e): freshcodex SIGKILL restore contract in the wall"
 
 ```ts
 async function enableFreshOpencode(page: Page): Promise<void> {
+  // These dispatches are client-only and MUST land AFTER the app bootstrap +
+  // /api/platform fetch (App.tsx:572,609 overwrite availableClis). Callers
+  // reach this helper only after harness.waitForConnection(), which is the
+  // donor's ordering (freshopencode-restart-recovery.spec.ts:100-115).
   await page.evaluate(() => {
     const harness = (window as any).__FRESHELL_TEST_HARNESS__
     harness?.dispatch({ type: 'connection/setAvailableClis', payload: { opencode: true } })
@@ -1333,6 +1404,11 @@ new session.
       env: { OPENCODE_CMD: fakeOpencodePath, FAKE_OPENCODE_AUDIT_LOG: auditLogPath },
       setupHome: seedWallConfig({ providers: ['opencode'], freshAgent: true }),
     })
+    // NOTE: the fixture's /session/:id/abort and /fork routes 404 -- known
+    // and out of contract scope (the only production caller is
+    // freshAgent.interrupt, whose error is swallowed,
+    // crates/freshell-freshagent/src/opencode_ws.rs:562-572). Do not add
+    // interrupt-shaped assertions against this fixture.
     try {
       await selectShellIfPickerShowing(page)
       const tabId = (await harness.getActiveTabId())!
@@ -1431,19 +1507,23 @@ git commit -m "test(e2e): freshopencode SIGKILL restore contract in the wall"
 
 **Interfaces:**
 - Consumes: Task 1 helpers; `openPanePicker`; `findFreshAgentLeaf`; `leafDurableIdentity`; `sendFreshAgentTurn` (Task 5).
-- Produces: `createFreshclaudePane(page, harness): Promise<void>`; fixture env contract `FAKE_CLAUDE_SIDECAR_HOLD_TURN=1` (a send never completes — pane stays `running`) — reused by Tasks 9 and 10.
+- Produces: `createFreshclaudePane(page, harness, cwd): Promise<void>`; fixture env contract `FAKE_CLAUDE_SIDECAR_HOLD_TURN=1` (a send never completes — pane stays `running`) — reused by Tasks 9 and 10.
 
 - [ ] **Step 1: Write the sidecar fixture from the canonical protocol, then verify field names**
 
-The protocol source of truth is the inline test fake
-`FAKE_CLAUDE_SIDECAR_SOURCE` at
+The CONTROL-FRAME reference (create/created/shutdown framing) is the inline
+test fake `FAKE_CLAUDE_SIDECAR_SOURCE` at
 `crates/freshell-freshagent/src/claude.rs:861-901` (cfg(test)-only, so it
-must be transcribed, not reused) and the integration fixture in
-`crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs`. Create
+must be transcribed, not reused) — but it emits ONLY `created`, so it
+**cannot catch field-shape bugs**. The authoritative FIELD-shape references
+are the real sidecar `crates/freshell-claude-sidecar/index.mjs:15-30` (its
+doc comment enumerates every emitted frame) and the client consumer
+`src/lib/fresh-agent-ws.ts:195-284` (what the client actually reads). Create
 `test/e2e-browser/fixtures/fake-claude-sidecar.mjs` with the following, then
-**diff every emitted `type` string and field name against those two Rust
-files and correct any mismatch** (the server forwards only known `sdk.*`
-types; an unknown type is silently dropped):
+**diff every emitted `type` string and field name against index.mjs +
+fresh-agent-ws.ts and correct any mismatch** (the server forwards only known
+`sdk.*` types and passes payload fields through verbatim; the client
+silently drops mis-shaped fields):
 
 ```js
 #!/usr/bin/env node
@@ -1452,8 +1532,17 @@ types; an unknown type is silently dropped):
 // newline-JSON stdio protocol from crates/freshell-freshagent/src/claude.rs:
 //   in : {"type":"create",requestId,cwd,model,permissionMode,effort,resumeSessionId}
 //        {"type":"send",sessionId,text} {"type":"interrupt",sessionId} {"type":"shutdown"}
-//   out: {"type":"created","sessionId"} then sdk.* event lines
-//        (renamed sdk.X -> freshAgent.X server-side).
+//   out: {"type":"created","sessionId"} FIRST (any earlier sdk.* line is
+//        DISCARDED by read_created, claude.rs:551; 45s budget claude.rs:71),
+//        then sdk.* event lines (renamed sdk.X -> freshAgent.X server-side).
+// FIELD shapes come from the REAL sidecar (crates/freshell-claude-sidecar/
+// index.mjs:15-30) + the client consumer (src/lib/fresh-agent-ws.ts:195-284):
+//   - sdk.assistant content MUST be an ARRAY of blocks (fresh-agent-ws.ts:260-265);
+//   - sdk.turn.complete MUST carry a numeric `at` (fresh-agent-ws.ts:233-240);
+//   - sdk.session.init cliSessionId MUST be a canonical UUID
+//     (shared/session-contract.ts:34) or no durable sessionRef ever lands.
+// The process MUST stay alive (no EOF) until shutdown/kill -- an early exit
+// stops the server's consumer.
 // FAKE_CLAUDE_SIDECAR_HOLD_TURN=1 -> a send starts running and never
 // completes (busy-restart wedge scenario).
 import readline from 'node:readline'
@@ -1476,17 +1565,47 @@ rl.on('line', (line) => {
   }
   if (msg.type === 'create') {
     const sessionId = msg.resumeSessionId ?? `fc-e2e-${process.pid}-${Date.now()}`
-    emit({ type: 'created', sessionId })
-    emit({ type: 'sdk.session.init', sessionId, cliSessionId: CLI_SESSION_ID })
+    // `created` FIRST -- pre-created sdk.* lines are discarded (claude.rs:551).
+    emit({ type: 'created', requestId: msg.requestId, sessionId })
+    // cliSessionId MUST match the canonical Claude UUID regex
+    // (shared/session-contract.ts:34) or the client never derives a durable
+    // sessionRef/resumeSessionId for the pane.
+    emit({
+      type: 'sdk.session.init',
+      sessionId,
+      cliSessionId: CLI_SESSION_ID,
+      model: msg.model ?? 'claude-opus-4-6',
+      cwd: msg.cwd ?? process.cwd(),
+      tools: [],
+    })
+    if (msg.resumeSessionId) {
+      // Resume creates set expectsHistoryHydration (fresh-agent-ws.ts:86-107,
+      // freshAgentSlice.ts:230-231) -- emit a snapshot so the restored pane
+      // (Tasks 7/9/10 restore halves) leaves isRestoring.
+      emit({ type: 'sdk.session.snapshot', sessionId, messages: [] })
+    }
+    // Required for pane status 'idle' (created alone only yields 'connected').
+    emit({ type: 'sdk.status', sessionId, status: 'idle' })
   } else if (msg.type === 'send') {
     emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'running' })
     if (!HOLD_TURN) {
+      // content MUST be an ARRAY of blocks: the client renders assistant
+      // messages only from event.content arrays (fresh-agent-ws.ts:260-265);
+      // a bare `text` field is silently dropped.
       emit({
         type: 'sdk.assistant',
         sessionId: msg.sessionId,
-        text: 'Fixture claude turn',
+        content: [{ type: 'text', text: 'Fixture claude turn' }],
+        model: 'claude-opus-4-6',
       })
-      emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, subtype: 'success' })
+      // turn.complete without a NUMERIC `at` is dropped by the client
+      // (fresh-agent-ws.ts:233-240).
+      emit({
+        type: 'sdk.turn.complete',
+        sessionId: msg.sessionId,
+        subtype: 'success',
+        at: Date.now(),
+      })
       emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
     }
   } else if (msg.type === 'shutdown') {
@@ -1502,13 +1621,23 @@ printf '%s\n' '{"type":"create","requestId":"r1","cwd":"/tmp"}' '{"type":"send",
   | timeout 2 node test/e2e-browser/fixtures/fake-claude-sidecar.mjs || true
 ```
 
-Expected: four JSON lines starting with `{"type":"created",...}`. (sessionId
-for the create is minted, so the send's `X` mismatch is fine for the smoke.)
+Expected: seven JSON lines, in order: `created`, `sdk.session.init`,
+`sdk.status` (idle), `sdk.status` (running), `sdk.assistant`,
+`sdk.turn.complete`, `sdk.status` (idle) — the FIRST line must be
+`{"type":"created",...}`. Verify the `sdk.assistant` line carries a
+`content` ARRAY of blocks (not a `text` field) and the `sdk.turn.complete`
+line carries a numeric `at`. (sessionId for the create is minted, so the
+send's `X` mismatch is fine for the smoke.)
 
 - [ ] **Step 3: Append the freshclaude creation helper**
 
 ```ts
-async function createFreshclaudePane(page: Page, harness: TestHarness): Promise<void> {
+async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: string): Promise<void> {
+  // setAvailableClis is client-only AND gets overwritten by the app
+  // bootstrap + /api/platform fetch (App.tsx:572,609). Callers reach this
+  // helper only after harness.waitForConnection(), which is what makes the
+  // dispatch land AFTER those overwrites (donor ordering:
+  // freshopencode-restart-recovery.spec.ts:100-115). Keep it that way.
   await page.evaluate(() => {
     ;(window as any).__FRESHELL_TEST_HARNESS__?.dispatch({
       type: 'connection/setAvailableClis',
@@ -1517,10 +1646,23 @@ async function createFreshclaudePane(page: Page, harness: TestHarness): Promise<
   })
   const picker = await openPanePicker(page)
   await picker.getByRole('button', { name: /^Freshclaude$/i }).click({ force: true })
-  await page.getByRole('option').first().click()
+  // /api/files/candidate-dirs returns [] on a clean isolated HOME (no $HOME
+  // fallback, crates/freshell-server/src/files.rs:15-26), so a "first
+  // option" may not exist -- TYPE the cwd and press Enter instead (donor:
+  // freshopencode-restart-recovery.spec.ts:117-124).
+  const directoryInput = page.getByLabel(/^Starting directory for Freshclaude$/i)
+  await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+  await directoryInput.fill(cwd)
+  await directoryInput.press('Enter')
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
     timeout: 15_000,
   })
+  // NOTE: once the canonical-UUID cliSessionId lands, the client fetches the
+  // thread snapshot and the Rust router has NO claude adapter -> 503
+  // FRESH_AGENT_RUNTIME_UNAVAILABLE (crates/freshell-freshagent/src/
+  // snapshot.rs:133-146), which can surface a history-load-error banner on a
+  // perfectly healthy fresh pane. Assert pane state via the harness (Redux),
+  // tolerate the banner -- never assert error-free UI chrome for freshclaude.
 }
 ```
 
@@ -1536,17 +1678,25 @@ with history rehydrated, status not wedged); the pin records today's reality.
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // EXPECTED-FAIL WALL PIN -- P0.2 (§2.8): freshAgent.attach for claude is
-    // silently swallowed (crates/freshell-ws/src/terminal.rs:534-553 `_ => {}`)
-    // and the snapshot endpoint 503s, so post-restart rebind + history
-    // rehydration cannot succeed today. FLIP when the claude attach arm +
-    // snapshot adapter land (P0.2 slices 1-4). See file doc comment.
+    // EXPECTED-FAIL WALL PIN -- P0.2 (§2.8): the FIRST failure today is that
+    // claude fresh-agent identity is never persisted -- the server sends no
+    // sessionRef for claude (crates/freshell-freshagent/src/claude.rs:94-96,247)
+    // and the persist middleware strips sessionId without a serverInstanceId
+    // (src/store/persistMiddleware.ts:245-266) -- so post-reload the pane
+    // sends NEITHER attach nor create, and the identity poll below times out.
+    // Attach-swallow (crates/freshell-ws/src/terminal.rs:535-553 `_ => {}`)
+    // and snapshot-503 (crates/freshell-freshagent/src/snapshot.rs:132-145)
+    // are real and block rebind + rehydration AFTER identity persistence
+    // lands. FLIP only when claude identity survives reload AND the attach
+    // arm + snapshot adapter land (P0.2 slices). See file doc comment.
     test.fail(
       e2eServerKind === 'rust',
-      'P0.2 (§2.8): freshclaude attach swallowed server-side; no snapshot adapter',
+      'P0.2 (§2.8): claude identity never persisted; attach swallow + missing snapshot adapter block rebind behind it',
     )
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshclaude-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
 
     const { server, harness } = await bootWall(page, {
       env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
@@ -1555,7 +1705,7 @@ with history rehydrated, status not wedged); the pin records today's reality.
     try {
       await selectShellIfPickerShowing(page)
       const tabId = (await harness.getActiveTabId())!
-      await createFreshclaudePane(page, harness)
+      await createFreshclaudePane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, tabId, 'wall freshclaude turn')
       await expect(
         page.locator('[data-context="fresh-agent"]').last().getByText('Fixture claude turn'),
@@ -1608,11 +1758,16 @@ Expected: reported as **expected failure** (suite green). Critically, verify
 from the trace/output that the failure happens AT OR AFTER the restore
 assertions — if creation or the first turn fails (before the kill), the fake
 sidecar protocol is wrong: re-check Step 1's field names against
-`claude.rs:861-901` (e.g. exact event type strings, status frame shape) and
-fix the fixture until the pre-kill half passes, because a wall entry that
-fails during setup measures nothing. If the whole test unexpectedly PASSES,
-remove the pin (and celebrate — but verify attach really happened by checking
-`harness.getSentWsMessages()` for a `freshAgent.attach` with the original id).
+`crates/freshell-claude-sidecar/index.mjs:15-30` and
+`src/lib/fresh-agent-ws.ts:195-284` (exact event type strings, `content`
+block array, numeric `at`, canonical-UUID `cliSessionId`) and fix the
+fixture until the pre-kill half passes, because a wall entry that fails
+during setup measures nothing. Expected first failure: the post-restart
+IDENTITY poll times out (claude identity is never persisted — see the pin
+comment), not the transcript assertion. If the whole test unexpectedly
+PASSES, remove the pin (and celebrate — but verify a restore message really
+went out by checking `harness.getSentWsMessages()` for a `freshAgent.attach`
+or resume-bearing `freshAgent.create` with the original id).
 
 - [ ] **Step 6: Commit**
 
@@ -1635,8 +1790,18 @@ git commit -m "test(e2e): fake claude sidecar + freshclaude SIGKILL restore cont
 - [ ] **Step 1: Append the browser-pane helper (donor: `browser-pane.spec.ts:8`) and the contract test**
 
 Per plan §2.9: browser/editor panes are pure client state — after
-SIGKILL+restart+reload their `url` / `filePath`+`content`+`viewMode` must be
-intact. (First-ever reload/restart coverage for these pane kinds.)
+SIGKILL+restart+reload the browser `url` and the editor `filePath`+`viewMode`
+must be intact. (First-ever reload/restart coverage for these pane kinds.)
+IMPORTANT: editor `content.content` is BLANKED at every persist flush AND
+load BY DESIGN (`stripEditorContent`,
+`src/store/persistMiddleware.ts:236-243,581`); visible content
+re-materializes ONLY via file re-fetch on mount when `filePath && !content`,
+gated on connection ready (`src/components/panes/EditorPane.tsx:450-463`).
+So the editor half is FILE-BACKED: write a real file inside the test's tmp
+dir, open it in the editor pane, and post-restart assert (a)
+`filePath`+`viewMode` round-trip in Redux and (b) visible content
+re-materializes via the re-fetch. Never assert `content.content` survives
+persistence — that is falsified-by-design, not a product red.
 
 ```ts
 async function createBrowserPaneInPage(page: Page): Promise<void> {
@@ -1654,6 +1819,14 @@ async function createBrowserPaneInPage(page: Page): Promise<void> {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-broweditor-'))
+    // FILE-BACKED editor pane: content.content never survives persistence
+    // (stripEditorContent blanks it at flush AND load, persistMiddleware.ts:
+    // 236-243,581 -- BY DESIGN); visible content re-materializes only via
+    // file re-fetch on mount (EditorPane.tsx:450-463, connection-gated).
+    const editorMarker = `wall-editor-${Math.random().toString(36).slice(2, 8)}`
+    const editorFilePath = path.join(sharedRoot, 'wall-editor.md')
+    await fs.writeFile(editorFilePath, `# wall\n\n${editorMarker}\n`)
     const { server, harness, info } = await bootWall(page)
     try {
       await selectShellIfPickerShowing(page)
@@ -1667,10 +1840,10 @@ async function createBrowserPaneInPage(page: Page): Promise<void> {
       const iframe = page.locator('iframe[title="Browser content"]')
       await iframe.waitFor({ state: 'attached', timeout: 10_000 })
 
-      // Editor pane via Redux dispatch (deterministic scratch-pad content).
-      const editorMarker = `wall-editor-${Math.random().toString(36).slice(2, 8)}`
+      // Editor pane via Redux dispatch, file-backed: empty content + filePath
+      // makes EditorPane auto-fetch the file on mount (EditorPane.tsx:450-463).
       await page.evaluate(
-        ({ currentTabId, marker }) => {
+        ({ currentTabId, filePath }) => {
           const harnessApi = (window as any).__FRESHELL_TEST_HARNESS__
           const state = harnessApi?.getState()
           const paneId = state?.panes?.activePane?.[currentTabId]
@@ -1683,16 +1856,16 @@ async function createBrowserPaneInPage(page: Page): Promise<void> {
               newPaneId: 'pane-wall-editor',
               newContent: {
                 kind: 'editor',
-                filePath: null,
+                filePath,
                 language: 'markdown',
-                content: `# wall\n\n${marker}`,
+                content: '',
                 readOnly: false,
                 viewMode: 'source',
               },
             },
           })
         },
-        { currentTabId: tabId, marker: editorMarker },
+        { currentTabId: tabId, filePath: editorFilePath },
       )
       await expect(page.locator('.monaco-editor').getByText(editorMarker)).toBeVisible({
         timeout: 20_000,
@@ -1705,7 +1878,11 @@ async function createBrowserPaneInPage(page: Page): Promise<void> {
       await waitForWsReady(page)
       await reloadAndReconnect(page, harness)
 
-      // CONTRACT §2.9: browser url and editor content/viewMode intact.
+      // CONTRACT §2.9: browser url intact; editor filePath+viewMode intact
+      // and visible content re-materialized from the FILE. Do NOT assert
+      // content.content in Redux -- it is '' by design (stripEditorContent,
+      // persistMiddleware.ts:236-243,581): a red there would be a TEST BUG,
+      // never a product regression to pin.
       const rehydratedTabId = (await harness.getActiveTabId())!
       await expect
         .poll(async () => {
@@ -1717,7 +1894,9 @@ async function createBrowserPaneInPage(page: Page): Promise<void> {
       const layout = await harness.getPaneLayout(rehydratedTabId)
       const editorLeaf = collectLeaves(layout).find((l) => l?.content?.kind === 'editor')
       expect(editorLeaf?.content?.viewMode).toBe('source')
-      expect(editorLeaf?.content?.content).toContain(editorMarker)
+      expect(editorLeaf?.content?.filePath).toBe(editorFilePath)
+      // Re-fetch is ASYNC and gated on connection ready (EditorPane.tsx:
+      // 454-457) -- poll for the visible content, never assert immediately.
       await expect(page.locator('.monaco-editor').getByText(editorMarker)).toBeVisible({
         timeout: 30_000,
       })
@@ -1726,6 +1905,7 @@ async function createBrowserPaneInPage(page: Page): Promise<void> {
       })
     } finally {
       await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
 ```
@@ -1831,11 +2011,16 @@ process.exit(result.status ?? 1)
     test.setTimeout(300_000)
     // EXPECTED-FAIL WALL PIN -- P0.1: this is the composed ruler; it flips
     // green only when every per-pane contract above is green un-pinned
-    // (P0.2..P1.13). Today the freshclaude leg (P0.2, §2.8) fails inside it.
-    // FLIP: delete this pin when the last per-pane pin is retired.
+    // (P0.2..P1.13). Today the FIRST red comes from the hidden-tab legs
+    // (F8/P1.11): post-reload only the LAST tab is active, so the hidden
+    // tabs' shell-recreate / claude-argv polls fail first. The freshclaude
+    // leg is ADDITIONALLY red (identity never persisted, P0.2), while the
+    // freshcodex/freshopencode identity polls can pass VACUOUSLY from
+    // persisted state. FLIP: delete this pin when the last per-pane pin is
+    // retired.
     test.fail(
       e2eServerKind === 'rust',
-      'P0.1: composed all-pane ruler; red until P0.2..P1.13 land',
+      'P0.1: composed all-pane ruler; red until F8 (P1.11) + P0.2..P1.13 land',
     )
 
     const CODEX_SESSION_ID = '99999999-8888-4777-8666-555555555555'
@@ -1882,9 +2067,13 @@ process.exit(result.status ?? 1)
       const urlInput = page.getByPlaceholder('Enter URL...')
       await urlInput.fill(`${info.baseUrl}/api/health`)
       await urlInput.press('Enter')
+      // FILE-BACKED editor pane (editor content.content never survives
+      // persistence -- stripEditorContent, persistMiddleware.ts:236-243,581).
       const editorMarker = 'ruler-editor-marker'
+      const editorFilePath = path.join(projectDir, 'ruler-editor.md')
+      await fs.writeFile(editorFilePath, `# ruler\n\n${editorMarker}\n`)
       await page.evaluate(
-        ({ currentTabId, marker }) => {
+        ({ currentTabId, filePath }) => {
           const harnessApi = (window as any).__FRESHELL_TEST_HARNESS__
           const state = harnessApi?.getState()
           const paneId = state?.panes?.activePane?.[currentTabId]
@@ -1897,20 +2086,35 @@ process.exit(result.status ?? 1)
               newPaneId: 'pane-ruler-editor',
               newContent: {
                 kind: 'editor',
-                filePath: null,
+                filePath,
                 language: 'markdown',
-                content: `# ruler\n\n${marker}`,
+                content: '',
                 readOnly: false,
                 viewMode: 'source',
               },
             },
           })
         },
-        { currentTabId: tab1, marker: editorMarker },
+        { currentTabId: tab1, filePath: editorFilePath },
       )
 
-      // --- TAB 2 (REST): claude terminal, fresh -> pre-allocated id. ---
-      const claudeTabId = await createTabViaRest(info, { mode: 'claude', cwd: projectDir })
+      // --- TAB 2 (picker/WS path): claude terminal, fresh -> pre-allocated
+      // id. REST POST /api/tabs never pre-allocates --session-id
+      // (terminal_tabs.rs:756-768); only the WS-path terminal.create does
+      // (terminal.rs:969-982), so create the tab via tab-add and pick Claude
+      // in the new tab's own pane-type picker. Type the cwd -- candidate
+      // dirs may be empty on a clean HOME (files.rs:15-26).
+      await page.locator('[data-context="tab-add"]').click()
+      await harness.waitForTabCount(2)
+      const claudeTabId = (await harness.getActiveTabId())!
+      const claudePicker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+      await claudePicker.getByRole('button', { name: /^Claude$/i }).click({ force: true })
+      const claudeDirInput = page.getByRole('combobox', {
+        name: /Starting directory for Claude/i,
+      })
+      await expect(claudeDirInput).toBeVisible({ timeout: 15_000 })
+      await claudeDirInput.fill(projectDir)
+      await claudeDirInput.press('Enter')
       const claudePreallocatedId: string = await expect
         .poll(async () => {
           const entries = await readArgvLog(claudeArgLog)
@@ -1952,7 +2156,7 @@ process.exit(result.status ?? 1)
         })
 
       // --- TAB 4: freshcodex; TAB 5: freshopencode; TAB 6: freshclaude. ---
-      // (Tab count so far: tab1 + claude REST tab + codex sidebar tab = 3;
+      // (Tab count so far: tab1 + claude picker tab + codex sidebar tab = 3;
       // the opencode pane is a SPLIT inside the codex tab, not a tab.)
       await page.locator('[data-context="tab-add"]').click()
       await harness.waitForTabCount(4)
@@ -1979,7 +2183,7 @@ process.exit(result.status ?? 1)
       await harness.waitForTabCount(6)
       const freshclaudeTabId = (await harness.getActiveTabId())!
       await selectShellIfPickerShowing(page)
-      await createFreshclaudePane(page, harness)
+      await createFreshclaudePane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, freshclaudeTabId, 'ruler freshclaude turn')
       const freshclaudeId = leafDurableIdentity(
         findFreshAgentLeaf(await harness.getPaneLayout(freshclaudeTabId)),
@@ -2010,14 +2214,19 @@ process.exit(result.status ?? 1)
         }, { timeout: 30_000 })
         .not.toBeNull()
 
-      // Browser + editor (§2.9): state intact.
+      // Browser + editor (§2.9): durable state intact. Editor content.content
+      // is '' by design after persistence (stripEditorContent,
+      // persistMiddleware.ts:236-243,581) -- assert the durable fields
+      // (filePath/viewMode) instead; tab1 is HIDDEN post-reload, so no
+      // visible-content re-fetch assertion here (the file-backed re-fetch is
+      // covered by Contract H on a visible pane).
       const tab1Layout = await harness.getPaneLayout(tab1)
       expect(
         collectLeaves(tab1Layout).find((l) => l?.content?.kind === 'browser')?.content?.url,
       ).toContain('/api/health')
-      expect(
-        collectLeaves(tab1Layout).find((l) => l?.content?.kind === 'editor')?.content?.content,
-      ).toContain(editorMarker)
+      const rulerEditorLeaf = collectLeaves(tab1Layout).find((l) => l?.content?.kind === 'editor')
+      expect(rulerEditorLeaf?.content?.viewMode).toBe('source')
+      expect(rulerEditorLeaf?.content?.filePath).toBe(editorFilePath)
 
       // Claude terminal (§2.2): resumed with the pre-allocated id.
       await expect
@@ -2066,6 +2275,12 @@ process.exit(result.status ?? 1)
       }
 
       // Quiet client: no alerts, no noisy error text (donor: restore-sync05).
+      // CAVEAT: freshclaude creates get a snapshot 503
+      // (FRESH_AGENT_RUNTIME_UNAVAILABLE, snapshot.rs:133-146) which can
+      // surface a history-load-error banner; if this count is nonzero ONLY
+      // because of that banner, scope the locator to exclude the freshclaude
+      // pane (or drop this line) rather than treating it as a new product
+      // red -- the pane-state assertions above are the real contract.
       await expect(page.getByRole('alert')).toHaveCount(0)
     } finally {
       await server.stop()
@@ -2079,9 +2294,19 @@ Notes for the implementer:
   `page.getByRole('button', { name: /add tab/i })` — check
   `browser-pane.spec.ts` / `restore-matrix.spec.ts` for the current idiom.
 - Hidden-tab panes may not re-create until revealed (that is F8, pinned in
-  Task 10) — the ruler's per-tab polls run against Redux layout state, and if
-  a hidden tab never re-creates, the poll fails inside an already-pinned test.
-  That is honest: the ruler is red until F8 lands too.
+  Task 10) — post-reload only the LAST tab is active, so expect the ruler's
+  FIRST red to be a hidden-tab leg (the tab1 shell-recreate poll or the
+  claude/codex/opencode resume-argv polls), NOT the freshclaude leg. The
+  freshclaude identity poll is additionally red (identity never persisted,
+  P0.2 — see Task 7's pin comment), while the freshcodex/freshopencode
+  identity polls can pass VACUOUSLY from persisted state (they measure
+  persistence, not restore). The ruler's per-tab polls run against Redux
+  layout state, and if a hidden tab never re-creates, the poll fails inside
+  an already-pinned test. That is honest: the ruler is red until F8 (P1.11)
+  and P0.2 land too. (Which hidden-tab assertion fails FIRST depends on
+  whether the dead-terminal census reaches hidden tabs' layouts — runtime-
+  dependent, verdict-neutral: both candidates are post-restart contract
+  assertions.)
 
 - [ ] **Step 3: Run it**
 
@@ -2108,9 +2333,11 @@ git commit -m "test(e2e): the ruler -- all-pane-types SIGKILL restore matrix (ex
 
 **Files:**
 - Modify: `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` (append 6 tests)
+- Modify: `test/e2e-browser/fixtures/fake-opencode-terminal.mjs` (Step 2: opt-in `FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH` determinism gate — a TEST fixture, allowed by this plan's constraints)
 
 **Interfaces:**
 - Consumes: all helpers from Tasks 1–7; additionally the Playwright `browser` fixture (for the two-clients test).
+- Produces: fixture env contract `FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH` (when set, the fake polls ~50ms for the gate file before writing its session row; unset = unchanged behavior).
 
 Append each test inside the describe block. Each carries its pin naming the
 plan item; apply the decision rule after each run.
@@ -2144,20 +2371,36 @@ server's ledger makes it recoverable; the client offers/executes recovery.
       'claude',
       path.join(sharedRoot, 'bin'),
     )
-    const { server, harness, info } = await bootWall(page, {
+    const { server, harness } = await bootWall(page, {
       env: { CLAUDE_CMD: fakeClaudePath, FAKE_CLAUDE_ARGV_LOG: argLogPath },
       setupHome: seedWallConfig({ providers: ['claude'] }),
     })
     try {
       await selectShellIfPickerShowing(page)
-      await createTabViaRest(info, { mode: 'claude', cwd: projectDir })
-      // Server-minted identity exists the moment the CLI spawns...
+      // Fresh claude pane via the picker/WS path -- REST POST /api/tabs never
+      // pre-allocates --session-id (terminal_tabs.rs:756-768); only the
+      // WS-path terminal.create does (terminal.rs:969-982). Type the cwd --
+      // candidate dirs may be empty on a clean HOME (files.rs:15-26).
+      const picker = await openPanePicker(page)
+      await picker.getByRole('button', { name: /^Claude$/i }).click({ force: true })
+      const dirInput = page.getByRole('combobox', { name: /Starting directory for Claude/i })
+      await expect(dirInput).toBeVisible({ timeout: 15_000 })
+      await dirInput.fill(projectDir)
+      await dirInput.press('Enter')
+
+      // Server-minted identity exists the moment the CLI spawns: the fake
+      // appends its argv line synchronously at spawn, so the first
+      // --session-id entry marks the pane's t=0. UI creation is slower than
+      // a REST call, so the poll gets a UI-scale timeout; the "within 5s of
+      // creation" premise is anchored on the SPAWN instead -- SIGKILL is
+      // issued immediately after the entry appears (moments after spawn,
+      // well inside any snapshot cadence).
       const preallocatedId: string = await expect
         .poll(async () => {
           const entries = await readArgvLog(argLogPath)
           const withId = entries.find((e) => e.argv.includes('--session-id'))
           return withId ? withId.argv[withId.argv.indexOf('--session-id') + 1] ?? null : null
-        }, { timeout: 5_000 })
+        }, { timeout: 20_000 })
         .not.toBeNull()
         .then(async () => {
           const entries = await readArgvLog(argLogPath)
@@ -2165,8 +2408,9 @@ server's ledger makes it recoverable; the client offers/executes recovery.
           return withId.argv[withId.argv.indexOf('--session-id') + 1]!
         })
 
-      // ...and the SIGKILL lands within 5s of creation, before any snapshot
-      // cadence could have persisted it. Then the browser loses its state.
+      // ...and the SIGKILL lands immediately after the spawn -- before any
+      // snapshot cadence could have persisted the binding. Then the browser
+      // loses its state.
       await server.restartAbrupt()
       await page.evaluate(() => localStorage.clear())
       await reloadAndReconnect(page, harness)
@@ -2199,7 +2443,70 @@ server's ledger makes it recoverable; the client offers/executes recovery.
   })
 ```
 
-- [ ] **Step 2: `SIGKILL-inside-locator-window` (pin P1.8 pending markers, §2.4/§4.2)**
+- [ ] **Step 2: `SIGKILL-inside-locator-window` (pin P1.8 pending markers, §2.4/§4.2) — with a determinism gate in the fixture**
+
+Without a control this pin is a RACE, not a deterministic red: the locator
+sweep runs every 150ms (`crates/freshell-server/src/main.rs:1112,543-546`)
+and the fixture writes its session row synchronously on first stdin
+(`test/e2e-browser/fixtures/fake-opencode-terminal.mjs:108-122`), so the
+association can beat the SIGKILL a few percent of runs — and an unexpected
+PASS of a `test.fail` pin is a HARD suite failure. The existing
+`FAKE_OPENCODE_SESSION_EVENT_GATE_PATH` seam lives in the SIDECAR fixture
+and gates SSE emission only (`fake-opencode.cjs:390,636-652`) — unsuitable
+here. So FIRST edit `test/e2e-browser/fixtures/fake-opencode-terminal.mjs`
+(a TEST fixture — allowed by this plan's constraints): replace its fresh-
+launch `else` branch (currently lines ~103-124) with the version below,
+adding an opt-in row gate that mirrors the sidecar's poll-for-gate-file
+pattern. Unset, behavior is byte-identical for the existing restore specs.
+
+```js
+} else {
+  process.stdout.write('opencode> \r\n')
+
+  // Opt-in determinism gate for the restore-contract wall
+  // (SIGKILL-inside-locator-window): when FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH
+  // is set, poll ~50ms for the gate file before writing the session row
+  // (mirrors FAKE_OPENCODE_SESSION_EVENT_GATE_PATH in fake-opencode.cjs:636-652,
+  // which gates SSE emission only and cannot gate this row write). The wall
+  // test sets the env and never creates the file pre-kill, so the identity
+  // deterministically never lands before the SIGKILL.
+  const rowGatePath = process.env.FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH
+
+  function commitSessionRow(sessionId, cwd) {
+    writeSessionRow(sessionId, cwd)
+    process.stdout.write(`opencode: session ${sessionId} started\r\n`)
+  }
+
+  let sessionCreated = false
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', () => {
+    // Any input at all counts as "the first submit" for this fixture's
+    // purposes -- the real locator arms only on Enter-shaped WS input, and
+    // the pty's own cooked-mode line discipline already withholds bytes
+    // from this process until the user presses Enter, so the first `data`
+    // event this process ever sees IS that submit.
+    if (sessionCreated) return
+    sessionCreated = true
+
+    const cwd = process.cwd()
+    const sessionId = `ses_e2e_${Date.now()}_${process.pid}`
+    if (!rowGatePath) {
+      commitSessionRow(sessionId, cwd)
+      return
+    }
+    const interval = setInterval(() => {
+      if (!fs.existsSync(rowGatePath)) return
+      clearInterval(interval)
+      commitSessionRow(sessionId, cwd)
+    }, 50)
+    interval.unref?.()
+  })
+  process.stdin.resume()
+}
+```
+
+Re-run the existing `opencode-terminal-restore-rust` spec after this edit to
+prove the unset-env path is unchanged. Then append the wall test:
 
 ```ts
   test('SIGKILL-inside-locator-window: never silently fresh', async ({
@@ -2212,19 +2519,31 @@ server's ledger makes it recoverable; the client offers/executes recovery.
     // minted identity permanently, and the pane restores SILENTLY FRESH --
     // no resume, no breadcrumb. FLIP when ledger pending markers land
     // (fresh-by-race must be visible) or the identity is captured in time.
+    // DETERMINISM: the fake's session-row write is held behind
+    // FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH and this test NEVER creates the
+    // gate file before the kill, so the identity provably cannot land
+    // pre-kill. Without the gate, the 150ms locator sweep (main.rs:1112)
+    // can beat the SIGKILL a few percent of runs -> unexpected PASS of this
+    // pin -> hard suite failure.
     test.fail(
       e2eServerKind === 'rust',
       'P1.8 (§2.4): SIGKILL inside locator window yields silent fresh, no breadcrumb',
     )
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-locwin-'))
     const argLogPath = path.join(sharedRoot, 'opencode-argv.jsonl')
+    // Deliberately never created -- see the DETERMINISM note above.
+    const rowGatePath = path.join(sharedRoot, 'row-gate-never-created')
     const fakeOpencodePath = await installFakeCli(
       FAKE_OPENCODE_TERMINAL_SOURCE,
       'opencode',
       path.join(sharedRoot, 'bin'),
     )
     const { server, harness } = await bootWall(page, {
-      env: { OPENCODE_CMD: fakeOpencodePath, FAKE_OPENCODE_TERMINAL_ARGV_LOG: argLogPath },
+      env: {
+        OPENCODE_CMD: fakeOpencodePath,
+        FAKE_OPENCODE_TERMINAL_ARGV_LOG: argLogPath,
+        FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH: rowGatePath,
+      },
       setupHome: seedWallConfig({ providers: ['opencode'] }),
     })
     try {
@@ -2336,15 +2655,29 @@ server's ledger makes it recoverable; the client offers/executes recovery.
       await waitForWsReady(pageB)
 
       // Let both recovery rounds fully settle before counting.
+      const countRespawns = async () =>
+        (await readArgvLog(argLogPath))
+          .slice(argvCountBeforeKill)
+          .filter((e) => hasResumePair(e.argv, CODEX_SESSION_ID)).length
       await expect
-        .poll(async () => {
-          const entries = await readArgvLog(argLogPath)
-          return entries
-            .slice(argvCountBeforeKill)
-            .filter((e) => hasResumePair(e.argv, CODEX_SESSION_ID)).length
-        }, { timeout: 45_000 })
+        .poll(countRespawns, { timeout: 45_000 })
         .toBeGreaterThan(0)
-      await page.waitForTimeout(10_000)
+      // STABLE-COUNT settle (not a fixed sleep): accept only when two samples
+      // >=5s apart agree, so a tail-latency straggler cannot make the count
+      // read 1 spuriously -- an unexpected PASS of this pin is a hard suite
+      // failure. Under today's bug the stable count is 2 (pin holds); when
+      // sessionRef single-flight lands it is 1 (pin flips loudly).
+      await expect
+        .poll(
+          async () => {
+            const first = await countRespawns()
+            await page.waitForTimeout(5_000)
+            const second = await countRespawns()
+            return second === first ? second : null
+          },
+          { timeout: 60_000 },
+        )
+        .not.toBeNull()
 
       // TARGET CONTRACT (§4.3 multi-client single-flight): EXACTLY 1 PTY.
       const respawns = (await readArgvLog(argLogPath))
@@ -2377,6 +2710,8 @@ server's ledger makes it recoverable; the client offers/executes recovery.
       'P0.2 (§2.8.1): busy freshclaude pane wedges BUSY after SIGKILL (attach swallowed)',
     )
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-fcbusy-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
     const { server, harness } = await bootWall(page, {
       env: {
         FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
@@ -2387,7 +2722,7 @@ server's ledger makes it recoverable; the client offers/executes recovery.
     try {
       await selectShellIfPickerShowing(page)
       const tabId = (await harness.getActiveTabId())!
-      await createFreshclaudePane(page, harness)
+      await createFreshclaudePane(page, harness, projectDir)
 
       // Send a turn that NEVER completes (HOLD_TURN) -> status running.
       const paneRoot = page.locator('[data-context="fresh-agent"]').last()
@@ -2570,7 +2905,7 @@ the output that the failure is the post-restart contract assertion, not setup.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add test/e2e-browser/specs/restore-contract-wall-rust.spec.ts
+git add test/e2e-browser/specs/restore-contract-wall-rust.spec.ts test/e2e-browser/fixtures/fake-opencode-terminal.mjs
 git commit -m "test(e2e): six named §5 P0.1 red tests pinned expected-fail in the wall"
 ```
 
