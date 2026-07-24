@@ -74,11 +74,9 @@ test.describe('Truly-idle alerting (terminal.idle)', () => {
   test.setTimeout(180_000)
 
   test('claude terminal: blue while busy, then green + one alert edge + tab shade after quiet grace; activating the tab clears the shade', async ({ page, e2eServerKind }) => {
-    test.fixme(
-      e2eServerKind === 'rust',
-      'pending rust terminal.idle emitter — feat/rust-terminal-activity-idle',
-    )
-
+    // Rust leg live since feat/rust-terminal-activity-idle: the Rust server's
+    // activity hub (`crates/freshell-ws/src/activity.rs`) emits the same
+    // pinned `terminal.idle` contract the legacy TrulyIdleEmitter does.
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-truly-idle-'))
     let server: E2eServerHandle | undefined
     try {
