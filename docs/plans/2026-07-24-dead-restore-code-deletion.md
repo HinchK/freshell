@@ -23,11 +23,20 @@
   - All TypeScript (`server/`, `src/`, `shared/`, `test/`) — the TS symbols with similar names are the legacy reference implementation, not callers of the Rust code.
 - **HALT RULE (per spec):** before deleting each symbol, re-verify it has zero non-test callers *at execution time* (a parallel task may have landed a caller since this plan was written). If a symbol has a real production caller: STOP deleting that symbol, keep it (and anything it needs), and record it in the Task 4 inventory. Do not force it.
 - **Feature flags:** `launch_lifecycle` (a consumer of `launch_plan`) is behind `#[cfg(feature = "real-transport")]`. A default-feature check is insufficient — always use `--all-features` on `freshell-codex` checks/tests.
-- **Process safety:** NEVER restart the user's self-hosted freshell server (pid 1262455 on port 3001), never bind :3001, never use broad kill patterns (`pkill node`, `pkill -f vite`, etc.).
+- **Process safety:** NEVER restart the user's self-hosted freshell server (historically pid 1262455 on port 3001 — the pid may have changed or the server may be down; the rule holds regardless), never bind :3001, never use broad kill patterns (`pkill node`, `pkill -f vite`, etc.).
 - **Coordinated suite:** the full repo suite runs only via the coordinator gate: check `npm run test:status` first; if another agent holds the gate, WAIT (poll; never kill the holder). Run as `FRESHELL_TEST_SUMMARY="..." npm test`.
 - **Docs:** do NOT commit `/home/dan/code/freshell/docs/plans/2026-07-24-restart-resilience-architecture-analysis.md` (untracked on main; read-only reference). Create no new markdown files beyond this plan.
 - **PR policy:** PR creation is NOT user-approved. After verification is green: commit, push the branch, then STOP before `gh pr create` and report branch name + deletion inventory.
-- **Line numbers** below were verified on 2026-07-24 at the branch point. This worktree is exclusive to this task so they should hold, but always locate regions by the quoted symbol names / marker comments, not by line number alone, and re-check boundaries before deleting.
+- **Line numbers** below were verified on 2026-07-24 at the branch point. This worktree is exclusive to this task (verified: clean tree, single checkout of the branch, only the plan commit beyond base) so they should hold, but always locate regions by the quoted symbol names / marker comments, not by line number alone, and re-check boundaries before deleting.
+
+### Validated baseline facts (load-bearing validation, 2026-07-24 — evidence in `.worktrees/.the-usual-logs/dead-restore-code-deletion/load-bearing-ledger.md`)
+
+- **origin/main == branch point a53f185a** at validation time — no commit after the branch point exists, so no caller can have landed yet. A mandatory pre-push re-check (Task 4 Step 5) guards the window between now and push.
+- **The parallel codexDurability wiring task does not consume the restore-decision symbols** (campaign doc §2.3.1 routes `terminal.codex.candidate.persisted` → identity registry, around the decision table; all 11 symbols grepped across docs, worktree plans, worktree crates, and open/merged PRs — zero consumers). Task 3's execution-time HALT re-check remains mandatory anyway.
+- **`cargo check --workspace --all-features --all-targets` runs green on this host** (12.19s warm) — the Task 4 gate is viable as written. It emits **4 pre-existing warnings in `freshell-server`** (dead_code: `DEFAULT_CLI_DETECTION_SPECS`, `has_cli`, `get`/`get_all`) — these are baseline, NOT caused by this deletion; only a *new* warning is attributable. `cargo fmt --check` and both clippy `-D warnings` gates are fully green at base.
+- **`cargo doc -p freshell-codex --all-features --no-deps` exits 0 at base but emits 4 pre-existing warnings** (3× `rustdoc::private_intra_doc_links` in remote_proxy/status/json_scan areas + 1× redundant explicit link target in transport.rs). Expectation everywhere below = exit 0, no `broken_intra_doc_links`, no NEW warnings; the 4 baseline warnings persist and are fine.
+- **`cargo test -p freshell-codex --all-features` is hermetic and host-safe** (inspected: loopback-ephemeral binds only, the sole spawn is a committed node fixture killed as its own child, the /proc reaper matches only a per-run UUID env needle, no real user-data access) and is **green at base: 190/190 tests** (lib 149; integration: app_server_drive 4, completion_gating 3, interrupt_rpc 1, launch_lifecycle 16, remote_proxy_relay 17). The launch_lifecycle spawn test requires `node` on PATH and the `ws` npm module resolvable (currently satisfied via the parent checkout's node_modules); if that breaks, the failure is environmental, not deletion-caused.
+- **The coordinated npm suite recorded a green full-suite run at exactly a53f185a on 2026-07-24 on this host** (coordinator store: `full-suite success exit=0`) — that record is the baseline for Task 4 Step 4. `npm test` runs vitest only (no cargo, no Rust binary, no :3001 contact; coordinator mutex is a unix socket). The host's WSL UDP-port-exhaustion failure mode is still live (remediation unimplemented; Tcpip event 4266 fires daily) — see Task 4 Step 4 triage guidance.
 
 ---
 
@@ -64,6 +73,8 @@ cargo test -p freshell-activity
 cargo test -p freshell-codex --all-features
 ```
 Expected: both PASS (exit 0). Record the test counts printed (e.g. `test result: ok. N passed`) — later tasks assert against them. If the baseline is red, STOP: report the failure instead of deleting anything (the base must be green first).
+
+Known-good reference (validated 2026-07-24 at base): `freshell-codex --all-features` = **190 tests total** (lib 149; integration: app_server_drive 4, completion_gating 3, interrupt_rpc 1, launch_lifecycle 16, remote_proxy_relay 17). If your counts differ, investigate before proceeding. Note: the launch_lifecycle spawn test needs `node` on PATH and the `ws` npm module resolvable (currently via the parent checkout's node_modules); a failure there with a module-resolution/spawn error is environmental — fix the environment, don't touch code.
 
 - [ ] **Step 2: Prove `bind_session` is dead (the "failing test" of a deletion)**
 
@@ -226,7 +237,7 @@ cargo clippy -p freshell-codex --all-features -- -D warnings
 cargo check -p freshell-freshagent -p freshell-server -p freshell-ws
 cargo fmt --check
 ```
-Expected: all PASS. `durability::tests` reports **4 passed** (was 5). No `dead_code` warnings. Total `freshell-codex` count = Task 1 baseline minus 1.
+Expected: all PASS. `durability::tests` reports **4 passed** (was 5). No NEW `dead_code` warnings in `freshell-codex` (clippy `-D warnings` enforces this). Total `freshell-codex` count = Task 1 baseline minus 1 (= 189 if baseline was 190). Baseline caveat: `cargo check -p freshell-freshagent -p freshell-server -p freshell-ws` emits **4 pre-existing `freshell-server` dead_code warnings** (`DEFAULT_CLI_DETECTION_SPECS`, `has_cli`, `get`/`get_all`) — these exist at base and are NOT caused by this deletion; only a warning that is not in that set is attributable.
 
 - [ ] **Step 5: Commit**
 
@@ -347,7 +358,7 @@ cargo clippy -p freshell-codex --all-features -- -D warnings
 cargo check -p freshell-freshagent -p freshell-server -p freshell-ws
 cargo fmt --check
 ```
-Expected: all PASS. `launch_plan::tests` reports **32 passed** (was 48: −15 restore-decision tests, −1 `restore_messages_match_restore_decision_ts`). `cargo doc` emits no `broken_intra_doc_links` warnings. No `dead_code` warnings.
+Expected: all PASS. `launch_plan::tests` reports **32 passed** (was 48: −15 restore-decision tests, −1 `restore_messages_match_restore_decision_ts`). Crate total = Task 1 baseline − 17 (= 173 if baseline was 190; lib 132). `cargo doc` exits 0 with no `broken_intra_doc_links` warnings and no NEW warnings — but note it emits **4 pre-existing warnings at base** (3× `rustdoc::private_intra_doc_links` in the remote_proxy/status/json_scan areas + 1× redundant explicit link target in transport.rs); those persist and are fine. No NEW `dead_code` warnings (the 4 baseline `freshell-server` ones persist in the multi-crate check).
 
 - [ ] **Step 8: Commit**
 
@@ -380,7 +391,7 @@ Expected: **zero hits** from the first command (any hit that was HALT-kept per t
 ```bash
 cargo check --workspace --all-features --all-targets
 ```
-Expected: PASS (this is what catches feature-gated consumers like `launch_lifecycle` behind `real-transport`, and integration tests under `crates/*/tests/`).
+Expected: PASS (this is what catches feature-gated consumers like `launch_lifecycle` behind `real-transport`, and integration tests under `crates/*/tests/`). Verified runnable green at base (12.19s warm). The 4 pre-existing `freshell-server` dead_code warnings (see Validated baseline facts) will appear — they are baseline; only a NEW warning indicates a problem.
 
 - [ ] **Step 3: Crate test suites**
 
@@ -389,7 +400,7 @@ cargo test -p freshell-codex --all-features
 cargo test -p freshell-activity
 cargo fmt --check
 ```
-Expected: PASS. `freshell-codex` total = Task 1 baseline − 17 (16 launch_plan tests + 1 durability test); `freshell-activity` total = baseline (unchanged).
+Expected: PASS. `freshell-codex` total = Task 1 baseline − 17 (16 launch_plan tests + 1 durability test; = 173 with lib 132 if baseline was the validated 190/149); `freshell-activity` total = baseline (unchanged).
 
 - [ ] **Step 4: Coordinated full repo suite (the coordinator gate)**
 
@@ -401,9 +412,22 @@ If another agent holds the gate: WAIT and re-poll (e.g. every 60s). NEVER kill t
 ```bash
 FRESHELL_TEST_SUMMARY="dead-restore-code-deletion: verify Rust dead-code removal did not affect the suite" npm test
 ```
-Expected: PASS (exit 0). (If `node_modules` is missing in this worktree, run `npm ci` first.) This deletion is Rust-only and cargo is not part of `npm test`, so this run proves the TS/server suite is unaffected; the cargo runs above are the Rust proof.
+Expected: PASS (exit 0). (If `node_modules` is missing in this worktree, run `npm ci` first.) This deletion is Rust-only and cargo is not part of `npm test` (verified: the coordinated suite is vitest-only — no cargo, no Rust binary, no :3001 contact), so this run proves the TS/server suite is unaffected; the cargo runs above are the Rust proof.
 
-- [ ] **Step 5: Push the branch — and STOP (no PR)**
+Additional guardrails (from load-bearing validation):
+- Do NOT set `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` in the gate shell — it would un-skip real-provider contract tests.
+- A green baseline EXISTS: the coordinator recorded `full-suite success exit=0` at exactly the base commit a53f185a on 2026-07-24 on this host. If this run is RED, do not immediately attribute it to the deletion: (1) check for the host's known-live WSL UDP-port-exhaustion signature (DNS/timeout-flavored errors; Tcpip event 4266 fires daily on this machine), (2) retry once — both vitest configs shuffle test order, so a pass on retry indicates flake/environment, not the deletion. Only a reproducible failure that names affected code is attributable; diagnose against the green baseline.
+
+- [ ] **Step 5: Pre-push freshness re-check, then push the branch — and STOP (no PR)**
+
+The dead-verdicts were re-confirmed against origin/main == a53f185a on 2026-07-24, but main may have moved since (parallel tasks are merging). Immediately before pushing, run the read-only re-check:
+
+```bash
+git ls-remote origin refs/heads/main
+```
+
+- If the SHA is still `a53f185a...`: proceed to push.
+- If main MOVED: inspect the new commits without fetching — `gh api "repos/{owner}/{repo}/compare/a53f185a...<new-sha>"` (derive owner/repo from `git remote get-url origin`) and search the returned file patches for every deleted symbol (`plan_codex_create_restore_decision`, `is_exact_live_codex_candidate`, `CodexCreateRestorePlan`, `CodexRestoreDecisionInput`, `CodexRestoreRejectKind`, `CodexRestoreRejectCode`, `CodexDurabilityEvidence`, `CodexCandidateIdentity`, `SessionRefInput`, `INVALID_RAW_CODEX_RESUME_MESSAGE`, `MISSING_CODEX_SESSION_REF_MESSAGE`, `DurabilityCandidate`, `CandidateImmutableError`, `default_durability_store_dir`, `bind_session`). If a new production Rust caller of a deleted symbol landed: restore that symbol (revert the relevant hunk from the deletion commit), re-run this task's verification steps, and record the restore + its caller in the Step 6 inventory. If no hit (or hits are TS/tests/the independent `terminal_tabs.rs` const): proceed.
 
 ```bash
 git push -u origin chore/dead-restore-code-deletion
@@ -448,6 +472,10 @@ fmt --check PASS; coordinated npm test PASS.
 ```
 
 ---
+
+## Load-Bearing Validation Addendum (2026-07-24, stage 2)
+
+Eight load-bearing assumptions were surfaced and validated (ledger + full evidence: `.worktrees/.the-usual-logs/dead-restore-code-deletion/load-bearing-ledger.md` and `reports/V1..V5.md`). Six verified (origin/main unchanged since branch point; wiring task does not consume the restore-decision symbols; worktree exclusive; workspace all-features gate runnable; `--all-features` tests hermetic and green 190/190; npm suite is vitest-only with no Rust/:3001 contact). Two falsified, plan fixed accordingly: (1) doc/warning gates are NOT warning-free at base — baseline warning sets recorded above and expectations scoped to "no NEW warnings"; (2) the npm suite has a same-day green baseline at a53f185a but the host's WSL UDP-exhaustion flake is still live — Task 4 Step 4 gained triage guidance. One accepted residual (time-of-check race on origin/main) is mitigated by the mandatory pre-push re-check added to Task 4 Step 5. Self-review re-run over all edited tasks: expectations remain exact (commands + expected outputs), no placeholders introduced, no scope change, symbol lists consistent with the deletion sets.
 
 ## Self-Review Notes (performed at plan-writing time)
 
