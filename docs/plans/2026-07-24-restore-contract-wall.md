@@ -701,7 +701,7 @@ codex `resume <id>`.
         findLeavesByMode(await harness.getPaneLayout(tabId), 'claude').map((l) => l.id),
       )
       const picker = await openPanePicker(page)
-      await picker.getByRole('button', { name: /^Claude$/i }).click({ force: true })
+      await picker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
       const dirInput = page.getByRole('combobox', { name: /Starting directory for Claude/i })
       await expect(dirInput).toBeVisible({ timeout: 15_000 })
       await dirInput.fill(projectDir)
@@ -801,11 +801,16 @@ npx playwright test --config test/e2e-browser/playwright.config.ts \
 Expected: PASS (client held `sessionRef`; §2.2 says this path works). The
 picker/WS path is the ONLY correct creation path here — do NOT "simplify" to
 `createTabViaRest`: the REST path never pre-allocates `--session-id`
-(`terminal_tabs.rs:756-768`), so the t=0 poll would time out by design. If
-the Claude picker button never shows, the `enabledProviders: ['claude']` seed
-or `CLAUDE_CMD` detection is the culprit (the picker requires availableClis +
-enabledProviders + not-disabled). If red with a faithful test, pin P0.4
-(§2.2).
+(`terminal_tabs.rs:756-768`), so the t=0 poll would time out by design. The
+picker button's accessible name is the extension registry label verbatim —
+`aria-label={option.label}` (`PanePicker.tsx:277`) fed from
+`extensions/claude-code/freshell.json` `"label": "Claude CLI"` via
+`cliConfigToOption` (`coding-cli-utils.ts:15-24`) — hence the anchored
+`/^Claude CLI$/i` (donor: `truly-idle-alerting.spec.ts:117`); `/^Claude$/i`
+would never match. If the button never RENDERS at all, then check the
+`enabledProviders: ['claude']` seed and `CLAUDE_CMD` detection (the picker
+requires availableClis + enabledProviders + not-disabled). If red with a
+faithful test, pin P0.4 (§2.2).
 
 - [ ] **Step 5: Commit**
 
@@ -1345,24 +1350,34 @@ git commit -m "test(e2e): freshcodex SIGKILL restore contract in the wall"
 
 **Interfaces:**
 - Consumes: Task 1 helpers; `FAKE_OPENCODE_SIDECAR_SOURCE`; `openPanePicker`; `findFreshAgentLeaf`; `leafDurableIdentity`.
-- Produces: `createFreshopencodePane(page, cwd): Promise<void>`, `enableFreshOpencode(page): Promise<void>` — reused by Task 9.
+- Produces: `createFreshopencodePane(page, cwd): Promise<void>`, `enableFreshOpencode(page, enabledProviders?): Promise<void>` (default `['opencode']`; pass the full provider list when later steps still need other providers' picker buttons — the patch REPLACES the array) — reused by Task 9.
 
 - [ ] **Step 1: Append the freshopencode helpers (donor: `freshopencode-restart-recovery.spec.ts:114-206`)**
 
 ```ts
-async function enableFreshOpencode(page: Page): Promise<void> {
+async function enableFreshOpencode(
+  page: Page,
+  enabledProviders: string[] = ['opencode'],
+): Promise<void> {
   // These dispatches are client-only and MUST land AFTER the app bootstrap +
   // /api/platform fetch (App.tsx:572,609 overwrite availableClis). Callers
   // reach this helper only after harness.waitForConnection(), which is the
   // donor's ordering (freshopencode-restart-recovery.spec.ts:100-115).
-  await page.evaluate(() => {
+  //
+  // CAUTION: mergeServerSettings REPLACES the enabledProviders array when the
+  // key is present (shared/settings.ts:1216-1218) -- it does not union. Any
+  // test that needs OTHER providers' picker buttons after this call (e.g. the
+  // Task 9 ruler, which still has freshclaude to create) MUST pass the full
+  // provider list, or those buttons disappear (PanePicker.tsx:125-152 gates
+  // fresh-agent options on enabledProviders.includes(<provider>)).
+  await page.evaluate((providers) => {
     const harness = (window as any).__FRESHELL_TEST_HARNESS__
     harness?.dispatch({ type: 'connection/setAvailableClis', payload: { opencode: true } })
     harness?.dispatch({
       type: 'settings/previewServerSettingsPatch',
-      payload: { codingCli: { enabledProviders: ['opencode'] }, freshAgent: { enabled: true } },
+      payload: { codingCli: { enabledProviders: providers }, freshAgent: { enabled: true } },
     })
-  })
+  }, enabledProviders)
 }
 
 async function createFreshopencodePane(page: Page, cwd: string): Promise<void> {
@@ -2108,7 +2123,7 @@ process.exit(result.status ?? 1)
       await harness.waitForTabCount(2)
       const claudeTabId = (await harness.getActiveTabId())!
       const claudePicker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
-      await claudePicker.getByRole('button', { name: /^Claude$/i }).click({ force: true })
+      await claudePicker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
       const claudeDirInput = page.getByRole('combobox', {
         name: /Starting directory for Claude/i,
       })
@@ -2172,7 +2187,12 @@ process.exit(result.status ?? 1)
       await harness.waitForTabCount(5)
       const freshopencodeTabId = (await harness.getActiveTabId())!
       await selectShellIfPickerShowing(page)
-      await enableFreshOpencode(page)
+      // MUST pass the FULL provider list: enableFreshOpencode's
+      // previewServerSettingsPatch REPLACES enabledProviders
+      // (mergeServerSettings, shared/settings.ts:1216-1218). The default
+      // ['opencode'] would hide the Freshclaude button needed for tab 6
+      // (PanePicker.tsx:125-152 gates on enabledProviders.includes('claude')).
+      await enableFreshOpencode(page, ['claude', 'codex', 'opencode'])
       await createFreshopencodePane(page, projectDir)
       await sendFreshAgentTurn(page, harness, freshopencodeTabId, 'ruler freshopencode turn')
       const freshopencodeId = leafDurableIdentity(
@@ -2382,7 +2402,7 @@ server's ledger makes it recoverable; the client offers/executes recovery.
       // WS-path terminal.create does (terminal.rs:969-982). Type the cwd --
       // candidate dirs may be empty on a clean HOME (files.rs:15-26).
       const picker = await openPanePicker(page)
-      await picker.getByRole('button', { name: /^Claude$/i }).click({ force: true })
+      await picker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
       const dirInput = page.getByRole('combobox', { name: /Starting directory for Claude/i })
       await expect(dirInput).toBeVisible({ timeout: 15_000 })
       await dirInput.fill(projectDir)
