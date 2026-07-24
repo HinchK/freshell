@@ -278,7 +278,9 @@ Preferred additional check: LSP `findReferences` on `plan_codex_create_restore_d
 
 - [ ] **Step 2: Delete the dead test asserting the dead constants (bottom of file first)**
 
-Delete lines **1218–1228**: the test `restore_messages_match_restore_decision_ts` (its `#[test]` attribute through its closing `}`). It asserts both `INVALID_RAW_CODEX_RESUME_MESSAGE` and `MISSING_CODEX_SESSION_REF_MESSAGE`.
+Delete lines **1217–1228**: the blank line at 1217 plus the test `restore_messages_match_restore_decision_ts` (its `#[test]` attribute at 1218 through its closing `}` at 1228). It asserts both `INVALID_RAW_CODEX_RESUME_MESSAGE` and `MISSING_CODEX_SESSION_REF_MESSAGE`.
+
+The preceding blank line at 1217 MUST be included in the deletion: this test is the last item in `mod tests`, and leaving a trailing blank line immediately before the module's closing `}` (line 1229) fails default rustfmt (`cargo fmt --check`, gated in Step 7 and Task 4 Step 3). After deletion, the previous test's closing `}` (old line 1216) is directly followed by the `mod tests` closing `}` — no blank line between them.
 
 - [ ] **Step 3: Delete the restore-decision test block**
 
