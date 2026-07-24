@@ -169,7 +169,14 @@ Expected: 147 passed (the verified baseline).
 
 - [ ] **Step 11: Fix `freshell-ws` `tests/freshagent_claude_kill_interrupt.rs:312,368,419` (await_holding_lock ×3)**
 
-At each site a `MutexGuard` is held across an `.await`. Fix by narrowing the guard's scope so it is dropped before the await (extract the needed value inside a block, or `drop(guard)` explicitly before awaiting) — preserve the assertion semantics exactly. Verify with:
+At each site a std `MutexGuard` is held across `.await` points. Do NOT narrow the guard's scope or drop it early: `CLAUDE_ENV_LOCK` exists to serialize ENTIRE tests that mutate the process-global `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE` env vars (its doc comment at :47-49), and `FakeClaudeSidecarEnv`'s contract (:94-97) requires the lock be held for the lifetime of the returned guard — releasing it before `spawn_server().await` would let the three tests (run concurrently by cargo's parallel test runner) race each other's env vars and interrupt-log files. Instead, migrate the lock to `tokio::sync::Mutex`, whose guard is designed to be held across `.await` and is not flagged by `clippy::await_holding_lock`. Mutual-exclusion semantics are preserved exactly:
+
+1. Change the declaration at :50 from `static CLAUDE_ENV_LOCK: Mutex<()> = Mutex::new(());` to `static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());`. (The crate's tokio dependency already enables the `sync` feature — `Cargo.toml:54` — so no manifest change. If the resolved tokio version lacks `const_new`, fall back to `static CLAUDE_ENV_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> = std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));` and lock via `CLAUDE_ENV_LOCK.lock().await` identically.)
+2. Change all three acquisitions (:312, :368, :419) from `let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());` to `let _guard = CLAUDE_ENV_LOCK.lock().await;` — tokio's mutex has no poisoning, so the `unwrap_or_else` disappears. All three holders are `#[tokio::test]` async fns, so `.await` is available; the plain `#[test]` at :450 never acquires the lock and needs no change.
+3. Keep each guard bound for the full test body — unchanged from today.
+4. If `Mutex` in the `use std::sync::{Arc, Mutex};` import at :35 becomes unused, remove just `Mutex` from that import (keep `Arc`); the compiler/clippy will confirm.
+
+Verify with:
 ```bash
 cargo test -p freshell-ws --test freshagent_claude_kill_interrupt
 ```
@@ -768,29 +775,35 @@ Expected: the 3 existing tests PASS; the 2 new tests FAIL (`next_frame_of_type` 
 
 - [ ] **Step 5: Guard the dispatch arms (GREEN)**
 
-In `handle_client_text` in `crates/freshell-ws/src/terminal.rs` (signature at :407-415 — `ws_tx` is in scope in the match arms), wrap the two existing arms. Keep the existing handler invocations byte-for-byte; only wrap them:
+In `handle_client_text` in `crates/freshell-ws/src/terminal.rs` (signature at :407-415 — `ws_tx: &mut WsSink` is in scope in the match arms), wrap the two existing arms. Two contracts govern the arm shape:
 
-`TerminalResize` arm (:500-503):
+- **Both handlers are synchronous, `()`-returning `fn`s** (`fn handle_attach(...)` at :1757, `fn handle_resize(...)` at :1817). Do NOT add `.await` to either handler call — there is none today.
+- **Every arm of this `match` evaluates to `bool`**: `handle_client_text` returns `bool`, and `false` makes the select-loop caller (:236) tear the connection down with `close_reason = "send_error"`. On the accept path keep the existing handler call and the existing `true` arm value byte-for-byte. On the reject path make the `send(...)` result the arm's value — exactly the `handle_kill` convention (:1847-1862, `send(ws_tx, &msg).await` as the tail expression) — so a socket-level send failure still closes the connection. Do not discard the `send` result with a `;`.
+
+`TerminalResize` arm (currently `{ handle_resize(resize, state); true }` at :500-503):
 ```rust
         ClientMessage::TerminalResize(resize) => {
             if terminal_dims_in_range(resize.cols, resize.rows) {
                 handle_resize(resize, state);
+                true
             } else {
-                send(ws_tx, &invalid_dims_error(resize.cols, resize.rows)).await;
+                send(ws_tx, &invalid_dims_error(resize.cols, resize.rows)).await
             }
         }
 ```
 
-`TerminalAttach` arm (:473-476) — same shape; the existing invocation is `handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1)` (handler signature at :1757-1763) — preserve it and its arguments byte-for-byte as they appear in the current arm (including any `.await`):
+`TerminalAttach` arm (currently `{ handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1); true }` at :473-476) — same shape; preserve the handler invocation and its arguments byte-for-byte as they appear in the current arm (no `.await` — the handler is sync):
 ```rust
         ClientMessage::TerminalAttach(attach) => {
             if terminal_dims_in_range(attach.cols, attach.rows) {
-                handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1).await;
+                handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
+                true
             } else {
-                send(ws_tx, &invalid_dims_error(attach.cols, attach.rows)).await;
+                send(ws_tx, &invalid_dims_error(attach.cols, attach.rows)).await
             }
         }
 ```
+(Borrow note: `resize`/`attach` are moved into the handler only on the accept path, and `cols`/`rows` are `Copy` `i64`s, so the reject path's field reads compile without clones.)
 
 Guarding at the dispatch arm (before any handler logic, terminal lookup, or identity check) matches Node, where Zod validation precedes all message handling. Leave the existing `clamp(0, u16::MAX as i64) as u16` casts at :1781-1782 and :1818-1819 in place — post-validation they only ever see in-range values, and they remain the overflow-safe `i64 → u16` conversion (values are now guaranteed `≤ 1000`, so the cast is lossless).
 
