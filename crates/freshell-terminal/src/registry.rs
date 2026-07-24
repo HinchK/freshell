@@ -208,7 +208,7 @@ struct TerminalShared {
     exit_code: Option<i64>,
     created_at: i64,
     last_activity_at: i64,
-    /// Current PTY geometry + epoch (`§5.3`): epoch starts 1, +1 only on real change.
+    /// Current PTY geometry + epoch (`§5.3`): epoch starts 1, +1 only on a real change after the first client geometry record.
     cols: u16,
     rows: u16,
     geometry_epoch: i64,
@@ -998,8 +998,9 @@ impl TerminalRegistry {
     }
 
     /// `terminal.resize` (`terminal-registry.ts:3975-3995`): `unchanged` when cols/rows
-    /// already match; else set them, `+1` the geometry epoch (`§5.3`), and resize the
-    /// PTY (errors swallowed, as node-pty's are).
+    /// already match; else set them, `+1` the geometry epoch (`§5.3`) unless this is the
+    /// first client geometry record (see `has_client_geometry`), and resize the PTY
+    /// (errors swallowed, as node-pty's are).
     pub fn resize(&self, terminal_id: &str, cols: u16, rows: u16) {
         let mut inner = self.inner.lock().expect("registry lock");
         if let Some(handle) = inner.terminals.get_mut(terminal_id) {
