@@ -212,6 +212,11 @@ struct TerminalShared {
     cols: u16,
     rows: u16,
     geometry_epoch: i64,
+    /// TERM-07 parity with Node's `hasPreviousGeometry` (`broker.ts:666-686`):
+    /// false until the first client-supplied geometry is recorded. The first
+    /// record applies dims WITHOUT bumping `geometry_epoch` (spawn defaults
+    /// never count as a prior record); later real changes bump.
+    has_client_geometry: bool,
     cwd: Option<String>,
     /// Directory metadata (`terminal-registry.ts:1614` stores `getModeLabel(opts.mode)`
     /// as the title at create; `getModeLabel('shell') === 'Shell'`). Defaults preserve
@@ -687,6 +692,7 @@ impl TerminalRegistry {
             cols: spec.cols,
             rows: spec.rows,
             geometry_epoch: 1,
+            has_client_geometry: false,
             cwd: spec.cwd.clone(),
             title: "Shell".to_string(),
             description: None,
@@ -983,12 +989,16 @@ impl TerminalRegistry {
         if let Some(handle) = inner.terminals.get_mut(terminal_id) {
             {
                 let mut s = handle.shared.lock().expect("terminal lock");
+                let first_record = !s.has_client_geometry;
+                s.has_client_geometry = true;
                 if s.cols == cols && s.rows == rows {
                     return;
                 }
                 s.cols = cols;
                 s.rows = rows;
-                s.geometry_epoch += 1;
+                if !first_record {
+                    s.geometry_epoch += 1;
+                }
             }
             if let Some(pty) = handle.pty.as_ref() {
                 pty.resize(cols, rows);
@@ -1355,6 +1365,7 @@ impl TerminalRegistry {
             cols: 120,
             rows: 30,
             geometry_epoch: 1,
+            has_client_geometry: false,
             cwd: None,
             title: "Shell".to_string(),
             description: None,
@@ -2567,17 +2578,39 @@ mod tests {
     fn resize_updates_geometry_epoch_only_on_change() {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
-        let (sink, seen) = collector();
-        // default 120x30, epoch 1.
-        reg.resize("T", 120, 30); // unchanged -> no epoch bump
-        reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
-        assert_eq!(attach_ready(&seen).unwrap().geometry_epoch, Some(1));
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+        reg.resize("T", 100, 40); // first record: applied, no bump
+        assert_eq!(reg.geometry("T"), Some((100, 40, 1)));
+        reg.resize("T", 100, 40); // identical dims: no bump
+        assert_eq!(reg.geometry("T"), Some((100, 40, 1)));
+        reg.resize("T", 90, 35); // subsequent real change: bump
+        assert_eq!(reg.geometry("T"), Some((90, 35, 2)));
+    }
 
-        // A real change bumps the epoch (observed on the next attach.ready).
+    #[test]
+    fn first_client_geometry_records_without_epoch_bump() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S"); // 120x30, epoch 1, no client geometry yet
+                                       // First client-supplied geometry: applied + recorded, NO epoch bump
+                                       // (Node recordTerminalGeometry: hasPreviousGeometry=false => no bump,
+                                       // broker.ts:666-686; spawn dims never count, broker.ts:692-697).
         reg.resize("T", 100, 40);
-        let (sink2, seen2) = collector();
-        reg.attach("T", 2, sink2, Some("b".into()), 0, false, None);
-        assert_eq!(attach_ready(&seen2).unwrap().geometry_epoch, Some(2));
+        assert_eq!(reg.geometry("T"), Some((100, 40, 1)));
+        // Second real change: bumps.
+        reg.resize("T", 90, 35);
+        assert_eq!(reg.geometry("T"), Some((90, 35, 2)));
+    }
+
+    #[test]
+    fn unchanged_first_geometry_still_counts_as_recorded() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // Node records geometry on 'unchanged' results too (ws-handler.ts:2995
+        // records for both 'resized' and 'unchanged'), so the NEXT change bumps.
+        reg.resize("T", 120, 30); // dims equal the spawn default: records, no change
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+        reg.resize("T", 95, 41);
+        assert_eq!(reg.geometry("T"), Some((95, 41, 2)));
     }
 
     #[test]
