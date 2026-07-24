@@ -169,6 +169,54 @@ async function bootWall(
   return { server, info, harness }
 }
 
+/** Seed ~/.codex/sessions/<id>.jsonl so the sidebar shows a resumable codex session. */
+function seedCodexHome(
+  sessionId: string,
+  sessionTitle: string,
+  projectDir: string,
+): (homeDir: string) => Promise<void> {
+  return async (homeDir: string) => {
+    await seedWallConfig({ providers: ['codex'] })(homeDir)
+    const codexSessionsDir = path.join(homeDir, '.codex', 'sessions')
+    await fs.mkdir(codexSessionsDir, { recursive: true })
+    const lines = [
+      JSON.stringify({
+        timestamp: '2026-07-21T08:00:00.000Z',
+        type: 'session_meta',
+        payload: { id: sessionId, cwd: projectDir },
+      }),
+      JSON.stringify({
+        timestamp: '2026-07-21T08:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: `${sessionTitle} request 1` }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-07-21T08:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: `${sessionTitle} reply 1` }],
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-07-21T08:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: `${sessionTitle} request 2` }],
+        },
+      }),
+    ]
+    await fs.writeFile(path.join(codexSessionsDir, `${sessionId}.jsonl`), `${lines.join('\n')}\n`)
+  }
+}
+
 // --- layout tree walkers (donor: opencode-terminal-restore-rust.spec.ts) ---
 
 function collectLeaves(node: any): any[] {
@@ -422,6 +470,99 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         .toBe(true)
       expect((await claudeContent())?.status).not.toBe('error')
       expect((await claudeContent())?.sessionRef?.sessionId).toBe(preallocatedId)
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('codex terminal: sessionRef-bound pane resumes with `resume <id>` after SIGKILL', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    const CODEX_SESSION_ID = '11111111-2222-4333-8444-555555555555'
+    const SESSION_TITLE = 'wall codex session'
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-codex-term-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const argLogPath = path.join(sharedRoot, 'codex-argv.jsonl')
+    const fakeCodexPath = await installFakeCli(
+      FAKE_CODEX_CLI_SOURCE,
+      'codex',
+      path.join(sharedRoot, 'bin'),
+    )
+
+    const { server, harness } = await bootWall(page, {
+      env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
+      setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+
+      // Open the seeded historical session from the sidebar (identity lands
+      // in content.sessionRef only -- the incident shape).
+      const sessionList = page.getByTestId('sidebar-session-list')
+      await expect(sessionList).toBeVisible({ timeout: 15_000 })
+      const sessionItem = page.getByText(SESSION_TITLE, { exact: false }).first()
+      await expect(sessionItem).toBeVisible({ timeout: 15_000 })
+      const tabCountBefore = await harness.getTabCount()
+      await sessionItem.click()
+      await expect(async () => {
+        expect(await harness.getTabCount()).toBe(tabCountBefore + 1)
+      }).toPass({ timeout: 15_000 })
+      const tabId = (await harness.getActiveTabId())!
+
+      const terminalIdBefore: string = await expect
+        .poll(async () => (await harness.getPaneLayout(tabId))?.content?.terminalId ?? null, {
+          timeout: 20_000,
+        })
+        .not.toBeNull()
+        .then(async () => (await harness.getPaneLayout(tabId))?.content?.terminalId)
+      expect((await harness.getPaneLayout(tabId))?.content?.sessionRef?.sessionId).toBe(
+        CODEX_SESSION_ID,
+      )
+
+      // Create-time resume proof.
+      await expect
+        .poll(async () => {
+          const entries = await readArgvLog(argLogPath)
+          return entries.some((e) => hasResumePair(e.argv, CODEX_SESSION_ID))
+        }, { timeout: 20_000 })
+        .toBe(true)
+
+      const argvCountBeforeKill = (await readArgvLog(argLogPath)).length
+
+      // --- SIGKILL + revive; live client recovers on its own reconnect. ---
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+
+      // CONTRACT §2.3: new terminalId, re-resumed argv, same sessionRef.
+      await expect
+        .poll(async () => {
+          const tid = (await harness.getPaneLayout(tabId))?.content?.terminalId ?? null
+          return tid && tid !== terminalIdBefore ? tid : null
+        }, { timeout: 30_000 })
+        .not.toBeNull()
+      await expect
+        .poll(async () => {
+          const entries = await readArgvLog(argLogPath)
+          return entries
+            .slice(argvCountBeforeKill)
+            .some((e) => hasResumePair(e.argv, CODEX_SESSION_ID))
+        }, { timeout: 30_000 })
+        .toBe(true)
+      const contentAfter = (await harness.getPaneLayout(tabId))?.content
+      expect(contentAfter?.status).not.toBe('error')
+      expect(contentAfter?.sessionRef?.sessionId).toBe(CODEX_SESSION_ID)
+      const terminalIdAfter = contentAfter?.terminalId
+      await expect
+        .poll(async () => {
+          const buffer = await harness.getTerminalBuffer(terminalIdAfter)
+          const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
+          return unwrapped.includes(`codex: resumed session ${CODEX_SESSION_ID}`)
+        }, { timeout: 20_000 })
+        .toBe(true)
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
