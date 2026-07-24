@@ -285,7 +285,7 @@ pub fn cli_provider_target(
 ) -> ProviderTarget {
     let effective_shell = resolve_shell(shell, host_os, is_wsl_env);
     let in_wsl_with_linux_shell = is_wsl_env && effective_shell == ShellType::System;
-    if !(crate::detect::is_windows_like(host_os, is_wsl_env) && !in_wsl_with_linux_shell) {
+    if !crate::detect::is_windows_like(host_os, is_wsl_env) || in_wsl_with_linux_shell {
         return ProviderTarget::Unix;
     }
     let force_wsl = is_windows(host_os) && cwd.is_some_and(is_linux_path);
@@ -506,9 +506,9 @@ pub fn build_spawn_spec(
 ///
 /// The env layer matches shell mode (parent − STRIP_ENV + TERM/COLORTERM/LANG/LC_ALL
 /// + user overrides, then `...cli.env` on top) and the cwd is resolved through the
-/// same `resolveUnixShellCwd`, so a claude/codex/opencode terminal lands in the
-/// requested directory with `CLAUDECODE` stripped (which the reference notes is
-/// required or child Claude refuses to start).
+///   same `resolveUnixShellCwd`, so a claude/codex/opencode terminal lands in the
+///   requested directory with `CLAUDECODE` stripped (which the reference notes is
+///   required or child Claude refuses to start).
 ///
 /// Scope: CLI panes are always created with `shell:'system'` (`PaneContainer`
 /// `createContentForType`), which resolves to the Linux system shell on WSL/Linux/

@@ -5,8 +5,8 @@
 //! `original≡rust` at T2. A faithful port of the claude path of `server/ws-handler.ts`
 //! (`freshAgent.create` / `freshAgent.send`) + `server/fresh-agent/adapters/claude/adapter.ts`
 //! + `server/sdk-bridge.ts` — but the SDK itself (`@anthropic-ai/claude-agent-sdk`, which
-//! has NO Rust equivalent) runs in the ONE sanctioned Node sidecar
-//! (`crates/freshell-claude-sidecar`, ADR Decision 2), spoken over newline-JSON stdio.
+//!   has NO Rust equivalent) runs in the ONE sanctioned Node sidecar
+//!   (`crates/freshell-claude-sidecar`, ADR Decision 2), spoken over newline-JSON stdio.
 //!
 //! ## Drive path (WS, not REST) — mirrors the codex slice
 //!

@@ -1904,7 +1904,7 @@ async fn handle_tabs_push(value: &serde_json::Value, ws_tx: &mut WsSink, state: 
 }
 
 enum TabsPushResponse {
-    Ack(ServerMessage),
+    Ack(Box<ServerMessage>),
     Error(serde_json::Value),
 }
 
@@ -1917,13 +1917,13 @@ async fn tabs_push_response(
     server_instance_id: String,
 ) -> TabsPushResponse {
     match process_tabs_push(value, reg, server_instance_id).await {
-        Ok(ack) => {
-            TabsPushResponse::Ack(ServerMessage::TabsSyncAck(freshell_protocol::TabsSyncAck {
+        Ok(ack) => TabsPushResponse::Ack(Box::new(ServerMessage::TabsSyncAck(
+            freshell_protocol::TabsSyncAck {
                 accepted: ack.accepted,
                 open_records: ack.open_records,
                 closed_records: ack.closed_records,
-            }))
-        }
+            },
+        ))),
         Err(message) => TabsPushResponse::Error(tabs_error_frame(&message)),
     }
 }
@@ -2150,11 +2150,13 @@ mod tabs_push_validation_tests {
         });
 
         match tabs_push_response(&frame, tabs.clone(), "srv-test".to_string()).await {
-            TabsPushResponse::Ack(ServerMessage::TabsSyncAck(ack)) => {
-                assert!(ack.accepted);
-                assert_eq!(ack.open_records, 1);
-            }
-            TabsPushResponse::Ack(other) => panic!("unexpected acknowledgement frame: {other:?}"),
+            TabsPushResponse::Ack(message) => match *message {
+                ServerMessage::TabsSyncAck(ack) => {
+                    assert!(ack.accepted);
+                    assert_eq!(ack.open_records, 1);
+                }
+                other => panic!("unexpected acknowledgement frame: {other:?}"),
+            },
             TabsPushResponse::Error(error) => {
                 panic!("registered extension mode push must be accepted: {error}")
             }

@@ -1,6 +1,6 @@
 //! Integration tests for [`crate::mcp_inject`] — §4 goldens G-G1/G-K1/G-X4/G-W1
 //! + the opencode merge/refcount/cleanup lifecycle (spec success criteria 4 and 7).
-//! Split out to respect the campaign's ≤1K-lines-per-file limit.
+//!   Split out to respect the campaign's ≤1K-lines-per-file limit.
 
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
