@@ -273,6 +273,13 @@ import type { Page } from '@playwright/test'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+// ESM project ("type": "module" in package.json): __dirname does not exist in
+// ESM modules, so derive it -- same convention as every fixture-referencing
+// donor spec (e.g. compound-restart-rust.spec.ts:49-51).
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 const FAKE_CODEX_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs')
 const FAKE_OPENCODE_TERMINAL_SOURCE = path.resolve(__dirname, '../fixtures/fake-opencode-terminal.mjs')
