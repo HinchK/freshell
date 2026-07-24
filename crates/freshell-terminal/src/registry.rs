@@ -996,6 +996,23 @@ impl TerminalRegistry {
         }
     }
 
+    /// Current geometry bookkeeping as `(cols, rows, geometry_epoch)`; `None`
+    /// for an unknown terminal id. Test/diagnostic seam for the TERM-07
+    /// attach-time resize (the values `attach.ready` stamps come from here).
+    pub fn geometry(&self, terminal_id: &str) -> Option<(u16, u16, i64)> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.map(|shared| {
+            let s = shared.lock().expect("terminal lock");
+            (s.cols, s.rows, s.geometry_epoch)
+        })
+    }
+
     /// `registry.kill()` (`terminal-registry.ts:3997-4033`): remove the terminal, send
     /// `terminal.exit{exitCode:0}` to every attached connection, and SIGKILL+reap the
     /// PTY. Bumps the inventory revision. Returns whether the terminal existed.
@@ -2561,6 +2578,15 @@ mod tests {
         let (sink2, seen2) = collector();
         reg.attach("T", 2, sink2, Some("b".into()), 0, false, None);
         assert_eq!(attach_ready(&seen2).unwrap().geometry_epoch, Some(2));
+    }
+
+    #[test]
+    fn geometry_reports_cols_rows_epoch() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S"); // headless default: 120x30, epoch 1
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+
+        assert_eq!(reg.geometry("nope"), None);
     }
 
     #[test]
