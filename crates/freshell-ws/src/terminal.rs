@@ -534,14 +534,21 @@ async fn handle_client_text(
         // `freshAgent.attach` (PR-4, reload-rehydrate): route codex/opencode to their
         // handlers (re-emit a status snapshot, transparently recover a crashed codex
         // sidecar, or emit the INVALID_SESSION_ID lost-session shape for an unknown
-        // session). Claude keeps the prior swallow behavior (out of scope here, matching
-        // the existing interrupt/kill dispatch's conservative default). Detached task,
-        // same pattern as the other `freshAgent.*` arms.
+        // session). Claude/kilroy (restart-resilience P0.2 slice 1) route to
+        // `FreshClaudeState::handle_attach`, which emits the same lost-session shape for
+        // untracked sessions so the client's `.lost` -> `triggerRecovery` machinery
+        // engages instead of a pane wedging BUSY after a server restart. Detached task,
+        // same pattern as the other `freshAgent.*` arms. `_` keeps swallowing only
+        // `Amplifier` (no fresh-agent runtime, same as the `FreshAgentSend` arm).
         ClientMessage::FreshAgentAttach(attach) => {
             match attach.provider {
                 freshell_protocol::AgentProvider::Codex => {
                     let fresh_codex = state.fresh_codex.clone();
                     tokio::spawn(async move { fresh_codex.handle_attach(attach).await });
+                }
+                freshell_protocol::AgentProvider::Claude => {
+                    let fresh_claude = state.fresh_claude.clone();
+                    tokio::spawn(async move { fresh_claude.handle_attach(attach).await });
                 }
                 freshell_protocol::AgentProvider::Opencode => {
                     let fresh_opencode = state.fresh_opencode.clone();
