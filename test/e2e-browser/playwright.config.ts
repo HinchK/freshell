@@ -88,6 +88,10 @@ const RUST_ONLY_SPECS = [
   // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
   // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
   /restore-contract-wall-rust\.spec\.ts$/,
+  // TERM-15/TERM-16 terminal-mode CLI activity: hard `expect(e2eServerKind
+  // ).toBe('rust')` guard (predates this list's convention; fails under the
+  // fixture-default 'legacy' when the match-all chromium project picks it up).
+  /terminal-activity-rust\.spec\.ts$/,
   // Lane A: busy-aware idle gate + queue-empty reason (imports RustServer
   // directly for restartAbrupt() and two concurrent servers).
   /idle-gate-semantics-rust\.spec\.ts$/,
