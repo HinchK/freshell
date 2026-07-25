@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use freshell_activity::amplifier::tailer::{AttachAt, TailerReadOutcome};
+use freshell_activity::amplifier::tailer::{AttachAt, TailerDegradeReason, TailerReadOutcome};
 use freshell_activity::amplifier::{
     create_reducer_state, reduce_amplifier_event, AmplifierActivityTracker, AmplifierEventsTailer,
     ReducerEffect, ReducerState,
@@ -56,6 +56,35 @@ use crate::terminal::now_ms;
 /// resume-created terminals, whose session dir already exists). Supplied by
 /// `freshell-server` from the amplifier home; `None` when unresolvable.
 pub type AmplifierEventsPathResolver = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// G8 parity with the frozen TS reference
+/// (server/coding-cli/amplifier-activity-integration.ts:50): never replay an
+/// events backlog larger than this at Start-attach — attach at Eof instead
+/// and let live records take over.
+pub(crate) const AMPLIFIER_CATCHUP_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Decide the effective attach point for an events lane. `file_len` is `None`
+/// when the events file could not be stat'ed (fresh sessions create
+/// events.jsonl lazily) — that must NOT count as over-cap.
+pub(crate) fn effective_attach_at(requested: AttachAt, file_len: Option<u64>) -> AttachAt {
+    match (requested, file_len) {
+        (AttachAt::Start, Some(len)) if len > AMPLIFIER_CATCHUP_MAX_BYTES => AttachAt::Eof,
+        (requested, _) => requested,
+    }
+}
+
+/// G4: bounded re-attach backoff schedule for a degraded events lane.
+/// Index = failures-1; after the last entry the lane gives up LOUDLY.
+/// Shape mirrors the repo's bounded-retry exemplar
+/// (crates/freshell-tauri/src/renderer_recovery.rs:44).
+pub(crate) const AMPLIFIER_LANE_RETRY_DELAYS_MS: [i64; 3] = [250, 1000, 3000];
+
+/// Backoff delay before the retry that follows the `failures`-th consecutive
+/// failure (1-based). `None` = retries exhausted.
+pub(crate) fn lane_retry_delay_ms(failures: u32) -> Option<i64> {
+    let index = failures.checked_sub(1)? as usize;
+    AMPLIFIER_LANE_RETRY_DELAYS_MS.get(index).copied()
+}
 
 /// Diagnostics counters backing the zero-polling tests.
 #[derive(Debug, Default)]
@@ -85,8 +114,25 @@ enum HubEvent {
 struct AmplifierLane {
     tailer: AmplifierEventsTailer,
     reducer_state: ReducerState,
+    /// Retained so a degrade can schedule a bounded re-attach (G4).
+    session_id: String,
+    events_path: PathBuf,
     /// Keeps the inotify watcher alive for the lane's lifetime.
     _watcher: notify::RecommendedWatcher,
+}
+
+/// G4: bookkeeping for a degraded amplifier events lane awaiting bounded
+/// re-attach. Lives on `HubInner` (the lane itself is dropped on degrade).
+#[derive(Debug, Clone)]
+struct LaneRetry {
+    session_id: String,
+    events_path: PathBuf,
+    /// Consecutive failures (degrades + failed re-attaches) since the last
+    /// successful read. Reset by an `Ok` read, not by a successful attach.
+    failures: u32,
+    /// When the next re-attach fires. `None` while an attempt is in flight or
+    /// has landed and awaits its first `Ok` read — arms no timer.
+    next_attempt_at: Option<i64>,
 }
 
 #[derive(Default)]
@@ -98,6 +144,8 @@ struct HubInner {
     /// terminal id → mode, for every tracked CLI terminal.
     modes: HashMap<String, String>,
     lanes: HashMap<String, AmplifierLane>,
+    /// G4: terminal id → pending bounded re-attach bookkeeping.
+    lane_retries: HashMap<String, LaneRetry>,
 }
 
 /// Cloneable handle to the hub (stored on `WsState`).
@@ -367,6 +415,7 @@ impl ActivityHub {
                     };
                     inner.idle.note_exit(&terminal_id);
                     inner.lanes.remove(&terminal_id);
+                    inner.lane_retries.remove(&terminal_id);
                     match mode.as_str() {
                         "claude" => {
                             let effects = inner.claude.note_exit(&terminal_id);
@@ -398,12 +447,32 @@ impl ActivityHub {
     ) {
         use notify::Watcher;
         let mut tailer = AmplifierEventsTailer::new(events_path);
+        // G8: never replay an unbounded backlog. Stat once at the call site;
+        // a failed stat means "file not created yet" and keeps Start.
+        let file_len = std::fs::metadata(events_path).ok().map(|m| m.len());
+        let effective = effective_attach_at(attach_at, file_len);
+        if effective != attach_at {
+            tracing::warn!(
+                terminal_id = %terminal_id,
+                session_id = %session_id,
+                size_bytes = file_len.unwrap_or(0),
+                cap_bytes = AMPLIFIER_CATCHUP_MAX_BYTES,
+                "amplifier_events_catchup_skipped: events backlog exceeds the catch-up cap; attaching at EOF (live records take over)"
+            );
+        }
+        let attach_at = effective;
         if let Err((reason, message)) = tailer.attach(attach_at) {
             tracing::warn!(
                 terminal_id = %terminal_id,
                 reason = ?reason,
                 message = %message,
                 "amplifier_events_lane_degraded: attach failed"
+            );
+            self.handle_attach_failure(
+                terminal_id,
+                session_id,
+                events_path,
+                matches!(reason, TailerDegradeReason::SchemaMismatch),
             );
             return;
         }
@@ -442,6 +511,7 @@ impl ActivityHub {
                     error = %error,
                     "amplifier_events_lane_degraded: watcher create failed"
                 );
+                self.handle_attach_failure(terminal_id, session_id, events_path, false);
                 return;
             }
         };
@@ -451,6 +521,7 @@ impl ActivityHub {
                 error = %error,
                 "amplifier_events_lane_degraded: watch failed"
             );
+            self.handle_attach_failure(terminal_id, session_id, events_path, false);
             return;
         }
 
@@ -472,6 +543,8 @@ impl ActivityHub {
                 AmplifierLane {
                     tailer,
                     reducer_state: create_reducer_state(),
+                    session_id: session_id.to_string(),
+                    events_path: events_path.to_path_buf(),
                     _watcher: watcher,
                 },
             );
@@ -521,6 +594,9 @@ impl ActivityHub {
                             frames.append(&mut f);
                         }
                     }
+                    // A successful read is the recovery signal: reset the
+                    // bounded-retry bookkeeping (and its timer).
+                    inner.lane_retries.remove(terminal_id);
                     inner.lanes.insert(terminal_id.to_string(), lane);
                 }
                 TailerReadOutcome::Degraded { reason, message } => {
@@ -530,15 +606,112 @@ impl ActivityHub {
                         message = %message,
                         "amplifier_events_lane_degraded"
                     );
-                    // Signal loss: busy reverts silently; the lane (and its
-                    // watcher) is dropped — no further reads.
+                    // Signal loss: busy reverts honestly right now; the lane
+                    // (and its watcher) is dropped, and a bounded re-attach
+                    // is scheduled (G4) unless the failure is deterministic.
                     let effects = inner
                         .amplifier
                         .note_events_signal_lost(terminal_id, now_ms());
                     let (mut f, _) = amplifier_frames(&mut inner.idle, effects);
                     frames.append(&mut f);
+                    self.note_lane_failure(
+                        &mut inner,
+                        terminal_id,
+                        &lane.session_id,
+                        &lane.events_path,
+                        matches!(reason, TailerDegradeReason::SchemaMismatch),
+                        &mut frames,
+                    );
                 }
             }
+            frames
+        };
+        self.emit(frames);
+    }
+
+    /// Record a lane failure (degrade or failed [re-]attach) and either
+    /// schedule the next bounded re-attach or give up LOUDLY. Caller holds
+    /// the `HubInner` lock; client-visible frames are pushed onto `frames`
+    /// and must be emitted by the caller AFTER releasing the lock.
+    fn note_lane_failure(
+        &self,
+        inner: &mut HubInner,
+        terminal_id: &str,
+        session_id: &str,
+        events_path: &Path,
+        permanent: bool,
+        frames: &mut Vec<ServerMessage>,
+    ) {
+        let failures = inner
+            .lane_retries
+            .get(terminal_id)
+            .map(|retry| retry.failures)
+            .unwrap_or(0)
+            + 1;
+        let delay = if permanent {
+            None
+        } else {
+            lane_retry_delay_ms(failures)
+        };
+        match delay {
+            Some(delay_ms) => {
+                tracing::warn!(
+                    terminal_id = %terminal_id,
+                    failures,
+                    delay_ms,
+                    "amplifier_events_lane_retry_scheduled"
+                );
+                inner.lane_retries.insert(
+                    terminal_id.to_string(),
+                    LaneRetry {
+                        session_id: session_id.to_string(),
+                        events_path: events_path.to_path_buf(),
+                        failures,
+                        next_attempt_at: Some(now_ms() + delay_ms),
+                    },
+                );
+            }
+            None => {
+                inner.lane_retries.remove(terminal_id);
+                tracing::error!(
+                    terminal_id = %terminal_id,
+                    failures,
+                    permanent,
+                    "amplifier_events_lane_dead: events lane gave up after bounded re-attach; amplifier status for this terminal is no longer tracked"
+                );
+                // LOUD give-up: clear the tracker record so the client
+                // clears any stale busy status (an existing frame shape the
+                // frozen client already renders) instead of freezing it.
+                // Also keeps amplifier_list() consistent. Post-remove the
+                // pane renders as ordinary idle, and the tracker no-ops all
+                // further signals for this terminal — both intended (DD1).
+                let effects = inner.amplifier.note_exit(terminal_id);
+                let (mut f, _) = amplifier_frames(&mut inner.idle, effects);
+                frames.append(&mut f);
+            }
+        }
+    }
+
+    /// Attach failed before a lane existed — route into the same bounded
+    /// retry machinery (lock is NOT held by the caller).
+    fn handle_attach_failure(
+        &self,
+        terminal_id: &str,
+        session_id: &str,
+        events_path: &Path,
+        permanent: bool,
+    ) {
+        let frames = {
+            let mut inner = self.inner.lock().expect("activity hub lock");
+            let mut frames = Vec::new();
+            self.note_lane_failure(
+                &mut inner,
+                terminal_id,
+                session_id,
+                events_path,
+                permanent,
+                &mut frames,
+            );
             frames
         };
         self.emit(frames);
@@ -548,7 +721,7 @@ impl ActivityHub {
     /// gate, then service any amplifier force-read requests.
     fn expire_due(&self) {
         let now = now_ms();
-        let (frames, force_reads) = {
+        let (frames, force_reads, reattaches) = {
             let mut inner = self.inner.lock().expect("activity hub lock");
             let mut frames = Vec::new();
             let claude = inner.claude.expire(now);
@@ -565,11 +738,46 @@ impl ActivityHub {
                     reason: emission.reason,
                 }));
             }
-            (frames, force_reads)
+            let now = now_ms();
+            let mut reattaches: Vec<(String, String, PathBuf)> = Vec::new();
+            for (terminal_id, retry) in inner.lane_retries.iter_mut() {
+                if matches!(retry.next_attempt_at, Some(at) if at <= now) {
+                    // Mark in flight: arms no timer until the attempt resolves.
+                    retry.next_attempt_at = None;
+                    reattaches.push((
+                        terminal_id.clone(),
+                        retry.session_id.clone(),
+                        retry.events_path.clone(),
+                    ));
+                }
+            }
+            (frames, force_reads, reattaches)
         };
         self.emit(frames);
         for terminal_id in force_reads {
             self.drain_lane(&terminal_id);
+        }
+        for (terminal_id, session_id, stored_path) in reattaches {
+            // Port of the legacy resolveEventsPath semantics: the path is
+            // keyed by session id — re-resolve at every attempt, falling
+            // back to the path captured at degrade time (unit tests run
+            // with resolver = None). Covers same-sid path moves only; an
+            // in-terminal amplifier restart mints a NEW sid, which nothing
+            // re-attaches — an inherited legacy gap, out of scope (DD6).
+            let events_path = self
+                .resolver
+                .as_ref()
+                .and_then(|resolve| resolve(&session_id))
+                .unwrap_or(stored_path);
+            tracing::info!(
+                terminal_id = %terminal_id,
+                "amplifier_events_lane_reattach_attempt"
+            );
+            // Always Eof: a rotated/reset file's history is not ours to
+            // replay. attach_lane builds a FRESH tailer + reducer state
+            // (both degrade latches are sticky), and its failure paths feed
+            // back into note_lane_failure, escalating `failures`.
+            self.attach_lane(&terminal_id, &session_id, &events_path, AttachAt::Eof);
         }
     }
 }
@@ -580,6 +788,11 @@ fn hub_next_deadline(inner: &HubInner) -> Option<i64> {
         inner.codex.next_deadline(),
         inner.amplifier.next_deadline(),
         inner.idle.next_deadline(),
+        inner
+            .lane_retries
+            .values()
+            .filter_map(|retry| retry.next_attempt_at)
+            .min(),
     ]
     .into_iter()
     .flatten()
@@ -824,6 +1037,21 @@ mod tests {
             serde_json::json!({
                 "ts": crate::now_iso(),
                 "schema": { "name": "amplifier.log", "ver": "1.0.0" },
+                "event": event,
+                "session_id": "sess-1",
+                "data": {}
+            })
+        )
+    }
+
+    /// A lifecycle record whose schema version fails the gate (major != 1) —
+    /// drives the tailer's deterministic SchemaMismatch degrade.
+    fn bad_schema_line(event: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "ts": crate::now_iso(),
+                "schema": { "name": "amplifier.log", "ver": "2.0.0" },
                 "event": event,
                 "session_id": "sess-1",
                 "data": {}
@@ -1163,6 +1391,386 @@ mod tests {
             let inner = hub.inner.lock().unwrap();
             assert_eq!(hub_next_deadline(&inner), None, "no deadline while idle");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catchup_cap_attaches_at_eof_for_oversized_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        // > 4 MiB of pre-filter noise (skipped without parsing — no lifecycle
+        // event prefix) followed by a lifecycle record that must NOT be
+        // replayed once the cap downgrades the attach to Eof.
+        let noise = format!("{{\"noise\":\"{}\"}}\n", "x".repeat(5 * 1024 * 1024));
+        std::fs::write(
+            &events_path,
+            [noise, amplifier_line("prompt:submit")].concat(),
+        )
+        .unwrap();
+
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "amplifier".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        hub.attach_amplifier_association("t1", "sess-1", &events_path);
+
+        // The oversized backlog must NOT be replayed: no busy upsert appears.
+        let busy = next_frame_matching(&mut rx, "amplifier.activity.updated", 1_500, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| u.iter().any(|r| r["phase"] == "busy"))
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(busy.is_none(), "oversized backlog was replayed: {busy:?}");
+
+        // The lane is LIVE at Eof: a freshly appended record drives busy.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&events_path)
+                .unwrap();
+            f.write_all(amplifier_line("prompt:submit").as_bytes())
+                .unwrap();
+            f.flush().unwrap();
+        }
+        let busy = next_frame_matching(&mut rx, "amplifier.activity.updated", 5_000, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == "t1" && r["phase"] == "busy")
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(
+            busy.is_some(),
+            "live append after Eof attach did not drive busy"
+        );
+    }
+
+    #[test]
+    fn effective_attach_at_caps_oversized_start_attach() {
+        // Missing file (stat failed / not yet created) must NEVER count as
+        // over-cap: keep Start and let the first inotify event drive the read.
+        assert_eq!(effective_attach_at(AttachAt::Start, None), AttachAt::Start);
+        // Exactly at the cap: strict `>` keeps Start (parity with the frozen
+        // TS reference, amplifier-activity-integration.ts:318).
+        assert_eq!(
+            effective_attach_at(AttachAt::Start, Some(AMPLIFIER_CATCHUP_MAX_BYTES)),
+            AttachAt::Start
+        );
+        // One byte over: downgrade to Eof.
+        assert_eq!(
+            effective_attach_at(AttachAt::Start, Some(AMPLIFIER_CATCHUP_MAX_BYTES + 1)),
+            AttachAt::Eof
+        );
+        // Eof requests are untouched regardless of size.
+        assert_eq!(
+            effective_attach_at(AttachAt::Eof, Some(AMPLIFIER_CATCHUP_MAX_BYTES + 1)),
+            AttachAt::Eof
+        );
+    }
+
+    #[test]
+    fn lane_retry_schedule_is_bounded() {
+        assert_eq!(lane_retry_delay_ms(1), Some(250));
+        assert_eq!(lane_retry_delay_ms(2), Some(1_000));
+        assert_eq!(lane_retry_delay_ms(3), Some(3_000));
+        assert_eq!(lane_retry_delay_ms(4), None, "retries must be bounded");
+    }
+
+    #[test]
+    fn lane_retry_deadline_feeds_hub_next_deadline() {
+        let mut inner = HubInner::default();
+        assert_eq!(hub_next_deadline(&inner), None);
+        inner.lane_retries.insert(
+            "t1".into(),
+            LaneRetry {
+                session_id: "sess-1".into(),
+                events_path: PathBuf::from("/nonexistent/events.jsonl"),
+                failures: 1,
+                next_attempt_at: Some(12_345),
+            },
+        );
+        assert_eq!(hub_next_deadline(&inner), Some(12_345));
+        // An in-flight attempt (None) arms no timer — no polling, no busy loop.
+        inner.lane_retries.get_mut("t1").unwrap().next_attempt_at = None;
+        assert_eq!(hub_next_deadline(&inner), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn degraded_lane_reattaches_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        std::fs::write(&events_path, amplifier_line("session:start")).unwrap();
+
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "amplifier".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        hub.attach_amplifier_association("t1", "sess-1", &events_path);
+        // Wait for the bind upsert: attach + initial drain are done.
+        let bound = next_frame_matching(&mut rx, "amplifier.activity.updated", 5_000, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == "t1" && r["sessionId"] == "sess-1")
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(bound.is_some(), "lane never attached");
+
+        // The bind upsert is emitted BEFORE the initial drain runs, so wait
+        // until the tailer has actually consumed the seed record — the
+        // truncation below must land below a NON-ZERO offset to be a reset.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let inner = hub.inner.lock().unwrap();
+                if inner
+                    .lanes
+                    .get("t1")
+                    .map(|lane| lane.tailer.offset() > 0)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "initial drain never consumed the seed record"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Rotation: truncate below the tailer's offset -> FileReset degrade.
+        std::fs::write(&events_path, "").unwrap();
+
+        // Bounded backoff: first re-attach fires 250 ms after the degrade.
+        // 1.2 s is comfortably past it while far below the 1 s second delay
+        // plus margin.
+        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+        {
+            let inner = hub.inner.lock().unwrap();
+            assert!(
+                inner.lanes.contains_key("t1"),
+                "lane was not re-attached after FileReset degrade"
+            );
+        }
+
+        // The recovered lane is LIVE with fresh tailer + reducer state:
+        // a new record drives a confirmed busy.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&events_path)
+                .unwrap();
+            f.write_all(amplifier_line("prompt:submit").as_bytes())
+                .unwrap();
+            f.flush().unwrap();
+        }
+        let busy = next_frame_matching(&mut rx, "amplifier.activity.updated", 5_000, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == "t1" && r["phase"] == "busy")
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(busy.is_some(), "recovered lane did not drive busy");
+
+        // An Ok read resets the bookkeeping — no timer leak.
+        {
+            let inner = hub.inner.lock().unwrap();
+            assert!(
+                inner.lane_retries.is_empty(),
+                "retry state leaked after recovery"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exhausted_lane_retries_give_up_loudly() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        std::fs::write(&events_path, amplifier_line("session:start")).unwrap();
+
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "amplifier".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        hub.attach_amplifier_association("t1", "sess-1", &events_path);
+        let bound = next_frame_matching(&mut rx, "amplifier.activity.updated", 5_000, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == "t1" && r["sessionId"] == "sess-1")
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(bound.is_some(), "lane never attached");
+
+        // Make the path permanently unreadable: delete file AND parent dir so
+        // every re-attach stat fails (ReadError on each of the 3 attempts).
+        std::fs::remove_file(&events_path).unwrap();
+        std::fs::remove_dir_all(dir.path()).unwrap();
+
+        // After 250 + 1000 + 3000 ms of failed re-attaches the hub gives up
+        // LOUDLY: the tracker record is removed so the client clears any
+        // stale busy status instead of freezing it (see Design Decision 1:
+        // the post-remove pane looks like ordinary idle, by design).
+        let removed = next_frame_matching(&mut rx, "amplifier.activity.updated", 10_000, |v| {
+            v["remove"]
+                .as_array()
+                .map(|r| r.iter().any(|id| id == "t1"))
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(
+            removed.is_some(),
+            "no visible remove after retries exhausted"
+        );
+
+        let (records, _) = hub.amplifier_list();
+        assert!(records.is_empty(), "tracker record survived give-up");
+        let inner = hub.inner.lock().unwrap();
+        assert!(inner.lanes.is_empty(), "a dead lane survived give-up");
+        assert!(
+            inner.lane_retries.is_empty(),
+            "retry state leaked after give-up"
+        );
+        assert_eq!(
+            hub_next_deadline(&inner),
+            None,
+            "timer leaked after give-up"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn schema_mismatch_gives_up_immediately_without_retries() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        std::fs::write(&events_path, bad_schema_line("prompt:submit")).unwrap();
+
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "amplifier".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        // The Start-attach initial drain hits the schema gate immediately.
+        hub.attach_amplifier_association("t1", "sess-1", &events_path);
+
+        let removed = next_frame_matching(&mut rx, "amplifier.activity.updated", 5_000, |v| {
+            v["remove"]
+                .as_array()
+                .map(|r| r.iter().any(|id| id == "t1"))
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(removed.is_some(), "no visible remove on schema mismatch");
+        let inner = hub.inner.lock().unwrap();
+        assert!(
+            inner.lane_retries.is_empty(),
+            "schema mismatch must not schedule retries — it is deterministic"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exit_clears_pending_lane_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        std::fs::write(&events_path, amplifier_line("session:start")).unwrap();
+
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "amplifier".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        hub.attach_amplifier_association("t1", "sess-1", &events_path);
+        let bound = next_frame_matching(&mut rx, "amplifier.activity.updated", 5_000, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == "t1" && r["sessionId"] == "sess-1")
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(bound.is_some(), "lane never attached");
+
+        // Persistent failure (file + dir gone) so the retry entry stays
+        // pending long enough to observe (first delays: 250 ms, 1000 ms).
+        std::fs::remove_file(&events_path).unwrap();
+        std::fs::remove_dir_all(dir.path()).unwrap();
+
+        // Wait until the degrade lands and a retry entry exists.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let inner = hub.inner.lock().unwrap();
+                if inner.lane_retries.contains_key("t1") {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "degrade never scheduled a retry"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Terminal exits while the retry is pending.
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now_ms(),
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let inner = hub.inner.lock().unwrap();
+        assert!(inner.lanes.is_empty());
+        assert!(
+            inner.lane_retries.is_empty(),
+            "exit must clear pending lane retries"
+        );
+        assert_eq!(hub_next_deadline(&inner), None, "timer leaked after exit");
     }
 
     /// G1 red test: the queued submit arrives BEFORE the BEL (claude

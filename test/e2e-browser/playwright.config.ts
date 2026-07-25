@@ -91,6 +91,9 @@ const RUST_ONLY_SPECS = [
   // Lane A: busy-aware idle gate + queue-empty reason (imports RustServer
   // directly for restartAbrupt() and two concurrent servers).
   /idle-gate-semantics-rust\.spec\.ts$/,
+  // AMPLIFIER EVENTS-LANE RESILIENCE (Lane B): imports RustServer directly
+  // for restartAbrupt(); drives the Rust activity hub's events lane.
+  /amplifier-lane-resilience-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -213,6 +216,9 @@ export default defineConfig({
         // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
         /restore-contract-wall-rust\.spec\.ts$/,
         /idle-gate-semantics-rust\.spec\.ts$/,
+        // AMPLIFIER EVENTS-LANE RESILIENCE (Lane B): rust-only, owns its
+        // servers, exercises events.jsonl rotation + abrupt restart.
+        /amplifier-lane-resilience-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
