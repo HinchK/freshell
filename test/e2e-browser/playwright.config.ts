@@ -94,6 +94,7 @@ const RUST_ONLY_SPECS = [
   // AMPLIFIER EVENTS-LANE RESILIENCE (Lane B): imports RustServer directly
   // for restartAbrupt(); drives the Rust activity hub's events lane.
   /amplifier-lane-resilience-rust\.spec\.ts$/,
+  /codex-status-completeness-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -219,6 +220,8 @@ export default defineConfig({
         // AMPLIFIER EVENTS-LANE RESILIENCE (Lane B): rust-only, owns its
         // servers, exercises events.jsonl rotation + abrupt restart.
         /amplifier-lane-resilience-rust\.spec\.ts$/,
+        // Rust-only: drives RustServer directly (restartAbrupt + raw WS frames).
+        /codex-status-completeness-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

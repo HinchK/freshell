@@ -96,7 +96,10 @@ pub(crate) fn verify_rollout_path(
 /// crate-private there; HOME only, never FRESHELL_HOME) joined with the
 /// `sessions` dir the way `freshell_sessions::directory_index::CodexSource`
 /// does.
-fn codex_sessions_root() -> Option<PathBuf> {
+///
+/// `pub` (re-exported from the crate root) for `freshell-server`'s boot-time
+/// codex rollout-locator wiring.
+pub fn codex_sessions_root() -> Option<PathBuf> {
     let home = match std::env::var("CODEX_HOME") {
         Ok(v) if !v.is_empty() => PathBuf::from(v),
         _ => {
@@ -215,6 +218,24 @@ pub(crate) fn handle_codex_candidate_persisted(
         Some(thread_id.to_string()),
     );
     broadcast_terminal_session_associated(state, &msg.terminal_id, thread_id, row.cwd.clone());
+    // G3: adopted identity also feeds the activity tracker, so this
+    // terminal's `codex.activity.updated` records and subsequent
+    // `terminal.turn.complete` frames carry the sessionId (a fresh codex
+    // terminal otherwise never gets one -- identity arrives only here).
+    // Placed AFTER the pinned associated/meta broadcast pair.
+    if let Some(hub) = &state.activity {
+        hub.bind_codex_session(&msg.terminal_id, thread_id);
+        // G9: the verified rollout also feeds the reconcile lane, so this
+        // fresh terminal gets real busy-state from disk, not just PTY
+        // heuristics. Both calls only enqueue hub events (Task 2/Task 6):
+        // no file I/O and no frame emission happens on this WS dispatch
+        // path -- the hub task does the work, keeping frames serialized.
+        hub.attach_codex_rollout(
+            &msg.terminal_id,
+            thread_id,
+            std::path::Path::new(&msg.rollout_path),
+        );
+    }
 }
 
 /// Fan `terminal.session.associated` + a `terminal.meta.updated` upsert to

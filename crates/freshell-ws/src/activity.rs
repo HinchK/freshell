@@ -86,6 +86,11 @@ pub(crate) fn lane_retry_delay_ms(failures: u32) -> Option<i64> {
     AMPLIFIER_LANE_RETRY_DELAYS_MS.get(index).copied()
 }
 
+/// G9: resolve a resumed codex terminal's session id to its rollout file
+/// (ownership-proof walk of the codex sessions root). `None` -> the terminal
+/// runs the PTY-only lane, same degradation as the amplifier resolver.
+pub type CodexRolloutLocator = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
 /// Diagnostics counters backing the zero-polling tests.
 #[derive(Debug, Default)]
 pub struct ActivityHubStats {
@@ -107,6 +112,25 @@ enum HubEvent {
     },
     /// The inotify watcher saw a change on a lane's events file.
     AmplifierFsChange {
+        terminal_id: String,
+    },
+    /// Bind a codex terminal's adopted session identity (hub-task emission).
+    CodexBind {
+        terminal_id: String,
+        session_id: String,
+    },
+    /// Attach a codex rollout-reconcile lane (resume-created terminal).
+    /// Channel-deferred like `AmplifierAttach` so the Created arm's own
+    /// frames are emitted before the lane's seeding frames.
+    CodexAttach {
+        terminal_id: String,
+        session_id: String,
+        rollout_path: PathBuf,
+    },
+    /// Rollout file changed on disk -- drain on the hub task (mirror of
+    /// `AmplifierFsChange`; the notify thread NEVER drains or emits itself,
+    /// preserving the single-emitter frame-ordering invariant).
+    CodexFsChange {
         terminal_id: String,
     },
 }
@@ -135,6 +159,15 @@ struct LaneRetry {
     next_attempt_at: Option<i64>,
 }
 
+/// G9: one rollout-reconcile lane per bound codex terminal (narrowed port of
+/// the legacy whole-library `reconcileProjects` -- deviations documented in
+/// `freshell-activity/src/codex.rs`).
+struct CodexLane {
+    tailer: crate::codex_reconcile::RolloutTailer,
+    /// Keeps the inotify watcher alive for the lane's lifetime.
+    _watcher: notify::RecommendedWatcher,
+}
+
 #[derive(Default)]
 struct HubInner {
     claude: ClaudeActivityTracker,
@@ -146,6 +179,8 @@ struct HubInner {
     lanes: HashMap<String, AmplifierLane>,
     /// G4: terminal id → pending bounded re-attach bookkeeping.
     lane_retries: HashMap<String, LaneRetry>,
+    codex_lanes: HashMap<String, CodexLane>,
+    codex_rollout_locator: Option<CodexRolloutLocator>,
 }
 
 /// Cloneable handle to the hub (stored on `WsState`).
@@ -204,6 +239,161 @@ impl ActivityHub {
             events_path: events_path.to_path_buf(),
             attach_at: AttachAt::Start,
         });
+    }
+
+    /// G3: bind a codex terminal's session identity into the activity
+    /// tracker (candidate adoption / rollout-reconcile lane). Idempotent;
+    /// silent no-op for untracked terminals. Channel-deferred (mirror of
+    /// `attach_amplifier_association`) so the resulting
+    /// `codex.activity.updated` identity upsert is emitted on the hub task,
+    /// preserving the single-emitter frame-ordering invariant; subsequent
+    /// `terminal.turn.complete` frames then carry `sessionId`.
+    pub fn bind_codex_session(&self, terminal_id: &str, session_id: &str) {
+        let _ = self.tx.send(HubEvent::CodexBind {
+            terminal_id: terminal_id.to_string(),
+            session_id: session_id.to_string(),
+        });
+    }
+
+    /// Install the resume-time rollout locator (called once from
+    /// `freshell-server` at boot; tests inject tempdir-backed closures).
+    pub fn set_codex_rollout_locator(&self, locator: CodexRolloutLocator) {
+        let mut inner = self.inner.lock().expect("activity hub lock");
+        inner.codex_rollout_locator = Some(locator);
+    }
+
+    /// G9: attach the rollout-reconcile lane for a bound codex terminal.
+    /// Channel-deferred like `attach_amplifier_association` (:147-159): the
+    /// caller (WS dispatch / candidate adopt / spawn_blocking locator) only
+    /// enqueues -- the tailer attach (file I/O), watcher registration, and
+    /// ALL frame emission run on the single hub task, preserving the
+    /// one-emitter frame-ordering invariant.
+    pub fn attach_codex_rollout(&self, terminal_id: &str, session_id: &str, rollout_path: &Path) {
+        let _ = self.tx.send(HubEvent::CodexAttach {
+            terminal_id: terminal_id.to_string(),
+            session_id: session_id.to_string(),
+            rollout_path: rollout_path.to_path_buf(),
+        });
+    }
+
+    /// Hub-task worker for `HubEvent::CodexAttach` (mirror of `attach_lane`).
+    /// Binds identity (idempotent), tails the rollout (bounded initial read),
+    /// watches it via inotify, and runs the initial drain -- which performs
+    /// resume-busy seeding when the rollout shows an unresolved turn.
+    fn attach_codex_lane(&self, terminal_id: &str, session_id: &str, rollout_path: &Path) {
+        use notify::Watcher;
+        // Deferred-attach guard: the resume-path locator runs on a blocking
+        // thread (35ms warm, seconds cold). A terminal that exits inside that
+        // window has its Exit processed FIRST (the Exit arm removes it from
+        // `modes` and `codex_lanes`); installing a lane afterwards would leak
+        // an inotify watcher that nothing ever removes. Check before building
+        // the tailer/watcher (cheapest exit) -- safe against interleaving
+        // because Exit and CodexAttach are both processed serially on the
+        // single hub task.
+        {
+            let inner = self.inner.lock().expect("activity hub lock");
+            if inner.modes.get(terminal_id).map(String::as_str) != Some("codex") {
+                tracing::debug!(
+                    terminal_id = %terminal_id,
+                    rollout = %rollout_path.display(),
+                    "codex rollout attach skipped: terminal no longer tracked"
+                );
+                return;
+            }
+        }
+        let mut tailer = crate::codex_reconcile::RolloutTailer::new(rollout_path);
+        if let Err(err) = tailer.attach() {
+            tracing::warn!(
+                terminal_id = %terminal_id,
+                rollout = %rollout_path.display(),
+                error = %err,
+                "codex rollout lane attach failed; PTY-only lane continues"
+            );
+            return;
+        }
+        // Watcher: mirror the amplifier watcher (activity.rs:412-436) EXACTLY.
+        // The closure captures only the hub-event sender + terminal id (never
+        // a hub clone: that would put an Arc cycle inside HubInner and let the
+        // notify thread emit frames out of order with the hub task). The
+        // event-kind filter is the amplifier one VERBATIM (copy the matches!
+        // expression from activity.rs:422-430): our own tail read triggers
+        // Access(..) events and an atime-driven Modify(Metadata(..)) --
+        // forwarding either would self-trigger one extra read per real read,
+        // breaking the zero-polling accounting.
+        let tx = self.tx.clone();
+        let watched_terminal = terminal_id.to_string();
+        let mut watcher =
+            match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                let Ok(event) = res else { return };
+                let relevant = matches!(
+                    event.kind,
+                    notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
+                        | notify::EventKind::Modify(notify::event::ModifyKind::Any)
+                        | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                        | notify::EventKind::Create(_)
+                        | notify::EventKind::Remove(_)
+                        | notify::EventKind::Any
+                );
+                if relevant {
+                    let _ = tx.send(HubEvent::CodexFsChange {
+                        terminal_id: watched_terminal.clone(),
+                    });
+                }
+            }) {
+                Ok(w) => w,
+                Err(err) => {
+                    tracing::warn!(error = %err, "codex rollout watcher construction failed");
+                    return;
+                }
+            };
+        if let Err(err) = watcher.watch(rollout_path, notify::RecursiveMode::NonRecursive) {
+            tracing::warn!(
+                rollout = %rollout_path.display(),
+                error = %err,
+                "codex rollout watch failed; PTY-only lane continues"
+            );
+            return;
+        }
+
+        let frames = {
+            let mut inner = self.inner.lock().expect("activity hub lock");
+            let bind = inner.codex.bind_session(terminal_id, session_id);
+            let frames = codex_frames(&mut inner.idle, bind);
+            inner.codex_lanes.insert(
+                terminal_id.to_string(),
+                CodexLane {
+                    tailer,
+                    _watcher: watcher,
+                },
+            );
+            frames
+        };
+        self.emit(frames);
+        // Initial drain: resume-busy seeding for a rollout already mid-turn.
+        self.drain_codex_lane(terminal_id);
+    }
+
+    /// Read new rollout lines and reconcile them into the codex tracker.
+    fn drain_codex_lane(&self, terminal_id: &str) {
+        self.stats.tail_reads.fetch_add(1, Ordering::SeqCst);
+        let frames = {
+            let mut inner = self.inner.lock().expect("activity hub lock");
+            let Some(lane) = inner.codex_lanes.get_mut(terminal_id) else {
+                return;
+            };
+            let lines = lane.tailer.read_new_lines();
+            if lines.is_empty() {
+                return;
+            }
+            let events = crate::codex_reconcile::fold_task_events(&lines);
+            if events.is_empty() {
+                return;
+            }
+            let now = crate::terminal::now_ms();
+            let effects = inner.codex.reconcile_rollout(terminal_id, &events, now);
+            codex_frames(&mut inner.idle, effects)
+        };
+        self.emit(frames);
     }
 
     /// `claude.activity.list` state (records + latest completions).
@@ -280,6 +470,27 @@ impl ActivityHub {
             HubEvent::AmplifierFsChange { terminal_id } => {
                 self.drain_lane(&terminal_id);
             }
+            HubEvent::CodexBind {
+                terminal_id,
+                session_id,
+            } => {
+                let frames = {
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    let effects = inner.codex.bind_session(&terminal_id, &session_id);
+                    codex_frames(&mut inner.idle, effects)
+                };
+                self.emit(frames);
+            }
+            HubEvent::CodexAttach {
+                terminal_id,
+                session_id,
+                rollout_path,
+            } => {
+                self.attach_codex_lane(&terminal_id, &session_id, &rollout_path);
+            }
+            HubEvent::CodexFsChange { terminal_id } => {
+                self.drain_codex_lane(&terminal_id);
+            }
         }
     }
 
@@ -339,6 +550,41 @@ impl ActivityHub {
                                 session_id: session_id.to_string(),
                                 events_path,
                                 attach_at: AttachAt::Eof,
+                            });
+                        }
+                    }
+                }
+                // G9: resume-created codex terminals attach the rollout-
+                // reconcile lane via the locator (fresh terminals get theirs
+                // from the candidate-adopt path instead). Channel-deferred
+                // like AmplifierAttach so create's frames land first.
+                //
+                // MEASURED (load-bearing validation, F6): the locator's walk
+                // of a real ~/.codex/sessions tree (8k+ files) is 35-55ms
+                // warm and seconds-scale cold -- NEVER run it inline on the
+                // hub task (the amplifier resolver stays inline because its
+                // path is deterministic and cheap; this one is not). The
+                // walk runs on a blocking thread; the attach event was
+                // already channel-deferred, so frame ordering vs the Created
+                // upsert is unchanged.
+                if mode == "codex" {
+                    if let Some(session_id) = resume_session_id.as_deref() {
+                        let locator = {
+                            let inner = self.inner.lock().expect("activity hub lock");
+                            inner.codex_rollout_locator.clone()
+                        };
+                        if let Some(locator) = locator {
+                            let tx = self.tx.clone();
+                            let terminal_id = terminal_id.clone();
+                            let session_id = session_id.to_string();
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(rollout_path) = locator(&session_id) {
+                                    let _ = tx.send(HubEvent::CodexAttach {
+                                        terminal_id,
+                                        session_id,
+                                        rollout_path,
+                                    });
+                                }
                             });
                         }
                     }
@@ -416,6 +662,7 @@ impl ActivityHub {
                     inner.idle.note_exit(&terminal_id);
                     inner.lanes.remove(&terminal_id);
                     inner.lane_retries.remove(&terminal_id);
+                    inner.codex_lanes.remove(&terminal_id);
                     match mode.as_str() {
                         "claude" => {
                             let effects = inner.claude.note_exit(&terminal_id);
@@ -1958,5 +2205,253 @@ mod tests {
                 .is_none(),
             "exactly one emission for the codex drain"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_codex_session_broadcasts_identity_and_stamps_completions() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: crate::terminal::now_ms(),
+            },
+        );
+        // Initial idle upsert (no sessionId -- the G3 gap state).
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial idle upsert");
+
+        // Bind: a fresh terminal's adopted candidate identity arrives.
+        hub.bind_codex_session("t1", "thread-1");
+        let bound = next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["sessionId"] == "thread-1"
+        })
+        .await
+        .expect("bind upsert carries sessionId");
+        assert_eq!(bound["upsert"][0]["terminalId"], "t1");
+
+        // Payoff: a subsequent turn's completion carries the session id.
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: crate::terminal::now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: crate::terminal::now_ms(),
+            },
+        );
+        let complete = next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+            v["terminalId"] == "t1"
+        })
+        .await
+        .expect("turn complete");
+        assert_eq!(complete["sessionId"], "thread-1");
+        assert_eq!(complete["provider"], "codex");
+    }
+
+    /// Write a rollout line and return the (dir-guard, path).
+    fn codex_rollout_fixture(lines: &[String]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("rollout-2026-07-25T08-00-00-sess-1.jsonl");
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write rollout");
+        (dir, path)
+    }
+
+    fn codex_event_line(payload_type: &str, at_ms: i64) -> String {
+        format!(
+            r#"{{"timestamp":{at_ms},"type":"event_msg","payload":{{"type":"{payload_type}"}}}}"#
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_rollout_lane_seeds_busy_then_clears_via_inotify() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial upsert");
+
+        // Rollout shows an unresolved turn (restored mid-turn).
+        let (_guard, rollout) =
+            codex_rollout_fixture(&[codex_event_line("task_started", now - 5_000)]);
+        hub.attach_codex_rollout("t1", "sess-1", &rollout);
+
+        // Resume-busy seeding: initial drain promotes to busy.
+        let busy = next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("seeded busy upsert");
+        assert_eq!(busy["upsert"][0]["sessionId"], "sess-1");
+
+        // The turn completes on disk -> inotify -> drain -> idle + completion.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .expect("append");
+            writeln!(f, "{}", codex_event_line("task_complete", now + 1_000)).expect("write");
+        }
+        let idle = next_frame_matching(&mut rx, "codex.activity.updated", 5_000, |v| {
+            v["upsert"][0]["phase"] == "idle"
+        })
+        .await
+        .expect("idle upsert after task_complete");
+        assert_eq!(idle["upsert"][0]["terminalId"], "t1");
+        let complete = next_frame_matching(&mut rx, "terminal.turn.complete", 5_000, |v| {
+            v["terminalId"] == "t1"
+        })
+        .await
+        .expect("turn complete from the reconcile lane");
+        assert_eq!(complete["sessionId"], "sess-1");
+        assert_eq!(complete["provider"], "codex");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_lane_is_torn_down_on_exit() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+        let (_guard, rollout) = codex_rollout_fixture(&[codex_event_line("task_started", now)]);
+        hub.attach_codex_rollout("t1", "sess-1", &rollout);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("busy");
+
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: crate::terminal::now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["remove"][0] == "t1"
+        })
+        .await
+        .expect("remove on exit");
+        let lanes = hub.inner.lock().unwrap().codex_lanes.len();
+        assert_eq!(lanes, 0, "exit drops the lane (and its inotify watcher)");
+    }
+
+    /// The resume-path locator runs on a blocking thread; a terminal that
+    /// exits inside that window has its Exit processed BEFORE the deferred
+    /// CodexAttach lands. The attach must not install a lane for the exited
+    /// terminal: nothing would ever remove it (leaked inotify watcher).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_attach_after_exit_installs_no_zombie_lane() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now,
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["remove"][0] == "t1"
+        })
+        .await
+        .expect("remove on exit");
+
+        // The deferred attach arrives after the exit was processed.
+        let (_guard, rollout) = codex_rollout_fixture(&[codex_event_line("task_started", now)]);
+        hub.attach_codex_rollout("t1", "sess-1", &rollout);
+
+        // Registry events and CodexAttach share the single hub channel, so a
+        // later Created's frame proves the attach was already processed.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t2".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: now,
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t2"
+        })
+        .await
+        .expect("barrier upsert for t2");
+
+        let lanes = hub.inner.lock().unwrap().codex_lanes.len();
+        assert_eq!(lanes, 0, "attach after exit must not install a zombie lane");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_created_codex_terminal_attaches_the_rollout_lane_via_locator() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        let (_guard, rollout) =
+            codex_rollout_fixture(&[codex_event_line("task_started", now - 5_000)]);
+        let rollout_for_locator = rollout.clone();
+        hub.set_codex_rollout_locator(Arc::new(move |session_id: &str| {
+            (session_id == "sess-1").then(|| rollout_for_locator.clone())
+        }));
+
+        // A restored codex terminal is a normal create carrying the resume id.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+
+        // The lane attaches and the initial drain seeds busy: the restored
+        // mid-turn terminal is blue, not lying idle/green (the G9 headline).
+        let busy = next_frame_matching(&mut rx, "codex.activity.updated", 5_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("resume-busy seeding via the locator-attached lane");
+        assert_eq!(busy["upsert"][0]["sessionId"], "sess-1");
     }
 }
