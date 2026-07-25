@@ -29,6 +29,7 @@ import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTer
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient } from '@/lib/ws-client'
+import { sendTerminalKill } from '@/lib/terminal-kill'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import {
   buildCodexIdentityMismatchRepairContent,
@@ -65,7 +66,7 @@ import {
   type DeferredAttachReason,
   type TerminalAttachPriority,
 } from '@/lib/terminal-attach-policy'
-import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { collectAllTerminalIds, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import {
   beginAttach,
@@ -2433,6 +2434,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     opts?: AttachTerminalOptions,
   ) => {
     if (suppressNetworkEffects) return
+    // Never attach a terminal the layouts no longer reference: the layout-diff
+    // middleware can only release subscriptions it saw acquired. Covers the
+    // close-during-create race and stale deferred re-attach timers.
+    const layouts = appStore.getState().panes.layouts
+    if (!collectAllTerminalIds(layouts).has(tid)) {
+      return
+    }
     const term = termRef.current
     if (!term) return
     const runtime = runtimeRef.current
@@ -2580,6 +2588,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   }, [
     suppressNetworkEffects,
     ws,
+    appStore,
     applySeqState,
     buildCheckpointReplayInput,
     clearQuarantineRepair,
@@ -2907,7 +2916,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       lastSentViewportRef.current = null
       applySeqState(createAttachSeqState())
       writeLocalXtermNotice(term, '\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
-      ws.send({ type: 'terminal.kill', terminalId })
+      sendTerminalKill(terminalId)
       return true
     }
 

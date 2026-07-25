@@ -5,6 +5,7 @@ import panesReducer, { closePane, replacePane, updatePaneTitle } from '@/store/p
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
+import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { findPaneContent } from '@/lib/pane-utils'
 import type { PaneNode } from '@/store/paneTypes'
 
@@ -33,6 +34,7 @@ function createStore(layout: PaneNode, opts?: { paneTitleSetByUser?: Record<stri
       connection: connectionReducer,
       turnCompletion: turnCompletionReducer,
     },
+    middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(terminalDetachMiddleware),
     preloadedState: {
       tabs: {
         tabs: [
@@ -100,12 +102,8 @@ describe('replace pane (e2e)', () => {
     }
     const store = createStore(layout)
 
-    // Simulate what ContextMenuProvider does: detach terminal, then dispatch replacePane
     const paneContent = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1')
     expect(paneContent?.kind).toBe('terminal')
-    if (paneContent?.kind === 'terminal' && paneContent.terminalId) {
-      wsMocks.send({ type: 'terminal.detach', terminalId: paneContent.terminalId })
-    }
     store.dispatch(replacePane({ tabId: 'tab-1', paneId: 'pane-1' }))
 
     // Verify terminal.detach was sent
@@ -191,16 +189,18 @@ describe('replace pane (e2e)', () => {
       // Verify tab.terminalId is set
       expect(store.getState().tabs.tabs[0].terminalId).toBe('term-1')
 
-      // Simulate what replacePaneAction does: detach + clear stale tab.terminalId + dispatch
+      // Simulate what replacePaneAction does: clear stale tab.terminalId + dispatch (terminalDetachMiddleware emits detach)
       const content = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1')
       if (content?.kind === 'terminal' && content.terminalId) {
-        wsMocks.send({ type: 'terminal.detach', terminalId: content.terminalId })
         const tab = store.getState().tabs.tabs.find((t) => t.id === 'tab-1')
         if (tab?.terminalId === content.terminalId) {
           store.dispatch(updateTab({ id: 'tab-1', updates: { terminalId: undefined } }))
         }
       }
       store.dispatch(replacePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+
+      // Verify terminal.detach was sent (by the middleware)
+      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'term-1' })
 
       // tab.terminalId should be cleared
       expect(store.getState().tabs.tabs[0].terminalId).toBeUndefined()
@@ -270,16 +270,18 @@ describe('replace pane (e2e)', () => {
       }
       const store = createStore(layout, { tabTerminalId: 'term-1' })
 
-      // Simulate PaneContainer.handleClose: detach + clear stale + dispatch closePane
+      // Simulate PaneContainer.handleClose: clear stale + dispatch closePane (terminalDetachMiddleware emits detach)
       const content = findPaneContent(store.getState().panes.layouts['tab-1'], 'pane-1')
       if (content?.kind === 'terminal' && content.terminalId) {
-        wsMocks.send({ type: 'terminal.detach', terminalId: content.terminalId })
         const tab = store.getState().tabs.tabs.find((t) => t.id === 'tab-1')
         if (tab?.terminalId === content.terminalId) {
           store.dispatch(updateTab({ id: 'tab-1', updates: { terminalId: undefined } }))
         }
       }
       store.dispatch(closePane({ tabId: 'tab-1', paneId: 'pane-1' }))
+
+      // Verify terminal.detach was sent (by the middleware)
+      expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.detach', terminalId: 'term-1' })
 
       // tab.terminalId should be cleared
       expect(store.getState().tabs.tabs[0].terminalId).toBeUndefined()
