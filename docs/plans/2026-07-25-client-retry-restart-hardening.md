@@ -33,7 +33,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 ## Reference map (current code, verified at 2bf579e6)
 
 - `src/components/TerminalView.tsx` (4593 lines):
-  - retry constants `:155-157` (`RATE_LIMIT_RETRY_MAX_ATTEMPTS = 5`, `RATE_LIMIT_RETRY_BASE_MS = 2000`, `RATE_LIMIT_RETRY_MAX_MS = 12000`, all exported), retry ref `:568`, `clearRateLimitRetry` `:2733-2740`, `scheduleRateLimitRetry` `:2798-2814`, `sendCreate` `:2759-2796`, restore-flag peek wrapper `getRestoreFlag` `:2749`, `ensure()` `:2896`, `failLaunch` `:2900-2928`, `settleCleanRestoreStartupExit` `:2930-2960`, `terminal.created` handler clears restore flag at `:3694`, exit-during-launch `failLaunch` call `:3816`, generic create-error handler (`RATE_LIMITED` retry entry) `:3995-4024`, INVALID_TERMINAL_ID guard `:4026-4040`, other-terminal filter `:4061`, `failedDuringLaunch` block `:4069-4088` (**fix target**), `status !== 'exited'` no-auto-respawn rule `:4092`, unmount cleanup `:4347-4355`.
+  - retry constants `:155-157` (`RATE_LIMIT_RETRY_MAX_ATTEMPTS = 5`, `RATE_LIMIT_RETRY_BASE_MS = 2000`, `RATE_LIMIT_RETRY_MAX_MS = 12000`, all exported), retry ref `:568`, `clearRateLimitRetry` `:2733-2740`, `scheduleRateLimitRetry` `:2798-2814`, `sendCreate` `:2759-2796`, restore-flag peek wrapper `getRestoreFlag` `:2749`, `ensure()` `:2896`, `failLaunch` `:2900-2928`, `settleCleanRestoreStartupExit` `:2930-2960`, `terminal.created` handler resets the retry budget at `:3689` (its FIRST line, before the duplicate-ack early return — **fix target**: becomes a timer-only cancel, see Step 1.3) and clears restore flag at `:3694`, exit-during-launch `failLaunch` call `:3816`, generic create-error handler (`RATE_LIMITED` retry entry) `:3995-4024`, INVALID_TERMINAL_ID guard `:4026-4040`, other-terminal filter `:4061`, `failedDuringLaunch` block `:4069-4088` (**fix target**), `status !== 'exited'` no-auto-respawn rule `:4092`, unmount cleanup `:4347-4355`.
 - `src/lib/terminal-restore.ts` (86 lines): non-destructive peek `consumeTerminalRestoreRequestId` `:51-54`, `clearTerminalRestoreRequestId` `:61-63`, `addTerminalRestoreRequestId` `:65-68`.
 - `src/App.tsx`: `import { createLogger } from '@/lib/client-logger'` `:73`, `const log = createLogger('App')` `:79`, `ReadyMessageSchema` `:149-154`, ready handler `:899-945` (restart block `:923-934`).
 - `src/store/turnCompletionSlice.ts` (158 lines): `resetCompletionDedupeBaselines` clears both `lastAtByTerminalId` and `lastIdleAtByTerminalId`, preserves attention (pinned by `test/unit/client/store/turnCompletionSlice.test.ts:82-97` and `:393-398`).
@@ -69,19 +69,20 @@ If another agent holds the gate, WAIT (do not kill a foreign holder). The worksp
 ### Task 1: Bounded launch retry for launch-time INVALID_TERMINAL_ID (TerminalView)
 
 **Files:**
-- Modify: `src/components/TerminalView.tsx:2798-2814` (generalize scheduler), `:3995-4001` (rename call site), `:2960` region (new `retryLaunchAfterInvalidTerminal` closure, added right after `settleCleanRestoreStartupExit`), `:4076-4088` (wire retry into `failedDuringLaunch`)
+- Modify: `src/components/TerminalView.tsx:2798-2814` (generalize scheduler), `:2740` region (new `cancelCreateRetryTimer` helper right after `clearRateLimitRetry`), `:3689` (`terminal.created` handler: full budget reset becomes a timer-only cancel), `:3995-4001` (rename call site), `:2960` region (new `retryLaunchAfterInvalidTerminal` closure, added right after `settleCleanRestoreStartupExit`), `:4076-4088` (wire retry into `failedDuringLaunch`)
 - Test: `test/unit/client/components/TerminalView.launchRetry.test.tsx` (new)
 
 **Interfaces:**
 - Consumes: `scheduleRateLimitRetry`/`rateLimitRetryRef`/`clearRateLimitRetry` machinery, `sendCreate(requestId)`, `failLaunch(message, restore, terminalId?)`, `addTerminalRestoreRequestId(requestId)` (already imported in TerminalView), exported constants `RATE_LIMIT_RETRY_*`.
-- Produces: effect-scope `scheduleCreateRetry(requestId: string, kind: 'rate-limit' | 'launch'): boolean` (replaces `scheduleRateLimitRetry`; same counter/timer/constants/staleness guard) and `ensure()`-scope `retryLaunchAfterInvalidTerminal(restore: boolean, deadTerminalId: string | undefined): boolean`. No new exports. Contract pinned by this task's unit suite (the authoritative pin for the retry — see the INVALID_TERMINAL_ID server facts in the reference map): pane stays `status: 'creating'` during retries, retried `terminal.create` reuses the same `createRequestId` with `restore: true` re-armed, exhaustion falls back to the existing `failLaunch` error state. Task 3's e2e pins whole-system restart convergence (census + re-drive + this retry as belt-and-braces), not this retry specifically.
+- Produces: effect-scope `scheduleCreateRetry(requestId: string, kind: 'rate-limit' | 'launch'): boolean` (replaces `scheduleRateLimitRetry`; same counter/timer/constants/staleness guard), effect-scope `cancelCreateRetryTimer()` (cancels a pending retry timer WITHOUT refunding the attempt count — used by the `terminal.created` handler at `:3689`), and `ensure()`-scope `retryLaunchAfterInvalidTerminal(restore: boolean, deadTerminalId: string | undefined): boolean`. No new exports. Contract pinned by this task's unit suite (the authoritative pin for the retry — see the INVALID_TERMINAL_ID server facts in the reference map): pane stays `status: 'creating'` during retries, retried `terminal.create` reuses the same `createRequestId` with `restore: true` re-armed, exhaustion falls back to the existing `failLaunch` error state. Task 3's e2e pins whole-system restart convergence (census + re-drive + this retry as belt-and-braces), not this retry specifically.
 
 Behavioral contract being built (write it as a comment above the new closure):
 - Launch-time `INVALID_TERMINAL_ID` (server no longer knows the terminal we just created — the restart/half-initialized signature, i.e. NO numeric `terminalExitCode` on the error) gets a bounded backoff retry (5 attempts, 2/4/8/12/12s — same budget as RATE_LIMITED) that re-sends `terminal.create` with the SAME `createRequestId`.
 - Server population honesty (validated at 2bf579e6, stage-2 ledger): only the LEGACY server emits this error at launch time; the RUST server surfaces the same terminal loss as a silent attach no-op healed by inventory census + reconnect re-drive, and never populates `terminalExitCode`. This retry therefore fires in production against legacy-server deployments today, and is deliberately generic so future error codes (`SESSION_RESERVED{retryAfterMs}` per campaign §4.3) can reuse it. Its proof is the unit suite; no rust e2e can exercise the trigger.
 - A launch failure that carries a numeric nonzero `terminalExitCode` means the CLI process spawned and died — do NOT respawn-storm it; fall straight to `failLaunch`. (`terminalExitCode === 0` + restore + sessionRef keeps its existing `settleCleanRestoreStartupExit` escape hatch, which runs FIRST.) This discriminator is legacy-only by construction: rust never sets the field (a rust crashed-CLI arrives as `terminal.created` + early `terminal.exit`, the untouched exit-during-launch path), so on rust the guard simply never suppresses a retry — correct on both servers.
 - The restore flag must be re-armed before each retry: `terminal.created` already consumed it at `:3694`, and `restore: true` also exempts the retry from the server's `terminal.create` rate limit (`server/ws-handler.ts:2376-2389`).
-- Exhaustion → the existing `failLaunch` path. Never an infinite loop.
+- The retry budget survives the anchor. Today the `terminal.created` handler's FIRST action is `clearRateLimitRetry()` (`:3689`), refunding the whole budget on every create-ack. That is wrong for this retry: a create-ack is NOT launch success — a launch-time `INVALID_TERMINAL_ID` can still follow (the anchored-then-lost cycle this fix targets), and because `restore: true` exempts the retried creates from the server-side rate limit, an anchor-time refund would make the create→created→INVALID_TERMINAL_ID→retry cycle unbounded against a server that repeatedly acks then loses the terminal. Step 1.3 therefore changes `:3689` to a timer-only cancel (`cancelCreateRetryTimer()`): a pending resend is moot once the ack arrives, but the attempt count persists. The budget bounds TOTAL create attempts per launch round and resets only at genuine round boundaries — `ensure()` start (`:2897`), `failLaunch` (`:2901`), `settleCleanRestoreStartupExit` (`:2931`), the three new-requestId mints (`:2873`, `:3961`, `:4127`), RATE_LIMITED exhaustion (`:4006`), and unmount (`:4348`) — all of which keep their full `clearRateLimitRetry()` calls unchanged. (No existing test pins the anchor-time refund: `TerminalView.rateLimit.test.ts` is pure constant arithmetic, and the lifecycle RATE_LIMITED test at `:2853` never delivers a `terminal.created` — verified at 2bf579e6.)
+- Exhaustion → the existing `failLaunch` path. Never an infinite loop — guaranteed by the anchor-surviving budget above, and pinned by test 3 (which anchors between every failure round precisely to prove the budget is not refunded).
 - Untouched invariants: the stale-error guard `:4026-4040` (only current-attach errors are acted on), the `status !== 'exited'` no-auto-respawn rule `:4092`, and the RATE_LIMITED retry behavior.
 
 - [ ] **Step 1.1: Write the failing tests**
@@ -261,7 +262,11 @@ describe('launch-time INVALID_TERMINAL_ID bounded retry', () => {
     expect(after[after.length - 1].restore).toBeUndefined()
   })
 
-  it('caps retries at RATE_LIMIT_RETRY_MAX_ATTEMPTS and then fails the launch', async () => {
+  it('caps retries at RATE_LIMIT_RETRY_MAX_ATTEMPTS even when every round anchors (terminal.created must NOT refund the budget)', async () => {
+    // This test deliberately anchors between every failure round. It can only
+    // pass if Step 1.3's :3689 change (full clearRateLimitRetry -> timer-only
+    // cancelCreateRetryTimer) is in place: with today's anchor-time refund the
+    // counter would oscillate 0->1->0->1 and exhaustion would never happen.
     vi.useFakeTimers()
     addTerminalRestoreRequestId(REQ)
     const { store, paneContent } = makeStore()
@@ -327,7 +332,7 @@ FRESHELL_TEST_SUMMARY="lane-C launch-retry RED" npm run test:vitest -- run \
   test/unit/client/components/TerminalView.launchRetry.test.tsx
 ```
 
-Expected: FAIL. Tests 1 and 2 fail with pane status `'error'` instead of `'creating'` (today's `failLaunch` dead-end at `:4086`). Test 4 may pass already (it pins current behavior) — that is acceptable for a pinned invariant; the suite as a whole must be red.
+Expected: FAIL. Tests 1 and 2 fail with pane status `'error'` instead of `'creating'` (today's `failLaunch` dead-end at `:4086`). Test 3 also fails red: today the FIRST launch-time failure goes straight to `failLaunch`, so its loop's `sentCreates().length` assertion fails on attempt 1 (no retry ever fires). Test 4 may pass already (it pins current behavior) — that is acceptable for a pinned invariant; the suite as a whole must be red.
 
 - [ ] **Step 1.3: Implement — generalize the scheduler**
 
@@ -356,7 +361,28 @@ In `src/components/TerminalView.tsx`, replace `:2798-2814`:
     }
 ```
 
-Update the single RATE_LIMITED call site at `:3997` from `scheduleRateLimitRetry(reqId)` to `scheduleCreateRetry(reqId, 'rate-limit')`. Grep the file for any other `scheduleRateLimitRetry` reference (there is exactly one call site today) and update it. `clearRateLimitRetry`, the shared `rateLimitRetryRef` counter (retry budget shared across both kinds — deliberate: bounds TOTAL create attempts per launch round), the staleness guard, and the exported constants are all unchanged.
+Update the single RATE_LIMITED call site at `:3997` from `scheduleRateLimitRetry(reqId)` to `scheduleCreateRetry(reqId, 'rate-limit')`. Grep the file for any other `scheduleRateLimitRetry` reference (there is exactly one call site today) and update it.
+
+Then make the anchor stop refunding the budget (required for the behavioral contract's "never an infinite loop" and for test 3 — see the budget bullet in the contract above). Add a sibling helper immediately after `clearRateLimitRetry` (`:2740`):
+
+```ts
+    // Cancels a pending create-retry resend WITHOUT refunding the attempt
+    // count. Used when terminal.created arrives: the ack makes a pending
+    // resend moot, but it is NOT launch success — a launch-time
+    // INVALID_TERMINAL_ID can still follow, and the budget must bound TOTAL
+    // create attempts per launch round (a full reset here would make the
+    // anchored-then-lost create cycle unbounded, and restore:true exempts
+    // those creates from the server-side rate limit).
+    const cancelCreateRetryTimer = () => {
+      const retryState = rateLimitRetryRef.current
+      if (retryState.timer) {
+        clearTimeout(retryState.timer)
+        retryState.timer = null
+      }
+    }
+```
+
+and change the FIRST line of the `terminal.created` handler (`:3689`) from `clearRateLimitRetry()` to `cancelCreateRetryTimer()`. That is the ONLY call site that changes. The other eight `clearRateLimitRetry()` call sites are genuine round boundaries and stay as full resets: the new-requestId mints (`:2873`, `:3961`, `:4127`), `ensure()` start (`:2897`), `failLaunch` (`:2901`), `settleCleanRestoreStartupExit` (`:2931`), RATE_LIMITED exhaustion (`:4006`), and unmount (`:4348`). `clearRateLimitRetry` itself, the shared `rateLimitRetryRef` counter (retry budget shared across both kinds — deliberate: bounds TOTAL create attempts per launch round), the staleness guard, and the exported constants are all unchanged. (No existing test pins the old anchor-time refund — verified at 2bf579e6: no test file references `clearRateLimitRetry`/`rateLimitRetryRef`, `TerminalView.rateLimit.test.ts` is constant arithmetic only, and the lifecycle RATE_LIMITED test `:2853` never delivers a `terminal.created`.)
 
 - [ ] **Step 1.4: Implement — the launch retry closure**
 
@@ -485,7 +511,12 @@ half-initialized signature) was a permanent dead-end: failLaunch set
 status:'error' with no retry. Reuse the rate-limit backoff scheduler
 (5 attempts, 2/4/8/12/12s) keyed on the SAME createRequestId, re-arming
 the restore flag before each retry so the non-destructive peek keeps
-delivering restore:true. Nonzero terminalExitCode still fails immediately
+delivering restore:true. The terminal.created handler now cancels only a
+pending retry timer instead of refunding the whole budget: an ack is not
+launch success, and the budget must bound TOTAL create attempts per
+launch round or an anchored-then-lost cycle (server acks, then loses the
+terminal) would retry forever - restore:true creates bypass the server
+rate limit. Nonzero terminalExitCode still fails immediately
 (no respawn storm). Exhaustion falls back to the existing failLaunch.
 
 Gap F9/G5 (P0) of the restart-resilience campaign, Lane C.
@@ -949,7 +980,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 Note: `restore-double-restart.spec.ts` already pins the FreshCodex double-restart incident. This spec covers the plain TERMINAL pane double-restart, which that spec does not.
 
-**Contingency note (validated at 2bf579e6, stage-2 ledger):** static analysis enumerated every death-#2 interleaving (not-yet-reconnected / create-in-flight / anchored-but-unattached / fully recovered) as converging via the restore-flag peek, per-reconnect re-drive, epoch-guarded create re-send, retry-budget reset on anchor (`:3689`/`:4127`), and inventory census — but the timing is empirically unproven. Known hazards if this spec flakes or fails: (a) the 1s gap may not always land inside the mid-recovery window (reconnect backoff base 1000ms vs `restartAbrupt()` boot time) — both fast and slow interleavings still converge, so a miss makes the spec less pointed, not wrong; (b) the App inventory path and TerminalView's error path are two concurrent recovery drivers minting different requestIds — orderings differ per run; (c) same-requestId duplicate creates can orphan a server-side PTY, invisible to this spec's assertions (out of scope). If the spec FAILS: that is a real convergence gap outside Tasks 1-2's fix list — investigate and report it honestly (do NOT weaken the no-`error` assertion); if fixing it needs production code beyond this lane's scope fence, stop and escalate rather than silently widening scope.
+**Contingency note (validated at 2bf579e6, stage-2 ledger):** static analysis enumerated every death-#2 interleaving (not-yet-reconnected / create-in-flight / anchored-but-unattached / fully recovered) as converging via the restore-flag peek, per-reconnect re-drive, epoch-guarded create re-send, per-round retry budgets (after Task 1: `:3689` cancels only the pending timer on anchor — the budget persists within a launch round by design — while the recovery mint at `:4127` starts a fresh round with a full budget), and inventory census — but the timing is empirically unproven. Known hazards if this spec flakes or fails: (a) the 1s gap may not always land inside the mid-recovery window (reconnect backoff base 1000ms vs `restartAbrupt()` boot time) — both fast and slow interleavings still converge, so a miss makes the spec less pointed, not wrong; (b) the App inventory path and TerminalView's error path are two concurrent recovery drivers minting different requestIds — orderings differ per run; (c) same-requestId duplicate creates can orphan a server-side PTY, invisible to this spec's assertions (out of scope). If the spec FAILS: that is a real convergence gap outside Tasks 1-2's fix list — investigate and report it honestly (do NOT weaken the no-`error` assertion); if fixing it needs production code beyond this lane's scope fence, stop and escalate rather than silently widening scope.
 
 - [ ] **Step 4.1: Write the spec**
 
