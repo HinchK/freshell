@@ -997,11 +997,20 @@ impl TerminalRegistry {
         }
     }
 
+    /// Node-parity geometry floor (`broker.ts:672-673`):
+    /// `Math.max(2, Math.floor(Number.isFinite(cols) ? cols : 80))`. For
+    /// `u16` input — always finite, always integral — the formula reduces
+    /// exactly to `.max(2)`; the `floor` and non-finite-fallback arms are
+    /// unrepresentable in the Rust type.
+    pub(crate) const MIN_GEOMETRY_DIM: u16 = 2;
+
     /// `terminal.resize` (`terminal-registry.ts:3975-3995`): `unchanged` when cols/rows
     /// already match; else set them, `+1` the geometry epoch (`§5.3`) unless this is the
     /// first client geometry record (see `has_client_geometry`), and resize the PTY
     /// (errors swallowed, as node-pty's are).
     pub fn resize(&self, terminal_id: &str, cols: u16, rows: u16) {
+        let cols = cols.max(Self::MIN_GEOMETRY_DIM);
+        let rows = rows.max(Self::MIN_GEOMETRY_DIM);
         let mut inner = self.inner.lock().expect("registry lock");
         if let Some(handle) = inner.terminals.get_mut(terminal_id) {
             {
@@ -1043,6 +1052,8 @@ impl TerminalRegistry {
         cols: u16,
         rows: u16,
     ) -> AttachResizeStatus {
+        let cols = cols.max(Self::MIN_GEOMETRY_DIM);
+        let rows = rows.max(Self::MIN_GEOMETRY_DIM);
         let inner = self.inner.lock().expect("registry lock");
         let Some(handle) = inner.terminals.get(terminal_id) else {
             return AttachResizeStatus::Missing;
@@ -2665,6 +2676,38 @@ mod tests {
         assert_eq!(reg.geometry("T"), Some((100, 40, 1)));
         reg.resize("T", 90, 35); // subsequent real change: bump
         assert_eq!(reg.geometry("T"), Some((90, 35, 2)));
+    }
+
+    #[test]
+    fn resize_floors_dimensions_at_two_node_broker_parity() {
+        // Node: recordTerminalGeometry floors both dims at 2 (broker.ts:672-673).
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.resize("T", 0, 0); // first record: floored to (2,2), no epoch bump
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1)));
+        reg.resize("T", 1, 1); // floors to (2,2): unchanged, no bump
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1)));
+        reg.resize("T", 1, 40); // floors to (2,40): real change, bump
+        assert_eq!(reg.geometry("T"), Some((2, 40, 2)));
+        reg.resize("T", 2, 2); // exact minimum passes through unaltered
+        assert_eq!(reg.geometry("T"), Some((2, 2, 3)));
+        reg.resize("T", 95, 41); // normal values pass through unaltered
+        assert_eq!(reg.geometry("T"), Some((95, 41, 4)));
+    }
+
+    #[test]
+    fn resize_for_attach_floors_dimensions_at_two_node_broker_parity() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let status = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 0, 1);
+        assert!(matches!(status, AttachResizeStatus::Resized));
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1))); // first record: no bump
+        let status = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 1, 2);
+        assert!(matches!(status, AttachResizeStatus::Unchanged)); // floored dup
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1)));
+        let status = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert!(matches!(status, AttachResizeStatus::Resized));
+        assert_eq!(reg.geometry("T"), Some((95, 41, 2)));
     }
 
     #[test]
