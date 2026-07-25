@@ -412,7 +412,7 @@ pub fn prefix_len_to_netmask(prefix: u32) -> String {
 pub fn parse_powershell_ip_prefix_lines(output: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in output.lines() {
-        let mut parts = line.trim().split_whitespace();
+        let mut parts = line.split_whitespace();
         let (Some(ip), Some(prefix)) = (parts.next(), parts.next()) else {
             continue;
         };

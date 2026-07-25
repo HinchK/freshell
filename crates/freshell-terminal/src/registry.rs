@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use freshell_platform::SpawnSpec;
 use freshell_protocol::{
     GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator,
-    TerminalAttachReady, TerminalExit, TerminalOutput, TerminalRunStatus,
+    TerminalAttachIntent, TerminalAttachReady, TerminalExit, TerminalOutput, TerminalRunStatus,
 };
 
 use crate::barrier_scanner::{BarrierReason, BarrierScanner, ScannerState};
@@ -208,10 +208,15 @@ struct TerminalShared {
     exit_code: Option<i64>,
     created_at: i64,
     last_activity_at: i64,
-    /// Current PTY geometry + epoch (`§5.3`): epoch starts 1, +1 only on real change.
+    /// Current PTY geometry + epoch (`§5.3`): epoch starts 1, +1 only on a real change after the first client geometry record.
     cols: u16,
     rows: u16,
     geometry_epoch: i64,
+    /// TERM-07 parity with Node's `hasPreviousGeometry` (`broker.ts:666-686`):
+    /// false until the first client-supplied geometry is recorded. The first
+    /// record applies dims WITHOUT bumping `geometry_epoch` (spawn defaults
+    /// never count as a prior record); later real changes bump.
+    has_client_geometry: bool,
     cwd: Option<String>,
     /// Directory metadata (`terminal-registry.ts:1614` stores `getModeLabel(opts.mode)`
     /// as the title at create; `getModeLabel('shell') === 'Shell'`). Defaults preserve
@@ -461,6 +466,22 @@ pub struct AttachOutcome {
     pub found: bool,
 }
 
+/// Outcome of the attach-time geometry application (TERM-07;
+/// `broker.ts:358-397` `shouldResize` + `resizeIfSessionMatches` parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachResizeStatus {
+    /// Geometry changed: cols/rows updated, epoch bumped, PTY resized.
+    Resized,
+    /// Geometry already matched: no epoch bump, no PTY syscall (Node `unchanged`).
+    Unchanged,
+    /// The intent/subscriber condition said not to resize (Node `shouldResize` false).
+    Skipped,
+    /// Terminal is not running (Node `not_running`): no mutation.
+    NotRunning,
+    /// Unknown terminal id (Node `missing`).
+    Missing,
+}
+
 impl TerminalRegistry {
     pub fn new() -> Self {
         Self {
@@ -687,6 +708,7 @@ impl TerminalRegistry {
             cols: spec.cols,
             rows: spec.rows,
             geometry_epoch: 1,
+            has_client_geometry: false,
             cwd: spec.cwd.clone(),
             title: "Shell".to_string(),
             description: None,
@@ -975,25 +997,121 @@ impl TerminalRegistry {
         }
     }
 
+    /// Node-parity geometry floor (`broker.ts:672-673`):
+    /// `Math.max(2, Math.floor(Number.isFinite(cols) ? cols : 80))`. For
+    /// `u16` input — always finite, always integral — the formula reduces
+    /// exactly to `.max(2)`; the `floor` and non-finite-fallback arms are
+    /// unrepresentable in the Rust type.
+    pub(crate) const MIN_GEOMETRY_DIM: u16 = 2;
+
     /// `terminal.resize` (`terminal-registry.ts:3975-3995`): `unchanged` when cols/rows
-    /// already match; else set them, `+1` the geometry epoch (`§5.3`), and resize the
-    /// PTY (errors swallowed, as node-pty's are).
+    /// already match; else set them, `+1` the geometry epoch (`§5.3`) unless this is the
+    /// first client geometry record (see `has_client_geometry`), and resize the PTY
+    /// (errors swallowed, as node-pty's are).
     pub fn resize(&self, terminal_id: &str, cols: u16, rows: u16) {
+        let cols = cols.max(Self::MIN_GEOMETRY_DIM);
+        let rows = rows.max(Self::MIN_GEOMETRY_DIM);
         let mut inner = self.inner.lock().expect("registry lock");
         if let Some(handle) = inner.terminals.get_mut(terminal_id) {
             {
                 let mut s = handle.shared.lock().expect("terminal lock");
+                let first_record = !s.has_client_geometry;
+                s.has_client_geometry = true;
                 if s.cols == cols && s.rows == rows {
                     return;
                 }
                 s.cols = cols;
                 s.rows = rows;
-                s.geometry_epoch += 1;
+                if !first_record {
+                    s.geometry_epoch += 1;
+                }
             }
             if let Some(pty) = handle.pty.as_ref() {
                 pty.resize(cols, rows);
             }
         }
+    }
+
+    /// TERM-07: apply the `terminal.attach`-supplied viewport geometry BEFORE
+    /// the broker attach/replay, replicating Node's `shouldResize`
+    /// (`broker.ts:358-362`): `viewport_hydrate` always resizes;
+    /// `transport_reconnect` resizes only when no OTHER socket is attached or
+    /// this same connection is re-attaching; `keepalive_delta` never resizes.
+    /// Node samples the client set PRE-attach, so call this before `attach`
+    /// inserts the subscriber (the insert would also destroy the
+    /// "existing attachment" evidence for the same `conn_id`).
+    /// Epoch semantics match `resize` (Task 2): the first-ever client
+    /// geometry record never bumps; later real changes bump. A record also
+    /// happens on unchanged dims when the resize is allowed, but never when
+    /// the intent condition skips it (Node `broker.ts:373, 387-392`).
+    pub fn resize_for_attach(
+        &self,
+        terminal_id: &str,
+        conn_id: u64,
+        intent: TerminalAttachIntent,
+        cols: u16,
+        rows: u16,
+    ) -> AttachResizeStatus {
+        let cols = cols.max(Self::MIN_GEOMETRY_DIM);
+        let rows = rows.max(Self::MIN_GEOMETRY_DIM);
+        let inner = self.inner.lock().expect("registry lock");
+        let Some(handle) = inner.terminals.get(terminal_id) else {
+            return AttachResizeStatus::Missing;
+        };
+        {
+            let mut s = handle.shared.lock().expect("terminal lock");
+            let has_other_attached = s.subscribers.keys().any(|k| *k != conn_id);
+            let existing_attachment = s.subscribers.contains_key(&conn_id);
+            let should_resize = match intent {
+                TerminalAttachIntent::ViewportHydrate => true,
+                TerminalAttachIntent::TransportReconnect => {
+                    !has_other_attached || existing_attachment
+                }
+                TerminalAttachIntent::KeepaliveDelta => false,
+            };
+            if !should_resize {
+                return AttachResizeStatus::Skipped;
+            }
+            if s.status != TerminalRunStatus::Running {
+                return AttachResizeStatus::NotRunning;
+            }
+            // Node records geometry for BOTH 'resized' and 'unchanged' results
+            // when shouldResize is true (broker.ts:387-392); a skipped attach
+            // never records (broker.ts:373). The first-ever record applies
+            // dims WITHOUT bumping the epoch (recordTerminalGeometry,
+            // broker.ts:666-686) -- the same rule `resize` follows since Task 2.
+            let first_record = !s.has_client_geometry;
+            s.has_client_geometry = true;
+            if s.cols == cols && s.rows == rows {
+                return AttachResizeStatus::Unchanged;
+            }
+            s.cols = cols;
+            s.rows = rows;
+            if !first_record {
+                s.geometry_epoch += 1;
+            }
+        }
+        if let Some(pty) = handle.pty.as_ref() {
+            pty.resize(cols, rows);
+        }
+        AttachResizeStatus::Resized
+    }
+
+    /// Current geometry bookkeeping as `(cols, rows, geometry_epoch)`; `None`
+    /// for an unknown terminal id. Test/diagnostic seam for the TERM-07
+    /// attach-time resize (the values `attach.ready` stamps come from here).
+    pub fn geometry(&self, terminal_id: &str) -> Option<(u16, u16, i64)> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.map(|shared| {
+            let s = shared.lock().expect("terminal lock");
+            (s.cols, s.rows, s.geometry_epoch)
+        })
     }
 
     /// `registry.kill()` (`terminal-registry.ts:3997-4033`): remove the terminal, send
@@ -1338,6 +1456,7 @@ impl TerminalRegistry {
             cols: 120,
             rows: 30,
             geometry_epoch: 1,
+            has_client_geometry: false,
             cwd: None,
             title: "Shell".to_string(),
             description: None,
@@ -2550,17 +2669,188 @@ mod tests {
     fn resize_updates_geometry_epoch_only_on_change() {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
-        let (sink, seen) = collector();
-        // default 120x30, epoch 1.
-        reg.resize("T", 120, 30); // unchanged -> no epoch bump
-        reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
-        assert_eq!(attach_ready(&seen).unwrap().geometry_epoch, Some(1));
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+        reg.resize("T", 100, 40); // first record: applied, no bump
+        assert_eq!(reg.geometry("T"), Some((100, 40, 1)));
+        reg.resize("T", 100, 40); // identical dims: no bump
+        assert_eq!(reg.geometry("T"), Some((100, 40, 1)));
+        reg.resize("T", 90, 35); // subsequent real change: bump
+        assert_eq!(reg.geometry("T"), Some((90, 35, 2)));
+    }
 
-        // A real change bumps the epoch (observed on the next attach.ready).
+    #[test]
+    fn resize_floors_dimensions_at_two_node_broker_parity() {
+        // Node: recordTerminalGeometry floors both dims at 2 (broker.ts:672-673).
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.resize("T", 0, 0); // first record: floored to (2,2), no epoch bump
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1)));
+        reg.resize("T", 1, 1); // floors to (2,2): unchanged, no bump
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1)));
+        reg.resize("T", 1, 40); // floors to (2,40): real change, bump
+        assert_eq!(reg.geometry("T"), Some((2, 40, 2)));
+        reg.resize("T", 2, 2); // exact minimum passes through unaltered
+        assert_eq!(reg.geometry("T"), Some((2, 2, 3)));
+        reg.resize("T", 95, 41); // normal values pass through unaltered
+        assert_eq!(reg.geometry("T"), Some((95, 41, 4)));
+    }
+
+    #[test]
+    fn resize_for_attach_floors_dimensions_at_two_node_broker_parity() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let status = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 0, 1);
+        assert!(matches!(status, AttachResizeStatus::Resized));
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1))); // first record: no bump
+        let status = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 1, 2);
+        assert!(matches!(status, AttachResizeStatus::Unchanged)); // floored dup
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1)));
+        let status = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert!(matches!(status, AttachResizeStatus::Resized));
+        assert_eq!(reg.geometry("T"), Some((95, 41, 2)));
+    }
+
+    #[test]
+    fn first_client_geometry_records_without_epoch_bump() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S"); // 120x30, epoch 1, no client geometry yet
+                                       // First client-supplied geometry: applied + recorded, NO epoch bump
+                                       // (Node recordTerminalGeometry: hasPreviousGeometry=false => no bump,
+                                       // broker.ts:666-686; spawn dims never count, broker.ts:692-697).
         reg.resize("T", 100, 40);
-        let (sink2, seen2) = collector();
+        assert_eq!(reg.geometry("T"), Some((100, 40, 1)));
+        // Second real change: bumps.
+        reg.resize("T", 90, 35);
+        assert_eq!(reg.geometry("T"), Some((90, 35, 2)));
+    }
+
+    #[test]
+    fn unchanged_first_geometry_still_counts_as_recorded() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // Node records geometry on 'unchanged' results too (ws-handler.ts:2995
+        // records for both 'resized' and 'unchanged'), so the NEXT change bumps.
+        reg.resize("T", 120, 30); // dims equal the spawn default: records, no change
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+        reg.resize("T", 95, 41);
+        assert_eq!(reg.geometry("T"), Some((95, 41, 2)));
+    }
+
+    #[test]
+    fn geometry_reports_cols_rows_epoch() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S"); // headless default: 120x30, epoch 1
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+
+        assert_eq!(reg.geometry("nope"), None);
+    }
+
+    #[test]
+    fn resize_for_attach_viewport_hydrate_applies_first_geometry_without_bump() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S"); // 120x30, epoch 1
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        // First-ever client geometry: applied, epoch NOT bumped (Node
+        // first-record-no-bump, broker.ts:666-686).
+        assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_second_change_bumps_epoch() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 100, 50);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        assert_eq!(reg.geometry("T"), Some((100, 50, 2)));
+    }
+
+    #[test]
+    fn resize_for_attach_unchanged_geometry_records_but_does_not_bump() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 120, 30);
+        assert_eq!(out, AttachResizeStatus::Unchanged);
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+        // Node records geometry on 'unchanged' results too (broker.ts:387-392),
+        // so the next real change must bump.
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        assert_eq!(reg.geometry("T"), Some((95, 41, 2)));
+    }
+
+    #[test]
+    fn resize_for_attach_keepalive_delta_never_resizes_or_records() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::KeepaliveDelta, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Skipped);
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+        // A skipped attach must NOT count as a geometry record (Node's forced
+        // 'unchanged' at broker.ts:373 never records): the next applied
+        // geometry is still the FIRST record, so no bump.
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_transport_reconnect_applies_when_alone() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // No subscribers at all -> no other attached sockets -> resize.
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::TransportReconnect, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_transport_reconnect_skips_when_other_socket_attached() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        reg.attach("T", 1, sink, Some("a".into()), 0, false, None); // conn 1 is attached
+                                                                    // conn 2 reconnects with another socket attached and no prior attachment of its own.
+        let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Skipped);
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_transport_reconnect_applies_when_same_conn_reattaches() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink1, _seen1) = collector();
+        let (sink2, _seen2) = collector();
+        reg.attach("T", 1, sink1, Some("a".into()), 0, false, None);
         reg.attach("T", 2, sink2, Some("b".into()), 0, false, None);
-        assert_eq!(attach_ready(&seen2).unwrap().geometry_epoch, Some(2));
+        // conn 2 already has an attachment -> resize even though conn 1 is also attached
+        // (Node: existingAttachment wins over hasOtherAttachedSockets).
+        let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        // First-ever geometry record: no epoch bump.
+        assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_missing_terminal() {
+        let reg = TerminalRegistry::new();
+        let out = reg.resize_for_attach("nope", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Missing);
+    }
+
+    #[test]
+    fn resize_for_attach_exited_terminal_not_running() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // finish_pty_exit flips a headless terminal to Exited while RETAINING
+        // the record (registry.rs:1112) -- the same seam the existing test
+        // attach_to_already_exited_terminal_delivers_synthetic_exit uses.
+        assert!(reg.finish_pty_exit("T", 7));
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert_eq!(out, AttachResizeStatus::NotRunning);
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
     }
 
     #[test]

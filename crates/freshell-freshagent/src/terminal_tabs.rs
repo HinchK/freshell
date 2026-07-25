@@ -547,10 +547,9 @@ fn codex_effective_resume_session_id(
     requested: Option<&str>,
     plan_session_id: Option<&str>,
 ) -> Option<String> {
-    match requested.filter(|s| !s.is_empty()) {
-        Some(requested) => Some(plan_session_id.unwrap_or(requested).to_string()),
-        None => None,
-    }
+    requested
+        .filter(|s| !s.is_empty())
+        .map(|requested| plan_session_id.unwrap_or(requested).to_string())
 }
 
 /// The terminal-mode spawn pipeline (`router.ts:724-793` for create,

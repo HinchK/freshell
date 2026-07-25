@@ -314,9 +314,7 @@ fn parse_url_protocol_host(url: &str) -> Option<(String, String)> {
     }
     let rest = &url[colon + 1..];
     let hostname = if let Some(after) = rest.strip_prefix("//") {
-        let end = after
-            .find(|c| matches!(c, '/' | ':' | '?' | '#'))
-            .unwrap_or(after.len());
+        let end = after.find(['/', ':', '?', '#']).unwrap_or(after.len());
         let host = &after[..end];
         if host.is_empty() {
             return None; // `new URL('ws://')` throws for special schemes

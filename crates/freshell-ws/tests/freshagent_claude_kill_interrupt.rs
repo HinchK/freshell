@@ -32,7 +32,7 @@
 //! unknown session.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -47,7 +47,7 @@ const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 /// Serializes every test in this file, all of which mutate the process-global
 /// `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE` env vars (mirrors `claude.rs`'s
 /// own `CLAUDE_ENV_LOCK` convention for the identical hazard).
-static CLAUDE_ENV_LOCK: Mutex<()> = Mutex::new(());
+static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ── fake claude sidecar (production wire protocol only: create/interrupt/shutdown) ──
 
@@ -309,7 +309,7 @@ fn create_frame(request_id: &str) -> Value {
 ///     wrong even though no timeout occurs).
 #[tokio::test]
 async fn claude_kill_frame_reaches_handle_kill_and_evicts_the_create_dedup_cache() {
-    let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
     let _sidecar = FakeClaudeSidecarEnv::install();
 
     let url = spawn_server().await;
@@ -365,7 +365,7 @@ async fn claude_kill_frame_reaches_handle_kill_and_evicts_the_create_dedup_cache
 /// broadcast to assert on (matching legacy's silence on success).
 #[tokio::test]
 async fn claude_interrupt_frame_reaches_the_sidecar_for_a_known_session() {
-    let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
     let sidecar = FakeClaudeSidecarEnv::install();
 
     let url = spawn_server().await;
@@ -416,7 +416,7 @@ async fn claude_interrupt_frame_reaches_the_sidecar_for_a_known_session() {
 /// created must produce an `error` frame, not silently vanish.
 #[tokio::test]
 async fn claude_interrupt_frame_errors_for_an_unknown_session() {
-    let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
     let _sidecar = FakeClaudeSidecarEnv::install();
 
     let url = spawn_server().await;

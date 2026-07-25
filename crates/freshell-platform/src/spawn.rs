@@ -102,6 +102,18 @@ pub struct SpawnSpec {
 pub const DEFAULT_COLS: u16 = 120;
 pub const DEFAULT_ROWS: u16 = 30;
 
+/// Node-parity spawn geometry defaulting (`terminal-registry.ts:1572-1573`:
+/// `opts.cols || 120`, `opts.rows || 30`). JavaScript `||` is a
+/// falsy-coalesce, not a clamp: `0` (the only falsy `u16`) falls back to the
+/// default, and every non-zero value passes through unchanged — there is no
+/// minimum floor on the spawn path in Node, so there is none here.
+pub fn dim_or_default(dim: Option<u16>, default: u16) -> u16 {
+    match dim {
+        None | Some(0) => default,
+        Some(v) => v,
+    }
+}
+
 /// Env vars stripped from the inherited parent before spawn
 /// (`buildSpawnSpec`, `terminal-registry.ts:1083-1097`). The terminal layer must
 /// remove these from the real parent env; the deterministic core can't (it holds
@@ -285,7 +297,7 @@ pub fn cli_provider_target(
 ) -> ProviderTarget {
     let effective_shell = resolve_shell(shell, host_os, is_wsl_env);
     let in_wsl_with_linux_shell = is_wsl_env && effective_shell == ShellType::System;
-    if !(crate::detect::is_windows_like(host_os, is_wsl_env) && !in_wsl_with_linux_shell) {
+    if !crate::detect::is_windows_like(host_os, is_wsl_env) || in_wsl_with_linux_shell {
         return ProviderTarget::Unix;
     }
     let force_wsl = is_windows(host_os) && cwd.is_some_and(is_linux_path);
@@ -365,8 +377,8 @@ pub fn build_spawn_spec(
     rows: Option<u16>,
 ) -> SpawnSpec {
     let env_overrides = build_env_overrides(env, user_env_overrides);
-    let cols = cols.unwrap_or(DEFAULT_COLS);
-    let rows = rows.unwrap_or(DEFAULT_ROWS);
+    let cols = dim_or_default(cols, DEFAULT_COLS);
+    let rows = dim_or_default(rows, DEFAULT_ROWS);
     let spec = |program: String, args: Vec<String>, cwd: Option<String>| SpawnSpec {
         program,
         args,
@@ -506,9 +518,9 @@ pub fn build_spawn_spec(
 ///
 /// The env layer matches shell mode (parent − STRIP_ENV + TERM/COLORTERM/LANG/LC_ALL
 /// + user overrides, then `...cli.env` on top) and the cwd is resolved through the
-/// same `resolveUnixShellCwd`, so a claude/codex/opencode terminal lands in the
-/// requested directory with `CLAUDECODE` stripped (which the reference notes is
-/// required or child Claude refuses to start).
+///   same `resolveUnixShellCwd`, so a claude/codex/opencode terminal lands in the
+///   requested directory with `CLAUDECODE` stripped (which the reference notes is
+///   required or child Claude refuses to start).
 ///
 /// Scope: CLI panes are always created with `shell:'system'` (`PaneContainer`
 /// `createContentForType`), which resolves to the Linux system shell on WSL/Linux/
@@ -535,8 +547,8 @@ pub fn build_cli_spawn_spec(
         args: launch.args.clone(),
         env_overrides,
         cwd: unix_cwd,
-        cols: cols.unwrap_or(DEFAULT_COLS),
-        rows: rows.unwrap_or(DEFAULT_ROWS),
+        cols: dim_or_default(cols, DEFAULT_COLS),
+        rows: dim_or_default(rows, DEFAULT_ROWS),
     }
 }
 
@@ -579,8 +591,8 @@ pub fn build_windows_cli_spawn_spec(
     for (k, v) in &launch.env {
         env_overrides.insert(k.clone(), v.clone());
     }
-    let cols = cols.unwrap_or(DEFAULT_COLS);
-    let rows = rows.unwrap_or(DEFAULT_ROWS);
+    let cols = dim_or_default(cols, DEFAULT_COLS);
+    let rows = dim_or_default(rows, DEFAULT_ROWS);
     let spec = |program: String, args: Vec<String>, cwd: Option<String>| SpawnSpec {
         program,
         args,
@@ -1069,3 +1081,7 @@ mod helper_tests {
         assert_eq!(quote_powershell_literal(""), "''");
     }
 }
+
+#[cfg(test)]
+#[path = "spawn_dims_tests.rs"]
+mod spawn_dims_tests;

@@ -59,9 +59,9 @@ use freshell_platform::{
     RealFileProbe, ShellType,
 };
 use freshell_protocol::{
-    ClientMessage, ErrorCode, ErrorMsg, Pong, ServerMessage, Shell, TerminalAttach, TerminalCreate,
-    TerminalCreated, TerminalIdOnly, TerminalKill, TerminalMetaRecord, TerminalMetaUpdated,
-    TerminalResize,
+    ClientMessage, ErrorCode, ErrorMsg, Pong, ServerMessage, SessionLocator, Shell, TerminalAttach,
+    TerminalCreate, TerminalCreated, TerminalIdOnly, TerminalKill, TerminalMetaRecord,
+    TerminalMetaUpdated, TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -471,8 +471,12 @@ async fn handle_client_text(
             handle_create(create, ws_tx, state, pane_reconcile_v1).await
         }
         ClientMessage::TerminalAttach(attach) => {
-            handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
-            true
+            if terminal_dims_in_range(attach.cols, attach.rows) {
+                handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
+                true
+            } else {
+                send(ws_tx, &invalid_dims_error(attach.cols, attach.rows)).await
+            }
         }
         ClientMessage::TerminalInput(input) => {
             state
@@ -498,8 +502,12 @@ async fn handle_client_text(
             true
         }
         ClientMessage::TerminalResize(resize) => {
-            handle_resize(resize, state);
-            true
+            if terminal_dims_in_range(resize.cols, resize.rows) {
+                handle_resize(resize, state);
+                true
+            } else {
+                send(ws_tx, &invalid_dims_error(resize.cols, resize.rows)).await
+            }
         }
         ClientMessage::TerminalDetach(detach) => {
             handle_detach(&detach.terminal_id, ws_tx, state, conn_id).await
@@ -1761,6 +1769,30 @@ fn handle_attach(
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
 ) {
+    // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
+    // `attach.ready` from the shared identity registry (create-time
+    // resume ids AND locator-associated ids both live there); the
+    // registry crate is identity-agnostic, so it's resolved here.
+    let canonical_session_ref = state.identity.session_ref_for(&attach.terminal_id);
+
+    // TERM-07 (`broker.ts:358-397` parity): apply the attach-supplied viewport
+    // geometry to the PTY BEFORE attach/replay. The intent + pre-attach
+    // subscriber condition lives in `resize_for_attach`; the session-identity
+    // guard (Node `resizeIfSessionMatches`) lives here because this crate owns
+    // the identity registry. This MUST run before `registry.attach`: attach's
+    // subscriber insert would destroy the pre-attach evidence the condition
+    // needs, and resizing under attach's per-terminal lock would deadlock.
+    if attach_geometry_identity_ok(
+        attach.expected_session_ref.as_ref(),
+        canonical_session_ref.as_ref(),
+    ) {
+        let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
+        let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
+        state
+            .registry
+            .resize_for_attach(&attach.terminal_id, conn_id, attach.intent, cols, rows);
+    }
+
     state.registry.attach(
         &attach.terminal_id,
         conn_id,
@@ -1768,12 +1800,59 @@ fn handle_attach(
         attach.attach_request_id.clone(),
         attach.since_seq.unwrap_or(0),
         terminal_output_batch_v1,
-        // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
-        // `attach.ready` from the shared identity registry (create-time
-        // resume ids AND locator-associated ids both live there); the
-        // registry crate is identity-agnostic, so it's resolved here.
-        state.identity.session_ref_for(&attach.terminal_id),
+        canonical_session_ref,
     );
+}
+
+/// Node's `resizeIfSessionMatches` identity guard
+/// (`server/terminal-registry.ts:3890-3903` `buildSessionIdentityMismatchResult`):
+/// no guard when the client sent no `expectedSessionRef`; when it did, the
+/// resize applies only if the terminal's canonical session identity matches.
+/// A terminal with no canonical identity cannot match an explicit expectation.
+fn attach_geometry_identity_ok(
+    expected: Option<&SessionLocator>,
+    canonical: Option<&SessionLocator>,
+) -> bool {
+    match (expected, canonical) {
+        (None, _) => true,
+        (Some(e), Some(c)) => e == c,
+        (Some(_), None) => false,
+    }
+}
+
+/// Node-parity geometry bounds for `terminal.attach` / `terminal.resize`
+/// (`shared/ws-protocol.ts:344-345, 364-365`): `cols` must be an integer in
+/// `[2, 1000]` and `rows` in `[2, 500]`. Node enforces this at the Zod
+/// boundary by REJECTING the frame with `INVALID_MESSAGE`
+/// (`ws-handler.ts:1856-1858`) — reject, not clamp — so out-of-range
+/// geometry never reaches the registry or the PTY.
+pub(crate) const MIN_TERMINAL_COLS: i64 = 2;
+pub(crate) const MAX_TERMINAL_COLS: i64 = 1000;
+pub(crate) const MIN_TERMINAL_ROWS: i64 = 2;
+pub(crate) const MAX_TERMINAL_ROWS: i64 = 500;
+
+pub(crate) fn terminal_dims_in_range(cols: i64, rows: i64) -> bool {
+    (MIN_TERMINAL_COLS..=MAX_TERMINAL_COLS).contains(&cols)
+        && (MIN_TERMINAL_ROWS..=MAX_TERMINAL_ROWS).contains(&rows)
+}
+
+/// The `INVALID_MESSAGE` error frame for an out-of-range geometry reject.
+/// `request_id` is `None` for exact Node parity: Node's Zod reject copies
+/// `msg?.requestId` (`ws-handler.ts:1858`) and neither attach nor resize has
+/// a `requestId` field.
+fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
+    ServerMessage::Error(ErrorMsg {
+        code: ErrorCode::InvalidMessage,
+        message: format!(
+            "terminal geometry out of range: cols must be in [2, 1000] and rows in [2, 500] (got cols={cols}, rows={rows})"
+        ),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: None,
+        terminal_exit_code: None,
+        terminal_id: None,
+    })
 }
 
 /// `terminal.resize` — resize the shared PTY (`registry.resize`); no dedicated wire
@@ -1868,7 +1947,7 @@ async fn handle_tabs_push(value: &serde_json::Value, ws_tx: &mut WsSink, state: 
 }
 
 enum TabsPushResponse {
-    Ack(ServerMessage),
+    Ack(Box<ServerMessage>),
     Error(serde_json::Value),
 }
 
@@ -1881,13 +1960,13 @@ async fn tabs_push_response(
     server_instance_id: String,
 ) -> TabsPushResponse {
     match process_tabs_push(value, reg, server_instance_id).await {
-        Ok(ack) => {
-            TabsPushResponse::Ack(ServerMessage::TabsSyncAck(freshell_protocol::TabsSyncAck {
+        Ok(ack) => TabsPushResponse::Ack(Box::new(ServerMessage::TabsSyncAck(
+            freshell_protocol::TabsSyncAck {
                 accepted: ack.accepted,
                 open_records: ack.open_records,
                 closed_records: ack.closed_records,
-            }))
-        }
+            },
+        ))),
         Err(message) => TabsPushResponse::Error(tabs_error_frame(&message)),
     }
 }
@@ -2114,11 +2193,13 @@ mod tabs_push_validation_tests {
         });
 
         match tabs_push_response(&frame, tabs.clone(), "srv-test".to_string()).await {
-            TabsPushResponse::Ack(ServerMessage::TabsSyncAck(ack)) => {
-                assert!(ack.accepted);
-                assert_eq!(ack.open_records, 1);
-            }
-            TabsPushResponse::Ack(other) => panic!("unexpected acknowledgement frame: {other:?}"),
+            TabsPushResponse::Ack(message) => match *message {
+                ServerMessage::TabsSyncAck(ack) => {
+                    assert!(ack.accepted);
+                    assert_eq!(ack.open_records, 1);
+                }
+                other => panic!("unexpected acknowledgement frame: {other:?}"),
+            },
             TabsPushResponse::Error(error) => {
                 panic!("registered extension mode push must be accepted: {error}")
             }
@@ -2752,5 +2833,95 @@ mod terminal_meta_created_tests {
                 }],
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod attach_geometry_tests {
+    use super::attach_geometry_identity_ok;
+    use freshell_protocol::SessionLocator;
+
+    fn locator(provider: &str, session_id: &str) -> SessionLocator {
+        SessionLocator {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn no_expectation_always_ok() {
+        assert!(attach_geometry_identity_ok(None, None));
+        assert!(attach_geometry_identity_ok(
+            None,
+            Some(&locator("codex", "s1"))
+        ));
+    }
+
+    #[test]
+    fn matching_expectation_ok() {
+        let expected = locator("codex", "s1");
+        let canonical = locator("codex", "s1");
+        assert!(attach_geometry_identity_ok(
+            Some(&expected),
+            Some(&canonical)
+        ));
+    }
+
+    #[test]
+    fn differing_expectation_mismatch() {
+        let expected = locator("codex", "s1");
+        let canonical = locator("codex", "s2");
+        assert!(!attach_geometry_identity_ok(
+            Some(&expected),
+            Some(&canonical)
+        ));
+    }
+
+    #[test]
+    fn expectation_against_no_identity_mismatch() {
+        let expected = locator("codex", "s1");
+        assert!(!attach_geometry_identity_ok(Some(&expected), None));
+    }
+}
+
+#[cfg(test)]
+mod terminal_dims_range_tests {
+    use super::{invalid_dims_error, terminal_dims_in_range};
+
+    #[test]
+    fn rejects_zero_and_one_below_node_floor() {
+        assert!(!terminal_dims_in_range(0, 24));
+        assert!(!terminal_dims_in_range(80, 0));
+        assert!(!terminal_dims_in_range(1, 24));
+        assert!(!terminal_dims_in_range(80, 1));
+        assert!(!terminal_dims_in_range(0, 0));
+    }
+
+    #[test]
+    fn rejects_negative_values() {
+        assert!(!terminal_dims_in_range(-1, 24));
+        assert!(!terminal_dims_in_range(80, -50));
+    }
+
+    #[test]
+    fn accepts_node_minimums_maximums_and_normal_values() {
+        assert!(terminal_dims_in_range(2, 2)); // Zod .min(2)
+        assert!(terminal_dims_in_range(80, 24));
+        assert!(terminal_dims_in_range(95, 41));
+        assert!(terminal_dims_in_range(1000, 500)); // Zod .max(1000)/.max(500)
+    }
+
+    #[test]
+    fn rejects_values_above_node_ceiling() {
+        assert!(!terminal_dims_in_range(1001, 500));
+        assert!(!terminal_dims_in_range(1000, 501));
+        assert!(!terminal_dims_in_range(i64::MAX, 24));
+    }
+
+    #[test]
+    fn invalid_dims_error_serializes_as_invalid_message() {
+        let value = serde_json::to_value(invalid_dims_error(0, -5)).expect("serialize");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["code"], "INVALID_MESSAGE");
     }
 }
