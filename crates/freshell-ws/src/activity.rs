@@ -57,6 +57,22 @@ use crate::terminal::now_ms;
 /// `freshell-server` from the amplifier home; `None` when unresolvable.
 pub type AmplifierEventsPathResolver = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
 
+/// G8 parity with the frozen TS reference
+/// (server/coding-cli/amplifier-activity-integration.ts:50): never replay an
+/// events backlog larger than this at Start-attach — attach at Eof instead
+/// and let live records take over.
+pub(crate) const AMPLIFIER_CATCHUP_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Decide the effective attach point for an events lane. `file_len` is `None`
+/// when the events file could not be stat'ed (fresh sessions create
+/// events.jsonl lazily) — that must NOT count as over-cap.
+pub(crate) fn effective_attach_at(requested: AttachAt, file_len: Option<u64>) -> AttachAt {
+    match (requested, file_len) {
+        (AttachAt::Start, Some(len)) if len > AMPLIFIER_CATCHUP_MAX_BYTES => AttachAt::Eof,
+        (requested, _) => requested,
+    }
+}
+
 /// Diagnostics counters backing the zero-polling tests.
 #[derive(Debug, Default)]
 pub struct ActivityHubStats {
@@ -1145,5 +1161,28 @@ mod tests {
             let inner = hub.inner.lock().unwrap();
             assert_eq!(hub_next_deadline(&inner), None, "no deadline while idle");
         }
+    }
+
+    #[test]
+    fn effective_attach_at_caps_oversized_start_attach() {
+        // Missing file (stat failed / not yet created) must NEVER count as
+        // over-cap: keep Start and let the first inotify event drive the read.
+        assert_eq!(effective_attach_at(AttachAt::Start, None), AttachAt::Start);
+        // Exactly at the cap: strict `>` keeps Start (parity with the frozen
+        // TS reference, amplifier-activity-integration.ts:318).
+        assert_eq!(
+            effective_attach_at(AttachAt::Start, Some(AMPLIFIER_CATCHUP_MAX_BYTES)),
+            AttachAt::Start
+        );
+        // One byte over: downgrade to Eof.
+        assert_eq!(
+            effective_attach_at(AttachAt::Start, Some(AMPLIFIER_CATCHUP_MAX_BYTES + 1)),
+            AttachAt::Eof
+        );
+        // Eof requests are untouched regardless of size.
+        assert_eq!(
+            effective_attach_at(AttachAt::Eof, Some(AMPLIFIER_CATCHUP_MAX_BYTES + 1)),
+            AttachAt::Eof
+        );
     }
 }
