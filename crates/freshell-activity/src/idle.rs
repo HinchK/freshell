@@ -60,10 +60,18 @@ struct TerminalIdleState {
     deadline: Option<i64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct IdleGate {
     states: HashMap<String, TerminalIdleState>,
     grace_ms: i64,
+}
+
+impl Default for IdleGate {
+    /// Production constructs the gate via `HubInner: Default` — the default
+    /// MUST carry the real grace window, not a zeroed one.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IdleGate {
@@ -385,5 +393,19 @@ mod tests {
         gate.note_exit("t1"); // legacy remove: whole state deleted
         gate.note_turn_boundary("t1", 200); // fresh terminal id reuse
         assert_eq!(gate.expire(200 + IDLE_GRACE_MS)[0].reason, TerminalIdleReason::Grace);
+    }
+
+    #[test]
+    fn default_gate_uses_the_production_grace_window() {
+        // HubInner is #[derive(Default)] (freshell-ws activity.rs), so
+        // PRODUCTION constructs IdleGate::default(). A derived Default left
+        // grace_ms == 0 — terminal.idle fired instantly at the boundary.
+        let mut gate = IdleGate::default();
+        gate.note_turn_boundary("t1", 100);
+        assert!(
+            gate.expire(100 + IDLE_GRACE_MS - 1).is_empty(),
+            "the default gate must honor the full grace window"
+        );
+        assert_eq!(gate.expire(100 + IDLE_GRACE_MS).len(), 1);
     }
 }
