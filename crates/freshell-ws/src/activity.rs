@@ -73,6 +73,19 @@ pub(crate) fn effective_attach_at(requested: AttachAt, file_len: Option<u64>) ->
     }
 }
 
+/// G4: bounded re-attach backoff schedule for a degraded events lane.
+/// Index = failures-1; after the last entry the lane gives up LOUDLY.
+/// Shape mirrors the repo's bounded-retry exemplar
+/// (crates/freshell-tauri/src/renderer_recovery.rs:44).
+pub(crate) const AMPLIFIER_LANE_RETRY_DELAYS_MS: [i64; 3] = [250, 1000, 3000];
+
+/// Backoff delay before the retry that follows the `failures`-th consecutive
+/// failure (1-based). `None` = retries exhausted.
+pub(crate) fn lane_retry_delay_ms(failures: u32) -> Option<i64> {
+    let index = failures.checked_sub(1)? as usize;
+    AMPLIFIER_LANE_RETRY_DELAYS_MS.get(index).copied()
+}
+
 /// Diagnostics counters backing the zero-polling tests.
 #[derive(Debug, Default)]
 pub struct ActivityHubStats {
@@ -106,6 +119,21 @@ struct AmplifierLane {
 }
 
 #[derive(Default)]
+/// G4: bookkeeping for a degraded amplifier events lane awaiting bounded
+/// re-attach. Lives on `HubInner` (the lane itself is dropped on degrade).
+#[derive(Debug, Clone)]
+struct LaneRetry {
+    session_id: String,
+    events_path: PathBuf,
+    /// Consecutive failures (degrades + failed re-attaches) since the last
+    /// successful read. Reset by an `Ok` read, not by a successful attach.
+    failures: u32,
+    /// When the next re-attach fires. `None` while an attempt is in flight or
+    /// has landed and awaits its first `Ok` read — arms no timer.
+    next_attempt_at: Option<i64>,
+}
+
+#[derive(Default)]
 struct HubInner {
     claude: ClaudeActivityTracker,
     codex: CodexActivityTracker,
@@ -114,6 +142,8 @@ struct HubInner {
     /// terminal id → mode, for every tracked CLI terminal.
     modes: HashMap<String, String>,
     lanes: HashMap<String, AmplifierLane>,
+    /// G4: terminal id → pending bounded re-attach bookkeeping.
+    lane_retries: HashMap<String, LaneRetry>,
 }
 
 /// Cloneable handle to the hub (stored on `WsState`).
@@ -610,11 +640,17 @@ fn hub_next_deadline(inner: &HubInner) -> Option<i64> {
         inner.codex.next_deadline(),
         inner.amplifier.next_deadline(),
         inner.idle.next_deadline(),
+        inner
+            .lane_retries
+            .values()
+            .filter_map(|retry| retry.next_attempt_at)
+            .min(),
     ]
     .into_iter()
     .flatten()
     .min()
 }
+
 
 /// Map claude tracker effects onto wire frames + idle-gate interactions.
 fn claude_frames(
@@ -1256,5 +1292,32 @@ mod tests {
             effective_attach_at(AttachAt::Eof, Some(AMPLIFIER_CATCHUP_MAX_BYTES + 1)),
             AttachAt::Eof
         );
+    }
+
+    #[test]
+    fn lane_retry_schedule_is_bounded() {
+        assert_eq!(lane_retry_delay_ms(1), Some(250));
+        assert_eq!(lane_retry_delay_ms(2), Some(1_000));
+        assert_eq!(lane_retry_delay_ms(3), Some(3_000));
+        assert_eq!(lane_retry_delay_ms(4), None, "retries must be bounded");
+    }
+
+    #[test]
+    fn lane_retry_deadline_feeds_hub_next_deadline() {
+        let mut inner = HubInner::default();
+        assert_eq!(hub_next_deadline(&inner), None);
+        inner.lane_retries.insert(
+            "t1".into(),
+            LaneRetry {
+                session_id: "sess-1".into(),
+                events_path: PathBuf::from("/nonexistent/events.jsonl"),
+                failures: 1,
+                next_attempt_at: Some(12_345),
+            },
+        );
+        assert_eq!(hub_next_deadline(&inner), Some(12_345));
+        // An in-flight attempt (None) arms no timer — no polling, no busy loop.
+        inner.lane_retries.get_mut("t1").unwrap().next_attempt_at = None;
+        assert_eq!(hub_next_deadline(&inner), None);
     }
 }
