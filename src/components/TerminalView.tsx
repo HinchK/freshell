@@ -2739,6 +2739,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       retryState.count = 0
     }
 
+    // Cancels a pending create-retry resend WITHOUT refunding the attempt
+    // count. Used when terminal.created arrives: the ack makes a pending
+    // resend moot, but it is NOT launch success — a launch-time
+    // INVALID_TERMINAL_ID can still follow, and the budget must bound TOTAL
+    // create attempts per launch round (a full reset here would make the
+    // anchored-then-lost create cycle unbounded, and restore:true exempts
+    // those creates from the server-side rate limit).
+    const cancelCreateRetryTimer = () => {
+      const retryState = rateLimitRetryRef.current
+      if (retryState.timer) {
+        clearTimeout(retryState.timer)
+        retryState.timer = null
+      }
+    }
+
     // consumeTerminalRestoreRequestId is a non-destructive peek (see
     // terminal-restore.ts) -- it's safe, and required for correctness, to
     // call it fresh on every sendCreate for the same requestId. An
@@ -2795,7 +2810,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       })
     }
 
-    const scheduleRateLimitRetry = (requestId: string) => {
+    const scheduleCreateRetry = (requestId: string, kind: 'rate-limit' | 'launch') => {
       const retryState = rateLimitRetryRef.current
       if (retryState.count >= RATE_LIMIT_RETRY_MAX_ATTEMPTS) return false
       retryState.count += 1
@@ -2809,7 +2824,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         if (requestIdRef.current !== requestId) return
         sendCreate(requestId)
       }, delayMs)
-      writeLocalXtermNotice(term, `\r\n[Rate limited - retrying in ${(delayMs / 1000).toFixed(0)}s]\r\n`)
+      const notice = kind === 'rate-limit'
+        ? `[Rate limited - retrying in ${(delayMs / 1000).toFixed(0)}s]`
+        : `[Terminal launch interrupted - retrying in ${(delayMs / 1000).toFixed(0)}s]`
+      writeLocalXtermNotice(term, `\r\n${notice}\r\n`)
       return true
     }
 
@@ -2957,6 +2975,54 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           dispatch(updateTab({ id: currentTab.id, updates: { status: 'exited' } }))
         }
         writeLocalXtermNotice(term, `\r\n[Restored terminal exited cleanly${message ? `: ${message}` : ''}]\r\n`)
+      }
+
+      // GAP F9/G5: a launch-time INVALID_TERMINAL_ID without a numeric
+      // terminalExitCode means the server no longer knows the terminal we just
+      // created — the restart / half-initialized-server signature. Instead of
+      // the permanent failLaunch dead-end, take a bounded backoff retry that
+      // re-sends terminal.create with the SAME createRequestId. The restore
+      // flag is re-armed first: terminal.created already consumed it (see the
+      // handler below), and restore:true also exempts the retry from the
+      // server's terminal.create rate limit. Exhaustion falls back to
+      // failLaunch. Server population (validated): only the legacy TS server
+      // emits this error at launch time (ws-handler.ts:2832); the rust server
+      // surfaces the same loss as a silent attach no-op healed by inventory
+      // census + reconnect re-drive, and never populates terminalExitCode.
+      // This closure is "the named retryer" future error codes
+      // (e.g. SESSION_RESERVED) will reuse — keep it generic.
+      const retryLaunchAfterInvalidTerminal = (
+        restore: boolean,
+        deadTerminalId: string | undefined,
+      ): boolean => {
+        const reqId = requestIdRef.current
+        if (!reqId) return false
+        if (restore) addTerminalRestoreRequestId(reqId)
+        if (!scheduleCreateRetry(reqId, 'launch')) return false
+        // Drop the dead terminal's identity so the retried create starts
+        // clean, but keep the pane in 'creating' (NOT 'error') while the
+        // retry timer runs. Mirrors failLaunch's cleanup minus the terminal
+        // error state.
+        clearQuarantineRepair()
+        setIsAttaching(false)
+        currentAttachRef.current = null
+        launchAttemptRef.current = null
+        deferredAttachStateRef.current = {
+          mode: 'none',
+          pendingIntent: null,
+          pendingSinceSeq: 0,
+          pendingReason: 'initial_hydrate',
+        }
+        if (deadTerminalId) {
+          clearTerminalCursor(deadTerminalId)
+          resetParserAppliedSurface()
+          forgetSentViewport(deadTerminalId)
+        }
+        lastSentViewportRef.current = null
+        terminalIdRef.current = undefined
+        applySeqState(createAttachSeqState())
+        updateContent({ terminalId: undefined, streamId: undefined, status: 'creating' })
+        return true
       }
 
       unsub = ws.onMessage((msg) => {
@@ -3686,7 +3752,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
-          clearRateLimitRetry()
+          cancelCreateRetryTimer()
           // This requestId has anchored -- it now has a real terminalId, so
           // any pending restore flag for it is resolved. Clear it explicitly
           // so it can't be resurrected (it's a non-destructive peek until
@@ -3994,7 +4060,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
         if (msg.type === 'error' && msg.requestId === reqId) {
           if (msg.code === 'RATE_LIMITED') {
-            const scheduled = scheduleRateLimitRetry(reqId)
+            const scheduled = scheduleCreateRetry(reqId, 'rate-limit')
             if (scheduled) {
               return
             }
@@ -4081,6 +4147,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               currentTerminalId
             ) {
               settleCleanRestoreStartupExit(currentTerminalId, msg.message)
+              return
+            }
+            // Only the "server lost the terminal" shape retries; a numeric
+            // nonzero terminalExitCode means the CLI spawned and died — do
+            // not respawn-storm it.
+            if (
+              typeof msg.terminalExitCode !== 'number'
+              && retryLaunchAfterInvalidTerminal(launchAttempt!.restore, currentTerminalId)
+            ) {
               return
             }
             failLaunch(msg.message || 'The terminal failed before it finished starting.', launchAttempt!.restore, currentTerminalId)
