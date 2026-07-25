@@ -410,11 +410,9 @@ async fn main() -> ExitCode {
     // codex sessions root; None -> PTY-only lane, same degradation as the
     // amplifier resolver above).
     if let Some(codex_sessions_root) = freshell_ws::codex_sessions_root() {
-        activity_hub.set_codex_rollout_locator(std::sync::Arc::new(
-            move |session_id: &str| {
-                freshell_ws::locate_codex_rollout(&codex_sessions_root, session_id)
-            },
-        ));
+        activity_hub.set_codex_rollout_locator(std::sync::Arc::new(move |session_id: &str| {
+            freshell_ws::locate_codex_rollout(&codex_sessions_root, session_id)
+        }));
     }
     let ws_state = WsState {
         activity: Some(activity_hub.clone()),

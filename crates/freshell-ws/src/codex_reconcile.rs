@@ -244,9 +244,15 @@ mod tests {
         let mut tailer = RolloutTailer::new(&path);
         tailer.attach().unwrap();
         assert_eq!(tailer.read_new_lines(), vec!["line1", "line2"]);
-        assert!(tailer.read_new_lines().is_empty(), "no new bytes -> no lines");
+        assert!(
+            tailer.read_new_lines().is_empty(),
+            "no new bytes -> no lines"
+        );
 
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         write!(f, "line3\npart").unwrap();
         assert_eq!(tailer.read_new_lines(), vec!["line3"]);
 
