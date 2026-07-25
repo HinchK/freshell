@@ -489,4 +489,93 @@ test.describe('Codex status completeness (Rust only)', () => {
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+
+  test('two concurrent servers keep independent codex status streams', async ({
+    page,
+    e2eServerKind,
+    browser,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-twin-'))
+    const fakeCodex = await installFakeCli(path.join(sharedRoot, 'bin'), 'codex', FAKE_BEL_CLI)
+    const mkServer = () =>
+      new RustServer({
+        env: { CODEX_CMD: fakeCodex },
+        setupHome: async (homeDir) => {
+          const freshellDir = path.join(homeDir, '.freshell')
+          await fs.mkdir(freshellDir, { recursive: true })
+          await fs.writeFile(
+            path.join(freshellDir, 'config.json'),
+            JSON.stringify(
+              { version: 1, settings: { codingCli: { enabledProviders: ['codex'] } } },
+              null,
+              2,
+            ),
+          )
+        },
+      })
+    const serverA = mkServer()
+    const serverB = mkServer()
+    let contextB: import('@playwright/test').BrowserContext | undefined
+    try {
+      const [infoA, infoB] = await Promise.all([serverA.start(), serverB.start()])
+      expect(infoA.port).not.toBe(infoB.port)
+
+      const captureA = new WsCapture(infoA.baseUrl, infoA.token)
+      const captureB = new WsCapture(infoB.baseUrl, infoB.token)
+      try {
+        await Promise.all([captureA.ready(), captureB.ready()])
+
+        // Server A: page-driven codex pane + a full turn.
+        const harnessA = await bootAndConnect(page, infoA)
+        await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+        const tabA = await harnessA.getActiveTabId()
+        const terminalA = await openCliPaneAndGetTerminalId(page, harnessA, tabA!, /Codex/i, 'codex')
+
+        // Server B: second browser context, its own codex pane + turn.
+        contextB = await browser.newContext()
+        const pageB = await contextB.newPage()
+        const harnessB = await bootAndConnect(pageB, infoB)
+        await expect(pageB.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+        const tabB = await harnessB.getActiveTabId()
+        const terminalB = await openCliPaneAndGetTerminalId(pageB, harnessB, tabB!, /Codex/i, 'codex')
+
+        // Drive a turn on A only.
+        await typePromptIntoLastPane(page, 'turn on A')
+        const completeA = await captureA.waitFor(
+          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalA,
+          15_000,
+          'A turn complete',
+        )
+        expect(completeA.provider).toBe('codex')
+
+        // Independence: B's stream never saw A's terminal, and vice versa.
+        expect(captureB.count((f) => f.terminalId === terminalA)).toBe(0)
+        expect(captureA.count((f) => f.terminalId === terminalB && f.type === 'terminal.turn.complete')).toBe(0)
+
+        // Now a turn on B, proving B's stream is live and independent.
+        await pageB.locator('.xterm').last().click()
+        await pageB.keyboard.type('turn on B')
+        await pageB.keyboard.press('Enter')
+        const completeB = await captureB.waitFor(
+          (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalB,
+          15_000,
+          'B turn complete',
+        )
+        expect(completeB.provider).toBe('codex')
+        expect(completeB.completionSeq).toBe(1)
+        expect(captureA.count((f) => f.terminalId === terminalB)).toBe(0)
+      } finally {
+        captureA.close()
+        captureB.close()
+      }
+    } finally {
+      await contextB?.close().catch(() => {})
+      await Promise.all([
+        serverA.stop().catch(() => {}),
+        serverB.stop().catch(() => {}),
+      ])
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
