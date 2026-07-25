@@ -355,23 +355,51 @@ Expected: FAIL to compile — `no method named 'bind_codex_session' found for st
 
 - [ ] **Step 3: Implement the hub method**
 
-Insert in `impl ActivityHub`, immediately AFTER the closing brace of `attach_amplifier_association` (currently activity.rs:159) and BEFORE the `claude_list` doc comment. Direct-lock style (a pure identity bind has no I/O — synchronous, testable; contrast with `attach_amplifier_association`, which is channel-deferred because it does file I/O):
+Insert in `impl ActivityHub`, immediately AFTER the closing brace of `attach_amplifier_association` (currently activity.rs:159) and BEFORE the `claude_list` doc comment. Channel-deferred style, mirroring `attach_amplifier_association` (:147-159): the hub's serialization invariant is that ALL frame emission happens on the single hub task (`emit` is otherwise unreachable off-task — see `drain_lane`/`attach_lane`), so a WS-dispatch caller must enqueue, never lock-compute-emit inline:
 
 ```rust
     /// G3: bind a codex terminal's session identity into the activity
     /// tracker (candidate adoption / rollout-reconcile lane). Idempotent;
-    /// silent no-op for untracked terminals. Emits the `codex.activity.updated`
-    /// identity upsert so subsequent `terminal.turn.complete` frames carry
-    /// `sessionId`.
+    /// silent no-op for untracked terminals. Channel-deferred (mirror of
+    /// `attach_amplifier_association`) so the resulting
+    /// `codex.activity.updated` identity upsert is emitted on the hub task,
+    /// preserving the single-emitter frame-ordering invariant; subsequent
+    /// `terminal.turn.complete` frames then carry `sessionId`.
     pub fn bind_codex_session(&self, terminal_id: &str, session_id: &str) {
-        let frames = {
-            let mut inner = self.inner.lock().expect("activity hub lock");
-            let effects = inner.codex.bind_session(terminal_id, session_id);
-            codex_frames(&mut inner.idle, effects)
-        };
-        self.emit(frames);
+        let _ = self.tx.send(HubEvent::CodexBind {
+            terminal_id: terminal_id.to_string(),
+            session_id: session_id.to_string(),
+        });
     }
 ```
+
+with a new `HubEvent` variant (private enum — no API impact), next to `AmplifierAttach`:
+
+```rust
+    /// Bind a codex terminal's adopted session identity (hub-task emission).
+    CodexBind {
+        terminal_id: String,
+        session_id: String,
+    },
+```
+
+and its arm in `handle_event` (next to the `AmplifierAttach` arm):
+
+```rust
+            HubEvent::CodexBind {
+                terminal_id,
+                session_id,
+            } => {
+                let frames = {
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    let effects = inner.codex.bind_session(&terminal_id, &session_id);
+                    codex_frames(&mut inner.idle, effects)
+                };
+                self.emit(frames);
+            }
+```
+
+(The Step 1 test is unchanged and still valid: it awaits the bind upsert from the broadcast receiver, which the hub task delivers after processing the enqueued event.)
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -648,23 +676,37 @@ Append inside `mod tests` in `crates/freshell-activity/src/codex.rs`:
         // complete the re-armed turn prematurely (the disjoint key spaces --
         // server-clock pending keys vs rollout-clock accepted keys -- make
         // last_emitted_turn_key powerless here; the swallow flag is the fix).
+        //
+        // Completion accounting matches the frozen PTY reference: a re-arm is
+        // NOT a turn end (`record_completion_if_idle` records only when the
+        // terminal lands Idle -- see its doc comment and the pinned PTY test
+        // `queued_submit_rearms_pending_after_the_bel_and_completes_each_turn`,
+        // where two submitted turns also yield exactly ONE completion, seq 1).
+        // So the reconcile clear here records nothing; the swallow flag is
+        // what keeps the late BEL echo from prematurely completing turn 2.
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t1", Some("thread-1"), 0);
         tracker.note_input("t1", "\r", 10); // turn 1 pending
         tracker.reconcile_rollout("t1", &started(12), 15); // promoted busy
         tracker.note_input("t1", "\r", 20); // queued submit (turn 2)
         let clear = tracker.reconcile_rollout("t1", &completed(25), 30);
-        assert_eq!(completions(&clear), vec![1], "turn 1 completes via reconcile");
-        // The BEL echo of turn 1's end arrives late on the PTY lane.
+        assert!(
+            completions(&clear).is_empty(),
+            "re-arm to the queued turn is not a turn end (PTY parity)"
+        );
+        // The BEL echo of turn 1's end arrives late on the PTY lane. Without
+        // the swallow flag it would end the RE-ARMED turn 2 prematurely (the
+        // pending-key path lands Idle and records a bogus completion).
         let echo = tracker.note_output("t1", "\u{07}", 35);
         assert!(
             completions(&echo).is_empty(),
             "BEL echo of a reconcile-cleared turn must be swallowed"
         );
-        // Turn 2 then actually runs and completes exactly once.
+        // Turn 2 then actually runs and completes exactly once -- the FIRST
+        // recorded completion (ledger seq 1; the re-arm recorded none).
         tracker.reconcile_rollout("t1", &started(40), 45);
         let done = tracker.reconcile_rollout("t1", &completed(60), 65);
-        assert_eq!(completions(&done), vec![2], "turn 2 completes exactly once");
+        assert_eq!(completions(&done), vec![1], "turn 2 completes exactly once");
     }
 
     #[test]
@@ -1256,7 +1298,7 @@ git commit -m "feat(ws): codex rollout tailer, task-event folder, and ownership-
 - Produces:
   - `pub fn attach_codex_rollout(&self, terminal_id: &str, session_id: &str, rollout_path: &Path)` — Task 7's triggers call this.
   - `pub fn set_codex_rollout_locator(&self, locator: CodexRolloutLocator)` and `pub type CodexRolloutLocator = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>` — Task 7's main.rs wiring calls these.
-  - Private: `struct CodexLane`, `HubInner.codex_lanes`, `HubInner.codex_rollout_locator`, `fn drain_codex_lane(&self, terminal_id: &str)`, Exit-arm teardown.
+  - Private: `struct CodexLane`, `HubInner.codex_lanes`, `HubInner.codex_rollout_locator`, `HubEvent::CodexAttach`/`HubEvent::CodexFsChange`, `fn attach_codex_lane(...)` (hub-task worker), `fn drain_codex_lane(&self, terminal_id: &str)`, Exit-arm teardown.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1413,7 +1455,7 @@ struct CodexLane {
     codex_rollout_locator: Option<CodexRolloutLocator>,
 ```
 
-(d) Add a `HubEvent` variant (private enum — no API impact):
+(d) Add two `HubEvent` variants (private enum — no API impact; `CodexBind` already exists from Task 2):
 
 ```rust
     /// Attach a codex rollout-reconcile lane (resume-created terminal).
@@ -1424,9 +1466,13 @@ struct CodexLane {
         session_id: String,
         rollout_path: PathBuf,
     },
+    /// Rollout file changed on disk -- drain on the hub task (mirror of
+    /// `AmplifierFsChange`; the notify thread NEVER drains or emits itself,
+    /// preserving the single-emitter frame-ordering invariant).
+    CodexFsChange { terminal_id: String },
 ```
 
-and its arm in `handle_event` (next to the `AmplifierAttach` arm):
+and their arms in `handle_event` (next to the `AmplifierAttach`/`AmplifierFsChange` arms):
 
 ```rust
             HubEvent::CodexAttach {
@@ -1434,7 +1480,10 @@ and its arm in `handle_event` (next to the `AmplifierAttach` arm):
                 session_id,
                 rollout_path,
             } => {
-                self.attach_codex_rollout(&terminal_id, &session_id, &rollout_path);
+                self.attach_codex_lane(&terminal_id, &session_id, &rollout_path);
+            }
+            HubEvent::CodexFsChange { terminal_id } => {
+                self.drain_codex_lane(&terminal_id);
             }
 ```
 
@@ -1449,10 +1498,24 @@ and its arm in `handle_event` (next to the `AmplifierAttach` arm):
     }
 
     /// G9: attach the rollout-reconcile lane for a bound codex terminal.
+    /// Channel-deferred like `attach_amplifier_association` (:147-159): the
+    /// caller (WS dispatch / candidate adopt / spawn_blocking locator) only
+    /// enqueues -- the tailer attach (file I/O), watcher registration, and
+    /// ALL frame emission run on the single hub task, preserving the
+    /// one-emitter frame-ordering invariant.
+    pub fn attach_codex_rollout(&self, terminal_id: &str, session_id: &str, rollout_path: &Path) {
+        let _ = self.tx.send(HubEvent::CodexAttach {
+            terminal_id: terminal_id.to_string(),
+            session_id: session_id.to_string(),
+            rollout_path: rollout_path.to_path_buf(),
+        });
+    }
+
+    /// Hub-task worker for `HubEvent::CodexAttach` (mirror of `attach_lane`).
     /// Binds identity (idempotent), tails the rollout (bounded initial read),
     /// watches it via inotify, and runs the initial drain -- which performs
     /// resume-busy seeding when the rollout shows an unresolved turn.
-    pub fn attach_codex_rollout(&self, terminal_id: &str, session_id: &str, rollout_path: &Path) {
+    fn attach_codex_lane(&self, terminal_id: &str, session_id: &str, rollout_path: &Path) {
         use notify::Watcher;
         let mut tailer = crate::codex_reconcile::RolloutTailer::new(rollout_path);
         if let Err(err) = tailer.attach() {
@@ -1464,17 +1527,35 @@ and its arm in `handle_event` (next to the `AmplifierAttach` arm):
             );
             return;
         }
-        let watcher_hub = self.clone();
-        let watcher_terminal = terminal_id.to_string();
+        // Watcher: mirror the amplifier watcher (activity.rs:412-436) EXACTLY.
+        // The closure captures only the hub-event sender + terminal id (never
+        // a hub clone: that would put an Arc cycle inside HubInner and let the
+        // notify thread emit frames out of order with the hub task). The
+        // event-kind filter is the amplifier one VERBATIM (copy the matches!
+        // expression from activity.rs:422-430): our own tail read triggers
+        // Access(..) events and an atime-driven Modify(Metadata(..)) --
+        // forwarding either would self-trigger one extra read per real read,
+        // breaking the zero-polling accounting.
+        let tx = self.tx.clone();
+        let watched_terminal = terminal_id.to_string();
         let mut watcher = match notify::recommended_watcher(
             move |res: Result<notify::Event, notify::Error>| {
                 let Ok(event) = res else { return };
-                let data_change = matches!(
+                use notify::event::ModifyKind;
+                use notify::EventKind::{Any, Create, Modify, Remove};
+                let relevant = matches!(
                     event.kind,
-                    notify::EventKind::Modify(_) | notify::EventKind::Create(_)
+                    Modify(ModifyKind::Data(_))
+                        | Modify(ModifyKind::Any)
+                        | Modify(ModifyKind::Name(_))
+                        | Create(_)
+                        | Remove(_)
+                        | Any
                 );
-                if data_change {
-                    watcher_hub.drain_codex_lane(&watcher_terminal);
+                if relevant {
+                    let _ = tx.send(HubEvent::CodexFsChange {
+                        terminal_id: watched_terminal.clone(),
+                    });
                 }
             },
         ) {
@@ -1673,7 +1754,10 @@ Expected: FAIL — times out waiting for the busy upsert (nothing attaches the l
     if let Some(hub) = &state.activity {
         hub.bind_codex_session(&msg.terminal_id, thread_id);
         // G9: the verified rollout also feeds the reconcile lane, so this
-        // fresh terminal gets real busy-state from disk, not just PTY heuristics.
+        // fresh terminal gets real busy-state from disk, not just PTY
+        // heuristics. Both calls only enqueue hub events (Task 2/Task 6):
+        // no file I/O and no frame emission happens on this WS dispatch
+        // path -- the hub task does the work, keeping frames serialized.
         hub.attach_codex_rollout(
             &msg.terminal_id,
             thread_id,
@@ -1769,8 +1853,14 @@ Then add:
 import { test, expect } from './helpers/fixtures.js' // match the donor spec's exact import line
 
 const THREAD_A = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee0001'
+const SESSION_TITLE = 'Codex status completeness seeded session'
 
-/** Write a real dated rollout owned by `sessionId` under <home>/.codex. */
+/** Write a real dated rollout owned by `sessionId` under <home>/.codex.
+ * Mirrors the donor seeds (codex-terminal-bounce-rust.spec.ts:129-131,
+ * sidebar-click-resume.spec.ts:174-177): the `session_meta` record carries
+ * identity/cwd, and the `response_item`/`message` records exist so a REAL
+ * title is extracted -- Task 9's sidebar resume gesture selects the session
+ * by that title text, so these records are load-bearing, not decoration. */
 async function seedRollout(
   homeDir: string,
   sessionId: string,
@@ -1784,6 +1874,24 @@ async function seedRollout(
       timestamp: '2026-07-25T08:00:00.000Z',
       type: 'session_meta',
       payload: { id: sessionId, cwd: os.tmpdir() },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-25T08:00:01.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: `${SESSION_TITLE} request 1` }],
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-25T08:00:02.000Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: `${SESSION_TITLE} reply 1` }],
+      },
     }),
     ...extraLines,
   ]
@@ -1918,7 +2026,7 @@ git commit -m "test(e2e): fresh codex terminal adoption stamps sessionId on turn
 - Modify: `test/e2e-browser/specs/codex-status-completeness-rust.spec.ts`
 
 **Interfaces:**
-- Consumes: Task 8's helpers; `RustServer.restartAbrupt()` (rust-server.ts:344 — SIGKILL process group, reboot on SAME home/port/token; `setupHome` re-runs on every boot — make it idempotent, do NOT overwrite the rollout on re-run); `fixtures/fake-codex-cli.mjs` (resume-aware fake, donor install pattern at `codex-terminal-bounce-rust.spec.ts:51-57`); sidebar resume gesture (donor: `codex-terminal-bounce-rust.spec.ts:101-162`, `sidebar-click-resume.spec.ts:178`).
+- Consumes: Task 8's helpers (including the title-bearing `seedRollout` — the sidebar gesture selects the session by its extracted title, so the seeded `response_item`/`message` records are load-bearing); `RustServer.restartAbrupt()` (rust-server.ts:344 — SIGKILL process group, reboot on SAME home/port/token; `setupHome` re-runs on every boot — make it idempotent, do NOT overwrite the rollout on re-run); `fixtures/fake-codex-cli.mjs` (resume-aware fake, donor install pattern at `codex-terminal-bounce-rust.spec.ts:51-57`); sidebar resume gesture (donor: the gesture block in `codex-terminal-bounce-rust.spec.ts`, ~:181-218 — wait for the `sidebar-session-list` testid, click `page.getByText(SESSION_TITLE, { exact: false }).first()`, and NOTE: the click opens a NEW tab — the donor waits for `getTabCount() === tabCountBefore + 1` then reads `getActiveTabId()`; same pattern in `sidebar-click-resume.spec.ts:218-256`).
 - Produces: nothing downstream.
 
 - [ ] **Step 1: Add the test**
@@ -1968,12 +2076,17 @@ Append inside the describe block. This test imports `RustServer` directly (it ne
       const info = await server.start()
       const harness = await bootAndConnect(page, info)
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
-      const tabId = await harness.getActiveTabId()
 
       // Resume the seeded session from the sidebar (donor gesture:
-      // codex-terminal-bounce-rust.spec.ts -- click the session entry).
+      // codex-terminal-bounce-rust.spec.ts ~:181-218 -- click the seeded
+      // session's TITLE entry; the click opens a NEW tab, so all later
+      // assertions target the returned resumeTabId, not the boot tab).
       // The rollout is currently RESOLVED (no task events), so no busy yet.
-      const terminalId = await resumeCodexSessionFromSidebar(page, harness, tabId!, THREAD_A)
+      const { tabId: resumeTabId, terminalId } = await resumeCodexSessionFromSidebar(
+        page,
+        harness,
+        SESSION_TITLE,
+      )
 
       // The turn goes mid-flight on disk (codex writes task_started), then
       // the server dies abruptly -- the classic mid-turn crash.
@@ -1987,7 +2100,7 @@ Append inside the describe block. This test imports `RustServer` directly (it ne
       const capture = new WsCapture(info.baseUrl, info.token)
       try {
         await capture.ready()
-        const restoredId = await waitForRestoredCodexTerminalId(harness, tabId!, terminalId)
+        const restoredId = await waitForRestoredCodexTerminalId(harness, resumeTabId, terminalId)
         await capture.waitFor(
           (f) =>
             f.type === 'codex.activity.updated' &&
@@ -1998,7 +2111,7 @@ Append inside the describe block. This test imports `RustServer` directly (it ne
           20_000,
           'resume-busy seeding after abrupt restart',
         )
-        await expect(tabBlueIcons(page, tabId!)).not.toHaveCount(0, { timeout: 10_000 })
+        await expect(tabBlueIcons(page, resumeTabId)).not.toHaveCount(0, { timeout: 10_000 })
 
         // The (dead) turn's completion arrives on disk -> lane clears it.
         await fs.appendFile(rolloutPath, `${taskEventLine('task_complete', '2026-07-25T09:05:00.000Z')}\n`)
@@ -2016,7 +2129,7 @@ Append inside the describe block. This test imports `RustServer` directly (it ne
         )
         expect(complete.provider).toBe('codex')
         expect(complete.sessionId).toBe(THREAD_A)
-        await expect(tabBlueIcons(page, tabId!)).toHaveCount(0, { timeout: 10_000 })
+        await expect(tabBlueIcons(page, resumeTabId)).toHaveCount(0, { timeout: 10_000 })
       } finally {
         capture.close()
       }
@@ -2028,8 +2141,13 @@ Append inside the describe block. This test imports `RustServer` directly (it ne
 ```
 
 Implement the two helpers in the same file:
-- `resumeCodexSessionFromSidebar(page, harness, tabId, sessionId)` — mirror the sidebar resume gesture from `codex-terminal-bounce-rust.spec.ts` (open the sidebar sessions list, click the seeded session's entry, then poll the pane layout — same `collectLeaves` polling as `openCliPaneAndGetTerminalId` — for a new codex leaf and return its `terminalId`). Copy the donor's selectors exactly.
-- `waitForRestoredCodexTerminalId(harness, tabId, previousId)` — `expect.poll` the pane layout until a codex leaf has a `terminalId` different from `previousId` (the restore mints a new terminal), return it.
+- `resumeCodexSessionFromSidebar(page, harness, title): Promise<{ tabId: string; terminalId: string }>` — mirror the sidebar resume gesture from `codex-terminal-bounce-rust.spec.ts` (~:181-218), copying the donor's selectors and waits exactly:
+  1. `await expect(page.getByTestId('sidebar-session-list')).toBeVisible(...)` (the donor does not toggle the sidebar open — the list is already rendered);
+  2. `const sessionItem = page.getByText(title, { exact: false }).first()` and wait for it visible — this is why `seedRollout`'s `response_item`/`message` records are load-bearing: the sidebar entry's text IS the extracted title;
+  3. `const tabCountBefore = await harness.getTabCount()`, then `await sessionItem.click()`;
+  4. the click opens a NEW tab (donor invariant): `await expect(async () => { expect(await harness.getTabCount()).toBe(tabCountBefore + 1) }).toPass({ timeout: 15_000 })`, then `const tabId = await harness.getActiveTabId()` (assert truthy);
+  5. poll THAT new tab's pane layout — same `collectLeaves` polling as `openCliPaneAndGetTerminalId` — for the codex leaf and return `{ tabId, terminalId }`.
+- `waitForRestoredCodexTerminalId(harness, tabId, previousId)` — `expect.poll` the pane layout of the RESUME tab (the returned `tabId` above, which persists client-side across the abrupt restart) until a codex leaf has a `terminalId` different from `previousId` (the restore mints a new terminal), return it.
 
 - [ ] **Step 2: Run the test**
 
