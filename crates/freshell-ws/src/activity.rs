@@ -41,7 +41,7 @@ use freshell_activity::amplifier::{
 };
 use freshell_activity::claude::ClaudeActivityTracker;
 use freshell_activity::codex::CodexActivityTracker;
-use freshell_activity::idle::IdleGate;
+use freshell_activity::idle::{IdleGate, IdleGatePhase};
 use freshell_activity::TrackerEffect;
 use freshell_protocol::{
     AgentProvider, AmplifierActivityRecord, AmplifierActivityUpdated, ClaudeActivityRecord,
@@ -595,14 +595,19 @@ fn claude_frames(
     for effect in effects {
         match effect {
             TrackerEffect::Changed { upsert, remove } => {
-                note_busy_upserts(
+                note_changed_to_gate(
                     idle,
                     upsert.iter().map(|r| {
                         (
                             r.terminal_id.as_str(),
-                            r.phase == freshell_protocol::ClaudePhase::Busy,
+                            if r.phase == freshell_protocol::ClaudePhase::Busy {
+                                IdleGatePhase::Busy
+                            } else {
+                                IdleGatePhase::Idle
+                            },
                         )
                     }),
+                    &remove,
                 );
                 frames.push(ServerMessage::ClaudeActivityUpdated(
                     ClaudeActivityUpdated { remove, upsert },
@@ -637,18 +642,19 @@ fn codex_frames(
     for effect in effects {
         match effect {
             TrackerEffect::Changed { upsert, remove } => {
-                note_busy_upserts(
+                note_changed_to_gate(
                     idle,
                     upsert.iter().map(|r| {
                         (
                             r.terminal_id.as_str(),
-                            matches!(
-                                r.phase,
-                                freshell_protocol::CodexPhase::Busy
-                                    | freshell_protocol::CodexPhase::Pending
-                            ),
+                            match r.phase {
+                                freshell_protocol::CodexPhase::Busy => IdleGatePhase::Busy,
+                                freshell_protocol::CodexPhase::Pending => IdleGatePhase::Pending,
+                                _ => IdleGatePhase::Idle,
+                            },
                         )
                     }),
+                    &remove,
                 );
                 frames.push(ServerMessage::CodexActivityUpdated(CodexActivityUpdated {
                     remove,
@@ -687,14 +693,19 @@ fn amplifier_frames(
     for effect in effects {
         match effect {
             TrackerEffect::Changed { upsert, remove } => {
-                note_busy_upserts(
+                note_changed_to_gate(
                     idle,
                     upsert.iter().map(|r| {
                         (
                             r.terminal_id.as_str(),
-                            r.phase == freshell_protocol::AmplifierPhase::Busy,
+                            if r.phase == freshell_protocol::AmplifierPhase::Busy {
+                                IdleGatePhase::Busy
+                            } else {
+                                IdleGatePhase::Idle
+                            },
                         )
                     }),
+                    &remove,
                 );
                 frames.push(ServerMessage::AmplifierActivityUpdated(
                     AmplifierActivityUpdated { remove, upsert },
@@ -721,12 +732,19 @@ fn amplifier_frames(
     (frames, force_reads)
 }
 
-/// A busy/pending upsert cancels any pending truly-idle window.
-fn note_busy_upserts<'a>(idle: &mut IdleGate, upserts: impl Iterator<Item = (&'a str, bool)>) {
-    for (terminal_id, busy) in upserts {
-        if busy {
-            idle.note_busy(terminal_id);
-        }
+/// Forward a tracker `Changed` effect to the idle gate IN FULL: every phase
+/// edge (busy AND idle — the gate's busy-awareness needs both) and every
+/// removal. Uniform across the claude/codex/amplifier lanes.
+fn note_changed_to_gate<'a>(
+    idle: &mut IdleGate,
+    upserts: impl Iterator<Item = (&'a str, IdleGatePhase)>,
+    remove: &[String],
+) {
+    for (terminal_id, phase) in upserts {
+        idle.note_phase(terminal_id, phase);
+    }
+    for terminal_id in remove {
+        idle.note_exit(terminal_id);
     }
 }
 
@@ -1145,5 +1163,192 @@ mod tests {
             let inner = hub.inner.lock().unwrap();
             assert_eq!(hub_next_deadline(&inner), None, "no deadline while idle");
         }
+    }
+
+    /// G1 red test: the queued submit arrives BEFORE the BEL (claude
+    /// in_flight >= 2). BEL #1 completes turn 1 while the tracker still
+    /// reports Busy (busy->busy emits no Changed frame — claude.rs
+    /// stacked_submits_need_matching_bels), so the boundary is the ONLY
+    /// effect. The gate must not arm; no terminal.idle may fire mid-turn.
+    /// The existing queued_prompt_suppresses_terminal_idle test sends its
+    /// second submit AFTER the BEL — this is the untested ordering.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stacked_submits_before_the_bel_suppress_terminal_idle() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "claude".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        // The second submit is typed BEFORE any BEL: in_flight == 2.
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        // BEL #1: turn 1 completes, turn 2 still running.
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: now_ms(),
+            },
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 3_000)
+                .await
+                .is_none(),
+            "terminal.idle must not fire while the queued turn is still running"
+        );
+    }
+
+    /// G2: draining the stacked queue emits exactly ONE terminal.idle with
+    /// reason queue-empty (evidence recorded at the mid-queue boundary).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn draining_stacked_submits_emits_one_queue_empty_idle() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "claude".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        for _ in 0..2 {
+            observer_send(
+                &hub,
+                ActivityEvent::Input {
+                    terminal_id: "t1".into(),
+                    data: "\r".into(),
+                    at: now_ms(),
+                },
+            );
+        }
+        for _ in 0..2 {
+            observer_send(
+                &hub,
+                ActivityEvent::Output {
+                    terminal_id: "t1".into(),
+                    data: "\u{07}".into(),
+                    at: now_ms(),
+                },
+            );
+        }
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("terminal.idle after the queue drains");
+        assert_eq!(idle["reason"], "queue-empty");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_000)
+                .await
+                .is_none(),
+            "exactly one emission per busy->truly-idle transition"
+        );
+    }
+
+    /// Codex lane: REGRESSION GUARD, green from birth (deviation note 3).
+    /// The Rust codex tracker never surfaces a Busy phase in the PTY lane
+    /// (CodexPhase::Busy is never assigned; note_output without a BEL emits
+    /// no effects, codex.rs:201-221), and the queued re-arm at the turn
+    /// clear stays Pending and is publicly SILENT (pending->pending is
+    /// suppressed by has_public_change, codex.rs:80-95/361-384; pinned by
+    /// the tracker test at codex.rs:509-527). So NO queue evidence can
+    /// accrue: the drain arms the gate normally (Changed(Idle) precedes
+    /// TurnComplete, codex.rs:231-239) and emits exactly one idle with
+    /// reason 'grace'. queue-empty stays unreachable for codex until Lane D
+    /// ports busy-phase entry; the gate side of that future contract is
+    /// pinned by idle::tests::codex_busy_to_pending_rearm_counts_as_queue_evidence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_queued_rearm_drains_to_a_single_grace_idle() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        // Turn 1 submitted -> Pending.
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        // Streaming output is publicly INERT for codex (refreshes
+        // last_observed_at only; no phase promotion, no effects).
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "working on it...".into(),
+                at: now_ms(),
+            },
+        );
+        // Queued submit while Pending (goes into the tracker's submit queue;
+        // publicly silent).
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+        // BEL #1: turn clear consumes the queued submit -> stays Pending;
+        // pending->pending is suppressed, so NO public Changed and NO
+        // completion (no queue evidence can reach the gate).
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: now_ms(),
+            },
+        );
+        // BEL #2: queue empty -> Idle + completion -> the gate arms.
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: now_ms(),
+            },
+        );
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("terminal.idle after the codex queue drains");
+        assert_eq!(
+            idle["reason"], "grace",
+            "codex queue evidence is unreachable pre-Lane-D (deviation note 3)"
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_000)
+                .await
+                .is_none(),
+            "exactly one emission for the codex drain"
+        );
     }
 }

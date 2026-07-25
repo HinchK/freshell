@@ -65,9 +65,8 @@ const MATRIX_SPECS = [
   /safe03-origin-matrix\.spec\.ts$/,
   /cfg03-backup-restore\.spec\.ts$/,
   // Truly-idle alerting (terminal.idle): end-to-end blue -> green + one alert
-  // edge + tab shade -> activate clears. Legacy leg runs; the rust leg is
-  // test.fixme pending the rust terminal.idle emitter
-  // (feat/rust-terminal-activity-idle) so it flips on trivially.
+  // edge + tab shade -> activate clears. Both legs live: the rust
+  // terminal.idle emitter shipped with feat/rust-terminal-activity-idle.
   /truly-idle-alerting\.spec\.ts$/,
   // AGENT-14 -- checkpoint create/list/metadata/restore driven through the
   // real "Rewind code to here" UI gesture (hover, click, confirm dialog,
@@ -89,6 +88,9 @@ const RUST_ONLY_SPECS = [
   // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
   // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
   /restore-contract-wall-rust\.spec\.ts$/,
+  // Lane A: busy-aware idle gate + queue-empty reason (imports RustServer
+  // directly for restartAbrupt() and two concurrent servers).
+  /idle-gate-semantics-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -210,6 +212,7 @@ export default defineConfig({
         // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
         // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
         /restore-contract-wall-rust\.spec\.ts$/,
+        /idle-gate-semantics-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
