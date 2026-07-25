@@ -53,8 +53,7 @@ struct TerminalIdleState {
     /// Tracker phase is specifically `pending` (codex submit gate).
     pending: bool,
     /// Queue evidence observed since the last emission (queued turn /
-    /// re-armed submit). Selects the `queue-empty` reason. (Wired in the
-    /// queue-evidence change; kept false until then.)
+    /// re-armed submit). Selects the `queue-empty` reason.
     saw_queue_evidence: bool,
     /// Armed grace deadline, if any.
     deadline: Option<i64>,
