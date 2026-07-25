@@ -95,6 +95,15 @@ const RUST_ONLY_SPECS = [
   // for restartAbrupt(); drives the Rust activity hub's events lane.
   /amplifier-lane-resilience-rust\.spec\.ts$/,
   /codex-status-completeness-rust\.spec\.ts$/,
+  // LANE E create protection: restore-storm contract; imports RustServer
+  // directly for restartAbrupt(). See docs/plans/2026-07-25-rust-create-protection.md
+  /create-protection-restore-storm-rust\.spec\.ts$/,
+  // LANE E create protection: frozen-client RATE_LIMITED ladder vs the Rust
+  // limiter. See docs/plans/2026-07-25-rust-create-protection.md
+  /create-rate-limit-ladder-rust\.spec\.ts$/,
+  // LANE E create protection: two concurrent RustServers, storm-isolation
+  // proof. See docs/plans/2026-07-25-rust-create-protection.md
+  /create-protection-isolation-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -222,6 +231,15 @@ export default defineConfig({
         /amplifier-lane-resilience-rust\.spec\.ts$/,
         // Rust-only: drives RustServer directly (restartAbrupt + raw WS frames).
         /codex-status-completeness-rust\.spec\.ts$/,
+        // LANE E create protection: restore-storm contract; imports RustServer
+        // directly for restartAbrupt(). See docs/plans/2026-07-25-rust-create-protection.md
+        /create-protection-restore-storm-rust\.spec\.ts$/,
+        // LANE E create protection: frozen-client RATE_LIMITED ladder vs the Rust
+        // limiter. See docs/plans/2026-07-25-rust-create-protection.md
+        /create-rate-limit-ladder-rust\.spec\.ts$/,
+        // LANE E create protection: two concurrent RustServers, storm-isolation
+        // proof. See docs/plans/2026-07-25-rust-create-protection.md
+        /create-protection-isolation-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

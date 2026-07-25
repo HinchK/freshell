@@ -75,6 +75,8 @@ async fn spawn_server(allowed_origins: Vec<String>) -> (String, String) {
         allowed_origins: Arc::new(allowed_origins),
         ws_max_payload_bytes: 16 * 1024 * 1024,
         term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
