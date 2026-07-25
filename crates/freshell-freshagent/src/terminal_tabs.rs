@@ -1989,9 +1989,7 @@ mod tests {
         if !is_wsl_env_live() {
             return;
         }
-        let _env_guard = crate::codex::tests::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = crate::codex::tests::ENV_LOCK.blocking_lock();
         let prior = std::env::var_os("POWERSHELL_EXE");
         struct RestoreEnv(Option<std::ffi::OsString>);
         impl Drop for RestoreEnv {

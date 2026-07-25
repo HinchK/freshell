@@ -283,9 +283,7 @@ mod tests {
         // provide that, and sharing it across modules is out of scope for this test, assert
         // the REALISTIC outcome instead: with no real codex binary reachable, the request
         // fails, but never with a 200 (masking a nonexistent thread as found).
-        let _guard = crate::codex::tests::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::codex::tests::ENV_LOCK.lock().await;
         std::env::set_var(
             "CODEX_CMD",
             "/definitely/not/a/real/codex/binary-xyz-does-not-exist",
