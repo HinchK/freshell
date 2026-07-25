@@ -529,7 +529,7 @@ mod tests {
     fn client_registry_matches_frozen_shape_for_claude() {
         let root = tmp();
         write_manifest(&root, "claude-code", CLAUDE_MANIFEST);
-        let reg = ExtensionRegistry::scan(&[root.clone()]);
+        let reg = ExtensionRegistry::scan(std::slice::from_ref(&root));
         let entries = reg.to_client_registry();
         assert_eq!(entries.len(), 1);
         let e = &entries[0];
@@ -557,7 +557,7 @@ mod tests {
     fn client_registry_includes_terminal_behavior_and_model_for_opencode() {
         let root = tmp();
         write_manifest(&root, "opencode", OPENCODE_MANIFEST);
-        let e = &ExtensionRegistry::scan(&[root.clone()]).to_client_registry()[0];
+        let e = &ExtensionRegistry::scan(std::slice::from_ref(&root)).to_client_registry()[0];
         assert_eq!(e["cli"]["supportsModel"], json!(true));
         assert_eq!(
             e["cli"]["terminalBehavior"],
@@ -573,7 +573,7 @@ mod tests {
         let root = tmp();
         write_manifest(&root, "claude-code", CLAUDE_MANIFEST);
         write_manifest(&root, "opencode", OPENCODE_MANIFEST);
-        let specs = ExtensionRegistry::scan(&[root.clone()]).cli_detection_specs();
+        let specs = ExtensionRegistry::scan(std::slice::from_ref(&root)).cli_detection_specs();
         assert_eq!(specs.len(), 2);
         let claude = specs.iter().find(|s| s.name == "claude").unwrap();
         assert_eq!(claude.env_var.as_deref(), Some("CLAUDE_CMD"));

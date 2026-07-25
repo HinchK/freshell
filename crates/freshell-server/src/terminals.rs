@@ -733,8 +733,7 @@ fn last_emitted_line(snapshot: &str) -> Option<String> {
         .split('\n')
         .map(str::trim)
         .filter(|l| !is_shell_prompt_line(l))
-        .filter(|l| !l.is_empty())
-        .next_back()?
+        .rfind(|l| !l.is_empty())?
         .to_string();
     let units: Vec<u16> = last.encode_utf16().collect();
     if units.len() <= MAX_LAST_LINE_CHARS {
