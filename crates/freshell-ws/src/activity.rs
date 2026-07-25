@@ -118,7 +118,6 @@ struct AmplifierLane {
     _watcher: notify::RecommendedWatcher,
 }
 
-#[derive(Default)]
 /// G4: bookkeeping for a degraded amplifier events lane awaiting bounded
 /// re-attach. Lives on `HubInner` (the lane itself is dropped on degrade).
 #[derive(Debug, Clone)]
@@ -650,7 +649,6 @@ fn hub_next_deadline(inner: &HubInner) -> Option<i64> {
     .flatten()
     .min()
 }
-
 
 /// Map claude tracker effects onto wire frames + idle-gate interactions.
 fn claude_frames(
@@ -1255,7 +1253,8 @@ mod tests {
                 .append(true)
                 .open(&events_path)
                 .unwrap();
-            f.write_all(amplifier_line("prompt:submit").as_bytes()).unwrap();
+            f.write_all(amplifier_line("prompt:submit").as_bytes())
+                .unwrap();
             f.flush().unwrap();
         }
         let busy = next_frame_matching(&mut rx, "amplifier.activity.updated", 5_000, |v| {
@@ -1268,7 +1267,10 @@ mod tests {
                 .unwrap_or(false)
         })
         .await;
-        assert!(busy.is_some(), "live append after Eof attach did not drive busy");
+        assert!(
+            busy.is_some(),
+            "live append after Eof attach did not drive busy"
+        );
     }
 
     #[test]
