@@ -31,6 +31,22 @@ pub enum SpawnGateError {
     Timeout,
 }
 
+/// Cancel-safe accounting for the `waiting` queue-depth counter.
+///
+/// The caller's future can be DROPPED while suspended in the queued wait
+/// (e.g. a WS connection task aborted on disconnect — Task 4 wires exactly
+/// that). A straight-line `fetch_sub` after the await would never run on
+/// that path, leaking a queue slot per cancellation until the gate wedges
+/// into permanent `QueueFull`. Putting the decrement in `Drop` covers every
+/// exit: success, timeout, and cancellation.
+struct WaitingGuard<'a>(&'a AtomicUsize);
+
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug)]
 pub struct SpawnGate {
     semaphore: Arc<Semaphore>,
@@ -81,6 +97,9 @@ impl SpawnGate {
             );
             return Err(SpawnGateError::QueueFull);
         }
+        // From here every exit path (success, timeout, or this future being
+        // dropped mid-wait) decrements `waiting` via the guard's Drop.
+        let _waiting_guard = WaitingGuard(&self.waiting);
         self.queued_total.fetch_add(1, Ordering::Relaxed);
         tracing::info!(
             target: "freshell_ws::spawn_gate",
@@ -90,7 +109,6 @@ impl SpawnGate {
 
         let acquired =
             tokio::time::timeout(timeout, self.semaphore.clone().acquire_owned()).await;
-        self.waiting.fetch_sub(1, Ordering::SeqCst);
         match acquired {
             Ok(Ok(permit)) => Ok(permit),
             // The semaphore is never closed; treat close like timeout.
@@ -174,6 +192,7 @@ mod tests {
             h.await.expect("task completes");
         }
         assert_eq!(*order.lock().await, vec![0, 1, 2, 3], "restore storms drain in order");
+        assert_eq!(gate.queued_total(), 4, "every queued waiter counts toward queued_total");
     }
 
     #[tokio::test]
@@ -204,6 +223,48 @@ mod tests {
         // The timed-out wait must not have consumed the permit.
         let again = gate.acquire(Duration::from_millis(500)).await;
         assert!(again.is_ok(), "no leaked permits after a timeout");
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_wait_reclaims_queue_slot() {
+        // A WS connection task can be aborted while suspended in the queued
+        // wait (Task 4 wires exactly that). The `waiting` slot must be
+        // reclaimed on cancellation, or drift eventually wedges the gate
+        // into permanent QueueFull.
+        let gate = Arc::new(SpawnGate::new(1, 1));
+        let holder = gate.acquire(Duration::from_secs(1)).await.expect("holder");
+
+        let waiter = {
+            let g = Arc::clone(&gate);
+            tokio::spawn(async move { g.acquire(Duration::from_secs(5)).await })
+        };
+        // Poll until the waiter is actually queued (no tight sleep race).
+        for _ in 0..200 {
+            if gate.queued_total() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(gate.queued_total(), 1, "waiter must be queued before abort");
+
+        // Drop the waiter's future while it is suspended in the queued wait.
+        waiter.abort();
+        let join = waiter.await;
+        assert!(join.is_err(), "waiter must have been cancelled, not completed");
+
+        // The cancelled wait's queue slot must be reclaimed: a fresh acquire
+        // must queue (and time out on the still-held permit), NOT QueueFull.
+        let res = gate.acquire(Duration::from_millis(50)).await;
+        assert_eq!(
+            res.unwrap_err(),
+            SpawnGateError::Timeout,
+            "cancelled queued wait must release its queue slot"
+        );
+
+        // And once the permit frees up, the gate fully recovers.
+        drop(holder);
+        let again = gate.acquire(Duration::from_millis(500)).await;
+        assert!(again.is_ok(), "gate recovers after a cancelled queued wait");
     }
 
     #[tokio::test]
