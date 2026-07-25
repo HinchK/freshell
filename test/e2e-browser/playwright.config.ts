@@ -89,6 +89,9 @@ const RUST_ONLY_SPECS = [
   // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
   // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
   /restore-contract-wall-rust\.spec\.ts$/,
+  // AMPLIFIER EVENTS-LANE RESILIENCE (Lane B): imports RustServer directly
+  // for restartAbrupt(); drives the Rust activity hub's events lane.
+  /amplifier-lane-resilience-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -210,6 +213,9 @@ export default defineConfig({
         // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
         // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
         /restore-contract-wall-rust\.spec\.ts$/,
+        // AMPLIFIER EVENTS-LANE RESILIENCE (Lane B): rust-only, owns its
+        // servers, exercises events.jsonl rotation + abrupt restart.
+        /amplifier-lane-resilience-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
