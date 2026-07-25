@@ -1465,39 +1465,6 @@ async fn handle_create(
     sent
 }
 
-/// Build the create-time `TerminalMetaRecord` for the port-side closure of
-/// DEV-0008 (`terminal.meta.updated` push subsystem, `port/oracle/DEVIATIONS.md`).
-///
-/// The original's `TerminalMetadataService.seedFromTerminal`
-/// (`terminal-metadata-service.ts:138-146`) runs off the registry's
-/// `'terminal.created'` event (`server/index.ts:516-524`) for every terminal,
-/// deriving `provider`/`sessionId` from `record.resumeSessionId` when the mode
-/// supports resume (`isTerminalProvider`, `terminal-metadata-service.ts:39-41`) --
-/// which is set for a fresh server-preallocated id (e.g. claude) just as much as
-/// for a genuine resume (`terminal-registry.ts:176-195` `TerminalSessionRefSource`;
-/// this fn's `resume_session_id` is the same value, `terminal.rs:507-536`).
-///
-/// Ported here: `terminalId`, `cwd`, `provider`, `sessionId`, `updatedAt` -- the
-/// fields known at create time with zero extra I/O. NOT ported (deferred,
-/// tracked under DEV-0008 as association-time follow-up, `do not build
-/// output-scanning now`):
-/// - git enrichment (`checkoutRoot`/`repoRoot`/`branch`/`isDirty`/`displaySubdir`,
-///   `enrichFromCwd`, `terminal-metadata-service.ts:260-286`) -- requires git
-///   process calls not wired into this crate. The client's
-///   `formatPaneRuntimeLabel` (`format-terminal-title-meta.ts:26`) already falls
-///   back to `safeBasename(meta.cwd)` when `displaySubdir`/`checkoutRoot` are
-///   absent, so sending bare `cwd` is a legacy-compatible degraded label, not a
-///   wire-shape violation.
-/// - session-association enrichment after start (indexer/codex-durability/
-///   opencode-controller sources, `session-association-broadcast.ts`) -- requires
-///   output/event scanning wiring this slice deliberately excludes.
-///
-/// Returns `None` for shell terminals (no provider, matching the original: a
-/// shell's seeded record never carries `provider`/`sessionId`, and this slice
-/// only concerns itself with the resume-identity fields) and for non-shell
-/// creates with no session identity yet at create time (e.g. a fresh `codex`
-/// create with an empty `resumeSessionId` -- identity arrives later via
-/// `terminal.session.bound`, which is the deferred association-time slice).
 /// Rust port of `isValidClaudeSessionId` (`shared/session-contract.ts:34,44-46`;
 /// regex /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i):
 /// canonical UUID shape with a version digit 1-5 (position 14) and a variant
@@ -1550,6 +1517,39 @@ fn resolve_claude_restore_session_id(state: &WsState, create_request_id: &str) -
     row.resume_session_id.filter(|s| !s.is_empty())
 }
 
+/// Build the create-time `TerminalMetaRecord` for the port-side closure of
+/// DEV-0008 (`terminal.meta.updated` push subsystem, `port/oracle/DEVIATIONS.md`).
+///
+/// The original's `TerminalMetadataService.seedFromTerminal`
+/// (`terminal-metadata-service.ts:138-146`) runs off the registry's
+/// `'terminal.created'` event (`server/index.ts:516-524`) for every terminal,
+/// deriving `provider`/`sessionId` from `record.resumeSessionId` when the mode
+/// supports resume (`isTerminalProvider`, `terminal-metadata-service.ts:39-41`) --
+/// which is set for a fresh server-preallocated id (e.g. claude) just as much as
+/// for a genuine resume (`terminal-registry.ts:176-195` `TerminalSessionRefSource`;
+/// this fn's `resume_session_id` is the same value, `terminal.rs:507-536`).
+///
+/// Ported here: `terminalId`, `cwd`, `provider`, `sessionId`, `updatedAt` -- the
+/// fields known at create time with zero extra I/O. NOT ported (deferred,
+/// tracked under DEV-0008 as association-time follow-up, `do not build
+/// output-scanning now`):
+/// - git enrichment (`checkoutRoot`/`repoRoot`/`branch`/`isDirty`/`displaySubdir`,
+///   `enrichFromCwd`, `terminal-metadata-service.ts:260-286`) -- requires git
+///   process calls not wired into this crate. The client's
+///   `formatPaneRuntimeLabel` (`format-terminal-title-meta.ts:26`) already falls
+///   back to `safeBasename(meta.cwd)` when `displaySubdir`/`checkoutRoot` are
+///   absent, so sending bare `cwd` is a legacy-compatible degraded label, not a
+///   wire-shape violation.
+/// - session-association enrichment after start (indexer/codex-durability/
+///   opencode-controller sources, `session-association-broadcast.ts`) -- requires
+///   output/event scanning wiring this slice deliberately excludes.
+///
+/// Returns `None` for shell terminals (no provider, matching the original: a
+/// shell's seeded record never carries `provider`/`sessionId`, and this slice
+/// only concerns itself with the resume-identity fields) and for non-shell
+/// creates with no session identity yet at create time (e.g. a fresh `codex`
+/// create with an empty `resumeSessionId` -- identity arrives later via
+/// `terminal.session.bound`, which is the deferred association-time slice).
 fn terminal_meta_record_for_create(
     terminal_id: &str,
     mode: &str,
