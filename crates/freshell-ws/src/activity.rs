@@ -234,6 +234,25 @@ impl ActivityHub {
     /// resume-busy seeding when the rollout shows an unresolved turn.
     fn attach_codex_lane(&self, terminal_id: &str, session_id: &str, rollout_path: &Path) {
         use notify::Watcher;
+        // Deferred-attach guard: the resume-path locator runs on a blocking
+        // thread (35ms warm, seconds cold). A terminal that exits inside that
+        // window has its Exit processed FIRST (the Exit arm removes it from
+        // `modes` and `codex_lanes`); installing a lane afterwards would leak
+        // an inotify watcher that nothing ever removes. Check before building
+        // the tailer/watcher (cheapest exit) -- safe against interleaving
+        // because Exit and CodexAttach are both processed serially on the
+        // single hub task.
+        {
+            let inner = self.inner.lock().expect("activity hub lock");
+            if inner.modes.get(terminal_id).map(String::as_str) != Some("codex") {
+                tracing::debug!(
+                    terminal_id = %terminal_id,
+                    rollout = %rollout_path.display(),
+                    "codex rollout attach skipped: terminal no longer tracked"
+                );
+                return;
+            }
+        }
         let mut tailer = crate::codex_reconcile::RolloutTailer::new(rollout_path);
         if let Err(err) = tailer.attach() {
             tracing::warn!(
@@ -1534,6 +1553,61 @@ mod tests {
         .expect("remove on exit");
         let lanes = hub.inner.lock().unwrap().codex_lanes.len();
         assert_eq!(lanes, 0, "exit drops the lane (and its inotify watcher)");
+    }
+
+    /// The resume-path locator runs on a blocking thread; a terminal that
+    /// exits inside that window has its Exit processed BEFORE the deferred
+    /// CodexAttach lands. The attach must not install a lane for the exited
+    /// terminal: nothing would ever remove it (leaked inotify watcher).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_attach_after_exit_installs_no_zombie_lane() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Exit {
+                terminal_id: "t1".into(),
+                at: now,
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["remove"][0] == "t1"
+        })
+        .await
+        .expect("remove on exit");
+
+        // The deferred attach arrives after the exit was processed.
+        let (_guard, rollout) = codex_rollout_fixture(&[codex_event_line("task_started", now)]);
+        hub.attach_codex_rollout("t1", "sess-1", &rollout);
+
+        // Registry events and CodexAttach share the single hub channel, so a
+        // later Created's frame proves the attach was already processed.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t2".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: now,
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t2"
+        })
+        .await
+        .expect("barrier upsert for t2");
+
+        let lanes = hub.inner.lock().unwrap().codex_lanes.len();
+        assert_eq!(lanes, 0, "attach after exit must not install a zombie lane");
     }
 
     #[tokio::test(flavor = "multi_thread")]
