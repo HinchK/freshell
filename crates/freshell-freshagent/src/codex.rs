@@ -3097,9 +3097,8 @@ pub(crate) mod tests {
     // (same convention as the crash-recovery tests above), serializing against
     // every other test in this module that mutates the process-global
     // `CODEX_CMD`/`FAKE_CODEX_APP_SERVER_BEHAVIOR` env vars.
-    #[allow(clippy::await_holding_lock)]
     async fn diag01_freshagent_events_fire_on_create_and_crash_detection() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         // The fixture below pins the durable thread id to this exact literal, so it's known
         // up front -- see `capture_by_session`'s doc comment for why this must be a
         // process-wide (not thread-local) capture: `freshagent.session.crash_detected` fires
@@ -3751,7 +3750,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn handle_attach_unknown_session_resumes_via_fake_app_server_and_registers_idle_snapshot()
     {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, mut rx) = state_with_bus();
 
@@ -3793,7 +3792,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn handle_attach_unknown_session_with_genuinely_missing_thread_emits_lost_session_error()
     {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(
             &json!({
                 "overrides": {
@@ -3832,7 +3831,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn handle_attach_unknown_session_with_transient_resume_failure_emits_resume_failed_error()
     {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         std::env::set_var(
             "CODEX_CMD",
             "/definitely/not/a/real/codex/binary-xyz-does-not-exist",
@@ -3861,7 +3860,7 @@ pub(crate) mod tests {
     /// serialize onto ONE `thread/resume` RPC / one spawned sidecar, not two.
     #[tokio::test]
     async fn handle_attach_single_flights_concurrent_resumes_for_the_same_unknown_thread() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let log_path = std::env::temp_dir().join(format!(
             "codex-resume-single-flight-{}-{}.jsonl",
             std::process::id(),
@@ -3994,7 +3993,7 @@ pub(crate) mod tests {
     /// deterministic and fast, no fake app-server needed.
     #[tokio::test]
     async fn fail_create_frame_carries_retryable_true() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         std::env::set_var(
             "CODEX_CMD",
             "/definitely/not/a/real/codex/binary-xyz-does-not-exist",
@@ -4108,7 +4107,7 @@ pub(crate) mod tests {
     /// response must carry the SAME `sessionId` as the first (a replay), not a new one.
     #[tokio::test]
     async fn handle_create_duplicate_request_id_reuses_the_session_and_spawns_once() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("dedup-sequential-marker-unused");
@@ -4146,7 +4145,7 @@ pub(crate) mod tests {
     /// single-flight serialization, not just cache-hit-after-the-fact.
     #[tokio::test]
     async fn handle_create_concurrent_duplicate_request_id_spawns_at_most_once() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("dedup-concurrent-marker-unused");
@@ -4181,7 +4180,7 @@ pub(crate) mod tests {
     /// two distinct sessions.
     #[tokio::test]
     async fn handle_create_distinct_request_ids_create_distinct_sessions() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("dedup-distinct-marker-unused");
 
@@ -4219,7 +4218,7 @@ pub(crate) mod tests {
     /// rather than "helpfully" minting a fresh one.
     #[tokio::test]
     async fn handle_create_replay_after_unrequested_exit_reuses_the_dead_session_no_new_spawn() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("dedup-post-exit-marker-unused");
@@ -4264,7 +4263,7 @@ pub(crate) mod tests {
     /// killed one.
     #[tokio::test]
     async fn handle_create_duplicate_after_explicit_kill_creates_a_fresh_session() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("dedup-post-kill-marker-unused");
 
@@ -4321,7 +4320,7 @@ pub(crate) mod tests {
     /// roughly 1-in-3 before the fix and must be 0-in-N after it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn handle_create_always_broadcasts_created_before_any_session_event() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
         for i in 0..30 {
@@ -4380,7 +4379,7 @@ pub(crate) mod tests {
     /// proves `thread/resume` was used, not `thread/start`.
     #[tokio::test]
     async fn handle_create_with_resume_session_id_resumes_the_same_thread() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-should-never-be-minted"}"#);
         let (st, mut rx) = state_with_bus();
 
@@ -4443,7 +4442,7 @@ pub(crate) mod tests {
     /// `lost_session_frame` (that shape is exclusive to `freshAgent.attach`).
     #[tokio::test]
     async fn handle_create_with_resume_on_genuinely_missing_thread_emits_create_failed() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(
             &json!({
                 "overrides": {
@@ -4511,7 +4510,7 @@ pub(crate) mod tests {
     /// under EITHER id, never a silent proceed against the wrong thread.
     #[tokio::test]
     async fn handle_create_with_resume_wrong_thread_id_fails_create_and_never_adopts() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(r#"{"threadResumeThreadId":"thread-B-wrong"}"#);
         let (st, mut rx) = state_with_bus();
 
@@ -4575,7 +4574,7 @@ pub(crate) mod tests {
     /// silently binds the pane to a sidecar sitting on the wrong thread.
     #[tokio::test]
     async fn handle_attach_unknown_session_wrong_thread_id_is_rejected_not_adopted() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(r#"{"threadResumeThreadId":"thread-B-wrong"}"#);
         let (st, mut rx) = state_with_bus();
 
@@ -4624,7 +4623,7 @@ pub(crate) mod tests {
     /// of silently re-registering the ORIGINAL id against a sidecar on the wrong thread.
     #[tokio::test]
     async fn crash_recovery_resume_wrong_thread_id_is_rejected_not_silently_recovered() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(r#"{"threadResumeThreadId":"thread-B-wrong"}"#);
         let (st, mut rx) = state_with_bus();
 
@@ -4762,7 +4761,7 @@ pub(crate) mod tests {
     /// once.
     #[tokio::test]
     async fn handle_attach_repeated_dead_thread_spawns_sidecar_at_most_once() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(
             &json!({
                 "overrides": {
@@ -4811,7 +4810,7 @@ pub(crate) mod tests {
     /// retry: a second sidecar spawn, a real `thread/resume`, and success.
     #[tokio::test]
     async fn handle_attach_dead_thread_retries_genuinely_after_cache_ttl_expires() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(
             &json!({
                 "overrides": {
@@ -4895,7 +4894,7 @@ pub(crate) mod tests {
     /// per-thread lock" -- this test is what makes that claim true instead of aspirational.
     #[tokio::test]
     async fn concurrent_attaches_against_a_not_yet_cached_dead_thread_spawn_at_most_one_sidecar() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd(
             &json!({
                 // Widens the race window: while the FIRST waiter's resume is in flight,
@@ -4973,7 +4972,7 @@ pub(crate) mod tests {
     /// Serializes every test in this module that mutates the process-global `CODEX_CMD` /
     /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` env vars (`std::env::set_var` is not safe to race
     /// across concurrently-running tests in the same binary).
-    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Point `CODEX_CMD` at the fake app-server and configure its scripted `behavior` (a
     /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` JSON blob \u2014 see the fixture's `loadBehavior()`).
@@ -5077,10 +5076,9 @@ pub(crate) mod tests {
     // serializes against `attach_after_unrequested_crash_recovers_and_emits_a_snapshot`
     // (the other test mutating the process-global `CODEX_CMD`/`FAKE_CODEX_APP_SERVER_BEHAVIOR`
     // env vars) for the test's ENTIRE duration, not just around individual calls.
-    #[allow(clippy::await_holding_lock)]
     async fn send_after_unrequested_crash_resumes_the_same_thread_id_and_completes_with_no_error_frame(
     ) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
         // The FIRST spawn crashes deterministically right after `thread/start` responds
@@ -5144,9 +5142,8 @@ pub(crate) mod tests {
     /// mint-new-thread behavior -- a `freshAgent.session.materialized` broadcast under a
     /// brand-new id, conversation memory for the old thread genuinely lost.
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(clippy::await_holding_lock)]
     async fn send_after_crash_falls_back_to_mint_new_thread_when_resume_reports_not_found() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
         configure_fake_codex_cmd(
@@ -5224,10 +5221,9 @@ pub(crate) mod tests {
     /// session mapped under its OLD id, still marked exited, for a future retry (mirroring
     /// the pre-existing `RespawnFailed` contract for a `thread/start` failure).
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(clippy::await_holding_lock)]
     async fn send_after_crash_with_transient_resume_failure_reports_respawn_failed_and_stays_exited(
     ) {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
         configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
@@ -5286,9 +5282,8 @@ pub(crate) mod tests {
     /// FIX-2: `freshAgent.attach` recovering a crashed session emits its fresh snapshot
     /// under the SAME thread id (resume-first), not a new one.
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(clippy::await_holding_lock)]
     async fn attach_after_unrequested_crash_resumes_and_emits_a_snapshot_with_the_same_id() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
         configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
@@ -5336,9 +5331,8 @@ pub(crate) mod tests {
     /// session must recover it exactly once -- one spawned sidecar, one `thread/resume`
     /// RPC -- never two independent respawns.
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(clippy::await_holding_lock)]
     async fn concurrent_send_and_attach_single_flight_recovery_for_the_same_crashed_session() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
         configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
@@ -5420,9 +5414,8 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread")]
     // Intentional: same rationale as the sibling test above -- `_guard` must span every
     // `.await` in this test to serialize the two tests' shared env-var mutations.
-    #[allow(clippy::await_holding_lock)]
     async fn attach_after_unrequested_crash_recovers_and_emits_a_snapshot() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
         configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
@@ -5485,7 +5478,7 @@ pub(crate) mod tests {
         // unset -- another test in this same process may have left it pointed at the fake
         // app-server (`ENV_LOCK` only serializes ordering, it doesn't restore the previous
         // value), so asserting on "absence of an override" is not reliable.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         std::env::set_var(
             "CODEX_CMD",
             "/definitely/not/a/real/codex/binary-xyz-does-not-exist",
@@ -5513,7 +5506,7 @@ pub(crate) mod tests {
     /// and `thread/resume`s the requested id on demand.
     #[tokio::test]
     async fn get_snapshot_ensure_runtime_resumes_a_thread_not_in_the_live_map() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         configure_fake_codex_cmd("{}");
         let (st, _rx) = state_with_bus();
 

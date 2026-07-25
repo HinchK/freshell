@@ -1185,11 +1185,10 @@ mod tests {
                 .clone();
             drop(sessions);
             let guard = session_arc.lock().await;
-            let id = guard
+            guard
                 .real_session_id
                 .clone()
-                .expect("send must have materialized a durable session");
-            id
+                .expect("send must have materialized a durable session")
         };
 
         // A duplicate create for the SAME requestId, as the frozen client resends on
