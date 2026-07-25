@@ -34,20 +34,6 @@ use serde_json::{json, Map, Value};
 
 const MANIFEST_FILE: &str = "freshell.json";
 
-/// `DEFAULT_CLI_DETECTION_SPECS` (`server/platform.ts:97-103`) — the built-in CLI
-/// set behind `detectAvailableClis`'s JS *default parameter*. NOT used on the
-/// server boot path: `server/index.ts` always passes its extension-derived
-/// `cliDetectionSpecs` array (possibly empty), so this set never applies there
-/// (pinned by a cwd-neutral live probe, 2026-07-12: `availableClis: {}` when no
-/// `extensions/` dir is present). Kept for reference parity with `platform.ts`.
-pub const DEFAULT_CLI_DETECTION_SPECS: &[(&str, &str, &str)] = &[
-    ("claude", "CLAUDE_CMD", "claude"),
-    ("codex", "CODEX_CMD", "codex"),
-    ("opencode", "OPENCODE_CMD", "opencode"),
-    ("gemini", "GEMINI_CMD", "gemini"),
-    ("kimi", "KIMI_CMD", "kimi"),
-];
-
 // ── Manifest schema (subset of server/extension-manifest.ts) ────────────────
 
 /// The terminal-behavior block (`extension-manifest.ts:45-48`).
@@ -192,13 +178,6 @@ impl ExtensionRegistry {
         ExtensionRegistry { entries }
     }
 
-    /// Whether any CLI extension was discovered.
-    pub fn has_cli(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.manifest.category == "cli" && e.manifest.cli.is_some())
-    }
-
     /// `toClientRegistry()` (`extension-manager.ts:144-191`): serialize the registry
     /// to the `ClientExtensionEntry[]` shape the SPA fetches at `GET /api/extensions`.
     pub fn to_client_registry(&self) -> Vec<Value> {
@@ -209,7 +188,8 @@ impl ExtensionRegistry {
     }
 
     /// The names of GENUINELY discovered CLI extension manifests -- NO
-    /// [`DEFAULT_CLI_DETECTION_SPECS`] fallback. This is the source for
+    /// `DEFAULT_CLI_DETECTION_SPECS` fallback (the JS default-parameter set in
+    /// `server/platform.ts:97-103`; the Rust mirror was deleted as dead code). This is the source for
     /// `codingCli.knownProviders` (settings tree): the original seeds
     /// `knownProviders` strictly from discovered extension manifests
     /// (`server/index.ts:276-294`), genuinely empty when none are found --
@@ -535,7 +515,11 @@ mod tests {
 
         let reg = ExtensionRegistry::scan(&[root.clone(), root2.clone()]);
         assert_eq!(reg.entries.len(), 2, "claude + opencode, dup dropped");
-        assert!(reg.has_cli());
+        // Strictly stronger than the deleted has_cli(): proves WHICH CLI manifests
+        // were discovered, not just that one exists (scan() sorts subdir names, so
+        // root's "claude-code" + "opencode" yield ["claude", "opencode"]; root2's
+        // dup is dropped).
+        assert_eq!(reg.discovered_cli_names(), vec!["claude", "opencode"]);
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&root2).ok();
