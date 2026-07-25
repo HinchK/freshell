@@ -27,13 +27,13 @@
 
 ## Design Decisions (locked in; do not re-litigate mid-execution)
 
-1. **Give-up-loudly signal = tracker-record removal via existing frames.** There is no existing "degraded" frame the client renders (verified: grepping client for `degraded` finds only an unrelated ws-reconnect log; `AmplifierPhase` is `{Idle, Busy}` only). The task spec forbids inventing a new client-side feature, and `shared/ws-protocol.ts` is a pinned contract owned outside this lane. The one existing, client-rendered signal that visibly distinguishes "we lost this lane" from "idle" is **removing the amplifier activity record**: `src/lib/pane-activity.ts:207-243` derives the pane's persistent session-known state from the record's *existence*, so a `remove` visibly clears the pane's amplifier status instead of freezing it stale. Implementation: on give-up, call `inner.amplifier.note_exit(terminal_id)` and route its effects through `amplifier_frames` (calling, not modifying) — this emits `{"type":"amplifier.activity.updated","remove":["<tid>"]}` AND keeps `amplifier_list()` consistent for late-joining clients — plus a `tracing::error!` with event `amplifier_events_lane_dead`.
+1. **Give-up-loudly signal = tracker-record removal via existing frames.** There is no existing "degraded" frame the client renders (verified: grepping client for `degraded` finds only an unrelated ws-reconnect log; `AmplifierPhase` is `{Idle, Busy}` only). The task spec forbids inventing a new client-side feature, and `shared/ws-protocol.ts` is a pinned contract owned outside this lane. What removal actually buys (validated against the frozen client, Stage-2 load-bearing check): a `remove` **clears a stale busy indication** — the sole apply site `App.tsx:1135-1141` deletes `byTerminalId[tid]` and busy rendering requires `record?.phase === 'busy'` (`src/lib/pane-activity.ts:164-172`) — so the pane can never freeze busy-stale. It is **NOT visually distinct from ordinary idle**: `resolvePaneIdleGreen` (`pane-activity.ts:248-252`) falls back to `sessionRef?.sessionId`, which every associated pane has, so post-remove the idle-green stays lit and the end state is pixel-identical to a normal idle pane. Alternatives inside the pinned contract were evaluated and rejected (an idle-phase upsert also looks like idle but additionally leaves a stale record implying a live lane; a new frame/field is forbidden) — removal remains the best available effect. The "loud" components are therefore: stale-busy clearing + `amplifier_list()` consistency for late joiners + a `tracing::error!` with event `amplifier_events_lane_dead`. Implementation: on give-up, call `inner.amplifier.note_exit(terminal_id)` and route its effects through `amplifier_frames` (calling, not modifying) — this emits `{"type":"amplifier.activity.updated","remove":["<tid>"]}`. **Intended consequence (validated):** after `note_exit`, the tracker no-ops `note_input`/`note_output`/`bind_session` for that terminal (`tracker.rs:245-247, 267-269, 144`), so ALL amplifier status — including PTY-side provisional busy — stays dead until the pane/terminal is recreated (the locator will not re-fire for a bound terminal). This is deliberate: a lane that failed 3 consecutive re-attaches must not half-track status that may be wrong.
 2. **Retry schedule:** `AMPLIFIER_LANE_RETRY_DELAYS_MS: [i64; 3] = [250, 1000, 3000]` (mirrors the repo's bounded-retry exemplar `crates/freshell-tauri/src/renderer_recovery.rs:44`). Max 3 re-attach attempts; a successful `Ok` read resets the counter. Exposed as `pub(crate) const` so tests assert the schedule directly.
 3. **Re-attach always at `AttachAt::Eof`** — a rotated/reset file's history is not ours to replay, and Eof-attach is the cheap `size == offset` no-op path.
-4. **Fresh state on every re-attach:** both `AmplifierEventsTailer.degraded` (tailer.rs:84, checked at :114) and `ReducerState.degraded` (reducer.rs:99, checked at :173) are sticky one-way latches. Every re-attach constructs a fresh `AmplifierEventsTailer::new(path)` + fresh `create_reducer_state()` — which `attach_lane` already does, so re-attach = re-invoking `attach_lane`.
-5. **`SchemaMismatch` never retries** — it is deterministic (the file's first lifecycle record fails the schema gate; retrying re-reads the same record). Give up loudly on the first occurrence. `ReadError` and `FileReset` are the transient, retry-worthy classes.
-6. **Path re-resolution (legacy port):** legacy resolution is pure sessionId keying (`indexer.getFilePathForSession(sessionId)`); a re-attach never carries offsets over and re-derives the path from the session id. Port: at each retry attempt, prefer `self.resolver(session_id)` (wired in production to `resolve_amplifier_events_path`, main.rs:1019-1032) and fall back to the `events_path` captured at degrade time (unit tests run with `resolver = None`). This handles the events.jsonl path changing across amplifier restarts inside the same terminal.
-7. **Initial-attach failures join the same machinery.** `attach_lane` today has three silent `warn + return` failure paths (tailer attach fail, watcher create fail, `watcher.watch()` fail). All three now route into the same failure handler, so a transient failure at first attach also gets bounded retries instead of silent permanent death.
+4. **Fresh state on every re-attach:** both `AmplifierEventsTailer.degraded` (tailer.rs:84, checked at :114) and `ReducerState.degraded` (reducer.rs:99, checked at :173) are sticky one-way latches. Every re-attach constructs a fresh `AmplifierEventsTailer::new(path)` + fresh `create_reducer_state()` — which `attach_lane` already does, so re-attach = re-invoking `attach_lane`. A fresh **watcher** per attach is likewise *required*, not merely tidy (validated empirically against notify 6.1.1): on `DELETE_SELF` notify silently drops the file watch (inotify backend L300), so a recreated same-path file emits nothing from the old watcher — only drop-and-re-attach recovers.
+5. **`SchemaMismatch` never retries** — it is deterministic (the file's first lifecycle record fails the schema gate; retrying re-reads the same record). Give up loudly on the first occurrence. `ReadError` and `FileReset` are the transient, retry-worthy classes. Validated: the frozen TS reference treated schema mismatch identically to every other degrade — terminal, zero retries (`amplifier-activity-integration.ts:193-221, 232-235`), so never-retry is strictly MORE generous than legacy parity; and the Rust gate cannot fire transiently on a torn line — it evaluates only complete, newline-terminated, fully-parsed lifecycle records (tailer.rs:228, 246, 255-279; torn-line buffering proven by the existing tailer test :407-436). The theoretical hole (a schema-bad file later *replaced* by a valid one) is inherited from legacy and unrecoverable within a ≤4.25 s retry window anyway — accepted.
+6. **Path re-resolution (legacy port):** legacy resolution is pure sessionId keying (`indexer.getFilePathForSession(sessionId)`); a re-attach never carries offsets over and re-derives the path from the session id. Port: at each retry attempt, prefer `self.resolver(session_id)` (wired in production to `resolve_amplifier_events_path`, main.rs:1019-1032) and fall back to the `events_path` captured at degrade time (unit tests run with `resolver = None`). Scope of what this covers (corrected by Stage-2 validation): re-resolution recovers **same-session-id path moves only** (e.g. a project-slug directory change) — the walk is sid-keyed over existing files. An amplifier *restart inside the same terminal* produces a NEW session id that nothing re-attaches: locator arming happens only at terminal create (terminal.rs:1394), a successful location permanently disarms it (amplifier_locator.rs:554-556), and both `arm()` and `drain_and_associate` reject already-bound terminals (amplifier_locator.rs:238-240; amplifier_association.rs:128-134). That new-sid gap is inherited unchanged from legacy (whose `resolveEventsPath` is equally sid-keyed, integration.ts:98/405/440) and is OUT OF SCOPE for this lane — the resolver call is kept because it is cheap, harmless, and exact legacy parity.
+7. **Initial-attach failures join the same machinery.** `attach_lane` today has three silent `warn + return` failure paths (tailer attach fail, watcher create fail, `watcher.watch()` fail). All three now route into the same failure handler, so a transient failure at first attach also gets bounded retries instead of silent permanent death. Safety validated (no lazy-creation false positive): both producers of `events_path` guarantee an already-existing, content-verified file — the locator emits `Located` only after `probe_events_file` opened and parsed the file (amplifier_locator.rs:604-666, :501-514; missing file = `NotReady` retry, :424-430), and the resume resolver returns only `is_file()` paths with `None` skipping the attach entirely (main.rs:1027; activity.rs:288) — so an initial-attach failure is always a genuine fault and can never burn retries then destructively give up on a healthy fresh session. (Empirically: `watcher.watch()` on a missing path returns `Err(Io(NotFound))`.) Note: `AttachAt::Start` performs no fs call at attach time (tailer.rs:127), so the tailer-attach-fail branch is effectively reachable only for resume/Eof attaches.
 8. **G8 lives in `attach_lane`, not the tailer** — stat once at the call site, downgrade `Start`→`Eof` when over cap. The tailer stays pure.
 
 ## File Structure
@@ -550,8 +550,9 @@ Test B — exhaustion surfaces loudly (spec requirement: "exhausted retries must
         std::fs::remove_dir_all(dir.path()).unwrap();
 
         // After 250 + 1000 + 3000 ms of failed re-attaches the hub gives up
-        // LOUDLY: the tracker record is removed so the client visibly drops
-        // the pane's amplifier status instead of freezing stale.
+        // LOUDLY: the tracker record is removed so the client clears any
+        // stale busy status instead of freezing it (see Design Decision 1:
+        // the post-remove pane looks like ordinary idle, by design).
         let removed = next_frame_matching(&mut rx, "amplifier.activity.updated", 10_000, |v| {
             v["remove"]
                 .as_array()
@@ -561,7 +562,11 @@ Test B — exhaustion surfaces loudly (spec requirement: "exhausted retries must
         .await;
         assert!(removed.is_some(), "no visible remove after retries exhausted");
 
-        assert!(hub.amplifier_list().is_empty(), "tracker record survived give-up");
+        // NOTE: amplifier_list() returns a tuple — destructure it and assert
+        // the records collection is empty (copy the exact call shape from an
+        // existing test that uses amplifier_list()).
+        let (records, _) = hub.amplifier_list();
+        assert!(records.is_empty(), "tracker record survived give-up");
         let inner = hub.inner.lock().unwrap();
         assert!(inner.lanes.is_empty(), "a dead lane survived give-up");
         assert!(inner.lane_retries.is_empty(), "retry state leaked after give-up");
@@ -784,9 +789,11 @@ And the insert site inside `attach_lane` (currently :469-477) gains the two fiel
                     "amplifier_events_lane_dead: events lane gave up after bounded re-attach; amplifier status for this terminal is no longer tracked"
                 );
                 // LOUD give-up: clear the tracker record so the client
-                // visibly drops the pane's amplifier status (an existing
-                // frame shape the frozen client already renders) instead of
-                // freezing it stale. Also keeps amplifier_list() consistent.
+                // clears any stale busy status (an existing frame shape the
+                // frozen client already renders) instead of freezing it.
+                // Also keeps amplifier_list() consistent. Post-remove the
+                // pane renders as ordinary idle, and the tracker no-ops all
+                // further signals for this terminal — both intended (DD1).
                 let effects = inner.amplifier.note_exit(terminal_id);
                 let (mut f, _) = amplifier_frames(&mut inner.idle, effects);
                 frames.append(&mut f);
@@ -916,9 +923,11 @@ Extend the tuple returned from the locked block to `(frames, force_reads, reatta
 ```rust
         for (terminal_id, session_id, stored_path) in reattaches {
             // Port of the legacy resolveEventsPath semantics: the path is
-            // keyed by session id and can move across amplifier restarts —
-            // re-resolve at every attempt, falling back to the path captured
-            // at degrade time (unit tests run with resolver = None).
+            // keyed by session id — re-resolve at every attempt, falling
+            // back to the path captured at degrade time (unit tests run
+            // with resolver = None). Covers same-sid path moves only; an
+            // in-terminal amplifier restart mints a NEW sid, which nothing
+            // re-attaches — an inherited legacy gap, out of scope (DD6).
             let events_path = self
                 .resolver
                 .as_ref()
@@ -969,7 +978,7 @@ A Degraded tailer outcome now schedules re-attach at Eof via the hub's
 single one-shot deadline (250/1000/3000 ms, fresh tailer + reducer state,
 per-attempt path re-resolution). Exhausted or deterministic (SchemaMismatch)
 failures give up LOUDLY: error log + tracker-record removal so the client
-visibly drops the pane status instead of freezing stale. Initial-attach
+clears any stale busy status instead of freezing it. Initial-attach
 failures feed the same machinery; exit clears pending retries.
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
@@ -1071,6 +1080,24 @@ async function findEventsFile(amplifierHome: string): Promise<string> {
   throw new Error(`no events.jsonl found under ${projectsRoot}`)
 }
 
+/** Poll the server debug log until `pattern` appears — the deterministic
+ *  "re-attach fired" observable. A blind fixed wait would race CI: a record
+ *  appended BEFORE the Eof re-attach lands sits behind the attach point and
+ *  is permanently invisible, failing the test with no retry recourse. */
+async function waitForServerLog(
+  debugLogPath: string,
+  pattern: string,
+  timeoutMs = 10_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    const contents = await fs.readFile(debugLogPath, 'utf8').catch(() => '')
+    if (contents.includes(pattern)) return
+    if (Date.now() > deadline) throw new Error(`server log never matched: ${pattern}`)
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+}
+
 test.describe('Amplifier events-lane resilience (Rust only)', () => {
   test.setTimeout(240_000)
 
@@ -1123,8 +1150,12 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
       // ROTATION: truncate the live file below the tailer offset (FileReset
       // degrade). Without the fix the lane dies here, permanently.
       await fs.truncate(eventsPath, 0)
-      // Bounded backoff: first re-attach fires at +250 ms; 2 s is generous.
-      await page.waitForTimeout(2_000)
+      // Deterministic recovery gate (validated hardening): wait for the hub
+      // to log the re-attach attempt (Task 4 emits
+      // amplifier_events_lane_reattach_attempt at info level), then a short
+      // settle for the attach + initial drain that follow it synchronously.
+      await waitForServerLog(info.debugLogPath, 'amplifier_events_lane_reattach_attempt')
+      await page.waitForTimeout(250)
 
       // Turn 2 by appending records DIRECTLY (no PTY input): busy and
       // turn-complete can then ONLY come from the recovered events lane --
@@ -1180,7 +1211,7 @@ npx playwright test --config test/e2e-browser/playwright.config.ts \
   --project=rust-chromium specs/amplifier-lane-resilience-rust.spec.ts
 ```
 Expected: `1 passed`. (First run pays the `cargo build --release -p freshell-server` cost.)
-Failure-mode note (this is the e2e's red-equivalent evidence): without Tasks 3-4, this test times out at `post-truncation busy from recovered lane` — the truncation kills the lane permanently and no further frames arrive.
+Failure-mode note (this is the e2e's red-equivalent evidence): without Tasks 3-4, this test fails at `waitForServerLog(... amplifier_events_lane_reattach_attempt)` — the truncation kills the lane permanently, no re-attach is ever attempted, and no further frames arrive.
 
 - [ ] **Step 4: Commit**
 
@@ -1259,6 +1290,23 @@ Append inside the `describe` block:
         30_000,
         'association bound before death',
       )
+      // Durable-persistence gate (validated in Stage 2): the durable copy of
+      // the association is CLIENT-side — the page's store flushes the layout
+      // synchronously when it applies the association (persistMiddleware.ts
+      // :686-687 bypasses the debounce). WsCapture above is a SEPARATE ws
+      // connection, so also wait until the page itself shows the bound
+      // session before killing the server. (Field name: copy the pane
+      // content shape the client binds at App.tsx:968-981 if it differs.)
+      await expect
+        .poll(async () => {
+          const layout = await harness.getPaneLayout(tabId!)
+          const leaves = collectLeaves(layout?.root ?? layout)
+          const amp = leaves.find((l: any) => l?.content?.terminalId === terminalId)
+          const ref =
+            amp?.content?.sessionRef?.sessionId ?? amp?.content?.resumeSessionId ?? ''
+          return typeof ref === 'string' && ref.startsWith('fake-amp-')
+        }, { timeout: 15_000 })
+        .toBe(true)
       capture.close()
       capture = null
 
@@ -1426,7 +1474,10 @@ Append inside the `describe` block:
       // Degrade + recover A's lane; B must be completely unaffected.
       const eventsA = await findEventsFile(homeA)
       await fs.truncate(eventsA, 0)
-      await page.waitForTimeout(2_000)
+      // Deterministic recovery gate (see Task 5): poll A's debug log for the
+      // re-attach attempt instead of a blind fixed wait.
+      await waitForServerLog(infoA.debugLogPath, 'amplifier_events_lane_reattach_attempt')
+      await page.waitForTimeout(250)
       await fs.appendFile(eventsA, record('prompt:submit'))
       await captureA.waitFor(
         (f) =>
@@ -1521,8 +1572,8 @@ Expected: branch pushed. **STOP HERE — PR creation is NOT approved.** Report: 
 
 **1. Spec coverage:**
 - G4 bounded re-attach with backoff at Eof, N attempts, loud give-up → Tasks 3-4 (schedule `[250,1000,3000]`, fresh tailer+reducer, Eof-only, error log + record removal).
-- Degraded-status signal the frozen client already renders → Design Decision 1 (record removal via `note_exit` effects; no new client feature; `shared/ws-protocol.ts` untouched).
-- Legacy `resolveEventsPath` re-resolution port → Design Decision 6 + Task 4 step 3(f) (per-attempt `self.resolver(session_id)` with stored-path fallback).
+- Degraded-status signal the frozen client already renders → Design Decision 1 (record removal via `note_exit` effects; no new client feature; `shared/ws-protocol.ts` untouched). Stage-2 validation corrected the claim's scope: removal clears stale busy (the actual G4 harm) but the post-remove pane renders as ordinary idle — documented in DD1 as the best effect available inside the pinned contract, with the alternatives that were evaluated and rejected.
+- Legacy `resolveEventsPath` re-resolution port → Design Decision 6 + Task 4 step 3(f) (per-attempt `self.resolver(session_id)` with stored-path fallback). Stage-2 validation corrected the rationale: this covers same-sid path moves only; new-sid in-terminal restarts are an inherited legacy gap, out of scope (documented in DD6).
 - G8 4 MiB cap, stat at attach, Eof fallback, log, missing-file-not-over-cap, implemented in `attach_lane` keeping the tailer pure, matching legacy (no divergence) → Tasks 1-2.
 - TDD red-first at unit level (Degraded→re-attach, exhausted→surface, oversized→Eof) and hub level following activity.rs test patterns → Tasks 1-4 Step 1/2 of each.
 - E2E: own RustServers via findFreePort (never 3001/3002), extends the amplifier-leg patterns, rotation/truncation recovery (Task 5), restartAbrupt with busy pane + lane re-attach (Task 6), two concurrent servers with independent lanes (Task 7), new spec = new file, minimal config appends (Task 5 Step 2).
@@ -1535,4 +1586,8 @@ Expected: branch pushed. **STOP HERE — PR creation is NOT approved.** Report: 
 
 **3. Type consistency check:** `effective_attach_at(AttachAt, Option<u64>) -> AttachAt` (Task 1) matches its Task 2 call. `lane_retry_delay_ms(u32) -> Option<i64>` (Task 3) matches Task 4's `note_lane_failure`. `LaneRetry { session_id: String, events_path: PathBuf, failures: u32, next_attempt_at: Option<i64> }` is constructed identically in Task 3 tests and Task 4 code. `note_lane_failure(&self, &mut HubInner, &str, &str, &Path, bool, &mut Vec<ServerMessage>)` matches all three call sites (drain Degraded arm, `handle_attach_failure`, and via it the three attach failure paths). E2E helpers `record`/`seedAmplifierProvider`/`findEventsFile` defined in Task 5 and reused unchanged in Tasks 6-7.
 
-**Known execution-time flex points (documented, not gaps):** exact current line numbers in activity.rs shift as edits land — anchors are given as function names + "currently :NNN"; `ActivityEvent::{Created,Exit}` field sets must be copied from the existing tests at :1022/:933 if they differ from the code shown; Task 6 documents the MODE-B reload fallback if amplifier restore requires it.
+**Known execution-time flex points (documented, not gaps):** exact current line numbers in activity.rs shift as edits land — anchors are given as function names + "currently :NNN"; `ActivityEvent::{Created,Exit}` field sets must be copied from the existing tests at :1022/:933 if they differ from the code shown; `amplifier_list()`'s tuple shape (Test B) and the pane-content sessionRef field name (Task 6 client gate) must be copied from existing usage; Task 6 documents the MODE-B reload fallback if amplifier restore requires it.
+
+## Load-Bearing Validation (Stage 2, performed after plan-writing)
+
+Ten load-bearing assumptions were surfaced and validated (ledger with full evidence: `.worktrees/.the-usual-logs/amplifier-events-lane-resilience/load-bearing-ledger.md`). Eight verified — notably: truncation/deletion of a watched file DO deliver filter-passing notify events with ~0.1 ms latency (empirical, notify =6.1.1 scratch probe + backend source); `remove` for a still-running terminal is benign to sessionRef/resume/dedupe; initial-attach failure can never be a healthy lazy-creation path (both events_path producers guarantee an existing file); the association's durable copy is flushed synchronously client-side, so Task 6's SIGKILL premise holds; legacy never retried ANY degrade, so the bounded-retry design is strictly more resilient than parity. Two falsified and fixed in this plan: (1) DD1's "visibly distinct from idle" claim — removal clears stale busy but post-remove renders as ordinary idle (DD1 reworded, test/commit comments aligned); (2) DD6's "handles path changes across amplifier restarts" rationale — re-resolution covers same-sid moves only (DD6 reworded). Hardening applied from validation findings: Tasks 5/7 now gate recovery on the `amplifier_events_lane_reattach_attempt` debug-log observable instead of a blind 2 s wait (a too-early append is lost forever); Task 6 gains a client-observed sessionRef gate before SIGKILL. Accepted residuals (recorded in the ledger): amplifier no-reload recovery is deferred to Task 6's documented MODE-B fallback; "real amplifier CLI writes events.jsonl append-only" rests on three frozen-reference comments (worst case if wrong: warn-logged successful re-attach per rotation — still resilient).
