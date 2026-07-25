@@ -144,6 +144,13 @@ pub async fn run(
     let output_queue = Arc::new(crate::backpressure::ConnectionOutputQueue::new(
         state.term09.queue_max_bytes,
     ));
+    // Per-connection `terminal.create` sliding-window rate limiter (legacy
+    // parity: `ClientState.terminalCreateTimestamps`, `ws-handler.ts:2376-2389`)
+    // — fresh/empty on every (re)connect, exactly like the original.
+    let mut create_limiter = crate::create_limit::CreateRateLimiter::new(
+        state.create_protect.rate_limit,
+        state.create_protect.rate_window_ms,
+    );
     let conn_sink: FrameSink = {
         let tx = conn_tx.clone();
         let output_queue = Arc::clone(&output_queue);
@@ -241,6 +248,7 @@ pub async fn run(
                             &conn_sink,
                             terminal_output_batch_v1,
                             pane_reconcile_v1,
+                            &mut create_limiter,
                         )
                         .await
                         {
@@ -412,6 +420,7 @@ async fn handle_client_text(
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
     pane_reconcile_v1: bool,
+    create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -468,7 +477,7 @@ async fn handle_client_text(
         }
         ClientMessage::ClientDiagnostic(_) => true,
         ClientMessage::TerminalCreate(create) => {
-            handle_create(create, ws_tx, state, pane_reconcile_v1).await
+            handle_create(create, ws_tx, state, pane_reconcile_v1, create_limiter).await
         }
         // P0.3: server-side codex identity capture from the client's persisted
         // candidate -- guarded (campaign plan §2.3.1); rejects are logged and
@@ -885,6 +894,7 @@ async fn handle_create(
     ws_tx: &mut WsSink,
     state: &WsState,
     pane_reconcile_v1: bool,
+    create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
     // Single-flight create-dedupe (reconciliation design §5.4, the council's
     // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
@@ -938,6 +948,24 @@ async fn handle_create(
     // Released on EVERY exit path of the spawn below (RAII), success or error;
     // the outcome itself is discoverable through the registry.
     let _keyed_create_guard = keyed_create_guard;
+
+    // Per-connection create rate limit (legacy parity: ws-handler.ts:2376-2389).
+    // restore:true bypasses — neither checked nor recorded (`if (!m.restore)`).
+    if create.restore != Some(true) && !create_limiter.try_acquire(crate::create_limit::epoch_ms())
+    {
+        tracing::warn!(
+            target: "freshell_ws::create_limit",
+            request_id = %create.request_id,
+            "terminal_create_rate_limited"
+        );
+        return send_create_error(
+            ws_tx,
+            ErrorCode::RateLimited,
+            "Too many terminal.create requests".to_string(),
+            &create.request_id,
+        )
+        .await;
+    }
 
     // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle validator);
     // `streamId` via UUIDv4 (the reference's randomUUID()).
@@ -1311,20 +1339,67 @@ async fn handle_create(
         }))
     };
 
-    if let Err(err) = state.registry.create(
-        &spec,
-        &child_env,
-        terminal_id.clone(),
-        stream_id,
-        &mode,
-        resume_session_id.as_deref(),
-        // The pane's stable creation key, stamped atomically with the registry
-        // insert (reconciliation design §5.1) — capability-independent and
-        // inert on its own; only the §5.4 dedupe branch is gated.
-        Some(&create.request_id),
-        None,
-        on_exit,
-    ) {
+    // Server-wide spawn gate (restart-storm protection; WSL-outage RCA prior
+    // art). restore creates go THROUGH the gate. RAII permit: released on
+    // completion, failure, or unwind when `_spawn_permit` drops at scope end.
+    let _spawn_permit = match state
+        .spawn_gate
+        .acquire(std::time::Duration::from_millis(
+            state.create_protect.spawn_timeout_ms,
+        ))
+        .await
+    {
+        Ok(permit) => permit,
+        Err(err) => {
+            // Gate rejection mirrors the failed-spawn cleanup below: discard a
+            // planned-but-unadopted codex launch (sidecar + proxy) and undo the
+            // MCP side effects already materialized by generate_mcp_injection
+            // (claude/gemini/kimi tmp config file; opencode sidecar refcount).
+            if let Some(launch) = codex_launch {
+                freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                    .discard(launch)
+                    .await;
+            }
+            cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+            let (code, msg) = spawn_gate_error_parts(err);
+            return send_create_error(ws_tx, code, msg.to_string(), &create.request_id).await;
+        }
+    };
+
+    // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
+    // spawns occupy a permit + a blocking thread, never an async worker
+    // (on small hosts, N inline blocking spawns would wedge the whole
+    // runtime including the timer driver). Permit stays held throughout.
+    let registry = state.registry.clone();
+    let spawn_spec = spec.clone();
+    let spawn_terminal_id = terminal_id.clone();
+    let spawn_mode = mode.clone();
+    let spawn_resume_session_id = resume_session_id.clone();
+    let spawn_create_request_id = create.request_id.clone();
+    let create_result = match tokio::task::spawn_blocking(move || {
+        registry.create(
+            &spawn_spec,
+            &child_env,
+            spawn_terminal_id,
+            stream_id,
+            &spawn_mode,
+            spawn_resume_session_id.as_deref(),
+            // The pane's stable creation key, stamped atomically with the registry
+            // insert (reconciliation design §5.1) — capability-independent and
+            // inert on its own; only the §5.4 dedupe branch is gated.
+            Some(&spawn_create_request_id),
+            None,
+            on_exit,
+        )
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(join_err) => Err(std::io::Error::other(format!(
+            "terminal spawn task panicked: {join_err}"
+        ))),
+    };
+    if let Err(err) = create_result {
         // Failed-spawn parity (`tr:1601-1610`): clean up MCP side-effects with the
         // mcpCwd (NOT procCwd), then surface `wrapTerminalSpawnError`'s message as
         // an `error{code:PTY_SPAWN_FAILED}` frame.
@@ -1725,6 +1800,22 @@ async fn handle_pane_reconcile(
         verdicts,
     });
     send(ws_tx, &result).await
+}
+
+/// Map a gate rejection to the client-facing error frame parts.
+/// QueueFull -> RATE_LIMITED so the frozen client's retry ladder converts
+/// overload into backoff-and-retry (by the retry, the queue has drained).
+/// Timeout -> PTY_SPAWN_FAILED: fail loud; the pane shows a launch error.
+fn spawn_gate_error_parts(err: crate::spawn_gate::SpawnGateError) -> (ErrorCode, &'static str) {
+    match err {
+        crate::spawn_gate::SpawnGateError::QueueFull => {
+            (ErrorCode::RateLimited, "Too many terminal.create requests")
+        }
+        crate::spawn_gate::SpawnGateError::Timeout => (
+            ErrorCode::PtySpawnFailed,
+            "Timed out waiting for a terminal spawn slot",
+        ),
+    }
 }
 
 async fn send_create_error(
@@ -2204,6 +2295,21 @@ fn validate_tabs_push(
         snapshot_revision,
         records,
     ))
+}
+
+#[cfg(test)]
+mod spawn_gate_error_parts_tests {
+    use super::*;
+
+    #[test]
+    fn spawn_gate_error_parts_maps_queue_full_to_rate_limited_and_timeout_to_spawn_failed() {
+        let (code, msg) = spawn_gate_error_parts(crate::spawn_gate::SpawnGateError::QueueFull);
+        assert!(matches!(code, ErrorCode::RateLimited));
+        assert_eq!(msg, "Too many terminal.create requests");
+        let (code, msg) = spawn_gate_error_parts(crate::spawn_gate::SpawnGateError::Timeout);
+        assert!(matches!(code, ErrorCode::PtySpawnFailed));
+        assert_eq!(msg, "Timed out waiting for a terminal spawn slot");
+    }
 }
 
 #[cfg(test)]
@@ -2691,6 +2797,8 @@ mod terminals_changed_tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
@@ -2895,6 +3003,8 @@ mod terminal_meta_created_tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,

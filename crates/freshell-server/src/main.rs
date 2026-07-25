@@ -406,6 +406,17 @@ async fn main() -> ExitCode {
         freshell_ws::activity::ActivityHub::new(Arc::clone(&broadcast_tx), resolver)
     };
     registry.set_activity_observer(activity_hub.registry_observer());
+    // G9: resume-time codex rollout locator (ownership-proof walk of the
+    // codex sessions root; None -> PTY-only lane, same degradation as the
+    // amplifier resolver above).
+    if let Some(codex_sessions_root) = freshell_ws::codex_sessions_root() {
+        activity_hub.set_codex_rollout_locator(std::sync::Arc::new(move |session_id: &str| {
+            freshell_ws::locate_codex_rollout(&codex_sessions_root, session_id)
+        }));
+    }
+    // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
+    // are guaranteed to come from the same env snapshot.
+    let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();
     let ws_state = WsState {
         activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
@@ -444,6 +455,10 @@ async fn main() -> ExitCode {
         allowed_origins: Arc::new(resolve_allowed_origins()),
         ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
         term09: freshell_ws::backpressure::Term09Config::from_env(),
+        create_protect,
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::from_config(
+            &create_protect,
+        )),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),

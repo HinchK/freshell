@@ -65,9 +65,8 @@ const MATRIX_SPECS = [
   /safe03-origin-matrix\.spec\.ts$/,
   /cfg03-backup-restore\.spec\.ts$/,
   // Truly-idle alerting (terminal.idle): end-to-end blue -> green + one alert
-  // edge + tab shade -> activate clears. Legacy leg runs; the rust leg is
-  // test.fixme pending the rust terminal.idle emitter
-  // (feat/rust-terminal-activity-idle) so it flips on trivially.
+  // edge + tab shade -> activate clears. Both legs live: the rust
+  // terminal.idle emitter shipped with feat/rust-terminal-activity-idle.
   /truly-idle-alerting\.spec\.ts$/,
   // AGENT-14 -- checkpoint create/list/metadata/restore driven through the
   // real "Rewind code to here" UI gesture (hover, click, confirm dialog,
@@ -89,6 +88,29 @@ const RUST_ONLY_SPECS = [
   // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
   // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
   /restore-contract-wall-rust\.spec\.ts$/,
+  // TERM-15/TERM-16 terminal-mode CLI activity: hard `expect(e2eServerKind
+  // ).toBe('rust')` guard (predates this list's convention; fails under the
+  // fixture-default 'legacy' when the match-all chromium project picks it up).
+  /terminal-activity-rust\.spec\.ts$/,
+  // Lane A: busy-aware idle gate + queue-empty reason (imports RustServer
+  // directly for restartAbrupt() and two concurrent servers).
+  /idle-gate-semantics-rust\.spec\.ts$/,
+  // AMPLIFIER EVENTS-LANE RESILIENCE (Lane B): imports RustServer directly
+  // for restartAbrupt(); drives the Rust activity hub's events lane.
+  /amplifier-lane-resilience-rust\.spec\.ts$/,
+  /codex-status-completeness-rust\.spec\.ts$/,
+  // LANE E create protection: restore-storm contract; imports RustServer
+  // directly for restartAbrupt(). See docs/plans/2026-07-25-rust-create-protection.md
+  /create-protection-restore-storm-rust\.spec\.ts$/,
+  // LANE E create protection: frozen-client RATE_LIMITED ladder vs the Rust
+  // limiter. See docs/plans/2026-07-25-rust-create-protection.md
+  /create-rate-limit-ladder-rust\.spec\.ts$/,
+  // LANE E create protection: two concurrent RustServers, storm-isolation
+  // proof. See docs/plans/2026-07-25-rust-create-protection.md
+  /create-protection-isolation-rust\.spec\.ts$/,
+  /launch-retry-restart-rust\.spec\.ts$/,
+  /double-restart-terminal-restore-rust\.spec\.ts$/,
+  /turn-complete-restart-resume-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -210,6 +232,24 @@ export default defineConfig({
         // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
         // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
         /restore-contract-wall-rust\.spec\.ts$/,
+        /idle-gate-semantics-rust\.spec\.ts$/,
+        // AMPLIFIER EVENTS-LANE RESILIENCE (Lane B): rust-only, owns its
+        // servers, exercises events.jsonl rotation + abrupt restart.
+        /amplifier-lane-resilience-rust\.spec\.ts$/,
+        // Rust-only: drives RustServer directly (restartAbrupt + raw WS frames).
+        /codex-status-completeness-rust\.spec\.ts$/,
+        // LANE E create protection: restore-storm contract; imports RustServer
+        // directly for restartAbrupt(). See docs/plans/2026-07-25-rust-create-protection.md
+        /create-protection-restore-storm-rust\.spec\.ts$/,
+        // LANE E create protection: frozen-client RATE_LIMITED ladder vs the Rust
+        // limiter. See docs/plans/2026-07-25-rust-create-protection.md
+        /create-rate-limit-ladder-rust\.spec\.ts$/,
+        // LANE E create protection: two concurrent RustServers, storm-isolation
+        // proof. See docs/plans/2026-07-25-rust-create-protection.md
+        /create-protection-isolation-rust\.spec\.ts$/,
+        /launch-retry-restart-rust\.spec\.ts$/,
+        /double-restart-terminal-restore-rust\.spec\.ts$/,
+        /turn-complete-restart-resume-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
