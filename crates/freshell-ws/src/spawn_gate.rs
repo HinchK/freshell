@@ -107,8 +107,7 @@ impl SpawnGate {
             "spawn_gate_queued"
         );
 
-        let acquired =
-            tokio::time::timeout(timeout, self.semaphore.clone().acquire_owned()).await;
+        let acquired = tokio::time::timeout(timeout, self.semaphore.clone().acquire_owned()).await;
         match acquired {
             Ok(Ok(permit)) => Ok(permit),
             // The semaphore is never closed; treat close like timeout.
@@ -167,7 +166,11 @@ mod tests {
         for h in handles {
             h.await.expect("task completes");
         }
-        assert_eq!(max_seen.load(Ordering::SeqCst), 2, "max in-flight must equal N");
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            2,
+            "max in-flight must equal N"
+        );
     }
 
     #[tokio::test]
@@ -191,8 +194,16 @@ mod tests {
         for h in handles {
             h.await.expect("task completes");
         }
-        assert_eq!(*order.lock().await, vec![0, 1, 2, 3], "restore storms drain in order");
-        assert_eq!(gate.queued_total(), 4, "every queued waiter counts toward queued_total");
+        assert_eq!(
+            *order.lock().await,
+            vec![0, 1, 2, 3],
+            "restore storms drain in order"
+        );
+        assert_eq!(
+            gate.queued_total(),
+            4,
+            "every queued waiter counts toward queued_total"
+        );
     }
 
     #[tokio::test]
@@ -200,10 +211,16 @@ mod tests {
         let gate = Arc::new(SpawnGate::new(1, 2));
         let _holder = gate.acquire(Duration::from_secs(1)).await.expect("holder");
         // Two waiters occupy the queue.
-        let w1 = { let g = Arc::clone(&gate); tokio::spawn(async move { g.acquire(Duration::from_secs(5)).await }) };
-        let w2 = { let g = Arc::clone(&gate); tokio::spawn(async move { g.acquire(Duration::from_secs(5)).await }) };
+        let w1 = {
+            let g = Arc::clone(&gate);
+            tokio::spawn(async move { g.acquire(Duration::from_secs(5)).await })
+        };
+        let w2 = {
+            let g = Arc::clone(&gate);
+            tokio::spawn(async move { g.acquire(Duration::from_secs(5)).await })
+        };
         tokio::time::sleep(Duration::from_millis(50)).await; // let them enqueue
-        // Third waiter overflows the cap: immediate loud failure.
+                                                             // Third waiter overflows the cap: immediate loud failure.
         let res = gate.acquire(Duration::from_secs(5)).await;
         assert_eq!(res.unwrap_err(), SpawnGateError::QueueFull);
         assert_eq!(gate.queue_rejections(), 1);
@@ -250,7 +267,10 @@ mod tests {
         // Drop the waiter's future while it is suspended in the queued wait.
         waiter.abort();
         let join = waiter.await;
-        assert!(join.is_err(), "waiter must have been cancelled, not completed");
+        assert!(
+            join.is_err(),
+            "waiter must have been cancelled, not completed"
+        );
 
         // The cancelled wait's queue slot must be reclaimed: a fresh acquire
         // must queue (and time out on the still-held permit), NOT QueueFull.
@@ -270,7 +290,10 @@ mod tests {
     #[tokio::test]
     async fn raii_drop_releases_permit() {
         let gate = SpawnGate::new(1, 64);
-        let p = gate.acquire(Duration::from_millis(100)).await.expect("first");
+        let p = gate
+            .acquire(Duration::from_millis(100))
+            .await
+            .expect("first");
         drop(p);
         let p2 = gate.acquire(Duration::from_millis(100)).await;
         assert!(p2.is_ok(), "dropping the guard frees the permit");

@@ -97,7 +97,11 @@ pub struct CreateRateLimiter {
 
 impl CreateRateLimiter {
     pub fn new(limit: usize, window_ms: u64) -> Self {
-        Self { timestamps: VecDeque::new(), limit, window_ms }
+        Self {
+            timestamps: VecDeque::new(),
+            limit,
+            window_ms,
+        }
     }
 
     /// Prune expired entries (strict `now - t < window` survival, legacy
@@ -135,7 +139,10 @@ mod tests {
         for _ in 0..10 {
             assert!(l.try_acquire(0));
         }
-        assert!(!l.try_acquire(0), "11th create in the window must be rejected");
+        assert!(
+            !l.try_acquire(0),
+            "11th create in the window must be rejected"
+        );
     }
 
     #[test]
@@ -156,7 +163,10 @@ mod tests {
         // Legacy keeps `now - t < windowMs`: at exactly `window` the stamp expires.
         let mut l = CreateRateLimiter::new(1, 10_000);
         assert!(l.try_acquire(0));
-        assert!(!l.try_acquire(9_999), "at now-t=9_999 the stamp still counts");
+        assert!(
+            !l.try_acquire(9_999),
+            "at now-t=9_999 the stamp still counts"
+        );
         assert!(l.try_acquire(10_000), "at now-t=10_000 the stamp is pruned");
     }
 
