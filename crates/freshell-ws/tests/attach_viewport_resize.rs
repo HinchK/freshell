@@ -9,7 +9,9 @@
 mod common;
 use common::*;
 
+use futures_util::SinkExt;
 use std::time::Duration;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 #[tokio::test]
 async fn viewport_hydrate_attach_resizes_pty_to_attached_geometry() {
@@ -137,5 +139,75 @@ async fn transport_reconnect_resizes_only_without_other_sockets_or_when_reattach
         registry.geometry(&terminal_id),
         Some((100, 50, 2)),
         "re-attach by the same connection: apply; the second record bumps the epoch"
+    );
+}
+
+#[tokio::test]
+async fn out_of_range_resize_is_rejected_with_invalid_message() {
+    // Node parity: terminal.resize cols/rows outside [2,1000]/[2,500] is
+    // rejected at the boundary (ws-protocol.ts:364-365, ws-handler.ts:1856-1858)
+    // and never reaches the registry — geometry and PTY stay untouched.
+    let (url, registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+    let terminal_id = create_shell_terminal(&mut ws, "req-dims-resize").await;
+    attach_with(
+        &mut ws,
+        &terminal_id,
+        "att-dims-resize",
+        "viewport_hydrate",
+        95,
+        41,
+        None,
+    )
+    .await;
+    wait_for_attach_ready(&mut ws, "att-dims-resize").await;
+    let before = registry.geometry(&terminal_id);
+    assert_eq!(before, Some((95, 41, 1)));
+
+    let frame = serde_json::json!({
+        "type": "terminal.resize",
+        "terminalId": terminal_id,
+        "cols": 0,
+        "rows": 0,
+    });
+    ws.send(WsMessage::Text(frame.to_string()))
+        .await
+        .expect("send resize");
+
+    let err = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(err["code"], "INVALID_MESSAGE");
+    assert_eq!(
+        registry.geometry(&terminal_id),
+        before,
+        "geometry must be untouched"
+    );
+}
+
+#[tokio::test]
+async fn out_of_range_attach_geometry_is_rejected_with_invalid_message() {
+    // Node parity: terminal.attach with cols=1 fails Zod validation, so the
+    // ENTIRE attach is rejected — no attach.ready, no resize, no replay.
+    let (url, registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+    let terminal_id = create_shell_terminal(&mut ws, "req-dims-attach").await;
+    let before = registry.geometry(&terminal_id);
+
+    attach_with(
+        &mut ws,
+        &terminal_id,
+        "att-dims-attach",
+        "viewport_hydrate",
+        1,
+        41,
+        None,
+    )
+    .await;
+
+    let err = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(err["code"], "INVALID_MESSAGE");
+    assert_eq!(
+        registry.geometry(&terminal_id),
+        before,
+        "rejected attach must not resize"
     );
 }

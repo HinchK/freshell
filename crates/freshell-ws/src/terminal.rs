@@ -471,8 +471,12 @@ async fn handle_client_text(
             handle_create(create, ws_tx, state, pane_reconcile_v1).await
         }
         ClientMessage::TerminalAttach(attach) => {
-            handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
-            true
+            if terminal_dims_in_range(attach.cols, attach.rows) {
+                handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
+                true
+            } else {
+                send(ws_tx, &invalid_dims_error(attach.cols, attach.rows)).await
+            }
         }
         ClientMessage::TerminalInput(input) => {
             state
@@ -498,8 +502,12 @@ async fn handle_client_text(
             true
         }
         ClientMessage::TerminalResize(resize) => {
-            handle_resize(resize, state);
-            true
+            if terminal_dims_in_range(resize.cols, resize.rows) {
+                handle_resize(resize, state);
+                true
+            } else {
+                send(ws_tx, &invalid_dims_error(resize.cols, resize.rows)).await
+            }
         }
         ClientMessage::TerminalDetach(detach) => {
             handle_detach(&detach.terminal_id, ws_tx, state, conn_id).await
@@ -1812,6 +1820,41 @@ fn attach_geometry_identity_ok(
     }
 }
 
+/// Node-parity geometry bounds for `terminal.attach` / `terminal.resize`
+/// (`shared/ws-protocol.ts:344-345, 364-365`): `cols` must be an integer in
+/// `[2, 1000]` and `rows` in `[2, 500]`. Node enforces this at the Zod
+/// boundary by REJECTING the frame with `INVALID_MESSAGE`
+/// (`ws-handler.ts:1856-1858`) — reject, not clamp — so out-of-range
+/// geometry never reaches the registry or the PTY.
+pub(crate) const MIN_TERMINAL_COLS: i64 = 2;
+pub(crate) const MAX_TERMINAL_COLS: i64 = 1000;
+pub(crate) const MIN_TERMINAL_ROWS: i64 = 2;
+pub(crate) const MAX_TERMINAL_ROWS: i64 = 500;
+
+pub(crate) fn terminal_dims_in_range(cols: i64, rows: i64) -> bool {
+    (MIN_TERMINAL_COLS..=MAX_TERMINAL_COLS).contains(&cols)
+        && (MIN_TERMINAL_ROWS..=MAX_TERMINAL_ROWS).contains(&rows)
+}
+
+/// The `INVALID_MESSAGE` error frame for an out-of-range geometry reject.
+/// `request_id` is `None` for exact Node parity: Node's Zod reject copies
+/// `msg?.requestId` (`ws-handler.ts:1858`) and neither attach nor resize has
+/// a `requestId` field.
+fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
+    ServerMessage::Error(ErrorMsg {
+        code: ErrorCode::InvalidMessage,
+        message: format!(
+            "terminal geometry out of range: cols must be in [2, 1000] and rows in [2, 500] (got cols={cols}, rows={rows})"
+        ),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: None,
+        terminal_exit_code: None,
+        terminal_id: None,
+    })
+}
+
 /// `terminal.resize` — resize the shared PTY (`registry.resize`); no dedicated wire
 /// reply. `unchanged` when the geometry already matches.
 fn handle_resize(resize: TerminalResize, state: &WsState) {
@@ -2838,5 +2881,47 @@ mod attach_geometry_tests {
     fn expectation_against_no_identity_mismatch() {
         let expected = locator("codex", "s1");
         assert!(!attach_geometry_identity_ok(Some(&expected), None));
+    }
+}
+
+#[cfg(test)]
+mod terminal_dims_range_tests {
+    use super::{invalid_dims_error, terminal_dims_in_range};
+
+    #[test]
+    fn rejects_zero_and_one_below_node_floor() {
+        assert!(!terminal_dims_in_range(0, 24));
+        assert!(!terminal_dims_in_range(80, 0));
+        assert!(!terminal_dims_in_range(1, 24));
+        assert!(!terminal_dims_in_range(80, 1));
+        assert!(!terminal_dims_in_range(0, 0));
+    }
+
+    #[test]
+    fn rejects_negative_values() {
+        assert!(!terminal_dims_in_range(-1, 24));
+        assert!(!terminal_dims_in_range(80, -50));
+    }
+
+    #[test]
+    fn accepts_node_minimums_maximums_and_normal_values() {
+        assert!(terminal_dims_in_range(2, 2)); // Zod .min(2)
+        assert!(terminal_dims_in_range(80, 24));
+        assert!(terminal_dims_in_range(95, 41));
+        assert!(terminal_dims_in_range(1000, 500)); // Zod .max(1000)/.max(500)
+    }
+
+    #[test]
+    fn rejects_values_above_node_ceiling() {
+        assert!(!terminal_dims_in_range(1001, 500));
+        assert!(!terminal_dims_in_range(1000, 501));
+        assert!(!terminal_dims_in_range(i64::MAX, 24));
+    }
+
+    #[test]
+    fn invalid_dims_error_serializes_as_invalid_message() {
+        let value = serde_json::to_value(invalid_dims_error(0, -5)).expect("serialize");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["code"], "INVALID_MESSAGE");
     }
 }
