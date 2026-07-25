@@ -1080,18 +1080,24 @@ async function findEventsFile(amplifierHome: string): Promise<string> {
   throw new Error(`no events.jsonl found under ${projectsRoot}`)
 }
 
-/** Poll the server debug log until `pattern` appears — the deterministic
- *  "re-attach fired" observable. A blind fixed wait would race CI: a record
- *  appended BEFORE the Eof re-attach lands sits behind the attach point and
- *  is permanently invisible, failing the test with no retry recourse. */
+/** Poll the Rust server's tracing log until `pattern` appears — the
+ *  deterministic "re-attach fired" observable. A blind fixed wait would race
+ *  CI: a record appended BEFORE the Eof re-attach lands sits behind the
+ *  attach point and is permanently invisible, failing the test with no retry
+ *  recourse. NOTE: the Rust fixture's `info.debugLogPath` is a constructed
+ *  path that NOTHING writes (the helper buffers stdout/stderr in memory,
+ *  `rust-server.ts:448-455`); the real tracing sink is
+ *  `FRESHELL_LOG_DIR/rust-server.jsonl` (`crates/freshell-server/src/logging.rs:74,:137`),
+ *  i.e. `path.join(info.logsDir, 'rust-server.jsonl')` — the same file
+ *  `diag03-rotation-redaction-rust.spec.ts:33` reads. Always pass that path. */
 async function waitForServerLog(
-  debugLogPath: string,
+  serverLogPath: string,
   pattern: string,
   timeoutMs = 10_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   for (;;) {
-    const contents = await fs.readFile(debugLogPath, 'utf8').catch(() => '')
+    const contents = await fs.readFile(serverLogPath, 'utf8').catch(() => '')
     if (contents.includes(pattern)) return
     if (Date.now() > deadline) throw new Error(`server log never matched: ${pattern}`)
     await new Promise((resolve) => setTimeout(resolve, 100))
@@ -1154,7 +1160,12 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
       // to log the re-attach attempt (Task 4 emits
       // amplifier_events_lane_reattach_attempt at info level), then a short
       // settle for the attach + initial drain that follow it synchronously.
-      await waitForServerLog(info.debugLogPath, 'amplifier_events_lane_reattach_attempt')
+      // The Rust tracing sink is rust-server.jsonl under info.logsDir —
+      // info.debugLogPath is never written by the Rust fixture.
+      await waitForServerLog(
+        path.join(info.logsDir, 'rust-server.jsonl'),
+        'amplifier_events_lane_reattach_attempt',
+      )
       await page.waitForTimeout(250)
 
       // Turn 2 by appending records DIRECTLY (no PTY input): busy and
@@ -1372,7 +1383,7 @@ npx playwright test --config test/e2e-browser/playwright.config.ts \
   --project=rust-chromium specs/amplifier-lane-resilience-rust.spec.ts
 ```
 Expected: `2 passed`.
-Debugging note if the restored pane never appears: `compound-restart-rust.spec.ts` MODE A proves no-reload recovery for codex; if the amplifier pane's restore requires a reload in practice, add `await page.reload()` + `bootAndConnect`-style re-init immediately after `restartAbrupt()` (MODE B, `compound-restart-rust.spec.ts:377`) rather than weakening the assertions. Server logs are at `info.debugLogPath`.
+Debugging note if the restored pane never appears: `compound-restart-rust.spec.ts` MODE A proves no-reload recovery for codex; if the amplifier pane's restore requires a reload in practice, add `await page.reload()` + `bootAndConnect`-style re-init immediately after `restartAbrupt()` (MODE B, `compound-restart-rust.spec.ts:377`) rather than weakening the assertions. Server logs are at `path.join(info.logsDir, 'rust-server.jsonl')` (the Rust tracing sink — `info.debugLogPath` is a constructed path the Rust fixture never writes).
 
 - [ ] **Step 3: Commit**
 
@@ -1474,9 +1485,13 @@ Append inside the `describe` block:
       // Degrade + recover A's lane; B must be completely unaffected.
       const eventsA = await findEventsFile(homeA)
       await fs.truncate(eventsA, 0)
-      // Deterministic recovery gate (see Task 5): poll A's debug log for the
-      // re-attach attempt instead of a blind fixed wait.
-      await waitForServerLog(infoA.debugLogPath, 'amplifier_events_lane_reattach_attempt')
+      // Deterministic recovery gate (see Task 5): poll A's tracing log
+      // (rust-server.jsonl under logsDir) for the re-attach attempt instead
+      // of a blind fixed wait.
+      await waitForServerLog(
+        path.join(infoA.logsDir, 'rust-server.jsonl'),
+        'amplifier_events_lane_reattach_attempt',
+      )
       await page.waitForTimeout(250)
       await fs.appendFile(eventsA, record('prompt:submit'))
       await captureA.waitFor(
