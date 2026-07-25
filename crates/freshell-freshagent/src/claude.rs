@@ -973,7 +973,7 @@ mod tests {
     fn sidecar_entry_resolves_to_the_vendored_package() {
         // Guard against the dedup tests' concurrent FRESHELL_CLAUDE_SIDECAR mutation
         // (see CLAUDE_ENV_LOCK below) -- this test reads the SAME process-global env var.
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.blocking_lock();
         std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
         // The compile-time path points at the vendored Node package beside this crate.
         let entry = sidecar_entry_path();
@@ -994,7 +994,7 @@ mod tests {
     /// Serializes every test in this file that mutates process-global env vars
     /// (`FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE`), mirroring codex's
     /// `ENV_LOCK` (`codex.rs`).
-    static CLAUDE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A minimal scripted fake claude sidecar (no real `@anthropic-ai/claude-agent-sdk`,
     /// no network, no cost): on `{"type":"create",...}` it appends a marker line to
@@ -1139,7 +1139,7 @@ rl.on('line', (line) => {
     /// SAME session id on the second response.
     #[tokio::test]
     async fn handle_create_duplicate_request_id_reuses_the_session_and_spawns_once() {
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
@@ -1170,7 +1170,7 @@ rl.on('line', (line) => {
     /// must still spawn at most one sidecar and both resolve to the SAME session.
     #[tokio::test]
     async fn handle_create_concurrent_duplicate_request_id_spawns_at_most_once() {
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
@@ -1200,7 +1200,7 @@ rl.on('line', (line) => {
     /// Control: DISTINCT requestIds must never dedup against each other.
     #[tokio::test]
     async fn handle_create_distinct_request_ids_create_distinct_sessions() {
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
@@ -1237,7 +1237,7 @@ rl.on('line', (line) => {
     /// it is dropped rather than mirrored redundantly -- 4 tests, not 5.
     #[tokio::test]
     async fn handle_create_duplicate_after_explicit_kill_creates_a_fresh_session() {
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
@@ -1330,7 +1330,7 @@ rl.on('line', (line) => {
     /// assert on instead).
     #[tokio::test]
     async fn handle_interrupt_forwards_the_request_to_the_sidecar_for_a_known_session() {
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
