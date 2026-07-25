@@ -352,6 +352,7 @@ describe('App restart signals (bootId + serverInstanceId fallback)', () => {
   })
 
   it('bootId absent: a serverInstanceId change is treated as an equivalent restart signal', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const store = createStore()
     await renderApp(store)
     sendReady({ serverInstanceId: 'srv-1' }) // no bootId
@@ -367,10 +368,11 @@ describe('App restart signals (bootId + serverInstanceId fallback)', () => {
       store.dispatch(recordTurnComplete({ tabId: 't1', paneId: 'p1', terminalId: 'codex:ses-resumed', at: 2_000 }))
     })
     expect(baselines(store)['codex:ses-resumed']).toBe(2_000)
+    warnSpy.mockRestore()
   })
 
   it('logs loudly when a ready frame carries no bootId', async () => {
-    const warnSpy = vi.spyOn(console, 'warn')
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {})
     const store = createStore()
     await renderApp(store)
     sendReady({ serverInstanceId: 'srv-1' })
@@ -388,11 +390,13 @@ describe('App restart signals (bootId + serverInstanceId fallback)', () => {
     sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1' }) // reconnect, same boot
     expect(baselines(store)['codex:ses-resumed']).toBe(5_000) // survived
     // Replay protection intact: an older at is still deduped.
-    const eventsBefore = store.getState().turnCompletion.pendingEvents.length
+    // (Plumbing note: App mounts useTurnCompletionNotifications, which consumes
+    // pendingEvents inside act(), so assert the reducer-level baseline evidence
+    // — a deduped completion leaves the baseline unadvanced.)
     act(() => {
       store.dispatch(recordTurnComplete({ tabId: 't1', paneId: 'p1', terminalId: 'codex:ses-resumed', at: 4_000 }))
     })
-    expect(store.getState().turnCompletion.pendingEvents.length).toBe(eventsBefore)
+    expect(baselines(store)['codex:ses-resumed']).toBe(5_000)
   })
 
   it('resets baselines on the FIRST parsed ready (idempotent first-ready reset)', async () => {
@@ -414,6 +418,7 @@ describe('App restart signals (bootId + serverInstanceId fallback)', () => {
   })
 
   it('a malformed ready frame neither wipes identity nor fakes a restart', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     const store = createStore()
     await renderApp(store)
     sendReady({ serverInstanceId: 'srv-1', bootId: 'boot-1' })
@@ -426,5 +431,6 @@ describe('App restart signals (bootId + serverInstanceId fallback)', () => {
     expect(conn.bootId).toBe('boot-1')          // NOT wiped
     expect(conn.serverRestarted).not.toBe(true) // no spurious restart
     expect(baselines(store)['codex:ses-resumed']).toBe(5_000) // preserved
+    errorSpy.mockRestore()
   })
 })
