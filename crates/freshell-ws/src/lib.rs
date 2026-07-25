@@ -193,6 +193,11 @@ pub struct WsState {
     /// tunables (legacy parity: `server/terminal-stream/constants.ts` +
     /// `client-output-queue.ts`). See [`crate::backpressure::Term09Config`].
     pub term09: crate::backpressure::Term09Config,
+    /// terminal.create protection knobs (rate limit + spawn gate). See
+    /// [`crate::create_limit::CreateProtectConfig`].
+    pub create_protect: crate::create_limit::CreateProtectConfig,
+    /// Server-wide PTY spawn gate. See [`crate::spawn_gate::SpawnGate`].
+    pub spawn_gate: std::sync::Arc<crate::spawn_gate::SpawnGate>,
     /// SAFE-06: inbound WS frame/message size bound (legacy parity:
     /// `ws-handler.ts:226` `wsMaxPayloadBytes: Number(process.env.WS_MAX_PAYLOAD_BYTES
     /// || 16 * 1024 * 1024)`, passed to the `ws` library's `maxPayload` at
@@ -709,6 +714,8 @@ mod tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,

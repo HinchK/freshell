@@ -144,6 +144,13 @@ pub async fn run(
     let output_queue = Arc::new(crate::backpressure::ConnectionOutputQueue::new(
         state.term09.queue_max_bytes,
     ));
+    // Per-connection `terminal.create` sliding-window rate limiter (legacy
+    // parity: `ClientState.terminalCreateTimestamps`, `ws-handler.ts:2376-2389`)
+    // — fresh/empty on every (re)connect, exactly like the original.
+    let mut create_limiter = crate::create_limit::CreateRateLimiter::new(
+        state.create_protect.rate_limit,
+        state.create_protect.rate_window_ms,
+    );
     let conn_sink: FrameSink = {
         let tx = conn_tx.clone();
         let output_queue = Arc::clone(&output_queue);
@@ -241,6 +248,7 @@ pub async fn run(
                             &conn_sink,
                             terminal_output_batch_v1,
                             pane_reconcile_v1,
+                            &mut create_limiter,
                         )
                         .await
                         {
@@ -412,6 +420,7 @@ async fn handle_client_text(
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
     pane_reconcile_v1: bool,
+    create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -468,7 +477,7 @@ async fn handle_client_text(
         }
         ClientMessage::ClientDiagnostic(_) => true,
         ClientMessage::TerminalCreate(create) => {
-            handle_create(create, ws_tx, state, pane_reconcile_v1).await
+            handle_create(create, ws_tx, state, pane_reconcile_v1, create_limiter).await
         }
         // P0.3: server-side codex identity capture from the client's persisted
         // candidate -- guarded (campaign plan §2.3.1); rejects are logged and
@@ -885,6 +894,7 @@ async fn handle_create(
     ws_tx: &mut WsSink,
     state: &WsState,
     pane_reconcile_v1: bool,
+    create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
     // Single-flight create-dedupe (reconciliation design §5.4, the council's
     // two-tab double-respawn blocker): on `paneReconcileV1` connections ONLY,
@@ -938,6 +948,24 @@ async fn handle_create(
     // Released on EVERY exit path of the spawn below (RAII), success or error;
     // the outcome itself is discoverable through the registry.
     let _keyed_create_guard = keyed_create_guard;
+
+    // Per-connection create rate limit (legacy parity: ws-handler.ts:2376-2389).
+    // restore:true bypasses — neither checked nor recorded (`if (!m.restore)`).
+    if create.restore != Some(true) && !create_limiter.try_acquire(crate::create_limit::epoch_ms())
+    {
+        tracing::warn!(
+            target: "freshell_ws::create_limit",
+            request_id = %create.request_id,
+            "terminal_create_rate_limited"
+        );
+        return send_create_error(
+            ws_tx,
+            ErrorCode::RateLimited,
+            "Too many terminal.create requests".to_string(),
+            &create.request_id,
+        )
+        .await;
+    }
 
     // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle validator);
     // `streamId` via UUIDv4 (the reference's randomUUID()).
@@ -2691,6 +2719,8 @@ mod terminals_changed_tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
@@ -2895,6 +2925,8 @@ mod terminal_meta_created_tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
