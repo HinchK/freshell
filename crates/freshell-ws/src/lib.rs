@@ -26,6 +26,7 @@ pub mod backpressure;
 pub mod create_limit;
 pub(crate) mod codex_candidate;
 pub mod existence;
+pub mod spawn_gate;
 pub mod identity;
 pub(crate) mod invariants;
 pub mod opencode_association;
