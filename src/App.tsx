@@ -919,18 +919,54 @@ export default function App() {
           resetOpencodeActivityOverlay()
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
-          dispatch(setServerInstanceId(nextServerInstanceId))
-          const newBootId = ready.success ? ready.data.bootId : undefined
+          // Restart detection (gaps F2/G10 + F10/G11). `bootId` stays OPTIONAL
+          // in ReadyMessageSchema on purpose: both live servers always emit it
+          // (legacy server/ws-handler.ts:1910-1915, rust freshell-ws/lib.rs:356),
+          // but the shared wire type and the frozen port-oracle contract mark
+          // it optional — hard-requiring it would fail the WHOLE ready frame
+          // against an older server and silently disable all ready handling.
+          // Instead: log loudly when absent and fall back to a
+          // serverInstanceId change as the restart signal. The fallback is
+          // DEFENSE-IN-DEPTH for unknown servers/forks: git archaeology shows
+          // no shipped server ever both omitted bootId and rotated
+          // serverInstanceId on restart (legacy's bootId-less window had a
+          // persistent instanceId; rust emits bootId unconditionally, even
+          // when its instanceId is ephemeral in no-home mode).
           const previousBootId = appStore.getState().connection.bootId
-          const serverRestarted = !!previousBootId && previousBootId !== newBootId
-          dispatch(setBootId(newBootId))
-          dispatch(setServerRestarted(serverRestarted))
-          if (serverRestarted) {
-            dispatch(setLiveTerminalIds([]))
-            // The fresh process replays nothing and may stamp a lower wall-clock `at` than
-            // a clamp-inflated pre-restart value; drop the per-terminal `at` baselines so a
-            // resumed durable session's next real completion is not swallowed as a replay.
-            dispatch(resetCompletionDedupeBaselines())
+          const previousServerInstanceId = appStore.getState().connection.serverInstanceId
+          if (!ready.success) {
+            // A malformed ready frame must not wipe identity or fake a
+            // restart: keep the stored bootId/serverInstanceId and skip
+            // restart detection for this frame.
+            log.error('ready frame failed schema validation; skipping restart detection', ready.error.issues)
+          } else {
+            dispatch(setServerInstanceId(nextServerInstanceId))
+            const newBootId = ready.data.bootId
+            if (!newBootId) {
+              log.warn('ready frame carried no bootId; falling back to serverInstanceId for restart detection')
+            }
+            const bootIdRestart = !!previousBootId && previousBootId !== newBootId
+            const instanceChanged = !!previousServerInstanceId
+              && !!nextServerInstanceId
+              && previousServerInstanceId !== nextServerInstanceId
+            const serverRestarted = bootIdRestart || (!newBootId && instanceChanged)
+            dispatch(setBootId(newBootId))
+            dispatch(setServerRestarted(serverRestarted))
+            if (serverRestarted) {
+              dispatch(setLiveTerminalIds([]))
+            }
+            // The fresh process replays nothing and may stamp a lower
+            // wall-clock `at` than a clamp-inflated pre-restart value; drop
+            // the per-terminal `at` baselines so a resumed durable session's
+            // next real completion is not swallowed. Fires on EITHER restart
+            // signal, and idempotently on the first parsed ready of the page
+            // lifetime (no-op while baselines are unpersisted; future-proofs
+            // against rehydrated baselines). Never on a plain reconnect with
+            // unchanged identity.
+            const firstReadyBaseline = !previousBootId && !previousServerInstanceId
+            if (serverRestarted || instanceChanged || firstReadyBaseline) {
+              dispatch(resetCompletionDedupeBaselines())
+            }
           }
           dispatch(resetWsSnapshotReceived())
           // If App registered late and missed a prior invalidation, a fresh HTTP baseline
