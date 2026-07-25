@@ -479,6 +479,66 @@ async function createBrowserPaneInPage(page: Page): Promise<void> {
   await expect(page.getByPlaceholder('Enter URL...')).toBeVisible({ timeout: 10_000 })
 }
 
+// --- dual-role CLI shims (Task 9 ruler only) -- CODEX_CMD serves BOTH the
+// codex terminal CLI and the freshcodex app-server; OPENCODE_CMD serves BOTH
+// the opencode terminal CLI and the freshopencode `serve` sidecar. Terminal
+// spawns are PTY PATH-style exec of a single file (NO whitespace split), so
+// each shim must be one executable. Dispatch on argv: codex sidecar argv
+// contains `app-server`; opencode sidecar argv[0] === 'serve'. Extensionless
+// executables default to CJS -- no ESM-detection dependence. ---
+
+/** Single-executable `codex` shim: app-server argv -> fake app-server; else terminal fake. */
+async function installDualRoleCodex(binDir: string, argLogPath: string): Promise<string> {
+  await fs.mkdir(binDir, { recursive: true })
+  const target = path.join(binDir, 'codex')
+  const script = `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process')
+const fs = require('node:fs')
+const path = require('node:path')
+const argv = process.argv.slice(2)
+if (argv.includes('app-server')) {
+  const result = spawnSync(process.execPath, [${JSON.stringify(FAKE_CODEX_APP_SERVER_SOURCE)}, ...argv], { stdio: 'inherit', env: process.env })
+  process.exit(result.status ?? 1)
+}
+const logPath = ${JSON.stringify(argLogPath)}
+fs.mkdirSync(path.dirname(logPath), { recursive: true })
+fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, t: Date.now(), argv }) + '\\n')
+const resumeIndex = argv.indexOf('resume')
+if (resumeIndex !== -1) {
+  process.stdout.write('codex: resumed session ' + (argv[resumeIndex + 1] ?? '') + '\\r\\n')
+} else {
+  process.stdout.write('codex> \\r\\n')
+}
+process.stdin.resume()
+`
+  await fs.writeFile(target, script, 'utf8')
+  await fs.chmod(target, 0o755)
+  return target
+}
+
+/** Single-executable `opencode` shim: `serve` argv -> fake sidecar; else terminal fake. */
+async function installDualRoleOpencode(
+  binDir: string,
+  argLogPath: string,
+  auditLogPath: string,
+): Promise<string> {
+  await fs.mkdir(binDir, { recursive: true })
+  const target = path.join(binDir, 'opencode')
+  const script = `#!/usr/bin/env node
+const { spawnSync } = require('node:child_process')
+const argv = process.argv.slice(2)
+const source = argv[0] === 'serve' || argv[0] === '--version'
+  ? ${JSON.stringify(FAKE_OPENCODE_SIDECAR_SOURCE)}
+  : ${JSON.stringify(FAKE_OPENCODE_TERMINAL_SOURCE)}
+const env = { ...process.env, FAKE_OPENCODE_AUDIT_LOG: ${JSON.stringify(auditLogPath)}, FAKE_OPENCODE_TERMINAL_ARGV_LOG: ${JSON.stringify(argLogPath)} }
+const result = spawnSync(process.execPath, [source, ...argv], { stdio: 'inherit', env })
+process.exit(result.status ?? 1)
+`
+  await fs.writeFile(target, script, 'utf8')
+  await fs.chmod(target, 0o755)
+  return target
+}
+
 // ---------------------------------------------------------------------------
 // The wall
 // ---------------------------------------------------------------------------
@@ -1269,6 +1329,339 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await expect(page.getByPlaceholder('Enter URL...')).toHaveValue(/\/api\/health/, {
         timeout: 15_000,
       })
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('THE RULER: all pane types live, one SIGKILL, every §2 contract holds', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(300_000)
+    // EXPECTED-FAIL WALL PIN -- P0.1: this is the composed ruler; it flips
+    // green only when every per-pane contract above is green un-pinned
+    // (P0.2..P1.13). OBSERVED first red (run of 2026-07-24): the freshclaude
+    // identity poll -- post-reload the freshclaude pane carries the canonical
+    // cliSessionId (the fixture's 44444444-... UUID) instead of the pre-kill
+    // ephemeral fc-e2e-* created id, and no rebind is possible behind that
+    // (attach swallow + snapshot 503, P0.2 -- see Contract G's pin). The
+    // hidden-tab legs (F8/P1.11) PASSED in this composition: the
+    // dead-terminal census DID reach hidden tabs' layouts and the claude/
+    // codex/opencode resume argv polls all went green -- the plan flagged
+    // this ordering as runtime-dependent and verdict-neutral (both candidates
+    // are post-restart contract assertions). The freshcodex/freshopencode
+    // identity polls pass VACUOUSLY from persisted state (they measure
+    // persistence, not restore). FLIP: delete this pin when the last
+    // per-pane pin is retired.
+    test.fail(
+      e2eServerKind === 'rust',
+      'P0.1: composed all-pane ruler; red until F8 (P1.11) + P0.2..P1.13 land',
+    )
+
+    const CODEX_SESSION_ID = '99999999-8888-4777-8666-555555555555'
+    const SESSION_TITLE = 'ruler codex session'
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-ruler-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const claudeArgLog = path.join(sharedRoot, 'claude-argv.jsonl')
+    const codexArgLog = path.join(sharedRoot, 'codex-argv.jsonl')
+    const opencodeArgLog = path.join(sharedRoot, 'opencode-argv.jsonl')
+    const opencodeAuditLog = path.join(sharedRoot, 'opencode-audit.jsonl')
+    const binDir = path.join(sharedRoot, 'bin')
+    const fakeClaudePath = await installFakeCli(FAKE_CLAUDE_CLI_SOURCE, 'claude', binDir)
+    const fakeCodexPath = await installDualRoleCodex(binDir, codexArgLog)
+    const fakeOpencodePath = await installDualRoleOpencode(binDir, opencodeArgLog, opencodeAuditLog)
+
+    const { server, harness, info } = await bootWall(page, {
+      env: {
+        CLAUDE_CMD: fakeClaudePath,
+        FAKE_CLAUDE_ARGV_LOG: claudeArgLog,
+        CODEX_CMD: fakeCodexPath,
+        FAKE_CODEX_ARGV_LOG: codexArgLog,
+        OPENCODE_CMD: fakeOpencodePath,
+        FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
+      },
+      setupHome: async (homeDir) => {
+        await seedWallConfig({ providers: ['claude', 'codex', 'opencode'], freshAgent: true })(
+          homeDir,
+        )
+        await seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir)(homeDir)
+        // seedCodexHome overwrote config.json with codex-only providers; the
+        // second write below restores the full set (both are idempotent).
+        await seedWallConfig({ providers: ['claude', 'codex', 'opencode'], freshAgent: true })(
+          homeDir,
+        )
+      },
+    })
+    try {
+      // Multi-tab picker opener (setup fix, run of 2026-07-24): openPanePicker
+      // probes `.xterm`.first() (pane-picker.ts:10-15), which in this
+      // multi-tab test is a HIDDEN tab's still-mounted terminal, so it falls
+      // through to an ambiguous 'Add pane' button -- strict-mode violation
+      // with >1 tab mounted. Pre-open the split picker from the VISIBLE
+      // terminal's context menu; the creation helpers' openPanePicker call
+      // then early-returns the already-open picker (pane-picker.ts:5-8),
+      // keeping the shared helpers verbatim.
+      const openSplitPickerOnVisibleTerminal = async () => {
+        await page.locator('.xterm:visible').last().click({ button: 'right' })
+        await page.getByRole('menuitem', { name: /split horizontally/i }).click()
+        await expect(page.getByRole('toolbar', { name: /pane type picker/i }).last()).toBeVisible({
+          timeout: 10_000,
+        })
+      }
+
+      await selectShellIfPickerShowing(page)
+      const tab1 = (await harness.getActiveTabId())!
+      // Wait for the boot pane to become a REAL terminal before splitting it,
+      // else the boot picker's fade-out swallows the right-click (same guard
+      // as Contracts B/D/E/F/G/H -- kept in the TEST BODY).
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+
+      // --- TAB 1: shell (already there) + browser + editor. ---
+      await createBrowserPaneInPage(page)
+      const urlInput = page.getByPlaceholder('Enter URL...')
+      await urlInput.fill(`${info.baseUrl}/api/health`)
+      await urlInput.press('Enter')
+      // FILE-BACKED editor pane (editor content.content never survives
+      // persistence -- stripEditorContent, persistMiddleware.ts:236-243,581).
+      // PLAINTEXT, not markdown (setup fix, run of 2026-07-24; same rationale
+      // as Contract H): the mount re-fetch recomputes viewMode =
+      // resolveViewMode(path, language) (EditorPane.tsx:399,122-127) and
+      // forces 'preview' for previewable files, clobbering the dispatched
+      // 'source' BEFORE the kill -- a fixture artifact, not a restore red.
+      const editorMarker = 'ruler-editor-marker'
+      const editorFilePath = path.join(projectDir, 'ruler-editor.txt')
+      await fs.writeFile(editorFilePath, `ruler\n\n${editorMarker}\n`)
+      await page.evaluate(
+        ({ currentTabId, filePath }) => {
+          const harnessApi = (window as any).__FRESHELL_TEST_HARNESS__
+          const state = harnessApi?.getState()
+          const paneId = state?.panes?.activePane?.[currentTabId]
+          harnessApi?.dispatch({
+            type: 'panes/splitPane',
+            payload: {
+              tabId: currentTabId,
+              paneId,
+              direction: 'horizontal',
+              newPaneId: 'pane-ruler-editor',
+              newContent: {
+                kind: 'editor',
+                filePath,
+                language: 'markdown',
+                content: '',
+                readOnly: false,
+                viewMode: 'source',
+              },
+            },
+          })
+        },
+        { currentTabId: tab1, filePath: editorFilePath },
+      )
+
+      // --- TAB 2 (picker/WS path): claude terminal, fresh -> pre-allocated
+      // id. REST POST /api/tabs never pre-allocates --session-id
+      // (terminal_tabs.rs:756-768); only the WS-path terminal.create does
+      // (terminal.rs:969-982), so create the tab via tab-add and pick Claude
+      // in the new tab's own pane-type picker. Type the cwd -- candidate
+      // dirs may be empty on a clean HOME (files.rs:15-26).
+      await page.locator('[data-context="tab-add"]').click()
+      await harness.waitForTabCount(2)
+      const claudeTabId = (await harness.getActiveTabId())!
+      const claudePicker = page.getByRole('toolbar', { name: /pane type picker/i }).last()
+      await claudePicker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
+      const claudeDirInput = page.getByRole('combobox', {
+        name: /Starting directory for Claude/i,
+      })
+      await expect(claudeDirInput).toBeVisible({ timeout: 15_000 })
+      await claudeDirInput.fill(projectDir)
+      await claudeDirInput.press('Enter')
+      const claudePreallocatedId: string = await expect
+        .poll(async () => {
+          const entries = await readArgvLog(claudeArgLog)
+          const withId = entries.find((e) => e.argv.includes('--session-id'))
+          return withId ? withId.argv[withId.argv.indexOf('--session-id') + 1] ?? null : null
+        }, { timeout: 20_000 })
+        .not.toBeNull()
+        .then(async () => {
+          const entries = await readArgvLog(claudeArgLog)
+          const withId = entries.find((e) => e.argv.includes('--session-id'))!
+          return withId.argv[withId.argv.indexOf('--session-id') + 1]!
+        })
+
+      // --- TAB 3 (sidebar): codex terminal on the seeded session. ---
+      const codexItem = page.getByText(SESSION_TITLE, { exact: false }).first()
+      await expect(codexItem).toBeVisible({ timeout: 15_000 })
+      await codexItem.click()
+      const codexTabId = (await harness.getActiveTabId())!
+      await expect
+        .poll(async () => (await harness.getPaneLayout(codexTabId))?.content?.terminalId ?? null, {
+          timeout: 20_000,
+        })
+        .not.toBeNull()
+
+      // --- TAB 3 split: opencode terminal, minted via Enter. ---
+      // Wait for the codex tab's xterm to render before opening the picker
+      // (boot-picker fade-out guard, same as Contracts B/D/E/F/G/H).
+      await expect(page.locator('.xterm').last()).toBeVisible({ timeout: 30_000 })
+      await openSplitPickerOnVisibleTerminal()
+      const opencodeLeaf = await openOpencodePaneAndGetLeaf(page, harness, codexTabId)
+      await page.locator('.xterm').last().click()
+      await page.keyboard.type('hello ruler opencode')
+      await page.keyboard.press('Enter')
+      const opencodeSessionId: string = await expect
+        .poll(async () => {
+          const l = await findLeafById(harness, codexTabId, opencodeLeaf.id)
+          return l?.content?.sessionRef?.sessionId ?? l?.content?.resumeSessionId ?? null
+        }, { timeout: 20_000 })
+        .not.toBeNull()
+        .then(async () => {
+          const l = await findLeafById(harness, codexTabId, opencodeLeaf.id)
+          return l?.content?.sessionRef?.sessionId ?? l?.content?.resumeSessionId
+        })
+
+      // --- TAB 4: freshcodex; TAB 5: freshopencode; TAB 6: freshclaude. ---
+      // (Tab count so far: tab1 + claude picker tab + codex sidebar tab = 3;
+      // the opencode pane is a SPLIT inside the codex tab, not a tab.)
+      await page.locator('[data-context="tab-add"]').click()
+      await harness.waitForTabCount(4)
+      const freshcodexTabId = (await harness.getActiveTabId())!
+      await selectShellIfPickerShowing(page)
+      // Wait for the new tab's shell xterm before opening the pane picker
+      // (boot-picker fade-out guard applies after every tab-add + shell pick).
+      await expect(page.locator('.xterm').last()).toBeVisible({ timeout: 30_000 })
+      await openSplitPickerOnVisibleTerminal()
+      await createFreshcodexPane(page, harness)
+      await sendFreshAgentTurn(page, harness, freshcodexTabId, 'ruler freshcodex turn')
+      const freshcodexId = leafDurableIdentity(
+        findFreshAgentLeaf(await harness.getPaneLayout(freshcodexTabId)),
+      )!
+
+      await page.locator('[data-context="tab-add"]').click()
+      await harness.waitForTabCount(5)
+      const freshopencodeTabId = (await harness.getActiveTabId())!
+      await selectShellIfPickerShowing(page)
+      await expect(page.locator('.xterm').last()).toBeVisible({ timeout: 30_000 })
+      // MUST pass the FULL provider list: enableFreshOpencode's
+      // previewServerSettingsPatch REPLACES enabledProviders
+      // (mergeServerSettings, shared/settings.ts:1216-1218). The default
+      // ['opencode'] would hide the Freshclaude button needed for tab 6
+      // (PanePicker.tsx:125-152 gates on enabledProviders.includes('claude')).
+      await enableFreshOpencode(page, ['claude', 'codex', 'opencode'])
+      await openSplitPickerOnVisibleTerminal()
+      await createFreshopencodePane(page, projectDir)
+      await sendFreshAgentTurn(page, harness, freshopencodeTabId, 'ruler freshopencode turn')
+      const freshopencodeId = leafDurableIdentity(
+        findFreshAgentLeaf(await harness.getPaneLayout(freshopencodeTabId)),
+      )!
+
+      await page.locator('[data-context="tab-add"]').click()
+      await harness.waitForTabCount(6)
+      const freshclaudeTabId = (await harness.getActiveTabId())!
+      await selectShellIfPickerShowing(page)
+      await expect(page.locator('.xterm').last()).toBeVisible({ timeout: 30_000 })
+      await openSplitPickerOnVisibleTerminal()
+      await createFreshclaudePane(page, harness, projectDir)
+      await sendFreshAgentTurn(page, harness, freshclaudeTabId, 'ruler freshclaude turn')
+      const freshclaudeId = leafDurableIdentity(
+        findFreshAgentLeaf(await harness.getPaneLayout(freshclaudeTabId)),
+      )!
+
+      const tabCountBefore = await harness.getTabCount()
+      const claudeArgvBefore = (await readArgvLog(claudeArgLog)).length
+      const codexArgvBefore = (await readArgvLog(codexArgLog)).length
+      const opencodeArgvBefore = (await readArgvLog(opencodeArgLog)).length
+      await flushPersistence(page)
+
+      // ===================== THE SIGKILL ====================
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+      await reloadAndReconnect(page, harness)
+      // ======================================================
+
+      expect(await harness.getTabCount()).toBe(tabCountBefore)
+
+      // Shell (§2.1): recreated, not error.
+      await expect
+        .poll(async () => {
+          const layout = await harness.getPaneLayout(tab1)
+          const shellLeaf = collectLeaves(layout).find(
+            (l) => l?.content?.kind === 'terminal' && (l?.content?.mode ?? 'shell') === 'shell',
+          )
+          return shellLeaf?.content?.terminalId ?? null
+        }, { timeout: 30_000 })
+        .not.toBeNull()
+
+      // Browser + editor (§2.9): durable state intact. Editor content.content
+      // is '' by design after persistence (stripEditorContent,
+      // persistMiddleware.ts:236-243,581) -- assert the durable fields
+      // (filePath/viewMode) instead; tab1 is HIDDEN post-reload, so no
+      // visible-content re-fetch assertion here (the file-backed re-fetch is
+      // covered by Contract H on a visible pane).
+      const tab1Layout = await harness.getPaneLayout(tab1)
+      expect(
+        collectLeaves(tab1Layout).find((l) => l?.content?.kind === 'browser')?.content?.url,
+      ).toContain('/api/health')
+      const rulerEditorLeaf = collectLeaves(tab1Layout).find((l) => l?.content?.kind === 'editor')
+      expect(rulerEditorLeaf?.content?.viewMode).toBe('source')
+      expect(rulerEditorLeaf?.content?.filePath).toBe(editorFilePath)
+
+      // Claude terminal (§2.2): resumed with the pre-allocated id.
+      await expect
+        .poll(async () => {
+          const entries = await readArgvLog(claudeArgLog)
+          return entries
+            .slice(claudeArgvBefore)
+            .some((e) => hasFlagPair(e.argv, '--resume', claudePreallocatedId))
+        }, { timeout: 45_000 })
+        .toBe(true)
+
+      // Codex terminal (§2.3): resumed.
+      await expect
+        .poll(async () => {
+          const entries = await readArgvLog(codexArgLog)
+          return entries
+            .slice(codexArgvBefore)
+            .some((e) => hasResumePair(e.argv, CODEX_SESSION_ID))
+        }, { timeout: 45_000 })
+        .toBe(true)
+
+      // Opencode terminal (§2.4): resumed.
+      await expect
+        .poll(async () => {
+          const entries = await readArgvLog(opencodeArgLog)
+          return entries
+            .slice(opencodeArgvBefore)
+            .some((e) => hasFlagPair(e.argv, '--session', opencodeSessionId))
+        }, { timeout: 45_000 })
+        .toBe(true)
+
+      // Fresh agents (§2.6/§2.7/§2.8): identities survive, status not wedged.
+      for (const [tabIdX, expectedId] of [
+        [freshcodexTabId, freshcodexId],
+        [freshopencodeTabId, freshopencodeId],
+        [freshclaudeTabId, freshclaudeId],
+      ] as const) {
+        await expect
+          .poll(async () => leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabIdX))), {
+            timeout: 45_000,
+          })
+          .toBe(expectedId)
+        const leafX = findFreshAgentLeaf(await harness.getPaneLayout(tabIdX))
+        expect(leafX?.content?.status).not.toBe('error')
+        expect(leafX?.content?.status).not.toBe('creating')
+      }
+
+      // Quiet client: no alerts, no noisy error text (donor: restore-sync05).
+      // CAVEAT: freshclaude creates get a snapshot 503
+      // (FRESH_AGENT_RUNTIME_UNAVAILABLE, snapshot.rs:133-146) which can
+      // surface a history-load-error banner; if this count is nonzero ONLY
+      // because of that banner, scope the locator to exclude the freshclaude
+      // pane (or drop this line) rather than treating it as a new product
+      // red -- the pane-state assertions above are the real contract.
+      await expect(page.getByRole('alert')).toHaveCount(0)
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
