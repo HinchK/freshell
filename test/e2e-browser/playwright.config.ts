@@ -92,6 +92,9 @@ const RUST_ONLY_SPECS = [
   // LANE E create protection: restore-storm contract; imports RustServer
   // directly for restartAbrupt(). See docs/plans/2026-07-25-rust-create-protection.md
   /create-protection-restore-storm-rust\.spec\.ts$/,
+  // LANE E create protection: frozen-client RATE_LIMITED ladder vs the Rust
+  // limiter. See docs/plans/2026-07-25-rust-create-protection.md
+  /create-rate-limit-ladder-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -216,6 +219,9 @@ export default defineConfig({
         // LANE E create protection: restore-storm contract; imports RustServer
         // directly for restartAbrupt(). See docs/plans/2026-07-25-rust-create-protection.md
         /create-protection-restore-storm-rust\.spec\.ts$/,
+        // LANE E create protection: frozen-client RATE_LIMITED ladder vs the Rust
+        // limiter. See docs/plans/2026-07-25-rust-create-protection.md
+        /create-rate-limit-ladder-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
