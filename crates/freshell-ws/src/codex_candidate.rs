@@ -215,6 +215,14 @@ pub(crate) fn handle_codex_candidate_persisted(
         Some(thread_id.to_string()),
     );
     broadcast_terminal_session_associated(state, &msg.terminal_id, thread_id, row.cwd.clone());
+    // G3: adopted identity also feeds the activity tracker, so this
+    // terminal's `codex.activity.updated` records and subsequent
+    // `terminal.turn.complete` frames carry the sessionId (a fresh codex
+    // terminal otherwise never gets one -- identity arrives only here).
+    // Placed AFTER the pinned associated/meta broadcast pair.
+    if let Some(hub) = &state.activity {
+        hub.bind_codex_session(&msg.terminal_id, thread_id);
+    }
 }
 
 /// Fan `terminal.session.associated` + a `terminal.meta.updated` upsert to
