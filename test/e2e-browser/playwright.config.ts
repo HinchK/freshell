@@ -89,6 +89,7 @@ const RUST_ONLY_SPECS = [
   // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
   // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
   /restore-contract-wall-rust\.spec\.ts$/,
+  /codex-status-completeness-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -210,6 +211,8 @@ export default defineConfig({
         // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
         // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
         /restore-contract-wall-rust\.spec\.ts$/,
+        // Rust-only: drives RustServer directly (restartAbrupt + raw WS frames).
+        /codex-status-completeness-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
