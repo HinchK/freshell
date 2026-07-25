@@ -414,6 +414,20 @@ impl ActivityHub {
     ) {
         use notify::Watcher;
         let mut tailer = AmplifierEventsTailer::new(events_path);
+        // G8: never replay an unbounded backlog. Stat once at the call site;
+        // a failed stat means "file not created yet" and keeps Start.
+        let file_len = std::fs::metadata(events_path).ok().map(|m| m.len());
+        let effective = effective_attach_at(attach_at, file_len);
+        if effective != attach_at {
+            tracing::warn!(
+                terminal_id = %terminal_id,
+                session_id = %session_id,
+                size_bytes = file_len.unwrap_or(0),
+                cap_bytes = AMPLIFIER_CATCHUP_MAX_BYTES,
+                "amplifier_events_catchup_skipped: events backlog exceeds the catch-up cap; attaching at EOF (live records take over)"
+            );
+        }
+        let attach_at = effective;
         if let Err((reason, message)) = tailer.attach(attach_at) {
             tracing::warn!(
                 terminal_id = %terminal_id,
@@ -1161,6 +1175,64 @@ mod tests {
             let inner = hub.inner.lock().unwrap();
             assert_eq!(hub_next_deadline(&inner), None, "no deadline while idle");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catchup_cap_attaches_at_eof_for_oversized_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let events_path = dir.path().join("events.jsonl");
+        // > 4 MiB of pre-filter noise (skipped without parsing — no lifecycle
+        // event prefix) followed by a lifecycle record that must NOT be
+        // replayed once the cap downgrades the attach to Eof.
+        let noise = format!("{{\"noise\":\"{}\"}}\n", "x".repeat(5 * 1024 * 1024));
+        std::fs::write(
+            &events_path,
+            [noise, amplifier_line("prompt:submit")].concat(),
+        )
+        .unwrap();
+
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "amplifier".into(),
+                resume_session_id: None,
+                at: now_ms(),
+            },
+        );
+        hub.attach_amplifier_association("t1", "sess-1", &events_path);
+
+        // The oversized backlog must NOT be replayed: no busy upsert appears.
+        let busy = next_frame_matching(&mut rx, "amplifier.activity.updated", 1_500, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| u.iter().any(|r| r["phase"] == "busy"))
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(busy.is_none(), "oversized backlog was replayed: {busy:?}");
+
+        // The lane is LIVE at Eof: a freshly appended record drives busy.
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&events_path)
+                .unwrap();
+            f.write_all(amplifier_line("prompt:submit").as_bytes()).unwrap();
+            f.flush().unwrap();
+        }
+        let busy = next_frame_matching(&mut rx, "amplifier.activity.updated", 5_000, |v| {
+            v["upsert"]
+                .as_array()
+                .map(|u| {
+                    u.iter()
+                        .any(|r| r["terminalId"] == "t1" && r["phase"] == "busy")
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        assert!(busy.is_some(), "live append after Eof attach did not drive busy");
     }
 
     #[test]
