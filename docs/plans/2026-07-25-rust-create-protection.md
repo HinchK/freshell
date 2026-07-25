@@ -39,7 +39,7 @@
 | `crates/freshell-ws/src/create_limit.rs` | Create | `CreateProtectConfig` (env-backed knobs for BOTH protections) + `CreateRateLimiter` (pure sliding-window math, injected clock) + `epoch_ms()` |
 | `crates/freshell-ws/src/spawn_gate.rs` | Create | `SpawnGate` (semaphore + queue cap + timeout + counters) + `SpawnGateError` |
 | `crates/freshell-ws/src/lib.rs` | Modify | `pub mod create_limit; pub mod spawn_gate;` + two new `WsState` fields |
-| `crates/freshell-ws/src/terminal.rs` | Modify | rate-limit check at top of `handle_create`; gate acquisition around `state.registry.create(...)` (~:1314); thread `&mut CreateRateLimiter` through `run` → `handle_client_text` → `handle_create` |
+| `crates/freshell-ws/src/terminal.rs` | Modify | rate-limit check in `handle_create` after the §5.4 claim loop (`:940`, see Task 3 Placement decision); gate acquisition around `state.registry.create(...)` (~:1314); thread `&mut CreateRateLimiter` through `run` → `handle_client_text` → `handle_create` |
 | `crates/freshell-server/src/main.rs` | Modify | boot wiring: `CreateProtectConfig::from_env()` + `SpawnGate` construction (~:446, next to `term09`) |
 | ~17 other `WsState { .. }` literal sites (listed in Task 3) | Modify | add the two new fields with defaults |
 | `crates/freshell-ws/tests/common/mod.rs` | Modify | `spawn_server_with_create_protect(cfg)` harness variant |
@@ -598,7 +598,7 @@ git commit -m "feat(rust): add FIFO-fair bounded-concurrency spawn gate with que
 
 **Files:**
 - Modify: `crates/freshell-ws/src/lib.rs` (two new `WsState` fields)
-- Modify: `crates/freshell-ws/src/terminal.rs` (thread limiter param; check at top of `handle_create`)
+- Modify: `crates/freshell-ws/src/terminal.rs` (thread limiter param; check in `handle_create` after the §5.4 claim loop — see Placement decision below)
 - Modify: `crates/freshell-server/src/main.rs` (boot wiring, ~:409 `WsState` literal / ~:446 next to `term09`)
 - Modify: every other `WsState { .. }` literal site (verified list): `crates/freshell-ws/src/lib.rs:682` (unit-test helper `fn state()`), `crates/freshell-ws/src/terminal.rs:2647`, `:2846`, `crates/freshell-ws/src/opencode_association.rs:226`, `crates/freshell-ws/src/amplifier_association.rs:251`, `crates/freshell-ws/tests/common/mod.rs:100`, and `crates/freshell-ws/tests/{codex_session_ref_resume,max_payload,safe08_restore_diagnostics,origin_policy,hello_timeout,pane_reconcile,freshagent_claude_kill_interrupt,keepalive,term09_output_queue,freshagent_claude_attach,codex_managed_launch_e2e,diag01_lifecycle_events}.rs` (find each with `rg -n 'WsState \{' crates/`; the compiler enumerates any missed site as a build error — that is the safety net)
 - Modify: `crates/freshell-ws/tests/common/mod.rs` (add `spawn_server_with_create_protect`)
@@ -618,7 +618,7 @@ git commit -m "feat(rust): add FIFO-fair bounded-concurrency spawn gate with que
   - `handle_client_text` and `handle_create` each gain one parameter: `create_limiter: &mut crate::create_limit::CreateRateLimiter` (both already carry `#[allow(clippy::too_many_arguments)]`).
   - Harness: `pub async fn spawn_server_with_create_protect(cfg: freshell_ws::create_limit::CreateProtectConfig) -> String` in `tests/common/mod.rs`, returning the ws URL like the existing `spawn_server()`.
 
-**Placement decision (pinned, validated):** the check goes AFTER the existing paneReconcileV1 requestId-dedupe short-circuit at the top of `handle_create` (`terminal.rs:889-898` — a deduped create must NOT be charged against the budget, matching legacy's dedupe-first ordering) and BEFORE the §5.4 keyed-create claim loop, so a rejected create never touches the keyed-create reservation or mints IDs. Honest divergence note vs legacy: legacy dedupes ALL duplicate requestIds before the limiter; Rust's dedupe exists only for paneReconcileV1-negotiating clients, and the frozen client never negotiates it (`ws-client.ts:343`). The frozen client DOES bulk re-send same-requestId creates on reconnect (`TerminalView.tsx:4227-4259` re-drive), and post-restart shell-pane creates are NON-restore (see Key existing facts) — against Rust those re-sends are counted by the limiter and, if rejected, recovered by the client's RATE_LIMITED ladder (same requestId, so the contract stays coherent). The underlying missing frozen-client dedupe (duplicate-PTY hazard when a `terminal.created` is lost to a disconnect) is a PRE-EXISTING Rust gap independent of this plan — do not fix it here; if it surfaces in testing, report it rather than expanding scope.
+**Placement decision (pinned, validated against the real code):** the paneReconcileV1 requestId-dedupe is NOT a separate short-circuit at the top of `handle_create` — it lives INSIDE the §5.4 keyed-create claim loop (`terminal.rs:898-937`: the loop opens at `:907`, the dedupe/adopt branch is `:908-927` and early-returns at `:926` without spawning; `:889-896` is only a comment block). So the limiter check goes AFTER the claim loop and BEFORE any terminal id is minted: insert it immediately after the loop's guard hand-off `let _keyed_create_guard = keyed_create_guard;` (`terminal.rs:940`) and before the `terminal_id` mint at `:944`. Consequences, in order: (1) an adoptable duplicate create returns at `:926` before ever reaching the limiter — a deduped create is neither checked nor charged, matching legacy's dedupe-first ordering (pinned by the `adopted_duplicate_create_is_never_charged_or_rejected` test below); (2) a rejected create never mints IDs; (3) a rejected paneReconcileV1 create HAS briefly taken the keyed-create reservation — acceptable and safe, because the `KeyedCreateGuard` is RAII (`terminal.rs:869-878`) and releases on the early return exactly like every other early return in this function, so the client's ladder retry with the same requestId re-reserves cleanly. Honest divergence note vs legacy: legacy dedupes ALL duplicate requestIds before the limiter; Rust's dedupe exists only for paneReconcileV1-negotiating clients, and the frozen client never negotiates it (`ws-client.ts:343`). The frozen client DOES bulk re-send same-requestId creates on reconnect (`TerminalView.tsx:4227-4259` re-drive), and post-restart shell-pane creates are NON-restore (see Key existing facts) — against Rust those re-sends are counted by the limiter and, if rejected, recovered by the client's RATE_LIMITED ladder (same requestId, so the contract stays coherent). The underlying missing frozen-client dedupe (duplicate-PTY hazard when a `terminal.created` is lost to a disconnect) is a PRE-EXISTING Rust gap independent of this plan — do not fix it here; if it surfaces in testing, report it rather than expanding scope.
 
 - [ ] **Step 1: Write the failing integration tests**
 
@@ -720,6 +720,42 @@ async fn restore_creates_bypass_and_do_not_record() {
     let r3 = send_create_and_await_reply(&mut ws, "cr-n3", false).await;
     assert_eq!(r3["code"], "RATE_LIMITED", "third non-restore create exceeds limit 2");
 }
+
+/// Pins the Placement decision: the paneReconcileV1 dedupe/adopt branch
+/// (terminal.rs:908-927, early return :926) runs BEFORE the limiter check,
+/// so an adoptable duplicate create is neither checked nor charged even
+/// when the budget is exhausted (legacy dedupe-first ordering).
+#[tokio::test]
+async fn adopted_duplicate_create_is_never_charged_or_rejected() {
+    let cfg = CreateProtectConfig { rate_limit: 2, rate_window_ms: 600_000, ..Default::default() };
+    let url = common::spawn_server_with_create_protect(cfg).await;
+    // paneReconcileV1-negotiated connection: identical to connect_and_hello
+    // except the hello adds `"capabilities":{"paneReconcileV1":true}` (an
+    // OBJECT, not an array) — copy the shape from the negotiating connect
+    // helper in tests/pane_reconcile.rs:130-162 (same 4 handshake frames).
+    let mut ws = connect_and_hello_pane_reconcile_v1(&url).await;
+
+    // Two charged creates exhaust the budget; capture the first terminalId.
+    let created = send_create_and_await_reply(&mut ws, "cr-dup", false).await;
+    assert_eq!(created["type"], "terminal.created");
+    let original_id = created["terminalId"].as_str().expect("terminalId").to_string();
+    let filler = send_create_and_await_reply(&mut ws, "cr-fill", false).await;
+    assert_eq!(filler["type"], "terminal.created");
+
+    // Prove the budget is exhausted: a FRESH requestId is rejected.
+    let over = send_create_and_await_reply(&mut ws, "cr-over", false).await;
+    assert_eq!(over["code"], "RATE_LIMITED", "fresh create over limit rejects: {over}");
+
+    // The duplicate-requestId re-send (the reconnect re-drive shape) must
+    // ADOPT the live terminal — never RATE_LIMITED, never a new spawn —
+    // because the adopt branch returns before the limiter is consulted.
+    // (Adoption is registry-wide by create_request_id and same-socket safe:
+    // registry.newest_live_by_create_request_id, freshell-terminal
+    // registry.rs:1516-1521.)
+    let adopted = send_create_and_await_reply(&mut ws, "cr-dup", false).await;
+    assert_eq!(adopted["type"], "terminal.created", "adopt, not rate limit: {adopted}");
+    assert_eq!(adopted["terminalId"], original_id.as_str(), "same live terminal adopted");
+}
 ```
 
 Add the harness variant in `crates/freshell-ws/tests/common/mod.rs` — copy the existing `spawn_server()` body exactly, changing only the two new `WsState` fields:
@@ -740,7 +776,7 @@ pub async fn spawn_server_with_create_protect(
 - [ ] **Step 2: Run to verify red**
 
 Run: `cargo test -p freshell-ws --test create_protection`
-Expected: FAIL — first a compile error (`WsState` has no field `create_protect`); after adding the fields mechanically (Step 3a) but before the handler check (Step 3c), the tests run and FAIL on `assert_eq!(rejected["type"], "error")` because the 4th create succeeds. Watch BOTH failure shapes.
+Expected: FAIL — first a compile error (`WsState` has no field `create_protect`); after adding the fields mechanically (Step 3a) but before the handler check (Step 3c), the tests run and FAIL on `assert_eq!(rejected["type"], "error")` because the 4th create succeeds (and `adopted_duplicate_create_is_never_charged_or_rejected` fails on its `cr-over` RATE_LIMITED assertion for the same reason). Watch BOTH failure shapes.
 
 - [ ] **Step 3: Implement**
 
@@ -773,7 +809,7 @@ let mut create_limiter = crate::create_limit::CreateRateLimiter::new(
 
 Thread `&mut create_limiter` through the `handle_client_text` call in the select loop, add `create_limiter: &mut crate::create_limit::CreateRateLimiter` to `handle_client_text`'s signature, and pass it into `handle_create` at the `ClientMessage::TerminalCreate` arm (`:470-471`). Update the two inline-test callers (`terminal.rs:2647`, `:2846` regions) to construct and pass a local limiter.
 
-3c. First statement of `handle_create` (`terminal.rs:883`, before the §5.4 claim loop at `:897`):
+3c. Immediately AFTER the §5.4 claim loop — insert directly after `let _keyed_create_guard = keyed_create_guard;` (`terminal.rs:940`) and before the terminal id mint at `:944` (see the Placement decision above; the dedupe/adopt branch inside the loop early-returns at `:926` before this check, so adopted duplicates are never charged):
 
 ```rust
     // Per-connection create rate limit (legacy parity: ws-handler.ts:2376-2389).
@@ -816,7 +852,7 @@ git commit -m "feat(rust): enforce per-connection terminal.create rate limit wit
 
 **Files:**
 - Modify: `crates/freshell-ws/src/terminal.rs` (gate acquisition + error mapping + pure mapping fn + inline unit test)
-- Test: `crates/freshell-ws/tests/create_protection.rs` (add gate smoke test)
+- Test: `crates/freshell-ws/tests/create_protection.rs` (add gate smoke test + zero-permit wiring-proof test)
 
 **Interfaces:**
 - Consumes: `WsState.spawn_gate`, `WsState.create_protect.spawn_timeout_ms` (Task 3), `spawn_gate::SpawnGateError` (Task 2).
@@ -881,11 +917,47 @@ async fn gate_at_concurrency_one_never_breaks_a_restore_storm() {
 }
 ```
 
+1c. The WIRING PROOF, also in `tests/create_protection.rs` — deterministic and non-vacuous: if `handle_create` never consults the gate, every create here plain-succeeds and the test FAILS. A zero-permit gate can never grant, so the first create queues and times out with the pinned Timeout error frame:
+
+```rust
+#[tokio::test]
+async fn zero_permit_gate_times_out_create_with_pinned_error_frame() {
+    // spawn_concurrency: 0 => SpawnGate::from_config builds a 0-permit
+    // semaphore (legal: only from_env treats 0 as "fall back to default";
+    // a literal config passes 0 straight through from_config -> new).
+    // acquire() can therefore never succeed: the create queues (under the
+    // 64-cap) and times out after spawn_timeout_ms.
+    let cfg = CreateProtectConfig {
+        spawn_concurrency: 0,
+        spawn_queue_cap: 64,
+        spawn_timeout_ms: 250,
+        ..Default::default()
+    };
+    let url = common::spawn_server_with_create_protect(cfg).await;
+    let mut ws = connect_and_hello(&url).await;
+
+    let rejected = send_create_and_await_reply(&mut ws, "cr-gate-timeout", false).await;
+    assert_eq!(rejected["type"], "error", "gate must reject: {rejected}");
+    assert_eq!(rejected["code"], "PTY_SPAWN_FAILED");
+    assert_eq!(rejected["message"], "Timed out waiting for a terminal spawn slot");
+    assert_eq!(rejected["requestId"], "cr-gate-timeout");
+
+    // restore:true is exempt from the RATE limit but NOT the gate.
+    let restore_rejected = send_create_and_await_reply(&mut ws, "cr-gate-restore", true).await;
+    assert_eq!(
+        restore_rejected["code"], "PTY_SPAWN_FAILED",
+        "restore creates go THROUGH the gate: {restore_rejected}"
+    );
+}
+```
+
 - [ ] **Step 2: Run to verify red**
 
 Run: `cargo test -p freshell-ws spawn_gate_error_parts`
 Expected: FAIL to compile — `spawn_gate_error_parts` not defined.
-(The smoke test passes already — it pins non-regression once the gate lands; note that in the task log.)
+Run: `cargo test -p freshell-ws --test create_protection zero_permit_gate`
+Expected: FAIL — the gate is not yet consulted by `handle_create`, so both creates plain-succeed (`terminal.created`) and the first `assert_eq!(rejected["type"], "error")` fails. This red run is what makes the wiring proof non-vacuous — capture it in the task log.
+(The concurrency-1 smoke test passes already — it pins non-regression once the gate lands; note that in the task log.)
 
 - [ ] **Step 3: Implement**
 
@@ -945,7 +1017,7 @@ Notes for the implementer:
 - [ ] **Step 4: Run to verify green**
 
 Run: `cargo test -p freshell-ws`
-Expected: PASS — unit map test, gate smoke, both Task 3 tests, and all pre-existing tests.
+Expected: PASS — unit map test, zero-permit wiring test, gate smoke, all three Task 3 tests, and all pre-existing tests.
 Run: `cargo clippy --workspace -- -D warnings`
 Expected: clean.
 
@@ -1460,7 +1532,7 @@ Do NOT run `gh pr create` — PR creation is not yet approved. Report: branch na
 - Wire shape pinned by a test that read the client handler's contract (`type`/`code`/`requestId` match + exact key set) → Task 3 integration test `eleventh_create_is_rate_limited_with_exact_wire_shape`.
 - Limiter in its own small module → Task 1 (`create_limit.rs`). `freshell-server/src/rate_limit.rs` was read; not reusable (wrong crate direction, global token bucket) → parallel module in freshell-ws, as the spec anticipated.
 - G12/F11 spawn gate: bounded semaphore (default N=4, env-configurable), FIFO-fair, queue-depth cap fails loud with an error frame, per-spawn timeout, RAII permit release on completion/failure/unwind, structured log + counters on queueing/rejection/timeout → Tasks 2, 4. The synchronous spawn runs under `spawn_blocking` while the permit is held (validated as required — inline blocking spawns would deadlock small hosts; Task 4). Restore creates exempt from the RATE limit but NOT the gate → pinned in Task 3 (bypass test) and Task 4 (restore storm through concurrency-1 gate).
-- TDD red tests: limiter window math + restore bypass + wire shape (Tasks 1, 3); gate bounds concurrency with max-in-flight N and all-complete, FIFO order, queue-cap fail-loud, permit release on timeout and drop (Task 2).
+- TDD red tests: limiter window math + restore bypass + wire shape + dedupe-before-limiter (adopted duplicate over an exhausted budget is never charged or rejected) (Tasks 1, 3); gate bounds concurrency with max-in-flight N and all-complete, FIFO order, queue-cap fail-loud, permit release on timeout and drop (Task 2); gate WIRING pinned non-vacuously by the zero-permit timeout test — it fails unless `handle_create` actually consults the gate, and its red run is captured before Task 4's implementation (Task 4).
 - E2E: own RustServers/ephemeral ports (all three specs), 15-pane reload storm + `restartAbrupt()` + limiter fires (validated: post-restart shell creates are non-restore) + ladder recovers ALL panes (Task 5), live non-restore flood → RATE_LIMITED → ladder recovery (Task 6), two concurrent servers isolation + raw-WS restore-bypass proof (Task 7), new spec files + minimal config appends (Tasks 5-7). Tab-add floods seed `panes.defaultNewPane:'shell'` (validated: default 'ask' fires zero creates) and pin `RUST_LOG:'info'` for the log greps.
 - Repo rules: TDD throughout, coordinated-suite etiquette + `FRESHELL_TEST_SUMMARY` (Task 8), push-then-STOP PR policy (Task 8), never touch the user's live server (constraint + spec `finally` blocks).
 - No gaps found; no UNRESOLVED COVERAGE GAP entries needed.
