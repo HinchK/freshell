@@ -382,7 +382,10 @@ mod tests {
         gate.note_phase("t1", IdleGatePhase::Pending);
         gate.note_phase("t1", IdleGatePhase::Idle);
         gate.note_turn_boundary("t1", 100);
-        assert_eq!(gate.expire(100 + IDLE_GRACE_MS)[0].reason, TerminalIdleReason::Grace);
+        assert_eq!(
+            gate.expire(100 + IDLE_GRACE_MS)[0].reason,
+            TerminalIdleReason::Grace
+        );
     }
 
     #[test]
@@ -392,7 +395,10 @@ mod tests {
         gate.note_turn_boundary("t1", 100); // evidence
         gate.note_exit("t1"); // legacy remove: whole state deleted
         gate.note_turn_boundary("t1", 200); // fresh terminal id reuse
-        assert_eq!(gate.expire(200 + IDLE_GRACE_MS)[0].reason, TerminalIdleReason::Grace);
+        assert_eq!(
+            gate.expire(200 + IDLE_GRACE_MS)[0].reason,
+            TerminalIdleReason::Grace
+        );
     }
 
     #[test]
