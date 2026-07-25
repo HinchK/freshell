@@ -1667,4 +1667,498 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await fs.rm(sharedRoot, { recursive: true, force: true })
     }
   })
+
+  // -------------------------------------------------------------------------
+  // The six named red tests from plan §5 P0.1
+  // -------------------------------------------------------------------------
+
+  test('SIGKILL-within-5s-of-pane-creation: identity survives without client state', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    // EXPECTED-FAIL WALL PIN -- P1.8+P1.9 (D3, §4.2): no server-side durable
+    // pane-identity record exists; with localStorage gone the binding is lost
+    // even though the pre-allocated claude session id was server-minted.
+    // FLIP when the pane-identity ledger + "recover my panes" surface land.
+    test.fail(
+      e2eServerKind === 'rust',
+      'P1.8+P1.9 (D3): pane created <5s before SIGKILL is unrecoverable after browser loss',
+    )
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-5s-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const argLogPath = path.join(sharedRoot, 'claude-argv.jsonl')
+    const fakeClaudePath = await installFakeCli(
+      FAKE_CLAUDE_CLI_SOURCE,
+      'claude',
+      path.join(sharedRoot, 'bin'),
+    )
+    const { server, harness, info } = await bootWall(page, {
+      env: { CLAUDE_CMD: fakeClaudePath, FAKE_CLAUDE_ARGV_LOG: argLogPath },
+      setupHome: seedWallConfig({ providers: ['claude'] }),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+      // Wait for the boot pane to become a REAL terminal before opening the
+      // pane picker, else openPanePicker races the boot picker's fade-out and
+      // the Claude click is swallowed (same guard as Contracts B/D/E/F/G/H).
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      // Fresh claude pane via the picker/WS path -- REST POST /api/tabs never
+      // pre-allocates --session-id (terminal_tabs.rs:756-768); only the
+      // WS-path terminal.create does (terminal.rs:969-982). Type the cwd --
+      // candidate dirs may be empty on a clean HOME (files.rs:15-26).
+      const picker = await openPanePicker(page)
+      await picker.getByRole('button', { name: /^Claude CLI$/i }).click({ force: true })
+      const dirInput = page.getByRole('combobox', { name: /Starting directory for Claude/i })
+      await expect(dirInput).toBeVisible({ timeout: 15_000 })
+      await dirInput.fill(projectDir)
+      await dirInput.press('Enter')
+
+      // Server-minted identity exists the moment the CLI spawns: the fake
+      // appends its argv line synchronously at spawn, so the first
+      // --session-id entry marks the pane's t=0. UI creation is slower than
+      // a REST call, so the poll gets a UI-scale timeout; the "within 5s of
+      // creation" premise is anchored on the SPAWN instead -- SIGKILL is
+      // issued immediately after the entry appears (moments after spawn,
+      // well inside any snapshot cadence).
+      const preallocatedId: string = await expect
+        .poll(async () => {
+          const entries = await readArgvLog(argLogPath)
+          const withId = entries.find((e) => e.argv.includes('--session-id'))
+          return withId ? withId.argv[withId.argv.indexOf('--session-id') + 1] ?? null : null
+        }, { timeout: 20_000 })
+        .not.toBeNull()
+        .then(async () => {
+          const entries = await readArgvLog(argLogPath)
+          const withId = entries.find((e) => e.argv.includes('--session-id'))!
+          return withId.argv[withId.argv.indexOf('--session-id') + 1]!
+        })
+
+      // ...and the SIGKILL lands immediately after the spawn -- before any
+      // snapshot cadence could have persisted the binding. Then the browser
+      // loses its state. TWO deviations from the naive clear+reload
+      // (observed hang, run of 2026-07-24, DEBUG=pw:api):
+      //   (1) an evaluate-time localStorage.clear() is racy -- the persist
+      //       middleware re-writes the whole state on the next store update
+      //       (reconnect churn), so the "lost" tabs came back. The clear must
+      //       run at NAVIGATION time (init script) to be deterministic.
+      //   (2) the app strips ?token= from the URL after stashing it in the
+      //       (now-cleared) localStorage, so a bare reload can never
+      //       re-authenticate -- WS stays offline forever and waitForConnection
+      //       hung to the 180s test timeout (setup hang, not the contract
+      //       red). Re-enter through the token URL instead -- the same door a
+      //       user who lost their browser state walks back in through.
+      await server.restartAbrupt()
+      await page.addInitScript(() => {
+        try {
+          localStorage.clear()
+          sessionStorage.clear()
+        } catch {
+          /* about:blank etc. */
+        }
+      })
+      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      await harness.waitForHarness()
+      await harness.waitForConnection()
+
+      // TARGET CONTRACT (§4.2/§4.4): the server still knows the binding --
+      // some pane resuming <preallocatedId> becomes reachable (auto-restored
+      // or offered via "recover my panes").
+      await expect
+        .poll(async () => {
+          const state = await harness.getState()
+          const layouts = state?.panes?.layouts ?? {}
+          for (const layout of Object.values(layouts)) {
+            const hit = collectLeaves(layout).find(
+              (l) => l?.content?.sessionRef?.sessionId === preallocatedId,
+            )
+            if (hit) return true
+          }
+          const recoverOffer = await page
+            .getByText(/recover .*pane/i)
+            .first()
+            .isVisible()
+            .catch(() => false)
+          return recoverOffer
+        }, { timeout: 30_000 })
+        .toBe(true)
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('SIGKILL-inside-locator-window: never silently fresh', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    // EXPECTED-FAIL WALL PIN -- P1.8 (§2.4/§4.2 pending markers): killing the
+    // server inside the opencode locator's ~2s correlation window loses the
+    // minted identity permanently, and the pane restores SILENTLY FRESH --
+    // no resume, no breadcrumb. FLIP when ledger pending markers land
+    // (fresh-by-race must be visible) or the identity is captured in time.
+    // DETERMINISM: the fake's session-row write is held behind
+    // FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH and this test NEVER creates the
+    // gate file before the kill, so the identity provably cannot land
+    // pre-kill. Without the gate, the 150ms locator sweep (main.rs:1112)
+    // can beat the SIGKILL a few percent of runs -> unexpected PASS of this
+    // pin -> hard suite failure.
+    test.fail(
+      e2eServerKind === 'rust',
+      'P1.8 (§2.4): SIGKILL inside locator window yields silent fresh, no breadcrumb',
+    )
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-locwin-'))
+    const argLogPath = path.join(sharedRoot, 'opencode-argv.jsonl')
+    // Deliberately never created -- see the DETERMINISM note above.
+    const rowGatePath = path.join(sharedRoot, 'row-gate-never-created')
+    const fakeOpencodePath = await installFakeCli(
+      FAKE_OPENCODE_TERMINAL_SOURCE,
+      'opencode',
+      path.join(sharedRoot, 'bin'),
+    )
+    const { server, harness } = await bootWall(page, {
+      env: {
+        OPENCODE_CMD: fakeOpencodePath,
+        FAKE_OPENCODE_TERMINAL_ARGV_LOG: argLogPath,
+        FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH: rowGatePath,
+      },
+      setupHome: seedWallConfig({ providers: ['opencode'] }),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
+      // Boot-picker fade-out guard before opening the pane picker (same as
+      // Contract D and every sibling).
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      const leaf = await openOpencodePaneAndGetLeaf(page, harness, tabId)
+
+      // Mint the session and kill IMMEDIATELY -- inside the locator window,
+      // before terminal.session.associated can land.
+      await page.locator('.xterm').last().click()
+      await page.keyboard.type('hello locator window')
+      await page.keyboard.press('Enter')
+      const argvCountBeforeKill = (await readArgvLog(argLogPath)).length
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+
+      // Wait for the pane to settle post-restart.
+      await expect
+        .poll(async () => {
+          const l = await findLeafById(harness, tabId, leaf.id)
+          const tid = l?.content?.terminalId ?? null
+          return tid && tid !== leaf.content.terminalId ? tid : null
+        }, { timeout: 30_000 })
+        .not.toBeNull()
+
+      // TARGET CONTRACT (§2.4/§4.2): EITHER resumed with a ses_ id, OR a
+      // visible fresh-by-race breadcrumb. Silent fresh is the failure.
+      const resumed = (await readArgvLog(argLogPath))
+        .slice(argvCountBeforeKill)
+        .some((e) => e.argv.includes('--session'))
+      const breadcrumbVisible = await page
+        .getByText(/couldn't be resumed|could not be resumed|fresh session/i)
+        .first()
+        .isVisible()
+        .catch(() => false)
+      expect(resumed || breadcrumbVisible).toBe(true)
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('two-clients-same-sessionRef: duplicate respawn must yield exactly 1 PTY', async ({
+    page,
+    browser,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    // EXPECTED-FAIL WALL PIN -- P1.7 (D8, §4.3): dedupe keys on
+    // createRequestId only; two clients holding the same sessionRef carry
+    // different createRequestIds, so BOTH respawn -> two PTYs -> two JSONL
+    // writers on one session file. FLIP when sessionRef-level single-flight
+    // lands (Phase 3 multi-client spec).
+    test.fail(
+      e2eServerKind === 'rust',
+      'P1.7 (D8): two clients on one sessionRef respawn two PTYs after SIGKILL',
+    )
+    const CODEX_SESSION_ID = '77777777-6666-4555-8444-333333333333'
+    const SESSION_TITLE = 'two-client codex session'
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-twoclient-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const argLogPath = path.join(sharedRoot, 'codex-argv.jsonl')
+    const fakeCodexPath = await installFakeCli(
+      FAKE_CODEX_CLI_SOURCE,
+      'codex',
+      path.join(sharedRoot, 'bin'),
+    )
+    const { server, harness, info } = await bootWall(page, {
+      env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
+      setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
+    })
+    const contextB = await browser.newContext()
+    const pageB = await contextB.newPage()
+    try {
+      // Client A opens the seeded session from the sidebar.
+      await selectShellIfPickerShowing(page)
+      await page.getByText(SESSION_TITLE, { exact: false }).first().click()
+      const tabIdA = (await harness.getActiveTabId())!
+      await expect
+        .poll(async () => (await harness.getPaneLayout(tabIdA))?.content?.sessionRef?.sessionId ?? null, {
+          timeout: 20_000,
+        })
+        .toBe(CODEX_SESSION_ID)
+
+      // Client B (separate context = separate localStorage) does the same.
+      await pageB.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const harnessB = new TestHarness(pageB)
+      await harnessB.waitForHarness()
+      await harnessB.waitForConnection()
+      await selectShellIfPickerShowing(pageB)
+      await pageB.getByText(SESSION_TITLE, { exact: false }).first().click()
+      const tabIdB = (await harnessB.getActiveTabId())!
+      await expect
+        .poll(async () => (await harnessB.getPaneLayout(tabIdB))?.content?.sessionRef?.sessionId ?? null, {
+          timeout: 20_000,
+        })
+        .toBe(CODEX_SESSION_ID)
+
+      const argvCountBeforeKill = (await readArgvLog(argLogPath)).length
+
+      // --- SIGKILL; both live clients race to respawn the same sessionRef. ---
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+      await waitForWsReady(pageB)
+
+      // Let both recovery rounds fully settle before counting.
+      const countRespawns = async () =>
+        (await readArgvLog(argLogPath))
+          .slice(argvCountBeforeKill)
+          .filter((e) => hasResumePair(e.argv, CODEX_SESSION_ID)).length
+      await expect
+        .poll(countRespawns, { timeout: 45_000 })
+        .toBeGreaterThan(0)
+      // STABLE-COUNT settle (not a fixed sleep): accept only when two samples
+      // >=5s apart agree, so a tail-latency straggler cannot make the count
+      // read 1 spuriously -- an unexpected PASS of this pin is a hard suite
+      // failure. Under today's bug the stable count is 2 (pin holds); when
+      // sessionRef single-flight lands it is 1 (pin flips loudly).
+      await expect
+        .poll(
+          async () => {
+            const first = await countRespawns()
+            await page.waitForTimeout(5_000)
+            const second = await countRespawns()
+            return second === first ? second : null
+          },
+          { timeout: 60_000 },
+        )
+        .not.toBeNull()
+
+      // TARGET CONTRACT (§4.3 multi-client single-flight): EXACTLY 1 PTY.
+      const respawns = (await readArgvLog(argLogPath))
+        .slice(argvCountBeforeKill)
+        .filter((e) => hasResumePair(e.argv, CODEX_SESSION_ID))
+      expect(respawns.length).toBe(1)
+    } finally {
+      await contextB.close()
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('freshclaude busy-restart: a pane that was BUSY at SIGKILL must not wedge BUSY', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    // PREDICTED-FAIL P0.2 (§2.8.1) but OBSERVED GREEN (run of 2026-07-24), so
+    // per the decision rule this test is NOT pinned. The plan predicted a
+    // forever-BUSY wedge (freshAgent.attach for claude is silently swallowed,
+    // crates/freshell-ws/src/terminal.rs:535-553, so no lost frame arrives).
+    // Observed: after SIGKILL+reload the pane's status LEAVES 'running' --
+    // claude fresh-agent identity is never persisted (claude.rs:94-96,247 +
+    // persistMiddleware.ts:245-266), so the rehydrated pane comes back in the
+    // pre-create shape rather than a wedged BUSY one. The §2.8.1 wedge
+    // (attach-swallow) is thus masked by the earlier P0.2 identity gap; the
+    // pane-level Contract G pin above still covers that gap. If a partial
+    // P0.2 fix lands identity persistence WITHOUT the attach arm, this test
+    // goes red -- pin it P0.2 (§2.8.1) at that point.
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-fcbusy-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const { server, harness } = await bootWall(page, {
+      env: {
+        FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE,
+        FAKE_CLAUDE_SIDECAR_HOLD_TURN: '1',
+      },
+      setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
+      // Boot-picker fade-out guard before createFreshclaudePane opens the
+      // pane picker (same as Contract G and every sibling).
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      await createFreshclaudePane(page, harness, projectDir)
+
+      // Send a turn that NEVER completes (HOLD_TURN) -> status running.
+      const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+      await expect
+        .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.status, {
+          timeout: 20_000,
+        })
+        .toBe('idle')
+      await paneRoot.getByRole('textbox', { name: 'Chat message input' }).fill('busy turn')
+      await paneRoot.getByRole('button', { name: 'Send' }).click()
+      await expect
+        .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.status, {
+          timeout: 20_000,
+        })
+        .toBe('running')
+
+      await flushPersistence(page)
+
+      // --- SIGKILL while BUSY, revive, reload (client re-attaches). ---
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+      await reloadAndReconnect(page, harness)
+
+      // TARGET CONTRACT (§2.8.1): within 45s the pane must LEAVE 'running' --
+      // any surfaced terminal state (lost/error/idle) is acceptable; a
+      // forever-running status is the wedge.
+      const rehydratedTabId = (await harness.getActiveTabId())!
+      await expect
+        .poll(
+          async () =>
+            findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))?.content?.status ?? null,
+          { timeout: 45_000 },
+        )
+        .not.toBe('running')
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('double-restart mid-recovery: a second SIGKILL during recovery must not duplicate or wedge', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    // OBSERVE-THEN-PIN -- if red, pin P1.7 (§4.3): respawn caps and keyed-
+    // create dedupe are dormant (paneReconcileV1 never sent), so a restart
+    // landing mid-recovery can double-create or dead-end panes (F9).
+    const CODEX_SESSION_ID = '55555555-4444-4333-8222-111111111111'
+    const SESSION_TITLE = 'double-restart codex session'
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-dblrestart-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const argLogPath = path.join(sharedRoot, 'codex-argv.jsonl')
+    const fakeCodexPath = await installFakeCli(
+      FAKE_CODEX_CLI_SOURCE,
+      'codex',
+      path.join(sharedRoot, 'bin'),
+    )
+    const { server, harness } = await bootWall(page, {
+      env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
+      setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+      await page.getByText(SESSION_TITLE, { exact: false }).first().click()
+      const tabId = (await harness.getActiveTabId())!
+      await expect
+        .poll(async () => (await harness.getPaneLayout(tabId))?.content?.terminalId ?? null, {
+          timeout: 20_000,
+        })
+        .not.toBeNull()
+      const tabCountBefore = await harness.getTabCount()
+      const argvCountBeforeKill = (await readArgvLog(argLogPath)).length
+
+      // First SIGKILL; wait until recovery is IN FLIGHT (a new spawn hit the
+      // argv log), then SIGKILL again mid-recovery.
+      await server.restartAbrupt()
+      await expect
+        .poll(async () => (await readArgvLog(argLogPath)).length, { timeout: 45_000 })
+        .toBeGreaterThan(argvCountBeforeKill)
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+
+      // CONTRACT: the pane settles resumed on the same session -- exactly one
+      // pane, same tab count, not status:error, resumed argv in the final
+      // recovery round.
+      await expect(async () => {
+        expect(await harness.getTabCount()).toBe(tabCountBefore)
+        const content = (await harness.getPaneLayout(tabId))?.content
+        expect(content?.status).not.toBe('error')
+        expect(content?.sessionRef?.sessionId).toBe(CODEX_SESSION_ID)
+        expect(content?.terminalId).toBeTruthy()
+      }).toPass({ timeout: 60_000 })
+      // No duplicate codex panes anywhere.
+      const state = await harness.getState()
+      const layouts = state?.panes?.layouts ?? {}
+      let codexLeaves = 0
+      for (const layout of Object.values(layouts)) {
+        codexLeaves += collectLeaves(layout).filter(
+          (l) => l?.content?.sessionRef?.sessionId === CODEX_SESSION_ID,
+        ).length
+      }
+      expect(codexLeaves).toBe(1)
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('hidden-pane rebind: a background tab pane must rebind without being revealed', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    // PREDICTED-FAIL P1.11 (F8) but OBSERVED GREEN (run of 2026-07-24), so
+    // per the decision rule this test is NOT pinned. The plan predicted that
+    // hidden panes never send create/attach on reconnect; observed instead
+    // that the hidden tab's pane got a NEW terminalId without being revealed
+    // -- consistent with the ruler run, where the dead-terminal census
+    // reached hidden tabs' layouts and their resume argv polls went green.
+    // If F8's prediction materializes in some other composition, pin P1.11
+    // here at that point.
+    const { server, harness, info } = await bootWall(page)
+    try {
+      await selectShellIfPickerShowing(page)
+      const hiddenTabId = (await harness.getActiveTabId())!
+      const hiddenTerminalIdBefore: string = await expect
+        .poll(async () => (await harness.getPaneLayout(hiddenTabId))?.content?.terminalId ?? null, {
+          timeout: 20_000,
+        })
+        .not.toBeNull()
+        .then(async () => (await harness.getPaneLayout(hiddenTabId))?.content?.terminalId)
+
+      // Second tab becomes active; the first is now hidden.
+      await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
+      await harness.waitForTabCount(2)
+      await expect
+        .poll(async () => harness.getActiveTabId(), { timeout: 15_000 })
+        .not.toBe(hiddenTabId)
+
+      // --- SIGKILL + revive; do NOT touch the hidden tab. ---
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+
+      // TARGET CONTRACT (F8): the HIDDEN pane rebinds (new terminalId) within
+      // 30s without being revealed.
+      await expect
+        .poll(async () => {
+          const tid = (await harness.getPaneLayout(hiddenTabId))?.content?.terminalId ?? null
+          return tid && tid !== hiddenTerminalIdBefore ? tid : null
+        }, { timeout: 30_000 })
+        .not.toBeNull()
+    } finally {
+      await server.stop()
+    }
+  })
 })
