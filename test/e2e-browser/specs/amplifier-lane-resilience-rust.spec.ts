@@ -320,4 +320,128 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+
+  test('abrupt server death mid-turn: lane re-attaches after restore and status flows again', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-restart-'))
+    const amplifierHome = path.join(sharedRoot, 'amplifier-home')
+    let capture: WsCapture | null = null
+    let capture2: WsCapture | null = null
+    let server: RustServer | null = null
+    try {
+      const fakeAmplifier = await installFakeCli(path.join(sharedRoot, 'bin'), 'amplifier', FAKE_AMPLIFIER_CLI)
+      server = new RustServer({
+        env: {
+          AMPLIFIER_CMD: fakeAmplifier,
+          AMPLIFIER_HOME: amplifierHome,
+          // Turn far outlives the restart: the pane is provably BUSY at death.
+          FAKE_AMPLIFIER_TURN_MS: '120000',
+        },
+        setupHome: seedAmplifierProvider,
+      })
+      const info = await server.start()
+      capture = new WsCapture(info.baseUrl, info.token)
+      await capture.ready()
+      const harness = await bootAndConnect(page, info)
+      const tabId = await harness.getActiveTabId()
+      const terminalId = await openCliPaneAndGetTerminalId(page, harness, tabId!, /Amplifier/i, 'amplifier')
+      await expect
+        .poll(async () => {
+          const buffer = await harness.getTerminalBuffer(terminalId)
+          return typeof buffer === 'string' && buffer.includes('amplifier>')
+        }, { timeout: 15_000 })
+        .toBe(true)
+
+      await typePromptIntoLastPane(page, 'long running turn')
+      // Wait for the LOCATOR ASSOCIATION to land (bind upsert carrying the
+      // fake session id), not just provisional busy: the association is what
+      // persists the sessionRef that restore resumes from.
+      await capture.waitFor(
+        (f) =>
+          f.type === 'amplifier.activity.updated' &&
+          f.upsert?.some(
+            (r: any) =>
+              r.terminalId === terminalId &&
+              typeof r.sessionId === 'string' &&
+              r.sessionId.startsWith('fake-amp-'),
+          ),
+        30_000,
+        'association bound before death',
+      )
+      // Durable-persistence gate (validated in Stage 2): the durable copy of
+      // the association is CLIENT-side — the page's store flushes the layout
+      // synchronously when it applies the association (persistMiddleware.ts
+      // :686-687 bypasses the debounce). WsCapture above is a SEPARATE ws
+      // connection, so also wait until the page itself shows the bound
+      // session before killing the server. (Field name: copy the pane
+      // content shape the client binds at App.tsx:968-981 if it differs.)
+      await expect
+        .poll(async () => {
+          const layout = await harness.getPaneLayout(tabId!)
+          const leaves = collectLeaves(layout?.root ?? layout)
+          const amp = leaves.find((l: any) => l?.content?.terminalId === terminalId)
+          const ref =
+            amp?.content?.sessionRef?.sessionId ?? amp?.content?.resumeSessionId ?? ''
+          return typeof ref === 'string' && ref.startsWith('fake-amp-')
+        }, { timeout: 15_000 })
+        .toBe(true)
+      capture.close()
+      capture = null
+
+      // ABRUPT DEATH: SIGKILL the server process group, then reboot on the
+      // same home/port/token. The page recovers via WS auto-reconnect.
+      await server.restartAbrupt()
+
+      const harness2 = new TestHarness(page)
+      await harness2.waitForConnection(30_000)
+
+      // The restored amplifier pane gets a NEW terminal id (resume respawn).
+      let restoredId = ''
+      await expect
+        .poll(async () => {
+          const layout = await harness2.getPaneLayout(tabId!)
+          const leaves = collectLeaves(layout?.root ?? layout)
+          const amp = leaves.find(
+            (l: any) =>
+              l?.content?.mode === 'amplifier' &&
+              typeof l?.content?.terminalId === 'string' &&
+              l.content.terminalId.length > 0 &&
+              l.content.terminalId !== terminalId,
+          )
+          restoredId = amp?.content?.terminalId ?? ''
+          return restoredId.length > 0
+        }, { timeout: 30_000 })
+        .toBe(true)
+
+      capture2 = new WsCapture(info.baseUrl, info.token)
+      await capture2.ready()
+
+      // The resume path attaches the events lane at Eof. Prove it is LIVE by
+      // appending records directly -- status can only flow through the lane.
+      const eventsPath = await findEventsFile(amplifierHome)
+      await fs.appendFile(eventsPath, record('prompt:submit'))
+      await capture2.waitFor(
+        (f) =>
+          f.type === 'amplifier.activity.updated' &&
+          f.upsert?.some((r: any) => r.terminalId === restoredId && r.phase === 'busy'),
+        30_000,
+        'post-restart busy via re-attached lane',
+      )
+      await fs.appendFile(eventsPath, record('prompt:complete'))
+      const complete = await capture2.waitFor(
+        (f) => f.type === 'terminal.turn.complete' && f.terminalId === restoredId,
+        30_000,
+        'post-restart turn complete via re-attached lane',
+      )
+      expect(complete.provider).toBe('amplifier')
+    } finally {
+      capture?.close()
+      capture2?.close()
+      await server?.stop().catch(() => {})
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
