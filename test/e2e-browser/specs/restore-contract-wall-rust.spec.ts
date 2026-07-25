@@ -466,6 +466,19 @@ async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: stri
   // tolerate the banner -- never assert error-free UI chrome for freshclaude.
 }
 
+// --- browser pane helper (donor: browser-pane.spec.ts:8) -- consumed
+// verbatim by the ruler (Task 9); keep the signature exact. ---
+
+async function createBrowserPaneInPage(page: Page): Promise<void> {
+  const termContainer = page.locator('.xterm').first()
+  await termContainer.click({ button: 'right' })
+  await page.getByRole('menuitem', { name: /split horizontally/i }).click()
+  const browserButton = page.getByRole('button', { name: /^Browser$/i })
+  await expect(browserButton).toBeVisible({ timeout: 10_000 })
+  await browserButton.click()
+  await expect(page.getByPlaceholder('Enter URL...')).toBeVisible({ timeout: 10_000 })
+}
+
 // ---------------------------------------------------------------------------
 // The wall
 // ---------------------------------------------------------------------------
@@ -1147,6 +1160,115 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       const finalLeaf = findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))
       expect(finalLeaf?.content?.status).not.toBe('error')
       expect(finalLeaf?.content?.status).not.toBe('creating')
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  // Per plan §2.9: browser/editor panes are pure client state -- after
+  // SIGKILL+restart+reload the browser url and the editor filePath+viewMode
+  // must be intact. First-ever reload/restart coverage for these pane kinds.
+  test('browser and editor panes: state intact after SIGKILL restart', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-broweditor-'))
+    // FILE-BACKED editor pane: content.content never survives persistence
+    // (stripEditorContent blanks it at flush AND load, persistMiddleware.ts:
+    // 236-243,581 -- BY DESIGN); visible content re-materializes only via
+    // file re-fetch on mount (EditorPane.tsx:450-463, connection-gated).
+    // PLAINTEXT file, not markdown: the mount re-fetch recomputes
+    // viewMode = resolveViewMode(path, language) (EditorPane.tsx:399,122-127)
+    // and forces 'preview' for previewable files (markdown/html), clobbering
+    // the dispatched 'source' and unmounting Monaco -- a fixture artifact,
+    // not a restore red. Plaintext resolves 'source', keeping the §2.9
+    // viewMode round-trip + Monaco-visible-marker assertions honest.
+    const editorMarker = `wall-editor-${Math.random().toString(36).slice(2, 8)}`
+    const editorFilePath = path.join(sharedRoot, 'wall-editor.txt')
+    await fs.writeFile(editorFilePath, `wall\n\n${editorMarker}\n`)
+    const { server, harness, info } = await bootWall(page)
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
+      // Wait for the boot pane to become a REAL terminal before right-clicking
+      // it, else the boot picker's fade-out swallows the interaction (same
+      // guard as Contracts B/D/E/F/G -- kept in the TEST BODY so the produced
+      // helper stays verbatim for the Task 9 ruler).
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+
+      // Browser pane with a concrete URL.
+      await createBrowserPaneInPage(page)
+      const urlInput = page.getByPlaceholder('Enter URL...')
+      await urlInput.fill(`${info.baseUrl}/api/health`)
+      await urlInput.press('Enter')
+      const iframe = page.locator('iframe[title="Browser content"]')
+      await iframe.waitFor({ state: 'attached', timeout: 10_000 })
+
+      // Editor pane via Redux dispatch, file-backed: empty content + filePath
+      // makes EditorPane auto-fetch the file on mount (EditorPane.tsx:450-463).
+      await page.evaluate(
+        ({ currentTabId, filePath }) => {
+          const harnessApi = (window as any).__FRESHELL_TEST_HARNESS__
+          const state = harnessApi?.getState()
+          const paneId = state?.panes?.activePane?.[currentTabId]
+          harnessApi?.dispatch({
+            type: 'panes/splitPane',
+            payload: {
+              tabId: currentTabId,
+              paneId,
+              direction: 'horizontal',
+              newPaneId: 'pane-wall-editor',
+              newContent: {
+                kind: 'editor',
+                filePath,
+                language: 'plaintext',
+                content: '',
+                readOnly: false,
+                viewMode: 'source',
+              },
+            },
+          })
+        },
+        { currentTabId: tabId, filePath: editorFilePath },
+      )
+      await expect(page.locator('.monaco-editor').getByText(editorMarker)).toBeVisible({
+        timeout: 20_000,
+      })
+
+      await flushPersistence(page)
+
+      // --- SIGKILL + revive, then reload. ---
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+      await reloadAndReconnect(page, harness)
+
+      // CONTRACT §2.9: browser url intact; editor filePath+viewMode intact
+      // and visible content re-materialized from the FILE. Do NOT assert
+      // content.content in Redux -- it is '' by design (stripEditorContent,
+      // persistMiddleware.ts:236-243,581): a red there would be a TEST BUG,
+      // never a product regression to pin.
+      const rehydratedTabId = (await harness.getActiveTabId())!
+      await expect
+        .poll(async () => {
+          const layout = await harness.getPaneLayout(rehydratedTabId)
+          const browserLeaf = collectLeaves(layout).find((l) => l?.content?.kind === 'browser')
+          return browserLeaf?.content?.url ?? null
+        }, { timeout: 30_000 })
+        .toContain('/api/health')
+      const layout = await harness.getPaneLayout(rehydratedTabId)
+      const editorLeaf = collectLeaves(layout).find((l) => l?.content?.kind === 'editor')
+      expect(editorLeaf?.content?.viewMode).toBe('source')
+      expect(editorLeaf?.content?.filePath).toBe(editorFilePath)
+      // Re-fetch is ASYNC and gated on connection ready (EditorPane.tsx:
+      // 454-457) -- poll for the visible content, never assert immediately.
+      await expect(page.locator('.monaco-editor').getByText(editorMarker)).toBeVisible({
+        timeout: 30_000,
+      })
+      await expect(page.getByPlaceholder('Enter URL...')).toHaveValue(/\/api\/health/, {
+        timeout: 15_000,
+      })
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
