@@ -493,23 +493,13 @@ async function installDualRoleCodex(binDir: string, argLogPath: string): Promise
   const target = path.join(binDir, 'codex')
   const script = `#!/usr/bin/env node
 const { spawnSync } = require('node:child_process')
-const fs = require('node:fs')
-const path = require('node:path')
 const argv = process.argv.slice(2)
 if (argv.includes('app-server')) {
   const result = spawnSync(process.execPath, [${JSON.stringify(FAKE_CODEX_APP_SERVER_SOURCE)}, ...argv], { stdio: 'inherit', env: process.env })
   process.exit(result.status ?? 1)
 }
-const logPath = ${JSON.stringify(argLogPath)}
-fs.mkdirSync(path.dirname(logPath), { recursive: true })
-fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, t: Date.now(), argv }) + '\\n')
-const resumeIndex = argv.indexOf('resume')
-if (resumeIndex !== -1) {
-  process.stdout.write('codex: resumed session ' + (argv[resumeIndex + 1] ?? '') + '\\r\\n')
-} else {
-  process.stdout.write('codex> \\r\\n')
-}
-process.stdin.resume()
+const result = spawnSync(process.execPath, [${JSON.stringify(FAKE_CODEX_CLI_SOURCE)}, ...argv], { stdio: 'inherit', env: { ...process.env, FAKE_CODEX_ARGV_LOG: ${JSON.stringify(argLogPath)} } })
+process.exit(result.status ?? 1)
 `
   await fs.writeFile(target, script, 'utf8')
   await fs.chmod(target, 0o755)
@@ -1358,7 +1348,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // per-pane pin is retired.
     test.fail(
       e2eServerKind === 'rust',
-      'P0.1: composed all-pane ruler; red until F8 (P1.11) + P0.2..P1.13 land',
+      'P0.1: composed all-pane ruler; red until P0.2 (freshclaude identity) + remaining P1.x land',
     )
 
     const CODEX_SESSION_ID = '99999999-8888-4777-8666-555555555555'
@@ -1450,7 +1440,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
               newContent: {
                 kind: 'editor',
                 filePath,
-                language: 'markdown',
+                language: 'plaintext',
                 content: '',
                 readOnly: false,
                 viewMode: 'source',
