@@ -7,7 +7,7 @@
 
 **Goal:** Port the legacy per-connection `terminal.create` sliding-window rate limit (with `restore:true` bypass) into the Rust server, and add a new server-wide bounded-concurrency PTY spawn gate, so the frozen client's existing `RATE_LIMITED` retry ladder becomes live and restart storms can no longer spawn unbounded concurrent PTYs.
 
-**Architecture:** Two small new modules in `crates/freshell-ws` — `create_limit.rs` (per-connection sliding-window limiter + boot config) and `spawn_gate.rs` (server-wide FIFO-fair `tokio::sync::Semaphore` gate with queue-depth cap and acquire timeout) — wired into `handle_create` in `crates/freshell-ws/src/terminal.rs`. The limiter is a per-connection local in `terminal::run` (mirroring `output_queue`); the gate is an `Arc` on `WsState`. No protocol change: `ErrorCode::RateLimited` already exists in the frozen enum with zero call sites.
+**Architecture:** Two small new modules in `crates/freshell-ws` — `create_limit.rs` (per-connection sliding-window limiter + boot config) and `spawn_gate.rs` (server-wide FIFO-fair `tokio::sync::Semaphore` gate with queue-depth cap and acquire timeout) — wired into `handle_create` in `crates/freshell-ws/src/terminal.rs`. The limiter is a per-connection local in `terminal::run` (mirroring `output_queue`); the gate is an `Arc` on `WsState`. The synchronous `registry.create` call is wrapped in `tokio::task::spawn_blocking` while the permit is held (validated necessity: on hosts with `nproc <= spawn_concurrency`, inline blocking spawns would wedge every tokio worker INCLUDING the timer driver, deadlocking the whole server — see Task 4). No protocol change: `ErrorCode::RateLimited` already exists in the frozen enum with zero call sites.
 
 **Tech Stack:** Rust (tokio, axum WS, serde), Playwright e2e (`test/e2e-browser/`), vitest (untouched — no Node server or client changes).
 
@@ -17,8 +17,9 @@
 - **Do NOT touch:** `activity.rs`/`idle.rs` (Lanes A/B/D), `codex_candidate.rs`/`codex.rs` (Lane D), client `src/` (Lane C — the frozen client ladder must work UNCHANGED against the new server-side limit; if a client change ever seems required, STOP and report instead of changing the client). No kimi/gemini/opencode work.
 - **Wire contract (pinned, byte-compatible with legacy `sendError`, `server/ws-handler.ts:1688-1712`):**
   `{"type":"error","code":"RATE_LIMITED","message":"Too many terminal.create requests","timestamp":"<ISO>","requestId":"<echo of create.requestId>"}` — no `retryAfter`, no extra keys (the generated contract `port/contract/ws-server-messages.schema.json` declares `additionalProperties:false` for `messages.error`). The client detects: `msg.type === 'error' && msg.requestId === <its requestId> && msg.code === 'RATE_LIMITED'` (`src/components/TerminalView.tsx:3995-3996`), retries the SAME requestId with delays 2s, 4s, 8s, 12s, 12s (5 attempts, ~38s total patience).
-- **Legacy parity numbers (server/ws-handler.ts:240-241, 2376-2389):** limit **10** creates per **10_000 ms** sliding window, per WS connection; env `TERMINAL_CREATE_RATE_LIMIT` / `TERMINAL_CREATE_RATE_WINDOW_MS` with `Number(env || default)` semantics (zero/invalid → default); prune predicate strict (`now - t < windowMs` survives); rejected creates consume NO budget (timestamp recorded on accept only); `restore:true` creates neither check nor record (`if (!m.restore)`).
-- **Gate semantics (new work, no legacy analogue — verified; do not hunt legacy for one):** restore creates ARE subject to the gate (it is exactly what protects restore storms); every gate wait must resolve far below the client's ~38s ladder patience.
+- **Legacy parity numbers (server/ws-handler.ts:240-241, 2376-2389):** limit **10** creates per **10_000 ms** sliding window, per WS connection; env `TERMINAL_CREATE_RATE_LIMIT` / `TERMINAL_CREATE_RATE_WINDOW_MS`; prune predicate strict (`now - t < windowMs` survives); rejected creates consume NO budget (timestamp recorded on accept only); `restore:true` creates neither check nor record (`if (!m.restore)`). **Env-parsing semantics (validated — legacy's edge behavior is a bug we deliberately do NOT copy):** legacy is `Number(env || default)`, so unset/`''` → default, but `'garbage'` → `NaN` → the limiter is silently DISABLED, and `'0'`/`'-5'` (truthy strings) → block ALL non-restore creates. Rust sanitizes instead: unset, unparseable, zero, or negative → default (`.filter(|&v| v > 0)`). Parity holds for the cases that matter (unset and valid positive values); the divergence is documented in `create_limit.rs`'s module doc.
+- **Gate semantics (new work, no legacy analogue — verified; do not hunt legacy for one):** restore creates ARE subject to the gate (it is exactly what protects restore storms); every gate wait must resolve far below the client's ~38s ladder patience. (Measured on this host: the permit-hold section — the synchronous spawn — is ~0.3ms, so a 30-create storm drains a concurrency-4 gate in ~10ms of cumulative wait.)
+- **KNOWN GAP (validated, accepted, documented — do NOT try to fix in this lane):** `handle_create` is NOT the only production PTY spawn path. `freshell-freshagent`'s `spawn_terminal_pane` (`crates/freshell-freshagent/src/terminal_tabs.rs:866`) calls `registry.create` via three token-authed REST routes — `POST /api/tabs`, `POST /api/panes/{id}/split`, `POST /api/panes/{id}/respawn` — mounted in production at `crates/freshell-server/src/main.rs:669`. These bypass both the limiter and the gate. Rationale for accepting: the restart-storm ingress this plan targets (the WSL-outage RCA scenario) is the WS path, which IS fully covered; freshell-freshagent cannot import freshell-ws (dependency direction — see the existing KNOWN GAP comment near `terminal_tabs.rs:820-840`), so sharing the gate needs a neutral-crate refactor that is out of this lane's scope; and the REST routes are already rate-bounded (not concurrency-bounded) by the unconditional SAFE-02 global HTTP token bucket (300-token burst, 5 req/s sustained — `main.rs:745-749` layers it over the merged freshagent router). Record a follow-up recommendation in the PR description: extend spawn-gate coverage to the REST spawn path via a shared/neutral home for the gate.
 - **E2E:** specs spin up their OWN Rust servers via `test/e2e-browser/helpers/rust-server.ts` (`RustServer`, ephemeral ports via `findFreePort`); NEVER ports 3001/3002 (the user's LIVE servers); NEVER restart the user's self-hosted Freshell server; keep `server.stop()` in `finally`. New specs = new files; `test/e2e-browser/playwright.config.ts` gets minimal appends (sibling lanes append too; trivial conflicts fine).
 - **TDD:** Red-Green-Refactor for every task; run the failing test and watch it fail before implementing.
 - **Coordinated suite etiquette:** `npm test` / `npm run check` wait for the shared coordinator gate; set `FRESHELL_TEST_SUMMARY` for broad runs; if another agent holds the gate, WAIT (four sibling lanes run concurrently). `cargo test` and Playwright e2e are NOT coordinator-gated.
@@ -43,9 +44,9 @@
 | ~17 other `WsState { .. }` literal sites (listed in Task 3) | Modify | add the two new fields with defaults |
 | `crates/freshell-ws/tests/common/mod.rs` | Modify | `spawn_server_with_create_protect(cfg)` harness variant |
 | `crates/freshell-ws/tests/create_protection.rs` | Create | real-socket integration tests: limit fires, restore bypass, wire-shape pin, gate smoke |
-| `test/e2e-browser/specs/create-protection-restore-storm-rust.spec.ts` | Create | 15-pane storm → `restartAbrupt()` → all restore, bypass proven |
+| `test/e2e-browser/specs/create-protection-restore-storm-rust.spec.ts` | Create | 15-pane reload storm → `restartAbrupt()` → limiter fires (non-restore recovery creates) → ladder recovers ALL panes |
 | `test/e2e-browser/specs/create-rate-limit-ladder-rust.spec.ts` | Create | non-restore flood → RATE_LIMITED fires → client ladder recovers |
-| `test/e2e-browser/specs/create-protection-isolation-rust.spec.ts` | Create | two concurrent RustServers; storm one; other unaffected |
+| `test/e2e-browser/specs/create-protection-isolation-rust.spec.ts` | Create | two concurrent RustServers; 2-connection restore storm on one (e2e bypass proof); other unaffected |
 | `test/e2e-browser/playwright.config.ts` | Modify | append the three spec regexes to `RUST_ONLY_SPECS` and the `rust-chromium` project's `testMatch` |
 
 Key existing facts (verified against this worktree; PR #530 already merged — these are post-merge line numbers):
@@ -55,8 +56,12 @@ Key existing facts (verified against this worktree; PR #530 already merged — t
 - Error frames: `send_create_error(ws_tx, ErrorCode, String, &request_id)` at `terminal.rs:1730-1747` builds `ServerMessage::Error(ErrorMsg { code, message, timestamp: crate::now_iso(), request_id: Some(..), .. })`.
 - `ErrorCode::RateLimited` exists (`crates/freshell-protocol/src/common.rs:74-97`) with zero call sites — no protocol change needed.
 - `state.registry.create(...)` call: `terminal.rs:1314-1359`, shaped `if let Err(err) = state.registry.create(/* 9 args */) { cleanup; return send_create_error(PtySpawnFailed, ...) }`. It is a synchronous blocking call (`crates/freshell-terminal/src/registry.rs:679`).
-- Config exemplar: `Term09Config` (`crates/freshell-ws/src/backpressure.rs:51-112`) — struct + `Default` + `from_env()` with private `env_usize`/`env_u64` helpers (`.filter(|&v| v > 0)` matches legacy `||` semantics) → `WsState.term09` field (`lib.rs:192-193`) → wired at `crates/freshell-server/src/main.rs:446`.
-- `tokio = { features = ["sync", ...] }` already in freshell-ws — `Semaphore` needs no Cargo.toml change. tokio's `Semaphore` is FIFO-fair: released permits go to queued waiters in order, and `try_acquire_owned` fails while waiters are queued, so a fast path cannot barge.
+- Config exemplar: `Term09Config` (`crates/freshell-ws/src/backpressure.rs:51-112`) — struct + `Default` + `from_env()` with private `env_usize`/`env_u64` helpers (`.filter(|&v| v > 0)` — a deliberate sanitization, NOT byte-parity with legacy `Number(env || default)`; see the env-parsing note in Global Constraints) → `WsState.term09` field (`lib.rs:192-193`) → wired at `crates/freshell-server/src/main.rs:446`.
+- `tokio = { features = ["sync", ...] }` already in freshell-ws — `Semaphore` needs no Cargo.toml change. tokio's `Semaphore` (workspace pins tokio **1.52.3**; fairness and cancel-safety were verified against that version's source) is FIFO-fair: released permits go to queued waiters in order, and `try_acquire_owned` fails while waiters are queued, so a fast path cannot barge. `timeout(acquire_owned())` is leak-free: a dropped acquire future unlinks its queue slot and returns any raced permit (`Drop for Acquire`, batch_semaphore.rs:686-708). Two cautions: NEVER call `OwnedSemaphorePermit::forget()` (it permanently shrinks gate capacity), and re-verify these guarantees on any future tokio major/minor bump.
+- Frozen-client restore semantics after abrupt restart + reload (validated end-to-end, post-PR #531): persisted panes keep `terminalId`, so reload goes attach → `INVALID_TERMINAL_ID` → re-create. Only panes with a durable `sessionRef` (coding-CLI panes) re-create with `restore:true`; plain SHELL panes take the fresh-recovery carve-out (`TerminalView.tsx:4105-4135`, `App.tsx:1015-1040`) and send NON-restore creates (`recoveryIntent: 'fresh_after_restore_unavailable'`, no `restore` key) which the limiter counts — legacy counts them identically (`if (!m.restore)`). Consequence: a 15-shell-pane reload storm DOES trip the limiter and recovers via the client ladder; that is the correct, legacy-parity behavior, and Task 5 asserts exactly that. `recoveryIntent` needs no special handling server-side: Rust checks only `create.restore`.
+- Client settings gotcha for e2e (validated): the tab-add button honors the SERVER setting `panes.defaultNewPane`, whose default is `'ask'` → new tabs mount PICKER panes and fire ZERO `terminal.create`s. E2E specs that flood via tab-add MUST seed `settings.panes.defaultNewPane: 'shell'` (exact lowercase) in `<home>/.freshell/config.json` via the fixture's `setupHome` — the wizard-bypass write spread-preserves it (`rust-server.ts:184-195`), the server deep-merges it, and `/api/bootstrap` delivers it. Precedent: `specs/settings-persistence-split.spec.ts:13-46`. Caution: an invalid value silently discards the WHOLE persisted settings tree (`settings_store.rs:1279`) — assert `GET /api/settings` shows `'shell'` before flooding.
+- Log observability chain for e2e (validated): fixture sets `FRESHELL_LOG_DIR` → server writes `<logsDir>/rust-server.jsonl`, default `EnvFilter` is `info`, event message strings land verbatim in the `msg` field, and `restartAbrupt()` re-opens append-mode (nothing lost). Hardening: the fixture spreads `process.env`, so an inherited `RUST_LOG=error` would suppress the WARN events — Tasks 5/6 pass `env: { RUST_LOG: 'info' }` explicitly.
+- `ErrorMsg` wire shape (validated): all five `Option` fields carry `skip_serializing_if`, envelope is internally tagged — `send_create_error` emits exactly `{type, code, message, timestamp, requestId}`. (Side finding, pre-existing and unrelated: reconcile error codes are missing from the schema's `code` enum; `RATE_LIMITED` IS present.)
 - `crates/freshell-server/src/rate_limit.rs` was read and is NOT reusable: it is a process-global HTTP token bucket (not a sliding window, not per-connection), and `freshell-ws` cannot import from `freshell-server` (dependency direction is server → ws). Its injectable-clock test style is the template we copy.
 - Do NOT read stale line numbers from the campaign plan for `terminal.rs` — the numbers above are post-#530.
 
@@ -86,12 +91,19 @@ Create `crates/freshell-ws/src/create_limit.rs` containing ONLY the test module 
 //!
 //! Legacy semantics reproduced EXACTLY:
 //! - default 10 creates per 10_000 ms sliding window, per WS connection
-//! - env `TERMINAL_CREATE_RATE_LIMIT` / `TERMINAL_CREATE_RATE_WINDOW_MS`,
-//!   `Number(env || default)` semantics: zero/unparseable falls back to default
+//! - env `TERMINAL_CREATE_RATE_LIMIT` / `TERMINAL_CREATE_RATE_WINDOW_MS`
+//!   (same names; parsing deliberately DIVERGES — see below)
 //! - prune predicate is strict: a timestamp survives while `now - t < window`
 //! - a REJECTED create consumes no budget (timestamps push on accept only)
 //! - `restore:true` creates bypass the limiter entirely (the CALLER enforces
 //!   the bypass; this type is bypass-agnostic)
+//!
+//! Deliberate env-parsing divergence from legacy: legacy is
+//! `Number(env || default)`, which silently DISABLES the limiter on an
+//! unparseable value (`NaN` comparisons are false) and blocks ALL creates on
+//! `'0'`/negatives (truthy strings). We sanitize instead: unset, unparseable,
+//! zero, or negative -> default. Parity holds for unset and valid positive
+//! values — the cases that matter.
 //!
 //! The spawn-gate knobs (new Rust-side work, no legacy analogue — see
 //! [`crate::spawn_gate`]) live in the same config struct to keep the
@@ -126,8 +138,9 @@ impl Default for CreateProtectConfig {
     }
 }
 
-/// `Number(env || default)` parity (same shape as the private helpers in
-/// `crate::backpressure`): unset, unparseable, or zero -> default.
+/// Sanitizing env parse (same shape as the private helpers in
+/// `crate::backpressure`): unset, unparseable, zero, or negative -> default.
+/// Deliberately saner than legacy `Number(env || default)` — see module doc.
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -322,8 +335,9 @@ git commit -m "feat(rust): add per-connection terminal.create sliding-window lim
   - `spawn_gate::SpawnGateError` — `enum { QueueFull, Timeout }` (derives `Debug, Clone, Copy, PartialEq, Eq`)
 
 **Design decisions (pinned):**
-- The permit is an RAII `OwnedSemaphorePermit`: dropped on completion, failure, or panic-unwind — no leaked permits on any exit path.
-- The timeout applies to permit ACQUISITION (queue wait). The spawn itself is a synchronous call that already blocks its own connection's select loop (pre-existing behavior, out of scope); while it holds a permit, a hung spawn occupies 1 of N permits, so the queue keeps draining through the remaining N-1 — that is how "one hung spawn can't block the queue" is satisfied. If ALL permits are wedged, queued waiters time out with a loud error frame instead of hanging forever.
+- The permit is an RAII `OwnedSemaphorePermit`: dropped on completion, failure, or panic-unwind — no leaked permits on any exit path. NEVER call `permit.forget()` — it permanently shrinks gate capacity. (Fairness + cancel-safety verified against the pinned tokio 1.52.3 source; re-verify on tokio bumps.)
+- The timeout applies to permit ACQUISITION (queue wait). The spawn itself runs inside `tokio::task::spawn_blocking` while the permit is held (Task 4) — validated as REQUIRED, not optional: with the spawn inline on worker threads, a host with `nproc <= spawn_concurrency` would have all workers (including tokio's timer driver) wedged by hung spawns, so even the gate timeouts could never fire. With spawn_blocking, a hung spawn occupies 1 of N permits plus a blocking-pool thread, the async workers stay free, and the queue keeps draining through the remaining N-1 permits — that is how "one hung spawn can't block the queue" is satisfied. If ALL permits are wedged, queued waiters time out with a loud error frame instead of hanging forever.
+- Accepted residual (documented, do not "fix"): if the gate is saturated ≥30s, a connection with 3+ queued creates can accumulate enough select-loop occupancy (creates are serialized per connection) to miss a keepalive ping tick and be terminated loudly. That only happens when every permit is wedged — exactly when failing loud is correct; the client reconnects and the ladder recovers.
 - FIFO fairness comes from tokio's fair `Semaphore` (released permits are handed to the oldest queued waiter; `try_acquire_owned` cannot barge past queued waiters).
 - Structured observability: `queued_total`/`queue_rejections`/`timeouts` counters + tracing events `spawn_gate_queued` (info), `spawn_gate_queue_full` (warn), `spawn_gate_timeout` (warn). Event NAMES are the log message string (repo convention, e.g. `terminal_identity_unresolved`) so e2e can grep server logs.
 
@@ -604,7 +618,7 @@ git commit -m "feat(rust): add FIFO-fair bounded-concurrency spawn gate with que
   - `handle_client_text` and `handle_create` each gain one parameter: `create_limiter: &mut crate::create_limit::CreateRateLimiter` (both already carry `#[allow(clippy::too_many_arguments)]`).
   - Harness: `pub async fn spawn_server_with_create_protect(cfg: freshell_ws::create_limit::CreateProtectConfig) -> String` in `tests/common/mod.rs`, returning the ws URL like the existing `spawn_server()`.
 
-**Placement decision (pinned):** the check is the FIRST statement of `handle_create` (before the §5.4 keyed-create claim loop at `terminal.rs:897`), so a rejected create never touches the keyed-create reservation or mints IDs. Divergence note vs legacy (which checks after requestId dedupe): the only flows that re-send duplicate requestIds in bulk are restore/reconcile flows, which carry `restore:true` and bypass entirely; the frozen client never bulk-sends non-restore duplicate-requestId creates, so the client-visible contract is identical.
+**Placement decision (pinned, validated):** the check goes AFTER the existing paneReconcileV1 requestId-dedupe short-circuit at the top of `handle_create` (`terminal.rs:889-898` — a deduped create must NOT be charged against the budget, matching legacy's dedupe-first ordering) and BEFORE the §5.4 keyed-create claim loop, so a rejected create never touches the keyed-create reservation or mints IDs. Honest divergence note vs legacy: legacy dedupes ALL duplicate requestIds before the limiter; Rust's dedupe exists only for paneReconcileV1-negotiating clients, and the frozen client never negotiates it (`ws-client.ts:343`). The frozen client DOES bulk re-send same-requestId creates on reconnect (`TerminalView.tsx:4227-4259` re-drive), and post-restart shell-pane creates are NON-restore (see Key existing facts) — against Rust those re-sends are counted by the limiter and, if rejected, recovered by the client's RATE_LIMITED ladder (same requestId, so the contract stays coherent). The underlying missing frozen-client dedupe (duplicate-PTY hazard when a `terminal.created` is lost to a disconnect) is a PRE-EXISTING Rust gap independent of this plan — do not fix it here; if it surfaces in testing, report it rather than expanding scope.
 
 - [ ] **Step 1: Write the failing integration tests**
 
@@ -896,10 +910,37 @@ Add `spawn_gate_error_parts` (code above) near `send_create_error` (`terminal.rs
     };
 ```
 
+Then wrap the synchronous `state.registry.create(...)` call at `terminal.rs:1314` in `tokio::task::spawn_blocking`, keeping the SAME error handling shape. This is REQUIRED, not optional (validated): `main.rs` is a bare `#[tokio::main]` (workers = nproc), so on hosts with `nproc <= spawn_concurrency` up to 4 inline blocking spawns would wedge every tokio worker — including the timer driver, so gate timeouts and keepalive ticks could never fire: server-wide deadlock, and a single hung spawn freezes a 1-CPU host entirely. Shape:
+
+```rust
+    // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
+    // spawns occupy a permit + a blocking thread, never an async worker
+    // (on small hosts, N inline blocking spawns would wedge the whole
+    // runtime including the timer driver). Permit stays held throughout.
+    let registry = state.registry.clone();
+    /* clone/move the 9 existing args into the closure */
+    let create_result = match tokio::task::spawn_blocking(move || {
+        registry.create(/* same 9 args, moved */)
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(join_err) => Err(std::io::Error::other(format!(
+            "terminal spawn task panicked: {join_err}"
+        ))),
+    };
+    if let Err(err) = create_result {
+        /* existing cleanup + send_create_error(PtySpawnFailed, ...) body, unchanged */
+    }
+```
+
+Adapt mechanically: args that are references get cloned into owned values before the closure (the compiler enumerates them); the `Err` arm's body is the EXISTING cleanup/error code, untouched.
+
 Notes for the implementer:
 - The early `return` path is safe: the §5.4 `KeyedCreateGuard` (RAII, `terminal.rs:869-878`) releases the keyed-create reservation on drop, same as every other early-return in this function.
-- Do NOT move or wrap the `state.registry.create(...)` call itself (no `spawn_blocking` refactor — explicitly out of scope; the permit being held across the existing synchronous call is the design).
-- The permit must cover the registry call AND the codex-adopt follow-up failure path directly below it (`:1367-1381`) is fine to leave inside the permit scope — the permit drops when `handle_create` returns.
+- The permit must cover the spawn_blocking await; the codex-adopt follow-up failure path directly below it (`:1367-1381`) is fine to leave inside the permit scope — the permit drops when `handle_create` returns.
+- Accepted residual (do not "fix"): under a fully wedged gate, serialized queued creates can stack select-loop waits past the 30s keepalive window and the storming connection gets terminated loudly — acceptable (fail loud, client reconnects); see Task 2's design decisions.
+- Do NOT touch `crates/freshell-terminal/src/registry.rs` — the spawn_blocking wrap lives entirely in `terminal.rs`; freshell-terminal stays tokio-free.
 
 - [ ] **Step 4: Run to verify green**
 
@@ -917,7 +958,17 @@ git commit -m "feat(rust): bound concurrent PTY spawns with FIFO spawn gate on t
 
 ---
 
-### Task 5: E2E — restore-storm spec (15 panes, abrupt restart, all restore, bypass proven)
+### Task 5: E2E — reload-storm spec (15 panes, abrupt restart, limiter fires, ladder recovers ALL panes)
+
+> **Validated premise correction:** after an abrupt restart + reload, plain
+> SHELL panes re-create with NON-restore (`recoveryIntent`) creates — only
+> sessionRef-bearing (coding-CLI) panes send `restore:true` (see Key existing
+> facts). So a 15-shell-pane reload storm legitimately TRIPS the limiter and
+> recovers via the frozen client's ladder — on legacy exactly as on Rust.
+> This spec asserts that real behavior (positive `terminal_create_rate_limited`
+> log grep = non-vacuous; every pane recovers = the ladder works end-to-end).
+> The restore-BYPASS e2e proof lives in Task 7's raw-WS restore flood, and at
+> the socket level in Task 3's `restore_creates_bypass_and_do_not_record`.
 
 **Files:**
 - Create: `test/e2e-browser/specs/create-protection-restore-storm-rust.spec.ts`
@@ -927,16 +978,21 @@ git commit -m "feat(rust): bound concurrent PTY spawns with FIFO spawn gate on t
 - Consumes: server behavior from Tasks 3-4 (default config: limit 10/10s, gate concurrency 4). Helpers copied per this suite's per-spec-ownership convention from `specs/compound-restart-rust.spec.ts` (`waitForWsReady`, `readServerLogs`) and `specs/restore-contract-wall-rust.spec.ts` (`collectLeaves`, `flushPersistence`, `reloadAndReconnect`).
 - Produces: nothing downstream.
 
-- [ ] **Step 1: Write the spec (red: it exercises restore-bypass behavior that only exists after Tasks 3-4 — run it once against a stub-free build to confirm it actually FAILS if you revert the server commits; in practice the red proof for e2e is running it on `origin/main`'s binary via `FRESHELL_E2E_RUST_SERVER_BIN` if convenient, otherwise document that Tasks 3-4 landed first and this spec pins them)**
+- [ ] **Step 1: Write the spec (red: the positive `terminal_create_rate_limited` log assertion only passes once Tasks 3-4 exist — on `origin/main`'s binary the burst is never rate limited, so the spec FAILS its non-vacuous grep; run it against `origin/main`'s binary via `FRESHELL_E2E_RUST_SERVER_BIN` if convenient, otherwise document that Tasks 3-4 landed first and this spec pins them)**
 
 ```ts
 /**
- * LANE E (create protection): restore-storm contract.
- * 15 terminal tabs -> SIGKILL restart (RustServer.restartAbrupt()) -> ALL
- * panes restore; the restore flood bypasses the create rate limit (server
- * log must NOT contain terminal_create_rate_limited) while the spawn gate
- * (default concurrency 4) is active. Owns its RustServer (ephemeral port,
+ * LANE E (create protection): reload-storm contract.
+ * 15 shell terminal tabs -> SIGKILL restart (RustServer.restartAbrupt()) ->
+ * the reload storm re-creates every pane with NON-restore (recoveryIntent)
+ * creates (validated frozen-client behavior post-PR #531), so the 15-burst
+ * TRIPS the 10/10s limiter (server log MUST contain
+ * terminal_create_rate_limited — non-vacuous) and the frozen client's
+ * RATE_LIMITED ladder recovers ALL panes, with the spawn gate (default
+ * concurrency 4) active throughout. Owns its RustServer (ephemeral port,
  * never the user's 3001/3002). Helpers copied per per-spec-ownership.
+ * Seeds panes.defaultNewPane:'shell' so tab-add mounts terminals directly
+ * (default 'ask' would create picker panes and fire ZERO creates).
  */
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -986,21 +1042,44 @@ async function allLeafTerminalIds(harness: TestHarness): Promise<(string | null)
 test.describe('Create protection: restore storm (Rust only)', () => {
   test.setTimeout(300_000)
 
-  test('15-pane storm survives abrupt restart; restore flood bypasses the rate limit', async ({ page, e2eServerKind }) => {
+  test('15-pane reload storm survives abrupt restart: limiter fires, ladder recovers all panes', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
-    const server = new RustServer({})
+    const server = new RustServer({
+      // An inherited RUST_LOG=error would suppress the WARN events this spec
+      // greps for (the fixture spreads process.env) — pin it.
+      env: { RUST_LOG: 'info' },
+      // Tab-add must mount shell terminals directly; the default
+      // panes.defaultNewPane:'ask' creates PICKER panes (zero creates).
+      // setupHome runs before the wizard-bypass write, which spread-preserves
+      // this seed (rust-server.ts:184-195); it re-runs on every boot, so the
+      // full-file write is idempotent. Value must be EXACT lowercase 'shell'
+      // (an invalid value silently discards the whole settings tree).
+      setupHome: async (homeDir) => {
+        const dir = path.join(homeDir, '.freshell')
+        await fs.mkdir(dir, { recursive: true })
+        await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify({
+          version: 1,
+          settings: { panes: { defaultNewPane: 'shell' } },
+        }, null, 2))
+      },
+    })
     const info: TestServerInfo = await server.start()
     try {
+      // Belt-and-suspenders: the seed actually took (converts a silent
+      // settings-tree fallback into a crisp failure here).
+      const settingsRes = await fetch(`${info.baseUrl}/api/settings`, {
+        headers: { 'x-auth-token': info.token },
+      })
+      expect(((await settingsRes.json()) as any)?.panes?.defaultNewPane).toBe('shell')
+
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
       const harness = new TestHarness(page)
       await harness.waitForHarness()
       await harness.waitForConnection()
+      await waitForWsReady(page) // also past /api/bootstrap settings hydration
 
-      // Boot picker -> first terminal.
-      for (const name of ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']) {
-        const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-        if (await button.isVisible().catch(() => false)) { await button.click(); break }
-      }
+      // With defaultNewPane:'shell' the first tab mounts a terminal directly
+      // (no boot picker).
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
       // Storm SETUP under the 10/10s limit: one tab per ~1.2s, waiting for
@@ -1031,8 +1110,11 @@ test.describe('Create protection: restore storm (Rust only)', () => {
       await harness.waitForConnection()
       await waitForWsReady(page)
 
-      // ALL panes restore: same tab count, every leaf re-anchors to a NEW
-      // live terminal, no pane in error status.
+      // ALL panes recover: same tab count, every leaf re-anchors to a NEW
+      // live terminal, no pane in error status. Shell panes re-create with
+      // NON-restore recoveryIntent creates; the 15-burst exceeds 10/10s, so
+      // ~5 get RATE_LIMITED and the frozen ladder retries them (2s/4s/8s
+      // cumulative — by ~14s the window has drained). 120s is generous.
       await expect.poll(() => harness.getTabCount(), { timeout: 60_000 }).toBe(TAB_COUNT)
       await expect.poll(async () => {
         const ids = await allLeafTerminalIds(harness)
@@ -1046,9 +1128,12 @@ test.describe('Create protection: restore storm (Rust only)', () => {
         }
       }
 
-      // Restore bypass proof: the restore flood must never trip the limiter.
+      // Non-vacuous proof the limiter actually fired on the reload storm
+      // (validated: post-restart shell-pane creates are non-restore, so a
+      // 15-burst MUST trip the 10/10s limit) — and the panes above still all
+      // recovered, which is the ladder working end-to-end.
       const logs = await readServerLogs(info.logsDir)
-      expect(logs).not.toContain('terminal_create_rate_limited')
+      expect(logs).toContain('terminal_create_rate_limited')
     } finally {
       await server.stop().catch(() => {})
     }
@@ -1074,7 +1159,7 @@ If lazy tab mounting makes background tabs restore only on visit, adapt by click
 
 ```bash
 git add test/e2e-browser/specs/create-protection-restore-storm-rust.spec.ts test/e2e-browser/playwright.config.ts
-git commit -m "test(e2e): restore storm survives abrupt restart with rate-limit bypass"
+git commit -m "test(e2e): reload storm survives abrupt restart via the frozen client ladder"
 ```
 
 ---
@@ -1099,6 +1184,8 @@ git commit -m "test(e2e): restore storm survives abrupt restart with rate-limit 
  * RATE_LIMITED frame; the client ladder (2/4/8/12/12s, same requestId)
  * recovers every pane WITHOUT any client change. Non-vacuous: the server
  * log must contain terminal_create_rate_limited.
+ * Seeds panes.defaultNewPane:'shell' (validated: the default 'ask' makes
+ * tab-add create PICKER panes — zero terminal.creates, vacuous test).
  */
 import fs from 'node:fs/promises'
 import path from 'node:path'
@@ -1108,24 +1195,31 @@ import { TestHarness } from '../helpers/test-harness.js'
 
 const TAB_COUNT = 15 // 15 burst creates: 10 accepted, 5 rate-limited
 
-// copy collectLeaves / allLeafTerminalIds / readServerLogs from Task 5's spec
+// copy collectLeaves / allLeafTerminalIds / readServerLogs / waitForWsReady
+// AND the setupHome defaultNewPane:'shell' seed from Task 5's spec
 
 test.describe('Create rate limit: client ladder recovery (Rust only)', () => {
   test.setTimeout(240_000)
 
   test('a non-restore create flood is rate limited and the ladder recovers all panes', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
-    const server = new RustServer({})
+    const server = new RustServer({
+      env: { RUST_LOG: 'info' }, // an inherited RUST_LOG=error would suppress the WARN grep
+      setupHome: /* same defaultNewPane:'shell' seed as Task 5 */,
+    })
     const info: TestServerInfo = await server.start()
     try {
+      // Seed took (guards the silent settings-tree fallback).
+      const settingsRes = await fetch(`${info.baseUrl}/api/settings`, {
+        headers: { 'x-auth-token': info.token },
+      })
+      expect(((await settingsRes.json()) as any)?.panes?.defaultNewPane).toBe('shell')
+
       await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
       const harness = new TestHarness(page)
       await harness.waitForHarness()
       await harness.waitForConnection()
-      for (const name of ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']) {
-        const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-        if (await button.isVisible().catch(() => false)) { await button.click(); break }
-      }
+      await waitForWsReady(page) // settings hydrated before the flood (bootstrap race)
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
 
       // BURST: rapid clicks, no waiting — every new tab mounts a fresh
@@ -1195,11 +1289,16 @@ git commit -m "test(e2e): frozen client ladder recovers a rate-limited create fl
 
 ```ts
 /**
- * LANE E (create protection): blast-radius isolation. Two concurrent
- * RustServer instances (first such spec — each has its own ephemeral port,
- * HOME, token, process group). Storm server A with restore creates over raw
- * WS while server B serves a browser session; B's health latency and
- * terminal interactivity must be unaffected.
+ * LANE E (create protection): blast-radius isolation + e2e restore-bypass
+ * proof. Two concurrent RustServer instances (first such spec — each has its
+ * own ephemeral port, HOME, token, process group). Storm server A with
+ * restore:true creates over raw WS from TWO connections (15 each — creates
+ * are serialized per connection server-side, so multiple connections are
+ * what puts parallel spawn pressure on the gate; the concurrency BOUND
+ * itself is pinned by Task 2/4 tests). 15 restore creates per connection
+ * inside one 10s window exceeds the 10/10s limit — every one succeeding IS
+ * the e2e restore-bypass proof. Meanwhile server B serves a browser session;
+ * B's health latency and terminal interactivity must be unaffected.
  */
 import { randomUUID } from 'node:crypto'
 import WebSocket from 'ws'
@@ -1208,7 +1307,8 @@ import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
 
-const STORM_CREATES = 30
+const STORM_CLIENTS = 2
+const CREATES_PER_CLIENT = 15 // > the 10/10s limit: succeeding proves restore bypass
 
 // copy the SyntheticClient class from reconcile-handshake-rust.spec.ts:61-165
 // (connect(info) does hello/ready; send(frame); waitFor(match, timeoutMs); close())
@@ -1237,23 +1337,36 @@ test.describe('Create protection: cross-server isolation (Rust only)', () => {
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await terminal.waitForPrompt({ timeout: 30_000 })
 
-      // Storm A over raw WS: restore:true shell creates (bypass A's rate
-      // limit so the SPAWN GATE does the bounding — 30 real PTY spawns).
-      const client = await SyntheticClient.connect(infoA)
+      // Storm A over raw WS from TWO connections (creates are serialized
+      // per connection server-side, so cross-connection is what exercises
+      // the gate in parallel): restore:true shell creates. 15 per
+      // connection inside one 10s window exceeds the 10/10s limit — every
+      // one succeeding proves the restore bypass e2e (30 real PTY spawns
+      // drain through the gate, default N=4).
+      const clients = await Promise.all(
+        Array.from({ length: STORM_CLIENTS }, () => SyntheticClient.connect(infoA)),
+      )
       const healthSamplesMs: number[] = []
       const storm = (async () => {
-        for (let i = 0; i < STORM_CREATES; i++) {
-          client.send({
-            type: 'terminal.create', requestId: `storm-${i}`,
-            mode: 'shell', shell: 'system', restore: true,
-          })
+        for (const [c, client] of clients.entries()) {
+          for (let i = 0; i < CREATES_PER_CLIENT; i++) {
+            client.send({
+              type: 'terminal.create', requestId: `storm-${c}-${i}`,
+              mode: 'shell', shell: 'system', restore: true,
+            })
+          }
         }
-        for (let i = 0; i < STORM_CREATES; i++) {
-          await client.waitFor(
-            (f) => (f.type === 'terminal.created' || f.type === 'error')
-              && f.requestId === `storm-${i}`,
-            60_000,
-          )
+        for (const [c, client] of clients.entries()) {
+          for (let i = 0; i < CREATES_PER_CLIENT; i++) {
+            const reply = await client.waitFor(
+              (f) => (f.type === 'terminal.created' || f.type === 'error')
+                && f.requestId === `storm-${c}-${i}`,
+              60_000,
+            )
+            // Restore bypass, proven e2e: no RATE_LIMITED, every spawn lands.
+            expect(reply.type, `restore create storm-${c}-${i} bypasses the limiter`)
+              .toBe('terminal.created')
+          }
         }
       })()
       // Meanwhile sample B's health latency.
@@ -1276,7 +1389,7 @@ test.describe('Create protection: cross-server isolation (Rust only)', () => {
       await terminal.executeCommand(`echo ${marker}`)
       await terminal.waitForOutput(marker, { timeout: 10_000 })
 
-      client.close()
+      for (const client of clients) client.close()
     } finally {
       await serverA.stop().catch(() => {})
       await serverB.stop().catch(() => {})
@@ -1298,7 +1411,7 @@ Config registration comment:
 - [ ] **Step 2: Run the spec**
 
 Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium specs/create-protection-isolation-rust.spec.ts`
-Expected: PASS. 30 `/bin/sh` PTYs on A drain through the gate (default N=4) in a few seconds; both servers stop and reap their own trees in `finally`.
+Expected: PASS. 30 shell PTYs on A (2 connections x 15) drain through the gate (default N=4) in a few seconds — measured spawn latency here is sub-millisecond per permit-hold; both servers stop and reap their own trees in `finally`.
 
 - [ ] **Step 3: Commit**
 
@@ -1346,13 +1459,13 @@ Do NOT run `gh pr create` — PR creation is not yet approved. Report: branch na
 - G6 rate limit, exact legacy semantics (10/10s sliding window, per connection, strict prune, reject-consumes-nothing, `restore:true` bypass, env names, `RATE_LIMITED` code) → Tasks 1, 3.
 - Wire shape pinned by a test that read the client handler's contract (`type`/`code`/`requestId` match + exact key set) → Task 3 integration test `eleventh_create_is_rate_limited_with_exact_wire_shape`.
 - Limiter in its own small module → Task 1 (`create_limit.rs`). `freshell-server/src/rate_limit.rs` was read; not reusable (wrong crate direction, global token bucket) → parallel module in freshell-ws, as the spec anticipated.
-- G12/F11 spawn gate: bounded semaphore (default N=4, env-configurable), FIFO-fair, queue-depth cap fails loud with an error frame, per-spawn timeout, RAII permit release on completion/failure/unwind, structured log + counters on queueing/rejection/timeout → Tasks 2, 4. Restore creates exempt from the RATE limit but NOT the gate → pinned in Task 3 (bypass test) and Task 4 (restore storm through concurrency-1 gate).
+- G12/F11 spawn gate: bounded semaphore (default N=4, env-configurable), FIFO-fair, queue-depth cap fails loud with an error frame, per-spawn timeout, RAII permit release on completion/failure/unwind, structured log + counters on queueing/rejection/timeout → Tasks 2, 4. The synchronous spawn runs under `spawn_blocking` while the permit is held (validated as required — inline blocking spawns would deadlock small hosts; Task 4). Restore creates exempt from the RATE limit but NOT the gate → pinned in Task 3 (bypass test) and Task 4 (restore storm through concurrency-1 gate).
 - TDD red tests: limiter window math + restore bypass + wire shape (Tasks 1, 3); gate bounds concurrency with max-in-flight N and all-complete, FIFO order, queue-cap fail-loud, permit release on timeout and drop (Task 2).
-- E2E: own RustServers/ephemeral ports (all three specs), 15+ pane storm + `restartAbrupt()` + all restore + bypass proof (Task 5), non-restore flood → RATE_LIMITED → ladder recovery (Task 6), two concurrent servers isolation (Task 7), new spec files + minimal config appends (Tasks 5-7).
+- E2E: own RustServers/ephemeral ports (all three specs), 15-pane reload storm + `restartAbrupt()` + limiter fires (validated: post-restart shell creates are non-restore) + ladder recovers ALL panes (Task 5), live non-restore flood → RATE_LIMITED → ladder recovery (Task 6), two concurrent servers isolation + raw-WS restore-bypass proof (Task 7), new spec files + minimal config appends (Tasks 5-7). Tab-add floods seed `panes.defaultNewPane:'shell'` (validated: default 'ask' fires zero creates) and pin `RUST_LOG:'info'` for the log greps.
 - Repo rules: TDD throughout, coordinated-suite etiquette + `FRESHELL_TEST_SUMMARY` (Task 8), push-then-STOP PR policy (Task 8), never touch the user's live server (constraint + spec `finally` blocks).
 - No gaps found; no UNRESOLVED COVERAGE GAP entries needed.
 
-**1b. No silent deferrals:** No stubs or mocks stand in for required behavior anywhere — integration tests use real sockets and real PTYs; e2e uses the real client bundle against the real Rust binary. The one explicitly out-of-scope adjacent item (`spawn_blocking` for the synchronous `registry.create`) is NOT a spec requirement — the spec asks for a bounded-concurrency gate with timeout/queue-cap semantics, which Tasks 2/4 deliver in production code; the pinned design-decision note in Task 2 documents how "one hung spawn can't block the queue" is satisfied (N-1 permits keep flowing; waiters time out loud).
+**1b. No silent deferrals:** No stubs or mocks stand in for required behavior anywhere — integration tests use real sockets and real PTYs; e2e uses the real client bundle against the real Rust binary. `spawn_blocking` around `registry.create` was originally deferred but validation FALSIFIED the deferral's premise (inline blocking spawns wedge every worker on hosts with `nproc <= concurrency`, deadlocking the timer driver itself) — it is now production scope in Task 4, and the "one hung spawn can't block the queue" claim is satisfied for real (permit + blocking-pool thread; async workers stay free; waiters time out loud). The two consciously-accepted residuals (saturated-gate keepalive kill; ungated freshagent REST spawn path, rate-bounded by SAFE-02) are documented in Task 2/4 notes and Global Constraints respectively — recorded, not silent.
 
 **2. Placeholder scan:** No TBD/TODO/"add appropriate handling" items. Two "copy from `<file>:<lines>`" references (hello helper, `SyntheticClient`) point at exact existing code the engineer opens and copies verbatim per the suite's stated per-spec-ownership convention — the copy-sources are pinned to file:line.
 
