@@ -80,6 +80,11 @@ enum HubEvent {
     AmplifierFsChange {
         terminal_id: String,
     },
+    /// Bind a codex terminal's adopted session identity (hub-task emission).
+    CodexBind {
+        terminal_id: String,
+        session_id: String,
+    },
 }
 
 struct AmplifierLane {
@@ -158,6 +163,20 @@ impl ActivityHub {
         });
     }
 
+    /// G3: bind a codex terminal's session identity into the activity
+    /// tracker (candidate adoption / rollout-reconcile lane). Idempotent;
+    /// silent no-op for untracked terminals. Channel-deferred (mirror of
+    /// `attach_amplifier_association`) so the resulting
+    /// `codex.activity.updated` identity upsert is emitted on the hub task,
+    /// preserving the single-emitter frame-ordering invariant; subsequent
+    /// `terminal.turn.complete` frames then carry `sessionId`.
+    pub fn bind_codex_session(&self, terminal_id: &str, session_id: &str) {
+        let _ = self.tx.send(HubEvent::CodexBind {
+            terminal_id: terminal_id.to_string(),
+            session_id: session_id.to_string(),
+        });
+    }
+
     /// `claude.activity.list` state (records + latest completions).
     pub fn claude_list(&self) -> (Vec<ClaudeActivityRecord>, Vec<TurnCompletionSnapshot>) {
         let inner = self.inner.lock().expect("activity hub lock");
@@ -231,6 +250,17 @@ impl ActivityHub {
             } => self.attach_lane(&terminal_id, &session_id, &events_path, attach_at),
             HubEvent::AmplifierFsChange { terminal_id } => {
                 self.drain_lane(&terminal_id);
+            }
+            HubEvent::CodexBind {
+                terminal_id,
+                session_id,
+            } => {
+                let frames = {
+                    let mut inner = self.inner.lock().expect("activity hub lock");
+                    let effects = inner.codex.bind_session(&terminal_id, &session_id);
+                    codex_frames(&mut inner.idle, effects)
+                };
+                self.emit(frames);
             }
         }
     }
@@ -1145,5 +1175,59 @@ mod tests {
             let inner = hub.inner.lock().unwrap();
             assert_eq!(hub_next_deadline(&inner), None, "no deadline while idle");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_codex_session_broadcasts_identity_and_stamps_completions() {
+        let (hub, mut rx) = hub();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: crate::terminal::now_ms(),
+            },
+        );
+        // Initial idle upsert (no sessionId -- the G3 gap state).
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial idle upsert");
+
+        // Bind: a fresh terminal's adopted candidate identity arrives.
+        hub.bind_codex_session("t1", "thread-1");
+        let bound = next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["sessionId"] == "thread-1"
+        })
+        .await
+        .expect("bind upsert carries sessionId");
+        assert_eq!(bound["upsert"][0]["terminalId"], "t1");
+
+        // Payoff: a subsequent turn's completion carries the session id.
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: crate::terminal::now_ms(),
+            },
+        );
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: crate::terminal::now_ms(),
+            },
+        );
+        let complete = next_frame_matching(&mut rx, "terminal.turn.complete", 3_000, |v| {
+            v["terminalId"] == "t1"
+        })
+        .await
+        .expect("turn complete");
+        assert_eq!(complete["sessionId"], "thread-1");
+        assert_eq!(complete["provider"], "codex");
     }
 }
