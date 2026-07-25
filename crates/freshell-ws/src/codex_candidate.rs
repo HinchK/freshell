@@ -17,14 +17,18 @@
 //!      parity `server/coding-cli/codex-app-server/durability-proof.ts:88-102`)
 
 use std::io::{BufRead, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use freshell_protocol::{
+    ServerMessage, SessionLocator, TerminalCodexCandidatePersisted, TerminalMetaRecord,
+    TerminalMetaUpdated, TerminalSessionAssociated,
+};
+
+use crate::terminal::now_ms;
+use crate::WsState;
 
 /// Codex thread ids are bare hyphenated UUIDs. Cheap shape check so an empty
 /// or junk id can never substring-match everything in the disk guard.
-// TEMPORARY (Task 1 only): no non-test consumer exists until Task 2's handler
-// lands; without this, `clippy --all-targets -- -D warnings` fails on
-// `dead_code` for the lib target. Task 2 Step 3 REMOVES this attribute.
-#[allow(dead_code)]
 pub(crate) fn is_uuid_shaped(s: &str) -> bool {
     s.len() == 36
         && s.chars().enumerate().all(|(i, c)| match i {
@@ -51,9 +55,6 @@ const MAX_FIRST_LINE_BYTES: u64 = 1024 * 1024;
 /// LINEAGE and matches a FOREIGN session in 54/144 real rollouts (V5); and
 /// never a substring match on filename or contents, which the same lineage
 /// data makes spoofable (40% of sampled rollouts contain foreign uuids).
-// TEMPORARY (Task 1 only): see is_uuid_shaped above. Task 2 Step 3 REMOVES
-// this attribute when the handler consumes it.
-#[allow(dead_code)]
 pub(crate) fn verify_rollout_path(
     rollout_path: &str,
     sessions_root: &Path,
@@ -87,6 +88,177 @@ pub(crate) fn verify_rollout_path(
     match record.pointer("/payload/id").and_then(|v| v.as_str()) {
         Some(id) if id == thread_id => Ok(()),
         _ => Err("thread_id_mismatch"),
+    }
+}
+
+/// `CODEX_HOME` env (non-empty) else `<HOME>/.codex`, then `/sessions` --
+/// mirrors `freshell-server/src/session_directory.rs::codex_home` (which is
+/// crate-private there; HOME only, never FRESHELL_HOME) joined with the
+/// `sessions` dir the way `freshell_sessions::directory_index::CodexSource`
+/// does.
+fn codex_sessions_root() -> Option<PathBuf> {
+    let home = match std::env::var("CODEX_HOME") {
+        Ok(v) if !v.is_empty() => PathBuf::from(v),
+        _ => {
+            #[cfg(windows)]
+            let base = std::env::var("USERPROFILE").ok()?;
+            #[cfg(not(windows))]
+            let base = std::env::var("HOME").ok()?;
+            PathBuf::from(base).join(".codex")
+        }
+    };
+    Some(home.join("sessions"))
+}
+
+/// Handle one `terminal.codex.candidate.persisted` frame. No reply frame on
+/// any path; rejects are WARN logs, accepts bind BOTH identity homes and
+/// broadcast (mirrors `opencode_association.rs`'s resolve path).
+pub(crate) fn handle_codex_candidate_persisted(
+    state: &WsState,
+    msg: TerminalCodexCandidatePersisted,
+) {
+    let thread_id = msg.candidate_thread_id.as_str();
+    if !is_uuid_shaped(thread_id) {
+        tracing::warn!(
+            terminal_id = %msg.terminal_id,
+            candidate_thread_id = %thread_id,
+            "codex_candidate_rejected: invalid_thread_id"
+        );
+        return;
+    }
+    // Guard 1: the terminal exists.
+    let Some(row) = state.registry.probe(&msg.terminal_id) else {
+        tracing::warn!(
+            terminal_id = %msg.terminal_id,
+            candidate_thread_id = %thread_id,
+            "codex_candidate_rejected: terminal_missing"
+        );
+        return;
+    };
+    // Guard 2: the terminal is codex-mode.
+    if row.mode != "codex" {
+        tracing::warn!(
+            terminal_id = %msg.terminal_id,
+            mode = %row.mode,
+            "codex_candidate_rejected: terminal_not_codex"
+        );
+        return;
+    }
+    // Guard 3a: the terminal is not already bound to a DIFFERENT session
+    // (stale-replay defense; a re-announce of the SAME id is an idempotent
+    // no-op -- the client re-sends on every durability update). ORDER
+    // MATTERS: this same-terminal check must run BEFORE guard 3b's
+    // cross-terminal check, so a legit re-announce short-circuits here and
+    // never reaches the retired-inclusive lookup.
+    if let Some(existing) = row.resume_session_id.as_deref().filter(|s| !s.is_empty()) {
+        if existing != thread_id {
+            tracing::warn!(
+                terminal_id = %msg.terminal_id,
+                candidate_thread_id = %thread_id,
+                bound_session_id = %existing,
+                "codex_candidate_rejected: terminal_already_bound"
+            );
+        }
+        return;
+    }
+    // Guard 3b: the claimed session is not bound to a DIFFERENT terminal --
+    // live OR retired (cross-pane hijack). Retired-INCLUSIVE deliberately
+    // (ledger A8): a victim's binding is retired at exit, so a live-only
+    // lookup would let a DEAD pane's candidate be replayed onto a fresh
+    // terminal. Blocks no legitimate flow: every legit resume binds at
+    // create time and short-circuits at guard 3a above.
+    if let Some(other_tid) = state
+        .identity
+        .find_by_session_including_retired("codex", thread_id)
+    {
+        if other_tid != msg.terminal_id {
+            tracing::warn!(
+                terminal_id = %msg.terminal_id,
+                candidate_thread_id = %thread_id,
+                bound_terminal_id = %other_tid,
+                "codex_candidate_rejected: session_bound_elsewhere"
+            );
+            return;
+        }
+    }
+    // Guard 4: disk truth.
+    let Some(root) = codex_sessions_root() else {
+        tracing::warn!(
+            terminal_id = %msg.terminal_id,
+            "codex_candidate_rejected: no_codex_sessions_root"
+        );
+        return;
+    };
+    if let Err(reason) = verify_rollout_path(&msg.rollout_path, &root, thread_id) {
+        tracing::warn!(
+            terminal_id = %msg.terminal_id,
+            candidate_thread_id = %thread_id,
+            rollout_path = %msg.rollout_path,
+            "codex_candidate_rejected: {reason}"
+        );
+        return;
+    }
+    // Bind both identity homes (they have different consumers -- see
+    // opencode_association.rs:135-148), then broadcast.
+    state.identity.upsert(
+        &msg.terminal_id,
+        Some("codex"),
+        Some(thread_id),
+        row.cwd.as_deref(),
+        now_ms(),
+    );
+    state.registry.set_meta(
+        &msg.terminal_id,
+        None,
+        None,
+        Some("codex".to_string()),
+        Some(thread_id.to_string()),
+    );
+    broadcast_terminal_session_associated(state, &msg.terminal_id, thread_id, row.cwd.clone());
+}
+
+/// Fan `terminal.session.associated` + a `terminal.meta.updated` upsert to
+/// every connection. Byte-for-byte the shape of
+/// `opencode_association.rs::broadcast_terminal_session_associated` with
+/// provider "codex". EMISSION ORDER IS PINNED: `associated` FIRST, then
+/// `meta.updated` (mirroring opencode_association.rs:163-198) -- the
+/// integration test awaits them in exactly this order, and
+/// `next_frame_of_type` drops out-of-order frames. Do not reorder.
+fn broadcast_terminal_session_associated(
+    state: &WsState,
+    terminal_id: &str,
+    session_id: &str,
+    cwd: Option<String>,
+) {
+    let associated = ServerMessage::TerminalSessionAssociated(TerminalSessionAssociated {
+        terminal_id: terminal_id.to_string(),
+        session_ref: SessionLocator {
+            provider: "codex".to_string(),
+            session_id: session_id.to_string(),
+        },
+    });
+    if let Ok(frame) = serde_json::to_string(&associated) {
+        let _ = state.broadcast_tx.send(frame);
+    }
+
+    let meta = ServerMessage::TerminalMetaUpdated(TerminalMetaUpdated {
+        remove: Vec::new(),
+        upsert: vec![TerminalMetaRecord {
+            terminal_id: terminal_id.to_string(),
+            updated_at: now_ms(),
+            branch: None,
+            checkout_root: None,
+            cwd,
+            display_subdir: None,
+            is_dirty: None,
+            provider: Some("codex".to_string()),
+            repo_root: None,
+            session_id: Some(session_id.to_string()),
+            token_usage: None,
+        }],
+    });
+    if let Ok(frame) = serde_json::to_string(&meta) {
+        let _ = state.broadcast_tx.send(frame);
     }
 }
 

@@ -470,6 +470,13 @@ async fn handle_client_text(
         ClientMessage::TerminalCreate(create) => {
             handle_create(create, ws_tx, state, pane_reconcile_v1).await
         }
+        // P0.3: server-side codex identity capture from the client's persisted
+        // candidate -- guarded (campaign plan §2.3.1); rejects are logged and
+        // ignored, never answered (legacy parity ws-handler.ts:2951-2963).
+        ClientMessage::TerminalCodexCandidatePersisted(candidate) => {
+            crate::codex_candidate::handle_codex_candidate_persisted(state, candidate);
+            true
+        }
         ClientMessage::TerminalAttach(attach) => {
             if terminal_dims_in_range(attach.cols, attach.rows) {
                 handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
