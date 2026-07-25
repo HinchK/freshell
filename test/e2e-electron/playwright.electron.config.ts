@@ -8,7 +8,11 @@ export default defineConfig({
   workers: 1,
   reporter: process.env.CI
     ? [['html', { open: 'never' }], ['github']]
-    : [['html', { open: 'on-failure' }]],
+    : // 'never' locally too: many concurrent agents run this suite, and
+      // 'on-failure' auto-opens a report browser page (localhost:9323) at the
+      // user on every failing run. View reports on demand with
+      // `npx playwright show-report`.
+      [['html', { open: 'never' }]],
   timeout: 120_000, // Electron startup can be slow
   expect: {
     timeout: 15_000,
