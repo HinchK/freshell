@@ -91,6 +91,7 @@ const RUST_ONLY_SPECS = [
   /restore-contract-wall-rust\.spec\.ts$/,
   /launch-retry-restart-rust\.spec\.ts$/,
   /double-restart-terminal-restore-rust\.spec\.ts$/,
+  /turn-complete-restart-resume-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -214,6 +215,7 @@ export default defineConfig({
         /restore-contract-wall-rust\.spec\.ts$/,
         /launch-retry-restart-rust\.spec\.ts$/,
         /double-restart-terminal-restore-rust\.spec\.ts$/,
+        /turn-complete-restart-resume-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
