@@ -2119,18 +2119,21 @@ mod tests {
         );
     }
 
-    /// Codex lane: REGRESSION GUARD, green from birth (deviation note 3).
-    /// The Rust codex tracker never surfaces a Busy phase in the PTY lane
-    /// (CodexPhase::Busy is never assigned; note_output without a BEL emits
-    /// no effects, codex.rs:201-221), and the queued re-arm at the turn
-    /// clear stays Pending and is publicly SILENT (pending->pending is
-    /// suppressed by has_public_change, codex.rs:80-95/361-384; pinned by
-    /// the tracker test at codex.rs:509-527). So NO queue evidence can
-    /// accrue: the drain arms the gate normally (Changed(Idle) precedes
-    /// TurnComplete, codex.rs:231-239) and emits exactly one idle with
-    /// reason 'grace'. queue-empty stays unreachable for codex until Lane D
-    /// ports busy-phase entry; the gate side of that future contract is
-    /// pinned by idle::tests::codex_busy_to_pending_rearm_counts_as_queue_evidence.
+    /// Codex PTY-ONLY lane: REGRESSION GUARD (deviation note 3). Without a
+    /// rollout-reconcile lane attached, the tracker never surfaces a Busy
+    /// phase (PTY output without a BEL emits no effects, and the queued
+    /// re-arm at the turn clear stays Pending and is publicly SILENT --
+    /// pending->pending is suppressed by has_public_change; pinned by the
+    /// codex.rs tracker tests). So NO queue evidence can accrue from the
+    /// PTY lane alone: the drain arms the gate normally and emits exactly
+    /// one idle with reason 'grace'.
+    ///
+    /// With the rollout lane attached (the codex-status-completeness work),
+    /// CodexPhase::Busy IS reachable and the busy->pending re-arm counts as
+    /// queue evidence -- the hub-level proof is
+    /// codex_rollout_busy_rearm_drains_to_a_single_queue_empty_idle below;
+    /// the gate side is pinned by
+    /// idle::tests::codex_busy_to_pending_rearm_counts_as_queue_evidence.
     #[tokio::test(flavor = "multi_thread")]
     async fn codex_queued_rearm_drains_to_a_single_grace_idle() {
         let (hub, mut rx) = hub();
@@ -2197,13 +2200,125 @@ mod tests {
             .expect("terminal.idle after the codex queue drains");
         assert_eq!(
             idle["reason"], "grace",
-            "codex queue evidence is unreachable pre-Lane-D (deviation note 3)"
+            "codex queue evidence is unreachable from the PTY lane alone (deviation note 3)"
         );
         assert!(
             next_frame_of_type(&mut rx, "terminal.idle", 1_000)
                 .await
                 .is_none(),
             "exactly one emission for the codex drain"
+        );
+    }
+
+    /// INTERACTION (idle-gate x codex-status-completeness): with the rollout
+    /// lane attached, CodexPhase::Busy is reachable, so the busy->pending
+    /// re-arm at a reconciled turn clear DOES accrue queue evidence -- the
+    /// eventual drain must emit exactly one terminal.idle with reason
+    /// 'queue-empty' (not 'grace'), the reconciled clear must stamp exactly
+    /// one completion, and the swallowed PTY BEL echo must not double-chime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_rollout_busy_rearm_drains_to_a_single_queue_empty_idle() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial upsert");
+
+        // Rollout shows an unresolved turn -> reconcile seeds Busy.
+        let (_guard, rollout) =
+            codex_rollout_fixture(&[codex_event_line("task_started", now - 5_000)]);
+        hub.attach_codex_rollout("t1", "sess-1", &rollout);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("seeded busy upsert");
+
+        // Queued submit while Busy (PTY lane): goes into the submit queue.
+        observer_send(
+            &hub,
+            ActivityEvent::Input {
+                terminal_id: "t1".into(),
+                data: "\r".into(),
+                at: now_ms(),
+            },
+        );
+
+        // Turn 1 completes on disk -> inotify -> drain: the queued submit is
+        // consumed at the clear (busy->pending re-arm = queue evidence), the
+        // mid-queue chime is SUPPRESSED (record_completion_if_idle stamps
+        // only when the resulting phase is Idle), and the next PTY BEL echo
+        // is armed to be swallowed.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .expect("append");
+            writeln!(f, "{}", codex_event_line("task_complete", now + 1_000)).expect("write");
+        }
+        next_frame_matching(&mut rx, "codex.activity.updated", 5_000, |v| {
+            v["upsert"][0]["phase"] == "pending"
+        })
+        .await
+        .expect("busy->pending re-arm upsert after the reconciled clear");
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.turn.complete", 1_000)
+                .await
+                .is_none(),
+            "no mid-queue chime: the re-arm clear must not stamp a completion"
+        );
+
+        // Late PTY BEL echo of the reconciled clear: swallowed one-shot (no
+        // transition, no completion -- the no-double-chime half).
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: now_ms(),
+            },
+        );
+        // Queued turn 2 ends via a real PTY BEL: queue empty -> Idle +
+        // completion #2 -> the gate arms.
+        observer_send(
+            &hub,
+            ActivityEvent::Output {
+                terminal_id: "t1".into(),
+                data: "\u{07}".into(),
+                at: now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "terminal.turn.complete", 5_000, |v| {
+            v["terminalId"] == "t1"
+        })
+        .await
+        .expect("one completion for the queued turn 2 drain");
+
+        let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
+            .await
+            .expect("terminal.idle after the codex queue drains");
+        assert_eq!(idle["terminalId"], "t1");
+        assert_eq!(
+            idle["reason"], "queue-empty",
+            "busy->pending re-arm via the rollout lane must count as queue evidence"
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_000)
+                .await
+                .is_none(),
+            "exactly one idle emission for the combined drain"
         );
     }
 
