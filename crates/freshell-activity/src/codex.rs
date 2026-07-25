@@ -25,10 +25,10 @@
 //!    and `unknown` phases, and resume-busy seeding) is not yet ported. On
 //!    the Rust server a codex pane would otherwise NEVER have an activity
 //!    record at all — the exact TERM-15 bug this crate fixes. The PTY-lane
-//!    state machine itself is ported faithfully. (A vestigial `bind_session`
-//!    binder for that lane was deleted as dead code; session identity arrives
-//!    via `track_terminal`'s `session_id` argument, and a future port of the
-//!    lane would introduce its own binder.)
+//!    state machine itself is ported faithfully. (`bind_session` is that
+//!    lane's binder: the candidate-adopt path and the rollout-reconcile lane
+//!    announce identity through it; resume identity still arrives via
+//!    `track_terminal`'s `session_id` argument.)
 //! 2. **Zero-polling**: `next_deadline()` + one-shot hub timer instead of the
 //!    5s sweep (`ACTIVITY_SWEEP_MS`), same as [`crate::claude`].
 
@@ -150,6 +150,26 @@ impl CodexActivityTracker {
         let next = state.to_record();
         self.states.insert(terminal_id.to_string(), state);
         changed(None, next)
+    }
+
+    /// Bind (or re-bind) the session identity of an already-tracked terminal.
+    /// The binder anticipated by deviation 1: the candidate-adopt path and the
+    /// rollout-reconcile lane both announce identity through here. Same
+    /// idempotent shape as `track_terminal`'s rebind branch and
+    /// `AmplifierActivityTracker::bind_session`: untracked terminal -> silent
+    /// no-op (never resurrects state for an exited terminal); same id ->
+    /// no-op (the client re-announces on every durability update).
+    pub fn bind_session(&mut self, terminal_id: &str, session_id: &str) -> Vec<CodexEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        if state.session_id.as_deref() == Some(session_id) {
+            return Vec::new();
+        }
+        let previous = state.to_record();
+        state.session_id = Some(session_id.to_string());
+        let next = state.to_record();
+        changed(Some(&previous), next)
     }
 
     pub fn note_exit(&mut self, terminal_id: &str) -> Vec<CodexEffect> {
@@ -591,5 +611,62 @@ mod tests {
             _ => None,
         });
         assert_eq!(session, Some(Some("thread-1".to_string())));
+    }
+
+    #[test]
+    fn bind_session_on_untracked_terminal_is_a_silent_noop() {
+        let mut tracker = CodexActivityTracker::new();
+        let effects = tracker.bind_session("t-unknown", "thread-9");
+        assert!(effects.is_empty());
+        assert!(tracker.list().is_empty());
+    }
+
+    #[test]
+    fn bind_session_is_idempotent_on_reannounce_and_emits_on_change() {
+        // The client re-sends `terminal.codex.candidate.persisted` on every
+        // durability update -- re-binding the same id must not spam frames.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+
+        let first = tracker.bind_session("t1", "thread-1");
+        assert_eq!(first.len(), 1, "identity change is a public change");
+        assert_eq!(tracker.list()[0].session_id.as_deref(), Some("thread-1"));
+
+        let again = tracker.bind_session("t1", "thread-1");
+        assert!(again.is_empty(), "same id re-announce is a no-op");
+
+        let rebound = tracker.bind_session("t1", "thread-2");
+        assert_eq!(rebound.len(), 1);
+        assert_eq!(tracker.list()[0].session_id.as_deref(), Some("thread-2"));
+    }
+
+    #[test]
+    fn bind_session_mid_turn_retroactively_stamps_the_completion() {
+        // G3: a FRESH codex terminal has no identity at create; the candidate
+        // adoption binds it mid-turn; the BEL's turn.complete must carry it.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.note_input("t1", "\r", 10);
+        let bind = tracker.bind_session("t1", "thread-1");
+        assert_eq!(bind.len(), 1, "bind while pending is a public change");
+        let effects = tracker.note_output("t1", "\u{07}", 9_000);
+        let complete_session = effects.iter().find_map(|e| match e {
+            TrackerEffect::TurnComplete { session_id, .. } => Some(session_id.clone()),
+            _ => None,
+        });
+        assert_eq!(complete_session, Some(Some("thread-1".to_string())));
+    }
+
+    #[test]
+    fn track_terminal_rebind_branch_updates_identity_in_place() {
+        // Pins the previously-untested rebind branch (track_terminal on an
+        // existing state with a NEW session id).
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        let effects = tracker.track_terminal("t1", Some("thread-2"), 5);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(tracker.list()[0].session_id.as_deref(), Some("thread-2"));
+        let noop = tracker.track_terminal("t1", Some("thread-2"), 6);
+        assert!(noop.is_empty());
     }
 }
