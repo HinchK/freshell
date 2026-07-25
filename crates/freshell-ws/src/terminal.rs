@@ -1351,6 +1351,16 @@ async fn handle_create(
     {
         Ok(permit) => permit,
         Err(err) => {
+            // Gate rejection mirrors the failed-spawn cleanup below: discard a
+            // planned-but-unadopted codex launch (sidecar + proxy) and undo the
+            // MCP side effects already materialized by generate_mcp_injection
+            // (claude/gemini/kimi tmp config file; opencode sidecar refcount).
+            if let Some(launch) = codex_launch {
+                freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                    .discard(launch)
+                    .await;
+            }
+            cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
             let (code, msg) = spawn_gate_error_parts(err);
             return send_create_error(ws_tx, code, msg.to_string(), &create.request_id).await;
         }
