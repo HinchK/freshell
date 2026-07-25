@@ -256,7 +256,7 @@ mod tests {
         write!(f, "line3\npart").unwrap();
         assert_eq!(tailer.read_new_lines(), vec!["line3"]);
 
-        write!(f, "ial4\n").unwrap();
+        writeln!(f, "ial4").unwrap();
         assert_eq!(tailer.read_new_lines(), vec!["partial4"]);
     }
 
