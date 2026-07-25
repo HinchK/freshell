@@ -183,14 +183,69 @@ mod tests {
 
     #[test]
     fn config_from_env_overrides_and_zero_falls_back() {
+        // Clean slate: remove all env vars to test fallback defaults.
+        std::env::remove_var("TERMINAL_CREATE_RATE_LIMIT");
+        std::env::remove_var("TERMINAL_CREATE_RATE_WINDOW_MS");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_CONCURRENCY");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_QUEUE_CAP");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_TIMEOUT_MS");
+
+        // Test: unset -> defaults
         let c = CreateProtectConfig::from_env();
-        // from_env() sanitizes (zero -> default), so this pin asserts the
-        // override direction works AND the fallback logic is in place.
-        assert!(c.rate_limit > 0);
-        assert!(c.rate_window_ms > 0);
-        assert!(c.spawn_concurrency > 0);
-        assert!(c.spawn_queue_cap > 0);
-        assert!(c.spawn_timeout_ms > 0);
+        let d = CreateProtectConfig::default();
+        assert_eq!(c.rate_limit, d.rate_limit);
+        assert_eq!(c.rate_window_ms, d.rate_window_ms);
+        assert_eq!(c.spawn_concurrency, d.spawn_concurrency);
+        assert_eq!(c.spawn_queue_cap, d.spawn_queue_cap);
+        assert_eq!(c.spawn_timeout_ms, d.spawn_timeout_ms);
+
+        // Test: valid positive override takes effect
+        std::env::set_var("TERMINAL_CREATE_RATE_LIMIT", "20");
+        std::env::set_var("TERMINAL_CREATE_RATE_WINDOW_MS", "20000");
+        std::env::set_var("FRESHELL_SPAWN_GATE_CONCURRENCY", "8");
+        std::env::set_var("FRESHELL_SPAWN_GATE_QUEUE_CAP", "128");
+        std::env::set_var("FRESHELL_SPAWN_GATE_TIMEOUT_MS", "20000");
+        let c = CreateProtectConfig::from_env();
+        assert_eq!(c.rate_limit, 20);
+        assert_eq!(c.rate_window_ms, 20000);
+        assert_eq!(c.spawn_concurrency, 8);
+        assert_eq!(c.spawn_queue_cap, 128);
+        assert_eq!(c.spawn_timeout_ms, 20000);
+
+        // Test: '0' -> fallback to default
+        std::env::set_var("TERMINAL_CREATE_RATE_LIMIT", "0");
+        std::env::set_var("TERMINAL_CREATE_RATE_WINDOW_MS", "0");
+        std::env::set_var("FRESHELL_SPAWN_GATE_CONCURRENCY", "0");
+        std::env::set_var("FRESHELL_SPAWN_GATE_QUEUE_CAP", "0");
+        std::env::set_var("FRESHELL_SPAWN_GATE_TIMEOUT_MS", "0");
+        let c = CreateProtectConfig::from_env();
+        let d = CreateProtectConfig::default();
+        assert_eq!(c.rate_limit, d.rate_limit);
+        assert_eq!(c.rate_window_ms, d.rate_window_ms);
+        assert_eq!(c.spawn_concurrency, d.spawn_concurrency);
+        assert_eq!(c.spawn_queue_cap, d.spawn_queue_cap);
+        assert_eq!(c.spawn_timeout_ms, d.spawn_timeout_ms);
+
+        // Test: unparseable -> fallback to default
+        std::env::set_var("TERMINAL_CREATE_RATE_LIMIT", "not-a-number");
+        std::env::set_var("TERMINAL_CREATE_RATE_WINDOW_MS", "not-a-number");
+        std::env::set_var("FRESHELL_SPAWN_GATE_CONCURRENCY", "not-a-number");
+        std::env::set_var("FRESHELL_SPAWN_GATE_QUEUE_CAP", "not-a-number");
+        std::env::set_var("FRESHELL_SPAWN_GATE_TIMEOUT_MS", "not-a-number");
+        let c = CreateProtectConfig::from_env();
+        let d = CreateProtectConfig::default();
+        assert_eq!(c.rate_limit, d.rate_limit);
+        assert_eq!(c.rate_window_ms, d.rate_window_ms);
+        assert_eq!(c.spawn_concurrency, d.spawn_concurrency);
+        assert_eq!(c.spawn_queue_cap, d.spawn_queue_cap);
+        assert_eq!(c.spawn_timeout_ms, d.spawn_timeout_ms);
+
+        // Cleanup
+        std::env::remove_var("TERMINAL_CREATE_RATE_LIMIT");
+        std::env::remove_var("TERMINAL_CREATE_RATE_WINDOW_MS");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_CONCURRENCY");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_QUEUE_CAP");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_TIMEOUT_MS");
     }
 
     #[test]
