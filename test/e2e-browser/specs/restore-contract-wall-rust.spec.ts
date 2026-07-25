@@ -316,6 +316,80 @@ async function findLeafById(harness: TestHarness, tabId: string, paneId: string)
   return collectLeaves(layout).find((leaf) => leaf.id === paneId) ?? null
 }
 
+// --- freshcodex fresh-agent helpers (donors: restore-matrix.spec.ts:62-92,
+// restore-double-restart.spec.ts:148-176) ---
+
+/**
+ * Install the fake codex app-server as a re-exec WRAPPER, never a content
+ * copy (donor: restore-matrix.spec.ts:62-92): the fixture's
+ * `import { WebSocketServer } from 'ws'` is an ESM bare specifier resolved
+ * relative to the FILE'S OWN location -- a copy dropped in a bare temp dir
+ * has no `node_modules` ancestor and dies with ERR_MODULE_NOT_FOUND.
+ */
+async function installFakeCodexAppServer(destDir: string): Promise<string> {
+  await fs.mkdir(destDir, { recursive: true })
+  const dest = path.join(destDir, 'fake-codex-app-server-wrapper.mjs')
+  const wrapper = `#!/usr/bin/env node
+import { spawnSync } from 'node:child_process'
+const target = ${JSON.stringify(FAKE_CODEX_APP_SERVER_SOURCE)}
+const result = spawnSync(process.execPath, [target, ...process.argv.slice(2)], { stdio: 'inherit' })
+process.exit(result.status ?? 1)
+`
+  await fs.writeFile(dest, wrapper, 'utf8')
+  await fs.chmod(dest, 0o755)
+  return dest
+}
+
+async function createFreshcodexPane(page: Page, harness: TestHarness): Promise<void> {
+  // setAvailableClis is client-only AND gets overwritten by the app
+  // bootstrap + /api/platform fetch (App.tsx:572,609). Callers reach this
+  // helper only after harness.waitForConnection(), which is what makes the
+  // dispatch land AFTER those overwrites (donor ordering:
+  // freshopencode-restart-recovery.spec.ts:100-115). Keep it that way.
+  await page.evaluate(() => {
+    ;(window as any).__FRESHELL_TEST_HARNESS__?.dispatch({
+      type: 'connection/setAvailableClis',
+      payload: { claude: false, codex: true },
+    })
+  })
+  const picker = await openPanePicker(page)
+  await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
+  // "First option" exists here only because selectShellIfPickerShowing
+  // already opened a shell whose live-terminal cwd becomes a candidate dir
+  // (/api/files/candidate-dirs returns [] on a truly clean boot -- no $HOME
+  // fallback, crates/freshell-server/src/files.rs:15-26). This mirrors the
+  // donor exactly (restore-double-restart.spec.ts:148-176); if no option
+  // renders, switch to the fill+Enter pattern used by
+  // createFreshopencodePane/createFreshclaudePane.
+  await page.getByRole('option').first().click()
+  await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
+    timeout: 15_000,
+  })
+}
+
+/** Send one chat turn in the last fresh-agent pane and wait for idle. */
+async function sendFreshAgentTurn(
+  page: Page,
+  harness: TestHarness,
+  tabId: string,
+  text: string,
+): Promise<void> {
+  const paneRoot = page.locator('[data-context="fresh-agent"]').last()
+  await expect
+    .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.status, {
+      timeout: 20_000,
+    })
+    .toBe('idle')
+  const composer = paneRoot.getByRole('textbox', { name: 'Chat message input' })
+  await composer.fill(text)
+  await paneRoot.getByRole('button', { name: 'Send' }).click()
+  await expect
+    .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(tabId))?.content?.status, {
+      timeout: 30_000,
+    })
+    .toBe('idle')
+}
+
 // ---------------------------------------------------------------------------
 // The wall
 // ---------------------------------------------------------------------------
@@ -699,6 +773,83 @@ test.describe('Restore Contract Wall (P0.1)', () => {
           return unwrapped.includes(`opencode: resumed session ${associatedSessionId}`)
         }, { timeout: 20_000 })
         .toBe(true)
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  // Per plan §2.6: freshcodex is the reference implementation -- after
+  // SIGKILL+restart+reload the pane must rebind to the SAME durable thread
+  // with history rehydrated ('Fixture turn' is the fake's deterministic
+  // reply) and a non-wedged status.
+  test('freshcodex: SIGKILL restore rebinds the same thread with history rehydrated', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshcodex-'))
+    const fakeCodexPath = await installFakeCodexAppServer(path.join(sharedRoot, 'bin'))
+
+    const { server, harness } = await bootWall(page, {
+      env: { CODEX_CMD: fakeCodexPath },
+      setupHome: seedWallConfig({ providers: ['codex'], freshAgent: true }),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
+      // Wait for the boot pane to become a REAL terminal before opening the
+      // pane picker, else openPanePicker races the boot picker's fade-out and
+      // the Freshcodex click is swallowed (donor ordering:
+      // restore-double-restart.spec.ts:210-214; same guard as Contracts B/D).
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      await createFreshcodexPane(page, harness)
+      await sendFreshAgentTurn(page, harness, tabId, 'wall freshcodex turn')
+      await expect(
+        page.locator('[data-context="fresh-agent"]').last().getByText('Fixture turn'),
+      ).toBeVisible({ timeout: 20_000 })
+
+      const originalSessionId: string = await expect
+        .poll(async () => leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId))) ?? null, {
+          timeout: 20_000,
+        })
+        .not.toBeNull()
+        .then(async () =>
+          leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId)))!,
+        )
+
+      await flushPersistence(page)
+      await harness.clearSentWsMessages()
+
+      // --- SIGKILL + revive, then reload (full client rehydrate). ---
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+      await reloadAndReconnect(page, harness)
+
+      // CONTRACT §2.6: same durable identity, history rehydrated, not wedged,
+      // and every post-reload create targets the ORIGINAL thread.
+      const rehydratedTabId = (await harness.getActiveTabId())!
+      const rehydratedIdentity: string | undefined = await expect
+        .poll(async () => leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))), {
+          timeout: 30_000,
+        })
+        .not.toBeUndefined()
+        .then(async () =>
+          leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))),
+        )
+      expect(rehydratedIdentity).toBe(originalSessionId)
+      await expect(
+        page.locator('[data-context="fresh-agent"]').last().getByText('Fixture turn'),
+      ).toBeVisible({ timeout: 30_000 })
+      const finalLeaf = findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))
+      expect(finalLeaf?.content?.status).not.toBe('error')
+
+      const sentAfterReload = await harness.getSentWsMessages()
+      const createsAfterReload = sentAfterReload.filter((m: any) => m?.type === 'freshAgent.create')
+      for (const create of createsAfterReload) {
+        const resumeTarget = (create as any).resumeSessionId ?? (create as any).sessionRef?.sessionId
+        expect(resumeTarget).toBe(originalSessionId)
+      }
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
