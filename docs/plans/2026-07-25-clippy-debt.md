@@ -7,16 +7,16 @@
 
 **Goal:** Make `cargo clippy --workspace --all-targets -- -D warnings` exit 0 for the entire freshell Rust workspace, with zero behavior changes, and add a CI guard so the debt cannot silently regrow.
 
-**Architecture:** This is a behavior-preserving chore, not a feature. The "red" is the failing clippy invocation (34 errors, inventory below, captured at base commit `4835de63`). Fixes land in small commits grouped by crate/lint-family: (1) migrate two test-only `static std::sync::Mutex<()>` env-serialization locks in `freshell-freshagent` to `tokio::sync::Mutex` — the exact convention the repo already uses in `crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs:50` — which fixes all 27 `await_holding_lock` errors AND deletes 7 pre-existing `#[allow(clippy::await_holding_lock)]` suppressions; (2) delete provably-dead code in `freshell-server` (dead since its only consumer was deliberately removed in commit `24ecdb8e` as a parity fix); (3) mechanical one-line lint fixes; (4) a new `.github/workflows/rust-clippy.yml` (there is currently NO cargo invocation anywhere in `.github/` — nothing to append to, so a new workflow is the trivial, non-disruptive option).
+**Architecture:** This is a behavior-preserving chore, not a feature. The "red" is the failing clippy invocation (36 errors, inventory below, captured at base commit `4835de63` and independently re-verified item-for-item on 2026-07-25 during plan validation). Fixes land in small commits grouped by crate/lint-family: (1) migrate two test-only `static std::sync::Mutex<()>` env-serialization locks in `freshell-freshagent` to `tokio::sync::Mutex` — the exact convention the repo already uses in `crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs:50` — which fixes all 27 `await_holding_lock` errors AND deletes 7 pre-existing `#[allow(clippy::await_holding_lock)]` suppressions; (2) delete provably-dead code in `freshell-server` (dead since its only consumer was deliberately removed in commit `24ecdb8e` as a parity fix); (3) mechanical one-line lint fixes; (4) a new `.github/workflows/rust-clippy.yml` (there is currently NO cargo invocation anywhere in `.github/` — nothing to append to, so a new workflow is the trivial, non-disruptive option).
 
-**Tech Stack:** Rust 1.96 stable (workspace `rust-version = "1.96"`), tokio 1.52.3 (`tokio::sync::Mutex::const_new` is `const fn` — works in a `static`), cargo clippy/fmt, GitHub Actions (`dtolnay/rust-toolchain@stable`, `Swatinem/rust-cache@v2`), gh CLI.
+**Tech Stack:** Rust 1.96.0 stable locally (verified: `rustc 1.96.0` / `clippy 0.1.96`; no `rust-toolchain.toml` or `clippy.toml` in the repo), tokio 1.52.3 (verified in Cargo.lock; `tokio::sync::Mutex::const_new` is `const fn` — proven by a pinned-version probe crate — and `sync` is enabled in both deps and dev-deps of freshell-freshagent), cargo clippy/fmt, GitHub Actions (`dtolnay/rust-toolchain` **pinned to `1.96.0`** — current stable is 1.97.1 whose clippy adds new default-warn lints, so a floating `@stable` would break green-local ⇒ green-CI; see Task 7 — plus `Swatinem/rust-cache@v2`), gh CLI.
 
 ## Global Constraints
 
-- **Base:** branch `clippy-debt` in worktree `/home/dan/code/freshell/.worktrees/clippy-debt`, branched from origin/main @ `4835de63`. All commands in this plan run from that worktree root unless stated otherwise.
+- **Base:** branch `chore/clippy-debt` (note: the worktree DIRECTORY is named `clippy-debt`, the git branch is `chore/clippy-debt` — verified) in worktree `/home/dan/code/freshell/.worktrees/clippy-debt`, branched from origin/main @ `4835de63`. All commands in this plan run from that worktree root unless stated otherwise.
 - **Behavior-preserving:** zero production logic edits beyond deletions of provably-dead code; every test that passed before must pass after. Do not blanket-`#[allow]` lints away. A targeted `#[allow]` with a one-line justification is the exception, not the pattern (this plan needs **zero** new allows and **deletes 7** existing ones).
 - **Final gates (all must pass):** `cargo clippy --workspace --all-targets -- -D warnings` exit 0; `cargo clippy -p freshell-codex --all-targets --features real-transport -- -D warnings` exit 0; `cargo test --workspace` green; `cargo fmt --all --check` clean; coordinated JS suite green (`FRESHELL_TEST_SUMMARY="clippy debt chore" npm test`).
-- **`--all-targets` is mandatory** in every clippy invocation — without it, `#[cfg(test)]` code is not linted and 28 of the 34 findings vanish.
+- **`--all-targets` is mandatory** in every clippy invocation — without it, `#[cfg(test)]` code is not linted and 32 of the 36 findings vanish.
 - **AGENTS.md hazards (mandatory):** NEVER restart the user's self-hosted freshell server; NEVER use broad kill patterns; broad JS test runs wait for the shared coordinator gate (`npm run test:status` to inspect; WAIT if held, never kill a foreign holder). Do NOT run `cargo build --release -p freshell-server` — the release binary is what `run-rust-server.sh` serves; debug-profile `cargo clippy`/`cargo test` are safe.
 - **Disk:** the worktree's cargo target dir will use several GB — fine; do not delete anything outside this worktree.
 - **PR policy:** PR creation for this chore branch IS pre-approved. When all gates are green: push, open PR titled `chore: zero out workspace clippy debt`, `gh pr checks --watch`, self-merge per repo norm, report PR number + merge commit. If PR checks fail, report rather than force.
@@ -26,7 +26,7 @@
 
 ## Red Baseline (captured at `4835de63`)
 
-`cargo clippy --workspace --all-targets -- -D warnings` → **exit 101**, 34 lint errors:
+`cargo clippy --workspace --all-targets -- -D warnings` → **exit 101**, 36 lint errors (the table below numbers them 1–36):
 
 | # | Lint | Location |
 |---|------|----------|
@@ -46,6 +46,10 @@
 Already verified clean at base (must stay clean): `cargo clippy -p freshell-codex --all-targets --features real-transport -- -D warnings` → exit 0 (fixed in #532), and `cargo clippy -p freshell-opencode --all-targets --features real-transport -- -D warnings` → exit 0.
 
 Related pre-existing suppressions that this plan **deletes**: `#[allow(clippy::await_holding_lock)]` in `codex.rs` at lines 3100, 5080, 5147, 5227, 5289, 5339, 5423 — all guarding the identical `ENV_LOCK` pattern.
+
+**Validation re-verification (2026-07-25, plan-validation stage):** the full inventory above was independently reproduced item-for-item, line-for-line at `d8f14c15` (= base `4835de63` + this plan doc only) with rustc/clippy 1.96.0; both feature-gated crates exit 0; exactly 7 allow lines, all in codex.rs; `cargo fmt --all --check` clean. The core mechanism was proven by a pinned probe crate (tokio =1.52.3): `Mutex::const_new` in a `static` and `blocking_lock()` compile, a tokio guard held across `.await` draws NO `await_holding_lock`, while a std guard does (positive control).
+
+**Green test baseline (captured at `d8f14c15`, rustc 1.96.0, node v22.21.1):** `cargo test --workspace` → exit 0, **1763 passed / 0 failed / 4 ignored across 70 suites** (freshell-server bin-unit suite: 328 passed). Task 8 compares against these numbers; any new failure is attributable to this branch.
 
 ---
 
@@ -122,7 +126,7 @@ with:
         let _guard = ENV_LOCK.lock().await;
 ```
 
-Verify the count first: `grep -c 'ENV_LOCK.lock().unwrap_or_else' crates/freshell-freshagent/src/codex.rs` must print `28`. After the replace, `grep -c 'ENV_LOCK.lock().await' crates/freshell-freshagent/src/codex.rs` must print `28` and the `unwrap_or_else` grep must print `0`.
+Verify the count first: `grep -c 'ENV_LOCK.lock().unwrap_or_else' crates/freshell-freshagent/src/codex.rs` must print `28`. After the replace, `grep -c 'ENV_LOCK.lock().await' crates/freshell-freshagent/src/codex.rs` must print `28` and the `unwrap_or_else` grep must print `0`. CAUTION: scope every replace to the named file — other crates (`freshell-ws`, `session_directory`) contain distinct, same-named env locks that must NOT be touched; never run a repo-wide sed for this pattern.
 
 - [ ] **Step 3: Delete the 7 now-dead `#[allow(clippy::await_holding_lock)]` attribute lines**
 
@@ -170,7 +174,7 @@ Expected: exactly 6 lint errors remain — 5 × `await_holding_lock` (claude.rs,
 - [ ] **Step 7: Run the crate's lib tests (needs `node` on PATH — several tests spawn a fake Node app-server)**
 
 Run: `cargo test -p freshell-freshagent --lib`
-Expected: PASS, zero failures, same test count as a pre-change run (do NOT add `--test-threads=1` to "fix" anything — the lock is the serialization contract; default parallelism is part of what's being proven).
+Expected: PASS, zero failures, same test count as the green baseline run recorded in the Red Baseline section (do NOT add `--test-threads=1` to "fix" anything — the lock is the serialization contract; default parallelism is part of what's being proven).
 
 - [ ] **Step 8: Commit**
 
@@ -320,10 +324,10 @@ to (drop the `let id = ...; id` binding — the expression becomes the block tai
 Run: `cargo clippy -p freshell-freshagent --all-targets -- -D warnings; echo "exit: $?"`
 Expected: exit 0.
 
-- [ ] **Step 3: Run the crate's lib tests**
+- [ ] **Step 3: Run the crate's lib tests — twice (flake check for the lock migration)**
 
-Run: `cargo test -p freshell-freshagent --lib`
-Expected: PASS, zero failures.
+Run: `cargo test -p freshell-freshagent --lib` **twice, back to back**.
+Expected: PASS both runs, zero failures. Rationale: the ENV_LOCK/CLAUDE_ENV_LOCK migration (Tasks 2–3) preserves mutual exclusion by construction, and inspection found no test depending on std-Mutex scheduling semantics — but runtime timing under parallel test threads is the one residual only execution can prove. Two consecutive green runs here (plus Task 2's and Task 3's runs = 4 total post-migration runs) is the accepted evidence bar. If EITHER run flakes on an env-var-dependent test, STOP: that is the migration's residual risk materializing — investigate the specific test's interleaving before proceeding (do not retry until green).
 
 - [ ] **Step 4: Commit**
 
@@ -448,7 +452,7 @@ and `get_all` becomes:
     pub async fn get_all(&self) -> HashMap<String, Value> {
 ```
 
-Method bodies unchanged.
+Method bodies unchanged. Companion edit: the module-level doc (session_metadata.rs, ~lines 22-28) describes `get()`/`get_all()` as read surfaces — append a parenthetical there, e.g. `(test-only until the session-indexer read path is ported)`, so the module doc doesn't imply a production API that the cfg gate removes.
 
 - [ ] **Step 5: Fix the now-conditional `HashMap` import (the trap)**
 
@@ -621,7 +625,9 @@ and pinned by the existing terminals tests."
 - Consumes: a green `cargo clippy --workspace --all-targets -- -D warnings` (Task 6) — every command this workflow runs must already pass locally before this task commits.
 - Produces: a CI check named `Rust Clippy / clippy` that Task 9's `gh pr checks --watch` will include.
 
-**Context:** `.github/workflows/` contains only Node/Electron workflows (`typecheck-client.yml`, `electron-build.yml`, `electron-release.yml`) — NO cargo invocation exists anywhere in CI today, and no job has a Rust toolchain or cargo cache to append to. A new self-contained workflow is therefore the trivial, non-disruptive option (it cannot break existing checks). It mirrors `typecheck-client.yml`'s trigger/permissions/concurrency shape. `crates/freshell-tauri` needs GTK/WebKit system libs to compile on `ubuntu-latest` — one apt-get step buys true full-workspace coverage rather than an `--exclude` carve-out. The two default-off `real-transport` features get an explicit second step (`--all-targets` does not imply `--all-features`), and `cargo fmt --all --check` rides along since rustfmt is free once the toolchain is installed.
+**Context:** `.github/workflows/` contains only Node/Electron workflows (`typecheck-client.yml`, `electron-build.yml`, `electron-release.yml`) — NO cargo invocation exists anywhere in CI today (verified by full-content read + grep during plan validation), no check-name collision exists (existing checks: `typecheck-client`, `build`, `release`), and repo Actions policy is `allowed_actions: "all"` so the third-party actions below are permitted (verified via `gh api repos/danshapiro/freshell/actions/permissions`). A new self-contained workflow is therefore the trivial, non-disruptive option (it cannot break existing checks). It mirrors `typecheck-client.yml`'s trigger/permissions/concurrency shape. `crates/freshell-tauri` needs GTK/WebKit system libs to compile on `ubuntu-latest` — one apt-get step buys true full-workspace coverage rather than an `--exclude` carve-out (package set verified against ubuntu-24.04/noble archives and the crate's actual lockfile: tauri 2.11.5 / wry 0.55.1; the Tauri-doc packages omitted here, `libxdo-dev`/`libssl-dev`, are verifiably unneeded — no libxdo/openssl-sys crates in Cargo.lock. Re-check the set when `ubuntu-latest` migrates to 26.04). The two default-off `real-transport` features get an explicit second step (`--all-targets` does not imply `--all-features`), and `cargo fmt --all --check` rides along since rustfmt is free once the toolchain is installed.
+
+**Toolchain pin (deliberate, validated decision):** the toolchain is pinned to `1.96.0`, NOT floating `@stable`. Validation falsified the "float is fine" assumption concretely: local is 1.96.0 but current stable is already 1.97.1, whose clippy adds new default-warn lints (`manual_clear`, `useless_borrows_in_formatting`) — a floating gate could go red on code that local 1.96 passes, and would re-redden every ~6-week Rust release. The pin makes green-local ⇒ green-CI deterministic. Trade-off accepted: the pin must be bumped deliberately (a small follow-up chore per Rust release: bump the version in this workflow, run the gate locally on the new toolchain, fix any new lints in the same PR).
 
 - [ ] **Step 1: Write the workflow**
 
@@ -650,8 +656,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned toolchain (NOT @stable): keeps green-local <=> green-CI deterministic.
+      # Current stable (1.97.x) already adds default-warn lints this branch was not
+      # validated against. Bump this pin deliberately: update the version, re-run the
+      # gate locally on that toolchain, fix new lints in the same PR.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: 1.96.0
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
@@ -681,6 +692,8 @@ jobs:
 ```
 
 - [ ] **Step 2: Verify locally that every command the workflow runs is green**
+
+First confirm the local toolchain matches the workflow's pin: `rustc --version` must print `1.96.0` (it did at validation time). If it doesn't, STOP and reconcile the pin with reality — never let the workflow's toolchain and the locally-verified toolchain diverge.
 
 Run (from the worktree root):
 
@@ -734,7 +747,7 @@ Expected: exit 0.
 - [ ] **Step 3: Full Rust test suite**
 
 Run: `cargo test --workspace` (allow up to ~15 minutes; several freshagent tests spawn Node fixture subprocesses — `node` must be on PATH)
-Expected: all crates PASS, zero failures. `freshell-server` contributes 332 tests (328 bin-unit + 4 integration). If any test fails, STOP and fix within the rules of engagement (behavior-preserving; test assertions unchanged except the one justified swap in Task 5) — do not proceed to the PR with a red suite.
+Expected: all crates PASS, zero failures — compare against the verified green baseline in the Red Baseline section (**1763 passed / 0 failed / 4 ignored across 70 suites** at `d8f14c15`; `freshell-server` bin-unit suite: 328; total may shift only by the test-count-neutral edits in this plan, i.e. it should NOT shift). If any test fails, STOP and fix within the rules of engagement (behavior-preserving; test assertions unchanged except the one justified swap in Task 5) — do not proceed to the PR with a red suite. A failure in an env-var-dependent freshagent test specifically means the lock migration's residual timing risk materialized — investigate the interleaving, do not retry-until-green.
 
 - [ ] **Step 4: Formatting gate**
 
@@ -763,7 +776,7 @@ No commit for this task.
 
 **Interfaces:**
 - Consumes: green gates from Task 8; the `Rust Clippy` workflow from Task 7 (it will run on this very PR — the guard proving itself is the point).
-- Produces: merged PR on `main`; final report of PR number + merge commit.
+- Produces: merged PR on `main`; the `clippy` check added to the repo's required status checks (Step 5 — this, not the workflow alone, is what makes "cannot regrow" true); final report of PR number + merge commit + enforcement status.
 
 - [ ] **Step 1: Push the branch**
 
@@ -778,11 +791,11 @@ gh pr create \
   --title "chore: zero out workspace clippy debt" \
   --body "$(cat <<'EOF'
 ## Summary
-Makes `cargo clippy --workspace --all-targets -- -D warnings` fully green (was: 34 errors at base 4835de63) and adds a CI workflow so the debt cannot silently regrow. Behavior-preserving: no production logic changes beyond deletion of provably-dead code; the only production code edit is a semantics-identical `filter(..).next_back()` → `rfind(..)` rewrite.
+Makes `cargo clippy --workspace --all-targets -- -D warnings` fully green (was: 36 errors at base 4835de63) and adds a CI workflow so the debt cannot silently regrow (made merge-blocking via required status check as a post-merge follow-up). Behavior-preserving: no production logic changes beyond deletion of provably-dead code; the only production code edit is a semantics-identical `filter(..).next_back()` → `rfind(..)` rewrite.
 
 - **freshell-freshagent (28 errors):** migrated the two test-only env-serialization locks (`ENV_LOCK`, `CLAUDE_ENV_LOCK`) from `std::sync::Mutex<()>` to `tokio::sync::Mutex<()>` — the convention `freshell-ws`'s integration tests already use. Fixes all 27 `await_holding_lock` errors and DELETES the 7 pre-existing `#[allow(clippy::await_holding_lock)]` suppressions (net: zero suppressions). Plus one `let_and_return` fix.
 - **freshell-server (8 errors):** deleted `DEFAULT_CLI_DETECTION_SPECS` and `has_cli` (dead since commit 24ecdb8e deliberately removed their only consumer as a parity fix); gated the not-yet-ported `SessionMetadataStore::{get,get_all}` read API to `#[cfg(test)]`; `rfind` rewrite; bool-assert and 3× `slice::from_ref` test lints.
-- **CI:** new `.github/workflows/rust-clippy.yml` (fmt + workspace clippy + real-transport feature clippy). The Rust workspace previously had zero CI coverage.
+- **CI:** new `.github/workflows/rust-clippy.yml` (fmt + workspace clippy + real-transport feature clippy), toolchain pinned to 1.96.0 (current stable's clippy adds default-warn lints this branch wasn't validated against; the pin keeps green-local ⇒ green-CI deterministic — bump it deliberately). The Rust workspace previously had zero CI coverage. After merge, the `clippy` check is added to the repo ruleset's required status checks so it actually blocks merges.
 
 ## Verification
 - `cargo clippy --workspace --all-targets -- -D warnings` → exit 0
@@ -812,12 +825,33 @@ git log --oneline -1 origin/main
 
 Expected: merge succeeds. Report: PR number (from Step 2 output) and the merge commit SHA (from the final `git log` line).
 
+- [ ] **Step 5: Make the `clippy` check REQUIRED (the actual "cannot regrow" enforcement)**
+
+Validation finding (2026-07-25): the repo has NO classic branch protection; merges to `main` are gated by active ruleset **14473229** ("Require Client Typecheck"), whose `required_status_checks` list contains only `{"context":"typecheck-client","integration_id":15368}`. Required checks are an explicit allowlist — a red `Rust Clippy / clippy` run would NOT block merges by itself. This step amends the ruleset. Sequencing is deliberate: it runs AFTER the merge (Step 4), because requiring a not-yet-existing check would block every open PR whose head ref lacks the workflow.
+
+This is an admin, state-changing repo-settings action (repo owner's `gh` auth has the rights — the same auth just self-merged). Preserve the existing `typecheck-client` requirement; the new context is the JOB name `clippy` (not the display string `Rust Clippy / clippy`), with `integration_id` 15368 (GitHub Actions app):
+
+```bash
+# 1. Fetch the current ruleset and append the clippy check, preserving everything else:
+gh api repos/danshapiro/freshell/rulesets/14473229 > /tmp/ruleset.json
+jq '.rules |= map(if .type == "required_status_checks"
+      then .parameters.required_status_checks += [{"context":"clippy","integration_id":15368}]
+      else . end)
+    | {name, target, enforcement, conditions, rules}' /tmp/ruleset.json > /tmp/ruleset-updated.json
+# 2. Inspect /tmp/ruleset-updated.json: it must contain BOTH typecheck-client AND clippy. Then:
+gh api -X PUT repos/danshapiro/freshell/rulesets/14473229 --input /tmp/ruleset-updated.json
+# 3. Verify the effective rules on main now require both checks:
+gh api "repos/danshapiro/freshell/rules/branches/main" | jq '[.[] | select(.type=="required_status_checks")]'
+```
+
+Expected: the final read-back shows required checks `typecheck-client` AND `clippy`. If the PUT fails (403 or schema rejection): do NOT retry blindly and do NOT weaken the existing ruleset — report in the final summary that the clippy gate is currently advisory (enforced only by the `gh pr checks --watch` self-merge norm) and needs a repo-admin to add `clippy` (integration_id 15368) to ruleset 14473229's required status checks. Include this enforcement status (enforced vs advisory) in the final report either way.
+
 ---
 
 ## Self-Review (performed at plan-writing time)
 
 **1. Spec coverage:**
-- Workspace clippy fully green → Tasks 2-6 (all 34 inventoried errors have an exact fix), gate in Tasks 6/8. ✓
+- Workspace clippy fully green → Tasks 2-6 (all 36 inventoried errors have an exact fix), gate in Tasks 6/8. ✓
 - Re-run clippy first to get the exact current list → done pre-plan AND Task 1 re-verifies (with an explicit instruction to fix any toolchain-drift extras under the same rules). ✓
 - freshell-codex real-transport stays clean → Task 1 Step 3 + Task 8 Step 2 + CI step. ✓
 - No blanket allows; MutexGuard restructure rules → zero new allows, 7 deleted; the tokio-mutex migration is the honest restructure for a `()` token whose guard IS the exclusion (clone-out-of-lock is inapplicable — nothing to clone). ✓
@@ -834,3 +868,16 @@ Expected: merge succeeds. Report: PR number (from Step 2 output) and the merge c
 **2. Placeholder scan:** no TBDs; every code step shows the exact before/after code; every run step has the exact command and expected outcome. One deliberate conditional (Task 5 Step 5: grouped vs standalone `HashMap` import) gives the concrete edit for each of the two possible current shapes rather than guessing — both branches are fully specified.
 
 **3. Type consistency:** `ENV_LOCK`/`CLAUDE_ENV_LOCK` keep their names, visibility (`pub(crate)`/private), and module paths — cross-file users (`snapshot.rs`, `terminal_tabs.rs`) compile against the same paths. `blocking_lock()`/`lock().await` match `tokio::sync::Mutex`'s API in tokio 1.52.3. `discovered_cli_names()` returns `Vec<String>`, comparable with `vec!["claude", "opencode"]` via `assert_eq!` (`String: PartialEq<&str>`). `std::slice::from_ref(&root)` yields `&[PathBuf]` matching `scan(dirs: &[PathBuf])`.
+
+---
+
+## Load-Bearing Validation Addendum (2026-07-25)
+
+Fifteen load-bearing assumptions were surfaced and validated (ledger: `.worktrees/.the-usual-logs/clippy-debt/load-bearing-ledger.md`). Result: 12 verified, 2 falsified (plan fixed), 1 accepted with mitigation. Plan changes applied and re-reviewed:
+
+- **Verified (plan now cites evidence, not memory):** the full 36-error inventory reproduced line-for-line at `d8f14c15`; tokio 1.52.3 `const_new`/`blocking_lock` proven by a pinned probe crate; the tokio-guard-across-await lint behavior proven with a std-guard positive control; all 34 async acquisition sites confirmed inside `#[tokio::test] async fn` bodies and both sync sites confirmed lock-before-`block_on` with no re-acquisition; dead-code verdicts confirmed by exhaustive census (no `[features]`, bin-only crate, no dependents; `24ecdb8e` hunk confirmed); CI apt package set confirmed against noble archives + the crate's lockfile; Actions policy `allowed_actions: "all"`; green test baseline captured (1763/0/4, 70 suites).
+- **Falsified → fixed:** (1) floating `@stable` toolchain ≠ local verdicts (stable is 1.97.1 with new default-warn lints; local is 1.96.0) → Task 7 pins `toolchain: 1.96.0` with a documented bump policy; Task 7 Step 2 now verifies the local/pin match. (2) A red clippy check would NOT have blocked merges (ruleset 14473229 requires only `typecheck-client`) → new Task 9 Step 5 adds `clippy` to the required status checks post-merge, with a report-don't-force fallback.
+- **Accepted with mitigation:** behavior-preservation of the std→tokio Mutex swap under parallel test timing is only fully provable post-migration; inspection cleared every statically checkable dependence (ordering/parking/nested-lock/poisoning), and Task 4 Step 3 now runs the crate suite twice (4 post-migration runs total) against the recorded green baseline, with STOP-and-investigate on any flake.
+- **Corrections:** error total is 36 (not 34); freshell-server bin-unit tests are 328; git branch is `chore/clippy-debt` (worktree dir `clippy-debt`).
+
+Re-review of edited tasks against items 1/1b/2/3 above: all edits are verification-strengthening or count corrections; no new deferrals (the Task 9 Step 5 fallback reports enforcement status rather than silently dropping it); every new step has exact commands and expected outcomes; no type contracts changed.
