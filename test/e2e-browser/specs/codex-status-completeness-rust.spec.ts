@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
 import { test, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
+import { RustServer } from '../helpers/rust-server.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
@@ -236,6 +237,69 @@ function taskEventLine(payloadType: string, isoTs: string): string {
   return JSON.stringify({ timestamp: isoTs, type: 'event_msg', payload: { type: payloadType } })
 }
 
+/**
+ * Resume the seeded codex session from the sidebar (donor gesture:
+ * codex-terminal-bounce-rust.spec.ts ~:181-218). Clicking the seeded
+ * session's TITLE entry opens a NEW tab; returns that tab's id plus the
+ * codex leaf's terminalId.
+ */
+async function resumeCodexSessionFromSidebar(
+  page: import('@playwright/test').Page,
+  harness: TestHarness,
+  title: string,
+): Promise<{ tabId: string; terminalId: string }> {
+  await expect(page.getByTestId('sidebar-session-list')).toBeVisible({ timeout: 15_000 })
+  const sessionItem = page.getByText(title, { exact: false }).first()
+  await expect(sessionItem).toBeVisible({ timeout: 15_000 })
+
+  const tabCountBefore = await harness.getTabCount()
+  await sessionItem.click()
+  await expect(async () => {
+    expect(await harness.getTabCount()).toBe(tabCountBefore + 1)
+  }).toPass({ timeout: 15_000 })
+
+  const tabId = await harness.getActiveTabId()
+  expect(tabId).toBeTruthy()
+
+  await expect.poll(async () => {
+    const layout = await harness.getPaneLayout(tabId!)
+    const leaf = collectLeaves(layout)
+      .find((l) => l?.content?.mode === 'codex' && l?.content?.terminalId)
+    return leaf?.content?.terminalId ?? null
+  }, { timeout: 20_000 }).not.toBeNull()
+  const layout = await harness.getPaneLayout(tabId!)
+  const leaf = collectLeaves(layout)
+    .find((l) => l?.content?.mode === 'codex' && l?.content?.terminalId)
+  return { tabId: tabId!, terminalId: leaf.content.terminalId as string }
+}
+
+/**
+ * After an abrupt restart, the live client re-creates the resume tab's codex
+ * terminal under a NEW id. Poll the RESUME tab's pane layout (the tab id
+ * persists client-side across the restart) until a codex leaf carries a
+ * terminalId different from `previousId`, and return it.
+ */
+async function waitForRestoredCodexTerminalId(
+  harness: TestHarness,
+  tabId: string,
+  previousId: string,
+): Promise<string> {
+  const findRestored = async () => {
+    const layout = await harness.getPaneLayout(tabId)
+    const leaf = collectLeaves(layout).find(
+      (l) =>
+        l?.content?.mode === 'codex' &&
+        l?.content?.terminalId &&
+        l.content.terminalId !== previousId,
+    )
+    return leaf?.content?.terminalId ?? null
+  }
+  await expect.poll(findRestored, { timeout: 30_000 }).not.toBeNull()
+  const restored = await findRestored()
+  expect(restored).toBeTruthy()
+  return restored as string
+}
+
 test.describe('Codex status completeness (Rust only)', () => {
   test.setTimeout(240_000)
 
@@ -316,6 +380,111 @@ test.describe('Codex status completeness (Rust only)', () => {
       expect(complete.sessionId).toBe(THREAD_A)
     } finally {
       capture.close()
+      await server.stop().catch(() => {})
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
+
+  test('restartAbrupt mid-codex-turn: restored pane seeds busy from the rollout, then completes with identity', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-restart-'))
+    const fakeCodex = await installFakeCli(
+      path.join(sharedRoot, 'bin'),
+      'codex',
+      path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs'),
+    )
+    let rolloutPath = ''
+    const server = new RustServer({
+      env: { CODEX_CMD: fakeCodex },
+      setupHome: async (homeDir) => {
+        const freshellDir = path.join(homeDir, '.freshell')
+        await fs.mkdir(freshellDir, { recursive: true })
+        await fs.writeFile(
+          path.join(freshellDir, 'config.json'),
+          JSON.stringify(
+            { version: 1, settings: { codingCli: { enabledProviders: ['codex'] } } },
+            null,
+            2,
+          ),
+        )
+        // Idempotent across restartAbrupt's setupHome re-run: seed only once.
+        const candidate = path.join(
+          homeDir, '.codex', 'sessions', '2026', '07', '25',
+          `rollout-2026-07-25T08-00-00-${THREAD_A}.jsonl`,
+        )
+        try {
+          await fs.access(candidate)
+          rolloutPath = candidate
+        } catch {
+          rolloutPath = await seedRollout(homeDir, THREAD_A)
+        }
+      },
+    })
+    try {
+      const info = await server.start()
+      const harness = await bootAndConnect(page, info)
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+
+      // Resume the seeded session from the sidebar (donor gesture:
+      // codex-terminal-bounce-rust.spec.ts ~:181-218 -- click the seeded
+      // session's TITLE entry; the click opens a NEW tab, so all later
+      // assertions target the returned resumeTabId, not the boot tab).
+      // The rollout is currently RESOLVED (no task events), so no busy yet.
+      const { tabId: resumeTabId, terminalId } = await resumeCodexSessionFromSidebar(
+        page,
+        harness,
+        SESSION_TITLE,
+      )
+
+      // The turn goes mid-flight on disk (codex writes task_started), then
+      // the server dies abruptly -- the classic mid-turn crash.
+      await fs.appendFile(rolloutPath, `${taskEventLine('task_started', '2026-07-25T09:00:00.000Z')}\n`)
+      await server.restartAbrupt()
+
+      // The page's WS auto-reconnects; the client restores the pane, which
+      // re-creates the terminal with the resume id -> locator attaches the
+      // lane -> initial drain sees the unresolved start -> BUSY (blue).
+      await harness.waitForConnection(30_000)
+      const capture = new WsCapture(info.baseUrl, info.token)
+      try {
+        await capture.ready()
+        const restoredId = await waitForRestoredCodexTerminalId(harness, resumeTabId, terminalId)
+        await capture.waitFor(
+          (f) =>
+            f.type === 'codex.activity.updated' &&
+            f.upsert?.some(
+              (r: any) =>
+                r.terminalId === restoredId && r.phase === 'busy' && r.sessionId === THREAD_A,
+            ),
+          20_000,
+          'resume-busy seeding after abrupt restart',
+        )
+        await expect(tabBlueIcons(page, resumeTabId)).not.toHaveCount(0, { timeout: 10_000 })
+
+        // The (dead) turn's completion arrives on disk -> lane clears it.
+        await fs.appendFile(rolloutPath, `${taskEventLine('task_complete', '2026-07-25T09:05:00.000Z')}\n`)
+        await capture.waitFor(
+          (f) =>
+            f.type === 'codex.activity.updated' &&
+            f.upsert?.some((r: any) => r.terminalId === restoredId && r.phase === 'idle'),
+          15_000,
+          'reconcile clear -> idle',
+        )
+        const complete = await capture.waitFor(
+          (f) => f.type === 'terminal.turn.complete' && f.terminalId === restoredId,
+          15_000,
+          'reconcile-lane turn complete',
+        )
+        expect(complete.provider).toBe('codex')
+        expect(complete.sessionId).toBe(THREAD_A)
+        await expect(tabBlueIcons(page, resumeTabId)).toHaveCount(0, { timeout: 10_000 })
+      } finally {
+        capture.close()
+      }
+    } finally {
       await server.stop().catch(() => {})
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
