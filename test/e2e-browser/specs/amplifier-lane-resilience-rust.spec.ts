@@ -444,4 +444,114 @@ test.describe('Amplifier events-lane resilience (Rust only)', () => {
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+
+  test('two concurrent servers run independent amplifier lanes', async ({
+    page,
+    browser,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    const rootA = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-dual-a-'))
+    const rootB = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-amp-dual-b-'))
+    const homeA = path.join(rootA, 'amplifier-home')
+    const homeB = path.join(rootB, 'amplifier-home')
+    let captureA: WsCapture | null = null
+    let captureB: WsCapture | null = null
+    let serverA: RustServer | null = null
+    let serverB: RustServer | null = null
+    let contextB: import('@playwright/test').BrowserContext | null = null
+    try {
+      const fakeA = await installFakeCli(path.join(rootA, 'bin'), 'amplifier', FAKE_AMPLIFIER_CLI)
+      const fakeB = await installFakeCli(path.join(rootB, 'bin'), 'amplifier', FAKE_AMPLIFIER_CLI)
+      serverA = new RustServer({
+        env: { AMPLIFIER_CMD: fakeA, AMPLIFIER_HOME: homeA, FAKE_AMPLIFIER_TURN_MS: '3000' },
+        setupHome: seedAmplifierProvider,
+      })
+      serverB = new RustServer({
+        env: { AMPLIFIER_CMD: fakeB, AMPLIFIER_HOME: homeB, FAKE_AMPLIFIER_TURN_MS: '3000' },
+        setupHome: seedAmplifierProvider,
+      })
+      const [infoA, infoB] = await Promise.all([serverA.start(), serverB.start()])
+      expect(infoA.port).not.toBe(infoB.port)
+
+      contextB = await browser.newContext()
+      const pageB = await contextB.newPage()
+
+      captureA = new WsCapture(infoA.baseUrl, infoA.token)
+      captureB = new WsCapture(infoB.baseUrl, infoB.token)
+      await Promise.all([captureA.ready(), captureB.ready()])
+
+      const harnessA = await bootAndConnect(page, infoA)
+      const harnessB = await bootAndConnect(pageB, infoB)
+      const tabA = await harnessA.getActiveTabId()
+      const tabB = await harnessB.getActiveTabId()
+      const tA = await openCliPaneAndGetTerminalId(page, harnessA, tabA!, /Amplifier/i, 'amplifier')
+      const tB = await openCliPaneAndGetTerminalId(pageB, harnessB, tabB!, /Amplifier/i, 'amplifier')
+      for (const [harness, tid] of [
+        [harnessA, tA],
+        [harnessB, tB],
+      ] as const) {
+        await expect
+          .poll(async () => {
+            const buffer = await harness.getTerminalBuffer(tid)
+            return typeof buffer === 'string' && buffer.includes('amplifier>')
+          }, { timeout: 15_000 })
+          .toBe(true)
+      }
+
+      // Drive one full turn on EACH server; both complete independently.
+      await typePromptIntoLastPane(page, 'turn on A')
+      await typePromptIntoLastPane(pageB, 'turn on B')
+      const cA = await captureA.waitFor(
+        (f) => f.type === 'terminal.turn.complete' && f.terminalId === tA,
+        45_000,
+        'server A turn complete',
+      )
+      const cB = await captureB.waitFor(
+        (f) => f.type === 'terminal.turn.complete' && f.terminalId === tB,
+        45_000,
+        'server B turn complete',
+      )
+      expect(cA.provider).toBe('amplifier')
+      expect(cB.provider).toBe('amplifier')
+
+      // Degrade + recover A's lane; B must be completely unaffected.
+      const eventsA = await findEventsFile(homeA)
+      await fs.truncate(eventsA, 0)
+      // Deterministic recovery gate (see Task 5): poll A's tracing log
+      // (rust-server.jsonl under logsDir) for the re-attach attempt instead
+      // of a blind fixed wait.
+      await waitForServerLog(
+        path.join(infoA.logsDir, 'rust-server.jsonl'),
+        'amplifier_events_lane_reattach_attempt',
+      )
+      await page.waitForTimeout(250)
+      await fs.appendFile(eventsA, record('prompt:submit'))
+      await captureA.waitFor(
+        (f) =>
+          f.type === 'amplifier.activity.updated' &&
+          f.upsert?.some((r: any) => r.terminalId === tA && r.phase === 'busy'),
+        15_000,
+        'A recovered busy after truncation',
+      )
+      await fs.appendFile(eventsA, record('prompt:complete'))
+      await captureA.waitFor(
+        (f) => f.type === 'terminal.turn.complete' && f.terminalId === tA && f.completionSeq === 2,
+        15_000,
+        'A recovered turn complete after truncation',
+      )
+      // Independence: B saw exactly its one completion, and A's degrade
+      // produced no frames for B's terminal on B's bus.
+      expect(captureB.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === tB)).toBe(1)
+      expect(captureB.count((f) => f.type === 'terminal.turn.complete' && f.terminalId === tA)).toBe(0)
+    } finally {
+      captureA?.close()
+      captureB?.close()
+      await serverA?.stop().catch(() => {})
+      await serverB?.stop().catch(() => {})
+      await contextB?.close().catch(() => {})
+      await fs.rm(rootA, { recursive: true, force: true }).catch(() => {})
+      await fs.rm(rootB, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
