@@ -86,12 +86,6 @@ pub(crate) fn warn_unresolved_terminal_identities(
 /// un-resumable session). ERROR, not WARN: unlike the sweep alarms above,
 /// this is a per-request hard failure the user sees. Grep target:
 /// `claude_restore_identity_unresolved`.
-// TEMPORARY (Task 3 only): no non-test consumer exists until Task 4's
-// terminal.rs restore path lands; without this, `clippy --all-targets --
-// -D warnings` fails on `dead_code` for the lib target (same convention as
-// Task 1's verifier — see plan commit 4d83c928). Task 4 REMOVES this
-// attribute when it calls this from the claude restore path.
-#[allow(dead_code)]
 pub(crate) fn error_claude_restore_unresolved(request_id: &str) {
     tracing::error!(
         target: "freshell_ws::invariants",

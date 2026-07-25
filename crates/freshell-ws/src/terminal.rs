@@ -1011,6 +1011,44 @@ async fn handle_create(
                 .map(|r| r.session_id.clone())
                 .or_else(|| create.resume_session_id.clone())
                 .filter(|s| !s.is_empty());
+            // P0.4 (campaign plan §2.2): a restore:true claude create with no
+            // client-supplied id must NEVER silently launch a bare `claude`
+            // (neither --resume nor --session-id => permanently un-resumable).
+            // Try the server-side ladder; auto-resume on success (never ask);
+            // reject loudly when nothing can resolve. Claude-only: gemini/kimi
+            // behavior is deliberately untouched, and fresh (non-restore)
+            // claude keeps the preallocation branch above.
+            if mode == "claude" && create.restore == Some(true) {
+                // Full Node reject-predicate parity (ws-handler.ts:2130-2139):
+                // a client-supplied claude id that is not canonical-UUID-shaped
+                // is NOT a usable restore identity -- treat it as unresolvable
+                // (fall to the ladder, then the loud reject). Scoped to the
+                // restore gate ONLY; non-restore resume derivation above is
+                // untouched.
+                if resume_session_id
+                    .as_deref()
+                    .is_some_and(|s| !is_canonical_claude_session_id(s))
+                {
+                    resume_session_id = None;
+                }
+                if resume_session_id.is_none() {
+                    resume_session_id =
+                        resolve_claude_restore_session_id(state, &create.request_id);
+                }
+                if resume_session_id.is_none() {
+                    crate::invariants::error_claude_restore_unresolved(&create.request_id);
+                    return send_create_error(
+                        ws_tx,
+                        ErrorCode::RestoreUnavailable,
+                        // Node parity (`server/ws-handler.ts:2130-2159`): the
+                        // frozen client's create-error handler shows
+                        // "[Restore failed] <this message>".
+                        "Restore requires a canonical session reference.".to_string(),
+                        &create.request_id,
+                    )
+                    .await;
+                }
+            }
         }
     }
 
@@ -1460,6 +1498,58 @@ async fn handle_create(
 /// creates with no session identity yet at create time (e.g. a fresh `codex`
 /// create with an empty `resumeSessionId` -- identity arrives later via
 /// `terminal.session.bound`, which is the deferred association-time slice).
+/// Rust port of `isValidClaudeSessionId` (`shared/session-contract.ts:34,44-46`;
+/// regex /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i):
+/// canonical UUID shape with a version digit 1-5 (position 14) and a variant
+/// digit [89ab] (position 19), case-insensitive. Same chars-based idiom as
+/// `codex_candidate::is_uuid_shaped`, extended with the version/variant
+/// constraints. Used ONLY by the P0.4 restore gate below -- non-restore
+/// resume derivation is deliberately untouched.
+fn is_canonical_claude_session_id(s: &str) -> bool {
+    s.len() == 36
+        && s.chars().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            14 => matches!(c, '1'..='5'),
+            19 => matches!(c.to_ascii_lowercase(), '8' | '9' | 'a' | 'b'),
+            _ => c.is_ascii_hexdigit(),
+        })
+}
+
+/// P0.4 server-side resolution ladder (campaign plan §2.2; this slice is
+/// in-process only -- the durable-ledger and disk-scan rungs land in a later
+/// slice, P1.8). A `restore:true` claude create that carried no usable client
+/// id gets one more chance: the newest terminal generation for the same
+/// createRequestId, consulted in both identity homes -- the same two-home
+/// precedence `reconcile.rs::resolve_authoritative_ref` uses.
+///
+/// GATED on the newest generation NOT being Running (ledger A13): if it is
+/// still live, auto-resuming would spawn a SECOND live claude on the same
+/// session id -- silently wrong. Return None and fail loud instead;
+/// capability-on clients get live adoption via the pane_reconcile dedupe.
+/// Lineage exists only for NATURAL exits: `registry.kill()` removes the row,
+/// so a restore after an explicit user-kill also fails loud -- correct under
+/// "never silently wrong".
+fn resolve_claude_restore_session_id(state: &WsState, create_request_id: &str) -> Option<String> {
+    let newest = state
+        .registry
+        .newest_by_create_request_id(create_request_id)?;
+    let row = state.registry.probe(&newest)?;
+    if row.status == freshell_protocol::TerminalRunStatus::Running {
+        return None;
+    }
+    if let Some(sref) = state.identity.session_ref_for(&newest) {
+        // Retired entries included -- an exited claude's identity is exactly
+        // what a same-lineage restore needs.
+        return (sref.provider == "claude").then_some(sref.session_id);
+    }
+    // Registry-side identity home (REST-created resumes carry identity only
+    // on the registry row).
+    if row.mode != "claude" {
+        return None;
+    }
+    row.resume_session_id.filter(|s| !s.is_empty())
+}
+
 fn terminal_meta_record_for_create(
     terminal_id: &str,
     mode: &str,
