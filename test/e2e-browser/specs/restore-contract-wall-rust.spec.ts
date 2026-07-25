@@ -390,6 +390,46 @@ async function sendFreshAgentTurn(
     .toBe('idle')
 }
 
+// --- freshopencode fresh-agent helpers (donor:
+// freshopencode-restart-recovery.spec.ts:114-206) ---
+
+async function enableFreshOpencode(
+  page: Page,
+  enabledProviders: string[] = ['opencode'],
+): Promise<void> {
+  // These dispatches are client-only and MUST land AFTER the app bootstrap +
+  // /api/platform fetch (App.tsx:572,609 overwrite availableClis). Callers
+  // reach this helper only after harness.waitForConnection(), which is the
+  // donor's ordering (freshopencode-restart-recovery.spec.ts:100-115).
+  //
+  // CAUTION: mergeServerSettings REPLACES the enabledProviders array when the
+  // key is present (shared/settings.ts:1216-1218) -- it does not union. Any
+  // test that needs OTHER providers' picker buttons after this call (e.g. the
+  // Task 9 ruler, which still has freshclaude to create) MUST pass the full
+  // provider list, or those buttons disappear (PanePicker.tsx:125-152 gates
+  // fresh-agent options on enabledProviders.includes(<provider>)).
+  await page.evaluate((providers) => {
+    const harness = (window as any).__FRESHELL_TEST_HARNESS__
+    harness?.dispatch({ type: 'connection/setAvailableClis', payload: { opencode: true } })
+    harness?.dispatch({
+      type: 'settings/previewServerSettingsPatch',
+      payload: { codingCli: { enabledProviders: providers }, freshAgent: { enabled: true } },
+    })
+  }, enabledProviders)
+}
+
+async function createFreshopencodePane(page: Page, cwd: string): Promise<void> {
+  const picker = await openPanePicker(page)
+  await picker.getByRole('button', { name: /^Freshopencode$/i }).click({ force: true })
+  const directoryInput = page.getByLabel(/^Starting directory for Freshopencode$/i)
+  await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+  await directoryInput.fill(cwd)
+  await directoryInput.press('Enter')
+  await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
+    timeout: 15_000,
+  })
+}
+
 // ---------------------------------------------------------------------------
 // The wall
 // ---------------------------------------------------------------------------
@@ -850,6 +890,122 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         const resumeTarget = (create as any).resumeSessionId ?? (create as any).sessionRef?.sessionId
         expect(resumeTarget).toBe(originalSessionId)
       }
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  // Per plan §2.7: the serve DB survives; after SIGKILL+restart+reload the
+  // pane must carry the SAME ses_* identity, rehydrate prompt+response, and
+  // mint NO new session.
+  test('freshopencode: SIGKILL restore keeps the ses_* identity and rehydrates history', async ({
+    page,
+    e2eServerKind,
+  }) => {
+    expect(e2eServerKind).toBe('rust')
+    // PINNED (observed failure mode, run of 2026-07-24): after
+    // SIGKILL+restart+RELOAD the rehydrated pane does NOT carry the durable
+    // ses_* identity -- leafDurableIdentity returns a freshly minted
+    // `freshopencode-<requestId>` placeholder (the lazy-create shape,
+    // server/fresh-agent/adapters/opencode/adapter.ts:75 /
+    // crates/freshell-freshagent/src/opencode_ws.rs:245) and no message
+    // history is visible, even though the durable ses_http_* session
+    // SURVIVED the kill (it still lists in the sidebar). The serve-DB
+    // survival half of §2.7 holds; the pane rebind half does not. The donor
+    // (freshopencode-restart-recovery.spec.ts) stays green because it never
+    // reloads the page -- live reconnect preserves in-memory pane state.
+    test.fail(
+      e2eServerKind === 'rust',
+      'P1.8/P1.13 (§2.7): post-reload freshopencode pane re-mints a freshopencode-* placeholder instead of rebinding the surviving ses_* session',
+    )
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshopencode-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const auditLogPath = path.join(sharedRoot, 'opencode-audit.jsonl')
+    const fakeOpencodePath = await installFakeCli(
+      FAKE_OPENCODE_SIDECAR_SOURCE,
+      'opencode',
+      path.join(sharedRoot, 'bin'),
+    )
+
+    const { server, harness } = await bootWall(page, {
+      env: { OPENCODE_CMD: fakeOpencodePath, FAKE_OPENCODE_AUDIT_LOG: auditLogPath },
+      setupHome: seedWallConfig({ providers: ['opencode'], freshAgent: true }),
+    })
+    // NOTE: the fixture's /session/:id/abort and /fork routes 404 -- known
+    // and out of contract scope (the only production caller is
+    // freshAgent.interrupt, whose error is swallowed,
+    // crates/freshell-freshagent/src/opencode_ws.rs:562-572). Do not add
+    // interrupt-shaped assertions against this fixture.
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
+      await enableFreshOpencode(page)
+      // Wait for the boot pane to become a REAL terminal before opening the
+      // pane picker, else openPanePicker races the boot picker's fade-out and
+      // the Freshopencode click is swallowed (donor:
+      // truly-idle-alerting.spec.ts:122; same guard as Contracts B/D/E --
+      // kept in the TEST BODY so the produced helpers stay verbatim).
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      await createFreshopencodePane(page, projectDir)
+
+      const prompt = 'wall freshopencode turn'
+      await sendFreshAgentTurn(page, harness, tabId, prompt)
+      await expect(page.getByText(`Fake OpenCode response: ${prompt}`)).toBeVisible({
+        timeout: 30_000,
+      })
+
+      // Materialized ses_* identity.
+      const sessionId: string = await expect
+        .poll(async () => {
+          const id = leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId)))
+          return id && /^ses_/.test(id) ? id : null
+        }, { timeout: 30_000 })
+        .not.toBeNull()
+        .then(async () =>
+          leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId)))!,
+        )
+
+      const auditRawBefore = await fs.readFile(auditLogPath, 'utf8').catch(() => '')
+      const auditCountBefore = auditRawBefore ? auditRawBefore.trim().split('\n').length : 0
+
+      await flushPersistence(page)
+
+      // --- SIGKILL + revive, then reload. The opencode.db lives under the
+      // preserved home (XDG_DATA_HOME) and survives; setupHome only rewrites
+      // config.json. ---
+      await server.restartAbrupt()
+      await waitForWsReady(page)
+      await reloadAndReconnect(page, harness)
+
+      // CONTRACT §2.7: same identity, history rehydrated, not wedged.
+      const rehydratedTabId = (await harness.getActiveTabId())!
+      await expect
+        .poll(async () => leafDurableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))), {
+          timeout: 30_000,
+        })
+        .toBe(sessionId)
+      await expect(page.getByText(prompt)).toBeVisible({ timeout: 30_000 })
+      await expect(page.getByText(`Fake OpenCode response: ${prompt}`)).toBeVisible({
+        timeout: 30_000,
+      })
+      const finalLeaf = findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))
+      expect(finalLeaf?.content?.status).not.toBe('error')
+
+      // No NEW durable session was minted by the restore.
+      const auditRawAfter = await fs.readFile(auditLogPath, 'utf8').catch(() => '')
+      const eventsAfter = auditRawAfter
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .slice(auditCountBefore)
+        .map((line) => JSON.parse(line) as { event?: string })
+      expect(
+        eventsAfter.filter(
+          (event) => event.event === 'session_create_requested' || event.event === 'session_created',
+        ),
+      ).toEqual([])
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
