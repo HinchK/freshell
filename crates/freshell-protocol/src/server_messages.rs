@@ -366,8 +366,9 @@ pub struct AmplifierActivityUpdated {
 
 /// `terminal.idle.reason` — why the server believes the terminal is truly
 /// idle: `grace` = a grace window passed with no new activity after the turn
-/// boundary; `queue-empty` = the provider positively reported no queued user
-/// prompt (reserved; every current CLI lane uses `grace`).
+/// boundary; `queue-empty` = queued-prompt evidence was observed during the
+/// turn (a boundary while busy, or a codex busy→pending re-arm) and the
+/// queue has since drained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TerminalIdleReason {
     #[serde(rename = "grace")]

@@ -11,10 +11,12 @@
 //!   yet"; claude/codex: a queued prompt auto-starting the next turn re-buses
 //!   the terminal, which CANCELS the pending emission entirely);
 //! * a busy re-entry cancels; the next boundary re-arms;
-//! * the window lapsing emits exactly one `terminal.idle` with reason
-//!   `grace` (per-CLI queued-prompt detection: where a CLI's queued-prompt
-//!   state is undetectable, grace-window-only is the accepted fallback —
-//!   every current lane uses `grace`);
+//! * the window lapsing emits exactly one `terminal.idle`; the reason is
+//!   `queue-empty` when queue evidence accrued since the last emission (a
+//!   boundary while the tracker still reported busy, or a codex
+//!   busy→pending re-arm), else `grace`;
+//! * a turn boundary while the tracker still reports busy/pending is a
+//!   QUEUED turn: it records queue evidence and never arms mid-turn;
 //! * subagent/tool completions inside a running turn never reach this gate
 //!   (the trackers only report REAL turn boundaries).
 //!
@@ -83,6 +85,11 @@ impl IdleGate {
         let state = self.states.entry(terminal_id.to_string()).or_default();
         let next_busy = matches!(phase, IdleGatePhase::Busy | IdleGatePhase::Pending);
         if next_busy {
+            // Codex busy->pending re-arm: a queued submit was consumed at the
+            // turn clear — queue evidence (legacy truly-idle-emitter.ts:94-95).
+            if state.busy && !state.pending && phase == IdleGatePhase::Pending {
+                state.saw_queue_evidence = true;
+            }
             state.deadline = None;
         }
         state.busy = next_busy;
@@ -95,6 +102,10 @@ impl IdleGate {
     pub fn note_turn_boundary(&mut self, terminal_id: &str, at: i64) {
         let state = self.states.entry(terminal_id.to_string()).or_default();
         if state.busy {
+            // Queued turn (claude in_flight ledger keeps phase busy until the
+            // queue drains): record queue evidence, never arm
+            // (legacy truly-idle-emitter.ts:114-118).
+            state.saw_queue_evidence = true;
             return;
         }
         state.deadline = Some(at + self.grace_ms);
@@ -140,10 +151,16 @@ impl IdleGate {
             if state.busy {
                 continue;
             }
+            let reason = if state.saw_queue_evidence {
+                TerminalIdleReason::QueueEmpty
+            } else {
+                TerminalIdleReason::Grace
+            };
+            state.saw_queue_evidence = false;
             emissions.push(IdleEmission {
                 terminal_id: terminal_id.clone(),
                 at,
-                reason: TerminalIdleReason::Grace,
+                reason,
             });
         }
         emissions
@@ -298,5 +315,75 @@ mod tests {
         gate.note_phase("t1", IdleGatePhase::Pending); // cancels
         gate.note_turn_boundary("t1", 200); // busy -> refuses to arm
         assert!(gate.expire(200 + 10 * IDLE_GRACE_MS).is_empty());
+    }
+
+    #[test]
+    fn boundary_while_busy_then_drain_emits_queue_empty() {
+        let mut gate = IdleGate::new();
+        gate.note_phase("t1", IdleGatePhase::Busy);
+        gate.note_turn_boundary("t1", 100); // queued turn: evidence, no arm
+        gate.note_phase("t1", IdleGatePhase::Idle); // queue drained
+        gate.note_turn_boundary("t1", 200); // arms
+        let emissions = gate.expire(200 + IDLE_GRACE_MS);
+        assert_eq!(
+            emissions,
+            vec![IdleEmission {
+                terminal_id: "t1".into(),
+                at: 200 + IDLE_GRACE_MS,
+                reason: TerminalIdleReason::QueueEmpty
+            }]
+        );
+    }
+
+    #[test]
+    fn evidence_resets_after_an_emission() {
+        let mut gate = IdleGate::new();
+        gate.note_phase("t1", IdleGatePhase::Busy);
+        gate.note_turn_boundary("t1", 100); // evidence
+        gate.note_phase("t1", IdleGatePhase::Idle);
+        gate.note_turn_boundary("t1", 200);
+        let first = gate.expire(200 + IDLE_GRACE_MS);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].reason, TerminalIdleReason::QueueEmpty);
+        // Next cycle without new evidence: plain grace.
+        gate.note_phase("t1", IdleGatePhase::Busy);
+        gate.note_phase("t1", IdleGatePhase::Idle);
+        gate.note_turn_boundary("t1", 10_000);
+        let emissions = gate.expire(10_000 + IDLE_GRACE_MS);
+        assert_eq!(emissions[0].reason, TerminalIdleReason::Grace);
+    }
+
+    #[test]
+    fn codex_busy_to_pending_rearm_counts_as_queue_evidence() {
+        // Legacy truly-idle-emitter.ts:90-98 — a busy->pending transition is
+        // the codex queued-submit-consumed-at-turn-clear signal.
+        let mut gate = IdleGate::new();
+        gate.note_phase("t1", IdleGatePhase::Busy);
+        gate.note_phase("t1", IdleGatePhase::Pending); // re-arm: evidence
+        gate.note_phase("t1", IdleGatePhase::Idle);
+        gate.note_turn_boundary("t1", 100);
+        let emissions = gate.expire(100 + IDLE_GRACE_MS);
+        assert_eq!(emissions[0].reason, TerminalIdleReason::QueueEmpty);
+    }
+
+    #[test]
+    fn pending_to_pending_is_not_queue_evidence() {
+        // Only the busy&&!pending -> pending edge counts (legacy :94).
+        let mut gate = IdleGate::new();
+        gate.note_phase("t1", IdleGatePhase::Pending);
+        gate.note_phase("t1", IdleGatePhase::Pending);
+        gate.note_phase("t1", IdleGatePhase::Idle);
+        gate.note_turn_boundary("t1", 100);
+        assert_eq!(gate.expire(100 + IDLE_GRACE_MS)[0].reason, TerminalIdleReason::Grace);
+    }
+
+    #[test]
+    fn exit_discards_queue_evidence_with_the_rest_of_the_state() {
+        let mut gate = IdleGate::new();
+        gate.note_phase("t1", IdleGatePhase::Busy);
+        gate.note_turn_boundary("t1", 100); // evidence
+        gate.note_exit("t1"); // legacy remove: whole state deleted
+        gate.note_turn_boundary("t1", 200); // fresh terminal id reuse
+        assert_eq!(gate.expire(200 + IDLE_GRACE_MS)[0].reason, TerminalIdleReason::Grace);
     }
 }
