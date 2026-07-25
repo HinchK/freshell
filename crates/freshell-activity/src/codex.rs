@@ -18,17 +18,20 @@
 //!
 //! DOCUMENTED DEVIATIONS from the reference (adjudicated, see PR):
 //!
-//! 1. **Tracking starts at terminal create, not session bind.** The reference
-//!    only tracks terminals the legacy codex session INDEXER has bound
-//!    (`terminal.session.bound`); that JSONL-reconcile lane
-//!    (`reconcileProjects` / `onTurnStarted` / `onTurnCompleted`, the `busy`
-//!    and `unknown` phases, and resume-busy seeding) is not yet ported. On
-//!    the Rust server a codex pane would otherwise NEVER have an activity
-//!    record at all — the exact TERM-15 bug this crate fixes. The PTY-lane
-//!    state machine itself is ported faithfully. (`bind_session` is that
-//!    lane's binder: the candidate-adopt path and the rollout-reconcile lane
-//!    announce identity through it; resume identity still arrives via
-//!    `track_terminal`'s `session_id` argument.)
+//! 1. **Tracking starts at terminal create, not session bind**, and the
+//!    JSONL-reconcile lane is ported NARROWED (G9): per-bound-terminal
+//!    rollout tailing (`freshell-ws/src/codex_reconcile.rs` + the hub's
+//!    codex lanes) instead of the legacy whole-library `reconcileProjects`
+//!    scan; tail-trusting bounded reads (256KB initial) instead of the
+//!    head+tail snippet sanitizer; and NO latent/association distrust
+//!    (`latentAcceptedStartAt` unported) because every Rust binding is
+//!    proof-carrying -- resume argv or disk-truth candidate adoption
+//!    (`verify_rollout_path`). `bind_session` is the lane's binder;
+//!    `reconcile_rollout` is its state machine; `busy`/`unknown`, the
+//!    busy-deadman, and `accepted_start_at` are live. Cross-lane
+//!    completion dedupe adds a one-shot BEL-echo swallow armed by
+//!    reconcile-initiated clears (the PTY and rollout key spaces are
+//!    disjoint clock domains, so the turn-key alone cannot dedupe them).
 //! 2. **Zero-polling**: `next_deadline()` + one-shot hub timer instead of the
 //!    5s sweep (`ACTIVITY_SWEEP_MS`), same as [`crate::claude`].
 

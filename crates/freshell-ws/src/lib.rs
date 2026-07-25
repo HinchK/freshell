@@ -36,6 +36,9 @@ pub mod tabs;
 pub mod tabs_persist;
 pub mod terminal;
 
+pub use codex_candidate::codex_sessions_root;
+pub use codex_reconcile::locate_codex_rollout;
+
 use std::sync::Arc;
 
 use axum::{

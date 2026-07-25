@@ -144,7 +144,7 @@ pub(crate) fn fold_task_events(lines: &[String]) -> CodexTaskEvents {
 /// documented-unsafe (codex_candidate.rs:46-57: 40% of sampled rollouts
 /// contain foreign uuids). Bounded recursive walk (the tree is
 /// `sessions/YYYY/MM/DD/rollout-*.jsonl`, flat `<id>.jsonl` in tests).
-pub(crate) fn locate_codex_rollout(sessions_root: &Path, session_id: &str) -> Option<PathBuf> {
+pub fn locate_codex_rollout(sessions_root: &Path, session_id: &str) -> Option<PathBuf> {
     fn walk(dir: &Path, session_id: &str, depth: u8, hit: &mut Option<PathBuf>) {
         if depth > 5 || hit.is_some() {
             return;

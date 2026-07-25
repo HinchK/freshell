@@ -487,6 +487,41 @@ impl ActivityHub {
                         }
                     }
                 }
+                // G9: resume-created codex terminals attach the rollout-
+                // reconcile lane via the locator (fresh terminals get theirs
+                // from the candidate-adopt path instead). Channel-deferred
+                // like AmplifierAttach so create's frames land first.
+                //
+                // MEASURED (load-bearing validation, F6): the locator's walk
+                // of a real ~/.codex/sessions tree (8k+ files) is 35-55ms
+                // warm and seconds-scale cold -- NEVER run it inline on the
+                // hub task (the amplifier resolver stays inline because its
+                // path is deterministic and cheap; this one is not). The
+                // walk runs on a blocking thread; the attach event was
+                // already channel-deferred, so frame ordering vs the Created
+                // upsert is unchanged.
+                if mode == "codex" {
+                    if let Some(session_id) = resume_session_id.as_deref() {
+                        let locator = {
+                            let inner = self.inner.lock().expect("activity hub lock");
+                            inner.codex_rollout_locator.clone()
+                        };
+                        if let Some(locator) = locator {
+                            let tx = self.tx.clone();
+                            let terminal_id = terminal_id.clone();
+                            let session_id = session_id.to_string();
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(rollout_path) = locator(&session_id) {
+                                    let _ = tx.send(HubEvent::CodexAttach {
+                                        terminal_id,
+                                        session_id,
+                                        rollout_path,
+                                    });
+                                }
+                            });
+                        }
+                    }
+                }
                 self.emit(frames);
             }
             ActivityEvent::Input {
@@ -1499,5 +1534,37 @@ mod tests {
         .expect("remove on exit");
         let lanes = hub.inner.lock().unwrap().codex_lanes.len();
         assert_eq!(lanes, 0, "exit drops the lane (and its inotify watcher)");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_created_codex_terminal_attaches_the_rollout_lane_via_locator() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        let (_guard, rollout) =
+            codex_rollout_fixture(&[codex_event_line("task_started", now - 5_000)]);
+        let rollout_for_locator = rollout.clone();
+        hub.set_codex_rollout_locator(Arc::new(move |session_id: &str| {
+            (session_id == "sess-1").then(|| rollout_for_locator.clone())
+        }));
+
+        // A restored codex terminal is a normal create carrying the resume id.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+
+        // The lane attaches and the initial drain seeds busy: the restored
+        // mid-turn terminal is blue, not lying idle/green (the G9 headline).
+        let busy = next_frame_matching(&mut rx, "codex.activity.updated", 5_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("resume-busy seeding via the locator-attached lane");
+        assert_eq!(busy["upsert"][0]["sessionId"], "sess-1");
     }
 }

@@ -406,6 +406,16 @@ async fn main() -> ExitCode {
         freshell_ws::activity::ActivityHub::new(Arc::clone(&broadcast_tx), resolver)
     };
     registry.set_activity_observer(activity_hub.registry_observer());
+    // G9: resume-time codex rollout locator (ownership-proof walk of the
+    // codex sessions root; None -> PTY-only lane, same degradation as the
+    // amplifier resolver above).
+    if let Some(codex_sessions_root) = freshell_ws::codex_sessions_root() {
+        activity_hub.set_codex_rollout_locator(std::sync::Arc::new(
+            move |session_id: &str| {
+                freshell_ws::locate_codex_rollout(&codex_sessions_root, session_id)
+            },
+        ));
+    }
     let ws_state = WsState {
         activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
