@@ -20,6 +20,7 @@
 - E2E specs spin up their OWN servers via `test/e2e-browser/helpers/rust-server.ts` (`RustServer`, ephemeral ports via `findFreePort()`). NEVER use ports 3001/3002 (the user's LIVE servers). NEVER restart the user's self-hosted Freshell server. NEVER use broad kill patterns.
 - Broad JS test runs go through the coordinator gate: `npm run test:status` to inspect; if another agent holds the gate, WAIT (four sibling lanes run concurrently). Set `FRESHELL_TEST_SUMMARY="lane D codex status completeness"` for broad runs. Cargo runs (`cargo test`) are not gated.
 - Server TS uses NodeNext/ESM: relative imports in `test/e2e-browser` include `.js` extensions.
+- **Sibling-lane composition (from the load-bearing validation pass, V5):** (a) do NOT reference `note_busy_upserts` by name in any new code or test — Lane A renames it (`note_changed_to_gate`); call only `codex_frames`, whose signature is preserved. (b) Lane A also fixes the idle grace from 0 to ~2000 ms — write any assertion adjacent to `terminal.idle` timing grace-window-tolerant (scan/poll, never assert immediate idle). (c) Lane E adds fields to `WsState` — if Task 3's duplicated spawn body stops compiling after a sibling merge, add the new fields exactly as the donor function has them (compiler-caught, expected). (d) Before ANY rebase onto merged sibling work, re-run a diff sweep of the shared surfaces (`activity.rs` Created/Exit arms, `tests/common/mod.rs`, `playwright.config.ts`, `main.rs:397-408`) — sibling plans are declarations, not contracts; line anchors WILL drift (anchor by symbol).
 - Commits: focused and atomic, one per task, message ends with the Amplifier co-author trailer:
 
 ```
@@ -47,6 +48,54 @@ Both options were evaluated against the legacy implementation (`server/coding-cl
 - **Per-bound-terminal rollout tailing** instead of the legacy whole-library `reconcileProjects` scan. The legacy tracker only ever touched terminals it had records for anyway; watching just the bound terminal's rollout file (mirroring the amplifier events lane) removes the indexer feed and the 2s/5s debounce machinery.
 - **Tail-trusting reads** instead of head+tail snippet + `sanitizeCodexTaskEventsForTruncatedSnippet`: the initial attach read is bounded to the last 256 KB of the rollout; incremental reads are offset-tailed. Trusting the tail is exactly what the legacy sanitizer converged to for truncated files, and it prevents the "permanently blue" hazard by construction (p99 rollout is 28 MB — never read whole files per change event).
 - **No latent/association distrust** (`latentAcceptedStartAt` is not ported): legacy needed it because `reason: 'association'` bindings were cwd/time GUESSES. Every Rust binding is proof-carrying — resume argv (`codex resume <id>`) or disk-truth candidate adoption (`verify_rollout_path`: first-line `session_meta.payload.id` ownership proof + single-owner guard 3b). Trusted bindings promote directly.
+
+## Validation record (load-bearing pass, 2026-07-25)
+
+The plan's load-bearing assumptions were validated before execution (full ledger:
+`.worktrees/.the-usual-logs/codex-status-completeness/load-bearing-ledger.md`, evidence in
+`reports/validator-V1..V6.md`). Findings that shape execution:
+
+1. **VERIFIED — single-file tailing is sound.** Codex source (installed version 0.145.0,
+   tag `rust-v0.145.0`): `codex resume <id>` opens the EXISTING rollout append-mode
+   (`codex-rs/core/src/rollout/recorder.rs:1828-1831`, `meta: None`); the foreign-lineage
+   `payload.session_id` cases are FORKS (new file), not resumes. Error recovery reopens the
+   same path; rollback is an appended logical marker, never a rewrite. The narrowing
+   deviation stands.
+2. **VERIFIED — locator contract.** Census of the real 8,234-rollout tree: first line is
+   always `session_meta`; `payload.id` is unique across files AND always equals the
+   filename uuid. First-match-wins needs no recency ordering. Real first lines are ~22 KB
+   (session_meta embeds `base_instructions`) — `first_line_owns`'s 1 MB `take` cap is
+   load-bearing; never reduce it below 64 KB.
+3. **VERIFIED — discriminators current.** All 3,762 rollouts newer than 2026-07-01 carry
+   the three `event_msg` discriminators with top-level ISO timestamps (26,116
+   `task_started` / 21,842 `task_complete` / 2,429 `turn_aborted` lines).
+4. **FALSIFIED — inline locator walk.** Measured on the real tree: 35–55 ms warm,
+   seconds-scale cold. The Created-arm trigger therefore runs the locator under
+   `tokio::task::spawn_blocking` (Task 7a as written below).
+5. **FALSIFIED — fresh-terminal production trigger (G3 scope note).** NO Rust code emits
+   `terminal.codex.durability.updated` (protocol-only type, `server_messages.rs:99/:889`;
+   durability store deferred to S5 per `launch_lifecycle.rs:21-28`), and the frozen
+   client's ONLY `terminal.codex.candidate.persisted` send site is gated on that message
+   (`TerminalView.tsx:3886-3919`). So against today's Rust server the candidate-adopt
+   trigger chain never fires in production; it goes live when S5 ports the durability
+   emitter (legacy reference: `broadcastCodexDurability`, `server/terminal-registry.ts:3044-3056`,
+   fed by the sidecar candidate chain). Tasks 3/7b remain REQUIRED — they are the
+   server-side half S5 plugs into, and the RESUME path (locator) is production-live now.
+   Task 8's raw-WS candidate injection is therefore a protocol-level proof of the adopt
+   path (the same established pattern as `tests/codex_candidate_persisted.rs`), not proof
+   of the production trigger chain — Task 8 documents this honestly.
+6. **FALSIFIED — two-field exactly-once dedupe.** Adversarial enumeration found two
+   reachable double-completion interleavings (and one pre-existing zero-fire). Task 4 now
+   ships the two fixes and pins them with tests: a one-shot BEL-echo swallow armed by
+   reconcile-initiated clears, and nulling `accepted_start_at` in
+   `transition_pending_after_turn_clear` (details in Task 4).
+7. **ACCEPTED RESIDUALS.** (a) Out-of-band rollout disappearance — codex compresses
+   rollouts idle ≥7 days to `.jsonl.zst` and unlinks the `.jsonl` (`compression.rs:253,651`;
+   currently inert locally), and `codex archive`/`delete` can remove files: the lane
+   degrades to PTY-only for that terminal (same class as a locator miss) and self-heals on
+   resume — deliberately NOT re-introducing tree watching. (b) Sibling-lane drift during
+   the wave: current state verified clean (all four siblings docs-only); composition notes
+   added to Global Constraints; re-run a shared-surface diff sweep before any rebase.
 
 ---
 
@@ -590,7 +639,59 @@ Append inside `mod tests` in `crates/freshell-activity/src/codex.rs`:
         let effects = tracker.reconcile_rollout("t-unknown", &started(100), 200);
         assert!(effects.is_empty());
     }
+
+    #[test]
+    fn reconcile_clear_with_queued_submit_swallows_the_late_bel_echo() {
+        // Load-bearing validation CE1: reconcile clear with a queued submit
+        // re-arms Pending (transition_after_turn_clear's has_queued_submit
+        // branch); the PTY BEL echo of the RECONCILED turn's end must not
+        // complete the re-armed turn prematurely (the disjoint key spaces --
+        // server-clock pending keys vs rollout-clock accepted keys -- make
+        // last_emitted_turn_key powerless here; the swallow flag is the fix).
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        tracker.note_input("t1", "\r", 10); // turn 1 pending
+        tracker.reconcile_rollout("t1", &started(12), 15); // promoted busy
+        tracker.note_input("t1", "\r", 20); // queued submit (turn 2)
+        let clear = tracker.reconcile_rollout("t1", &completed(25), 30);
+        assert_eq!(completions(&clear), vec![1], "turn 1 completes via reconcile");
+        // The BEL echo of turn 1's end arrives late on the PTY lane.
+        let echo = tracker.note_output("t1", "\u{07}", 35);
+        assert!(
+            completions(&echo).is_empty(),
+            "BEL echo of a reconcile-cleared turn must be swallowed"
+        );
+        // Turn 2 then actually runs and completes exactly once.
+        tracker.reconcile_rollout("t1", &started(40), 45);
+        let done = tracker.reconcile_rollout("t1", &completed(60), 65);
+        assert_eq!(completions(&done), vec![2], "turn 2 completes exactly once");
+    }
+
+    #[test]
+    fn dup_bel_chunk_after_stale_accepted_completes_exactly_once() {
+        // Load-bearing validation CE2: transition_pending_after_turn_clear
+        // must null accepted_start_at. A deadman-demoted seeded busy leaves a
+        // stale accepted anchor; without the fix, a dup-BEL chunk (real PTY
+        // behavior, see the existing dup-BEL test) fires TWO completions in
+        // one note_output call -- pending-key chime then stale-accepted chime.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200); // seeded busy, accepted=100
+        tracker.expire(200 + BUSY_DEADMAN_MS + 1); // demote to Unknown
+        let submit_at = 200 + BUSY_DEADMAN_MS + 1_000;
+        tracker.note_input("t1", "\r", submit_at); // new pending turn
+        let bel = tracker.note_output("t1", "\u{07}\u{07}", submit_at + 500);
+        assert_eq!(
+            completions(&bel).len(),
+            1,
+            "one turn end -> exactly one completion, even for a dup-BEL chunk"
+        );
+    }
 ```
+
+(If `note_input`/`note_output`/`expire` signatures differ from the existing tests'
+usage, match the existing tests exactly — these two tests reuse only constructions
+already present in the suite.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -634,7 +735,7 @@ fn max_ts(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 }
 ```
 
-(b) Add two fields to `TerminalActivity` (after `accepted_start_at: Option<i64>,`):
+(b) Add three fields to `TerminalActivity` (after `accepted_start_at: Option<i64>,`):
 
 ```rust
     /// Rollout-reconcile lane: newest `task_started` timestamp ever seen for
@@ -643,9 +744,15 @@ fn max_ts(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     /// Rollout-reconcile lane: newest clear (`task_complete`/`turn_aborted`)
     /// ever seen; a start is only unresolved if newer than this.
     last_cleared_at: Option<i64>,
+    /// One-shot: a reconcile-initiated turn clear arms this so the PTY BEL
+    /// echo of the SAME physical turn end is swallowed instead of completing
+    /// a re-armed queued turn prematurely (validation counterexample CE1 --
+    /// the PTY and reconcile key spaces are disjoint clock domains, so
+    /// `last_emitted_turn_key` alone cannot dedupe across lanes).
+    swallow_next_bel: bool,
 ```
 
-and initialize both to `None` in `track_terminal`'s state literal (next to `accepted_start_at: None,`).
+and initialize the two `Option`s to `None` and the flag to `false` in `track_terminal`'s state literal (next to `accepted_start_at: None,`).
 
 (c) Add the reconcile method in `impl CodexActivityTracker`, after `bind_session`:
 
@@ -715,6 +822,10 @@ and initialize both to `None` in `track_terminal`'s state literal (next to `acce
                         .unwrap_or(false)
                 {
                     transition_pending_after_turn_clear(state, at, &mut self.ledger, &mut completions);
+                    // CE1: swallow the PTY BEL echo of this reconciled turn end
+                    // (armed regardless of whether the fold arrived as one
+                    // batch or split batches -- batch-agnostic by design).
+                    state.swallow_next_bel = true;
                 } else if (state.phase == CodexPhase::Busy || state.phase == CodexPhase::Unknown)
                     && state
                         .accepted_start_at
@@ -722,6 +833,7 @@ and initialize both to `None` in `track_terminal`'s state literal (next to `acce
                         .unwrap_or(false)
                 {
                     transition_after_turn_clear(state, at, &mut self.ledger, &mut completions);
+                    state.swallow_next_bel = true;
                 }
             }
         }
@@ -743,14 +855,19 @@ and initialize both to `None` in `track_terminal`'s state literal (next to `acce
 
 NOTE: mirror the exact `TrackerEffect::TurnComplete` push shape used at the end of `note_output` (codex.rs:232-239) — copy its field construction verbatim if it differs from the above.
 
-(d) `transition_after_turn_clear` (codex.rs:386-411) and the `Busy` arms of `note_input`/`expire`/`next_deadline` are now LIVE — do not delete anything; the tests in Step 1 pin them. Also pin the dedupe interplay: `record_completion_if_idle`'s `last_emitted_turn_key` now sees both `pending_submit_at` keys (PTY) and `accepted_start_at` keys (reconcile); the "exactly once" tests above prove no double-fire.
+(d) Two cross-lane dedupe fixes required by the load-bearing validation pass (counterexamples CE1/CE2 in `validator-V4.md`; both edits are in this OWNED file):
+
+1. **BEL-echo swallow (CE1).** In `note_output`'s BEL handling, BEFORE any completion logic runs for a BEL occurrence: if `state.swallow_next_bel` is true, set it to `false` and treat that BEL as consumed (no phase transition, no completion) — one-shot. Also clear the flag in `note_input` whenever a NEW submit is recorded from Idle/Unknown (a fresh pending turn means any armed swallow is stale). The reconcile clear paths in (c) arm the flag; without it, a reconcile clear that re-arms Pending for a queued submit lets the late PTY BEL echo of the RECONCILED turn complete the queued turn prematurely, and the queued turn then completes AGAIN via its own rollout clear (the two key spaces are disjoint clock domains — `last_emitted_turn_key` cannot catch this).
+2. **Null the accepted anchor on pending clears (CE2).** In `transition_pending_after_turn_clear` (codex.rs:361-384), add `state.accepted_start_at = None;` alongside the other anchor resets (mirror how `transition_after_turn_clear` nulls it). Without this, a deadman-demoted seeded busy leaves a stale `accepted_start_at`, and a dup-BEL chunk fires two completions in one `note_output` call (pending-key chime, then stale-accepted chime).
+
+(e) `transition_after_turn_clear` (codex.rs:386-411) and the `Busy` arms of `note_input`/`expire`/`next_deadline` are now LIVE — do not delete anything; the tests in Step 1 pin them. Also pin the dedupe interplay: `record_completion_if_idle`'s `last_emitted_turn_key` now sees both `pending_submit_at` keys (PTY) and `accepted_start_at` keys (reconcile); the "exactly once" tests above (including the CE1/CE2 tests) prove no double-fire. Known pre-existing PTY-parity behavior, NOT fixed here (validation CE3): pending decay leaves `queued_submit_at` stale, so a later real turn's BEL can re-arm onto a ghost queued submit and complete silently without a chime — this exists in the frozen PTY reference today and is out of this lane's scope; do not "fix" it opportunistically.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
 cargo test -p freshell-activity
 ```
-Expected: PASS — all 8 new tests plus all pre-existing tests (especially `queued_submit_rearms_pending_after_the_bel_and_completes_each_turn` and `deadline_driven_expiry_converges_for_a_quiet_submit`, which prove no regression in the PTY lane).
+Expected: PASS — all 10 new tests plus all pre-existing tests (especially `queued_submit_rearms_pending_after_the_bel_and_completes_each_turn` and `deadline_driven_expiry_converges_for_a_quiet_submit`, which prove no regression in the PTY lane; the swallow flag must not disturb them — it only arms on RECONCILE-initiated clears, which those tests never trigger).
 
 - [ ] **Step 5: Commit**
 
@@ -1515,6 +1632,15 @@ Expected: FAIL — times out waiting for the busy upsert (nothing attaches the l
                 // reconcile lane via the locator (fresh terminals get theirs
                 // from the candidate-adopt path instead). Channel-deferred
                 // like AmplifierAttach so create's frames land first.
+                //
+                // MEASURED (load-bearing validation, F6): the locator's walk
+                // of a real ~/.codex/sessions tree (8k+ files) is 35-55ms
+                // warm and seconds-scale cold -- NEVER run it inline on the
+                // hub task (the amplifier resolver stays inline because its
+                // path is deterministic and cheap; this one is not). The
+                // walk runs on a blocking thread; the attach event was
+                // already channel-deferred, so frame ordering vs the Created
+                // upsert is unchanged.
                 if mode == "codex" {
                     if let Some(session_id) = resume_session_id.as_deref() {
                         let locator = {
@@ -1522,17 +1648,24 @@ Expected: FAIL — times out waiting for the busy upsert (nothing attaches the l
                             inner.codex_rollout_locator.clone()
                         };
                         if let Some(locator) = locator {
-                            if let Some(rollout_path) = locator(session_id) {
-                                let _ = self.tx.send(HubEvent::CodexAttach {
-                                    terminal_id: terminal_id.clone(),
-                                    session_id: session_id.to_string(),
-                                    rollout_path,
-                                });
-                            }
+                            let tx = self.tx.clone();
+                            let terminal_id = terminal_id.clone();
+                            let session_id = session_id.to_string();
+                            tokio::task::spawn_blocking(move || {
+                                if let Some(rollout_path) = locator(&session_id) {
+                                    let _ = tx.send(HubEvent::CodexAttach {
+                                        terminal_id,
+                                        session_id,
+                                        rollout_path,
+                                    });
+                                }
+                            });
                         }
                     }
                 }
 ```
+
+(Adapt the deferred-send mechanics to the file's reality: if the `HubEvent` sender is not a clonable sync-`send` handle usable off-task (check how the `AmplifierAttach` deferred send at activity.rs:284-297 obtains its sender), obtain the sender the same way that precedent does and move THAT into the `spawn_blocking` closure. The non-negotiable part, per the measured falsification, is that `locator(...)` executes on a blocking thread, not on the hub task.)
 
 (b) **Candidate adopt** — in `codex_candidate.rs`, extend the Task 3 block (the rollout path is already disk-truth verified by guard 4):
 
@@ -1588,7 +1721,10 @@ Wait — `codex_sessions_root` is currently private (`fn`); make it `pub(crate)`
 //!    proof-carrying -- resume argv or disk-truth candidate adoption
 //!    (`verify_rollout_path`). `bind_session` is the lane's binder;
 //!    `reconcile_rollout` is its state machine; `busy`/`unknown`, the
-//!    busy-deadman, and `accepted_start_at` are live.
+//!    busy-deadman, and `accepted_start_at` are live. Cross-lane
+//!    completion dedupe adds a one-shot BEL-echo swallow armed by
+//!    reconcile-initiated clears (the PTY and rollout key spaces are
+//!    disjoint clock domains, so the turn-key alone cannot dedupe them).
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1740,7 +1876,9 @@ test.describe('Codex status completeness (Rust only)', () => {
 })
 ```
 
-Verify the exact client-frame field casing against the Rust protocol type for `TerminalCodexCandidatePersisted` (`crates/freshell-protocol`, `rename_all = "camelCase"` convention → `terminalId`/`candidateThreadId`/`rolloutPath`); if the wire names differ, match the protocol.
+Verify the exact client-frame field casing against the Rust protocol type for `TerminalCodexCandidatePersisted` (`crates/freshell-protocol`, `rename_all = "camelCase"` convention → `terminalId`/`candidateThreadId`/`rolloutPath`); if the wire names differ, match the protocol. Known required field the snippet above omits: `capturedAt` (protocol `captured_at: i64`, client_messages.rs:229) — include it (e.g. `capturedAt: Date.now()`), or the frame is rejected on deserialize.
+
+NOTE (validated scope, see the Validation record): no Rust code emits `terminal.codex.durability.updated` today, so the production client never sends this candidate frame against the Rust server — the trigger chain goes live at S5. This spec's raw-WS injection is the established protocol-level proof of the server-side adopt path (same pattern as `crates/freshell-ws/tests/codex_candidate_persisted.rs`); it is honest evidence for the SERVER half of G3-fresh, and the plan documents the S5 dependency explicitly rather than claiming production-trigger coverage.
 
 - [ ] **Step 2: Register the spec (both lists — the safe convention)**
 
@@ -2018,7 +2156,7 @@ This test drives both servers over raw WS (no page needed for server B; use the 
 ```bash
 npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium codex-status-completeness -g "two concurrent"
 ```
-Expected: PASS.
+Expected: PASS. (Validated, V6: concurrent `start()`s are safe — `ensureRustServerBuilt` uses `spawnSync`, which serializes builds on the event loop, and all instance state is instance-scoped. Known loud-flake mode: on a COLD build, both `findFreePort()` probes resolve before the first build finishes, widening the port-reuse TOCTOU window; if the test flakes on a bind failure, the fix is a warm binary — run any rust e2e first, or set `FRESHELL_E2E_RUST_SERVER_BIN` — NOT staggered starts.)
 
 - [ ] **Step 3: Run the whole new spec file**
 
@@ -2089,7 +2227,9 @@ Then STOP. Do NOT run `gh pr create` or any equivalent — PR creation is not ye
 - Scope fence: owned files only + justified additive touches (File Structure table + Global Constraints); Lane A/B regions untouched (`codex_frames` et al. only CALLED; `attach_lane`/`drain_lane` untouched; the single Exit-arm line is outside both regions); terminal.rs/registry.rs/idle.rs/client src untouched. ✓
 - Repo rules: TDD per task, coordinator-gate awareness (Tasks 1 step 0, 11), no server restarts, no broad kills, PR stop: Global Constraints + Task 11. ✓
 
-**1b. No silent deferrals.** Every requirement lands in production behavior with a real-outcome test: identity on the wire (e2e Task 8 asserts the actual `terminal.turn.complete` frame), busy from disk truth (e2e Task 9 restores against a real rollout file after a real SIGKILL restart), stream isolation (Task 10, two real servers). Fake CLIs (`fake-bel-cli`, `fake-codex-cli`) are the repo's established CI-safe provider stand-ins (campaign convention; real-provider contracts remain opt-in via `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1`) — they stub the codex BINARY, not the behavior under test (freshell's status pipeline). No TODO/stub/expected-fail remains. No UNRESOLVED COVERAGE GAPS.
+**1b. No silent deferrals.** Every requirement lands in production behavior with a real-outcome test: identity on the wire (e2e Task 8 asserts the actual `terminal.turn.complete` frame), busy from disk truth (e2e Task 9 restores against a real rollout file after a real SIGKILL restart), stream isolation (Task 10, two real servers). Fake CLIs (`fake-bel-cli`, `fake-codex-cli`) are the repo's established CI-safe provider stand-ins (campaign convention; real-provider contracts remain opt-in via `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1`) — they stub the codex BINARY, not the behavior under test (freshell's status pipeline). No TODO/stub/expected-fail remains. One EXPLICIT (not silent) scope boundary from the load-bearing validation pass: the fresh-terminal candidate-adopt trigger chain is production-inert until S5 ports the durability emitter (Validation record item 5) — the server-side adopt path this plan builds is exactly what S5 plugs into, the resume path is production-live now, and Task 8 states what its raw-WS injection does and does not prove. No UNRESOLVED COVERAGE GAPS.
+
+**1c. Load-bearing validation applied.** The validation pass (ledger: `.worktrees/.the-usual-logs/codex-status-completeness/load-bearing-ledger.md`) verified 5 assumptions and falsified 3; every falsification is reflected above: S5 trigger note (Validation record + Task 8), CE1/CE2 dedupe fixes with pinning tests (Task 4 Steps 1/3d), `spawn_blocking` locator (Task 7a), plus sibling-composition rules (Global Constraints) and the Task 10 cold-build flake contingency.
 
 **2. Placeholder scan.** No TBD/TODO/"implement later"/"add appropriate handling". Two intentional donor-mirroring instructions remain with exact file:line donors and full surrounding code: the `spawn_server_with_specs_and_activity` body (Task 3 — byte-copy of an existing function plus two quoted insertions) and the sidebar-resume gesture helper (Task 9 — donor `codex-terminal-bounce-rust.spec.ts:101-162`, with the helper's contract and polling implementation specified). These reference existing repo code by exact location, not future work.
 
@@ -2101,4 +2241,5 @@ Then STOP. Do NOT run `gh pr create` or any equivalent — PR creation is not ye
 - `fold_task_events(&[String]) -> CodexTaskEvents`, `locate_codex_rollout(&Path, &str) -> Option<PathBuf>` — defined Task 5 (`pub(crate)`; locator promoted to `pub` in Task 7 with the re-export), consumed Tasks 6/7. ✓
 - `bind_codex_session(&self, &str, &str)`, `attach_codex_rollout(&self, &str, &str, &Path)`, `set_codex_rollout_locator(&self, CodexRolloutLocator)` — defined Tasks 2/6, called Tasks 3/6/7 and tests, matching signatures. ✓
 - Helper name discipline: codex uses `changed`, claude uses `commit_change` — Task 1 uses `changed`. ✓
+- `swallow_next_bel: bool` — private `TerminalActivity` field (Task 4b), armed only inside `reconcile_rollout` (Task 4c), consumed only inside `note_input`/`note_output` (Task 4d) — no cross-task signature impact. ✓
 - E2E helper names (`WsCapture.send`, `seedRollout`, `taskEventLine`, `resumeCodexSessionFromSidebar`, `waitForRestoredCodexTerminalId`) consistent across Tasks 8-10. ✓
