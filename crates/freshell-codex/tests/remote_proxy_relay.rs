@@ -70,14 +70,9 @@ async fn start_fake_upstream() -> FakeUpstream {
                 let _ = sink.close().await;
             });
             tokio::spawn(async move {
-                loop {
-                    match stream.next().await {
-                        Some(Ok(msg)) => {
-                            if in_tx.send(msg).is_err() {
-                                break;
-                            }
-                        }
-                        _ => break,
+                while let Some(Ok(msg)) = stream.next().await {
+                    if in_tx.send(msg).is_err() {
+                        break;
                     }
                 }
             });
@@ -784,8 +779,7 @@ async fn close_tears_down_active_connections_and_stops_accepting_new_ones() {
     );
 
     let reconnect = timeout(Duration::from_millis(500), connect_async(&ws_url)).await;
-    match reconnect {
-        Ok(Ok(_)) => panic!("expected connecting after close() to fail (listener stopped)"),
-        _ => {}
+    if let Ok(Ok(_)) = reconnect {
+        panic!("expected connecting after close() to fail (listener stopped)");
     }
 }
