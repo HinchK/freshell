@@ -87,6 +87,10 @@ use std::path::Path;
 
 /// Codex thread ids are bare hyphenated UUIDs. Cheap shape check so an empty
 /// or junk id can never substring-match everything in the disk guard.
+// TEMPORARY (Task 1 only): no non-test consumer exists until Task 2's handler
+// lands; without this, `clippy --all-targets -- -D warnings` fails on
+// `dead_code` for the lib target. Task 2 Step 3 REMOVES this attribute.
+#[allow(dead_code)]
 pub(crate) fn is_uuid_shaped(s: &str) -> bool {
     s.len() == 36
         && s.chars().enumerate().all(|(i, c)| match i {
@@ -113,6 +117,9 @@ const MAX_FIRST_LINE_BYTES: u64 = 1024 * 1024;
 /// LINEAGE and matches a FOREIGN session in 54/144 real rollouts (V5); and
 /// never a substring match on filename or contents, which the same lineage
 /// data makes spoofable (40% of sampled rollouts contain foreign uuids).
+// TEMPORARY (Task 1 only): see is_uuid_shaped above. Task 2 Step 3 REMOVES
+// this attribute when the handler consumes it.
+#[allow(dead_code)]
 pub(crate) fn verify_rollout_path(
     rollout_path: &str,
     sessions_root: &Path,
@@ -333,7 +340,7 @@ Expected: all 10 tests PASS (9 on non-unix).
 - [ ] **Step 4: Quality gates**
 
 Run: `cargo fmt --all && cargo clippy -p freshell-ws --all-targets -- -D warnings`
-Expected: clean.
+Expected: clean. (Clean DEPENDS on the two temporary `#[allow(dead_code)]` attributes from Step 1: until Task 2's handler consumes these functions, the lib target would otherwise fail `-D warnings` with `dead_code`. Do not remove them here — Task 2 Step 3 does.)
 
 - [ ] **Step 5: Commit**
 
@@ -689,7 +696,9 @@ Expected: FAIL at the happy-path phase — `next_frame_of_type(ws, "terminal.ses
 
 - [ ] **Step 3: Implement the handler**
 
-First, in `crates/freshell-ws/src/identity.rs`, append inside `impl TerminalIdentityRegistry` (after `find_by_session`, whose doc comment explains the live-only semantics this deliberately does NOT share):
+First, in `crates/freshell-ws/src/codex_candidate.rs`, DELETE the two temporary `#[allow(dead_code)]` attributes (and their `// TEMPORARY (Task 1 only)` comment lines) from `is_uuid_shaped` and `verify_rollout_path` — the handler below is their real consumer, so this task's Step 5 clippy gate now proves they are live code.
+
+Then, in `crates/freshell-ws/src/identity.rs`, append inside `impl TerminalIdentityRegistry` (after `find_by_session`, whose doc comment explains the live-only semantics this deliberately does NOT share):
 
 ```rust
     /// Guard 3b's retired-INCLUSIVE session lookup (P0.3, ledger A8): the
