@@ -49,6 +49,33 @@ pub const BUSY_DEADMAN_MS: i64 = 120_000;
 
 pub type CodexEffect = TrackerEffect<CodexActivityRecord>;
 
+/// Latest codex rollout task-event timestamps (epoch ms), folded from
+/// `event_msg` records: `task_started` / `task_complete` / `turn_aborted`.
+/// Mirror of `freshell_sessions::CodexTaskEventSnapshot`, duplicated here so
+/// this crate stays dependency-free (kernel-thin tracker).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CodexTaskEvents {
+    pub latest_task_started_at: Option<i64>,
+    pub latest_task_completed_at: Option<i64>,
+    pub latest_turn_aborted_at: Option<i64>,
+}
+
+impl CodexTaskEvents {
+    pub fn is_empty(&self) -> bool {
+        self.latest_task_started_at.is_none()
+            && self.latest_task_completed_at.is_none()
+            && self.latest_turn_aborted_at.is_none()
+    }
+}
+
+fn max_ts(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, None) => a,
+        (None, b) => b,
+    }
+}
+
 #[derive(Debug)]
 struct TerminalActivity {
     terminal_id: String,
@@ -61,6 +88,18 @@ struct TerminalActivity {
     pending_until: Option<i64>,
     queued_submit_at: Option<i64>,
     accepted_start_at: Option<i64>,
+    /// Rollout-reconcile lane: newest `task_started` timestamp ever seen for
+    /// this terminal's session (promotion is edge-triggered on a NEWER start).
+    last_seen_task_started_at: Option<i64>,
+    /// Rollout-reconcile lane: newest clear (`task_complete`/`turn_aborted`)
+    /// ever seen; a start is only unresolved if newer than this.
+    last_cleared_at: Option<i64>,
+    /// One-shot: a reconcile-initiated turn clear arms this so the PTY BEL
+    /// echo of the SAME physical turn end is swallowed instead of completing
+    /// a re-armed queued turn prematurely (validation counterexample CE1 --
+    /// the PTY and reconcile key spaces are disjoint clock domains, so
+    /// `last_emitted_turn_key` alone cannot dedupe across lanes).
+    swallow_next_bel: bool,
     last_observed_at: i64,
     last_emitted_turn_key: Option<i64>,
     parser_state: ParserState,
@@ -143,6 +182,9 @@ impl CodexActivityTracker {
             pending_until: None,
             queued_submit_at: None,
             accepted_start_at: None,
+            last_seen_task_started_at: None,
+            last_cleared_at: None,
+            swallow_next_bel: false,
             last_observed_at: at,
             last_emitted_turn_key: None,
             parser_state: ParserState::new(),
@@ -170,6 +212,106 @@ impl CodexActivityTracker {
         state.session_id = Some(session_id.to_string());
         let next = state.to_record();
         changed(Some(&previous), next)
+    }
+
+    /// Rollout-reconcile lane (`reconcileProjects`, narrowed to one bound
+    /// terminal): fold the rollout's latest task events into the state
+    /// machine. Promotion rule (all Rust bindings are proof-carrying, so
+    /// every binding is trusted -- see module deviations): a NEW
+    /// `task_started`, newer than every known clear and newer than the
+    /// accepted anchor, promotes to `busy`. Clear rule: a NEW clear at/after
+    /// the turn anchor ends the turn (pending anchor first, then accepted),
+    /// recording exactly one completion via the shared dedupe.
+    pub fn reconcile_rollout(
+        &mut self,
+        terminal_id: &str,
+        events: &CodexTaskEvents,
+        at: i64,
+    ) -> Vec<CodexEffect> {
+        let Some(state) = self.states.get_mut(terminal_id) else {
+            return Vec::new();
+        };
+        let previous = state.to_record();
+        let mut completions: Vec<(Option<String>, i64, i64)> = Vec::new();
+
+        let observed_clear = max_ts(
+            events.latest_task_completed_at,
+            events.latest_turn_aborted_at,
+        );
+
+        // Promote on a NEW unresolved start.
+        if let Some(started_at) = events.latest_task_started_at {
+            let is_new = state
+                .last_seen_task_started_at
+                .map(|seen| started_at > seen)
+                .unwrap_or(true);
+            state.last_seen_task_started_at =
+                max_ts(state.last_seen_task_started_at, Some(started_at));
+            let effective_clear = max_ts(observed_clear, state.last_cleared_at);
+            if is_new
+                && state
+                    .accepted_start_at
+                    .map(|accepted| started_at > accepted)
+                    .unwrap_or(true)
+                && effective_clear
+                    .map(|cleared| started_at > cleared)
+                    .unwrap_or(true)
+            {
+                state.phase = CodexPhase::Busy;
+                state.accepted_start_at = Some(started_at);
+                state.updated_at = at;
+                state.last_observed_at = at;
+            }
+        }
+
+        // Clear on a NEW terminating event at/after the turn anchor.
+        if let Some(cleared_at) = observed_clear {
+            let is_new_clear = state
+                .last_cleared_at
+                .map(|seen| cleared_at > seen)
+                .unwrap_or(true);
+            state.last_cleared_at = max_ts(state.last_cleared_at, Some(cleared_at));
+            if is_new_clear {
+                if state.phase == CodexPhase::Pending
+                    && state
+                        .pending_submit_at
+                        .map(|pending| cleared_at >= pending)
+                        .unwrap_or(false)
+                {
+                    transition_pending_after_turn_clear(
+                        state,
+                        at,
+                        &mut self.ledger,
+                        &mut completions,
+                    );
+                    // CE1: swallow the PTY BEL echo of this reconciled turn end
+                    // (armed regardless of whether the fold arrived as one
+                    // batch or split batches -- batch-agnostic by design).
+                    state.swallow_next_bel = true;
+                } else if (state.phase == CodexPhase::Busy || state.phase == CodexPhase::Unknown)
+                    && state
+                        .accepted_start_at
+                        .map(|accepted| cleared_at >= accepted)
+                        .unwrap_or(false)
+                {
+                    transition_after_turn_clear(state, at, &mut self.ledger, &mut completions);
+                    state.swallow_next_bel = true;
+                }
+            }
+        }
+
+        let next = state.to_record();
+        let terminal_id = state.terminal_id.clone();
+        let mut effects = changed(Some(&previous), next);
+        for (session_id, at, completion_seq) in completions {
+            effects.push(TrackerEffect::TurnComplete {
+                terminal_id: terminal_id.clone(),
+                session_id,
+                at,
+                completion_seq,
+            });
+        }
+        effects
     }
 
     pub fn note_exit(&mut self, terminal_id: &str) -> Vec<CodexEffect> {
@@ -205,6 +347,11 @@ impl CodexActivityTracker {
             return changed(Some(&previous), next);
         }
 
+        if state.phase == CodexPhase::Idle || state.phase == CodexPhase::Unknown {
+            // A fresh pending turn starts here: any armed BEL-echo swallow
+            // (CE1) belongs to a PREVIOUS reconciled turn and is stale.
+            state.swallow_next_bel = false;
+        }
         if state.pending_submit_at.is_none() {
             state.pending_submit_at = Some(at);
         } else if state.queued_submit_at.is_none() {
@@ -243,6 +390,13 @@ impl CodexActivityTracker {
         let previous = state.to_record();
         let mut completions: Vec<(Option<String>, i64, i64)> = Vec::new();
         for _ in 0..clear_count {
+            // CE1: a reconcile-initiated clear already ended this physical
+            // turn; its late PTY BEL echo is consumed one-shot, with no
+            // transition and no completion.
+            if state.swallow_next_bel {
+                state.swallow_next_bel = false;
+                continue;
+            }
             if !consume_turn_complete_signal(state, at, &mut self.ledger, &mut completions) {
                 break;
             }
@@ -385,9 +539,14 @@ fn transition_pending_after_turn_clear(
     completions: &mut Vec<(Option<String>, i64, i64)>,
 ) {
     let turn_key = state.pending_submit_at;
+    let queued = has_queued_submit(state);
+    // CE2: a pending-key turn end also retires any accepted anchor -- a
+    // stale one (e.g. left by a deadman-demoted seeded busy) would let the
+    // second BEL of a dup-BEL chunk fire a bogus extra completion.
+    state.accepted_start_at = None;
     state.updated_at = at;
     state.last_observed_at = at;
-    if has_queued_submit(state) {
+    if queued {
         state.phase = CodexPhase::Pending;
         state.pending_submit_at = state.queued_submit_at;
         state.pending_freshness_at = Some(at);
@@ -668,5 +827,194 @@ mod tests {
         assert_eq!(tracker.list()[0].session_id.as_deref(), Some("thread-2"));
         let noop = tracker.track_terminal("t1", Some("thread-2"), 6);
         assert!(noop.is_empty());
+    }
+
+    fn started(at: i64) -> CodexTaskEvents {
+        CodexTaskEvents {
+            latest_task_started_at: Some(at),
+            ..Default::default()
+        }
+    }
+    fn completed(at: i64) -> CodexTaskEvents {
+        CodexTaskEvents {
+            latest_task_completed_at: Some(at),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reconcile_seeds_busy_for_an_unresolved_rollout() {
+        // Resume-busy seeding: a terminal restored mid-turn (rollout shows a
+        // task_started newer than any clear) paints busy immediately.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        let effects = tracker.reconcile_rollout("t1", &started(100), 200);
+        assert_eq!(phases(&effects), vec![CodexPhase::Busy]);
+        assert_eq!(tracker.list()[0].phase, CodexPhase::Busy);
+    }
+
+    #[test]
+    fn reconcile_ignores_an_already_resolved_rollout() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        let events = CodexTaskEvents {
+            latest_task_started_at: Some(100),
+            latest_task_completed_at: Some(150),
+            latest_turn_aborted_at: None,
+        };
+        let effects = tracker.reconcile_rollout("t1", &events, 200);
+        assert!(effects.is_empty());
+        assert_eq!(tracker.list()[0].phase, CodexPhase::Idle);
+    }
+
+    #[test]
+    fn reconcile_clear_completes_a_seeded_busy_turn_with_identity() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200);
+        let effects = tracker.reconcile_rollout("t1", &completed(300), 400);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert_eq!(completions(&effects), vec![1]);
+        let session = effects.iter().find_map(|e| match e {
+            TrackerEffect::TurnComplete { session_id, .. } => Some(session_id.clone()),
+            _ => None,
+        });
+        assert_eq!(session, Some(Some("thread-1".to_string())));
+    }
+
+    #[test]
+    fn reconcile_turn_aborted_also_clears_and_completes() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.reconcile_rollout("t1", &started(100), 200);
+        let events = CodexTaskEvents {
+            latest_turn_aborted_at: Some(300),
+            ..Default::default()
+        };
+        let effects = tracker.reconcile_rollout("t1", &events, 400);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert_eq!(completions(&effects), vec![1]);
+    }
+
+    #[test]
+    fn reconcile_clear_completes_a_pending_pty_turn_exactly_once() {
+        // JSONL task_complete usually lands BEFORE the PTY BEL: the pending
+        // turn completes once via reconcile; the late BEL is an idle BEL and
+        // must be ignored (single chime per turn -- legacy dedupe intent).
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        tracker.note_input("t1", "\r", 10);
+        let effects = tracker.reconcile_rollout("t1", &completed(50), 60);
+        assert_eq!(phases(&effects), vec![CodexPhase::Idle]);
+        assert_eq!(completions(&effects), vec![1]);
+        let bel = tracker.note_output("t1", "\u{07}", 70);
+        assert!(
+            completions(&bel).is_empty(),
+            "late BEL must not double-complete"
+        );
+    }
+
+    #[test]
+    fn bel_clears_a_reconcile_promoted_busy_turn_exactly_once() {
+        // The reverse race: reconcile promotes Pending->Busy (task_started
+        // confirms the submit), then the BEL ends the turn via the
+        // accepted_start_at path (transition_after_turn_clear goes live).
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        tracker.note_input("t1", "\r", 10);
+        let promote = tracker.reconcile_rollout("t1", &started(20), 30);
+        assert_eq!(phases(&promote), vec![CodexPhase::Busy]);
+        let bel = tracker.note_output("t1", "\u{07}", 9_000);
+        assert_eq!(completions(&bel), vec![1]);
+        // A later stale task_complete for the same turn is a no-op (idle).
+        let late = tracker.reconcile_rollout("t1", &completed(8_000), 9_500);
+        assert!(completions(&late).is_empty());
+    }
+
+    #[test]
+    fn busy_deadman_demotes_to_unknown_and_reconcile_repromotes() {
+        // The busy-deadman (previously structurally dead) is now reachable:
+        // a seeded busy with no observation for BUSY_DEADMAN_MS goes Unknown
+        // instead of lying blue forever; a NEWER unresolved start re-promotes.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", None, 0);
+        tracker.reconcile_rollout("t1", &started(100), 200);
+        assert!(
+            tracker.next_deadline().is_some(),
+            "busy arms the deadman timer"
+        );
+        let effects = tracker.expire(200 + BUSY_DEADMAN_MS + 1);
+        assert_eq!(phases(&effects), vec![CodexPhase::Unknown]);
+        let re = tracker.reconcile_rollout("t1", &started(500_000), 500_100);
+        assert_eq!(phases(&re), vec![CodexPhase::Busy]);
+    }
+
+    #[test]
+    fn reconcile_on_untracked_terminal_is_a_noop() {
+        let mut tracker = CodexActivityTracker::new();
+        let effects = tracker.reconcile_rollout("t-unknown", &started(100), 200);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn reconcile_clear_with_queued_submit_swallows_the_late_bel_echo() {
+        // Load-bearing validation CE1: reconcile clear with a queued submit
+        // re-arms Pending (transition_after_turn_clear's has_queued_submit
+        // branch); the PTY BEL echo of the RECONCILED turn's end must not
+        // complete the re-armed turn prematurely (the disjoint key spaces --
+        // server-clock pending keys vs rollout-clock accepted keys -- make
+        // last_emitted_turn_key powerless here; the swallow flag is the fix).
+        //
+        // Completion accounting matches the frozen PTY reference: a re-arm is
+        // NOT a turn end (`record_completion_if_idle` records only when the
+        // terminal lands Idle -- see its doc comment and the pinned PTY test
+        // `queued_submit_rearms_pending_after_the_bel_and_completes_each_turn`,
+        // where two submitted turns also yield exactly ONE completion, seq 1).
+        // So the reconcile clear here records nothing; the swallow flag is
+        // what keeps the late BEL echo from prematurely completing turn 2.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        tracker.note_input("t1", "\r", 10); // turn 1 pending
+        tracker.reconcile_rollout("t1", &started(12), 15); // promoted busy
+        tracker.note_input("t1", "\r", 20); // queued submit (turn 2)
+        let clear = tracker.reconcile_rollout("t1", &completed(25), 30);
+        assert!(
+            completions(&clear).is_empty(),
+            "re-arm to the queued turn is not a turn end (PTY parity)"
+        );
+        // The BEL echo of turn 1's end arrives late on the PTY lane. Without
+        // the swallow flag it would end the RE-ARMED turn 2 prematurely (the
+        // pending-key path lands Idle and records a bogus completion).
+        let echo = tracker.note_output("t1", "\u{07}", 35);
+        assert!(
+            completions(&echo).is_empty(),
+            "BEL echo of a reconcile-cleared turn must be swallowed"
+        );
+        // Turn 2 then actually runs and completes exactly once -- the FIRST
+        // recorded completion (ledger seq 1; the re-arm recorded none).
+        tracker.reconcile_rollout("t1", &started(40), 45);
+        let done = tracker.reconcile_rollout("t1", &completed(60), 65);
+        assert_eq!(completions(&done), vec![1], "turn 2 completes exactly once");
+    }
+
+    #[test]
+    fn dup_bel_chunk_after_stale_accepted_completes_exactly_once() {
+        // Load-bearing validation CE2: transition_pending_after_turn_clear
+        // must null accepted_start_at. A deadman-demoted seeded busy leaves a
+        // stale accepted anchor; without the fix, a dup-BEL chunk (real PTY
+        // behavior, see the existing dup-BEL test) fires TWO completions in
+        // one note_output call -- pending-key chime then stale-accepted chime.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("thread-1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200); // seeded busy, accepted=100
+        tracker.expire(200 + BUSY_DEADMAN_MS + 1); // demote to Unknown
+        let submit_at = 200 + BUSY_DEADMAN_MS + 1_000;
+        tracker.note_input("t1", "\r", submit_at); // new pending turn
+        let bel = tracker.note_output("t1", "\u{07}\u{07}", submit_at + 500);
+        assert_eq!(
+            completions(&bel).len(),
+            1,
+            "one turn end -> exactly one completion, even for a dup-BEL chunk"
+        );
     }
 }
