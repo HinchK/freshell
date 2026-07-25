@@ -24,6 +24,7 @@ pub mod activity;
 pub mod amplifier_association;
 pub mod backpressure;
 pub(crate) mod codex_candidate;
+pub(crate) mod codex_reconcile;
 pub mod existence;
 pub mod identity;
 pub(crate) mod invariants;
