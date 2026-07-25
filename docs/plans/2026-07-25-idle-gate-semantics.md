@@ -398,7 +398,7 @@ test.describe('idle-gate semantics (rust)', () => {
         const harness = new TestHarness(page)
         await harness.waitForHarness()
         await harness.waitForConnection()
-        const terminalId = await openBootCliPane(page, harness, /Amplifier CLI/i, 'amplifier', sharedRoot)
+        const terminalId = await openBootCliPane(page, harness, /Amplifier/i, 'amplifier', sharedRoot)
 
         // prompt:complete #1 lands at ~3.0s, #2 at ~3.8s (the second events
         // append EXTENDS the armed window -- still one emission, after grace).
@@ -907,7 +907,9 @@ Append to `mod tests` in `idle.rs`:
         gate.note_turn_boundary("t1", 100); // evidence
         gate.note_phase("t1", IdleGatePhase::Idle);
         gate.note_turn_boundary("t1", 200);
-        assert_eq!(gate.expire(200 + IDLE_GRACE_MS).len(), 1); // queue-empty
+        let first = gate.expire(200 + IDLE_GRACE_MS);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].reason, TerminalIdleReason::QueueEmpty);
         // Next cycle without new evidence: plain grace.
         gate.note_phase("t1", IdleGatePhase::Busy);
         gate.note_phase("t1", IdleGatePhase::Idle);
