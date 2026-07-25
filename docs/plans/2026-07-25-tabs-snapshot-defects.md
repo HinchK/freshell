@@ -15,9 +15,11 @@
 
 - Base: `origin/main @ c491aee0`. Work ONLY inside the worktree `/home/dan/code/freshell/.worktrees/tabs-snapshot-defects`, branch `fix/tabs-snapshot-defects`. All relative paths below are relative to that worktree root.
 - SCOPE FENCE (Lane A6 of a 6-lane wave): you own `crates/freshell-ws/src/tabs_persist.rs`, the new `crates/freshell-ws/src/tabs_persist_retention.rs`, minimal ack construction in `crates/freshell-ws/src/tabs.rs` + `crates/freshell-ws/src/terminal.rs`, `crates/freshell-protocol/src/server_messages.rs` (one struct), `crates/freshell-protocol/tests/roundtrip.rs`, `shared/ws-protocol.ts` (one type), the regenerated `port/contract/ws-server-messages.schema.json`, and tests. Do NOT touch `crates/freshell-ws/src/tabs_persist_validation.rs`, `crates/freshell-server/src/tabs_snapshots.rs` (`pane_to_create_body` / restore endpoint — Lane A1 / kata h9vt own those), or client `src/` (READ-only for the ack schema). No kimi/gemini.
+- CROSS-LANE COORDINATION (verified during load-bearing validation by inspecting the sibling lanes' plans — see the ledger at `.worktrees/.the-usual-logs/tabs-snapshot-defects/load-bearing-ledger.md`): sibling lanes DO touch files this lane edits. Lane `createrequestid-stabilization` owns `tabs_persist_validation.rs` and also appends tests to `tabs_persist_tests.rs`; lane `pane-identity-ledger` modifies `server_messages.rs` (new `durability.degraded` variant, WITHOUT regenerating the frozen contract), `invariants.rs`, and `terminal.rs`; lane `scrollback-persistence` modifies `terminal.rs` (`handle_create`). Consequences: (1) keep this lane's edits to those files minimal and append-only where possible; trivial textual merge conflicts at integration are expected and fine; (2) the contract regen in Task 5 is merge-order-dependent — Task 8 Step 3 now REQUIRES a pre-push drift check (rebase + re-run `npm run contract:generate` + re-verify if any owned file or `port/contract/*` moved on origin/main).
 - Empty-push skip (`tabs.rs:205-214`): semantics stay EXACTLY as-is (the design question belongs to kata h9vt). We only add ack-shape test coverage.
 - Repo file-size limit: 1,000 lines per file (`port/AGENTS.md`). `tabs_persist.rs` is at 999 — net growth must go to the sibling module.
-- Rust tests are ungated: `cargo test -p freshell-ws` runs freely. Broad npm runs (`npm test`, `npm run check`, `npm run test:vitest`) go through the shared coordinator gate: check `npm run test:status` first; if another agent holds the gate, WAIT (5 sibling lanes run concurrently — never kill a foreign holder). Set `FRESHELL_TEST_SUMMARY="..."` for broad runs.
+- Rust tests are ungated: `cargo test -p freshell-ws` runs freely. Broad npm runs (`npm test`, `npm run check`) go through the shared coordinator gate: check `npm run test:status` first; if another agent holds the gate, WAIT (5 sibling lanes run concurrently — never kill a foreign holder). Set `FRESHELL_TEST_SUMMARY="..."` for broad runs. VERIFIED (ledger A9): coordinator state is keyed on the git common dir, so the gate IS shared across worktrees; `test:status` is a pure read; targeted `npm run test:vitest -- <file>` is a passthrough that never takes the gate.
+- NPM TOOLING IN THE WORKTREE — no install step needed (VERIFIED, ledger A10): the worktree has no `node_modules`, but node/npm resolution falls through to the parent checkout's `/home/dan/code/freshell/node_modules` (the worktree nests under it), and the contract generator is `__dirname`-relative, so `npm run contract:generate` run from the worktree root reads the WORKTREE's `shared/ws-protocol.ts` and writes the WORKTREE's `port/contract/`. Do NOT run `npm install`/`npm ci` in the worktree. Lockfiles are byte-identical to main's.
 - Quality gates mirroring CI: `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` must pass before push.
 - Commits: Conventional-Commit style with scope (e.g. `fix(ws): ...`). Match the co-author trailer convention visible in `git log -5 --format=%B` (the repo appends an Amplifier trailer).
 - NEVER restart the user's self-hosted server; NEVER bind ports 3001/3002; NEVER use broad kill patterns. Disk has ~36 GB free — halt on ENOSPC.
@@ -196,16 +198,21 @@ upcoming defect fixes need room. No behavior change."
 - Consumes: Task 1's `retention` module.
 - Produces: `#[must_use] pub(crate) enum PersistOutcome { Persisted, Skipped { reason: &'static str }, Failed { reason: String } }`, re-exported as `crate::tabs_persist::PersistOutcome`; `persist_generation(...) -> PersistOutcome` (same 8 parameters, unchanged order); invariant alarm event name `tabs_snapshot_dropped_oversize` on target `freshell_ws::invariants`; `crate::invariants::capture::capture()` visible crate-wide under `cfg(test)`.
 
-- [ ] **Step 1: Make the invariants capture harness crate-visible (test infra)**
+- [ ] **Step 1: Hoist the invariants capture harness to crate visibility (test infra)**
 
-Open `crates/freshell-ws/src/invariants.rs` and find the capture-layer module (~lines 120–198, `mod capture` with `pub fn capture() -> (Arc<Mutex<Vec<CapturedEvent>>>, tracing::subscriber::DefaultGuard)`). Ensure the module is declared so sibling modules' tests can use it:
+VERIFIED (load-bearing validation, ledger A1): `mod capture` (invariants.rs:120) is currently nested INSIDE the private `#[cfg(test)] mod tests` (invariants.rs:100), so the path `crate::invariants::capture` does NOT exist today — a visibility keyword alone is not enough. Do a mechanical hoist:
+
+1. Move the entire `mod capture { ... }` block (~lines 120–198) OUT of `mod tests` to `invariants.rs` top level, declared as:
 
 ```rust
 #[cfg(test)]
 pub(crate) mod capture {
 ```
 
-and that `capture()`, `CapturedEvent`, and its `target` / `message` fields are at least `pub(crate)`. If they already are, skip this step. No production code changes.
+2. Re-point the two intra-`mod tests` references to it (`capture::CapturedEvent` uses at ~:200 and ~:285) — `use super::capture;` at the top of `mod tests` keeps them compiling unchanged.
+3. Ensure `capture()`, `CapturedEvent`, and its `target` / `message` fields are at least `pub(crate)` (`target`/`message` are already `pub`; verified).
+
+The module's `use` statements are self-contained, so the hoist is mechanical. Run `cargo test -p freshell-ws invariants` to prove the existing invariants tests still pass. No production code changes.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -930,7 +937,7 @@ Expected: `port/contract/ws-server-messages.schema.json` changed; the `tabs.sync
 cargo test -p freshell-protocol
 npm run test:status
 ```
-Then run the contract freeze test through the coordinated channel (WAIT if the gate is held by a sibling lane):
+Then run the contract freeze test (VERIFIED, ledger A9: `npm run test:vitest` is a coordinator PASSTHROUGH — it never takes the gate, so no WAIT is needed for this targeted run; only broad `npm test` acquires the gate):
 ```bash
 FRESHELL_TEST_SUMMARY="lane A6: tabs.sync.ack optional persisted/persistReason contract regen" \
   npm run test:vitest -- test/unit/port/ws-contract-freeze.test.ts
@@ -1088,7 +1095,9 @@ fn list_snapshot_devices_locked(dir: &Path) -> std::io::Result<Vec<String>> {
 }
 ```
 
-Blast radius note: the only production consumer is the REST snapshot surface in `crates/freshell-server/src/tabs_snapshots.rs`, which already handles `Err` (that fail-loud path is pinned by `corrupt_generation_file_reads_as_error_not_absence`). No changes there.
+Blast radius note: the only production consumer is the REST snapshot surface in `crates/freshell-server/src/tabs_snapshots.rs`, which already handles `Err` (that fail-loud path is pinned by `corrupt_generation_file_reads_as_error_not_absence`). No changes there. (Cross-lane check, ledger A3: the sibling lane owning that file only extracts `pane_to_create_body`, never touches `list_snapshot_devices`, and its new tests use single-deviceId fixtures — compatible.)
+
+Line-budget contingency (ledger A15): `tabs_persist.rs` must stay ≤1,000 lines after this rewrite (~+17 net). If it would exceed the limit, move `list_snapshot_devices_locked` into `tabs_persist_retention.rs` (same `use super::*` pattern) instead of trimming elsewhere.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -1253,13 +1262,24 @@ FRESHELL_TEST_SUMMARY="lane A6 tabs-snapshot defect fixes: full suite (contract 
 ```
 Expected: PASS — in particular `test/unit/port/ws-contract-freeze.test.ts` (schema regenerated in Task 5) and `test/server/ws-tabs-registry.test.ts` (its ack assertions use subset-matching `toMatchObject`, unaffected by the new optional fields).
 
-- [ ] **Step 3: Push the branch and STOP**
+- [ ] **Step 3: Pre-push drift check (REQUIRED — sibling lanes touch shared files)**
+
+Sibling lanes verifiably edit `terminal.rs`, `server_messages.rs`, `invariants.rs`, and `tabs_persist_tests.rs`, and one adds a `ServerMessage` variant WITHOUT regenerating the frozen contract (ledger A2, falsified). Before pushing:
 
 ```bash
-git log --oneline origin/main..HEAD   # expect the 7 commits from Tasks 1-7 (+ the plan commit)
+git fetch origin
+git log --name-only c491aee0..origin/main -- crates/freshell-ws/src crates/freshell-protocol shared/ws-protocol.ts port/contract
+```
+- If EMPTY intersection with this lane's files: proceed to Step 4.
+- If anything owned/shared moved on main: `git rebase origin/main`, resolve conflicts (expect trivial append conflicts in `tabs_persist_tests.rs`; distinct regions in `terminal.rs`), re-run `npm run contract:generate` (the regenerated schema must include BOTH lanes' changes — the byte-for-byte freeze test enforces this), then re-run Step 1 and Step 2 in full before pushing.
+
+- [ ] **Step 4: Push the branch and STOP**
+
+```bash
+git log --oneline origin/main..HEAD   # expect the 7 commits from Tasks 1-7 (+ the plan commits)
 git push -u origin fix/tabs-snapshot-defects
 ```
-PR POLICY: NOT approved. Do NOT run `gh pr create`. Report: the branch name, the commit list, and the Step 1–2 proof (test/clippy/fmt output summaries), plus the noted client follow-up (SPA has no `tabs.sync.ack` handler; surfacing `persisted:false` in the UI is future client work).
+PR POLICY: NOT approved. Do NOT run `gh pr create`. Report: the branch name, the commit list, and the Step 1–2 proof (test/clippy/fmt output summaries), plus these verified follow-up notes: (1) client follow-up — the SPA has no `tabs.sync.ack` handler; surfacing `persisted:false` in the UI is future client work; (2) deployment latency (ledger A6) — the live self-hosted server is the Rust binary `~/.local/bin/freshell-prod` (verified via process/strings inspection), a pre-fix build, so these fixes stay latent until it is rebuilt/redeployed (do NOT restart it yourself); (3) the authorizing lane spec lives in the wave session log, not the repo — quote its defect-2 remedy language in the eventual PR description.
 
 ---
 
@@ -1267,4 +1287,5 @@ PR POLICY: NOT approved. Do NOT run `gh pr create`. Report: the branch name, the
 
 - **Spec coverage:** Defect 1 → Tasks 1+3 (exempt corrupt dirs, loud logs, clean-only eviction, fail-the-write when unenforceable). Defect 2 → Tasks 2+4+5 (honest outcome, ERROR-not-WARN, invariant alarm per the crate's `terminal_identity_unresolved`-class convention, wire-compat-verified ack field, contract regen, cap-policy decision recorded). Defect 3 → Task 6 (verify-all-agree with loud error — one of the spec's two sanctioned options). Sweep (reaper/PERSIST_LOCK/empty-push) → Task 7 with audit rationale. Red-first per defect: Tasks 2, 3, 4, 5, 6 each observe RED before GREEN. E2E: spec explicitly accepts unit/integration coverage here; all tests use real tempdir filesystems and the real push handler path (`tabs_push_response`), no mocks or fakes anywhere in this plan.
 - **No silent deferrals:** the only deferred items are ones the spec itself defers — the kata h9vt empty-push/use-it-or-remove-it decision (explicitly out of scope) and client UI consumption of `persisted:false` (spec: "note it as follow-up — do not edit"), recorded in Task 8's report step. No UNRESOLVED COVERAGE GAPs.
+- **Load-bearing validation addendum (Stage 2):** 15 assumptions surfaced; 10 verified, 2 falsified, 3 deferred-with-fallbacks (ledger: `.worktrees/.the-usual-logs/tabs-snapshot-defects/load-bearing-ledger.md`). Falsified + fixed here: (A1) the invariants capture module is nested inside `#[cfg(test)] mod tests` — Task 2 Step 1 rewritten from "visibility tweak" to a mechanical hoist; (A2) sibling lanes DO edit `terminal.rs`/`server_messages.rs`/`invariants.rs`/`tabs_persist_tests.rs` and one adds an unregenerated ServerMessage variant — coordination constraint added and Task 8 gained a mandatory pre-push drift check (rebase + contract re-regen + re-verify). Verified findings folded in: targeted `test:vitest` is coordinator-passthrough (Task 5 Step 4 wording), worktree npm needs no install (Global Constraints note), oracle corpora carry no `tabs.sync` traffic so the ack change cannot break equivalence suites, spec sanction confirmed verbatim for the contract change / cap outage mode / verify-all-agree / E2E exemption, live server confirmed Rust (report note). Re-review of edited tasks (incl. item 1b): no new coverage gaps, no silent deferrals introduced; interfaces and step numbering stay consistent (Task 8 steps renumbered 1-4; drift-check step consumes only read-only git + existing regen command).
 - **Type consistency check:** `PersistOutcome::{Persisted, Skipped{reason: &'static str}, Failed{reason: String}}` used identically in Tasks 2, 3, 4, 7; `PushAck.persisted: Option<bool>` / `persist_reason: Option<String>` (Task 4) map to `TabsSyncAck.persisted` / `persist_reason` (serde camelCase → `persisted`/`persistReason`) which match `TabsSyncAckMessage.persisted?`/`persistReason?` (Task 5); `enforce_device_cap(root, target_dir) -> io::Result<()>` signature unchanged across Tasks 1 and 3.
