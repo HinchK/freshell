@@ -7,7 +7,7 @@
 
 **Goal:** Make the freshell web client survive server restarts without dead-end panes or swallowed turn-complete chimes: bounded retry for launch-time `INVALID_TERMINAL_ID` (gap F9/G5, P0), a `serverInstanceId` fallback restart signal when `bootId` is absent (gap F2/G10), and dedupe-baseline resets that fire on both restart signals and idempotently on first-ready (gap F10/G11).
 
-**Architecture:** All three fixes are client-only (React/Redux, `src/`). Fix 1 generalizes the existing rate-limit retry scheduler in `TerminalView.tsx` and routes launch-time `INVALID_TERMINAL_ID` through it, keyed on the SAME `createRequestId` with the restore flag re-armed. Fixes 2+3 restructure the ~35-line `'ready'` restart-detection block in `App.tsx`: parse-failure guard, `serverInstanceId` fallback, loud logging, and a widened dedupe-reset condition. Three new Playwright rust-only e2e specs prove the behavior against real abrupt server restarts.
+**Architecture:** All three fixes are client-only (React/Redux, `src/`). Fix 1 generalizes the existing rate-limit retry scheduler in `TerminalView.tsx` and routes launch-time `INVALID_TERMINAL_ID` through it, keyed on the SAME `createRequestId` with the restore flag re-armed. Fixes 2+3 restructure the ~35-line `'ready'` restart-detection block in `App.tsx`: parse-failure guard, `serverInstanceId` fallback, loud logging, and a widened dedupe-reset condition. Three new Playwright rust-only e2e specs pin whole-system restart convergence against real abrupt server restarts (the retry itself is unit-pinned — see the validated server facts in the reference map: the rust server surfaces lost terminals silently, so no rust e2e can exercise the INVALID_TERMINAL_ID trigger).
 
 **Tech Stack:** React 18, Redux Toolkit, Zod, Vitest + Testing Library (unit), Playwright + `RustServer` fixture (e2e).
 
@@ -37,7 +37,8 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - `src/lib/terminal-restore.ts` (86 lines): non-destructive peek `consumeTerminalRestoreRequestId` `:51-54`, `clearTerminalRestoreRequestId` `:61-63`, `addTerminalRestoreRequestId` `:65-68`.
 - `src/App.tsx`: `import { createLogger } from '@/lib/client-logger'` `:73`, `const log = createLogger('App')` `:79`, `ReadyMessageSchema` `:149-154`, ready handler `:899-945` (restart block `:923-934`).
 - `src/store/turnCompletionSlice.ts` (158 lines): `resetCompletionDedupeBaselines` clears both `lastAtByTerminalId` and `lastIdleAtByTerminalId`, preserves attention (pinned by `test/unit/client/store/turnCompletionSlice.test.ts:82-97` and `:393-398`).
-- Server facts: legacy TS server ALWAYS emits `bootId` on ready (`server/ws-handler.ts:1910-1915`); rust server always emits both (`crates/freshell-ws/src/lib.rs:356-362`). The shared wire type (`shared/ws-protocol.ts:605-611`) and the frozen port-oracle contract (`test/unit/port/oracle/mutation-validation.test.ts:645-669`) keep both OPTIONAL.
+- Server facts: legacy TS server ALWAYS emits `bootId` on ready (`server/ws-handler.ts:1910-1915`); rust server always emits both (`crates/freshell-ws/src/lib.rs:356-362`), unconditionally even when its instance-id is ephemeral (no-home / persistence-failure mode, `main.rs:132-150`). The shared wire type (`shared/ws-protocol.ts:605-611`) and the frozen port-oracle contract (`test/unit/port/oracle/mutation-validation.test.ts:645-669`) keep both OPTIONAL.
+- Server facts, INVALID_TERMINAL_ID (validated by exhaustive census at 2bf579e6 — see the stage-2 ledger): the LEGACY server emits attach-time `INVALID_TERMINAL_ID` and populates `terminalExitCode` (`server/ws-handler.ts:2690-2696`, `:2780-2787`, `:2832`). The RUST server does NEITHER: its only production `InvalidTerminalId` emitter is `handle_kill` (`crates/freshell-ws/src/terminal.rs:1994-2009`, `request_id: None`); attach-to-unknown is a documented silent no-op (`terminal.rs:1867-1868`, `registry.rs:461-467`); every rust `ErrorMsg` sets `terminal_exit_code: None` (`lib.rs:642`, `terminal.rs:1743,1957,2006`) — a rust CLI that spawns-and-dies manifests as `terminal.created` + early `terminal.exit`, never an error frame. Rust instead heals lost terminals via `terminal.inventory` sent on EVERY connection (`lib.rs:370-397`) → `clearDeadTerminals` → `clearTerminalContentForRecreate` (`src/store/panesSlice.ts:525-549`). Consequence: Task 1's retry trigger fires today only against legacy-server deployments (plus any future error codes wired into the generic scheduler); the rust-only e2e specs pin convergence, not the retry.
 - Test harness models: `test/unit/client/components/TerminalView.lifecycle.test.tsx` (mock boilerplate lines 1-120; RATE_LIMITED retry test at `:2853`), `test/unit/client/components/App.ws-bootstrap.test.tsx` (ready-handler harness), `test/e2e-browser/specs/compound-restart-rust.spec.ts` (restartAbrupt + seeding), `test/e2e-browser/specs/terminal-activity-rust.spec.ts` (fake-bel-cli + CLI pane open), `test/e2e-browser/specs/truly-idle-alerting.spec.ts` (`state.turnCompletion` assertions).
 
 ---
@@ -73,18 +74,19 @@ If another agent holds the gate, WAIT (do not kill a foreign holder). The worksp
 
 **Interfaces:**
 - Consumes: `scheduleRateLimitRetry`/`rateLimitRetryRef`/`clearRateLimitRetry` machinery, `sendCreate(requestId)`, `failLaunch(message, restore, terminalId?)`, `addTerminalRestoreRequestId(requestId)` (already imported in TerminalView), exported constants `RATE_LIMIT_RETRY_*`.
-- Produces: effect-scope `scheduleCreateRetry(requestId: string, kind: 'rate-limit' | 'launch'): boolean` (replaces `scheduleRateLimitRetry`; same counter/timer/constants/staleness guard) and `ensure()`-scope `retryLaunchAfterInvalidTerminal(restore: boolean, deadTerminalId: string | undefined): boolean`. No new exports. Task 3's e2e spec relies on: pane stays `status: 'creating'` during retries, retried `terminal.create` reuses the same `createRequestId` with `restore: true` re-armed, exhaustion falls back to the existing `failLaunch` error state.
+- Produces: effect-scope `scheduleCreateRetry(requestId: string, kind: 'rate-limit' | 'launch'): boolean` (replaces `scheduleRateLimitRetry`; same counter/timer/constants/staleness guard) and `ensure()`-scope `retryLaunchAfterInvalidTerminal(restore: boolean, deadTerminalId: string | undefined): boolean`. No new exports. Contract pinned by this task's unit suite (the authoritative pin for the retry — see the INVALID_TERMINAL_ID server facts in the reference map): pane stays `status: 'creating'` during retries, retried `terminal.create` reuses the same `createRequestId` with `restore: true` re-armed, exhaustion falls back to the existing `failLaunch` error state. Task 3's e2e pins whole-system restart convergence (census + re-drive + this retry as belt-and-braces), not this retry specifically.
 
 Behavioral contract being built (write it as a comment above the new closure):
 - Launch-time `INVALID_TERMINAL_ID` (server no longer knows the terminal we just created — the restart/half-initialized signature, i.e. NO numeric `terminalExitCode` on the error) gets a bounded backoff retry (5 attempts, 2/4/8/12/12s — same budget as RATE_LIMITED) that re-sends `terminal.create` with the SAME `createRequestId`.
-- A launch failure that carries a numeric nonzero `terminalExitCode` means the CLI process spawned and died — do NOT respawn-storm it; fall straight to `failLaunch`. (`terminalExitCode === 0` + restore + sessionRef keeps its existing `settleCleanRestoreStartupExit` escape hatch, which runs FIRST.)
+- Server population honesty (validated at 2bf579e6, stage-2 ledger): only the LEGACY server emits this error at launch time; the RUST server surfaces the same terminal loss as a silent attach no-op healed by inventory census + reconnect re-drive, and never populates `terminalExitCode`. This retry therefore fires in production against legacy-server deployments today, and is deliberately generic so future error codes (`SESSION_RESERVED{retryAfterMs}` per campaign §4.3) can reuse it. Its proof is the unit suite; no rust e2e can exercise the trigger.
+- A launch failure that carries a numeric nonzero `terminalExitCode` means the CLI process spawned and died — do NOT respawn-storm it; fall straight to `failLaunch`. (`terminalExitCode === 0` + restore + sessionRef keeps its existing `settleCleanRestoreStartupExit` escape hatch, which runs FIRST.) This discriminator is legacy-only by construction: rust never sets the field (a rust crashed-CLI arrives as `terminal.created` + early `terminal.exit`, the untouched exit-during-launch path), so on rust the guard simply never suppresses a retry — correct on both servers.
 - The restore flag must be re-armed before each retry: `terminal.created` already consumed it at `:3694`, and `restore: true` also exempts the retry from the server's `terminal.create` rate limit (`server/ws-handler.ts:2376-2389`).
 - Exhaustion → the existing `failLaunch` path. Never an infinite loop.
 - Untouched invariants: the stale-error guard `:4026-4040` (only current-attach errors are acted on), the `status !== 'exited'` no-auto-respawn rule `:4092`, and the RATE_LIMITED retry behavior.
 
 - [ ] **Step 1.1: Write the failing tests**
 
-Create `test/unit/client/components/TerminalView.launchRetry.test.tsx`. Harness: copy the mock boilerplate from `TerminalView.lifecycle.test.tsx` lines 1-120 (wsMocks / MockTerminal / FitAddon / lucide / ResizeObserver / rAF stubs / `createSettingsState` / beforeEach-afterEach), with ONE deliberate difference: do **NOT** `vi.mock('@/lib/terminal-restore')` — this file uses the REAL module so the re-arm → non-destructive-peek chain is exercised for real (same approach as `TerminalView.restore-flag-persistence.test.tsx`).
+Create `test/unit/client/components/TerminalView.launchRetry.test.tsx`. Harness: copy the FULL harness from `TerminalView.lifecycle.test.tsx` — it spans roughly lines 1-381, NOT just the top of the file (verified at 2bf579e6): the hoisted mocks + `vi.mock` blocks at `:1-118` (wsMocks / MockTerminal / FitAddon / lucide / xterm.css), the `wsMocks.send` implementation + `messageHandler` capture at ~`:326-355`, the `beforeEach`/`afterEach` at ~`:326-381` (fake-timer teardown, `terminalInstances.length = 0`, rAF/ResizeObserver stubs), and any helpers you use (`expectTerminalWriteContaining` ~`:260-266`, `withCurrentAttachRequestId` ~`:268-314`). The test body below defines its own `createSettingsState`. ONE deliberate difference: do **NOT** copy the `vi.mock('@/lib/terminal-restore')` block (it sits at ~`:67-73`, INSIDE the mock range — skip it) — this file uses the REAL module so the re-arm → non-destructive-peek chain is exercised for real (same approach as `TerminalView.restore-flag-persistence.test.tsx`).
 
 ```tsx
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -106,10 +108,11 @@ import {
   resolveLocalSettings,
 } from '@shared/settings'
 
-// ... wsMocks / terminalThemeMocks / MockTerminal / FitAddon / lucide /
-// xterm.css mocks copied verbatim from TerminalView.lifecycle.test.tsx
-// (lines 1-120), EXCEPT the vi.mock('@/lib/terminal-restore') block, which is
-// intentionally omitted: this suite uses the real terminal-restore module.
+// ... FULL harness copied from TerminalView.lifecycle.test.tsx (~lines 1-381:
+// hoisted mocks :1-118, wsMocks.send + messageHandler capture ~:326-355,
+// beforeEach/afterEach ~:326-381, helpers as needed), EXCEPT the
+// vi.mock('@/lib/terminal-restore') block at ~:67-73, which is intentionally
+// omitted: this suite uses the real terminal-restore module.
 
 import TerminalView, {
   RATE_LIMIT_RETRY_MAX_ATTEMPTS,
@@ -368,7 +371,11 @@ Inside `ensure()`, immediately after `settleCleanRestoreStartupExit` (after `:29
       // flag is re-armed first: terminal.created already consumed it (see the
       // handler below), and restore:true also exempts the retry from the
       // server's terminal.create rate limit. Exhaustion falls back to
-      // failLaunch. This closure is "the named retryer" future error codes
+      // failLaunch. Server population (validated): only the legacy TS server
+      // emits this error at launch time (ws-handler.ts:2832); the rust server
+      // surfaces the same loss as a silent attach no-op healed by inventory
+      // census + reconnect re-drive, and never populates terminalExitCode.
+      // This closure is "the named retryer" future error codes
       // (e.g. SESSION_RESERVED) will reuse — keep it generic.
       const retryLaunchAfterInvalidTerminal = (
         restore: boolean,
@@ -501,6 +508,10 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Produces: new restart-detection semantics inside the ready handler (no new exports). Task 5's e2e spec relies on: a restart detected by either signal clears the dedupe baselines so a post-restart completion is never swallowed, and repeat readys with unchanged identity do NOT reset.
 
 **Schema decision (document verbatim as a code comment):** `bootId` stays `.optional()` in `ReadyMessageSchema`. Both live servers always emit it (legacy: `server/ws-handler.ts:1910-1915`; rust: `crates/freshell-ws/src/lib.rs:356-362`), but the shared wire type (`shared/ws-protocol.ts:605-611`) and the frozen port-oracle contract (`test/unit/port/oracle/mutation-validation.test.ts:645-669`) mark it optional. Hard-requiring it would make the ENTIRE ready frame fail `safeParse` against any older server, silently disabling all ready processing — strictly worse than degraded restart detection. Instead: keep it optional, log loudly when absent, and fall back to a `serverInstanceId` change as the restart signal.
+
+**Fallback framing (validated by git archaeology — state honestly in the code comment):** the `serverInstanceId` fallback is DEFENSE-IN-DEPTH, not a fix for a known population. No shipped server ever both omitted `bootId` and rotated `serverInstanceId` on restart: the legacy server's bootId-less window (`f1179844` 2026-02-15 → `c7e82b60` 2026-03-28) had a PERSISTENT file-backed instanceId from day one (bootId was added precisely because instanceId could not signal restarts — `docs/plans/2026-03-27-stability-fixes.md:79`), and the rust server has emitted `bootId` unconditionally since its first commit, even in the no-home/persistence-failure mode where its instanceId IS ephemeral (`main.rs:132-150`). The fallback hedges unknown forks/harnesses; the `instanceChanged` leg of the dedupe reset has independent real value (a genuinely different server identity must drop baselines regardless of restart semantics).
+
+**Out-of-scope note (do NOT act on it):** `src/lib/ws-client.ts:150-152` contains a sibling identity wipe (`_serverInstanceId = undefined` on an invalid ready), reachable via the preconnected path (`App.tsx:1263`). It is outside this lane's scope fence — leave it; flagged for a future lane in the stage-2 ledger.
 
 **New semantics:**
 1. `safeParse` failure → `log.error`, keep the stored `bootId`/`serverInstanceId` (do NOT dispatch `setServerInstanceId(undefined)`), skip restart detection entirely. (Fixes the pre-existing bug where a malformed frame wiped identity AND spuriously flagged a restart.)
@@ -676,7 +687,12 @@ Replace it with:
           // it optional — hard-requiring it would fail the WHOLE ready frame
           // against an older server and silently disable all ready handling.
           // Instead: log loudly when absent and fall back to a
-          // serverInstanceId change as the restart signal.
+          // serverInstanceId change as the restart signal. The fallback is
+          // DEFENSE-IN-DEPTH for unknown servers/forks: git archaeology shows
+          // no shipped server ever both omitted bootId and rotated
+          // serverInstanceId on restart (legacy's bootId-less window had a
+          // persistent instanceId; rust emits bootId unconditionally, even
+          // when its instanceId is ephemeral in no-home mode).
           const previousBootId = appStore.getState().connection.bootId
           const previousServerInstanceId = appStore.getState().connection.serverInstanceId
           if (!ready.success) {
@@ -771,15 +787,17 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 ---
 
-### Task 3: E2E — create in flight across abrupt restart retries and lands
+### Task 3: E2E — create in flight across abrupt restart converges (regression pin)
 
 **Files:**
 - Create: `test/e2e-browser/specs/launch-retry-restart-rust.spec.ts`
 - Modify: `test/e2e-browser/playwright.config.ts` (two one-line regex additions; sibling lanes append too — trivial conflicts are fine)
 
 **Interfaces:**
-- Consumes: `RustServer` (`start`, `restartAbrupt`, `stop`), `TestHarness` (`waitForHarness`, `waitForConnection`, `getState`), `window.__FRESHELL_TEST_HARNESS__.getWsReadyState()`, Task 1's retry behavior.
+- Consumes: `RustServer` (`start`, `restartAbrupt`, `stop`), `TestHarness` (`waitForHarness`, `waitForConnection`, `getState`), `window.__FRESHELL_TEST_HARNESS__.getWsReadyState()`, the whole client recovery pipeline (ws-client reliable-send + reconnect re-drive + inventory census + Task 1's retry as belt-and-braces).
 - Produces: nothing consumed by later tasks.
+
+**Honesty note (validated at 2bf579e6, stage-2 ledger):** this spec is a whole-system CONVERGENCE regression pin, not a discriminating proof of Task 1's retry. The rust server never emits launch-time `INVALID_TERMINAL_ID` (attach-to-unknown is a silent no-op), and the pre-fix client likely converges via the ws-client create re-send + reconnect re-drive (unanchored panes) and the every-connection `terminal.inventory` census (anchored-dead panes) — so this spec is expected green even against base. It still earns its keep: no existing spec pins create-in-flight-across-SIGKILL convergence, and it guards every recovery path Task 1 touches. Task 1's retry is authoritatively pinned by its unit suite (the trigger is legacy-server/future-code territory; no e2e fixture can abrupt-restart the legacy server). Known blind spot, deliberately out of scope: same-requestId duplicate creates on reconnect can orphan a server-side PTY (client doesn't negotiate `pane_reconcile_v1`); the spec asserts client convergence, not server terminal count.
 
 - [ ] **Step 3.1: Write the spec**
 
@@ -793,9 +811,15 @@ import { TestHarness } from '../helpers/test-harness.js'
 /**
  * LANE C / GAP F9: a terminal.create round in flight when the server dies
  * abruptly (SIGKILL, no clean WS close, revived on the same port/token) must
- * NOT strand the pane in a permanent status:'error' — the client's bounded
- * launch retry (same createRequestId, restore re-armed) must land it.
- * Rust-only: requires RustServer.restartAbrupt().
+ * NOT strand the pane in a permanent status:'error' — every pane converges
+ * to a live terminal. This is a whole-system CONVERGENCE regression pin over
+ * the client recovery pipeline (ws-client create re-send + reconnect
+ * re-drive + inventory census + the bounded launch retry as belt-and-braces).
+ * It is NOT a discriminating proof of the launch retry: the rust server
+ * surfaces lost terminals as silent attach no-ops (never launch-time
+ * INVALID_TERMINAL_ID), so the retry's authoritative pin is its unit suite
+ * (TerminalView.launchRetry.test.tsx). Rust-only: requires
+ * RustServer.restartAbrupt().
  */
 
 async function selectShellIfPickerShowing(page: import('@playwright/test').Page): Promise<void> {
@@ -904,7 +928,7 @@ Expected: PASS. (First run builds `dist/` via globalSetup and `target/release/fr
 
 ```bash
 git add test/e2e-browser/specs/launch-retry-restart-rust.spec.ts test/e2e-browser/playwright.config.ts
-git commit -m "test(e2e): create-in-flight abrupt restart lands via launch retry (Lane C F9)
+git commit -m "test(e2e): create-in-flight abrupt restart converges (Lane C F9 regression pin)
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
@@ -924,6 +948,8 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Produces: nothing consumed by later tasks.
 
 Note: `restore-double-restart.spec.ts` already pins the FreshCodex double-restart incident. This spec covers the plain TERMINAL pane double-restart, which that spec does not.
+
+**Contingency note (validated at 2bf579e6, stage-2 ledger):** static analysis enumerated every death-#2 interleaving (not-yet-reconnected / create-in-flight / anchored-but-unattached / fully recovered) as converging via the restore-flag peek, per-reconnect re-drive, epoch-guarded create re-send, retry-budget reset on anchor (`:3689`/`:4127`), and inventory census — but the timing is empirically unproven. Known hazards if this spec flakes or fails: (a) the 1s gap may not always land inside the mid-recovery window (reconnect backoff base 1000ms vs `restartAbrupt()` boot time) — both fast and slow interleavings still converge, so a miss makes the spec less pointed, not wrong; (b) the App inventory path and TerminalView's error path are two concurrent recovery drivers minting different requestIds — orderings differ per run; (c) same-requestId duplicate creates can orphan a server-side PTY, invisible to this spec's assertions (out of scope). If the spec FAILS: that is a real convergence gap outside Tasks 1-2's fix list — investigate and report it honestly (do NOT weaken the no-`error` assertion); if fixing it needs production code beyond this lane's scope fence, stop and escalate rather than silently widening scope.
 
 - [ ] **Step 4.1: Write the spec**
 
@@ -1257,14 +1283,16 @@ Do NOT run `gh pr create` (PR creation is not yet approved). Report: branch name
 ## Self-Review (completed by the plan author)
 
 **1. Spec coverage:**
-- G5/F9 bounded retry, same requestId, restore:true preserved via peek, retries capped, exhaustion → existing error state → Task 1 (+ e2e Task 3). Guard block `:4026-4040` stale-error immunity and `:4092` exited-no-respawn explicitly untouched and guarded by existing tests `:2038`/`:2931`.
+- G5/F9 bounded retry, same requestId, restore:true preserved via peek, retries capped, exhaustion → existing error state → Task 1 (authoritative pin: the unit suite; e2e Task 3 pins whole-system restart convergence — the rust server never emits the launch-time trigger, per the validated server facts in the reference map). Guard block `:4026-4040` stale-error immunity and `:4092` exited-no-respawn explicitly untouched and guarded by existing tests `:2038`/`:2931`.
 - G10/F2 serverInstanceId fallback + loud log + legacy-server check + documented schema decision → Task 2 (decision: keep optional; both servers verified to emit bootId; rationale in code comment).
 - G11/F10 reset on both signals + first-ready idempotence + never-swallowed regression pins → Task 2 (App-level tests 1, 2, 5; slice-level reset semantics already pinned at `turnCompletionSlice.test.ts:82-97`).
 - TDD unit list from the spec: retry fires/same requestId/restore:true (Task 1 tests 1-2), retries capped (test 3), exhaustion → error (test 3), bootId-absent fallback (Task 2 test 2), dedupe reset on both signals (Task 2 tests 1-2), no reset spam on every ready (Task 2 test 4). ✓
 - E2E list: own RustServer/ephemeral ports (all three specs), restartAbrupt mid-create (Task 3), rapid double restart (Task 4), exactly-once chime across restart (Task 5), new files + playwright.config registration (each task). ✓
 - No UNRESOLVED COVERAGE GAPS.
 
-**1b. No silent deferrals:** every fix lands as production behavior proven by unit tests against real reducers/components and by e2e specs against a real rust server with real SIGKILL restarts. The only mocked seams in unit tests are the ws transport and xterm rendering (established harness convention); the e2e specs close those seams end-to-end. Task 5's doc comment states honestly which regression is unit-pinned vs e2e-proven.
+**1b. No silent deferrals:** every fix lands as production behavior proven by unit tests against real reducers/components and by e2e specs against a real rust server with real SIGKILL restarts. The only mocked seams in unit tests are the ws transport and xterm rendering (established harness convention); the e2e specs close the transport/rendering seams end-to-end at the convergence level. Stated honestly (Task 3 honesty note, Task 5 scope note): Task 1's retry and Task 2's fallback/reset semantics are unit-pinned; the e2e specs pin user-visible convergence and exactly-once alerting, not the individual mechanisms — the rust server cannot emit the retry's trigger, and no e2e fixture can abrupt-restart the legacy server that does.
+
+**Stage-2 load-bearing validation addendum (2026-07-25):** 11 assumptions validated (ledger: `.worktrees/.the-usual-logs/client-retry-restart-hardening/load-bearing-ledger.md`). Falsified and fixed in this plan: rust emits launch-time INVALID_TERMINAL_ID (it does not — reference map + Task 1 contract + Task 3 reframed as convergence pin), rust populates terminalExitCode (it does not — discriminator documented as legacy-only), Task 3 discriminates for Task 1 (it does not — honesty note added), a bootId-less rotating-instanceId server population exists (it does not — Fix 2 reframed as defense-in-depth), Task 1's harness-copy line range (corrected to ~:1-381 excluding the terminal-restore mock). Verified: double-restart convergence machinery (Task 4 contingency note added for the empirical residual), unseeded-codex recovery + zero-spurious-alert-edge behavior (Task 5 sound), malformed-ready restructure safety (all consumers treat undefined as skip; ws-client sibling wipe noted out-of-scope), environment e2e capability, retry-send-while-disconnected safety. The edited tasks were re-checked against the writing-plans Self-Review including 1b: no new placeholders, no type drift, no silent deferrals introduced — the reframings make existing proof claims *more* honest, and all production code snippets are unchanged except comments.
 
 **2. Placeholder scan:** the two "copy boilerplate from X verbatim" instructions (Task 1 harness from `TerminalView.lifecycle.test.tsx:1-120`; Task 2 harness from `App.ws-bootstrap.test.tsx`) reference exact existing sources and follow the repo's documented copy-per-file convention — the novel test bodies and all production code are given in full. No TBD/TODO/"add error handling" items remain.
 
