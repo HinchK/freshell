@@ -5,7 +5,7 @@
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
 > for tracking.
 
-**Goal:** Fix false-chime / spurious truly-idle in the Rust freshell server by making the `IdleGate` busy-aware (G1) and by emitting the `queue-empty` idle reason with legacy-parity semantics (G2), for the claude, codex, and amplifier terminal CLI lanes.
+**Goal:** Fix false-chime / spurious truly-idle in the Rust freshell server by making the `IdleGate` busy-aware (G1) and by emitting the `queue-empty` idle reason with legacy-parity semantics (G2), for the claude, codex, and amplifier terminal CLI lanes. Observable reasons today: `queue-empty` on the claude lane; `grace` on the codex and amplifier lanes (see deviation notes 3-4 — the gate implements the full legacy decision table, but the Rust codex tracker does not yet surface the phase edges that accrue codex queue evidence).
 
 **Architecture:** Port the legacy Node `TrulyIdleEmitter` decision table (`server/coding-cli/truly-idle-emitter.ts`) faithfully into the Rust `IdleGate` (`crates/freshell-activity/src/idle.rs`): per-terminal `busy`/`pending`/`saw_queue_evidence` state fed from the tracker `Changed` streams, a turn boundary that records queue evidence instead of arming while busy, and an `expire` that picks `queue-empty` vs `grace` from the evidence flag. The three `*_frames` functions in `crates/freshell-ws/src/activity.rs` (lines 589-731) are rewired to forward BOTH phase edges (busy AND idle) plus removals to the gate — uniformly for claude, codex, and amplifier. Also fixes a latent bug discovered during investigation: production constructs `IdleGate::default()` whose derived `Default` leaves `grace_ms == 0`, so `terminal.idle` fires instantly instead of after the 2 s grace window.
 
@@ -33,7 +33,8 @@
 
 1. **"FLIP the test.fixme in playwright.config.ts:69-73"** — there is NO `test.fixme` to flip. Verified by full-file reads: `test/e2e-browser/specs/truly-idle-alerting.spec.ts` (189 lines) contains zero `fixme` occurrences and its header (lines 77-79) says "Rust leg live since feat/rust-terminal-activity-idle"; the spec IS in `MATRIX_SPECS` (`playwright.config.ts:71`) so its rust leg already runs under the `rust-chromium` project. The comment at `playwright.config.ts:68-70` claiming a fixme is STALE. This plan satisfies the requirement's intent by (a) correcting the stale comment (Task 1) and (b) proving the rust leg passes post-fix (Task 6). The "red e2e that exposes G1" role is served by the NEW spec written red-first in Task 1.
 2. **Latent grace-window bug folded in (Task 4):** `HubInner` is `#[derive(Default)]` (`crates/freshell-ws/src/activity.rs:92`), so production builds `IdleGate::default()` with `grace_ms == 0` — `IdleGate::new()` is never called in production. `terminal.idle` therefore fires immediately at the turn boundary instead of after `IDLE_GRACE_MS` (2000 ms). Evidence: `cargo test -p freshell-ws --lib activity::` completes its 6 tests in ~3.0 s wall — exactly the one 3 s absence-wait, with the idle-flow tests emitting instantly. This is squarely idle-gate semantics (it makes the G1 false chime instantaneous) and is fixed inside `idle.rs` only (manual `Default` impl), respecting the fence.
-3. **Amplifier reason is `grace`, by design.** The amplifier tracker has no queue ledger (a second `prompt:submit` while Busy is a no-op, and `TurnCompleted` only fires from phase Busy — `amplifier/tracker.rs:205-232`), so a boundary-while-busy can never occur for amplifier and no queue evidence can accrue. This matches the legacy emitter, where only claude (boundary-while-busy) and codex (busy→pending re-arm) can set `sawQueueEvidence`. The uniform G1 fix (busy-aware gate + full phase forwarding) IS applied to the amplifier lane; its e2e asserts reason `grace` and grace-window respect.
+3. **Codex reason is `grace` too — the Rust codex tracker cannot surface queue evidence (validated, load-bearing).** The legacy TS codex tracker has a real `busy` phase, so its busy→pending re-arm set `sawQueueEvidence`. The RUST codex tracker does not: `CodexPhase::Busy` is never assigned anywhere in the workspace (only compared — codex.rs:179/209/217/264/305); `note_output` without a BEL emits no effects (codex.rs:201-221), so streaming output does NOT promote Pending→Busy; the queued re-arm at a turn clear keeps phase `Pending` (`transition_pending_after_turn_clear`, codex.rs:361-384) and `has_public_change` (codex.rs:80-95) suppresses pending→pending, so the re-arm is publicly SILENT — pinned by the tracker's own test `queued_submit_rearms_pending_after_the_bel_and_completes_each_turn` (codex.rs:509-527). At the drain, `Changed(Idle)` precedes `TurnComplete` in one effect vector (codex.rs:231-239), so the gate arms normally with no accrued evidence → reason `grace`, before AND after this plan's fix. Consequences baked into this plan: the codex hub test and codex e2e assert reason `grace` (their red-first role for the e2e is the grace-window timing assertion, which the `grace_ms==0` bug fails); the gate-level unit test `codex_busy_to_pending_rearm_counts_as_queue_evidence` (Task 3) STAYS — it pins the gate side of the contract for when Lane D ("codex-status-completeness") ports busy-phase entry. Sibling-worktree snapshot at plan-validation time: no sibling has touched codex.rs/activity.rs/trackers; Lane D's plan introduces `CodexPhase::Busy` only via a JSONL rollout-reconcile lane, which the fake-BEL PTY fixture never produces — so the `grace` assertions here remain correct even after Lane D lands. At rebase time, re-check sibling diffs (`git diff 2bf579e6...<sibling>` for codex.rs/activity.rs) before finalizing.
+4. **Amplifier reason is `grace`, by design.** The amplifier tracker has no queue ledger (a second `prompt:submit` while Busy is a no-op, and `TurnCompleted` only fires from phase Busy — `amplifier/tracker.rs:205-232`), so a boundary-while-busy can never occur for amplifier and no queue evidence can accrue. This matches the legacy emitter, where only claude (boundary-while-busy) and codex (busy→pending re-arm) can set `sawQueueEvidence`. The uniform G1 fix (busy-aware gate + full phase forwarding) IS applied to the amplifier lane; its e2e asserts reason `grace` and grace-window respect.
 
 ## File Structure
 
@@ -173,9 +174,14 @@ Create `test/e2e-browser/specs/idle-gate-semantics-rust.spec.ts`. Notes for the 
 // touches ports 3001/3002 (the user's live servers).
 //
 // RED HISTORY: written BEFORE the Rust fix. Pre-fix expected failures:
-//   - claude/codex queued tests: a terminal.idle fires MID-TURN after the
-//     first BEL (G1), and the final reason is 'grace' not 'queue-empty' (G2);
-//   - amplifier test: terminal.idle fires instantly (grace_ms==0 Default bug);
+//   - claude queued test: a terminal.idle fires MID-TURN after the first BEL
+//     (G1), and the final reason is 'grace' not 'queue-empty' (G2);
+//   - codex + amplifier tests: terminal.idle fires instantly at the drain
+//     (grace_ms==0 Default bug) -- the >= GRACE_MS timing assertions trip.
+//     NOTE: codex asserts reason 'grace', NOT 'queue-empty' -- the Rust codex
+//     tracker never surfaces a Busy phase in the PTY lane, so queue evidence
+//     is unreachable for codex until Lane D ports busy-phase entry (plan
+//     deviation note 3);
 //   - restart + two-server tests are regression guards and may already pass.
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -323,7 +329,7 @@ test.describe('idle-gate semantics (rust)', () => {
     }
   })
 
-  test('codex: queued submit re-arm never fires idle mid-turn; drain emits one queue-empty idle', async ({ page, e2eServerKind }) => {
+  test('codex: queued submit never fires idle mid-turn; drain emits one grace idle after the full grace window', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-idlegate-codex-'))
     try {
@@ -343,7 +349,11 @@ test.describe('idle-gate semantics (rust)', () => {
         const terminalId = await openBootCliPane(page, harness, /Codex CLI/i, 'codex', sharedRoot)
 
         // Slow turn 1 + immediate queued turn 2 (its BEL arrives first and is
-        // consumed as the codex busy->pending re-arm = queue evidence).
+        // consumed at the turn clear). NOTE (deviation note 3): the Rust codex
+        // tracker never surfaces a Busy phase in the PTY lane -- the re-arm is
+        // publicly silent (pending->pending suppressed), so NO queue evidence
+        // accrues and the drain reason is 'grace', not 'queue-empty' (that
+        // stays unreachable for codex until Lane D ports busy-phase entry).
         await typePrompt(page, 'first slow prompt')
         await typePrompt(page, 'second prompt')
 
@@ -353,8 +363,11 @@ test.describe('idle-gate semantics (rust)', () => {
         expect(capture.count(idleFor(terminalId))).toBe(0)
 
         const idle = await capture.waitFor(idleFor(terminalId), GRACE_MS + 4_000, 'terminal.idle')
-        expect(idle.reason).toBe('queue-empty')
+        expect(idle.reason).toBe('grace')
         expect(idle.at).toBeGreaterThanOrEqual(tc.at)
+        // Grace-window respect (the RED assertion pre-fix): kills the
+        // grace_ms==0 Default bug on the codex lane.
+        expect(idle.at - tc.at).toBeGreaterThanOrEqual(GRACE_MS)
 
         await page.waitForTimeout(1_500)
         expect(capture.count(idleFor(terminalId))).toBe(1)
@@ -570,7 +583,7 @@ npx playwright test --config test/e2e-browser/playwright.config.ts \
 
 Expected: FAIL. Specifically:
 - claude test: FAILS at the G1 probe (`expect(capture.count(idleFor(terminalId))).toBe(0)` after turn.complete #1 — a `terminal.idle` fired mid-turn) or, if it limps past, at `expect(idle.reason).toBe('queue-empty')` receiving `'grace'`.
-- codex test: FAILS the same way (mid-turn idle count, or reason `'grace'`).
+- codex test: FAILS at `expect(idle.at - tc.at).toBeGreaterThanOrEqual(GRACE_MS)` (idle fires instantly — the `grace_ms == 0` Default bug). The reason assertion is `'grace'` and already matches pre-fix (deviation note 3: codex queue evidence is unreachable), so the timing assertion is the red one.
 - amplifier test: FAILS at `expect(idle.at - tc.at).toBeGreaterThanOrEqual(2000)` (idle fires instantly — the `grace_ms == 0` Default bug).
 - restart and two-server tests: may PASS (they are regression guards).
 
@@ -585,8 +598,9 @@ git add test/e2e-browser/helpers/ws-capture.ts \
 git commit -m "test(e2e): red idle-gate semantics spec (queued-before-BEL, restart, two-server)
 
 RED by design: proves G1 (mid-turn terminal.idle after a queued submit
-that precedes the BEL) and G2 (queue-empty reason unreachable) plus the
-grace_ms==0 IdleGate::default() bug, ahead of the Rust fix tasks.
+that precedes the BEL) and G2 (queue-empty reason unreachable on the
+claude lane) plus the grace_ms==0 IdleGate::default() bug (codex +
+amplifier grace-window assertions), ahead of the Rust fix tasks.
 Also corrects the stale 'rust leg is test.fixme' comment in
 playwright.config.ts (the rust leg has been live since PR #525).
 
@@ -1270,10 +1284,20 @@ Append inside `mod tests` in `crates/freshell-ws/src/activity.rs` (after the las
         );
     }
 
-    /// Codex lane parity: a queued submit consumed at the turn clear
-    /// (busy->pending re-arm) is queue evidence; the drain emits queue-empty.
+    /// Codex lane: REGRESSION GUARD, green from birth (deviation note 3).
+    /// The Rust codex tracker never surfaces a Busy phase in the PTY lane
+    /// (CodexPhase::Busy is never assigned; note_output without a BEL emits
+    /// no effects, codex.rs:201-221), and the queued re-arm at the turn
+    /// clear stays Pending and is publicly SILENT (pending->pending is
+    /// suppressed by has_public_change, codex.rs:80-95/361-384; pinned by
+    /// the tracker test at codex.rs:509-527). So NO queue evidence can
+    /// accrue: the drain arms the gate normally (Changed(Idle) precedes
+    /// TurnComplete, codex.rs:231-239) and emits exactly one idle with
+    /// reason 'grace'. queue-empty stays unreachable for codex until Lane D
+    /// ports busy-phase entry; the gate side of that future contract is
+    /// pinned by idle::tests::codex_busy_to_pending_rearm_counts_as_queue_evidence.
     #[tokio::test(flavor = "multi_thread")]
-    async fn codex_queued_rearm_drains_to_a_queue_empty_idle() {
+    async fn codex_queued_rearm_drains_to_a_single_grace_idle() {
         let (hub, mut rx) = hub();
         observer_send(
             &hub,
@@ -1293,7 +1317,8 @@ Append inside `mod tests` in `crates/freshell-ws/src/activity.rs` (after the las
                 at: now_ms(),
             },
         );
-        // Streaming output promotes Pending -> Busy (output liveness).
+        // Streaming output is publicly INERT for codex (refreshes
+        // last_observed_at only; no phase promotion, no effects).
         observer_send(
             &hub,
             ActivityEvent::Output {
@@ -1302,7 +1327,8 @@ Append inside `mod tests` in `crates/freshell-ws/src/activity.rs` (after the las
                 at: now_ms(),
             },
         );
-        // Queued submit while Busy.
+        // Queued submit while Pending (goes into the tracker's submit queue;
+        // publicly silent).
         observer_send(
             &hub,
             ActivityEvent::Input {
@@ -1311,8 +1337,9 @@ Append inside `mod tests` in `crates/freshell-ws/src/activity.rs` (after the las
                 at: now_ms(),
             },
         );
-        // BEL #1: turn clear consumes the queued submit -> Busy->Pending
-        // re-arm (queue evidence), NO completion.
+        // BEL #1: turn clear consumes the queued submit -> stays Pending;
+        // pending->pending is suppressed, so NO public Changed and NO
+        // completion (no queue evidence can reach the gate).
         observer_send(
             &hub,
             ActivityEvent::Output {
@@ -1333,7 +1360,16 @@ Append inside `mod tests` in `crates/freshell-ws/src/activity.rs` (after the las
         let idle = next_frame_of_type(&mut rx, "terminal.idle", 5_000)
             .await
             .expect("terminal.idle after the codex queue drains");
-        assert_eq!(idle["reason"], "queue-empty");
+        assert_eq!(
+            idle["reason"], "grace",
+            "codex queue evidence is unreachable pre-Lane-D (deviation note 3)"
+        );
+        assert!(
+            next_frame_of_type(&mut rx, "terminal.idle", 1_000)
+                .await
+                .is_none(),
+            "exactly one emission for the codex drain"
+        );
     }
 ```
 
@@ -1342,13 +1378,13 @@ Append inside `mod tests` in `crates/freshell-ws/src/activity.rs` (after the las
 ```bash
 cargo test -p freshell-ws --lib activity::stacked_submits_before_the_bel_suppress_terminal_idle \
 && cargo test -p freshell-ws --lib activity::draining_stacked_submits_emits_one_queue_empty_idle \
-&& cargo test -p freshell-ws --lib activity::codex_queued_rearm_drains_to_a_queue_empty_idle
+&& cargo test -p freshell-ws --lib activity::codex_queued_rearm_drains_to_a_single_grace_idle
 ```
 
-Expected: all three FAIL —
+Expected: the two claude tests FAIL —
 - `stacked_submits_before_the_bel...`: a `terminal.idle` arrives within 3 s (the gate armed at BEL #1 because nothing feeds it phase edges yet);
 - `draining_stacked_submits...`: reason is `"grace"` (no evidence reached the gate);
-- `codex_queued_rearm...`: reason is `"grace"`.
+- `codex_queued_rearm_drains_to_a_single_grace_idle`: PASSES already (green from birth, by design). It is a REGRESSION GUARD, not part of the red→green proof: the codex drain arms the gate with no evidence both before and after the wiring (deviation note 3), so its value is pinning single-emission + reason `grace` and proving the wiring introduces no codex regression.
 
 - [ ] **Step 3: Wire the gate — replace `note_busy_upserts` with full phase + removal forwarding**
 
@@ -1458,7 +1494,7 @@ cargo test -p freshell-ws --lib activity:: && cargo test -p freshell-activity &&
 ```
 
 Expected: ALL PASS —
-- the 3 new hub tests go green;
+- the two new claude hub tests go red→green; the codex regression guard stays green;
 - the 6 pre-existing hub tests stay green, in particular `claude_submit_bel_turn_complete_and_terminal_idle_flow` (asserts `reason == "grace"`, activity.rs:875), `amplifier_events_lane_drives_busy_complete_and_idle_via_inotify` (`"grace"`, :1105), `queued_prompt_suppresses_terminal_idle`, and `idle_terminals_arm_no_timers_and_read_no_files` (`hub_next_deadline == None` — the new per-terminal gate states carry no deadline, so no phantom timers);
 - the whole `freshell-activity` crate (62+ lib tests) stays green (claude/codex/amplifier trackers untouched).
 
@@ -1473,7 +1509,9 @@ Changed upsert forwards its phase (claude/amplifier Busy|Idle, codex
 Busy|Pending|Idle) and every removal drops gate state — uniformly for
 the claude BEL, codex BEL, and amplifier events lanes. With the
 busy-aware gate this closes G1 (queued submit BEFORE the BEL no longer
-chimes mid-turn) and makes queue-empty reachable on the wire (G2).
+chimes mid-turn) and makes queue-empty reachable on the wire for the
+claude lane (G2; codex stays 'grace' until its tracker ports busy-phase
+entry — Lane D).
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
@@ -1574,15 +1612,15 @@ Then STOP. Do NOT run `gh pr create` (not user-approved). Final report must incl
 - branch name `fix/idle-gate-semantics` + head commit hash;
 - red→green proof, naming the exact tests:
   - unit: `idle::tests::turn_boundary_while_busy_never_arms`, `idle::tests::boundary_while_busy_then_drain_emits_queue_empty`, `idle::tests::codex_busy_to_pending_rearm_counts_as_queue_evidence`, `idle::tests::default_gate_uses_the_production_grace_window` (each observed failing in Tasks 2-4 Step 2, passing after implementation);
-  - hub: `activity::tests::stacked_submits_before_the_bel_suppress_terminal_idle`, `activity::tests::draining_stacked_submits_emits_one_queue_empty_idle`, `activity::tests::codex_queued_rearm_drains_to_a_queue_empty_idle` (failing in Task 5 Step 2, passing in Step 4);
-  - e2e: the 3 provider tests in `idle-gate-semantics-rust.spec.ts` (failing in Task 1 Step 4, passing in Task 6 Step 1);
+  - hub: `activity::tests::stacked_submits_before_the_bel_suppress_terminal_idle`, `activity::tests::draining_stacked_submits_emits_one_queue_empty_idle` (failing in Task 5 Step 2, passing in Step 4); plus `activity::tests::codex_queued_rearm_drains_to_a_single_grace_idle` as a green-from-birth regression guard (deviation note 3 — not part of the red→green proof);
+  - e2e: the 3 provider tests in `idle-gate-semantics-rust.spec.ts` (failing in Task 1 Step 4 — claude at the G1/G2 assertions, codex + amplifier at the ≥ GRACE_MS grace-window assertions — passing in Task 6 Step 1);
 - verification command outputs summary (cargo workspace / clippy / fmt / npm run check / lint).
 
 ---
 
 ## Self-Review (performed at plan time)
 
-1. **Spec coverage:** G1 busy-aware arming — Tasks 2 (gate) + 5 (uniform wiring across claude/codex/amplifier lanes at activity.rs 589-731) + the exact red test the spec demands (queued submit BEFORE the BEL, hub level: Task 5 Step 1 first test; e2e level: Task 1 claude/codex tests). G2 queue-empty parity — Task 3 ports the full legacy decision table with per-branch unit tests (boundary-while-busy, codex busy→pending re-arm, evidence reset on emit, pending→pending negative, remove-clears, expiry busy guard, idle-flip inert, re-arm resets window); wire field pre-exists, doc comments updated. Truly-idle spec rust leg — no fixme exists (deviation note 1); stale comment fixed (Task 1), leg proven green (Task 6). E2E requirements — own RustServer instances w/ ephemeral ports + mkdtemp homes (all 5 tests), never 3001/3002, queued-submit-before-BEL per CLI, correct reason after drain, `restartAbrupt()` mid-busy with no spurious idle/chime, two concurrent servers with independent streams, new spec file + minimal one-line config appends. Repo rules — TDD red→green everywhere, cargo + coordinated suite, coordinator-gate etiquette, no server restarts/broad kills, push-then-STOP before PR.
-2. **No silent deferrals:** every requirement lands in production code paths proven by wire-level e2e against the real release server binary with real (fake-CLI-driven) PTYs; no stubs or seams stand in for behavior. The amplifier lane intentionally asserts reason `grace` — that is legacy-correct production behavior, not a deferral (deviation note 3). The lone judgment call folded in rather than deferred: the `Default` grace bug (Task 4), required for any grace-window e2e assertion to be truthful.
+1. **Spec coverage:** G1 busy-aware arming — Tasks 2 (gate) + 5 (uniform wiring across claude/codex/amplifier lanes at activity.rs 589-731) + the exact red test the spec demands (queued submit BEFORE the BEL, hub level: Task 5 Step 1 first test; e2e level: Task 1 claude/codex tests). G2 queue-empty parity — Task 3 ports the full legacy decision table with per-branch unit tests (boundary-while-busy, codex busy→pending re-arm, evidence reset on emit, pending→pending negative, remove-clears, expiry busy guard, idle-flip inert, re-arm resets window); wire field pre-exists, doc comments updated; observable on the wire for claude (codex/amplifier stay `grace` per deviation notes 3-4, with the codex gate contract unit-pinned for Lane D). Truly-idle spec rust leg — no fixme exists (deviation note 1); stale comment fixed (Task 1), leg proven green (Task 6). E2E requirements — own RustServer instances w/ ephemeral ports + mkdtemp homes (all 5 tests), never 3001/3002, queued-submit-before-BEL per CLI, correct reason after drain, `restartAbrupt()` mid-busy with no spurious idle/chime, two concurrent servers with independent streams, new spec file + minimal one-line config appends. Repo rules — TDD red→green everywhere, cargo + coordinated suite, coordinator-gate etiquette, no server restarts/broad kills, push-then-STOP before PR.
+2. **No silent deferrals:** every requirement lands in production code paths proven by wire-level e2e against the real release server binary with real (fake-CLI-driven) PTYs; no stubs or seams stand in for behavior. The amplifier AND codex lanes intentionally assert reason `grace` — legacy-correct (amplifier, deviation note 4) and Rust-tracker-correct (codex, deviation note 3; validated against codex.rs — queue evidence is unreachable until Lane D ports busy-phase entry), not deferrals. The gate side of the codex queue-empty contract is still built and unit-pinned (Task 3). The lone judgment call folded in rather than deferred: the `Default` grace bug (Task 4), required for any grace-window e2e assertion to be truthful.
 3. **Placeholder scan:** no TBDs; every code step carries complete code; commands carry expected outcomes; the two spots where the implementer must verify against a reference file (WsCapture hello handshake; provider-button locators) name the exact file+lines to copy from — verification instructions, not placeholders.
 4. **Type consistency:** `IdleGatePhase{Busy,Pending,Idle}` and `note_phase(&str, IdleGatePhase)` are identical in Tasks 2, 3, and 5; `note_changed_to_gate(idle, upserts, &remove)` matches its definition; `note_turn_boundary(&str, i64)` signature never changes (all 6 pre-existing call sites untouched); `IdleEmission`/`TerminalIdleReason` untouched; e2e helper API (`ready/waitFor/count/all/close`) matches all five uses.
