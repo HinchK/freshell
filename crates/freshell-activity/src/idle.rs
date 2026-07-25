@@ -35,10 +35,32 @@ pub struct IdleEmission {
     pub reason: TerminalIdleReason,
 }
 
+/// Tracker phase kinds the gate distinguishes (legacy `isBusyPhase` plus the
+/// codex `pending` special case that carries queue evidence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleGatePhase {
+    Busy,
+    Pending,
+    Idle,
+}
+
+#[derive(Debug, Default)]
+struct TerminalIdleState {
+    /// Tracker reports busy-or-pending (legacy `isBusyPhase`).
+    busy: bool,
+    /// Tracker phase is specifically `pending` (codex submit gate).
+    pending: bool,
+    /// Queue evidence observed since the last emission (queued turn /
+    /// re-armed submit). Selects the `queue-empty` reason. (Wired in the
+    /// queue-evidence change; kept false until then.)
+    saw_queue_evidence: bool,
+    /// Armed grace deadline, if any.
+    deadline: Option<i64>,
+}
+
 #[derive(Debug, Default)]
 pub struct IdleGate {
-    /// terminal id → grace deadline (armed at a turn boundary).
-    pending: HashMap<String, i64>,
+    states: HashMap<String, TerminalIdleState>,
     grace_ms: i64,
 }
 
@@ -49,50 +71,77 @@ impl IdleGate {
 
     pub fn with_grace_ms(grace_ms: i64) -> Self {
         Self {
-            pending: HashMap::new(),
+            states: HashMap::new(),
             grace_ms,
         }
     }
 
-    /// A positive turn boundary: arm (or re-arm) the grace window.
+    /// A tracker `Changed` upsert: record the phase edge. Busy/pending cancels
+    /// any pending window; an idle report is INERT (no cancel, no arm —
+    /// deadman/signal-loss idle flips never arm).
+    pub fn note_phase(&mut self, terminal_id: &str, phase: IdleGatePhase) {
+        let state = self.states.entry(terminal_id.to_string()).or_default();
+        let next_busy = matches!(phase, IdleGatePhase::Busy | IdleGatePhase::Pending);
+        if next_busy {
+            state.deadline = None;
+        }
+        state.busy = next_busy;
+        state.pending = phase == IdleGatePhase::Pending;
+    }
+
+    /// A positive turn boundary. While the tracker still reports busy this is
+    /// a QUEUED turn (claude keeps phase Busy until in_flight drains): never
+    /// arm mid-turn. Otherwise arm (or re-arm) the grace window.
     pub fn note_turn_boundary(&mut self, terminal_id: &str, at: i64) {
-        self.pending
-            .insert(terminal_id.to_string(), at + self.grace_ms);
+        let state = self.states.entry(terminal_id.to_string()).or_default();
+        if state.busy {
+            return;
+        }
+        state.deadline = Some(at + self.grace_ms);
     }
 
-    /// The terminal re-entered busy (a queued prompt started the next turn):
-    /// cancel any pending emission — it was never truly idle.
+    /// Provisional busy (submit-shaped PTY input / amplifier TurnBegan):
+    /// cancel any pending emission — it was never truly idle. Does NOT set
+    /// the busy flag: only confirmed tracker phase edges do that.
     pub fn note_busy(&mut self, terminal_id: &str) {
-        self.pending.remove(terminal_id);
-    }
-
-    /// New session-file activity while the window is pending (amplifier:
-    /// events.jsonl appends): extend the window — file writes mean the
-    /// session is still doing something.
-    pub fn note_activity(&mut self, terminal_id: &str, at: i64) {
-        if let Some(deadline) = self.pending.get_mut(terminal_id) {
-            *deadline = (*deadline).max(at + self.grace_ms);
+        if let Some(state) = self.states.get_mut(terminal_id) {
+            state.deadline = None;
         }
     }
 
-    /// Terminal exited: never emit for a dead terminal.
-    pub fn note_exit(&mut self, terminal_id: &str) {
-        self.pending.remove(terminal_id);
+    /// New session-file activity while the window is pending (amplifier:
+    /// events.jsonl appends): extend the window.
+    pub fn note_activity(&mut self, terminal_id: &str, at: i64) {
+        if let Some(state) = self.states.get_mut(terminal_id) {
+            if let Some(deadline) = state.deadline.as_mut() {
+                *deadline = (*deadline).max(at + self.grace_ms);
+            }
+        }
     }
 
-    /// Emit every window whose deadline has lapsed (once each).
+    /// Terminal exited or was removed from a tracker: drop ALL gate state for
+    /// it (legacy remove semantics — never emit for a dead terminal).
+    pub fn note_exit(&mut self, terminal_id: &str) {
+        self.states.remove(terminal_id);
+    }
+
+    /// Emit every window whose deadline has lapsed (once each). A terminal
+    /// that re-entered busy never emits (defensive second gate).
     pub fn expire(&mut self, at: i64) -> Vec<IdleEmission> {
-        let due: Vec<String> = self
-            .pending
-            .iter()
-            .filter(|(_, &deadline)| at >= deadline)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let mut emissions = Vec::with_capacity(due.len());
-        for terminal_id in due {
-            self.pending.remove(&terminal_id);
+        let mut emissions = Vec::new();
+        for (terminal_id, state) in self.states.iter_mut() {
+            let Some(deadline) = state.deadline else {
+                continue;
+            };
+            if at < deadline {
+                continue;
+            }
+            state.deadline = None;
+            if state.busy {
+                continue;
+            }
             emissions.push(IdleEmission {
-                terminal_id,
+                terminal_id: terminal_id.clone(),
                 at,
                 reason: TerminalIdleReason::Grace,
             });
@@ -102,7 +151,7 @@ impl IdleGate {
 
     /// Earliest pending deadline — `None` when no window is armed.
     pub fn next_deadline(&self) -> Option<i64> {
-        self.pending.values().copied().min()
+        self.states.values().filter_map(|s| s.deadline).min()
     }
 }
 
@@ -176,5 +225,78 @@ mod tests {
         let emissions = gate.expire(50 + IDLE_GRACE_MS);
         assert_eq!(emissions.len(), 1);
         assert_eq!(gate.next_deadline(), Some(100 + IDLE_GRACE_MS));
+    }
+
+    #[test]
+    fn turn_boundary_while_busy_never_arms() {
+        let mut gate = IdleGate::new();
+        gate.note_phase("t1", IdleGatePhase::Busy);
+        // claude in_flight >= 2: BEL #1's boundary lands while the tracker
+        // still reports Busy (busy->busy emits no Changed frame, so the gate's
+        // busy flag persists from the FIRST busy upsert).
+        gate.note_turn_boundary("t1", 100);
+        assert_eq!(gate.next_deadline(), None);
+        assert!(gate.expire(100 + 10 * IDLE_GRACE_MS).is_empty());
+    }
+
+    #[test]
+    fn boundary_after_the_idle_flip_arms_normally() {
+        let mut gate = IdleGate::new();
+        gate.note_phase("t1", IdleGatePhase::Busy);
+        // The final BEL: Changed(Idle) is processed BEFORE TurnComplete in the
+        // same effect vector, so the gate sees not-busy at the boundary.
+        gate.note_phase("t1", IdleGatePhase::Idle);
+        gate.note_turn_boundary("t1", 100);
+        assert_eq!(gate.next_deadline(), Some(100 + IDLE_GRACE_MS));
+        assert_eq!(gate.expire(100 + IDLE_GRACE_MS).len(), 1);
+    }
+
+    #[test]
+    fn idle_phase_report_is_inert() {
+        // Deadman/signal-loss idle flips arrive WITHOUT a turn boundary and
+        // never arm; they also never cancel an armed window (legacy parity).
+        let mut gate = IdleGate::new();
+        gate.note_phase("t1", IdleGatePhase::Idle);
+        assert_eq!(gate.next_deadline(), None);
+        gate.note_turn_boundary("t1", 100);
+        gate.note_phase("t1", IdleGatePhase::Idle); // e.g. duplicate idle upsert
+        assert_eq!(gate.next_deadline(), Some(100 + IDLE_GRACE_MS));
+    }
+
+    #[test]
+    fn busy_phase_report_cancels_a_pending_window() {
+        let mut gate = IdleGate::new();
+        gate.note_turn_boundary("t1", 100);
+        gate.note_phase("t1", IdleGatePhase::Busy);
+        assert_eq!(gate.next_deadline(), None);
+        assert!(gate.expire(100 + IDLE_GRACE_MS).is_empty());
+    }
+
+    #[test]
+    fn pending_phase_counts_as_busy_for_the_boundary_gate() {
+        let mut gate = IdleGate::new();
+        gate.note_phase("t1", IdleGatePhase::Pending);
+        gate.note_turn_boundary("t1", 100);
+        assert_eq!(gate.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_second_boundary_rearms_the_full_window() {
+        let mut gate = IdleGate::new();
+        gate.note_turn_boundary("t1", 100);
+        gate.note_turn_boundary("t1", 1_000);
+        assert_eq!(gate.next_deadline(), Some(1_000 + IDLE_GRACE_MS));
+        assert!(gate.expire(100 + IDLE_GRACE_MS).is_empty());
+    }
+
+    #[test]
+    fn expire_never_emits_while_busy_even_with_a_stale_deadline() {
+        // Defensive second gate (legacy handleGraceExpiry's busy guard): if a
+        // deadline somehow survives into a busy phase, drop it silently.
+        let mut gate = IdleGate::new();
+        gate.note_turn_boundary("t1", 100);
+        gate.note_phase("t1", IdleGatePhase::Pending); // cancels
+        gate.note_turn_boundary("t1", 200); // busy -> refuses to arm
+        assert!(gate.expire(200 + 10 * IDLE_GRACE_MS).is_empty());
     }
 }
