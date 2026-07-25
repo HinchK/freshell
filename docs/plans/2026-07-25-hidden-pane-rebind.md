@@ -7,14 +7,15 @@
 
 **Goal:** Background (hidden-tab) panes — both terminal and fresh-agent — must rebind their sessions after a WS reconnect or abrupt server restart WITHOUT being revealed, while expensive surface hydration stays deferred/staggered.
 
-**Architecture:** Hidden panes are fully mounted React components (hiding is CSS `visibility:hidden` per-tab via the `hidden` prop chain `App → TabContent → PaneLayout → PaneContainer → leaf view`), so the rebind driver lives in the per-pane effects — no App-level driver is needed (`src/App.tsx`'s inventory census at ~:1018–1091 already walks every tab hidden-agnostically and stays untouched). The fix splits **session rebind** (cheap WS frames: `freshAgent.create`/`freshAgent.attach`/`terminal.attach`) from **surface hydration** (HTTP snapshot fetch, viewport hydrate): cheap rebind now runs regardless of `hidden`, paced through queues; hydration stays deferred to reveal (fresh-agent) or flows through the existing one-at-a-time background hydration queue (terminal). Concretely: (1) a new `src/lib/rebind-queue.ts` caps concurrent in-flight hidden fresh-agent rebinds (fresh-agent frames have NO server-side gate, so client pacing matters); (2) `FreshAgentView`'s four `hidden` early-returns (create effect, create-reconnect, attach effect, attach-reconnect) are removed, with hidden sends routed through the rebind queue and the reconnect-driven snapshot refresh deferred to reveal; (3) `TerminalView`'s two hidden-defer sites that today never re-drive (`terminal.created`-while-hidden ~:3833 and `runRefreshAttach`-while-hidden ~:2609) now call the existing `registerForBackgroundHydration()`, so the already-staggered hydration queue attaches them without reveal (terminal creates already fire hidden today and are `restore:true`-exempt from the server rate limit, with the server spawn gate — 4 concurrent, FIFO, from PR #532 — pacing actual PTY spawns; no client-side create pacing change is needed or wanted, to keep PR #532's launch-retry semantics untouched).
+**Architecture:** Hidden panes are fully mounted React components (hiding is CSS `visibility:hidden` per-tab via the `hidden` prop chain `App → TabContent → PaneLayout → PaneContainer → leaf view`), so the rebind driver lives in the per-pane effects — no App-level driver is needed (`src/App.tsx`'s inventory census at ~:1018–1091 already walks every tab hidden-agnostically and stays untouched). The fix splits **session rebind** (cheap WS frames: `freshAgent.create`/`freshAgent.attach`/`terminal.attach`) from **surface hydration** (HTTP snapshot fetch, viewport hydrate): cheap rebind now runs regardless of `hidden`, paced through queues; hydration stays deferred to reveal (fresh-agent) or flows through the existing one-at-a-time background hydration queue (terminal). Concretely: (1) a new `src/lib/rebind-queue.ts` caps concurrent in-flight hidden fresh-agent rebinds (VERIFIED: no server-side gate exists anywhere in the ws dispatch path for `freshAgent.*` — all arms are `tokio::spawn`ed ungated, only per-requestId create dedup — so client pacing is the only pacing; and `freshAgent.attach` is NOT always cheap either: post-restart, a codex attach on a resumable session spawns a sidecar process and opencode broadcasts a snapshot frame per attach, so hidden ATTACH sends are queue-paced too, not just creates); (2) `FreshAgentView`'s four `hidden` early-returns (create effect, create-reconnect, attach effect, attach-reconnect) are removed, with hidden sends routed through the rebind queue and the reconnect-driven snapshot refresh deferred to reveal; (3) `TerminalView`'s two hidden-defer sites that today never re-drive (`terminal.created`-while-hidden ~:3833 and `runRefreshAttach`-while-hidden ~:2609) now clear their stale hydration slot/guard and call the existing `registerForBackgroundHydration({ queueIfStarted: true })` — VERIFIED: the hydration queue has NO reconnect pump and its `onActiveTabReady` is one-shot for the app session, so `queueIfStarted` is the ONLY post-startup enqueue+pump path; a bare `register()` after startup is inert (terminal creates already fire hidden today and are `restore:true`-exempt from the server rate limit; VERIFIED: the server dispatches `terminal.create` inline-awaited per WS connection, so one client's creates serialize through the spawn gate — 4 concurrent, FIFO, from PR #532 — and a single client cannot hit the gate's 10s permit timeout; no client-side create pacing change is needed or wanted, to keep PR #532's launch-retry semantics untouched. Caveat: a gate `Timeout` maps to `PTY_SPAWN_FAILED`, which the client does NOT retry — only `RATE_LIMITED` re-arms — so do not claim retry absorbs gate timeouts).
 
 **Tech Stack:** React 18 + Redux Toolkit client, Vitest 3 (jsdom) unit tests, Playwright e2e with the owned `RustServer` fixture (`restartAbrupt()`), Rust server (READ-ONLY for this lane).
 
 ## Global Constraints
 
 - **Worktree:** `/home/dan/code/freshell/.worktrees/hidden-pane-rebind`, branch `fix/hidden-pane-rebind`, base `origin/main @ c491aee0`. All paths below are relative to the worktree root.
-- **Scope fence — you own:** `src/components/fresh-agent/FreshAgentView.tsx`, `src/components/TerminalView.tsx`, `src/App.tsx` recovery-driver region (this plan leaves it untouched), small client lib/store additions (`src/lib/rebind-queue.ts`), test files.
+- **Base staleness (verified, informational):** `origin/main` has advanced past the base by exactly #534 (`c38c4fac`, "centralize terminal detach") and #535 (`c3b468b0`, script/e2e-only). Verified by diff: both Task 5 edit sites survive VERBATIM on main (shifted +9/+8 lines), `FreshAgentView.tsx` has a zero-line diff, and the merge contexts do not overlap #534's hunks (clean auto-merge). Stay on base `c491aee0`; if the branch is later merged/rebased onto main, note that post-#534 `attachTerminal` gates on layout membership (`collectAllTerminalIds(layouts).has(tid)`), so any test store must have the created terminalId present in `panes.layouts` when a hydration trigger fires, and the Task 5 Step 5 "zero modifications" pin refers to #534's versions of those test files.
+- **Scope fence — you own:** `src/components/fresh-agent/FreshAgentView.tsx`, `src/components/TerminalView.tsx`, `src/App.tsx` recovery-driver region (this plan leaves it untouched), small client lib/store additions (`src/lib/rebind-queue.ts`; a defensive guard in `src/store/freshAgentSlice.ts`'s `markSessionLost` — Task 3), test files.
 - **Scope fence — forbidden:** `src/store/persistMiddleware.ts`, `src/store/tab-registry-snapshot.ts` (Lane A1), everything under `crates/` (Lanes A2/A3/A5/A6 — server is READ-ONLY; if a server change seems required, STOP the task and report instead of editing).
 - **No kimi/gemini** provider work anywhere.
 - **PR #532 launch-retry semantics must stay intact** (see Task 5 hazards): `terminal.created` keeps calling `cancelCreateRetryTimer()` (no budget refund); `restore:true` re-arm ordering in `retryLaunchAfterInvalidTerminal`; nonzero-`terminalExitCode` never retries; `clearRateLimitRetry()` in the main-effect cleanup stays.
@@ -307,12 +308,12 @@ git commit -m "feat(client): add RebindQueue to pace hidden-pane rebinds"
 ### Task 3: FreshAgentView — hidden panes ATTACH on reconnect; hydration deferred to reveal
 
 **Files:**
-- Modify: `src/components/fresh-agent/FreshAgentView.tsx` (attach effect :1113–1126, attach-reconnect handler :1128–1138, plus three new refs/effects near the existing ref block ~:664)
-- Test: `test/unit/client/components/fresh-agent/FreshAgentView.hidden-rebind.test.tsx` (new)
+- Modify: `src/components/fresh-agent/FreshAgentView.tsx` (attach effect :1113–1126, attach-reconnect handler :1128–1138, plus three new refs/effects near the existing ref block ~:664); `src/store/freshAgentSlice.ts` (one defensive guard in `markSessionLost`, Step 4b)
+- Test: `test/unit/client/components/fresh-agent/FreshAgentView.hidden-rebind.test.tsx` (new); `test/unit/client/store/freshAgentSlice.test.ts` (extend, Step 4b)
 
 **Interfaces:**
 - Consumes: `getRebindQueue()`, `RebindJob` from Task 2 (`import { getRebindQueue } from '@/lib/rebind-queue'`).
-- Produces (relied on by Task 4): in-component refs `hiddenRef: React.MutableRefObject<boolean | undefined>`, `pendingRevealRefreshRef: React.MutableRefObject<boolean>`, `pendingRebindReleaseRef: React.MutableRefObject<(() => void) | null>`, and the reveal-refresh effect. Job keys: `` `freshagent:${paneId}:attach` `` and (Task 4) `` `freshagent:${paneId}:create` ``.
+- Produces (relied on by Task 4): in-component refs `hiddenRef: React.MutableRefObject<boolean | undefined>`, `pendingRevealRefreshRef: React.MutableRefObject<boolean>`, `pendingRebindReleaseRef: React.MutableRefObject<(() => void) | null>`, and the reveal-refresh effect. Job keys: `` `freshagent:${paneId}:attach` `` and (Task 4) `` `freshagent:${paneId}:create:${createRequestId}` `` (the requestId is included so a stale queued job from an unmounted/superseded instance can never dedup-block a newly minted `createRequestId`).
 
 Current behavior (verbatim guards being removed): the attach effect early-returns on `if (!paneContent.sessionId || hidden) return` and the reconnect handler on `if (hidden || !paneContent.sessionId) return` — so a background tab's fresh-agent pane never re-attaches after a reconnect until reveal. Note the pane-refresh path (:997–1000) already sends `freshAgent.attach` while hidden, so "hidden never attaches" is not an invariant we'd be breaking.
 
@@ -480,6 +481,8 @@ import { getRebindQueue } from '@/lib/rebind-queue'
 
 Notes: `hidden` is deliberately REMOVED from the guard AND the dep array — reveal must not re-fire this effect (that is exactly the "reveal performs only surface hydration" contract; the session was already rebound while hidden). `freshOpenCodeRouteCwd` stays in deps so a cwd change still re-attaches (unchanged behavior), but the send reads the ref so a queued job uses fresh values.
 
+Why attach goes through the queue (verified server-side, read-only): a tracked-alive attach is a cheap no-op (broadcast bus, no per-pane subscription), but post-restart a codex attach on an untracked-resumable session SPAWNS a sidecar process, and opencode broadcasts a snapshot frame on every attach — so queue pacing of hidden attaches is load-bearing, not ceremony. Also verified: a dead/unknown-session attach gets `freshAgent.error{code:'INVALID_SESSION_ID'}` back from all three providers, which the client already maps to `markSessionLost` (`src/lib/fresh-agent-ws.ts:326-328`) → the `.lost` recovery re-creates — this is the engine Task 4 relies on. Caveat: codex's transient failure frame (`CODEX_ATTACH_RESUME_FAILED`) maps to `sessionError`, NOT session-lost; the per-reconnect re-enqueue above is what re-drives attach in that case.
+
 3d. Replace the ATTACH-reconnect handler (currently :1128–1138) with:
 
 ```tsx
@@ -531,6 +534,33 @@ Notes: `hidden` is deliberately REMOVED from the guard AND the dep array — rev
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.hidden-rebind.test.tsx`
 Expected: PASS (all 4).
 
+- [ ] **Step 4b: Harden `markSessionLost` against missing session entries (red→green)**
+
+Verified hazard (empirically reproduced during plan validation): the `freshAgent` slice is NOT persisted, and `markSessionLost` (`src/store/freshAgentSlice.ts:461-465`) resolves a session key without checking existence, then does `state.sessions[key].lost = true` — on a freshly reloaded client whose dead-session attach races ahead of any `sessionCreated`/`sessionInit`, this THROWS (`Cannot set properties of undefined`) inside ws-client's un-try/catch'd handler loop and starves `.lost` recovery. Pre-existing for visible panes; this lane's hidden attaches widen exposure, so harden it here.
+
+First add a failing test to `test/unit/client/store/freshAgentSlice.test.ts` (mirror the file's existing store-construction helpers):
+
+```ts
+it('markSessionLost is a safe no-op when the session entry does not exist (reload + dead-session attach)', () => {
+  // Fresh store: sessions map empty (slice is unpersisted after reload).
+  expect(() =>
+    store.dispatch(markSessionLost({ sessionId: 's-ghost', sessionType: 'freshclaude', provider: 'claude' })),
+  ).not.toThrow()
+  expect(store.getState().freshAgent.sessions).toEqual({})
+})
+```
+
+Run it (expect the throw), then guard the reducer — in `markSessionLost`, after the key is resolved, replace the direct write with (adapt to the reducer's actual local names):
+
+```ts
+const session = state.sessions[key]
+if (!session) return
+session.lost = true
+```
+
+Re-run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.test.ts`
+Expected: PASS, including the existing markSessionLost tests (they pre-seed entries, so behavior for existing sessions is unchanged).
+
 - [ ] **Step 5: Run the existing FreshAgentView suite for regressions**
 
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/`
@@ -539,7 +569,7 @@ Expected: PASS. If an existing test asserted "no attach while hidden", update it
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/fresh-agent/FreshAgentView.hidden-rebind.test.tsx
+git add src/components/fresh-agent/FreshAgentView.tsx src/store/freshAgentSlice.ts test/unit/client/components/fresh-agent/FreshAgentView.hidden-rebind.test.tsx test/unit/client/store/freshAgentSlice.test.ts
 git commit -m "fix(client): hidden fresh-agent panes re-attach on reconnect, hydration deferred to reveal"
 ```
 
@@ -555,7 +585,7 @@ git commit -m "fix(client): hidden fresh-agent panes re-attach on reconnect, hyd
 - Consumes: `getRebindQueue()` (Task 2); `hiddenRef` / `pendingRebindReleaseRef` (Task 3); existing `createSentRef`, `registerFreshAgentCreate`, `buildCreateMessage`, `paneContentRef`.
 - Produces: after an abrupt restart, a hidden fresh-agent pane whose `.lost` recovery (:1534–1563, already un-gated) mints a new `createRequestId` now actually SENDS `freshAgent.create` without reveal. `createSentRef` semantics unchanged (reset on `createRequestId` change at :828–832).
 
-Why this is safe: `freshAgent.create` spawns a sidecar process, so hidden creates are the storm risk — every hidden create goes through the queue (max 4 in-flight, released on the `freshAgent.created` / create-failed ack or the 10s backstop). The server has no rate limit on `freshAgent.*` (verified read-only: `crates/freshell-ws/src/create_limit.rs` covers `terminal.create` only), so this client pacing is the only pacing. The transport already replays `inFlightCreates` on reconnect (`src/lib/ws-client.ts:194–205`), which is visibility-blind — precedent that hidden creates already happen at the transport layer.
+Why this is safe: `freshAgent.create` spawns a sidecar process, so hidden creates are the storm risk — every hidden create goes through the queue (max 4 in-flight, released on the `freshAgent.created` / create-failed ack or the 10s backstop). The server has no gate on `freshAgent.*` ANYWHERE in the dispatch path (verified read-only across `crates/freshell-ws` + `crates/freshell-freshagent`: all `FreshAgent*` arms are `tokio::spawn`ed ungated; `create_limit.rs` covers `terminal.create` only; the only dampener is per-requestId create dedup), so this client pacing is the only pacing. That server-side dedup caps sidecar spawns at one per pane ONLY when retries reuse the same requestId — which they do here by construction: the job key and the sent frame both derive from the pane's current `createRequestId`. The transport already replays `inFlightCreates` on reconnect (`src/lib/ws-client.ts:194–205`), which is visibility-blind — precedent that hidden creates already happen at the transport layer.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -681,7 +711,9 @@ In `src/components/fresh-agent/FreshAgentView.tsx`:
     }
     if (hiddenRef.current) {
       getRebindQueue().enqueue({
-        key: `freshagent:${paneId}:create`,
+        // requestId in the key: a stale queued job from a superseded/unmounted
+        // instance must never dedup-block a newly minted createRequestId.
+        key: `freshagent:${paneId}:create:${paneContent.createRequestId}`,
         run: runCreate,
       })
     } else {
@@ -719,7 +751,7 @@ In `src/components/fresh-agent/FreshAgentView.tsx`:
         sendFreshAgentMessage(buildCreateMessage(latest))
       }
       if (hiddenRef.current) {
-        getRebindQueue().enqueue({ key: `freshagent:${paneId}:create`, run: resend })
+        getRebindQueue().enqueue({ key: `freshagent:${paneId}:create:${current.createRequestId}`, run: resend })
       } else {
         resend()
       }
@@ -786,10 +818,15 @@ git commit -m "fix(client): hidden fresh-agent panes create/re-create via paced 
 - Test: `test/unit/client/components/TerminalView.hidden-rebind.test.tsx` (new)
 
 **Interfaces:**
-- Consumes: existing `registerForBackgroundHydration()` (`TerminalView.tsx:2273–2282`) and the background hydration effect (:2689–2709) that attaches with `priority: 'background'`; existing `getHydrationQueue()` from `src/lib/hydration-queue.ts` (strict one-at-a-time — this IS the terminal-side stagger; no rebind-queue usage here).
+- Consumes: existing `registerForBackgroundHydration(options?)` (`TerminalView.tsx:2273–2282` — it forwards options to `getHydrationQueue().register(entry, options)`) and the background hydration effect (:2689–2709) that attaches with `priority: 'background'`; existing `getHydrationQueue()` from `src/lib/hydration-queue.ts` (strict one-at-a-time — this IS the terminal-side stagger; no rebind-queue usage here). CRITICAL (verified): the queue has NO reconnect pump — `entry.trigger()` fires only via `register({queueIfStarted:true})`, `unregister` of the active pane, the ONE-SHOT `onActiveTabReady` (`started` never resets), or `onHydrationComplete` chaining. A bare `register()` after startup only does `entries.set()` and is inert forever.
 - Produces: after `terminal.created` arrives while hidden, or after an explicit refresh detaches while hidden, the pane is queued for background hydration and gets a real `terminal.attach` without reveal. Reveal on an already-`live` pane performs only layout fit (existing :2660 guard `deferred.mode === 'waiting_for_geometry'` — pinned by a test below).
 
 Background (the defect, verbatim from HEAD): sites (c) `onReconnect`+hidden (:4352) and (d) main-effect+hidden (:4400) already call `registerForBackgroundHydration()`, but site (a) `terminal.created`+hidden (:3833–3840) and site (b) `runRefreshAttach`+hidden (:2609–2617) do NOT — they set `waiting_for_geometry`, send no attach frame, and wait for reveal. Site (b) is worse: it already sent `terminal.detach` at :2607, so the pane is actively detached server-side. Meanwhile the server's idle reaper kills detached+running+quiet terminals after 15 minutes (`crates/freshell-ws/.../registry.rs:368` read-only) — a hidden wedged pane can be GC'd before reveal.
+
+Validation findings this task's implementation MUST honor (all verified by exhaustive read of `hydration-queue.ts` + every call site):
+1. A bare `registerForBackgroundHydration()` is inert post-startup (see Interfaces above) — pass `{ queueIfStarted: true }`, the ONLY post-startup enqueue+pump path. (The existing sites (c)/(d) are themselves partially inert for the same reason — precedent for registration, not for draining; do NOT copy their bare-call form.)
+2. `hydrationRegisteredRef` (:2274) is reset only on reveal/unmount, so a pane that background-hydrated once can never re-register — reset it to `false` at these sites before calling the wrapper.
+3. If a background hydration was in flight when the connection died, the queue's `activePane` is never cleared and `advance()` blocks queue-wide. Calling `getHydrationQueue().onHydrationComplete(paneIdRef.current)` first clears this pane's stale slot (no-op when this pane isn't the active one) — after a restart every dead terminal's site (a) fires, so each pane clears its own potential wedge.
 
 **PR #532 hazards to preserve (verify via the launchRetry suite in Step 5):**
 1. `terminal.created` keeps calling `cancelCreateRetryTimer()` (:3755) — do not touch.
@@ -859,8 +896,14 @@ describe('TerminalView hidden-pane rebind (F8)', () => {
     // Server acks the create. Mirror the terminal.created frame shape used in
     // TerminalView.lifecycle.test.tsx.
     deliverWsMessage({ type: 'terminal.created', requestId: 'req-1', terminalId: 'term-1', streamId: 'stream-1' })
-    // THE FIX: hidden pane must now be registered for background hydration.
-    expect(hydrationMocks.queue.register).toHaveBeenCalled()
+    // THE FIX: hidden pane must now be registered for background hydration
+    // WITH queueIfStarted (the queue's only post-startup pump path), after
+    // clearing this pane's stale slot.
+    expect(hydrationMocks.queue.onHydrationComplete).toHaveBeenCalled()
+    expect(hydrationMocks.queue.register).toHaveBeenCalledWith(
+      expect.objectContaining({ trigger: expect.any(Function) }),
+      expect.objectContaining({ queueIfStarted: true }),
+    )
     const entry = hydrationMocks.registered.at(-1)!
     // When the hydration queue grants the slot, a real attach frame goes out.
     act(() => { entry.trigger() })
@@ -893,10 +936,50 @@ describe('TerminalView hidden-pane rebind (F8)', () => {
 
 If the `terminal.created` / `terminal.attach.ready` frames need more fields to pass the component's handler guards, copy the exact fixture frames from `TerminalView.lifecycle.test.tsx` — do not invent fields.
 
+Also create `test/unit/client/lib/hydration-queue.rebind.test.ts`, pinning the REAL queue's post-startup semantics this task depends on (the mocked-queue tests above are structurally incapable of detecting a missing pump). Before writing it, read `src/lib/hydration-queue.ts` and mirror its actual export names and the `onActiveTabReady` call shape used at `TerminalView.tsx:2204-2209` (if only a singleton is exported, use `getHydrationQueue()` plus its test reset helper instead of a factory):
+
+```ts
+import { describe, expect, it } from 'vitest'
+import { createHydrationQueue } from '@/lib/hydration-queue'
+
+function makeEntry(paneId: string, calls: string[]) {
+  return { tabId: 'tab-1', paneId, trigger: () => { calls.push(paneId) } }
+}
+
+describe('hydration queue — post-startup rebind drain (F8)', () => {
+  it('a bare register() after startup never triggers (documents why queueIfStarted is required)', () => {
+    const queue = createHydrationQueue()
+    const calls: string[] = []
+    queue.onActiveTabReady('tab-1') // started = true; one-shot
+    queue.register(makeEntry('pane-a', calls))
+    expect(calls).toEqual([])
+  })
+
+  it('register({ queueIfStarted: true }) after startup triggers with no further events', () => {
+    const queue = createHydrationQueue()
+    const calls: string[] = []
+    queue.onActiveTabReady('tab-1')
+    queue.register(makeEntry('pane-a', calls), { queueIfStarted: true })
+    expect(calls).toEqual(['pane-a'])
+  })
+
+  it('onHydrationComplete(stalePane) un-wedges the queue for later registrations', () => {
+    const queue = createHydrationQueue()
+    const calls: string[] = []
+    queue.onActiveTabReady('tab-1')
+    queue.register(makeEntry('pane-a', calls), { queueIfStarted: true }) // active, never completes (dead attach)
+    queue.register(makeEntry('pane-b', calls), { queueIfStarted: true }) // held behind the wedge
+    expect(calls).toEqual(['pane-a'])
+    queue.onHydrationComplete('pane-a') // exactly what the Task 5 sites do first
+    expect(calls).toEqual(['pane-a', 'pane-b'])
+  })
+})
+```
+
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.hidden-rebind.test.tsx`
-Expected: test 1 FAILS at `expect(hydrationMocks.queue.register).toHaveBeenCalled()` — the created-while-hidden branch never registers. (Test 2 may incidentally fail at the same point; that's fine for RED.)
+Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.hidden-rebind.test.tsx test/unit/client/lib/hydration-queue.rebind.test.ts`
+Expected: component test 1 FAILS at the `register` assertion — the created-while-hidden branch never registers (test 2 may incidentally fail at the same point; that's fine for RED). The hydration-queue tests document EXISTING queue behavior and should pass immediately — if any of the three fails, STOP: the queue semantics differ from the verified analysis and Step 3's approach must be re-checked against the real code.
 
 - [ ] **Step 3: Implement (two 1-line insertions)**
 
@@ -915,7 +998,19 @@ Expected: test 1 FAILS at `expect(hydrationMocks.queue.register).toHaveBeenCalle
               // through the background hydration queue (one-at-a-time stagger)
               // instead of waiting for reveal -- otherwise the terminal sits
               // detached server-side and is idle-reaped after 15 minutes.
-              registerForBackgroundHydration()
+              // Order matters (verified queue semantics):
+              // 1) clear this pane's stale active slot -- a background
+              //    hydration that died with the old connection otherwise
+              //    wedges the whole queue (no-op when not the active pane);
+              // 2) reset the registration guard -- it is only cleared on
+              //    reveal/unmount, so a previously-hydrated pane could never
+              //    re-register;
+              // 3) queueIfStarted -- the queue has NO reconnect pump and
+              //    onActiveTabReady is one-shot, so this is the only
+              //    post-startup path that enqueues AND pumps.
+              getHydrationQueue().onHydrationComplete(paneIdRef.current)
+              hydrationRegisteredRef.current = false
+              registerForBackgroundHydration({ queueIfStarted: true })
             } else {
 ```
 
@@ -933,17 +1028,20 @@ Expected: test 1 FAILS at `expect(hydrationMocks.queue.register).toHaveBeenCalle
           setIsAttaching(false)
           // F8: the detach was already sent above -- re-arm the attach via the
           // background hydration queue so a hidden refresh cannot strand the
-          // pane detached until reveal.
-          registerForBackgroundHydration()
+          // pane detached until reveal. Same three-step sequence as the
+          // terminal.created site (see its comment for why each line exists).
+          getHydrationQueue().onHydrationComplete(paneIdRef.current)
+          hydrationRegisteredRef.current = false
+          registerForBackgroundHydration({ queueIfStarted: true })
         } else {
 ```
 
-Nothing else changes. `registerForBackgroundHydration` (defined at :2273 as a component-level `useCallback`) is in scope at both sites; it self-dedups via `hydrationRegisteredRef`. The reveal effect (:2655–2687) already unregisters on reveal, and the background effect (:2690–2709) already no-ops if the pane became visible — no interaction changes needed.
+Nothing else changes. `registerForBackgroundHydration` (defined at :2273 as a component-level `useCallback` taking `options?: { queueIfStarted?: boolean }` which it forwards to `getHydrationQueue().register`) is in scope at both sites, as are `getHydrationQueue`, `paneIdRef`, and `hydrationRegisteredRef`. The explicit `hydrationRegisteredRef.current = false` reset is what makes the wrapper's self-dedup (`if (hydrationRegisteredRef.current) return`) safe to keep. The reveal effect (:2655–2687) already unregisters on reveal, and the background effect (:2690–2709) already no-ops if the pane became visible — no interaction changes needed. Do NOT "fix" sites (c)/(d) (:4352/:4400) in this task — they have the same latent inertness but changing them is out of this task's minimal scope; the e2e in Task 6 exercises the restart path through sites (a)/(b).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.hidden-rebind.test.tsx`
-Expected: PASS (both).
+Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.hidden-rebind.test.tsx test/unit/client/lib/hydration-queue.rebind.test.ts`
+Expected: PASS (both component tests + all three queue tests).
 
 - [ ] **Step 5: PR #532 + lifecycle regression sweep**
 
@@ -959,7 +1057,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.hidden-rebind.test.tsx
+git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.hidden-rebind.test.tsx test/unit/client/lib/hydration-queue.rebind.test.ts
 git commit -m "fix(client): hidden terminal panes attach via background hydration after create/refresh"
 ```
 
@@ -974,7 +1072,7 @@ git commit -m "fix(client): hidden terminal panes attach via background hydratio
 
 **Interfaces:**
 - Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts`) — `start()`, `restartAbrupt()`, `stop()`, ephemeral ports; `TestHarness`; fake sidecar fixture `test/e2e-browser/fixtures/fake-claude-sidecar.mjs`.
-- Produces: e2e proof of the user story: multi-tab layout (visible + hidden terminal + hidden fresh-agent), SIGKILL restart, hidden panes rebound WITHOUT reveal (asserted via harness Redux state, which only updates when the server round-trips create/attach acks to this client — i.e. server-side rebind evidence), then reveal shows correct content/status instantly, and a busy-at-restart hidden pane un-wedges without reveal.
+- Produces: e2e proof of the user story: multi-tab layout (visible + hidden terminal + hidden fresh-agent), SIGKILL restart, hidden panes rebound WITHOUT reveal (asserted via harness Redux state), then reveal shows correct content/status instantly, and a busy-at-restart hidden pane un-wedges without reveal. Evidence validity (verified by enumerating all slice writers): client-side writers of `terminalId`/`status` DO exist (tab-open flows, persistence hydration), but none can mint a NEW terminalId on an existing pane without user action or a page reload — so the polls below are genuine server-round-trip evidence PROVIDED the spec (i) never reloads the page after restart and (ii) asserts the new id differs from the old (both already built into the tests below; do not weaken either).
 
 Per this suite's convention (documented in `restore-contract-wall-rust.spec.ts`'s header), helpers are COPIED into the spec, not imported from sibling specs. Copy these helpers verbatim from `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts`: `bootWall`, `selectShellIfPickerShowing`, `createTabViaRest`, `restApiHeaders`, `waitForWsReady`, `seedWallConfig`, `installFakeCli`, `createFreshclaudePane` (and its transitive helpers). Known gotcha to carry over: with >1 tab mounted, `.xterm` locators match HIDDEN tabs' still-mounted terminals — always use `.xterm:visible` (the wall spec documents this at :1390–1396).
 
@@ -1130,7 +1228,7 @@ npm run test:e2e -- --project=rust-chromium specs/hidden-pane-rebind-rust.spec.t
 ```
 Expected: with Tasks 3–5 already merged into the branch, tests 1 and 2 should PASS (green proof of the feature). If this spec had been written before Tasks 3–5 it would be red — if either test FAILS now, treat it as a real defect in the implementation tasks and fix there, not by weakening assertions.
 
-Contingency for test 2 (fresh-agent): if the hidden pane never leaves `exited`/lost state, the client is not reacting to the server's response to `freshAgent.attach` for a dead session. Diagnose read-only: `readServerLogs(info.logsDir)` and `grep -rn "freshAgent.attach" crates/freshell-freshagent/src/ crates/freshell-ws/src/` to learn the exact error/lost frame the server sends, then handle that frame in `FreshAgentView`'s `ws.onMessage` table by dispatching the existing `markSessionLost` path (client-only change, in scope — the `.lost` recovery at :1534–1563 then re-creates with resume). If the server sends NOTHING for a dead-session attach, STOP and report (a server change would be required, which this lane must not make).
+Contingency for test 2 (fresh-agent) — the dead-session attach contract is now VERIFIED, not unknown: all three providers reply to `freshAgent.attach` for an untracked session with `freshAgent.error{code:'INVALID_SESSION_ID'}` (claude `crates/freshell-freshagent/src/claude.rs:395-401,510-522`; codex `codex.rs:999-1002`; opencode `opencode_ws.rs:591-612`; wire-tested in `crates/freshell-ws/tests/freshagent_claude_attach.rs:178-230`), and the client already maps that frame to `markSessionLost` (`src/lib/fresh-agent-ws.ts:326-328`, routed visibility-blind via `App.tsx:1258`) → the `.lost` recovery at :1534–1563 re-creates. So test 2 failing does NOT mean "server sends nothing" — diagnose read-only with `readServerLogs(info.logsDir)` for what actually happened. Known gaps to check first: (1) codex's TRANSIENT failure frame (`CODEX_ATTACH_RESUME_FAILED`) maps to `sessionError`, not session-lost — recovery then rides the next reconnect's re-enqueued attach; (2) the `markSessionLost` missing-entry guard from Task 3 Step 4b must be in place (without it a reload+dead-session sequence throws in the handler loop). A server change should not be needed; if the logs nonetheless prove one is, STOP and report (this lane must not make it).
 
 - [ ] **Step 3: Run the wall's hidden-pane entry (must stay green; nothing to un-pin)**
 
@@ -1176,7 +1274,7 @@ Expected: the new spec PASSES; the wall spec's pinned entries stay expected-fail
 - [ ] **Step 4: Scope-fence audit**
 
 Run: `git diff --stat origin/main...HEAD`
-Expected touched files ONLY: `docs/plans/2026-07-25-hidden-pane-rebind.md`, `src/lib/rebind-queue.ts`, `src/components/fresh-agent/FreshAgentView.tsx`, `src/components/TerminalView.tsx`, `test/unit/client/lib/rebind-queue.test.ts`, `test/unit/client/components/fresh-agent/FreshAgentView.hidden-rebind.test.tsx`, `test/unit/client/components/TerminalView.hidden-rebind.test.tsx`, `test/e2e-browser/specs/hidden-pane-rebind-rust.spec.ts`, `test/e2e-browser/playwright.config.ts` (plus, only if the Task 6 contingency fired, the `FreshAgentView` onMessage addition already listed). NOTHING under `crates/`, `src/store/persistMiddleware.ts`, or `src/store/tab-registry-snapshot.ts`.
+Expected touched files ONLY: `docs/plans/2026-07-25-hidden-pane-rebind.md`, `src/lib/rebind-queue.ts`, `src/components/fresh-agent/FreshAgentView.tsx`, `src/components/TerminalView.tsx`, `src/store/freshAgentSlice.ts`, `test/unit/client/lib/rebind-queue.test.ts`, `test/unit/client/lib/hydration-queue.rebind.test.ts`, `test/unit/client/components/fresh-agent/FreshAgentView.hidden-rebind.test.tsx`, `test/unit/client/store/freshAgentSlice.test.ts`, `test/unit/client/components/TerminalView.hidden-rebind.test.tsx`, `test/e2e-browser/specs/hidden-pane-rebind-rust.spec.ts`, `test/e2e-browser/playwright.config.ts` (plus, only if the Task 6 contingency fired, the `FreshAgentView` onMessage addition already listed). NOTHING under `crates/`, `src/store/persistMiddleware.ts`, or `src/store/tab-registry-snapshot.ts`.
 
 - [ ] **Step 5: Push and STOP (PR policy: not approved)**
 
@@ -1204,4 +1302,12 @@ Then STOP — do NOT run `gh pr create`. Report: branch name, the head commit SH
 
 **2. Placeholder scan:** no TBD/TODO/"handle edge cases" steps; every code step shows code. Two deliberate "copy from donor file" scaffolding instructions (test-mock preambles, wall-spec helpers) reference concrete named files/lines and follow that suite's own copy-not-import convention; the novel test bodies and all production code are written out in full.
 
-**3. Type consistency:** `RebindJob`/`RebindQueue`/`getRebindQueue`/`resetRebindQueueForTests` names match across Tasks 2/3/4; job keys `` `freshagent:${paneId}:attach` `` / `` `freshagent:${paneId}:create` `` consistent; `hiddenRef`/`pendingRevealRefreshRef`/`pendingRebindReleaseRef` declared in Task 3, consumed in Task 4; Task 5 uses only pre-existing component symbols (`registerForBackgroundHydration`, `deferredAttachStateRef`, `hiddenRef`, `setIsAttaching`).
+**3. Type consistency:** `RebindJob`/`RebindQueue`/`getRebindQueue`/`resetRebindQueueForTests` names match across Tasks 2/3/4; job keys `` `freshagent:${paneId}:attach` `` / `` `freshagent:${paneId}:create:${createRequestId}` `` consistent; `hiddenRef`/`pendingRevealRefreshRef`/`pendingRebindReleaseRef` declared in Task 3, consumed in Task 4; Task 5 uses only pre-existing component symbols (`registerForBackgroundHydration`, `getHydrationQueue`, `paneIdRef`, `hydrationRegisteredRef`, `deferredAttachStateRef`, `hiddenRef`, `setIsAttaching`).
+
+## Self-Review addendum (after load-bearing validation pass)
+
+A validation pass (assumption ledger: `.worktrees/.the-usual-logs/hidden-pane-rebind/load-bearing-ledger.md`; evidence reports V1–V8 alongside it) verified 11 load-bearing assumptions and falsified 2, and this plan was updated accordingly:
+
+- **Falsified A2 → Task 5 rewritten:** the hydration queue has NO reconnect pump; bare `register()` post-startup is inert. Task 5's insertions now clear the stale slot (`onHydrationComplete`), reset `hydrationRegisteredRef`, and register with `{ queueIfStarted: true }`; a new real-queue test file (`hydration-queue.rebind.test.ts`) pins the drain semantics the mocked-queue tests cannot see. Re-ran self-review items over Task 5: spec coverage intact (attach-without-reveal now actually drives); no silent deferrals (sites (c)/(d)'s latent inertness is explicitly out-of-scope, noted, and not needed for the F8 contract — the restart path flows through sites (a)/(b)); no placeholders (all inserted code shown; the queue test carries an explicit verify-exports instruction per the donor-copy convention); types consistent (wrapper's `options` parameter verified real at :2273–2282).
+- **Falsified A5 (partial) → Architecture corrected:** `freshAgent.attach` is not unconditionally cheap (post-restart codex attach spawns a sidecar; opencode broadcasts a snapshot per attach) — hidden attach pacing through the rebind queue is load-bearing and stays.
+- **Verified A3 → Task 6 contingency replaced** with the proven `INVALID_SESSION_ID` contract; **verified A4 edge → Task 3 Step 4b** adds the `markSessionLost` missing-entry guard (red→green, slice test); **verified A9 → Architecture rationale corrected** (creates serialize per WS connection; gate Timeout is NOT client-retried); **verified A10 → Global Constraints** documents #534/#535 merge cleanliness and the post-#534 layout-membership test hazard; **verified A12/A13 → create job keys include `createRequestId`** so stale queued jobs can't dedup-block a new requestId (ws-client buffering/flush semantics confirmed for queued sends).
