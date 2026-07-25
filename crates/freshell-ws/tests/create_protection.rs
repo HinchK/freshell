@@ -187,6 +187,61 @@ async fn restore_creates_bypass_and_do_not_record() {
     );
 }
 
+#[tokio::test]
+async fn gate_at_concurrency_one_never_breaks_a_restore_storm() {
+    let cfg = CreateProtectConfig {
+        spawn_concurrency: 1,
+        spawn_queue_cap: 64,
+        spawn_timeout_ms: 30_000,
+        ..Default::default()
+    };
+    let url = common::spawn_server_with_create_protect(cfg).await;
+
+    // Two connections firing interleaved restore creates: every one must
+    // succeed (restore bypasses the RATE limit but NOT the gate).
+    let mut ws_a = connect_and_hello(&url).await;
+    let mut ws_b = connect_and_hello(&url).await;
+    for i in 0..4 {
+        let ra = send_create_and_await_reply(&mut ws_a, &format!("cr-a-{i}"), true).await;
+        assert_eq!(ra["type"], "terminal.created", "conn A create {i}: {ra}");
+        let rb = send_create_and_await_reply(&mut ws_b, &format!("cr-b-{i}"), true).await;
+        assert_eq!(rb["type"], "terminal.created", "conn B create {i}: {rb}");
+    }
+}
+
+#[tokio::test]
+async fn zero_permit_gate_times_out_create_with_pinned_error_frame() {
+    // spawn_concurrency: 0 => SpawnGate::from_config builds a 0-permit
+    // semaphore (legal: only from_env treats 0 as "fall back to default";
+    // a literal config passes 0 straight through from_config -> new).
+    // acquire() can therefore never succeed: the create queues (under the
+    // 64-cap) and times out after spawn_timeout_ms.
+    let cfg = CreateProtectConfig {
+        spawn_concurrency: 0,
+        spawn_queue_cap: 64,
+        spawn_timeout_ms: 250,
+        ..Default::default()
+    };
+    let url = common::spawn_server_with_create_protect(cfg).await;
+    let mut ws = connect_and_hello(&url).await;
+
+    let rejected = send_create_and_await_reply(&mut ws, "cr-gate-timeout", false).await;
+    assert_eq!(rejected["type"], "error", "gate must reject: {rejected}");
+    assert_eq!(rejected["code"], "PTY_SPAWN_FAILED");
+    assert_eq!(
+        rejected["message"],
+        "Timed out waiting for a terminal spawn slot"
+    );
+    assert_eq!(rejected["requestId"], "cr-gate-timeout");
+
+    // restore:true is exempt from the RATE limit but NOT the gate.
+    let restore_rejected = send_create_and_await_reply(&mut ws, "cr-gate-restore", true).await;
+    assert_eq!(
+        restore_rejected["code"], "PTY_SPAWN_FAILED",
+        "restore creates go THROUGH the gate: {restore_rejected}"
+    );
+}
+
 /// Pins the Placement decision: the paneReconcileV1 dedupe/adopt branch
 /// (terminal.rs:908-927, early return :926) runs BEFORE the limiter check,
 /// so an adoptable duplicate create is neither checked nor charged even
