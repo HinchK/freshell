@@ -126,7 +126,13 @@ fn resolve_authoritative_ref(
     if let Some(sref) = pane.session_ref.clone() {
         return Some(sref);
     }
-    // 4. ONE uniform promotion rule: {provider: mode, sessionId: resumeSessionId}.
+    // 4. ONE uniform promotion rule.
+    promoted_legacy_claim(pane)
+}
+
+/// §5.2's ONE uniform promotion rule: a legacy `mode` + `resumeSessionId`
+/// pair IS a sessionRef claim — `{provider: mode, sessionId: resumeSessionId}`.
+fn promoted_legacy_claim(pane: &ReconcilePane) -> Option<SessionLocator> {
     let mode = pane
         .mode
         .as_deref()
@@ -203,14 +209,21 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
     // live terminal ALREADY carrying the claimed sessionRef wins over
     // createRequestId keying — every other client's claim for the same ref
     // (regardless of createRequestId) attaches to the winner, never a
-    // respawn that would open a second JSONL writer (D8).
-    if let Some(claim) = pane.session_ref.as_ref() {
-        if let Some(tid) = live_terminal_for_claimed_ref(deps, claim) {
+    // respawn that would open a second JSONL writer (D8). The effective
+    // claim is the structured `sessionRef`, or the legacy `mode` +
+    // `resumeSessionId` pair promoted by §5.2's ONE uniform rule — a
+    // legacy-claiming client must not bypass this branch.
+    if let Some(claim) = pane
+        .session_ref
+        .clone()
+        .or_else(|| promoted_legacy_claim(pane))
+    {
+        if let Some(tid) = live_terminal_for_claimed_ref(deps, &claim) {
             let server_ref = deps
                 .identity
                 .session_ref_for(&tid)
                 .or_else(|| Some(claim.clone()));
-            let corrected = corrected_flag(pane.session_ref.as_ref(), server_ref.as_ref());
+            let corrected = corrected_flag(Some(&claim), server_ref.as_ref());
             return PaneVerdict {
                 terminal_id: Some(tid),
                 session_ref: server_ref,
@@ -760,6 +773,40 @@ mod tests {
         assert_eq!(v.terminal_id.as_deref(), Some("T-rest-live"));
         assert_eq!(v.session_ref, Some(sref("codex", "s-shared")));
         assert_eq!(v.corrected, None, "the claim matched server truth");
+    }
+
+    /// Council rule 6, legacy-claim half: §5.2's ONE uniform promotion rule
+    /// applies BEFORE the sessionRef-attach lookup — a pane claiming only the
+    /// legacy `mode` + `resumeSessionId` pair (NO structured sessionRef)
+    /// whose session is carried by a live terminal under a DIFFERENT
+    /// createRequestId attaches to that terminal, never the D8 respawn that
+    /// would open a second JSONL writer.
+    #[test]
+    fn legacy_resume_claim_attaches_to_live_terminal_across_create_request_ids() {
+        let f = Fixture::new();
+        f.registry.register_headless(HeadlessTerminal {
+            terminal_id: "T-legacy-live".to_string(),
+            stream_id: "S-legacy-live".to_string(),
+            mode: "codex".to_string(),
+            resume_session_id: Some("s-legacy".to_string()),
+            create_request_id: Some("cr-WINNER".to_string()),
+            created_at: Some(1_000),
+        });
+        // Session Present on disk — the fall-through path would derive the
+        // D8 respawn.
+        f.probe.set("codex", "s-legacy", SessionExistence::Present);
+
+        let mut p = pane("cr-OTHER");
+        p.mode = Some("codex".to_string());
+        p.resume_session_id = Some("s-legacy".to_string()); // legacy claim only
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Attach);
+        assert_eq!(v.terminal_id.as_deref(), Some("T-legacy-live"));
+        assert_eq!(v.session_ref, Some(sref("codex", "s-legacy")));
+        assert_eq!(
+            v.corrected, None,
+            "a matching promoted claim is not a correction"
+        );
     }
 
     /// §9.1 test 8 trust boundary, respawn shape: the claim contradicts the
