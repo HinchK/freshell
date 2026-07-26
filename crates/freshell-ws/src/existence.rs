@@ -29,6 +29,10 @@ pub enum SessionExistence {
     Absent,
     /// Known provider, but the index cannot answer yet (cold/unavailable).
     Unknown,
+    /// Known provider whose session root does not exist on this machine —
+    /// it will never warm up, so downstream answers an immediate
+    /// `error{provider_unavailable}` with NO deferral (never `index_warming`).
+    ProviderUnavailable,
 }
 
 /// The reconcile derivation's read-only view of disk session truth.

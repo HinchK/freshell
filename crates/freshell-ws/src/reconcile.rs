@@ -249,6 +249,13 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
             reason: Some("index_warming".to_string()),
             ..base(pane, ReconcileVerdict::Error)
         },
+        // A known provider with no home on this machine is NOT warming — the
+        // honest, immediate provider_unavailable (the handler's single
+        // deferral fires only on index_warming, `terminal.rs`).
+        SessionExistence::ProviderUnavailable => PaneVerdict {
+            reason: Some("provider_unavailable".to_string()),
+            ..base(pane, ReconcileVerdict::Error)
+        },
     }
 }
 
@@ -488,6 +495,22 @@ mod tests {
         let v = f.one(p);
         assert_eq!(v.verdict, ReconcileVerdict::Error);
         assert_eq!(v.reason.as_deref(), Some("index_warming"));
+    }
+
+    /// A known provider whose session root does not exist on this machine →
+    /// immediate error{provider_unavailable} — never index_warming (which
+    /// would trigger the handler's deferral), never dead_session.
+    #[test]
+    fn provider_unavailable_existence_yields_error_provider_unavailable() {
+        let f = Fixture::new();
+        f.probe
+            .set("codex", "s-pu", SessionExistence::ProviderUnavailable);
+        let mut p = pane("cr-pu");
+        p.mode = Some("codex".to_string());
+        p.session_ref = Some(sref("codex", "s-pu"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Error);
+        assert_eq!(v.reason.as_deref(), Some("provider_unavailable"));
     }
 
     /// Row 6: no terminalId at all, just a claim that IS on disk → respawn

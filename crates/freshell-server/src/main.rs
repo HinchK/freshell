@@ -444,6 +444,26 @@ async fn main() -> ExitCode {
                 // transcript deleted while the server was DOWN still derives
                 // loud dead_session (per-boot observed set is empty then).
                 Some(std::sync::Arc::clone(&pane_ledger)),
+                // Provider session roots resolved with the SAME helpers the
+                // `session_index` sources above use — a known provider whose
+                // root does not exist on this machine derives an immediate
+                // `error{provider_unavailable}`, never `index_warming`.
+                session_directory::provider_home()
+                    .map(|h| {
+                        std::collections::HashMap::from([
+                            ("claude".to_string(), session_directory::claude_home(&h)),
+                            ("codex".to_string(), session_directory::codex_home(&h)),
+                            (
+                                "opencode".to_string(),
+                                freshell_sessions::parse::default_opencode_data_home(),
+                            ),
+                            (
+                                "amplifier".to_string(),
+                                freshell_sessions::amplifier::amplifier_home(&h),
+                            ),
+                        ])
+                    })
+                    .unwrap_or_default(),
             )),
             None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         },

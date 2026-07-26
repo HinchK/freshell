@@ -638,6 +638,34 @@ async fn warming_never_completes_yields_error_index_warming() {
     );
 }
 
+/// A known provider with no home on this machine is NOT warming — it gets
+/// the honest provider_unavailable label, immediately (no 2s deferral).
+#[tokio::test]
+async fn provider_unavailable_is_immediate_and_honest() {
+    // A single scripted answer repeats forever — "always ProviderUnavailable".
+    let probe = FlippingProbe::new(vec![
+        freshell_ws::existence::SessionExistence::ProviderUnavailable,
+    ]);
+    // Deliberately LARGE budget: proves no deferral happens for this reason.
+    let server = spawn_server_with_probe(std::sync::Arc::new(probe), |state| {
+        state.reconcile_deferral_budget_ms = 30_000
+    })
+    .await;
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    let started = std::time::Instant::now();
+    ws.send(reconcile_request_with_session_ref("codex", "sess-9"))
+        .await
+        .expect("send request");
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "provider_unavailable must never trigger the warming deferral"
+    );
+    let v = &result["verdicts"][0];
+    assert_eq!(v["verdict"], "error");
+    assert_eq!(v["reason"], "provider_unavailable");
+}
+
 /// The deferral is real: index warms during the wait -> the SECOND derivation
 /// answers with the warm verdict, not error.
 #[tokio::test]
