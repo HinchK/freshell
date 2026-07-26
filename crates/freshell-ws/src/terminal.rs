@@ -2750,6 +2750,74 @@ mod tabs_push_validation_tests {
             TabsPushResponse::Error(error) => panic!("must be accepted: {error}"),
         }
     }
+
+    /// Wave-A cross-lane pin (A6 x A1): a push whose pane payloads carry
+    /// `createRequestId` (Lane A1's snapshot schema addition, BOTH mint
+    /// shapes: 32-hex server mint and 21-char client nanoid) rides through the
+    /// honest-persist ack path (Lane A6) unchanged -- accepted, persisted (the
+    /// success ack OMITS the persisted/persistReason fields on the wire), and
+    /// the key round-trips into the persisted generation verbatim.
+    #[tokio::test]
+    async fn create_request_id_panes_push_persists_with_honest_ack() {
+        let snapshots = tempfile::tempdir().unwrap();
+        let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
+        let frame = serde_json::json!({
+            "type": "tabs.sync.push",
+            "deviceId": "dev-1",
+            "deviceLabel": "Device 1",
+            "clientInstanceId": "client-1",
+            "snapshotRevision": 1,
+            "records": [{
+                "tabKey": "dev-1:tab-1",
+                "tabId": "tab-1",
+                "tabName": "wave-a",
+                "status": "open",
+                "revision": 1,
+                "updatedAt": 1,
+                "paneCount": 2,
+                "panes": [{
+                    "paneId": "pane-term",
+                    "kind": "terminal",
+                    "payload": {
+                        "mode": "shell",
+                        "shell": "system",
+                        "createRequestId": "a3f2b8d07a98b5fb2f4af05baf580000"
+                    }
+                }, {
+                    "paneId": "pane-fresh",
+                    "kind": "fresh-agent",
+                    "payload": {
+                        "sessionType": "freshclaude",
+                        "provider": "claude",
+                        "createRequestId": "e7w-2ovQqojRoZRD6iyk_"
+                    }
+                }]
+            }]
+        });
+        match tabs_push_response(&frame, tabs, "srv-test".to_string()).await {
+            TabsPushResponse::Ack(message) => {
+                let wire = serde_json::to_value(&*message).unwrap();
+                assert_eq!(wire["accepted"], true, "{wire}");
+                assert!(
+                    wire.get("persisted").is_none(),
+                    "createRequestId payloads must persist cleanly (success ack omits persisted): {wire}"
+                );
+                assert!(wire.get("persistReason").is_none(), "{wire}");
+            }
+            TabsPushResponse::Error(error) => panic!("must be accepted: {error}"),
+        }
+        let persisted = crate::tabs_persist::read_generation(snapshots.path(), "dev-1", 0)
+            .unwrap()
+            .expect("accepted push persisted");
+        assert_eq!(
+            persisted["records"][0]["panes"][0]["payload"]["createRequestId"],
+            "a3f2b8d07a98b5fb2f4af05baf580000"
+        );
+        assert_eq!(
+            persisted["records"][0]["panes"][1]["payload"]["createRequestId"],
+            "e7w-2ovQqojRoZRD6iyk_"
+        );
+    }
 }
 
 /// `tabs.sync.query` — reply `tabs.sync.snapshot` with the merged cross-device view
