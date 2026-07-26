@@ -1220,6 +1220,18 @@ impl TerminalRegistry {
         let Some(mut handle) = handle else {
             return false;
         };
+        // sessionRef lease fix (finding 1): the kill path REMOVES the row
+        // entirely, so `claim_session_ref`'s "known dead" probe (which needs
+        // a registered-but-not-Running row) can never fire for a killed
+        // winner — an UNKNOWN id would be honored as `BoundElsewhere{dead-id}`
+        // forever. Prune any sessionRef binding pointing at this terminal at
+        // row-removal time instead. This is the ONLY row-removal site
+        // (natural exit RETAINS the row via `finish_pty_exit`). The `inner`
+        // lock is already released here, so no ordering hazard.
+        self.session_ref_bindings
+            .lock()
+            .expect("session-ref bindings lock")
+            .retain(|_, bound_id| bound_id != terminal_id);
         let was_running = {
             let mut s = handle.shared.lock().expect("terminal lock");
             let was_running = s.status == TerminalRunStatus::Running;
@@ -1824,7 +1836,7 @@ impl TerminalRegistry {
         terminal_id: &str,
     ) -> bool {
         let key = session_ref_key(locator);
-        let bound = {
+        {
             let mut leases = self
                 .session_ref_leases
                 .lock()
@@ -1835,18 +1847,24 @@ impl TerminalRegistry {
                         && !lease.revoked =>
                 {
                     leases.remove(&key);
-                    true
+                    // ATOMICITY (fix round 1, finding 2): the binding MUST be
+                    // inserted while the leases lock is still held. Releasing
+                    // the lease first and binding under a separate lock opens
+                    // a window where a racing `claim_session_ref` sees no live
+                    // row, no binding, and no lease -> `Acquired` -> a second
+                    // spawn: the exact duplicate-writer race this primitive
+                    // exists to close. Lock order leases -> bindings is
+                    // acyclic: `claim_session_ref`'s bindings block ends
+                    // before it takes the leases lock, and no other path
+                    // acquires the leases lock while holding bindings.
+                    self.session_ref_bindings
+                        .lock()
+                        .expect("session-ref bindings lock")
+                        .insert(key, terminal_id.to_string());
                 }
-                _ => false,
+                _ => return false,
             }
-        };
-        if !bound {
-            return false;
         }
-        self.session_ref_bindings
-            .lock()
-            .expect("session-ref bindings lock")
-            .insert(key, terminal_id.to_string());
         self.alarm_if_duplicate_session_ref(locator);
         true
     }
@@ -3996,6 +4014,40 @@ mod tests {
         ));
         // The revoked holder's late completion is rejected.
         assert!(!reg.complete_session_ref_claim(&s, "cr-A", "term-late"));
+    }
+
+    /// Fix round 1, finding 1: a KILLED winner must not strand the
+    /// sessionRef. The kill path REMOVES the terminal row entirely
+    /// ([`TerminalRegistry::kill_internal`]), so the binding's terminal id
+    /// becomes UNKNOWN to the registry — the claim-time "known dead" probe
+    /// can never fire. The binding must instead be pruned at row-removal
+    /// time so the next claim wins, rather than answering
+    /// `BoundElsewhere{dead-id}` forever.
+    #[test]
+    fn killed_winner_binding_is_pruned_so_next_claim_acquires() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-A", 1, 1000),
+            SessionRefClaim::Acquired
+        ));
+        // The winner's spawn registers a real row carrying the ref, then binds.
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-win".to_string(),
+            stream_id: "S-win".to_string(),
+            mode: "claude".to_string(),
+            resume_session_id: Some("s1".to_string()),
+            create_request_id: Some("cr-A".to_string()),
+            created_at: Some(1_000),
+        });
+        assert!(reg.complete_session_ref_claim(&s, "cr-A", "T-win"));
+        // User kills the winner: the real kill path removes the row entirely.
+        assert!(reg.kill("T-win"));
+        // The dead winner must not strand losers.
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 2000),
+            SessionRefClaim::Acquired
+        ));
     }
 
     /// §5.1 atomic-stamp insert-edge interleave (§9.1 test 5): the key is part
