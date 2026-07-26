@@ -661,17 +661,31 @@ impl PaneLedger {
                 .values()
                 .any(|r| r.live_terminal_id.as_deref() == Some(marker.terminal_id.as_str()));
             let aged_out = now_ms - marker.spawned_at > PENDING_MARKER_TTL_MS;
-            if (covered || aged_out)
-                && Self::remove_pending(&root, &mut index, &marker.terminal_id).is_ok()
-            {
-                tracing::warn!(
-                    target: "freshell_ws::pane_ledger",
-                    terminal_id = %marker.terminal_id,
-                    covered_by_binding = covered,
-                    aged_out = aged_out,
-                    "pane_ledger_stale_marker_swept: crash-window residue or aged past TTL"
-                );
-                report.stale_markers_removed.push(marker.terminal_id);
+            if covered || aged_out {
+                match Self::remove_pending(&root, &mut index, &marker.terminal_id) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            target: "freshell_ws::pane_ledger",
+                            terminal_id = %marker.terminal_id,
+                            covered_by_binding = covered,
+                            aged_out = aged_out,
+                            "pane_ledger_stale_marker_swept: crash-window residue or aged past TTL"
+                        );
+                        report.stale_markers_removed.push(marker.terminal_id);
+                    }
+                    Err(err) => {
+                        // Fail loud, never silent: the marker stays; the
+                        // next boot/GC pass retries naturally.
+                        tracing::warn!(
+                            target: "freshell_ws::pane_ledger",
+                            terminal_id = %marker.terminal_id,
+                            covered_by_binding = covered,
+                            aged_out = aged_out,
+                            error = %err,
+                            "pane_ledger_stale_marker_sweep_failed: marker removal failed; will retry next pass"
+                        );
+                    }
+                }
             }
         }
 
@@ -720,10 +734,24 @@ impl PaneLedger {
                     provider: loser.provider.clone(),
                     session_id: loser.session_id.clone(),
                 };
-                if self.write_binding(&root, &mut index, &loser).is_ok() {
-                    report
-                        .supersession_repairs
-                        .push((loser_ref, winner.clone()));
+                match self.write_binding(&root, &mut index, &loser) {
+                    Ok(()) => {
+                        report
+                            .supersession_repairs
+                            .push((loser_ref, winner.clone()));
+                    }
+                    Err(err) => {
+                        // Fail loud, never silent: the loser stays bound on
+                        // disk; the repair re-runs at the next boot scan.
+                        tracing::error!(
+                            target: "freshell_ws::pane_ledger",
+                            terminal_id = %terminal_id,
+                            loser_session_id = %loser_ref.session_id,
+                            winner_session_id = %winner.session_id,
+                            error = %err,
+                            "pane_ledger_supersession_repair_failed: retire write failed; row left bound"
+                        );
+                    }
                 }
             }
         }
@@ -770,15 +798,27 @@ impl PaneLedger {
         // this loop finds nothing on the boot path).
         let markers: Vec<PendingMarker> = index.pending.values().cloned().collect();
         for marker in markers {
-            if now_ms - marker.spawned_at > PENDING_MARKER_TTL_MS
-                && Self::remove_pending(root, index, &marker.terminal_id).is_ok()
-            {
-                tracing::warn!(
-                    target: "freshell_ws::pane_ledger",
-                    terminal_id = %marker.terminal_id,
-                    "pane_ledger_stale_marker_swept: aged past TTL (periodic GC)"
-                );
-                report.stale_markers_removed.push(marker.terminal_id);
+            if now_ms - marker.spawned_at > PENDING_MARKER_TTL_MS {
+                match Self::remove_pending(root, index, &marker.terminal_id) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            target: "freshell_ws::pane_ledger",
+                            terminal_id = %marker.terminal_id,
+                            "pane_ledger_stale_marker_swept: aged past TTL (periodic GC)"
+                        );
+                        report.stale_markers_removed.push(marker.terminal_id);
+                    }
+                    Err(err) => {
+                        // Fail loud, never silent: the marker stays; the
+                        // next GC pass retries naturally.
+                        tracing::warn!(
+                            target: "freshell_ws::pane_ledger",
+                            terminal_id = %marker.terminal_id,
+                            error = %err,
+                            "pane_ledger_stale_marker_sweep_failed: marker removal failed; will retry next pass"
+                        );
+                    }
+                }
             }
         }
 
@@ -800,8 +840,19 @@ impl PaneLedger {
                             session_id = %sref.session_id,
                             "pane_ledger_gc_tombstoned: bound row expired to tombstone (never deleted by timer)"
                         );
-                        if self.write_binding(root, index, &row).is_ok() {
-                            report.gc_tombstoned.push(sref);
+                        match self.write_binding(root, index, &row) {
+                            Ok(()) => report.gc_tombstoned.push(sref),
+                            Err(err) => {
+                                // Fail loud, never silent: the row stays
+                                // bound on disk; the next GC pass retries.
+                                tracing::error!(
+                                    target: "freshell_ws::pane_ledger",
+                                    provider = %sref.provider,
+                                    session_id = %sref.session_id,
+                                    error = %err,
+                                    "pane_ledger_gc_tombstone_failed: tombstone write failed; row left bound"
+                                );
+                            }
                         }
                     }
                 }
@@ -809,17 +860,30 @@ impl PaneLedger {
                     let old_enough = now_ms - row.updated_at > TOMBSTONE_GC_TTL_MS;
                     if old_enough && transcript_absent(&row.provider, &row.session_id) {
                         let path = Self::binding_path(root, &row.provider, &row.session_id);
-                        if std::fs::remove_file(&path).is_ok() {
-                            index
-                                .bindings
-                                .remove(&(row.provider.clone(), row.session_id.clone()));
-                            tracing::info!(
-                                target: "freshell_ws::pane_ledger",
-                                provider = %sref.provider,
-                                session_id = %sref.session_id,
-                                "pane_ledger_tombstone_deleted: transcript gone (direct stat) and tombstone TTL elapsed"
-                            );
-                            report.tombstones_deleted.push(sref);
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => {
+                                index
+                                    .bindings
+                                    .remove(&(row.provider.clone(), row.session_id.clone()));
+                                tracing::info!(
+                                    target: "freshell_ws::pane_ledger",
+                                    provider = %sref.provider,
+                                    session_id = %sref.session_id,
+                                    "pane_ledger_tombstone_deleted: transcript gone (direct stat) and tombstone TTL elapsed"
+                                );
+                                report.tombstones_deleted.push(sref);
+                            }
+                            Err(err) => {
+                                // Fail loud, never silent: the tombstone
+                                // stays; the next GC pass retries naturally.
+                                tracing::warn!(
+                                    target: "freshell_ws::pane_ledger",
+                                    provider = %sref.provider,
+                                    session_id = %sref.session_id,
+                                    error = %err,
+                                    "pane_ledger_tombstone_delete_failed: tombstone file removal failed; will retry next pass"
+                                );
+                            }
                         }
                     }
                 }
@@ -881,19 +945,33 @@ impl PaneLedger {
                 }
             };
             let quarantined_path = path.with_file_name(format!("{name}.quarantined-{now_ms}"));
-            tracing::error!(
-                target: "freshell_ws::pane_ledger",
-                path = %path.display(),
-                quarantined = %quarantined_path.display(),
-                error = %error,
-                "pane_ledger_row_quarantined: unparsable row renamed aside (fail loud per-row, never per-store)"
-            );
-            if std::fs::rename(&path, &quarantined_path).is_ok() {
-                report.quarantined.push(QuarantinedRow {
-                    original_path: path,
-                    quarantined_path,
-                    error,
-                });
+            match std::fs::rename(&path, &quarantined_path) {
+                Ok(()) => {
+                    tracing::error!(
+                        target: "freshell_ws::pane_ledger",
+                        path = %path.display(),
+                        quarantined = %quarantined_path.display(),
+                        error = %error,
+                        "pane_ledger_row_quarantined: unparsable row renamed aside (fail loud per-row, never per-store)"
+                    );
+                    report.quarantined.push(QuarantinedRow {
+                        original_path: path,
+                        quarantined_path,
+                        error,
+                    });
+                }
+                Err(rename_err) => {
+                    // Fail loud, never silent: the bad row stays in place;
+                    // the next boot scan retries the quarantine.
+                    tracing::error!(
+                        target: "freshell_ws::pane_ledger",
+                        path = %path.display(),
+                        quarantined = %quarantined_path.display(),
+                        row_error = %error,
+                        error = %rename_err,
+                        "pane_ledger_quarantine_rename_failed: unparsable row left in place; will retry next boot"
+                    );
+                }
             }
         }
     }
