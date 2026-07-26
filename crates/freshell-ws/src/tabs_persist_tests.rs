@@ -1445,3 +1445,31 @@ fn agreeing_multi_generation_dir_lists_exactly_one_device_id() {
     put(dir.path(), "dev", "c2", 1, 2000, vec![open_record("dev:t2", "b", 1)]);
     assert_eq!(devices(dir.path()), vec!["dev".to_string()]);
 }
+
+#[test]
+fn persist_lock_recovers_from_poison() {
+    // `with_persist_lock` is documented poison-tolerant: a panic while
+    // persisting must not wedge all future pushes/restores. NOTE: this
+    // deliberately poisons the process-global PERSIST_LOCK; every later
+    // acquisition goes through the same into_inner() recovery, which is
+    // exactly the property under test.
+    let _ = std::thread::spawn(|| {
+        with_persist_lock(|| panic!("deliberately poison PERSIST_LOCK"))
+    })
+    .join();
+    let value = with_persist_lock(|| 42);
+    assert_eq!(value, 42, "a poisoned persist lock must still be acquirable");
+    // And a real write still works end-to-end after poisoning.
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = persist_generation(
+        dir.path(),
+        "srv-1",
+        "dev",
+        "Dev",
+        "c1",
+        1,
+        &[open_record("dev:t", "t", 1)],
+        1000,
+    );
+    assert_eq!(outcome, PersistOutcome::Persisted);
+}

@@ -2372,6 +2372,43 @@ mod tabs_push_validation_tests {
     }
 
     #[tokio::test]
+    async fn empty_push_ack_is_unchanged_and_omits_persist_fields() {
+        // The empty-push skip is BY DESIGN (wipe/unload protection) and its
+        // semantics belong to kata h9vt — pin that it is NOT reported as a
+        // persistence failure and the ack shape is byte-identical to before.
+        let snapshots = tempfile::tempdir().unwrap();
+        let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
+        let frame = serde_json::json!({
+            "type": "tabs.sync.push",
+            "deviceId": "dev-1",
+            "deviceLabel": "Device 1",
+            "clientInstanceId": "client-1",
+            "snapshotRevision": 1,
+            "records": []
+        });
+        match tabs_push_response(&frame, tabs, "srv-test".to_string()).await {
+            TabsPushResponse::Ack(message) => {
+                let wire = serde_json::to_value(&*message).unwrap();
+                assert_eq!(wire["type"], "tabs.sync.ack");
+                assert_eq!(wire["accepted"], true);
+                assert_eq!(wire["openRecords"], 0);
+                assert!(
+                    wire.get("persisted").is_none(),
+                    "by-design empty-push skip must not read as a persistence failure: {wire}"
+                );
+                assert!(wire.get("persistReason").is_none(), "{wire}");
+            }
+            TabsPushResponse::Error(error) => panic!("empty push must be accepted: {error}"),
+        }
+        assert!(
+            crate::tabs_persist::list_snapshot_devices(snapshots.path())
+                .unwrap()
+                .is_empty(),
+            "empty push must not create a persisted generation"
+        );
+    }
+
+    #[tokio::test]
     async fn custom_extension_mode_push_is_accepted_and_persisted() {
         let snapshots = tempfile::tempdir().unwrap();
         let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
