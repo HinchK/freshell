@@ -21,10 +21,53 @@ pub(crate) enum PersistOutcome {
     Failed { reason: String },
 }
 
+/// One device dir's health for eviction scoring.
+struct DeviceDirHealth {
+    /// Max `capturedAt` over cleanly-parseable files (`i64::MIN` when the dir
+    /// holds no parseable generation at all, e.g. an empty dir).
+    newest: i64,
+    /// Files (or the dir listing itself) that failed to read, parse, or carry
+    /// an i64 `capturedAt`.
+    unreadable: usize,
+    path: PathBuf,
+}
+
+fn scan_device_dir(path: PathBuf) -> DeviceDirHealth {
+    let mut newest = i64::MIN;
+    let mut unreadable = 0usize;
+    match std::fs::read_dir(&path) {
+        // An unlistable dir is unreadable evidence, not an empty dir.
+        Err(_) => unreadable += 1,
+        Ok(entries) => {
+            for f in entries.flatten().map(|e| e.path()) {
+                if f.extension().is_none_or(|x| x != "json") {
+                    continue;
+                }
+                let captured = std::fs::read_to_string(&f)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .and_then(|v| v.get("capturedAt").and_then(Value::as_i64));
+                match captured {
+                    Some(c) => newest = newest.max(c),
+                    None => unreadable += 1,
+                }
+            }
+        }
+    }
+    DeviceDirHealth {
+        newest,
+        unreadable,
+        path,
+    }
+}
+
 /// Enforce MAX_SNAPSHOT_DEVICES before a write. New targets reserve one slot;
 /// existing targets also repair a previously over-cap root. Lease-protected
-/// restores and the write target are never candidates. If no eligible victim
-/// remains, fail with `WouldBlock` rather than creating another directory.
+/// restores, the write target, and — fail-loud, campaign P2.17 defect 1 —
+/// any dir holding unreadable generation files are never candidates: corrupt
+/// dirs are forensic evidence, not the cheapest victim. If no cleanly
+/// parseable victim remains, fail the incoming write with `WouldBlock`
+/// rather than destroying evidence or creating another directory.
 pub(super) fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Result<()> {
     let target_exists = target_dir.exists();
     let entries = match std::fs::read_dir(root) {
@@ -32,27 +75,11 @@ pub(super) fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Res
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
-    let mut dirs: Vec<(i64, PathBuf)> = entries
+    let dirs: Vec<DeviceDirHealth> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_dir())
-        .map(|p| {
-            let newest = std::fs::read_dir(&p)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|f| f.path())
-                .filter(|f| f.extension().is_some_and(|x| x == "json"))
-                .filter_map(|f| {
-                    serde_json::from_str::<Value>(&std::fs::read_to_string(&f).ok()?)
-                        .ok()?
-                        .get("capturedAt")
-                        .and_then(Value::as_i64)
-                })
-                .max()
-                .unwrap_or(0);
-            (newest, p)
-        })
+        .map(scan_device_dir)
         .collect();
     let mut device_count = dirs.len();
     let allowed_before_write = if target_exists {
@@ -60,16 +87,40 @@ pub(super) fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Res
     } else {
         MAX_SNAPSHOT_DEVICES.saturating_sub(1)
     };
-    dirs.retain(|(_, path)| path != target_dir && !restore_protects(path));
+    if device_count <= allowed_before_write {
+        return Ok(());
+    }
+    // Under eviction pressure only: classify candidates. Corrupt dirs are
+    // exempt AND loud (bounded: this only logs while over-cap).
+    let mut corrupt_exempt = 0usize;
+    let mut candidates: Vec<(i64, PathBuf)> = Vec::new();
+    for d in dirs {
+        if d.path == *target_dir || restore_protects(&d.path) {
+            continue;
+        }
+        if d.unreadable > 0 {
+            corrupt_exempt += 1;
+            tracing::error!(target: "freshell_ws::invariants",
+                path = %d.path.display(), unreadable = d.unreadable,
+                "tabs_snapshot_corrupt_dir_exempt_from_eviction: device dir holds unreadable generation files; exempting it from cap eviction to preserve forensic evidence");
+            continue;
+        }
+        candidates.push((d.newest, d.path));
+    }
+    candidates.sort_by_key(|(c, _)| *c);
+    let mut candidates = candidates.into_iter();
     while device_count > allowed_before_write {
-        if dirs.is_empty() {
+        let Some((_, victim)) = candidates.next() else {
+            tracing::error!(target: "freshell_ws::invariants",
+                root = %root.display(), corrupt_exempt,
+                "tabs_snapshot_device_cap_unenforceable: no cleanly-parseable eviction candidate remains; failing the incoming write instead of destroying evidence");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                "snapshot device cap is exhausted: all eviction candidates are protected by active restores; retry the tabs-sync push",
+                "snapshot device cap is exhausted: remaining candidates are protected by active restores or hold unreadable (corrupt) generations; refusing to evict",
             ));
-        }
-        dirs.sort_by_key(|(c, _)| *c);
-        let (_, victim) = dirs.remove(0);
+        };
+        tracing::warn!(target: "freshell_ws::tabs", path = %victim.display(),
+            "tabs_snapshot_device_evicted: device cap reached; evicting the least-recently-written clean device dir");
         remove_dir_all_logged(&victim)?;
         device_count -= 1;
     }

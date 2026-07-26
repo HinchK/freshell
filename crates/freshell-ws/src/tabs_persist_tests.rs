@@ -1273,3 +1273,125 @@ fn successful_persist_returns_persisted() {
     assert_eq!(outcome, PersistOutcome::Persisted);
     assert_eq!(list_generations(dir.path(), "dev", "c1").len(), 1);
 }
+
+// Corrupt every generation file in a device dir (defect-1 fixtures) and
+// return the dir path.
+fn corrupt_all_files(dir: &std::path::Path, device: &str) -> std::path::PathBuf {
+    let ddir = device_dir_for(dir, device).unwrap();
+    for path in std::fs::read_dir(&ddir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+    {
+        if path.extension().is_some_and(|x| x == "json") {
+            std::fs::write(&path, b"{ not valid json").unwrap();
+        }
+    }
+    ddir
+}
+
+#[test]
+fn corrupt_device_dir_is_exempt_from_cap_eviction() {
+    // Fail-loud: a dir with >=1 unreadable file is forensic evidence and must
+    // NEVER be the eviction victim. The oldest CLEAN dir evicts instead.
+    // (Old scoring gave an all-corrupt dir capturedAt=0 -> evicted FIRST.)
+    let (events, _guard) = crate::invariants::capture::capture();
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..MAX_SNAPSHOT_DEVICES {
+        let dev = format!("dev-{n:03}");
+        put(
+            dir.path(),
+            &dev,
+            "c1",
+            1,
+            1000 + n as i64,
+            vec![open_record(&format!("{dev}:t"), "t", 1)],
+        );
+    }
+    // dev-001 is nearly the oldest AND fully corrupt: the old code evicts it
+    // first (score 0). It must survive; clean oldest dev-000 evicts instead.
+    let corrupt_dir = corrupt_all_files(dir.path(), "dev-001");
+
+    put(
+        dir.path(),
+        "dev-new",
+        "c1",
+        1,
+        9000,
+        vec![open_record("dev-new:t", "new", 1)],
+    );
+
+    assert!(
+        corrupt_dir.exists(),
+        "corrupt dir must be exempt from eviction"
+    );
+    assert!(
+        !device_dir_for(dir.path(), "dev-000").unwrap().exists(),
+        "the oldest CLEAN dir must be the victim instead"
+    );
+    assert!(
+        device_dir_for(dir.path(), "dev-new").unwrap().exists(),
+        "the new write must land"
+    );
+    let events = events.lock().unwrap();
+    assert!(
+        events.iter().any(|e| e.target == "freshell_ws::invariants"
+            && e.message
+                .contains("tabs_snapshot_corrupt_dir_exempt_from_eviction")),
+        "exempting a corrupt dir must be loud, got: {events:?}"
+    );
+}
+
+#[test]
+fn cap_unenforceable_fails_the_write_and_preserves_all_evidence() {
+    // When every candidate holds unreadable files, refuse to evict: fail the
+    // incoming write loudly rather than destroy evidence.
+    let (events, _guard) = crate::invariants::capture::capture();
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..MAX_SNAPSHOT_DEVICES {
+        let dev = format!("dev-{n:03}");
+        put(
+            dir.path(),
+            &dev,
+            "c1",
+            1,
+            1000 + n as i64,
+            vec![open_record(&format!("{dev}:t"), "t", 1)],
+        );
+        corrupt_all_files(dir.path(), &dev);
+    }
+    let outcome = persist_generation(
+        dir.path(),
+        "srv-1",
+        "dev-new",
+        "Dev",
+        "c1",
+        1,
+        &[open_record("dev-new:t", "new", 1)],
+        9000,
+    );
+    assert!(
+        matches!(outcome, PersistOutcome::Failed { .. }),
+        "unenforceable cap must fail the incoming write, got {outcome:?}"
+    );
+    assert!(
+        !device_dir_for(dir.path(), "dev-new").unwrap().exists(),
+        "no new dir may be created past the cap"
+    );
+    let surviving = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .count();
+    assert_eq!(
+        surviving, MAX_SNAPSHOT_DEVICES,
+        "no corrupt dir may be destroyed"
+    );
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message.contains("tabs_snapshot_device_cap_unenforceable")),
+        "must alarm loudly: {events:?}"
+    );
+}
