@@ -310,6 +310,7 @@ function loadInitialPanesState(): PanesState {
     restoreFallbackAttemptsByPane: {},
     deadSessionAdjudication: [],
     reconcileWarming: null,
+    reconcilePendingPanes: {},
   }
 
   try {
@@ -329,6 +330,7 @@ function loadInitialPanesState(): PanesState {
       restoreFallbackAttemptsByPane: {},
       deadSessionAdjudication: [],
       reconcileWarming: null,
+      reconcilePendingPanes: {},
     }
     state = cleanOrphanedLayouts(state)
     return state
@@ -550,6 +552,13 @@ function clearPaneRefreshRequest(state: PanesState, tabId: string, paneId: strin
   if (Object.keys(tabRequests).length === 0) {
     delete state.refreshRequestsByPane?.[tabId]
   }
+}
+
+/** Resolve the view-level pre-verdict wait for a pane: every fold-target
+ *  reducer (attach/reset for both kinds, and setPaneRestoreError) calls this
+ *  so the pane's deferred mount-create is released once its verdict folds. */
+function clearReconcilePendingForPane(state: PanesState, tabId: string, paneId: string): void {
+  if (state.reconcilePendingPanes) delete state.reconcilePendingPanes[`${tabId}:${paneId}`]
 }
 
 function clearRestoreFallbackAttemptForPane(state: PanesState, tabId: string, paneId: string) {
@@ -1696,6 +1705,7 @@ export const panesSlice = createSlice({
       state.restoreFallbackAttemptsByPane = {}
       state.deadSessionAdjudication = []
       state.reconcileWarming = null
+      state.reconcilePendingPanes = {}
     },
 
     updatePaneTitle: (
@@ -1909,6 +1919,7 @@ export const panesSlice = createSlice({
         content.reconcileNotice = RECONCILE_NOTICE_DUPLICATE
       }
       clearRestoreFallbackAttemptForPane(state, tabId, paneId)
+      clearReconcilePendingForPane(state, tabId, paneId)
     },
 
     /**
@@ -1972,6 +1983,7 @@ export const panesSlice = createSlice({
         content.reconcileNotice = reconcileFreshNotice(reason)
       }
       clearRestoreFallbackAttemptForPane(state, tabId, paneId)
+      clearReconcilePendingForPane(state, tabId, paneId)
     },
 
     /**
@@ -2008,6 +2020,7 @@ export const panesSlice = createSlice({
       content.reconcileEpoch = (content.reconcileEpoch ?? 0) + 1
       if (corrected) content.reconcileNotice = RECONCILE_NOTICE_CORRECTED
       else if (duplicate) content.reconcileNotice = RECONCILE_NOTICE_DUPLICATE
+      clearReconcilePendingForPane(state, tabId, paneId)
     },
 
     /**
@@ -2055,6 +2068,7 @@ export const panesSlice = createSlice({
       content.reconcileEpoch = (content.reconcileEpoch ?? 0) + 1
       if (corrected) content.reconcileNotice = RECONCILE_NOTICE_CORRECTED
       else if (intent === 'fresh' && reason) content.reconcileNotice = reconcileFreshNotice(reason)
+      clearReconcilePendingForPane(state, tabId, paneId)
     },
 
     setPaneReconcileNotice: (
@@ -2099,6 +2113,25 @@ export const panesSlice = createSlice({
       state.reconcileWarming = null
     },
 
+    /** Replaces the map: paneKey -> startedAt for every pane named in an
+     *  outgoing pane.reconcile request (view-level pre-verdict wait state). */
+    setReconcilePendingPanes: (
+      state,
+      action: PayloadAction<{ paneKeys: string[]; startedAt: number }>
+    ) => {
+      const map: Record<string, number> = {}
+      for (const key of action.payload.paneKeys) map[key] = action.payload.startedAt
+      state.reconcilePendingPanes = map
+    },
+
+    clearReconcilePendingPane: (state, action: PayloadAction<{ paneKey: string }>) => {
+      if (state.reconcilePendingPanes) delete state.reconcilePendingPanes[action.payload.paneKey]
+    },
+
+    clearAllReconcilePendingPanes: (state) => {
+      state.reconcilePendingPanes = {}
+    },
+
     /**
      * Loud, non-destructive per-pane breadcrumb for reconcile
      * dead_session/invalid/error verdicts. Sets only restoreError —
@@ -2111,6 +2144,8 @@ export const panesSlice = createSlice({
       const content = findReconcilePaneContent(state, action.payload.tabId, action.payload.paneId)
       if (!content) return
       content.restoreError = action.payload.restoreError
+      // dead/invalid/error verdicts resolve the pre-verdict wait too
+      clearReconcilePendingForPane(state, action.payload.tabId, action.payload.paneId)
     },
 
     repairCodexIdentityMismatch: (
@@ -2199,6 +2234,9 @@ export const {
   clearDeadSessionAdjudication,
   setReconcileWarming,
   clearReconcileWarming,
+  setReconcilePendingPanes,
+  clearReconcilePendingPane,
+  clearAllReconcilePendingPanes,
   setPaneRestoreError,
   repairCodexIdentityMismatch,
 } = panesSlice.actions

@@ -359,6 +359,9 @@ export interface PanesState {
    * Ephemeral UI state — must never be persisted.
    */
   reconcileWarming?: ReconcileWarmingState | null
+  /** Ephemeral: paneKey -> wall-clock ms when a reconcile request naming this pane went out.
+   *  While present (and young), the pane's mount drive defers its create until the verdict folds. */
+  reconcilePendingPanes?: Record<string, number>
 }
 
 /**

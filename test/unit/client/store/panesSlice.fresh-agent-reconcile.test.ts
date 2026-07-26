@@ -18,11 +18,16 @@ import panesReducer, {
   initLayout,
   updatePaneContent,
   restoreLayout,
+  applyReconcileAttach,
+  resetPaneForReconcileCreate,
   applyFreshAgentReconcileAttach,
   resetFreshAgentPaneForReconcileCreate,
   setPaneRestoreError,
   setPaneReconcileNotice,
   clearPaneReconcileNotice,
+  setReconcilePendingPanes,
+  clearReconcilePendingPane,
+  clearAllReconcilePendingPanes,
 } from '../../../../src/store/panesSlice'
 import type { PanesState } from '../../../../src/store/panesSlice'
 import {
@@ -335,5 +340,118 @@ describe('widened per-pane reducers', () => {
     expect(leafContent(s, tabId).reconcileNotice).toBe('hello')
     s = panesReducer(s, clearPaneReconcileNotice({ tabId, paneId }))
     expect(leafContent(s, tabId).reconcileNotice).toBeUndefined()
+  })
+})
+
+// --- reconcilePendingPanes: view-level pre-verdict wait state (Task 6) ---
+
+/** One terminal pane (tab1:p1) and one fresh-agent pane (tab2:p2) in the same state. */
+function stateWithBothPaneKinds(): PanesState {
+  let s = panesReducer(emptyState(), initLayout({
+    tabId: 'tab1',
+    paneId: 'p1',
+    content: { kind: 'terminal', mode: 'claude', shell: 'system', createRequestId: 'cr-term' } as PaneContentInput,
+  }))
+  s = panesReducer(s, initLayout({
+    tabId: 'tab2',
+    paneId: 'p2',
+    content: {
+      kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+      createRequestId: 'cr-fa', status: 'creating',
+    } as PaneContentInput,
+  }))
+  return s
+}
+
+describe('reconcilePendingPanes', () => {
+  beforeEach(() => {
+    localStorageMock.clear()
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+    resetPersistFlushListenersForTests()
+    resetPersistedPanesCacheForTests()
+    resetPersistedLayoutCacheForTests()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('set replaces the map; clearPane removes one; clearAll empties', () => {
+    let s = panesReducer(emptyState(), setReconcilePendingPanes({
+      paneKeys: ['old:stale'], startedAt: 100,
+    }))
+    // set REPLACES the map (old:stale gone)
+    s = panesReducer(s, setReconcilePendingPanes({
+      paneKeys: ['tab1:p1', 'tab2:p2'], startedAt: 200,
+    }))
+    expect(s.reconcilePendingPanes).toEqual({ 'tab1:p1': 200, 'tab2:p2': 200 })
+
+    s = panesReducer(s, clearReconcilePendingPane({ paneKey: 'tab1:p1' }))
+    expect(s.reconcilePendingPanes).toEqual({ 'tab2:p2': 200 })
+
+    s = panesReducer(s, clearAllReconcilePendingPanes())
+    expect(s.reconcilePendingPanes).toEqual({})
+  })
+
+  it('every fold reducer clears its pane pending flag (attach, both kinds)', () => {
+    let s = stateWithBothPaneKinds()
+    s = panesReducer(s, setReconcilePendingPanes({ paneKeys: ['tab1:p1', 'tab2:p2'], startedAt: 1 }))
+
+    s = panesReducer(s, applyReconcileAttach({ tabId: 'tab1', paneId: 'p1', terminalId: 'term-1' }))
+    expect(s.reconcilePendingPanes).toEqual({ 'tab2:p2': 1 })
+
+    s = panesReducer(s, applyFreshAgentReconcileAttach({
+      tabId: 'tab2', paneId: 'p2',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    }))
+    expect(s.reconcilePendingPanes).toEqual({})
+  })
+
+  it('every fold reducer clears its pane pending flag (reset-for-create, both kinds)', () => {
+    let s = stateWithBothPaneKinds()
+    s = panesReducer(s, setReconcilePendingPanes({ paneKeys: ['tab1:p1', 'tab2:p2'], startedAt: 1 }))
+
+    s = panesReducer(s, resetPaneForReconcileCreate({ tabId: 'tab1', paneId: 'p1', intent: 'fresh' }))
+    expect(s.reconcilePendingPanes).toEqual({ 'tab2:p2': 1 })
+
+    s = panesReducer(s, resetFreshAgentPaneForReconcileCreate({ tabId: 'tab2', paneId: 'p2', intent: 'fresh' }))
+    expect(s.reconcilePendingPanes).toEqual({})
+  })
+
+  it('setPaneRestoreError clears the pane pending flag', () => {
+    let s = stateWithFreshAgentPane() // tab1:p1 fresh-agent pane
+    s = panesReducer(s, setReconcilePendingPanes({ paneKeys: [`${tabId}:${paneId}`], startedAt: 1 }))
+    s = panesReducer(s, setPaneRestoreError({
+      tabId, paneId,
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'dead_live_handle' },
+    }))
+    expect(s.reconcilePendingPanes).toEqual({})
+  })
+
+  it('is not persisted (slice-level field absent from the persisted panes section)', async () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    store.dispatch(addTab({ mode: 'shell' }))
+    const persistTabId = store.getState().tabs.tabs[0].id
+    store.dispatch(initLayout({
+      tabId: persistTabId,
+      paneId: 'p1',
+      content: { kind: 'terminal', mode: 'shell', shell: 'system', createRequestId: 'cr-1' } as PaneContentInput,
+    }))
+    store.dispatch(setReconcilePendingPanes({ paneKeys: [`${persistTabId}:p1`], startedAt: Date.now() }))
+
+    vi.runAllTimers()
+
+    const raw = localStorage.getItem('freshell.layout.v3')
+    if (!raw) throw new Error('nothing persisted to freshell.layout.v3')
+    const parsed = JSON.parse(raw)
+    expect('reconcilePendingPanes' in parsed.panes).toBe(false)
+    // Neighbouring ephemeral fields are also stripped (sanity anchor for the strip site)
+    expect('deadSessionAdjudication' in parsed.panes).toBe(false)
+    expect('reconcileWarming' in parsed.panes).toBe(false)
   })
 })
