@@ -17,6 +17,7 @@ import {
 } from '@/store/sessionsThunks'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
+import { collectTerminalPaneTargets } from '@/lib/pane-reconcile'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -808,31 +809,6 @@ export default function App() {
         }
       }
 
-      const collectTerminalPaneTargets = (terminalIds: string[]) => {
-        const terminalIdSet = new Set(terminalIds)
-        const layouts = appStore.getState().panes.layouts
-        const targets: Array<{ tabId: string; paneId: string }> = []
-        for (const [tabId, layout] of Object.entries(layouts)) {
-          ;(function walk(node: any) {
-            if (!node) return
-            if (node.type === 'leaf') {
-              if (
-                node.content?.kind === 'terminal' &&
-                node.content.terminalId &&
-                terminalIdSet.has(node.content.terminalId)
-              ) {
-                targets.push({ tabId, paneId: node.id })
-              }
-              return
-            }
-            if (node.type === 'split' && Array.isArray(node.children)) {
-              for (const child of node.children) walk(child)
-            }
-          })(layout)
-        }
-        return targets
-      }
-
       const findPaneById = (layout: any, paneId: string): any | undefined => {
         if (!layout) return undefined
         if (layout.type === 'leaf') return layout.id === paneId ? layout : undefined
@@ -875,7 +851,7 @@ export default function App() {
         queueActiveSessionWindowRefresh: () => queueActiveSessionWindowRefresh() as any,
         fetchTerminalDirectoryWindow: (payload) => fetchTerminalDirectoryWindow(payload) as any,
         handleRecoverableTerminalIds: (terminalIds) => {
-          const targets = collectTerminalPaneTargets(terminalIds)
+          const targets = collectTerminalPaneTargets(appStore.getState().panes.layouts, terminalIds)
           if (targets.length === 0) return
           const removedSet = new Set(terminalIds)
           const currentLiveIds = appStore.getState().connection.liveTerminalIds

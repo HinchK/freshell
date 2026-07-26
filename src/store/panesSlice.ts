@@ -1989,6 +1989,20 @@ export const panesSlice = createSlice({
       state.reconcileWarming = null
     },
 
+    /**
+     * Loud, non-destructive per-pane breadcrumb for reconcile
+     * dead_session/invalid/error verdicts. Sets only restoreError —
+     * never touches identity, handles, or createRequestId.
+     */
+    setPaneRestoreError: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; restoreError: RestoreError }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (!content) return
+      content.restoreError = action.payload.restoreError
+    },
+
     repairCodexIdentityMismatch: (
       state,
       action: PayloadAction<{
@@ -2073,6 +2087,7 @@ export const {
   clearDeadSessionAdjudication,
   setReconcileWarming,
   clearReconcileWarming,
+  setPaneRestoreError,
   repairCodexIdentityMismatch,
 } = panesSlice.actions
 
