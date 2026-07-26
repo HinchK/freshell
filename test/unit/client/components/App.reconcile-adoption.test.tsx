@@ -113,6 +113,7 @@ vi.mock('@/lib/api', () => ({
     post: vi.fn().mockResolvedValue({}),
   },
   fetchSidebarSessionsSnapshot: (options?: unknown) => fetchSidebarSessionsSnapshot(options),
+  getRecoveryInventory: async () => ({ recoverable: false, contentId: 'test', device: null, otherDevices: [], ledgerOnly: [] }),
   getTerminalDirectoryPage: (options?: unknown, init?: unknown) => getTerminalDirectoryPage(options, init),
   searchTerminalView: (terminalId: string, query: string, options?: unknown) => searchTerminalView(terminalId, query, options),
   isApiUnauthorizedError: (err: any) => !!err && typeof err === 'object' && err.status === 401,
