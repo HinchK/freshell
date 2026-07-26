@@ -96,6 +96,20 @@ pub(crate) fn error_claude_restore_unresolved(request_id: &str) {
     );
 }
 
+/// P1.8 (spec §4.2 write-failure policy): a ledger write failed. The event
+/// itself proceeded (fail loud, degrade to status quo) — but this pane may
+/// not survive a restart, and the live `durability.degraded` frame was
+/// pushed at failure time.
+pub(crate) fn error_pane_ledger_write_failed(terminal_id: &str, err: &std::io::Error) {
+    tracing::error!(
+        target: "freshell_ws::invariants",
+        terminal_id = %terminal_id,
+        error = %err,
+        "pane_ledger_write_failed: identity event could not be durably recorded; \
+         durability.degraded pushed live to attached clients"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

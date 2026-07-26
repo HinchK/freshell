@@ -89,6 +89,17 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The modes that get a spawn-time pending marker: EXACTLY the modes with a
+/// registered post-spawn identity resolver (codex candidate adoption,
+/// opencode/amplifier locator sweeps). NOT "any non-shell mode" (V7.md):
+/// claude has create-time identity (pre-allocation) and NO resolver — its
+/// degenerate no-identity payloads (mismatched-provider sessionRef,
+/// empty-string session id; V5.md) spawn un-resumable and stay ledgerless
+/// by design; kimi/gemini/custom extension modes have no resolver, so a
+/// marker for them could never resolve and would only leak until the TTL
+/// sweep. Every mode listed here MUST have a resolution hook (Tasks 8-9).
+const MARKER_MODES: [&str; 3] = ["codex", "opencode", "amplifier"];
+
 /// Map the protocol `shell` enum to the platform `ShellType`.
 fn map_shell(shell: Shell) -> ShellType {
     match shell {
@@ -1312,6 +1323,8 @@ async fn handle_create(
         // -> `terminalMetadata.retire(terminalId)` (`server/index.ts:526-534`), so a
         // rename cascade still resolves after this terminal's process has exited.
         let identity = state.identity.clone();
+        // P1.8 exit hygiene: the pending-marker delete rides the same hook.
+        let pane_ledger = std::sync::Arc::clone(&state.pane_ledger);
         // Restore-across-restart fix: disarm the amplifier locator too, so an
         // exited (never-submitted, or already-associated) terminal's armed
         // entry is never left dangling (mirrors `handleExit`,
@@ -1330,6 +1343,16 @@ async fn handle_create(
             freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .notify_terminal_exit(&tid);
             identity.retire(&tid);
+            // P1.8: an observed PTY exit in this epoch ends any
+            // identity-in-flight window — the marker's job (distinguishing
+            // fresh-by-race from fresh-by-intent across a SERVER death) is
+            // over. Best-effort; never load-bearing. INLINE sync call is
+            // correct HERE: the ExitHook (`pty.rs:55`, `FnOnce + Send`) runs
+            // on the PTY's blocking/reader thread, not an async worker —
+            // the one truly-synchronous ledger call site (V1.md).
+            if let Err(err) = pane_ledger.delete_pending(&tid) {
+                tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_exit");
+            }
             if let Some(locator) = &amplifier_locator {
                 locator.disarm(&tid);
             }
@@ -1521,6 +1544,60 @@ async fn handle_create(
             record.cwd.as_deref(),
             record.updated_at,
         );
+    }
+
+    // P1.8 (spec §4.2 write triggers): the durable ledger write rides the
+    // SAME identity event that seeds the in-memory registry — atomic
+    // temp+rename, AWAITED before the create is answered (durable-before-
+    // answer). It runs on the blocking pool, not the per-connection
+    // dispatch task: each write costs ~15ms p50 / 21-64ms p99 in fsyncs
+    // (V1.md), 2-3 orders past tokio's async-worker budget — the same
+    // reasoning as the PTY spawn_blocking above. A failure never blocks
+    // the create but is surfaced LIVE (surface_write_failure).
+    if let Some(record) = &create_meta_record {
+        // Identity known at spawn: claude pre-allocation (trigger a) and
+        // every resume/restore create (all providers) — a binding row.
+        if let (Some(provider), Some(session_id)) =
+            (record.provider.as_deref(), record.session_id.as_deref())
+        {
+            let ledger = std::sync::Arc::clone(&state.pane_ledger);
+            let provider = provider.to_string();
+            let session_id = session_id.to_string();
+            let write_terminal_id = record.terminal_id.clone();
+            let write_mode = mode.clone();
+            let write_cwd = record.cwd.clone();
+            let write_request_id = create.request_id.clone();
+            let now = now_ms();
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.record_binding(&crate::pane_ledger::BindingWrite {
+                    provider: &provider,
+                    session_id: &session_id,
+                    terminal_id: &write_terminal_id,
+                    mode: &write_mode,
+                    cwd: write_cwd.as_deref(),
+                    create_request_id: Some(&write_request_id),
+                    now_ms: now,
+                })
+            })
+            .await
+            .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+            crate::pane_ledger::surface_write_failure(state, &record.terminal_id, result);
+        }
+    } else if MARKER_MODES.contains(&mode.as_str()) {
+        // Identity-bearing pane whose identity is still in flight (fresh
+        // codex/opencode/amplifier — trigger d): a durable pending marker
+        // from spawn until resolution deletes it (binding-first order).
+        let ledger = std::sync::Arc::clone(&state.pane_ledger);
+        let write_terminal_id = terminal_id_for_meta.clone();
+        let write_mode = mode.clone();
+        let write_cwd = spec.cwd.clone();
+        let now = now_ms();
+        let result = tokio::task::spawn_blocking(move || {
+            ledger.record_pending(&write_terminal_id, &write_mode, write_cwd.as_deref(), now)
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+        crate::pane_ledger::surface_write_failure(state, &terminal_id_for_meta, result);
     }
 
     let created = ServerMessage::TerminalCreated(TerminalCreated {
@@ -2084,6 +2161,28 @@ async fn handle_detach(
 /// silently).
 async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) -> bool {
     if kill_and_broadcast(state, &kill.terminal_id) {
+        // P1.8 trigger (e): explicit user close — best-effort retire of the
+        // binding (`closed`) + marker cleanup. Best-effort by spec: SIGKILL
+        // is the tested mode, so retire-on-close must never be load-bearing.
+        // `session_ref_for` is retired-INCLUSIVE, so it still answers after
+        // the retire() inside kill_and_broadcast. Awaited spawn_blocking:
+        // fsync must not pin the dispatch task (V1.md; the PTY-spawn
+        // precedent above).
+        let sref = state.identity.session_ref_for(&kill.terminal_id);
+        let ledger = std::sync::Arc::clone(&state.pane_ledger);
+        let tid = kill.terminal_id.clone();
+        let now = now_ms();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(sref) = sref {
+                if let Err(err) = ledger.retire_closed(&sref.provider, &sref.session_id, now) {
+                    tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_retire_failed_on_kill");
+                }
+            }
+            if let Err(err) = ledger.delete_pending(&tid) {
+                tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_kill");
+            }
+        })
+        .await;
         return true;
     }
     let msg = ServerMessage::Error(ErrorMsg {

@@ -405,6 +405,34 @@ impl PaneLedger {
         Ok(())
     }
 
+    /// Best-effort retire on observed clean close (trigger e). Missing or
+    /// already-retired rows are Ok — this path is never load-bearing.
+    pub fn retire_closed(
+        &self,
+        provider: &str,
+        session_id: &str,
+        now_ms: i64,
+    ) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let Some(mut row) = index
+            .bindings
+            .get(&(provider.to_string(), session_id.to_string()))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if row.state != RowState::Bound {
+            return Ok(());
+        }
+        row.state = RowState::Retired;
+        row.retired_reason = Some(RetiredReason::Closed);
+        row.updated_at = now_ms;
+        self.write_binding(root, &mut index, &row)
+    }
+
     /// Raw single-row read from the index (no chain following — that is
     /// `lookup_by_session`, Task 2). Memory-only (V1.md read policy).
     pub fn load_binding(&self, provider: &str, session_id: &str) -> Option<BindingRow> {
@@ -613,6 +641,29 @@ impl PaneLedger {
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+}
+
+/// The write-failure policy (spec §4.2): a ledger write failure NEVER blocks
+/// the create/identity event, but it is never silent — structured ERROR +
+/// invariant counter + a LIVE `durability.degraded` frame to attached
+/// clients, at failure time (a verdict-time flag would be posthumous).
+pub(crate) fn surface_write_failure(
+    state: &crate::WsState,
+    terminal_id: &str,
+    result: std::io::Result<()>,
+) {
+    let Err(err) = result else { return };
+    crate::invariants::error_pane_ledger_write_failed(terminal_id, &err);
+    let msg = freshell_protocol::ServerMessage::DurabilityDegraded(
+        freshell_protocol::DurabilityDegraded {
+            terminal_id: terminal_id.to_string(),
+            reason: "ledger_write_failed".to_string(),
+            message: "This pane's identity could not be durably recorded; it may not survive a server restart.".to_string(),
+        },
+    );
+    if let Ok(frame) = serde_json::to_string(&msg) {
+        let _ = state.broadcast_tx.send(frame);
     }
 }
 

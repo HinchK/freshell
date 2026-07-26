@@ -44,6 +44,11 @@ pub enum ServerMessage {
     CodingCliStderr(CodingCliStderr),
     #[serde(rename = "config.fallback")]
     ConfigFallback(ConfigFallback),
+    // Extension surface (P1.8 pane-identity ledger, not in the frozen T0
+    // inventory): live per-pane durability warning. See
+    // `EXTENSION_SERVER_MESSAGE_TYPES`.
+    #[serde(rename = "durability.degraded")]
+    DurabilityDegraded(DurabilityDegraded),
     #[serde(rename = "error")]
     Error(ErrorMsg),
     #[serde(rename = "extension.server.error")]
@@ -202,9 +207,15 @@ pub const SERVER_MESSAGE_TYPES: [&str; 53] = [
 /// (TERM-15/TERM-16 follow-on). Kept out of [`SERVER_MESSAGE_TYPES`] so
 /// `tests/inventory.rs` keeps pinning the frozen contract untouched; the
 /// extension shapes are pinned by `tests/activity_extension.rs`.
-pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 3] = [
+pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 4] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
+    // P1.8 pane-identity ledger: live per-pane durability warning. NOT the
+    // same family as the frozen `terminal.codex.durability.updated`
+    // (`SERVER_MESSAGE_TYPES`), which is codex-sidecar durability; this frame
+    // is intentionally general pane-durability — the name collision is
+    // nearest-neighbor only, not overlap.
+    "durability.degraded",
     "terminal.idle",
 ];
 
@@ -890,6 +901,20 @@ pub struct TerminalAttachReady {
 pub struct TerminalCodexDurabilityUpdated {
     pub durability: CodexDurability,
     pub terminal_id: String,
+}
+
+/// P1.8 write-failure policy (spec §4.2): pushed LIVE at ledger-write
+/// failure time so the warning arrives BEFORE the restart it warns about —
+/// never a posthumous verdict flag. Frozen clients ignore unknown frame
+/// types; rendering lands with the Phase 3 client adoption lane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurabilityDegraded {
+    pub terminal_id: String,
+    /// Machine-readable, e.g. "ledger_write_failed".
+    pub reason: String,
+    /// Human-readable pane warning.
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
