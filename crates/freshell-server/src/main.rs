@@ -22,6 +22,7 @@ mod diag;
 mod existence;
 mod extensions;
 mod files;
+mod identity_sink;
 mod instance_id;
 mod logging;
 mod network;
@@ -427,6 +428,18 @@ async fn main() -> ExitCode {
         home.as_ref()
             .map(|h| h.join(".freshell").join("pane-ledger")),
     ));
+    // P1.13: inject the ledger-backed identity sink into the fresh-agent
+    // states (constructed earlier, before the ledger exists — the
+    // post-construction setter exists precisely for this ordering). All
+    // clones of each state share the `Arc<OnceLock>` field, so this covers
+    // every route's clone.
+    let fresh_agent_identity_sink: freshell_freshagent::SharedPaneIdentitySink =
+        std::sync::Arc::new(identity_sink::LedgerIdentitySink::new(pane_ledger.clone()));
+    fresh_codex_state.set_identity_sink(fresh_agent_identity_sink.clone());
+    fresh_claude_state.set_identity_sink(fresh_agent_identity_sink.clone());
+    fresh_opencode_state.set_identity_sink(fresh_agent_identity_sink.clone());
+    // opencode REST surface (Task 7's materialization site; V10 A13-N1)
+    fresh_agent_state.set_identity_sink(fresh_agent_identity_sink.clone());
     let ws_state = WsState {
         activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
