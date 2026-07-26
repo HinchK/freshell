@@ -854,6 +854,7 @@ async fn main() -> ExitCode {
                     .map(|h| h.join(".freshell").join("tabs-snapshots")),
                 ledger: std::sync::Arc::clone(&pane_ledger),
                 registry: registry.clone(),
+                identity: terminal_identity.clone(),
             },
         ))
         .merge(network::router(network_state))

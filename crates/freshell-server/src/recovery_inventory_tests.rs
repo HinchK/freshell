@@ -84,6 +84,59 @@ fn binding_row(provider: &str, session_id: &str, state_parts: StateParts) -> Bin
     binding_row_at(provider, session_id, state_parts, 1000)
 }
 
+/// WAVE-B fast-follow (B3 lane review): the inventory's D7 liveness join must
+/// match the server guard's width (terminal.rs D7 live-guard: identity-registry
+/// owner check PLUS the registry-row scan). A locator-adopted terminal holds
+/// its session in the IDENTITY registry while the registry row's
+/// resume_session_id stays unset (fresh pane, never resumed) -- the inventory
+/// must still report that session live, or it gets offered for resume and the
+/// accept dies on the server guard instead of never being offered.
+#[test]
+fn live_session_keys_includes_identity_registry_bound_sessions() {
+    let registry = freshell_terminal::TerminalRegistry::new();
+    registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: "t-live".into(),
+        stream_id: "s1".into(),
+        mode: "codex".into(),
+        resume_session_id: None, // fresh pane: row carries no resume id
+        create_request_id: None,
+        created_at: None,
+    });
+    let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    identity.upsert("t-live", Some("codex"), Some("sess-live-1"), None, 0);
+
+    let keys = live_session_keys(&registry, &identity);
+    assert!(
+        keys.contains(&("codex".to_string(), "sess-live-1".to_string())),
+        "identity-registry-bound session of a Running terminal must be live"
+    );
+}
+
+/// Retired identity entries and identity entries whose terminal is not
+/// Running never widen the live set.
+#[test]
+fn live_session_keys_ignores_retired_and_dead_identity_entries() {
+    let registry = freshell_terminal::TerminalRegistry::new();
+    // No registry row at all for "t-gone" -- its identity entry must not count.
+    let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    identity.upsert("t-gone", Some("codex"), Some("sess-gone"), None, 0);
+    // A retired entry on a live terminal must not count either.
+    registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: "t-retired".into(),
+        stream_id: "s2".into(),
+        mode: "claude".into(),
+        resume_session_id: None,
+        create_request_id: None,
+        created_at: None,
+    });
+    identity.upsert("t-retired", Some("claude"), Some("sess-retired"), None, 0);
+    assert!(identity.retire("t-retired"));
+
+    let keys = live_session_keys(&registry, &identity);
+    assert!(!keys.contains(&("codex".to_string(), "sess-gone".to_string())));
+    assert!(!keys.contains(&("claude".to_string(), "sess-retired".to_string())));
+}
+
 #[test]
 fn empty_inputs_not_recoverable() {
     let out = build_inventory(vec![], vec![], no_live());
@@ -355,6 +408,7 @@ fn test_state(
             ledger_root,
         )),
         registry: test_registry(),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
     }
 }
 

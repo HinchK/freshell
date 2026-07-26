@@ -342,6 +342,10 @@ pub struct RecoveryInventoryState {
     pub snapshots_dir: Option<std::path::PathBuf>,
     pub ledger: std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>,
     pub registry: freshell_terminal::TerminalRegistry,
+    /// The SAME shared identity registry the WS state receives — read-only
+    /// here (the wave-B widened D7 liveness join: locator-adopted terminals
+    /// hold their session identity here, not on the registry row).
+    pub identity: freshell_ws::identity::TerminalIdentityRegistry,
 }
 
 #[derive(serde::Deserialize)]
@@ -411,7 +415,7 @@ async fn inventory_handler(
             }
         }
     };
-    let live = live_session_keys(&state.registry);
+    let live = live_session_keys(&state.registry, &state.identity);
     Json(build_inventory(unions, state.ledger.list_bindings(), live)).into_response()
 }
 
@@ -419,8 +423,20 @@ async fn inventory_handler(
 /// currently-Running terminal row — the same row fields the ladder's A13 guard
 /// reads (`terminal.rs:1690-1745`: mode + resume session id, status ==
 /// `TerminalRunStatus::Running`).
-fn live_session_keys(registry: &freshell_terminal::TerminalRegistry) -> HashSet<(String, String)> {
-    registry
+///
+/// WAVE-B widening (B3 lane review): the D7 create-rung server guard checks
+/// BOTH stores — the identity-registry owner (probed Running) AND the
+/// registry-row scan. A locator-adopted terminal (codex/opencode/amplifier)
+/// holds its session in the identity registry while the row's
+/// `resume_session_id` stays unset, so the registry-row scan alone under-counts
+/// live sessions: the inventory would offer them for resume and the accept
+/// would die on the server guard. Join both stores here so the offer and the
+/// guard agree.
+fn live_session_keys(
+    registry: &freshell_terminal::TerminalRegistry,
+    identity: &freshell_ws::identity::TerminalIdentityRegistry,
+) -> HashSet<(String, String)> {
+    let mut keys: HashSet<(String, String)> = registry
         .directory()
         .into_iter()
         .filter(|row| row.status == freshell_protocol::TerminalRunStatus::Running)
@@ -429,7 +445,25 @@ fn live_session_keys(registry: &freshell_terminal::TerminalRegistry) -> HashSet<
                 .filter(|s| !s.is_empty())
                 .map(|sid| (row.mode, sid))
         })
-        .collect()
+        .collect();
+    // Identity-registry side of the join: live (non-retired) entries whose
+    // owning terminal probes Running — mirrors the guard's
+    // `identity_owner_live` arm.
+    for entry in identity.list() {
+        let (Some(provider), Some(session_id)) = (entry.provider, entry.session_id) else {
+            continue;
+        };
+        if session_id.is_empty() {
+            continue;
+        }
+        let owner_running = registry
+            .probe(&entry.terminal_id)
+            .is_some_and(|r| r.status == freshell_protocol::TerminalRunStatus::Running);
+        if owner_running {
+            keys.insert((provider, session_id));
+        }
+    }
+    keys
 }
 
 fn read_foreign_unions(
