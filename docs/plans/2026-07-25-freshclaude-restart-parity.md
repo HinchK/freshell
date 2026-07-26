@@ -1798,8 +1798,15 @@ import fs from 'node:fs'
 import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { test, expect } from '../helpers/fixtures'
-import { RustServer } from '../helpers/rust-server'
+import { fileURLToPath } from 'node:url'
+import { test, expect } from '../helpers/fixtures.js'
+import { RustServer } from '../helpers/rust-server.js'
+
+// ESM project ("type": "module" in package.json): __dirname does not exist in
+// ESM modules -- derive it, same shim as the donor spec
+// (restore-contract-wall-rust.spec.ts:36-40).
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 const FIXTURE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 
@@ -1819,11 +1826,14 @@ test.describe('freshclaude restart parity (rust)', () => {
     })
     try {
       await selectShellIfPickerShowing(page)
+      // Donor convention (:1149): tabId from the harness AFTER the picker settles.
+      // No page.reload() anywhere in this test, so one read suffices.
+      const tabId = (await harness.getActiveTabId())!
       const projectDir = path.join(sharedRoot, 'proj')
       await fsp.mkdir(projectDir, { recursive: true })
       await createFreshclaudePane(page, harness, projectDir)
       const prompt = `parity first turn ${Math.random().toString(36).slice(2, 10)}`
-      await sendFreshAgentTurn(page, harness, prompt)
+      await sendFreshAgentTurn(page, harness, tabId, prompt)
       await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn')
 
       // Durable identity = the fixture's canonical UUID (via liveDurableIdentity;
@@ -1831,7 +1841,7 @@ test.describe('freshclaude restart parity (rust)', () => {
       let originalDurable = ''
       await expect
         .poll(async () => {
-          const layout = await harness.getPaneLayout()
+          const layout = await harness.getPaneLayout(tabId)
           originalDurable = liveDurableIdentity(findFreshAgentLeaf(layout))
           return originalDurable
         })
@@ -1861,7 +1871,7 @@ test.describe('freshclaude restart parity (rust)', () => {
       // ...and the pane settled WITHOUT the lost path: status back to idle...
       await expect
         .poll(async () => {
-          const layout = await harness.getPaneLayout()
+          const layout = await harness.getPaneLayout(tabId)
           return findFreshAgentLeaf(layout)?.content?.status
         }, { timeout: 30_000 })
         .toBe('idle')
@@ -1888,9 +1898,9 @@ test.describe('freshclaude restart parity (rust)', () => {
 
       // Same conversation continues: next send round-trips on the resumed session.
       const secondPrompt = `parity second turn ${Math.random().toString(36).slice(2, 10)}`
-      await sendFreshAgentTurn(page, harness, secondPrompt)
+      await sendFreshAgentTurn(page, harness, tabId, secondPrompt)
       await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn')
-      const layout = await harness.getPaneLayout()
+      const layout = await harness.getPaneLayout(tabId)
       expect(liveDurableIdentity(findFreshAgentLeaf(layout))).toBe(originalDurable)
     } finally {
       await server.stop().catch(() => {})
@@ -1913,6 +1923,7 @@ test.describe('freshclaude restart parity (rust)', () => {
     })
     try {
       await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
       const projectDir = path.join(sharedRoot, 'proj')
       await fsp.mkdir(projectDir, { recursive: true })
       await createFreshclaudePane(page, harness, projectDir)
@@ -1922,7 +1933,7 @@ test.describe('freshclaude restart parity (rust)', () => {
       await page.getByRole('button', { name: 'Send' }).click()
       await expect
         .poll(async () => {
-          const layout = await harness.getPaneLayout()
+          const layout = await harness.getPaneLayout(tabId)
           return findFreshAgentLeaf(layout)?.content?.status
         })
         .toBe('running')
@@ -1933,13 +1944,13 @@ test.describe('freshclaude restart parity (rust)', () => {
       // Un-wedge proof: the attach arm's idle snapshot clears the stuck state.
       await expect
         .poll(async () => {
-          const layout = await harness.getPaneLayout()
+          const layout = await harness.getPaneLayout(tabId)
           return findFreshAgentLeaf(layout)?.content?.status
         }, { timeout: 30_000 })
         .toBe('idle')
 
       // And the conversation is live again on the SAME durable session.
-      await sendFreshAgentTurn(page, harness, `post-wedge turn ${Date.now()}`)
+      await sendFreshAgentTurn(page, harness, tabId, `post-wedge turn ${Date.now()}`)
       await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn')
       const resumed = fs
         .readFileSync(requestLog, 'utf-8')
@@ -1956,7 +1967,7 @@ test.describe('freshclaude restart parity (rust)', () => {
 })
 ```
 
-Adaptation notes for the implementer (verify against the donor spec while copying helpers): `sendFreshAgentTurn`'s exact signature in the donor takes `(page, harness, tabId, text)` — either copy its tabId acquisition too or inline the simpler fill/click/poll-idle sequence shown in the donor's body; keep `expect.poll` timeouts within the global 60s test timeout (bump per-test via `test.setTimeout(120_000)` at the top of each test — restart + resume + snapshot legs are slow). If `harness.getPaneLayout()`/leaf status field names differ (`content.status` vs a selector into Redux), mirror the donor's exact polling expressions (`restore-contract-wall-rust.spec.ts:1139-1214` freshclaude body is the authoritative reference for both).
+Adaptation notes for the implementer (verify against the donor spec while copying helpers): the skeleton already uses the donor's exact call shapes — `sendFreshAgentTurn(page, harness, tabId, text)` (donor :373–393), `getPaneLayout(tabId)` (`test-harness.ts:166` requires the tabId), and tabId acquired once via `(await harness.getActiveTabId())!` after the picker settles (donor :1149; the donor re-reads it only after `page.reload()`, which these tests never do). Keep `expect.poll` timeouts within the global 60s test timeout (bump per-test via `test.setTimeout(120_000)` at the top of each test — restart + resume + snapshot legs are slow). If leaf status field names differ (`content.status` vs a selector into Redux), mirror the donor's exact polling expressions (`restore-contract-wall-rust.spec.ts:1139-1214` freshclaude body is the authoritative reference).
 
 - [ ] **Step 3: Register the spec (both places)**
 
