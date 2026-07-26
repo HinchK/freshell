@@ -170,6 +170,7 @@ async fn spawn_server(ping_interval_ms: u64) -> String {
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,

@@ -159,6 +159,7 @@ async fn spawn_server_with_probe(
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: None,
         session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,

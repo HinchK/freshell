@@ -134,6 +134,7 @@ pub async fn spawn_server_with_specs(
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
@@ -215,6 +216,7 @@ pub async fn spawn_server_with_ledger(
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
@@ -292,11 +294,97 @@ pub async fn spawn_server_with_specs_and_activity(
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: Some(activity_hub.clone()),
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
     };
 
+    let router = freshell_ws::router(state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (format!("ws://{addr}/ws", addr = addr), registry)
+}
+
+/// [`spawn_server_with_specs_and_activity`], with the codex rollout LOCATOR
+/// wired and its sweep spawned (Lane B2: fresh codex panes gain identity
+/// server-side with NO client candidate frame). Identical body except two
+/// deltas: `codex_locator` is `Some(CodexLocator)` rooted at
+/// `codex_sessions_root` (tests pass `<CODEX_HOME>/sessions` — the same root
+/// `codex_sessions_root()` resolves in the real server), and the locator
+/// sweep is spawned before the router.
+#[allow(dead_code)] // not every test binary uses the codex-locator variant
+pub async fn spawn_server_with_specs_activity_and_codex_locator(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    codex_sessions_root: &std::path::Path,
+) -> (String, freshell_terminal::TerminalRegistry) {
+    let auth_token = Arc::new(AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings =
+        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
+    let registry = freshell_terminal::TerminalRegistry::new();
+
+    let activity_hub =
+        freshell_ws::activity::ActivityHub::new(std::sync::Arc::clone(&broadcast_tx), None);
+    registry.set_activity_observer(activity_hub.registry_observer());
+
+    let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+            ),
+        ),
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(cli_commands),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        config_fallback: None,
+        amplifier_locator: None,
+        opencode_locator: None,
+        codex_locator: Some(std::sync::Arc::new(
+            freshell_sessions::codex_locator::CodexLocator::new(codex_sessions_root.to_path_buf()),
+        )),
+        activity: Some(activity_hub.clone()),
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+    };
+
+    // Mirrors main.rs's sweep wiring; 150 ms is re-declared here because
+    // main.rs's AMPLIFIER_LOCATOR_SWEEP_INTERVAL is private to the server
+    // binary.
+    freshell_ws::codex_association::spawn_codex_locator_sweep(
+        state.clone(),
+        std::time::Duration::from_millis(150),
+    );
     let router = freshell_ws::router(state);
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -358,6 +446,7 @@ pub async fn spawn_server_with_create_protect(
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,

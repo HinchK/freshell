@@ -130,6 +130,9 @@ const RUST_ONLY_SPECS = [
   // Reconcile client adoption (Task 14): verdict-driven recovery with the
   // real SPA. Imports RustServer directly (restart()/restartAbrupt()).
   /reconcile-client-adoption-rust\.spec\.ts$/,
+  // Lane B2 codex rollout locator: rust-only (legacy has no codex terminal
+  // locator); imports the RustServer-backed harness for same-port restart.
+  /codex-terminal-restore-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -292,6 +295,9 @@ export default defineConfig({
         // all driven by pane.reconcile verdicts in the real SPA. Rust-only:
         // imports RustServer directly (restart()/restartAbrupt()).
         /reconcile-client-adoption-rust\.spec\.ts$/,
+        // Lane B2 codex rollout locator: rust-only (legacy has no codex terminal
+        // locator); imports the RustServer-backed harness for same-port restart.
+        /codex-terminal-restore-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

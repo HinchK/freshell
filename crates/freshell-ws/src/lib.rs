@@ -23,7 +23,8 @@
 pub mod activity;
 pub mod amplifier_association;
 pub mod backpressure;
-pub(crate) mod codex_candidate;
+pub mod codex_association;
+pub(crate) mod codex_identity;
 pub(crate) mod codex_reconcile;
 pub mod create_limit;
 pub mod existence;
@@ -39,7 +40,7 @@ pub mod tabs;
 pub mod tabs_persist;
 pub mod terminal;
 
-pub use codex_candidate::codex_sessions_root;
+pub use codex_identity::codex_sessions_root;
 pub use codex_reconcile::locate_codex_rollout;
 
 use std::sync::Arc;
@@ -248,6 +249,17 @@ pub struct WsState {
     /// point no-ops in that case. Sibling to `amplifier_locator` (spec §8: a
     /// provider-parameterized locator was explicitly rejected).
     pub opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
+    /// The codex terminal-pane rollout locator (Lane B2): correlates a fresh
+    /// codex PTY's first Enter with the new rollout JSONL codex writes under
+    /// the sessions root — real codex materializes the file only at the first
+    /// user prompt, so the locator's windows are Enter-anchored (no spawn
+    /// window) — so the terminal can be bound to a session identity and
+    /// `terminal.rs`'s generic resume derivation can drive `codex resume <id>`
+    /// on restart. `None` when HOME/CODEX_HOME are unresolvable — every
+    /// [`crate::codex_association`] entry point no-ops in that case. Sibling
+    /// to `opencode_locator` (a provider-parameterized locator was explicitly
+    /// rejected there; same call here).
+    pub codex_locator: Option<Arc<freshell_sessions::codex_locator::CodexLocator>>,
     /// TERM-15/TERM-16: the terminal-mode CLI activity hub (claude/codex/
     /// amplifier trackers + the truly-idle gate + the amplifier events
     /// lanes). `None` in unit tests that never exercise activity; always
@@ -748,6 +760,7 @@ mod tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            codex_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
