@@ -852,6 +852,53 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   click instead of opening a duplicate, and survives a server restart + browser refresh
   with its session identity intact.
 
+### EDEV-08 — REST pane create MINTS a stable `createRequestId` into the broadcast pane content (pane-identity stabilization)
+- what_differs: `POST /api/tabs` (terminal path) and `POST /api/panes/:id/split` (which
+  shares `spawn_terminal_pane`) now accept-or-mint a `createRequestId`
+  (`Uuid::new_v4().simple()`, 32 lowercase hex; a caller-supplied key — the snapshot-restore
+  path via `pane_to_create_body` — is honored verbatim) and emit it in the broadcast pane
+  content: `ui.command{tab.create}` `payload.paneContent.createRequestId` and
+  `ui.command{pane.split}` `payload.newContent.createRequestId`
+  (`crates/freshell-freshagent/src/terminal_tabs.rs`, `spawn_terminal_pane`), with the same
+  key stamped atomically into the terminal registry (`TerminalRegistry::create`'s existing
+  `create_request_id` parameter). Legacy emits NO `createRequestId` in either payload
+  (`server/agent-api/router.ts:762-789` tab.create terminal paneContent, `:1360-1380`
+  pane.split newContent) — the frozen client then mints its own substitute nanoid on receipt
+  (`src/store/panesSlice.ts:78-79`). Parity nuance, `ui.command{pane.attach}`: `POST
+  /api/panes/:id/respawn` delegates to the same shared pipeline (`pane_ops.rs`), so its
+  `pane.attach` `content` now carries the key too — there legacy ALREADY mints one
+  (`router.ts:1602` respawn, `:1646` terminal-attach, `createRequestId: nanoid()`), so
+  pane.attach moves TOWARD parity (both sides keyed; value format differs, uuid-simple vs
+  nanoid — both opaque ids the oracle normalizer masks,
+  `port/oracle/harness/normalize.ts:77` `createRequestId: ID('RID')`). The fresh-agent
+  tab.create path already carried the key on BOTH sides (`router.ts:558/:578`; the rust
+  fresh-agent create) — unchanged. Wire-contract safe: the frozen `ui.command` payload is
+  free-form (`port/contract/ws-server-messages.schema.json:2856-2874`, `"payload": true`);
+  absence of the field stays legal on read everywhere (backward compat).
+- why_intentional: Rust is the better side — the legacy keyless broadcast is the root cause
+  of pane-identity correlation loss (restart-resilience campaign P1.6 /
+  reconciliation-handshake design §5.5 precondition 2): a REST-created pane never receives a
+  server-known identity key, the client's substitute nanoid is re-minted on hydrate, so
+  panes cannot be re-identified across reload/restore and server state keyed on
+  `create_request_id` (terminal registry) can never match a client pane. Minting
+  server-side — and honoring the captured key on snapshot restore — makes the key stable
+  end-to-end with ZERO legacy-server changes and no client schema change.
+- evidence: RED-first unit coverage in `crates/freshell-freshagent/src/terminal_tabs.rs`
+  (`rest_create_terminal_tab_mints_and_stamps_create_request_id`,
+  `rest_create_honors_caller_supplied_create_request_id`) and the extended split assertion
+  in `crates/freshell-freshagent/src/pane_ops.rs`
+  (`split_terminal_pane_spawns_real_pty_and_broadcasts_pane_split`) plus the extended
+  respawn rotation test (`respawn_pane_replaces_terminal_in_place_and_broadcasts_pane_attach`,
+  also `pane_ops.rs`); e2e pin:
+  `test/e2e-browser/specs/createrequestid-stabilization-rust.spec.ts` (the 32-hex
+  server-mint discriminator + reload-preserves-key). Legacy shape:
+  `server/agent-api/router.ts:762-789` / `:1360-1380` (no key), `:1602` / `:1646`
+  (pane.attach, keyed).
+- user_impact: A REST-created terminal pane keeps ONE stable identity key from creation
+  through reload/restore — the precondition for reconciliation-phase dedupe/adoption —
+  instead of a fresh client-minted key per hydrate; snapshot-restored panes are re-created
+  under their captured key.
+
 <!--
 Template:
 
