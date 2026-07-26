@@ -111,6 +111,8 @@ const RUST_ONLY_SPECS = [
   /launch-retry-restart-rust\.spec\.ts$/,
   /double-restart-terminal-restore-rust\.spec\.ts$/,
   /turn-complete-restart-resume-rust\.spec\.ts$/,
+  // Freshclaude restart parity (P0.2 §2.8 items 2-4) -- imports RustServer for restartAbrupt()
+  /freshclaude-restart-parity-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -250,6 +252,8 @@ export default defineConfig({
         /launch-retry-restart-rust\.spec\.ts$/,
         /double-restart-terminal-restore-rust\.spec\.ts$/,
         /turn-complete-restart-resume-rust\.spec\.ts$/,
+        // Freshclaude restart parity (P0.2 §2.8 items 2-4) -- imports RustServer for restartAbrupt()
+        /freshclaude-restart-parity-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
