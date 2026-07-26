@@ -120,6 +120,9 @@ const RUST_ONLY_SPECS = [
   /pane-ledger-restart-rust\.spec\.ts$/,
   // Freshclaude restart parity (P0.2 §2.8 items 2-4) -- imports RustServer for restartAbrupt()
   /freshclaude-restart-parity-rust\.spec\.ts$/,
+  // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
+  // restartAbrupt(); hidden panes must rebind without being revealed.
+  /hidden-pane-rebind-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -270,6 +273,9 @@ export default defineConfig({
         /pane-ledger-restart-rust\.spec\.ts$/,
         // Freshclaude restart parity (P0.2 §2.8 items 2-4) -- imports RustServer for restartAbrupt()
         /freshclaude-restart-parity-rust\.spec\.ts$/,
+        // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
+        // restartAbrupt(); hidden panes must rebind without being revealed.
+        /hidden-pane-rebind-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
