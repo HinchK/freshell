@@ -16,6 +16,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
   switch (content.kind) {
     case 'terminal':
       return {
+        createRequestId: content.createRequestId,
         mode: content.mode,
         shell: content.shell,
         sessionRef: content.sessionRef,
@@ -43,6 +44,7 @@ function stripPanePayload(content: PaneContent, serverInstanceId: string): Recor
       }
     case 'fresh-agent':
       return {
+        createRequestId: content.createRequestId,
         provider: content.provider,
         sessionType: content.sessionType,
         sessionRef: content.sessionRef,
