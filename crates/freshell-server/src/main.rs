@@ -27,6 +27,7 @@ mod logging;
 mod network;
 mod proxy;
 mod rate_limit;
+mod recovery_inventory;
 mod screenshots;
 mod serve_client;
 mod session_directory;
