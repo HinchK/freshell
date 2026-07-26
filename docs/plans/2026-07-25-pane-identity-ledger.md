@@ -1388,6 +1388,8 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
         )
         .unwrap();
     }
+    // Constructed AFTER the forged rows, as promised above.
+    let ledger = PaneLedger::new(Some(root.clone()));
 
     let report = ledger.boot_scan(3_000, &never_absent);
     assert_eq!(report.supersession_repairs.len(), 1);
@@ -1890,8 +1892,11 @@ The existence probe is constructed around `main.rs:425-435`. AFTER `pane_ledger`
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
+                    // Same Option handling as the boot-scan closure above:
+                    // no home => defer (false) — never the destructive branch.
                     ledger.gc(now, &|provider, session_id| {
-                        transcript_definitively_absent(&home, provider, session_id)
+                        home.as_deref()
+                            .is_some_and(|h| transcript_definitively_absent(h, provider, session_id))
                     });
                 })
                 .await;
