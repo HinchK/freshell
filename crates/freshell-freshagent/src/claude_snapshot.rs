@@ -344,6 +344,10 @@ pub(crate) fn build_claude_snapshot_json(
         "sessionId": thread_id,
         "revision": revision.max(0),
         "latestTurnId": latest_turn_id,
+        // Deliberate divergence from codex (which serves live status from session
+        // state): this adapter is disk-only and always reports "idle" -- live status
+        // is authoritative via the WS status events, so the client ignores this on
+        // live sessions.
         "status": "idle",
         "capabilities": {
             "send": true,
@@ -369,6 +373,14 @@ pub(crate) async fn get_claude_snapshot(
     session_type: &str,
     thread_id: &str,
 ) -> Result<Value, ClaudeSnapshotError> {
+    // Cannot check => must not deny (the attach arm in claude.rs treats this exact
+    // state as Transient): with NO resolvable store root we cannot assert the
+    // session is gone, so this is Io (-> 500), never NotFound (-> 404 lost).
+    if claude_home_candidates().is_empty() {
+        return Err(ClaudeSnapshotError::Io(
+            "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/HOME all unset)".into(),
+        ));
+    }
     // Miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
     let path = locate_transcript(thread_id).ok_or(ClaudeSnapshotError::NotFound)?;
     let mtime_ms = std::fs::metadata(&path)
@@ -507,5 +519,54 @@ mod tests {
         // The dominant real prompt shape (object-with-string-content, ledger A5)
         // must yield a text turn -- local-echo clearing depends on it.
         assert_eq!(turns[3]["items"][0]["text"], "cli string content question");
+    }
+
+    /// Saves the named env vars on construction and restores them on drop (so the
+    /// restore also runs on panic while the caller still holds `CLAUDE_ENV_LOCK` --
+    /// locals drop in reverse declaration order, lock guard last).
+    struct EnvVarsRestore {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+    impl EnvVarsRestore {
+        fn remove_all(keys: &[&'static str]) -> Self {
+            let saved = keys
+                .iter()
+                .map(|k| {
+                    let v = std::env::var(k).ok();
+                    std::env::remove_var(k);
+                    (*k, v)
+                })
+                .collect();
+            Self { saved }
+        }
+    }
+    impl Drop for EnvVarsRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_no_resolvable_store_root_is_io_not_notfound() {
+        // Cannot check => must not deny: with every store-root env var unset the
+        // server cannot assert the session is gone, so the error must be Io (-> 500),
+        // never NotFound (-> 404 FRESH_AGENT_LOST_SESSION). Env vars are
+        // process-global -- serialize under the shared claude env lock.
+        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+        let _restore = EnvVarsRestore::remove_all(&["CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "HOME"]);
+        assert!(claude_home_candidates().is_empty());
+        let result =
+            get_claude_snapshot("freshclaude", "55555555-5555-4555-8555-555555555555").await;
+        match result {
+            Err(ClaudeSnapshotError::Io(msg)) => {
+                assert!(msg.contains("no claude store root resolvable"), "{msg}");
+            }
+            other => panic!("expected Io (cannot-check must not deny), got {other:?}"),
+        }
     }
 }

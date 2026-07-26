@@ -90,7 +90,8 @@ pub struct FreshClaudeState {
     /// `status==creating` reattaches to the ONE session it already created instead of
     /// spawning a fresh claude sidecar per resend. Cleared for a session's entries only
     /// on an explicit `freshAgent.kill` ([`Self::handle_kill`]); an unrequested sidecar
-    /// exit does NOT evict (mirrors legacy, see the type doc).
+    /// exit does NOT evict from THIS dedup cache (mirrors legacy, see the type doc) --
+    /// it DOES evict the dead entry from the `sessions` map (consumer-exit eviction).
     create_dedup: Arc<FreshAgentCreateDedup<ClaudeCreateRecord>>,
     /// Single-flight guard for resume-on-attach, keyed by DURABLE id (codex's
     /// `resuming` analog, simplified: contenders return immediately instead of
@@ -123,9 +124,11 @@ struct ClaudeSession {
     /// (Task 6), where the map key is the CLIENT's original id. `handle_send`/
     /// `handle_interrupt` MUST address the sidecar with this id, never the map key.
     sidecar_session_id: String,
-    /// Best-effort copy of the durable Claude UUID once `sdk.session.init` arrives.
-    /// Written by the stdout consumer; consumed by the snapshot adapter (later task in
-    /// the restart-parity plan) — until then it is only read from in-crate tests.
+    /// Best-effort copy of the durable Claude UUID, recorded from `sdk.session.init`
+    /// by the stdout consumer. Nothing in production reads it: attach/eviction resolve
+    /// durable ids through [`FreshClaudeState::cli_index`], and the snapshot adapter
+    /// is disk-only. Currently read only by in-crate tests; kept as a diagnostic/
+    /// forward slot.
     #[allow(dead_code)]
     cli_session_id: Option<String>,
 }
