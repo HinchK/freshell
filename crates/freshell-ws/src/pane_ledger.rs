@@ -134,6 +134,14 @@ pub struct QuarantinedRow {
     pub error: String,
 }
 
+/// A chain-terminus lookup result. `corrected == true` means the caller's
+/// claimed ref was superseded and this row is the live successor.
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    pub row: BindingRow,
+    pub corrected: bool,
+}
+
 /// The in-memory write-through index (V1.md / A15). Loaded ONCE at
 /// construction by a single directory scan; every successful file write
 /// updates it in the same locked section. Unparsable / wrong-version files
@@ -315,12 +323,25 @@ impl PaneLedger {
         index: &mut LedgerIndex,
         w: &BindingWrite<'_>,
     ) -> std::io::Result<()> {
+        // Supersession (G3, retire-never-defend): if this terminal already
+        // owns a DIFFERENT bound identity, the order is pinned — write the
+        // new `bound` row FIRST, then retire the old. A crash between the
+        // two leaves two bound rows; the boot-scan repair (Task 4) closes
+        // that window. Detection is a memory scan over the index (V1.md).
+        let previous = index
+            .bindings
+            .values()
+            .find(|r| {
+                r.state == RowState::Bound
+                    && r.live_terminal_id.as_deref() == Some(w.terminal_id)
+                    && (r.provider != w.provider || r.session_id != w.session_id)
+            })
+            .cloned();
+
         let key = (w.provider.to_string(), w.session_id.to_string());
         let existing = index.bindings.get(&key);
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
         if existing.is_some_and(|r| r.retired_reason == Some(RetiredReason::GcExpired)) {
-            // `retired/gc_expired -> bound` is a LEGAL transition, taken
-            // automatically and loudly logged (spec §4.2 lifecycle).
             tracing::info!(
                 target: "freshell_ws::pane_ledger",
                 provider = %w.provider,
@@ -343,7 +364,26 @@ impl PaneLedger {
             retired_reason: None,
             superseded_by: None,
         };
-        self.write_binding(root, index, &row)
+        self.write_binding(root, index, &row)?; // new bound row FIRST (pinned)
+
+        if let Some(mut old) = previous {
+            old.state = RowState::Retired;
+            old.retired_reason = Some(RetiredReason::Superseded);
+            old.superseded_by = Some(SessionLocator {
+                provider: w.provider.to_string(),
+                session_id: w.session_id.to_string(),
+            });
+            old.updated_at = w.now_ms;
+            tracing::info!(
+                target: "freshell_ws::pane_ledger",
+                terminal_id = %w.terminal_id,
+                old_session_id = %old.session_id,
+                new_session_id = %w.session_id,
+                "pane_ledger_superseded: binding moved; old row retired, never defended"
+            );
+            self.write_binding(root, index, &old)?; // THEN retire the old
+        }
+        Ok(())
     }
 
     /// One row: durable file FIRST, then the write-through index — in the
@@ -370,6 +410,46 @@ impl PaneLedger {
             .bindings
             .get(&(provider.to_string(), session_id.to_string()))
             .cloned()
+    }
+
+    /// Follow the `supersededBy` chain from a claimed ref to its terminus.
+    /// Chains cannot cycle (a supersession write always targets a fresh row
+    /// and retires its predecessor in the same act) — the hop cap is a
+    /// corruption backstop, loud when hit.
+    pub fn lookup_by_session(&self, provider: &str, session_id: &str) -> Option<Resolution> {
+        self.root.as_ref()?;
+        let index = self.guard(); // memory-only chain walk (V1.md read policy)
+        let mut row = index
+            .bindings
+            .get(&(provider.to_string(), session_id.to_string()))
+            .cloned()?;
+        let mut corrected = false;
+        let mut hops = 0u32;
+        while row.state == RowState::Retired {
+            let Some(next) = row.superseded_by.clone() else {
+                break; // closed / gc_expired terminus — caller applies its reader rule
+            };
+            hops += 1;
+            if hops > 32 {
+                tracing::error!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %provider,
+                    session_id = %session_id,
+                    "pane_ledger_chain_overflow: supersession chain exceeded 32 hops (corruption?)"
+                );
+                return None;
+            }
+            let Some(next_row) = index
+                .bindings
+                .get(&(next.provider.clone(), next.session_id.clone()))
+                .cloned()
+            else {
+                break;
+            };
+            row = next_row;
+            corrected = true;
+        }
+        Some(Resolution { row, corrected })
     }
 
     /// Whether this server has EVER durably bound this identity — bound or

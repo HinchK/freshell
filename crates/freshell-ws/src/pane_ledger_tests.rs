@@ -190,3 +190,78 @@ fn secondary_index_reads_by_terminal_and_request_id() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn rebind_retires_old_row() {
+    // Red test `rebind-retires-old-row` (spec §4.2 G3): a pane's binding
+    // legitimately moves -> the writer retires the old row and writes the
+    // new one; the old row records WHERE identity went.
+    let root = temp_root("rebind");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("codex", "th-old", "t1", 1_000))
+        .unwrap();
+    ledger
+        .record_binding(&write("codex", "th-new", "t1", 2_000))
+        .unwrap();
+
+    let old = ledger.load_binding("codex", "th-old").unwrap();
+    assert_eq!(old.state, RowState::Retired);
+    assert_eq!(old.retired_reason, Some(RetiredReason::Superseded));
+    let by = old.superseded_by.expect("supersededBy set");
+    assert_eq!(by.provider, "codex");
+    assert_eq!(by.session_id, "th-new");
+
+    let new = ledger.load_binding("codex", "th-new").unwrap();
+    assert_eq!(new.state, RowState::Bound);
+    assert_eq!(new.live_terminal_id.as_deref(), Some("t1"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn client_claims_superseded_ref_is_answered_from_the_chain_terminus() {
+    // Red test `client-claims-superseded-ref` (ledger-API level; full
+    // verdict wiring is Phase 3): a lookup for a superseded ref follows
+    // `supersededBy` to the live bound row and reports corrected:true —
+    // never returns the retired row as the answer.
+    let root = temp_root("chain");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("codex", "th-1", "t1", 1_000))
+        .unwrap();
+    ledger
+        .record_binding(&write("codex", "th-2", "t1", 2_000))
+        .unwrap();
+    ledger
+        .record_binding(&write("codex", "th-3", "t1", 3_000))
+        .unwrap();
+
+    let hit = ledger.lookup_by_session("codex", "th-1").expect("resolves");
+    assert!(hit.corrected);
+    assert_eq!(hit.row.session_id, "th-3");
+    assert_eq!(hit.row.state, RowState::Bound);
+
+    // A direct claim of the live terminus is NOT a correction.
+    let direct = ledger.lookup_by_session("codex", "th-3").unwrap();
+    assert!(!direct.corrected);
+
+    // A retired row with no successor (e.g. closed) is returned as-is so
+    // callers can apply their own reader rule — but never invents a bound.
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn rebind_to_the_same_identity_is_not_a_supersession() {
+    let root = temp_root("samebind");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("codex", "th-1", "t1", 1_000))
+        .unwrap();
+    ledger
+        .record_binding(&write("codex", "th-1", "t1", 2_000))
+        .unwrap();
+    let row = ledger.load_binding("codex", "th-1").unwrap();
+    assert_eq!(row.state, RowState::Bound);
+    assert_eq!(row.retired_reason, None);
+    std::fs::remove_dir_all(&root).ok();
+}
