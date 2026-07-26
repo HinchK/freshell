@@ -51,6 +51,7 @@ import TabsView from '@/components/TabsView'
 import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
 import { SetupWizard } from '@/components/SetupWizard'
+import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { fetchNetworkStatus } from '@/store/networkSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
@@ -1767,6 +1768,8 @@ npm run serve`}</pre>
           }}
         />
       )}
+      {/* LANE B3 (recover-my-panes): self-gating recovery offer — see docs/plans/2026-07-26-recover-my-panes.md */}
+      <RecoveryOfferPanel />
       </div>
     </ContextMenuProvider>
   )
