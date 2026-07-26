@@ -1012,3 +1012,8 @@ PR POLICY: NOT approved — do NOT run `gh pr create`. Final output: branch name
   risk). Existing rung-1 consultation already collapses post-adoption
   duplicates. Residual pinning test rewritten: pre-adoption duplicate is
   transient, not permanent.
+
+### Case (c) push seam (Task 3)
+- VERIFIED FAILING then FIXED: sweep signature was blind to identity
+  adoption; now includes a (terminal_id, provider, session_id) digest.
+  Adoption/open/close push sessions.changed within one 2s tick.

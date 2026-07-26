@@ -661,7 +661,7 @@ async fn main() -> ExitCode {
         // `ws_state` is Clone (cheap: every field is an Arc/primitive), so
         // this borrows nothing from the `ws_state` binding consumed by the
         // router merge below.
-        spawn_sessions_sweep(Arc::clone(index), ws_state.clone(), SESSIONS_SWEEP_INTERVAL);
+        spawn_sessions_sweep(Arc::clone(index), ws_state.clone(), terminal_identity.clone(), SESSIONS_SWEEP_INTERVAL);
     }
     // Restore-across-restart fix: the amplifier locator's polling cycle (its
     // Enter↔session-dir correlation is entirely poll-driven -- see
@@ -1432,6 +1432,16 @@ const AMPLIFIER_LOCATOR_SWEEP_INTERVAL: std::time::Duration = std::time::Duratio
 ///    Accepted: bake-in is a transitional deployment mode, not the target
 ///    single-process architecture.
 ///
+/// 4. **Terminal identity-registry changes (locator adoption, terminal open/close) --
+///    CLOSED by folding terminal identity into the digest.** The identity
+///    registry tracks live coding-CLI panes; when a new pane opens, a locator
+///    session-id is adopted (recorded on the terminal), or a pane exits, the
+///    registry changes but the disk corpus does NOT. This signature now
+///    includes a (terminal_id, provider, session_id) digest (NOT updated_at or
+///    cwd; see identity_updated_at_alone_does_not_move_the_sweep_signature and
+///    the test comments) so locator adoptions and terminal state changes push
+///    sessions.changed within one 2s tick.
+///
 /// No committed provider parser currently allows a title-only rename with
 /// no new turn to ALSO leave the sweep signature blind at the source-file
 /// level (a title is always derived from message content that also carries
@@ -1442,11 +1452,28 @@ const AMPLIFIER_LOCATOR_SWEEP_INTERVAL: std::time::Duration = std::time::Duratio
 /// `server/sessions-sync/service.ts`) additionally hashes file
 /// content/mtime to catch this class of edit; that fuller comparison is
 /// intentionally NOT ported here.
+/// Signature of the session-directory view as the sidebar sees it:
+/// disk corpus (count + max activity) PLUS a digest of the live identity
+/// registry (terminal_id, provider, session_id triples -- NOT updated_at,
+/// see identity_updated_at_alone_does_not_move_the_sweep_signature).
 fn sessions_sweep_signature(
     items: &[freshell_sessions::directory_index::IndexedSession],
-) -> (usize, i64) {
+    identities: &[freshell_ws::identity::TerminalIdentity],
+) -> (usize, i64, u64) {
+    use std::hash::{Hash, Hasher};
     let max_last_activity_at = items.iter().map(|s| s.last_activity_at).max().unwrap_or(0);
-    (items.len(), max_last_activity_at)
+    let mut refs: Vec<(&str, &str, &str)> = identities
+        .iter()
+        .map(|i| (
+            i.terminal_id.as_str(),
+            i.provider.as_deref().unwrap_or(""),
+            i.session_id.as_deref().unwrap_or(""),
+        ))
+        .collect();
+    refs.sort_unstable();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    refs.hash(&mut hasher);
+    (items.len(), max_last_activity_at, hasher.finish())
 }
 
 /// SESSION-09: periodic sweep that detects session-directory changes and
@@ -1490,16 +1517,17 @@ fn sessions_sweep_signature(
 fn spawn_sessions_sweep(
     session_index: Arc<freshell_sessions::directory_index::SessionIndex>,
     ws_state: WsState,
+    identity: freshell_ws::identity::TerminalIdentityRegistry,
     interval: std::time::Duration,
 ) {
     tokio::spawn(async move {
-        let mut last_signature = sessions_sweep_signature(&session_index.snapshot().await);
+        let mut last_signature = sessions_sweep_signature(&session_index.snapshot().await, &identity.list());
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
             let items = session_index.snapshot().await;
-            let signature = sessions_sweep_signature(&items);
+            let signature = sessions_sweep_signature(&items, &identity.list());
             if signature != last_signature {
                 last_signature = signature;
                 freshell_ws::terminal::broadcast_sessions_changed(&ws_state);
@@ -1573,15 +1601,59 @@ mod sessions_sweep_tests {
         }
     }
 
+    /// The undocumented fourth gap, closed: the sweep signature must move when
+    /// the identity registry changes -- a locator adoption (session_id appears
+    /// on a live terminal) alters the session-directory join result, so the
+    /// sidebar needs a sessions.changed push.
+    #[test]
+    fn identity_registry_changes_move_the_sweep_signature() {
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        let items: Vec<IndexedSession> = Vec::new();
+
+        let empty = sessions_sweep_signature(&items, &identity.list());
+
+        identity.upsert("term-1", Some("codex"), None, None, 1_000);
+        let with_terminal = sessions_sweep_signature(&items, &identity.list());
+        assert_ne!(empty, with_terminal, "a new live coding terminal must move the signature");
+
+        identity.upsert("term-1", Some("codex"), Some("thread-a"), None, 2_000);
+        let adopted = sessions_sweep_signature(&items, &identity.list());
+        assert_ne!(with_terminal, adopted, "locator adoption must move the signature");
+
+        identity.retire("term-1");
+        let retired = sessions_sweep_signature(&items, &identity.list());
+        assert_ne!(adopted, retired, "terminal exit must move the signature");
+    }
+
+    /// updated_at alone must NOT move the signature -- it changes on every
+    /// heartbeat-ish upsert and would turn the sweep into a 2s firehose.
+    #[test]
+    fn identity_updated_at_alone_does_not_move_the_sweep_signature() {
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        let items: Vec<IndexedSession> = Vec::new();
+        identity.upsert("term-1", Some("codex"), Some("thread-a"), None, 1_000);
+        let a = sessions_sweep_signature(&items, &identity.list());
+        identity.upsert("term-1", Some("codex"), Some("thread-a"), None, 9_000);
+        let b = sessions_sweep_signature(&items, &identity.list());
+        assert_eq!(a, b);
+    }
+
     #[test]
     fn empty_snapshot_signature_is_zero_count_zero_activity() {
-        assert_eq!(sessions_sweep_signature(&[]), (0, 0));
+        // Hash of an empty identity list is consistent but non-zero (it's the hash
+        // of an empty vec). The important assertion is that count and activity are zero.
+        let sig = sessions_sweep_signature(&[], &[]);
+        assert_eq!(sig.0, 0);
+        assert_eq!(sig.1, 0);
     }
 
     #[test]
     fn signature_pairs_count_with_the_max_last_activity_at() {
         let items = vec![mk_indexed(100), mk_indexed(500), mk_indexed(200)];
-        assert_eq!(sessions_sweep_signature(&items), (3, 500));
+        let sig = sessions_sweep_signature(&items, &[]);
+        assert_eq!(sig.0, 3);
+        assert_eq!(sig.1, 500);
+        // Hash component is stable but implementation-dependent; we just check it exists
     }
 
     /// The scenario the sweep task depends on: writing a NEW session file
@@ -1603,10 +1675,10 @@ mod sessions_sweep_tests {
             vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
             std::time::Duration::from_millis(0),
         );
-        let before = sessions_sweep_signature(&index.snapshot().await);
+        let before = sessions_sweep_signature(&index.snapshot().await, &[]);
         assert_ne!(
             before,
-            (0, 0),
+            (0, 0, 0),
             "seed session should produce a nonzero signature"
         );
 
@@ -1624,13 +1696,13 @@ mod sessions_sweep_tests {
         // background -- poll until it settles instead of asserting on the
         // immediate return value (the periodic `spawn_sessions_sweep` this
         // mirrors already tolerates this same one-tick lag in production).
-        let mut after = sessions_sweep_signature(&index.snapshot().await);
+        let mut after = sessions_sweep_signature(&index.snapshot().await, &[]);
         for _ in 0..50 {
             if after != before {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            after = sessions_sweep_signature(&index.snapshot().await);
+            after = sessions_sweep_signature(&index.snapshot().await, &[]);
         }
         assert_ne!(
             after, before,
@@ -1662,7 +1734,7 @@ mod sessions_sweep_tests {
             vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
             std::time::Duration::from_millis(0),
         );
-        let before = sessions_sweep_signature(&index.snapshot().await);
+        let before = sessions_sweep_signature(&index.snapshot().await, &[]);
 
         // A new session lands with an OLDER timestamp than the existing
         // max -- e.g. a restored/imported session, or (as in the
@@ -1676,13 +1748,13 @@ mod sessions_sweep_tests {
         );
         // Stale-while-revalidate: poll until the detached background sweep
         // settles (see `new_session_file_changes_the_signature`'s comment).
-        let mut after = sessions_sweep_signature(&index.snapshot().await);
+        let mut after = sessions_sweep_signature(&index.snapshot().await, &[]);
         for _ in 0..50 {
             if after != before {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            after = sessions_sweep_signature(&index.snapshot().await);
+            after = sessions_sweep_signature(&index.snapshot().await, &[]);
         }
         assert_ne!(
             after, before,
@@ -1708,8 +1780,8 @@ mod sessions_sweep_tests {
             vec![Arc::new(ClaudeSource::new(claude_home.clone())) as Arc<dyn SessionSource>],
             std::time::Duration::from_millis(0),
         );
-        let first = sessions_sweep_signature(&index.snapshot().await);
-        let second = sessions_sweep_signature(&index.snapshot().await);
+        let first = sessions_sweep_signature(&index.snapshot().await, &[]);
+        let second = sessions_sweep_signature(&index.snapshot().await, &[]);
         assert_eq!(first, second, "an unchanged home must yield a stable token");
 
         std::fs::remove_dir_all(claude_home.parent().unwrap()).ok();
