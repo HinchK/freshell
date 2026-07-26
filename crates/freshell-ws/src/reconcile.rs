@@ -158,6 +158,28 @@ fn attach(
     }
 }
 
+/// Council rule 6: the live terminal (if any) currently carrying this CLAIMED
+/// sessionRef — consulted across BOTH identity stores, mirroring
+/// [`resolve_authoritative_ref`]'s dual-source read: the ws-owned identity
+/// registry (live entries, re-verified against registry liveness so a stale
+/// un-retired entry never produces a phantom attach), then the registry-row
+/// join (REST-created resumes whose identity never reached the identity
+/// registry across the crate boundary).
+fn live_terminal_for_claimed_ref(
+    deps: &ReconcileDeps<'_>,
+    claim: &SessionLocator,
+) -> Option<String> {
+    if let Some(entry) = deps
+        .identity
+        .find_by_session(&claim.provider, &claim.session_id)
+    {
+        if deps.registry.is_live(&entry.terminal_id) {
+            return Some(entry.terminal_id);
+        }
+    }
+    deps.registry.live_terminal_for_session_ref(claim)
+}
+
 fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdict {
     // §5.3 row 10 protocol hygiene: malformed entries get an explicit reason.
     if pane.pane_key.is_empty() {
@@ -176,6 +198,27 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
     else {
         return invalid(pane, "missing_create_request_id");
     };
+
+    // Council rule 6 (sessionRef-level single-flight, reconcile side): a
+    // live terminal ALREADY carrying the claimed sessionRef wins over
+    // createRequestId keying — every other client's claim for the same ref
+    // (regardless of createRequestId) attaches to the winner, never a
+    // respawn that would open a second JSONL writer (D8).
+    if let Some(claim) = pane.session_ref.as_ref() {
+        if let Some(tid) = live_terminal_for_claimed_ref(deps, claim) {
+            let server_ref = deps
+                .identity
+                .session_ref_for(&tid)
+                .or_else(|| Some(claim.clone()));
+            let corrected = corrected_flag(pane.session_ref.as_ref(), server_ref.as_ref());
+            return PaneVerdict {
+                terminal_id: Some(tid),
+                session_ref: server_ref,
+                corrected,
+                ..base(pane, ReconcileVerdict::Attach)
+            };
+        }
+    }
 
     // Rows 1/2/2b: any LIVE terminal wins.
     let t1 = deps.registry.newest_live_by_create_request_id(&key);
@@ -688,6 +731,35 @@ mod tests {
             Some(sref("codex", "s-rest")),
             "identity must resolve via the registry-side resume_session_id"
         );
+    }
+
+    /// Council rule 6, registry-row half: a REST-created LIVE terminal whose
+    /// identity lives ONLY on the registry row (resume_session_id, no
+    /// identity-registry entry) still answers a different client's claim for
+    /// the same sessionRef with attach{its terminalId} — never a second
+    /// writer (D8).
+    #[test]
+    fn cross_client_claim_attaches_to_live_rest_created_terminal() {
+        let f = Fixture::new();
+        f.registry.register_headless(HeadlessTerminal {
+            terminal_id: "T-rest-live".to_string(),
+            stream_id: "S-rest-live".to_string(),
+            mode: "codex".to_string(),
+            resume_session_id: Some("s-shared".to_string()),
+            create_request_id: Some("cr-WINNER".to_string()),
+            created_at: Some(1_000),
+        });
+        // Session Present on disk — the D8 shape would otherwise be respawn.
+        f.probe.set("codex", "s-shared", SessionExistence::Present);
+
+        let mut p = pane("cr-OTHER");
+        p.mode = Some("codex".to_string());
+        p.session_ref = Some(sref("codex", "s-shared"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Attach);
+        assert_eq!(v.terminal_id.as_deref(), Some("T-rest-live"));
+        assert_eq!(v.session_ref, Some(sref("codex", "s-shared")));
+        assert_eq!(v.corrected, None, "the claim matched server truth");
     }
 
     /// §9.1 test 8 trust boundary, respawn shape: the claim contradicts the

@@ -508,6 +508,45 @@ async fn contradicting_claim_is_answered_with_server_ref_and_corrected() {
     assert_eq!(verdict["corrected"], true);
 }
 
+/// Council rule 6 (sessionRef-level single-flight, reconcile side): a live
+/// terminal spawned under createRequestId A and identity-stamped with
+/// sessionRef {claude, sess-x} answers a reconcile claim from
+/// createRequestId B (a different client) with attach{terminalId of A's
+/// terminal} — never a second writer for the same session file (D8).
+#[tokio::test]
+async fn different_create_request_id_same_session_ref_gets_attach_to_winner() {
+    let server = spawn_server().await;
+    // Seed: headless terminal live in the registry, identity-stamped with
+    // sessionRef {claude, sess-x} (the existing seeding pattern).
+    headless(&server, "T-winner", Some("cr-WINNER"), "claude", 1_000);
+    server
+        .identity
+        .upsert("T-winner", Some("claude"), Some("sess-x"), None, 1);
+
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    ws.send(reconcile_request(
+        "rec-xclient",
+        serde_json::json!([{
+            "paneKey": "pk-x",
+            "kind": "terminal",
+            "mode": "claude",
+            "createRequestId": "cr-OTHER",
+            "sessionRef": { "provider": "claude", "sessionId": "sess-x" }
+        }]),
+    ))
+    .await
+    .expect("send request");
+
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    let v = &result["verdicts"][0];
+    assert_eq!(v["verdict"], "attach");
+    assert_eq!(v["terminalId"], "T-winner");
+    assert_eq!(
+        v["sessionRef"],
+        serde_json::json!({ "provider": "claude", "sessionId": "sess-x" })
+    );
+}
+
 // --- 9.1.10 single-flight create-dedupe --------------------------------------------
 
 /// Change #1 (the council's two-tab double-respawn blocker): on a

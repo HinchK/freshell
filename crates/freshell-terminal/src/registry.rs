@@ -1631,6 +1631,72 @@ impl TerminalRegistry {
         }
     }
 
+    /// Live terminal ids currently carrying this sessionRef via the
+    /// registry-row join: `mode == locator.provider &&
+    /// resume_session_id == Some(locator.session_id) && status Running`,
+    /// newest generation first (`created_at` desc, `terminal_id` desc
+    /// tie-break, mirroring [`Self::terminals_by_create_request_id`]).
+    ///
+    /// LOOKUP DESIGN (validator-corrected): registry rows have NO dedicated
+    /// `session_ref` field ([`TerminalShared::inventory`] hardcodes
+    /// `session_ref: None`), so row identity IS this join. Rows are one of
+    /// the TWO identity stores — the other is `freshell-ws`'s identity
+    /// registry, which this crate cannot see (dep direction) — so ws-side
+    /// callers consult both.
+    fn live_terminal_ids_for_session_ref(&self, locator: &SessionLocator) -> Vec<String> {
+        let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .values()
+                .map(|h| Arc::clone(&h.shared))
+                .collect()
+        };
+        let mut rows: Vec<(i64, String)> = shareds
+            .iter()
+            .filter_map(|shared| {
+                let s = shared.lock().expect("terminal lock");
+                if s.status == TerminalRunStatus::Running
+                    && s.mode == locator.provider
+                    && s.resume_session_id.as_deref() == Some(locator.session_id.as_str())
+                {
+                    Some((s.created_at, s.terminal_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        rows.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Council rule 6: the live terminal (newest first) currently carrying
+    /// this sessionRef, if any — the reconcile derivation and the create-path
+    /// lease (Tasks 5/6) attach every other client's claim for the same ref
+    /// to this winner, regardless of `createRequestId`.
+    pub fn live_terminal_for_session_ref(&self, locator: &SessionLocator) -> Option<String> {
+        self.live_terminal_ids_for_session_ref(locator)
+            .into_iter()
+            .next()
+    }
+
+    /// Council rule 9, D8 backstop: >=2 live PTYs carrying one sessionRef is
+    /// the two-writers corruption shape. Alarm loudly (ERROR-level invariant
+    /// log); never kill silently. Returns whether the invariant is violated.
+    pub fn alarm_if_duplicate_session_ref(&self, locator: &SessionLocator) -> bool {
+        let live = self.live_terminal_ids_for_session_ref(locator);
+        if live.len() >= 2 {
+            tracing::error!(target: "invariant",
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                live = live.len(),
+                terminal_ids = ?live,
+                "duplicate_pty_for_session_ref: >=2 live PTYs share one sessionRef");
+            return true;
+        }
+        false
+    }
+
     /// The current `terminals.changed.revision` (run-monotonic, `§7.5`).
     pub fn revision(&self) -> i64 {
         self.inner.lock().expect("registry lock").revision
@@ -3466,6 +3532,87 @@ mod tests {
         assert_eq!(
             warn.fields.get("create_request_id").map(String::as_str),
             Some("cr-dup")
+        );
+    }
+
+    /// Council rule 6 support: the registry-row join (mode +
+    /// resume_session_id + Running) finds the live terminal carrying a
+    /// sessionRef — exited generations and other providers/sessions never
+    /// match.
+    #[test]
+    fn live_terminal_for_session_ref_joins_rows_on_mode_and_resume_id() {
+        let reg = TerminalRegistry::new();
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-ref".to_string(),
+            stream_id: "S-ref".to_string(),
+            mode: "codex".to_string(),
+            resume_session_id: Some("sess-r".to_string()),
+            create_request_id: Some("cr-a".to_string()),
+            created_at: Some(1_000),
+        });
+        let locator = SessionLocator {
+            provider: "codex".to_string(),
+            session_id: "sess-r".to_string(),
+        };
+        assert_eq!(
+            reg.live_terminal_for_session_ref(&locator),
+            Some("T-ref".to_string())
+        );
+        // Wrong provider / wrong session never match.
+        assert!(reg
+            .live_terminal_for_session_ref(&SessionLocator {
+                provider: "claude".to_string(),
+                session_id: "sess-r".to_string(),
+            })
+            .is_none());
+        assert!(reg
+            .live_terminal_for_session_ref(&SessionLocator {
+                provider: "codex".to_string(),
+                session_id: "other".to_string(),
+            })
+            .is_none());
+        // An exited terminal is not a live carrier.
+        reg.finish_pty_exit("T-ref", 0);
+        assert!(reg.live_terminal_for_session_ref(&locator).is_none());
+    }
+
+    /// Council rule 9 (D8 backstop): >=2 live PTYs stamped with ONE
+    /// sessionRef is the two-writers corruption shape — the alarm returns
+    /// true and ERROR-logs `duplicate_pty_for_session_ref`; one live carrier
+    /// returns false and stays silent.
+    #[test]
+    fn alarm_if_duplicate_session_ref_fires_only_on_two_live_carriers() {
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        let stamped = |id: &str, created_at: i64| HeadlessTerminal {
+            terminal_id: id.to_string(),
+            stream_id: format!("S-{id}"),
+            mode: "claude".to_string(),
+            resume_session_id: Some("sess-dup".to_string()),
+            create_request_id: None,
+            created_at: Some(created_at),
+        };
+        let locator = SessionLocator {
+            provider: "claude".to_string(),
+            session_id: "sess-dup".to_string(),
+        };
+
+        reg.register_headless(stamped("dupA", 1_000));
+        assert!(
+            !reg.alarm_if_duplicate_session_ref(&locator),
+            "one live carrier must not trip the alarm"
+        );
+
+        reg.register_headless(stamped("dupB", 2_000));
+        assert!(reg.alarm_if_duplicate_session_ref(&locator));
+        let captured = events.lock().unwrap();
+        let alarm = captured
+            .iter()
+            .find(|e| e.message.contains("duplicate_pty_for_session_ref"))
+            .expect(">=2 live PTYs on one sessionRef must emit the invariant alarm");
+        assert_eq!(
+            alarm.fields.get("session_id").map(String::as_str),
+            Some("sess-dup")
         );
     }
 
