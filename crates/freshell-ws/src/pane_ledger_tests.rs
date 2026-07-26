@@ -545,6 +545,11 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
             state: RowState::Bound,
             retired_reason: None,
             superseded_by: None,
+            pane_kind: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
         };
         write_row_atomic(
             &root
@@ -635,6 +640,195 @@ fn gc_expired_tombstone_rebinds_on_a_live_identity_event() {
     assert_eq!(row.state, RowState::Bound);
     assert_eq!(row.retired_reason, None);
     std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
+    let root = temp_root("fresh-agent-roundtrip");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provider: "codex",
+            session_id: "thread-1",
+            mode: "freshcodex",
+            cwd: Some("/home/u/proj"),
+            create_request_id: Some("req-1"),
+            model: Some("gpt-5.3-codex-spark"),
+            sandbox: Some("workspace-write"),
+            permission_mode: Some("on-request"),
+            effort: Some("high"),
+            supersedes: None,
+            now_ms: 1_000,
+        })
+        .unwrap();
+    let row = ledger.load_binding("codex", "thread-1").expect("row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(row.model.as_deref(), Some("gpt-5.3-codex-spark"));
+    assert_eq!(row.sandbox.as_deref(), Some("workspace-write"));
+    assert_eq!(row.permission_mode.as_deref(), Some("on-request"));
+    assert_eq!(row.effort.as_deref(), Some("high"));
+    assert_eq!(row.cwd.as_deref(), Some("/home/u/proj"));
+    assert_eq!(row.created_at, 1_000);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
+    let root = temp_root("fresh-agent-upsert");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let base = FreshAgentBindingWrite {
+        provider: "opencode",
+        session_id: "ses_abc",
+        mode: "freshopencode",
+        cwd: Some("/w"),
+        create_request_id: None,
+        model: Some("m1"),
+        sandbox: None,
+        permission_mode: None,
+        effort: Some("low"),
+        supersedes: None,
+        now_ms: 1_000,
+    };
+    ledger.record_fresh_agent_binding(&base).unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            model: Some("m2"),
+            effort: None,
+            now_ms: 2_000,
+            ..base
+        })
+        .unwrap();
+    let row = ledger.load_binding("opencode", "ses_abc").expect("row");
+    assert_eq!(row.created_at, 1_000, "upsert must preserve created_at");
+    assert_eq!(row.updated_at, 2_000);
+    assert_eq!(row.model.as_deref(), Some("m2"));
+    assert_eq!(
+        row.effort, None,
+        "settings are a full snapshot, not a merge"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn supersedes_retires_the_old_row_and_links_the_chain() {
+    // G3 supersession (V8/A14): codex crash-respawn must retire the OLD
+    // thread row and link it to the new one — never leave two Bound rows.
+    let root = temp_root("fresh-agent-supersedes");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let base = FreshAgentBindingWrite {
+        provider: "codex",
+        session_id: "old-thread",
+        mode: "freshcodex",
+        cwd: Some("/w"),
+        create_request_id: None,
+        model: Some("m"),
+        sandbox: None,
+        permission_mode: None,
+        effort: None,
+        supersedes: None,
+        now_ms: 1_000,
+    };
+    ledger.record_fresh_agent_binding(&base).unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            session_id: "new-thread",
+            supersedes: Some("old-thread"),
+            now_ms: 2_000,
+            ..base
+        })
+        .unwrap();
+    let old = ledger
+        .load_binding("codex", "old-thread")
+        .expect("old row kept");
+    assert_eq!(
+        old.state,
+        RowState::Retired,
+        "old row retired, never left Bound"
+    );
+    assert_eq!(
+        old.superseded_by.as_ref().map(|l| l.session_id.as_str()),
+        Some("new-thread"),
+        "supersededBy links old → new"
+    );
+    let res = ledger
+        .lookup_by_session("codex", "old-thread")
+        .expect("chain resolves");
+    assert!(
+        res.corrected,
+        "claiming the old id is a corrected resolution"
+    );
+    assert_eq!(
+        res.row.session_id, "new-thread",
+        "resolution lands at the terminus"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
+    // create_request_id is advisory, latest-observed (D4): a rewrite that
+    // carries None must not erase the previously observed value.
+    let root = temp_root("fresh-agent-req-id");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let base = FreshAgentBindingWrite {
+        provider: "codex",
+        session_id: "thread-1",
+        mode: "freshcodex",
+        cwd: None,
+        create_request_id: Some("req-1"),
+        model: None,
+        sandbox: None,
+        permission_mode: None,
+        effort: None,
+        supersedes: None,
+        now_ms: 1_000,
+    };
+    ledger.record_fresh_agent_binding(&base).unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            create_request_id: None,
+            now_ms: 2_000,
+            ..base
+        })
+        .unwrap();
+    let row = ledger.load_binding("codex", "thread-1").expect("row");
+    assert_eq!(row.create_request_id.as_deref(), Some("req-1"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn supersedes_of_a_missing_old_row_is_a_silent_noop() {
+    let root = temp_root("fresh-agent-supersedes-missing");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provider: "codex",
+            session_id: "new-thread",
+            mode: "freshcodex",
+            cwd: None,
+            create_request_id: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: Some("never-existed"),
+            now_ms: 1_000,
+        })
+        .expect("missing old row is a silent no-op, not an error");
+    assert!(ledger.load_binding("codex", "never-existed").is_none());
+    let row = ledger.load_binding("codex", "new-thread").expect("row");
+    assert_eq!(row.state, RowState::Bound);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn old_terminal_rows_without_settings_fields_still_deserialize() {
+    // A wave-A row serialized before this change has none of the new fields.
+    let json = r#"{"ledgerVersion":1,"provider":"claude","sessionId":"s1","mode":"claude",
+        "createdAt":1,"updatedAt":1,"lastObservedAt":1,"state":"bound"}"#;
+    let row: BindingRow = serde_json::from_str(json).expect("old row must parse");
+    assert_eq!(row.pane_kind, None);
+    assert_eq!(row.model, None);
 }
 
 #[test]

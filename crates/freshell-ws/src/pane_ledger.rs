@@ -112,6 +112,20 @@ pub struct BindingRow {
     pub retired_reason: Option<RetiredReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<SessionLocator>,
+    /// "fresh-agent" for fresh-agent rows (P1.13); absent on terminal rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_kind: Option<String>,
+    /// Resume-invocation record (campaign plan §4.2): exactly what the
+    /// provider-native resume command needs. Updated when the user changes
+    /// them. All optional under LEDGER_VERSION 1 — no version bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// Evidence that identity establishment was in flight (G1: never a binding).
@@ -134,6 +148,27 @@ pub struct BindingWrite<'a> {
     pub mode: &'a str,
     pub cwd: Option<&'a str>,
     pub create_request_id: Option<&'a str>,
+    pub now_ms: i64,
+}
+
+/// One fresh-agent identity event's worth of binding-row input (P1.13).
+/// Settings are a FULL snapshot: callers always know the current values,
+/// so writes replace rather than merge.
+#[derive(Debug, Clone, Copy)]
+pub struct FreshAgentBindingWrite<'a> {
+    pub provider: &'a str,
+    pub session_id: &'a str,
+    pub mode: &'a str,
+    pub cwd: Option<&'a str>,
+    pub create_request_id: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub sandbox: Option<&'a str>,
+    pub permission_mode: Option<&'a str>,
+    pub effort: Option<&'a str>,
+    /// G3 supersession (V8/A14): the OLD session id this binding replaces
+    /// (codex crash-respawn). When `Some`, the old `(provider, supersedes)`
+    /// row is retired and linked AFTER the new row persists.
+    pub supersedes: Option<&'a str>,
     pub now_ms: i64,
 }
 
@@ -366,6 +401,11 @@ impl PaneLedger {
             state: RowState::Bound,
             retired_reason: None,
             superseded_by: None,
+            pane_kind: None,
+            model: None,
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
         };
         self.write_binding(root, index, &row)?; // new bound row FIRST (pinned)
 
@@ -385,6 +425,78 @@ impl PaneLedger {
                 "pane_ledger_superseded: binding moved; old row retired, never defended"
             );
             self.write_binding(root, index, &old)?; // THEN retire the old
+        }
+        Ok(())
+    }
+
+    /// Record (or refresh) a `bound` row for a fresh-agent identity event
+    /// (P1.13). Upsert keyed `(provider, session_id)`: settings are a FULL
+    /// snapshot (replace, not merge); `created_at` is preserved on rewrite.
+    /// When `w.supersedes` names a different old session id, the old row is
+    /// retired and linked AFTER the new bound row persists (G3 order pinned,
+    /// V8/A14) — a missing old row is a silent no-op.
+    pub fn record_fresh_agent_binding(
+        &self,
+        w: &FreshAgentBindingWrite<'_>,
+    ) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+
+        let key = (w.provider.to_string(), w.session_id.to_string());
+        let existing = index.bindings.get(&key);
+        let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
+        // Advisory field: keep the existing row's value when the new write
+        // has none (latest-observed semantics, D4).
+        let create_request_id = w
+            .create_request_id
+            .map(str::to_string)
+            .or_else(|| existing.and_then(|r| r.create_request_id.clone()));
+        let row = BindingRow {
+            ledger_version: LEDGER_VERSION,
+            provider: w.provider.to_string(),
+            session_id: w.session_id.to_string(),
+            mode: w.mode.to_string(),
+            cwd: w.cwd.map(str::to_string),
+            live_terminal_id: None, // fresh-agent panes have no terminal
+            create_request_id,
+            created_at,
+            updated_at: w.now_ms,
+            last_observed_at: w.now_ms,
+            state: RowState::Bound,
+            retired_reason: None,
+            superseded_by: None,
+            pane_kind: Some("fresh-agent".into()),
+            model: w.model.map(str::to_string),
+            sandbox: w.sandbox.map(str::to_string),
+            permission_mode: w.permission_mode.map(str::to_string),
+            effort: w.effort.map(str::to_string),
+        };
+        self.write_binding(root, &mut index, &row)?; // new bound row FIRST (pinned)
+
+        if let Some(old_id) = w.supersedes {
+            if old_id != w.session_id {
+                let old_key = (w.provider.to_string(), old_id.to_string());
+                if let Some(mut old) = index.bindings.get(&old_key).cloned() {
+                    old.state = RowState::Retired;
+                    old.retired_reason = Some(RetiredReason::Superseded);
+                    old.superseded_by = Some(SessionLocator {
+                        provider: w.provider.to_string(),
+                        session_id: w.session_id.to_string(),
+                    });
+                    old.updated_at = w.now_ms;
+                    tracing::info!(
+                        target: "freshell_ws::pane_ledger",
+                        old_session_id = %old_id,
+                        new_session_id = %w.session_id,
+                        "pane_ledger_superseded: fresh-agent binding moved; \
+                         old row retired, never defended"
+                    );
+                    self.write_binding(root, &mut index, &old)?; // THEN retire the old
+                }
+                // Missing old row: silent no-op.
+            }
         }
         Ok(())
     }
