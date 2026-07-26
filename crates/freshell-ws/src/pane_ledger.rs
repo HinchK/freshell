@@ -515,22 +515,18 @@ impl PaneLedger {
         if let Some(old_id) = w.supersedes {
             if old_id != w.session_id {
                 let old_key = (w.provider.to_string(), old_id.to_string());
-                if let Some(mut old) = index.bindings.get(&old_key).cloned() {
-                    old.state = RowState::Retired;
-                    old.retired_reason = Some(RetiredReason::Superseded);
-                    old.superseded_by = Some(SessionLocator {
-                        provider: w.provider.to_string(),
-                        session_id: w.session_id.to_string(),
-                    });
-                    old.updated_at = w.now_ms;
-                    tracing::info!(
-                        target: "freshell_ws::pane_ledger",
-                        old_session_id = %old_id,
-                        new_session_id = %w.session_id,
-                        "pane_ledger_superseded: fresh-agent binding moved; \
-                         old row retired, never defended"
-                    );
-                    self.write_binding(root, &mut index, &old)?; // THEN retire the old
+                if let Some(old) = index.bindings.get(&old_key).cloned() {
+                    self.retire_and_link_locked(
+                        root,
+                        &mut index,
+                        old,
+                        SessionLocator {
+                            provider: w.provider.to_string(),
+                            session_id: w.session_id.to_string(),
+                        },
+                        w.now_ms,
+                        None, // fresh-agent rows own no terminal
+                    )?;
                 }
                 // Missing old row: silent no-op.
             }
