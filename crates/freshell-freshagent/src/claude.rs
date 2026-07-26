@@ -92,6 +92,10 @@ pub struct FreshClaudeState {
     /// on an explicit `freshAgent.kill` ([`Self::handle_kill`]); an unrequested sidecar
     /// exit does NOT evict (mirrors legacy, see the type doc).
     create_dedup: Arc<FreshAgentCreateDedup<ClaudeCreateRecord>>,
+    /// Single-flight guard for resume-on-attach, keyed by DURABLE id (codex's
+    /// `resuming` analog, simplified: contenders return immediately instead of
+    /// waiting -- the winner's frames broadcast to every client anyway).
+    resuming: Arc<TokioMutex<std::collections::HashSet<String>>>,
 }
 
 /// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
@@ -134,6 +138,7 @@ impl FreshClaudeState {
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             cli_index: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
+            resuming: Arc::new(TokioMutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -413,27 +418,144 @@ impl FreshClaudeState {
         ));
     }
 
-    // ── freshAgent.attach (restart-resilience P0.2, slice 1: stop the swallow) ──────────
+    // ── freshAgent.attach (restart parity: resume untracked sessions in place) ──────────
 
-    /// Handle a `freshAgent.attach` for claude/kilroy. Decision table (this slice):
+    /// Handle a `freshAgent.attach` for claude/kilroy. Decision table (restart parity):
     ///
     /// | State | Action |
     /// |---|---|
-    /// | tracked | no-op -- NO frame (wire-shape parity with codex tracked-and-alive) |
-    /// | NOT tracked | `lost_session_frame` (`INVALID_SESSION_ID`) -> the client marks the pane `.lost` and `triggerRecovery` re-creates with `resumeSessionId` |
-    ///
-    /// Unlike codex (`ensure_session_resumable`) and opencode (`resume_durable_session`)
-    /// there is deliberately NO in-place resume here yet: claude has no server-side resume
-    /// path in the Rust port, and the restart-resilience plan (§2.8) slices that as
-    /// follow-on work (record cliSessionId, real attach arm, snapshot adapter). In this
-    /// slice recovery is CLIENT-driven -- the lost frame un-wedges a pane stuck BUSY
-    /// after a server restart instead of the prior silent swallow.
+    /// | tracked under `msg.session_id` | no-op -- NO frame (wire-shape parity, unchanged). Safe against dead sidecars ONLY because the consumer-exit eviction removes dead entries (ledger A9) |
+    /// | untracked, no canonical durable id on the message | `lost_session_frame` (`INVALID_SESSION_ID`) -- unchanged fallback (also covers the verified A2 edge: a pane that never learned its UUID pre-kill attaches bare; lost -> client re-create is the designed, non-destructive outcome) |
+    /// | untracked, durable id already in `cli_index` | no-op (a concurrent attach already resumed it; its frames broadcast to all). Index rows for dead sessions are evicted by the consumer-exit path |
+    /// | untracked, transcript EXISTS (in ANY candidate root) | spawn sidecar and resume with the session's ORIGINAL cwd from `transcript_cwd` (ledger A15: the CLI's resume lookup is cwd-slug-scoped); if that cwd no longer exists, resume by the transcript's `.jsonl` PATH (verified cli.js escape hatch that bypasses slug scoping) with the attach cwd. Register under the CLIENT's `msg.session_id`, emit idle `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID -- NEVER a nanoid (the frozen client persists it unvalidated, ledger A14/N3) |
+    /// | untracked, transcript ABSENT in EVERY candidate root | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
+    /// | untracked, spawn/pipe/created failure (incl. no store root resolvable) | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- NEVER the lost frame |
     pub async fn handle_attach(&self, msg: FreshAgentAttach) {
-        let tracked = self.sessions.lock().await.contains_key(&msg.session_id);
-        if tracked {
-            return;
+        if self.sessions.lock().await.contains_key(&msg.session_id) {
+            return; // tracked-and-alive: no frame (wire-shape parity with codex)
         }
-        self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
+        let Some(durable) = attach_durable_id(&msg) else {
+            // No durable identity to resume from: the pre-parity fallback (PR #529).
+            self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
+            return;
+        };
+        if self.cli_index.lock().await.contains_key(&durable) {
+            return; // already resumed under another placeholder; frames broadcast anyway
+        }
+        {
+            let mut resuming = self.resuming.lock().await;
+            if !resuming.insert(durable.clone()) {
+                return; // a concurrent attach is resuming this exact durable id
+            }
+        }
+        let outcome = self.resume_for_attach(&msg, &durable).await;
+        self.resuming.lock().await.remove(&durable);
+        match outcome {
+            Ok(()) => {}
+            Err(ResumeClaudeError::NotFound) => {
+                self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
+            }
+            Err(ResumeClaudeError::Transient(err)) => {
+                self.send_error(&None, "CLAUDE_ATTACH_RESUME_FAILED", &err);
+            }
+        }
+    }
+
+    /// The not-tracked resume (codex `ensure_session_resumable` analog, file-store
+    /// flavored): transcript-present gate -> spawn sidecar with `resumeSessionId` ->
+    /// register under the CLIENT's id -> idle snapshot.
+    async fn resume_for_attach(
+        &self,
+        msg: &FreshAgentAttach,
+        durable: &str,
+    ) -> Result<(), ResumeClaudeError> {
+        if crate::claude_snapshot::claude_home_candidates().is_empty() {
+            // No store root resolvable at all: we cannot CHECK, so we must not DENY.
+            return Err(ResumeClaudeError::Transient(
+                "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/HOME unset)"
+                    .to_string(),
+            ));
+        }
+        // Positive denial only when the transcript is absent in EVERY candidate
+        // root (CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude -- ledger A3).
+        let Some(transcript) = crate::claude_snapshot::locate_transcript(durable) else {
+            return Err(ResumeClaudeError::NotFound);
+        };
+        // The CLI's resume lookup is scoped to the ORIGINAL cwd's project slug
+        // (ledger A15) -- resume with the cwd recorded in the transcript itself.
+        // If that directory is gone, fall back to path-based resume
+        // (`--resume <path>.jsonl` bypasses slug scoping -- verified cli.js 2.1.220),
+        // keeping the attach cwd for the process itself.
+        let original_cwd = crate::claude_snapshot::transcript_cwd(&transcript)
+            .filter(|c| std::path::Path::new(c).is_dir());
+        let (resume_value, resume_cwd) = match original_cwd {
+            Some(cwd) => (json!(durable), json!(cwd)),
+            None => (json!(transcript.to_string_lossy()), json!(msg.cwd)),
+        };
+
+        let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar()
+            .await
+            .map_err(ResumeClaudeError::Transient)?;
+        let request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
+        let create_req = json!({
+            "type": "create",
+            "requestId": request_id,
+            "cwd": resume_cwd,
+            "model": Value::Null,
+            "permissionMode": Value::Null,
+            "effort": Value::Null,
+            "resumeSessionId": resume_value,
+        });
+        if let Err(err) = write_line(&mut stdin, &create_req).await {
+            let _ = child.start_kill();
+            reap_owned_claude_sidecars(&ownership_id);
+            return Err(ResumeClaudeError::Transient(err));
+        }
+        let mut reader = BufReader::new(stdout).lines();
+        let sidecar_session_id = match read_created(&mut reader, SIDECAR_CREATE_BUDGET).await {
+            Ok(id) => id,
+            Err(err) => {
+                let _ = child.start_kill();
+                reap_owned_claude_sidecars(&ownership_id);
+                return Err(ResumeClaudeError::Transient(err));
+            }
+        };
+
+        let session_type = session_type_str(msg.session_type).to_string();
+        // Register under the CLIENT's id: the consumer stamps the map key on every
+        // envelope and the frozen client routes by envelope sessionId
+        // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane.
+        // 4-arg spawn_consumer: the sidecar's created id is the eviction identity
+        // guard for this consumer.
+        let consumer = self.spawn_consumer(
+            reader,
+            msg.session_id.clone(),
+            session_type.clone(),
+            sidecar_session_id.clone(),
+        );
+        self.sessions.lock().await.insert(
+            msg.session_id.clone(),
+            ClaudeSession {
+                stdin,
+                child,
+                ownership_id,
+                consumer,
+                sidecar_session_id,
+                cli_session_id: Some(durable.to_string()),
+            },
+        );
+        self.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), msg.session_id.clone());
+
+        self.broadcast(&status_snapshot_frame(
+            &msg.session_id,
+            durable,
+            "idle",
+            &session_type,
+        ));
+        Ok(())
     }
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
@@ -585,6 +707,61 @@ fn session_type_str(session_type: SessionType) -> &'static str {
 /// `codex.rs`/`opencode_ws.rs` (both document the duplication) -- but unlike those two this
 /// one cannot hardcode the session type: provider `claude` covers BOTH `freshclaude` and
 /// `kilroy`, so the envelope's sessionType comes from the attach message.
+/// The durable claude id an attach carries: `resumeSessionId` first, then
+/// `sessionRef.sessionId` -- both written by the FROZEN client
+/// (`FreshAgentView.tsx:303-313`). Only canonical UUIDs qualify
+/// (`shared/session-contract.ts:34`) -- a nanoid here would just miss the store.
+fn attach_durable_id(msg: &FreshAgentAttach) -> Option<String> {
+    let candidate = msg
+        .resume_session_id
+        .clone()
+        .or_else(|| msg.session_ref.as_ref().map(|r| r.session_id.clone()))?;
+    is_canonical_claude_uuid(&candidate).then_some(candidate)
+}
+
+fn is_canonical_claude_uuid(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// The codex-shape idle status snapshot (`freshAgent.session.snapshot`) claude emits
+/// after a resume-on-attach: provider-agnostic client-side (`fresh-agent-ws.ts:196-206`),
+/// it un-wedges a BUSY pane and hands the durable UUID over via `timelineSessionId`.
+fn status_snapshot_frame(
+    session_id: &str,
+    timeline_session_id: &str,
+    status: &str,
+    session_type: &str,
+) -> ServerMessage {
+    ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: json!({
+            "type": "freshAgent.session.snapshot",
+            "sessionId": session_id,
+            "latestTurnId": Value::Null,
+            "status": status,
+            "timelineSessionId": timeline_session_id,
+        }),
+        provider: PROVIDER.to_string(),
+        session_id: session_id.to_string(),
+        session_type: session_type.to_string(),
+    })
+}
+
+/// Why a resume-on-attach could not produce a live session (codex's
+/// `ResumeSessionError` analog).
+#[derive(Debug)]
+enum ResumeClaudeError {
+    /// The transcript store positively has no file for this durable id.
+    NotFound,
+    /// Spawn/pipe/`created` failure -- the session may be perfectly resumable;
+    /// NEVER declared lost (opencode_ws.rs discipline).
+    Transient(String),
+}
+
 fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMessage {
     ServerMessage::FreshAgentEvent(FreshAgentEvent {
         event: json!({
@@ -918,6 +1095,209 @@ pub(crate) mod tests {
         );
     }
 
+    // ── freshAgent.attach: resume-on-attach (restart parity, Task 6) ──────────────
+
+    fn attach_msg_with_resume(session_id: &str, durable: &str) -> FreshAgentAttach {
+        let mut msg = attach_msg(session_id);
+        msg.resume_session_id = Some(durable.to_string());
+        msg
+    }
+
+    fn write_fake_transcript(home: &std::path::Path, durable: &str) {
+        let dir = home.join("projects").join("-t");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{durable}.jsonl")),
+            // `cwd` present + existing (ledger A15): the resume request must carry
+            // the transcript's ORIGINAL cwd, and resume by UUID (primary path).
+            r#"{"type":"user","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        )
+        .unwrap();
+    }
+
+    /// Bounded drain of the broadcast receiver until a `freshAgent.event` envelope with
+    /// the given INNER type arrives (mirrors [`await_claude_created`]'s 15s shape).
+    async fn await_frame_of_inner_type(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        inner_type: &str,
+    ) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.event" && frame["event"]["type"] == inner_type {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("freshAgent.event with inner type {inner_type} within budget"))
+    }
+
+    /// Bounded drain until a TOP-LEVEL `error` ServerMessage arrives; returns its message.
+    async fn await_top_level_error(rx: &mut tokio::sync::broadcast::Receiver<String>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "error" {
+                    return frame["message"].as_str().unwrap_or_default().to_string();
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("top-level error frame within budget"))
+    }
+
+    #[tokio::test]
+    async fn attach_untracked_with_transcript_resumes_and_emits_idle_snapshot() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        let durable = "77777777-7777-4777-8777-777777777777";
+        write_fake_transcript(home.path(), durable);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (st, mut rx) = state_with_bus();
+        st.handle_attach(attach_msg_with_resume("client-nanoid-1", durable))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        // Registered under the CLIENT's id (envelope tagging + send routing depend on it).
+        assert!(st.sessions.lock().await.contains_key("client-nanoid-1"));
+        assert_eq!(
+            st.cli_index.lock().await.get(durable),
+            Some(&"client-nanoid-1".to_string())
+        );
+        // The fake received resumeSessionId (spawn log now records the create request).
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        assert!(
+            log.contains(durable),
+            "sidecar create must carry resumeSessionId"
+        );
+        // Idle snapshot frame, tagged with the client's id + the durable timeline id.
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(frame["sessionId"], "client-nanoid-1");
+        assert_eq!(frame["event"]["status"], "idle");
+        assert_eq!(frame["event"]["timelineSessionId"], durable);
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn attach_untracked_with_missing_transcript_emits_lost_frame() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("projects")).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let (st, mut rx) = state_with_bus();
+        st.handle_attach(attach_msg_with_resume(
+            "client-nanoid-2",
+            "88888888-8888-4888-8888-888888888888",
+        ))
+        .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    #[tokio::test]
+    async fn attach_transient_spawn_failure_is_not_a_lost_frame() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let durable = "99999999-9999-4999-8999-999999999999";
+        write_fake_transcript(home.path(), durable);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "/nonexistent-node-binary");
+        let (st, mut rx) = state_with_bus();
+        st.handle_attach(attach_msg_with_resume("client-nanoid-3", durable))
+            .await;
+        std::env::remove_var("FRESHELL_CLAUDE_NODE");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        // Mirrors codex: transient => top-level error with the provider code,
+        // explicitly NOT INVALID_SESSION_ID.
+        let err = await_top_level_error(&mut rx).await;
+        assert!(err.contains("CLAUDE_ATTACH_RESUME_FAILED"));
+        assert!(st.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_untracked_without_any_durable_id_still_emits_lost_frame() {
+        // The pre-parity fallback (PR #529) is preserved verbatim.
+        let (st, mut rx) = state_with_bus();
+        st.handle_attach(attach_msg("no-resume-anywhere")).await;
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    #[tokio::test]
+    async fn concurrent_attaches_for_the_same_durable_id_spawn_at_most_one_sidecar() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        let durable = "12121212-1212-4121-8121-121212121212";
+        write_fake_transcript(home.path(), durable);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let (st, _rx) = state_with_bus();
+        let a = st.clone();
+        let b = st.clone();
+        let m1 = attach_msg_with_resume("nano-a", durable);
+        let m2 = attach_msg_with_resume("nano-b", durable);
+        tokio::join!(a.handle_attach(m1), b.handle_attach(m2));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(env.spawn_count(), 1, "single-flight per durable id");
+        drop(env);
+    }
+
+    /// Decision-table row 3: a durable id ALREADY in `cli_index` means an earlier
+    /// attach resumed it under another placeholder -- this attach must neither
+    /// spawn nor broadcast anything (the winner's frames reach every client).
+    #[tokio::test]
+    async fn attach_with_durable_id_already_indexed_is_a_no_op() {
+        let (st, mut rx) = state_with_bus();
+        let durable = "56565656-5656-4656-8656-565656565656";
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), "earlier-winner".to_string());
+        st.handle_attach(attach_msg_with_resume("late-attacher", durable))
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "indexed-durable attach must broadcast nothing"
+        );
+        assert!(st.sessions.lock().await.is_empty());
+    }
+
+    /// Ledger A15's failure case: the transcript's recorded cwd no longer exists on
+    /// disk, so the resume request must carry the transcript's `.jsonl` PATH (the
+    /// verified cli.js escape hatch bypassing slug scoping) instead of the bare UUID.
+    #[tokio::test]
+    async fn attach_resume_falls_back_to_transcript_path_when_original_cwd_is_gone() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        let durable = "34343434-3434-4343-8343-343434343434";
+        let dir = home.path().join("projects").join("-t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join(format!("{durable}.jsonl"));
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","cwd":"/nonexistent-original-cwd-freshell-task6","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        )
+        .unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let (st, mut rx) = state_with_bus();
+        st.handle_attach(attach_msg_with_resume("client-nanoid-4", durable))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        assert!(
+            log.contains(transcript.to_string_lossy().as_ref()),
+            "cwd-gone resume must carry the transcript PATH, got: {log}"
+        );
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(frame["event"]["timelineSessionId"], durable);
+        drop(env);
+    }
+
     #[test]
     fn normalize_maps_the_known_sdk_set_and_ignores_others() {
         assert_eq!(
@@ -1163,6 +1543,12 @@ rl.on('line', (line) => {
                 spawn_log,
                 interrupt_log,
             }
+        }
+
+        /// Path of the spawn log (one full JSON create-request line per spawn) so tests
+        /// can assert what the sidecar received (e.g. `resumeSessionId`).
+        fn spawn_log_path(&self) -> &std::path::Path {
+            &self.spawn_log
         }
 
         /// Number of times the fake sidecar has been spawned so far (one marker line per
