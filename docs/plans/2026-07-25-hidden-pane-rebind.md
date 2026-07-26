@@ -52,8 +52,8 @@ If the baseline is RED: STOP and report — do not build on a red base.
 
 - [ ] **Step 3: Confirm branch state**
 
-Run: `git -C /home/dan/code/freshell/.worktrees/hidden-pane-rebind status --short && git log --oneline -1`
-Expected: clean tree (except this plan file once committed), HEAD at `c491aee0` on `fix/hidden-pane-rebind`.
+Run: `git -C /home/dan/code/freshell/.worktrees/hidden-pane-rebind status --short && git -C /home/dan/code/freshell/.worktrees/hidden-pane-rebind log --oneline -1 && git -C /home/dan/code/freshell/.worktrees/hidden-pane-rebind merge-base HEAD origin/main`
+Expected: clean tree, HEAD is the latest `docs(plan)` commit on `fix/hidden-pane-rebind` (the branch carries plan-only commits atop the baseline), and `merge-base HEAD origin/main` prints `c491aee0` — the green baseline commit this branch builds on. If the merge-base is anything else, STOP and report: the branch has drifted from the recorded baseline.
 
 No commit for this task.
 
@@ -1045,9 +1045,9 @@ Expected: PASS (both component tests + all three queue tests).
 
 - [ ] **Step 5: PR #532 + lifecycle regression sweep**
 
-Run: `npm run test:vitest -- run test/unit/components/TerminalView.launchRetry.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx`
-(If the launchRetry path 404s, locate it: `git ls-files | grep launchRetry` — the file was added by PR #532 and may live under `test/unit/client/components/`.)
-Expected: PASS with zero modifications to those files. If launchRetry fails, the change broke #532 semantics — revert and re-approach; do NOT edit the launchRetry tests.
+Run: `npm run test:vitest -- run test/unit/client/components/TerminalView.launchRetry.test.tsx test/unit/client/components/TerminalView.visibility.test.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx`
+Before trusting the result, confirm the launchRetry suite actually executed: its file name must appear in the vitest output with a non-zero test count (vitest silently skips positional path filters that match nothing, so a wrong path would make this gate pass vacuously). If it did not run, locate it with `git ls-files | grep launchRetry` and re-run with the correct path.
+Expected: PASS with zero modifications to those files, launchRetry suite confirmed executed. If launchRetry fails, the change broke #532 semantics — revert and re-approach; do NOT edit the launchRetry tests.
 
 - [ ] **Step 6: Full TerminalView suite**
 
@@ -1355,3 +1355,11 @@ An independent cross-model review found the Task 6 e2e assertions non-discrimina
 - **Task 6 test 2 rewritten to discriminate:** the previous usable-status poll was satisfiable by stale pre-restart Redux state (freshAgent status mutates only via server frames; nothing degrades it on disconnect). The poll now also requires `content.createRequestId` changed — minted only by the `.lost` recovery (fresh nanoid at FreshAgentView.tsx:1021), which pre-fix is gated on `!hidden` and which itself requires the server's `INVALID_SESSION_ID` round trip. sessionId equality is deliberately NOT asserted: the fake sidecar resumes with the SAME sessionId (`fixtures/fake-claude-sidecar.mjs:39`), so it discriminates nothing.
 - **Broken call signatures fixed:** `createFreshclaudePane(page, harness, cwd)` requires the third `cwd` argument (wall spec :436; its `directoryInput.fill(cwd)` throws on undefined) — test 2 now passes `os.tmpdir()`; the hydration-queue pin tests now call `onActiveTabReady('tab-1', ['tab-1'])` matching the real two-argument API (`neighborFirstOrder` indexes into `tabOrder`), so the Step 2 STOP gate can no longer trip spuriously.
 - Re-ran self-review items over the edited Tasks 5/6: spec coverage intact (the e2e now proves the hidden attach and hidden recovery specifically, not just re-create); no silent deferrals; no placeholders (all changed test code shown in full); type consistency (`streamId`/`createRequestId` are real pane-content fields written by the cited handlers; evidence-validity note and Step 2 expectations updated to match the new discriminators).
+
+## Self-Review addendum (after fresh-eyes review, iteration 2)
+
+A second independent cross-model review found two executable defects in verification steps, both fixed:
+
+- **Task 1 Step 3 expectation was unsatisfiable:** it demanded HEAD at `c491aee0`, but the branch necessarily carries plan-only commits atop that baseline, so `git log --oneline -1` could never match and a literal implementer would stop at a failed verification. The step now expects HEAD to be the latest `docs(plan)` commit and verifies the baseline via `git merge-base HEAD origin/main` = `c491aee0`, with an explicit STOP if the merge-base drifted. The compound command also now applies `git -C <worktree>` to every chained git invocation (it previously covered only `status`, silently depending on CWD).
+- **Task 5 Step 5 #532 gate passed vacuously:** the launchRetry path was `test/unit/components/...` instead of `test/unit/client/components/...`; vitest silently drops positional path filters that match nothing, so the run went green without ever executing the launchRetry suite and the "if it 404s" contingency never triggered. The path is corrected, and the step now requires positive confirmation that the launchRetry file appears in vitest output with a non-zero test count before trusting the result.
+- Re-ran self-review items over the edited Tasks 1/5 steps: expectations are now achievable as written at execution time; no command/assertion mismatches remain in those steps; no other steps reference the old path or the HEAD-at-baseline expectation (verified by search); no placeholders introduced.
