@@ -1000,3 +1000,15 @@ PR POLICY: NOT approved — do NOT run `gh pr create`. Final output: branch name
 - cargo test -p freshell-freshagent: PASS.
 - sidebarSelectors + SidebarItem.running-state vitest: PASS (39 tests).
 - Disk headroom: 17G available.
+
+### Case (c) join/ghost, server unit level (Task 2)
+- VERIFIED FAILING then FIXED: /api/terminals sidebar projection hard-coded
+  session_ref = None for codex; an adopted terminal's row now carries its
+  registry session identity (rung 1), so the client Phase-E terminal:<id>
+  ghost never materializes. RED proof: assertion-level (or compile-level if
+  the seam was threaded), then green.
+- Validated non-change: the rung-2 PaneLedger fallback in session_directory
+  joins was evaluated and REJECTED (no production window; dormant-machinery
+  risk). Existing rung-1 consultation already collapses post-adoption
+  duplicates. Residual pinning test rewritten: pre-adoption duplicate is
+  transient, not permanent.
