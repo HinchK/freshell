@@ -33,6 +33,7 @@ pub mod opencode_association;
 pub mod origin;
 pub mod pane_ledger;
 pub mod reconcile;
+pub mod reconcile_freshagent;
 pub mod screenshot;
 pub mod spawn_gate;
 pub mod tabs;
