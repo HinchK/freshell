@@ -111,6 +111,10 @@ const RUST_ONLY_SPECS = [
   /launch-retry-restart-rust\.spec\.ts$/,
   /double-restart-terminal-restore-rust\.spec\.ts$/,
   /turn-complete-restart-resume-rust\.spec\.ts$/,
+  // Lane A1 (P1.6): createRequestId stabilization — asserts the Rust REST
+  // ingress mints the key (Uuid::simple format), so it must run against the
+  // rust server only.
+  /createrequestid-stabilization-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -250,6 +254,10 @@ export default defineConfig({
         /launch-retry-restart-rust\.spec\.ts$/,
         /double-restart-terminal-restore-rust\.spec\.ts$/,
         /turn-complete-restart-resume-rust\.spec\.ts$/,
+        // Lane A1 (P1.6): createRequestId stabilization — asserts the Rust REST
+        // ingress mints the key (Uuid::simple format), so it must run against the
+        // rust server only.
+        /createrequestid-stabilization-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
