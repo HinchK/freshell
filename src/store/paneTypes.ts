@@ -273,6 +273,29 @@ export type RestoreFallbackAttempt = {
 }
 
 /**
+ * One pane awaiting user adjudication after the server reported its
+ * session dead in a pane.reconcile verdict. Council rule 12: dead_session
+ * is a UI state, not a deletion — the pane stays until the user decides.
+ */
+export type DeadSessionEntry = {
+  tabId: string
+  paneId: string
+  title: string
+  mode: string
+  sessionRef?: { provider: string; sessionId: string }
+  reason?: string
+}
+
+/**
+ * Slice-level banner state while reconcile-driven creates are warming.
+ * Ephemeral — must never be persisted.
+ */
+export type ReconcileWarmingState = {
+  count: number
+  paneRefs: { tabId: string; paneId: string }[]
+}
+
+/**
  * Recursive tree structure for pane layouts.
  * A leaf is a single pane with content.
  * A split divides space between two children.
@@ -318,6 +341,16 @@ export interface PanesState {
    * Must never be persisted.
    */
   restoreFallbackAttemptsByPane: Record<string, Record<string, RestoreFallbackAttempt>>
+  /**
+   * Batched dead-session adjudication list from pane.reconcile verdicts.
+   * Ephemeral UI state — must never be persisted.
+   */
+  deadSessionAdjudication?: DeadSessionEntry[]
+  /**
+   * Reconcile warming banner state while reconcile-driven creates run.
+   * Ephemeral UI state — must never be persisted.
+   */
+  reconcileWarming?: ReconcileWarmingState | null
 }
 
 /**
