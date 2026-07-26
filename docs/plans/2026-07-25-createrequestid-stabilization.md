@@ -659,7 +659,7 @@ Adapt mechanics (broadcast receiver type, `try_recv` vs the module's drain helpe
 In `crates/freshell-freshagent/src/pane_ops.rs`'s `mod tests`, extend the EXISTING test `split_terminal_pane_spawns_real_pty_and_broadcasts_pane_split` (`:1103`) with one additional assertion where it inspects the `pane.split` `ui.command` payload:
 
 ```rust
-        let crid = payload["newContent"]["createRequestId"]
+        let crid = msg["payload"]["newContent"]["createRequestId"]
             .as_str()
             .expect("split newContent.createRequestId missing");
         assert_eq!(crid.len(), 32);
@@ -964,7 +964,7 @@ cargo test -p freshell-ws --lib validation_tests
 ```
 Expected: 3 passed (behavior locks — green immediately; a failure is a finding, not a fixture bug — HALT and report). Then confirm the neighbors still pass:
 ```bash
-cargo test -p freshell-ws semantically_corrupt corrupt_generation_file
+cargo test -p freshell-ws --lib -- semantically_corrupt corrupt_generation_file
 ```
 Expected: `semantically_corrupt_generation_files_fail_loud` and `corrupt_generation_file_reads_as_error_not_absence` still PASS (the fail-loud model for GENUINE corruption is unchanged; we added tolerance locks, not tolerance code).
 
