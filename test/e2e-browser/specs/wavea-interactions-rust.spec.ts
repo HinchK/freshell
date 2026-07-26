@@ -409,11 +409,21 @@ test.describe('wave-A cross-lane interactions', () => {
           }, { timeout: 30_000 })
           .not.toBeNull()
 
-        // NO CROSS-TALK: the fresh-agent identity never leaks into the pane
-        // ledger (its store is the sidecar bridge index), and no ledger row
-        // was rebound to it.
+        // NO CROSS-TALK (wave-B update): B4 (freshagent-verdicts-resume) now
+        // DELIBERATELY writes kind:fresh-agent ledger rows (paneKind:
+        // 'fresh-agent', pane_ledger.rs), so the fresh-agent identity IS
+        // allowed in the ledger -- but ONLY as a fresh-agent row. The wave-A
+        // invariant this pin protects survives narrowed: the fresh-agent UUID
+        // must never appear as a TERMINAL row, and no terminal row was
+        // rebound to it.
         for (const row of rowsAfter) {
-          expect(row.sessionId, 'fresh-agent UUID must never appear in the pane ledger').not.toBe(FRESH_DURABLE)
+          if (row.sessionId === FRESH_DURABLE) {
+            expect(
+              row.paneKind,
+              'fresh-agent UUID may only appear as a kind:fresh-agent ledger row (B4), never a terminal row',
+            ).toBe('fresh-agent')
+            expect(row.liveTerminalId, 'fresh-agent ledger rows own no terminal').toBeFalsy()
+          }
         }
         // ...and nothing got quarantined by the boot scan.
         const allFiles = await listFiles(ledgerDir)
