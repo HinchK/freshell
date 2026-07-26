@@ -1523,7 +1523,19 @@ async fn send_keys(
         // broadcast -- durable-before-answer), resolving the pane's placeholder id.
         // Without this site, REST-created sessions (the e2e seeding surface) never get
         // a resume record (V10 A13-N1). Opencode has no sandbox/permission concepts.
-        if let Some(sink) = state.identity_sink() {
+        // No-laundering guard (V7/A10, parity with `record_codex_binding` and
+        // claude's consumer arm): never persist an all-blank settings snapshot --
+        // it would make `was_recorded` true while `load_settings` returns None,
+        // arming a FALSE SETTINGS_RESET for a legitimately-default create.
+        let has_recordable_settings =
+            pane.model.is_some() || pane.effort.is_some() || pane.cwd.is_some();
+        if !has_recordable_settings {
+            tracing::debug!(
+                session = %durable_id,
+                "freshagent.opencode.rest_binding_skipped: all-blank settings snapshot"
+            );
+        }
+        if let (Some(sink), true) = (state.identity_sink(), has_recordable_settings) {
             if let Err(e) = sink
                 .record_binding(identity_sink::FreshAgentBindingUpsert {
                     provider: PROVIDER.into(),
@@ -2510,6 +2522,59 @@ mod tests {
         assert_eq!(b.settings.model.as_deref(), Some("big-model"));
         assert_eq!(b.settings.effort.as_deref(), Some("high"));
         assert_eq!(b.settings.cwd.as_deref(), Some("/w"));
+    }
+
+    /// WAVE-B fast-follow (B4 lane review): the REST send-keys materialization
+    /// site gets the SAME no-laundering guard as `record_codex_binding` /
+    /// claude's consumer arm (V7/A10): never persist an all-blank settings
+    /// snapshot -- it would make `was_recorded` true while `load_settings`
+    /// returns None, arming a FALSE SETTINGS_RESET for a
+    /// legitimately-default create on a later resume.
+    #[tokio::test]
+    async fn rest_send_keys_materialization_skips_all_blank_settings() {
+        let st = state();
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(CreateCapableHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+
+        let fake = Arc::new(identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // A REST-created pane with NO model/effort/cwd -- the all-blank shape.
+        st.panes.lock().expect("panes mutex").insert(
+            "pane-blank".to_string(),
+            PaneEntry {
+                placeholder_id: "freshopencode-b1".to_string(),
+                cwd: None,
+                model: None,
+                effort: None,
+                durable_id: None,
+            },
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let _resp = send_keys(
+            State(st.clone()),
+            Path("pane-blank".to_string()),
+            headers,
+            Json(json!({ "text": "hello", "timeout": 0 })),
+        )
+        .await;
+
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "an all-blank settings snapshot must never be persisted (V7/A10 no-laundering guard)"
+        );
     }
 
     // -- Batch D PR-6: rich transcript items for the opencode snapshot endpoint --
