@@ -509,9 +509,12 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - [ ] **Step 1: Observe the RED created by Task 2's regen**
 
 Run: `cargo test -p freshell-protocol --locked 2>&1 | tail -30`
-Expected: FAILURES in `tests/inventory.rs` — `client_types_match_inventory_exactly`
-(count 28 vs 29 and/or missing `amplifier.activity.list`),
-`server_types_match_inventory_exactly` (53 vs 56), `combined_surface_is_81` (81 vs 85).
+Expected: exactly 2 FAILURES, both in `tests/inventory.rs` —
+`client_types_match_inventory_exactly` (count 28 vs 29 and/or missing
+`amplifier.activity.list`) and `server_types_match_inventory_exactly` (53 vs 56).
+`combined_surface_is_81` still PASSES here: it never reads the JSON inventory — it
+asserts `all_message_types().len() == 81` purely from the crate constants, which are
+still 28+53=81 until this task's own edits change (and rename) it in Step 4.
 All other test files (`activity_extension`, `version`, `pane_reconcile`, `roundtrip`)
 still pass — `version.rs` only compares the `wsProtocolVersion` scalar (still 7).
 If `roundtrip.rs` or `version.rs` fail, STOP and report — that would be field-level or
