@@ -127,6 +127,9 @@ const RUST_ONLY_SPECS = [
   // ledger-join coherence, A2xA3 dual claude identity stores). Imports
   // RustServer directly for restartAbrupt().
   /wavea-interactions-rust\.spec\.ts$/,
+  // P1.13 (Lane B4 Task 14): per-provider settings survive restart + codex
+  // crash memory-loss banner. Imports RustServer directly for restartAbrupt().
+  /freshagent-settings-resume-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -284,6 +287,10 @@ export default defineConfig({
         // ledger-join coherence, A2xA3 dual claude identity stores). Imports
         // RustServer directly for restartAbrupt().
         /wavea-interactions-rust\.spec\.ts$/,
+        // P1.13 (Lane B4 Task 14): per-provider settings survive restart +
+        // codex crash memory-loss banner. Imports RustServer directly for
+        // restartAbrupt().
+        /freshagent-settings-resume-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

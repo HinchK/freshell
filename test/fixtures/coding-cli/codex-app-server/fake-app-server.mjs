@@ -476,6 +476,22 @@ wss.on('connection', (socket) => {
       return
     }
 
+    // behavior.crashOnPromptMarker + behavior.crashOnPromptMarkerOnceMarkerPath:
+    // if the inbound turn input contains the marker AND this process wins the
+    // cross-process once-claim (claimCrossProcessOnce's 'wx' marker file),
+    // hard-exit(1) BEFORE responding to simulate a mid-turn sidecar crash.
+    // The respawned process finds the marker file on disk and proceeds
+    // normally. Cross-process (unlike exitProcessAfterMethodsOnce's
+    // per-process "once" set, which would make the respawn exit again).
+    if (
+      method === 'turn/start' &&
+      behavior.crashOnPromptMarker &&
+      JSON.stringify(message.params?.input ?? '').includes(behavior.crashOnPromptMarker) &&
+      claimCrossProcessOnce(behavior.crashOnPromptMarkerOnceMarkerPath, 'crashOnPromptMarker')
+    ) {
+      process.exit(1)
+    }
+
     const override = behavior.overrides?.[method]
     const delayMs = Number(behavior.delayMethodsMs?.[method] || 0)
     const floodStdoutBytes = Number(behavior.floodStdoutBeforeMethodsBytes?.[method] || 0)
