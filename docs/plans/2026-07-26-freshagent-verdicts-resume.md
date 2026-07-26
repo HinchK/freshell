@@ -1196,10 +1196,13 @@ async fn send_with_changed_settings_refreshes_the_binding() {
 
 (Driver plumbing comes from the existing tests in this file — e.g. the materialization/send tests around the harnesses at `:1080-1111` and `:1795-1819`; the assertions stand as written.)
 
+Also write the failing REST-path test NOW (it is part of this task's RED phase, not an afterthought): in `crates/freshell-freshagent/src/lib.rs`'s existing test module, add `#[tokio::test] async fn rest_send_keys_materialization_records_binding()` — modeled on the existing REST send-keys materialization (AGENT-08 continuity) test (locate the donor at implementation time) — install a `FakeIdentitySink` on `FreshAgentState`, drive the REST send-keys cold-start materialization for a REST-created pane carrying model/effort, and assert the sink received a binding whose `session_id` is the durable id, `resolves_pending` is the pane's placeholder id, and whose settings carry the REST create's model/effort.
+
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p freshell-freshagent opencode_ws -- materialization_resolves_pending send_with_changed_settings`
-Expected: FAIL — no pendings, no bindings recorded.
+Then: `cargo test -p freshell-freshagent rest_send_keys_materialization_records_binding`
+Expected: FAIL for all three — no pendings, no bindings recorded (WS or REST).
 
 - [ ] **Step 3: Implement**
 
@@ -1244,19 +1247,20 @@ if let Some(sink) = self.identity_sink() {
 ```
 (Adapt local variable names at the site; opencode has no sandbox/permission concepts — always `None`.)
 3. `handle_send` commit (`:397-398`): after `session.model = model.clone(); session.effort = effort.clone();`, if the session id is durable (`starts_with("ses_")`), record a refresh binding (same awaited construction as above with `resolves_pending: None`, `create_request_id: None`, `supersedes: None`).
-4. REST materialization (`crates/freshell-freshagent/src/lib.rs`, the send-keys handler's cold-start block that persists `entry.durable_id` and broadcasts `FreshAgentSessionMaterialized`, near `lib.rs:1477-1516`): record the same binding through `FreshAgentState`'s sink (field added in Task 2, injected in Task 3) — `session_id: durable_id`, `mode: "freshopencode"`, `create_request_id: None`, `resolves_pending: Some(pane.placeholder_id.clone())`, settings from the pane record (`pane.model` / `pane.effort` / `pane.cwd`), awaited BEFORE the materialized broadcast (the handler is async). On `Err`, warn + broadcast the same `LEDGER_WRITE_FAILED` error-frame shape via `state.broadcast`. Without this site, REST-created sessions (Task 14 e2e test 2's seeding surface) never get a resume record (V10 A13-N1). Add an inline test in `lib.rs`'s existing test module, modeled on the existing send-keys materialization (AGENT-08 continuity) test — locate the donor at implementation time — asserting the `FakeIdentitySink` received a binding carrying the REST create's model/effort.
+4. REST materialization (`crates/freshell-freshagent/src/lib.rs`, the send-keys handler's cold-start block that persists `entry.durable_id` and broadcasts `FreshAgentSessionMaterialized`, near `lib.rs:1477-1516`): record the same binding through `FreshAgentState`'s sink (field added in Task 2, injected in Task 3) — `session_id: durable_id`, `mode: "freshopencode"`, `create_request_id: None`, `resolves_pending: Some(pane.placeholder_id.clone())`, settings from the pane record (`pane.model` / `pane.effort` / `pane.cwd`), awaited BEFORE the materialized broadcast (the handler is async). On `Err`, warn + broadcast the same `LEDGER_WRITE_FAILED` error-frame shape via `state.broadcast`. Without this site, REST-created sessions (Task 14 e2e test 2's seeding surface) never get a resume record (V10 A13-N1). This is the site Step 1's `rest_send_keys_materialization_records_binding` test (already written, currently RED) exercises — implementing this item turns it GREEN.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-freshagent opencode_ws`
-Expected: PASS.
+Then: `cargo test -p freshell-freshagent rest_send_keys_materialization_records_binding`
+Expected: PASS (both — the second run proves the REST site in `lib.rs`, not just the WS sites).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/freshell-freshagent/src/opencode_ws.rs
-git commit -m "feat(opencode): pending marker at create, binding row at ses_* materialization, refresh on settings change (P1.13)"
+git add crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-freshagent/src/lib.rs
+git commit -m "feat(opencode): pending marker at create, binding row at ses_* materialization (WS + REST send-keys), refresh on settings change (P1.13)"
 ```
 
 ---
