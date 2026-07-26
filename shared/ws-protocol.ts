@@ -821,6 +821,10 @@ export type TabsSyncAckMessage = {
   accepted: boolean
   openRecords: number
   closedRecords: number
+  /** false when the accepted push was NOT durably persisted (fail-loud honesty). Omitted on success. */
+  persisted?: boolean
+  /** machine-readable reason accompanying persisted:false (e.g. "oversize") */
+  persistReason?: string
 }
 
 export type TabsSyncSnapshotOpenRecord = Record<string, unknown> & {

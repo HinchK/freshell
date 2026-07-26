@@ -1617,6 +1617,12 @@
         "openRecords": {
           "type": "number"
         },
+        "persistReason": {
+          "type": "string"
+        },
+        "persisted": {
+          "type": "boolean"
+        },
         "type": {
           "const": "tabs.sync.ack",
           "type": "string"
