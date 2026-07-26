@@ -1022,3 +1022,12 @@ PR POLICY: NOT approved — do NOT run `gh pr create`. Final output: branch name
 - VERIFIED FAILING then FIXED: REST-created codex panes were never armed for
   B2 locator adoption. Now armed, mirroring amplifier/opencode.
 - note_submit REST coverage: REST path added (before-write, is_submit_input-gated) (Step 5 outcome).
+
+### Case (c) end-to-end (Task 5)
+- Pinning e2e: fresh REST-created codex terminal collapses to ONE green row
+  without reload. Result on fixed branch: PASS. Result on bf6242a1 server
+  binary: FAIL (the 45s no-reload wait timed out with the single codex row
+  still carrying a client-minted `terminal:<id>` ghost session id --
+  `expect(sessionId?.startsWith('terminal:')).toBe(false)` received `true`;
+  no arming -> no adoption, the ghost never collapses to the real rollout
+  id) -- red->green proven.

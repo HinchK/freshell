@@ -139,6 +139,8 @@ const RUST_ONLY_SPECS = [
   // P1.13 (Lane B4 Task 14): per-provider settings survive restart + codex
   // crash memory-loss banner. Imports RustServer directly for restartAbrupt().
   /freshagent-settings-resume-rust\.spec\.ts$/,
+  // imports RustServer directly; restart()/ledger semantics are rust-only (P1.14)
+  /sidebar-registry-sync-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -308,6 +310,9 @@ export default defineConfig({
         // codex crash memory-loss banner. Imports RustServer directly for
         // restartAbrupt().
         /freshagent-settings-resume-rust\.spec\.ts$/,
+        // P1.14 (Lane C1): sidebar/tab-registry sync pinning suite -- imports
+        // RustServer directly; restart()/ledger semantics are rust-only.
+        /sidebar-registry-sync-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
