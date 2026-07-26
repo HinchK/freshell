@@ -46,6 +46,7 @@ notify = "6"
 freshell-freshagent = { path = "../freshell-freshagent" }
 # Transport: axum's WebSocket upgrade is tokio-tungstenite-backed (ADR Decision 3).
 axum = { version = "0.8", features = ["ws"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 # ISO-8601 timestamp for `ready.timestamp` (matches Date#toISOString()).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -79,6 +80,10 @@ tracing = "0.1"
 # canonical `records` serialization, truncated to 128 bits. Same version the
 # workspace already resolves via crates/freshell-terminal/Cargo.toml:36.
 sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+# `flock(2)` for pane_ledger's single-writer store lock (ConfigLock pattern).
+libc = "0.2"
 
 [dev-dependencies]
 # tabs_persist tests write snapshot generations into throwaway dirs. Same

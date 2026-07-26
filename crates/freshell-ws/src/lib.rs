@@ -31,6 +31,7 @@ pub mod identity;
 pub(crate) mod invariants;
 pub mod opencode_association;
 pub mod origin;
+pub mod pane_ledger;
 pub mod reconcile;
 pub mod screenshot;
 pub mod spawn_gate;
