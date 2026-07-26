@@ -228,8 +228,8 @@ git commit -m "feat(reconcile): widen ReconcilePane kind to fresh-agent + hello 
 
 **Files:**
 - Modify: `src/store/paneTypes.ts` (`FreshAgentPaneContent`, ~:174-203)
-- Modify: `src/store/panesSlice.ts` (`stripStaleIds` ~:878-887)
-- Modify: `src/store/persistMiddleware.ts` (fresh-agent arm of the per-pane strip, ~:245-266)
+- Modify: `src/store/panesSlice.ts` (`stripStaleIds` ~:869-890)
+- NO change: `src/store/persistMiddleware.ts` — its kind-agnostic `stripTransientSessionFields` (:245-268) ALREADY applies to `kind === 'fresh-agent'` and ALREADY strips `pendingReconcile`/`reconcileNotice`/`reconcileEpoch` (the "A19: reconcile fold state is volatile — never persisted" destructure at :254-257). The only gap on base is the `stripStaleIds` restore path.
 - Test: `test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts` (create)
 
 **Interfaces:**
@@ -238,15 +238,39 @@ git commit -m "feat(reconcile): widen ReconcilePane kind to fresh-agent + hello 
 
 - [ ] **Step 1: Write the failing tests** — create `test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts`:
 
+The RED-gate test targets the ONLY gap on base: `stripStaleIds` (invoked solely by the `restoreLayout` reducer via `normalizeRestoredTree`, panesSlice.ts:900/:952) does not strip the three new fields from fresh-agent leaves. Model it on the existing `stripStaleIds` fresh-agent test at `test/unit/client/store/panesSlice.test.ts:4238-4292` ("strips stale fresh-agent runtime identity while preserving durable resume options") — plain `panesReducer(initialState, restoreLayout(...))`, no store/middleware needed (note `restoreLayout` early-returns if the tab already has a layout, which the model test's `initialState` handles):
+
 ```ts
 import { describe, expect, it } from 'vitest'
 
 describe('fresh-agent reconcile volatile fields', () => {
+  it('restoreLayout strips reconcileEpoch/pendingReconcile/reconcileNotice from fresh-agent leaves', () => {
+    // Copy the reducer mechanics from panesSlice.test.ts:4238-4292 exactly,
+    // adding the three fold fields to the restored leaf's content (use the same
+    // `as PaneNode` cast as the model — the fields land on the type in Step 3):
+    const state = panesReducer(initialState, restoreLayout({
+      tabId: 'tab-1',
+      layout: leafWith({
+        kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+        createRequestId: 'req-1', status: 'connected',
+        sessionRef: { provider: 'claude', sessionId: '11111111-1111-4111-8111-111111111111' },
+        reconcileEpoch: 3, pendingReconcile: 'respawn', reconcileNotice: 'x',
+      }),
+    }))
+    const content = restoredLeafContent(state, 'tab-1')
+    expect('reconcileEpoch' in content).toBe(false)
+    expect('pendingReconcile' in content).toBe(false)
+    expect('reconcileNotice' in content).toBe(false)
+    expect(content.sessionRef?.sessionId).toBe('11111111-1111-4111-8111-111111111111')
+  })
+
   it('persistence strips reconcileEpoch/pendingReconcile/reconcileNotice from fresh-agent panes', async () => {
-    // Follow the existing pattern in test/unit/client/store/panesSlice.reconcile.test.ts (:223-248):
-    // build a store with one fresh-agent leaf whose content carries all three fields,
-    // run the persist middleware's serialization path, and assert the persisted leaf
-    // contains none of them.
+    // GREEN ON BASE — regression coverage only, NOT part of the red gate.
+    // persistMiddleware's kind-agnostic stripTransientSessionFields (:245-268)
+    // already strips these three fields for fresh-agent panes (A19 destructure).
+    // Follow the terminal reconcileEpoch strip test at
+    // test/unit/client/store/panesSlice.reconcile.test.ts:214-251 (real store +
+    // persistMiddleware, mocked localStorage, fake timers) with a fresh-agent leaf.
     const persisted = await persistLeafWithContent({
       kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
       createRequestId: 'req-1', status: 'connected',
@@ -261,14 +285,14 @@ describe('fresh-agent reconcile volatile fields', () => {
 })
 ```
 
-`persistLeafWithContent` is a local helper you write in this test file by copying the store+middleware setup from `test/unit/client/store/panesSlice.reconcile.test.ts` (the terminal `reconcileEpoch` strip test at :248 is the model — reuse its mechanics exactly, swapping in a fresh-agent leaf).
+`leafWith`/`restoredLeafContent` are trivial local helpers copied from the model test's mechanics; `persistLeafWithContent` is a local helper copying the store+middleware setup from `test/unit/client/store/panesSlice.reconcile.test.ts:214-251` with a fresh-agent leaf swapped in.
 
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
 npm run test:vitest -- run test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts
 ```
-Expected: FAIL — TypeScript rejects the unknown fields (compile error) — that IS the red state.
+Expected: the `restoreLayout` test FAILS at runtime — `stripStaleIds`'s fresh-agent arm only strips `sessionId`/`createRequestId`/`status`/`serverInstanceId`/`createError` today, so all three fold fields survive restore and the `in` assertions fail. That is the red state. (vitest does not typecheck, so the not-yet-declared fields cause no compile error.) The persistence test PASSES on base — that is expected; it is regression coverage, not the gate.
 
 - [ ] **Step 3: Implement**
 
@@ -283,7 +307,7 @@ Expected: FAIL — TypeScript rejects the unknown fields (compile error) — tha
   reconcileEpoch?: number
 ```
 
-`src/store/panesSlice.ts` `stripStaleIds` fresh-agent arm (:878-887) — add the three fields to the destructure:
+`src/store/panesSlice.ts` `stripStaleIds` fresh-agent arm (~:869-890) — add the three fields to the destructure:
 
 ```ts
 if (content.kind === 'fresh-agent') {
@@ -296,7 +320,7 @@ if (content.kind === 'fresh-agent') {
 }
 ```
 
-`src/store/persistMiddleware.ts` — locate the fresh-agent branch of the per-pane transient strip (the sibling of the terminal strip at :253-259; if the fresh-agent path flows only through `stripStaleIds`, the panesSlice change above is sufficient — verify by making the test pass, and if it already passes after the panesSlice edit, make no persistMiddleware change).
+`src/store/persistMiddleware.ts` — make NO change. There is no separate fresh-agent branch: the single kind-agnostic `stripTransientSessionFields` (:245-268) already covers `kind === 'fresh-agent'` and already strips `pendingReconcile`/`reconcileNotice`/`reconcileEpoch` (A19 destructure at :254-257). The persistence test in Step 1 proves this and guards it as a regression. (The serialization path flows only through `stripTransientSessionFields`; `stripStaleIds` sits only on the `restoreLayout` restore path — the two are disjoint.)
 
 - [ ] **Step 4: Run tests to verify pass**
 
@@ -308,8 +332,8 @@ Expected: PASS (including the pre-existing fresh-agent persistence suite — no 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/paneTypes.ts src/store/panesSlice.ts src/store/persistMiddleware.ts test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts
-git commit -m "feat(reconcile): fresh-agent volatile fold fields (epoch/pending/notice) + persistence strips"
+git add src/store/paneTypes.ts src/store/panesSlice.ts test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts
+git commit -m "feat(reconcile): fresh-agent volatile fold fields (epoch/pending/notice) + restoreLayout strip"
 ```
 
 ---
@@ -2078,16 +2102,21 @@ git commit -m "fix(server): cross-kind liveness guards - terminal and fresh-agen
 
 **Files:**
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx` (create.failed handler :1292-1307; new re-drive machinery mirroring `TerminalView.tsx:3122-3160`)
+- Modify: `src/lib/fresh-agent-ws.ts` (gate the GLOBAL `createFailed` projection at :134-144 — see Step 3; without this the error card renders from `pendingCreateFailures` no matter what the pane-level handler does)
 - Test: `test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx` (extend)
+- Test: `test/unit/client/lib/fresh-agent-ws.test.ts` (extend — the FreshAgentView harness does not exercise `handleFreshAgentMessage`, so the global gate needs its own test here, alongside the existing create.failed projection coverage at :137-154)
 
 **Interfaces:**
 - Consumes: server `freshAgent.create.failed { code: 'SESSION_RESERVED', retryable: true }` (Task 12) and `freshAgent.error { code: 'SESSION_RESERVED' }` (Task 13); single-pane reconcile + fold (Task 10 machinery).
 - Produces (constants exported for tests):
   - `FRESH_AGENT_RESERVE_RETRY_WINDOW_MS = 30_000` (> 20s lease TTL + margin — same arithmetic as `TerminalView.tsx:162-168`), `FRESH_AGENT_RESERVE_RETRY_FLOOR_MS = 1_000`.
   - On `create.failed{SESSION_RESERVED}`: do NOT set `status: 'create-failed'`; open the window on first hit; `setTimeout(FLOOR)` then re-arm `createSentRef` and re-send the SAME create (same `createRequestId`). On window exhaustion: single-pane reconcile → fold (auto-resolve: winner live → `attach` verdict → silent attach; winner failed → `dead_session`/`fresh` with the visible panel/notice — council rule 8).
+  - CRITICAL — two independent writers feed one error card: the card condition is `pendingCreateFailure || paneContent.createError` (FreshAgentView.tsx:2016), and `pendingCreateFailure` comes from the GLOBAL projection `handleFreshAgentMessage` → `dispatch(createFailed(...))` → `state.freshAgent.pendingCreateFailures[createRequestId]` (fresh-agent-ws.ts:134-144), NOT from the pane-level handler. Gating only the pane-content patch still flashes the card every retry cycle, exposes a manual Retry that re-mints `createRequestId` and races the same-requestId re-drive, and — because nothing clears `pendingCreateFailures` on attach (`clearPendingCreateFailure` fires only on create re-registration and effect cleanup) — leaves a permanent "Create failed" card on a pane that auto-resolved via a silent attach. Therefore the GLOBAL projection must also skip `SESSION_RESERVED && retryable` (Step 3), so no `pendingCreateFailures` entry ever exists for a transient reservation.
   - On `freshAgent.error{SESSION_RESERVED}` (attach loser): re-send the attach after `FLOOR` within the same window; exhaustion → same single-pane reconcile.
 
 - [ ] **Step 1: Write the failing tests**
+
+IMPORTANT — the `receiveWs` helper in these tests MUST deliver each message through BOTH paths: the global `handleFreshAgentMessage` from `src/lib/fresh-agent-ws.ts` AND the mounted view's ws listener. Model it on the existing dual-delivery helper `deliverThroughAppAndMountedView` (`FreshAgentView.test.tsx:1162-1176`). The default harness pattern (calling `wsMock.onMessage.mock.calls[0][0]` directly) never runs the global `createFailed` projection, which is exactly the path that breaks the contract — pane-only delivery would let the tests pass while the real app still shows the error card.
 
 ```ts
 it('create.failed SESSION_RESERVED re-drives the same create after the floor', async () => {
@@ -2097,6 +2126,9 @@ it('create.failed SESSION_RESERVED re-drives the same create after the floor', a
   receiveWs({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SESSION_RESERVED', message: 'reserved', retryable: true })
   await flush()
   expect(leafContent(store.getState()).status).toBe('creating') // not create-failed
+  // the GLOBAL projection must not have minted an error-card entry either:
+  expect(store.getState().freshAgent.pendingCreateFailures['req-1']).toBeUndefined()
+  expect(document.querySelector('.fresh-agent-error-card')).toBeNull()
   await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
   expect(sentOfType('freshAgent.create')).toHaveLength(2)
   expect(sentOfType('freshAgent.create')[1].requestId).toBe('req-1')
@@ -2119,6 +2151,9 @@ it('exhaustion auto-resolves via a single-pane reconcile', async () => {
     verdicts: [{ paneKey: req.panes[0].paneKey, verdict: 'attach', sessionRef: { provider: 'claude', sessionId: DURABLE } }] })
   await flush()
   expect(leafContent(store.getState()).sessionId).toBe(DURABLE)
+  // council rule 8: SILENT attach — no stale error card may survive the auto-resolve
+  expect(store.getState().freshAgent.pendingCreateFailures).toEqual({})
+  expect(document.querySelector('.fresh-agent-error-card')).toBeNull()
 })
 
 it('non-reserved create.failed still lands create-failed status (regression)', async () => {
@@ -2129,6 +2164,22 @@ it('non-reserved create.failed still lands create-failed status (regression)', a
   expect(leafContent(store.getState()).status).toBe('create-failed')
 })
 ```
+
+And in `test/unit/client/lib/fresh-agent-ws.test.ts` (alongside the existing create.failed projection test at :137-154 — the FreshAgentView harness cannot cover this path on its own):
+
+```ts
+it('create.failed SESSION_RESERVED (retryable) is not projected into pendingCreateFailures and keeps the create route alive', () => {
+  // mirror the setup of the existing create.failed projection test (:137-154):
+  registerFreshAgentCreate(/* requestId: 'req-1', route as in the model test */)
+  handleFreshAgentMessage({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SESSION_RESERVED', message: 'reserved', retryable: true }, dispatch)
+  expect(dispatched(createFailed)).toHaveLength(0) // no pendingCreateFailures entry
+  // route NOT consumed — the same-requestId re-drive's eventual created/failed must still route:
+  handleFreshAgentMessage({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SPAWN_FAILED', message: 'x', retryable: false }, dispatch)
+  expect(dispatched(createFailed)).toHaveLength(1) // non-reserved still projects (regression)
+})
+```
+
+(Adapt the assertion helpers to the file's existing mock-dispatch idiom — the properties to prove are exactly: SESSION_RESERVED+retryable → no `createFailed` dispatch and no `consumeCreateRoute`; any other code → unchanged projection.)
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -2162,7 +2213,7 @@ const redriveAfterSessionReserved = useCallback(() => {
 }, [dispatch, paneId, reconcileLostPane, tabId])
 ```
 
-In the `freshAgent.create.failed` handler (:1292-1307), before the generic arm:
+In the `freshAgent.create.failed` handler (:1292-1307), before the generic arm — but AFTER the existing `releasePendingRebind()` call at :1293 (skipping it would leak a rebind-queue slot for 10s on every retry cycle):
 
 ```ts
 if (message.code === 'SESSION_RESERVED' && message.retryable) {
@@ -2171,19 +2222,31 @@ if (message.code === 'SESSION_RESERVED' && message.retryable) {
 }
 ```
 
+In `src/lib/fresh-agent-ws.ts` `handleFreshAgentMessage`, gate the GLOBAL `create.failed` projection (:134-144) with the same predicate, placed BEFORE both `consumeCreateRoute(requestId)` and `dispatch(createFailed(...))`:
+
+```ts
+if (msg.code === 'SESSION_RESERVED' && msg.retryable) {
+  return // transient reservation: no pendingCreateFailures entry (no error card / no Retry
+         // racing the same-requestId re-drive), and the create route stays alive so the
+         // re-driven create's eventual created/failed still routes to this pane
+}
+```
+
+This is what makes the contract hold: with no `pendingCreateFailures[createRequestId]` entry ever minted for SESSION_RESERVED, the error card (condition `pendingCreateFailure || paneContent.createError`, FreshAgentView.tsx:2016) stays absent during the re-drive window, and nothing stale survives the exhaustion attach auto-resolve (whose fold never clears that slice — the only clears are create re-registration at fresh-agent-ws.ts:105 and the effect cleanup at FreshAgentView.tsx:2216-2221).
+
 In `src/lib/fresh-agent-ws.ts` `freshAgent.error` projection (:325-335): leave global handling unchanged (SESSION_RESERVED ≠ INVALID_SESSION_ID so it flows to `sessionError` today) — instead intercept in FreshAgentView's ws listener: on `freshAgent.error` for this pane's session with `code === 'SESSION_RESERVED'`, call `redriveAfterSessionReserved()` (which re-arms attach via the same nudge — the attach effect keys on `sessionId` which is still set) and suppress the pane-level error banner for that code (check where `sessionErrorMessage` renders, :2046, and filter SESSION_RESERVED). Clear `reserveRedriveRef` (window + timer) on `freshAgent.created` and on unmount.
 
 - [ ] **Step 4: Run tests to verify pass**
 
 ```bash
-npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx "test/unit/client/components/fresh-agent/FreshAgentView.test.tsx"
+npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx "test/unit/client/components/fresh-agent/FreshAgentView.test.tsx" test/unit/client/lib/fresh-agent-ws.test.ts
 ```
-Expected: PASS.
+Expected: PASS (including the pre-existing fresh-agent-ws create.failed projection test — the gate must not disturb non-reserved codes).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/components/fresh-agent/FreshAgentView.tsx src/lib/fresh-agent-ws.ts test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx
+git add src/components/fresh-agent/FreshAgentView.tsx src/lib/fresh-agent-ws.ts test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx test/unit/client/lib/fresh-agent-ws.test.ts
 git commit -m "feat(reconcile): fresh-agent SESSION_RESERVED bounded re-drive + reconcile auto-resolve on exhaustion"
 ```
 
