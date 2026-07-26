@@ -1971,13 +1971,24 @@ REAL `PaneLedger::new(Some(dir))`. The codex adaptations, per test:
         // with ("codex", <TID>) via state.identity.upsert(...), then retire it
         // via state.identity.retire("victim") (the exit-path call —
         // terminal.rs:1370 area shows the exact form).
-        // Register a real PTY "t1" (codex mode), arm it, then
-        // note_possible_submit(&state, "t1", "\r").await to open the
+        // Register a real PTY "t1" (codex mode), arm it, and keep a locator
+        // handle (let locator = state.codex_locator.as_ref().unwrap().clone()).
+        // Then note_possible_submit(&state, "t1", "\r").await to open the
         // Enter-anchored window, THEN seed the rollout for <TID> (after the
         // submit — the first-submit re-snapshot would exclude a pre-seeded
-        // file), and poll drain_and_associate past the window.
-        // Assert: t1 gained NO identity (state.identity.session_ref_for("t1")
-        // is None) and its registry entry's resume_session_id is None.
+        // file) with payload.cwd set to THE PANE'S OWN cwd, exactly as in the
+        // first test — the rollout must be a fully resolvable candidate, or
+        // this test proves nothing. Poll drain_and_associate past the window.
+        //
+        // Assert BOTH halves. The positive resolution signal comes FIRST so
+        // the negative assertions cannot pass vacuously — a locator that
+        // never resolved (wrong cwd, bad seed timing) also leaves identity
+        // None, and identity-only assertions cannot tell those worlds apart:
+        //   locator.armed_count() == 0
+        //     // tick emitted Located and disarmed: resolution HAPPENED, so
+        //     // whatever follows is the adoption-tail guard's doing
+        //   state.identity.session_ref_for("t1") is None   // guard refused
+        //   registry entry for t1: resume_session_id is None
     }
 ```
 
@@ -1996,7 +2007,11 @@ can fail: temporarily invert one core assertion per test (e.g. assert the
 identity is `None`), watch it fail, restore it. Record "verified-red by
 inversion" in the commit message. The third test (bound-elsewhere) exercises
 Task 3's new guard end-to-end for the first time — if it passes first try,
-apply the same inversion check.
+invert its POSITIVE signal (assert `locator.armed_count() == 1`), watch it
+fail, restore. Inverting only the identity-is-None assertions is NOT a valid
+check for this test: those fail identically whether the guard fired or the
+locator never resolved, so they cannot prove the test is non-vacuous — the
+armed_count inversion is the one that proves resolution actually occurred.
 
 - [ ] **Step 3: Fix any real gaps minimally; re-run to GREEN**
 
