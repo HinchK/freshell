@@ -569,6 +569,7 @@ impl FreshClaudeState {
             actual_session_ref: None,
             expected_session_ref: None,
             request_id: request_id.clone(),
+            retry_after_ms: None,
             terminal_exit_code: None,
             terminal_id: None,
         }));

@@ -94,6 +94,11 @@ pub enum ErrorCode {
     /// failed (poisoned lock, index handle error). The client keeps its state
     /// and may re-send.
     ReconcileUnavailable,
+    /// D8 per-sessionRef single-flight (council rules 6/7/8): another create
+    /// for the same sessionRef is in flight on a `paneReconcileV1`-negotiated
+    /// connection. The loser retries after the frame's `retryAfterMs` hint —
+    /// by then it either adopts the winner's terminal or wins the next claim.
+    SessionReserved,
 }
 
 /// The coding-agent providers (`claude | codex | opencode | amplifier`).

@@ -621,7 +621,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       path.join(sharedRoot, 'bin'),
     )
 
-    const { server, harness } = await bootWall(page, {
+    const { server, harness, info } = await bootWall(page, {
       env: { CLAUDE_CMD: fakeClaudePath, FAKE_CLAUDE_ARGV_LOG: argLogPath },
       setupHome: seedWallConfig({ providers: ['claude'] }),
     })
@@ -696,6 +696,26 @@ test.describe('Restore Contract Wall (P0.1)', () => {
           timeout: 20_000,
         })
         .toBe(preallocatedId)
+
+      // FIXTURE REALISM (reconcile adoption): real claude writes
+      // ~/.claude/projects/<proj>/<sessionId>.jsonl as soon as the session
+      // starts; the fake CLI does not. Under the adopted client the
+      // post-restart verdict is derived from DISK truth (a claimed session
+      // with no file is a loud dead_session, never an optimistic silent
+      // respawn), so mirror what real claude persists before the kill.
+      const claudeProjDir = path.join(info.homeDir, '.claude', 'projects', 'wall-claude-proj')
+      await fs.mkdir(claudeProjDir, { recursive: true })
+      await fs.writeFile(
+        path.join(claudeProjDir, `${preallocatedId}.jsonl`),
+        `${JSON.stringify({
+          type: 'user',
+          message: 'wall claude fixture transcript',
+          uuid: 'msg-1',
+          cwd: projectDir,
+          timestamp: '2026-07-21T08:00:00.000Z',
+        })}\n`,
+        'utf8',
+      )
 
       const argvCountBeforeKill = (await readArgvLog(argLogPath)).length
 
@@ -1870,15 +1890,11 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // EXPECTED-FAIL WALL PIN -- P1.7 (D8, §4.3): dedupe keys on
-    // createRequestId only; two clients holding the same sessionRef carry
-    // different createRequestIds, so BOTH respawn -> two PTYs -> two JSONL
-    // writers on one session file. FLIP when sessionRef-level single-flight
-    // lands (Phase 3 multi-client spec).
-    test.fail(
-      e2eServerKind === 'rust',
-      'P1.7 (D8): two clients on one sessionRef respawn two PTYs after SIGKILL',
-    )
+    // P1.7 (D8, §4.3) LANDED -- pin flipped by the reconcile-client-adoption
+    // lane: the server now runs a per-sessionRef single-flight lease on the
+    // create path (losers get error{SESSION_RESERVED}) and reconcile verdicts
+    // attach every other client's claim to the winner, so two clients holding
+    // the same sessionRef converge to EXACTLY ONE PTY after SIGKILL.
     const CODEX_SESSION_ID = '77777777-6666-4555-8444-333333333333'
     const SESSION_TITLE = 'two-client codex session'
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-twoclient-'))
@@ -1938,9 +1954,8 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         .toBeGreaterThan(0)
       // STABLE-COUNT settle (not a fixed sleep): accept only when two samples
       // >=5s apart agree, so a tail-latency straggler cannot make the count
-      // read 1 spuriously -- an unexpected PASS of this pin is a hard suite
-      // failure. Under today's bug the stable count is 2 (pin holds); when
-      // sessionRef single-flight lands it is 1 (pin flips loudly).
+      // read 1 spuriously. Under the pre-lease bug the stable count was 2;
+      // with sessionRef single-flight landed it must be exactly 1.
       await expect
         .poll(
           async () => {
@@ -2044,9 +2059,12 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // OBSERVE-THEN-PIN -- if red, pin P1.7 (§4.3): respawn caps and keyed-
-    // create dedupe are dormant (paneReconcileV1 never sent), so a restart
-    // landing mid-recovery can double-create or dead-end panes (F9).
+    // ADOPTED REALITY (reconcile-client-adoption lane): the client advertises
+    // capabilities.paneReconcileV1 in hello and sends pane.reconcile.request
+    // after EVERY ready, so a restart landing mid-recovery is answered by a
+    // fresh verdict round on the next reconnect -- panes converge to exactly
+    // one live terminal each (asserted via /api/terminals), never a
+    // double-create or a dead-ended pane (F9).
     const CODEX_SESSION_ID = '55555555-4444-4333-8222-111111111111'
     const SESSION_TITLE = 'double-restart codex session'
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-dblrestart-'))
@@ -2058,7 +2076,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       'codex',
       path.join(sharedRoot, 'bin'),
     )
-    const { server, harness } = await bootWall(page, {
+    const { server, harness, info } = await bootWall(page, {
       env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
       setupHome: seedCodexHome(CODEX_SESSION_ID, SESSION_TITLE, projectDir),
     })
@@ -2073,6 +2091,11 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         .not.toBeNull()
       const tabCountBefore = await harness.getTabCount()
       const argvCountBeforeKill = (await readArgvLog(argLogPath)).length
+      const countReconcileRequests = async () =>
+        (await harness.getSentWsMessages()).filter(
+          (m) => (m as { type?: string })?.type === 'pane.reconcile.request',
+        ).length
+      const reconcileRequestsBeforeKill = await countReconcileRequests()
 
       // First SIGKILL; wait until recovery is IN FLIGHT (a new spawn hit the
       // argv log), then SIGKILL again mid-recovery.
@@ -2082,6 +2105,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         .toBeGreaterThan(argvCountBeforeKill)
       await server.restartAbrupt()
       await waitForWsReady(page)
+
+      // ADOPTED CONTRACT: the client re-sends pane.reconcile.request on the
+      // post-restart ready (the request is per-connection, so the reconnect
+      // after the final SIGKILL must have produced at least one more).
+      await expect
+        .poll(countReconcileRequests, { timeout: 30_000 })
+        .toBeGreaterThan(reconcileRequestsBeforeKill)
 
       // CONTRACT: the pane settles resumed on the same session -- exactly one
       // pane, same tab count, not status:error, resumed argv in the final
@@ -2103,6 +2133,22 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         ).length
       }
       expect(codexLeaves).toBe(1)
+      // CONVERGENCE via the REST directory: the persisted codex pane ends
+      // with EXACTLY ONE live PTY -- the one the pane is attached to. A
+      // stray duplicate from the interrupted first recovery round would
+      // show up here as a second running codex terminal.
+      const paneTerminalId = (await harness.getPaneLayout(tabId))?.content?.terminalId
+      await expect
+        .poll(async () => {
+          const res = await fetch(`${info.baseUrl}/api/terminals`, {
+            headers: restApiHeaders(info),
+          })
+          if (!res.ok) return null
+          const terms = (await res.json()) as Array<{ terminalId: string; mode: string; status: string }>
+          const runningCodex = terms.filter((t) => t.mode === 'codex' && t.status === 'running')
+          return runningCodex.length === 1 && runningCodex[0].terminalId === paneTerminalId
+        }, { timeout: 30_000 })
+        .toBe(true)
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })

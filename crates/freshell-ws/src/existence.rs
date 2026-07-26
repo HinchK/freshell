@@ -9,7 +9,8 @@
 //!   downstream), never `Unknown`.
 //! * [`SessionExistence::Unknown`] is reserved strictly for a *cold index on a
 //!   known provider* (boot sweep not finished / index unavailable) — it is
-//!   what makes the `retry` verdict honest instead of guessing (§5.3 row 5).
+//!   what makes the `error{index_warming}` verdict honest instead of
+//!   guessing (§5.3 row 5).
 //!
 //! Trait-shaped so crate tests inject a fake; the real implementation is
 //! backed by the shared `freshell_sessions::directory_index::SessionIndex`
@@ -28,6 +29,10 @@ pub enum SessionExistence {
     Absent,
     /// Known provider, but the index cannot answer yet (cold/unavailable).
     Unknown,
+    /// Known provider whose session root does not exist on this machine —
+    /// it will never warm up, so downstream answers an immediate
+    /// `error{provider_unavailable}` with NO deferral (never `index_warming`).
+    ProviderUnavailable,
 }
 
 /// The reconcile derivation's read-only view of disk session truth.

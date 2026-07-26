@@ -123,9 +123,10 @@ class SyntheticClient {
   }
 
   /**
-   * One reconcile round-trip. The retry verdict is part of the protocol
-   * (cold index → `retry(index_warming)`); `reconcileUntilStable` below is
-   * the client-side re-request loop the design prescribes.
+   * One reconcile round-trip. A cold index yields `error{index_warming}`
+   * after the server's ONE bounded deferral (`retry` is deleted from the
+   * wire); `reconcileUntilStable` below is this harness's bounded
+   * re-request loop so the tests stay robust on slow cold-index machines.
    */
   async reconcile(panes: Array<Record<string, unknown>>): Promise<Frame[]> {
     const reconcileId = `rec-${Math.random().toString(36).slice(2)}`
@@ -136,12 +137,16 @@ class SyntheticClient {
     return (result as { verdicts: Frame[] }).verdicts
   }
 
-  /** Re-request while any verdict is `retry` (bounded), per §5.3 row 5. */
+  /** Re-request while any verdict is `error{index_warming}` (bounded), per §5.3 row 5. */
   async reconcileUntilStable(panes: Array<Record<string, unknown>>): Promise<Frame[]> {
     let verdicts: Frame[] = []
     for (let attempt = 0; attempt < 40; attempt++) {
       verdicts = await this.reconcile(panes)
-      if (!verdicts.some((v) => (v as { verdict?: string }).verdict === 'retry')) return verdicts
+      const warming = (v: Frame) => {
+        const { verdict, reason } = v as { verdict?: string; reason?: string }
+        return verdict === 'error' && reason === 'index_warming'
+      }
+      if (!verdicts.some(warming)) return verdicts
       await new Promise((r) => setTimeout(r, 250))
     }
     return verdicts

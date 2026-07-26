@@ -127,6 +127,9 @@ const RUST_ONLY_SPECS = [
   // ledger-join coherence, A2xA3 dual claude identity stores). Imports
   // RustServer directly for restartAbrupt().
   /wavea-interactions-rust\.spec\.ts$/,
+  // Reconcile client adoption (Task 14): verdict-driven recovery with the
+  // real SPA. Imports RustServer directly (restart()/restartAbrupt()).
+  /reconcile-client-adoption-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -284,6 +287,11 @@ export default defineConfig({
         // ledger-join coherence, A2xA3 dual claude identity stores). Imports
         // RustServer directly for restartAbrupt().
         /wavea-interactions-rust\.spec\.ts$/,
+        // Reconcile client adoption (Task 14): mixed-pane restart recovery,
+        // batched dead-session adjudication, double-restart convergence --
+        // all driven by pane.reconcile verdicts in the real SPA. Rust-only:
+        // imports RustServer directly (restart()/restartAbrupt()).
+        /reconcile-client-adoption-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

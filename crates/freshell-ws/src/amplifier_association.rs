@@ -316,6 +316,7 @@ mod tests {
             config_fallback: None,
             amplifier_locator: Some(StdArc::new(AmplifierLocator::new(amplifier_home))),
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             opencode_locator: None,
             activity: None,
         };

@@ -4,6 +4,7 @@ import {
   normalizeFreshAgentEffortOverride,
   normalizeFreshAgentModelSelection,
   normalizeFreshAgentPendingLocalEcho,
+  type DeadSessionEntry,
   type FreshAgentPaneContent,
   type LivePaneContentInput,
   type PanesState,
@@ -11,6 +12,7 @@ import {
   type PaneContentInput,
   type PaneNode,
   type PaneRefreshRequest,
+  type ReconcileWarmingState,
   type SessionLocator,
   type TerminalPaneContent,
 } from './paneTypes'
@@ -93,6 +95,11 @@ function normalizePaneContent(
       streamId: typeof input.streamId === 'string' && input.streamId.length > 0 ? input.streamId : undefined,
       ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
+      reconcileNotice: typeof input.reconcileNotice === 'string' ? input.reconcileNotice : undefined,
+      pendingReconcile: input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
+        ? input.pendingReconcile
+        : undefined,
+      reconcileEpoch: typeof input.reconcileEpoch === 'number' ? input.reconcileEpoch : undefined,
     }
   }
   if (input.kind === 'browser') {
@@ -291,6 +298,8 @@ function loadInitialPanesState(): PanesState {
     zoomedPane: {},
     refreshRequestsByPane: {},
     restoreFallbackAttemptsByPane: {},
+    deadSessionAdjudication: [],
+    reconcileWarming: null,
   }
 
   try {
@@ -308,6 +317,8 @@ function loadInitialPanesState(): PanesState {
       zoomedPane: {},
       refreshRequestsByPane: {},
       restoreFallbackAttemptsByPane: {},
+      deadSessionAdjudication: [],
+      reconcileWarming: null,
     }
     state = cleanOrphanedLayouts(state)
     return state
@@ -565,6 +576,30 @@ function clearTerminalContentForRecreate(
   } else {
     clearRestoreFallbackAttemptForPane(state, tabId, node.id)
   }
+}
+
+// Reconcile notice copy — exact strings reused by later tasks/tests.
+export const RECONCILE_NOTICE_CORRECTED = 'Session identity corrected by server — this pane now points at its live session.'
+export const RECONCILE_NOTICE_DUPLICATE = 'A duplicate terminal for this session was detected and ignored.'
+export function reconcileFreshNotice(reason: string): string {
+  return `Started fresh (${reason}).`
+}
+
+/**
+ * Locate a terminal pane's content by (tabId, paneId) for reconcile folds.
+ * Same pane walk as clearTerminalContentForRecreate's callers (via findLeaf),
+ * but the folds below never mint a createRequestId — council rule 2.
+ */
+function findReconcileTerminalContent(
+  state: PanesState,
+  tabId: string,
+  paneId: string,
+): TerminalPaneContent | undefined {
+  const root = state.layouts[tabId]
+  if (!root) return undefined
+  const leaf = findLeaf(root, paneId)
+  if (!leaf || leaf.content.kind !== 'terminal') return undefined
+  return leaf.content
 }
 
 function freshAgentPaneMatchesMaterializedSession(
@@ -1340,6 +1375,17 @@ export const panesSlice = createSlice({
           if (node.id === paneId) {
             previousContentForTitle = node.content
             const nextContent = normalizePaneContent(content, node.content)
+            // A19: when terminal.created folds a terminalId into this pane,
+            // the reconcile intent is consumed — stale respawn/fresh intent
+            // must never survive past a completed create.
+            if (
+              nextContent.kind === 'terminal'
+              && nextContent.pendingReconcile
+              && nextContent.terminalId
+              && (node.content.kind !== 'terminal' || node.content.terminalId !== nextContent.terminalId)
+            ) {
+              nextContent.pendingReconcile = undefined
+            }
             normalizedContentForTitle = nextContent
             return { ...node, content: nextContent }
           }
@@ -1621,6 +1667,8 @@ export const panesSlice = createSlice({
       state.zoomedPane = {}
       state.refreshRequestsByPane = {}
       state.restoreFallbackAttemptsByPane = {}
+      state.deadSessionAdjudication = []
+      state.reconcileWarming = null
     },
 
     updatePaneTitle: (
@@ -1794,6 +1842,167 @@ export const panesSlice = createSlice({
       }
     },
 
+    /**
+     * Fold a pane.reconcile attach/duplicate verdict into pane content.
+     * Council rule 2: never mints a createRequestId — the existing one is preserved.
+     */
+    applyReconcileAttach: (
+      state,
+      action: PayloadAction<{
+        tabId: string
+        paneId: string
+        terminalId: string
+        serverInstanceId?: string
+        sessionRef?: SessionLocator
+        corrected?: boolean
+        duplicate?: boolean
+      }>
+    ) => {
+      const { tabId, paneId, terminalId, serverInstanceId, corrected, duplicate } = action.payload
+      if (!terminalId) return
+      const content = findReconcileTerminalContent(state, tabId, paneId)
+      if (!content) return
+
+      content.terminalId = terminalId
+      content.serverInstanceId = serverInstanceId
+      content.streamId = undefined
+      content.status = 'running'
+      content.restoreError = undefined
+      const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
+      if (sessionRef) {
+        content.sessionRef = sessionRef
+        content.resumeSessionId = undefined
+      }
+      content.pendingReconcile = undefined
+      // A1 fix: same-createRequestId folds are only observable via the epoch bump.
+      content.reconcileEpoch = (content.reconcileEpoch ?? 0) + 1
+      if (corrected) {
+        content.reconcileNotice = RECONCILE_NOTICE_CORRECTED
+      } else if (duplicate) {
+        content.reconcileNotice = RECONCILE_NOTICE_DUPLICATE
+      }
+      clearRestoreFallbackAttemptForPane(state, tabId, paneId)
+    },
+
+    /**
+     * Fold a pane.reconcile respawn/fresh verdict: clear live handles so
+     * TerminalView re-creates, PRESERVING createRequestId (D4 — the
+     * load-bearing difference from clearTerminalContentForRecreate).
+     */
+    resetPaneForReconcileCreate: (
+      state,
+      action: PayloadAction<{
+        tabId: string
+        paneId: string
+        intent: 'respawn' | 'fresh'
+        sessionRef?: SessionLocator
+        reason?: string
+        corrected?: boolean
+      }>
+    ) => {
+      const { tabId, paneId, corrected } = action.payload
+      const content = findReconcileTerminalContent(state, tabId, paneId)
+      if (!content) return
+      let intent = action.payload.intent
+      let reason = action.payload.reason
+      const sessionRef = sanitizeSessionRef(action.payload.sessionRef)
+
+      content.terminalId = undefined
+      content.serverInstanceId = undefined
+      content.streamId = undefined
+      content.status = 'creating'
+      content.restoreError = undefined
+
+      if (intent === 'respawn') {
+        if (sessionRef && sessionRef.provider === content.mode) {
+          content.sessionRef = sessionRef
+          content.resumeSessionId = undefined
+        } else {
+          // Invariant: respawn requires sessionRef.provider === pane mode.
+          // The server create path filters on it; a mismatch spawns
+          // identity-less. Degrade loudly to fresh-with-notice.
+          log.error('resetPaneForReconcileCreate: respawn sessionRef/provider mismatch — degrading to fresh', {
+            tabId,
+            paneId,
+            paneMode: content.mode,
+            sessionRefProvider: sessionRef?.provider,
+          })
+          intent = 'fresh'
+          reason = reason ?? (sessionRef ? 'respawn_provider_mismatch' : 'respawn_session_ref_missing')
+        }
+      }
+      if (intent === 'fresh') {
+        content.sessionRef = undefined
+        content.resumeSessionId = undefined
+        content.codexDurability = undefined
+      }
+      content.pendingReconcile = intent
+      // A1 fix: same-createRequestId folds are only observable via the epoch bump.
+      content.reconcileEpoch = (content.reconcileEpoch ?? 0) + 1
+      if (corrected) {
+        content.reconcileNotice = RECONCILE_NOTICE_CORRECTED
+      } else if (intent === 'fresh' && reason) {
+        content.reconcileNotice = reconcileFreshNotice(reason)
+      }
+      clearRestoreFallbackAttemptForPane(state, tabId, paneId)
+    },
+
+    setPaneReconcileNotice: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; notice: string }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (!content) return
+      content.reconcileNotice = action.payload.notice
+    },
+
+    clearPaneReconcileNotice: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (!content) return
+      content.reconcileNotice = undefined
+    },
+
+    /** Council rule 12: dead_session is a UI state, not a deletion — panes wait for the user. */
+    setDeadSessionAdjudication: (state, action: PayloadAction<DeadSessionEntry[]>) => {
+      state.deadSessionAdjudication = action.payload
+    },
+
+    resolveDeadSessionEntry: (state, action: PayloadAction<{ tabId: string; paneId: string }>) => {
+      const { tabId, paneId } = action.payload
+      state.deadSessionAdjudication = (state.deadSessionAdjudication ?? []).filter(
+        (entry) => !(entry.tabId === tabId && entry.paneId === paneId),
+      )
+    },
+
+    clearDeadSessionAdjudication: (state) => {
+      state.deadSessionAdjudication = []
+    },
+
+    setReconcileWarming: (state, action: PayloadAction<ReconcileWarmingState>) => {
+      state.reconcileWarming = action.payload
+    },
+
+    clearReconcileWarming: (state) => {
+      state.reconcileWarming = null
+    },
+
+    /**
+     * Loud, non-destructive per-pane breadcrumb for reconcile
+     * dead_session/invalid/error verdicts. Sets only restoreError —
+     * never touches identity, handles, or createRequestId.
+     */
+    setPaneRestoreError: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; restoreError: RestoreError }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (!content) return
+      content.restoreError = action.payload.restoreError
+    },
+
     repairCodexIdentityMismatch: (
       state,
       action: PayloadAction<{
@@ -1869,6 +2078,16 @@ export const {
   toggleZoom,
   clearDeadTerminals,
   clearTerminalLiveHandles,
+  applyReconcileAttach,
+  resetPaneForReconcileCreate,
+  setPaneReconcileNotice,
+  clearPaneReconcileNotice,
+  setDeadSessionAdjudication,
+  resolveDeadSessionEntry,
+  clearDeadSessionAdjudication,
+  setReconcileWarming,
+  clearReconcileWarming,
+  setPaneRestoreError,
   repairCodexIdentityMismatch,
 } = panesSlice.actions
 

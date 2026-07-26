@@ -76,6 +76,24 @@ if (argv[0] === 'resume') {
       JSON.stringify({ event: 'session:config', working_dir: cwd }),
     ]
     fs.writeFileSync(path.join(sessionDir, 'events.jsonl'), `${lines.join('\n')}\n`)
+    // FIXTURE REALISM (reconcile adoption): real amplifier persists
+    // `metadata.json` alongside `events.jsonl` -- and `metadata.json` is the
+    // CANONICAL record the session index reads
+    // (`crates/freshell-sessions/src/amplifier.rs`: "Only metadata.json is
+    // read+parsed for the session-directory listing"; R10b requires
+    // `working_dir`). Without it, a claimed amplifier session is invisible
+    // to the disk-truth existence probe and the post-restart reconcile
+    // verdict is honestly `dead_session{session_not_on_disk}` instead of
+    // respawn-with-resume. Mirror what the real CLI writes.
+    fs.writeFileSync(
+      path.join(sessionDir, 'metadata.json'),
+      JSON.stringify({
+        session_id: sessionId,
+        working_dir: cwd,
+        created: new Date().toISOString(),
+        name: `fake amplifier e2e session ${sessionId}`,
+      }),
+    )
 
     process.stdout.write(`amplifier: session ${sessionId} started\r\n`)
   })
