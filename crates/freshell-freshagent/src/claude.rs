@@ -813,7 +813,7 @@ fn now_iso() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn state() -> FreshClaudeState {
@@ -1074,7 +1074,10 @@ mod tests {
     /// Serializes every test in this file that mutates process-global env vars
     /// (`FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE`), mirroring codex's
     /// `ENV_LOCK` (`codex.rs`).
-    static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // `pub(crate)` so snapshot.rs's claude-store tests share this ONE lock (mirroring
+    // how snapshot.rs reuses `crate::codex::tests::ENV_LOCK`) -- two independent
+    // per-file locks would NOT serialize against each other.
+    pub(crate) static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A minimal scripted fake claude sidecar (no real `@anthropic-ai/claude-agent-sdk`,
     /// no network, no cost): on `{"type":"create",...}` it appends a marker line to

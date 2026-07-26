@@ -132,10 +132,8 @@ pub(crate) enum ClaudeSnapshotError {
     /// No transcript file for this id -- the store positively does not know it
     /// (maps to 404 FRESH_AGENT_LOST_SESSION, the codex/opencode convention).
     NotFound,
-    /// The file exists but could not be read.
-    // Task 5's endpoint reads the message into the 500 error body; until then
-    // the field is constructed but never read.
-    Io(#[allow(dead_code)] String),
+    /// The file exists but could not be read; the message becomes the 500 error body.
+    Io(String),
 }
 
 /// One transcript JSONL line -> zero-or-one snapshot turn. Parsing rules are the
@@ -368,9 +366,6 @@ pub(crate) fn build_claude_snapshot_json(
 
 /// Locate + read + build. `revision` = transcript mtime in ms (monotonic as the file
 /// grows -- `mergeSnapshotForDisplay` DROPS revision regressions), fallback turn count.
-// Task 5 wires this into the HTTP snapshot endpoint; until then it (and its whole
-// call graph: locate/build/parse/summarize + ClaudeSnapshotError) has no lib caller.
-#[allow(dead_code)]
 pub(crate) async fn get_claude_snapshot(
     session_type: &str,
     thread_id: &str,
