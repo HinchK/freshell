@@ -275,6 +275,7 @@ export const HelloSchema = z.object({
     // REQUIRED here (not just in the sent object): Zod non-strict objects silently
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
+    paneReconcileFreshAgentV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -575,8 +576,8 @@ export const ReconcileSessionRefSchema = SessionLocatorSchema
 export const ReconcilePaneSchema = z.object({
   /** Opaque to the server; echoed verbatim on the verdict. */
   paneKey: z.string().min(1),
-  /** v1: 'terminal' only. */
-  kind: z.literal('terminal'),
+  /** v1: 'terminal' or 'fresh-agent'. */
+  kind: z.enum(['terminal', 'fresh-agent']),
   /** TerminalMode string as persisted ('shell', 'claude', …). */
   mode: z.string().min(1),
   /** The pane's stable creation key — required by contract. */
@@ -638,7 +639,12 @@ export type PaneVerdict = z.infer<typeof PaneVerdictSchema>
 export type PaneReconcileResultMessage = z.infer<typeof PaneReconcileResultSchema>
 
 /** Server capability advertisement on `ready`: present iff the client's hello opted in via capabilities.paneReconcileV1. */
-export const ReadyCapabilitiesSchema = z.object({ paneReconcileV1: z.literal(true).optional() }).optional()
+export const ReadyCapabilitiesSchema = z
+  .object({
+    paneReconcileV1: z.literal(true).optional(),
+    paneReconcileFreshAgentV1: z.literal(true).optional(),
+  })
+  .optional()
 
 export type ReadyCapabilities = z.infer<typeof ReadyCapabilitiesSchema>
 

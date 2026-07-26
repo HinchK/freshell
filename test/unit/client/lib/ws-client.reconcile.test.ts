@@ -148,4 +148,24 @@ describe('WsClient pane-reconcile capability', () => {
       expect.objectContaining({ type: 'terminal.create', requestId: 'cr-new' }),
     ])
   })
+
+  it('hello opts into paneReconcileFreshAgentV1', async () => {
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    expect(MockWebSocket.instances).toHaveLength(1)
+    MockWebSocket.instances[0]._open()
+
+    const sentMessages = framesOf(MockWebSocket.instances[0])
+    const hello = sentMessages.find((m) => m.type === 'hello') as { capabilities?: Record<string, unknown> }
+    expect(hello?.capabilities?.paneReconcileFreshAgentV1).toBe(true)
+
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p
+  })
+
+  it('getServerCapabilities exposes paneReconcileFreshAgentV1 from ready', async () => {
+    const client = getWsClient()
+    await connectAndReady(client, { capabilities: { paneReconcileV1: true, paneReconcileFreshAgentV1: true } })
+    expect(client.getServerCapabilities().paneReconcileFreshAgentV1).toBe(true)
+  })
 })
