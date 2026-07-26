@@ -2615,6 +2615,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         pendingReason: 'explicit_refresh',
       }
       setIsAttaching(false)
+      // F8: the detach was already sent above -- re-arm the attach via the
+      // background hydration queue so a hidden refresh cannot strand the
+      // pane detached until reveal. Same three-step sequence as the
+      // terminal.created site (see its comment for why each line exists).
+      getHydrationQueue().onHydrationComplete(paneIdRef.current)
+      hydrationRegisteredRef.current = false
+      registerForBackgroundHydration({ queueIfStarted: true })
     } else {
       attachTerminal(tid, 'viewport_hydrate', {
         clearViewportFirst: true,
@@ -2624,7 +2631,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
     return true
-  }, [attachTerminal, dispatch, paneId, suppressNetworkEffects, tabId, ws])
+  }, [attachTerminal, dispatch, paneId, registerForBackgroundHydration, suppressNetworkEffects, tabId, ws])
 
   // Apply settings changes
   useEffect(() => {
@@ -3838,6 +3845,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               pendingReason: 'terminal_created',
             }
             setIsAttaching(false)
+            // F8: a hidden pane still owes the server an attach. Drive it
+            // through the background hydration queue (one-at-a-time stagger)
+            // instead of waiting for reveal -- otherwise the terminal sits
+            // detached server-side and is idle-reaped after 15 minutes.
+            // Order matters (verified queue semantics):
+            // 1) clear this pane's stale active slot -- a background
+            //    hydration that died with the old connection otherwise
+            //    wedges the whole queue (no-op when not the active pane);
+            // 2) reset the registration guard -- it is only cleared on
+            //    reveal/unmount, so a previously-hydrated pane could never
+            //    re-register;
+            // 3) queueIfStarted -- the queue has NO reconnect pump and
+            //    onActiveTabReady is one-shot, so this is the only
+            //    post-startup path that enqueues AND pumps.
+            getHydrationQueue().onHydrationComplete(paneIdRef.current)
+            hydrationRegisteredRef.current = false
+            registerForBackgroundHydration({ queueIfStarted: true })
           } else {
             attachTerminal(newId, 'viewport_hydrate', { clearViewportFirst: true })
           }
