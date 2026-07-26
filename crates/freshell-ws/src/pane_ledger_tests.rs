@@ -369,6 +369,245 @@ fn delete_pending_is_a_noop_when_missing() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+fn never_absent(_p: &str, _s: &str) -> bool {
+    false
+}
+
+#[test]
+fn corrupt_ledger_boot_quarantines_per_row_never_per_store() {
+    // Red test `corrupt-ledger-boot` (spec §4.2): an unparsable row is
+    // renamed aside + logged, never silently dropped, and never causes
+    // healthy rows to be skipped.
+    let root = temp_root("corrupt");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("claude", "sess-good", "t1", 1_000))
+        .unwrap();
+    let bad = root.join("bindings").join("claude").join("sess-bad.json");
+    std::fs::write(&bad, b"{ not json").unwrap();
+    // A future-versioned row is also quarantined (ledgerVersion gates
+    // migration), never silently reinterpreted.
+    let vnext = root.join("bindings").join("claude").join("sess-vnext.json");
+    std::fs::write(
+        &vnext,
+        br#"{"ledgerVersion": 999, "someFutureShape": true}"#,
+    )
+    .unwrap();
+
+    let report = ledger.boot_scan(2_000, &never_absent);
+    assert_eq!(report.quarantined.len(), 2);
+    assert!(!bad.exists(), "corrupt row renamed aside");
+    assert!(!vnext.exists(), "future-version row renamed aside");
+    let provider_dir = root.join("bindings").join("claude");
+    let quarantined: Vec<String> = std::fs::read_dir(&provider_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".quarantined-"))
+        .collect();
+    assert_eq!(quarantined.len(), 2, "renamed aside, not deleted");
+    // Healthy rows still served.
+    assert!(ledger.load_binding("claude", "sess-good").is_some());
+    assert_eq!(ledger.quarantined_rows().len(), 2, "surfaced via API");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn crash_between_binding_write_and_marker_delete_is_repaired_at_boot() {
+    // Red test `crash-between-binding-write-and-marker-delete`: both rows
+    // present (the safe crash shape the pinned order buys) -> the boot
+    // sweep deletes the stale marker; the binding row wins throughout.
+    let root = temp_root("crash-window");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .unwrap();
+    ledger
+        .record_binding(&write("codex", "th-1", "t1", 2_000))
+        .unwrap();
+    // (simulates: binding written, crash before marker delete)
+
+    let report = ledger.boot_scan(3_000, &never_absent);
+    assert_eq!(report.stale_markers_removed, vec!["t1".to_string()]);
+    assert!(ledger.list_pending_raw().is_empty());
+    assert!(ledger.load_binding("codex", "th-1").is_some());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn boot_scan_never_sweeps_a_marker_merely_because_the_terminal_is_not_live() {
+    // Spec §4.2: pending markers are GC'd only for terminals whose clean
+    // exit was observed IN THIS PROCESS EPOCH — never swept at boot just
+    // because the terminal isn't currently live. That would erase the
+    // fresh-by-race breadcrumb at exactly the boot that needs it.
+    let root = temp_root("marker-preserved");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending("t1", "opencode", Some("/tmp/p"), 1_000)
+        .unwrap();
+    let report = ledger.boot_scan(2_000, &never_absent);
+    assert!(report.stale_markers_removed.is_empty());
+    assert!(ledger.pending_for_terminal("t1").is_some());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn aged_out_marker_is_swept_after_its_ttl() {
+    // A8/V7: a marker can leak (e.g. its pane died with a dead server and
+    // the terminal id is never re-minted). Lifetime is BOUNDED: a marker
+    // older than PENDING_MARKER_TTL_MS is swept, loudly. Fresh-by-race
+    // evidence matters at the boots NEAR the crash — a 30-day-old marker
+    // is stale noise, not evidence.
+    let root = temp_root("marker-ttl");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .unwrap();
+    let report = ledger.boot_scan(1_000 + PENDING_MARKER_TTL_MS + 1, &never_absent);
+    assert_eq!(report.stale_markers_removed, vec!["t1".to_string()]);
+    assert!(ledger.list_pending_raw().is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn periodic_gc_sweeps_aged_markers_without_a_restart() {
+    // The `gc` contract includes the aged-marker sweep (see the Interfaces
+    // note and the PENDING_MARKER_TTL_MS doc): the leaked-marker lifetime
+    // bound must hold on a LONG-RUNNING server, so the periodic path — not
+    // just boot_scan — must sweep aged markers.
+    let root = temp_root("marker-ttl-gc");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .unwrap();
+    // A fresh marker survives a GC pass (never swept merely for age < TTL)...
+    let report = ledger.gc(2_000, &never_absent);
+    assert!(report.stale_markers_removed.is_empty());
+    assert!(ledger.pending_for_terminal("t1").is_some());
+    // ...but an aged-out one is swept by gc() alone — no boot_scan involved.
+    let report = ledger.gc(1_000 + PENDING_MARKER_TTL_MS + 1, &never_absent);
+    assert_eq!(report.stale_markers_removed, vec!["t1".to_string()]);
+    assert!(ledger.list_pending_raw().is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
+    // Red test `crash-mid-supersession-two-bound-rows`: the new bound row
+    // was written but the crash landed before the old row was retired ->
+    // two bound rows share a pane lineage (liveTerminalId). Boot repair:
+    // newer updatedAt wins, older auto-retired as superseded, loudly.
+    let root = temp_root("two-bound");
+    // Forge the crash shape directly on disk (record_binding would retire
+    // the old); the ledger is constructed AFTER, so its construction-time
+    // index load sees the forged rows — the actual post-crash boot shape.
+    for (sid, at) in [("th-old", 1_000i64), ("th-new", 2_000i64)] {
+        let row = BindingRow {
+            ledger_version: LEDGER_VERSION,
+            provider: "codex".into(),
+            session_id: sid.into(),
+            mode: "codex".into(),
+            cwd: None,
+            live_terminal_id: Some("t1".into()),
+            create_request_id: None,
+            created_at: at,
+            updated_at: at,
+            last_observed_at: at,
+            state: RowState::Bound,
+            retired_reason: None,
+            superseded_by: None,
+        };
+        write_row_atomic(
+            &root
+                .join("bindings")
+                .join("codex")
+                .join(format!("{sid}.json")),
+            &row,
+        )
+        .unwrap();
+    }
+    // Constructed AFTER the forged rows, as promised above.
+    let ledger = PaneLedger::new(Some(root.clone()));
+
+    let report = ledger.boot_scan(3_000, &never_absent);
+    assert_eq!(report.supersession_repairs.len(), 1);
+    let old = ledger.load_binding("codex", "th-old").unwrap();
+    assert_eq!(old.state, RowState::Retired);
+    assert_eq!(old.retired_reason, Some(RetiredReason::Superseded));
+    assert_eq!(old.superseded_by.as_ref().unwrap().session_id, "th-new");
+    let new = ledger.load_binding("codex", "th-new").unwrap();
+    assert_eq!(new.state, RowState::Bound);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn gc_expires_unobserved_bound_rows_to_tombstones_never_deletion() {
+    let root = temp_root("gc");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("claude", "sess-old", "t1", 1_000))
+        .unwrap();
+    let now = 1_000 + BOUND_GC_TTL_MS + 1;
+    let report = ledger.gc(now, &never_absent);
+    assert_eq!(report.gc_tombstoned.len(), 1);
+    let row = ledger.load_binding("claude", "sess-old").unwrap();
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::GcExpired));
+    // NOT deleted — a tombstone.
+    assert!(ledger.ever_bound("claude", "sess-old"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn tombstone_deletion_is_conditioned_on_transcript_absence() {
+    let root = temp_root("tombstone");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("claude", "sess-x", "t1", 1_000))
+        .unwrap();
+    let expire_at = 1_000 + BOUND_GC_TTL_MS + 1;
+    ledger.gc(expire_at, &never_absent);
+    let delete_at = expire_at + TOMBSTONE_GC_TTL_MS + 1;
+
+    // Transcript still on disk (or unknown) -> tombstone survives forever.
+    let report = ledger.gc(delete_at, &never_absent);
+    assert!(report.tombstones_deleted.is_empty());
+    assert!(ledger.ever_bound("claude", "sess-x"));
+
+    // Definitively absent -> deletion is finally allowed.
+    let report = ledger.gc(delete_at, &|_p, _s| true);
+    assert_eq!(report.tombstones_deleted.len(), 1);
+    assert!(!ledger.ever_bound("claude", "sess-x"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn gc_expired_tombstone_rebinds_on_a_live_identity_event() {
+    // Spec §4.2: `retired/gc_expired -> bound` is a LEGAL transition, taken
+    // automatically (never-ask-when-we-can-act) and loudly logged.
+    let root = temp_root("revive");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("claude", "sess-x", "t1", 1_000))
+        .unwrap();
+    ledger.gc(1_000 + BOUND_GC_TTL_MS + 1, &never_absent);
+    assert_eq!(
+        ledger
+            .load_binding("claude", "sess-x")
+            .unwrap()
+            .retired_reason,
+        Some(RetiredReason::GcExpired)
+    );
+    let revive_at = 1_000 + BOUND_GC_TTL_MS + 2;
+    ledger
+        .record_binding(&write("claude", "sess-x", "t2", revive_at))
+        .unwrap();
+    let row = ledger.load_binding("claude", "sess-x").unwrap();
+    assert_eq!(row.state, RowState::Bound);
+    assert_eq!(row.retired_reason, None);
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn rebind_to_the_same_identity_is_not_a_supersession() {
     let root = temp_root("samebind");

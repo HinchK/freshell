@@ -61,6 +61,13 @@ pub const BOUND_GC_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 /// conversation is still recoverable.
 pub const TOMBSTONE_GC_TTL_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 
+/// Pending markers older than this are swept (boot scan + periodic GC),
+/// bounding leaked-marker lifetime (A8/V7: a pane that dies WITH the server
+/// leaves a marker no exit hook will ever delete — terminal ids are never
+/// re-minted). Fresh-by-race evidence matters at the boots near the crash;
+/// a month-old marker is stale noise.
+pub const PENDING_MARKER_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowState {
@@ -132,6 +139,17 @@ pub struct QuarantinedRow {
     pub original_path: PathBuf,
     pub quarantined_path: PathBuf,
     pub error: String,
+}
+
+/// What one boot scan / GC pass did — every field is also loudly logged.
+#[derive(Debug, Default)]
+pub struct BootScanReport {
+    pub quarantined: Vec<QuarantinedRow>,
+    pub stale_markers_removed: Vec<String>,
+    /// (retired old ref, winning new ref) pairs from the crash-window repair.
+    pub supersession_repairs: Vec<(SessionLocator, SessionLocator)>,
+    pub gc_tombstoned: Vec<SessionLocator>,
+    pub tombstones_deleted: Vec<SessionLocator>,
 }
 
 /// A chain-terminus lookup result. `corrected == true` means the caller's
@@ -601,6 +619,292 @@ impl PaneLedger {
             return Vec::new();
         }
         self.guard().pending.values().cloned().collect()
+    }
+
+    /// Boot-time hygiene (spec §4.2): per-row quarantine, stale-marker
+    /// sweep, supersession crash-window repair, then a GC pass. Fail loud
+    /// per-row, never per-store. The directory walks here are BOOT-ONLY —
+    /// steady-state reads stay on the in-memory index (V1.md).
+    pub fn boot_scan(
+        &self,
+        now_ms: i64,
+        transcript_absent: &dyn Fn(&str, &str) -> bool,
+    ) -> BootScanReport {
+        let Some(root) = self.root.clone() else {
+            return BootScanReport::default();
+        };
+        let mut index = self.guard();
+        let mut report = BootScanReport::default();
+
+        // 1. Quarantine unparsable / wrong-version rows (bindings + pending).
+        //    These never made it into the index (load_index keeps only clean
+        //    current-version parses), so no index maintenance is needed here.
+        self.quarantine_unparsable(&root, now_ms, &mut report);
+        {
+            let mut q = self.quarantined.write().unwrap_or_else(|p| p.into_inner());
+            q.extend(report.quarantined.iter().cloned());
+        }
+
+        // 2. Stale-marker sweep — two cases, both loud:
+        //    (a) a marker whose terminalId already has a binding row is
+        //        stale — the crash-between-write-and-delete shape;
+        //    (b) a marker older than PENDING_MARKER_TTL_MS is aged out
+        //        (A8/V7: bounds leaked markers from panes that died WITH the
+        //        server — no exit hook will ever fire for them and terminal
+        //        ids are never re-minted).
+        //    Markers that are neither are PRESERVED (fresh-by-race
+        //    evidence), never swept merely because the terminal isn't live.
+        let markers: Vec<PendingMarker> = index.pending.values().cloned().collect();
+        for marker in markers {
+            let covered = index
+                .bindings
+                .values()
+                .any(|r| r.live_terminal_id.as_deref() == Some(marker.terminal_id.as_str()));
+            let aged_out = now_ms - marker.spawned_at > PENDING_MARKER_TTL_MS;
+            if (covered || aged_out)
+                && Self::remove_pending(&root, &mut index, &marker.terminal_id).is_ok()
+            {
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    terminal_id = %marker.terminal_id,
+                    covered_by_binding = covered,
+                    aged_out = aged_out,
+                    "pane_ledger_stale_marker_swept: crash-window residue or aged past TTL"
+                );
+                report.stale_markers_removed.push(marker.terminal_id);
+            }
+        }
+
+        // 3. Supersession crash-window repair: two bound rows on one pane
+        //    lineage — newer updatedAt wins, older auto-retired, loud.
+        let mut by_terminal: std::collections::HashMap<String, Vec<BindingRow>> =
+            std::collections::HashMap::new();
+        for row in index.bindings.values() {
+            if row.state == RowState::Bound {
+                if let Some(tid) = &row.live_terminal_id {
+                    by_terminal
+                        .entry(tid.clone())
+                        .or_default()
+                        .push(row.clone());
+                }
+            }
+        }
+        for (terminal_id, mut rows) in by_terminal {
+            if rows.len() < 2 {
+                continue;
+            }
+            // Tiebreak rationale (A16, strategist report): both rows were
+            // written by a SINGLE process run, milliseconds apart — the only
+            // hazard is a wall-clock step landing INSIDE that ms-wide window.
+            // Accepted: wall-clock updatedAt is the tiebreak. If this ever
+            // bites, stamp an in-process AtomicU64 sequence into rows as a
+            // secondary tiebreak (schema addition, P1.13-compatible).
+            rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+            let winner = SessionLocator {
+                provider: rows[0].provider.clone(),
+                session_id: rows[0].session_id.clone(),
+            };
+            for mut loser in rows.into_iter().skip(1) {
+                loser.state = RowState::Retired;
+                loser.retired_reason = Some(RetiredReason::Superseded);
+                loser.superseded_by = Some(winner.clone());
+                loser.updated_at = now_ms;
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    terminal_id = %terminal_id,
+                    loser_session_id = %loser.session_id,
+                    winner_session_id = %winner.session_id,
+                    "pane_ledger_supersession_repair: two bound rows on one lineage; newer updatedAt wins"
+                );
+                let loser_ref = SessionLocator {
+                    provider: loser.provider.clone(),
+                    session_id: loser.session_id.clone(),
+                };
+                if self.write_binding(&root, &mut index, &loser).is_ok() {
+                    report
+                        .supersession_repairs
+                        .push((loser_ref, winner.clone()));
+                }
+            }
+        }
+
+        // 4. GC pass (also runs periodically via `gc`).
+        let gc_report = self.gc_locked(&root, &mut index, now_ms, transcript_absent);
+        report.gc_tombstoned = gc_report.gc_tombstoned;
+        report.tombstones_deleted = gc_report.tombstones_deleted;
+        report
+    }
+
+    /// The periodic subset: expire unobserved bound rows TO TOMBSTONES,
+    /// delete old tombstones ONLY when the transcript is definitively gone —
+    /// per the caller's DIRECT-STAT closure (V10.md: probe Absent alone is
+    /// not definitive; see the boot_scan contract) — and sweep aged-out
+    /// pending markers (the leaked-marker lifetime bound must hold on a
+    /// long-running server, not only across restarts).
+    pub fn gc(
+        &self,
+        now_ms: i64,
+        transcript_absent: &dyn Fn(&str, &str) -> bool,
+    ) -> BootScanReport {
+        let Some(root) = self.root.clone() else {
+            return BootScanReport::default();
+        };
+        let mut index = self.guard();
+        self.gc_locked(&root, &mut index, now_ms, transcript_absent)
+    }
+
+    fn gc_locked(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        now_ms: i64,
+        transcript_absent: &dyn Fn(&str, &str) -> bool,
+    ) -> BootScanReport {
+        let mut report = BootScanReport::default();
+
+        // Aged-marker sweep (A8/V7): part of the periodic subset per the
+        // `gc` contract, so a long-running server bounds leaked-marker
+        // lifetime WITHOUT a restart. Only the TTL case runs here — the
+        // covered-by-binding case is boot-only crash-window residue
+        // (boot_scan step 2, which also handles the TTL case at boot, so
+        // this loop finds nothing on the boot path).
+        let markers: Vec<PendingMarker> = index.pending.values().cloned().collect();
+        for marker in markers {
+            if now_ms - marker.spawned_at > PENDING_MARKER_TTL_MS
+                && Self::remove_pending(root, index, &marker.terminal_id).is_ok()
+            {
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    terminal_id = %marker.terminal_id,
+                    "pane_ledger_stale_marker_swept: aged past TTL (periodic GC)"
+                );
+                report.stale_markers_removed.push(marker.terminal_id);
+            }
+        }
+
+        let rows: Vec<BindingRow> = index.bindings.values().cloned().collect();
+        for mut row in rows {
+            let sref = SessionLocator {
+                provider: row.provider.clone(),
+                session_id: row.session_id.clone(),
+            };
+            match row.state {
+                RowState::Bound => {
+                    if now_ms - row.last_observed_at > BOUND_GC_TTL_MS {
+                        row.state = RowState::Retired;
+                        row.retired_reason = Some(RetiredReason::GcExpired);
+                        row.updated_at = now_ms;
+                        tracing::info!(
+                            target: "freshell_ws::pane_ledger",
+                            provider = %sref.provider,
+                            session_id = %sref.session_id,
+                            "pane_ledger_gc_tombstoned: bound row expired to tombstone (never deleted by timer)"
+                        );
+                        if self.write_binding(root, index, &row).is_ok() {
+                            report.gc_tombstoned.push(sref);
+                        }
+                    }
+                }
+                RowState::Retired => {
+                    let old_enough = now_ms - row.updated_at > TOMBSTONE_GC_TTL_MS;
+                    if old_enough && transcript_absent(&row.provider, &row.session_id) {
+                        let path = Self::binding_path(root, &row.provider, &row.session_id);
+                        if std::fs::remove_file(&path).is_ok() {
+                            index
+                                .bindings
+                                .remove(&(row.provider.clone(), row.session_id.clone()));
+                            tracing::info!(
+                                target: "freshell_ws::pane_ledger",
+                                provider = %sref.provider,
+                                session_id = %sref.session_id,
+                                "pane_ledger_tombstone_deleted: transcript gone (direct stat) and tombstone TTL elapsed"
+                            );
+                            report.tombstones_deleted.push(sref);
+                        }
+                    }
+                }
+            }
+        }
+        report
+    }
+
+    fn quarantine_unparsable(&self, root: &Path, now_ms: i64, report: &mut BootScanReport) {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(providers) = std::fs::read_dir(Self::bindings_dir(root)) {
+            for provider in providers.flatten() {
+                if let Ok(files) = std::fs::read_dir(provider.path()) {
+                    candidates.extend(files.flatten().map(|f| f.path()));
+                }
+            }
+        }
+        if let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) {
+            candidates.extend(files.flatten().map(|f| f.path()));
+        }
+        for path in candidates {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.contains(".tmp-") {
+                // Orphan temp from a crashed write — reap with a WARN (the
+                // `sweep_orphan_tmp` discipline).
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    path = %path.display(),
+                    "pane_ledger_orphan_tmp_reaped"
+                );
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue; // prior quarantine residue
+            }
+            let error = match load_row::<serde_json::Value>(&path) {
+                Err(e) => format!("{e}"),
+                Ok(value) => {
+                    let version = value.get("ledgerVersion").and_then(|v| v.as_u64());
+                    if version == Some(u64::from(LEDGER_VERSION)) {
+                        // Version ok — but does it parse as its row type?
+                        let is_pending = path
+                            .parent()
+                            .map(|p| p.ends_with("pending"))
+                            .unwrap_or(false);
+                        let typed_ok = if is_pending {
+                            serde_json::from_value::<PendingMarker>(value).is_ok()
+                        } else {
+                            serde_json::from_value::<BindingRow>(value).is_ok()
+                        };
+                        if typed_ok {
+                            continue; // healthy
+                        }
+                        "row shape does not match its type".to_string()
+                    } else {
+                        format!("unsupported ledgerVersion {version:?} (gate: {LEDGER_VERSION})")
+                    }
+                }
+            };
+            let quarantined_path = path.with_file_name(format!("{name}.quarantined-{now_ms}"));
+            tracing::error!(
+                target: "freshell_ws::pane_ledger",
+                path = %path.display(),
+                quarantined = %quarantined_path.display(),
+                error = %error,
+                "pane_ledger_row_quarantined: unparsable row renamed aside (fail loud per-row, never per-store)"
+            );
+            if std::fs::rename(&path, &quarantined_path).is_ok() {
+                report.quarantined.push(QuarantinedRow {
+                    original_path: path,
+                    quarantined_path,
+                    error,
+                });
+            }
+        }
+    }
+
+    /// Rows quarantined by this process's boot scan — the Phase-3 verdict
+    /// surfacing (`ledger_quarantined` breadcrumb) reads this.
+    pub fn quarantined_rows(&self) -> Vec<QuarantinedRow> {
+        self.quarantined
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 }
 
