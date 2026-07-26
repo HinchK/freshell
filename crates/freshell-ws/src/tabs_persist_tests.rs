@@ -1403,7 +1403,14 @@ fn mixed_device_id_dir_is_a_loud_error_not_first_file_wins() {
     // generation must agree, or the read fails loudly.
     let (events, _guard) = crate::invariants::capture::capture();
     let dir = tempfile::tempdir().unwrap();
-    put(dir.path(), "dev", "c1", 1, 1000, vec![open_record("dev:t", "t", 1)]);
+    put(
+        dir.path(),
+        "dev",
+        "c1",
+        1,
+        1000,
+        vec![open_record("dev:t", "t", 1)],
+    );
     // Hand-craft a second, fully VALID generation in the same dir whose
     // embedded deviceId disagrees.
     let ddir = device_dir_for(dir.path(), "dev").unwrap();
@@ -1425,7 +1432,8 @@ fn mixed_device_id_dir_is_a_loud_error_not_first_file_wins() {
     let err = list_snapshot_devices(dir.path())
         .expect_err("conflicting deviceIds in one dir must be an error");
     assert!(
-        err.to_string().contains("tabs_snapshot_device_identity_conflict"),
+        err.to_string()
+            .contains("tabs_snapshot_device_identity_conflict"),
         "{err}"
     );
     let events = events.lock().unwrap();
@@ -1441,8 +1449,22 @@ fn agreeing_multi_generation_dir_lists_exactly_one_device_id() {
     // Regression guard for the fix: reading ALL files (not just the first)
     // must still dedupe agreeing generations to one id.
     let dir = tempfile::tempdir().unwrap();
-    put(dir.path(), "dev", "c1", 1, 1000, vec![open_record("dev:t", "a", 1)]);
-    put(dir.path(), "dev", "c2", 1, 2000, vec![open_record("dev:t2", "b", 1)]);
+    put(
+        dir.path(),
+        "dev",
+        "c1",
+        1,
+        1000,
+        vec![open_record("dev:t", "a", 1)],
+    );
+    put(
+        dir.path(),
+        "dev",
+        "c2",
+        1,
+        2000,
+        vec![open_record("dev:t2", "b", 1)],
+    );
     assert_eq!(devices(dir.path()), vec!["dev".to_string()]);
 }
 
@@ -1453,12 +1475,13 @@ fn persist_lock_recovers_from_poison() {
     // deliberately poisons the process-global PERSIST_LOCK; every later
     // acquisition goes through the same into_inner() recovery, which is
     // exactly the property under test.
-    let _ = std::thread::spawn(|| {
-        with_persist_lock(|| panic!("deliberately poison PERSIST_LOCK"))
-    })
-    .join();
+    let _ = std::thread::spawn(|| with_persist_lock(|| panic!("deliberately poison PERSIST_LOCK")))
+        .join();
     let value = with_persist_lock(|| 42);
-    assert_eq!(value, 42, "a poisoned persist lock must still be acquirable");
+    assert_eq!(
+        value, 42,
+        "a poisoned persist lock must still be acquirable"
+    );
     // And a real write still works end-to-end after poisoning.
     let dir = tempfile::tempdir().unwrap();
     let outcome = persist_generation(
