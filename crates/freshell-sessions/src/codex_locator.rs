@@ -656,4 +656,313 @@ mod tests {
         assert_eq!(locator.fs_scan_count(), before);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    const TID2: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    #[test]
+    fn rollout_present_at_arm_is_never_a_candidate() {
+        let root = unique_temp_dir("snapshot");
+        // File exists BEFORE arm — the known-files snapshot must exclude it
+        // forever, regardless of any timing.
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 1_000));
+        assert!(locator.tick(1_000 + CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1); // zero candidates → keep watching
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn foreign_cwd_rollout_is_never_a_candidate() {
+        let root = unique_temp_dir("cwd");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/home/me/project-a")));
+        assert!(locator.note_submit("t1", 0));
+        write_rollout(&root, "2026/07/26", TID, Some("/home/me/project-b"));
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollout_without_cwd_field_never_binds() {
+        // cwd is REQUIRED (A4 hardening): `SessionMeta.cwd` is non-optional
+        // at codex 0.145.0 and 3,858/3,858 + 500/500 real rollouts carry it.
+        // A no-cwd first line is a foreign shape — accepting it would be
+        // pure attack surface (a location-blind universal candidate).
+        let root = unique_temp_dir("no-cwd");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        write_rollout(&root, "2026/07/26", TID, None);
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_new_rollouts_in_one_window_refuse_to_bind() {
+        let root = unique_temp_dir("ambiguous");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        write_rollout(&root, "2026/07/26", TID2, Some("/tmp"));
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        // Refusal marks the evaluation resolved but stays armed…
+        assert_eq!(locator.armed_count(), 1);
+        // …and a later Enter re-opens a fresh window (both files are now
+        // still absent from known_files, so still ambiguous — proves the
+        // refusal is repeatable, never a guess).
+        assert!(locator.note_submit("t1", CODEX_WINDOW_MS + 100));
+        assert!(locator
+            .tick(CODEX_WINDOW_MS + 100 + CODEX_WINDOW_MS)
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn same_rollout_claimed_by_two_armed_terminals_refuses_both() {
+        let root = unique_temp_dir("contested");
+        let locator = CodexLocator::new(root.clone());
+        // Two panes, SAME cwd, armed concurrently, submitting in the same
+        // tick; ONE new rollout. The contested-cwd census refuses both
+        // (Pass 2's same-tick claim check remains as defense-in-depth).
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.arm("t2", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        assert!(locator.note_submit("t2", 0));
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn staggered_same_cwd_armed_terminals_never_bind_uncontested() {
+        // Cross-tick contested guard (A4 hardening): ambiguity refusal must
+        // not be same-tick-only. While ≥2 ARMED terminals share a normalized
+        // cwd, NO candidate with that cwd binds for any of them — staggered
+        // deadlines must not let pane A grab pane B's rollout uncontested.
+        let root = unique_temp_dir("staggered");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.arm("t2", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        assert!(locator.note_submit("t2", 5_000));
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        // t1's deadline fires alone: contested cwd → refuse.
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        // t2's deadline: still contested → refuse.
+        assert!(locator.tick(5_000 + CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 2);
+        // One pane exits (disarm); the survivor re-opens with a fresh Enter
+        // and may now bind — re-evaluation is legitimate once uncontested.
+        locator.disarm("t2");
+        assert!(locator.note_submit("t1", 10_000));
+        let located = locator.tick(10_000 + CODEX_WINDOW_MS);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].terminal_id, "t1");
+        assert_eq!(located[0].thread_id, TID);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn zero_candidate_window_keeps_watching_and_later_enter_reopens() {
+        let root = unique_temp_dir("reopen");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        // Window closes with zero candidates → keep watching (stays armed).
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        // A later Enter re-opens; the rollout appears; resolves via the new
+        // Enter-anchored window.
+        let enter_at = 10 * CODEX_WINDOW_MS;
+        assert!(locator.note_submit("t1", enter_at));
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        let located = locator.tick(enter_at + CODEX_WINDOW_MS);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].thread_id, TID);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn later_enter_reopen_keeps_the_first_submit_snapshot() {
+        // Slow materialization (>2 s Enter→creation) is recovered by a later
+        // Enter ONLY if re-opens never re-snapshot: the pane's own late
+        // rollout appears between the first window's close and the second
+        // Enter, and must STAY a candidate. Only the FIRST submit
+        // re-snapshots (pinned via fs_scan_count).
+        let root = unique_temp_dir("reopen-snapshot");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0)); // first submit: re-snapshot
+                                               // First window closes empty.
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        // The pane's own rollout lands LATE — after the window, before the
+        // next Enter.
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        let scans_before = locator.fs_scan_count();
+        assert!(locator.note_submit("t1", 10_000)); // re-open: NO re-snapshot
+        assert_eq!(locator.fs_scan_count(), scans_before);
+        let located = locator.tick(10_000 + CODEX_WINDOW_MS);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].thread_id, TID);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mid_turn_enter_never_reopens_a_pending_evaluation() {
+        let root = unique_temp_dir("midturn");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 100));
+        // Second Enter while the first evaluation is still pending: no-op.
+        assert!(!locator.note_submit("t1", 200));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn non_session_meta_or_malformed_first_line_is_never_a_candidate() {
+        // COMPLETE (newline-terminated) garbage lines are `Probe::Never` —
+        // not pending: codex writes the whole meta line + '\n' in one
+        // write-then-flush, so a complete non-candidate line never becomes
+        // one. (Empty/torn lines are the pending case — see the tests below.)
+        let root = unique_temp_dir("badmeta");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        let dir = root.join("2026/07/26");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("rollout-2026-07-26T08-00-00-{TID}.jsonl")),
+            format!(r#"{{"type":"event_msg","payload":{{"id":"{TID}"}}}}"#),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("rollout-2026-07-26T08-00-01-{TID2}.jsonl")),
+            "not json at all\n",
+        )
+        .unwrap();
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_first_line_file_is_pending_and_binds_once_meta_lands() {
+        // A3 (validated): codex CREATES the rollout file, then awaits
+        // git-info collection (subprocesses, 5 s timeout each, worst ~10 s)
+        // BEFORE writing the session_meta first line. A deadline scan can
+        // observe the empty file — it must be a re-probed PENDING candidate,
+        // never dropped by a one-shot read.
+        let root = unique_temp_dir("pending");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        let dir = root.join("2026/07/26");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("rollout-2026-07-26T08-00-00-{TID}.jsonl"));
+        std::fs::write(&file, "").unwrap(); // created, meta not yet written
+                                            // Deadline scan: pending candidate → bind NOTHING, stay unresolved.
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        // Meta line lands (well within grace); the next sweep binds it.
+        // (write_rollout reuses the same filename — same ts, same TID.)
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        let located = locator.tick(CODEX_WINDOW_MS + 300);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].thread_id, TID);
+        assert_eq!(locator.armed_count(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn readable_candidate_never_binds_while_another_new_file_is_pending() {
+        // A4 (validated, CRITICAL): the pane's OWN rollout can sit
+        // unreadable in the git-info gap while a FOREIGN same-cwd rollout is
+        // already readable. Pending candidates are BIND-BLOCKING — the
+        // readable file must not win the window.
+        let root = unique_temp_dir("pending-block");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        // Pane's own file: created, first line not yet written.
+        let dir = root.join("2026/07/26");
+        std::fs::create_dir_all(&dir).unwrap();
+        let own = dir.join(format!("rollout-2026-07-26T08-00-00-{TID}.jsonl"));
+        std::fs::write(&own, "").unwrap();
+        // Foreign file: fully readable, same cwd.
+        write_rollout(&root, "2026/07/26", TID2, Some("/tmp"));
+        // Deadline: NOTHING binds while the pending file exists.
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        // Own meta line lands → TWO candidates → ambiguity refusal (fail
+        // toward refusal, never a guess).
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        assert!(locator.tick(CODEX_WINDOW_MS + 300).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pending_file_that_never_parses_expires_after_grace() {
+        // Grace is bounded (A4 hardening 1): once PENDING_FIRST_LINE_GRACE_MS
+        // elapses without a readable first line, the file is permanently
+        // excluded and stops blocking; a surviving sole candidate may then
+        // bind.
+        let root = unique_temp_dir("pending-expiry");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        let dir = root.join("2026/07/26");
+        std::fs::create_dir_all(&dir).unwrap();
+        let own = dir.join(format!("rollout-2026-07-26T08-00-00-{TID}.jsonl"));
+        std::fs::write(&own, "").unwrap(); // never gains a first line
+        write_rollout(&root, "2026/07/26", TID2, Some("/tmp"));
+        // First due scan sees the pending file (grace clock starts here).
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        // Still blocked just before grace expiry…
+        assert!(locator
+            .tick(CODEX_WINDOW_MS + PENDING_FIRST_LINE_GRACE_MS - 1)
+            .is_empty());
+        // …then the never-parsed file expires and the sole survivor binds.
+        let located = locator.tick(CODEX_WINDOW_MS + PENDING_FIRST_LINE_GRACE_MS);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].thread_id, TID2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_sessions_root_is_tolerated_and_resolves_once_it_appears() {
+        let base = unique_temp_dir("missing-root");
+        let root = base.join("does-not-exist-yet");
+        let locator = CodexLocator::new(root.clone());
+        // arm() scans the missing root — tolerated, never a panic.
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty()); // no panic, keep watching
+        assert_eq!(locator.armed_count(), 1);
+        assert!(locator.note_submit("t1", 2 * CODEX_WINDOW_MS));
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        let located = locator.tick(3 * CODEX_WINDOW_MS);
+        assert_eq!(located.len(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn flat_test_shape_rollout_resolves() {
+        // locate_codex_rollout supports flat `<id>.jsonl`; the locator's walk
+        // must too (integration fixtures seed this shape).
+        let root = unique_temp_dir("flat");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        write_rollout(&root, ".", TID, Some("/tmp"));
+        let located = locator.tick(CODEX_WINDOW_MS);
+        assert_eq!(located.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
