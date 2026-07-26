@@ -123,6 +123,10 @@ const RUST_ONLY_SPECS = [
   // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
   // restartAbrupt(); hidden panes must rebind without being revealed.
   /hidden-pane-rebind-rust\.spec\.ts$/,
+  // Wave-A integration preflight: cross-lane interaction proofs (A1xA3
+  // ledger-join coherence, A2xA3 dual claude identity stores). Imports
+  // RustServer directly for restartAbrupt().
+  /wavea-interactions-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -276,6 +280,10 @@ export default defineConfig({
         // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
         // restartAbrupt(); hidden panes must rebind without being revealed.
         /hidden-pane-rebind-rust\.spec\.ts$/,
+        // Wave-A integration preflight: cross-lane interaction proofs (A1xA3
+        // ledger-join coherence, A2xA3 dual claude identity stores). Imports
+        // RustServer directly for restartAbrupt().
+        /wavea-interactions-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
