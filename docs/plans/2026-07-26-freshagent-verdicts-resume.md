@@ -59,7 +59,7 @@
 
 **Files:**
 - Modify: `crates/freshell-ws/src/pane_ledger.rs`
-- Test: inline `#[cfg(test)] mod` in the same file (follow the existing test module, e.g. `record_binding_roundtrips_all_fields`)
+- Test: `crates/freshell-ws/src/pane_ledger_tests.rs` — the tests live in this sibling file, pulled in by `#[cfg(test)] #[path = "pane_ledger_tests.rs"] mod tests;` at `pane_ledger.rs:797-799` (follow the existing tests there, e.g. `record_binding_roundtrips_all_fields` at `pane_ledger_tests.rs:41`)
 
 **Interfaces:**
 - Consumes: existing `BindingRow`, `RowState`, `PaneLedger` internals (`record_binding` at `pane_ledger.rs:315` is the structural donor).
@@ -70,12 +70,13 @@
 
 - [ ] **Step 1: Write the failing tests**
 
-Add to the existing `#[cfg(test)]` module in `pane_ledger.rs` (reuse the module's existing temp-root helper — the same one `record_binding_roundtrips_all_fields` uses):
+Add to `crates/freshell-ws/src/pane_ledger_tests.rs` (the sibling tests file — `pane_ledger.rs:797-799` declares `#[cfg(test)] #[path = "pane_ledger_tests.rs"] mod tests;`). There is NO combined ledger-constructor helper; follow the file's existing convention (see `record_binding_roundtrips_all_fields`): `let root = temp_root("<label>"); let ledger = PaneLedger::new(Some(root.clone()));` with a manual trailing `std::fs::remove_dir_all(&root).ok();` (the `temp_root(label: &str) -> PathBuf` helper at `pane_ledger_tests.rs:8-20` returns a plain `PathBuf` — no Drop guard):
 
 ```rust
 #[test]
 fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
-    let (ledger, _tmp) = test_ledger(); // the module's existing temp-root constructor helper
+    let root = temp_root("fresh-agent-roundtrip"); // existing helper, pane_ledger_tests.rs:8-20
+    let ledger = PaneLedger::new(Some(root.clone()));
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             provider: "codex",
@@ -99,11 +100,13 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
     assert_eq!(row.effort.as_deref(), Some("high"));
     assert_eq!(row.cwd.as_deref(), Some("/home/u/proj"));
     assert_eq!(row.created_at, 1_000);
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
 fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
-    let (ledger, _tmp) = test_ledger();
+    let root = temp_root("fresh-agent-upsert");
+    let ledger = PaneLedger::new(Some(root.clone()));
     let base = FreshAgentBindingWrite {
         provider: "opencode",
         session_id: "ses_abc",
@@ -126,13 +129,15 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
     assert_eq!(row.updated_at, 2_000);
     assert_eq!(row.model.as_deref(), Some("m2"));
     assert_eq!(row.effort, None, "settings are a full snapshot, not a merge");
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[test]
 fn supersedes_retires_the_old_row_and_links_the_chain() {
     // G3 supersession (V8/A14): codex crash-respawn must retire the OLD
     // thread row and link it to the new one — never leave two Bound rows.
-    let (ledger, _tmp) = test_ledger();
+    let root = temp_root("fresh-agent-supersedes");
+    let ledger = PaneLedger::new(Some(root.clone()));
     let base = FreshAgentBindingWrite {
         provider: "codex",
         session_id: "old-thread",
@@ -165,6 +170,7 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
     let res = ledger.lookup_by_session("codex", "old-thread").expect("chain resolves");
     assert!(res.corrected, "claiming the old id is a corrected resolution");
     assert_eq!(res.row.session_id, "new-thread", "resolution lands at the terminus");
+    std::fs::remove_dir_all(&root).ok();
 }
 // (Match the EXACT `RowState`/`RetiredReason` variant names and `Resolution`
 // field names from pane_ledger.rs:107-148 / :450-484 — verify at implementation;
@@ -252,7 +258,7 @@ Expected: PASS (all three new tests plus every pre-existing pane_ledger test).
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
-git add crates/freshell-ws/src/pane_ledger.rs
+git add crates/freshell-ws/src/pane_ledger.rs crates/freshell-ws/src/pane_ledger_tests.rs
 git commit -m "feat(ledger): resume-invocation record fields + fresh-agent binding upsert (P1.13)"
 ```
 
@@ -2255,7 +2261,7 @@ git commit -m "feat(ws): fresh-agent panes enter the reconcile verdict system be
 **Interfaces:**
 - Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts`): `start()`, `restartAbrupt()` (SIGKILL + reboot on same home/port/token), `{env, setupHome}` options. `bootWall(page, {env, setupHome})` from the wall spec's helper pattern (test 4 only — tests 1-3 drive the server directly, no browser page needed). Fakes: `CODEX_CMD="node <fake-app-server.mjs>"` + `FAKE_CODEX_APP_SERVER_BEHAVIOR` (inline env JSON, STATIC per server boot — nothing can be rewritten between sidecar spawns, V4/A6; supports `appendThreadOperationLogPath` → JSONL `{method, threadId, params}`); `OPENCODE_CMD` + `FAKE_OPENCODE_AUDIT_LOG` (JSONL entries keyed by `event` field — there is NO `path` field, V4/A5); `FRESHELL_CLAUDE_SIDECAR` + `FAKE_CLAUDE_SIDECAR_LOG` (JSONL of every inbound message).
 - SEEDING SURFACES (V3/A3 — REST `POST /api/tabs` rejects `agent != "opencode"` with 400, `crates/freshell-freshagent/src/lib.rs:1268`; REST send-keys/capture 404 for codex/claude sessions, which never enter the REST `panes` map):
-  - **codex + claude (tests 1/3/4 creation):** raw WS `freshAgent.create` (schema `crates/freshell-protocol/src/client_messages.rs:457-488`, camelCase: `requestId`, `sessionType`, `cwd`, `model`, `effort`, `permissionMode`, `sandbox`, `resumeSessionId`; codex carries model/sandbox/approvalPolicy on `thread/start` and effort per `turn/start`; claude forwards model/permissionMode/effort to the sidecar verbatim), driven via `freshAgent.send`. Dispatch is gated on `settings.freshAgent.enabled=true` (`terminal.rs:567`) — PATCH settings first. Donor for the whole flow (settings-PATCH + raw create + created-wait): `crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs` (raw create at `:295`); port the same message sequence to the spec's Node context (`fetch` + `WebSocket`), following the hello/ready handshake the sibling specs use — verify exact PATCH endpoint shape against the donor during implementation.
+  - **codex + claude (tests 1/3/4 creation):** raw WS `freshAgent.create` (schema `crates/freshell-protocol/src/client_messages.rs:457-488`, camelCase: `requestId`, `sessionType`, `provider`, `cwd`, `model`, `effort`, `permissionMode`, `sandbox`, `resumeSessionId`; `provider` is `Option<AgentProvider>` in the schema but the dispatch at `terminal.rs:566-586` matches only `Some(Codex|Claude|Opencode)` and SILENTLY DROPS `provider: None` — every raw create in this spec MUST include `provider: 'codex' | 'opencode' | 'claude'`. `FreshAgentAttach.provider` is REQUIRED (non-Option, `client_messages.rs:492-503`) — an attach frame without it fails deserialization outright; codex carries model/sandbox/approvalPolicy on `thread/start` and effort per `turn/start`; claude forwards model/permissionMode/effort to the sidecar verbatim), driven via `freshAgent.send`. Dispatch is gated on `settings.freshAgent.enabled=true` (`terminal.rs:567`) — PATCH settings first. Donor for the whole flow (settings-PATCH + raw create + created-wait): `crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs` (raw create at `:295`); port the same message sequence to the spec's Node context (`fetch` + `WebSocket`), following the hello/ready handshake the sibling specs use — verify exact PATCH endpoint shape against the donor during implementation.
   - **opencode (test 2):** keeps REST `POST /api/tabs` `{ agent: 'opencode', model, effort }` + `POST /api/panes/:id/send-keys` (the REST surface is opencode-only and honors model/effort per-turn, V3 §2).
 - RESUME TOPOLOGY (V2/A4 — after `page.reload()` the frozen client NEVER sends `freshAgent.attach`; it sends `freshAgent.create{resumeSessionId, sessionRef}` (persistMiddleware strips `sessionId`). Attach fires only on `ws.onReconnect` WITHOUT reload. Each test below states which path it exercises and why.)
 - Donor spec for boot/env/restart plumbing: `test/e2e-browser/specs/freshclaude-restart-parity-rust.spec.ts:212-310`; donor for banner/UI flow (test 4): the wall/restore-matrix pane-creation patterns.
@@ -2280,7 +2286,7 @@ if (
 }
 ```
 
-(b) `fake-opencode.cjs` — audit the parsed prompt body (V4/A5: today the `prompt_async` handler parses the body but audits only `{event:'prompt_async', sessionId, routeDirectory, directory, prompt}`; `model`/`effort`/`reasoningEffort` are DISCARDED). In the prompt POST handler (`:776-809`), add the parsed body fields to the `appendAudit` payload at `:793-799`, e.g. `body: { model: body.model, effort: body.effort, reasoningEffort: body.reasoningEffort }` (~2 lines).
+(b) `fake-opencode.cjs` — audit the parsed prompt body (V4/A5: today the `prompt_async` handler parses the body but audits only `{event:'prompt_async', sessionId, routeDirectory, directory, prompt}`; the settings fields are DISCARDED). WIRE SHAPE (verified against `build_prompt_body`, `crates/freshell-opencode/src/serve.rs:939-955`): the body carries `model` as an OBJECT `{ providerID, modelID }` — included only when `split_opencode_model` succeeds, i.e. the model id is `provider/model`-shaped (`crates/freshell-opencode/src/model.rs:141-155` returns `None` for blank/slashless/edge-slash values, so the caller omits `model` entirely) — and effort as the string field `variant` (only when non-empty). There is NO `effort` or `reasoningEffort` key on the wire. In the prompt POST handler (`:776-809`), add the parsed body fields to the `appendAudit` payload at `:793-799`: `body: { model: body.model, variant: body.variant }` (~2 lines).
 
 - [ ] **Step 2: Write the four e2e tests (they fail against pre-fix behavior only where the fix is server-side; write them to assert the FIXED contract)**
 
@@ -2288,8 +2294,8 @@ if (
 
 1. **`codex: create-shaped resume after restart carries the recorded model`** — exercises the CREATE-resume path (R1 + ledger-fill), the exact wire shape the frozen client sends after `page.reload()` (V2/A4). No browser page.
    - Boot with `CODEX_CMD` fake + static behavior including `appendThreadOperationLogPath: <tmp>/codex-ops.jsonl` (resume succeeds by default).
-   - PATCH `settings.freshAgent.enabled=true`; open a raw WS; `freshAgent.create` with `{ sessionType: 'freshcodex', model: 'gpt-5.3-codex', sandbox: 'workspace-write', cwd: <tmp> }`; await `freshAgent.created` (capture the durable thread id); one `freshAgent.send`; await the turn.
-   - `await server.restartAbrupt()`; open a NEW raw WS; send `freshAgent.create` with `{ sessionType: 'freshcodex', resumeSessionId: <thread id> }` and NO model/sandbox — proving the values come from the LEDGER (R1 fills gaps, Task 5(d)), not from the message; await the created/attach-equivalent reply.
+   - PATCH `settings.freshAgent.enabled=true`; open a raw WS; `freshAgent.create` with `{ provider: 'codex', sessionType: 'freshcodex', model: 'gpt-5.3-codex', sandbox: 'workspace-write', cwd: <tmp> }`; await `freshAgent.created` (capture the durable thread id); one `freshAgent.send`; await the turn.
+   - `await server.restartAbrupt()`; open a NEW raw WS; send `freshAgent.create` with `{ provider: 'codex', sessionType: 'freshcodex', resumeSessionId: <thread id> }` and NO model/sandbox — proving the values come from the LEDGER (R1 fills gaps, Task 5(d)), not from the message; await the created/attach-equivalent reply.
    - Assertion block:
    ```ts
    const ops = fs.readFileSync(opLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
@@ -2301,22 +2307,25 @@ if (
 
 2. **`opencode: create-shaped resume after restart → next send carries the recorded model/effort`** — REST seeding (V3: opencode-only surface) + the create-shaped resume the frozen client sends post-reload (V2/A4; honored server-side by Task 8(b) — the P1.13 pin mechanism). No browser page.
    - Boot with `OPENCODE_CMD` fake + `FAKE_OPENCODE_AUDIT_LOG`.
-   - REST `POST /api/tabs` `{ agent: 'opencode', model: 'big-model', effort: 'high' }`; REST send-keys once (materializes `ses_*` — Task 7's REST-site ledger write records the settings; read the `ses_*` id from the audit log's `prompt_async` entry `sessionId`).
-   - `restartAbrupt()` (the REST panes map is in-memory and gone — post-restart driving is via WS). Open a raw WS (settings PATCH as in test 1); send `freshAgent.create{ sessionType: 'freshopencode', resumeSessionId: <ses_*> }` with NO model/effort; await created (must answer the `ses_*` id, not a placeholder); `freshAgent.send` one message with NO per-send settings.
+   - REST `POST /api/tabs` `{ agent: 'opencode', model: 'fakeprov/big-model', effort: 'high' }` — the model id MUST be `provider/model`-shaped: `split_opencode_model` (`crates/freshell-opencode/src/model.rs:141-155`) returns `None` for slashless ids, in which case `build_prompt_body` omits `model` from the wire entirely and the assertions below can never pass; REST send-keys once (materializes `ses_*` — Task 7's REST-site ledger write records the settings; read the `ses_*` id from the audit log's `prompt_async` entry `sessionId`).
+   - `restartAbrupt()` (the REST panes map is in-memory and gone — post-restart driving is via WS). Open a raw WS (settings PATCH as in test 1); send `freshAgent.create{ provider: 'opencode', sessionType: 'freshopencode', resumeSessionId: <ses_*> }` with NO model/effort; await created (must answer the `ses_*` id, not a placeholder); `freshAgent.send` one message with NO per-send settings.
    - Assertion block:
    ```ts
    const audit = fs.readFileSync(auditLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
    const prompts = audit.filter((e) => e.event === 'prompt_async') // V4: entries have `event`, never `path`
    const afterRestart = prompts[prompts.length - 1]
-   expect(afterRestart.body?.model ? JSON.stringify(afterRestart.body.model) : '', 'post-restart send must carry the recorded model').toContain('big-model')
-   expect(JSON.stringify(afterRestart.body ?? {}), 'post-restart send must carry the recorded effort').toContain('high')
+   // On the wire (build_prompt_body, serve.rs:939-955): model is the OBJECT
+   // { providerID: 'fakeprov', modelID: 'big-model' }, effort is the string
+   // field `variant` — never `effort`/`reasoningEffort`.
+   expect(afterRestart.body?.model, 'post-restart send must carry the recorded model').toEqual({ providerID: 'fakeprov', modelID: 'big-model' })
+   expect(afterRestart.body?.variant, 'post-restart send must carry the recorded effort (wire field: variant)').toBe('high')
    ```
-   (`body` is the field added in Step 1(b); assert on the audited body fields, matching the fake's actual shape at implementation time.)
+   (`body` is the field added in Step 1(b) — `{ model, variant }`; if the fake's parsed-body key names differ at implementation time, keep asserting the same VALUES — a `{providerID, modelID}` model object and `variant: 'high'` — against the fake's actual shape.)
 
 3. **`claude: attach resume request carries model/permissionMode`** — exercises the ATTACH path (`resume_for_attach`, Task 10's fix target). Attach is the no-reload restart topology: the frozen client sends it on `ws.onReconnect` without reload (V2/A4), and the donor spec proves attach-on-the-wire for claude. No browser page.
    - Boot with `FRESHELL_CLAUDE_SIDECAR` fake + `FAKE_CLAUDE_SIDECAR_LOG` (exactly the donor's env, `rust-server.ts` + donor `:212-310`).
-   - Settings PATCH; raw WS `freshAgent.create` `{ sessionType: 'freshclaude', model: 'opus-x', permissionMode: 'plan', cwd: <tmp> }`; await created + `sdk.session.init` handling (donor wait); capture the durable session id; one send.
-   - `restartAbrupt()`; new raw WS; send `freshAgent.attach { sessionId: <durable>, sessionType: 'freshclaude' }` (raw-attach donor: `crates/freshell-ws/tests/freshagent_claude_attach.rs:112`); await the resume.
+   - Settings PATCH; raw WS `freshAgent.create` `{ provider: 'claude', sessionType: 'freshclaude', model: 'opus-x', permissionMode: 'plan', cwd: <tmp> }`; await created + `sdk.session.init` handling (donor wait); capture the durable session id; one send.
+   - `restartAbrupt()`; new raw WS; send `freshAgent.attach { provider: 'claude', sessionId: <durable>, sessionType: 'freshclaude' }` — `provider` is a REQUIRED attach field; omitting it fails deserialization (raw-attach donor: the inline `json!` frame at `crates/freshell-ws/tests/freshagent_claude_attach.rs:276`, `{type, provider: "claude", sessionId, sessionType: "freshclaude"}`); await the resume.
    - Assertion block:
    ```ts
    const msgs = fs.readFileSync(sidecarLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
