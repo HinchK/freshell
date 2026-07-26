@@ -7,10 +7,13 @@
 //! `server/ws-handler.ts:2951-2963`):
 //!   1. the terminalId exists in the registry
 //!   2. that terminal is codex-mode
-//!   3. the terminal is not already bound to a DIFFERENT thread id (stale
-//!      replay) and the claimed thread id is not already bound to a DIFFERENT
-//!      terminal -- live OR retired (cross-pane hijack, including replaying a
-//!      DEAD pane's candidate onto a fresh pane)
+//!   3. binding uniqueness, in two halves: 3a -- the terminal is not already
+//!      bound to a DIFFERENT thread id (stale replay), enforced HERE; and
+//!      3b -- the claimed thread id is not already bound to a DIFFERENT
+//!      terminal, live OR retired (cross-pane hijack, including replaying a
+//!      DEAD pane's candidate onto a fresh pane), enforced INSIDE
+//!      `adopt_codex_identity` (codex_identity.rs), the shared adoption
+//!      tail, not by this handler
 //!   4. disk truth: the rolloutPath canonicalizes under the codex sessions
 //!      root and its FIRST JSONL record is a `session_meta` whose
 //!      `payload.id` is the claimed thread id (bounded 1MB read; legacy
@@ -138,26 +141,6 @@ pub(crate) async fn handle_codex_candidate_persisted(
             );
         }
         return;
-    }
-    // Guard 3b: the claimed session is not bound to a DIFFERENT terminal --
-    // live OR retired (cross-pane hijack). Retired-INCLUSIVE deliberately
-    // (ledger A8): a victim's binding is retired at exit, so a live-only
-    // lookup would let a DEAD pane's candidate be replayed onto a fresh
-    // terminal. Blocks no legitimate flow: every legit resume binds at
-    // create time and short-circuits at guard 3a above.
-    if let Some(other_tid) = state
-        .identity
-        .find_by_session_including_retired("codex", thread_id)
-    {
-        if other_tid != msg.terminal_id {
-            tracing::warn!(
-                terminal_id = %msg.terminal_id,
-                candidate_thread_id = %thread_id,
-                bound_terminal_id = %other_tid,
-                "codex_candidate_rejected: session_bound_elsewhere"
-            );
-            return;
-        }
     }
     // Guard 4: disk truth.
     let Some(root) = codex_sessions_root() else {
