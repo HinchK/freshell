@@ -661,7 +661,12 @@ async fn main() -> ExitCode {
         // `ws_state` is Clone (cheap: every field is an Arc/primitive), so
         // this borrows nothing from the `ws_state` binding consumed by the
         // router merge below.
-        spawn_sessions_sweep(Arc::clone(index), ws_state.clone(), terminal_identity.clone(), SESSIONS_SWEEP_INTERVAL);
+        spawn_sessions_sweep(
+            Arc::clone(index),
+            ws_state.clone(),
+            terminal_identity.clone(),
+            SESSIONS_SWEEP_INTERVAL,
+        );
     }
     // Restore-across-restart fix: the amplifier locator's polling cycle (its
     // Enter↔session-dir correlation is entirely poll-driven -- see
@@ -1464,11 +1469,13 @@ fn sessions_sweep_signature(
     let max_last_activity_at = items.iter().map(|s| s.last_activity_at).max().unwrap_or(0);
     let mut refs: Vec<(&str, &str, &str)> = identities
         .iter()
-        .map(|i| (
-            i.terminal_id.as_str(),
-            i.provider.as_deref().unwrap_or(""),
-            i.session_id.as_deref().unwrap_or(""),
-        ))
+        .map(|i| {
+            (
+                i.terminal_id.as_str(),
+                i.provider.as_deref().unwrap_or(""),
+                i.session_id.as_deref().unwrap_or(""),
+            )
+        })
         .collect();
     refs.sort_unstable();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1521,7 +1528,8 @@ fn spawn_sessions_sweep(
     interval: std::time::Duration,
 ) {
     tokio::spawn(async move {
-        let mut last_signature = sessions_sweep_signature(&session_index.snapshot().await, &identity.list());
+        let mut last_signature =
+            sessions_sweep_signature(&session_index.snapshot().await, &identity.list());
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1614,11 +1622,17 @@ mod sessions_sweep_tests {
 
         identity.upsert("term-1", Some("codex"), None, None, 1_000);
         let with_terminal = sessions_sweep_signature(&items, &identity.list());
-        assert_ne!(empty, with_terminal, "a new live coding terminal must move the signature");
+        assert_ne!(
+            empty, with_terminal,
+            "a new live coding terminal must move the signature"
+        );
 
         identity.upsert("term-1", Some("codex"), Some("thread-a"), None, 2_000);
         let adopted = sessions_sweep_signature(&items, &identity.list());
-        assert_ne!(with_terminal, adopted, "locator adoption must move the signature");
+        assert_ne!(
+            with_terminal, adopted,
+            "locator adoption must move the signature"
+        );
 
         identity.retire("term-1");
         let retired = sessions_sweep_signature(&items, &identity.list());
@@ -1653,7 +1667,7 @@ mod sessions_sweep_tests {
         let sig = sessions_sweep_signature(&items, &[]);
         assert_eq!(sig.0, 3);
         assert_eq!(sig.1, 500);
-        // Hash component is stable but implementation-dependent; we just check it exists
+        // Hash component is stable but implementation-dependent; not asserted here
     }
 
     /// The scenario the sweep task depends on: writing a NEW session file
@@ -1677,8 +1691,8 @@ mod sessions_sweep_tests {
         );
         let before = sessions_sweep_signature(&index.snapshot().await, &[]);
         assert_ne!(
-            before,
-            (0, 0, 0),
+            (before.0, before.1),
+            (0, 0),
             "seed session should produce a nonzero signature"
         );
 
