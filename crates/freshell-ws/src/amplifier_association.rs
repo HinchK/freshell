@@ -317,6 +317,7 @@ mod tests {
             amplifier_locator: Some(StdArc::new(AmplifierLocator::new(amplifier_home))),
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             opencode_locator: None,
+            codex_locator: None,
             activity: None,
         };
         (state, rx)

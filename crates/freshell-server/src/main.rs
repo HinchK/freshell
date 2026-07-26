@@ -340,6 +340,12 @@ async fn main() -> ExitCode {
             freshell_sessions::parse::default_opencode_data_home(),
         ),
     ));
+    // Lane B2 (campaign §2.3.2): server-side codex identity locator. Same
+    // sessions root the resume-time rollout locator below walks. `None`
+    // when HOME/CODEX_HOME are unresolvable — every codex_association
+    // entry point no-ops in that case.
+    let codex_locator = freshell_ws::codex_sessions_root()
+        .map(|root| std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(root)));
     // Slice 3a (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md): wire the
     // SAME locators + coding-CLI command specs `ws_state` (below) gets into
     // `fresh_agent_state` too, so `POST /api/tabs` terminal-mode creates (a)
@@ -432,6 +438,7 @@ async fn main() -> ExitCode {
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),
         opencode_locator: opencode_locator.clone(),
+        codex_locator: codex_locator.clone(),
         // Reconciliation handshake disk-truth probe (design §5.1): backed by
         // the SAME shared session index the History surfaces read; the
         // no-index fallback (honest `Unknown` on known providers) when no
@@ -634,6 +641,13 @@ async fn main() -> ExitCode {
     // Reuses the SAME cadence as the amplifier sweep above.
     if opencode_locator.is_some() {
         freshell_ws::opencode_association::spawn_opencode_locator_sweep(
+            ws_state.clone(),
+            AMPLIFIER_LOCATOR_SWEEP_INTERVAL,
+        );
+    }
+    // Lane B2: codex locator sweep — same cadence as the sibling sweeps.
+    if codex_locator.is_some() {
+        freshell_ws::codex_association::spawn_codex_locator_sweep(
             ws_state.clone(),
             AMPLIFIER_LOCATOR_SWEEP_INTERVAL,
         );

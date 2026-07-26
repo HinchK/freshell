@@ -134,6 +134,7 @@ pub async fn spawn_server_with_specs(
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
     };
@@ -214,6 +215,7 @@ pub async fn spawn_server_with_ledger(
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
     };
@@ -290,6 +292,7 @@ pub async fn spawn_server_with_specs_and_activity(
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: Some(activity_hub.clone()),
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
     };
@@ -355,6 +358,7 @@ pub async fn spawn_server_with_create_protect(
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
     };

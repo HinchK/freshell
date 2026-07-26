@@ -524,6 +524,16 @@ async fn handle_client_text(
             }
         }
         ClientMessage::TerminalInput(input) => {
+            // Lane B2: MUST complete before the Enter reaches the PTY — the
+            // codex locator's FIRST-submit re-snapshot has to finish before
+            // codex can materialize the rollout this very Enter triggers
+            // (else the pane's own file could land in the snapshot and be
+            // permanently excluded). Sound here: this socket task processes
+            // frames sequentially, and the enclosing handler is already
+            // async. Non-submit data returns immediately; only the first
+            // Enter of an armed codex pane scans (7-9 ms warm — A6).
+            crate::codex_association::note_possible_submit(state, &input.terminal_id, &input.data)
+                .await;
             state
                 .registry
                 .input(&input.terminal_id, input.data.as_bytes());
@@ -1352,6 +1362,10 @@ async fn handle_create(
         // (never-submitted, or already-associated) opencode terminal's armed
         // entry is never left dangling.
         let opencode_locator = state.opencode_locator.clone();
+        // Lane B2: sibling disarm for the codex rollout locator, so an
+        // exited (never-submitted, or already-associated) codex terminal's
+        // armed entry is never left dangling.
+        let codex_locator = state.codex_locator.clone();
         Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
             registry.finish_pty_exit(&tid, exit_code);
@@ -1375,6 +1389,9 @@ async fn handle_create(
                 locator.disarm(&tid);
             }
             if let Some(locator) = &opencode_locator {
+                locator.disarm(&tid);
+            }
+            if let Some(locator) = &codex_locator {
                 locator.disarm(&tid);
             }
         }))
@@ -1525,6 +1542,40 @@ async fn handle_create(
         resolved_cwd.as_deref(),
         resume_session_id.as_deref(),
     );
+
+    // Lane B2: arm the codex rollout locator for a FRESH (non-resuming)
+    // codex pane. Restore-created panes WITHOUT identity arm too — arm()
+    // gates on resume_session_id, never a restore flag (the wave-A re-arm
+    // contract).
+    //
+    // ORDERING NOTE (A5, validated): this arm runs AFTER the PTY spawn
+    // (registry.create + adopt() have already awaited above). That is safe
+    // ONLY because windows are Enter-anchored: real codex materializes its
+    // rollout at the first user prompt, never in the spawn→arm gap, so the
+    // snapshot cannot miss the pane's own file. Do not reinterpret this as
+    // "snapshot precedes spawn" — it does not need to.
+    //
+    // The arm() snapshot walks the sessions tree; run it on the blocking
+    // pool, not the WS dispatch path (A6: warm walks are 7-9 ms today and
+    // ~100 ms at 100k files, but cold dentry cache after a reboot is the
+    // one unmeasured tail).
+    {
+        let state = state.clone();
+        let terminal_id = terminal_id.clone();
+        let mode = mode.clone();
+        let cwd = resolved_cwd.clone();
+        let resume = resume_session_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::codex_association::maybe_arm(
+                &state,
+                &terminal_id,
+                &mode,
+                cwd.as_deref(),
+                resume.as_deref(),
+            );
+        })
+        .await;
+    }
 
     // Snapshot the id before it's moved into `created` below -- needed for the
     // `terminal.meta.updated` create-time slice after the create frame is sent.
@@ -3193,6 +3244,7 @@ mod terminals_changed_tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            codex_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         };
@@ -3400,6 +3452,7 @@ mod terminal_meta_created_tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            codex_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         };
