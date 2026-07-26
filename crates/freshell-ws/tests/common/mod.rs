@@ -136,6 +136,7 @@ pub async fn spawn_server_with_specs(
         opencode_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        fresh_agent_respawn_counts: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -216,6 +217,7 @@ pub async fn spawn_server_with_ledger(
         opencode_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        fresh_agent_respawn_counts: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -292,6 +294,7 @@ pub async fn spawn_server_with_specs_and_activity(
         opencode_locator: None,
         activity: Some(activity_hub.clone()),
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        fresh_agent_respawn_counts: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -357,6 +360,7 @@ pub async fn spawn_server_with_create_protect(
         opencode_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        fresh_agent_respawn_counts: Default::default(),
     };
 
     let router = freshell_ws::router(state);

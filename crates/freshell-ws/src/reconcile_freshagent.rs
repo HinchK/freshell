@@ -49,6 +49,138 @@ pub struct FreshAgentReconcileSnapshot {
     pub facts: std::collections::HashMap<String /* paneKey */, FreshAgentPaneFacts>,
 }
 
+/// The ONE async gathering pass per reconcile request (Task 13): session-map
+/// liveness, disk existence, ledger supersession resolution, in-request
+/// dedupe, and the respawn cap all condense into per-pane facts here, so
+/// [`verdict_for_pane`] stays pure + sync inside derive_verdicts'
+/// catch_unwind. Built ONCE per request and REUSED if deps are re-derived —
+/// rebuilding would double-burn the respawn counter.
+///
+/// Respawn-cap rationale (V2/A7): the terminal donor counts actual process
+/// exits within a liveness window and RESETS on survival
+/// (`registry.rs:1271-1283`) — per-answer burning without decay would let 3
+/// reloads kill a healthy session. Counting respawn ANSWERS with
+/// reset-on-live means only a genuinely non-recovering loop trips the cap.
+/// Residual A19 (accepted): the next-wave client's reconcile cadence is
+/// unpinned — REVISIT the cap value/semantics when that client lands.
+pub async fn build_snapshot(
+    state: &crate::WsState,
+    panes: &[ReconcilePane],
+) -> FreshAgentReconcileSnapshot {
+    let mut facts = std::collections::HashMap::new();
+    let mut claimed: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    for pane in panes
+        .iter()
+        .filter(|p| p.kind.as_deref() == Some("fresh-agent"))
+    {
+        let Some(sref) = pane.session_ref.as_ref() else {
+            continue; // verdict fn answers no_recoverable_identity
+        };
+        // G3 reader rule (V8/A14): resolve the CLAIM through the ledger's
+        // supersession chain FIRST — dedupe, liveness, existence, and the
+        // respawn counter all key on the TERMINUS id (lookup_by_session is
+        // public + memory-only).
+        let resolved = state
+            .pane_ledger
+            .lookup_by_session(&sref.provider, &sref.session_id)
+            .filter(|r| r.corrected)
+            .map(|r| r.row.session_id);
+        let session_id = resolved.clone().unwrap_or_else(|| sref.session_id.clone());
+        let key = (sref.provider.clone(), session_id.clone());
+        if let Some(winner) = claimed.get(&key) {
+            facts.insert(
+                pane.pane_key.clone(),
+                FreshAgentPaneFacts {
+                    presence: FreshAgentPresence::Unknown,
+                    duplicate_of: Some(winner.clone()),
+                    respawn_exhausted: false,
+                    resolved_session_id: resolved,
+                },
+            );
+            continue;
+        }
+        claimed.insert(key.clone(), pane.pane_key.clone());
+        let live = match sref.provider.as_str() {
+            "codex" => state.fresh_codex.has_live_session(&session_id).await,
+            "claude" => state.fresh_claude.has_live_session(&session_id).await,
+            "opencode" => state.fresh_opencode.has_live_session(&session_id).await,
+            _ => false,
+        };
+        use crate::existence::SessionExistence as E;
+        let presence = if live {
+            FreshAgentPresence::Live
+        } else {
+            // Exhaustive match, NO catch-all (B1 hardening: when B1 adds
+            // E::ProviderUnavailable this goes non-exhaustive — add the
+            // pre-decided arm `E::ProviderUnavailable => FreshAgentPresence::Unknown`).
+            match state.session_existence.exists(&sref.provider, &session_id) {
+                E::Present => FreshAgentPresence::OnDisk,
+                E::Absent => {
+                    if state
+                        .session_existence
+                        .ever_observed(&sref.provider, &session_id)
+                    {
+                        FreshAgentPresence::GoneObserved
+                    } else {
+                        FreshAgentPresence::NeverObserved
+                    }
+                }
+                E::Unknown => {
+                    // The ledger is positive evidence the session existed.
+                    if state.pane_ledger.ever_bound(&sref.provider, &session_id) {
+                        FreshAgentPresence::OnDisk
+                    } else {
+                        FreshAgentPresence::Unknown
+                    }
+                }
+            }
+        };
+        // Respawn cap (V2/A7 — reworked): count only answers that actually
+        // come back `respawn`, and CLEAR the counter when presence resolves
+        // Live (a successful respawn is OBSERVED as the session going live).
+        // The counting lives HERE because for non-duplicate panes the verdict
+        // is fully determined by presence: OnDisk/Unknown + !exhausted ⇒
+        // respawn (see verdict_for_pane) — so "this answer will be respawn"
+        // is known at increment time. Mutation stays in this async builder,
+        // OUTSIDE derive_verdicts' catch_unwind.
+        let respawn_exhausted = match presence {
+            FreshAgentPresence::Live => {
+                state
+                    .fresh_agent_respawn_counts
+                    .lock()
+                    .expect("respawn counts poisoned")
+                    .remove(&key); // reset-on-live
+                false
+            }
+            FreshAgentPresence::OnDisk | FreshAgentPresence::Unknown => {
+                let mut counts = state
+                    .fresh_agent_respawn_counts
+                    .lock()
+                    .expect("respawn counts poisoned");
+                let c = counts.entry(key).or_insert(0);
+                if *c >= FRESH_AGENT_RESPAWN_CAP {
+                    true // this answer becomes dead_session{respawn_exhausted}; no burn
+                } else {
+                    *c += 1; // this answer goes out as `respawn` — burn one
+                    false
+                }
+            }
+            FreshAgentPresence::GoneObserved | FreshAgentPresence::NeverObserved => false,
+        };
+        facts.insert(
+            pane.pane_key.clone(),
+            FreshAgentPaneFacts {
+                presence,
+                duplicate_of: None,
+                respawn_exhausted,
+                resolved_session_id: resolved,
+            },
+        );
+    }
+    FreshAgentReconcileSnapshot { facts }
+}
+
 /// The SINGLE PaneVerdict construction point in this module (B1-coexistence
 /// hardening, V9/A12 — keep it that way).
 fn base(pane: &ReconcilePane, verdict: ReconcileVerdict) -> PaneVerdict {

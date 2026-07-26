@@ -291,6 +291,7 @@ mod tests {
             opencode_locator: Some(StdArc::new(OpencodeLocator::new(data_home))),
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            fresh_agent_respawn_counts: Default::default(),
         };
         (state, rx)
     }

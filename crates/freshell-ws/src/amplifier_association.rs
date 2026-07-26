@@ -316,6 +316,7 @@ mod tests {
             config_fallback: None,
             amplifier_locator: Some(StdArc::new(AmplifierLocator::new(amplifier_home))),
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            fresh_agent_respawn_counts: Default::default(),
             opencode_locator: None,
             activity: None,
         };

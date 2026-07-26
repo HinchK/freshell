@@ -1,27 +1,145 @@
-//! `paneReconcileFreshAgentV1` capability wire tests — raw-WS
-//! (tokio-tungstenite) integration against an in-process axum server, on the
-//! `pane_reconcile.rs` harness convention (ephemeral loopback ports, never a
-//! fixed one).
+//! `paneReconcileFreshAgentV1` capability + verdict-derivation wire tests —
+//! raw-WS (tokio-tungstenite) integration against an in-process axum server,
+//! on the `pane_reconcile.rs` harness convention (ephemeral loopback ports,
+//! never a fixed one).
 //!
-//! Covered here (Task 11 — capability negotiation only):
+//! Covered here:
 //! * negotiation — `hello.capabilities.paneReconcileFreshAgentV1` → echoed in
 //!   `ready.capabilities` (typed `ReadyCapabilities`, omitted when absent).
 //! * frozen-client protection — a connection WITHOUT the capability keeps the
 //!   pre-existing verdict for `kind: "fresh-agent"`: `invalid` /
 //!   `unsupported_kind` (the permanent regression guard).
-//!
-//! Task 13 extends this file with the fresh-agent verdict derivation tests.
+//! * Task 13 — fresh-agent verdict derivation: the four states, live→attach,
+//!   in-request dedupe, the respawn cap + reset-on-live, and the G3
+//!   supersession-chain reader rule end-to-end through the real ledger.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use freshell_ws::existence::SessionExistence;
+use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
+
+/// Serializes every test in this file that mutates the process-global
+/// `FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE` / `CLAUDE_CONFIG_DIR`
+/// env vars, mirroring `freshagent_claude_attach.rs`'s convention for the
+/// same hazard.
+static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// ── scripted disk-truth probe ─────────────────────────────────────────────────
+
+#[derive(Default)]
+struct StubProbe {
+    answers: std::sync::Mutex<std::collections::HashMap<(String, String), SessionExistence>>,
+    observed: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+}
+impl freshell_ws::existence::SessionExistenceProbe for StubProbe {
+    fn exists(&self, provider: &str, session_id: &str) -> SessionExistence {
+        self.answers
+            .lock()
+            .unwrap()
+            .get(&(provider.into(), session_id.into()))
+            .copied()
+            .unwrap_or(SessionExistence::Unknown)
+    }
+    fn ever_observed(&self, provider: &str, session_id: &str) -> bool {
+        self.observed
+            .lock()
+            .unwrap()
+            .contains(&(provider.into(), session_id.into()))
+    }
+}
+
+// ── fake claude sidecar (donor: freshagent_claude_attach.rs) ──────────────────
+
+/// A minimal scripted fake claude sidecar (no real SDK, no network, no cost)
+/// speaking the SAME newline-JSON protocol `spawn_sidecar()` drives the
+/// vendored package with. On `create` it replies `created`, then
+/// `sdk.session.init` echoing `resumeSessionId` (or a fixed durable UUID the
+/// tests control) as the durable `cliSessionId`, then `sdk.status idle`; on
+/// `shutdown` it exits.
+const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
+import readline from 'node:readline'
+
+let counter = 0
+const rl = readline.createInterface({ input: process.stdin, terminal: false })
+rl.on('line', (line) => {
+  const trimmed = line.trim()
+  if (!trimmed) return
+  let msg
+  try {
+    msg = JSON.parse(trimmed)
+  } catch {
+    return
+  }
+  if (msg.type === 'create') {
+    counter += 1
+    const sessionId = `fake-claude-session-${process.pid}-${counter}`
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
+    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
+  } else if (msg.type === 'shutdown') {
+    process.exit(0)
+  }
+})
+"#;
+
+/// The fixed durable `cliSessionId` the fake sidecar mints on a plain (non
+/// resume) `create` — the id the live-session tests key their probe on.
+const FAKE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+/// A fresh temp dir holding the fake sidecar script, with
+/// `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE` pointed at it, PLUS an
+/// empty claude store with `CLAUDE_CONFIG_DIR` pointed at it (so no test ever
+/// touches the real home). Caller must hold [`CLAUDE_ENV_LOCK`] for the
+/// lifetime of the returned guard.
+struct FakeClaudeEnv {
+    dir: std::path::PathBuf,
+}
+impl FakeClaudeEnv {
+    fn install() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-fake-claude-reconcile-ws-{}",
+            uuid_like_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
+        let script = dir.join("fake-claude-sidecar.mjs");
+        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
+        let store = dir.join("claude-store");
+        std::fs::create_dir_all(&store).expect("create claude store dir");
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &store);
+        Self { dir }
+    }
+}
+impl Drop for FakeClaudeEnv {
+    fn drop(&mut self) {
+        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+        std::env::remove_var("FRESHELL_CLAUDE_NODE");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Dependency-free unique suffix (avoids pulling in `uuid` for this test crate).
+fn uuid_like_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{nanos}-{:?}", std::thread::current().id())
+}
 
 fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
@@ -29,7 +147,7 @@ fn test_settings_value() -> serde_json::Value {
         "codingCli": { "enabledProviders": [], "mcpServer": true, "providers": {} },
         "editor": { "externalEditor": "auto" },
         "extensions": { "disabled": [] },
-        "freshAgent": { "defaultPlugins": [], "enabled": false, "providers": {} },
+        "freshAgent": { "defaultPlugins": [], "enabled": true, "providers": {} },
         "logging": { "debug": false },
         "network": { "configured": true, "host": "127.0.0.1" },
         "panes": { "defaultNewPane": "ask" },
@@ -45,27 +163,41 @@ fn test_settings_value() -> serde_json::Value {
 
 struct Server {
     url: String,
-    // Shared-registry handles, donor-shaped: Task 13's derivation tests seed
-    // generations through these; Task 11's negotiation tests don't need to.
+    // Shared-registry handles, donor-shaped: derivation tests seed state
+    // through these; the negotiation tests don't need to.
     #[allow(dead_code)]
     registry: freshell_terminal::TerminalRegistry,
     #[allow(dead_code)]
     identity: freshell_ws::identity::TerminalIdentityRegistry,
+    /// The REAL temp-root ledger shared with the server (G3 tests seed it).
+    pane_ledger: Arc<PaneLedger>,
+    /// Clone of `WsState.fresh_agent_respawn_counts` for direct assertions.
+    respawn_counts: Arc<Mutex<HashMap<(String, String), u32>>>,
+    /// Keeps the ledger's temp root alive for the server's lifetime.
+    #[allow(dead_code)]
+    ledger_root: tempfile::TempDir,
 }
 
-/// Real axum server on an ephemeral loopback port. Returns handles to the
-/// SHARED registry + identity registry so tests can seed generations
-/// deterministically (the §9.1 headless convention).
-async fn spawn_server() -> Server {
+/// Real axum server on an ephemeral loopback port, with the scripted
+/// disk-truth probe + a REAL temp-root pane ledger injected via the pub
+/// `WsState` fields. Returns handles to the SHARED registries/ledger/counter
+/// so tests can seed and assert deterministically (the §9.1 headless
+/// convention).
+async fn spawn_server_with_probe(probe: Arc<StubProbe>) -> Server {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
     let registry = freshell_terminal::TerminalRegistry::new();
     let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    let ledger_root = tempfile::tempdir().expect("ledger temp root");
+    let pane_ledger = Arc::new(PaneLedger::new_locked(Some(
+        ledger_root.path().to_path_buf(),
+    )));
+    let respawn_counts: Arc<Mutex<HashMap<(String, String), u32>>> = Arc::default();
 
     let state = WsState {
-        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        pane_ledger: Arc::clone(&pane_ledger),
         identity: identity.clone(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
@@ -75,7 +207,7 @@ async fn spawn_server() -> Server {
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
-            serde_json::json!({ "freshAgent": { "enabled": false } }),
+            serde_json::json!({ "freshAgent": { "enabled": true } }),
         ),
         fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
         fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
@@ -102,7 +234,8 @@ async fn spawn_server() -> Server {
         amplifier_locator: None,
         opencode_locator: None,
         activity: None,
-        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        session_existence: probe,
+        fresh_agent_respawn_counts: Arc::clone(&respawn_counts),
     };
 
     let router = freshell_ws::router(state);
@@ -118,7 +251,14 @@ async fn spawn_server() -> Server {
         url: format!("ws://{addr}/ws"),
         registry,
         identity,
+        pane_ledger,
+        respawn_counts,
+        ledger_root,
     }
+}
+
+async fn spawn_server() -> Server {
+    spawn_server_with_probe(Arc::new(StubProbe::default())).await
 }
 
 type TestWs =
@@ -201,6 +341,56 @@ async fn reconcile_request(ws: &mut TestWs, panes: serde_json::Value) -> serde_j
     result["verdicts"].clone()
 }
 
+/// Drain frames until one matching `predicate` arrives (or the budget expires).
+async fn await_frame(
+    ws: &mut TestWs,
+    budget: Duration,
+    predicate: impl Fn(&Value) -> bool,
+) -> Value {
+    tokio::time::timeout(budget, async {
+        loop {
+            let msg = ws
+                .next()
+                .await
+                .expect("stream not ended")
+                .expect("no ws error");
+            let WsMessage::Text(text) = msg else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&text).unwrap();
+            if predicate(&value) {
+                return value;
+            }
+        }
+    })
+    .await
+    .expect("expected frame did not arrive within budget")
+}
+
+/// Drive a claude `freshAgent.create` through the fake sidecar and return the
+/// durable `cliSessionId` from the `freshAgent.session.init` event.
+async fn create_live_claude_session(ws: &mut TestWs, request_id: &str) -> String {
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "freshAgent.create",
+            "requestId": request_id,
+            "sessionType": "freshclaude",
+            "provider": "claude",
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send freshAgent.create");
+    let init = await_frame(ws, Duration::from_secs(15), |v| {
+        v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.session.init"
+    })
+    .await;
+    init["event"]["cliSessionId"]
+        .as_str()
+        .expect("session.init carries the durable cliSessionId")
+        .to_string()
+}
+
 // --- negotiation ---------------------------------------------------------------
 
 #[tokio::test]
@@ -229,4 +419,259 @@ async fn without_the_capability_fresh_agent_kind_stays_invalid_unsupported() {
     .await;
     assert_eq!(verdicts[0]["verdict"], "invalid");
     assert_eq!(verdicts[0]["reason"], "unsupported_kind");
+}
+
+// --- Task 13: fresh-agent verdict derivation -------------------------------------
+
+#[tokio::test]
+async fn fresh_agent_verdicts_cover_the_four_states() {
+    let probe = std::sync::Arc::new(StubProbe::default());
+    probe.answers.lock().unwrap().insert(
+        ("codex".into(), "resumable".into()),
+        SessionExistence::Present,
+    );
+    probe.answers.lock().unwrap().insert(
+        ("claude".into(), "deleted".into()),
+        SessionExistence::Absent,
+    );
+    probe
+        .observed
+        .lock()
+        .unwrap()
+        .insert(("claude".into(), "deleted".into()));
+    probe.answers.lock().unwrap().insert(
+        ("opencode".into(), "never".into()),
+        SessionExistence::Absent,
+    );
+    let server = spawn_server_with_probe(probe).await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "a", "kind": "fresh-agent", "sessionRef": {"provider": "codex", "sessionId": "resumable"} },
+            { "paneKey": "b", "kind": "fresh-agent", "sessionRef": {"provider": "claude", "sessionId": "deleted"} },
+            { "paneKey": "c", "kind": "fresh-agent", "sessionRef": {"provider": "opencode", "sessionId": "never"} },
+            { "paneKey": "d", "kind": "fresh-agent" },
+            { "paneKey": "t", "kind": "terminal", "mode": "shell", "createRequestId": "cr-t" }
+        ]),
+    )
+    .await;
+    assert_eq!(
+        verdicts[0]["verdict"], "respawn",
+        "killed-server-but-resumable"
+    );
+    assert_eq!(verdicts[0]["sessionRef"]["sessionId"], "resumable");
+    assert_eq!(verdicts[1]["verdict"], "dead_session", "transcript deleted");
+    assert_eq!(verdicts[1]["reason"], "session_not_on_disk");
+    assert_eq!(verdicts[2]["verdict"], "fresh", "never existed");
+    assert_eq!(verdicts[2]["reason"], "identity_never_observed");
+    assert_eq!(verdicts[3]["verdict"], "fresh");
+    assert_eq!(verdicts[3]["reason"], "no_recoverable_identity");
+    // Terminal panes in the same request still work (mixed-kind request):
+    assert_eq!(verdicts[4]["paneKey"], "t");
+    assert_eq!(
+        verdicts[4]["verdict"], "fresh",
+        "shell terminal answered normally"
+    );
+}
+
+#[tokio::test]
+async fn live_fresh_agent_session_gets_attach() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeClaudeEnv::install();
+
+    let server = spawn_server().await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+
+    let cli_session_id = create_live_claude_session(&mut ws, "req-live-attach").await;
+    assert_eq!(cli_session_id, FAKE_DURABLE_ID);
+
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "live", "kind": "fresh-agent",
+              "sessionRef": {"provider": "claude", "sessionId": cli_session_id} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "attach");
+    assert_eq!(verdicts[0]["sessionRef"]["sessionId"], cli_session_id);
+    assert!(verdicts[0].get("terminalId").is_none());
+}
+
+#[tokio::test]
+async fn duplicate_session_claims_dedupe_within_one_request() {
+    let probe = std::sync::Arc::new(StubProbe::default());
+    probe
+        .answers
+        .lock()
+        .unwrap()
+        .insert(("codex".into(), "t1".into()), SessionExistence::Present);
+    let server = spawn_server_with_probe(probe).await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "first",  "kind": "fresh-agent", "sessionRef": {"provider": "codex", "sessionId": "t1"} },
+            { "paneKey": "second", "kind": "fresh-agent", "sessionRef": {"provider": "codex", "sessionId": "t1"} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "respawn");
+    assert_eq!(verdicts[1]["verdict"], "fresh");
+    assert_eq!(verdicts[1]["reason"], "duplicate_session_claim");
+    assert_eq!(verdicts[1]["duplicate"], "first");
+}
+
+#[tokio::test]
+async fn respawn_cap_turns_the_fourth_answer_into_dead_session() {
+    // The session stays Present-but-never-live, so every answer maps to
+    // respawn; only RESPAWN ANSWERS burn the cap (V2/A7).
+    let probe = std::sync::Arc::new(StubProbe::default());
+    probe
+        .answers
+        .lock()
+        .unwrap()
+        .insert(("codex".into(), "cap".into()), SessionExistence::Present);
+    let server = spawn_server_with_probe(probe).await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    for i in 0..4 {
+        let verdicts = reconcile_request(
+            &mut ws,
+            serde_json::json!([
+                { "paneKey": "p", "kind": "fresh-agent", "sessionRef": {"provider": "codex", "sessionId": "cap"} }
+            ]),
+        )
+        .await;
+        if i < 3 {
+            assert_eq!(verdicts[0]["verdict"], "respawn", "answer {i}");
+        } else {
+            assert_eq!(verdicts[0]["verdict"], "dead_session");
+            assert_eq!(verdicts[0]["reason"], "respawn_exhausted");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_session_resolving_live_clears_the_respawn_counter() {
+    // Reset-on-live (V2/A7): a successful respawn is OBSERVED as the session
+    // going live; the counter must clear so healthy sessions are never
+    // exhausted by reconnect/reload storms.
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let _env = FakeClaudeEnv::install();
+
+    let probe = std::sync::Arc::new(StubProbe::default());
+    probe.answers.lock().unwrap().insert(
+        ("claude".into(), FAKE_DURABLE_ID.into()),
+        SessionExistence::Present,
+    );
+    let server = spawn_server_with_probe(probe).await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+
+    // TWO reconcile requests while the session is NOT yet live → both respawn.
+    for i in 0..2 {
+        let verdicts = reconcile_request(
+            &mut ws,
+            serde_json::json!([
+                { "paneKey": "p", "kind": "fresh-agent",
+                  "sessionRef": {"provider": "claude", "sessionId": FAKE_DURABLE_ID} }
+            ]),
+        )
+        .await;
+        assert_eq!(verdicts[0]["verdict"], "respawn", "pre-live answer {i}");
+    }
+    assert_eq!(
+        server
+            .respawn_counts
+            .lock()
+            .unwrap()
+            .get(&("claude".to_string(), FAKE_DURABLE_ID.to_string()))
+            .copied(),
+        Some(2),
+        "two respawn answers burned two"
+    );
+
+    // Drive freshAgent.create through the fake sidecar so has_live_session
+    // becomes true for the durable id.
+    let cli_session_id = create_live_claude_session(&mut ws, "req-reset-on-live").await;
+    assert_eq!(cli_session_id, FAKE_DURABLE_ID);
+
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "p", "kind": "fresh-agent",
+              "sessionRef": {"provider": "claude", "sessionId": FAKE_DURABLE_ID} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "attach");
+    assert!(
+        !server
+            .respawn_counts
+            .lock()
+            .unwrap()
+            .contains_key(&("claude".to_string(), FAKE_DURABLE_ID.to_string())),
+        "counter cleared (not merely un-incremented) when presence resolved Live"
+    );
+}
+
+#[tokio::test]
+async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
+    // G3 reader rule end-to-end (V8/A14). Seed the REAL temp-root ledger.
+    let probe = std::sync::Arc::new(StubProbe::default());
+    // The old rollout may ALSO still exist on disk — the point is we never
+    // answer the retired ref.
+    probe
+        .answers
+        .lock()
+        .unwrap()
+        .insert(("codex".into(), "new-t".into()), SessionExistence::Present);
+    let server = spawn_server_with_probe(probe).await;
+    let now = 1_000;
+    server
+        .pane_ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provider: "codex",
+            session_id: "old-t",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: None,
+            model: Some("m"),
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: None,
+            now_ms: now,
+        })
+        .unwrap();
+    server
+        .pane_ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            provider: "codex",
+            session_id: "new-t",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: None,
+            model: Some("m"),
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: Some("old-t"),
+            now_ms: now + 1,
+        })
+        .unwrap();
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "p", "kind": "fresh-agent", "sessionRef": {"provider": "codex", "sessionId": "old-t"} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "respawn");
+    assert_eq!(
+        verdicts[0]["sessionRef"]["sessionId"], "new-t",
+        "answer from the chain terminus"
+    );
+    assert_eq!(verdicts[0]["corrected"], true);
 }

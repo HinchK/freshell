@@ -699,6 +699,14 @@ impl FreshOpencodeState {
         session.turn_task = Some(turn_task);
     }
 
+    /// Reconcile liveness probe (campaign §4.3, Task 13): is this id tracked
+    /// in the sessions map? The map is keyed by BOTH the placeholder AND the
+    /// durable `ses_*` id (the `remember()` mirror), so a durable-id lookup
+    /// resolves the same record.
+    pub async fn has_live_session(&self, session_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(session_id)
+    }
+
     // ── freshAgent.kill (WS) ────────────────────────────────────────────────
 
     /// Handle a `freshAgent.kill` for opencode: remove the session's bookkeeping (both

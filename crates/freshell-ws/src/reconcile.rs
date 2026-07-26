@@ -29,6 +29,11 @@ pub struct ReconcileDeps<'a> {
     pub registry: &'a TerminalRegistry,
     pub identity: &'a TerminalIdentityRegistry,
     pub existence: &'a dyn SessionExistenceProbe,
+    /// Fresh-agent facts snapshot (campaign §4.3): `Some` only on a
+    /// connection that negotiated `paneReconcileFreshAgentV1` AND presented
+    /// fresh-agent panes; `None` keeps the frozen client's
+    /// `invalid{unsupported_kind}` contract.
+    pub fresh_agent: Option<&'a crate::reconcile_freshagent::FreshAgentReconcileSnapshot>,
 }
 
 /// Derive one verdict per presented pane, 1:1 by `paneKey`, order preserved
@@ -166,6 +171,9 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
     }
     match pane.kind.as_deref() {
         Some("terminal") => {}
+        Some("fresh-agent") => {
+            return crate::reconcile_freshagent::verdict_for_pane(deps.fresh_agent, pane)
+        }
         Some(_) => return invalid(pane, "unsupported_kind"),
         None => return invalid(pane, "missing_kind"),
     }
@@ -328,6 +336,7 @@ mod tests {
                 registry: &self.registry,
                 identity: &self.identity,
                 existence: &self.probe,
+                fresh_agent: None,
             }
         }
 
@@ -543,7 +552,7 @@ mod tests {
         assert_eq!(v.reason.as_deref(), Some("missing_create_request_id"));
 
         let mut bad_kind = pane("cr-10c");
-        bad_kind.kind = Some("fresh-agent".to_string());
+        bad_kind.kind = Some("browser".to_string());
         let v = f.one(bad_kind);
         assert_eq!(v.verdict, ReconcileVerdict::Invalid);
         assert_eq!(v.reason.as_deref(), Some("unsupported_kind"));

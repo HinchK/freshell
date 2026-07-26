@@ -460,6 +460,9 @@ async fn main() -> ExitCode {
             )),
             None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         },
+        // Per-boot fresh-agent respawn-answer counter (campaign §4.3, V2/A7):
+        // in-memory by design — a restart intentionally resets it.
+        fresh_agent_respawn_counts: Default::default(),
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),

@@ -1906,20 +1906,21 @@ pub fn broadcast_sessions_changed(state: &WsState) {
 
 /// Send the reference's `sendError` frame for a failed `terminal.create`
 /// (`ws-handler.ts:2606-2614`): `{ code, message, requestId }`.
-/// `pane.reconcile.request` (reconciliation design §5): a PURE READ over the
-/// terminal registry × identity registry × disk index — one verdict per
-/// presented pane. Safe to receive N times on N sockets (§7); the only error
-/// paths are the explicit `RECONCILE_TOO_LARGE` cap and the
+/// `pane.reconcile.request` (reconciliation design §5): the terminal sources
+/// remain a PURE READ over the terminal registry × identity registry × disk
+/// index — one verdict per presented pane, safe to receive N times on N
+/// sockets (§7). The capability-gated fresh-agent snapshot is the ONE
+/// exception: it mutates the per-boot respawn counter
+/// (`WsState.fresh_agent_respawn_counts`, bounded per `(provider,
+/// sessionId)`; reset when the session resolves Live — V2/A7). The only
+/// error paths are the explicit `RECONCILE_TOO_LARGE` cap and the
 /// `RECONCILE_UNAVAILABLE` derivation-failure frame, both carrying the
 /// `reconcileId` for correlation.
 async fn handle_pane_reconcile(
     request: freshell_protocol::PaneReconcileRequest,
     ws_tx: &mut WsSink,
     state: &WsState,
-    // `paneReconcileFreshAgentV1` negotiation: threaded here in Task 11,
-    // consumed by the fresh-agent verdict derivation in Task 13 (underscore
-    // prefix drops then).
-    _pane_reconcile_fresh_agent_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
 ) -> bool {
     if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
         return send_create_error(
@@ -1934,10 +1935,24 @@ async fn handle_pane_reconcile(
         )
         .await;
     }
+    // Built ONCE per reconcile request and reused for any re-derivation of deps
+    // (B1's warming deferral re-derives via rebuild_deps — rebuilding the
+    // snapshot would double-burn the respawn counter; V9 §3.6).
+    let fresh_agent_snapshot = if pane_reconcile_fresh_agent_v1
+        && request
+            .panes
+            .iter()
+            .any(|p| p.kind.as_deref() == Some("fresh-agent"))
+    {
+        Some(crate::reconcile_freshagent::build_snapshot(state, &request.panes).await)
+    } else {
+        None
+    };
     let deps = crate::reconcile::ReconcileDeps {
         registry: &state.registry,
         identity: &state.identity,
         existence: state.session_existence.as_ref(),
+        fresh_agent: fresh_agent_snapshot.as_ref(),
     };
     // §8 frame-level failure: a panicking derivation (poisoned lock) must
     // surface as an explicit error frame, never silence.
@@ -3203,6 +3218,7 @@ mod terminals_changed_tests {
             opencode_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            fresh_agent_respawn_counts: Default::default(),
         };
         (state, rx)
     }
@@ -3410,6 +3426,7 @@ mod terminal_meta_created_tests {
             opencode_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            fresh_agent_respawn_counts: Default::default(),
         };
         (state, rx)
     }

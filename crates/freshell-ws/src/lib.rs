@@ -230,6 +230,15 @@ pub struct WsState {
     /// of `identity` and the locator handles); [`crate::existence::NoIndexProbe`]
     /// when no provider home resolves.
     pub session_existence: crate::existence::SharedExistenceProbe,
+    /// Per-boot fresh-agent respawn-answer counter, keyed `(provider,
+    /// sessionId)` (campaign §4.3, V2/A7). Counts RESPAWN ANSWERS only —
+    /// incremented by [`crate::reconcile_freshagent::build_snapshot`] when an
+    /// answer goes out as `respawn`, and CLEARED when the session's presence
+    /// resolves Live (a successful respawn is OBSERVED as the session going
+    /// live), so healthy sessions are never exhausted by reconnect/reload
+    /// storms. In-memory only: a server restart intentionally resets it.
+    pub fresh_agent_respawn_counts:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), u32>>>,
     /// The opencode terminal-pane session locator (restore-across-restart fix,
     /// `docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): correlates a
     /// fresh opencode PTY's first Enter/submit (or a row written at spawn) with
@@ -758,6 +767,7 @@ mod tests {
             opencode_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            fresh_agent_respawn_counts: Default::default(),
         }
     }
 

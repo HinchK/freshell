@@ -1038,6 +1038,17 @@ impl FreshCodexState {
 
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
 
+    /// Reconcile liveness probe (campaign §4.3, Task 13): is this thread id
+    /// tracked in the sessions map with a sidecar that has NOT exited? The
+    /// exited check matters — a crashed sidecar stays mapped for lazy respawn
+    /// ([`Self::ensure_session_alive`]), but it is not attach-ably live.
+    pub async fn has_live_session(&self, session_id: &str) -> bool {
+        let guard = self.sessions.lock().await;
+        guard
+            .get(session_id)
+            .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
+    }
+
     /// Handle a `freshAgent.attach` for codex (reload-rehydrate). Decision table:
     ///
     /// | State | Action |

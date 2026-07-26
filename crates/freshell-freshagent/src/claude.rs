@@ -477,6 +477,17 @@ impl FreshClaudeState {
         ));
     }
 
+    /// Reconcile liveness probe (campaign §4.3, Task 13): resolve the DURABLE
+    /// claude UUID through [`Self::cli_index`] to its sessions-map key, then
+    /// check the map. The sessions map is read UNFILTERED — no session_type
+    /// filter, so kilroy sessions count for free (V2 N-A17-1).
+    pub async fn has_live_session(&self, session_id: &str) -> bool {
+        let Some(key) = self.cli_index.lock().await.get(session_id).cloned() else {
+            return false;
+        };
+        self.sessions.lock().await.contains_key(&key)
+    }
+
     // ── freshAgent.attach (restart parity: resume untracked sessions in place) ──────────
 
     /// Handle a `freshAgent.attach` for claude/kilroy. Decision table (restart parity):

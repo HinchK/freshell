@@ -176,6 +176,7 @@ async fn spawn_server() -> String {
         opencode_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        fresh_agent_respawn_counts: Default::default(),
     };
 
     let router = freshell_ws::router(state);
