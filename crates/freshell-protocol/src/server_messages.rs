@@ -512,6 +512,11 @@ pub struct ErrorMsg {
     pub expected_session_ref: Option<SessionLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// D8 (`SESSION_RESERVED` only): how long the loser should wait before
+    /// re-sending its create. Additive and omitted everywhere else, so every
+    /// other error frame stays byte-identical on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]

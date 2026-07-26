@@ -414,6 +414,43 @@ const DEFAULT_RESPAWN_GENERATION_CAP: i64 = 3;
 pub const SESSION_REF_LEASE_TTL_MS: u64 = 20_000;
 pub const SESSION_RESERVED_RETRY_AFTER_MS: u64 = 1_000;
 
+/// The effective lease TTL: `FRESHELL_SESSION_REF_LEASE_TTL_MS` when set to a
+/// positive integer, else [`SESSION_REF_LEASE_TTL_MS`]. Same sanitizing-parse
+/// shape as the spawn-gate timeout's `FRESHELL_SPAWN_GATE_TIMEOUT_MS`
+/// (`freshell-ws/src/create_limit.rs`) — unset/unparseable/zero → default.
+/// Kept next to the const so the client's re-drive window derivation
+/// (Task 12: window > TTL + margin) stays visible in one place.
+pub fn session_ref_lease_ttl_ms() -> u64 {
+    std::env::var("FRESHELL_SESSION_REF_LEASE_TTL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(SESSION_REF_LEASE_TTL_MS)
+}
+
+/// Whether `pid` is still alive (`kill(pid, 0)`): the ESRCH death-confirm
+/// probe of the kill-before-release discipline (council rule 8). Only ESRCH
+/// confirms death — EPERM (or any other errno) reports ALIVE, so an
+/// uncertain probe can never release a lease it shouldn't. Non-unix: PTY
+/// pids are never recorded there ([`crate::pty::PtyTerminal::pid`] is
+/// `None`), so no pid-carrying lease can exist and this is unreachable.
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 performs existence/permission checking only; no
+        // signal is delivered.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Outcome of [`TerminalRegistry::claim_session_ref`] (council rule 7, D8:
 /// one in-flight create per sessionRef, liveness-bound).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1775,7 +1812,7 @@ impl TerminalRegistry {
                 SessionRefClaim::Acquired
             }
             Some(lease) => {
-                let expired = now_ms > lease.acquired_at_ms + SESSION_REF_LEASE_TTL_MS;
+                let expired = now_ms > lease.acquired_at_ms + session_ref_lease_ttl_ms();
                 if !expired {
                     return SessionRefClaim::Held {
                         retry_after_ms: SESSION_RESERVED_RETRY_AFTER_MS,
@@ -1918,6 +1955,41 @@ impl TerminalRegistry {
             .lock()
             .expect("session-ref lease lock")
             .remove(&session_ref_key(locator));
+    }
+
+    /// The terminalId a completed claim bound this sessionRef to
+    /// ([`Self::complete_session_ref_claim`]), if any — the read side of the
+    /// registry binding map (Task 6 winner bind; also a test probe).
+    pub fn bound_terminal_for_session_ref(&self, locator: &SessionLocator) -> Option<String> {
+        self.session_ref_bindings
+            .lock()
+            .expect("session-ref bindings lock")
+            .get(&session_ref_key(locator))
+            .cloned()
+    }
+
+    /// The live child pid behind `terminal_id`'s PTY handle (unix only;
+    /// `None` for headless/exited terminals). Task 6: the winner records this
+    /// on its sessionRef lease ([`Self::set_session_ref_lease_pid`]).
+    pub fn pid_of(&self, terminal_id: &str) -> Option<u32> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner
+            .terminals
+            .get(terminal_id)
+            .and_then(|h| h.pty.as_ref())
+            .and_then(|p| p.pid())
+    }
+
+    /// The terminal whose PTY handle carries `pid`. The kill-before-release
+    /// paths (lease TTL expiry, holder conn death) must kill through the
+    /// REGISTRY handle ([`Self::kill`] → group-kill discipline, `pty.rs`) —
+    /// NEVER a raw single-pid SIGKILL — so they resolve the recorded pid back
+    /// to its owning terminal first.
+    pub fn live_terminal_for_pid(&self, pid: u32) -> Option<String> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner.terminals.iter().find_map(|(id, h)| {
+            (h.pty.as_ref().and_then(|p| p.pid()) == Some(pid)).then(|| id.clone())
+        })
     }
 
     /// §5.4 backstop detector (always-on, capability-independent): if a key
