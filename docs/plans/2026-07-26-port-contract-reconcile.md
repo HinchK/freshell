@@ -1073,3 +1073,45 @@ and the workflow. Counts are consistent throughout: 29/56/85 (inventory+Rust),
 (`CLIENT_MESSAGE_TYPES`, `SERVER_MESSAGE_TYPES`, `EXTENSION_CLIENT_MESSAGE_TYPES`,
 `EXTENSION_SERVER_MESSAGE_TYPES`) and test names
 (`combined_surface_is_85` rename) are used consistently between Tasks 3 and 6.
+
+---
+
+## Reconciliation outcomes (filled at execution time)
+
+- **Decision taken:** (a) UPDATE — artifacts regenerated to 29 c2s / 56 s2c /
+  66 schemas at wsProtocolVersion 7; Rust frozen surface 29/56/85 with
+  EXTENSION_* reduced to ["durability.degraded"] (server) / [] (client).
+- **Proof:** `npm run test:port` 38/38; `cargo test -p freshell-protocol` green;
+  `npm run contract:generate` followed by `git diff --exit-code -- port/contract`
+  clean (idempotent); coordinated `npm test` green; clippy -D warnings clean.
+  Observed at execution: coordinated `npm test` exit 0 (coordinator: full-suite
+  success; default:test/unit=success, server:test/server=success); `cargo clippy
+  --workspace --all-targets -- -D warnings` finished clean (exit 0); `cargo test
+  -p freshell-protocol --locked` all green (freeze suite 11 passed, version suite
+  5 passed incl. matches_message_inventory / matches_inbound_schema_bundle /
+  matches_outbound_schema_bundle, 0 failed); stash check printed 4x `PINNED:`
+  (amplifier.activity.list, amplifier.activity.list.response,
+  amplifier.activity.updated, terminal.idle) and `grep -c 'pane.reconcile'
+  port/contract/ws-message-inventory.json` = 2.
+- **Anti-rot:** `npm run test:port` + `.github/workflows/port-contract.yml`
+  (freeze suite + regen idempotency + cargo test -p freshell-protocol on every PR).
+  FOLLOW-UP for user: mark the `port-contract` check required in branch protection.
+- **stash@{0} on the main checkout:** verified fully obsoleted (its 4 additions are
+  now pinned; its pane.reconcile removals were stale against bf6242a1). SAFE TO
+  DROP — left in place for the user to drop.
+- **B2 residual ("~20-line cleanup"):** located (codex-candidate wire-surface
+  deletion, `.the-usual-logs/codex-rollout-locator/reports/codex-candidate.md:494-498`)
+  but NOT applied: the legacy Node server is a live consumer
+  (`server/ws-handler.ts:2951` -> `server/terminal-registry.ts:3986`) and still emits
+  the trigger, so deleting the client sender changes behavior against the Node
+  server — prohibited by this lane's no-behavior-change fence. FOLLOW-UP for user:
+  decide alongside legacy-Node retirement. `terminal.codex.candidate.persisted`
+  remains fully pinned.
+- **Oracle suite (pre-execution validation finding):** `npm run test:oracle` is
+  regen-NEUTRAL (identical failure set before/after regen) but NOT green at base in a
+  fresh clone: 4 pre-existing failures — mutation-e2e ×2 (stale buildinfo path:
+  `test/oracle/mutation-e2e.test.ts:45` clears `node_modules/.cache/...` but
+  `tsconfig.server.json:12` moved buildinfo to `dist/` in `1de2258d`) and
+  rust-equivalence ×2 (machine-sensitive discovery of an installed `amplifier` CLI).
+  Out of this lane's scope. FOLLOW-UP for user: one-line mutation-e2e path fix as a
+  separate change; do not gate anything on a fully-green oracle until then.
