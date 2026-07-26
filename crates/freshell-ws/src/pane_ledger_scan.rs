@@ -176,6 +176,16 @@ impl PaneLedger {
     /// not definitive; see the boot_scan contract) — and sweep aged-out
     /// pending markers (the leaked-marker lifetime bound must hold on a
     /// long-running server, not only across restarts).
+    ///
+    /// Lock granularity: unlike the pre-serve boot scan, this path runs
+    /// CONCURRENTLY with async readers (handshake stamping, restore rung,
+    /// ever_bound), so it never holds the index guard across the whole
+    /// batch of fsyncing writes (~15-64ms each). It snapshots the work list
+    /// under the guard, then drops and re-acquires the guard per item; each
+    /// per-item helper re-reads current index state under the re-acquired
+    /// guard and skips items that no longer qualify. The write-through
+    /// invariant is preserved: every file mutation and its index update
+    /// still happen under ONE guard acquisition.
     pub fn gc(
         &self,
         now_ms: i64,
@@ -184,10 +194,39 @@ impl PaneLedger {
         let Some(root) = self.root.clone() else {
             return BootScanReport::default();
         };
-        let mut index = self.guard();
-        self.gc_locked(&root, &mut index, now_ms, transcript_absent)
+        let mut report = BootScanReport::default();
+        let (marker_ids, row_keys) = {
+            let index = self.guard();
+            (
+                index.pending.keys().cloned().collect::<Vec<String>>(),
+                index
+                    .bindings
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<(String, String)>>(),
+            )
+        };
+        for terminal_id in marker_ids {
+            let mut index = self.guard();
+            self.gc_marker_locked(&root, &mut index, &terminal_id, now_ms, &mut report);
+        }
+        for key in row_keys {
+            let mut index = self.guard();
+            self.gc_row_locked(
+                &root,
+                &mut index,
+                &key,
+                now_ms,
+                transcript_absent,
+                &mut report,
+            );
+        }
+        report
     }
 
+    /// The boot-time GC pass: same per-item helpers as `gc`, driven under
+    /// the caller's single guard (boot_scan runs pre-serve — no concurrent
+    /// readers exist, so batch-holding the guard is free and minimal).
     fn gc_locked(
         &self,
         root: &Path,
@@ -196,107 +235,142 @@ impl PaneLedger {
         transcript_absent: &dyn Fn(&str, &str) -> bool,
     ) -> BootScanReport {
         let mut report = BootScanReport::default();
-
-        // Aged-marker sweep (A8/V7): part of the periodic subset per the
-        // `gc` contract, so a long-running server bounds leaked-marker
-        // lifetime WITHOUT a restart. Only the TTL case runs here — the
-        // covered-by-binding case is boot-only crash-window residue
-        // (boot_scan step 2, which also handles the TTL case at boot, so
-        // this loop finds nothing on the boot path).
-        let markers: Vec<PendingMarker> = index.pending.values().cloned().collect();
-        for marker in markers {
-            if now_ms - marker.spawned_at > PENDING_MARKER_TTL_MS {
-                match Self::remove_pending(root, index, &marker.terminal_id) {
-                    Ok(()) => {
-                        tracing::warn!(
-                            target: "freshell_ws::pane_ledger",
-                            terminal_id = %marker.terminal_id,
-                            "pane_ledger_stale_marker_swept: aged past TTL (periodic GC)"
-                        );
-                        report.stale_markers_removed.push(marker.terminal_id);
-                    }
-                    Err(err) => {
-                        // Fail loud, never silent: the marker stays; the
-                        // next GC pass retries naturally.
-                        tracing::warn!(
-                            target: "freshell_ws::pane_ledger",
-                            terminal_id = %marker.terminal_id,
-                            error = %err,
-                            "pane_ledger_stale_marker_sweep_failed: marker removal failed; will retry next pass"
-                        );
-                    }
-                }
-            }
+        let marker_ids: Vec<String> = index.pending.keys().cloned().collect();
+        for terminal_id in marker_ids {
+            self.gc_marker_locked(root, index, &terminal_id, now_ms, &mut report);
         }
-
-        let rows: Vec<BindingRow> = index.bindings.values().cloned().collect();
-        for mut row in rows {
-            let sref = SessionLocator {
-                provider: row.provider.clone(),
-                session_id: row.session_id.clone(),
-            };
-            match row.state {
-                RowState::Bound => {
-                    if now_ms - row.last_observed_at > BOUND_GC_TTL_MS {
-                        row.state = RowState::Retired;
-                        row.retired_reason = Some(RetiredReason::GcExpired);
-                        row.updated_at = now_ms;
-                        tracing::info!(
-                            target: "freshell_ws::pane_ledger",
-                            provider = %sref.provider,
-                            session_id = %sref.session_id,
-                            "pane_ledger_gc_tombstoned: bound row expired to tombstone (never deleted by timer)"
-                        );
-                        match self.write_binding(root, index, &row) {
-                            Ok(()) => report.gc_tombstoned.push(sref),
-                            Err(err) => {
-                                // Fail loud, never silent: the row stays
-                                // bound on disk; the next GC pass retries.
-                                tracing::error!(
-                                    target: "freshell_ws::pane_ledger",
-                                    provider = %sref.provider,
-                                    session_id = %sref.session_id,
-                                    error = %err,
-                                    "pane_ledger_gc_tombstone_failed: tombstone write failed; row left bound"
-                                );
-                            }
-                        }
-                    }
-                }
-                RowState::Retired => {
-                    let old_enough = now_ms - row.updated_at > TOMBSTONE_GC_TTL_MS;
-                    if old_enough && transcript_absent(&row.provider, &row.session_id) {
-                        let path = Self::binding_path(root, &row.provider, &row.session_id);
-                        match std::fs::remove_file(&path) {
-                            Ok(()) => {
-                                index
-                                    .bindings
-                                    .remove(&(row.provider.clone(), row.session_id.clone()));
-                                tracing::info!(
-                                    target: "freshell_ws::pane_ledger",
-                                    provider = %sref.provider,
-                                    session_id = %sref.session_id,
-                                    "pane_ledger_tombstone_deleted: transcript gone (direct stat) and tombstone TTL elapsed"
-                                );
-                                report.tombstones_deleted.push(sref);
-                            }
-                            Err(err) => {
-                                // Fail loud, never silent: the tombstone
-                                // stays; the next GC pass retries naturally.
-                                tracing::warn!(
-                                    target: "freshell_ws::pane_ledger",
-                                    provider = %sref.provider,
-                                    session_id = %sref.session_id,
-                                    error = %err,
-                                    "pane_ledger_tombstone_delete_failed: tombstone file removal failed; will retry next pass"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+        let row_keys: Vec<(String, String)> = index.bindings.keys().cloned().collect();
+        for key in row_keys {
+            self.gc_row_locked(root, index, &key, now_ms, transcript_absent, &mut report);
         }
         report
+    }
+
+    /// Aged-marker sweep for ONE marker, under the caller's guard (A8/V7):
+    /// part of the periodic subset per the `gc` contract, so a long-running
+    /// server bounds leaked-marker lifetime WITHOUT a restart. Only the TTL
+    /// case runs here — the covered-by-binding case is boot-only
+    /// crash-window residue (boot_scan step 2, which also handles the TTL
+    /// case at boot, so this finds nothing on the boot path). Re-reads the
+    /// marker from the index: one resolved/removed between the snapshot and
+    /// this guard acquisition is skipped safely.
+    fn gc_marker_locked(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        terminal_id: &str,
+        now_ms: i64,
+        report: &mut BootScanReport,
+    ) {
+        let Some(marker) = index.pending.get(terminal_id) else {
+            return; // resolved/removed since the snapshot — no longer qualifies
+        };
+        if now_ms - marker.spawned_at <= PENDING_MARKER_TTL_MS {
+            return;
+        }
+        match Self::remove_pending(root, index, terminal_id) {
+            Ok(()) => {
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    terminal_id = %terminal_id,
+                    "pane_ledger_stale_marker_swept: aged past TTL (periodic GC)"
+                );
+                report.stale_markers_removed.push(terminal_id.to_string());
+            }
+            Err(err) => {
+                // Fail loud, never silent: the marker stays; the
+                // next GC pass retries naturally.
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    terminal_id = %terminal_id,
+                    error = %err,
+                    "pane_ledger_stale_marker_sweep_failed: marker removal failed; will retry next pass"
+                );
+            }
+        }
+    }
+
+    /// GC for ONE binding row, under the caller's guard. Re-reads the row
+    /// from the index: one rewritten/removed between the snapshot and this
+    /// guard acquisition is re-evaluated against its CURRENT state (e.g. a
+    /// re-bound row with a fresh `last_observed_at` no longer qualifies and
+    /// is skipped).
+    fn gc_row_locked(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        key: &(String, String),
+        now_ms: i64,
+        transcript_absent: &dyn Fn(&str, &str) -> bool,
+        report: &mut BootScanReport,
+    ) {
+        let Some(mut row) = index.bindings.get(key).cloned() else {
+            return; // deleted since the snapshot — no longer qualifies
+        };
+        let sref = SessionLocator {
+            provider: row.provider.clone(),
+            session_id: row.session_id.clone(),
+        };
+        match row.state {
+            RowState::Bound => {
+                if now_ms - row.last_observed_at > BOUND_GC_TTL_MS {
+                    row.state = RowState::Retired;
+                    row.retired_reason = Some(RetiredReason::GcExpired);
+                    row.updated_at = now_ms;
+                    tracing::info!(
+                        target: "freshell_ws::pane_ledger",
+                        provider = %sref.provider,
+                        session_id = %sref.session_id,
+                        "pane_ledger_gc_tombstoned: bound row expired to tombstone (never deleted by timer)"
+                    );
+                    match self.write_binding(root, index, &row) {
+                        Ok(()) => report.gc_tombstoned.push(sref),
+                        Err(err) => {
+                            // Fail loud, never silent: the row stays
+                            // bound on disk; the next GC pass retries.
+                            tracing::error!(
+                                target: "freshell_ws::pane_ledger",
+                                provider = %sref.provider,
+                                session_id = %sref.session_id,
+                                error = %err,
+                                "pane_ledger_gc_tombstone_failed: tombstone write failed; row left bound"
+                            );
+                        }
+                    }
+                }
+            }
+            RowState::Retired => {
+                let old_enough = now_ms - row.updated_at > TOMBSTONE_GC_TTL_MS;
+                if old_enough && transcript_absent(&row.provider, &row.session_id) {
+                    let path = Self::binding_path(root, &row.provider, &row.session_id);
+                    match std::fs::remove_file(&path) {
+                        Ok(()) => {
+                            index
+                                .bindings
+                                .remove(&(row.provider.clone(), row.session_id.clone()));
+                            tracing::info!(
+                                target: "freshell_ws::pane_ledger",
+                                provider = %sref.provider,
+                                session_id = %sref.session_id,
+                                "pane_ledger_tombstone_deleted: transcript gone (direct stat) and tombstone TTL elapsed"
+                            );
+                            report.tombstones_deleted.push(sref);
+                        }
+                        Err(err) => {
+                            // Fail loud, never silent: the tombstone
+                            // stays; the next GC pass retries naturally.
+                            tracing::warn!(
+                                target: "freshell_ws::pane_ledger",
+                                provider = %sref.provider,
+                                session_id = %sref.session_id,
+                                error = %err,
+                                "pane_ledger_tombstone_delete_failed: tombstone file removal failed; will retry next pass"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn quarantine_unparsable(&self, root: &Path, now_ms: i64, report: &mut BootScanReport) {

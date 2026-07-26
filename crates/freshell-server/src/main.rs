@@ -514,7 +514,7 @@ async fn main() -> ExitCode {
                 ticker.tick().await;
                 let ledger = std::sync::Arc::clone(&ledger);
                 let home = gc_home.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                let joined = tokio::task::spawn_blocking(move || {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
@@ -528,6 +528,12 @@ async fn main() -> ExitCode {
                     });
                 })
                 .await;
+                if let Err(e) = joined {
+                    tracing::error!(
+                        error = %e,
+                        "pane_ledger_gc_join_failed: periodic GC task panicked or was cancelled"
+                    );
+                }
             }
         });
     }
