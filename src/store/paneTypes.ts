@@ -94,6 +94,12 @@ export type TerminalPaneContent = {
   restoreError?: RestoreError
   /** Initial working directory */
   initialCwd?: string
+  /** One-shot user-visible reconcile notice (corrected identity, fresh-by-reason, duplicate ignored). Rendered then cleared by TerminalView. */
+  reconcileNotice?: string
+  /** Set by verdict folding; consumed by TerminalView when it sends terminal.create. 'respawn' = create-with-resume from sessionRef; 'fresh' = clean create. */
+  pendingReconcile?: 'respawn' | 'fresh'
+  /** VOLATILE fold counter. Incremented by applyReconcileAttach / resetPaneForReconcileCreate so a fold on an already-mounted pane (same createRequestId — never re-minted) re-fires TerminalView's create-or-attach effect (Task 12 adds it to the dep array). Stripped from persistence (Task 8). */
+  reconcileEpoch?: number
 }
 
 /**

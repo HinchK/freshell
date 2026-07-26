@@ -93,6 +93,11 @@ function normalizePaneContent(
       streamId: typeof input.streamId === 'string' && input.streamId.length > 0 ? input.streamId : undefined,
       ...(restoreError.success ? { restoreError: restoreError.data } : {}),
       initialCwd: typeof input.initialCwd === 'string' ? input.initialCwd : undefined,
+      reconcileNotice: typeof input.reconcileNotice === 'string' ? input.reconcileNotice : undefined,
+      pendingReconcile: input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
+        ? input.pendingReconcile
+        : undefined,
+      reconcileEpoch: typeof input.reconcileEpoch === 'number' ? input.reconcileEpoch : undefined,
     }
   }
   if (input.kind === 'browser') {
