@@ -158,9 +158,34 @@ impl FreshClaudeState {
     }
 
     /// The wired identity sink, if any.
-    #[allow(dead_code)] // used by identity-event tasks (Tasks 4-10)
     fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
         self.identity_sink.get().cloned()
+    }
+
+    /// Broadcast a `freshAgent.error` alarm/degradation frame (P1.13; Task 10
+    /// consumes this too). Same envelope contract as codex's helper (`codex.rs`):
+    /// top-level `sessionType`/`provider` are REQUIRED (locator resolution) and
+    /// `message` is user-facing (the banner shows the message, never the code) —
+    /// but unlike codex this one cannot hardcode the session type: provider
+    /// `claude` covers BOTH `freshclaude` and `kilroy`, so the flavour is a param.
+    fn emit_fresh_agent_error(
+        &self,
+        session_id: &str,
+        session_type: &str,
+        code: &str,
+        message: &str,
+    ) {
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: json!({
+                "type": "freshAgent.error",
+                "sessionId": session_id,
+                "code": code,
+                "message": message,
+            }),
+            provider: PROVIDER.to_string(),
+            session_id: session_id.to_string(),
+            session_type: session_type.to_string(),
+        }));
     }
 
     /// Reap every owned claude sidecar: SIGTERM the Node process (so it cleanly kills its
@@ -231,6 +256,17 @@ impl FreshClaudeState {
             }
         };
 
+        // P1.13: FULL settings snapshot for the binding row the consumer writes at
+        // `sdk.session.init` (claude has no sandbox concept — always `None`). Built
+        // from the SAME values the create request below actually sends.
+        let settings = crate::identity_sink::FreshAgentSettings {
+            model: msg.model.clone(),
+            sandbox: None,
+            permission_mode: msg.permission_mode.clone(),
+            effort: msg.effort.clone(),
+            cwd: msg.cwd.clone(),
+        };
+
         // Send the create request (faithful to createClaudeSdkOptions inputs).
         let create_req = json!({
             "type": "create",
@@ -262,11 +298,13 @@ impl FreshClaudeState {
         };
 
         // Start the stdout consumer (the completion edge normalization lives here).
+        // `Some(settings)` => the consumer records a binding row at `sdk.session.init`.
         let consumer = self.spawn_consumer(
             reader,
             created.clone(),
             session_type.to_string(),
             created.clone(),
+            Some(settings),
         );
 
         self.sessions.lock().await.insert(
@@ -546,13 +584,16 @@ impl FreshClaudeState {
         // Register under the CLIENT's id: the consumer stamps the map key on every
         // envelope and the frozen client routes by envelope sessionId
         // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane.
-        // 4-arg spawn_consumer: the sidecar's created id is the eviction identity
-        // guard for this consumer.
+        // The sidecar's created id is the eviction identity guard for this consumer.
+        // `settings: None` (P1.13): until Task 10 resolves the ledger record for the
+        // resume path, record NOTHING here — writing would launder a blank row under
+        // the new cliSessionId (V7/A10).
         let consumer = self.spawn_consumer(
             reader,
             msg.session_id.clone(),
             session_type.clone(),
             sidecar_session_id.clone(),
+            None,
         );
         self.sessions.lock().await.insert(
             msg.session_id.clone(),
@@ -601,16 +642,25 @@ impl FreshClaudeState {
     /// `sidecar_session_id` is the id THIS consumer's sidecar is keyed by; it guards the
     /// eviction so a stale consumer can never evict a newer session re-registered under
     /// the same map key (attach-resume, Task 6).
+    ///
+    /// `settings` (P1.13): `Some` = record a fresh-agent binding row at
+    /// `sdk.session.init` (create path / resume-with-record); `None` = do NOT record
+    /// (resume of a never-recorded session — writing would launder a blank row under
+    /// the new cliSessionId, V7/A10). The row's `mode` is the `session_type` param
+    /// (the `"freshclaude"` vs `"kilroy"` flavour; provider is always [`PROVIDER`]).
     fn spawn_consumer(
         &self,
         mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
         session_id: String,
         session_type: String,
         sidecar_session_id: String,
+        settings: Option<crate::identity_sink::FreshAgentSettings>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         let sessions = self.sessions.clone();
         let cli_index = self.cli_index.clone();
+        let identity_sink = self.identity_sink();
+        let state = self.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
@@ -631,6 +681,36 @@ impl FreshClaudeState {
                             .insert(cli_id.to_string(), session_id.clone());
                         if let Some(session) = sessions.lock().await.get_mut(&session_id) {
                             session.cli_session_id = Some(cli_id.to_string());
+                        }
+                        // P1.13: binding row keyed by the DURABLE cliSessionId, with
+                        // the FULL create-settings snapshot — AWAITED here (this arm
+                        // runs on the async consumer task) so the row is durable
+                        // BEFORE the init-driven broadcast below proceeds (V8/A11).
+                        // A failed write is surfaced user-visibly, never
+                        // warn-and-drop, then the identity event proceeds.
+                        if let (Some(sink), Some(settings)) =
+                            (identity_sink.clone(), settings.as_ref())
+                        {
+                            if let Err(e) = sink
+                                .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                                    provider: PROVIDER.into(),
+                                    session_id: cli_id.to_string(),
+                                    mode: session_type.clone(),
+                                    create_request_id: None,
+                                    resolves_pending: None,
+                                    supersedes: None,
+                                    settings: settings.clone(),
+                                })
+                                .await
+                            {
+                                tracing::warn!(error = %e, session = %cli_id, "freshagent.claude.binding_write_failed");
+                                state.emit_fresh_agent_error(
+                                    cli_id,
+                                    &session_type,
+                                    "LEDGER_WRITE_FAILED",
+                                    "Failed to persist this session's resume record - settings may not survive a server restart.",
+                                );
+                            }
                         }
                     }
                 }
@@ -1858,6 +1938,56 @@ rl.on('line', (line) => {
         .await;
         assert!(st.cli_index.lock().await.is_empty());
         drop(env);
+    }
+
+    /// P1.13 (Task 9): the `sdk.session.init` arm must record ONE fresh-agent binding
+    /// row through the identity sink — keyed by the DURABLE cliSessionId, carrying the
+    /// FULL create-settings snapshot and the sessionType flavour — AWAITED before the
+    /// init-driven broadcast proceeds (durable-before-answer, V8/A11).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_init_records_binding_with_create_settings() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Drive freshAgent.create with sessionType kilroy + explicit settings.
+        let mut msg = dedup_create_msg("req-binding-init");
+        msg.session_type = SessionType::Kilroy;
+        msg.model = Some("opus-x".to_string());
+        msg.permission_mode = Some("plan".to_string());
+        msg.effort = Some("high".to_string());
+        msg.cwd = Some(env.dir.to_string_lossy().to_string());
+        state.handle_create(msg).await;
+        await_claude_created(&mut rx, "req-binding-init").await;
+
+        // Wait for sdk.session.init to be consumed: the binding write is AWAITED
+        // before the init frame broadcasts, so seeing the freshAgent.session.init
+        // envelope proves the row already landed.
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.session.init" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("freshAgent.session.init consumed within budget");
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings.last().expect("binding at sdk.session.init");
+        assert_eq!(b.provider, "claude");
+        assert_eq!(b.mode, "kilroy", "sessionType flavour preserved in the row");
+        assert_eq!(
+            b.session_id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "keyed by cliSessionId"
+        );
+        assert_eq!(b.settings.model.as_deref(), Some("opus-x"));
+        assert_eq!(b.settings.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(b.settings.effort.as_deref(), Some("high"));
+        assert!(b.settings.cwd.is_some());
     }
 
     /// Ledger A9: consumer exit (== sidecar death) must evict the dead session AND its
