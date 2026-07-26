@@ -118,6 +118,8 @@ const RUST_ONLY_SPECS = [
   // P1.8 pane-identity ledger SIGKILL durability walls: imports RustServer
   // directly for restartAbrupt(). See docs/plans/2026-07-25-pane-identity-ledger.md
   /pane-ledger-restart-rust\.spec\.ts$/,
+  // Freshclaude restart parity (P0.2 §2.8 items 2-4) -- imports RustServer for restartAbrupt()
+  /freshclaude-restart-parity-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -266,6 +268,8 @@ export default defineConfig({
         // creation and survive an abrupt SIGKILL + boot scan. Rust-only:
         // imports RustServer directly for restartAbrupt().
         /pane-ledger-restart-rust\.spec\.ts$/,
+        // Freshclaude restart parity (P0.2 §2.8 items 2-4) -- imports RustServer for restartAbrupt()
+        /freshclaude-restart-parity-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

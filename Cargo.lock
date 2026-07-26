@@ -1302,6 +1302,7 @@ dependencies = [
  "freshell-terminal",
  "libc",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",

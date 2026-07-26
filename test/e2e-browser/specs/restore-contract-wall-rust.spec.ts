@@ -1120,20 +1120,25 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // EXPECTED-FAIL WALL PIN -- P0.2 (§2.8): the FIRST failure today is that
-    // claude fresh-agent identity is never persisted -- the server sends no
-    // sessionRef for claude (crates/freshell-freshagent/src/claude.rs:94-96,247)
-    // and the persist middleware strips sessionId without a serverInstanceId
-    // (src/store/persistMiddleware.ts:245-266) -- so post-reload the pane
-    // sends NEITHER attach nor create, and the identity poll below times out.
-    // Attach-swallow (crates/freshell-ws/src/terminal.rs:535-553 `_ => {}`)
-    // and snapshot-503 (crates/freshell-freshagent/src/snapshot.rs:132-145)
-    // are real and block rebind + rehydration AFTER identity persistence
-    // lands. FLIP only when claude identity survives reload AND the attach
-    // arm + snapshot adapter land (P0.2 slices). See file doc comment.
+    // EXPECTED-FAIL WALL PIN -- P0.2 (§2.8), PARTIALLY LANDED by
+    // feat/freshclaude-restart-parity: the attach-resume arm + claude snapshot
+    // adapter shipped, so post-reload the HISTORY leg passes ('Fixture claude
+    // turn' renders from the REST snapshot) and the STATUS leg passes (not
+    // 'error'/'creating') -- probed 2026-07-25 with the identity leg
+    // neutralized: green in one run. The IDENTITY leg still fails, and the
+    // blocker is the CLIENT persistence gap this pin has always named:
+    // persistMiddleware strips content.sessionId (src/store/
+    // persistMiddleware.ts:245-266), so after reload the pane re-CREATEs
+    // (resumeSessionId carries the durable UUID -- the conversation itself
+    // resumes) and receives a NEW create-time sidecar id; observed
+    // pre-kill fc-e2e-84069-1785038517244 vs post-reload
+    // fc-e2e-88780-1785038519518, so leafDurableIdentity's first arm
+    // (content.sessionId) can never match across reload until the client
+    // persists it. FLIP when claude pane identity survives reload
+    // (client-side persistMiddleware work -- out of this branch's fence).
     test.fail(
       e2eServerKind === 'rust',
-      'P0.2 (§2.8): claude identity never persisted; attach swallow + missing snapshot adapter block rebind behind it',
+      'P0.2 (§2.8): server legs landed (attach-resume + snapshot adapter; history + status green); client gap remains -- persistMiddleware strips content.sessionId so the post-reload identity leg fails',
     )
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshclaude-'))
@@ -1348,7 +1353,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // per-pane pin is retired.
     test.fail(
       e2eServerKind === 'rust',
-      'P0.1: composed all-pane ruler; red until P0.2 (freshclaude identity) + remaining P1.x land',
+      'P0.1: composed all-pane ruler; red until remaining P1.x land + the P0.2 client identity-persistence gap closes (P0.2 server legs -- attach-resume + snapshot adapter -- landed on feat/freshclaude-restart-parity)',
     )
 
     const CODEX_SESSION_ID = '99999999-8888-4777-8666-555555555555'
