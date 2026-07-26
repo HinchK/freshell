@@ -546,14 +546,17 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     // REST-create a fresh codex terminal tab (no resume id) --
     // request shape: donor remote-tab-linkage-rust.spec.ts:197.
     const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
-      headers: { authorization: `Bearer ${info.token}`, 'content-type': 'application/json' },
+      headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
       data: { mode: 'codex', cwd: PROJECT_DIR },
     })
     expect(res.ok()).toBe(true)
 
     // The driven client shows the pane; type Enter so the fake codex
     // terminal materializes its rollout (Enter-gated, fixture contract).
-    await expect(page.locator('.xterm')).toBeVisible({ timeout: 20_000 })
+    // NOTE: multiple .xterm elements stay mounted (every tab's TabContent is
+    // kept alive, App.tsx:1611) -- always scope with .last()/.first() or
+    // Playwright strict mode throws (donor: remote-tab-linkage-rust.spec.ts:179).
+    await expect(page.locator('.xterm').last()).toBeVisible({ timeout: 20_000 })
     await page.locator('.xterm').last().click()
     await page.keyboard.press('Enter')
 
@@ -586,16 +589,15 @@ Prereq (once per e2e session): `cargo build --release -p freshell-server` happen
 cd /home/dan/code/freshell/.worktrees/sidebar-registry-sync
 npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium specs/sidebar-registry-sync-rust.spec.ts 2>&1 | tail -30
 ```
-Since Tasks 2–4 are already merged into this branch, expected: PASS. To capture the red→green proof required by the lane deliverable, ALSO run the RED demonstration:
+Since Tasks 2–4 are already merged into this branch, expected: PASS. To capture the red→green proof required by the lane deliverable, ALSO run the RED demonstration against a pre-fix binary built from the base commit. NOTE: do NOT try `git stash` for this — by this point the Task 2–4 fixes are COMMITTED, so there is nothing under `crates/` to stash; a stash would be a no-op, the rebuild would produce the FIXED binary, and the run would pass where a FAIL is expected. Build the base-commit server in a throwaway worktree instead:
 ```bash
-git stash push -- crates/   # temporarily remove the server fixes
-cargo build --release -p freshell-server
-FRESHELL_E2E_RUST_SERVER_BIN=$PWD/target/release/freshell-server \
+git worktree add /tmp/p114-prefix bf6242a1
+(cd /tmp/p114-prefix && cargo build --release -p freshell-server)
+FRESHELL_E2E_RUST_SERVER_BIN=/tmp/p114-prefix/target/release/freshell-server \
   npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium specs/sidebar-registry-sync-rust.spec.ts 2>&1 | tail -15
-git stash pop
-cargo build --release -p freshell-server
+git worktree remove /tmp/p114-prefix
 ```
-Expected: FAIL on the stashed (pre-fix) binary — validated deterministic symptom: the `data-has-tab='true'` wait times out (no arming → no adoption → never green); a green `terminal:<id>` ghost row may ALSO appear (client Phase-E on the unstamped feed). Record the exact symptom observed plus both run outcomes (this is the e2e red→green proof). Attribution note for the report: this scenario's red→green primarily proves Task 4 (arming) and Task 2 (feed stamping); Task 3 is evidenced by the no-reload constraint, not by row collapse. If the stash dance is impractical (e.g. conflicts), an acceptable substitute proof: check out `bf6242a1` of `crates/` in a temp build dir and point `FRESHELL_E2E_RUST_SERVER_BIN` at that binary.
+Expected: FAIL on the pre-fix (`bf6242a1`) binary — validated deterministic symptom: the `data-has-tab='true'` wait times out (no arming → no adoption → never green); a green `terminal:<id>` ghost row may ALSO appear (client Phase-E on the unstamped feed). Record the exact symptom observed plus both run outcomes (this is the e2e red→green proof). Attribution note for the report: this scenario's red→green primarily proves Task 4 (arming) and Task 2 (feed stamping); Task 3 is evidenced by the no-reload constraint, not by row collapse.
 
 - [ ] **Step 3: Record + commit**
 
@@ -657,7 +659,7 @@ test('case-b: REST-created resume tabs are green and dedupe on click', async ({ 
     ['codex', SEEDED_CODEX_THREAD_ID],
   ] as const) {
     const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
-      headers: { authorization: `Bearer ${info.token}`, 'content-type': 'application/json' },
+      headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
       // VALIDATED: raw codex resumeSessionId is deliberately 400-rejected at
       // HEAD (terminal_tabs.rs:124-131, pinned by
       // create_codex_tab_rejects_raw_resume_session_id_without_session_ref);
@@ -677,15 +679,19 @@ test('case-b: REST-created resume tabs are green and dedupe on click', async ({ 
 
     // Dedupe contract: clicking the green row focuses the existing pane
     // instead of opening a second tab (donor: remote-tab-linkage:253).
-    const tabsBefore = await page.evaluate(() => (window as any).__freshellHarness?.getTabCount?.() ?? -1)
+    // Harness global is window.__FRESHELL_TEST_HARNESS__ (helpers/test-harness.ts:150).
+    // Deliberately NO optional chaining and NO fallback value: if the harness
+    // is missing this evaluate must THROW, not have both sides default to the
+    // same sentinel and pass vacuously.
+    const tabsBefore = await page.evaluate(() => (window as any).__FRESHELL_TEST_HARNESS__.getTabCount())
     await row.click()
     await page.waitForTimeout(500)
-    const tabsAfter = await page.evaluate(() => (window as any).__freshellHarness?.getTabCount?.() ?? -1)
+    const tabsAfter = await page.evaluate(() => (window as any).__FRESHELL_TEST_HARNESS__.getTabCount())
     expect(tabsAfter).toBe(tabsBefore)
   }
 })
 ```
-(Use the harness access idiom the donor spec actually uses — `remote-tab-linkage-rust.spec.ts:253` — if it differs from `window.__freshellHarness`.)
+(Copy the exact harness access idiom from the donor — `remote-tab-linkage-rust.spec.ts:253` — but keep it fail-loud: never add a `?? <sentinel>` fallback around `getTabCount()`, because a missing harness would then make before/after equal and the dedupe gate would pass without checking anything.)
 
 - [ ] **Step 2: Run it**
 
@@ -743,7 +749,7 @@ test('case-a: sidebar joins survive a graceful server restart', async ({ page })
     ['codex', SEEDED_CODEX_THREAD_ID],
   ] as const) {
     const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
-      headers: { authorization: `Bearer ${info.token}`, 'content-type': 'application/json' },
+      headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
       // VALIDATED: raw codex resumeSessionId is deliberately 400-rejected at
       // HEAD (terminal_tabs.rs:124-131, pinned by
       // create_codex_tab_rejects_raw_resume_session_id_without_session_ref);
@@ -762,6 +768,18 @@ test('case-a: sidebar joins survive a graceful server restart', async ({ page })
   // Persist the layout before the restart (donor: remote-tab-linkage:277-285).
   await page.evaluate(() => (window as any).__freshellStore?.dispatch?.({ type: 'persist/flushNow' }))
 
+  // Snapshot the --resume count BEFORE the restart. The argv log is shared
+  // across the whole serial suite (case-b already resumed SEEDED_CLAUDE_ID
+  // once, and this test's own pre-restart create adds another), so any
+  // absolute threshold is satisfied before the restart even happens and
+  // would pass vacuously. Only a before/after increase proves the respawn.
+  const countResumes = (entries: Array<{ argv: string[] }>) =>
+    entries.filter((e) => {
+      const i = e.argv.indexOf('--resume')
+      return i !== -1 && e.argv[i + 1] === SEEDED_CLAUDE_ID
+    }).length
+  const resumesBefore = countResumes(await readArgvLog(path.join(sharedRoot, 'claude-argv.jsonl')))
+
   await server.restart()
   await page.reload({ waitUntil: 'domcontentloaded' })
   // reconnect wait: copy the exact idiom from server-restart-recovery.spec.ts:106-111
@@ -778,13 +796,12 @@ test('case-a: sidebar joins survive a graceful server restart', async ({ page })
   // No provisional ghosts left over from respawned terminals.
   await expect(page.locator('[data-provider="codex"][data-session-id^="terminal:"]')).toHaveCount(0, { timeout: 45_000 })
 
-  // Respawn proof: the fake claude CLI was relaunched with --resume after restart.
-  const entries = await readArgvLog(path.join(sharedRoot, 'claude-argv.jsonl'))
-  const resumes = entries.filter((e) => {
-    const i = e.argv.indexOf('--resume')
-    return i !== -1 && e.argv[i + 1] === SEEDED_CLAUDE_ID
-  })
-  expect(resumes.length).toBeGreaterThanOrEqual(2) // pre-restart + post-restart
+  // Respawn proof: the fake claude CLI was relaunched with --resume AFTER the
+  // restart -- assert the count INCREASED relative to the pre-restart
+  // snapshot (an absolute >=N threshold would already be met pre-restart and
+  // prove nothing about the respawn).
+  const resumesAfter = countResumes(await readArgvLog(path.join(sharedRoot, 'claude-argv.jsonl')))
+  expect(resumesAfter).toBeGreaterThan(resumesBefore)
 })
 ```
 (Use the store/persist access idiom the donor actually uses at `remote-tab-linkage-rust.spec.ts:277-285` — copy verbatim.)
@@ -835,7 +852,7 @@ test('case-d: recovered panes join green in the sidebar', async ({ page }) => {
 
   // Open a claude resume pane so there is something to lose + recover.
   const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
-    headers: { authorization: `Bearer ${info.token}`, 'content-type': 'application/json' },
+    headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
     data: { mode: 'claude', cwd: PROJECT_DIR, resumeSessionId: SEEDED_CLAUDE_ID },
   })
   expect(res.ok()).toBe(true)
@@ -929,7 +946,7 @@ Expected: all PASS. (These cover the amplifier Incident-4 variant, the generic r
 
 Finalize the `## Verification Report` section so it answers the spec's deliverable directly:
 - Table of the four contract cases → PASS-as-is / FIXED (with commit shas) / FAIL-with-evidence (cross-lane, routed).
-- The fixes list: ledger-backed join (Task 2), identity-aware sweep push (Task 3), REST codex arming (Task 4), plus any contingencies that fired.
+- The fixes list: identity-registry stamping of the `/api/terminals` projection (Task 2 — NOT a ledger-backed join; that premise was falsified during load-bearing validation), identity-aware sweep push (Task 3), REST codex arming (Task 4), plus any contingencies that fired.
 - "What remains" with justification. Expected residuals to document honestly (both are outside this lane's contract cases, documented not deferred-from-scope): (1) tabs open ONLY in another client/device still render grey locally — `hasTab` means "open in THIS client"; the registry pane payload carries `sessionRef` (untyped) and a semantics decision (green vs a third state) is a user-facing design call the campaign must make; (2) REST-created terminal identities are never retired on exit (documented at `terminal_tabs.rs:839-853`, a crate-cycle constraint predating this lane); (3) the §4.2 rung-2 ledger fallback in the sidebar join has NO production window (validated this workflow: every Bound-row writer upserts the registry with the session id first; terminal ids are never re-minted across restarts) — the sidebar consults rung 1 only, deliberately; record this so future lanes don't re-plan it; (4) `paneReconcileFreshAgentV1` is shipped-but-dormant (the client never sends it) — fresh-agent verdict entries are inert; this lane's terminal-pane cases are unaffected. Also record the Task 4 scope interpretation and the Task 2 `terminals.rs` ownership interpretation (see Global Constraints) for the campaign owner.
 - Red→green proof pointers: Task 2/3/4 RED steps + Task 5 Step 2's pre-fix binary run.
 
