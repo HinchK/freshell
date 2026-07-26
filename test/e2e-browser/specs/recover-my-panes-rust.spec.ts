@@ -226,32 +226,23 @@ test.describe('recover-my-panes browser-loss recovery (rust only)', () => {
   const FRESH_CONTEXT_OPTIONS = { serviceWorkers: 'block' as const }
 
   /**
-   * Open a FRESH context (empty storage) and require the recovery offer.
-   * Retries with a brand-new fresh context (same eligibility — the user
-   * opening another fresh window) as insurance against residual transient
-   * boot-fetch loss; a genuinely broken offer still fails all attempts —
-   * the red-verification (panel unmounted) proves this loop fails.
+   * Open a FRESH context (empty storage) and REQUIRE the recovery offer —
+   * one context, one hard `toBeVisible` assertion (the brief's contract).
+   * No retry loop: with service workers blocked (above) the only known cause
+   * of transient offer suppression is gone, and a retry here would quietly
+   * absorb exactly the flaky-offer regression class this feature already
+   * exhibited once. If the offer ever goes flaky again, this MUST fail loud.
    */
   async function openFreshContextWithOffer(
     browser: import('@playwright/test').Browser,
     label: string,
   ): Promise<{ ctx: BrowserContext; page: Page; harness: TestHarness }> {
-    const attempts = 3
-    for (let attempt = 1; attempt <= attempts; attempt++) {
-      const ctx = await browser.newContext(FRESH_CONTEXT_OPTIONS)
-      const page = await ctx.newPage()
-      traceInventoryFailures(page, label)
-      const harness = await connect(page, info)
-      try {
-        await page.getByTestId('recovery-offer-panel').waitFor({ state: 'visible', timeout: 15_000 })
-        return { ctx, page, harness }
-      } catch (err) {
-        if (attempt === attempts) throw err
-        console.log(`[${label}] offer absent in fresh context (attempt ${attempt}/${attempts}) — retrying with a new context`)
-        await ctx.close()
-      }
-    }
-    throw new Error('unreachable')
+    const ctx = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const page = await ctx.newPage()
+    traceInventoryFailures(page, label)
+    const harness = await connect(page, info)
+    await expect(page.getByTestId('recovery-offer-panel')).toBeVisible({ timeout: 15_000 })
+    return { ctx, page, harness }
   }
 
   // Scenario 1's claude session — scenario 2/3 reason about the same log.
