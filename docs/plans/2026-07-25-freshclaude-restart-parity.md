@@ -7,14 +7,14 @@
 
 **Goal:** Bring freshclaude/kilroy fresh-agent sessions to restart parity with codex: record the durable Claude UUID (`cliSessionId`) server-side, resume untracked sessions in place on `freshAgent.attach` (lost-frame only on positive denial), and serve chat-history snapshots from the on-disk Claude transcript instead of 503.
 
-**Architecture:** Three server-side slices in `crates/freshell-freshagent` mirroring the codex reference (`codex.rs ensure_session_resumable`/`handle_attach`) and opencode's lost-vs-transport discipline. The snapshot adapter reads the isolated `CLAUDE_HOME/projects/*/<uuid>.jsonl` transcript directly (no sidecar burn — claude has no `thread/read` RPC; the legacy Node server's `extractChatMessagesFromJsonl` is the parsing precedent). The FROZEN client already sends everything needed: `freshAgent.attach` carries `resumeSessionId` (the Claude UUID) + `sessionRef`, and the snapshot fetch uses the UUID as `threadId`.
+**Architecture:** Three server-side slices in `crates/freshell-freshagent` mirroring the codex reference (`codex.rs ensure_session_resumable`/`handle_attach`) and opencode's lost-vs-transport discipline. The snapshot adapter reads the Claude store's `projects/*/<uuid>.jsonl` transcript directly, resolving the store root as ordered candidates `CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude` (the real CLI honors CLAUDE_CONFIG_DIR and ignores CLAUDE_HOME — validated, ledger A3). No sidecar burn: the sidecar protocol has no history op, and the SDK's own `getSessionMessages` is itself just a local JSONL read (ledger A16); the legacy Node server's `extractChatMessagesFromJsonl` is the parsing precedent (with real-store fixes — ledger A5). The FROZEN client already sends everything needed: `freshAgent.attach` carries `resumeSessionId` (the Claude UUID) + `sessionRef`, and the snapshot fetch uses the UUID as `threadId`.
 
 **Tech Stack:** Rust (tokio, axum, serde_json), Node (test fixtures only — the vendored sidecar needs NO production change), Playwright e2e, vitest (zod contract pin).
 
 ## Global Constraints
 
 - **Worktree:** all work in `/home/dan/code/freshell/.worktrees/freshclaude-restart-parity`, branch `feat/freshclaude-restart-parity`, base `origin/main @ c491aee0`.
-- **Scope fence (owned files):** `crates/freshell-freshagent/src/claude.rs`, `crates/freshell-freshagent/src/snapshot.rs`, a NEW `crates/freshell-freshagent/src/claude_snapshot.rs` (+ its `mod` line in `crates/freshell-freshagent/src/lib.rs`), `crates/freshell-claude-sidecar/index.mjs` (turns out: no change needed), the `FreshAgentAttach` claude arm in `crates/freshell-ws/src/terminal.rs` (turns out: dispatch already routes to `handle_attach` — no terminal.rs change needed), test files and fixtures.
+- **Scope fence (owned files):** `crates/freshell-freshagent/src/claude.rs`, `crates/freshell-freshagent/src/snapshot.rs`, a NEW `crates/freshell-freshagent/src/claude_snapshot.rs` (+ its `mod` line in `crates/freshell-freshagent/src/lib.rs`), `crates/freshell-freshagent/Cargo.toml` (adding the `tempfile` dev-dependency ONLY — verified absent today), `crates/freshell-claude-sidecar/index.mjs` (turns out: no change needed), the `FreshAgentAttach` claude arm in `crates/freshell-ws/src/terminal.rs` (turns out: dispatch already routes to `handle_attach` — no terminal.rs change needed), test files and fixtures.
 - **Do NOT touch:** the `terminal.create` path in `terminal.rs` (Lane A3), `codex.rs`/`opencode_ws.rs` beyond reading, `tabs_persist*`/`tabs_snapshots` (A1/A6), `registry.rs` (A5), anything under client `src/` — **the frozen client must work UNCHANGED; if a client change seems required, STOP and report.** No kimi/gemini.
 - **TDD:** Red-Green-Refactor at every step — run the failing test BEFORE implementing.
 - **Tests/e2e:** e2e specs create their OWN `RustServer` instances on ephemeral ports (`findFreePort` inside the harness) — NEVER ports 3001/3002. Broad vitest runs go through the coordinator gate (`npm run test:status` first; set `FRESHELL_TEST_SUMMARY="freshclaude restart parity"`; WAIT if held — 5 sibling lanes run concurrently). Playwright is NOT coordinator-gated. Cargo has no repo-blessed wrapper — use `cargo test -p <crate>` directly.
@@ -31,14 +31,18 @@
 - `spawn_consumer` (claude.rs:421–442) is a generic rename-and-rebroadcast loop; `sdk_line_to_frame` (claude.rs:452–468) clones the inner event, renames `sdk.*` → `freshAgent.*` via `normalize_sdk_type` (claude.rs:472–492, includes `"sdk.session.init" => "freshAgent.session.init"`), and injects the **sessions-map key** as the envelope `sessionId`. The client prefers the envelope id (`src/lib/fresh-agent-ws.ts:180-183`).
 - The sidecar emits `{type:'sdk.session.init', sessionId, cliSessionId, model, cwd, tools}` (index.mjs:119–135); `cliSessionId` is the durable Claude UUID = the transcript filename stem. Today it is forwarded to the client and NEVER retained server-side.
 - The real sidecar already passes `resume: req.resumeSessionId` into the SDK (index.mjs:209) — **no sidecar production change is needed** for resume.
-- FROZEN client attach payload (`FreshAgentView.tsx:303-313`, sent at `:999`, `:1115`, `:1135` incl. ws.onReconnect): `sessionId` = the original create-time nanoid (never rekeyed), `resumeSessionId` = the Claude UUID (from `session.cliSessionId`), `sessionRef = {provider:'claude', sessionId:<UUID>}`, plus `cwd`. `FreshAgentAttach` (client_messages.rs:490–502) already deserializes `resume_session_id` and `session_ref` — currently read by NO handler.
+- FROZEN client attach payload (`FreshAgentView.tsx:303-313`, sent at `:999`, `:1115`, `:1135` incl. ws.onReconnect): `sessionId` = the original create-time nanoid (never rekeyed), `resumeSessionId` = the Claude UUID (from `session.cliSessionId`), `sessionRef = {provider:'claude', sessionId:<UUID>}`, plus `cwd`. `FreshAgentAttach` (`crates/freshell-protocol/src/client_messages.rs:490–502` — the protocol crate, NOT freshell-ws) already deserializes `resume_session_id` and `session_ref` — currently read by NO handler.
 - FROZEN client snapshot fetch (`FreshAgentView.tsx:1275-1420`): `GET /api/fresh-agent/threads/{sessionType}/{provider}/{threadId}?cwd=…` with `threadId` = the **Claude UUID** (never the nanoid); suppressed while `.lost`; no request at all if no UUID is known.
 - `freshAgent.session.snapshot` inner events are provider-agnostic client-side (`fresh-agent-ws.ts:196-206`): one such frame un-wedges BUSY and hands the durable UUID over via `timelineSessionId`.
 - Codex status-snapshot inner shape (codex.rs:2658–2696): `{type:"freshAgent.session.snapshot", sessionId, latestTurnId:null, status, timelineSessionId}`.
 - `spawn_sidecar()` (claude.rs:529–565) inherits the parent env wholesale (HOME/CLAUDE_HOME isolation comes from the server env). `sidecar_entry_path()` honors `FRESHELL_CLAUDE_SIDECAR`; node binary from `FRESHELL_CLAUDE_NODE`.
 - `read_created(&mut reader, SIDECAR_CREATE_BUDGET)` (claude.rs:569–617) returns the sidecar's nanoid; `write_line` (claude.rs:635–643) writes one JSON line to stdin; `mint_ownership_id`/`reap_owned_claude_sidecars` (claude.rs:663–710).
 - Transcript layout: `<claude_home>/projects/<cwd-slug>/<uuid>.jsonl`; slug is lossy — locate by FILENAME scan across `projects/*` (+ one subdir level), never by re-deriving the slug (legacy precedent `server/session-history-loader.ts:132-226`).
-- `claude_home` resolution precedent: env `CLAUDE_HOME` (non-empty) else `<home>/.claude` (`server/claude-home.ts`, and `crates/freshell-server/src/session_directory.rs:446` which is `pub(crate)` to freshell-server — NOT callable from freshell-freshagent, so we duplicate the 5-line resolver).
+- Claude store-root resolution — **validated against cli.js 2.1.220 + sdk.mjs 0.2.71 (load-bearing ledger A3, FALSIFIED the old assumption):** the real CLI/SDK resolve the transcript store as `CLAUDE_CONFIG_DIR` (env) else `$HOME/.claude`; **`CLAUDE_HOME` appears 0× in cli.js — the CLI ignores it.** `CLAUDE_HOME` is a freshell-legacy knob only (`server/claude-home.ts`, `session_directory.rs:446` — `pub(crate)` to freshell-server, not callable from freshell-freshagent). The e2e harness isolates via `HOME` (its `CLAUDE_HOME` setting is inert for the CLI but read by freshell code, and it points at `$HOME/.claude` so all candidates coincide). Our resolver therefore returns ORDERED CANDIDATES `CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude` and positive denial requires absence in ALL of them — never a single root.
+- Real-SDK resume semantics — **validated (ledger A1/A12/A15):** `--fork-session` is opt-in; by default `--resume <uuid>` REUSES the original session id and appends to the SAME `<slug>/<uuid>.jsonl` (the old fork-on-resume behavior is gone as of mid-2025); mid-turn transcripts (unanswered trailing user message) are a first-class resume case (`interrupted_turn` classification). BUT the resume lookup is **cwd-slug-scoped (+ git worktrees of that cwd)** — resuming from a different cwd fails with "No conversation found", exit 1. Escape hatch (verified in cli.js): `--resume` also accepts a direct `.jsonl` file PATH, bypassing slug scoping. Rare wild-world failure: resume can silently mint a NEW id (GH claude-agent-sdk-python#555) — the consumer's init interception must warn + re-index on rotation, never assume.
+- Transcript retention — **validated (ledger A4):** claude GC deletes `projects/*/*.jsonl` older than `cleanupPeriodDays` (default 30d; a real store shows the 30-day cliff). An absent file can mean *expired*, but expired ⇒ the CLI cannot resume it either, so file-absent ⇒ lost remains honest.
+- Real transcript line shapes — **validated over 23,615 real lines (ledger A5, FALSIFIED the legacy-as-coded contract):** real typed user prompts are dominantly `message:{role,content:"<string>"}` (object-with-STRING-content — a shape the legacy Node parser DROPS); assistant lines are 100% object-with-array content (blocks only text/thinking/tool_use/tool_result); lines carry `isMeta`/`isSidechain`/`isCompactSummary` flags whose `true` values mark synthetic/subagent lines that must be SKIPPED; a dozen other top-level `type` values exist and are safely filtered by the user|assistant gate. Store layout: 100% of main transcripts at `projects/<slug>/<uuid>.jsonl` depth 1 (deeper jsonl are non-UUID subagent files); sizes p50 335 KB / p99 7.9 MB / max 83 MB.
+- SDK history API — **validated (ledger A16):** SDK 0.2.71 DOES export `getSessionMessages`/`listSessions`, but they are themselves local JSONL readers with the same root resolution — our direct read is behaviorally equivalent and avoids a sidecar protocol change.
 - snapshot.rs handler (snapshot.rs:86–147): arms for `("freshcodex","codex")` and `("freshopencode","opencode")`; claude falls to the catch-all → 503 `FRESH_AGENT_RUNTIME_UNAVAILABLE`. Pinning test `valid_but_unregistered_locator_is_503_with_code` (snapshot.rs:253–272) must be replaced. NotFound convention: 404 + `"FRESH_AGENT_LOST_SESSION"`.
 - e2e fixture `test/e2e-browser/fixtures/fake-claude-sidecar.mjs`: emits `created` → `sdk.session.init` (cliSessionId = `44444444-4444-4444-8444-444444444444`, overridable via `FAKE_CLAUDE_SIDECAR_CLI_SESSION_ID`) → (`sdk.session.snapshot messages:[]` if resume) → `sdk.status idle`; `send` → running → assistant `'Fixture claude turn'` → `turn.complete` → idle; knob `FAKE_CLAUDE_SIDECAR_HOLD_TURN=1`. Writes NO files, NO log.
 - `RustServer` harness (`test/e2e-browser/helpers/rust-server.ts`): mkdtemp HOME + `findFreePort` + random token; `applyIsolatedHomeEnvironment` pins HOME/CLAUDE_HOME per test; caller `env` wins; `restartAbrupt()` = SIGKILL process group + reboot on same home/port/token. New rust-only specs must be registered in BOTH `RUST_ONLY_SPECS` and the `rust-chromium` project's `testMatch` in `test/e2e-browser/playwright.config.ts`.
@@ -50,7 +54,7 @@
 | File | Responsibility |
 |---|---|
 | `crates/freshell-freshagent/src/claude.rs` (modify) | Record cliSessionId (index + session field), sidecar-id-aware send/interrupt, resume-on-attach arm, status-snapshot frame builder |
-| `crates/freshell-freshagent/src/claude_snapshot.rs` (create) | Pure claude transcript machinery: `claude_home()`, `find_transcript()`, JSONL→turns parser, snapshot JSON builder, `get_claude_snapshot()` |
+| `crates/freshell-freshagent/src/claude_snapshot.rs` (create) | Pure claude transcript machinery: `claude_home_candidates()`, `find_transcript()`, `locate_transcript()`, `transcript_cwd()`, JSONL→turns parser, snapshot JSON builder, `get_claude_snapshot()` |
 | `crates/freshell-freshagent/src/lib.rs` (modify) | `pub(crate) mod claude_snapshot;` |
 | `crates/freshell-freshagent/src/snapshot.rs` (modify) | `("freshclaude"\|"kilroy", "claude")` handler arm; replace the 503 pin test |
 | `test/fixtures/fresh-agent/claude-transcript-sample.jsonl` (create) | Shared sample transcript (Rust builder input + TS contract test input) |
@@ -78,7 +82,8 @@ Task order: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9. Tasks 2–5 (snap
   - `FreshClaudeState.cli_index: Arc<TokioMutex<HashMap<String, String>>>` — durable `cliSessionId` → sessions-map key.
   - `ClaudeSession.cli_session_id: Option<String>` — best-effort copy of the durable id.
   - `ClaudeSession.sidecar_session_id: String` — the id the SIDECAR knows this session by (== map key for created sessions; differs for resumed ones in Task 6). `handle_send`/`handle_interrupt` write THIS id to the sidecar.
-  - Test helper `FakeClaudeSidecarEnv` unchanged; `FAKE_CLAUDE_SIDECAR_SOURCE` extended to emit `sdk.session.init`.
+  - Test helper `FakeClaudeSidecarEnv` unchanged; `FAKE_CLAUDE_SIDECAR_SOURCE` extended to emit `sdk.session.init` (+ an `__exit__` send trigger).
+  - Consumer-exit eviction guarantee: when a sidecar dies (its stdout consumer loop ends), the session entry AND its `cli_index` entries are evicted, identity-guarded. Validation FALSIFIED the old "kill/shutdown are the only eviction paths needed" belief (ledger A9): without this, a dead-but-tracked session makes Task 6's "tracked ⇒ no-op" attach row silently strand panes forever.
 
 - [ ] **Step 1: Extend the in-crate fake sidecar to emit `sdk.session.init`**
 
@@ -92,6 +97,8 @@ console.log(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }));
 ```
 
 Also make the fake's create branch append `JSON.stringify(msg)` (the whole parsed create request) as the spawn-log line instead of just the pid, so tests can assert `resumeSessionId` was received. Update `spawn_count()` accordingly (count lines — unchanged behavior).
+
+Also add to the fake's `send` handling: if the send's `text` is `'__exit__'`, call `process.exit(0)` — this lets tests kill the sidecar through the public API and exercise the consumer-exit eviction added below (ledger A9).
 
 - [ ] **Step 2: Write the failing test**
 
@@ -132,6 +139,34 @@ async fn session_init_records_cli_session_id_in_the_index() {
 
 (Mirror the exact `FreshAgentKill` field set from the existing kill tests at claude.rs:1239–1300 — copy their construction verbatim if it differs.)
 
+Also add the consumer-exit eviction test (mirror the existing send test's message construction for the `send_msg` helper):
+
+```rust
+#[tokio::test]
+async fn consumer_exit_evicts_dead_session_and_index() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeClaudeSidecarEnv::install();
+    let (st, mut rx) = state_with_bus();
+    st.handle_create(dedup_create_msg("req-evict-1")).await;
+    let created = await_claude_created(&mut rx, "req-evict-1").await;
+    // Kill the sidecar through the public API (fake exits on text "__exit__"),
+    // then poll (bounded) until the consumer-exit eviction clears BOTH maps.
+    st.handle_send(send_msg(&created, "__exit__")).await; // mirror the existing send-test helper
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if st.sessions.lock().await.is_empty() && st.cli_index.lock().await.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "consumer exit must evict the dead session and its cli_index entries"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    drop(env);
+}
+```
+
 - [ ] **Step 3: Run test to verify it fails**
 
 ```bash
@@ -166,7 +201,7 @@ Expected: FAIL to compile — `cli_index` field does not exist. (Compile failure
 
 3. In `handle_create` (insert site claude.rs:224–232), set `sidecar_session_id: created.clone(), cli_session_id: None` on the inserted `ClaudeSession`. Same for the test helper `insert_fake_claude_session` (claude.rs:765–783): `sidecar_session_id: id.to_string(), cli_session_id: None`.
 
-4. In `spawn_consumer` (claude.rs:421–442), clone `self.sessions` and `self.cli_index` into the task and intercept session-init lines before the generic rebroadcast:
+4. In `spawn_consumer` (claude.rs:421–442), clone `self.sessions` and `self.cli_index` into the task, intercept session-init lines before the generic rebroadcast, and EVICT on loop exit (ledger A9: consumer exit was the missing eviction path — without it a dead-but-tracked session strands panes against Task 6's "tracked ⇒ no-op" attach row). `spawn_consumer` gains a `sidecar_session_id: String` parameter (the id this consumer's sidecar is keyed by — pass `created.clone()` at the existing `handle_create` call site) used as the eviction identity guard:
 
 ```rust
         let broadcast_tx = self.broadcast_tx.clone();
@@ -242,8 +277,10 @@ git commit -m "feat(freshagent): record claude cliSessionId in a durable-id inde
 **Interfaces:**
 - Consumes: nothing from other tasks.
 - Produces:
-  - `pub(crate) fn claude_home() -> Option<PathBuf>` — env `CLAUDE_HOME` (non-empty) else `$HOME/.claude`; `None` if neither resolvable.
+  - `pub(crate) fn claude_home_candidates() -> Vec<PathBuf>` — ordered, deduped store roots: env `CLAUDE_CONFIG_DIR` (non-empty; what the real CLI honors — ledger A3), then env `CLAUDE_HOME` (non-empty; freshell-legacy), then `$HOME/.claude`. Empty vec only if none resolvable.
   - `pub(crate) fn find_transcript(claude_home: &Path, session_id: &str) -> Option<PathBuf>` — filename scan of `projects/*/<session_id>.jsonl` + one subdir level; rejects path-traversal ids.
+  - `pub(crate) fn locate_transcript(session_id: &str) -> Option<PathBuf>` — `find_transcript` across ALL candidate roots in order; positive denial requires absence EVERYWHERE.
+  - `pub(crate) fn transcript_cwd(path: &Path) -> Option<String>` — first non-empty `cwd` field among the transcript's lines (real claude lines carry `cwd` on 100% of user/assistant lines — ledger A5 census). Task 6 resumes with the session's ORIGINAL cwd because the CLI's resume lookup is cwd-scoped (ledger A15).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -252,14 +289,21 @@ Create `crates/freshell-freshagent/src/claude_snapshot.rs` containing ONLY the t
 ```rust
 //! Claude fresh-agent snapshot adapter (restart-resilience plan §2.8 item 4).
 //!
-//! Reads the Claude CLI's own transcript store (`<claude_home>/projects/<cwd-slug>/
+//! Reads the Claude CLI's own transcript store (`<store-root>/projects/<cwd-slug>/
 //! <uuid>.jsonl`) directly -- the first file-reading snapshot source in the Rust port.
-//! Design choice over codex's resume-and-ask: claude has no `thread/read` RPC, a
-//! sidecar resume burns a real SDK process per snapshot GET, and the legacy Node
-//! server already proved direct-read viable (`server/session-history-loader.ts`).
+//! Design choice over codex's resume-and-ask: the sidecar protocol has no history op,
+//! the SDK's own `getSessionMessages` is itself just a local JSONL read with the same
+//! root resolution (ledger A16), a sidecar resume burns a real SDK process per
+//! snapshot GET, and the legacy Node server already proved direct-read viable
+//! (`server/session-history-loader.ts` -- with real-store parsing fixes, ledger A5).
+//! Store-root resolution is ORDERED CANDIDATES (`CLAUDE_CONFIG_DIR` > `CLAUDE_HOME` >
+//! `$HOME/.claude`) because the real CLI honors CLAUDE_CONFIG_DIR and IGNORES
+//! CLAUDE_HOME (ledger A3) -- reading a single root risks false positive denial.
 //! The transcript store is also the AUTHORITY for lost-vs-alive on attach
 //! ([`crate::FreshClaudeState::handle_attach`]): file present => resumable, file
-//! absent => positively gone (mirrors opencode's 404 rule).
+//! absent in EVERY candidate root => positively gone (mirrors opencode's 404 rule;
+//! honest even under claude's 30-day `cleanupPeriodDays` GC -- an expired transcript
+//! is unresumable by the CLI too, ledger A4).
 
 #[cfg(test)]
 mod tests {
@@ -304,10 +348,25 @@ mod tests {
         assert_eq!(find_transcript(home.path(), "a/b"), None);
         assert_eq!(find_transcript(home.path(), ""), None);
     }
+
+    #[test]
+    fn transcript_cwd_reads_the_first_cwd_field() {
+        let home = temp_home();
+        let file = home.path().join("t.jsonl");
+        std::fs::write(
+            &file,
+            "{\"type\":\"summary\"}\n{\"type\":\"user\",\"cwd\":\"/home/user/proj\",\"message\":\"hi\"}\n",
+        )
+        .unwrap();
+        assert_eq!(transcript_cwd(&file), Some("/home/user/proj".to_string()));
+        let empty = home.path().join("e.jsonl");
+        std::fs::write(&empty, "").unwrap();
+        assert_eq!(transcript_cwd(&empty), None);
+    }
 }
 ```
 
-If `tempfile` is not already a dev-dependency of `freshell-freshagent` (check `crates/freshell-freshagent/Cargo.toml`), add under `[dev-dependencies]`: `tempfile = "3"` (match the workspace's existing tempfile version if one is pinned elsewhere — `grep -rn "tempfile" crates/*/Cargo.toml`).
+`tempfile` is NOT currently a dev-dependency of `freshell-freshagent` (verified — ledger A17e): add under `[dev-dependencies]` in `crates/freshell-freshagent/Cargo.toml`: `tempfile = "3"` (match the workspace's existing tempfile version if one is pinned elsewhere — `grep -rn "tempfile" crates/*/Cargo.toml`).
 
 Add to `crates/freshell-freshagent/src/lib.rs` (next to `mod claude;`): `pub(crate) mod claude_snapshot;`
 
@@ -325,18 +384,64 @@ Add above the test module:
 ```rust
 use std::path::{Path, PathBuf};
 
-/// `getClaudeHome()` parity (`server/claude-home.ts`, duplicated because
-/// `freshell-server::session_directory::claude_home` is `pub(crate)` to that crate):
-/// env `CLAUDE_HOME` (non-empty) else `$HOME/.claude`. The sidecar and the claude CLI
-/// inherit this same env, so this resolution names the SAME store they write to.
-pub(crate) fn claude_home() -> Option<PathBuf> {
-    match std::env::var("CLAUDE_HOME") {
-        Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
-        _ => match std::env::var("HOME") {
-            Ok(h) if !h.is_empty() => Some(PathBuf::from(h).join(".claude")),
-            _ => None,
-        },
+/// Ordered candidate store roots. The real CLI resolves its store as
+/// `CLAUDE_CONFIG_DIR ?? $HOME/.claude` and IGNORES `CLAUDE_HOME` (verified against
+/// cli.js 2.1.220 -- ledger A3); `CLAUDE_HOME` is freshell's legacy knob
+/// (`server/claude-home.ts`, `session_directory.rs` -- `pub(crate)` to that crate).
+/// We read ALL candidates so a reader/writer root mismatch can never turn a live
+/// session into a false positive denial.
+pub(crate) fn claude_home_candidates() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    if let Ok(v) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !v.is_empty() {
+            push(PathBuf::from(v));
+        }
     }
+    if let Ok(v) = std::env::var("CLAUDE_HOME") {
+        if !v.is_empty() {
+            push(PathBuf::from(v));
+        }
+    }
+    if let Ok(h) = std::env::var("HOME") {
+        if !h.is_empty() {
+            push(PathBuf::from(h).join(".claude"));
+        }
+    }
+    out
+}
+
+/// `find_transcript` across every candidate root, in resolution order.
+/// Positive denial (attach) and snapshot 404 both require a miss EVERYWHERE.
+pub(crate) fn locate_transcript(session_id: &str) -> Option<PathBuf> {
+    claude_home_candidates()
+        .iter()
+        .find_map(|root| find_transcript(root, session_id))
+}
+
+/// The session's ORIGINAL cwd: first non-empty `cwd` field among the transcript's
+/// lines (100% of real user/assistant lines carry it -- ledger A5 census). Needed
+/// because the CLI's resume lookup is scoped to the original cwd's project slug
+/// (ledger A15). Reads lazily, stops at the first hit; malformed lines skipped.
+pub(crate) fn transcript_cwd(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(serde_json::Value::as_str) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Locate `<claude_home>/projects/*/<session_id>.jsonl` (or one subdir deeper, e.g.
@@ -420,13 +525,15 @@ Contract recap the builder MUST satisfy (zod `.strict()` at every level — `sha
 
 - [ ] **Step 1: Create the shared sample transcript**
 
-Create `test/fixtures/fresh-agent/claude-transcript-sample.jsonl` (exactly these 7 lines — covers: string-form message, structured text, thinking, tool_use/tool_result, skipped non-message line types, malformed line):
+Create `test/fixtures/fresh-agent/claude-transcript-sample.jsonl` (exactly these 9 lines — covers: string-form message, object-with-STRING-content message (the DOMINANT real prompt shape — ledger A5), structured text, thinking, tool_use/tool_result, a skipped `isMeta` line, skipped non-message line types, malformed line):
 
 ```
 {"type":"summary","summary":"ignored line type"}
 {"type":"user","timestamp":"2026-07-25T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"first question"}]}}
 {"type":"assistant","timestamp":"2026-07-25T10:00:01.000Z","message":{"id":"msg_01","role":"assistant","model":"claude-opus-4-6","content":[{"type":"thinking","thinking":"pondering"},{"type":"text","text":"first answer"}]}}
 {"type":"user","timestamp":"2026-07-25T10:00:02.000Z","message":"plain string question"}
+{"type":"user","timestamp":"2026-07-25T10:00:02.500Z","message":{"role":"user","content":"cli string content question"}}
+{"type":"user","isMeta":true,"timestamp":"2026-07-25T10:00:02.600Z","message":{"role":"user","content":"Caveat: synthetic meta line that must be skipped"}}
 {"type":"assistant","timestamp":"2026-07-25T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"bash","input":{"command":"ls"}}]}}
 {"type":"user","timestamp":"2026-07-25T10:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":[{"type":"text","text":"file-a\nfile-b"}],"is_error":false}]}}
 not json at all
@@ -481,8 +588,11 @@ Add to `claude_snapshot.rs` tests:
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), before, "turnIds must be unique (historyBodies map key)");
-        assert_eq!(turns.len(), 5); // summary + malformed lines skipped
-        assert_eq!(built["latestTurnId"], turns[4]["turnId"]);
+        assert_eq!(turns.len(), 6); // summary + malformed + isMeta lines skipped
+        assert_eq!(built["latestTurnId"], turns[5]["turnId"]);
+        // The dominant real prompt shape (object-with-string-content, ledger A5)
+        // must yield a text turn -- local-echo clearing depends on it.
+        assert_eq!(turns[3]["items"][0]["text"], "cli string content question");
     }
 ```
 
@@ -598,9 +708,13 @@ pub(crate) enum ClaudeSnapshotError {
 }
 
 /// One transcript JSONL line -> zero-or-one snapshot turn. Parsing rules are the
-/// legacy `extractChatMessagesFromJsonl` contract (`server/session-history-loader.ts:36-131`):
-/// keep only type user|assistant; message may be a plain string or `{content: [...]}`;
-/// malformed lines and unknown block kinds are skipped, never fatal.
+/// legacy `extractChatMessagesFromJsonl` contract (`server/session-history-loader.ts:36-131`)
+/// PLUS the real-store fixes from the ledger A5 census (23,615 real lines): keep only
+/// type user|assistant; message may be a plain string, `{content: [...]}`, or
+/// `{content: "<string>"}` (the DOMINANT real prompt shape, which legacy-as-coded
+/// drops); lines flagged isMeta/isSidechain/isCompactSummary/isVisibleInTranscriptOnly
+/// are synthetic/subagent noise and are SKIPPED; malformed lines and unknown block
+/// kinds are skipped, never fatal.
 fn parse_transcript_turns(thread_id: &str, transcript: &str) -> Vec<Value> {
     let mut turns: Vec<Value> = Vec::new();
     for line in transcript.lines() {
@@ -616,6 +730,13 @@ fn parse_transcript_turns(thread_id: &str, transcript: &str) -> Vec<Value> {
             Some("assistant") => "assistant",
             _ => continue,
         };
+        // Real transcripts flag synthetic/subagent lines (ledger A5): skip them.
+        if ["isMeta", "isSidechain", "isCompactSummary", "isVisibleInTranscriptOnly"]
+            .iter()
+            .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
+        {
+            continue;
+        }
         let msg = obj.get("message");
         let blocks: Vec<Value> = match msg {
             Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
@@ -800,8 +921,8 @@ pub(crate) async fn get_claude_snapshot(
     session_type: &str,
     thread_id: &str,
 ) -> Result<Value, ClaudeSnapshotError> {
-    let home = claude_home().ok_or(ClaudeSnapshotError::NotFound)?;
-    let path = find_transcript(&home, thread_id).ok_or(ClaudeSnapshotError::NotFound)?;
+    // Miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
+    let path = locate_transcript(thread_id).ok_or(ClaudeSnapshotError::NotFound)?;
     let mtime_ms = std::fs::metadata(&path)
         .ok()
         .and_then(|m| m.modified().ok())
@@ -915,12 +1036,16 @@ git commit -m "test: pin rust claude snapshot golden against the strict zod cont
 The existing test module (snapshot.rs:176+) builds a router with a `SnapshotState` and issues requests (see `valid_but_unregistered_locator_is_503_with_code`, snapshot.rs:253–272, for the harness pattern — reuse its helpers verbatim). Add:
 
 ```rust
-    // Serializes CLAUDE_HOME mutation across tests in this file (process-global env).
-    static SNAPSHOT_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    // Env vars are process-global and cargo test is multi-threaded: EVERY test that
+    // mutates claude-store env (this file AND claude.rs) must take the SAME lock —
+    // two independent per-file locks would NOT serialize against each other (ledger
+    // A13). Make claude.rs's existing `CLAUDE_ENV_LOCK` `pub(crate)` (mirroring how
+    // this file already reuses `crate::codex::tests::ENV_LOCK`) and use it here:
+    use crate::claude::tests::CLAUDE_ENV_LOCK;
 
     #[tokio::test]
     async fn claude_locator_serves_a_snapshot_from_the_transcript_store() {
-        let _guard = SNAPSHOT_ENV_LOCK.lock().await;
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join("projects").join("-e2e");
         std::fs::create_dir_all(&dir).unwrap();
@@ -929,14 +1054,16 @@ The existing test module (snapshot.rs:176+) builds a router with a `SnapshotStat
             r#"{"type":"user","timestamp":"2026-07-25T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#,
         )
         .unwrap();
-        std::env::set_var("CLAUDE_HOME", home.path());
+        // CLAUDE_CONFIG_DIR is the FIRST candidate root (what the real CLI honors,
+        // ledger A3) — setting it makes the test immune to ambient CLAUDE_HOME/HOME.
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
 
         // <build router + authorized GET exactly like the existing tests do>
         let (status, body) = get_json(
             "/api/fresh-agent/threads/freshclaude/claude/55555555-5555-4555-8555-555555555555",
         )
         .await;
-        std::env::remove_var("CLAUDE_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["sessionType"], "freshclaude");
         assert_eq!(body["provider"], "claude");
@@ -947,15 +1074,15 @@ The existing test module (snapshot.rs:176+) builds a router with a `SnapshotStat
 
     #[tokio::test]
     async fn claude_locator_with_unknown_session_id_is_404_with_lost_session_code() {
-        let _guard = SNAPSHOT_ENV_LOCK.lock().await;
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("projects")).unwrap();
-        std::env::set_var("CLAUDE_HOME", home.path());
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
         let (status, body) = get_json(
             "/api/fresh-agent/threads/kilroy/claude/66666666-6666-4666-8666-666666666666",
         )
         .await;
-        std::env::remove_var("CLAUDE_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body["code"], "FRESH_AGENT_LOST_SESSION");
     }
@@ -1019,7 +1146,7 @@ git commit -m "feat(freshagent): serve claude/kilroy snapshots from the transcri
 - Test: both of the above
 
 **Interfaces:**
-- Consumes: Task 1 (`cli_index`, `sidecar_session_id`), Task 2 (`claude_snapshot::{claude_home, find_transcript}`), existing `spawn_sidecar`, `write_line`, `read_created`, `spawn_consumer`, `lost_session_frame`, `send_error`, `session_type_str`.
+- Consumes: Task 1 (`cli_index`, `sidecar_session_id`, consumer-exit eviction), Task 2 (`claude_snapshot::{claude_home_candidates, locate_transcript, transcript_cwd}`), existing `spawn_sidecar`, `write_line`, `read_created`, `spawn_consumer`, `lost_session_frame`, `send_error`, `session_type_str`.
 - Produces:
   - `FreshClaudeState.resuming: Arc<TokioMutex<HashSet<String>>>` — single-flight per durable id.
   - `enum ResumeClaudeError { NotFound, Transient(String) }` (private).
@@ -1029,16 +1156,16 @@ git commit -m "feat(freshagent): serve claude/kilroy snapshots from the transcri
 
 | State | Action |
 |---|---|
-| tracked under `msg.session_id` | no-op — NO frame (wire-shape parity, unchanged) |
-| untracked, no canonical durable id on the message | `lost_session_frame` (`INVALID_SESSION_ID`) — unchanged fallback |
-| untracked, durable id already in `cli_index` | no-op (a concurrent attach already resumed it; its frames broadcast to all) |
-| untracked, transcript file EXISTS | spawn sidecar with `resumeSessionId=<durable>`, register under the CLIENT's `msg.session_id`, emit idle `freshAgent.session.snapshot` |
-| untracked, transcript file ABSENT | `lost_session_frame` — positive denial: the store is the authority |
-| untracked, spawn/pipe/created failure | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` — NEVER the lost frame |
+| tracked under `msg.session_id` | no-op — NO frame (wire-shape parity, unchanged). Safe against dead sidecars ONLY because Task 1's consumer-exit eviction removes dead entries (ledger A9) |
+| untracked, no canonical durable id on the message | `lost_session_frame` (`INVALID_SESSION_ID`) — unchanged fallback (also covers the verified A2 edge: a pane that never learned its UUID pre-kill attaches bare; lost→client re-create is the designed, non-destructive outcome) |
+| untracked, durable id already in `cli_index` | no-op (a concurrent attach already resumed it; its frames broadcast to all). Index rows for dead sessions are evicted by Task 1 |
+| untracked, transcript EXISTS (in ANY candidate root) | spawn sidecar and resume with the session's ORIGINAL cwd from `transcript_cwd` (ledger A15: the CLI's resume lookup is cwd-slug-scoped); if that cwd no longer exists, resume by the transcript's `.jsonl` PATH (verified cli.js escape hatch that bypasses slug scoping) with the attach cwd. Register under the CLIENT's `msg.session_id`, emit idle `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID — NEVER a nanoid (the frozen client persists it unvalidated, ledger A14/N3) |
+| untracked, transcript ABSENT in EVERY candidate root | `lost_session_frame` — positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
+| untracked, spawn/pipe/created failure (incl. no store root resolvable) | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` — NEVER the lost frame |
 
 - [ ] **Step 1: Write the failing unit tests**
 
-Add to claude.rs `mod tests` (all take `CLAUDE_ENV_LOCK` since they mutate `CLAUDE_HOME`/sidecar env; reuse `attach_msg(session_id)` but note it must now populate the resume fields — extend the helper with a variant):
+Add to claude.rs `mod tests` (all take `CLAUDE_ENV_LOCK` since they mutate `CLAUDE_CONFIG_DIR`/sidecar env — the ONE shared lock, ledger A13; tests set `CLAUDE_CONFIG_DIR`, the FIRST candidate root, so they are immune to ambient `CLAUDE_HOME`/`HOME`; reuse `attach_msg(session_id)` but note it must now populate the resume fields — extend the helper with a variant):
 
 ```rust
     fn attach_msg_with_resume(session_id: &str, durable: &str) -> FreshAgentAttach {
@@ -1052,7 +1179,9 @@ Add to claude.rs `mod tests` (all take `CLAUDE_ENV_LOCK` since they mutate `CLAU
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(format!("{durable}.jsonl")),
-            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            // `cwd` present + existing (ledger A15): the resume request must carry
+            // the transcript's ORIGINAL cwd, and resume by UUID (primary path).
+            r#"{"type":"user","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
         )
         .unwrap();
     }
@@ -1064,11 +1193,11 @@ Add to claude.rs `mod tests` (all take `CLAUDE_ENV_LOCK` since they mutate `CLAU
         let home = tempfile::tempdir().unwrap();
         let durable = "77777777-7777-4777-8777-777777777777";
         write_fake_transcript(home.path(), durable);
-        std::env::set_var("CLAUDE_HOME", home.path());
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
 
         let (st, mut rx) = state_with_bus();
         st.handle_attach(attach_msg_with_resume("client-nanoid-1", durable)).await;
-        std::env::remove_var("CLAUDE_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
 
         // Registered under the CLIENT's id (envelope tagging + send routing depend on it).
         assert!(st.sessions.lock().await.contains_key("client-nanoid-1"));
@@ -1092,14 +1221,14 @@ Add to claude.rs `mod tests` (all take `CLAUDE_ENV_LOCK` since they mutate `CLAU
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("projects")).unwrap();
-        std::env::set_var("CLAUDE_HOME", home.path());
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
         let (st, mut rx) = state_with_bus();
         st.handle_attach(attach_msg_with_resume(
             "client-nanoid-2",
             "88888888-8888-4888-8888-888888888888",
         ))
         .await;
-        std::env::remove_var("CLAUDE_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
         assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
     }
@@ -1110,12 +1239,12 @@ Add to claude.rs `mod tests` (all take `CLAUDE_ENV_LOCK` since they mutate `CLAU
         let home = tempfile::tempdir().unwrap();
         let durable = "99999999-9999-4999-8999-999999999999";
         write_fake_transcript(home.path(), durable);
-        std::env::set_var("CLAUDE_HOME", home.path());
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
         std::env::set_var("FRESHELL_CLAUDE_NODE", "/nonexistent-node-binary");
         let (st, mut rx) = state_with_bus();
         st.handle_attach(attach_msg_with_resume("client-nanoid-3", durable)).await;
         std::env::remove_var("FRESHELL_CLAUDE_NODE");
-        std::env::remove_var("CLAUDE_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         // Mirrors codex.rs:3832: transient => top-level error with the provider code,
         // explicitly NOT INVALID_SESSION_ID.
         let err = await_top_level_error(&mut rx).await;
@@ -1139,14 +1268,14 @@ Add to claude.rs `mod tests` (all take `CLAUDE_ENV_LOCK` since they mutate `CLAU
         let home = tempfile::tempdir().unwrap();
         let durable = "12121212-1212-4121-8121-121212121212";
         write_fake_transcript(home.path(), durable);
-        std::env::set_var("CLAUDE_HOME", home.path());
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
         let (st, _rx) = state_with_bus();
         let a = st.clone();
         let b = st.clone();
         let m1 = attach_msg_with_resume("nano-a", durable);
         let m2 = attach_msg_with_resume("nano-b", durable);
         tokio::join!(a.handle_attach(m1), b.handle_attach(m2));
-        std::env::remove_var("CLAUDE_HOME");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         assert_eq!(env.spawn_count(), 1, "single-flight per durable id");
         drop(env);
     }
@@ -1279,13 +1408,28 @@ enum ResumeClaudeError {
         msg: &FreshAgentAttach,
         durable: &str,
     ) -> Result<(), ResumeClaudeError> {
-        let home = crate::claude_snapshot::claude_home().ok_or_else(|| {
-            ResumeClaudeError::Transient("no CLAUDE_HOME/HOME resolvable".to_string())
-        })?;
-        if crate::claude_snapshot::find_transcript(&home, durable).is_none() {
-            // Positive denial: the transcript store is the authority for claude.
-            return Err(ResumeClaudeError::NotFound);
+        if crate::claude_snapshot::claude_home_candidates().is_empty() {
+            // No store root resolvable at all: we cannot CHECK, so we must not DENY.
+            return Err(ResumeClaudeError::Transient(
+                "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/HOME unset)".to_string(),
+            ));
         }
+        // Positive denial only when the transcript is absent in EVERY candidate
+        // root (CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude -- ledger A3).
+        let Some(transcript) = crate::claude_snapshot::locate_transcript(durable) else {
+            return Err(ResumeClaudeError::NotFound);
+        };
+        // The CLI's resume lookup is scoped to the ORIGINAL cwd's project slug
+        // (ledger A15) -- resume with the cwd recorded in the transcript itself.
+        // If that directory is gone, fall back to path-based resume
+        // (`--resume <path>.jsonl` bypasses slug scoping -- verified cli.js 2.1.220),
+        // keeping the attach cwd for the process itself.
+        let original_cwd = crate::claude_snapshot::transcript_cwd(&transcript)
+            .filter(|c| std::path::Path::new(c).is_dir());
+        let (resume_value, resume_cwd) = match original_cwd {
+            Some(cwd) => (json!(durable), json!(cwd)),
+            None => (json!(transcript.to_string_lossy()), json!(msg.cwd)),
+        };
 
         let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar()
             .await
@@ -1294,11 +1438,11 @@ enum ResumeClaudeError {
         let create_req = json!({
             "type": "create",
             "requestId": request_id,
-            "cwd": msg.cwd,
+            "cwd": resume_cwd,
             "model": Value::Null,
             "permissionMode": Value::Null,
             "effort": Value::Null,
-            "resumeSessionId": durable,
+            "resumeSessionId": resume_value,
         });
         let mut reader = BufReader::new(stdout).lines();
         if let Err(err) = write_line(&mut stdin, &create_req).await {
@@ -1362,8 +1506,8 @@ Add to `crates/freshell-ws/tests/freshagent_claude_attach.rs` (reuse its `spawn_
 ```rust
 #[tokio::test]
 async fn claude_attach_with_resumable_transcript_resumes_and_emits_snapshot_over_ws() {
-    // env lock + fake sidecar install + temp CLAUDE_HOME with
-    // projects/-t/aaaaaaa....jsonl seeded (one user line), then:
+    // env lock + fake sidecar install + temp CLAUDE_CONFIG_DIR with
+    // projects/-t/aaaaaaa....jsonl seeded (one user line carrying "cwd":"/tmp"), then:
     let durable = "abababab-abab-4bab-8bab-abababababab";
     send_json(&mut ws, &serde_json::json!({
         "type": "freshAgent.attach",
@@ -1408,7 +1552,7 @@ git commit -m "feat(freshagent): resume untracked claude sessions on attach (los
 - Consumes: nothing (standalone fixture).
 - Produces (Task 8 relies on these exact behaviors/knobs):
   - `FAKE_CLAUDE_SIDECAR_LOG=<path>` — every parsed stdin request appended as `{pid, t, msg}` JSONL (the `options.resume` proof).
-  - Transcript persistence: create ensures, and each send appends to, `$CLAUDE_HOME/projects/-fixture/<cliSessionId>.jsonl` in claude-code line shape (so the Task 5 adapter serves real history and the Task 6 attach gate finds the file).
+  - Transcript persistence: create ensures, and each send appends to, `<store-root>/projects/-fixture/<cliSessionId>.jsonl` (store root = `CLAUDE_CONFIG_DIR || CLAUDE_HOME || ~/.claude`, mirroring the real CLI's resolution — ledger A3) in claude-code line shape INCLUDING `cwd` (so the Task 5 adapter serves real history, the Task 6 attach gate finds the file, and the resume request carries the original cwd — ledger A15).
   - Resume continuity: `create` with `resumeSessionId` → `cliSessionId = resumeSessionId` (same durable id across restarts).
   - `FAKE_CLAUDE_SIDECAR_HOLD_TURN_ONCE_MARKER=<path>` — the FIRST send (across sidecar processes sharing the marker path) starts running and never completes; later sends behave normally. Existing knobs (`FAKE_CLAUDE_SIDECAR_HOLD_TURN`, `FAKE_CLAUDE_SIDECAR_CLI_SESSION_ID`) keep working.
 
@@ -1428,7 +1572,7 @@ const CLI_SESSION_ID =
   process.env.FAKE_CLAUDE_SIDECAR_CLI_SESSION_ID ?? '44444444-4444-4444-8444-444444444444'
 const REQUEST_LOG = process.env.FAKE_CLAUDE_SIDECAR_LOG
 
-// sessionId (bridge nanoid) -> cliSessionId (durable uuid)
+// sessionId (bridge nanoid) -> { cliSessionId (durable uuid), cwd }
 const sessions = new Map()
 
 function emit(obj) {
@@ -1442,7 +1586,12 @@ function logRequest(msg) {
 }
 
 function claudeHome() {
-  return process.env.CLAUDE_HOME || path.join(os.homedir(), '.claude')
+  // Mirror the REAL CLI's resolution (CLAUDE_CONFIG_DIR first -- ledger A3), then
+  // the freshell-legacy CLAUDE_HOME the harness sets, then ~/.claude -- the same
+  // candidate order as the Rust claude_home_candidates().
+  return (
+    process.env.CLAUDE_CONFIG_DIR || process.env.CLAUDE_HOME || path.join(os.homedir(), '.claude')
+  )
 }
 
 function transcriptPath(cliSessionId) {
@@ -1452,10 +1601,13 @@ function transcriptPath(cliSessionId) {
 }
 
 // Claude-code transcript line shape (what the Rust snapshot adapter parses).
-function appendTranscript(cliSessionId, role, text) {
+// `cwd` is load-bearing: the attach arm resumes with the transcript's ORIGINAL
+// cwd (ledger A15 -- real lines carry cwd on 100% of user/assistant lines).
+function appendTranscript(cliSessionId, role, text, cwd) {
   const line = {
     type: role,
     timestamp: new Date().toISOString(),
+    cwd: cwd ?? process.cwd(),
     message: { role, content: [{ type: 'text', text }] },
   }
   fs.appendFileSync(transcriptPath(cliSessionId), `${JSON.stringify(line)}\n`)
@@ -1475,7 +1627,8 @@ rl.on('line', (line) => {
     // Resume continuity: a resumed session keeps its durable id (what the real
     // CLI's transcript filename stem provides across restarts).
     const cliSessionId = msg.resumeSessionId ?? CLI_SESSION_ID
-    sessions.set(sessionId, cliSessionId)
+    const cwd = msg.cwd ?? process.cwd()
+    sessions.set(sessionId, { cliSessionId, cwd })
     // Ensure the transcript file EXISTS from create (the attach arm's
     // transcript-present gate reads it before any send happens post-restart).
     fs.closeSync(fs.openSync(transcriptPath(cliSessionId), 'a'))
@@ -1485,7 +1638,7 @@ rl.on('line', (line) => {
       sessionId,
       cliSessionId,
       model: msg.model ?? 'claude-opus-4-6',
-      cwd: msg.cwd ?? process.cwd(),
+      cwd,
       tools: [],
     })
     if (msg.resumeSessionId) {
@@ -1493,9 +1646,9 @@ rl.on('line', (line) => {
     }
     emit({ type: 'sdk.status', sessionId, status: 'idle' })
   } else if (msg.type === 'send') {
-    const cliSessionId = sessions.get(msg.sessionId) ?? CLI_SESSION_ID
+    const { cliSessionId, cwd } = sessions.get(msg.sessionId) ?? { cliSessionId: CLI_SESSION_ID }
     emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'running' })
-    appendTranscript(cliSessionId, 'user', msg.text)
+    appendTranscript(cliSessionId, 'user', msg.text, cwd)
     const holdOnce = HOLD_ONCE_MARKER && !fs.existsSync(HOLD_ONCE_MARKER)
     if (holdOnce) {
       fs.mkdirSync(path.dirname(HOLD_ONCE_MARKER), { recursive: true })
@@ -1503,7 +1656,7 @@ rl.on('line', (line) => {
       return // wedged: running forever (busy-restart scenario)
     }
     if (HOLD_TURN) return
-    appendTranscript(cliSessionId, 'assistant', 'Fixture claude turn')
+    appendTranscript(cliSessionId, 'assistant', 'Fixture claude turn', cwd)
     emit({
       type: 'sdk.assistant',
       sessionId: msg.sessionId,
@@ -1839,4 +1992,6 @@ Then STOP. Do NOT run `gh pr create` (not approved). The final report must inclu
 
 **2. Placeholder scan:** no TBD/TODO/"handle edge cases"/"similar to Task N" steps; every code step shows code; the two "verify against the donor/actual file" notes are adaptation instructions with named authoritative sources (donor spec lines, zod file lines), not omissions.
 
-**3. Type consistency:** `cli_index: Arc<TokioMutex<HashMap<String,String>>>` (Task 1) is what Task 6 reads/writes; `sidecar_session_id`/`cli_session_id` fields introduced in Task 1 are the ones Task 6's `ClaudeSession` literal sets; `claude_snapshot::{claude_home, find_transcript}` (Task 2) match Task 5/6 call sites; `build_claude_snapshot_json(session_type, thread_id, transcript, revision)` and `get_claude_snapshot(session_type, thread_id)` signatures match between Tasks 3 and 5; `ClaudeSnapshotError::{NotFound, Io}` matches the Task 5 match arms; fixture env knob names in Task 7 match Task 8's spec env exactly.
+**3. Type consistency:** `cli_index: Arc<TokioMutex<HashMap<String,String>>>` (Task 1) is what Task 6 reads/writes; `sidecar_session_id`/`cli_session_id` fields introduced in Task 1 are the ones Task 6's `ClaudeSession` literal sets; `claude_snapshot::{claude_home_candidates, locate_transcript, transcript_cwd}` (Task 2) match Task 5/6 call sites; `build_claude_snapshot_json(session_type, thread_id, transcript, revision)` and `get_claude_snapshot(session_type, thread_id)` signatures match between Tasks 3 and 5; `ClaudeSnapshotError::{NotFound, Io}` matches the Task 5 match arms; fixture env knob names in Task 7 match Task 8's spec env exactly.
+
+**4. Load-bearing validation pass (post-writing):** 18 assumptions surfaced, 12 verified / 7 falsified, all falsifications planned around (full ledger: `.worktrees/.the-usual-logs/freshclaude-restart-parity/load-bearing-ledger.md`, with per-topic evidence reports alongside). The falsifications and their fixes, now reflected in the tasks above: **A3** (CLI ignores CLAUDE_HOME; honors CLAUDE_CONFIG_DIR) → candidate-root resolver + deny-only-if-absent-everywhere + tests pin CLAUDE_CONFIG_DIR; **A15** (resume lookup is cwd-scoped) → resume with the transcript's original `cwd`, `.jsonl`-path resume fallback, fixture transcripts carry `cwd`; **A5** (real prompts are object-with-string-content; meta lines exist) → parser skips isMeta/isSidechain/isCompactSummary/isVisibleInTranscriptOnly, sample+golden exercise the content-string shape; **A9** (sidecar death never evicted the sessions map) → identity-guarded consumer-exit eviction + test, making the attach table's no-op rows safe; **A13** (two per-file env locks don't serialize) → single shared `CLAUDE_ENV_LOCK` (pub(crate)); **A17e** (tempfile dev-dep missing) → unconditional Cargo.toml add, fence updated; **A16** (SDK does expose local history readers) → rationale text corrected, architecture unchanged. Verified load-bearing facts the plan now leans on explicitly: resume preserves the durable UUID by default (fork is opt-in) with a warn+reindex guard for the rare silent-rotation failure mode (GH claude-agent-sdk-python#555); the frozen client ignores unknown top-level error codes, runs no attach watchdog, folds the codex-shape idle snapshot provider-agnostically, and adopts `timelineSessionId`/`cliSessionId` UNVALIDATED into persisted state (so the server must only ever emit durable UUIDs there — pinned in Task 6's tests). Accepted residuals (recorded in the ledger): live-probe confirmation of resume behavior (needs ~$0.05 of real API spend — probe commands recorded in the ledger's v2 report for the user to run at will), possible one-turn API spend on mid-turn resume, and p99 multi-MB transcript serialization cost.
