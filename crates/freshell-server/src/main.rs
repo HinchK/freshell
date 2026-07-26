@@ -440,6 +440,10 @@ async fn main() -> ExitCode {
         session_existence: match &session_index {
             Some(index) => std::sync::Arc::new(existence::IndexExistenceProbe::new(
                 std::sync::Arc::clone(index),
+                // P1.8 read 2: the durable ledger backs `ever_observed`, so a
+                // transcript deleted while the server was DOWN still derives
+                // loud dead_session (per-boot observed set is empty then).
+                Some(std::sync::Arc::clone(&pane_ledger)),
             )),
             None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         },
