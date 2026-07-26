@@ -249,6 +249,7 @@ mod tests {
         let broadcast_tx = StdArc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: StdArc::clone(&auth_token),
             server_instance_id: StdArc::new("srv-1111".to_string()),
