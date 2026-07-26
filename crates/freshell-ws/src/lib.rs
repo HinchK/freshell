@@ -24,6 +24,7 @@ pub mod activity;
 pub mod amplifier_association;
 pub mod backpressure;
 pub(crate) mod codex_candidate;
+pub(crate) mod codex_identity;
 pub(crate) mod codex_reconcile;
 pub mod create_limit;
 pub mod existence;
@@ -39,7 +40,7 @@ pub mod tabs;
 pub mod tabs_persist;
 pub mod terminal;
 
-pub use codex_candidate::codex_sessions_root;
+pub use codex_identity::codex_sessions_root;
 pub use codex_reconcile::locate_codex_rollout;
 
 use std::sync::Arc;

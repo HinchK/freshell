@@ -17,14 +17,11 @@
 //!      parity `server/coding-cli/codex-app-server/durability-proof.ts:88-102`)
 
 use std::io::{BufRead, Read};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use freshell_protocol::{
-    ServerMessage, SessionLocator, TerminalCodexCandidatePersisted, TerminalMetaRecord,
-    TerminalMetaUpdated, TerminalSessionAssociated,
-};
+use freshell_protocol::TerminalCodexCandidatePersisted;
 
-use crate::terminal::now_ms;
+use crate::codex_identity::{adopt_codex_identity, codex_sessions_root, CodexAdoption};
 use crate::WsState;
 
 /// Codex thread ids are bare hyphenated UUIDs. Cheap shape check so an empty
@@ -89,28 +86,6 @@ pub(crate) fn verify_rollout_path(
         Some(id) if id == thread_id => Ok(()),
         _ => Err("thread_id_mismatch"),
     }
-}
-
-/// `CODEX_HOME` env (non-empty) else `<HOME>/.codex`, then `/sessions` --
-/// mirrors `freshell-server/src/session_directory.rs::codex_home` (which is
-/// crate-private there; HOME only, never FRESHELL_HOME) joined with the
-/// `sessions` dir the way `freshell_sessions::directory_index::CodexSource`
-/// does.
-///
-/// `pub` (re-exported from the crate root) for `freshell-server`'s boot-time
-/// codex rollout-locator wiring.
-pub fn codex_sessions_root() -> Option<PathBuf> {
-    let home = match std::env::var("CODEX_HOME") {
-        Ok(v) if !v.is_empty() => PathBuf::from(v),
-        _ => {
-            #[cfg(windows)]
-            let base = std::env::var("USERPROFILE").ok()?;
-            #[cfg(not(windows))]
-            let base = std::env::var("HOME").ok()?;
-            PathBuf::from(base).join(".codex")
-        }
-    };
-    Some(home.join("sessions"))
 }
 
 /// Handle one `terminal.codex.candidate.persisted` frame. No reply frame on
@@ -201,98 +176,21 @@ pub(crate) async fn handle_codex_candidate_persisted(
         );
         return;
     }
-    // Bind both identity homes (they have different consumers -- see
-    // opencode_association.rs:135-148), then broadcast.
-    state.identity.upsert(
-        &msg.terminal_id,
-        Some("codex"),
-        Some(thread_id),
-        row.cwd.as_deref(),
-        now_ms(),
-    );
-    state.registry.set_meta(
-        &msg.terminal_id,
-        None,
-        None,
-        Some("codex".to_string()),
-        Some(thread_id.to_string()),
-    );
-    // P1.8 (trigger b): the verified adoption is an identity event -- durable
-    // binding row first, then the spawn-time pending marker is deleted.
-    // Awaited spawn_blocking inside the helper: the fsync completes before
-    // the associated broadcast, without pinning the dispatch worker (V1.md).
-    crate::pane_ledger::ledger_resolve_identity(
+    // The shared adoption tail (codex_identity.rs): binds both identity
+    // homes, awaits the durable ledger row, broadcasts the pinned
+    // associated/meta pair, and feeds the activity hub. It re-checks guard
+    // 3b (session bound elsewhere, retired-inclusive) internally; a reject
+    // there stays a silent WARN, matching this channel's no-reply contract.
+    adopt_codex_identity(
         state,
-        &msg.terminal_id,
-        "codex",
-        thread_id,
-        row.cwd.as_deref(),
+        CodexAdoption {
+            terminal_id: &msg.terminal_id,
+            thread_id,
+            rollout_path: Some(Path::new(&msg.rollout_path)),
+            cwd: row.cwd.as_deref(),
+        },
     )
     .await;
-    broadcast_terminal_session_associated(state, &msg.terminal_id, thread_id, row.cwd.clone());
-    // G3: adopted identity also feeds the activity tracker, so this
-    // terminal's `codex.activity.updated` records and subsequent
-    // `terminal.turn.complete` frames carry the sessionId (a fresh codex
-    // terminal otherwise never gets one -- identity arrives only here).
-    // Placed AFTER the pinned associated/meta broadcast pair.
-    if let Some(hub) = &state.activity {
-        hub.bind_codex_session(&msg.terminal_id, thread_id);
-        // G9: the verified rollout also feeds the reconcile lane, so this
-        // fresh terminal gets real busy-state from disk, not just PTY
-        // heuristics. Both calls only enqueue hub events (Task 2/Task 6):
-        // no file I/O and no frame emission happens on this WS dispatch
-        // path -- the hub task does the work, keeping frames serialized.
-        hub.attach_codex_rollout(
-            &msg.terminal_id,
-            thread_id,
-            std::path::Path::new(&msg.rollout_path),
-        );
-    }
-}
-
-/// Fan `terminal.session.associated` + a `terminal.meta.updated` upsert to
-/// every connection. Byte-for-byte the shape of
-/// `opencode_association.rs::broadcast_terminal_session_associated` with
-/// provider "codex". EMISSION ORDER IS PINNED: `associated` FIRST, then
-/// `meta.updated` (mirroring opencode_association.rs:163-198) -- the
-/// integration test awaits them in exactly this order, and
-/// `next_frame_of_type` drops out-of-order frames. Do not reorder.
-fn broadcast_terminal_session_associated(
-    state: &WsState,
-    terminal_id: &str,
-    session_id: &str,
-    cwd: Option<String>,
-) {
-    let associated = ServerMessage::TerminalSessionAssociated(TerminalSessionAssociated {
-        terminal_id: terminal_id.to_string(),
-        session_ref: SessionLocator {
-            provider: "codex".to_string(),
-            session_id: session_id.to_string(),
-        },
-    });
-    if let Ok(frame) = serde_json::to_string(&associated) {
-        let _ = state.broadcast_tx.send(frame);
-    }
-
-    let meta = ServerMessage::TerminalMetaUpdated(TerminalMetaUpdated {
-        remove: Vec::new(),
-        upsert: vec![TerminalMetaRecord {
-            terminal_id: terminal_id.to_string(),
-            updated_at: now_ms(),
-            branch: None,
-            checkout_root: None,
-            cwd,
-            display_subdir: None,
-            is_dirty: None,
-            provider: Some("codex".to_string()),
-            repo_root: None,
-            session_id: Some(session_id.to_string()),
-            token_usage: None,
-        }],
-    });
-    if let Ok(frame) = serde_json::to_string(&meta) {
-        let _ = state.broadcast_tx.send(frame);
-    }
 }
 
 #[cfg(test)]
