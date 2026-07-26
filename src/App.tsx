@@ -52,6 +52,8 @@ import OverviewView from '@/components/OverviewView'
 import TabsView from '@/components/TabsView'
 import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
+import { DeadSessionPanel } from '@/components/DeadSessionPanel'
+import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
 import { SetupWizard } from '@/components/SetupWizard'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { fetchNetworkStatus } from '@/store/networkSlice'
@@ -1827,6 +1829,8 @@ npm run serve`}</pre>
         </div>
       )}
       <AuthRequiredModal />
+      <DeadSessionPanel />
+      <ReconcileWarmingBanner />
       {showSetupWizard && (
         <SetupWizard
           initialStep={wizardInitialStep}
