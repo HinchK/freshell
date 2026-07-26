@@ -1552,6 +1552,18 @@ impl FreshCodexState {
             },
         ));
 
+        // P1.13 §2.6b (Task 6): memory loss must be user-visible, not server-log-only.
+        // Emitted AFTER the materialized broadcast above -- the frozen client re-keys
+        // its session state on `materialized` (`fresh-agent-ws.ts:143-160`); emitting
+        // first would target a session id the client no longer tracks. The non-`RESTORE_`
+        // error branch also clears streaming and forces `running -> idle` -- safe here,
+        // the turn is already dead.
+        self.emit_fresh_agent_error(
+            &new_thread_id,
+            "THREAD_MEMORY_LOST",
+            "Codex crashed and this pane was restarted as a new thread. The agent no longer has memory of the earlier conversation in this pane.",
+        );
+
         Ok(EnsureAliveOutcome::Respawned {
             new_session_id: new_thread_id,
         })
@@ -5715,6 +5727,80 @@ pub(crate) mod tests {
         let guard = st.sessions.lock().await;
         assert!(!guard.contains_key(&thread_id));
         assert!(guard.contains_key(&new_thread_id));
+    }
+
+    /// P1.13 §2.6b (Task 6): crash respawn discards conversation memory -- that loss must be
+    /// user-visible. After the mint-new-thread fallback, a `THREAD_MEMORY_LOST` degradation
+    /// frame is broadcast under the NEW thread id, AFTER the
+    /// `freshAgent.session.materialized` frame (the frozen client re-keys its session state
+    /// on materialized; an error frame emitted first would target an id the client no
+    /// longer tracks).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_after_crash_mint_new_thread_broadcasts_thread_memory_lost_after_materialized() {
+        let _guard = ENV_LOCK.lock().await;
+        let (st, mut rx) = state_with_bus();
+
+        configure_fake_codex_cmd(
+            r#"{"threadStartThreadId":"thread-original","exitProcessAfterMethodsOnce":["thread/start"]}"#,
+        );
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+
+        // The respawned sidecar's `thread/resume` reports the thread as genuinely gone,
+        // forcing the mint-new-thread crash-respawn fallback.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "thread-respawned",
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32001, "message": "Thread not found" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        st.handle_send(FreshAgentSend {
+            request_id: Some("req-2".to_string()),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "hello again".to_string(),
+            images: None,
+            cwd: None,
+            settings: None,
+        })
+        .await;
+
+        let mut saw_materialized = false;
+        let mut new_thread_id = String::new();
+        let mut degradation_after_materialized = false;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            if text.contains("freshAgent.session.materialized") {
+                saw_materialized = true;
+                let materialized: Value = serde_json::from_str(&text).unwrap();
+                new_thread_id = materialized["sessionId"].as_str().unwrap().to_string();
+            }
+            if text.contains("THREAD_MEMORY_LOST") {
+                assert!(
+                    saw_materialized,
+                    "degradation frame must follow materialized (client re-keys on it)"
+                );
+                assert!(
+                    text.contains(&new_thread_id),
+                    "frame must target the NEW thread id"
+                );
+                degradation_after_materialized = true;
+                break;
+            }
+        }
+        assert!(
+            degradation_after_materialized,
+            "crash respawn must broadcast a user-visible degradation frame"
+        );
     }
 
     /// FIX-2: a resume failure that is NOT "thread not found" (a transient RPC error) must
