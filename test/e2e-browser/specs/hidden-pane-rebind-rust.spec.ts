@@ -274,9 +274,12 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
 
   test('hidden fresh-agent pane recovers after abrupt restart without reveal', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
-    const argvLog = path.join(os.tmpdir(), `freshell-e2e-claude-argv-${Date.now()}.jsonl`)
+    // Sidecar REQUEST log (FAKE_CLAUDE_SIDECAR_LOG, fake-claude-sidecar.mjs
+    // Task 7 knob): the post-restart resume proof below reads it. NOT the
+    // terminal-CLI argv log -- the fresh-agent path never spawns the CLI.
+    const requestLog = path.join(os.tmpdir(), `freshell-e2e-claude-sidecar-${Date.now()}.jsonl`)
     const { server, harness, info } = await bootWall(page, {
-      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE, FAKE_CLAUDE_ARGV_LOG: argvLog },
+      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE, FAKE_CLAUDE_SIDECAR_LOG: requestLog },
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
     try {
@@ -297,14 +300,27 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
           return c?.sessionId && c?.createRequestId ? true : null
         }, { timeout: 30_000 })
         .not.toBeNull()
+      // Wait for the DURABLE identity (sdk.session.init merge writes the
+      // canonical UUID to sessionRef.sessionId + resumeSessionId,
+      // FreshAgentView.tsx mergePaneContent) -- the post-restart attach must
+      // deterministically carry it so the server's restart-parity resume arm
+      // (claude.rs handle_attach decision table) can engage.
+      await expect
+        .poll(async () => {
+          const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
+          return c?.sessionRef?.sessionId ?? c?.resumeSessionId ?? ''
+        }, { timeout: 30_000 })
+        .toBe('44444444-4444-4444-8444-444444444444')
       const contentBefore = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))!.content!
-      // Recovery proof is createRequestId, NOT sessionId: the fake sidecar
-      // resumes with the SAME sessionId (fixtures/fake-claude-sidecar.mjs:39),
-      // so sessionId equality proves nothing either way. createRequestId is a
-      // fresh nanoid minted ONLY when the client's .lost recovery re-creates
-      // (FreshAgentView.tsx), and that recovery only fires after the server
-      // round-trips freshAgent.error{INVALID_SESSION_ID} to this pane's
-      // post-restart attach.
+      const originalDurable = (contentBefore.sessionRef?.sessionId ?? contentBefore.resumeSessionId) as string
+      // COMBINED-TREE CONTRACT (F8 rebind x freshclaude restart parity): with
+      // the restart-parity attach arm merged, a post-restart attach carrying
+      // the durable UUID is resumed IN PLACE (sidecar respawn with
+      // resumeSessionId) -- the server no longer round-trips
+      // freshAgent.error{INVALID_SESSION_ID}, so the client's .lost re-create
+      // must NOT fire and createRequestId must stay STABLE. (On the A4 lane
+      // alone -- pre-parity fallback #529 -- recovery was proven by a CHANGED
+      // createRequestId; that discriminator is obsolete in the merged tree.)
       const createRequestIdBefore = contentBefore.createRequestId as string
 
       // Hide it behind a new shell tab.
@@ -316,24 +332,45 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       await waitForWsReady(page)
 
       // TARGET CONTRACT (F8): WITHOUT reveal, the hidden fresh-agent pane's
-      // session recovers to a usable state. DISCRIMINATING evidence -- this
-      // poll FAILS on the unfixed base: pre-fix, a hidden pane sends nothing
-      // after restart and freshAgent status only mutates via server frames,
-      // so stale pre-restart state still shows `sessionId` + 'idle'. But that
-      // stale state carries the OLD createRequestId. A CHANGED createRequestId
-      // requires the .lost recovery to have run (which pre-fix is gated on
-      // !hidden), and that recovery only fires after the server round-trips
-      // INVALID_SESSION_ID; usable status then requires the re-created
-      // session's server frames. Do not weaken either conjunct.
+      // session recovers to a usable state. DISCRIMINATING evidence -- stale
+      // pre-restart Redux state also shows `sessionId` + 'idle', so client
+      // state alone proves nothing. The discriminator is SERVER-SIDE: the
+      // sidecar request log must contain a `create` carrying
+      // `resumeSessionId === originalDurable`, which only the restart-parity
+      // resume arm emits, and it only runs when THIS hidden pane's
+      // post-restart freshAgent.attach actually went out (the rebind queue
+      // under test driving the attach arm). The initial pane create carries
+      // NO resumeSessionId, so a matching entry is unambiguous post-restart
+      // evidence. Do not weaken either conjunct.
       await expect
         .poll(async () => {
           const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
           const status = c?.status ?? ''
           const usable = c?.sessionId && ['connected', 'idle', 'running'].includes(status)
-          const recovered = c?.createRequestId && c.createRequestId !== createRequestIdBefore
-          return usable && recovered ? `${c.createRequestId}:${status}` : null
+          const log = await fs.readFile(requestLog, 'utf-8').catch(() => '')
+          // The parity arm resumes by durable UUID when the session's original
+          // cwd survives, or by the transcript's `.jsonl` PATH when it does
+          // not (claude.rs decision table, ledger A15). Both carry the durable
+          // UUID; accept either shape.
+          const resumed = log
+            .split('\n')
+            .filter(Boolean)
+            .map((l) => JSON.parse(l))
+            .some(
+              (e) =>
+                e.msg?.type === 'create' &&
+                typeof e.msg?.resumeSessionId === 'string' &&
+                (e.msg.resumeSessionId === originalDurable ||
+                  e.msg.resumeSessionId.endsWith(`/${originalDurable}.jsonl`)),
+            )
+          return usable && resumed ? `resumed:${status}` : null
         }, { timeout: 30_000 })
         .not.toBeNull()
+
+      // In-place resume means the client's .lost re-create fallback must NOT
+      // have fired: createRequestId stays stable (no duplicate-create storm).
+      const contentAfter = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))!.content!
+      expect(contentAfter.createRequestId).toBe(createRequestIdBefore)
 
       // Reveal: transcript surface hydrates and the composer is usable.
       await revealTab(page, harness, freshTabId)
