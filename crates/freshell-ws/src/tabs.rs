@@ -232,7 +232,8 @@ impl TabsRegistry {
 
         drop(state); // release the registry mutex before filesystem I/O
         if let Some((dir, records)) = persist_input {
-            crate::tabs_persist::persist_generation(
+            // Outcome is wired onto the ack in the ack-plumbing change; explicitly discarded until PushAck carries it.
+            let _ = crate::tabs_persist::persist_generation(
                 &dir,
                 server_instance_id,
                 device_id,

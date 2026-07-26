@@ -29,7 +29,7 @@ fn put(
     captured: i64,
     recs: Vec<Value>,
 ) {
-    persist_generation(dir, "srv-1", device, "Dev", client, rev, &recs, captured);
+    let _ = persist_generation(dir, "srv-1", device, "Dev", client, rev, &recs, captured);
 }
 // Result-unwrapping helpers so the tests read cleanly (readers are fail-loud).
 fn union(dir: &std::path::Path, device: &str) -> Option<Value> {
@@ -797,7 +797,7 @@ fn concurrent_pushes_same_and_different_devices_stay_consistent() {
             };
             let client = format!("client-{n}");
             for rev in 1..=6i64 {
-                persist_generation(
+                let _ = persist_generation(
                     &root,
                     "srv",
                     &device,
@@ -1236,4 +1236,40 @@ fn every_supported_pane_kind_passes_semantic_generation_validation() {
         read_device_union(dir.path(), "dev").unwrap().is_some(),
         "all supported pane schemas should be readable"
     );
+}
+
+#[test]
+fn oversize_drop_returns_skipped_and_fires_invariant_alarm() {
+    // Campaign fail-loud: an oversize drop must be an ERROR-class invariant
+    // alarm and an honest non-Persisted outcome — never a silent WARN + Ok.
+    let (events, _guard) = crate::invariants::capture::capture();
+    let dir = tempfile::tempdir().unwrap();
+    let big = "x".repeat(MAX_SNAPSHOT_BYTES + 10);
+    let mut rec = open_record("dev:t1", "big", 1);
+    rec["blob"] = json!(big);
+    let outcome = persist_generation(dir.path(), "srv-1", "dev", "Dev", "c1", 1, &[rec], 1000);
+    assert_eq!(outcome, PersistOutcome::Skipped { reason: "oversize" });
+    let events = events.lock().unwrap();
+    assert!(
+        events.iter().any(|e| e.target == "freshell_ws::invariants"
+            && e.message.contains("tabs_snapshot_dropped_oversize")),
+        "oversize drop must fire the invariant alarm, got: {events:?}"
+    );
+}
+
+#[test]
+fn successful_persist_returns_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = persist_generation(
+        dir.path(),
+        "srv-1",
+        "dev",
+        "Dev",
+        "c1",
+        1,
+        &[open_record("dev:t1", "t", 1)],
+        1000,
+    );
+    assert_eq!(outcome, PersistOutcome::Persisted);
+    assert_eq!(list_generations(dir.path(), "dev", "c1").len(), 1);
 }

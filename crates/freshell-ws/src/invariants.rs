@@ -97,7 +97,89 @@ pub(crate) fn error_claude_restore_unresolved(request_id: &str) {
 }
 
 #[cfg(test)]
+pub(crate) mod capture {
+    //! Thread-local capturing subscriber recording TARGET + message +
+    //! fields (the `freshell-freshagent` DIAG-01 convention, extended
+    //! with `metadata().target()` since these alarms are target-scoped).
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    #[derive(Debug, Clone, Default)]
+    pub struct CapturedEvent {
+        pub target: String,
+        pub message: String,
+        pub fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        message: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.message = rendered;
+            } else {
+                self.fields.insert(field.name().to_string(), rendered);
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("capture lock")
+                .push(CapturedEvent {
+                    target: event.metadata().target().to_string(),
+                    message: visitor.message,
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    pub fn capture() -> (
+        Arc<Mutex<Vec<CapturedEvent>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (events, guard)
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use super::capture;
     use super::*;
 
     fn row(
@@ -114,86 +196,6 @@ mod tests {
             created_at,
             resume_session_id: resume_session_id.map(str::to_string),
             cwd: None,
-        }
-    }
-
-    mod capture {
-        //! Thread-local capturing subscriber recording TARGET + message +
-        //! fields (the `freshell-freshagent` DIAG-01 convention, extended
-        //! with `metadata().target()` since these alarms are target-scoped).
-        use std::collections::BTreeMap;
-        use std::sync::{Arc, Mutex};
-        use tracing::field::{Field, Visit};
-        use tracing::{Event, Subscriber};
-        use tracing_subscriber::layer::{Context, SubscriberExt};
-        use tracing_subscriber::Layer;
-
-        #[derive(Debug, Clone, Default)]
-        pub struct CapturedEvent {
-            pub target: String,
-            pub message: String,
-            pub fields: BTreeMap<String, String>,
-        }
-
-        #[derive(Default)]
-        struct FieldVisitor {
-            message: String,
-            fields: BTreeMap<String, String>,
-        }
-
-        impl Visit for FieldVisitor {
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                let rendered = format!("{value:?}");
-                if field.name() == "message" {
-                    self.message = rendered;
-                } else {
-                    self.fields.insert(field.name().to_string(), rendered);
-                }
-            }
-            fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "message" {
-                    self.message = value.to_string();
-                } else {
-                    self.fields
-                        .insert(field.name().to_string(), value.to_string());
-                }
-            }
-            fn record_i64(&mut self, field: &Field, value: i64) {
-                self.fields
-                    .insert(field.name().to_string(), value.to_string());
-            }
-        }
-
-        struct CaptureLayer {
-            events: Arc<Mutex<Vec<CapturedEvent>>>,
-        }
-
-        impl<S: Subscriber> Layer<S> for CaptureLayer {
-            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-                let mut visitor = FieldVisitor::default();
-                event.record(&mut visitor);
-                self.events
-                    .lock()
-                    .expect("capture lock")
-                    .push(CapturedEvent {
-                        target: event.metadata().target().to_string(),
-                        message: visitor.message,
-                        fields: visitor.fields,
-                    });
-            }
-        }
-
-        pub fn capture() -> (
-            Arc<Mutex<Vec<CapturedEvent>>>,
-            tracing::subscriber::DefaultGuard,
-        ) {
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let layer = CaptureLayer {
-                events: Arc::clone(&events),
-            };
-            let subscriber = tracing_subscriber::registry().with(layer);
-            let guard = tracing::subscriber::set_default(subscriber);
-            (events, guard)
         }
     }
 

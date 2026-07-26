@@ -7,6 +7,20 @@
 
 use super::*;
 
+/// The honest result of one persistence attempt. `tabs.sync.push` surfaces
+/// non-persistence on the ack (`persisted:false` + reason) instead of
+/// silently ACKing (campaign fail-loud principle, P2.17 defect 2).
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PersistOutcome {
+    /// The generation was durably written.
+    Persisted,
+    /// Deliberately not written (policy: oversize or malformed identifiers).
+    Skipped { reason: &'static str },
+    /// The write was attempted and failed (io error / cap unenforceable).
+    Failed { reason: String },
+}
+
 /// Enforce MAX_SNAPSHOT_DEVICES before a write. New targets reserve one slot;
 /// existing targets also repair a previously over-cap root. Lease-protected
 /// restores and the write target are never candidates. If no eligible victim

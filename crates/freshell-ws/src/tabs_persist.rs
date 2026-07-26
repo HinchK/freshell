@@ -762,10 +762,11 @@ fn sweep_orphan_tmp(device_dir: &Path) {
 /// atomically (tmp + rename), then enforce every retention cap: oversize skip,
 /// per-(device,client) generation cap, global-per-device file cap, device count
 /// cap. The ENTIRE read-plan-mutate cycle runs under `PERSIST_LOCK` so it is
-/// atomic w.r.t. any other push (`:678`). Best-effort: any failure is a WARN
-/// with the full path + error, never an Err (a failed snapshot must never fail a
-/// tabs push), and a partial-write failure leaves the last-good generations
-/// intact (nothing is deleted before the new file is durably renamed into place).
+/// atomic w.r.t. any other push (`:678`). Best-effort w.r.t. the push (a failed
+/// snapshot never fails a tabs push) but HONEST: every non-write returns a
+/// non-`Persisted` outcome that the ack surfaces. A partial-write failure leaves
+/// the last-good generations intact (nothing is deleted before the new file is
+/// durably renamed into place).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_generation(
     dir: &Path,
@@ -776,14 +777,19 @@ pub(crate) fn persist_generation(
     snapshot_revision: i64,
     open_records: &[Value],
     captured_at: i64,
-) {
+) -> PersistOutcome {
     // Serialize the whole filesystem cycle (see `with_persist_lock`).
-    let write = || -> std::io::Result<()> {
+    let write = || -> std::io::Result<PersistOutcome> {
         let Some(device_dir) = device_dir_for(dir, device_id) else {
-            return Ok(()); // empty/uncontainable device id -> never persist
+            // empty/uncontainable device id -> never persist
+            return Ok(PersistOutcome::Skipped {
+                reason: "invalid-device-id",
+            });
         };
         let Some(client_enc) = encode_device_id(client_instance_id) else {
-            return Ok(());
+            return Ok(PersistOutcome::Skipped {
+                reason: "invalid-client-instance-id",
+            });
         };
         let snapshot = json!({
             "deviceId": device_id,
@@ -796,9 +802,10 @@ pub(crate) fn persist_generation(
         });
         let bytes = serde_json::to_vec_pretty(&snapshot)?;
         if bytes.len() > MAX_SNAPSHOT_BYTES {
-            tracing::warn!(target: "freshell_ws::tabs", device_id = %device_id,
-                bytes = bytes.len(), "tabs_snapshot_skipped_oversize");
-            return Ok(());
+            tracing::error!(target: "freshell_ws::invariants",
+                device_id = %device_id, bytes = bytes.len(), max = MAX_SNAPSHOT_BYTES,
+                "tabs_snapshot_dropped_oversize: generation exceeds MAX_SNAPSHOT_BYTES; nothing was persisted and the ack will carry persisted:false");
+            return Ok(PersistOutcome::Skipped { reason: "oversize" });
         }
         // Device cap: if this is a NEW device dir and we're at the cap, evict
         // the least-recently-written device (oldest max-capturedAt) first.
@@ -844,11 +851,17 @@ pub(crate) fn persist_generation(
                 ))),
             };
         }
-        Ok(())
+        Ok(PersistOutcome::Persisted)
     };
-    if let Err(err) = with_persist_lock(write) {
-        tracing::warn!(target: "freshell_ws::tabs", device_id = %device_id, dir = %dir.display(),
-            error = %err, "tabs_snapshot_persist_failed: generation not written");
+    match with_persist_lock(write) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::warn!(target: "freshell_ws::tabs", device_id = %device_id, dir = %dir.display(),
+                error = %err, "tabs_snapshot_persist_failed: generation not written");
+            PersistOutcome::Failed {
+                reason: err.to_string(),
+            }
+        }
     }
 }
 
@@ -942,6 +955,7 @@ fn enforce_device_file_cap(device_dir: &Path) -> std::io::Result<()> {
 #[path = "tabs_persist_retention.rs"]
 mod retention;
 use retention::enforce_device_cap;
+pub(crate) use retention::PersistOutcome;
 
 #[cfg(test)]
 #[path = "tabs_persist_tests.rs"]
