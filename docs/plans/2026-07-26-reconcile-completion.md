@@ -133,6 +133,12 @@ it('getServerCapabilities exposes paneReconcileFreshAgentV1 from ready', () => {
 })
 ```
 
+NOTE (red-gate honesty): the `getServerCapabilities` test above is GREEN on base
+— ws-client stores `msg.capabilities ?? {}` raw with no Zod parse
+(`src/lib/ws-client.ts:158`), and vitest does not typecheck — so it is regression
+coverage only, NOT part of this task's red gate. The red gate is the `hello`
+test plus the two schema tests below.
+
 And a schema test (same file or a small block in `test/unit/client/lib/pane-reconcile.test.ts`):
 
 ```ts
@@ -146,8 +152,15 @@ it('ReconcilePaneSchema accepts kind fresh-agent', () => {
   expect(parsed.success).toBe(true)
 })
 
-it('ReadyCapabilitiesSchema accepts paneReconcileFreshAgentV1', () => {
-  expect(ReadyCapabilitiesSchema.safeParse({ paneReconcileFreshAgentV1: true }).success).toBe(true)
+it('ReadyCapabilitiesSchema preserves paneReconcileFreshAgentV1 through parsing', () => {
+  const parsed = ReadyCapabilitiesSchema.safeParse({ paneReconcileV1: true, paneReconcileFreshAgentV1: true })
+  expect(parsed.success).toBe(true)
+  // Load-bearing assertion: Zod non-strict objects STRIP unknown keys — they do
+  // NOT reject (see the comment at shared/ws-protocol.ts:274-276). So
+  // `.success` is true even on base and proves nothing. App consumes the
+  // Zod-PARSED ready.data.capabilities (src/App.tsx:1022); if the key is
+  // stripped, the feature silently never activates. Assert the key SURVIVES:
+  expect(parsed.success ? parsed.data?.paneReconcileFreshAgentV1 : undefined).toBe(true)
 })
 ```
 
@@ -156,7 +169,7 @@ it('ReadyCapabilitiesSchema accepts paneReconcileFreshAgentV1', () => {
 ```bash
 npm run test:vitest -- run test/unit/client/lib/ws-client.reconcile.test.ts test/unit/client/lib/pane-reconcile.test.ts
 ```
-Expected: FAIL — schema rejects `'fresh-agent'` / unknown capability key; hello lacks the field.
+Expected: FAIL — three red tests, each for its own reason: (1) `ReconcilePaneSchema` rejects `kind: 'fresh-agent'` (today it is `z.literal('terminal')`); (2) the key-survival assertion fails because Zod non-strict objects STRIP the unknown `paneReconcileFreshAgentV1` key — they do NOT reject it — so `parsed.data.paneReconcileFreshAgentV1` is `undefined` on base while `.success` is true; (3) the hello test fails because hello lacks the field. The `getServerCapabilities` test is expected GREEN here (regression coverage only — see the note in Step 1).
 
 - [ ] **Step 3: Implement** — in `shared/ws-protocol.ts`:
 
@@ -818,9 +831,22 @@ it('flushes remaining held creates after RECONCILE_VERDICT_WAIT_MS (legacy fallb
   // hold req-a; advance RECONCILE_VERDICT_WAIT_MS + 50 -> req-a on the wire, same requestId
 })
 
-it('without paneReconcileV1 the pre-ready flush is byte-identical (regression: existing flush test)', () => {
-  // ready WITHOUT capabilities -> create flushed immediately (mirrors the existing
-  // "flushes the pre-ready create queue" test at :140-150)
+it('without paneReconcileV1 the pre-ready flush is byte-identical (regression)', () => {
+  // ready WITHOUT capabilities (or without paneReconcileV1) -> create flushed
+  // immediately. NOTE: this is a NEW test — the existing test at :140-150 is
+  // the capability-ACKED case (see Step 1b), not this capability-less case.
+})
+```
+
+- [ ] **Step 1b: Flip the pinned capability-acked flush test** — the EXISTING test at `test/unit/client/lib/ws-client.reconcile.test.ts:140-150` ("flushes the pre-ready create queue even when the capability is acked") pins the OLD behavior this task deliberately reverses: it queues a pre-ready `terminal.create`, sends `ready` WITH `capabilities.paneReconcileV1: true`, and asserts the create IS on the wire. Under the new hold semantics that create moves to `heldCreates` instead (and the file uses fake timers, so the `RECONCILE_VERDICT_WAIT_MS` fallback never fires on its own) — the test MUST be updated in the same commit or Step 4 cannot go green. Rewrite it to assert the NEW contract (this also retires the base design decision documented at ws-client.ts:202-205 — that comment is updated in Step 3):
+
+```ts
+it('holds the pre-ready create queue when the capability is acked; timeout fallback flushes it', () => {
+  // (was: "flushes the pre-ready create queue even when the capability is acked")
+  // queue a pre-ready terminal.create; receiveReady with paneReconcileV1: true
+  // -> NOT on the wire (held);
+  // vi.advanceTimersByTime(RECONCILE_VERDICT_WAIT_MS + 50)
+  // -> on the wire with the SAME requestId (legacy fallback, never a silent wedge)
 })
 ```
 
@@ -831,14 +857,14 @@ npm run test:vitest -- run test/unit/client/lib/ws-client.reconcile.test.ts
 ```
 Expected: FAIL — creates flush immediately today (that flush-before-handler ordering is exactly the falsified race).
 
-- [ ] **Step 3: Implement** per the Hold semantics block. Keep the changes inside `WsClient`: a `heldCreates` map + `reconcileHoldActive` flag + `reconcileHoldPendingSet: Set<string> | null` + one timer. Branch the :183-189 flush loop on `serverCapabilities.paneReconcileV1`; branch `send()`'s post-ready create path on the hold state; extend `cancelCreate` (:136-149) with `this.heldCreates.delete(requestId)`. The reconnect blind-replay suppression at :204-214 is untouched.
+- [ ] **Step 3: Implement** per the Hold semantics block. Keep the changes inside `WsClient`: a `heldCreates` map + `reconcileHoldActive` flag + `reconcileHoldPendingSet: Set<string> | null` + one timer. Branch the :183-189 flush loop on `serverCapabilities.paneReconcileV1`; branch `send()`'s post-ready create path on the hold state; extend `cancelCreate` (:136-149) with `this.heldCreates.delete(requestId)`. Update the now-obsolete design comment at ws-client.ts:202-205 ("The preReadyCreateQueue flush above is unchanged...") to describe the new hold behavior. The reconnect blind-replay suppression at :204-214 is untouched.
 
 - [ ] **Step 4: Run tests to verify pass**
 
 ```bash
 npm run test:vitest -- run test/unit/client/lib/
 ```
-Expected: PASS, including every pre-existing ws-client suite in that directory (no regression to the capability-less flush).
+Expected: PASS, including every pre-existing ws-client suite in that directory (no regression to the capability-LESS flush; the capability-ACKED flush test at :140-150 was deliberately flipped to the hold contract in Step 1b — it must pass in its updated form).
 
 - [ ] **Step 5: Commit**
 
