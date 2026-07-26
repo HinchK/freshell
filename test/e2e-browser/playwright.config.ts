@@ -111,6 +111,9 @@ const RUST_ONLY_SPECS = [
   /launch-retry-restart-rust\.spec\.ts$/,
   /double-restart-terminal-restore-rust\.spec\.ts$/,
   /turn-complete-restart-resume-rust\.spec\.ts$/,
+  // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
+  // restartAbrupt(); hidden panes must rebind without being revealed.
+  /hidden-pane-rebind-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -250,6 +253,9 @@ export default defineConfig({
         /launch-retry-restart-rust\.spec\.ts$/,
         /double-restart-terminal-restore-rust\.spec\.ts$/,
         /turn-complete-restart-resume-rust\.spec\.ts$/,
+        // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
+        // restartAbrupt(); hidden panes must rebind without being revealed.
+        /hidden-pane-rebind-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
