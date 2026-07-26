@@ -103,12 +103,16 @@ const basePaneContent: FreshAgentPaneContent = {
 
 let currentStore: ReturnType<typeof createStore>
 
-function renderView({ paneContent, hidden }: { paneContent: FreshAgentPaneContent; hidden: boolean }) {
+function renderView({ paneContent, hidden, paneId = 'pane-1' }: {
+  paneContent: FreshAgentPaneContent
+  hidden: boolean
+  paneId?: string
+}) {
   currentStore = createStore()
-  currentStore.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: paneContent }))
+  currentStore.dispatch(initLayout({ tabId: 'tab-1', paneId, content: paneContent }))
   return render(
     <Provider store={currentStore}>
-      <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={paneContent} hidden={hidden} />
+      <FreshAgentView tabId="tab-1" paneId={paneId} paneContent={paneContent} hidden={hidden} />
     </Provider>,
   )
 }
@@ -228,5 +232,83 @@ describe('FreshAgentView hidden-pane rebind (F8)', () => {
     rerenderView(rerender, { paneContent, hidden: false })
     act(() => { vi.advanceTimersByTime(500) })
     expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeGreaterThan(callsBeforeReconnect)
+  })
+})
+
+describe('FreshAgentView hidden-pane create rebind (F8)', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    resetRebindQueueForTests()
+    wsMock.send.mockClear()
+  })
+  afterEach(() => { vi.useRealTimers() })
+
+  function createFramesSent() {
+    return wsMock.send.mock.calls
+      .map(([frame]: [{ type?: string }]) => frame)
+      .filter((frame: { type?: string }) => frame?.type === 'freshAgent.create')
+  }
+
+  it('a HIDDEN pane in status creating sends freshAgent.create (restart recovery)', () => {
+    const paneContent: FreshAgentPaneContent = {
+      ...basePaneContent,
+      sessionId: undefined,
+      status: 'creating',
+      createRequestId: 'req-hidden-1',
+    }
+    renderView({ paneContent, hidden: true })
+    act(() => { vi.advanceTimersByTime(500) })
+    const creates = createFramesSent()
+    expect(creates.length).toBe(1)
+    expect(creates[0]).toMatchObject({ type: 'freshAgent.create', requestId: 'req-hidden-1' })
+  })
+
+  it('hidden creates are paced: N panes never exceed 4 un-acked in-flight creates', () => {
+    // Render 6 hidden panes sharing the mocked ws. None receives a
+    // freshAgent.created ack, so the queue must hold creates 5 and 6 back
+    // until the 10s auto-release backstop.
+    for (let i = 0; i < 6; i++) {
+      renderView({
+        paneContent: {
+          ...basePaneContent,
+          sessionId: undefined,
+          status: 'creating',
+          createRequestId: `req-storm-${i}`,
+        },
+        paneId: `pane-storm-${i}`,
+        hidden: true,
+      })
+    }
+    act(() => { vi.advanceTimersByTime(1_000) })
+    expect(createFramesSent().length).toBe(4)
+    act(() => { vi.advanceTimersByTime(10_000) })
+    expect(createFramesSent().length).toBe(6)
+  })
+
+  it('the freshAgent.created ack releases the queue slot', () => {
+    for (let i = 0; i < 5; i++) {
+      renderView({
+        paneContent: {
+          ...basePaneContent,
+          sessionId: undefined,
+          status: 'creating',
+          createRequestId: `req-ack-${i}`,
+        },
+        paneId: `pane-ack-${i}`,
+        hidden: true,
+      })
+    }
+    act(() => { vi.advanceTimersByTime(1_000) })
+    expect(createFramesSent().length).toBe(4)
+    // Deliver the created ack for the first pane through every registered
+    // onMessage handler (mirror the freshAgent.created frame shape used by
+    // the donor FreshAgentView.test.tsx created-frame fixture).
+    act(() => {
+      for (const call of wsMock.onMessage.mock.calls) {
+        call[0]({ type: 'freshAgent.created', requestId: 'req-ack-0', sessionId: 'sess-ack-0' })
+      }
+    })
+    act(() => { vi.advanceTimersByTime(1_000) })
+    expect(createFramesSent().length).toBe(5)
   })
 })
