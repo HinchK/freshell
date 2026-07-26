@@ -127,6 +127,10 @@ const RUST_ONLY_SPECS = [
   // ledger-join coherence, A2xA3 dual claude identity stores). Imports
   // RustServer directly for restartAbrupt().
   /wavea-interactions-rust\.spec\.ts$/,
+  // B3/P1.9 recover-my-panes browser-loss recovery: drives the Rust-only
+  // GET /api/recovery/inventory + RecoveryOfferPanel; imports RustServer
+  // directly for restart(). See docs/plans/2026-07-26-recover-my-panes.md
+  /recover-my-panes-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -284,6 +288,10 @@ export default defineConfig({
         // ledger-join coherence, A2xA3 dual claude identity stores). Imports
         // RustServer directly for restartAbrupt().
         /wavea-interactions-rust\.spec\.ts$/,
+        // B3/P1.9 recover-my-panes browser-loss recovery (offer, accept-resume,
+        // mixed-kind, reload guard, decline, live no-restart). Rust-only:
+        // drives GET /api/recovery/inventory; imports RustServer for restart().
+        /recover-my-panes-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
