@@ -407,6 +407,14 @@ pub fn build_handshake_with_capabilities(
         if terminal.session_ref.is_none() {
             terminal.session_ref = state.identity.session_ref_for(&terminal.terminal_id);
         }
+        if terminal.session_ref.is_none() {
+            // P1.8 (spec §4.2 reads + precedence): the ledger's bound rows
+            // are the durable second rung of the identity authority chain —
+            // consulted only when live process truth is absent.
+            terminal.session_ref = state
+                .pane_ledger
+                .bound_session_ref_for_terminal(&terminal.terminal_id);
+        }
     }
     messages.push(ServerMessage::TerminalInventory(TerminalInventory {
         boot_id,
