@@ -461,7 +461,9 @@ const freshAgentSlice = createSlice({
     markSessionLost(state, action: PayloadAction<SessionMutationPayload>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
-      state.sessions[key].lost = true
+      const session = state.sessions[key]
+      if (!session) return
+      session.lost = true
     },
 
     removeSession(state, action: PayloadAction<SessionMutationPayload>) {

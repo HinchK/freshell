@@ -19,6 +19,7 @@ import { clearPendingCreateFailure, setSessionStatus } from '@/store/freshAgentS
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
+import { getRebindQueue } from '@/lib/rebind-queue'
 import {
   normalizeFreshAgentEffort,
   normalizeFreshAgentModel,
@@ -662,6 +663,18 @@ export function FreshAgentView({
   ])
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
+  // F8 hidden-pane rebind: mirror `hidden` into a ref for use inside queued
+  // jobs and ws callbacks (same pattern as TerminalView's hiddenRef).
+  const hiddenRef = useRef(hidden)
+  useEffect(() => {
+    hiddenRef.current = hidden
+  }, [hidden])
+  // Snapshot refresh owed at next reveal (set when a reconnect happens hidden).
+  const pendingRevealRefreshRef = useRef(false)
+  // Release callback for an in-flight queued CREATE rebind (Task 4 wires the
+  // ack; declared here so both attach + create paths share one ref).
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- consumed by the queued-create path (Task 4)
+  const pendingRebindReleaseRef = useRef<(() => void) | null>(null)
   // Session-scoped "always allow" tool names; reset with the pane, never persisted.
   const alwaysAllowToolsRef = useRef<Set<string>>(new Set())
   // Auto-title state tracks four things:
@@ -1111,11 +1124,30 @@ export function FreshAgentView({
   ])
 
   useEffect(() => {
-    if (!paneContent.sessionId || hidden) return
-    sendFreshAgentMessage(buildFreshAgentAttachMessage(paneContent, freshOpenCodeRouteCwd))
+    if (!paneContent.sessionId) return
+    const sendAttach = () => {
+      const current = paneContentRef.current
+      if (!current.sessionId) return
+      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+      sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
+    }
+    if (hiddenRef.current) {
+      // Hidden: cheap session rebind still happens, but paced through the
+      // rebind queue so 20 background panes do not stampede the server.
+      getRebindQueue().enqueue({
+        key: `freshagent:${paneId}:attach`,
+        run: (release) => {
+          sendAttach()
+          // attach has no ack frame -- hold the slot briefly for spacing.
+          setTimeout(release, 100)
+        },
+      })
+    } else {
+      sendAttach()
+    }
   }, [
     freshOpenCodeRouteCwd,
-    hidden,
+    paneId,
     paneContent.provider,
     paneContent.resumeSessionId,
     paneContent.sessionId,
@@ -1126,16 +1158,42 @@ export function FreshAgentView({
   ])
 
   useEffect(() => {
-    if (hidden || !paneContent.sessionId) return
+    if (!paneContent.sessionId) return
     if (typeof ws.onReconnect !== 'function') return
     return ws.onReconnect(() => {
       const current = paneContentRef.current
       if (!current.sessionId) return
-      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-      sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
-      scheduleSnapshotRefresh()
+      const sendAttach = () => {
+        const latest = paneContentRef.current
+        if (!latest.sessionId) return
+        const cwd = getFreshOpenCodeRouteCwd(latest, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+        sendFreshAgentMessage(buildFreshAgentAttachMessage(latest, cwd))
+      }
+      if (hiddenRef.current) {
+        getRebindQueue().enqueue({
+          key: `freshagent:${paneId}:attach`,
+          run: (release) => {
+            sendAttach()
+            setTimeout(release, 100)
+          },
+        })
+        // Surface hydration (HTTP transcript snapshot fetch) is EXPENSIVE --
+        // defer it until reveal instead of fetching for every hidden pane.
+        pendingRevealRefreshRef.current = true
+      } else {
+        sendAttach()
+        scheduleSnapshotRefresh()
+      }
     })
-  }, [hidden, paneContent.sessionId, scheduleSnapshotRefresh, sendFreshAgentMessage, ws])
+  }, [paneId, paneContent.sessionId, scheduleSnapshotRefresh, sendFreshAgentMessage, ws])
+
+  // F8: consume the deferred snapshot refresh on reveal.
+  useEffect(() => {
+    if (hidden) return
+    if (!pendingRevealRefreshRef.current) return
+    pendingRevealRefreshRef.current = false
+    scheduleSnapshotRefresh()
+  }, [hidden, scheduleSnapshotRefresh])
 
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
