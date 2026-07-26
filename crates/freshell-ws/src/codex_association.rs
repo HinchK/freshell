@@ -230,6 +230,21 @@ mod tests {
         (state, rx)
     }
 
+    /// Sibling of `state_with_locator` with a REAL (enabled) pane ledger
+    /// rooted at `ledger_dir` — copied from `opencode_association.rs`'s
+    /// harness rather than churning every existing caller of the
+    /// disabled-ledger fixture.
+    fn state_with_locator_and_ledger(
+        data_home: std::path::PathBuf,
+        ledger_dir: &std::path::Path,
+    ) -> (WsState, tokio::sync::broadcast::Receiver<String>) {
+        let (mut state, rx) = state_with_locator(data_home);
+        state.pane_ledger = std::sync::Arc::new(crate::pane_ledger::PaneLedger::new(Some(
+            ledger_dir.to_path_buf(),
+        )));
+        (state, rx)
+    }
+
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -240,6 +255,30 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// Write a rollout file whose FIRST line is the session_meta identity
+    /// record, exactly the shape the real codex CLI writes (payload.id =
+    /// identity; payload.cwd = the session's working dir). Reused inline
+    /// from `codex_locator.rs`'s test helper.
+    fn write_rollout(
+        root: &std::path::Path,
+        rel_dir: &str,
+        thread_id: &str,
+        cwd: Option<&str>,
+    ) -> std::path::PathBuf {
+        let dir = root.join(rel_dir);
+        std::fs::create_dir_all(&dir).expect("create rollout dir");
+        let file = dir.join(format!("rollout-2026-07-26T08-00-00-{thread_id}.jsonl"));
+        let payload = match cwd {
+            Some(c) => format!(r#"{{"id":"{thread_id}","cwd":"{c}"}}"#),
+            None => format!(r#"{{"id":"{thread_id}"}}"#),
+        };
+        let line = format!(
+            r#"{{"timestamp":"2026-07-26T08:00:00.000Z","type":"session_meta","payload":{payload}}}"#
+        );
+        std::fs::write(&file, format!("{line}\n")).expect("write rollout");
+        file
     }
 
     #[test]
@@ -277,5 +316,308 @@ mod tests {
         // consumed the window — a direct note_submit still returns true.
         assert!(locator.note_submit("t1", now_ms()));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fresh codex pane: rollout appears after arm → sweep binds identity,
+    /// writes the durable binding row, and broadcasts both frames in the
+    /// pinned order.
+    #[tokio::test]
+    async fn drain_and_associate_binds_identity_ledger_and_broadcasts() {
+        const TID: &str = "11111111-2222-3333-4444-555555555555";
+        let home = unique_temp_dir("drain-associate");
+        let ledger_dir = unique_temp_dir("drain-associate-ledger");
+        let (state, mut rx) = state_with_locator_and_ledger(home.clone(), &ledger_dir);
+
+        // A running codex terminal the association controller can validate
+        // against (mode/status/resume_session_id all read from
+        // `state.registry`, mirroring the controller's own reject checks).
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None);
+
+        // OPEN THE WINDOW FIRST: windows are Enter-anchored (no spawn
+        // window), so resolution requires a submit, and the FIRST submit
+        // re-snapshots known_files — the rollout MUST be seeded AFTER this
+        // call (a pre-seeded file would be captured by the re-snapshot and
+        // never bind; that exclusion is the Task 1/2 hardening, not a bug).
+        note_possible_submit(&state, "t1", "\r").await;
+
+        // THEN write the rollout the locator must find (lands well inside
+        // the 2 s Enter-anchored window).
+        write_rollout(&home, "2026/07/26", TID, Some("/tmp"));
+
+        // Drain repeatedly until the locator's correlation window has
+        // definitely closed relative to wall-clock `now_ms()`.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if state
+                .identity
+                .get("t1")
+                .and_then(|i| i.session_id)
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(
+            state.identity.session_ref_for("t1"),
+            Some(freshell_protocol::SessionLocator {
+                provider: "codex".to_string(),
+                session_id: TID.to_string(),
+            })
+        );
+
+        let dir_entry = state
+            .registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == "t1")
+            .unwrap();
+        assert_eq!(dir_entry.resume_session_id.as_deref(), Some(TID));
+
+        let hit = state
+            .pane_ledger
+            .lookup_by_session("codex", TID)
+            .expect("binding row written at resolution");
+        assert_eq!(hit.row.live_terminal_id.as_deref(), Some("t1"));
+        assert!(state.pane_ledger.pending_for_terminal("t1").is_none());
+
+        // Broadcasts, in the pinned order: `terminal.session.associated`
+        // FIRST, then `terminal.meta.updated` (frame type assertions exactly
+        // as the opencode sibling does them, plus the order pin).
+        let mut frames = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            frames.push(frame);
+        }
+        let associated_at = frames
+            .iter()
+            .position(|f| f.contains("terminal.session.associated") && f.contains(TID))
+            .expect("expected a terminal.session.associated broadcast");
+        let meta_at = frames
+            .iter()
+            .position(|f| f.contains("terminal.meta.updated") && f.contains(TID))
+            .expect("expected a terminal.meta.updated broadcast");
+        assert!(
+            associated_at < meta_at,
+            "pinned order: associated THEN meta.updated"
+        );
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+    }
+
+    /// Wave-A re-arm contract (the codex mirror of P1.10): a restore-created
+    /// pane WITHOUT identity (resume None) arms like a fresh pane, records a
+    /// pending marker, and resolves into the ledger — binding row first,
+    /// marker gone after.
+    #[tokio::test]
+    async fn restore_created_pane_without_identity_arms_and_resolves_into_the_ledger() {
+        const TID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let home = unique_temp_dir("p110-restore-rearm");
+        let ledger_dir = unique_temp_dir("p110-ledger");
+        let (state, _rx) = state_with_locator_and_ledger(home.clone(), &ledger_dir);
+
+        // A real PTY registry row, exactly as the sibling resolve-path test
+        // spawns it (the controller's reject checks read mode/status/resume
+        // from `state.registry`).
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        // The restore-shaped arm: identity absent, so resume is None — the
+        // exact argument shape terminal.rs's handle_create produces for a
+        // restore:true create that carried no sessionRef.
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None);
+        assert_eq!(state.codex_locator.as_ref().unwrap().armed_count(), 1);
+
+        // The spawn-time pending marker (written by handle_create in
+        // production — written directly here because this test drives the
+        // module, not the WS handler).
+        state
+            .pane_ledger
+            .record_pending("t1", "codex", Some("/tmp"), now_ms())
+            .unwrap();
+
+        // Enter-anchored window needs the submit; the first-submit
+        // re-snapshot would exclude a pre-seeded file, so the rollout is
+        // written only AFTER this await completes.
+        note_possible_submit(&state, "t1", "\r").await;
+
+        write_rollout(&home, "2026/07/26", TID, Some("/tmp"));
+
+        // Drain repeatedly until the locator's correlation window has
+        // definitely closed relative to wall-clock `now_ms()`.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if state
+                .identity
+                .get("t1")
+                .and_then(|i| i.session_id)
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Resolution wrote the binding and deleted the marker (pinned order).
+        let hit = state
+            .pane_ledger
+            .lookup_by_session("codex", TID)
+            .expect("binding row written at resolution");
+        assert_eq!(hit.row.live_terminal_id.as_deref(), Some("t1"));
+        assert!(state.pane_ledger.pending_for_terminal("t1").is_none());
+        assert!(state.pane_ledger.list_pending_raw().is_empty());
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+    }
+
+    /// One-writer defense survives the channel swap: a session already bound
+    /// to ANOTHER terminal (including a retired binding) is never re-adopted.
+    #[tokio::test]
+    async fn located_session_bound_elsewhere_is_rejected() {
+        const TID: &str = "99999999-8888-7777-6666-555555555555";
+        let home = unique_temp_dir("bound-elsewhere");
+        let (state, _rx) = state_with_locator(home.clone());
+
+        // The victim's binding, RETIRED — exactly the state the exit path
+        // leaves behind (terminal.rs's exit hook calls
+        // `identity.retire(&tid)`). Retired-INCLUSIVE is the point: a dead
+        // pane's identity must still repel adoption by a fresh terminal.
+        state
+            .identity
+            .upsert("victim", Some("codex"), Some(TID), Some("/tmp"), now_ms());
+        assert!(state.identity.retire("victim"));
+
+        // A real PTY "t1" (codex mode), armed, with a locator handle kept
+        // for the positive resolution signal below.
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None);
+        let locator = state.codex_locator.as_ref().unwrap().clone();
+        assert_eq!(locator.armed_count(), 1);
+
+        // Open the Enter-anchored window, THEN seed the rollout (after the
+        // submit — the first-submit re-snapshot would exclude a pre-seeded
+        // file) with payload.cwd set to THE PANE'S OWN cwd: the rollout must
+        // be a fully resolvable candidate, or this test proves nothing.
+        note_possible_submit(&state, "t1", "\r").await;
+        write_rollout(&home, "2026/07/26", TID, Some("/tmp"));
+
+        // Poll drain_and_associate past the window.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if locator.armed_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // POSITIVE resolution signal FIRST, so the negative assertions
+        // cannot pass vacuously: tick emitted Located and disarmed —
+        // resolution HAPPENED, so whatever follows is the adoption-tail
+        // guard's doing (a locator that never resolved would also leave
+        // identity None, and identity-only assertions cannot tell those
+        // worlds apart).
+        assert_eq!(locator.armed_count(), 0);
+        // Guard refused: nothing adopted.
+        assert!(state.identity.session_ref_for("t1").is_none());
+        let dir_entry = state
+            .registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == "t1")
+            .unwrap();
+        assert!(dir_entry.resume_session_id.is_none());
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
