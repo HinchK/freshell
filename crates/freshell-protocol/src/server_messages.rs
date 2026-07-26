@@ -757,6 +757,11 @@ pub struct Pong {
 pub struct ReadyCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_v1: Option<bool>,
+    /// Fresh-agent restart resilience: `Some(true)` iff the connection's
+    /// `hello` opted in via `capabilities.paneReconcileFreshAgentV1` —
+    /// omitted from the wire entirely otherwise (frozen-client inertness).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_fresh_agent_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

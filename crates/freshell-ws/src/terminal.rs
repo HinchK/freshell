@@ -122,6 +122,7 @@ pub async fn run(
     terminal_output_batch_v1: bool,
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -259,6 +260,7 @@ pub async fn run(
                             &conn_sink,
                             terminal_output_batch_v1,
                             pane_reconcile_v1,
+                            pane_reconcile_fresh_agent_v1,
                             &mut create_limiter,
                         )
                         .await
@@ -449,6 +451,7 @@ async fn handle_client_text(
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
     pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
@@ -708,7 +711,8 @@ async fn handle_client_text(
             // byte-inertness does not depend on this, since it never sends
             // the request at all (§3).
             if pane_reconcile_v1 {
-                return handle_pane_reconcile(request, ws_tx, state).await;
+                return handle_pane_reconcile(request, ws_tx, state, pane_reconcile_fresh_agent_v1)
+                    .await;
             }
             true
         }
@@ -1912,6 +1916,10 @@ async fn handle_pane_reconcile(
     request: freshell_protocol::PaneReconcileRequest,
     ws_tx: &mut WsSink,
     state: &WsState,
+    // `paneReconcileFreshAgentV1` negotiation: threaded here in Task 11,
+    // consumed by the fresh-agent verdict derivation in Task 13 (underscore
+    // prefix drops then).
+    _pane_reconcile_fresh_agent_v1: bool,
 ) -> bool {
     if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
         return send_create_error(
