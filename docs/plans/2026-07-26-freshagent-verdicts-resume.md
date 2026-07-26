@@ -44,6 +44,7 @@
 | `crates/freshell-server/src/main.rs` | Modify | construct + inject the sink into the three provider states + `FreshAgentState` (REST surface) |
 | `crates/freshell-ws/src/reconcile_freshagent.rs` | Create | snapshot types, async snapshot builder (supersession-chain resolution, respawn cap w/ reset-on-live), pure verdict mapping, dedupe |
 | `crates/freshell-ws/src/reconcile.rs` | Modify (minimal) | one `ReconcileDeps` field + one match arm + invert one unit test |
+| `crates/freshell-protocol/src/server_messages.rs` | Modify (minimal) | `ReadyCapabilities` gains an optional `pane_reconcile_fresh_agent_v1` field (the `paneReconcileFreshAgentV1` ready echo — the ready frame is typed; there is no raw-JSON path) |
 | `crates/freshell-ws/src/lib.rs` | Modify | `mod reconcile_freshagent;`, `paneReconcileFreshAgentV1` capability parse/echo, `WsState.fresh_agent_respawn_counts` |
 | `crates/freshell-ws/src/terminal.rs` | Modify | thread capability bool; build fresh-agent snapshot in `handle_pane_reconcile` |
 | `crates/freshell-ws/tests/pane_reconcile_freshagent.rs` | Create | direct-WS integration tests for the fresh-agent arm |
@@ -84,7 +85,7 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
             mode: "freshcodex",
             cwd: Some("/home/u/proj"),
             create_request_id: Some("req-1"),
-            model: Some("gpt-5.3-codex"),
+            model: Some("gpt-5.3-codex-spark"),
             sandbox: Some("workspace-write"),
             permission_mode: Some("on-request"),
             effort: Some("high"),
@@ -94,7 +95,7 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
         .unwrap();
     let row = ledger.load_binding("codex", "thread-1").expect("row");
     assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
-    assert_eq!(row.model.as_deref(), Some("gpt-5.3-codex"));
+    assert_eq!(row.model.as_deref(), Some("gpt-5.3-codex-spark"));
     assert_eq!(row.sandbox.as_deref(), Some("workspace-write"));
     assert_eq!(row.permission_mode.as_deref(), Some("on-request"));
     assert_eq!(row.effort.as_deref(), Some("high"));
@@ -411,6 +412,9 @@ pub struct FreshAgentBindingUpsert {
     pub mode: String,
     pub create_request_id: Option<String>,
     pub resolves_pending: Option<String>,
+    /// G3 supersession (V8/A14): OLD session id this binding replaces
+    /// (codex crash-respawn passes the old thread id; everyone else None).
+    pub supersedes: Option<String>,
     pub settings: FreshAgentSettings,
 }
 
@@ -573,7 +577,7 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             settings: FreshAgentSettings {
-                model: Some("gpt-5.3-codex".into()),
+                model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
                 permission_mode: Some("on-request".into()),
                 effort: None,
@@ -584,7 +588,7 @@ mod tests {
         .expect("awaited write succeeds");
         // Awaited write => durable and readable IMMEDIATELY, no polling.
         let s = sink.load_settings("codex", "t1").expect("binding visible after await");
-        assert_eq!(s.model.as_deref(), Some("gpt-5.3-codex"));
+        assert_eq!(s.model.as_deref(), Some("gpt-5.3-codex-spark"));
         assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
         assert!(sink.was_recorded("codex", "t1"));
         assert!(!sink.was_recorded("codex", "nope"));
@@ -775,7 +779,7 @@ async fn create_records_fresh_agent_binding_with_settings() {
     // settings — reuse create_real_fake_session, passing model/sandbox if it
     // accepts them, otherwise inline the same freshAgent.create the existing
     // create tests send, with:
-    //   model: "gpt-5.3-codex", sandbox: "workspace-write",
+    //   model: "gpt-5.3-codex-spark", sandbox: "workspace-write",
     //   permissionMode: "on-request", effort: "high", cwd: <tmp dir>
     let thread_id = create_real_fake_session(&state /* …with settings… */).await;
 
@@ -783,7 +787,7 @@ async fn create_records_fresh_agent_binding_with_settings() {
     let b = bindings.iter().find(|b| b.session_id == thread_id).expect("binding row written at thread/start");
     assert_eq!(b.provider, "codex");
     assert_eq!(b.mode, "freshcodex");
-    assert_eq!(b.settings.model.as_deref(), Some("gpt-5.3-codex"));
+    assert_eq!(b.settings.model.as_deref(), Some("gpt-5.3-codex-spark"));
     assert_eq!(b.settings.sandbox.as_deref(), Some("workspace-write"));
     assert_eq!(b.settings.permission_mode.as_deref(), Some("on-request"));
     assert_eq!(b.settings.effort.as_deref(), Some("high"));
@@ -913,7 +917,7 @@ async fn resume_after_restart_reapplies_settings_from_ledger() {
     let (state, _bus) = state_with_bus();
     let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
     fake.seed("codex", "thread-9", crate::identity_sink::FreshAgentSettings {
-        model: Some("gpt-5.3-codex".into()),
+        model: Some("gpt-5.3-codex-spark".into()),
         sandbox: Some("workspace-write".into()),
         permission_mode: Some("on-request".into()),
         effort: Some("high".into()),
@@ -929,7 +933,7 @@ async fn resume_after_restart_reapplies_settings_from_ledger() {
     // (1) The registered session carries the recovered settings:
     let sessions = state.sessions.lock().await;
     let s = sessions.get("thread-9").expect("session registered");
-    assert_eq!(s.model, "gpt-5.3-codex");
+    assert_eq!(s.model, "gpt-5.3-codex-spark");
     assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
     assert_eq!(s.permission_mode.as_deref(), Some("on-request"));
     assert_eq!(s.effort.as_deref(), Some("high"));
@@ -939,7 +943,7 @@ async fn resume_after_restart_reapplies_settings_from_ledger() {
     let log = std::fs::read_to_string(op_log.path()).unwrap();
     let resume_line = log.lines().find(|l| l.contains("\"thread/resume\"")).expect("thread/resume logged");
     let entry: serde_json::Value = serde_json::from_str(resume_line).unwrap();
-    assert_eq!(entry["params"]["model"], "gpt-5.3-codex");
+    assert_eq!(entry["params"]["model"], "gpt-5.3-codex-spark");
     assert_eq!(entry["params"]["sandbox"], "workspace-write");
 }
 
@@ -1581,6 +1585,7 @@ git commit -m "fix(claude): resume-in-place reapplies model/permissionMode/effor
 **Files:**
 - Modify: `crates/freshell-ws/src/lib.rs` (parse at the hello handler — sibling pattern `terminalOutputBatchV1` at `lib.rs:592-597`; `paneReconcileV1` at `:574-578`; ready echo where `paneReconcileV1` is echoed)
 - Modify: `crates/freshell-ws/src/terminal.rs` (`terminal::run` signature + `handle_pane_reconcile` param)
+- Modify: `crates/freshell-protocol/src/server_messages.rs` (`ReadyCapabilities` struct at `:757-760` — the ready echo requires a new typed field; see Step 3)
 - Test: `crates/freshell-ws/tests/pane_reconcile_freshagent.rs` (new file — first two tests)
 
 **Interfaces:**
@@ -1637,7 +1642,7 @@ let pane_reconcile_fresh_agent_v1 = value
     .unwrap_or(false);
 ```
 
-Echo `paneReconcileFreshAgentV1: true` in `ready.capabilities` when negotiated (same conditional style as `paneReconcileV1` — omitted entirely when false). Thread the bool through `terminal::run` into `handle_pane_reconcile` (parameter only in this task; used in Task 13).
+Echo `paneReconcileFreshAgentV1: true` in `ready.capabilities` when negotiated (same conditional style as `paneReconcileV1` — omitted entirely when false). NOTE the echo side is TYPED, not raw JSON: the ready frame is built via `build_handshake_with_capabilities` (`crates/freshell-ws/src/lib.rs:370-381`) from the `ReadyCapabilities` struct (`crates/freshell-protocol/src/server_messages.rs:757-760`, currently containing only `pane_reconcile_v1`). Add a sibling field `pane_reconcile_fresh_agent_v1` to `ReadyCapabilities`, mirroring `pane_reconcile_v1`'s type and serde attributes exactly (same rename-to-`paneReconcileFreshAgentV1` / omit-when-absent behavior), and populate it at the `build_handshake_with_capabilities` call site only when negotiated. Thread the bool through `terminal::run` into `handle_pane_reconcile` (parameter only in this task; used in Task 13).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1649,8 +1654,9 @@ Expected: PASS.
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 git add crates/freshell-ws/src/lib.rs crates/freshell-ws/src/terminal.rs \
+        crates/freshell-protocol/src/server_messages.rs \
         crates/freshell-ws/tests/pane_reconcile_freshagent.rs
-git commit -m "feat(ws): paneReconcileFreshAgentV1 capability - parsed, threaded, echoed; frozen client unaffected"
+git commit -m "feat(ws): paneReconcileFreshAgentV1 capability - parsed, threaded, echoed via typed ReadyCapabilities; frozen client unaffected"
 ```
 
 ---
@@ -2294,14 +2300,14 @@ if (
 
 1. **`codex: create-shaped resume after restart carries the recorded model`** — exercises the CREATE-resume path (R1 + ledger-fill), the exact wire shape the frozen client sends after `page.reload()` (V2/A4). No browser page.
    - Boot with `CODEX_CMD` fake + static behavior including `appendThreadOperationLogPath: <tmp>/codex-ops.jsonl` (resume succeeds by default).
-   - PATCH `settings.freshAgent.enabled=true`; open a raw WS; `freshAgent.create` with `{ provider: 'codex', sessionType: 'freshcodex', model: 'gpt-5.3-codex', sandbox: 'workspace-write', cwd: <tmp> }`; await `freshAgent.created` (capture the durable thread id); one `freshAgent.send`; await the turn.
+   - PATCH `settings.freshAgent.enabled=true`; open a raw WS; `freshAgent.create` with `{ provider: 'codex', sessionType: 'freshcodex', model: 'gpt-5.3-codex-spark', sandbox: 'workspace-write', cwd: <tmp> }`; await `freshAgent.created` (capture the durable thread id); one `freshAgent.send`; await the turn.
    - `await server.restartAbrupt()`; open a NEW raw WS; send `freshAgent.create` with `{ provider: 'codex', sessionType: 'freshcodex', resumeSessionId: <thread id> }` and NO model/sandbox — proving the values come from the LEDGER (R1 fills gaps, Task 5(d)), not from the message; await the created/attach-equivalent reply.
    - Assertion block:
    ```ts
    const ops = fs.readFileSync(opLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
    const resume = ops.find((o) => o.method === 'thread/resume')
    expect(resume, 'restart must resume the durable thread').toBeTruthy()
-   expect(resume.params.model, 'resume must carry the recorded model, not null').toBe('gpt-5.3-codex')
+   expect(resume.params.model, 'resume must carry the recorded model, not null').toBe('gpt-5.3-codex-spark')
    expect(resume.params.sandbox, 'resume must carry the recorded sandbox').toBe('workspace-write')
    ```
 
