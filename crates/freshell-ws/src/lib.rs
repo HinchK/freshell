@@ -23,7 +23,8 @@
 pub mod activity;
 pub mod amplifier_association;
 pub mod backpressure;
-pub(crate) mod codex_candidate;
+pub mod codex_association;
+pub(crate) mod codex_identity;
 pub(crate) mod codex_reconcile;
 pub mod create_limit;
 pub mod existence;
@@ -33,13 +34,14 @@ pub mod opencode_association;
 pub mod origin;
 pub mod pane_ledger;
 pub mod reconcile;
+pub mod reconcile_freshagent;
 pub mod screenshot;
 pub mod spawn_gate;
 pub mod tabs;
 pub mod tabs_persist;
 pub mod terminal;
 
-pub use codex_candidate::codex_sessions_root;
+pub use codex_identity::codex_sessions_root;
 pub use codex_reconcile::locate_codex_rollout;
 
 use std::sync::Arc;
@@ -229,6 +231,23 @@ pub struct WsState {
     /// of `identity` and the locator handles); [`crate::existence::NoIndexProbe`]
     /// when no provider home resolves.
     pub session_existence: crate::existence::SharedExistenceProbe,
+    /// Reconciliation handshake (design §5.3 row 5): the budget, in
+    /// milliseconds, for `handle_pane_reconcile`'s ONE bounded deferral when
+    /// a derivation comes back `error{index_warming}` — wait at most this
+    /// long, re-derive once, answer. Never loops. Default
+    /// [`crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT`] (2000ms);
+    /// tests shrink it so the warming paths are observable without a real
+    /// 2s wait (mirrors `ping_interval_ms` / `hello_timeout_ms`).
+    pub reconcile_deferral_budget_ms: u64,
+    /// Per-boot fresh-agent respawn-answer counter, keyed `(provider,
+    /// sessionId)` (campaign §4.3, V2/A7). Counts RESPAWN ANSWERS only —
+    /// incremented by [`crate::reconcile_freshagent::build_snapshot`] when an
+    /// answer goes out as `respawn`, and CLEARED when the session's presence
+    /// resolves Live (a successful respawn is OBSERVED as the session going
+    /// live), so healthy sessions are never exhausted by reconnect/reload
+    /// storms. In-memory only: a server restart intentionally resets it.
+    pub fresh_agent_respawn_counts:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), u32>>>,
     /// The opencode terminal-pane session locator (restore-across-restart fix,
     /// `docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): correlates a
     /// fresh opencode PTY's first Enter/submit (or a row written at spawn) with
@@ -240,6 +259,17 @@ pub struct WsState {
     /// point no-ops in that case. Sibling to `amplifier_locator` (spec §8: a
     /// provider-parameterized locator was explicitly rejected).
     pub opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
+    /// The codex terminal-pane rollout locator (Lane B2): correlates a fresh
+    /// codex PTY's first Enter with the new rollout JSONL codex writes under
+    /// the sessions root — real codex materializes the file only at the first
+    /// user prompt, so the locator's windows are Enter-anchored (no spawn
+    /// window) — so the terminal can be bound to a session identity and
+    /// `terminal.rs`'s generic resume derivation can drive `codex resume <id>`
+    /// on restart. `None` when HOME/CODEX_HOME are unresolvable — every
+    /// [`crate::codex_association`] entry point no-ops in that case. Sibling
+    /// to `opencode_locator` (a provider-parameterized locator was explicitly
+    /// rejected there; same call here).
+    pub codex_locator: Option<Arc<freshell_sessions::codex_locator::CodexLocator>>,
     /// TERM-15/TERM-16: the terminal-mode CLI activity hub (claude/codex/
     /// amplifier trackers + the truly-idle gate + the amplifier events
     /// lanes). `None` in unit tests that never exercise activity; always
@@ -357,7 +387,7 @@ pub fn spawn_idle_monitor(
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
-    build_handshake_with_capabilities(state, false)
+    build_handshake_with_capabilities(state, false, false)
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
@@ -368,6 +398,7 @@ pub fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
 pub fn build_handshake_with_capabilities(
     state: &WsState,
     pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
 ) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
     let mut messages = vec![
@@ -375,9 +406,12 @@ pub fn build_handshake_with_capabilities(
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
             server_instance_id: Some(state.server_instance_id.as_ref().clone()),
-            capabilities: pane_reconcile_v1.then_some(freshell_protocol::ReadyCapabilities {
-                pane_reconcile_v1: Some(true),
-            }),
+            capabilities: (pane_reconcile_v1 || pane_reconcile_fresh_agent_v1).then_some(
+                freshell_protocol::ReadyCapabilities {
+                    pane_reconcile_v1: pane_reconcile_v1.then_some(true),
+                    pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
+                },
+            ),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
             settings: state.settings.as_ref().clone(),
@@ -577,8 +611,19 @@ async fn handle_socket(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Fresh-agent restart resilience: same opt-in gate as `paneReconcileV1`,
+    // for the fresh-agent verdict families. The frozen client never sends it,
+    // so its handshake stays byte-for-byte unchanged.
+    let pane_reconcile_fresh_agent_v1 = value
+        .get("capabilities")
+        .and_then(|c| c.get("paneReconcileFreshAgentV1"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Authenticated: emit the ordered handshake.
-    for msg in build_handshake_with_capabilities(&state, pane_reconcile_v1) {
+    for msg in
+        build_handshake_with_capabilities(&state, pane_reconcile_v1, pane_reconcile_fresh_agent_v1)
+    {
         let json = match serde_json::to_string(&msg) {
             Ok(json) => json,
             Err(_) => return,
@@ -615,6 +660,7 @@ async fn handle_socket(
         terminal_output_batch_v1,
         ui_screenshot_v1,
         pane_reconcile_v1,
+        pane_reconcile_fresh_agent_v1,
         origin_kind,
     )
     .await;
@@ -665,6 +711,7 @@ async fn send_error(
         actual_session_ref: None,
         expected_session_ref: None,
         request_id: None,
+        retry_after_ms: None,
         terminal_exit_code: None,
         terminal_id: None,
     });
@@ -739,8 +786,11 @@ mod tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            codex_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
         }
     }
 
@@ -800,7 +850,7 @@ mod tests {
     #[test]
     fn handshake_advertises_pane_reconcile_only_when_negotiated() {
         let s = state();
-        let negotiated = build_handshake_with_capabilities(&s, true);
+        let negotiated = build_handshake_with_capabilities(&s, true, false);
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -814,7 +864,7 @@ mod tests {
             "non-negotiating hello must not change ready's shape: {ready}"
         );
         // Same shape as an explicit `false` negotiation.
-        let unnegotiated = build_handshake_with_capabilities(&s, false);
+        let unnegotiated = build_handshake_with_capabilities(&s, false, false);
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
     }

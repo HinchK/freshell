@@ -405,6 +405,105 @@ pub type ActivityObserver = Arc<dyn Fn(ActivityEvent) + Send + Sync>;
 const DEFAULT_RESPAWN_LIVENESS_WINDOW_MS: i64 = 30_000;
 const DEFAULT_RESPAWN_GENERATION_CAP: i64 = 3;
 
+/// Explicit wall-clock backstop for a hung holder. NOT derived from any
+/// "spawn budget" — the 10s constant at create_limit.rs:49 (spawn_timeout_ms,
+/// env FRESHELL_SPAWN_GATE_TIMEOUT_MS) bounds the spawn-GATE PERMIT wait,
+/// not spawn duration; spawns run unbounded in spawn_blocking. Task 6 makes
+/// this env-tunable and adds spawn-duration instrumentation to tune it on
+/// evidence.
+pub const SESSION_REF_LEASE_TTL_MS: u64 = 20_000;
+pub const SESSION_RESERVED_RETRY_AFTER_MS: u64 = 1_000;
+
+/// The effective lease TTL: `FRESHELL_SESSION_REF_LEASE_TTL_MS` when set to a
+/// positive integer, else [`SESSION_REF_LEASE_TTL_MS`]. Same sanitizing-parse
+/// shape as the spawn-gate timeout's `FRESHELL_SPAWN_GATE_TIMEOUT_MS`
+/// (`freshell-ws/src/create_limit.rs`) — unset/unparseable/zero → default.
+/// Kept next to the const so the client's re-drive window derivation
+/// (Task 12: window > TTL + margin) stays visible in one place.
+pub fn session_ref_lease_ttl_ms() -> u64 {
+    std::env::var("FRESHELL_SESSION_REF_LEASE_TTL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(SESSION_REF_LEASE_TTL_MS)
+}
+
+/// Whether `pid` is still alive (`kill(pid, 0)`): the ESRCH death-confirm
+/// probe of the kill-before-release discipline (council rule 8). Only ESRCH
+/// confirms death — EPERM (or any other errno) reports ALIVE, so an
+/// uncertain probe can never release a lease it shouldn't. Non-unix: PTY
+/// pids are never recorded there ([`crate::pty::PtyTerminal::pid`] is
+/// `None`), so no pid-carrying lease can exist and this is unreachable.
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 performs existence/permission checking only; no
+        // signal is delivered.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Outcome of [`TerminalRegistry::claim_session_ref`] (council rule 7, D8:
+/// one in-flight create per sessionRef, liveness-bound).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRefClaim {
+    Acquired,
+    Held {
+        retry_after_ms: u64,
+    },
+    /// TTL expired on a holder with a recorded child: caller must kill the
+    /// holder's spawn via the REGISTRY handle (group-kill discipline,
+    /// pty.rs:352-386 — never a raw single-pid SIGKILL), CONFIRM death, then
+    /// call force_release_after_confirmed_kill and re-claim. The pid is for
+    /// ESRCH-confirmation, not for raw kill().
+    ExpiredNeedsKill {
+        pid: u32,
+    },
+    BoundElsewhere {
+        terminal_id: String,
+    },
+}
+
+/// One in-flight sessionRef create reservation (value side of
+/// `TerminalRegistry::session_ref_leases`, keyed `"provider\u{0}sessionId"`).
+/// Released on spawn complete (bind), spawn fail (error), or holder
+/// connection death; [`SESSION_REF_LEASE_TTL_MS`] is the wall-clock backstop
+/// for a hung holder — expiry is KILL-BEFORE-RELEASE (a pid-carrying lease
+/// stays held until the caller confirms the kill; a pid-less one is revoked
+/// and held closed, never released except via holder conn death or spawn
+/// failure, both of which prove no orphan child exists).
+#[derive(Debug, Clone)]
+struct SessionRefLease {
+    /// Stored alongside the string key so conn-death cleanup can hand
+    /// callers real [`SessionLocator`]s without parsing NUL-joined keys.
+    locator: SessionLocator,
+    holder_create_request_id: String,
+    holder_conn: u64,
+    acquired_at_ms: u64,
+    /// The spawned child's pid once the holder records it
+    /// ([`TerminalRegistry::set_session_ref_lease_pid`]) — presence decides
+    /// TTL expiry's shape (`ExpiredNeedsKill` vs revoke-and-hold-closed).
+    pid: Option<u32>,
+    /// Set when TTL expired on a pid-less holder: there is nothing to kill,
+    /// so the lease is held closed and the holder's late
+    /// [`TerminalRegistry::complete_session_ref_claim`] is rejected.
+    revoked: bool,
+}
+
+/// A sessionRef lease's map key: `"provider\u{0}sessionId"` (NUL joint —
+/// neither side can contain it, so the key is collision-free).
+fn session_ref_key(locator: &SessionLocator) -> String {
+    format!("{}\u{0}{}", locator.provider, locator.session_id)
+}
+
 #[derive(Clone)]
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -450,6 +549,19 @@ pub struct TerminalRegistry {
     /// one key could BOTH pass the `newest_live_by_create_request_id` check
     /// and both spawn — the exact duplicate-writer shape the dedupe closes.
     keyed_create_inflight: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Council rule 7 (D8): one in-flight create per sessionRef. Keyed
+    /// `"provider\u{0}sessionId"` ([`session_ref_key`]); see
+    /// [`SessionRefLease`] for the release/TTL/kill-before-release rules.
+    /// Mirrors the `keyed_create_inflight` shape (claim before spawn,
+    /// release after bind/fail/conn-death).
+    session_ref_leases: Arc<Mutex<HashMap<String, SessionRefLease>>>,
+    /// locator key ([`session_ref_key`]) → the terminalId a completed claim
+    /// bound the sessionRef to. Consulted by
+    /// [`Self::claim_session_ref`] alongside
+    /// [`Self::live_terminal_for_session_ref`]; a binding whose terminal is
+    /// KNOWN dead (registered but not Running) is pruned instead of
+    /// answering `BoundElsewhere`, so a dead winner never strands losers.
+    session_ref_bindings: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Default for TerminalRegistry {
@@ -500,6 +612,8 @@ impl TerminalRegistry {
             )),
             respawn_generation_cap: Arc::new(AtomicI64::new(DEFAULT_RESPAWN_GENERATION_CAP)),
             keyed_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            session_ref_leases: Arc::new(Mutex::new(HashMap::new())),
+            session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1143,6 +1257,18 @@ impl TerminalRegistry {
         let Some(mut handle) = handle else {
             return false;
         };
+        // sessionRef lease fix (finding 1): the kill path REMOVES the row
+        // entirely, so `claim_session_ref`'s "known dead" probe (which needs
+        // a registered-but-not-Running row) can never fire for a killed
+        // winner — an UNKNOWN id would be honored as `BoundElsewhere{dead-id}`
+        // forever. Prune any sessionRef binding pointing at this terminal at
+        // row-removal time instead. This is the ONLY row-removal site
+        // (natural exit RETAINS the row via `finish_pty_exit`). The `inner`
+        // lock is already released here, so no ordering hazard.
+        self.session_ref_bindings
+            .lock()
+            .expect("session-ref bindings lock")
+            .retain(|_, bound_id| bound_id != terminal_id);
         let was_running = {
             let mut s = handle.shared.lock().expect("terminal lock");
             let was_running = s.status == TerminalRunStatus::Running;
@@ -1612,6 +1738,304 @@ impl TerminalRegistry {
             .remove(key);
     }
 
+    /// Council rule 7 (D8): claim the one in-flight create slot for a
+    /// sessionRef. Checks, in order:
+    ///
+    /// 1. A live terminal already carrying the ref
+    ///    ([`Self::live_terminal_for_session_ref`]) or a recorded binding
+    ///    whose terminal is not KNOWN dead → `BoundElsewhere` (attach to the
+    ///    winner). A binding whose terminal is known dead (registered but
+    ///    not Running) is pruned instead — a dead winner must not strand
+    ///    losers.
+    /// 2. A held, unexpired lease → `Held` (retry after
+    ///    [`SESSION_RESERVED_RETRY_AFTER_MS`]).
+    /// 3. A held lease past `acquired_at_ms + `[`SESSION_REF_LEASE_TTL_MS`]:
+    ///    with a recorded pid → `ExpiredNeedsKill` (KILL-BEFORE-RELEASE: the
+    ///    lease stays held until [`Self::force_release_after_confirmed_kill`]);
+    ///    without one (holder hung pre-spawn, nothing to kill) → revoke the
+    ///    lease, ERROR-log, and answer `Held` — hold closed, never release
+    ///    what you can't kill.
+    /// 4. Otherwise the slot is free → record the lease, `Acquired`.
+    ///
+    /// `now_ms` is caller-supplied wall-clock so tests never sleep.
+    pub fn claim_session_ref(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+        holder_conn: u64,
+        now_ms: u64,
+    ) -> SessionRefClaim {
+        let key = session_ref_key(locator);
+
+        // 1a. Row-join liveness: a live terminal already carries this ref.
+        if let Some(terminal_id) = self.live_terminal_for_session_ref(locator) {
+            return SessionRefClaim::BoundElsewhere { terminal_id };
+        }
+
+        // 1b. Recorded binding — honored unless its terminal is KNOWN dead
+        // (a registered row that is no longer Running). Lock order: the
+        // bindings mutex is held across the liveness probes, which take only
+        // the registry `inner` + terminal locks; no path acquires bindings
+        // while holding those, so the order is acyclic.
+        {
+            let mut bindings = self
+                .session_ref_bindings
+                .lock()
+                .expect("session-ref bindings lock");
+            if let Some(terminal_id) = bindings.get(&key).cloned() {
+                let known_dead = self.is_running(&terminal_id) && !self.is_live(&terminal_id);
+                if known_dead {
+                    bindings.remove(&key);
+                } else {
+                    return SessionRefClaim::BoundElsewhere { terminal_id };
+                }
+            }
+        }
+
+        self.claim_session_ref_lease_phase(locator, holder_create_request_id, holder_conn, now_ms)
+    }
+
+    /// Lease phase of [`Self::claim_session_ref`] (steps 2-4: held /
+    /// expired / free). Split out so the claim-side TOCTOU re-check
+    /// (final review finding 1) can be pinned by a test that stages
+    /// "loser passed checks 1a/1b before the winner registered" without
+    /// threads: a full `claim_session_ref` call is always caught by step
+    /// 1b while a binding exists, so only a direct entry here can
+    /// exercise the under-lock re-check.
+    fn claim_session_ref_lease_phase(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+        holder_conn: u64,
+        now_ms: u64,
+    ) -> SessionRefClaim {
+        let key = session_ref_key(locator);
+        let mut leases = self
+            .session_ref_leases
+            .lock()
+            .expect("session-ref lease lock");
+        match leases.get_mut(&key) {
+            None => {
+                // Claim-side TOCTOU (final review finding 1): checks 1a/1b
+                // ran BEFORE this lock was taken. A loser preempted across
+                // the winner's register -> `complete_session_ref_claim`
+                // window arrives here after complete removed the winner's
+                // lease -- seeing no lease -- while only the bindings map
+                // records the winner. Re-check bindings WHILE HOLDING the
+                // leases lock: a recorded binding means a winner already
+                // completed, so answer `BoundElsewhere` instead of
+                // double-acquiring (a second spawn on one sessionRef is the
+                // duplicate-writer shape D8 exists to close). Lock order
+                // leases -> bindings matches `complete_session_ref_claim`
+                // and is acyclic: step 1b's bindings block ends before the
+                // leases lock is taken, and no path acquires the leases
+                // lock while holding bindings. A binding observed here is
+                // either freshly completed (live winner) or, if its winner
+                // has since died, handled on the loser's retry claim, whose
+                // step 1b prunes known-dead winners.
+                let bound = self
+                    .session_ref_bindings
+                    .lock()
+                    .expect("session-ref bindings lock")
+                    .get(&key)
+                    .cloned();
+                if let Some(terminal_id) = bound {
+                    return SessionRefClaim::BoundElsewhere { terminal_id };
+                }
+                leases.insert(
+                    key,
+                    SessionRefLease {
+                        locator: locator.clone(),
+                        holder_create_request_id: holder_create_request_id.to_string(),
+                        holder_conn,
+                        acquired_at_ms: now_ms,
+                        pid: None,
+                        revoked: false,
+                    },
+                );
+                SessionRefClaim::Acquired
+            }
+            Some(lease) => {
+                let expired = now_ms > lease.acquired_at_ms + session_ref_lease_ttl_ms();
+                if !expired {
+                    return SessionRefClaim::Held {
+                        retry_after_ms: SESSION_RESERVED_RETRY_AFTER_MS,
+                    };
+                }
+                match lease.pid {
+                    Some(pid) => SessionRefClaim::ExpiredNeedsKill { pid },
+                    None => {
+                        if !lease.revoked {
+                            lease.revoked = true;
+                            tracing::error!(target: "invariant",
+                                provider = %locator.provider,
+                                session_id = %locator.session_id,
+                                holder_create_request_id = %lease.holder_create_request_id,
+                                acquired_at_ms = lease.acquired_at_ms,
+                                now_ms,
+                                "session_ref_lease_revoked: TTL expired on a pid-less holder; held closed");
+                        }
+                        SessionRefClaim::Held {
+                            retry_after_ms: SESSION_RESERVED_RETRY_AFTER_MS,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record the holder's spawned child pid on its lease, arming the TTL
+    /// expiry's `ExpiredNeedsKill` path. No-op if the lease is gone or held
+    /// by a different `createRequestId`.
+    pub fn set_session_ref_lease_pid(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+        pid: u32,
+    ) {
+        let key = session_ref_key(locator);
+        let mut leases = self
+            .session_ref_leases
+            .lock()
+            .expect("session-ref lease lock");
+        if let Some(lease) = leases.get_mut(&key) {
+            if lease.holder_create_request_id == holder_create_request_id {
+                lease.pid = Some(pid);
+            }
+        }
+    }
+
+    /// Spawn succeeded: record binding, release lease, run the duplicate alarm.
+    /// Returns false if the lease was revoked while spawning (caller must kill
+    /// its own child and fail the create loudly). A revoked lease is NOT
+    /// released here — kill-before-release: the caller confirms its child's
+    /// death, then calls [`Self::force_release_after_confirmed_kill`].
+    pub fn complete_session_ref_claim(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+        terminal_id: &str,
+    ) -> bool {
+        let key = session_ref_key(locator);
+        {
+            let mut leases = self
+                .session_ref_leases
+                .lock()
+                .expect("session-ref lease lock");
+            match leases.get(&key) {
+                Some(lease)
+                    if lease.holder_create_request_id == holder_create_request_id
+                        && !lease.revoked =>
+                {
+                    leases.remove(&key);
+                    // ATOMICITY (fix round 1, finding 2): the binding MUST be
+                    // inserted while the leases lock is still held. Releasing
+                    // the lease first and binding under a separate lock opens
+                    // a window where a racing `claim_session_ref` sees no live
+                    // row, no binding, and no lease -> `Acquired` -> a second
+                    // spawn: the exact duplicate-writer race this primitive
+                    // exists to close. Lock order leases -> bindings is
+                    // acyclic: `claim_session_ref`'s bindings block ends
+                    // before it takes the leases lock, and no other path
+                    // acquires the leases lock while holding bindings.
+                    self.session_ref_bindings
+                        .lock()
+                        .expect("session-ref bindings lock")
+                        .insert(key, terminal_id.to_string());
+                }
+                _ => return false,
+            }
+        }
+        self.alarm_if_duplicate_session_ref(locator);
+        true
+    }
+
+    /// Spawn failed: release the holder's lease (no child exists — the spawn
+    /// itself errored — so release is safe even for a revoked lease). No-op
+    /// if the lease is gone or held by a different `createRequestId`.
+    pub fn fail_session_ref_claim(&self, locator: &SessionLocator, holder_create_request_id: &str) {
+        let key = session_ref_key(locator);
+        let mut leases = self
+            .session_ref_leases
+            .lock()
+            .expect("session-ref lease lock");
+        if leases
+            .get(&key)
+            .is_some_and(|l| l.holder_create_request_id == holder_create_request_id)
+        {
+            leases.remove(&key);
+        }
+    }
+
+    /// Connection death: release this conn's leases. Returns (locator_key, pid)
+    /// pairs whose in-flight children the caller must kill (kill-before-release
+    /// applies: entries WITH a pid are returned still-held; caller kills,
+    /// confirms, then calls force_release_after_confirmed_kill).
+    pub fn release_session_ref_leases_for_conn(
+        &self,
+        conn: u64,
+    ) -> Vec<(SessionLocator, Option<u32>)> {
+        let mut leases = self
+            .session_ref_leases
+            .lock()
+            .expect("session-ref lease lock");
+        let mut out = Vec::new();
+        leases.retain(|_, lease| {
+            if lease.holder_conn != conn {
+                return true;
+            }
+            out.push((lease.locator.clone(), lease.pid));
+            // pid-less: nothing spawned, release now. pid-carrying: keep held
+            // until the caller confirms the kill (kill-before-release).
+            lease.pid.is_some()
+        });
+        out
+    }
+
+    /// The caller killed the holder's child via the registry PTY handle and
+    /// CONFIRMED death (ESRCH): release the lease so the next claim wins.
+    pub fn force_release_after_confirmed_kill(&self, locator: &SessionLocator) {
+        self.session_ref_leases
+            .lock()
+            .expect("session-ref lease lock")
+            .remove(&session_ref_key(locator));
+    }
+
+    /// The terminalId a completed claim bound this sessionRef to
+    /// ([`Self::complete_session_ref_claim`]), if any — the read side of the
+    /// registry binding map (Task 6 winner bind; also a test probe).
+    pub fn bound_terminal_for_session_ref(&self, locator: &SessionLocator) -> Option<String> {
+        self.session_ref_bindings
+            .lock()
+            .expect("session-ref bindings lock")
+            .get(&session_ref_key(locator))
+            .cloned()
+    }
+
+    /// The live child pid behind `terminal_id`'s PTY handle (unix only;
+    /// `None` for headless/exited terminals). Task 6: the winner records this
+    /// on its sessionRef lease ([`Self::set_session_ref_lease_pid`]).
+    pub fn pid_of(&self, terminal_id: &str) -> Option<u32> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner
+            .terminals
+            .get(terminal_id)
+            .and_then(|h| h.pty.as_ref())
+            .and_then(|p| p.pid())
+    }
+
+    /// The terminal whose PTY handle carries `pid`. The kill-before-release
+    /// paths (lease TTL expiry, holder conn death) must kill through the
+    /// REGISTRY handle ([`Self::kill`] → group-kill discipline, `pty.rs`) —
+    /// NEVER a raw single-pid SIGKILL — so they resolve the recorded pid back
+    /// to its owning terminal first.
+    pub fn live_terminal_for_pid(&self, pid: u32) -> Option<String> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner.terminals.iter().find_map(|(id, h)| {
+            (h.pty.as_ref().and_then(|p| p.pid()) == Some(pid)).then(|| id.clone())
+        })
+    }
+
     /// §5.4 backstop detector (always-on, capability-independent): if a key
     /// now has two or more LIVE terminals, make it loud — two live PTYs on one
     /// `createRequestId` means two JSONL writers on one session file.
@@ -1629,6 +2053,72 @@ impl TerminalRegistry {
                 "ws.reconcile.duplicate_pty"
             );
         }
+    }
+
+    /// Live terminal ids currently carrying this sessionRef via the
+    /// registry-row join: `mode == locator.provider &&
+    /// resume_session_id == Some(locator.session_id) && status Running`,
+    /// newest generation first (`created_at` desc, `terminal_id` desc
+    /// tie-break, mirroring [`Self::terminals_by_create_request_id`]).
+    ///
+    /// LOOKUP DESIGN (validator-corrected): registry rows have NO dedicated
+    /// `session_ref` field ([`TerminalShared::inventory`] hardcodes
+    /// `session_ref: None`), so row identity IS this join. Rows are one of
+    /// the TWO identity stores — the other is `freshell-ws`'s identity
+    /// registry, which this crate cannot see (dep direction) — so ws-side
+    /// callers consult both.
+    fn live_terminal_ids_for_session_ref(&self, locator: &SessionLocator) -> Vec<String> {
+        let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .values()
+                .map(|h| Arc::clone(&h.shared))
+                .collect()
+        };
+        let mut rows: Vec<(i64, String)> = shareds
+            .iter()
+            .filter_map(|shared| {
+                let s = shared.lock().expect("terminal lock");
+                if s.status == TerminalRunStatus::Running
+                    && s.mode == locator.provider
+                    && s.resume_session_id.as_deref() == Some(locator.session_id.as_str())
+                {
+                    Some((s.created_at, s.terminal_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        rows.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Council rule 6: the live terminal (newest first) currently carrying
+    /// this sessionRef, if any — the reconcile derivation and the create-path
+    /// lease (Tasks 5/6) attach every other client's claim for the same ref
+    /// to this winner, regardless of `createRequestId`.
+    pub fn live_terminal_for_session_ref(&self, locator: &SessionLocator) -> Option<String> {
+        self.live_terminal_ids_for_session_ref(locator)
+            .into_iter()
+            .next()
+    }
+
+    /// Council rule 9, D8 backstop: >=2 live PTYs carrying one sessionRef is
+    /// the two-writers corruption shape. Alarm loudly (ERROR-level invariant
+    /// log); never kill silently. Returns whether the invariant is violated.
+    pub fn alarm_if_duplicate_session_ref(&self, locator: &SessionLocator) -> bool {
+        let live = self.live_terminal_ids_for_session_ref(locator);
+        if live.len() >= 2 {
+            tracing::error!(target: "invariant",
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                live = live.len(),
+                terminal_ids = ?live,
+                "duplicate_pty_for_session_ref: >=2 live PTYs share one sessionRef");
+            return true;
+        }
+        false
     }
 
     /// The current `terminals.changed.revision` (run-monotonic, `§7.5`).
@@ -3467,6 +3957,258 @@ mod tests {
             warn.fields.get("create_request_id").map(String::as_str),
             Some("cr-dup")
         );
+    }
+
+    /// Council rule 6 support: the registry-row join (mode +
+    /// resume_session_id + Running) finds the live terminal carrying a
+    /// sessionRef — exited generations and other providers/sessions never
+    /// match.
+    #[test]
+    fn live_terminal_for_session_ref_joins_rows_on_mode_and_resume_id() {
+        let reg = TerminalRegistry::new();
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-ref".to_string(),
+            stream_id: "S-ref".to_string(),
+            mode: "codex".to_string(),
+            resume_session_id: Some("sess-r".to_string()),
+            create_request_id: Some("cr-a".to_string()),
+            created_at: Some(1_000),
+        });
+        let locator = SessionLocator {
+            provider: "codex".to_string(),
+            session_id: "sess-r".to_string(),
+        };
+        assert_eq!(
+            reg.live_terminal_for_session_ref(&locator),
+            Some("T-ref".to_string())
+        );
+        // Wrong provider / wrong session never match.
+        assert!(reg
+            .live_terminal_for_session_ref(&SessionLocator {
+                provider: "claude".to_string(),
+                session_id: "sess-r".to_string(),
+            })
+            .is_none());
+        assert!(reg
+            .live_terminal_for_session_ref(&SessionLocator {
+                provider: "codex".to_string(),
+                session_id: "other".to_string(),
+            })
+            .is_none());
+        // An exited terminal is not a live carrier.
+        reg.finish_pty_exit("T-ref", 0);
+        assert!(reg.live_terminal_for_session_ref(&locator).is_none());
+    }
+
+    /// Council rule 9 (D8 backstop): >=2 live PTYs stamped with ONE
+    /// sessionRef is the two-writers corruption shape — the alarm returns
+    /// true and ERROR-logs `duplicate_pty_for_session_ref`; one live carrier
+    /// returns false and stays silent.
+    #[test]
+    fn alarm_if_duplicate_session_ref_fires_only_on_two_live_carriers() {
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        let stamped = |id: &str, created_at: i64| HeadlessTerminal {
+            terminal_id: id.to_string(),
+            stream_id: format!("S-{id}"),
+            mode: "claude".to_string(),
+            resume_session_id: Some("sess-dup".to_string()),
+            create_request_id: None,
+            created_at: Some(created_at),
+        };
+        let locator = SessionLocator {
+            provider: "claude".to_string(),
+            session_id: "sess-dup".to_string(),
+        };
+
+        reg.register_headless(stamped("dupA", 1_000));
+        assert!(
+            !reg.alarm_if_duplicate_session_ref(&locator),
+            "one live carrier must not trip the alarm"
+        );
+
+        reg.register_headless(stamped("dupB", 2_000));
+        assert!(reg.alarm_if_duplicate_session_ref(&locator));
+        let captured = events.lock().unwrap();
+        let alarm = captured
+            .iter()
+            .find(|e| e.message.contains("duplicate_pty_for_session_ref"))
+            .expect(">=2 live PTYs on one sessionRef must emit the invariant alarm");
+        assert_eq!(
+            alarm.fields.get("session_id").map(String::as_str),
+            Some("sess-dup")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Council rule 7 (D8): sessionRef liveness-bound lease — claim /
+    // complete / fail / conn-death release / TTL kill-before-release.
+    // ------------------------------------------------------------------
+
+    fn test_registry() -> TerminalRegistry {
+        TerminalRegistry::new()
+    }
+
+    fn locator(provider: &str, session_id: &str) -> SessionLocator {
+        SessionLocator {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn second_claim_while_held_is_reserved() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-A", 1, 1000),
+            SessionRefClaim::Acquired
+        ));
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 1500),
+            SessionRefClaim::Held { .. }
+        ));
+    }
+
+    #[test]
+    fn completed_claim_yields_bound_elsewhere() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        reg.claim_session_ref(&s, "cr-A", 1, 1000);
+        assert!(reg.complete_session_ref_claim(&s, "cr-A", "term-1"));
+        match reg.claim_session_ref(&s, "cr-B", 2, 2000) {
+            SessionRefClaim::BoundElsewhere { terminal_id } => assert_eq!(terminal_id, "term-1"),
+            other => panic!("expected BoundElsewhere, got {other:?}"),
+        }
+    }
+
+    /// winner-dies-mid-claim (council red test): holder conn death releases the
+    /// pid-less lease; the loser's next claim wins.
+    #[test]
+    fn winner_dies_mid_claim_releases_lease() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        reg.claim_session_ref(&s, "cr-A", 1, 1000);
+        let to_kill = reg.release_session_ref_leases_for_conn(1);
+        assert!(to_kill.iter().all(|(_, pid)| pid.is_none()));
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 1500),
+            SessionRefClaim::Acquired
+        ));
+    }
+
+    /// winner-hangs-mid-claim (council red test): TTL expiry with a recorded
+    /// child pid demands kill-before-release; confirmed kill releases; a pid-less
+    /// hung holder is revoked and HELD CLOSED, never released.
+    #[test]
+    fn winner_hangs_mid_claim_ttl_is_kill_before_release() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        reg.claim_session_ref(&s, "cr-A", 1, 1000);
+        reg.set_session_ref_lease_pid(&s, "cr-A", 4242);
+        let late = 1000 + SESSION_REF_LEASE_TTL_MS + 1;
+        match reg.claim_session_ref(&s, "cr-B", 2, late) {
+            SessionRefClaim::ExpiredNeedsKill { pid } => assert_eq!(pid, 4242),
+            other => panic!("expected ExpiredNeedsKill, got {other:?}"),
+        }
+        reg.force_release_after_confirmed_kill(&s);
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, late + 1),
+            SessionRefClaim::Acquired
+        ));
+    }
+
+    #[test]
+    fn hung_holder_without_pid_is_revoked_and_held_closed() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        reg.claim_session_ref(&s, "cr-A", 1, 1000);
+        let late = 1000 + SESSION_REF_LEASE_TTL_MS + 1;
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, late),
+            SessionRefClaim::Held { .. }
+        ));
+        // The revoked holder's late completion is rejected.
+        assert!(!reg.complete_session_ref_claim(&s, "cr-A", "term-late"));
+    }
+
+    /// Fix round 1, finding 1: a KILLED winner must not strand the
+    /// sessionRef. The kill path REMOVES the terminal row entirely
+    /// ([`TerminalRegistry::kill_internal`]), so the binding's terminal id
+    /// becomes UNKNOWN to the registry — the claim-time "known dead" probe
+    /// can never fire. The binding must instead be pruned at row-removal
+    /// time so the next claim wins, rather than answering
+    /// `BoundElsewhere{dead-id}` forever.
+    #[test]
+    fn killed_winner_binding_is_pruned_so_next_claim_acquires() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-A", 1, 1000),
+            SessionRefClaim::Acquired
+        ));
+        // The winner's spawn registers a real row carrying the ref, then binds.
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-win".to_string(),
+            stream_id: "S-win".to_string(),
+            mode: "claude".to_string(),
+            resume_session_id: Some("s1".to_string()),
+            create_request_id: Some("cr-A".to_string()),
+            created_at: Some(1_000),
+        });
+        assert!(reg.complete_session_ref_claim(&s, "cr-A", "T-win"));
+        // User kills the winner: the real kill path removes the row entirely.
+        assert!(reg.kill("T-win"));
+        // The dead winner must not strand losers.
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 2000),
+            SessionRefClaim::Acquired
+        ));
+    }
+
+    /// Final-review finding 1 (claim-side TOCTOU): loser B passes checks
+    /// 1a/1b while both maps are still empty, is preempted across the
+    /// winner's register -> `complete_session_ref_claim` window, then takes
+    /// the leases lock AFTER complete removed the lease. Pre-fix the lease
+    /// phase saw "no lease" and answered `Acquired` -> a second spawn for
+    /// the same sessionRef (the duplicate-writer shape D8 exists to close).
+    ///
+    /// Staged sequentially, no threads: the winner claims, registers its
+    /// row, and completes (binding recorded, lease gone); B then enters the
+    /// lease phase DIRECTLY -- exactly the state B is in after its early
+    /// (empty) 1a/1b pass. A full `claim_session_ref` call from B cannot
+    /// pin the fix: while the binding exists, step 1b always intercepts it,
+    /// so only direct entry exercises the under-lock bindings re-check.
+    #[test]
+    fn lease_phase_rechecks_bindings_under_leases_lock() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-A", 1, 1000),
+            SessionRefClaim::Acquired
+        ));
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-win".to_string(),
+            stream_id: "S-win".to_string(),
+            mode: "claude".to_string(),
+            resume_session_id: Some("s1".to_string()),
+            create_request_id: Some("cr-A".to_string()),
+            created_at: Some(1_000),
+        });
+        assert!(reg.complete_session_ref_claim(&s, "cr-A", "T-win"));
+        // B resumes at the lease phase; its 1a/1b ran before the winner
+        // existed, so neither check fired. It must NOT acquire.
+        match reg.claim_session_ref_lease_phase(&s, "cr-B", 2, 2000) {
+            SessionRefClaim::BoundElsewhere { terminal_id } => {
+                assert_eq!(terminal_id, "T-win")
+            }
+            other => panic!("expected BoundElsewhere, got {other:?}"),
+        }
+        // The full claim path agrees (step 1a/1b catch it sequentially).
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 2000),
+            SessionRefClaim::BoundElsewhere { .. }
+        ));
     }
 
     /// §5.1 atomic-stamp insert-edge interleave (§9.1 test 5): the key is part

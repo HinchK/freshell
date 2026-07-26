@@ -18,10 +18,11 @@ use crate::identity::TerminalIdentityRegistry;
 /// never silently truncated.
 pub const MAX_RECONCILE_PANES: usize = 200;
 
-/// §5.3 row 5 placeholder cadence for `retry(index_warming)` (the retry
-/// mechanism itself is an OPEN user decision, design §8.0 — this implements
-/// the documented placeholder).
-pub const RETRY_AFTER_MS: i64 = 2000;
+/// §5.3 row 5 default budget for the handler's ONE bounded deferral before
+/// re-deriving verdicts once (council-pinned single deferral): when a
+/// derivation comes back `error{index_warming}`, `handle_pane_reconcile`
+/// waits at most this long, re-derives once, and answers — never loops.
+pub const RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT: u64 = 2000;
 
 /// The read-only inputs of the derivation (§5.1) — all shared handles that
 /// already live on [`crate::WsState`].
@@ -29,6 +30,11 @@ pub struct ReconcileDeps<'a> {
     pub registry: &'a TerminalRegistry,
     pub identity: &'a TerminalIdentityRegistry,
     pub existence: &'a dyn SessionExistenceProbe,
+    /// Fresh-agent facts snapshot (campaign §4.3): `Some` only on a
+    /// connection that negotiated `paneReconcileFreshAgentV1` AND presented
+    /// fresh-agent panes; `None` keeps the frozen client's
+    /// `invalid{unsupported_kind}` contract.
+    pub fresh_agent: Option<&'a crate::reconcile_freshagent::FreshAgentReconcileSnapshot>,
 }
 
 /// Derive one verdict per presented pane, 1:1 by `paneKey`, order preserved
@@ -60,7 +66,6 @@ fn invalid(pane: &ReconcilePane, reason: &str) -> PaneVerdict {
         session_ref: None,
         corrected: None,
         reason: Some(reason.to_string()),
-        retry_after_ms: None,
         duplicate: None,
     }
 }
@@ -73,7 +78,6 @@ fn base(pane: &ReconcilePane, verdict: ReconcileVerdict) -> PaneVerdict {
         session_ref: None,
         corrected: None,
         reason: None,
-        retry_after_ms: None,
         duplicate: None,
     }
 }
@@ -127,7 +131,13 @@ fn resolve_authoritative_ref(
     if let Some(sref) = pane.session_ref.clone() {
         return Some(sref);
     }
-    // 4. ONE uniform promotion rule: {provider: mode, sessionId: resumeSessionId}.
+    // 4. ONE uniform promotion rule.
+    promoted_legacy_claim(pane)
+}
+
+/// §5.2's ONE uniform promotion rule: a legacy `mode` + `resumeSessionId`
+/// pair IS a sessionRef claim — `{provider: mode, sessionId: resumeSessionId}`.
+fn promoted_legacy_claim(pane: &ReconcilePane) -> Option<SessionLocator> {
     let mode = pane
         .mode
         .as_deref()
@@ -159,6 +169,28 @@ fn attach(
     }
 }
 
+/// Council rule 6: the live terminal (if any) currently carrying this CLAIMED
+/// sessionRef — consulted across BOTH identity stores, mirroring
+/// [`resolve_authoritative_ref`]'s dual-source read: the ws-owned identity
+/// registry (live entries, re-verified against registry liveness so a stale
+/// un-retired entry never produces a phantom attach), then the registry-row
+/// join (REST-created resumes whose identity never reached the identity
+/// registry across the crate boundary).
+fn live_terminal_for_claimed_ref(
+    deps: &ReconcileDeps<'_>,
+    claim: &SessionLocator,
+) -> Option<String> {
+    if let Some(entry) = deps
+        .identity
+        .find_by_session(&claim.provider, &claim.session_id)
+    {
+        if deps.registry.is_live(&entry.terminal_id) {
+            return Some(entry.terminal_id);
+        }
+    }
+    deps.registry.live_terminal_for_session_ref(claim)
+}
+
 fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdict {
     // §5.3 row 10 protocol hygiene: malformed entries get an explicit reason.
     if pane.pane_key.is_empty() {
@@ -166,6 +198,9 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
     }
     match pane.kind.as_deref() {
         Some("terminal") => {}
+        Some("fresh-agent") => {
+            return crate::reconcile_freshagent::verdict_for_pane(deps.fresh_agent, pane)
+        }
         Some(_) => return invalid(pane, "unsupported_kind"),
         None => return invalid(pane, "missing_kind"),
     }
@@ -177,6 +212,34 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
     else {
         return invalid(pane, "missing_create_request_id");
     };
+
+    // Council rule 6 (sessionRef-level single-flight, reconcile side): a
+    // live terminal ALREADY carrying the claimed sessionRef wins over
+    // createRequestId keying — every other client's claim for the same ref
+    // (regardless of createRequestId) attaches to the winner, never a
+    // respawn that would open a second JSONL writer (D8). The effective
+    // claim is the structured `sessionRef`, or the legacy `mode` +
+    // `resumeSessionId` pair promoted by §5.2's ONE uniform rule — a
+    // legacy-claiming client must not bypass this branch.
+    if let Some(claim) = pane
+        .session_ref
+        .clone()
+        .or_else(|| promoted_legacy_claim(pane))
+    {
+        if let Some(tid) = live_terminal_for_claimed_ref(deps, &claim) {
+            let server_ref = deps
+                .identity
+                .session_ref_for(&tid)
+                .or_else(|| Some(claim.clone()));
+            let corrected = corrected_flag(Some(&claim), server_ref.as_ref());
+            return PaneVerdict {
+                terminal_id: Some(tid),
+                session_ref: server_ref,
+                corrected,
+                ..base(pane, ReconcileVerdict::Attach)
+            };
+        }
+    }
 
     // Rows 1/2/2b: any LIVE terminal wins.
     let t1 = deps.registry.newest_live_by_create_request_id(&key);
@@ -248,8 +311,14 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
         }
         SessionExistence::Unknown => PaneVerdict {
             reason: Some("index_warming".to_string()),
-            retry_after_ms: Some(RETRY_AFTER_MS),
-            ..base(pane, ReconcileVerdict::Retry)
+            ..base(pane, ReconcileVerdict::Error)
+        },
+        // A known provider with no home on this machine is NOT warming — the
+        // honest, immediate provider_unavailable (the handler's single
+        // deferral fires only on index_warming, `terminal.rs`).
+        SessionExistence::ProviderUnavailable => PaneVerdict {
+            reason: Some("provider_unavailable".to_string()),
+            ..base(pane, ReconcileVerdict::Error)
         },
     }
 }
@@ -328,6 +397,7 @@ mod tests {
                 registry: &self.registry,
                 identity: &self.identity,
                 existence: &self.probe,
+                fresh_agent: None,
             }
         }
 
@@ -477,18 +547,35 @@ mod tests {
         );
     }
 
-    /// Row 5 (§9.1 test 6): cold index on a known provider → honest retry,
-    /// never dead_session, never optimistic respawn.
+    /// Row 5 (§9.1 test 6): cold index on a known provider → honest
+    /// error{index_warming}, never dead_session, never optimistic respawn.
+    /// (`retry` is deleted from the wire; the handler's bounded single
+    /// deferral is the recovery attempt, `terminal.rs`.)
     #[test]
-    fn row5_unknown_existence_yields_retry_with_backoff() {
+    fn row5_unknown_existence_yields_error_index_warming() {
         let f = Fixture::new();
         f.probe.set("claude", "s-cold", SessionExistence::Unknown);
         let mut p = pane("cr-5");
         p.session_ref = Some(sref("claude", "s-cold"));
         let v = f.one(p);
-        assert_eq!(v.verdict, ReconcileVerdict::Retry);
+        assert_eq!(v.verdict, ReconcileVerdict::Error);
         assert_eq!(v.reason.as_deref(), Some("index_warming"));
-        assert_eq!(v.retry_after_ms, Some(RETRY_AFTER_MS));
+    }
+
+    /// A known provider whose session root does not exist on this machine →
+    /// immediate error{provider_unavailable} — never index_warming (which
+    /// would trigger the handler's deferral), never dead_session.
+    #[test]
+    fn provider_unavailable_existence_yields_error_provider_unavailable() {
+        let f = Fixture::new();
+        f.probe
+            .set("codex", "s-pu", SessionExistence::ProviderUnavailable);
+        let mut p = pane("cr-pu");
+        p.mode = Some("codex".to_string());
+        p.session_ref = Some(sref("codex", "s-pu"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Error);
+        assert_eq!(v.reason.as_deref(), Some("provider_unavailable"));
     }
 
     /// Row 6: no terminalId at all, just a claim that IS on disk → respawn
@@ -543,7 +630,7 @@ mod tests {
         assert_eq!(v.reason.as_deref(), Some("missing_create_request_id"));
 
         let mut bad_kind = pane("cr-10c");
-        bad_kind.kind = Some("fresh-agent".to_string());
+        bad_kind.kind = Some("browser".to_string());
         let v = f.one(bad_kind);
         assert_eq!(v.verdict, ReconcileVerdict::Invalid);
         assert_eq!(v.reason.as_deref(), Some("unsupported_kind"));
@@ -665,6 +752,69 @@ mod tests {
             v.session_ref,
             Some(sref("codex", "s-rest")),
             "identity must resolve via the registry-side resume_session_id"
+        );
+    }
+
+    /// Council rule 6, registry-row half: a REST-created LIVE terminal whose
+    /// identity lives ONLY on the registry row (resume_session_id, no
+    /// identity-registry entry) still answers a different client's claim for
+    /// the same sessionRef with attach{its terminalId} — never a second
+    /// writer (D8).
+    #[test]
+    fn cross_client_claim_attaches_to_live_rest_created_terminal() {
+        let f = Fixture::new();
+        f.registry.register_headless(HeadlessTerminal {
+            terminal_id: "T-rest-live".to_string(),
+            stream_id: "S-rest-live".to_string(),
+            mode: "codex".to_string(),
+            resume_session_id: Some("s-shared".to_string()),
+            create_request_id: Some("cr-WINNER".to_string()),
+            created_at: Some(1_000),
+        });
+        // Session Present on disk — the D8 shape would otherwise be respawn.
+        f.probe.set("codex", "s-shared", SessionExistence::Present);
+
+        let mut p = pane("cr-OTHER");
+        p.mode = Some("codex".to_string());
+        p.session_ref = Some(sref("codex", "s-shared"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Attach);
+        assert_eq!(v.terminal_id.as_deref(), Some("T-rest-live"));
+        assert_eq!(v.session_ref, Some(sref("codex", "s-shared")));
+        assert_eq!(v.corrected, None, "the claim matched server truth");
+    }
+
+    /// Council rule 6, legacy-claim half: §5.2's ONE uniform promotion rule
+    /// applies BEFORE the sessionRef-attach lookup — a pane claiming only the
+    /// legacy `mode` + `resumeSessionId` pair (NO structured sessionRef)
+    /// whose session is carried by a live terminal under a DIFFERENT
+    /// createRequestId attaches to that terminal, never the D8 respawn that
+    /// would open a second JSONL writer.
+    #[test]
+    fn legacy_resume_claim_attaches_to_live_terminal_across_create_request_ids() {
+        let f = Fixture::new();
+        f.registry.register_headless(HeadlessTerminal {
+            terminal_id: "T-legacy-live".to_string(),
+            stream_id: "S-legacy-live".to_string(),
+            mode: "codex".to_string(),
+            resume_session_id: Some("s-legacy".to_string()),
+            create_request_id: Some("cr-WINNER".to_string()),
+            created_at: Some(1_000),
+        });
+        // Session Present on disk — the fall-through path would derive the
+        // D8 respawn.
+        f.probe.set("codex", "s-legacy", SessionExistence::Present);
+
+        let mut p = pane("cr-OTHER");
+        p.mode = Some("codex".to_string());
+        p.resume_session_id = Some("s-legacy".to_string()); // legacy claim only
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Attach);
+        assert_eq!(v.terminal_id.as_deref(), Some("T-legacy-live"));
+        assert_eq!(v.session_ref, Some(sref("codex", "s-legacy")));
+        assert_eq!(
+            v.corrected, None,
+            "a matching promoted claim is not a correction"
         );
     }
 

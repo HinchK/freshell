@@ -60,7 +60,7 @@ use freshell_protocol::{
     FreshAgentSend, FreshAgentSendAccepted, ServerMessage, SessionType,
 };
 
-use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome};
+use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
 const PROVIDER: &str = "claude";
@@ -97,6 +97,12 @@ pub struct FreshClaudeState {
     /// `resuming` analog, simplified: contenders return immediately instead of
     /// waiting -- the winner's frames broadcast to every client anyway).
     resuming: Arc<TokioMutex<std::collections::HashSet<String>>>,
+    /// P1.13 identity-event sink (the pane-ledger bridge,
+    /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
+    /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
+    /// post-construction by `freshell-server` (precedent:
+    /// `TerminalRegistry::set_activity_observer`).
+    identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
 }
 
 /// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
@@ -142,7 +148,44 @@ impl FreshClaudeState {
             cli_index: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             resuming: Arc::new(TokioMutex::new(std::collections::HashSet::new())),
+            identity_sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
+    pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
+        let _ = self.identity_sink.set(sink);
+    }
+
+    /// The wired identity sink, if any.
+    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+        self.identity_sink.get().cloned()
+    }
+
+    /// Broadcast a `freshAgent.error` alarm/degradation frame (P1.13; Task 10
+    /// consumes this too). Same envelope contract as codex's helper (`codex.rs`):
+    /// top-level `sessionType`/`provider` are REQUIRED (locator resolution) and
+    /// `message` is user-facing (the banner shows the message, never the code) —
+    /// but unlike codex this one cannot hardcode the session type: provider
+    /// `claude` covers BOTH `freshclaude` and `kilroy`, so the flavour is a param.
+    fn emit_fresh_agent_error(
+        &self,
+        session_id: &str,
+        session_type: &str,
+        code: &str,
+        message: &str,
+    ) {
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: json!({
+                "type": "freshAgent.error",
+                "sessionId": session_id,
+                "code": code,
+                "message": message,
+            }),
+            provider: PROVIDER.to_string(),
+            session_id: session_id.to_string(),
+            session_type: session_type.to_string(),
+        }));
     }
 
     /// Reap every owned claude sidecar: SIGTERM the Node process (so it cleanly kills its
@@ -213,6 +256,17 @@ impl FreshClaudeState {
             }
         };
 
+        // P1.13: FULL settings snapshot for the binding row the consumer writes at
+        // `sdk.session.init` (claude has no sandbox concept — always `None`). Built
+        // from the SAME values the create request below actually sends.
+        let settings = crate::identity_sink::FreshAgentSettings {
+            model: msg.model.clone(),
+            sandbox: None,
+            permission_mode: msg.permission_mode.clone(),
+            effort: msg.effort.clone(),
+            cwd: msg.cwd.clone(),
+        };
+
         // Send the create request (faithful to createClaudeSdkOptions inputs).
         let create_req = json!({
             "type": "create",
@@ -244,11 +298,13 @@ impl FreshClaudeState {
         };
 
         // Start the stdout consumer (the completion edge normalization lives here).
+        // `Some(settings)` => the consumer records a binding row at `sdk.session.init`.
         let consumer = self.spawn_consumer(
             reader,
             created.clone(),
             session_type.to_string(),
             created.clone(),
+            Some(settings),
         );
 
         self.sessions.lock().await.insert(
@@ -421,6 +477,17 @@ impl FreshClaudeState {
         ));
     }
 
+    /// Reconcile liveness probe (campaign §4.3, Task 13): resolve the DURABLE
+    /// claude UUID through [`Self::cli_index`] to its sessions-map key, then
+    /// check the map. The sessions map is read UNFILTERED — no session_type
+    /// filter, so kilroy sessions count for free (V2 N-A17-1).
+    pub async fn has_live_session(&self, session_id: &str) -> bool {
+        let Some(key) = self.cli_index.lock().await.get(session_id).cloned() else {
+            return false;
+        };
+        self.sessions.lock().await.contains_key(&key)
+    }
+
     // ── freshAgent.attach (restart parity: resume untracked sessions in place) ──────────
 
     /// Handle a `freshAgent.attach` for claude/kilroy. Decision table (restart parity):
@@ -484,6 +551,30 @@ impl FreshClaudeState {
         let Some(transcript) = crate::claude_snapshot::locate_transcript(durable) else {
             return Err(ResumeClaudeError::NotFound);
         };
+        // P1.13 (Task 10): recover the pane's recorded settings from the ledger so a
+        // resume-in-place does not silently revert model/permissionMode/effort. V7/A10
+        // alarm gate: alarm ONLY when the ledger PROVES prior recording yet no snapshot
+        // is recoverable. Never-recorded transcripts (the entire pre-existing
+        // ~/.claude/projects population — resume_for_attach exists FOR them) stay silent.
+        let sink = self.identity_sink();
+        let recovered = sink
+            .as_ref()
+            .and_then(|s| s.load_settings("claude", durable));
+        if recovered.is_none()
+            && sink
+                .as_ref()
+                .is_some_and(|s| s.was_recorded("claude", durable))
+        {
+            // Recorded before, unrecoverable now — the genuine anomaly.
+            tracing::warn!(session = %durable, "freshagent.claude.settings_record_unrecoverable");
+            self.emit_fresh_agent_error(
+                durable,
+                session_type_str(msg.session_type), // preserves freshclaude vs kilroy in the frame
+                "SETTINGS_RESET",
+                "Session settings could not be recovered after restart - the agent is running with default model and permissions. Reconfirm your settings.",
+            );
+        }
+        let rec = recovered.clone().unwrap_or_default();
         // The CLI's resume lookup is scoped to the ORIGINAL cwd's project slug
         // (ledger A15) -- resume with the cwd recorded in the transcript itself.
         // If that directory is gone, fall back to path-based resume
@@ -493,7 +584,12 @@ impl FreshClaudeState {
             .filter(|c| std::path::Path::new(c).is_dir());
         let (resume_value, resume_cwd) = match original_cwd {
             Some(cwd) => (json!(durable), json!(cwd)),
-            None => (json!(transcript.to_string_lossy()), json!(msg.cwd)),
+            // Attach cwd stays primary; the ledger record's cwd is a FINAL
+            // fallback only when both existing sources are absent (Task 10).
+            None => (
+                json!(transcript.to_string_lossy()),
+                json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
+            ),
         };
 
         let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar()
@@ -504,9 +600,11 @@ impl FreshClaudeState {
             "type": "create",
             "requestId": request_id,
             "cwd": resume_cwd,
-            "model": Value::Null,
-            "permissionMode": Value::Null,
-            "effort": Value::Null,
+            // Recovered from the ledger record (Task 10); `json!` serializes `None`
+            // as `null`, preserving today's fallback wire shape exactly on a miss.
+            "model": rec.model,
+            "permissionMode": rec.permission_mode,
+            "effort": rec.effort,
             "resumeSessionId": resume_value,
         });
         if let Err(err) = write_line(&mut stdin, &create_req).await {
@@ -528,13 +626,17 @@ impl FreshClaudeState {
         // Register under the CLIENT's id: the consumer stamps the map key on every
         // envelope and the frozen client routes by envelope sessionId
         // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane.
-        // 4-arg spawn_consumer: the sidecar's created id is the eviction identity
-        // guard for this consumer.
+        // The sidecar's created id is the eviction identity guard for this consumer.
+        // `settings` (P1.13, Task 10): `Some(rec)` re-records the row under any new
+        // cliSessionId (the old durable's row keeps serving `load_settings`, so later
+        // attaches with the old id still resolve — no repeat-fire, V7 §4); `None`
+        // records nothing (no laundered blank row under the new id, V7/A10).
         let consumer = self.spawn_consumer(
             reader,
             msg.session_id.clone(),
             session_type.clone(),
             sidecar_session_id.clone(),
+            recovered,
         );
         self.sessions.lock().await.insert(
             msg.session_id.clone(),
@@ -569,6 +671,7 @@ impl FreshClaudeState {
             actual_session_ref: None,
             expected_session_ref: None,
             request_id: request_id.clone(),
+            retry_after_ms: None,
             terminal_exit_code: None,
             terminal_id: None,
         }));
@@ -583,16 +686,25 @@ impl FreshClaudeState {
     /// `sidecar_session_id` is the id THIS consumer's sidecar is keyed by; it guards the
     /// eviction so a stale consumer can never evict a newer session re-registered under
     /// the same map key (attach-resume, Task 6).
+    ///
+    /// `settings` (P1.13): `Some` = record a fresh-agent binding row at
+    /// `sdk.session.init` (create path / resume-with-record); `None` = do NOT record
+    /// (resume of a never-recorded session — writing would launder a blank row under
+    /// the new cliSessionId, V7/A10). The row's `mode` is the `session_type` param
+    /// (the `"freshclaude"` vs `"kilroy"` flavour; provider is always [`PROVIDER`]).
     fn spawn_consumer(
         &self,
         mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
         session_id: String,
         session_type: String,
         sidecar_session_id: String,
+        settings: Option<crate::identity_sink::FreshAgentSettings>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         let sessions = self.sessions.clone();
         let cli_index = self.cli_index.clone();
+        let identity_sink = self.identity_sink();
+        let state = self.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
@@ -613,6 +725,43 @@ impl FreshClaudeState {
                             .insert(cli_id.to_string(), session_id.clone());
                         if let Some(session) = sessions.lock().await.get_mut(&session_id) {
                             session.cli_session_id = Some(cli_id.to_string());
+                        }
+                        // P1.13: binding row keyed by the DURABLE cliSessionId, with
+                        // the FULL create-settings snapshot — AWAITED here (this arm
+                        // runs on the async consumer task) so the row is durable
+                        // BEFORE the init-driven broadcast below proceeds (V8/A11).
+                        // A failed write is surfaced user-visibly, never
+                        // warn-and-drop, then the identity event proceeds.
+                        // No-laundering guard (V7/A10, parity with codex's
+                        // `record_codex_binding`): never persist an all-blank
+                        // snapshot — it would make `was_recorded` true while
+                        // `load_settings` returns None (the server sink's
+                        // blank-snapshot guard), arming a FALSE SETTINGS_RESET
+                        // for a legitimately-default create on a later resume.
+                        let recordable = settings
+                            .as_ref()
+                            .filter(|s| **s != crate::identity_sink::FreshAgentSettings::default());
+                        if let (Some(sink), Some(settings)) = (identity_sink.clone(), recordable) {
+                            if let Err(e) = sink
+                                .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                                    provider: PROVIDER.into(),
+                                    session_id: cli_id.to_string(),
+                                    mode: session_type.clone(),
+                                    create_request_id: None,
+                                    resolves_pending: None,
+                                    supersedes: None,
+                                    settings: settings.clone(),
+                                })
+                                .await
+                            {
+                                tracing::warn!(error = %e, session = %cli_id, "freshagent.claude.binding_write_failed");
+                                state.emit_fresh_agent_error(
+                                    cli_id,
+                                    &session_type,
+                                    "LEDGER_WRITE_FAILED",
+                                    "Failed to persist this session's resume record - settings may not survive a server restart.",
+                                );
+                            }
                         }
                     }
                 }
@@ -1839,6 +1988,245 @@ rl.on('line', (line) => {
         })
         .await;
         assert!(st.cli_index.lock().await.is_empty());
+        drop(env);
+    }
+
+    /// P1.13 (Task 9): the `sdk.session.init` arm must record ONE fresh-agent binding
+    /// row through the identity sink — keyed by the DURABLE cliSessionId, carrying the
+    /// FULL create-settings snapshot and the sessionType flavour — AWAITED before the
+    /// init-driven broadcast proceeds (durable-before-answer, V8/A11).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_init_records_binding_with_create_settings() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Drive freshAgent.create with sessionType kilroy + explicit settings.
+        let mut msg = dedup_create_msg("req-binding-init");
+        msg.session_type = SessionType::Kilroy;
+        msg.model = Some("opus-x".to_string());
+        msg.permission_mode = Some("plan".to_string());
+        msg.effort = Some("high".to_string());
+        msg.cwd = Some(env.dir.to_string_lossy().to_string());
+        state.handle_create(msg).await;
+        await_claude_created(&mut rx, "req-binding-init").await;
+
+        // Wait for sdk.session.init to be consumed: the binding write is AWAITED
+        // before the init frame broadcasts, so seeing the freshAgent.session.init
+        // envelope proves the row already landed.
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.session.init" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("freshAgent.session.init consumed within budget");
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings.last().expect("binding at sdk.session.init");
+        assert_eq!(b.provider, "claude");
+        assert_eq!(b.mode, "kilroy", "sessionType flavour preserved in the row");
+        assert_eq!(
+            b.session_id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "keyed by cliSessionId"
+        );
+        assert_eq!(b.settings.model.as_deref(), Some("opus-x"));
+        assert_eq!(b.settings.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(b.settings.effort.as_deref(), Some("high"));
+        assert!(b.settings.cwd.is_some());
+    }
+
+    /// No-laundering guard (V7/A10, parity with codex's `record_codex_binding`):
+    /// a create carrying NO optional settings (model/permissionMode/effort/cwd all
+    /// None) must NOT persist an all-blank binding row at `sdk.session.init`. A blank
+    /// row makes `was_recorded` true while `load_settings` returns None (the server
+    /// sink's blank-snapshot guard) — the exact SETTINGS_RESET alarm condition — so a
+    /// legitimately-default session would false-alarm on a later resume. The init
+    /// frame itself still broadcasts; only the ledger write is skipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_init_with_all_blank_settings_records_no_binding() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // dedup_create_msg carries no model/permissionMode/effort/cwd — the
+        // all-blank snapshot shape.
+        state
+            .handle_create(dedup_create_msg("req-binding-blank"))
+            .await;
+        await_claude_created(&mut rx, "req-binding-blank").await;
+
+        // The init frame still broadcasts (the skip affects ONLY the ledger write).
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.session.init" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("freshAgent.session.init consumed within budget");
+
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "an all-blank settings snapshot must not be persisted \
+             (it would arm a false SETTINGS_RESET on resume)"
+        );
+        drop(env);
+    }
+
+    // ── resume settings-from-ledger (P1.13, Task 10) ─────────────────────────────
+
+    /// P1.13 (Task 10): resume-in-place must reapply the pane's recorded
+    /// model/permissionMode/effort from the ledger record instead of sending Nulls —
+    /// the known defect where a restarted freshclaude/kilroy pane silently reverted
+    /// its settings. The fake sidecar logs the WHOLE create-request JSON per spawn,
+    /// so the wire itself is the assertion surface.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_for_attach_reapplies_settings_from_ledger() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (state, _rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "claude",
+            DURABLE,
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("opus-x".into()),
+                sandbox: None,
+                permission_mode: Some("plan".into()),
+                effort: Some("high".into()),
+                cwd: None,
+            },
+        );
+        state.set_identity_sink(fake);
+
+        // Drive the donor resume flow (attach to DURABLE with a transcript on disk).
+        state
+            .handle_attach(attach_msg_with_resume("client-nanoid-settings", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        let create_req: serde_json::Value =
+            serde_json::from_str(log.lines().next().expect("one spawn-logged create request"))
+                .unwrap();
+        assert_eq!(create_req["model"], "opus-x");
+        assert_eq!(create_req["permissionMode"], "plan");
+        assert_eq!(create_req["effort"], "high");
+        drop(env);
+    }
+
+    /// V7/A10: record misses are ROUTINE — `resume_for_attach` exists precisely to
+    /// serve never-tracked transcripts (every claude-CLI-created and pre-ship session
+    /// in the shared `~/.claude/projects` store). They resume silently with nulls
+    /// exactly as today (the preserved fallback), and record NOTHING under the new
+    /// cliSessionId (settings: None ⇒ no laundered blank row — Task 9).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_without_record_is_silent_and_sends_nulls() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (state, mut rx) = state_with_bus();
+        // Deliberately empty: no record, no snapshot.
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        state
+            .handle_attach(attach_msg_with_resume("client-nanoid-norec", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        // Today's behavior preserved as the silent fallback: nulls on the wire.
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        let create_req: serde_json::Value =
+            serde_json::from_str(log.lines().next().expect("one spawn-logged create request"))
+                .unwrap();
+        assert_eq!(create_req["model"], Value::Null);
+        assert_eq!(create_req["permissionMode"], Value::Null);
+        assert_eq!(create_req["effort"], Value::Null);
+
+        // Bounded bus drain (pattern from Task 5): NO SETTINGS_RESET frame may appear.
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            assert!(
+                !text.contains("SETTINGS_RESET"),
+                "never-recorded resume must stay silent"
+            );
+        }
+        // No defaults laundering: no binding row was written under the new cliSessionId.
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "a load_settings miss must not write a blank row"
+        );
+        drop(env);
+    }
+
+    /// The genuine anomaly (V7/A10): the ledger PROVES prior fresh-agent recording,
+    /// yet no snapshot is recoverable — the only resume case that alarms.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_with_prior_record_but_unrecoverable_settings_alarms() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // was_recorded=true, load_settings=None — the SETTINGS_RESET-positive fixture.
+        fake.seed_recorded_only("claude", DURABLE);
+        state.set_identity_sink(fake);
+
+        state
+            .handle_attach(attach_msg_with_resume("client-nanoid-alarm", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let mut found = false;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["event"]["code"] == "SETTINGS_RESET" {
+                // Top-level sessionType/provider (locator resolution) + a
+                // user-facing message (the banner shows the message, never the code).
+                assert_eq!(frame["event"]["type"], "freshAgent.error");
+                assert_eq!(frame["sessionType"], "freshclaude");
+                assert_eq!(frame["provider"], "claude");
+                assert!(frame["event"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Reconfirm your settings"));
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "recorded-but-unrecoverable resume must broadcast SETTINGS_RESET"
+        );
         drop(env);
     }
 

@@ -57,10 +57,64 @@ struct Server {
     identity: freshell_ws::identity::TerminalIdentityRegistry,
 }
 
+/// Test probe that answers `exists` from a scripted sequence (pops from the
+/// Vec, repeats the last answer forever) — how the deferral tests simulate an
+/// index that warms up (or never does) between derivations.
+struct FlippingProbe {
+    answers: std::sync::Mutex<std::collections::VecDeque<freshell_ws::existence::SessionExistence>>,
+    last: std::sync::Mutex<freshell_ws::existence::SessionExistence>,
+}
+
+impl FlippingProbe {
+    fn new(answers: Vec<freshell_ws::existence::SessionExistence>) -> Self {
+        let last = *answers.last().expect("at least one scripted answer");
+        Self {
+            answers: std::sync::Mutex::new(answers.into_iter().collect()),
+            last: std::sync::Mutex::new(last),
+        }
+    }
+}
+
+impl freshell_ws::existence::SessionExistenceProbe for FlippingProbe {
+    fn exists(
+        &self,
+        _provider: &str,
+        _session_id: &str,
+    ) -> freshell_ws::existence::SessionExistence {
+        match self.answers.lock().unwrap().pop_front() {
+            Some(answer) => answer,
+            None => *self.last.lock().unwrap(),
+        }
+    }
+
+    fn ever_observed(&self, _provider: &str, _session_id: &str) -> bool {
+        false
+    }
+}
+
 /// Real axum server on an ephemeral loopback port. Returns handles to the
 /// SHARED registry + identity registry so tests can seed generations
 /// deterministically (the §9.1 headless convention).
 async fn spawn_server() -> Server {
+    spawn_server_with(|_| {}).await
+}
+
+/// [`spawn_server`] with a state mutator (e.g. shrink the deferral budget so
+/// the warming tests never wait a real 2s).
+async fn spawn_server_with(mutate: impl FnOnce(&mut WsState)) -> Server {
+    spawn_server_with_probe(
+        std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        mutate,
+    )
+    .await
+}
+
+/// [`spawn_server_with`] with an injected existence probe (design §5.1: the
+/// disk-truth input is a test fake).
+async fn spawn_server_with_probe(
+    probe: freshell_ws::existence::SharedExistenceProbe,
+    mutate: impl FnOnce(&mut WsState),
+) -> Server {
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -68,7 +122,7 @@ async fn spawn_server() -> Server {
     let registry = freshell_terminal::TerminalRegistry::new();
     let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
 
-    let state = WsState {
+    let mut state = WsState {
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: identity.clone(),
         auth_token: Arc::clone(&auth_token),
@@ -105,9 +159,13 @@ async fn spawn_server() -> Server {
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: None,
-        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        session_existence: probe,
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
     };
+    mutate(&mut state);
 
     let router = freshell_ws::router(state);
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -190,6 +248,21 @@ fn reconcile_request(reconcile_id: &str, panes: serde_json::Value) -> WsMessage 
             "panes": panes,
         })
         .to_string(),
+    )
+}
+
+/// One-pane request whose only recoverable identity is a structured claim —
+/// existence-probe-driven rows (5/warming) are reached deterministically.
+fn reconcile_request_with_session_ref(provider: &str, session_id: &str) -> WsMessage {
+    reconcile_request(
+        "rec-warming",
+        serde_json::json!([{
+            "paneKey": "pk-warm",
+            "kind": "terminal",
+            "mode": provider,
+            "createRequestId": format!("cr-{session_id}"),
+            "sessionRef": { "provider": provider, "sessionId": session_id }
+        }]),
     )
 }
 
@@ -437,6 +510,45 @@ async fn contradicting_claim_is_answered_with_server_ref_and_corrected() {
     assert_eq!(verdict["corrected"], true);
 }
 
+/// Council rule 6 (sessionRef-level single-flight, reconcile side): a live
+/// terminal spawned under createRequestId A and identity-stamped with
+/// sessionRef {claude, sess-x} answers a reconcile claim from
+/// createRequestId B (a different client) with attach{terminalId of A's
+/// terminal} — never a second writer for the same session file (D8).
+#[tokio::test]
+async fn different_create_request_id_same_session_ref_gets_attach_to_winner() {
+    let server = spawn_server().await;
+    // Seed: headless terminal live in the registry, identity-stamped with
+    // sessionRef {claude, sess-x} (the existing seeding pattern).
+    headless(&server, "T-winner", Some("cr-WINNER"), "claude", 1_000);
+    server
+        .identity
+        .upsert("T-winner", Some("claude"), Some("sess-x"), None, 1);
+
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    ws.send(reconcile_request(
+        "rec-xclient",
+        serde_json::json!([{
+            "paneKey": "pk-x",
+            "kind": "terminal",
+            "mode": "claude",
+            "createRequestId": "cr-OTHER",
+            "sessionRef": { "provider": "claude", "sessionId": "sess-x" }
+        }]),
+    ))
+    .await
+    .expect("send request");
+
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    let v = &result["verdicts"][0];
+    assert_eq!(v["verdict"], "attach");
+    assert_eq!(v["terminalId"], "T-winner");
+    assert_eq!(
+        v["sessionRef"],
+        serde_json::json!({ "provider": "claude", "sessionId": "sess-x" })
+    );
+}
+
 // --- 9.1.10 single-flight create-dedupe --------------------------------------------
 
 /// Change #1 (the council's two-tab double-respawn blocker): on a
@@ -536,4 +648,84 @@ async fn frozen_client_create_path_is_unchanged_no_dedupe() {
 
     server.registry.kill(&id1);
     server.registry.kill(&id2);
+}
+
+// --- 9.1.6 index warming: error{index_warming} + bounded single deferral ----------
+
+/// warming-never-completes (council red test): a probe pinned to Unknown
+/// forever must yield error{index_warming} after ONE bounded deferral —
+/// never a hang, never a fake fresh/dead_session.
+#[tokio::test]
+async fn warming_never_completes_yields_error_index_warming() {
+    // Server with deferral budget shrunk for tests (50ms) and the default
+    // NoIndexProbe (always Unknown for known providers).
+    let server = spawn_server_with(|state| state.reconcile_deferral_budget_ms = 50).await;
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    let started = std::time::Instant::now();
+    ws.send(reconcile_request_with_session_ref("claude", "sess-1"))
+        .await
+        .expect("send request");
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "bounded, single deferral"
+    );
+    let v = &result["verdicts"][0];
+    assert_eq!(v["verdict"], "error");
+    assert_eq!(v["reason"], "index_warming");
+    assert!(
+        v.get("retryAfterMs").is_none(),
+        "retry is deleted from the wire"
+    );
+}
+
+/// A known provider with no home on this machine is NOT warming — it gets
+/// the honest provider_unavailable label, immediately (no 2s deferral).
+#[tokio::test]
+async fn provider_unavailable_is_immediate_and_honest() {
+    // A single scripted answer repeats forever — "always ProviderUnavailable".
+    let probe = FlippingProbe::new(vec![
+        freshell_ws::existence::SessionExistence::ProviderUnavailable,
+    ]);
+    // Deliberately LARGE budget: proves no deferral happens for this reason.
+    let server = spawn_server_with_probe(std::sync::Arc::new(probe), |state| {
+        state.reconcile_deferral_budget_ms = 30_000
+    })
+    .await;
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    let started = std::time::Instant::now();
+    ws.send(reconcile_request_with_session_ref("codex", "sess-9"))
+        .await
+        .expect("send request");
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "provider_unavailable must never trigger the warming deferral"
+    );
+    let v = &result["verdicts"][0];
+    assert_eq!(v["verdict"], "error");
+    assert_eq!(v["reason"], "provider_unavailable");
+}
+
+/// The deferral is real: index warms during the wait -> the SECOND derivation
+/// answers with the warm verdict, not error.
+#[tokio::test]
+async fn warming_resolves_during_deferral_rederives() {
+    // Fake probe: first call Unknown, subsequent calls Absent (never observed
+    // -> per existing rules the verdict for a never-observed identity is
+    // fresh{identity_never_observed}).
+    let probe = FlippingProbe::new(vec![
+        freshell_ws::existence::SessionExistence::Unknown,
+        freshell_ws::existence::SessionExistence::Absent,
+    ]);
+    let server = spawn_server_with_probe(std::sync::Arc::new(probe), |state| {
+        state.reconcile_deferral_budget_ms = 50
+    })
+    .await;
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    ws.send(reconcile_request_with_session_ref("claude", "sess-2"))
+        .await
+        .expect("send request");
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    assert_ne!(result["verdicts"][0]["verdict"], "error");
 }

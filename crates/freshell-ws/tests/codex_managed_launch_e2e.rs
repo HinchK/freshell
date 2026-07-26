@@ -153,8 +153,11 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
         activity: None,
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
     };
 
     let router = freshell_ws::router(state);

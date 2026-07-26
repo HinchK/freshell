@@ -135,9 +135,17 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       // Prove the reconnected terminal is FUNCTIONALLY alive (not just
       // showing stale pre-restart DOM content): a brand-new command must
       // still execute correctly after the client recreates/reattaches.
+      // Budget note: 60s, not 20s. The assertion is unchanged (the marker
+      // MUST appear); only the wait budget grew. Under a full-project run
+      // this spec shares the host with ~14 parallel workers each spawning
+      // rust servers (and cargo build-lock contention), and the
+      // post-restart recreate/reattach round-trip was observed to
+      // legitimately exceed 20s under that load while passing comfortably
+      // in isolation (both observed on 2026-07-26). The spec-level
+      // test.setTimeout(180_000) already anticipated slow full-suite runs.
       const marker2 = `HARNESS01-POST-RESTART-${randomUUID()}`
       await terminal.executeCommand(`echo ${marker2}`)
-      await terminal.waitForOutput(marker2, { timeout: 20_000 })
+      await terminal.waitForOutput(marker2, { timeout: 60_000 })
 
       const xtermText = await page.locator('.xterm').first().textContent()
       expect(xtermText).not.toContain('[Error]')

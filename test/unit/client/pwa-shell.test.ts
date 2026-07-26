@@ -110,7 +110,7 @@ describe('PWA shell registration', () => {
     })
   })
 
-  it('reloads once when a new service worker takes control', () => {
+  it('reloads once when a new service worker takes control of an already-controlled page', () => {
     const register = vi.fn().mockResolvedValue({ update: vi.fn().mockResolvedValue(undefined) })
     const addEventListener = vi.fn()
     const handlers: Record<string, EventListener> = {}
@@ -122,6 +122,9 @@ describe('PWA shell registration', () => {
       writable: true,
       value: {
         register,
+        // The page is ALREADY controlled -- this controllerchange is an
+        // UPDATE swap, the case the stale-client reload exists for.
+        controller: {},
         addEventListener: vi.fn((event: string, handler: EventListener) => {
           handlers[event] = handler
           addEventListener(event, handler)
@@ -142,6 +145,47 @@ describe('PWA shell registration', () => {
     expect(reload).toHaveBeenCalledTimes(1)
     expect(storage.setItem).toHaveBeenCalledWith('freshell.sw.controller-reload', '1')
     expect(addEventListener).toHaveBeenCalledWith('controllerchange', expect.any(Function))
+  })
+
+  it('does not reload on the first controllerchange of an uncontrolled page (first-boot claim)', () => {
+    // WAVE-B fast-follow (B3 lane review): on FIRST boot the SW's
+    // install -> skipWaiting -> clients.claim fires controllerchange on a
+    // page that was never controlled. Reloading there races the first-boot
+    // recovery offer: by the time the reload lands, the auto shell tab has
+    // persisted a layout, hadPersistedLayoutAtBoot flips true, and the
+    // offer is permanently lost. The first claim must NOT reload; only a
+    // real update swap (controller already existed) does.
+    const register = vi.fn().mockResolvedValue({ update: vi.fn().mockResolvedValue(undefined) })
+    const handlers: Record<string, EventListener> = {}
+    const reload = vi.fn()
+    const storage = createStorageMock()
+
+    Object.defineProperty(navigator, 'serviceWorker', {
+      configurable: true,
+      writable: true,
+      value: {
+        register,
+        // No controller: the page was NOT controlled when we registered.
+        controller: null,
+        addEventListener: vi.fn((event: string, handler: EventListener) => {
+          handlers[event] = handler
+        }),
+      },
+    })
+
+    Object.defineProperty(window, 'sessionStorage', {
+      configurable: true,
+      writable: true,
+      value: storage,
+    })
+
+    registerServiceWorker({ enabled: true, reload, storage })
+    // First claim: no reload.
+    handlers.controllerchange?.(new Event('controllerchange'))
+    expect(reload).not.toHaveBeenCalled()
+    // A LATER swap (a genuine update) still reloads.
+    handlers.controllerchange?.(new Event('controllerchange'))
+    expect(reload).toHaveBeenCalledTimes(1)
   })
 
   it('clears the stale reload sentinel on startup', () => {

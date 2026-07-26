@@ -251,6 +251,10 @@ function stripTransientSessionFields(content: any): any {
     resumeSessionId: _resumeSessionId,
     sessionRef: _legacySessionRef,
     sessionId: _sessionId,
+    // A19: reconcile fold state is volatile — never persisted.
+    pendingReconcile: _pendingReconcile,
+    reconcileNotice: _reconcileNotice,
+    reconcileEpoch: _reconcileEpoch,
     ...rest
   } = content
 
@@ -593,6 +597,8 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             zoomedPane: _zp,
             refreshRequestsByPane: _rrbp,
             restoreFallbackAttemptsByPane: _rfabp,
+            deadSessionAdjudication: _dsa,
+            reconcileWarming: _rw,
             ...persistablePanes
           } = state.panes
           persistablePanesSection = {

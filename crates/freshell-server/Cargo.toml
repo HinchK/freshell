@@ -66,6 +66,10 @@ dotenvy = "0.15.7"
 # `createHash('sha1')` (`fresh-agent-extras-router.ts:76`) -- not a security
 # use of SHA-1, just a deterministic per-cwd bucket name.
 sha1 = "0.10"
+# B3/P1.9 `recovery_inventory.rs`: the 16-hex-char `contentId` digest over the
+# timestamp-free inventory substance (same sha2 the tabs-persist digest
+# convention uses, `crates/freshell-ws/src/tabs_persist.rs:82-87`).
+sha2 = "0.10"
 # DIAG-01/DIAG-03: structured JSONL logging. `tracing` is the event/span API;
 # `tracing-subscriber`'s `registry` (default feature) gives the `Layer` +
 # `LookupSpan` machinery `logging.rs`'s custom formatter builds on, and

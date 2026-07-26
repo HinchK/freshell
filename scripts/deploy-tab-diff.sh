@@ -266,43 +266,27 @@ case "$CMD" in
     echo "================ TAB-DIFF DIVERGENCE (${COUNT}) ================"
     jq -r '.[] | "\(.verdict)\tdevice=\(.pane.device)\ttab=\(.pane.tabName) (\(.pane.tabKey))\tpane=\(.pane.paneId)\tkind=\(.pane.kind)\twas=\(.pane.sessionRef.provider // "-"):\(.pane.sessionRef.sessionId // "-")\(if .after then "\tnow=\(.after.provider):\(.after.sessionId)" else "" end)"' <<<"$DIFF"
     echo "================================================================"
-    # Remediation is TARGETED (:175): it restores ONLY the diverged panes (one
-    # --pane per diverged paneKey, the restore API's selective mode) from the
-    # IMMUTABLE multi-client BUNDLE recorded in the BEFORE capture (the exact
-    # set of per-client component generation ids at capture), via --components
-    # -- the SAME coherent union the capture saw, NEVER a single client's
-    # generationId (:2621), and never the WHOLE union (which would duplicate
-    # every still-healthy pane). Everything is read from the BEFORE file +
+    # Remediation points at the UI recovery flow (recover-my-panes): the
+    # tabs-snapshots store is read by GET /api/recovery/inventory, and a
+    # fresh browser context connecting to the server is offered the captured
+    # panes to rebuild. Everything below is read from the BEFORE file +
     # $DIFF, so verify performs ZERO network operations in --after/offline
     # mode (:2619).
     # NO CAPTURED IDENTITY panes are NOT snapshot-remediable: no generation
-    # carries a sessionRef for them, so restore-tabs.sh could only rebuild a
-    # blank session (a duplicate of the loss). They get a manual-recovery
-    # note instead of a --pane entry.
+    # carries a sessionRef for them, so any snapshot-driven recovery could
+    # only rebuild a blank session (a duplicate of the loss). They get a
+    # manual-recovery note instead.
     UNVERIFIABLE=$(jq '[.[] | select(.verdict == "NO CAPTURED IDENTITY")]' <<<"$DIFF")
     REMEDIABLE=$(jq '[.[] | select(.verdict != "NO CAPTURED IDENTITY")]' <<<"$DIFF")
     if [[ "$(jq 'length' <<<"$UNVERIFIABLE")" != "0" ]]; then
-      echo "UNRECOVERABLE FROM SNAPSHOTS: identity was never captured for these live CLI panes, so restore-tabs.sh cannot rebuild them."
+      echo "UNRECOVERABLE FROM SNAPSHOTS: identity was never captured for these live CLI panes, so no snapshot-driven recovery can rebuild them."
       echo "Recover manually from the provider's own session store (e.g. 'amplifier resume', 'codex resume', 'claude --resume'), matching by cwd and last activity."
       jq -r '.[] | "  NO-IDENTITY device=\(.pane.device)\ttab=\(.pane.tabName) (\(.pane.tabKey))\tpane=\(.pane.paneId)\tmode=\(.pane.mode // "-")"' <<<"$UNVERIFIABLE"
     fi
     if [[ "$(jq 'length' <<<"$REMEDIABLE")" != "0" ]]; then
-      echo "REMEDIATION (rebuild each diverged device's MISSING panes from its captured immutable bundle):"
-      while IFS= read -r -d '' dev; do
-        comps=$(jq -r --arg d "$dev" '(.bundles[$d].components // []) | join(",")' "$BEFORE")
-        if [[ -z "$comps" ]]; then
-          printf 'ERROR: no captured bundle for device %q in the before-file; cannot recommend a union-consistent restore.\n' "$dev" >&2
-          continue
-        fi
-        pane_args=""
-        while IFS= read -r -d '' pk; do
-          pane_args+=$(printf ' --pane %q' "$pk")
-        done < <(jq -j --arg d "$dev" \
-          '[.[] | select(.pane.device == $d) | "\(.pane.tabKey)#\(.pane.paneId)"] | unique | .[] | . + "\u0000"' \
-          <<<"$REMEDIABLE")
-        printf '  scripts/restore-tabs.sh --url %q --token <TOKEN> --device %q --components %s --force%s\n' \
-          "$URL" "$dev" "$comps" "$pane_args"
-      done < <(jq -j '[.[].pane.device] | unique | .[] | . + "\u0000"' <<<"$REMEDIABLE")
+      echo "REMEDIATION (UI recovery flow): open a FRESH browser context (new profile or incognito window) against ${URL} and sign in."
+      echo "The recover-my-panes offer surfaces the captured snapshot for each affected device; accept it to rebuild the missing panes with their captured session identity."
+      jq -r '[.[].pane.device] | unique | .[] | "  affected device: \(.)"' <<<"$REMEDIABLE"
     fi
     cleanup; exit 1
     ;;

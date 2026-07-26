@@ -319,14 +319,27 @@ test.describe('Amplifier Restore (Rust only)', () => {
         // own greppable stdout marker, scoped to THIS pane's terminal, and
         // (2) the argv log the fixture writes on every invocation
         // (independent of terminal-buffer scraping).
-        await expect(async () => {
-          const leaf = await findLeafById(tabId!, positivePaneId)
-          expect(leaf?.content?.status).not.toBe('error')
-          expect(leaf?.content?.terminalId).toBeTruthy()
-        }).toPass({ timeout: 30_000 })
-
-        const restoredTerminalId: string | undefined = (await findLeafById(tabId!, positivePaneId))?.content?.terminalId
+        // Wait for the pane to hold a NEW terminalId (the respawn's), not
+        // the persisted pre-restart one. Under the adopted reconcile client
+        // the pane is non-destructive on boot: it keeps its persisted
+        // terminalId + status until the verdict folds, so a "status not
+        // error && terminalId truthy" gate is satisfiable by the STALE
+        // pre-restart identity and racing it captured a dead terminal id
+        // (the resume marker then lands in the NEW terminal's buffer,
+        // invisible to a poll scoped to the stale one). Same pattern the
+        // restore-contract wall's claude scenario uses: poll until the id
+        // provably changed.
+        const restoredTerminalId: string = await expect
+          .poll(async () => {
+            const leaf = await findLeafById(tabId!, positivePaneId)
+            if (leaf?.content?.status === 'error') return null
+            const tid = leaf?.content?.terminalId
+            return tid && tid !== terminalIdBefore ? tid : null
+          }, { timeout: 30_000 })
+          .not.toBeNull()
+          .then(async () => (await findLeafById(tabId!, positivePaneId))!.content.terminalId)
         expect(restoredTerminalId).toBeTruthy()
+        expect(restoredTerminalId).not.toBe(terminalIdBefore)
         // Same xterm line-wrap caveat as the "session started" marker above
         // -- strip newlines before matching.
         await expect.poll(async () => {

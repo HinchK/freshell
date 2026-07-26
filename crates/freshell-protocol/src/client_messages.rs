@@ -359,7 +359,9 @@ pub struct ReconcilePane {
     /// client omitted it (the entry is then `invalid`).
     #[serde(default)]
     pub pane_key: String,
-    /// v1: `"terminal"` only (fresh-agent extension deferred, §12).
+    /// v1: `"terminal"`; `"fresh-agent"` is answered on connections that
+    /// negotiated `paneReconcileFreshAgentV1` (campaign §4.3) — otherwise it
+    /// keeps the frozen-client `invalid{unsupported_kind}` contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// `TerminalMode` string as persisted (`"shell"`, `"claude"`, …).

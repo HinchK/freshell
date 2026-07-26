@@ -22,11 +22,13 @@ mod diag;
 mod existence;
 mod extensions;
 mod files;
+mod identity_sink;
 mod instance_id;
 mod logging;
 mod network;
 mod proxy;
 mod rate_limit;
+mod recovery_inventory;
 mod screenshots;
 mod serve_client;
 mod session_directory;
@@ -340,6 +342,12 @@ async fn main() -> ExitCode {
             freshell_sessions::parse::default_opencode_data_home(),
         ),
     ));
+    // Lane B2 (campaign §2.3.2): server-side codex identity locator. Same
+    // sessions root the resume-time rollout locator below walks. `None`
+    // when HOME/CODEX_HOME are unresolvable — every codex_association
+    // entry point no-ops in that case.
+    let codex_locator = freshell_ws::codex_sessions_root()
+        .map(|root| std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(root)));
     // Slice 3a (docs/plans/2026-07-18-agent-api-mcp-parity-spec.md): wire the
     // SAME locators + coding-CLI command specs `ws_state` (below) gets into
     // `fresh_agent_state` too, so `POST /api/tabs` terminal-mode creates (a)
@@ -427,11 +435,24 @@ async fn main() -> ExitCode {
         home.as_ref()
             .map(|h| h.join(".freshell").join("pane-ledger")),
     ));
+    // P1.13: inject the ledger-backed identity sink into the fresh-agent
+    // states (constructed earlier, before the ledger exists — the
+    // post-construction setter exists precisely for this ordering). All
+    // clones of each state share the `Arc<OnceLock>` field, so this covers
+    // every route's clone.
+    let fresh_agent_identity_sink: freshell_freshagent::SharedPaneIdentitySink =
+        std::sync::Arc::new(identity_sink::LedgerIdentitySink::new(pane_ledger.clone()));
+    fresh_codex_state.set_identity_sink(fresh_agent_identity_sink.clone());
+    fresh_claude_state.set_identity_sink(fresh_agent_identity_sink.clone());
+    fresh_opencode_state.set_identity_sink(fresh_agent_identity_sink.clone());
+    // opencode REST surface (Task 7's materialization site; V10 A13-N1)
+    fresh_agent_state.set_identity_sink(fresh_agent_identity_sink.clone());
     let ws_state = WsState {
         activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),
         opencode_locator: opencode_locator.clone(),
+        codex_locator: codex_locator.clone(),
         // Reconciliation handshake disk-truth probe (design §5.1): backed by
         // the SAME shared session index the History surfaces read; the
         // no-index fallback (honest `Unknown` on known providers) when no
@@ -444,9 +465,35 @@ async fn main() -> ExitCode {
                 // transcript deleted while the server was DOWN still derives
                 // loud dead_session (per-boot observed set is empty then).
                 Some(std::sync::Arc::clone(&pane_ledger)),
+                // Provider session roots resolved with the SAME helpers the
+                // `session_index` sources above use — a known provider whose
+                // root does not exist on this machine derives an immediate
+                // `error{provider_unavailable}`, never `index_warming`.
+                session_directory::provider_home()
+                    .map(|h| {
+                        std::collections::HashMap::from([
+                            ("claude".to_string(), session_directory::claude_home(&h)),
+                            ("codex".to_string(), session_directory::codex_home(&h)),
+                            (
+                                "opencode".to_string(),
+                                freshell_sessions::parse::default_opencode_data_home(),
+                            ),
+                            (
+                                "amplifier".to_string(),
+                                freshell_sessions::amplifier::amplifier_home(&h),
+                            ),
+                        ])
+                    })
+                    .unwrap_or_default(),
             )),
             None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         },
+        // §5.3 row 5: the ONE bounded index-warming deferral's budget
+        // (council-pinned single deferral, default 2000ms).
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        // Per-boot fresh-agent respawn-answer counter (campaign §4.3, V2/A7):
+        // in-memory by design — a restart intentionally resets it.
+        fresh_agent_respawn_counts: Default::default(),
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
@@ -638,6 +685,13 @@ async fn main() -> ExitCode {
             AMPLIFIER_LOCATOR_SWEEP_INTERVAL,
         );
     }
+    // Lane B2: codex locator sweep — same cadence as the sibling sweeps.
+    if codex_locator.is_some() {
+        freshell_ws::codex_association::spawn_codex_locator_sweep(
+            ws_state.clone(),
+            AMPLIFIER_LOCATOR_SWEEP_INTERVAL,
+        );
+    }
     // DIAG-05: the diag router's `sessionsProjects` reads the SAME session
     // index (clone before the move below into `session_directory_state`).
     let diag_session_index = session_index.clone();
@@ -787,12 +841,22 @@ async fn main() -> ExitCode {
             snapshots_dir: home
                 .as_ref()
                 .map(|h| h.join(".freshell").join("tabs-snapshots")),
-            fresh_agent: fresh_agent_state.clone(),
-            screenshots: screenshots.clone(),
-            terminals: registry.clone(), // the SAME TerminalRegistry from main.rs:246
-            restore_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            restore_ack_timeout: std::time::Duration::from_secs(5),
         }))
+        // B3/P1.9 Task 2: the recovery-inventory read surface. Joins the SAME
+        // tabs-snapshots store as `tabs_snapshots` above (read-only), the
+        // pane-identity ledger (`:427`), and the shared terminal registry
+        // (`:249`, the D7 liveness join).
+        .merge(recovery_inventory::router(
+            recovery_inventory::RecoveryInventoryState {
+                auth_token: auth_token.as_ref().clone(),
+                snapshots_dir: home
+                    .as_ref()
+                    .map(|h| h.join(".freshell").join("tabs-snapshots")),
+                ledger: std::sync::Arc::clone(&pane_ledger),
+                registry: registry.clone(),
+                identity: terminal_identity.clone(),
+            },
+        ))
         .merge(network::router(network_state))
         .merge(session_directory::router(session_directory_state))
         .merge(sessions::router(sessions::SessionsState {

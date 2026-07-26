@@ -15,7 +15,8 @@
 //! feeds a monotone observed-set, so "disk has seen this identity at least
 //! once (this boot)" survives the session later disappearing from disk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use freshell_sessions::directory_index::SessionIndex;
@@ -33,17 +34,25 @@ pub struct IndexExistenceProbe {
     /// memory — survives restarts, so a transcript deleted while the server
     /// was down yields loud dead_session, not silent fresh.
     ledger: Option<Arc<freshell_ws::pane_ledger::PaneLedger>>,
+    /// Each known provider's session root on THIS machine (the same paths
+    /// `main.rs` hands the index sources). A known provider whose root does
+    /// not exist will never warm up — the cold-index answer for it is
+    /// `ProviderUnavailable`, not the deferrable `Unknown`. A provider with
+    /// no entry keeps the plain `Unknown` cold answer.
+    provider_roots: HashMap<String, PathBuf>,
 }
 
 impl IndexExistenceProbe {
     pub fn new(
         index: Arc<SessionIndex>,
         ledger: Option<Arc<freshell_ws::pane_ledger::PaneLedger>>,
+        provider_roots: HashMap<String, PathBuf>,
     ) -> Self {
         Self {
             index,
             observed: Mutex::new(HashSet::new()),
             ledger,
+            provider_roots,
         }
     }
 
@@ -78,7 +87,19 @@ impl SessionExistenceProbe for IndexExistenceProbe {
             self.kick_refresh();
         }
         match self.index.peek() {
-            None => SessionExistence::Unknown,
+            None => {
+                // Cold index: a known provider whose session root does not
+                // exist on this machine will NEVER warm up — that's an
+                // immediate, honest provider_unavailable, not index_warming.
+                if self
+                    .provider_roots
+                    .get(provider)
+                    .is_some_and(|root| !root.exists())
+                {
+                    return SessionExistence::ProviderUnavailable;
+                }
+                SessionExistence::Unknown
+            }
             Some(items) => {
                 self.record_observed(&items);
                 let hit = items
@@ -152,7 +173,14 @@ mod tests {
             Duration::from_millis(50),
             None, // no persistent parse-cache — fully isolated temp home
         ));
-        (IndexExistenceProbe::new(Arc::clone(&index), None), index)
+        (
+            IndexExistenceProbe::new(
+                Arc::clone(&index),
+                None,
+                HashMap::from([("claude".to_string(), home.to_path_buf())]),
+            ),
+            index,
+        )
     }
 
     /// Construct a probe exactly as `main.rs` does — over an index whose
@@ -164,11 +192,11 @@ mod tests {
     ) -> IndexExistenceProbe {
         let home = temp_claude_home("with-ledger");
         let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
-            vec![Arc::new(ClaudeSource::new(home)) as Arc<dyn SessionSource>],
+            vec![Arc::new(ClaudeSource::new(home.clone())) as Arc<dyn SessionSource>],
             Duration::from_millis(50),
             None,
         ));
-        IndexExistenceProbe::new(index, ledger)
+        IndexExistenceProbe::new(index, ledger, HashMap::from([("claude".to_string(), home)]))
     }
 
     #[test]
@@ -236,6 +264,40 @@ mod tests {
         let home = temp_claude_home("cold");
         let (probe, _index) = probe_over(&home);
         // Nothing published yet — honest Unknown, never a guessed Absent.
+        assert_eq!(probe.exists("claude", "s-cold"), SessionExistence::Unknown);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A known provider whose session root does NOT exist on this machine
+    /// will never warm up — the probe answers `ProviderUnavailable`, not the
+    /// deferrable `Unknown`.
+    #[tokio::test]
+    async fn missing_provider_root_is_provider_unavailable_not_unknown() {
+        let home = temp_claude_home("root-missing");
+        let gone = home.join("never-created-claude-root");
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(gone.clone())) as Arc<dyn SessionSource>],
+            Duration::from_millis(50),
+            None,
+        ));
+        let probe = IndexExistenceProbe::new(
+            index,
+            None,
+            std::collections::HashMap::from([("claude".to_string(), gone)]),
+        );
+        assert_eq!(
+            probe.exists("claude", "s-any"),
+            SessionExistence::ProviderUnavailable
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The counterpart boundary: the root EXISTS but the index is still cold
+    /// → `Unknown` (warming), unchanged by the ProviderUnavailable check.
+    #[tokio::test]
+    async fn existing_but_cold_provider_root_stays_unknown() {
+        let home = temp_claude_home("root-cold");
+        let (probe, _index) = probe_over(&home);
         assert_eq!(probe.exists("claude", "s-cold"), SessionExistence::Unknown);
         let _ = std::fs::remove_dir_all(&home);
     }

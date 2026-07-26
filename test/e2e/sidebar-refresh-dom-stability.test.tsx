@@ -86,6 +86,7 @@ vi.mock('@/lib/ws-client', () => ({
 }))
 
 vi.mock('@/lib/api', () => ({
+  getRecoveryInventory: async () => ({ recoverable: false, contentId: 'test', device: null, otherDevices: [], ledgerOnly: [] }),
   api: {
     get: (url: string) => apiGet(url),
     patch: vi.fn().mockResolvedValue({}),

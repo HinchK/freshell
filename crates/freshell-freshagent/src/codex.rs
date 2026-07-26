@@ -68,7 +68,7 @@ use freshell_protocol::{
     FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 
-use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome};
+use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
@@ -146,6 +146,12 @@ pub struct FreshCodexState {
     /// entries only on an explicit `freshAgent.kill` ([`Self::handle_kill`]); an
     /// unrequested sidecar exit does NOT evict (mirrors legacy, see the type doc).
     create_dedup: Arc<FreshAgentCreateDedup<CodexCreateRecord>>,
+    /// P1.13 identity-event sink (the pane-ledger bridge,
+    /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
+    /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
+    /// post-construction by `freshell-server` (precedent:
+    /// `TerminalRegistry::set_activity_observer`).
+    identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -272,7 +278,99 @@ impl FreshCodexState {
             dead_threads: Arc::new(TokioMutex::new(HashMap::new())),
             dead_thread_ttl: DEAD_THREAD_CACHE_TTL,
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
+            identity_sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
+    pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
+        let _ = self.identity_sink.set(sink);
+    }
+
+    /// The wired identity sink, if any.
+    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+        self.identity_sink.get().cloned()
+    }
+
+    /// P1.13: write one fresh-agent binding row (FULL settings snapshot) through the
+    /// identity sink. AWAITED at every identity site (the wave-A durable-before-answer
+    /// policy) BEFORE that site's reply/broadcast goes out; a failed write is surfaced
+    /// user-visibly ([`Self::emit_fresh_agent_error`], never warn-and-drop) and then the
+    /// identity event proceeds -- a write failure never blocks it.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_codex_binding(
+        &self,
+        session_id: &str,
+        create_request_id: Option<&str>,
+        model: &str,
+        sandbox: Option<&str>,
+        permission_mode: Option<&str>,
+        effort: Option<&str>,
+        cwd: Option<&str>,
+        supersedes: Option<&str>,
+    ) {
+        let Some(sink) = self.identity_sink() else {
+            return;
+        };
+        let settings = crate::identity_sink::FreshAgentSettings {
+            model: if model.is_empty() {
+                None
+            } else {
+                Some(model.into())
+            },
+            sandbox: sandbox.map(Into::into),
+            permission_mode: permission_mode.map(Into::into),
+            effort: effort.map(Into::into),
+            cwd: cwd.map(Into::into),
+        };
+        // No-laundering guard (V7/A10): never persist an all-blank snapshot --
+        // it would mask a genuine record miss forever. Real creates always carry
+        // at least cwd; a supersession write always goes through (G3 linkage).
+        if settings == crate::identity_sink::FreshAgentSettings::default() && supersedes.is_none() {
+            return;
+        }
+        if let Err(e) = sink
+            .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                provider: "codex".into(),
+                session_id: session_id.into(),
+                mode: "freshcodex".into(),
+                create_request_id: create_request_id.map(Into::into),
+                resolves_pending: None,
+                supersedes: supersedes.map(Into::into),
+                settings,
+            })
+            .await
+        {
+            tracing::warn!(error = %e, session = %session_id, "freshagent.codex.ledger_write_failed");
+            self.emit_fresh_agent_error(
+                session_id,
+                "LEDGER_WRITE_FAILED",
+                "Failed to persist this session's resume record - settings may not survive a server restart.",
+            );
+        }
+    }
+
+    /// Broadcast a `freshAgent.error` alarm/degradation frame (Tasks 5/6 consume this
+    /// too). Wire shape (V1/A2, verified against `fresh-agent-ws.ts:182-193`):
+    /// `{ "type": "freshAgent.event", "sessionId", "sessionType", "provider",
+    /// "event": { "type": "freshAgent.error", "code", "message" } }` -- built on the
+    /// SAME [`ServerMessage::FreshAgentEvent`] envelope [`lost_session_frame`] uses (the
+    /// existing `freshAgent.error` forwarding path), so it is byte-compatible with the
+    /// frozen client's banner path: top-level `sessionType`/`provider` are REQUIRED
+    /// (locator resolution) and `message` is user-facing (the banner shows the message,
+    /// never the code).
+    fn emit_fresh_agent_error(&self, session_id: &str, code: &str, message: &str) {
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: json!({
+                "type": "freshAgent.error",
+                "sessionId": session_id,
+                "code": code,
+                "message": message,
+            }),
+            provider: PROVIDER.to_string(),
+            session_id: session_id.to_string(),
+            session_type: SESSION_TYPE.to_string(),
+        }));
     }
 
     /// The `PATCH /api/settings` sub-router (the fresh-clients enable toggle).
@@ -353,11 +451,23 @@ impl FreshCodexState {
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
 
-        let cwd = msg.cwd.clone();
-        let model = normalize_freshcodex_model(msg.model.as_deref());
-        let effort = normalize_freshcodex_effort(Some(&model), msg.effort.as_deref());
-        let sandbox = msg.sandbox.map(sandbox_wire_value);
-        let permission_mode = msg.permission_mode.clone();
+        // P1.13 (Task 5, R1): for a resume-create the client's explicit params win and
+        // the ledger record fills the gaps -- merged BEFORE normalization, so a missing
+        // model recovers the recorded one instead of being rewritten to the default.
+        let rec = match msg.resume_session_id.as_deref() {
+            Some(resume_id) => self
+                .identity_sink()
+                .and_then(|s| s.load_settings("codex", resume_id))
+                .unwrap_or_default(),
+            None => crate::identity_sink::FreshAgentSettings::default(),
+        };
+        let cwd = msg.cwd.clone().or(rec.cwd);
+        let raw_model = msg.model.clone().or(rec.model);
+        let model = normalize_freshcodex_model(raw_model.as_deref());
+        let raw_effort = msg.effort.clone().or(rec.effort);
+        let effort = normalize_freshcodex_effort(Some(&model), raw_effort.as_deref());
+        let sandbox = msg.sandbox.map(sandbox_wire_value).or(rec.sandbox);
+        let permission_mode = msg.permission_mode.clone().or(rec.permission_mode);
 
         // Validate the effort maps to the codex wire vocabulary (adapter create calls
         // toCodexReasoningEffort purely to reject unsupported efforts before spawning).
@@ -618,11 +728,11 @@ impl FreshCodexState {
             thread_id.clone(),
             CodexSession {
                 client,
-                model,
-                effort,
+                model: model.clone(),
+                effort: effort.clone(),
                 cwd: cwd.clone(),
-                sandbox,
-                permission_mode,
+                sandbox: sandbox.clone(),
+                permission_mode: permission_mode.clone(),
                 active_turn,
                 consumer,
                 kill_tx: Some(kill_tx),
@@ -630,6 +740,22 @@ impl FreshCodexState {
                 exited,
             },
         );
+
+        // P1.13 identity event (Task 4): the ledger binding row for this create,
+        // AWAITED before the `freshAgent.created` reply below goes out
+        // (durable-before-answer). Covers both the healthy create and the
+        // `handle_create_resume` (R1) path -- both funnel through this shared tail.
+        self.record_codex_binding(
+            &thread_id,
+            Some(&request_id),
+            &model,
+            sandbox.as_deref(),
+            permission_mode.as_deref(),
+            effort.as_deref(),
+            cwd.as_deref(),
+            None,
+        )
+        .await;
 
         // DIAG-01: fresh-agent session lifecycle -- provider/session_id/cwd,
         // never the turn text/prompt content.
@@ -817,6 +943,7 @@ impl FreshCodexState {
             actual_session_ref: None,
             expected_session_ref: None,
             request_id: request_id.clone(),
+            retry_after_ms: None,
             terminal_exit_code: None,
             terminal_id: None,
         }));
@@ -911,6 +1038,17 @@ impl FreshCodexState {
     }
 
     // ── freshAgent.attach (reload-rehydrate, PR-4) ──────────────────────────
+
+    /// Reconcile liveness probe (campaign §4.3, Task 13): is this thread id
+    /// tracked in the sessions map with a sidecar that has NOT exited? The
+    /// exited check matters — a crashed sidecar stays mapped for lazy respawn
+    /// ([`Self::ensure_session_alive`]), but it is not attach-ably live.
+    pub async fn has_live_session(&self, session_id: &str) -> bool {
+        let guard = self.sessions.lock().await;
+        guard
+            .get(session_id)
+            .is_some_and(|s| !s.exited.load(Ordering::SeqCst))
+    }
 
     /// Handle a `freshAgent.attach` for codex (reload-rehydrate). Decision table:
     ///
@@ -1065,7 +1203,7 @@ impl FreshCodexState {
         &self,
         session_id: &str,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
-        let (cwd, model, effort, sandbox, permission_mode) = {
+        let (cwd, session_model, session_effort, session_sandbox, session_permission_mode) = {
             let guard = self.sessions.lock().await;
             let session = guard.get(session_id).ok_or(EnsureAliveError::NotFound)?;
             if !session.exited.load(Ordering::SeqCst) {
@@ -1077,6 +1215,29 @@ impl FreshCodexState {
                 session.effort.clone(),
                 session.sandbox.clone(),
                 session.permission_mode.clone(),
+            )
+        };
+
+        // P1.13 (Task 5, R2): a blank stored model means this registration came from a
+        // settings-less resume (a record miss at R3 time) -- fall back to the ledger
+        // record so crash recovery doesn't silently respawn onto defaults.
+        let (model, sandbox, permission_mode, effort) = if session_model.is_empty() {
+            let rec = self
+                .identity_sink()
+                .and_then(|s| s.load_settings("codex", session_id))
+                .unwrap_or_default();
+            (
+                rec.model.unwrap_or_default(),
+                rec.sandbox,
+                rec.permission_mode,
+                rec.effort,
+            )
+        } else {
+            (
+                session_model,
+                session_sandbox,
+                session_permission_mode,
+                session_effort,
             )
         };
 
@@ -1246,11 +1407,11 @@ impl FreshCodexState {
                 session_id.to_string(),
                 CodexSession {
                     client,
-                    model,
-                    effort,
-                    cwd,
-                    sandbox,
-                    permission_mode,
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    cwd: cwd.clone(),
+                    sandbox: sandbox.clone(),
+                    permission_mode: permission_mode.clone(),
                     active_turn,
                     consumer,
                     kill_tx: Some(kill_tx),
@@ -1259,6 +1420,22 @@ impl FreshCodexState {
                 },
             );
         }
+
+        // P1.13 identity event (Task 4, R2): refresh write under the SAME id --
+        // snapshots the LIVE in-session values (which originate from a real
+        // create/user change); the helper's no-laundering guard skips it if they
+        // are all blank. AWAITED before this fn returns (durable-before-answer).
+        self.record_codex_binding(
+            session_id,
+            None,
+            &model,
+            sandbox.as_deref(),
+            permission_mode.as_deref(),
+            effort.as_deref(),
+            cwd.as_deref(),
+            None,
+        )
+        .await;
 
         // FIX (CODEX-FIRST triage Finding 2): the app-server just proved this id alive again
         // -- clear any stale "recently gone" marking so it doesn't linger.
@@ -1333,11 +1510,11 @@ impl FreshCodexState {
                 new_thread_id.clone(),
                 CodexSession {
                     client,
-                    model,
-                    effort,
-                    cwd,
-                    sandbox,
-                    permission_mode,
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    cwd: cwd.clone(),
+                    sandbox: sandbox.clone(),
+                    permission_mode: permission_mode.clone(),
                     active_turn,
                     consumer,
                     kill_tx: Some(kill_tx),
@@ -1346,6 +1523,23 @@ impl FreshCodexState {
                 },
             );
         }
+
+        // P1.13 identity event (Task 4): NEW ledger row under the new thread id with
+        // `supersedes: Some(old_thread_id)` -- the G3 supersession linkage (V8/A14):
+        // the ledger retires the old row and links it to the new one. This is the
+        // ONLY site that ever knows both ids; the edge is unrecoverable if not
+        // written here. AWAITED before the materialized broadcast below goes out.
+        self.record_codex_binding(
+            &new_thread_id,
+            None,
+            &model,
+            sandbox.as_deref(),
+            permission_mode.as_deref(),
+            effort.as_deref(),
+            cwd.as_deref(),
+            Some(old_session_id),
+        )
+        .await;
 
         // DIAG-01: crash recovery had to mint a fresh thread -- the durable
         // identity MOVED (old_session_id -> new_thread_id); conversation
@@ -1369,6 +1563,18 @@ impl FreshCodexState {
                 }),
             },
         ));
+
+        // P1.13 §2.6b (Task 6): memory loss must be user-visible, not server-log-only.
+        // Emitted AFTER the materialized broadcast above -- the frozen client re-keys
+        // its session state on `materialized` (`fresh-agent-ws.ts:143-160`); emitting
+        // first would target a session id the client no longer tracks. The non-`RESTORE_`
+        // error branch also clears streaming and forces `running -> idle` -- safe here,
+        // the turn is already dead.
+        self.emit_fresh_agent_error(
+            &new_thread_id,
+            "THREAD_MEMORY_LOST",
+            "Codex crashed and this pane was restarted as a new thread. The agent no longer has memory of the earlier conversation in this pane.",
+        );
 
         Ok(EnsureAliveOutcome::Respawned {
             new_session_id: new_thread_id,
@@ -1715,14 +1921,41 @@ impl FreshCodexState {
             .await
             .map_err(ResumeSessionError::Transient)?;
 
+        // P1.13 (Task 5, R3): recover this thread's recorded settings snapshot BEFORE
+        // issuing `thread/resume`, gated per V7/A10.
+        let sink = self.identity_sink();
+        let recovered = sink
+            .as_ref()
+            .and_then(|s| s.load_settings("codex", thread_id));
+        // A record miss with NO prior recording (pre-ship / historical / sidebar-opened
+        // -- the populations this resume path exists to serve, see `snapshot_runtime_for`)
+        // is ROUTINE: resume silently with defaults exactly as before. NO alarm, NO
+        // defaults write (V7).
+        if recovered.is_none()
+            && sink
+                .as_ref()
+                .is_some_and(|s| s.was_recorded("codex", thread_id))
+        {
+            // The ledger PROVES prior fresh-agent recording, yet nothing is
+            // recoverable -- the genuine "never-happens" anomaly. Alarm.
+            tracing::warn!(session = %thread_id, "freshagent.codex.settings_record_unrecoverable");
+            self.emit_fresh_agent_error(
+                thread_id,
+                "SETTINGS_RESET",
+                "Session settings could not be recovered after restart - the agent is \
+                 running with default model and permissions. Reconfirm your settings.",
+            );
+        }
+        let rec = recovered.clone().unwrap_or_default();
+
         let resume_result = client
             .resume_thread(
                 thread_id,
                 StartThreadParams {
                     cwd: cwd.map(str::to_string),
-                    model: None,
-                    sandbox: None,
-                    approval_policy: None,
+                    model: rec.model.clone(),
+                    sandbox: rec.sandbox.clone(),
+                    approval_policy: rec.permission_mode.clone(),
                 },
             )
             .await;
@@ -1788,15 +2021,14 @@ impl FreshCodexState {
                 thread_id.to_string(),
                 CodexSession {
                     client: client.clone(),
-                    // Unknown until a `freshAgent.send` supplies one (matches the
-                    // reference's `settingsByThread` being unpopulated for a thread this
-                    // process has never created/sent to); `handle_send` overwrites these
-                    // via its own `rememberThreadSettings`-equivalent path when it runs.
-                    model: String::new(),
-                    effort: None,
-                    cwd: cwd.map(str::to_string),
-                    sandbox: None,
-                    permission_mode: None,
+                    // P1.13 (Task 5, R3): the ledger record's settings snapshot -- blank
+                    // only when no record was recoverable (never-recorded historical
+                    // sessions resume on defaults, exactly as before this fix).
+                    model: rec.model.clone().unwrap_or_default(),
+                    effort: rec.effort.clone(),
+                    cwd: cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
+                    sandbox: rec.sandbox.clone(),
+                    permission_mode: rec.permission_mode.clone(),
                     active_turn: active_turn.clone(),
                     consumer,
                     kill_tx: Some(kill_tx),
@@ -1805,6 +2037,26 @@ impl FreshCodexState {
                 },
             );
         }
+
+        // P1.13 identity event (Task 5, R3): refresh write re-persisting the RECOVERED
+        // live values, `supersedes: None` -- GATED on an actual recovery. On a miss it
+        // must NOT run: writing would launder blank defaults into the ledger and
+        // permanently mask the miss (V7 §2's laundering finding). AWAITED before this
+        // fn returns (durable-before-answer).
+        if recovered.is_some() {
+            self.record_codex_binding(
+                thread_id,
+                None,
+                rec.model.as_deref().unwrap_or(""),
+                rec.sandbox.as_deref(),
+                rec.permission_mode.as_deref(),
+                rec.effort.as_deref(),
+                cwd.or(rec.cwd.as_deref()),
+                None,
+            )
+            .await;
+        }
+
         Ok(ResumedCodexSession {
             client,
             active_turn,
@@ -3979,6 +4231,141 @@ pub(crate) mod tests {
         }
     }
 
+    /// Task 5 (R3): a restart/reload resume of a thread the ledger holds a full settings
+    /// record for must reapply model/sandbox/permission/effort -- on the registered
+    /// session AND on the `thread/resume` RPC itself (the wire is the contract).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_restart_reapplies_settings_from_ledger() {
+        let _guard = ENV_LOCK.lock().await;
+        let op_log = tempfile::NamedTempFile::new().unwrap();
+        configure_fake_codex_cmd(
+            &json!({ "appendThreadOperationLogPath": op_log.path().to_str().unwrap() }).to_string(),
+        );
+        let (state, _bus) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "codex",
+            "thread-9",
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("gpt-5.3-codex-spark".into()),
+                sandbox: Some("workspace-write".into()),
+                permission_mode: Some("on-request".into()),
+                effort: Some("high".into()),
+                cwd: Some("/w".into()),
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        // Simulate the restart path exactly as the existing R3 tests above do
+        // (`handle_attach_unknown_session_*`): attach to "thread-9", which is NOT in
+        // the in-memory map.
+        state.handle_attach(attach_msg("thread-9")).await;
+
+        // (1) The registered session carries the recovered settings:
+        let sessions = state.sessions.lock().await;
+        let s = sessions.get("thread-9").expect("session registered");
+        assert_eq!(s.model, "gpt-5.3-codex-spark");
+        assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(s.permission_mode.as_deref(), Some("on-request"));
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        drop(sessions);
+
+        // The fake app-server's log write lands from a SEPARATE OS process (see the
+        // single-flight test above) -- poll briefly for it before the one real read.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !std::fs::read_to_string(op_log.path())
+                .unwrap_or_default()
+                .contains("\"thread/resume\"")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("thread/resume reaches the fake app-server's op log");
+
+        // (2) The thread/resume RPC itself carried them (the wire is the contract):
+        let log = std::fs::read_to_string(op_log.path()).unwrap();
+        let resume_line = log
+            .lines()
+            .find(|l| l.contains("\"thread/resume\""))
+            .expect("thread/resume logged");
+        let entry: serde_json::Value = serde_json::from_str(resume_line).unwrap();
+        assert_eq!(entry["params"]["model"], "gpt-5.3-codex-spark");
+        assert_eq!(entry["params"]["sandbox"], "workspace-write");
+    }
+
+    /// V7/A10: record misses are ROUTINE (pre-ship sessions, sidebar-opened historical
+    /// threads -- R3 exists FOR them, see `snapshot_runtime_for`'s doc). They must
+    /// resume silently with defaults exactly as today, and must NOT launder a defaults
+    /// row into the ledger. Permanent regression guard for V7's no-spam rule.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_of_a_never_recorded_session_is_silent_and_writes_no_defaults_row() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (state, mut bus_rx) = state_with_bus();
+        // Deliberately empty: no record, no snapshot.
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Same R3 entry point as above for an untracked "thread-x".
+        state.handle_attach(attach_msg("thread-x")).await;
+
+        // Bounded drain: NO SETTINGS_RESET frame may appear.
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), bus_rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            assert!(
+                !text.contains("SETTINGS_RESET"),
+                "never-recorded resume must stay silent"
+            );
+        }
+        // No defaults laundering (V7 §2): no binding row was written for thread-x.
+        assert!(
+            !fake
+                .bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|b| b.session_id == "thread-x"),
+            "a load_settings miss must not write a defaults row"
+        );
+    }
+
+    /// The genuine anomaly: the ledger PROVES prior fresh-agent recording, yet no
+    /// snapshot is recoverable -- the only case that alarms (V7/A10).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_with_a_prior_record_but_unrecoverable_settings_alarms_settings_reset() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (state, mut bus_rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed_recorded_only("codex", "thread-y"); // was_recorded=true, load_settings=None
+        state.set_identity_sink(fake);
+
+        // Same R3 entry point, attaching untracked "thread-y".
+        state.handle_attach(attach_msg("thread-y")).await;
+
+        let mut found = false;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), bus_rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            if text.contains("SETTINGS_RESET") {
+                // A2 qualification (V1): the frame must carry top-level
+                // sessionType/provider and a user-facing message.
+                assert!(text.contains("freshcodex") && text.contains("codex"));
+                assert!(text.contains("Reconfirm your settings"));
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "recorded-but-unrecoverable resume must broadcast SETTINGS_RESET"
+        );
+    }
+
     /// REVIEW FIX (Minor, item 3): `fail_create`'s `freshAgent.create.failed` frame must
     /// carry `retryable: true`, matching legacy's hardcoded `retryable: true` on every
     /// create-failed path this port's `fail_create` corresponds to (`ws-handler.ts:3334`
@@ -5066,6 +5453,144 @@ pub(crate) mod tests {
         assert_eq!(exited_frame["sessionId"], session_id);
     }
 
+    /// Task 4 (P1.13): a healthy create writes a fresh-agent binding row (provider
+    /// `codex`, mode `freshcodex`, FULL settings snapshot) through the identity sink
+    /// at thread/start -- the ledger row a restarted server later resumes from.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_records_fresh_agent_binding_with_settings() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Drive a real create through the fake app server, requesting explicit
+        // settings -- `create_real_fake_session` doesn't accept settings, so this
+        // inlines the same `freshAgent.create` the existing create tests send.
+        let tmp_cwd = std::env::temp_dir().to_string_lossy().to_string();
+        state
+            .handle_create(FreshAgentCreate {
+                request_id: "req-bind-1".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: Some(tmp_cwd),
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: None,
+                model: Some("gpt-5.3-codex-spark".to_string()),
+                model_selection: None,
+                permission_mode: Some("on-request".to_string()),
+                sandbox: Some(freshell_protocol::Sandbox::WorkspaceWrite),
+                effort: Some("high".to_string()),
+                plugins: None,
+            })
+            .await;
+        let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "fixture create failed: {created}"
+        );
+        let thread_id = created["sessionId"].as_str().unwrap().to_string();
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == thread_id)
+            .expect("binding row written at thread/start");
+        assert_eq!(b.provider, "codex");
+        assert_eq!(b.mode, "freshcodex");
+        assert_eq!(b.settings.model.as_deref(), Some("gpt-5.3-codex-spark"));
+        assert_eq!(b.settings.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(b.settings.permission_mode.as_deref(), Some("on-request"));
+        assert_eq!(b.settings.effort.as_deref(), Some("high"));
+    }
+
+    /// Task 4 (P1.13, awaited-writes policy): a failed ledger write is surfaced as a
+    /// live `freshAgent.error{code:'LEDGER_WRITE_FAILED'}` frame (never a silent
+    /// warn-and-drop) AND the create still succeeds -- a write failure never blocks
+    /// the identity event.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ledger_write_failure_is_surfaced_as_a_live_frame() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.fail_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state.set_identity_sink(fake.clone());
+
+        state
+            .handle_create(FreshAgentCreate {
+                request_id: "req-ledger-fail".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: None,
+                model: Some("gpt-5.3-codex-spark".to_string()),
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+            })
+            .await;
+
+        // Drain the bus (bounded, as in the alarm tests): both the alarm frame and
+        // the created frame must arrive -- in either order.
+        let mut failure_frame: Option<Value> = None;
+        let mut created_frame: Option<Value> = None;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.event"
+                    && frame["event"]["code"] == "LEDGER_WRITE_FAILED"
+                {
+                    failure_frame = Some(frame);
+                } else if frame["type"] == "freshAgent.created" {
+                    created_frame = Some(frame);
+                }
+                if failure_frame.is_some() && created_frame.is_some() {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("a LEDGER_WRITE_FAILED frame AND freshAgent.created arrive within the budget");
+
+        let failure = failure_frame.expect("a LEDGER_WRITE_FAILED frame was broadcast");
+        assert_eq!(failure["sessionType"], "freshcodex");
+        assert_eq!(failure["provider"], "codex");
+        assert_eq!(failure["event"]["type"], "freshAgent.error");
+        assert!(
+            failure["event"]["message"]
+                .as_str()
+                .is_some_and(|m| !m.is_empty()),
+            "the alarm carries a user-facing message: {failure}"
+        );
+
+        // The create still succeeded: the session exists under the created id.
+        let created = created_frame.expect("the create still succeeded");
+        let thread_id = created["sessionId"].as_str().unwrap().to_string();
+        let guard = state.sessions.lock().await;
+        assert!(
+            guard.contains_key(&thread_id),
+            "a write failure never blocks the identity event"
+        );
+    }
+
     /// FIX-2 (codex-first triage): crash recovery is resume-first now. The crashed
     /// sidecar respawns, `thread/resume`s the ORIGINAL thread id, and the turn completes
     /// under that SAME id -- no `freshAgent.session.materialized` broadcast (the durable
@@ -5214,6 +5739,80 @@ pub(crate) mod tests {
         let guard = st.sessions.lock().await;
         assert!(!guard.contains_key(&thread_id));
         assert!(guard.contains_key(&new_thread_id));
+    }
+
+    /// P1.13 §2.6b (Task 6): crash respawn discards conversation memory -- that loss must be
+    /// user-visible. After the mint-new-thread fallback, a `THREAD_MEMORY_LOST` degradation
+    /// frame is broadcast under the NEW thread id, AFTER the
+    /// `freshAgent.session.materialized` frame (the frozen client re-keys its session state
+    /// on materialized; an error frame emitted first would target an id the client no
+    /// longer tracks).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_after_crash_mint_new_thread_broadcasts_thread_memory_lost_after_materialized() {
+        let _guard = ENV_LOCK.lock().await;
+        let (st, mut rx) = state_with_bus();
+
+        configure_fake_codex_cmd(
+            r#"{"threadStartThreadId":"thread-original","exitProcessAfterMethodsOnce":["thread/start"]}"#,
+        );
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+
+        // The respawned sidecar's `thread/resume` reports the thread as genuinely gone,
+        // forcing the mint-new-thread crash-respawn fallback.
+        configure_fake_codex_cmd(
+            &json!({
+                "threadStartThreadId": "thread-respawned",
+                "overrides": {
+                    "thread/resume": {
+                        "error": { "code": -32001, "message": "Thread not found" }
+                    }
+                }
+            })
+            .to_string(),
+        );
+
+        st.handle_send(FreshAgentSend {
+            request_id: Some("req-2".to_string()),
+            provider: freshell_protocol::AgentProvider::Codex,
+            session_id: thread_id.clone(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            text: "hello again".to_string(),
+            images: None,
+            cwd: None,
+            settings: None,
+        })
+        .await;
+
+        let mut saw_materialized = false;
+        let mut new_thread_id = String::new();
+        let mut degradation_after_materialized = false;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            if text.contains("freshAgent.session.materialized") {
+                saw_materialized = true;
+                let materialized: Value = serde_json::from_str(&text).unwrap();
+                new_thread_id = materialized["sessionId"].as_str().unwrap().to_string();
+            }
+            if text.contains("THREAD_MEMORY_LOST") {
+                assert!(
+                    saw_materialized,
+                    "degradation frame must follow materialized (client re-keys on it)"
+                );
+                assert!(
+                    text.contains(&new_thread_id),
+                    "frame must target the NEW thread id"
+                );
+                degradation_after_materialized = true;
+                break;
+            }
+        }
+        assert!(
+            degradation_after_materialized,
+            "crash respawn must broadcast a user-visible degradation frame"
+        );
     }
 
     /// FIX-2: a resume failure that is NOT "thread not found" (a transient RPC error) must

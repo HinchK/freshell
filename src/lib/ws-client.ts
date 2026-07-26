@@ -7,7 +7,7 @@ import {
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
 import { WS_PROTOCOL_VERSION } from '@shared/ws-version'
-import type { ServerMessage, SessionLocator } from '@shared/ws-protocol'
+import type { ReadyCapabilities, ServerMessage, SessionLocator } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
 
 const log = createLogger('WsClient')
@@ -127,6 +127,9 @@ export class WsClient {
   private reconnectEpoch = 0
   private inFlightCreates = new Map<string, InFlightCreate>()
   private preReadyCreateQueue = new Map<string, unknown>()
+  // Per-connection: {} until a ready with capabilities arrives on the CURRENT
+  // socket; reset on disconnect so a downgraded server is honored.
+  private serverCapabilities: NonNullable<ReadyCapabilities> = {}
 
   constructor(private url: string) {}
 
@@ -150,6 +153,9 @@ export class WsClient {
       this._serverInstanceId = typeof msg.serverInstanceId === 'string' && msg.serverInstanceId.trim()
         ? msg.serverInstanceId
         : undefined
+      // Capture BEFORE the replay block below: the CURRENT socket's ack decides
+      // whether the blind in-flight create replay runs.
+      this.serverCapabilities = msg.capabilities ?? {}
       this.clearReadyTimeout()
       const isReconnect = this.wasConnectedOnce
       this.wasConnectedOnce = true
@@ -192,7 +198,10 @@ export class WsClient {
         this.sendNow(next)
       }
 
-      if (isReconnect) {
+      // When paneReconcileV1 was acked on THIS socket's ready, verdicts (not blind
+      // resends) decide the fate of in-flight creates. The preReadyCreateQueue
+      // flush above is unchanged: those are new user-initiated creates.
+      if (isReconnect && !this.serverCapabilities.paneReconcileV1) {
         for (const [requestId, entry] of this.inFlightCreates.entries()) {
           if (entry.lastResendEpoch === this.reconnectEpoch) continue
           if (createRequestIdsFlushed.has(requestId)) {
@@ -280,6 +289,14 @@ export class WsClient {
     return this._serverInstanceId
   }
 
+  /**
+   * Capabilities acked by the server on the CURRENT socket's ready.
+   * Returns {} until a ready with capabilities arrives; reset on disconnect.
+   */
+  getServerCapabilities(): NonNullable<ReadyCapabilities> {
+    return this.serverCapabilities
+  }
+
   connect(): Promise<void> {
     // StrictMode / double-mount safe: callers can call connect() multiple times and should
     // receive the same in-flight promise until the socket is "ready".
@@ -340,7 +357,7 @@ export class WsClient {
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true },
+          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, paneReconcileV1: true },
           ...helloExtensions,
         })
       }
@@ -381,6 +398,9 @@ export class WsClient {
         const closedBeforeReady = !wasReady
         this._state = 'disconnected'
         this.ws = null
+        // Capabilities are per-connection: reset so a downgraded server (next
+        // ready without the ack) is honored.
+        this.serverCapabilities = {}
         this.disconnectHandlers.forEach((handler) => handler())
 
         // Close codes:
@@ -515,6 +535,7 @@ export class WsClient {
     this.pendingMessages = []
     this.inFlightCreates.clear()
     this.preReadyCreateQueue.clear()
+    this.serverCapabilities = {}
     this._serverInstanceId = undefined
     this.connectPromise = null
     this.reconnectAttempts = 0

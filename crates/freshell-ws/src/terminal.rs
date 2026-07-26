@@ -122,6 +122,7 @@ pub async fn run(
     terminal_output_batch_v1: bool,
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -259,6 +260,7 @@ pub async fn run(
                             &conn_sink,
                             terminal_output_batch_v1,
                             pane_reconcile_v1,
+                            pane_reconcile_fresh_agent_v1,
                             &mut create_limiter,
                         )
                         .await
@@ -436,6 +438,24 @@ pub async fn run(
         state.screenshots.remove_capable_client(conn_id);
     }
     state.registry.remove_connection(conn_id);
+
+    // D8 conn-death lease release (council rule 8): pid-less in-flight leases
+    // are released inside the registry call; pid-carrying ones come back
+    // STILL-HELD — kill via the registry handle, confirm, then force-release
+    // (kill-before-release). Unconfirmed kills hold the lease closed.
+    for (locator, pid) in state.registry.release_session_ref_leases_for_conn(conn_id) {
+        let Some(pid) = pid else { continue };
+        if kill_session_ref_holder_and_confirm(&state.registry, pid).await {
+            state.registry.force_release_after_confirmed_kill(&locator);
+        } else {
+            tracing::error!(target: "invariant",
+                connection_id = conn_id,
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                pid,
+                "session_ref_lease_conn_death_kill_unconfirmed: holding lease closed");
+        }
+    }
 }
 
 /// Parse + dispatch one inbound client text frame. Returns `false` to close the
@@ -449,6 +469,7 @@ async fn handle_client_text(
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
     pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
@@ -506,13 +527,26 @@ async fn handle_client_text(
         }
         ClientMessage::ClientDiagnostic(_) => true,
         ClientMessage::TerminalCreate(create) => {
-            handle_create(create, ws_tx, state, pane_reconcile_v1, create_limiter).await
+            handle_create(
+                create,
+                ws_tx,
+                state,
+                conn_id,
+                pane_reconcile_v1,
+                create_limiter,
+            )
+            .await
         }
-        // P0.3: server-side codex identity capture from the client's persisted
-        // candidate -- guarded (campaign plan §2.3.1); rejects are logged and
-        // ignored, never answered (legacy parity ws-handler.ts:2951-2963).
+        // RETIRED (campaign §2.3.2, Lane B2): codex identity has exactly one
+        // writer -- the server-side rollout locator (codex_association). The
+        // frozen client still sends this frame (TerminalView.tsx durability
+        // handler), so accept-and-ignore with a debug breadcrumb; never an
+        // error to the client, never an identity write.
         ClientMessage::TerminalCodexCandidatePersisted(candidate) => {
-            crate::codex_candidate::handle_codex_candidate_persisted(state, candidate).await;
+            tracing::debug!(
+                terminal_id = %candidate.terminal_id,
+                "codex_candidate_ignored: client candidate channel retired (server locator is authoritative)"
+            );
             true
         }
         ClientMessage::TerminalAttach(attach) => {
@@ -524,6 +558,16 @@ async fn handle_client_text(
             }
         }
         ClientMessage::TerminalInput(input) => {
+            // Lane B2: MUST complete before the Enter reaches the PTY — the
+            // codex locator's FIRST-submit re-snapshot has to finish before
+            // codex can materialize the rollout this very Enter triggers
+            // (else the pane's own file could land in the snapshot and be
+            // permanently excluded). Sound here: this socket task processes
+            // frames sequentially, and the enclosing handler is already
+            // async. Non-submit data returns immediately; only the first
+            // Enter of an armed codex pane scans (7-9 ms warm — A6).
+            crate::codex_association::note_possible_submit(state, &input.terminal_id, &input.data)
+                .await;
             state
                 .registry
                 .input(&input.terminal_id, input.data.as_bytes());
@@ -708,7 +752,8 @@ async fn handle_client_text(
             // byte-inertness does not depend on this, since it never sends
             // the request at all (§3).
             if pane_reconcile_v1 {
-                return handle_pane_reconcile(request, ws_tx, state).await;
+                return handle_pane_reconcile(request, ws_tx, state, pane_reconcile_fresh_agent_v1)
+                    .await;
             }
             true
         }
@@ -915,6 +960,115 @@ impl Drop for KeyedCreateGuard {
     }
 }
 
+/// The sessionRef a create claims at spawn time (council rule 7, D8), when
+/// resolvable from the create BODY alone: a non-shell mode whose session id
+/// comes from `sessionRef` (provider must match the mode — the same filter
+/// as the resume derivation in `handle_create`) or the legacy
+/// `resumeSessionId`. Later-resolved identities (fresh-claude preallocation,
+/// the P0.4 restore ladder) are freshly minted or single-source and carry no
+/// concurrent-duplicate shape, so they claim nothing.
+fn create_session_locator(create: &TerminalCreate) -> Option<SessionLocator> {
+    if create.mode == "shell" {
+        return None;
+    }
+    let session_id = create
+        .session_ref
+        .as_ref()
+        .filter(|r| r.provider == create.mode)
+        .map(|r| r.session_id.clone())
+        .or_else(|| create.resume_session_id.clone())
+        .filter(|s| !s.is_empty())?;
+    Some(SessionLocator {
+        provider: create.mode.clone(),
+        session_id,
+    })
+}
+
+/// RAII release of a D8 sessionRef lease claim
+/// ([`freshell_terminal::TerminalRegistry::claim_session_ref`] →
+/// `Acquired`): on EVERY non-complete exit of `handle_create` — pre-spawn
+/// error, spawn failure, or task cancellation — drop releases the lease via
+/// `fail_session_ref_claim` (a no-op once `complete_session_ref_claim`
+/// removed it). The winner path disarms and completes explicitly.
+struct SessionRefLeaseGuard {
+    registry: freshell_terminal::TerminalRegistry,
+    locator: SessionLocator,
+    holder_create_request_id: String,
+    claimed_at_ms: i64,
+    armed: bool,
+}
+
+impl SessionRefLeaseGuard {
+    /// Hand ownership of the release decision back to the caller (winner
+    /// bind or the revoked-lease kill path).
+    fn disarm(mut self) -> (SessionLocator, i64) {
+        self.armed = false;
+        (self.locator.clone(), self.claimed_at_ms)
+    }
+}
+
+impl Drop for SessionRefLeaseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .fail_session_ref_claim(&self.locator, &self.holder_create_request_id);
+        }
+    }
+}
+
+/// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
+/// thread reaps promptly — `pty.rs` reader/waiter). `true` = death CONFIRMED.
+async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
+    for _ in 0..20u8 {
+        if !freshell_terminal::registry::pid_alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    !freshell_terminal::registry::pid_alive(pid)
+}
+
+/// Kill-before-release (council rule 8): kill a lease holder's spawn via the
+/// REGISTRY PTY handle ([`freshell_terminal::TerminalRegistry::kill`] —
+/// group-kill discipline, `pty.rs`; NEVER a raw single-pid SIGKILL), then
+/// confirm death. `true` = confirmed dead — only then may the caller
+/// `force_release_after_confirmed_kill`. Unconfirmed (or a pid no registry
+/// terminal owns, where nothing can be group-killed) holds the lease closed.
+async fn kill_session_ref_holder_and_confirm(
+    registry: &freshell_terminal::TerminalRegistry,
+    pid: u32,
+) -> bool {
+    match registry.live_terminal_for_pid(pid) {
+        Some(terminal_id) => {
+            registry.kill(&terminal_id);
+        }
+        None => {
+            tracing::error!(target: "invariant",
+                pid,
+                "session_ref_lease_kill_unroutable: no registry terminal owns the holder pid; holding lease closed");
+            return false;
+        }
+    }
+    confirm_pid_dead_within_500ms(pid).await
+}
+
+/// The D8 loser reply: `error{SESSION_RESERVED, requestId, retryAfterMs}` —
+/// the only error frame that carries `retryAfterMs`.
+async fn send_session_reserved(ws_tx: &mut WsSink, request_id: &str, retry_after_ms: u64) -> bool {
+    let msg = ServerMessage::Error(ErrorMsg {
+        code: ErrorCode::SessionReserved,
+        message: "Another terminal.create for this sessionRef is in flight".to_string(),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: Some(request_id.to_string()),
+        retry_after_ms: Some(retry_after_ms),
+        terminal_exit_code: None,
+        terminal_id: None,
+    });
+    send(ws_tx, &msg).await
+}
+
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
@@ -922,6 +1076,7 @@ async fn handle_create(
     create: TerminalCreate,
     ws_tx: &mut WsSink,
     state: &WsState,
+    conn_id: u64,
     pane_reconcile_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
@@ -977,6 +1132,89 @@ async fn handle_create(
     // Released on EVERY exit path of the spawn below (RAII), success or error;
     // the outcome itself is discoverable through the registry.
     let _keyed_create_guard = keyed_create_guard;
+
+    // Council rule 7 (D8 two-writers closure): per-sessionRef single-flight,
+    // negotiated connections ONLY. The claim runs BEFORE the rate limiter —
+    // a loser's SESSION_RESERVED (like the §5.4 adopt above, the
+    // create_protection.rs precedent) is neither checked nor charged. Legacy
+    // connections never enter this branch: their create flow stays
+    // byte-for-byte unchanged (§11 fence).
+    let mut session_ref_lease: Option<SessionRefLeaseGuard> = None;
+    if pane_reconcile_v1 {
+        if let Some(locator) = create_session_locator(&create) {
+            use freshell_terminal::registry::SessionRefClaim;
+            // Bounded: at most one ExpiredNeedsKill kill→confirm→re-claim
+            // round per create; a second expiry answers reserved instead.
+            for round in 0..2u8 {
+                match state.registry.claim_session_ref(
+                    &locator,
+                    &create.request_id,
+                    conn_id,
+                    now_ms().max(0) as u64,
+                ) {
+                    SessionRefClaim::Acquired => {
+                        session_ref_lease = Some(SessionRefLeaseGuard {
+                            registry: state.registry.clone(),
+                            locator: locator.clone(),
+                            holder_create_request_id: create.request_id.clone(),
+                            claimed_at_ms: now_ms(),
+                            armed: true,
+                        });
+                        break;
+                    }
+                    SessionRefClaim::BoundElsewhere { terminal_id } => {
+                        // Attach to the winner: mirror the §5.4 adopt emission
+                        // above — name the EXISTING terminal, spawn nothing.
+                        tracing::info!(
+                            terminal_id = %terminal_id,
+                            create_request_id = %create.request_id,
+                            provider = %locator.provider,
+                            session_id = %locator.session_id,
+                            "terminal.create.session_ref_attached"
+                        );
+                        let created = ServerMessage::TerminalCreated(TerminalCreated {
+                            created_at: now_ms(),
+                            request_id: create.request_id,
+                            terminal_id: terminal_id.clone(),
+                            clear_codex_durability: None,
+                            cwd: state.registry.probe(&terminal_id).and_then(|row| row.cwd),
+                            restore_error: None,
+                            session_ref: state
+                                .identity
+                                .session_ref_for(&terminal_id)
+                                .or(Some(locator)),
+                        });
+                        return send(ws_tx, &created).await;
+                    }
+                    SessionRefClaim::Held { retry_after_ms } => {
+                        return send_session_reserved(ws_tx, &create.request_id, retry_after_ms)
+                            .await;
+                    }
+                    SessionRefClaim::ExpiredNeedsKill { pid } => {
+                        if round == 0
+                            && kill_session_ref_holder_and_confirm(&state.registry, pid).await
+                        {
+                            state.registry.force_release_after_confirmed_kill(&locator);
+                            continue; // the slot is now free — re-claim
+                        }
+                        // Unconfirmed kill (or a second expiry in one create):
+                        // hold closed, fail loud, answer reserved.
+                        tracing::error!(target: "invariant",
+                            provider = %locator.provider,
+                            session_id = %locator.session_id,
+                            pid,
+                            "session_ref_lease_expired_kill_unconfirmed: holding lease closed");
+                        return send_session_reserved(
+                            ws_tx,
+                            &create.request_id,
+                            freshell_terminal::registry::SESSION_RESERVED_RETRY_AFTER_MS,
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
 
     // Per-connection create rate limit (legacy parity: ws-handler.ts:2376-2389).
     // restore:true bypasses — neither checked nor recorded (`if (!m.restore)`).
@@ -1113,6 +1351,61 @@ async fn handle_create(
                     .await;
                 }
             }
+        }
+    }
+
+    // D7 liveness guard on the DIRECT wire-sessionRef rung (recover-my-panes
+    // Task 2b, defense-in-depth). Every other live-guard lives inside the
+    // createRequestId-keyed ladder (`resolve_claude_restore_session_id`), which
+    // the direct rung above bypasses entirely -- and the D5 recovery path
+    // re-mints the createRequestId, so a session that goes live between the
+    // inventory fetch and the user's accept would otherwise silently spawn a
+    // SECOND `<cli> --resume S` while the original live PTY owns S (the
+    // one-JSONL-writer doctrine: "silently wrong"). Mirrors the ladder's A13
+    // row-matching -- the identity-registry owner check plus the REST-shaped
+    // live-registry-row scan -- but MODE-GENERIC: codex/opencode/amplifier had
+    // no live-guard on ANY path, so this closes their gap too. Applies only
+    // when the resume id was derived from the wire `sessionRef` (the
+    // resumeSessionId fallback and ladder-resolved ids keep their existing
+    // guards).
+    if let Some(live_sid) = create
+        .session_ref
+        .as_ref()
+        .filter(|r| r.provider == mode)
+        .map(|r| r.session_id.as_str())
+        .filter(|sid| !sid.is_empty() && resume_session_id.as_deref() == Some(*sid))
+    {
+        let identity_owner_live =
+            state
+                .identity
+                .find_by_session(&mode, live_sid)
+                .is_some_and(|owner| {
+                    state
+                        .registry
+                        .probe(&owner.terminal_id)
+                        .is_some_and(|r| r.status == freshell_protocol::TerminalRunStatus::Running)
+                });
+        let registry_row_live = identity_owner_live
+            || state.registry.directory().into_iter().any(|entry| {
+                entry.mode == mode
+                    && entry.resume_session_id.as_deref() == Some(live_sid)
+                    && entry.status == freshell_protocol::TerminalRunStatus::Running
+            });
+        if registry_row_live {
+            tracing::warn!(
+                target: "freshell_ws::terminal",
+                mode = %mode,
+                session_id = %live_sid,
+                request_id = %create.request_id,
+                "create_refused: a Running terminal already owns this session (D7 live-guard)"
+            );
+            return send_create_error(
+                ws_tx,
+                ErrorCode::RestoreUnavailable,
+                format!("Session {live_sid} is still running on the server."),
+                &create.request_id,
+            )
+            .await;
         }
     }
 
@@ -1352,6 +1645,10 @@ async fn handle_create(
         // (never-submitted, or already-associated) opencode terminal's armed
         // entry is never left dangling.
         let opencode_locator = state.opencode_locator.clone();
+        // Lane B2: sibling disarm for the codex rollout locator, so an
+        // exited (never-submitted, or already-associated) codex terminal's
+        // armed entry is never left dangling.
+        let codex_locator = state.codex_locator.clone();
         Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
             registry.finish_pty_exit(&tid, exit_code);
@@ -1375,6 +1672,9 @@ async fn handle_create(
                 locator.disarm(&tid);
             }
             if let Some(locator) = &opencode_locator {
+                locator.disarm(&tid);
+            }
+            if let Some(locator) = &codex_locator {
                 locator.disarm(&tid);
             }
         }))
@@ -1474,6 +1774,19 @@ async fn handle_create(
         .await;
     }
 
+    // D8: arm the lease's TTL kill path — record the just-spawned child's pid
+    // on the winner's lease immediately (its presence decides ExpiredNeedsKill
+    // vs revoke-and-hold-closed on expiry).
+    if let Some(guard) = &session_ref_lease {
+        if let Some(pid) = state.registry.pid_of(&terminal_id) {
+            state.registry.set_session_ref_lease_pid(
+                &guard.locator,
+                &guard.holder_create_request_id,
+                pid,
+            );
+        }
+    }
+
     // DEV-0006 S4: adopt the managed codex launch for this terminal
     // (`codexPlan.sidecar.adopt({terminalId, generation: 0})`, `ws:2511`) — ownership
     // transfers from the planner to the terminal; the PTY exit hook above tears it
@@ -1525,6 +1838,40 @@ async fn handle_create(
         resolved_cwd.as_deref(),
         resume_session_id.as_deref(),
     );
+
+    // Lane B2: arm the codex rollout locator for a FRESH (non-resuming)
+    // codex pane. Restore-created panes WITHOUT identity arm too — arm()
+    // gates on resume_session_id, never a restore flag (the wave-A re-arm
+    // contract).
+    //
+    // ORDERING NOTE (A5, validated): this arm runs AFTER the PTY spawn
+    // (registry.create + adopt() have already awaited above). That is safe
+    // ONLY because windows are Enter-anchored: real codex materializes its
+    // rollout at the first user prompt, never in the spawn→arm gap, so the
+    // snapshot cannot miss the pane's own file. Do not reinterpret this as
+    // "snapshot precedes spawn" — it does not need to.
+    //
+    // The arm() snapshot walks the sessions tree; run it on the blocking
+    // pool, not the WS dispatch path (A6: warm walks are 7-9 ms today and
+    // ~100 ms at 100k files, but cold dentry cache after a reboot is the
+    // one unmeasured tail).
+    {
+        let state = state.clone();
+        let terminal_id = terminal_id.clone();
+        let mode = mode.clone();
+        let cwd = resolved_cwd.clone();
+        let resume = resume_session_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::codex_association::maybe_arm(
+                &state,
+                &terminal_id,
+                &mode,
+                cwd.as_deref(),
+                resume.as_deref(),
+            );
+        })
+        .await;
+    }
 
     // Snapshot the id before it's moved into `created` below -- needed for the
     // `terminal.meta.updated` create-time slice after the create frame is sent.
@@ -1618,6 +1965,56 @@ async fn handle_create(
         crate::pane_ledger::surface_write_failure(state, &terminal_id_for_meta, result);
     }
 
+    // D8 winner bind: record sessionRef→terminalId in the REGISTRY binding
+    // map (inside `complete_session_ref_claim` — atomic with the lease
+    // release, then the duplicate alarm). The pane-ledger binding write above
+    // is PRE-EXISTING create-path behavior, deliberately not duplicated here.
+    if let Some(guard) = session_ref_lease.take() {
+        let (locator, claimed_at_ms) = guard.disarm();
+        if state
+            .registry
+            .complete_session_ref_claim(&locator, &create.request_id, &terminal_id)
+        {
+            // Spawn-duration instrumentation: the evidence stream for tuning
+            // FRESHELL_SESSION_REF_LEASE_TTL_MS (registry.rs).
+            tracing::info!(
+                terminal_id = %terminal_id,
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                spawn_elapsed_ms = now_ms().saturating_sub(claimed_at_ms),
+                "session_ref.winner_bound"
+            );
+        } else {
+            // Revoked while spawning (TTL expired on the then-pid-less lease):
+            // kill OUR OWN just-spawned child via the registry handle
+            // (group-kill discipline), confirm, and fail the create loudly.
+            let pid = state.registry.pid_of(&terminal_id);
+            state.registry.kill(&terminal_id);
+            let confirmed = match pid {
+                Some(pid) => confirm_pid_dead_within_500ms(pid).await,
+                // No pid handle to probe: the registry kill removed the row;
+                // nothing is left to signal, so treat as confirmed.
+                None => true,
+            };
+            if confirmed {
+                state.registry.force_release_after_confirmed_kill(&locator);
+            } else {
+                tracing::error!(target: "invariant",
+                    terminal_id = %terminal_id,
+                    provider = %locator.provider,
+                    session_id = %locator.session_id,
+                    "session_ref_lease_revoked_child_kill_unconfirmed: holding lease closed");
+            }
+            return send_create_error(
+                ws_tx,
+                ErrorCode::InternalError,
+                "Terminal create lost its sessionRef lease during spawn; the spawned process was killed".to_string(),
+                &create.request_id,
+            )
+            .await;
+        }
+    }
+
     let created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
         request_id: create.request_id,
@@ -1646,8 +2043,9 @@ async fn handle_create(
 /// regex /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i):
 /// canonical UUID shape with a version digit 1-5 (position 14) and a variant
 /// digit [89ab] (position 19), case-insensitive. Same chars-based idiom as
-/// `codex_candidate::is_uuid_shaped`, extended with the version/variant
-/// constraints. Used ONLY by the P0.4 restore gate below -- non-restore
+/// the codex locator's uuid shape gate
+/// (`freshell_sessions::codex_locator::is_uuid_shaped`), extended with the
+/// version/variant constraints. Used ONLY by the P0.4 restore gate below -- non-restore
 /// resume derivation is deliberately untouched.
 fn is_canonical_claude_session_id(s: &str) -> bool {
     s.len() == 36
@@ -1902,16 +2300,21 @@ pub fn broadcast_sessions_changed(state: &WsState) {
 
 /// Send the reference's `sendError` frame for a failed `terminal.create`
 /// (`ws-handler.ts:2606-2614`): `{ code, message, requestId }`.
-/// `pane.reconcile.request` (reconciliation design §5): a PURE READ over the
-/// terminal registry × identity registry × disk index — one verdict per
-/// presented pane. Safe to receive N times on N sockets (§7); the only error
-/// paths are the explicit `RECONCILE_TOO_LARGE` cap and the
+/// `pane.reconcile.request` (reconciliation design §5): the terminal sources
+/// remain a PURE READ over the terminal registry × identity registry × disk
+/// index — one verdict per presented pane, safe to receive N times on N
+/// sockets (§7). The capability-gated fresh-agent snapshot is the ONE
+/// exception: it mutates the per-boot respawn counter
+/// (`WsState.fresh_agent_respawn_counts`, bounded per `(provider,
+/// sessionId)`; reset when the session resolves Live — V2/A7). The only
+/// error paths are the explicit `RECONCILE_TOO_LARGE` cap and the
 /// `RECONCILE_UNAVAILABLE` derivation-failure frame, both carrying the
 /// `reconcileId` for correlation.
 async fn handle_pane_reconcile(
     request: freshell_protocol::PaneReconcileRequest,
     ws_tx: &mut WsSink,
     state: &WsState,
+    pane_reconcile_fresh_agent_v1: bool,
 ) -> bool {
     if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
         return send_create_error(
@@ -1926,16 +2329,37 @@ async fn handle_pane_reconcile(
         )
         .await;
     }
-    let deps = crate::reconcile::ReconcileDeps {
-        registry: &state.registry,
-        identity: &state.identity,
-        existence: state.session_existence.as_ref(),
+    // Built ONCE per reconcile request and reused for any re-derivation of deps
+    // (B1's warming deferral re-derives via rebuild_deps — rebuilding the
+    // snapshot would double-burn the respawn counter; V9 §3.6).
+    let fresh_agent_snapshot = if pane_reconcile_fresh_agent_v1
+        && request
+            .panes
+            .iter()
+            .any(|p| p.kind.as_deref() == Some("fresh-agent"))
+    {
+        Some(crate::reconcile_freshagent::build_snapshot(state, &request.panes).await)
+    } else {
+        None
     };
     // §8 frame-level failure: a panicking derivation (poisoned lock) must
-    // surface as an explicit error frame, never silence.
-    let verdicts = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::reconcile::derive_verdicts(&deps, &request.panes)
-    })) {
+    // surface as an explicit error frame, never silence. The deps are rebuilt
+    // per derivation so nothing borrowed for the pure read is ever held
+    // across the deferral await below. The fresh-agent snapshot is NOT
+    // rebuilt — it was built once above (rebuilding would double-burn the
+    // respawn counter; V9 §3.6) and each rebuilt deps borrows the same one.
+    let derive = || {
+        let deps = crate::reconcile::ReconcileDeps {
+            registry: &state.registry,
+            identity: &state.identity,
+            existence: state.session_existence.as_ref(),
+            fresh_agent: fresh_agent_snapshot.as_ref(),
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::reconcile::derive_verdicts(&deps, &request.panes)
+        }))
+    };
+    let mut verdicts = match derive() {
         Ok(verdicts) => verdicts,
         Err(_) => {
             return send_create_error(
@@ -1947,6 +2371,41 @@ async fn handle_pane_reconcile(
             .await;
         }
     };
+    // §5.3 row 5: ONE bounded deferral when the index is still warming, then
+    // exactly one re-derivation — never a loop. The wait is a plain bounded
+    // sleep: the `SessionIndex` behind the probe exposes no sweep-completion
+    // signal to await (`peek()`/`is_fresh()` are sync and non-blocking by
+    // design, and `snapshot().await` on a truly cold index runs the sweep
+    // inline for potentially minutes — unbounded, so unusable here). The
+    // honest expectation stands: a truly cold scan takes far longer than the
+    // budget, so `error{index_warming}` is EXPECTED on cold boots and the
+    // client's manual retry affordance is the recovery path. The stall is
+    // delay-only and scoped to THIS connection's select loop, bounded by the
+    // budget (default 2000ms, shrunk in tests).
+    let warming = |vs: &[freshell_protocol::PaneVerdict]| {
+        vs.iter().any(|v| {
+            matches!(v.verdict, freshell_protocol::ReconcileVerdict::Error)
+                && v.reason.as_deref() == Some("index_warming")
+        })
+    };
+    if warming(&verdicts) {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            state.reconcile_deferral_budget_ms,
+        ))
+        .await;
+        verdicts = match derive() {
+            Ok(verdicts) => verdicts,
+            Err(_) => {
+                return send_create_error(
+                    ws_tx,
+                    ErrorCode::ReconcileUnavailable,
+                    "reconcile derivation failed; keep current state and re-send".to_string(),
+                    &request.reconcile_id,
+                )
+                .await;
+            }
+        };
+    }
     let result = ServerMessage::PaneReconcileResult(freshell_protocol::PaneReconcileResult {
         reconcile_id: request.reconcile_id,
         boot_id: state.boot_id.as_ref().clone(),
@@ -1985,6 +2444,7 @@ async fn send_create_error(
         actual_session_ref: None,
         expected_session_ref: None,
         request_id: Some(request_id.to_string()),
+        retry_after_ms: None,
         terminal_exit_code: None,
         terminal_id: None,
     });
@@ -2199,6 +2659,7 @@ fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
         actual_session_ref: None,
         expected_session_ref: None,
         request_id: None,
+        retry_after_ms: None,
         terminal_exit_code: None,
         terminal_id: None,
     })
@@ -2269,6 +2730,7 @@ async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) ->
         actual_session_ref: None,
         expected_session_ref: None,
         request_id: None,
+        retry_after_ms: None,
         terminal_id: Some(kill.terminal_id),
         terminal_exit_code: None,
     });
@@ -3193,8 +3655,11 @@ mod terminals_changed_tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            codex_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
         };
         (state, rx)
     }
@@ -3400,8 +3865,11 @@ mod terminal_meta_created_tests {
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
+            codex_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
         };
         (state, rx)
     }

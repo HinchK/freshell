@@ -69,12 +69,15 @@ use freshell_opencode::{
     SdkProviderEvent, SessionSignal, SnapshotStatus,
 };
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreated, FreshAgentEvent,
-    FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend, FreshAgentSendAccepted,
-    FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,
+    FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
+    FreshAgentSend, FreshAgentSendAccepted, FreshAgentSessionMaterialized, ServerMessage,
+    SessionLocator,
 };
 
-use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState};
+use crate::{
+    FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState, SharedPaneIdentitySink,
+};
 
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`).
 const SESSION_TYPE: &str = "freshopencode";
@@ -102,6 +105,12 @@ pub struct FreshOpencodeState {
     /// [`OpencodeSession`] object. Cleared for a session's entries only on an explicit
     /// `freshAgent.kill` ([`Self::handle_kill`]).
     create_dedup: Arc<FreshAgentCreateDedup<OpencodeCreateRecord>>,
+    /// P1.13 identity-event sink (the pane-ledger bridge,
+    /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
+    /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
+    /// post-construction by `freshell-server` (precedent:
+    /// `TerminalRegistry::set_activity_observer`).
+    identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -188,11 +197,57 @@ impl FreshOpencodeState {
             fresh_agent,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
+            identity_sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
+    pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
+        let _ = self.identity_sink.set(sink);
+    }
+
+    /// The wired identity sink, if any.
+    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+        self.identity_sink.get().cloned()
+    }
+
+    /// Broadcast a `freshAgent.error` alarm/degradation frame (Task 8 consumes this
+    /// too). Same envelope contract as codex.rs's helper (verified against
+    /// `fresh-agent-ws.ts:182-193`): `{ "type": "freshAgent.event", "sessionId",
+    /// "sessionType", "provider", "event": { "type": "freshAgent.error", "code",
+    /// "message" } }` -- built on the SAME [`ServerMessage::FreshAgentEvent`] envelope
+    /// [`lost_session_frame`] uses, so it is byte-compatible with the frozen client's
+    /// banner path: top-level `sessionType`/`provider` are REQUIRED (locator
+    /// resolution) and `message` is user-facing (the banner shows the message, never
+    /// the code).
+    fn emit_fresh_agent_error(&self, session_id: &str, code: &str, message: &str) {
+        self.broadcast(&event_frame(
+            session_id,
+            json!({
+                "type": "freshAgent.error",
+                "sessionId": session_id,
+                "code": code,
+                "message": message,
+            }),
+        ));
     }
 
     fn broadcast(&self, msg: &ServerMessage) {
         self.fresh_agent.broadcast(msg);
+    }
+
+    /// Broadcast a `freshAgent.create.failed` frame (mirrors codex.rs's `fail_create`;
+    /// `ws-handler.ts:3388-3405`'s generic catch -- always `retryable: true`,
+    /// `ws-handler.ts:3403`).
+    fn fail_create(&self, request_id: &str, code: &str, message: &str) {
+        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
+            FreshAgentCreateFailed {
+                code: code.to_string(),
+                message: message.to_string(),
+                request_id: request_id.to_string(),
+                retryable: Some(true),
+            },
+        ));
     }
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
@@ -203,6 +258,7 @@ impl FreshOpencodeState {
             actual_session_ref: None,
             expected_session_ref: None,
             request_id: request_id.clone(),
+            retry_after_ms: None,
             terminal_exit_code: None,
             terminal_id: None,
         }));
@@ -240,6 +296,23 @@ impl FreshOpencodeState {
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
 
+        // P1.13 (Task 8, V2/A4 -- THE P1.13 wall-pin mechanism): after a page reload
+        // the frozen client never sends `freshAgent.attach` -- its ONLY resume vehicle
+        // is `freshAgent.create{resumeSessionId: ses_*}` (persistMiddleware strips
+        // `sessionId`, gating both attach effects off). A create naming a durable
+        // `ses_*` id must REBIND that surviving session (mirroring codex/claude's
+        // resume-in-create), never mint a fresh `freshopencode-*` placeholder.
+        let resume_target = msg
+            .resume_session_id
+            .clone()
+            .or_else(|| msg.session_ref.as_ref().map(|r| r.session_id.clone()))
+            .filter(|id| id.starts_with("ses_"));
+        if let Some(durable_id) = resume_target {
+            self.handle_create_resume(request_id, durable_id, &msg)
+                .await;
+            return;
+        }
+
         let model = normalize_opencode_model(msg.model.as_deref());
         let effort = normalize_opencode_effort(model.as_deref(), msg.effort.as_deref());
         let placeholder = format!("freshopencode-{request_id}");
@@ -262,6 +335,23 @@ impl FreshOpencodeState {
             )
             .await;
 
+        // P1.13: pending marker (AWAITED before the created broadcast --
+        // durable-before-answer). A failed write is surfaced user-visibly, never
+        // silently dropped, and never blocks the create.
+        if let Some(sink) = self.identity_sink() {
+            if let Err(e) = sink
+                .record_pending(&placeholder, SESSION_TYPE, msg.cwd.as_deref())
+                .await
+            {
+                tracing::warn!(error = %e, placeholder = %placeholder, "freshagent.opencode.pending_write_failed");
+                self.emit_fresh_agent_error(
+                    &placeholder,
+                    "LEDGER_WRITE_FAILED",
+                    "Failed to persist this pane's identity marker - identity may not survive a crash.",
+                );
+            }
+        }
+
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
@@ -276,6 +366,91 @@ impl FreshOpencodeState {
     }
 
     // ── freshAgent.send (WS) — materialize-or-send ─────────────────────────
+
+    /// The resume branch of `handle_create` (P1.13 Task 8, V2/A4): rebind the
+    /// surviving durable `ses_*` session instead of minting a `freshopencode-*`
+    /// placeholder. Routes through the SAME resume machinery `freshAgent.attach`
+    /// uses ([`Self::resume_durable_session`], which applies settings-from-ledger
+    /// and the V7/A10 `SETTINGS_RESET` gate), then answers `freshAgent.created`
+    /// with the durable id so the frozen client ends up re-keyed to the `ses_*`
+    /// identity. Mirrors codex's `handle_create_resume`: a resume target that is
+    /// genuinely gone (or an unreachable sidecar) fails the create loudly
+    /// (`freshAgent.create.failed`) -- never a silently-minted fresh session,
+    /// never a `lost_session_frame` (that shape is exclusive to `freshAgent.attach`).
+    async fn handle_create_resume(
+        &self,
+        request_id: String,
+        durable_id: String,
+        msg: &FreshAgentCreate,
+    ) {
+        // Already tracked locally (a live pane, or an earlier attach/create already
+        // rebound it)? Reuse it -- mirrors handle_attach's local-map-first lookup.
+        let existing = {
+            let guard = self.sessions.lock().await;
+            guard.get(&durable_id).cloned()
+        };
+        let session_arc = match existing {
+            Some(session_arc) => session_arc,
+            None => match self
+                .resume_durable_session(&durable_id, msg.cwd.as_deref())
+                .await
+            {
+                Ok(session_arc) => session_arc,
+                Err(ResumeOpencodeError::NotFound) => {
+                    self.fail_create(
+                        &request_id,
+                        "FRESH_AGENT_CREATE_FAILED",
+                        &format!("opencode session {durable_id} not found"),
+                    );
+                    return;
+                }
+                Err(ResumeOpencodeError::Manager(err)) => {
+                    self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string());
+                    return;
+                }
+            },
+        };
+
+        // Explicit client params on the create win over the ledger record (Task 5(d)
+        // precedence): merge msg over the resumed session's values BEFORE
+        // normalization, so an omitted param recovers the recorded value instead of
+        // being rewritten to the default.
+        {
+            let mut session = session_arc.lock().await;
+            let raw_model = msg.model.clone().or_else(|| session.model.clone());
+            let model = normalize_opencode_model(raw_model.as_deref());
+            let raw_effort = msg.effort.clone().or_else(|| session.effort.clone());
+            let effort = normalize_opencode_effort(model.as_deref(), raw_effort.as_deref());
+            session.model = model;
+            session.effort = effort;
+            if msg.cwd.is_some() {
+                session.cwd = msg.cwd.clone();
+            }
+        }
+
+        // requestId dedup cache: a duplicate create replays the DURABLE id (never a
+        // placeholder), keeping the reconnect-resend behavior intact.
+        self.create_dedup
+            .record_success(
+                &request_id,
+                OpencodeCreateRecord {
+                    placeholder_id: durable_id.clone(),
+                },
+            )
+            .await;
+
+        self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
+            provider: PROVIDER.to_string(),
+            request_id,
+            runtime_provider: PROVIDER.to_string(),
+            session_id: durable_id.clone(),
+            session_type: SESSION_TYPE.to_string(),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.to_string(),
+                session_id: durable_id,
+            }),
+        }));
+    }
 
     /// Handle a `freshAgent.send` for opencode: `materializeOrSend` (`adapter.ts:324-361`).
     /// Creates the durable `ses_*` session ONLY if this session has not materialized yet
@@ -368,6 +543,37 @@ impl FreshOpencodeState {
                 .await
                 .insert(durable_id.clone(), session_arc.clone());
 
+            // P1.13: binding row at materialization (AWAITED BEFORE the materialized
+            // broadcast -- durable-before-answer), resolving the create's pending
+            // marker. Opencode has no sandbox/permission concepts -- always `None`.
+            if let Some(sink) = self.identity_sink() {
+                if let Err(e) = sink
+                    .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                        provider: PROVIDER.into(),
+                        session_id: durable_id.clone(),
+                        mode: SESSION_TYPE.into(),
+                        create_request_id: request_id.clone(),
+                        resolves_pending: Some(session.placeholder_id.clone()),
+                        supersedes: None,
+                        settings: crate::identity_sink::FreshAgentSettings {
+                            model: session.model.clone(),
+                            sandbox: None,
+                            permission_mode: None,
+                            effort: session.effort.clone(),
+                            cwd: session.cwd.clone(),
+                        },
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.binding_write_failed");
+                    self.emit_fresh_agent_error(
+                        &durable_id,
+                        "LEDGER_WRITE_FAILED",
+                        "Failed to persist this session's resume record - settings may not survive a server restart.",
+                    );
+                }
+            }
+
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
             self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
@@ -396,6 +602,40 @@ impl FreshOpencodeState {
 
         session.model = model.clone();
         session.effort = effort.clone();
+
+        // P1.13: settings-change refresh -- once durable, every send's committed
+        // model/effort re-snapshot the binding row (AWAITED BEFORE send.accepted --
+        // durable-before-answer). No pending resolution or supersession here.
+        if acked_session_id.starts_with("ses_") {
+            if let Some(sink) = self.identity_sink() {
+                if let Err(e) = sink
+                    .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                        provider: PROVIDER.into(),
+                        session_id: acked_session_id.clone(),
+                        mode: SESSION_TYPE.into(),
+                        create_request_id: None,
+                        resolves_pending: None,
+                        supersedes: None,
+                        settings: crate::identity_sink::FreshAgentSettings {
+                            model: session.model.clone(),
+                            sandbox: None,
+                            permission_mode: None,
+                            effort: session.effort.clone(),
+                            cwd: session.cwd.clone(),
+                        },
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %e, session = %acked_session_id, "freshagent.opencode.binding_write_failed");
+                    self.emit_fresh_agent_error(
+                        &acked_session_id,
+                        "LEDGER_WRITE_FAILED",
+                        "Failed to persist this session's resume record - settings may not survive a server restart.",
+                    );
+                }
+            }
+        }
+
         let real_id = acked_session_id.clone();
         let route = session.cwd.clone();
         let text = msg.text.clone();
@@ -458,6 +698,14 @@ impl FreshOpencodeState {
             }
         });
         session.turn_task = Some(turn_task);
+    }
+
+    /// Reconcile liveness probe (campaign §4.3, Task 13): is this id tracked
+    /// in the sessions map? The map is keyed by BOTH the placeholder AND the
+    /// durable `ses_*` id (the `remember()` mirror), so a durable-id lookup
+    /// resolves the same record.
+    pub async fn has_live_session(&self, session_id: &str) -> bool {
+        self.sessions.lock().await.contains_key(session_id)
     }
 
     // ── freshAgent.kill (WS) ────────────────────────────────────────────────
@@ -675,10 +923,49 @@ impl FreshOpencodeState {
             }
             Err(err) => return Err(ResumeOpencodeError::Manager(err)),
         };
-        let _ = info;
+        // P1.13 (Task 8): recover this session's recorded settings snapshot, gated
+        // per V7/A10 (same vocabulary + gating as codex.rs's Task 5 site).
+        let sink = self.identity_sink();
+        let recovered = sink
+            .as_ref()
+            .and_then(|s| s.load_settings(PROVIDER, session_id));
+        if recovered.is_none()
+            && sink
+                .as_ref()
+                .is_some_and(|s| s.was_recorded(PROVIDER, session_id))
+        {
+            // Recorded before, unrecoverable now -- the genuine anomaly. Never-recorded
+            // sessions (pre-ship / serve-known-but-ledger-unknown, the ROUTINE attach
+            // population per this handler's own doc above) resume silently with defaults.
+            tracing::warn!(session = %session_id, "freshagent.opencode.settings_record_unrecoverable");
+            self.emit_fresh_agent_error(
+                session_id,
+                "SETTINGS_RESET",
+                "Session settings could not be recovered after restart - the agent is running with default model and effort. Reconfirm your settings.",
+            );
+        }
+        let rec = recovered.clone().unwrap_or_default();
 
-        let mut session =
-            OpencodeSession::new(session_id.to_string(), cwd.map(str::to_string), None, None);
+        // Stop discarding the serve body (the old `let _ = info;`): its `directory`
+        // is the session's REAL working directory -- a better cwd than the attach
+        // message's, though the ledger record's still wins.
+        let serve_dir = info
+            .get("directory")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string);
+        let cwd = rec
+            .cwd
+            .clone()
+            .or(serve_dir)
+            .or_else(|| cwd.map(str::to_string));
+
+        let mut session = OpencodeSession::new(
+            session_id.to_string(),
+            cwd.clone(),
+            rec.model.clone(),
+            rec.effort.clone(),
+        );
         session.real_session_id = Some(session_id.to_string());
         session.serve_bridge = Some(self.spawn_serve_bridge(
             manager,
@@ -691,6 +978,39 @@ impl FreshOpencodeState {
             .lock()
             .await
             .insert(session_id.to_string(), session_arc.clone());
+
+        // P1.13 (Task 8): refresh the binding row after a successful resume -- AWAITED
+        // (durable-before-answer), and ONLY when a record was actually recovered: never
+        // launder a defaults row for a never-recorded session (V7).
+        if recovered.is_some() {
+            if let Some(sink) = sink {
+                if let Err(e) = sink
+                    .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                        provider: PROVIDER.into(),
+                        session_id: session_id.to_string(),
+                        mode: SESSION_TYPE.into(),
+                        create_request_id: None,
+                        resolves_pending: None,
+                        supersedes: None,
+                        settings: crate::identity_sink::FreshAgentSettings {
+                            model: rec.model.clone(),
+                            sandbox: None,
+                            permission_mode: None,
+                            effort: rec.effort.clone(),
+                            cwd,
+                        },
+                    })
+                    .await
+                {
+                    tracing::warn!(error = %e, session = %session_id, "freshagent.opencode.binding_write_failed");
+                    self.emit_fresh_agent_error(
+                        session_id,
+                        "LEDGER_WRITE_FAILED",
+                        "Failed to persist this session's resume record - settings may not survive a server restart.",
+                    );
+                }
+            }
+        }
 
         Ok(session_arc)
     }
@@ -1066,8 +1386,11 @@ mod tests {
                 ]))
                 .unwrap()
             } else {
+                // Like the real serve, `GET /session/:id` carries the session's own
+                // `directory` -- Task 8's resume path consumes it instead of
+                // discarding the body (`let _ = info;`).
                 serde_json::to_vec(
-                    &json!({ "id": id, "title": "materialized session", "time": { "updated": 5 } }),
+                    &json!({ "id": id, "title": "materialized session", "time": { "updated": 5 }, "directory": "/serve/dir" }),
                 )
                 .unwrap()
             };
@@ -1785,6 +2108,323 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("SESSION_NOT_FOUND"));
+    }
+
+    // ── P1.13: identity-sink writes (pending at create, binding at materialization,
+    // refresh on settings change) ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn materialization_resolves_pending_into_binding_with_settings() {
+        // Harness: same FakeHttp setup the existing materialization test uses.
+        let (state, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Create with settings, then first send (materializes ses_*):
+        // freshAgent.create { requestId: "r1", sessionType: "freshopencode",
+        //                     cwd: "/w", model: "big-model", effort: "high" }
+        let mut create = create_msg("r1");
+        create.cwd = Some("/w".to_string());
+        create.model = Some("big-model".to_string());
+        create.effort = Some("high".to_string());
+        state.handle_create(create).await;
+        state
+            .handle_send(send_msg("freshopencode-r1", "hello"))
+            .await;
+
+        // Pending was recorded at create under the placeholder:
+        let pendings = fake.pendings.lock().unwrap();
+        assert!(pendings
+            .iter()
+            .any(|(id, mode, _)| id.starts_with("freshopencode-") && mode == "freshopencode"));
+        drop(pendings);
+
+        // Binding recorded at materialization, resolving the pending:
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id.starts_with("ses_"))
+            .expect("binding at materialization");
+        assert_eq!(b.provider, "opencode");
+        assert_eq!(b.settings.model.as_deref(), Some("big-model"));
+        assert_eq!(b.settings.effort.as_deref(), Some("high"));
+        assert!(
+            b.settings.cwd.is_some(),
+            "cwd captured (upgraded from created.directory)"
+        );
+        assert!(b
+            .resolves_pending
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("freshopencode-"));
+    }
+
+    #[tokio::test]
+    async fn send_with_changed_settings_refreshes_the_binding() {
+        // Same harness; after materialization, send again with
+        // settings: { model: "small-model", effort: "low" } (FreshAgentSendSettings,
+        // consumed per-turn by handle_send's normalize block).
+        let (state, _killed) = state().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        let mut create = create_msg("r2");
+        create.cwd = Some("/w".to_string());
+        create.model = Some("big-model".to_string());
+        create.effort = Some("high".to_string());
+        state.handle_create(create).await;
+        let placeholder = "freshopencode-r2";
+        state.handle_send(send_msg(placeholder, "first")).await;
+
+        let mut second = send_msg(placeholder, "second");
+        second.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            effort: Some("low".to_string()),
+            model: Some("small-model".to_string()),
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(second).await;
+
+        // Assert the LAST recorded binding for the ses_* id carries the new values:
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id.starts_with("ses_"))
+            .unwrap();
+        assert_eq!(b.settings.model.as_deref(), Some("small-model"));
+        assert_eq!(b.settings.effort.as_deref(), Some("low"));
+    }
+
+    // ── P1.13 Task 8: settings-from-ledger resume (attach + create-with-resume) ──
+
+    /// The durable `ses_*` id [`RealisticServeHttp`] mints for its FIRST
+    /// `POST /session` -- the one durable serve session the Task 8 harness
+    /// pre-creates.
+    const DURABLE_ID: &str = "ses_1";
+
+    /// Task 8 harness: a [`RealisticServeHttp`]-backed state (same fakes as the
+    /// donor test `attach_unknown_session_resumes_a_durable_serve_session_not_in_the_local_map`)
+    /// with ONE durable serve session pre-created ([`DURABLE_ID`]) that the local WS
+    /// session map has never heard of, plus a bus receiver subscribed BEFORE any
+    /// handler runs. Each test wires its own identity-sink fixture.
+    async fn state_with_durable_serve_session(
+    ) -> (FreshOpencodeState, tokio::sync::broadcast::Receiver<String>) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(RealisticServeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        let created = manager
+            .create_session(None, None, None)
+            .await
+            .expect("create_session");
+        assert_eq!(
+            created.id, DURABLE_ID,
+            "sanity: RealisticServeHttp mints ses_1 for its first create"
+        );
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        assert!(
+            !st.sessions.lock().await.contains_key(DURABLE_ID),
+            "not tracked locally yet"
+        );
+        (st, rx)
+    }
+
+    #[tokio::test]
+    async fn resume_durable_session_reapplies_settings_from_ledger() {
+        // Same RealisticServeHttp harness as the donor test.
+        let (state, _rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("big-model".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: Some("high".into()),
+                cwd: Some("/real/project".into()),
+            },
+        );
+        state.set_identity_sink(fake);
+
+        // Drive the same attach the donor test drives -- with a COMPETING cwd on
+        // the attach message, so the cwd assertion below proves precedence rather
+        // than absence.
+        let mut attach = attach_msg(DURABLE_ID);
+        attach.cwd = Some("/attach/cwd".to_string());
+        state.handle_attach(attach).await;
+
+        let sessions = state.sessions.lock().await;
+        let s = sessions.get(DURABLE_ID).expect("resumed").lock().await;
+        assert_eq!(s.model.as_deref(), Some("big-model"));
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        assert_eq!(
+            s.cwd.as_deref(),
+            Some("/real/project"),
+            "cwd from the record, not the attach message"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_without_record_is_silent_and_uses_serve_directory() {
+        // Same harness; NO seed (never-recorded session -- the ROUTINE case, V7:
+        // handle_attach's own doc describes this attach population).
+        let (state, mut rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        // RealisticServeHttp's GET /session/:id directory is now used instead of
+        // being discarded.
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions.get(DURABLE_ID).expect("resumed").lock().await;
+            assert_eq!(
+                s.cwd.as_deref(),
+                Some("/serve/dir"),
+                "the serve GET /session/:id body's directory must be used, not discarded"
+            );
+        }
+
+        // NO SETTINGS_RESET frame was broadcast (bounded bus drain -- Task 5 pattern).
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            assert!(
+                !text.contains("SETTINGS_RESET"),
+                "never-recorded resume must stay silent"
+            );
+        }
+
+        // NO refresh binding was written for the session (no defaults laundering).
+        assert!(
+            !fake
+                .bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|b| b.session_id == DURABLE_ID),
+            "a load_settings miss must not write a defaults row"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_with_prior_record_but_unrecoverable_settings_alarms() {
+        // fake.seed_recorded_only("opencode", DURABLE_ID) -- was_recorded=true,
+        // load_settings=None. The genuine anomaly: the only case that alarms (V7/A10).
+        let (state, mut rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed_recorded_only("opencode", DURABLE_ID);
+        state.set_identity_sink(fake);
+
+        state.handle_attach(attach_msg(DURABLE_ID)).await;
+
+        let mut found = false;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            if text.contains("SETTINGS_RESET") {
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                // Top-level sessionType/provider (locator resolution) + a
+                // user-facing message (the banner shows the message, not the code).
+                assert_eq!(frame["sessionType"], "freshopencode");
+                assert_eq!(frame["provider"], "opencode");
+                assert_eq!(frame["event"]["code"], "SETTINGS_RESET");
+                assert!(frame["event"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Reconfirm your settings"));
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "recorded-but-unrecoverable resume must broadcast SETTINGS_RESET"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_resume_session_id_rebinds_the_durable_session() {
+        // V2/A4: the frozen client's ONLY post-reload resume vehicle is
+        // freshAgent.create{resumeSessionId: ses_*} -- donor shape: codex's
+        // handle_create_with_resume_session_id_resumes_the_same_thread.
+        let (state, mut rx) = state_with_durable_serve_session().await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "opencode",
+            DURABLE_ID,
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("big-model".into()),
+                sandbox: None,
+                permission_mode: None,
+                effort: Some("high".into()),
+                cwd: Some("/real/project".into()),
+            },
+        );
+        state.set_identity_sink(fake);
+
+        let mut create = create_msg("req-resume-oc");
+        create.resume_session_id = Some(DURABLE_ID.to_string());
+        state.handle_create(create).await;
+
+        let sessions = state.sessions.lock().await;
+        assert!(
+            sessions.contains_key(DURABLE_ID),
+            "rebound to the surviving ses_*"
+        );
+        let s = sessions.get(DURABLE_ID).unwrap().lock().await;
+        assert_eq!(
+            s.model.as_deref(),
+            Some("big-model"),
+            "settings-from-ledger applied on the create path"
+        );
+        drop(s);
+        drop(sessions);
+
+        // And the FreshAgentCreated broadcast answered with the ses_* id (not a
+        // freshopencode-* placeholder) -- capture it via the bus receiver.
+        let mut created_frame: Option<serde_json::Value> = None;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if frame["type"] == "freshAgent.created" {
+                created_frame = Some(frame);
+                break;
+            }
+        }
+        let created = created_frame.expect("a freshAgent.created frame was broadcast");
+        assert_eq!(
+            created["sessionId"], DURABLE_ID,
+            "created must answer with the durable ses_* id, not a placeholder"
+        );
+        assert_eq!(created["sessionRef"]["sessionId"], DURABLE_ID);
+        assert!(
+            !created["sessionId"]
+                .as_str()
+                .unwrap()
+                .starts_with("freshopencode-"),
+            "never a freshopencode-* placeholder on a resume-create"
+        );
     }
 
     // ── PR-3: serve-stream bridge (status / turn.complete gating) ─────────

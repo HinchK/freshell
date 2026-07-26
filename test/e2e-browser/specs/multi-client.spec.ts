@@ -272,11 +272,13 @@ test.describe('Multi-Client', () => {
     // either way. So the specific intent value is an internal implementation
     // choice, not the behavior this test is meant to guard -- asserting the
     // exact intent was over-constraining an implementation detail rather than
-    // the contract. What DOES matter, and is still asserted: page2 issued
-    // exactly one re-attach for this terminal (not zero -- a silently dropped
-    // reconnect -- and not a runaway retry storm), using a reconnect-shaped
-    // intent (not a cold 'keepalive_delta', which would mean it never
-    // recognized this as a reconnect at all).
+    // the contract. What DOES matter, and is still asserted: page2 issued a
+    // BOUNDED 1..2 re-attaches for this terminal (not zero -- a silently
+    // dropped reconnect -- and not a runaway retry storm; the 2 covers the
+    // reconnect attach plus at most one designed pane.reconcile fold
+    // re-fire via the reconcileEpoch bump, detailed below), using a
+    // reconnect-shaped intent (not a cold 'keepalive_delta', which would
+    // mean it never recognized this as a reconnect at all).
     await page2.waitForFunction((id) => {
       const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
       return sent.some((msg: any) =>
@@ -294,7 +296,20 @@ test.describe('Multi-Client', () => {
         && (msg?.intent === 'transport_reconnect' || msg?.intent === 'viewport_hydrate')
       )
     }, terminalId!)
-    expect(reconnectAttachMessages).toHaveLength(1)
+    // Under paneReconcileV1 (the adopted client) a reconnect has TWO
+    // legitimate attach sources for a live pane: (1) TerminalView's own
+    // reconnect/reveal path, and (2) the pane.reconcile `attach` verdict
+    // fold, which bumps `reconcileEpoch` and deliberately re-fires the
+    // attach effect so the pane converges on server truth even when the
+    // client's own bookkeeping is wrong (the A1 epoch-bump design pin in
+    // `panesSlice.reconcile.test.ts`: "every fold bumps reconcileEpoch").
+    // The pre-reconcile client had only source (1), which is what the old
+    // `toHaveLength(1)` encoded. The behavior this test actually guards is
+    // unchanged and still asserted: the reconnect was not silently dropped
+    // (>= 1), and there is no runaway retry storm (<= 2 -- exactly the two
+    // named sources, nothing unbounded).
+    expect(reconnectAttachMessages.length).toBeGreaterThanOrEqual(1)
+    expect(reconnectAttachMessages.length).toBeLessThanOrEqual(2)
 
     await executeCommand(page1, 'printf "__PTY_SIZE_AFTER__:%s\\n" "$(stty size)"')
     const afterSize = await waitForMarkedPtySize(page1, '__PTY_SIZE_AFTER__', terminalId!)

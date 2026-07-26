@@ -110,7 +110,7 @@ fn wrong_typed_create_request_id_never_poisons_the_device() {
         .expect("wrong-typed createRequestId must NOT make the device unreadable")
         .expect("generation present");
     // Current (locked) behavior: the unknown field passes through verbatim —
-    // nothing strips it; the CONSUMERS (pane_to_create_body, REST ingress)
+    // nothing strips it; the CONSUMERS (REST ingress, recovery inventory)
     // drop non-strings, so the only cost is that one pane loses key identity.
     let panes = &union["records"][0]["panes"];
     assert_eq!(panes[0]["payload"]["createRequestId"], 42);

@@ -512,6 +512,11 @@ pub struct ErrorMsg {
     pub expected_session_ref: Option<SessionLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// D8 (`SESSION_RESERVED` only): how long the loser should wait before
+    /// re-sending its create. Additive and omitted everywhere else, so every
+    /// other error frame stays byte-identical on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -688,8 +693,10 @@ pub enum ReconcileVerdict {
     Respawn,
     Fresh,
     DeadSession,
-    Retry,
     Invalid,
+    /// Terminal per-pane error state (replaces the deleted `retry`):
+    /// reason is one of "index_warming" | "provider_unavailable".
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -708,12 +715,9 @@ pub struct PaneVerdict {
     /// Present iff the server overrode a differing client claim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corrected: Option<bool>,
-    /// fresh / dead_session / retry / invalid: machine-readable code.
+    /// fresh / dead_session / error / invalid: machine-readable code.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// retry only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry_after_ms: Option<i64>,
     /// Row 2b (invariant I6): a newer duplicate generation exists for the same
     /// `createRequestId`; the client stays on its live attachment and this
     /// merely flags the duplicate `terminalId`.
@@ -757,6 +761,11 @@ pub struct Pong {
 pub struct ReadyCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_v1: Option<bool>,
+    /// Fresh-agent restart resilience: `Some(true)` iff the connection's
+    /// `hello` opted in via `capabilities.paneReconcileFreshAgentV1` —
+    /// omitted from the wire entirely otherwise (frozen-client inertness).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_fresh_agent_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

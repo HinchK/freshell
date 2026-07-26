@@ -253,4 +253,77 @@ test.describe('pane-identity ledger restart durability', () => {
       await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
+
+  test('SIGKILL inside the codex locator window leaves a durable fresh-by-race marker', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'pane-ledger-locator-'))
+    let capturedHome = ''
+    try {
+      const fakeCodex = await installFakeCli(path.join(sharedRoot, 'bin'), 'codex', 'fake-codex-terminal.mjs')
+      const seed = seedConfig()
+      // ROLLOUT GATE (REQUIRED for this wall's premise): the fake codex
+      // WRITES a real rollout JSONL on its FIRST Enter unless
+      // FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH is set and the gate file
+      // never exists (fake-codex-terminal.mjs:76-86). Point it at a
+      // path we NEVER create, so identity deterministically never resolves
+      // and the pending marker is the only evidence — no race against the
+      // SIGKILL.
+      const rolloutGate = path.join(sharedRoot, 'rollout-gate-never-created')
+      const server = new RustServer({
+        env: { CODEX_CMD: fakeCodex, FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH: rolloutGate },
+        setupHome: async (homeDir: string) => {
+          capturedHome = homeDir
+          await seed(homeDir)
+        },
+      })
+      const info = await server.start()
+      try {
+        await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+        const harness = new TestHarness(page)
+        await harness.waitForHarness()
+        await harness.waitForConnection()
+        await selectShellIfPickerShowing(page)
+        await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+
+        const ledgerDir = path.join(capturedHome, '.freshell', 'pane-ledger')
+        await openCliPane(page, /^Codex CLI$/i)
+        await within5s(
+          async () => (await listFiles(path.join(ledgerDir, 'pending'))).some((f) => f.endsWith('.json')),
+          'codex pending marker on disk',
+        )
+
+        // The codex pending marker exists from SPAWN (codex is in
+        // MARKER_MODES), but the locator WINDOW is Enter-anchored: it only
+        // opens on the pane's first submit. Click the fresh pane's xterm
+        // (`.last()` — only the boot shell and this pane exist) and type +
+        // Enter so the SIGKILL below lands INSIDE an open window. A short
+        // settle lets the Enter complete the browser -> WS -> PTY hop
+        // before the kill.
+        await page.locator('.xterm').last().click()
+        await page.keyboard.type('hello codex')
+        await page.keyboard.press('Enter')
+        await page.waitForTimeout(500)
+
+        // SIGKILL INSIDE the locator window (the never-created gate means
+        // no rollout exists for the fake, so identity never resolves — the
+        // marker is the only evidence identity was in flight).
+        await server.restartAbrupt()
+        await expect(async () => {
+          const status = await page.evaluate(() => (window as any).__FRESHELL_TEST_HARNESS__?.getWsReadyState())
+          expect(status).toBe('ready')
+        }).toPass({ timeout: 60_000 })
+
+        // The restarted boot scan PRESERVED the marker (fresh-by-race
+        // distinguishable from fresh-by-intent) — and nothing bound it.
+        const pending = (await listFiles(path.join(ledgerDir, 'pending'))).filter((f) => f.endsWith('.json'))
+        expect(pending.length).toBeGreaterThan(0)
+        const bindings = await listFiles(path.join(ledgerDir, 'bindings'))
+        expect(bindings.filter((f) => f.endsWith('.json'))).toHaveLength(0)
+      } finally {
+        await server.stop().catch(() => {})
+      }
+    } finally {
+      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
+    }
+  })
 })
