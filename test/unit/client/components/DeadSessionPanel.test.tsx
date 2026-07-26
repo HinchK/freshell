@@ -4,7 +4,11 @@ import userEvent from '@testing-library/user-event'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import type { Store } from '@reduxjs/toolkit'
-import panesReducer, { resetPaneForReconcileCreate, clearReconcileWarming } from '@/store/panesSlice'
+import panesReducer, {
+  resetPaneForReconcileCreate,
+  resetFreshAgentPaneForReconcileCreate,
+  clearReconcileWarming,
+} from '@/store/panesSlice'
 import type { DeadSessionEntry, PaneNode, ReconcileWarmingState } from '@/store/paneTypes'
 import { buildRestoreError } from '@shared/session-contract'
 import { DeadSessionPanel } from '@/components/DeadSessionPanel'
@@ -177,6 +181,47 @@ describe('DeadSessionPanel + ReconcileWarmingBanner', () => {
     expect(leaf.content.createRequestId).toBe('cr-p1')
     expect(leaf.content.status).toBe('creating')
     expect(leaf.content.sessionRef).toBeUndefined()
+  })
+
+  // Task 5: fresh-agent rows must dispatch the fresh-agent reset — the
+  // terminal-only reducer no-ops on fresh-agent content (a silent wedge).
+  it('Start fresh here on a fresh-agent entry dispatches the fresh-agent reset (createRequestId preserved)', async () => {
+    const { store } = renderWithStore({
+      deadSessionAdjudication: [
+        {
+          tabId: 'tab-1',
+          paneId: 'p1',
+          title: 'Freshclaude',
+          mode: 'claude',
+          kind: 'fresh-agent',
+          sessionRef: { provider: 'claude', sessionId: 'sess-dead' },
+        },
+      ],
+      extraContentByPane: {
+        p1: {
+          kind: 'fresh-agent',
+          sessionType: 'claude',
+          provider: 'claude',
+          status: 'connected',
+          sessionId: 'sess-dead',
+          sessionRef: { provider: 'claude', sessionId: 'sess-dead' },
+          resumeSessionId: 'sess-dead',
+          mode: undefined,
+          shell: undefined,
+          terminalId: undefined,
+        },
+      },
+    })
+    await userEvent.click(screen.getByRole('button', { name: /start fresh here/i }))
+    expect(dispatchedTypes(store)).toContain(resetFreshAgentPaneForReconcileCreate.type)
+    const leaf = findLeaf(store.getState().panes.layouts['tab-1'], 'p1')
+    expect(leaf.content.kind).toBe('fresh-agent')
+    expect(leaf.content.status).toBe('creating')
+    expect(leaf.content.sessionRef).toBeUndefined()
+    expect(leaf.content.resumeSessionId).toBeUndefined()
+    // Council rule 2 / I7: same createRequestId — never re-minted by any fold path.
+    expect(leaf.content.createRequestId).toBe('cr-p1')
+    expect(store.getState().panes.deadSessionAdjudication).toHaveLength(0)
   })
 
   // Council rule 12: dead_session is a UI state, not a deletion — closing is an explicit user act.
