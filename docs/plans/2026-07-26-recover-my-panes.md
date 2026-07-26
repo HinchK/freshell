@@ -22,7 +22,7 @@ Within Option A, per the directive "reuse what serves the UI flow, DELETE what d
 ## Design Decisions
 
 **D1 — Trigger conditions (Principle 4 compliance).** The offer appears iff ALL of:
-1. `localStorage` had NO layout key (`freshell.layout.v3` and `freshell.layout.v3.bak` both absent) **captured at module load**, before the asynchronous writers — the auto-shell-tab (`App.tsx:1423-1427`) and the 500 ms persist debounce — can write one, OR a pending-offer flag from a prior undecided visit is set (see D3). Synchronous module-load writers of `freshell.layout.v3` DO exist (`storage-migration.ts:332/431`, self-executing via `main.tsx`'s first import, and `migrateV2ToV3` at `persistedState.ts:594` during tabsSlice module eval), but each fires only when durable layout data ALREADY existed — so key-presence at boot-state module eval remains the correct "had layout" signal, and the capture design stands. Two invariants are pinned in Task 3: `import '@/store/storage-migration'` stays the FIRST import in `main.tsx` (it re-materializes `freshell.layout.v3` from the `.backup-before-fresh-agent-centralization` key before capture — which is why boot-state checks only v3 + .bak), and `boot-state.ts` is never imported from `main.tsx` above that line.
+1. `localStorage` had NO layout key (`freshell.layout.v3` and `freshell.layout.v3.bak` both absent) **captured at module load**, before the asynchronous writers — the auto-shell-tab (`App.tsx:1423-1427`) and the 500 ms persist debounce — can write one, OR a pending-offer flag from a prior undecided visit is set (see D3). Synchronous module-load writers of `freshell.layout.v3` DO exist (`storage-migration.ts:332/431`, self-executing via `main.tsx`'s side-effect import at `main.tsx:4`, and `migrateV2ToV3` at `persistedState.ts:594` during tabsSlice module eval), but each fires only when durable layout data ALREADY existed — so key-presence at boot-state module eval remains the correct "had layout" signal, and the capture design stands. Two invariants are pinned in Task 3: `import '@/store/storage-migration'` stays ahead of the `@/store/store` and `@/App` imports in `main.tsx` (the only imports above it — react, react-dom/client, react-redux — are pure library imports with no localStorage side effects; storage-migration re-materializes `freshell.layout.v3` from the `.backup-before-fresh-agent-centralization` key before capture — which is why boot-state checks only v3 + .bak), and `boot-state.ts` is never imported from `main.tsx` at all.
 2. `GET /api/recovery/inventory` reports `recoverable: true`.
 3. The inventory `contentId` is not in the dismissed list.
 
@@ -76,7 +76,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 | `crates/freshell-server/src/main.rs` (modify) | `mod recovery_inventory;` + one `.merge(...)` |
 | `crates/freshell-ws/src/terminal.rs` (modify, Task 2b) | Liveness guard on the direct wire-sessionRef rung (D7 defense-in-depth) |
 | `crates/freshell-ws/tests/live_session_ref_guard.rs` (create, Task 2b) | Integration proof: live session + sessionRef create ⇒ loud refusal, no duplicate spawn |
-| `src/main.tsx` (modify, Task 3) | Comment only — pins the storage-migration-first import-order invariant (D1/A8) |
+| `src/main.tsx` (modify, Task 3) | Comment only — pins the storage-migration-before-store/App import-order invariant (D1/A8) |
 | `crates/freshell-server/src/tabs_snapshots.rs` (modify, Task 9) | Restore endpoint deleted; the GET read side (incl. `get_snapshot`) survives |
 | `crates/freshell-server/src/tabs_snapshots_marker.rs`, `tabs_snapshots_create_body.rs` (delete, Task 9) | Server-push machinery — no UI-flow consumer |
 | `crates/freshell-server/src/tabs_snapshots_selectors.rs` (modify, Task 9) | Delete `parse_restore_selection` only; `parse_selector`/`Selector` survive (surviving GET read API) |
@@ -771,7 +771,7 @@ git commit -m "feat(ws): refuse sessionRef restore while a Running terminal owns
 **Files:**
 - Create: `src/lib/recovery/boot-state.ts`
 - Create: `src/lib/recovery/dismissal.ts`
-- Modify: `src/main.tsx` (comment only — pin the import-order invariant on the existing first import; no code change)
+- Modify: `src/main.tsx` (comment only — pin the import-order invariant on the existing `import '@/store/storage-migration'` line (currently `main.tsx:4`, after the react/react-dom/react-redux library imports); no code change)
 - Create: `test/unit/client/lib/recovery/boot-state.test.ts`
 - Create: `test/unit/client/lib/recovery/dismissal.test.ts`
 - Create: `test/unit/client/lib/recovery/main-import-order.test.ts`
@@ -835,12 +835,20 @@ import { readFileSync } from 'node:fs'
 describe('boot-state capture ordering invariants (D1/A8)', () => {
   const src = readFileSync('src/main.tsx', 'utf8')
 
-  it('storage-migration is the FIRST import in main.tsx', () => {
+  it('storage-migration is imported before the store and App in main.tsx', () => {
     // It re-materializes freshell.layout.v3 from the
     // `.backup-before-fresh-agent-centralization` key BEFORE any capture can run —
-    // which is why boot-state checks only v3 + .bak.
-    const firstImport = src.match(/^import .*$/m)?.[0] ?? ''
-    expect(firstImport).toContain('@/store/storage-migration')
+    // which is why boot-state checks only v3 + .bak. The imports above it
+    // (react, react-dom/client, react-redux) are pure library imports with no
+    // localStorage side effects, so "before store/App" is the real invariant.
+    const migrationIdx = src.indexOf("import '@/store/storage-migration'")
+    const storeIdx = src.indexOf("from '@/store/store'")
+    const appIdx = src.indexOf("from '@/App'")
+    expect(migrationIdx).toBeGreaterThan(-1)
+    expect(storeIdx).toBeGreaterThan(-1)
+    expect(appIdx).toBeGreaterThan(-1)
+    expect(migrationIdx).toBeLessThan(storeIdx)
+    expect(migrationIdx).toBeLessThan(appIdx)
   })
 
   it('boot-state is never imported from main.tsx', () => {
@@ -908,13 +916,15 @@ export function computeHadPersistedLayout(storage: Pick<Storage, 'getItem'>): bo
 }
 
 // Captured at module import. Synchronous module-load writers of freshell.layout.v3 DO
-// exist (storage-migration.ts:332/431 — self-executing via main.tsx's FIRST import — and
-// migrateV2ToV3, persistedState.ts:594, during tabsSlice module eval), but each fires only
-// when durable layout data ALREADY existed, so key-presence here remains the correct
-// "had layout" signal. storage-migration also re-materializes freshell.layout.v3 from the
-// `.backup-before-fresh-agent-centralization` key BEFORE this module can load — which is
-// why we check only v3 + .bak. Invariants (pinned by main-import-order.test.ts): the
-// storage-migration import stays FIRST in main.tsx; main.tsx never imports this module.
+// exist (storage-migration.ts:332/431 — self-executing via main.tsx's side-effect import
+// at main.tsx:4 — and migrateV2ToV3, persistedState.ts:594, during tabsSlice module eval),
+// but each fires only when durable layout data ALREADY existed, so key-presence here
+// remains the correct "had layout" signal. storage-migration also re-materializes
+// freshell.layout.v3 from the `.backup-before-fresh-agent-centralization` key BEFORE this
+// module can load — which is why we check only v3 + .bak. Invariants (pinned by
+// main-import-order.test.ts): the storage-migration import stays ahead of the store/App
+// imports in main.tsx (the imports above it are side-effect-free library imports);
+// main.tsx never imports this module.
 // The asynchronous writers (auto shell tab App.tsx:1423-1427, 500ms persist debounce)
 // land long after module eval (see docs/plans/2026-07-26-recover-my-panes.md D1).
 export const hadPersistedLayoutAtBoot: boolean =
@@ -924,8 +934,9 @@ export const hadPersistedLayoutAtBoot: boolean =
 In `src/main.tsx`, add a comment on the existing `import '@/store/storage-migration'` line (no code change):
 
 ```ts
-// MUST stay the FIRST import: recover-my-panes boot-state (D1) depends on migrations
-// having re-materialized freshell.layout.v3 BEFORE any capture runs — see
+// MUST stay ahead of the store/App imports: recover-my-panes boot-state (D1) depends on
+// migrations having re-materialized freshell.layout.v3 BEFORE any capture runs (the
+// react/react-dom/react-redux imports above are side-effect-free) — see
 // docs/plans/2026-07-26-recover-my-panes.md and main-import-order.test.ts.
 ```
 
