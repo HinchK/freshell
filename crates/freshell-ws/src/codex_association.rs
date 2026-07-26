@@ -622,4 +622,105 @@ mod tests {
         state.registry.kill("t1");
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    /// B2xB4 misbind hardening (B2 plan item 10, fix assigned to B4's
+    /// territory): a freshagent codex sidecar writes rollouts into the SAME
+    /// `$HOME/.codex/sessions` root, so a later bare Enter on a codex
+    /// TERMINAL pane could adopt the fresh-agent thread as a sole candidate.
+    /// B4's kind:fresh-agent ledger rows (written durable-before-answer at
+    /// thread start) are the exclusion signal: the adoption tail must refuse
+    /// a freshagent-known thread id.
+    #[tokio::test]
+    async fn located_freshagent_known_thread_is_rejected() {
+        const TID: &str = "aaaabbbb-cccc-4ddd-8eee-ffff00001111";
+        let home = unique_temp_dir("freshagent-known");
+        let ledger_dir = unique_temp_dir("freshagent-known-ledger");
+        let (state, _rx) = state_with_locator_and_ledger(home.clone(), &ledger_dir);
+
+        // The fresh-agent thread's ledger row, exactly what B4's
+        // record_codex_binding persists at thread/start (durable BEFORE the
+        // create reply goes out).
+        state
+            .pane_ledger
+            .record_fresh_agent_binding(&crate::pane_ledger::FreshAgentBindingWrite {
+                provider: "codex",
+                session_id: TID,
+                mode: "freshcodex",
+                cwd: Some("/tmp"),
+                create_request_id: None,
+                model: Some("gpt-5"),
+                sandbox: None,
+                permission_mode: None,
+                effort: None,
+                supersedes: None,
+                now_ms: now_ms(),
+            })
+            .expect("seed fresh-agent ledger row");
+
+        // A real PTY "t1" (codex mode), armed.
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None);
+        let locator = state.codex_locator.as_ref().unwrap().clone();
+        assert_eq!(locator.armed_count(), 1);
+
+        // Bare Enter opens the window, THEN the freshagent sidecar's rollout
+        // appears in the shared sessions root with the pane's own cwd -- the
+        // exact misbind shape from B2 plan item 10.
+        note_possible_submit(&state, "t1", "\r").await;
+        write_rollout(&home, "2026/07/26", TID, Some("/tmp"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if locator.armed_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Resolution HAPPENED (locator disarmed) -- so the refusal below is
+        // the adoption-tail guard's doing, not a locator no-op.
+        assert_eq!(locator.armed_count(), 0);
+        // Guard refused: the fresh-agent thread never binds to the terminal.
+        assert!(state.identity.session_ref_for("t1").is_none());
+        let dir_entry = state
+            .registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == "t1")
+            .unwrap();
+        assert!(dir_entry.resume_session_id.is_none());
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+    }
 }

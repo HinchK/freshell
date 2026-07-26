@@ -70,6 +70,34 @@ pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) 
             return false;
         }
     }
+    // B2xB4 misbind hardening (B2 plan item 10, fix enabled by B4's
+    // kind:fresh-agent ledger rows): the freshagent codex sidecar writes
+    // rollouts into the SAME sessions root the locator walks, so a foreign
+    // same-cwd rollout appearing after a pane's first Enter could misbind as
+    // a sole candidate. A thread id the server knows as a FRESH-AGENT
+    // session -- live in the fresh_codex session map, or recorded by B4's
+    // durable-before-answer ledger write at thread start -- must never bind
+    // to a terminal pane.
+    if state.fresh_codex.has_live_session(a.thread_id).await {
+        tracing::warn!(
+            terminal_id = %a.terminal_id,
+            thread_id = %a.thread_id,
+            "codex_adopt_rejected: freshagent_live_session"
+        );
+        return false;
+    }
+    if state
+        .pane_ledger
+        .lookup_by_session("codex", a.thread_id)
+        .is_some_and(|r| r.row.pane_kind.as_deref() == Some("fresh-agent"))
+    {
+        tracing::warn!(
+            terminal_id = %a.terminal_id,
+            thread_id = %a.thread_id,
+            "codex_adopt_rejected: freshagent_ledger_row"
+        );
+        return false;
+    }
     // Both identity homes -- different consumers (see opencode_association.rs:135-148).
     state.identity.upsert(
         a.terminal_id,
