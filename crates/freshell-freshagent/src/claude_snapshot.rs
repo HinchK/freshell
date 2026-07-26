@@ -18,13 +18,14 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::{json, Map, Value};
+
 /// Ordered candidate store roots. The real CLI resolves its store as
 /// `CLAUDE_CONFIG_DIR ?? $HOME/.claude` and IGNORES `CLAUDE_HOME` (verified against
 /// cli.js 2.1.220 -- ledger A3); `CLAUDE_HOME` is freshell's legacy knob
 /// (`server/claude-home.ts`, `session_directory.rs` -- `pub(crate)` to that crate).
 /// We read ALL candidates so a reader/writer root mismatch can never turn a live
 /// session into a false positive denial.
-#[allow(dead_code)]
 pub(crate) fn claude_home_candidates() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut push = |p: PathBuf| {
@@ -52,7 +53,6 @@ pub(crate) fn claude_home_candidates() -> Vec<PathBuf> {
 
 /// `find_transcript` across every candidate root, in resolution order.
 /// Positive denial (attach) and snapshot 404 both require a miss EVERYWHERE.
-#[allow(dead_code)]
 pub(crate) fn locate_transcript(session_id: &str) -> Option<PathBuf> {
     claude_home_candidates()
         .iter()
@@ -85,7 +85,6 @@ pub(crate) fn transcript_cwd(path: &Path) -> Option<String> {
 /// `<project>/<session-id-dir>/...` layouts). Filename scan, NEVER slug re-derivation:
 /// the cwd->slug encoding is lossy (`docs/port-plan.md:45`). Sorted dirs for
 /// determinism (mirrors `directory_index.rs::discover_claude_home`).
-#[allow(dead_code)]
 pub(crate) fn find_transcript(claude_home: &Path, session_id: &str) -> Option<PathBuf> {
     if session_id.is_empty()
         || session_id.contains('/')
@@ -125,6 +124,274 @@ pub(crate) fn find_transcript(claude_home: &Path, session_id: &str) -> Option<Pa
         }
     }
     None
+}
+
+/// Why a claude snapshot could not be served.
+#[derive(Debug)]
+pub(crate) enum ClaudeSnapshotError {
+    /// No transcript file for this id -- the store positively does not know it
+    /// (maps to 404 FRESH_AGENT_LOST_SESSION, the codex/opencode convention).
+    NotFound,
+    /// The file exists but could not be read.
+    // Task 5's endpoint reads the message into the 500 error body; until then
+    // the field is constructed but never read.
+    Io(#[allow(dead_code)] String),
+}
+
+/// One transcript JSONL line -> zero-or-one snapshot turn. Parsing rules are the
+/// legacy `extractChatMessagesFromJsonl` contract (`server/session-history-loader.ts:36-131`)
+/// PLUS the real-store fixes from the ledger A5 census (23,615 real lines): keep only
+/// type user|assistant; message may be a plain string, `{content: [...]}`, or
+/// `{content: "<string>"}` (the DOMINANT real prompt shape, which legacy-as-coded
+/// drops); lines flagged isMeta/isSidechain/isCompactSummary/isVisibleInTranscriptOnly
+/// are synthetic/subagent noise and are SKIPPED; malformed lines and unknown block
+/// kinds are skipped, never fatal.
+fn parse_transcript_turns(thread_id: &str, transcript: &str) -> Vec<Value> {
+    let mut turns: Vec<Value> = Vec::new();
+    for line in transcript.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let role = match obj.get("type").and_then(Value::as_str) {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            _ => continue,
+        };
+        // Real transcripts flag synthetic/subagent lines (ledger A5): skip them.
+        if [
+            "isMeta",
+            "isSidechain",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ]
+        .iter()
+        .any(|k| obj.get(*k).and_then(Value::as_bool) == Some(true))
+        {
+            continue;
+        }
+        let msg = obj.get("message");
+        let blocks: Vec<Value> = match msg {
+            Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+            Some(Value::Object(m)) => match m.get("content") {
+                Some(Value::Array(arr)) => arr.clone(),
+                Some(Value::String(text)) => vec![json!({ "type": "text", "text": text })],
+                _ => continue,
+            },
+            _ => continue,
+        };
+
+        let ordinal = turns.len();
+        let turn_id = format!("{thread_id}:{ordinal}");
+        let mut items: Vec<Value> = Vec::new();
+        for (j, block) in blocks.iter().enumerate() {
+            let item_id = format!("{turn_id}-i{j}");
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                        items.push(json!({ "id": item_id, "kind": "text", "text": text }));
+                    }
+                }
+                Some("thinking") => {
+                    let text = block
+                        .get("thinking")
+                        .or_else(|| block.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    items.push(json!({ "id": item_id, "kind": "thinking", "text": text }));
+                }
+                Some("tool_use") => {
+                    let tool_use_id = block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(item_id.as_str())
+                        .to_string();
+                    let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                    let mut item = Map::new();
+                    item.insert("id".into(), json!(item_id));
+                    item.insert("kind".into(), json!("tool_use"));
+                    item.insert("toolUseId".into(), json!(tool_use_id));
+                    item.insert("name".into(), json!(name));
+                    if let Some(input) = block.get("input") {
+                        item.insert("input".into(), input.clone());
+                    }
+                    items.push(Value::Object(item));
+                }
+                Some("tool_result") => {
+                    let tool_use_id = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or(item_id.as_str())
+                        .to_string();
+                    let is_error = block
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    items.push(json!({
+                        "id": item_id,
+                        "kind": "tool_result",
+                        "toolUseId": tool_use_id,
+                        "content": tool_result_text(block),
+                        "isError": is_error,
+                    }));
+                }
+                _ => {}
+            }
+        }
+        if items.is_empty() {
+            continue;
+        }
+
+        let summary = summarize(&items);
+        let mut turn = Map::new();
+        turn.insert("id".into(), json!(turn_id));
+        turn.insert("turnId".into(), json!(turn_id));
+        if let Some(message_id) = msg
+            .and_then(|m| m.get("id"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            turn.insert("messageId".into(), json!(message_id));
+        }
+        turn.insert("ordinal".into(), json!(ordinal));
+        turn.insert("source".into(), json!("durable"));
+        turn.insert("role".into(), json!(role));
+        if let Some(ts) = obj.get("timestamp").and_then(Value::as_str) {
+            turn.insert("timestamp".into(), json!(ts));
+        }
+        if let Some(model) = msg
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            turn.insert("model".into(), json!(model));
+        }
+        turn.insert("summary".into(), json!(summary));
+        turn.insert("items".into(), json!(items));
+        turns.push(Value::Object(turn));
+    }
+    turns
+}
+
+/// Flatten a tool_result block's content (string, or array of text blocks) to a string.
+fn tool_result_text(block: &Value) -> String {
+    match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|p| p.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Turn summary: first non-empty `text` item's text, falling back to the first
+/// non-empty `thinking` item's text (char-safe truncate), else a tool label --
+/// `FreshAgentTurnSchema.summary` is REQUIRED. Text is preferred over thinking
+/// so an assistant turn's summary is its visible answer, not its reasoning
+/// preamble (golden fixture turn 1: items `[thinking "pondering", text "first
+/// answer"]` must summarize to `"first answer"`).
+fn summarize(items: &[Value]) -> String {
+    let first_text_of = |kind: &str| -> Option<String> {
+        items.iter().find_map(|item| {
+            if item.get("kind").and_then(Value::as_str) != Some(kind) {
+                return None;
+            }
+            let trimmed = item.get("text").and_then(Value::as_str)?.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.chars().take(120).collect())
+            }
+        })
+    };
+    if let Some(summary) = first_text_of("text").or_else(|| first_text_of("thinking")) {
+        return summary;
+    }
+    for item in items {
+        match item.get("kind").and_then(Value::as_str) {
+            Some("tool_use") => {
+                if let Some(name) = item.get("name").and_then(Value::as_str) {
+                    return name.to_string();
+                }
+            }
+            Some("tool_result") => return "[tool result]".to_string(),
+            _ => {}
+        }
+    }
+    "[claude turn]".to_string()
+}
+
+/// Build the `FreshAgentSnapshotSchema`-exact JSON (`shared/fresh-agent-contract.ts:230-246`,
+/// zod `.strict()` -- every key here is either required or schema-known; NOTHING extra).
+pub(crate) fn build_claude_snapshot_json(
+    session_type: &str,
+    thread_id: &str,
+    transcript: &str,
+    revision: i64,
+) -> Value {
+    let turns = parse_transcript_turns(thread_id, transcript);
+    let latest_turn_id = turns
+        .last()
+        .and_then(|t| t.get("turnId"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({
+        "sessionType": session_type,
+        "provider": "claude",
+        "threadId": thread_id,
+        "sessionId": thread_id,
+        "revision": revision.max(0),
+        "latestTurnId": latest_turn_id,
+        "status": "idle",
+        "capabilities": {
+            "send": true,
+            "interrupt": true,
+            "approvals": false,
+            "questions": false,
+            "fork": false,
+        },
+        "tokenUsage": { "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 },
+        "pendingApprovals": [],
+        "pendingQuestions": [],
+        "worktrees": [],
+        "diffs": [],
+        "childThreads": [],
+        "turns": turns,
+        "extensions": {},
+    })
+}
+
+/// Locate + read + build. `revision` = transcript mtime in ms (monotonic as the file
+/// grows -- `mergeSnapshotForDisplay` DROPS revision regressions), fallback turn count.
+// Task 5 wires this into the HTTP snapshot endpoint; until then it (and its whole
+// call graph: locate/build/parse/summarize + ClaudeSnapshotError) has no lib caller.
+#[allow(dead_code)]
+pub(crate) async fn get_claude_snapshot(
+    session_type: &str,
+    thread_id: &str,
+) -> Result<Value, ClaudeSnapshotError> {
+    // Miss in EVERY candidate root => 404 (positive denial; ledger A3/A4).
+    let path = locate_transcript(thread_id).ok_or(ClaudeSnapshotError::NotFound)?;
+    let mtime_ms = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64);
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| ClaudeSnapshotError::Io(e.to_string()))?;
+    let mut snapshot = build_claude_snapshot_json(session_type, thread_id, &content, 0);
+    let turn_count = snapshot["turns"]
+        .as_array()
+        .map(|a| a.len() as i64)
+        .unwrap_or(0);
+    snapshot["revision"] = json!(mtime_ms.unwrap_or(turn_count).max(0));
+    Ok(snapshot)
 }
 
 #[cfg(test)]
@@ -187,5 +454,64 @@ mod tests {
         let empty = home.path().join("e.jsonl");
         std::fs::write(&empty, "").unwrap();
         assert_eq!(transcript_cwd(&empty), None);
+    }
+
+    const SAMPLE_TRANSCRIPT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/fresh-agent/claude-transcript-sample.jsonl"
+    ));
+    const GOLDEN_SNAPSHOT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/fresh-agent/claude-snapshot-golden.json"
+    ));
+
+    #[test]
+    fn builder_output_matches_the_golden_snapshot_fixture() {
+        let built = build_claude_snapshot_json(
+            "freshclaude",
+            "44444444-4444-4444-8444-444444444444",
+            SAMPLE_TRANSCRIPT,
+            1753437600000,
+        );
+        let golden: serde_json::Value =
+            serde_json::from_str(GOLDEN_SNAPSHOT).expect("golden parses");
+        assert_eq!(built, golden);
+    }
+
+    #[test]
+    fn user_turns_carry_role_user_and_literal_prompt_text() {
+        // Load-bearing for the frozen client's local-echo clearing: claude's
+        // send.accepted has no submittedTurnId, so the client matches prompt text
+        // against role:'user' turns (freshAgentSlice fold).
+        let built = build_claude_snapshot_json("freshclaude", "t", SAMPLE_TRANSCRIPT, 0);
+        let turns = built["turns"].as_array().unwrap();
+        let first = &turns[0];
+        assert_eq!(first["role"], "user");
+        assert_eq!(first["items"][0]["kind"], "text");
+        assert_eq!(first["items"][0]["text"], "first question");
+    }
+
+    #[test]
+    fn turn_ids_are_unique_and_ordering_is_transcript_order() {
+        let built = build_claude_snapshot_json("kilroy", "t", SAMPLE_TRANSCRIPT, 0);
+        assert_eq!(built["sessionType"], "kilroy");
+        let turns = built["turns"].as_array().unwrap();
+        let mut ids: Vec<&str> = turns
+            .iter()
+            .map(|t| t["turnId"].as_str().unwrap())
+            .collect();
+        let before = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(
+            ids.len(),
+            before,
+            "turnIds must be unique (historyBodies map key)"
+        );
+        assert_eq!(turns.len(), 6); // summary + malformed + isMeta lines skipped
+        assert_eq!(built["latestTurnId"], turns[5]["turnId"]);
+        // The dominant real prompt shape (object-with-string-content, ledger A5)
+        // must yield a text turn -- local-echo clearing depends on it.
+        assert_eq!(turns[3]["items"][0]["text"], "cli string content question");
     }
 }
