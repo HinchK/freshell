@@ -890,19 +890,31 @@ fn tool_result_text(block: &Value) -> String {
     }
 }
 
-/// Turn summary: first text/thinking item's text (char-safe truncate), else a
-/// tool label -- `FreshAgentTurnSchema.summary` is REQUIRED.
+/// Turn summary: first non-empty `text` item's text, falling back to the first
+/// non-empty `thinking` item's text (char-safe truncate), else a tool label --
+/// `FreshAgentTurnSchema.summary` is REQUIRED. Text is preferred over thinking
+/// so an assistant turn's summary is its visible answer, not its reasoning
+/// preamble (golden fixture turn 1: items `[thinking "pondering", text "first
+/// answer"]` must summarize to `"first answer"`).
 fn summarize(items: &[Value]) -> String {
+    let first_text_of = |kind: &str| -> Option<String> {
+        items.iter().find_map(|item| {
+            if item.get("kind").and_then(Value::as_str) != Some(kind) {
+                return None;
+            }
+            let trimmed = item.get("text").and_then(Value::as_str)?.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.chars().take(120).collect())
+            }
+        })
+    };
+    if let Some(summary) = first_text_of("text").or_else(|| first_text_of("thinking")) {
+        return summary;
+    }
     for item in items {
         match item.get("kind").and_then(Value::as_str) {
-            Some("text") | Some("thinking") => {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        return trimmed.chars().take(120).collect();
-                    }
-                }
-            }
             Some("tool_use") => {
                 if let Some(name) = item.get("name").and_then(Value::as_str) {
                     return name.to_string();
