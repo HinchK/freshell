@@ -13,7 +13,7 @@
 
 ## Global Constraints
 
-- Base: `origin/main @ c491aee0`. Work ONLY inside the worktree `/home/dan/code/freshell/.worktrees/tabs-snapshot-defects`, branch `fix/tabs-snapshot-defects`. All relative paths below are relative to that worktree root.
+- Base: forked from `origin/main` at `c491aee0` (the merge-base). The branch HEAD additionally carries this plan's `docs:` commits, and `origin/main` may have advanced past the base — Task 8 Step 3's pre-push drift check handles that; all line anchors below are stated against `c491aee0`. Work ONLY inside the worktree `/home/dan/code/freshell/.worktrees/tabs-snapshot-defects`, branch `fix/tabs-snapshot-defects`. All relative paths below are relative to that worktree root.
 - SCOPE FENCE (Lane A6 of a 6-lane wave): you own `crates/freshell-ws/src/tabs_persist.rs`, the new `crates/freshell-ws/src/tabs_persist_retention.rs`, minimal ack construction in `crates/freshell-ws/src/tabs.rs` + `crates/freshell-ws/src/terminal.rs`, `crates/freshell-protocol/src/server_messages.rs` (one struct), `crates/freshell-protocol/tests/roundtrip.rs`, `shared/ws-protocol.ts` (one type), the regenerated `port/contract/ws-server-messages.schema.json`, and tests. Do NOT touch `crates/freshell-ws/src/tabs_persist_validation.rs`, `crates/freshell-server/src/tabs_snapshots.rs` (`pane_to_create_body` / restore endpoint — Lane A1 / kata h9vt own those), or client `src/` (READ-only for the ack schema). No kimi/gemini.
 - CROSS-LANE COORDINATION (verified during load-bearing validation by inspecting the sibling lanes' plans — see the ledger at `.worktrees/.the-usual-logs/tabs-snapshot-defects/load-bearing-ledger.md`): sibling lanes DO touch files this lane edits. Lane `createrequestid-stabilization` owns `tabs_persist_validation.rs` and also appends tests to `tabs_persist_tests.rs`; lane `pane-identity-ledger` modifies `server_messages.rs` (new `durability.degraded` variant, WITHOUT regenerating the frozen contract), `invariants.rs`, and `terminal.rs`; lane `scrollback-persistence` modifies `terminal.rs` (`handle_create`). Consequences: (1) keep this lane's edits to those files minimal and append-only where possible; trivial textual merge conflicts at integration are expected and fine; (2) the contract regen in Task 5 is merge-order-dependent — Task 8 Step 3 now REQUIRES a pre-push drift check (rebase + re-run `npm run contract:generate` + re-verify if any owned file or `port/contract/*` moved on origin/main).
 - Empty-push skip (`tabs.rs:205-214`): semantics stay EXACTLY as-is (the design question belongs to kata h9vt). We only add ack-shape test coverage.
@@ -74,7 +74,8 @@ Wire-compat facts (verified): the SPA parses server messages with `JSON.parse(..
 Run (from the worktree root):
 ```bash
 cd /home/dan/code/freshell/.worktrees/tabs-snapshot-defects
-git log --oneline -1        # expect: c491aee0 ...
+git merge-base --is-ancestor c491aee0 HEAD && echo BASE-OK   # expect: BASE-OK
+git log --oneline c491aee0..HEAD   # expect: only this plan's docs commits (docs: ...); no code commits yet
 cargo test -p freshell-ws
 cargo test -p freshell-protocol
 npm run test:status
@@ -876,35 +877,38 @@ tabs.sync.ack handler and no runtime validation of server messages."
 
 - [ ] **Step 1: Write the failing roundtrip test**
 
-In `crates/freshell-protocol/tests/roundtrip.rs`, add (mirror the file's existing `server_roundtrip(...)` call style exactly — the helper at ~lines 59-79 validates the re-serialized message against `outbound_schema()["messages"][type]`):
+In `crates/freshell-protocol/tests/roundtrip.rs`, add the test below in the file's wire-string helper style. The helper's actual contract (verified at ~line 63) is `fn server_roundtrip(wire: &str, type_name: &str) -> ServerMessage`: it deserializes the wire JSON string, asserts the re-serialization is structurally identical to the input, then validates it against `outbound_schema()["messages"][type_name]` — so `type_name` must be the exact wire discriminant string `"tabs.sync.ack"`. (This test compiles only after Task 4 added the two optional fields to the Rust `TabsSyncAck` struct — Task 4 is a hard prerequisite.)
 
 ```rust
 #[test]
 fn tabs_sync_ack_roundtrips_with_and_without_persist_fields() {
-    server_roundtrip(ServerMessage::TabsSyncAck(TabsSyncAck {
-        accepted: true,
-        closed_records: 0,
-        open_records: 3,
-        persisted: None,
-        persist_reason: None,
-    }));
+    // Success shape: fields omitted — byte-identical to today's ack on the wire.
+    let base = r#"{"type":"tabs.sync.ack","accepted":true,"closedRecords":0,"openRecords":3}"#;
+    match server_roundtrip(base, "tabs.sync.ack") {
+        ServerMessage::TabsSyncAck(ack) => {
+            assert_eq!(ack.persisted, None);
+            assert_eq!(ack.persist_reason, None);
+        }
+        other => panic!("expected TabsSyncAck, got {other:?}"),
+    }
     // The honest-failure shape must conform to the frozen contract too.
-    server_roundtrip(ServerMessage::TabsSyncAck(TabsSyncAck {
-        accepted: true,
-        closed_records: 0,
-        open_records: 3,
-        persisted: Some(false),
-        persist_reason: Some("oversize".to_string()),
-    }));
+    let failed = r#"{"type":"tabs.sync.ack","accepted":true,"closedRecords":0,"openRecords":3,"persisted":false,"persistReason":"oversize"}"#;
+    match server_roundtrip(failed, "tabs.sync.ack") {
+        ServerMessage::TabsSyncAck(ack) => {
+            assert_eq!(ack.persisted, Some(false));
+            assert_eq!(ack.persist_reason.as_deref(), Some("oversize"));
+        }
+        other => panic!("expected TabsSyncAck, got {other:?}"),
+    }
 }
 ```
 
-(Adjust import paths / helper invocation to match the file's existing tests verbatim.)
+(Match the file's existing tests for the `match`/panic idiom; the two round-trip assertions inside the helper pass because `skip_serializing_if` omits `None` fields in the first frame and emits both `Some` fields in the second.)
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test -p freshell-protocol tabs_sync_ack_roundtrips -- --nocapture`
-Expected: FAIL — the second roundtrip violates the committed schema's `"additionalProperties": false` for `tabs.sync.ack` (which does not yet know `persisted`/`persistReason`). The first case passes (fields omitted). If BOTH pass, the schema was not being enforced — stop and investigate before proceeding.
+Expected: FAIL — the second `server_roundtrip` call fails the helper's schema-conformance assertion, because the committed frozen schema's `tabs.sync.ack` entry has `"additionalProperties": false` and does not yet know `persisted`/`persistReason`. (The first call, with the fields omitted, succeeds before that panic — deserialization and round-trip equality pass for both frames; only the second frame's schema check can fire.) If the test PASSES outright, the schema was not being enforced — stop and investigate before proceeding.
 
 - [ ] **Step 3: Extend the shared TS type and regenerate the contract**
 
