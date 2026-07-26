@@ -14,7 +14,7 @@
 ## Global Constraints
 
 - Work ONLY inside the worktree `/home/dan/code/freshell/.worktrees/createrequestid-stabilization` (branch based on `origin/main @ c491aee0`). All relative paths below are relative to this worktree root.
-- **Scope fence (owned files):** `src/store/panesSlice.ts` + persisted-state hydrate path, `src/store/persistMiddleware.ts` (behavior locked by test; no code change expected), `src/lib/tab-registry-snapshot.ts`, `crates/freshell-ws/src/tabs_persist_validation_tests.rs` (new; `tabs_persist_tests.rs` is Lane A6's to modify — do not touch it) + a 3-line test-module registration at the end of `crates/freshell-ws/src/tabs_persist.rs`, `crates/freshell-server/src/tabs_snapshots.rs` `pane_to_create_body` (+ its test files), `crates/freshell-freshagent` pane-create ingress (`terminal_tabs.rs`, `pane_ops.rs` tests only), plus two port-parity bookkeeping docs written in Task 7 only: `port/oracle/DEVIATIONS.md` (append one EDEV entry) and `port/contract/nondeterministic-fields.md` (one table-row edit).
+- **Scope fence (owned files):** `src/store/panesSlice.ts` + persisted-state hydrate path, `src/store/persistMiddleware.ts` (behavior locked by test; no code change expected), `src/lib/tab-registry-snapshot.ts`, `crates/freshell-ws/src/tabs_persist_validation_tests.rs` (new; `tabs_persist_tests.rs` is Lane A6's to modify — do not touch it) + a 3-line `#[cfg(test)]` test-module registration at the end of `crates/freshell-ws/src/tabs_persist_validation.rs` (`tabs_persist.rs` itself is at 999 lines against the 1,000-line cap, `port/AGENTS.md:81` — do not add lines to it), `crates/freshell-server/src/tabs_snapshots.rs` `pane_to_create_body` (+ its test files), `crates/freshell-freshagent` pane-create ingress (`terminal_tabs.rs`, `pane_ops.rs` tests only), plus two port-parity bookkeeping docs written in Task 7 only: `port/oracle/DEVIATIONS.md` (append one EDEV entry) and `port/contract/nondeterministic-fields.md` (one table-row edit).
 - **Do NOT touch:** `crates/freshell-ws/src/tabs_persist.rs` caps/eviction (Lane A6 owns it), `src/components/TerminalView.tsx` / `src/components/fresh-agent/FreshAgentView.tsx` reconnect handlers (Lane A4), `crates/freshell-freshagent` `claude.rs`/`snapshot.rs` (Lane A2), `crates/freshell-terminal/src/registry.rs` (Lane A5 — we only pass a value to its existing `create_request_id` parameter, with ONE documented exception: Task 3 makes `fn probe_create_request_id` `pub` (`registry.rs:1578`) — a one-word visibility change, no behavior change — so `freshell-freshagent` tests can assert the registry stamp; Lane A5 (scrollback-persistence) owns this file and is appending a 10th trailing `scrollback` param to `TerminalRegistry::create`, so whichever lane lands second takes a small mechanical rebase here), `crates/freshell-ws/src/reconcile.rs`. No kimi/gemini/opencode-fresh-agent changes.
 - **Do NOT change recreate semantics:** `clearTerminalContentForRecreate` (`panesSlice.ts:525-548`), `restartFreshAgentCreate` (`:1448`), `stripStaleIds`/`normalizeRestoredTree` (`:812-846`, the `restoreLayout` fresh-identity path), and the `FreshAgentView` new-session/fork mints are **intentional per-recreate mints**. They must keep rotating the key. The existing suites (`panesSlice.test.ts`, `crossTabSync.test.ts`, `terminal-restore.test.ts`) already assert this rotation and serve as the regression gate.
 - Red-Green-Refactor TDD for every change. Frequent, focused, atomic commits.
@@ -44,7 +44,7 @@ The design doc's frozen-client deviation budget (8 files) must be re-counted at 
 | `crates/freshell-freshagent/src/terminal_tabs.rs` | Modify (`spawn_terminal_pane`, 3 edits + tests) | REST ingress accepts-or-mints `createRequestId`, stamps registry, emits in `paneContent` (covers `/api/tabs`, `/api/panes/:id/split`, and `/api/panes/:id/respawn`) |
 | `crates/freshell-freshagent/src/pane_ops.rs` | Modify (tests only) | BOTH the split-path broadcast test and the respawn rotation test are extended to assert the key (production code unchanged — split and respawn delegate to `spawn_terminal_pane`) |
 | `crates/freshell-terminal/src/registry.rs` | Modify (1 word) | `probe_create_request_id` becomes `pub` so freshell-freshagent tests can assert the registry stamp (documented fence exception) |
-| `crates/freshell-ws/src/tabs_persist.rs` | Modify (3-line `#[cfg(test)]` module registration at EOF only) | Register the new sibling test file (caps/eviction untouched — Lane A6 owns those) |
+| `crates/freshell-ws/src/tabs_persist_validation.rs` | Modify (3-line `#[cfg(test)]` module registration at EOF only) | Register the new sibling test file. NOT in `tabs_persist.rs`: that file is 999/1,000 lines (`port/AGENTS.md:81` cap), so registration lives in this 563-line `#[path]` child instead — validator logic untouched, caps/eviction untouched (Lane A6 owns those) |
 | `crates/freshell-ws/src/tabs_persist_validation_tests.rs` | Create | Behavior locks: string round-trips, absent-still-valid, wrong-type-never-poisons-the-device (NO validator code change — see Task 4 rationale) |
 | `crates/freshell-server/src/tabs_snapshots.rs` | Modify | Replace inline `pane_to_create_body` with `#[path]`-sibling module include (1,000-line limit) |
 | `crates/freshell-server/src/tabs_snapshots_create_body.rs` | Create | `pane_to_create_body` moved verbatim + `createRequestId` passthrough |
@@ -809,14 +809,14 @@ git commit -m "feat(freshagent): REST pane-create ingress mints and stamps creat
 ### Task 4: Rust — lock snapshot-pipeline tolerance for `createRequestId` (tests only; NO validator change)
 
 **Files:**
-- Modify: `crates/freshell-ws/src/tabs_persist.rs` (3-line `#[cfg(test)]` module registration appended at end of file, after the existing `mod tests;` at `:997-999` — nowhere near the Lane-A6-owned caps/eviction code)
+- Modify: `crates/freshell-ws/src/tabs_persist_validation.rs` (3-line `#[cfg(test)]` module registration appended at end of file — the file is 563 lines today; ZERO validator-logic change. This file is a `#[path]` child of `tabs_persist` — registered at `tabs_persist.rs:96-97` as `#[path = "tabs_persist_validation.rs"] mod validation;` — so a test module declared here is a descendant of `tabs_persist` and keeps `pub(crate)`/private visibility)
 - Create: `crates/freshell-ws/src/tabs_persist_validation_tests.rs`
-- Do NOT modify: `crates/freshell-ws/src/tabs_persist_validation.rs`, `crates/freshell-ws/src/tabs_persist_tests.rs` (Lane A6 co-edits the latter — our tests live in the new sibling file to avoid merge conflicts)
+- Do NOT modify: `crates/freshell-ws/src/tabs_persist.rs` (it is 999 lines — appending even a 3-line registration there would break the ≤1,000-line cap, `port/AGENTS.md:81`, that this plan treats as binding; its caps/eviction code is also Lane-A6-owned), `crates/freshell-ws/src/tabs_persist_tests.rs` (Lane A6 co-edits it — our tests live in the new sibling file to avoid merge conflicts)
 
 **Why NO strict check (read this before "improving" anything):** the write-accept path (`validate_incoming_generation`, `tabs_persist.rs:104`) and the read path (`read_generation_file`, `tabs_persist.rs:108`) share ONE `validate_generation`. Any type check added there is therefore also a READ check, and the read blast radius is catastrophic: `all_generations_parsed` (`tabs_persist.rs:265-292`) propagates the first invalid file with `?`, so ONE wrong-typed field in ONE generation file makes `read_device_union`, `read_device_overview`, `read_generation`, and `read_generations_union_by_ids` return `Err` for the ENTIRE device — and `list_snapshot_devices` (`tabs_persist.rs:297-330`) reads one file per device dir, so it Errs for ALL devices on the server. Historical user disks are unauditable, and a wrong-typed value could plausibly exist (e.g. written through a pre-Task-4 server's unknown-field tolerance). Meanwhile strictness buys nothing: every consumer of the field already drops non-strings safely (`pane_to_create_body`'s `.filter(|v| v.is_string())` — Task 5 — and the Task-3 REST ingress), and the validator's existing unknown-field tolerance means string values already round-trip write→read unchanged with zero code change (write path is insert-only stamping: `terminal.rs:2262-2297`, `tabs.rs:133-142`; `persist_generation` serializes records verbatim: `tabs_persist.rs:788-796`; `validate_generation` never mutates). So this task LOCKS that tolerance with tests instead of adding validation. Enforcement of the field's type lives at the consumers, where a bad value costs one pane its identity key — not a device its entire snapshot history.
 
 **Interfaces:**
-- Consumes: `persist_generation` (`tabs_persist.rs:770`, `pub(crate)`), `read_device_union` (`:544`), `list_snapshot_devices` (`:297`), `validate_incoming_generation` (`:104`, `pub(crate)`), `TabsRegistry::with_persist_dir` + `replace_client_snapshot` (`crates/freshell-ws/src/tabs.rs:121-129`) — all reachable via `use super::*;` / `use crate::tabs::TabsRegistry;` from a child test module of `tabs_persist`.
+- Consumes: `persist_generation` (`tabs_persist.rs:770`, `pub(crate)`), `read_device_union` (`:544`), `list_snapshot_devices` (`:297`), `validate_incoming_generation` (`:104`, `pub(crate)`), `TabsRegistry::with_persist_dir` + `replace_client_snapshot` (`crates/freshell-ws/src/tabs.rs:121-129`) — all reachable via `use super::super::*;` / `use crate::tabs::TabsRegistry;` from the test module, which is a grandchild of `tabs_persist` (declared inside its `validation` child, hence the double `super`).
 - Produces: locked guarantees the rest of the plan builds on — (a) a string `payload.createRequestId` on terminal + fresh-agent panes round-trips push→persist→read unchanged (what Task 2 writes, Task 5 reads); (b) absence stays valid (legacy snapshots readable); (c) a wrong-typed value NEVER makes a generation — let alone the device — unreadable (read succeeds, value passes through verbatim; consumers drop it).
 
 - [ ] **Step 1: Write the behavior-locking tests**
@@ -835,9 +835,12 @@ Create `crates/freshell-ws/src/tabs_persist_validation_tests.rs` with exactly th
 //! see the Task 4 rationale in
 //! docs/plans/2026-07-25-createrequestid-stabilization.md. Sibling file to
 //! `tabs_persist_tests.rs` (co-owned by Lane A6, hence the separate file);
-//! helper shapes are mirrored from there.
+//! helper shapes are mirrored from there. Registered from
+//! `tabs_persist_validation.rs` (a `#[path]` child of `tabs_persist`) because
+//! `tabs_persist.rs` sits at 999 lines against the 1,000-line cap
+//! (port/AGENTS.md:81) — hence the double `super` below.
 
-use super::*;
+use super::super::*; // grandparent = tabs_persist (this mod lives under its `validation` child)
 use crate::tabs::TabsRegistry;
 use serde_json::{json, Value};
 
@@ -946,7 +949,7 @@ fn wrong_typed_create_request_id_never_poisons_the_device() {
 
 - [ ] **Step 2: Register the sibling test module**
 
-In `crates/freshell-ws/src/tabs_persist.rs`, append at the very end of the file (directly after the existing registration at `:997-999`, `#[cfg(test)]` / `#[path = "tabs_persist_tests.rs"]` / `mod tests;`):
+In `crates/freshell-ws/src/tabs_persist_validation.rs`, append at the very end of the file (after the closing `}` at `:563` — the file is 563 lines today, so this lands it at 566):
 
 ```rust
 #[cfg(test)]
@@ -954,7 +957,7 @@ In `crates/freshell-ws/src/tabs_persist.rs`, append at the very end of the file 
 mod validation_tests;
 ```
 
-This is the file's own established pattern. It does not touch the caps/eviction logic Lane A6 owns, and it keeps `tabs_persist_tests.rs` untouched (Lane A6 co-edits that file).
+Why HERE and not `tabs_persist.rs`: `tabs_persist.rs` is 999 lines and `port/AGENTS.md:81` caps files at 1,000 — appending the registration there would break the cap this plan treats as binding (cf. Task 5's extraction for exactly this reason). `tabs_persist_validation.rs` is itself a `#[path]` child of `tabs_persist` (`tabs_persist.rs:96-97`: `#[path = "tabs_persist_validation.rs"] mod validation;`), so the test module lands at `tabs_persist::validation::validation_tests` — still a descendant of `tabs_persist`, which is what keeps `pub(crate)` items reachable and makes Step 1's `use super::super::*;` resolve. The nested `#[path]` resolves relative to the directory containing `tabs_persist_validation.rs` (`src/`), so it finds the new sibling file. This is a `#[cfg(test)]`-gated module declaration ONLY — zero validator-logic change, honoring this task's NO-validator-change rule. Repo precedent for a sibling test file registering another sibling to respect the cap: `crates/freshell-server/src/tabs_snapshots_tests.rs:987`. It does not touch the caps/eviction logic Lane A6 owns, and it keeps `tabs_persist_tests.rs` untouched (Lane A6 co-edits that file).
 
 - [ ] **Step 3: Run the new tests**
 
@@ -974,7 +977,7 @@ Run:
 ```bash
 cargo fmt --all
 cargo clippy -p freshell-ws --all-targets -- -D warnings
-git add crates/freshell-ws/src/tabs_persist.rs crates/freshell-ws/src/tabs_persist_validation_tests.rs
+git add crates/freshell-ws/src/tabs_persist_validation.rs crates/freshell-ws/src/tabs_persist_validation_tests.rs
 git commit -m "test(ws): lock snapshot read/write tolerance for pane createRequestId"
 ```
 
