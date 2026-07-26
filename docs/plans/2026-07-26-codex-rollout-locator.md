@@ -73,8 +73,9 @@ Node .mjs fake-CLI fixture.
    server share ONE sessions tree:
    `<CODEX_HOME|~/.codex>/sessions/YYYY/MM/DD/rollout-<ts>-<threadId>.jsonl`
    (flat `<id>.jsonl` also supported, used by tests). Pane↔rollout attribution
-   therefore needs a disambiguator: arm-time known-files snapshot + the
-   rollout's own `session_meta.payload.cwd` + ambiguity refusal.
+   therefore needs a disambiguator set: arm-time known-files snapshot +
+   Enter-anchored windows + REQUIRED-cwd match + pending-first-line
+   bind-blocking + contested-cwd refusal (see Validated Premises below).
 2. **"One watcher, two consumers" is not feasible for discovery.** The wave-2
    status watcher (`activity.rs:349`) watches a SINGLE already-known rollout
    file, NonRecursive, and only exists once identity is known — chicken-and-egg
@@ -102,6 +103,81 @@ Node .mjs fake-CLI fixture.
    forbidden by the scope fence (Lane B4 owns those crates). WS-created panes
    (the frozen client's only path) are covered. This is a spec-directed
    boundary, not a deferral: record it in the final commit message.
+
+### Validated Premises (load-bearing validation, 2026-07-26 — trust these over any stale task prose)
+
+Evidence sources: codex source @ tag `rust-v0.145.0` + installed
+`codex-cli 0.145.0`; a 3,858-rollout local corpus (100% first-line parse);
+frozen-client code inspection. Full reports:
+`.worktrees/.the-usual-logs/codex-rollout-locator/reports/validator-*.md`.
+A codex upgrade re-opens every codex-behavior item below.
+
+7. **(A1, FALSIFIED spawn premise) Rollout files are Enter-anchored.** Codex
+   creates the rollout file ONLY when the first user prompt is recorded
+   (`RolloutRecorder` defers file creation to `persist()`, materialized via
+   `ensure_rollout_materialized()`). A rollout can NEVER legitimately appear
+   for a pane's own codex before Enter — so the locator has NO spawn window:
+   windows open only on `note_submit`. Arm still snapshots immediately.
+8. **(A3, FALSIFIED one-shot read) Create→meta-line gap is real.** After
+   creating the file codex awaits git-info collection (subprocesses, 5 s
+   timeout each; typically ms, worst ~10 s) BEFORE writing the session_meta
+   first line. A new file with an empty/incomplete first line is therefore a
+   PENDING, BIND-BLOCKING candidate re-probed up to
+   `PENDING_FIRST_LINE_GRACE_MS = 10_000` — never dropped by a one-shot read,
+   and never outvoted by a readable foreign file while pending.
+9. **(A4, FALSIFIED — misbind defenses insufficient as originally planned.)**
+   The original snapshot+cwd+same-tick-ambiguity trio allowed clean misbinds
+   (same-cwd foreign codex/exec/fork, staggered same-cwd panes, the
+   spawn-window pure-foreign capture). Mandatory hardenings, all encoded in
+   Tasks 1-3: Enter-only windows (item 7); cwd REQUIRED — a no-cwd
+   session_meta NEVER binds (`SessionMeta.cwd` is non-optional at 0.145.0,
+   3,858/3,858 corpus; a permissive no-cwd rule is pure attack surface);
+   pending-candidate bind-blocking (item 8); CROSS-TICK contested-cwd
+   refusal — while ≥2 armed terminals share a normalized cwd nothing binds
+   for any of them; and the adoption tail refuses a thread id already bound
+   to another terminal (retired-inclusive; idempotent same-terminal re-adopt
+   allowed).
+10. **(A4 residual risk — documented, NOT solvable in this lane.)** A
+    freshell-freshagent codex agent session started in the SAME cwd during a
+    pane's open window can still misbind as a sole candidate: freshagent's
+    `codex app-server` sidecar writes rollouts into the same
+    `$HOME/.codex/sessions` root. Recommended future fix (Lane B4
+    coordination): exclude freshagent-known thread ids (`thread/start`
+    results) at adoption. Recorded here so the risk is owned, not silent.
+11. **(A5) The post-spawn arm site is safe — but only because of item 7.**
+    The planned `maybe_arm` call site (terminal.rs ~:1521-1527) runs AFTER
+    the PTY spawn, with awaits in between. Enter-anchored discovery makes
+    the spawn→arm gap harmless: the pane's own rollout cannot exist yet. Do
+    not describe the snapshot as preceding spawn — it doesn't need to.
+12. **(A6, verified with corrections) Walk performance.** Real tree
+    (3,858 files): 7-9 ms warm. Synthetic 100k files: p95 96 ms warm, worst
+    117 ms under 8-way concurrency (native ext4, WSL2). The earlier
+    "35-55 ms on an 8k-file tree" figure did NOT reproduce — do not cite it.
+    Cold cache is unmeasured (needs sudo): run BOTH `arm()` and `tick()`
+    scans inside `spawn_blocking`, never on the WS dispatch path.
+13. **(A2/A9, confirmed) cwd + shape + resume argv.** `payload.cwd` is the
+    codex process's physical `getcwd` path recorded verbatim (no
+    canonicalization codex-side); equality holds BECAUSE freshell's
+    `normalize_cwd` opportunistically canonicalizes the pane side — that
+    canonicalize is load-bearing. `payload.id` == the filename threadId, a
+    36-char UUID; `codex resume <uuid>` positional is first-class. 0.145.0
+    source contains `.jsonl.zst` rollout compression — fresh sessions still
+    write plain `.jsonl`; the `.jsonl` suffix filter excludes compressed
+    artifacts. Filename timestamp and `YYYY/MM/DD` dir are precomputed at
+    session construction — can predate on-disk creation by the whole idle
+    gap / cross midnight; the locator never filters on either. Resumed
+    sessions append to their existing file (no new file) — consistent with
+    the arm gate refusing resume panes.
+14. **(A10/A7, confirmed) Env + frozen client.** The PTY child inherits the
+    server env minus a STRIP_ENV list that touches neither `CODEX_HOME` nor
+    `HOME`, and codex is exec'd directly (no shell rc) — the shared
+    sessions-root premise holds. Residual (noted, not fixed): a per-terminal
+    `envOverrides` containing `CODEX_HOME` would diverge the child's root.
+    The frozen client applies `terminal.session.associated`
+    provider-generically (`App.tsx:1004-1017` → panesSlice `sessionRef`) and
+    its candidate sender is dormant against the Rust server; its conflict
+    guard drops a push only when the pane already holds a DIFFERENT
+    sessionRef — impossible for the fresh panes the locator arms.
 
 ## File Structure
 
@@ -136,7 +212,7 @@ Key existing reference files (read, don't modify beyond what tasks say):
 
 ---
 
-### Task 1: CodexLocator skeleton — types, arm gates, scan substrate, spawn-window happy path
+### Task 1: CodexLocator skeleton — types, arm gates, scan substrate, Enter-anchored happy path
 
 **Files:**
 - Create: `crates/freshell-sessions/src/codex_locator.rs`
@@ -150,6 +226,7 @@ Key existing reference files (read, don't modify beyond what tasks say):
 
 ```rust
 pub const CODEX_WINDOW_MS: i64 = 2_000;
+pub const PENDING_FIRST_LINE_GRACE_MS: i64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Located {
@@ -167,7 +244,7 @@ impl CodexLocator {
     pub fn armed_count(&self) -> usize;
     pub fn fs_scan_count(&self) -> u64;
     pub fn arm(&self, terminal_id: &str, mode: &str, status_running: bool,
-               resume_session_id: Option<&str>, cwd: Option<&str>, now_ms: i64) -> bool;
+               resume_session_id: Option<&str>, cwd: Option<&str>) -> bool;
     pub fn disarm(&self, terminal_id: &str);
     pub fn note_submit(&self, terminal_id: &str, at_ms: i64) -> bool;
     pub fn tick(&self, now_ms: i64) -> Vec<Located>;
@@ -175,22 +252,60 @@ impl CodexLocator {
 ```
 
 Design notes to encode in the module doc (deliberate deviations from the
-opencode locator, each with rationale):
+opencode locator, each with rationale — the codex-behavior facts below are
+validated against codex source @ rust-v0.145.0 and a 3,858-rollout local
+corpus; see "Validated Premises" above):
 - Substrate is a filesystem snapshot-diff, not SQLite row-diff: codex persists
   one JSONL rollout file per session under the sessions root.
 - There is NO `pre_epsilon_ms` and NO created-at time bound: filesystems have
   no reliable cross-platform creation time. The arm-time `known_files`
   snapshot is the sole (and primary — same as opencode's `known_ids`) safety:
-  a file already present at arm can never bind to this terminal.
-- Window semantics are otherwise identical to opencode: deadline is
-  `arm_ms + spawn_window_ms` until a submit lands, then `enter_ms + window_ms`;
-  submits only extend, never shorten; evaluation happens once per open window
-  (`resolved` flag), and a later Enter re-opens it.
+  a file already present at arm can never bind to this terminal. The locator
+  also never filters by the FILENAME timestamp or by today's `YYYY/MM/DD`
+  directory: the filename timestamp is precomputed at codex session
+  construction and can predate on-disk creation by the entire user idle gap,
+  and the dated dir can be a previous day across midnight — the full-tree
+  snapshot-diff sidesteps both.
+- Windows are ENTER-ANCHORED ONLY — there is NO spawn-anchored window (a
+  deliberate deviation from opencode). Real codex (0.145.0) defers rollout
+  file creation until the first user prompt is recorded (`RolloutRecorder`
+  defers to `persist()`, materialized via `ensure_rollout_materialized()`),
+  so a rollout can NEVER legitimately appear for this pane's codex before
+  Enter — a spawn window would be a pure FOREIGN-capture window. `arm()`
+  still takes the known-files snapshot immediately; it schedules no deadline
+  until `note_submit`. Deadline is `enter_ms + window_ms`; evaluation happens
+  once per open window (`resolved` flag), and a later Enter re-opens it.
+- cwd is REQUIRED: a first line whose `session_meta.payload` lacks `cwd` is
+  never a candidate (`SessionMeta.cwd` is non-optional at 0.145.0;
+  3,858/3,858 real rollouts carry it — a no-cwd rule would be pure foreign
+  attack surface). The cwd match relies on `normalize_cwd`'s opportunistic
+  `fs::canonicalize` of the pane side being load-bearing: `payload.cwd` is
+  the codex process's physical `getcwd` path, recorded verbatim.
+- Pending first-line grace: codex CREATES the file, then awaits git-info
+  collection (subprocesses, 5 s timeout each, worst ~10 s) BEFORE writing the
+  `session_meta` line — a deadline scan can see an empty/incomplete first
+  line. Such a NEW file is a PENDING candidate: re-probed each sweep up to
+  `PENDING_FIRST_LINE_GRACE_MS`, and while ANY pending candidate exists the
+  terminal binds NOTHING (bind-blocking — a readable foreign file must not
+  win while the pane's own file sits in its git-info gap). An Enter→creation
+  latency exceeding the 2 s window (slow first-prompt recording) is mitigated
+  by this grace plus window re-open on a later Enter.
+- Contested-cwd refusal is CROSS-TICK: while ≥2 armed terminals share a
+  normalized cwd, no candidate with that cwd binds for any of them —
+  staggered deadlines must not let one pane grab a sibling's rollout
+  uncontested.
+- Resumed codex sessions append to their EXISTING rollout file (no new file)
+  — consistent with the arm gate refusing resume panes. Compressed rollout
+  artifacts (`.jsonl.zst`, present in 0.145.0 source) are excluded by the
+  `.jsonl` suffix filter; fresh sessions always write plain `.jsonl`.
 - Scans happen ONLY at arm time and at deadline evaluations (never on idle
-  ticks — proven by `fs_scan_count`), bounded to walk depth 5 (the tree is
-  `sessions/YYYY/MM/DD/rollout-*.jsonl`; flat `<id>.jsonl` in tests). Measured
-  35-55 ms warm on a real 8k-file tree; callers run `tick()` in
-  `spawn_blocking`.
+  ticks — proven by `fs_scan_count`; a pending candidate keeps its window's
+  evaluation due, so re-probes ride the same gate), bounded to walk depth 5
+  (the tree is `sessions/YYYY/MM/DD/rollout-*.jsonl`; flat `<id>.jsonl` in
+  tests). Measured (A6, native ext4 under WSL2): 7-9 ms on the real
+  3.8k-file tree; synthetic 100k files p95 96 ms warm, worst 117 ms under
+  8-way concurrency. Cold-cache is unmeasured — callers run BOTH `arm()` and
+  `tick()` inside `spawn_blocking`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -240,20 +355,24 @@ mod tests {
     const TID: &str = "11111111-2222-3333-4444-555555555555";
 
     #[test]
-    fn fresh_rollout_written_at_spawn_resolves_via_spawn_window() {
-        let root = unique_temp_dir("spawn-happy");
+    fn fresh_rollout_after_first_enter_resolves_via_enter_window() {
+        let root = unique_temp_dir("enter-happy");
         let cwd = root.join("project");
         std::fs::create_dir_all(&cwd).unwrap();
         let cwd_s = cwd.to_string_lossy().to_string();
         let locator = CodexLocator::new(root.clone());
 
-        assert!(locator.arm("t1", "codex", true, None, Some(&cwd_s), 1_000));
-        // Rollout appears AFTER arm, BEFORE the spawn deadline — no Enter at all.
+        assert!(locator.arm("t1", "codex", true, None, Some(&cwd_s)));
+        // No submit yet -> no deadline exists; nothing to evaluate.
+        assert!(locator.tick(10_000).is_empty());
+        // Enter at 20_000; the rollout appears AFTER the submit (real codex
+        // materializes the file only when the first user prompt is recorded).
+        assert!(locator.note_submit("t1", 20_000));
         let path = write_rollout(&root, "2026/07/26", TID, Some(&cwd_s));
 
-        // Before the deadline: nothing yet (evaluation happens at deadline).
-        assert!(locator.tick(1_000 + CODEX_WINDOW_MS - 1).is_empty());
-        let located = locator.tick(1_000 + CODEX_WINDOW_MS);
+        // Before the Enter-anchored deadline: nothing yet.
+        assert!(locator.tick(20_000 + CODEX_WINDOW_MS - 1).is_empty());
+        let located = locator.tick(20_000 + CODEX_WINDOW_MS);
         assert_eq!(
             located,
             vec![Located {
@@ -265,7 +384,25 @@ mod tests {
         );
         // Success fully resolves and disarms; tick() drains.
         assert_eq!(locator.armed_count(), 0);
-        assert!(locator.tick(1_000 + CODEX_WINDOW_MS + 1).is_empty());
+        assert!(locator.tick(20_000 + CODEX_WINDOW_MS + 1).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rollout_after_arm_without_submit_is_never_bound_and_never_scanned() {
+        // A1 (validated): real codex creates the rollout ONLY at the first
+        // user prompt, so before Enter every new same-cwd rollout is by
+        // construction FOREIGN. With no submit there is NO window: the file
+        // must never bind and no deadline scans may run.
+        let root = unique_temp_dir("no-submit");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert_eq!(locator.fs_scan_count(), 1); // the arm snapshot
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert!(locator.tick(100 * CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        assert_eq!(locator.fs_scan_count(), 1); // still only the arm snapshot
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -274,17 +411,17 @@ mod tests {
         let root = unique_temp_dir("gates");
         let locator = CodexLocator::new(root.clone());
         // wrong mode
-        assert!(!locator.arm("t1", "opencode", true, None, Some("/tmp"), 0));
+        assert!(!locator.arm("t1", "opencode", true, None, Some("/tmp")));
         // not running
-        assert!(!locator.arm("t1", "codex", false, None, Some("/tmp"), 0));
+        assert!(!locator.arm("t1", "codex", false, None, Some("/tmp")));
         // resume id present — the ONLY already-bound gate (no restore flag)
-        assert!(!locator.arm("t1", "codex", true, Some(TID), Some("/tmp"), 0));
+        assert!(!locator.arm("t1", "codex", true, Some(TID), Some("/tmp")));
         // missing / empty cwd
-        assert!(!locator.arm("t1", "codex", true, None, None, 0));
-        assert!(!locator.arm("t1", "codex", true, None, Some(""), 0));
+        assert!(!locator.arm("t1", "codex", true, None, None));
+        assert!(!locator.arm("t1", "codex", true, None, Some("")));
         // happy arm, then idempotent re-arm returns false
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
-        assert!(!locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(!locator.arm("t1", "codex", true, None, Some("/tmp")));
         assert_eq!(locator.armed_count(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -293,7 +430,8 @@ mod tests {
     fn disarmed_terminal_never_resolves() {
         let root = unique_temp_dir("disarm");
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
         write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
         locator.disarm("t1");
         assert!(locator.tick(CODEX_WINDOW_MS + 1).is_empty());
@@ -310,9 +448,10 @@ mod tests {
         assert!(locator.tick(10_000).is_empty());
         assert_eq!(locator.fs_scan_count(), 0);
         // Arming scans once (the known-files snapshot)…
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
         assert_eq!(locator.fs_scan_count(), 1);
-        // …but a tick BEFORE any deadline is due still scans nothing.
+        // …and a tick BEFORE any Enter-anchored deadline is due (here: no
+        // submit at all, so no deadline exists) still scans nothing.
         let before = locator.fs_scan_count();
         assert!(locator.tick(1).is_empty());
         assert_eq!(locator.fs_scan_count(), before);
@@ -345,25 +484,59 @@ module is the RED state for a new module.
 //! flat `<id>.jsonl` in tests). A new session is a NEW FILE — so the locator
 //! does a snapshot-diff of the file set, not a row-diff.
 //!
+//! Codex-behavior facts below are validated against codex source @
+//! rust-v0.145.0 and a 3,858-rollout corpus; a codex upgrade re-opens them.
+//!
 //! Deliberate deviations from the opencode locator, with rationale:
+//! - Windows are ENTER-ANCHORED ONLY — no spawn window. Real codex defers
+//!   rollout file creation until the first user prompt is recorded
+//!   (`RolloutRecorder` defers to `persist()`, materialized via
+//!   `ensure_rollout_materialized()`), so before the pane's first Enter every
+//!   new same-cwd rollout is by construction FOREIGN. `arm()` takes the
+//!   known-files snapshot immediately but schedules NO deadline until
+//!   `note_submit`.
 //! - NO `pre_epsilon_ms` and NO created-at time bound: filesystems have no
 //!   reliable cross-platform creation time (mtime moves on every append).
-//!   The arm-time `known_files` snapshot is the sole safety — a file already
-//!   present at arm can never bind to this terminal. (For opencode the
-//!   snapshot is ALSO the primary safety; the time bound there is
-//!   defense-in-depth the fs cannot provide.)
+//!   The arm-time `known_files` snapshot is the primary safety — a file
+//!   already present at arm can never bind to this terminal. The FILENAME
+//!   timestamp and the dated `YYYY/MM/DD` dir are never used as filters
+//!   either: both are precomputed at codex session construction and can
+//!   predate on-disk creation by the entire user idle gap (the dir can even
+//!   be "yesterday" across midnight). The full-tree snapshot-diff sidesteps
+//!   both.
 //! - Attribution disambiguator: the rollout's own first-line
-//!   `session_meta.payload.cwd` (when present) must match the armed
-//!   terminal's cwd. When absent, ambiguity refusal still protects
-//!   concurrent spawns (see `tick`).
+//!   `session_meta.payload.cwd` is REQUIRED and must match the armed
+//!   terminal's cwd (`SessionMeta.cwd` is non-optional at 0.145.0;
+//!   3,858/3,858 real rollouts carry it — accepting a no-cwd line would be
+//!   pure foreign attack surface). `payload.cwd` is the codex process's
+//!   physical `getcwd` path recorded verbatim; equality holds because
+//!   `normalize_cwd` opportunistically canonicalizes the pane side — that
+//!   canonicalize is load-bearing for symlinked spawn dirs.
+//! - Pending first-line grace: codex CREATES the file, then awaits git-info
+//!   collection (subprocesses, 5 s timeout each, worst ~10 s) BEFORE writing
+//!   the `session_meta` line. A NEW file whose first line is empty/incomplete
+//!   is a PENDING candidate: re-probed each sweep up to
+//!   `PENDING_FIRST_LINE_GRACE_MS`, and while ANY pending candidate exists
+//!   this terminal binds NOTHING (bind-blocking — a readable foreign file
+//!   must not win while the pane's own file sits in its git-info gap).
+//!   Enter→creation latency beyond the 2 s window is mitigated by this grace
+//!   plus window re-open on a later Enter.
+//! - Contested-cwd refusal is CROSS-TICK: while ≥2 armed terminals share a
+//!   normalized cwd, no candidate with that cwd binds for any of them.
 //! - Ownership is proven ONLY by `payload.id` on line 1 — NEVER the filename
 //!   (prefilter-grade at best), NEVER `payload.session_id` (fork/resume
 //!   LINEAGE: matches a FOREIGN session in 54/144 sampled real rollouts) —
 //!   same predicate as `freshell-ws`'s `first_line_owns`.
+//! - Resumed codex sessions append to their EXISTING rollout file (no new
+//!   file) — consistent with the arm gate refusing resume panes. Compressed
+//!   artifacts (`.jsonl.zst`, present in 0.145.0 source) fail the `.jsonl`
+//!   suffix filter; fresh sessions always write plain `.jsonl`.
 //!
-//! Zero cost when idle: scans happen only at arm and at deadline
-//! evaluations, proven by `fs_scan_count`. Callers run `tick()` inside
-//! `tokio::task::spawn_blocking`.
+//! Zero cost when idle: scans happen only at arm and at due Enter-anchored
+//! evaluations (a pending candidate keeps its evaluation due, so re-probes
+//! ride the same gate), proven by `fs_scan_count`. Callers run BOTH `arm()`
+//! and `tick()` inside `tokio::task::spawn_blocking` (cold dentry cache is
+//! the one unmeasured tail — A6).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -372,10 +545,18 @@ use std::sync::Mutex;
 
 use crate::opencode_locator::normalize_cwd;
 
-/// Correlation window after a submit (Enter-anchored deadline), and the
-/// spawn-anchored fallback window (spawn_window_ms := window_ms, kept
-/// distinct for clarity — same convention as the opencode locator).
+/// Correlation window after a submit (Enter-anchored deadline). There is NO
+/// spawn-anchored window: real codex (0.145.0) creates the rollout file only
+/// when the first user prompt is recorded, so before the pane's first Enter
+/// every new same-cwd rollout is by construction foreign.
 pub const CODEX_WINDOW_MS: i64 = 2_000;
+
+/// Bounded re-probe grace for a NEW file whose first line is not yet
+/// readable: codex creates the file, then awaits git-info collection
+/// (subprocesses, 5 s timeout each, worst ~10 s) before writing the
+/// `session_meta` line. Matches codex's worst case and the magnitude of the
+/// existing `IDENTITY_RESOLUTION_GRACE_MS`.
+pub const PENDING_FIRST_LINE_GRACE_MS: i64 = 10_000;
 
 /// Bounded first-line read cap — real rollouts reach 152 MB; observed real
 /// first lines are ≤ 22.4 KB. Mirrors `codex_reconcile.rs`.
@@ -396,10 +577,15 @@ pub struct Located {
 #[derive(Debug, Clone)]
 struct Armed {
     cwd_normalized: String,
-    arm_ms: i64,
     known_files: HashSet<PathBuf>,
     enter_ms: Option<i64>,
     resolved: bool,
+    /// NEW files whose first line was empty/incomplete when probed, keyed to
+    /// first-seen ms. While any un-expired entry exists, this terminal binds
+    /// NOTHING (bind-blocking); entries older than
+    /// `PENDING_FIRST_LINE_GRACE_MS` are merged into `known_files`
+    /// (permanently excluded — fail toward refusal).
+    pending_first_line: HashMap<PathBuf, i64>,
 }
 
 #[derive(Default)]
@@ -410,7 +596,6 @@ struct Inner {
 pub struct CodexLocator {
     sessions_root: PathBuf,
     window_ms: i64,
-    spawn_window_ms: i64,
     inner: Mutex<Inner>,
     fs_scan_count: AtomicU64,
 }
@@ -424,7 +609,6 @@ impl CodexLocator {
         Self {
             sessions_root,
             window_ms,
-            spawn_window_ms: window_ms,
             inner: Mutex::new(Inner::default()),
             fs_scan_count: AtomicU64::new(0),
         }
@@ -442,6 +626,8 @@ impl CodexLocator {
     /// NO resume id (the only already-bound gate — never a restore flag, so
     /// restore-created identity-less panes re-arm for free), non-empty cwd,
     /// not already armed. On success takes the arm-time known-files snapshot.
+    /// Arming schedules NO deadline — windows open only on `note_submit`
+    /// (Enter-anchored; see module doc).
     pub fn arm(
         &self,
         terminal_id: &str,
@@ -449,7 +635,6 @@ impl CodexLocator {
         status_running: bool,
         resume_session_id: Option<&str>,
         cwd: Option<&str>,
-        now_ms: i64,
     ) -> bool {
         if mode != "codex" || !status_running || resume_session_id.is_some() {
             return false;
@@ -466,10 +651,10 @@ impl CodexLocator {
             terminal_id.to_string(),
             Armed {
                 cwd_normalized: normalize_cwd(cwd),
-                arm_ms: now_ms,
                 known_files,
                 enter_ms: None,
                 resolved: false,
+                pending_first_line: HashMap::new(),
             },
         );
         true
@@ -479,9 +664,11 @@ impl CodexLocator {
         self.inner.lock().unwrap().armed.remove(terminal_id);
     }
 
-    /// Enter re-open semantics (mirrors opencode): a mid-turn Enter never
-    /// re-opens a still-pending evaluation; a resolved (zero-candidate /
-    /// ambiguous) terminal gets a fresh Enter-anchored deadline.
+    /// The FIRST submit is what opens a window at all (windows are
+    /// Enter-anchored — arm schedules no deadline). Re-open semantics mirror
+    /// opencode: a mid-turn Enter never re-opens a still-pending evaluation;
+    /// a resolved (zero-candidate / ambiguous / contested) terminal gets a
+    /// fresh Enter-anchored deadline.
     pub fn note_submit(&self, terminal_id: &str, at_ms: i64) -> bool {
         let mut inner = self.inner.lock().unwrap();
         let Some(armed) = inner.armed.get_mut(terminal_id) else {
@@ -495,18 +682,25 @@ impl CodexLocator {
         true
     }
 
-    fn deadline(&self, armed: &Armed) -> i64 {
-        match armed.enter_ms {
-            Some(enter_ms) => enter_ms + self.window_ms,
-            None => armed.arm_ms + self.spawn_window_ms,
-        }
+    /// A terminal is due only when an Enter-anchored deadline exists and has
+    /// passed. No submit -> no window -> never evaluated (see module doc).
+    fn due(&self, armed: &Armed, now_ms: i64) -> bool {
+        matches!(armed.enter_ms, Some(enter_ms) if !armed.resolved && now_ms >= enter_ms + self.window_ms)
     }
 
-    /// One evaluation per open window, at (or after) its deadline. Outcomes:
+    /// Evaluation at (or after) an Enter-anchored deadline. Outcomes:
+    /// any NEW file with an empty/incomplete first line (codex's
+    /// create→session_meta git-info gap) → PENDING: bind NOTHING for this
+    /// terminal, stay unresolved, re-probe each sweep up to
+    /// `PENDING_FIRST_LINE_GRACE_MS` (grace-expired files are permanently
+    /// excluded);
     /// 0 candidates → keep watching (stays armed, `resolved = true`);
     /// >1 candidates for one terminal → WARN + refuse (never guess);
+    /// exactly one candidate but ≥2 ARMED terminals share this cwd → WARN +
+    /// refuse (contested cwd — cross-tick, so staggered deadlines can't grab
+    /// a sibling's rollout uncontested);
     /// one candidate claimed by ≥2 terminals in the same tick → WARN + refuse
-    /// ALL claimants (concurrent same-cwd spawns are indistinguishable);
+    /// ALL claimants (defense-in-depth behind the cwd census);
     /// exactly one clean match → emit `Located` and disarm. `tick()` drains.
     pub fn tick(&self, now_ms: i64) -> Vec<Located> {
         {
@@ -514,49 +708,88 @@ impl CodexLocator {
             if inner.armed.is_empty() {
                 return Vec::new();
             }
-            if !inner
-                .armed
-                .values()
-                .any(|a| !a.resolved && now_ms >= self.deadline(a))
-            {
+            if !inner.armed.values().any(|a| self.due(a, now_ms)) {
                 return Vec::new();
             }
         }
         let current = self.scan_rollout_files();
         let mut inner = self.inner.lock().unwrap();
 
+        // Cross-tick contested-cwd census over ALL armed terminals (not just
+        // the due ones): two armed same-cwd panes are indistinguishable on
+        // this substrate, whatever their deadlines.
+        let mut cwd_counts: HashMap<String, usize> = HashMap::new();
+        for a in inner.armed.values() {
+            *cwd_counts.entry(a.cwd_normalized.clone()).or_insert(0) += 1;
+        }
+
         // Pass 1: per-terminal candidate evaluation.
         let mut claims: Vec<(String, Located)> = Vec::new();
         for (terminal_id, armed) in inner.armed.iter_mut() {
-            if armed.resolved || now_ms < self.deadline(armed) {
+            if !matches!(armed.enter_ms, Some(e) if !armed.resolved && now_ms >= e + self.window_ms)
+            {
+                continue;
+            }
+            let new_paths: Vec<PathBuf> =
+                current.difference(&armed.known_files).cloned().collect();
+            let mut matches: Vec<(PathBuf, RolloutMeta)> = Vec::new();
+            let mut pending_blocking = false;
+            for path in new_paths {
+                match probe_rollout(&path) {
+                    Probe::Candidate(meta) => {
+                        armed.pending_first_line.remove(&path);
+                        if normalize_cwd(&meta.cwd) == armed.cwd_normalized {
+                            matches.push((path, meta));
+                        }
+                    }
+                    Probe::NotYet => {
+                        let first_seen =
+                            *armed.pending_first_line.entry(path.clone()).or_insert(now_ms);
+                        if now_ms - first_seen >= PENDING_FIRST_LINE_GRACE_MS {
+                            // Grace exhausted: permanently excluded (fail
+                            // toward refusal — A4 hardening 1).
+                            armed.pending_first_line.remove(&path);
+                            armed.known_files.insert(path);
+                        } else {
+                            pending_blocking = true;
+                        }
+                    }
+                    Probe::Never => {}
+                }
+            }
+            if pending_blocking {
+                // A new file is still inside codex's create→session_meta gap
+                // (git-info collection, worst ~10 s). It may be THIS pane's
+                // rollout — binding any other candidate now could hand the
+                // window to a foreign file while the true owner is unreadable.
+                // Bind nothing, stay unresolved, re-probe next sweep.
+                tracing::debug!(
+                    terminal_id = %terminal_id,
+                    "codex_locator_pending: new rollout first line not yet readable; deferring evaluation"
+                );
                 continue;
             }
             armed.resolved = true;
-            let mut matches: Vec<(PathBuf, RolloutMeta)> = Vec::new();
-            for path in current.difference(&armed.known_files) {
-                let Some(meta) = probe_rollout(path) else {
-                    continue;
-                };
-                if let Some(cwd) = &meta.cwd {
-                    if normalize_cwd(cwd) != armed.cwd_normalized {
-                        continue;
-                    }
-                }
-                matches.push((path.clone(), meta));
-            }
             match matches.len() {
                 0 => {} // keep watching
                 1 => {
-                    let (path, meta) = matches.remove(0);
-                    claims.push((
-                        terminal_id.clone(),
-                        Located {
-                            terminal_id: terminal_id.clone(),
-                            thread_id: meta.thread_id,
-                            rollout_path: path,
-                            cwd: armed.cwd_normalized.clone(),
-                        },
-                    ));
+                    if cwd_counts.get(&armed.cwd_normalized).copied().unwrap_or(0) >= 2 {
+                        tracing::warn!(
+                            terminal_id = %terminal_id,
+                            "codex_locator_contested_cwd: >=2 armed terminals share this cwd; refusing to bind"
+                        );
+                    } else {
+                        let (path, meta) = matches.remove(0);
+                        claims.push((
+                            terminal_id.clone(),
+                            Located {
+                                terminal_id: terminal_id.clone(),
+                                thread_id: meta.thread_id,
+                                rollout_path: path,
+                                cwd: armed.cwd_normalized.clone(),
+                            },
+                        ));
+                    }
                 }
                 n => {
                     tracing::warn!(
@@ -568,8 +801,10 @@ impl CodexLocator {
             }
         }
 
-        // Pass 2: cross-terminal conflict — the same rollout (or thread id)
-        // claimed by two armed terminals in one tick is unattributable.
+        // Pass 2: same-tick cross-terminal conflict — the same rollout (or
+        // thread id) claimed by two armed terminals in one tick is
+        // unattributable. (Defense-in-depth: the contested-cwd census above
+        // already refuses same-cwd claimants across ticks.)
         let mut located = Vec::new();
         for (terminal_id, candidate) in &claims {
             let contested = claims.iter().any(|(other_tid, other)| {
@@ -624,37 +859,67 @@ impl CodexLocator {
 
 struct RolloutMeta {
     thread_id: String,
-    cwd: Option<String>,
+    /// REQUIRED — `SessionMeta.cwd` is non-optional at codex 0.145.0
+    /// (3,858/3,858 real rollouts carry it); a no-cwd first line is a
+    /// foreign shape, never a candidate (A4 hardening).
+    cwd: String,
 }
 
-/// Identity probe: bounded first-line read; the line must be a
-/// `session_meta` whose `payload.id` is a bare hyphenated UUID. Anything
-/// else (foreign shapes, oversized lines, non-JSON) is silently not a
-/// candidate — the locator never errors on foreign files in a shared tree.
-fn probe_rollout(path: &Path) -> Option<RolloutMeta> {
+/// Tri-state probe result. The distinction between `NotYet` and `Never` is
+/// load-bearing: codex writes the whole session_meta line + '\n' in one
+/// write-then-flush, so a COMPLETE (newline-terminated) line that fails the
+/// candidate shape will never become one, while an empty file or a line
+/// without its trailing newline is codex's create→meta gap (or a raced
+/// write) — "not yet", not "never" (A3, validated).
+enum Probe {
+    /// Parseable `session_meta` with a bare-UUID `payload.id` AND a
+    /// `payload.cwd` — a real candidate shape.
+    Candidate(RolloutMeta),
+    /// Empty file, transient open/read failure, or first line still missing
+    /// its trailing newline — re-probe within the pending grace.
+    NotYet,
+    /// Complete first line that is not a codex session_meta candidate
+    /// (non-JSON, wrong type, non-UUID id, missing cwd, oversized) — never
+    /// a candidate; the locator stays silent on foreign files.
+    Never,
+}
+
+/// Identity probe: bounded first-line read (see `Probe` for the tri-state
+/// semantics).
+fn probe_rollout(path: &Path) -> Probe {
     use std::io::BufRead;
-    let file = std::fs::File::open(path).ok()?;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Probe::NotYet;
+    };
     let mut reader = std::io::BufReader::new(file).take(MAX_FIRST_LINE_BYTES);
     let mut first_line = Vec::new();
-    reader.read_until(b'\n', &mut first_line).ok()?;
+    if reader.read_until(b'\n', &mut first_line).is_err() {
+        return Probe::NotYet;
+    }
     if first_line.len() as u64 >= MAX_FIRST_LINE_BYTES && !first_line.ends_with(b"\n") {
-        return None;
+        return Probe::Never; // oversized: will never fit the cap
     }
-    let record: serde_json::Value = serde_json::from_slice(&first_line).ok()?;
+    if first_line.is_empty() || !first_line.ends_with(b"\n") {
+        return Probe::NotYet; // create→meta gap, or a raced partial write
+    }
+    let Ok(record) = serde_json::from_slice::<serde_json::Value>(&first_line) else {
+        return Probe::Never;
+    };
     if record.get("type").and_then(|v| v.as_str()) != Some("session_meta") {
-        return None;
+        return Probe::Never;
     }
-    let thread_id = record.pointer("/payload/id").and_then(|v| v.as_str())?;
+    let Some(thread_id) = record.pointer("/payload/id").and_then(|v| v.as_str()) else {
+        return Probe::Never;
+    };
     if !is_uuid_shaped(thread_id) {
-        return None;
+        return Probe::Never;
     }
-    let cwd = record
-        .pointer("/payload/cwd")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    Some(RolloutMeta {
+    let Some(cwd) = record.pointer("/payload/cwd").and_then(|v| v.as_str()) else {
+        return Probe::Never; // cwd REQUIRED (A4 hardening)
+    };
+    Probe::Candidate(RolloutMeta {
         thread_id: thread_id.to_string(),
-        cwd,
+        cwd: cwd.to_string(),
     })
 }
 
@@ -691,7 +956,7 @@ Check whether `tracing` is already a dependency of `freshell-sessions`
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-sessions codex_locator`
-Expected: PASS (4 tests).
+Expected: PASS (6 tests).
 
 - [ ] **Step 5: Format, lint, commit**
 
@@ -699,7 +964,7 @@ Expected: PASS (4 tests).
 cargo fmt --all
 cargo clippy -p freshell-sessions --all-targets -- -D warnings
 git add crates/freshell-sessions/src/codex_locator.rs crates/freshell-sessions/src/lib.rs crates/freshell-sessions/src/opencode_locator.rs crates/freshell-sessions/Cargo.toml
-git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot substrate, spawn-window resolve"
+git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot substrate, Enter-anchored resolve with pending-first-line grace"
 ```
 (Omit `Cargo.toml` from the add list if it was not modified.)
 
@@ -727,7 +992,8 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
         // forever, regardless of any timing.
         write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 1_000));
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 1_000));
         assert!(locator.tick(1_000 + CODEX_WINDOW_MS).is_empty());
         assert_eq!(locator.armed_count(), 1); // zero candidates → keep watching
         let _ = std::fs::remove_dir_all(&root);
@@ -737,7 +1003,8 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
     fn foreign_cwd_rollout_is_never_a_candidate() {
         let root = unique_temp_dir("cwd");
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/home/me/project-a"), 0));
+        assert!(locator.arm("t1", "codex", true, None, Some("/home/me/project-a")));
+        assert!(locator.note_submit("t1", 0));
         write_rollout(&root, "2026/07/26", TID, Some("/home/me/project-b"));
         assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
         assert_eq!(locator.armed_count(), 1);
@@ -745,14 +1012,18 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
     }
 
     #[test]
-    fn rollout_without_cwd_field_still_resolves_when_unambiguous() {
+    fn rollout_without_cwd_field_never_binds() {
+        // cwd is REQUIRED (A4 hardening): `SessionMeta.cwd` is non-optional
+        // at codex 0.145.0 and 3,858/3,858 + 500/500 real rollouts carry it.
+        // A no-cwd first line is a foreign shape — accepting it would be
+        // pure attack surface (a location-blind universal candidate).
         let root = unique_temp_dir("no-cwd");
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
         write_rollout(&root, "2026/07/26", TID, None);
-        let located = locator.tick(CODEX_WINDOW_MS);
-        assert_eq!(located.len(), 1);
-        assert_eq!(located[0].thread_id, TID);
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -760,7 +1031,8 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
     fn two_new_rollouts_in_one_window_refuse_to_bind() {
         let root = unique_temp_dir("ambiguous");
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
         write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
         write_rollout(&root, "2026/07/26", TID2, Some("/tmp"));
         assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
@@ -778,9 +1050,13 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
     fn same_rollout_claimed_by_two_armed_terminals_refuses_both() {
         let root = unique_temp_dir("contested");
         let locator = CodexLocator::new(root.clone());
-        // Two panes, SAME cwd, armed concurrently; ONE new rollout.
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
-        assert!(locator.arm("t2", "codex", true, None, Some("/tmp"), 0));
+        // Two panes, SAME cwd, armed concurrently, submitting in the same
+        // tick; ONE new rollout. The contested-cwd census refuses both
+        // (Pass 2's same-tick claim check remains as defense-in-depth).
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.arm("t2", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        assert!(locator.note_submit("t2", 0));
         write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
         assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
         assert_eq!(locator.armed_count(), 2);
@@ -788,13 +1064,45 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
     }
 
     #[test]
-    fn rollout_written_lazily_after_first_enter_resolves_via_enter_window() {
-        let root = unique_temp_dir("enter");
+    fn staggered_same_cwd_armed_terminals_never_bind_uncontested() {
+        // Cross-tick contested guard (A4 hardening): ambiguity refusal must
+        // not be same-tick-only. While ≥2 ARMED terminals share a normalized
+        // cwd, NO candidate with that cwd binds for any of them — staggered
+        // deadlines must not let pane A grab pane B's rollout uncontested.
+        let root = unique_temp_dir("staggered");
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
-        // Spawn window expires with zero candidates → keep watching.
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.arm("t2", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        assert!(locator.note_submit("t2", 5_000));
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        // t1's deadline fires alone: contested cwd → refuse.
         assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
-        // Enter long after the spawn window; rollout appears just after it.
+        // t2's deadline: still contested → refuse.
+        assert!(locator.tick(5_000 + CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 2);
+        // One pane exits (disarm); the survivor re-opens with a fresh Enter
+        // and may now bind — re-evaluation is legitimate once uncontested.
+        locator.disarm("t2");
+        assert!(locator.note_submit("t1", 10_000));
+        let located = locator.tick(10_000 + CODEX_WINDOW_MS);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].terminal_id, "t1");
+        assert_eq!(located[0].thread_id, TID);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn zero_candidate_window_keeps_watching_and_later_enter_reopens() {
+        let root = unique_temp_dir("reopen");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        // Window closes with zero candidates → keep watching (stays armed).
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        // A later Enter re-opens; the rollout appears; resolves via the new
+        // Enter-anchored window.
         let enter_at = 10 * CODEX_WINDOW_MS;
         assert!(locator.note_submit("t1", enter_at));
         write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
@@ -808,7 +1116,7 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
     fn mid_turn_enter_never_reopens_a_pending_evaluation() {
         let root = unique_temp_dir("midturn");
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
         assert!(locator.note_submit("t1", 100));
         // Second Enter while the first evaluation is still pending: no-op.
         assert!(!locator.note_submit("t1", 200));
@@ -817,9 +1125,14 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
 
     #[test]
     fn non_session_meta_or_malformed_first_line_is_never_a_candidate() {
+        // COMPLETE (newline-terminated) garbage lines are `Probe::Never` —
+        // not pending: codex writes the whole meta line + '\n' in one
+        // write-then-flush, so a complete non-candidate line never becomes
+        // one. (Empty/torn lines are the pending case — see the tests below.)
         let root = unique_temp_dir("badmeta");
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
         let dir = root.join("2026/07/26");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -833,6 +1146,91 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
         )
         .unwrap();
         assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_first_line_file_is_pending_and_binds_once_meta_lands() {
+        // A3 (validated): codex CREATES the rollout file, then awaits
+        // git-info collection (subprocesses, 5 s timeout each, worst ~10 s)
+        // BEFORE writing the session_meta first line. A deadline scan can
+        // observe the empty file — it must be a re-probed PENDING candidate,
+        // never dropped by a one-shot read.
+        let root = unique_temp_dir("pending");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        let dir = root.join("2026/07/26");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("rollout-2026-07-26T08-00-00-{TID}.jsonl"));
+        std::fs::write(&file, "").unwrap(); // created, meta not yet written
+        // Deadline scan: pending candidate → bind NOTHING, stay unresolved.
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        // Meta line lands (well within grace); the next sweep binds it.
+        // (write_rollout reuses the same filename — same ts, same TID.)
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        let located = locator.tick(CODEX_WINDOW_MS + 300);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].thread_id, TID);
+        assert_eq!(locator.armed_count(), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn readable_candidate_never_binds_while_another_new_file_is_pending() {
+        // A4 (validated, CRITICAL): the pane's OWN rollout can sit
+        // unreadable in the git-info gap while a FOREIGN same-cwd rollout is
+        // already readable. Pending candidates are BIND-BLOCKING — the
+        // readable file must not win the window.
+        let root = unique_temp_dir("pending-block");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        // Pane's own file: created, first line not yet written.
+        let dir = root.join("2026/07/26");
+        std::fs::create_dir_all(&dir).unwrap();
+        let own = dir.join(format!("rollout-2026-07-26T08-00-00-{TID}.jsonl"));
+        std::fs::write(&own, "").unwrap();
+        // Foreign file: fully readable, same cwd.
+        write_rollout(&root, "2026/07/26", TID2, Some("/tmp"));
+        // Deadline: NOTHING binds while the pending file exists.
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        // Own meta line lands → TWO candidates → ambiguity refusal (fail
+        // toward refusal, never a guess).
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        assert!(locator.tick(CODEX_WINDOW_MS + 300).is_empty());
+        assert_eq!(locator.armed_count(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pending_file_that_never_parses_expires_after_grace() {
+        // Grace is bounded (A4 hardening 1): once PENDING_FIRST_LINE_GRACE_MS
+        // elapses without a readable first line, the file is permanently
+        // excluded and stops blocking; a surviving sole candidate may then
+        // bind.
+        let root = unique_temp_dir("pending-expiry");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
+        let dir = root.join("2026/07/26");
+        std::fs::create_dir_all(&dir).unwrap();
+        let own = dir.join(format!("rollout-2026-07-26T08-00-00-{TID}.jsonl"));
+        std::fs::write(&own, "").unwrap(); // never gains a first line
+        write_rollout(&root, "2026/07/26", TID2, Some("/tmp"));
+        // First due scan sees the pending file (grace clock starts here).
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        // Still blocked just before grace expiry…
+        assert!(locator
+            .tick(CODEX_WINDOW_MS + PENDING_FIRST_LINE_GRACE_MS - 1)
+            .is_empty());
+        // …then the never-parsed file expires and the sole survivor binds.
+        let located = locator.tick(CODEX_WINDOW_MS + PENDING_FIRST_LINE_GRACE_MS);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].thread_id, TID2);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -841,7 +1239,9 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
         let base = unique_temp_dir("missing-root");
         let root = base.join("does-not-exist-yet");
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
+        // arm() scans the missing root — tolerated, never a panic.
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
         assert!(locator.tick(CODEX_WINDOW_MS).is_empty()); // no panic, keep watching
         assert_eq!(locator.armed_count(), 1);
         assert!(locator.note_submit("t1", 2 * CODEX_WINDOW_MS));
@@ -857,7 +1257,8 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
         // must too (integration fixtures seed this shape).
         let root = unique_temp_dir("flat");
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp"), 0));
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0));
         write_rollout(&root, ".", TID, Some("/tmp"));
         let located = locator.tick(CODEX_WINDOW_MS);
         assert_eq!(located.len(), 1);
@@ -952,7 +1353,10 @@ pub(crate) async fn adopt_codex_identity(state: &crate::WsState, a: CodexAdoptio
     // replaying a DEAD pane's identity onto a fresh terminal. Copied from
     // candidate guard 3b (codex_candidate.rs:167-186) — keep the exact
     // comparison semantics that code uses today; re-adopting the SAME
-    // terminal is an idempotent allow.
+    // terminal is an idempotent allow. This guard is also a REQUIRED A4
+    // misbind hardening for the locator path: the adoption tail must refuse
+    // a thread id already bound to another terminal (Validated Premise 9),
+    // so it must never be weakened when the candidate channel is deleted.
     if let Some(existing) = state
         .identity
         .find_by_session_including_retired("codex", a.thread_id)
@@ -1128,7 +1532,11 @@ Expected: COMPILE ERROR (module functions and `codex_locator` field missing).
 //! CodexLocator at create, feed Enter submits, and on resolution adopt the
 //! identity through the shared `codex_identity::adopt_codex_identity` tail.
 //! Structure mirrors `opencode_association.rs` — deliberately (spec §5-shape
-//! duplication over a premature provider-generic controller).
+//! duplication over a premature provider-generic controller). One deliberate
+//! deviation: the locator's windows are ENTER-ANCHORED ONLY (no spawn
+//! window) — real codex materializes its rollout only at the first user
+//! prompt, so `maybe_arm` only takes the snapshot and `note_possible_submit`
+//! is what opens a correlation window.
 
 use crate::WsState;
 
@@ -1148,7 +1556,7 @@ pub(crate) fn maybe_arm(
         return;
     }
     if let Some(locator) = &state.codex_locator {
-        locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
+        locator.arm(terminal_id, mode, true, resume_session_id, cwd);
     }
 }
 
@@ -1226,10 +1634,12 @@ Wiring edits:
 1. `crates/freshell-ws/src/lib.rs`:
    - `pub mod codex_association;` (next to `opencode_association` at `:36`-ish, alphabetical)
    - Add the `codex_locator` field to `WsState` next to `opencode_locator`
-     (~`:242`), doc comment mirroring opencode's ("correlates a fresh codex
-     PTY's spawn/first-Enter with the new rollout JSONL codex writes under the
-     sessions root, so the terminal can be bound and `terminal.rs`'s generic
-     resume derivation can drive `codex resume <id>` on restart").
+     (~`:242`), doc comment mirroring opencode's shape but Enter-anchored
+     ("correlates a fresh codex PTY's first Enter with the new rollout JSONL
+     codex writes under the sessions root — real codex materializes the file
+     only at the first user prompt — so the terminal can be bound and
+     `terminal.rs`'s generic resume derivation can drive `codex resume <id>`
+     on restart").
    - The compiler will enumerate every literal `WsState` constructor that now
      misses the field (association tests, other in-crate tests, main.rs).
      Add `codex_locator: None,` everywhere except the sites Tasks 4-5 say
@@ -1263,14 +1673,40 @@ Wiring edits:
      // codex pane. Restore-created panes WITHOUT identity arm too — arm()
      // gates on resume_session_id, never a restore flag (the wave-A re-arm
      // contract).
-     crate::codex_association::maybe_arm(
-         state,
-         &terminal_id,
-         &mode,
-         resolved_cwd.as_deref(),
-         resume_session_id.as_deref(),
-     );
+     //
+     // ORDERING NOTE (A5, validated): this arm runs AFTER the PTY spawn
+     // (registry.create + adopt() have already awaited above). That is safe
+     // ONLY because windows are Enter-anchored: real codex materializes its
+     // rollout at the first user prompt, never in the spawn→arm gap, so the
+     // snapshot cannot miss the pane's own file. Do not reinterpret this as
+     // "snapshot precedes spawn" — it does not need to.
+     //
+     // The arm() snapshot walks the sessions tree; run it on the blocking
+     // pool, not the WS dispatch path (A6: warm walks are 7-9 ms today and
+     // ~100 ms at 100k files, but cold dentry cache after a reboot is the
+     // one unmeasured tail).
+     {
+         let state = state.clone();
+         let terminal_id = terminal_id.clone();
+         let mode = mode.clone();
+         let cwd = resolved_cwd.clone();
+         let resume = resume_session_id.clone();
+         let _ = tokio::task::spawn_blocking(move || {
+             crate::codex_association::maybe_arm(
+                 &state,
+                 &terminal_id,
+                 &mode,
+                 cwd.as_deref(),
+                 resume.as_deref(),
+             );
+         })
+         .await;
+     }
      ```
+     (Adapt the exact clone set to the local variable types at the call site
+     — the compile-truth is the surrounding function; the requirement is that
+     `maybe_arm` executes on the blocking pool and completes before the
+     create handler returns.)
    - Submit seam — after the opencode `note_possible_submit` (`:542-546`):
      ```rust
      crate::codex_association::note_possible_submit(state, &input.terminal_id, &input.data);
@@ -1339,6 +1775,11 @@ REAL `PaneLedger::new(Some(dir))`. The codex adaptations, per test:
         //   "payload":{"id":"<TID>","cwd":"<the pane's cwd>"}}
         // (reuse the write_rollout shape from codex_locator.rs tests inline).
         //
+        // Then OPEN THE WINDOW: note_possible_submit(&state, "t1", "\r") —
+        // windows are Enter-anchored (no spawn window), so resolution
+        // requires a submit. The 40×100 ms drain poll comfortably covers the
+        // 2 s Enter-anchored deadline.
+        //
         // Poll drain_and_associate until resolution, then assert:
         //   state.identity.session_ref_for("t1") == Some(codex/<TID>)  (provider + id)
         //   registry directory entry for t1: resume_session_id == Some(<TID>)
@@ -1358,7 +1799,9 @@ REAL `PaneLedger::new(Some(dir))`. The codex adaptations, per test:
         // the rollout-file seed above instead of the sqlite row, and provider
         // "codex" in the ledger lookups. Record the pending marker via
         // state.pane_ledger.record_pending("t1", "codex", Some(cwd), now)
-        // before resolution, exactly as the sibling does.
+        // before resolution, exactly as the sibling does. As in the first
+        // test, add note_possible_submit(&state, "t1", "\r") after seeding
+        // the rollout — Enter-anchored windows need the submit.
     }
 
     /// One-writer defense survives the channel swap: a session already bound
@@ -1370,7 +1813,8 @@ REAL `PaneLedger::new(Some(dir))`. The codex adaptations, per test:
         // via state.identity.retire("victim") (the exit-path call —
         // terminal.rs:1370 area shows the exact form).
         // Register a real PTY "t1" (codex mode), arm it, seed the rollout for
-        // <TID>, poll drain_and_associate past the window.
+        // <TID>, note_possible_submit(&state, "t1", "\r") to open the
+        // Enter-anchored window, poll drain_and_associate past the window.
         // Assert: t1 gained NO identity (state.identity.session_ref_for("t1")
         // is None) and its registry entry's resume_session_id is None.
     }
@@ -1452,7 +1896,10 @@ from `codex_candidate_activity.rs::adopted_candidate_identity_reaches_codex_acti
    with first line
    `{"timestamp":"2026-07-24T12:00:00.000Z","type":"session_meta","payload":{"id":"<THREAD>","cwd":"<terminal cwd>"}}`
    — the terminal's cwd is whatever the harness passed to terminal.create;
-   use that same value.
+   use that same value. THEN send a single `terminal.input` of `"\r"` over
+   the socket: windows are Enter-anchored (validated A1 — real codex
+   materializes the rollout only at the first user prompt; there is no spawn
+   window), so the submit is what opens the 2 s evaluation window.
 3. Await `codex.activity.updated` carrying `sessionId == <THREAD>` (the sweep
    runs every 150 ms in the real server; give the await the same generous
    timeout the donor test used).
@@ -1464,12 +1911,12 @@ from `codex_candidate_activity.rs::adopted_candidate_identity_reaches_codex_acti
    locator's `attach_codex_rollout` handed the file to the status watcher and
    completions are stamped.
 
-Note on determinism: the fresh terminal never receives an Enter in this test,
-so resolution rides the SPAWN window — create the rollout file promptly after
-`terminal.created` arrives. If flake appears because the 2 s spawn window
-elapses before the file lands, send a single `terminal.input` of `"\r"` after
-writing the file (Enter re-opens the window — pinned by Task 2's
-`rollout_written_lazily_after_first_enter_resolves_via_enter_window`).
+Note on determinism: resolution REQUIRES the Enter — there is no spawn
+window. Write the rollout file first, then send the `"\r"`; the
+Enter-anchored deadline (2 s later, swept every 150 ms) evaluates and binds.
+If flake appears because of ordering, send another `"\r"` — a later Enter
+re-opens the window (pinned by Task 2's
+`zero_candidate_window_keeps_watching_and_later_enter_reopens`).
 
 - [ ] **Step 2: Run to verify it fails for the right reason**
 
@@ -1591,9 +2038,13 @@ helpers were copied wrong, fix the copy first; the RED must be the adoption.)
 4. `crates/freshell-ws/src/invariants.rs` — update the
    `terminal_identity_unresolved` doc comment (`:39-47` area): the grace
    window (`IDENTITY_RESOLUTION_GRACE_MS = 5 × AMPLIFIER_DIR_APPEAR_WINDOW_MS`
-   = 10 s) now also covers the codex locator (`CODEX_WINDOW_MS` = 2 s — same
-   magnitude, no numeric change); mention that fresh codex panes are expected
-   to resolve via `codex_association` within grace. Doc text only — no logic
+   = 10 s) now also covers the codex locator (`CODEX_WINDOW_MS` = 2 s,
+   Enter-anchored, plus `PENDING_FIRST_LINE_GRACE_MS` = 10 s that applies
+   ONLY in the anomalous empty-first-line gap — no numeric change here);
+   mention that fresh codex panes are expected to resolve via
+   `codex_association` within grace of their first Enter, and that a
+   maximally slow codex git-info gap can legitimately outlast the alarm
+   grace (the alarm is advisory in that case). Doc text only — no logic
    change.
 
 - [ ] **Step 4: Run to GREEN + full-crate regression**
@@ -1797,7 +2248,12 @@ restart-same-port, negative control):
    and `sessionRef.provider === 'codex'`. NO client candidate can exist here:
    the Rust server never emits `terminal.codex.durability.updated`, so the
    frozen client's candidate sender never fires — identity arriving at all IS
-   the server-locator proof. State this in a comment.
+   the server-locator proof. State this in a comment, citing the validated
+   client path (A7): the frozen client applies `terminal.session.associated`
+   provider-generically (`App.tsx:1004-1017` → panesSlice `sessionRef`,
+   `resumeSessionId` cleared), and its conflict guard only drops a push when
+   the pane ALREADY holds a different sessionRef — impossible for fresh panes
+   (the locator arms only unbound panes).
 8. Restart + reload (donor flow). Post-restart positive proofs (BOTH):
    - buffer contains `codex: resumed session <id>`;
    - the argv log's post-restart entries contain the ADJACENT PAIR
@@ -1889,9 +2345,10 @@ then apply this delta):
     //   identity provably cannot resolve pre-kill and the pending marker is
     //   the only evidence.
     // - pane: openCliPane(page, /^Codex CLI$/i), then click the pane's xterm
-    //   and type + Enter (the codex locator marker exists from spawn — codex
-    //   is already in MARKER_MODES — but the typed Enter also opens the
-    //   locator window, making this a true inside-the-window kill).
+    //   and type + Enter (the codex ledger pending marker exists from spawn —
+    //   codex is already in MARKER_MODES — and the typed Enter is what opens
+    //   the locator window at all: windows are Enter-anchored, so this is a
+    //   true inside-the-window kill).
     // - assertions: identical — pending/*.json survives restartAbrupt(),
     //   bindings/ has zero *.json.
   })
@@ -1979,7 +2436,26 @@ git add test/e2e-browser/specs/restore-contract-wall-rust.spec.ts
 git commit -m "test(e2e): flip restore-contract-wall pins now green under the codex server-side locator"
 ```
 
-- [ ] **Step 5: Push the branch and STOP**
+- [ ] **Step 5: One-writer merge-time gate (mechanical, before push)**
+
+Sibling lanes run concurrently; the "one writer per codex identity fact"
+claim must be re-proven against the integration base, not just this
+worktree. After rebasing/merging onto the integration base (and again if the
+base moves before push), run:
+
+```bash
+rg "adopt_codex_identity|ledger_resolve_identity|codex.candidate|session\.associated" crates/ --type rust
+git diff "$(git merge-base origin/main HEAD)"..HEAD -- crates/freshell-ws/src/terminal.rs
+```
+
+Confirm: (a) the only codex identity writers are `codex_identity.rs` /
+`codex_association.rs` and the create-time resume path — no sibling lane
+added another; (b) no sibling lane moved the `terminal.rs` seams this lane
+edited (arm at create, submit seam, exit disarm, retired candidate match
+arm). Investigate ANY unexpected hit BEFORE the final "one writer" commit
+message is written; do not push over an unexplained conflict.
+
+- [ ] **Step 6: Push the branch and STOP**
 
 ```bash
 git log --oneline origin/main..HEAD          # review the task commits
@@ -1995,8 +2471,15 @@ results incl. wall disposition, and the scope-fence note that REST-lane
 ## Self-Review (performed at plan-writing time)
 
 **1. Spec coverage:**
-- Server-side rollout-appear locator, arm at create, correlation window per
-  opencode precedent (spawn window + submit extension) → Tasks 1-2, 4.
+- Server-side rollout-appear locator, arm at create, Enter-anchored
+  correlation windows (Validated Premise 7: real codex materializes the
+  rollout only at the first user prompt — there is no spawn window; arm
+  takes only the snapshot) → Tasks 1-2, 4.
+- Misbind hardenings from the A4 adversarial validation (required cwd,
+  pending-first-line bind-blocking grace, cross-tick contested-cwd refusal,
+  bound-elsewhere adoption refusal) → Tasks 1-3, pinned by Task 2's guard
+  tests and Task 5 test 3; the freshagent same-cwd residual is documented in
+  Validated Premise 10 and named in Task 11's report, not silently absorbed.
 - Reuse-don't-duplicate the wave-2 watcher → Premise Correction 2: discovery
   cannot ride the per-file status watcher (verified structural fact); the
   locator polls only-while-armed and hands the discovered path to the
@@ -2020,11 +2503,14 @@ results incl. wall disposition, and the scope-fence note that REST-lane
 - Re-arm on restore-created identity-less panes → arm() gates on
   resume_session_id only (Task 1 gate test), controller comment (Task 4),
   end-to-end pin (Task 5 test 2).
-- TDD red-first list: locator-resolves-fresh (T1), SIGKILL-inside-window
-  fresh-by-race pending-marker-no-binding (T10 e2e + T5 ledger pins),
-  resolve-after-submit-extension (T2), candidate inert (T7), binding row at
-  resolve (T5), turn.complete carries sessionId (T6). E2E fixture + fresh →
-  no-candidate → restart → `resume <id>` (T8-9). Pin flips (T11).
+- TDD red-first list: locator-resolves-after-first-Enter (T1),
+  no-submit-never-binds (T1), SIGKILL-inside-window fresh-by-race
+  pending-marker-no-binding (T10 e2e + T5 ledger pins), window re-open on a
+  later Enter (T2), no-cwd-never-binds (T2), pending-first-line
+  bind-blocking + grace expiry (T2), staggered contested-cwd refusal (T2),
+  candidate inert (T7), binding row at resolve (T5), turn.complete carries
+  sessionId (T6). E2E fixture + fresh → no-candidate → restart →
+  `resume <id>` (T8-9). Pin flips + one-writer merge gate (T11).
 - Scope fence → Global Constraints + Premise Correction 6 (freshell-freshagent
   untouched; REST-lane arming named in the final report, not silently
   dropped).
