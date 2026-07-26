@@ -18,6 +18,11 @@ import panesReducer, {
   initLayout,
   updatePaneContent,
   restoreLayout,
+  applyFreshAgentReconcileAttach,
+  resetFreshAgentPaneForReconcileCreate,
+  setPaneRestoreError,
+  setPaneReconcileNotice,
+  clearPaneReconcileNotice,
 } from '../../../../src/store/panesSlice'
 import type { PanesState } from '../../../../src/store/panesSlice'
 import {
@@ -178,5 +183,157 @@ describe('fresh-agent reconcile volatile fields', () => {
     expect('pendingReconcile' in persisted.content).toBe(false)
     expect('reconcileNotice' in persisted.content).toBe(false)
     expect(persisted.content.sessionRef?.sessionId).toBe('11111111-1111-4111-8111-111111111111')
+  })
+})
+
+// --- Fresh-agent fold reducers (Task 3) ---
+
+const tabId = 'tab1'
+const paneId = 'p1'
+const DURABLE = '11111111-1111-4111-8111-111111111111'
+const ORIGINAL_CREATE_REQUEST_ID = 'cr-keep'
+
+/** Raw slice state with one fresh-agent leaf (mirrors panesSlice.reconcile.test.ts's builder). */
+function stateWithFreshAgentPane(overrides: Record<string, unknown> = {}): PanesState {
+  return panesReducer(emptyState(), initLayout({
+    tabId,
+    paneId,
+    content: {
+      kind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      createRequestId: ORIGINAL_CREATE_REQUEST_ID,
+      status: 'creating',
+      ...overrides,
+    } as PaneContentInput,
+  }))
+}
+
+describe('applyFreshAgentReconcileAttach', () => {
+  it('sets the live handle from the verdict sessionRef, clears errors, bumps epoch', () => {
+    const state = stateWithFreshAgentPane({
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'dead_live_handle' },
+      createError: { code: 'SPAWN_FAILED', message: 'boom' },
+    })
+    const next = panesReducer(state, applyFreshAgentReconcileAttach({
+      tabId, paneId,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      serverInstanceId: 'srv-1', corrected: true,
+    }))
+    const c = leafContent(next, tabId)
+    expect(c.sessionId).toBe(DURABLE)
+    expect(c.sessionRef).toEqual({ provider: 'claude', sessionId: DURABLE })
+    expect(c.resumeSessionId).toBe(DURABLE)
+    expect(c.status).toBe('connected')
+    expect(c.serverInstanceId).toBe('srv-1')
+    expect(c.restoreError).toBeUndefined()
+    expect(c.createError).toBeUndefined()
+    expect(c.createRequestId).toBe(ORIGINAL_CREATE_REQUEST_ID) // never re-minted
+    expect(c.reconcileEpoch).toBe(1)
+    expect(c.reconcileNotice).toBeTruthy() // corrected is user-visible
+  })
+
+  it('sets the duplicate notice when the verdict is a duplicate', () => {
+    const next = panesReducer(stateWithFreshAgentPane(), applyFreshAgentReconcileAttach({
+      tabId, paneId,
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      duplicate: true,
+    }))
+    expect(leafContent(next, tabId).reconcileNotice)
+      .toBe('A duplicate terminal for this session was detected and ignored.')
+  })
+
+  it('no-ops when the verdict carries no sessionRef', () => {
+    const state = stateWithFreshAgentPane()
+    const next = panesReducer(state, applyFreshAgentReconcileAttach({ tabId, paneId }))
+    expect(next).toEqual(state)
+    const c = leafContent(next, tabId)
+    expect(c.sessionId).toBeUndefined()
+    expect(c.reconcileEpoch).toBeUndefined()
+  })
+
+  it('no-ops when the verdict sessionRef provider mismatches the pane provider', () => {
+    const state = stateWithFreshAgentPane()
+    const next = panesReducer(state, applyFreshAgentReconcileAttach({
+      tabId, paneId,
+      sessionRef: { provider: 'codex', sessionId: DURABLE },
+    }))
+    expect(next).toEqual(state)
+  })
+})
+
+describe('resetFreshAgentPaneForReconcileCreate', () => {
+  it('respawn adopts the server-named sessionRef and arms pendingReconcile', () => {
+    const state = stateWithFreshAgentPane({ sessionId: 'live-old', serverInstanceId: 'srv-old', status: 'connected' })
+    const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({
+      tabId, paneId, intent: 'respawn',
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+    }))
+    const c = leafContent(next, tabId)
+    expect(c.sessionId).toBeUndefined()
+    expect(c.serverInstanceId).toBeUndefined()
+    expect(c.status).toBe('creating')
+    expect(c.sessionRef).toEqual({ provider: 'claude', sessionId: DURABLE })
+    expect(c.resumeSessionId).toBe(DURABLE)
+    expect(c.pendingReconcile).toBe('respawn')
+    expect(c.reconcileEpoch).toBe(1)
+    expect(c.createRequestId).toBe(ORIGINAL_CREATE_REQUEST_ID)
+  })
+
+  it('respawn with provider-mismatched sessionRef degrades loudly to fresh', () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      const state = stateWithFreshAgentPane()
+      const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({
+        tabId, paneId, intent: 'respawn',
+        sessionRef: { provider: 'codex', sessionId: DURABLE }, // pane provider is claude
+      }))
+      const c = leafContent(next, tabId)
+      expect(c.pendingReconcile).toBe('fresh')
+      expect(c.sessionRef).toBeUndefined()
+      expect(c.resumeSessionId).toBeUndefined()
+      expect(c.createRequestId).toBe(ORIGINAL_CREATE_REQUEST_ID)
+      expect(errorSpy).toHaveBeenCalled()
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
+  it('fresh wipes durable identity and clears restoreError', () => {
+    const state = stateWithFreshAgentPane({
+      sessionRef: { provider: 'claude', sessionId: DURABLE },
+      resumeSessionId: DURABLE,
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'dead_live_handle' },
+    })
+    const next = panesReducer(state, resetFreshAgentPaneForReconcileCreate({
+      tabId, paneId, intent: 'fresh', reason: 'identity_never_observed',
+    }))
+    const c = leafContent(next, tabId)
+    expect(c.sessionRef).toBeUndefined()
+    expect(c.resumeSessionId).toBeUndefined()
+    expect(c.status).toBe('creating')
+    expect(c.restoreError).toBeUndefined()
+    expect(c.pendingReconcile).toBe('fresh')
+    expect(c.reconcileEpoch).toBe(1)
+    expect(c.reconcileNotice).toBe('Started fresh (identity_never_observed).')
+    expect(c.createRequestId).toBe(ORIGINAL_CREATE_REQUEST_ID)
+  })
+})
+
+describe('widened per-pane reducers', () => {
+  it('setPaneRestoreError writes restoreError on a fresh-agent pane', () => {
+    const next = panesReducer(stateWithFreshAgentPane(), setPaneRestoreError({
+      tabId, paneId,
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'dead_live_handle' },
+    }))
+    expect(leafContent(next, tabId).restoreError?.reason).toBe('dead_live_handle')
+  })
+
+  it('setPaneReconcileNotice / clearPaneReconcileNotice act on a fresh-agent pane', () => {
+    let s = stateWithFreshAgentPane()
+    s = panesReducer(s, setPaneReconcileNotice({ tabId, paneId, notice: 'hello' }))
+    expect(leafContent(s, tabId).reconcileNotice).toBe('hello')
+    s = panesReducer(s, clearPaneReconcileNotice({ tabId, paneId }))
+    expect(leafContent(s, tabId).reconcileNotice).toBeUndefined()
   })
 })

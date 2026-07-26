@@ -288,6 +288,8 @@ export type DeadSessionEntry = {
   paneId: string
   title: string
   mode: string
+  /** Absent = terminal (backwards compatible). */
+  kind?: 'terminal' | 'fresh-agent'
   sessionRef?: { provider: string; sessionId: string }
   reason?: string
 }
