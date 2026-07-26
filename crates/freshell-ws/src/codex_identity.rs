@@ -1,8 +1,8 @@
 //! Shared codex identity adoption tail: bind a verified codex thread id into
 //! every identity home (identity store, registry meta, durable pane ledger,
 //! broadcast frames, activity hub) in the load-bearing order. Extracted from
-//! `codex_candidate.rs` so both the candidate channel and the server-side
-//! rollout locator adopt identically.
+//! the retired client candidate channel (`codex_candidate.rs`, campaign
+//! §2.3.2) and now owned solely by the server-side rollout locator.
 
 use std::path::{Path, PathBuf};
 
@@ -50,9 +50,9 @@ pub(crate) struct CodexAdoption<'a> {
 pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) -> bool {
     // Cross-pane hijack / replay defense, retired-INCLUSIVE (ledger A8): a
     // victim's binding retires at exit, so a live-only lookup would allow
-    // replaying a DEAD pane's identity onto a fresh terminal. Copied from
-    // candidate guard 3b (codex_candidate.rs:167-186) -- keep the exact
-    // comparison semantics that code uses today; re-adopting the SAME
+    // replaying a DEAD pane's identity onto a fresh terminal. Inherited from
+    // the retired candidate channel's guard 3b -- keep the exact
+    // comparison semantics that code used; re-adopting the SAME
     // terminal is an idempotent allow. This guard is also a REQUIRED A4
     // misbind hardening for the locator path: the adoption tail must refuse
     // a thread id already bound to another terminal (Validated Premise 9),

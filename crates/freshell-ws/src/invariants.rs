@@ -36,6 +36,17 @@ use crate::identity::TerminalIdentityRegistry;
 /// (2s) after a submit; five windows of slack keeps the alarm quiet through
 /// any normal association latency while still firing within seconds of a
 /// genuinely-lost identity.
+///
+/// This same grace also covers the codex locator
+/// ([`freshell_sessions::codex_locator::CODEX_WINDOW_MS`] = 2s,
+/// Enter-anchored, plus
+/// [`freshell_sessions::codex_locator::PENDING_FIRST_LINE_GRACE_MS`] = 10s
+/// that applies ONLY in the anomalous empty-first-line gap): fresh codex
+/// panes are expected to resolve via `codex_association` within this grace
+/// of their first Enter. A maximally slow codex git-info gap (rollout header
+/// held back until codex finishes probing repo state) can legitimately
+/// outlast the alarm grace -- in that case the alarm is advisory, not a
+/// lost identity.
 pub(crate) const IDENTITY_RESOLUTION_GRACE_MS: i64 =
     5 * freshell_sessions::amplifier_locator::AMPLIFIER_DIR_APPEAR_WINDOW_MS;
 

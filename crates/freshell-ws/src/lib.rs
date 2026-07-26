@@ -24,7 +24,6 @@ pub mod activity;
 pub mod amplifier_association;
 pub mod backpressure;
 pub mod codex_association;
-pub(crate) mod codex_candidate;
 pub(crate) mod codex_identity;
 pub(crate) mod codex_reconcile;
 pub mod create_limit;

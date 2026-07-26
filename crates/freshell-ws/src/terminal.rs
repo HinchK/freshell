@@ -508,11 +508,16 @@ async fn handle_client_text(
         ClientMessage::TerminalCreate(create) => {
             handle_create(create, ws_tx, state, pane_reconcile_v1, create_limiter).await
         }
-        // P0.3: server-side codex identity capture from the client's persisted
-        // candidate -- guarded (campaign plan §2.3.1); rejects are logged and
-        // ignored, never answered (legacy parity ws-handler.ts:2951-2963).
+        // RETIRED (campaign §2.3.2, Lane B2): codex identity has exactly one
+        // writer -- the server-side rollout locator (codex_association). The
+        // frozen client still sends this frame (TerminalView.tsx durability
+        // handler), so accept-and-ignore with a debug breadcrumb; never an
+        // error to the client, never an identity write.
         ClientMessage::TerminalCodexCandidatePersisted(candidate) => {
-            crate::codex_candidate::handle_codex_candidate_persisted(state, candidate).await;
+            tracing::debug!(
+                terminal_id = %candidate.terminal_id,
+                "codex_candidate_ignored: client candidate channel retired (server locator is authoritative)"
+            );
             true
         }
         ClientMessage::TerminalAttach(attach) => {
@@ -1697,8 +1702,9 @@ async fn handle_create(
 /// regex /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i):
 /// canonical UUID shape with a version digit 1-5 (position 14) and a variant
 /// digit [89ab] (position 19), case-insensitive. Same chars-based idiom as
-/// `codex_candidate::is_uuid_shaped`, extended with the version/variant
-/// constraints. Used ONLY by the P0.4 restore gate below -- non-restore
+/// the codex locator's uuid shape gate
+/// (`freshell_sessions::codex_locator::is_uuid_shaped`), extended with the
+/// version/variant constraints. Used ONLY by the P0.4 restore gate below -- non-restore
 /// resume derivation is deliberately untouched.
 fn is_canonical_claude_session_id(s: &str) -> bool {
     s.len() == 36

@@ -13,7 +13,7 @@ use freshell_activity::codex::CodexTaskEvents;
 use freshell_sessions::time::parse_timestamp_ms;
 
 /// Initial attach reads at most this much of the rollout's tail. Rollouts
-/// reach 28MB+ (p99, see codex_candidate.rs:72-73); the latest task events
+/// reach 28MB+ (p99, V5 sampling); the latest task events
 /// live at the end, and trusting the tail is the legacy sanitizer's
 /// converged behavior for truncated snapshots.
 pub(crate) const INITIAL_TAIL_BYTES: u64 = 256 * 1024;
@@ -141,8 +141,8 @@ pub(crate) fn fold_task_events(lines: &[String]) -> CodexTaskEvents {
 /// the codex sessions root. Filename containment is only a cheap PREFILTER;
 /// ownership is proven by the first line being a `session_meta` whose
 /// `payload.id` equals the session id -- filename/substring matching alone is
-/// documented-unsafe (codex_candidate.rs:46-57: 40% of sampled rollouts
-/// contain foreign uuids). Bounded recursive walk (the tree is
+/// documented-unsafe (V5 sampling: 40% of sampled rollouts
+/// contain foreign uuids as fork/resume lineage). Bounded recursive walk (the tree is
 /// `sessions/YYYY/MM/DD/rollout-*.jsonl`, flat `<id>.jsonl` in tests).
 pub fn locate_codex_rollout(sessions_root: &Path, session_id: &str) -> Option<PathBuf> {
     fn walk(dir: &Path, session_id: &str, depth: u8, hit: &mut Option<PathBuf>) {

@@ -20,7 +20,7 @@ use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// Fake codex: records argv to $CODEX_ARGV_CAPTURE_PATH (atomic tmp+mv) then
-/// sleeps. Copied from tests/codex_candidate_persisted.rs.
+/// sleeps. Copied from the (retired) tests/codex_candidate_persisted.rs.
 #[cfg(unix)]
 fn write_fake_codex() -> std::path::PathBuf {
     let script_path = std::env::temp_dir().join(format!(
