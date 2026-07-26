@@ -302,6 +302,292 @@ fn stale_clients_generations_are_dropped() {
     );
 }
 
+// ── Task 2: `GET /api/recovery/inventory` route tests ─────────────────────────
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use tower::ServiceExt;
+
+/// Snapshot fixture written directly with the store's REAL layout —
+/// `<dir>/<device>/<client>-<capturedAt:020>-r<rev:012>.json` (alphanumeric
+/// device/client ids need no escaping).
+fn write_snapshot(
+    dir: &std::path::Path,
+    device: &str,
+    client: &str,
+    captured_at: u64,
+    rev: u64,
+    records: serde_json::Value,
+) {
+    let doc = json!({
+        "deviceId": device, "deviceLabel": format!("label-{device}"), "clientInstanceId": client,
+        "serverInstanceId": "srv-test", "snapshotRevision": rev, "capturedAt": captured_at,
+        "records": records
+    });
+    let d = dir.join(device);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(
+        d.join(format!("{client}-{captured_at:020}-r{rev:012}.json")),
+        serde_json::to_vec(&doc).unwrap(),
+    )
+    .unwrap();
+}
+
+// Fresh EMPTY terminal registry — constructed exactly the way main.rs:249 does;
+// no running terminals => every pane comes back `live: false`.
+fn test_registry() -> freshell_terminal::TerminalRegistry {
+    freshell_terminal::TerminalRegistry::new()
+}
+
+fn test_state(
+    dir: Option<std::path::PathBuf>,
+    ledger_root: Option<std::path::PathBuf>,
+) -> RecoveryInventoryState {
+    RecoveryInventoryState {
+        auth_token: "tok".into(),
+        snapshots_dir: dir,
+        ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(
+            ledger_root,
+        )),
+        registry: test_registry(),
+    }
+}
+
+async fn get(
+    router: axum::Router,
+    uri: &str,
+    auth: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let mut req = Request::builder().method("GET").uri(uri);
+    if let Some(token) = auth {
+        req = req.header("x-auth-token", token);
+    }
+    let resp = router
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn route_requires_auth_and_serves_inventory() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "clientA",
+        1000,
+        1,
+        json!([
+            {"tabKey":"k1","tabId":"t1","tabName":"work","status":"open","revision":1,"updatedAt":1000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal","payload":{"mode":"shell","initialCwd":"/w"}}]}
+        ]),
+    );
+    let router = router(test_state(Some(tmp.path().to_path_buf()), None));
+    // house convention: 401 case asserted alongside the happy path
+    let (code, _) = get(
+        router.clone(),
+        "/api/recovery/inventory?clientInstanceId=me",
+        None,
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::UNAUTHORIZED);
+    let (code, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(code, axum::http::StatusCode::OK);
+    assert_eq!(body["recoverable"], true);
+    assert_eq!(body["device"]["deviceId"], "dev1");
+    assert_eq!(body["device"]["tabs"][0]["panes"][0]["cwd"], "/w");
+}
+
+#[tokio::test]
+async fn route_excludes_requesting_clients_own_generations() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "oldclient",
+        1000,
+        1,
+        json!([
+            {"tabKey":"k1","tabId":"t1","tabName":"work","status":"open","revision":1,"updatedAt":1000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "me",
+        2000,
+        1,
+        json!([
+            {"tabKey":"junk","tabId":"tj","tabName":"junk","status":"open","revision":1,"updatedAt":2000,
+             "paneCount":1,"panes":[{"paneId":"pj","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    let router = router(test_state(Some(tmp.path().to_path_buf()), None));
+    let (_, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    let tabs = body["device"]["tabs"].as_array().unwrap();
+    assert!(
+        tabs.iter().all(|t| t["tabKey"] != "junk"),
+        "requester's own push must be filtered out"
+    );
+    assert!(tabs.iter().any(|t| t["tabKey"] == "k1"));
+}
+
+#[tokio::test]
+async fn route_serves_ledger_only_recovery_without_snapshots() {
+    // Seed a binding file the ledger boot-scan will load (BindingRow camelCase JSON).
+    let home = tempfile::tempdir().unwrap();
+    let broot = home.path().join("pane-ledger");
+    std::fs::create_dir_all(broot.join("bindings").join("claude")).unwrap();
+    std::fs::write(
+        broot.join("bindings").join("claude").join("S1.json"),
+        serde_json::to_vec(&json!({
+            "ledgerVersion": 1, "provider": "claude", "sessionId": "S1", "mode": "claude",
+            "cwd": "/w", "createdAt": 1, "updatedAt": 1, "lastObservedAt": 1, "state": "bound"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let router = router(test_state(None, Some(broot)));
+    let (_, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    assert_eq!(body["recoverable"], true);
+    assert_eq!(body["ledgerOnly"][0]["sessionId"], "S1");
+}
+
+#[tokio::test]
+async fn route_drops_stale_rotated_clients() {
+    // A15: a client silent >15 min (heartbeat is 5 min) is closed or rotated - its
+    // resurrected tab must not enter the inventory union.
+    let tmp = tempfile::tempdir().unwrap();
+    let t_max: u64 = 100_000_000;
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "fresh",
+        t_max,
+        1,
+        json!([
+            {"tabKey":"k1","tabId":"t1","tabName":"work","status":"open","revision":1,"updatedAt":t_max,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "stale",
+        t_max - 16 * 60 * 1000,
+        1,
+        json!([
+            {"tabKey":"zombie","tabId":"tz","tabName":"zombie","status":"open","revision":1,"updatedAt":t_max - 16 * 60 * 1000,
+             "paneCount":1,"panes":[{"paneId":"pz","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    let router = router(test_state(Some(tmp.path().to_path_buf()), None));
+    let (_, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    let tabs = body["device"]["tabs"].as_array().unwrap();
+    assert!(
+        tabs.iter().all(|t| t["tabKey"] != "zombie"),
+        "stale client's tab must be dropped"
+    );
+    assert!(tabs.iter().any(|t| t["tabKey"] == "k1"));
+}
+
+#[tokio::test]
+async fn route_bootagoms_drops_concurrent_post_boot_clients() {
+    // A16/D2 at the ROUTE level: this test forces the bootAgoMs -> boot_cutoff ->
+    // read_foreign_unions(_, _, boot_cutoff) wiring to actually exist. It uses REAL
+    // wall-clock capturedAt values because boot_cutoff is computed from now_ms().
+    let tmp = tempfile::tempdir().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    // The genuinely lost client: its only push predates the requester's boot by 60s.
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "lost",
+        now - 60_000,
+        1,
+        json!([
+            {"tabKey":"k1","tabId":"t1","tabName":"work","status":"open","revision":1,"updatedAt":now - 60_000,
+             "paneCount":1,"panes":[{"paneId":"p1","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    // A concurrently-born fresh window: ALL of its generations postdate the boot.
+    write_snapshot(
+        tmp.path(),
+        "dev1",
+        "concurrent",
+        now,
+        1,
+        json!([
+            {"tabKey":"junk","tabId":"tj","tabName":"junk","status":"open","revision":1,"updatedAt":now,
+             "paneCount":1,"panes":[{"paneId":"pj","kind":"terminal","payload":{"mode":"shell"}}]}
+        ]),
+    );
+    let router = router(test_state(Some(tmp.path().to_path_buf()), None));
+    // Requester booted 30s ago => boot_cutoff = now - 30s: "concurrent" (born now) is
+    // post-boot junk and must be dropped; "lost" (60s ago) predates boot and survives.
+    let (_, body) = get(
+        router.clone(),
+        "/api/recovery/inventory?clientInstanceId=me&bootAgoMs=30000",
+        Some("tok"),
+    )
+    .await;
+    let tabs = body["device"]["tabs"].as_array().unwrap();
+    assert!(
+        tabs.iter().all(|t| t["tabKey"] != "junk"),
+        "post-boot concurrent client must be dropped (A16)"
+    );
+    assert!(
+        tabs.iter().any(|t| t["tabKey"] == "k1"),
+        "pre-boot lost client must survive"
+    );
+    // Without bootAgoMs (default 0 => boot_cutoff = now at handler time) BOTH clients
+    // predate the cutoff and BOTH tabs appear - pins the optional-default-0 contract.
+    let (_, body) = get(
+        router,
+        "/api/recovery/inventory?clientInstanceId=me",
+        Some("tok"),
+    )
+    .await;
+    let tabs = body["device"]["tabs"].as_array().unwrap();
+    assert!(
+        tabs.iter().any(|t| t["tabKey"] == "junk"),
+        "default cutoff must drop nothing pre-request"
+    );
+    assert!(tabs.iter().any(|t| t["tabKey"] == "k1"));
+}
+
 #[test]
 fn concurrent_fresh_windows_generations_are_dropped() {
     // A16/D2: a client whose ENTIRE retained history postdates the requester's boot is a

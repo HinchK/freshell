@@ -3,7 +3,6 @@
 //! inventory shape. No I/O here — Task 2 (the HTTP route) feeds it from the
 //! snapshot store, the ledger, and the terminal registry, and consumes
 //! `select_foreign_recent_generation_ids` when composing each device's union.
-#![allow(dead_code)] // consumed by Task 2 (the /api/recovery route wiring)
 
 use freshell_ws::pane_ledger::{BindingRow, RetiredReason, RowState};
 use serde_json::{json, Value};
@@ -133,7 +132,7 @@ pub fn build_inventory(
     let mut tabs_per_union: Vec<Vec<Value>> = Vec::new();
     for d in &unions {
         let doc = &d.union_doc;
-        let device_id = doc["deviceId"].as_str().unwrap_or("").to_string();
+        let device_id = d.device_id.clone();
         let tabs: Vec<Value> = doc["records"]
             .as_array()
             .cloned()
@@ -322,6 +321,151 @@ fn digest16(parts: &[String]) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(parts.join("\u{1}").as_bytes());
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// ── Task 2: the `GET /api/recovery/inventory` route ───────────────────────────
+
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+
+use crate::boot::{is_authed, unauthorized};
+
+/// State for the recovery-inventory read surface. `registry` is the SAME
+/// shared `TerminalRegistry` the WS server state receives (`main.rs:249`) —
+/// read-only here (the D7 liveness join).
+#[derive(Clone)]
+pub struct RecoveryInventoryState {
+    pub auth_token: String,
+    pub snapshots_dir: Option<std::path::PathBuf>,
+    pub ledger: std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>,
+    pub registry: freshell_terminal::TerminalRegistry,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InventoryQuery {
+    client_instance_id: Option<String>,
+    boot_ago_ms: Option<u64>,
+}
+
+pub fn router(state: RecoveryInventoryState) -> Router {
+    Router::new()
+        .route("/api/recovery/inventory", get(inventory_handler))
+        .with_state(state)
+}
+
+/// Epoch millis — the same convention the tabs-persist/tabs stores use
+/// (`tabs.rs:549`), as `u64` because the A15/A16 cutoffs are unsigned.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Snapshot store present but unreadable, or the blocking read task failed:
+/// fail LOUD (500) — never a silent empty inventory (the
+/// `tabs_snapshots.rs:61` precedent).
+fn internal_error() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "recovery inventory unavailable" })),
+    )
+        .into_response()
+}
+
+async fn inventory_handler(
+    State(state): State<RecoveryInventoryState>,
+    headers: HeaderMap,
+    Query(q): Query<InventoryQuery>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let exclude = q.client_instance_id.unwrap_or_default();
+    // D2/A16: anchor the concurrent-client filter to the requester's boot.
+    // Missing param => 0 => boot_cutoff = now, so nothing that predates the
+    // request is dropped.
+    let boot_cutoff = now_ms().saturating_sub(q.boot_ago_ms.unwrap_or(0));
+    let unions = match state.snapshots_dir.clone() {
+        None => vec![],
+        Some(dir) => {
+            let job = tokio::task::spawn_blocking(move || {
+                read_foreign_unions(&dir, &exclude, boot_cutoff)
+            });
+            match job.await {
+                Ok(Ok(u)) => u,
+                Ok(Err(e)) => {
+                    tracing::error!(target: "freshell_server::recovery_inventory",
+                        error = %e, "recovery inventory snapshot read failed");
+                    return internal_error();
+                }
+                Err(e) => {
+                    tracing::error!(target: "freshell_server::recovery_inventory",
+                        error = %e, "recovery inventory join failed");
+                    return internal_error();
+                }
+            }
+        }
+    };
+    let live = live_session_keys(&state.registry);
+    Json(build_inventory(unions, state.ledger.list_bindings(), live)).into_response()
+}
+
+/// Read-only liveness join (D7): `(provider = mode, sessionId)` for every
+/// currently-Running terminal row — the same row fields the ladder's A13 guard
+/// reads (`terminal.rs:1690-1745`: mode + resume session id, status ==
+/// `TerminalRunStatus::Running`).
+fn live_session_keys(registry: &freshell_terminal::TerminalRegistry) -> HashSet<(String, String)> {
+    registry
+        .directory()
+        .into_iter()
+        .filter(|row| row.status == freshell_protocol::TerminalRunStatus::Running)
+        .filter_map(|row| {
+            row.resume_session_id
+                .filter(|s| !s.is_empty())
+                .map(|sid| (row.mode, sid))
+        })
+        .collect()
+}
+
+fn read_foreign_unions(
+    dir: &std::path::Path,
+    exclude_client: &str,
+    boot_cutoff: u64,
+) -> std::io::Result<Vec<DeviceUnion>> {
+    use freshell_ws::tabs_persist::{
+        list_snapshot_devices, read_device_overview, read_generations_union_by_ids, ComponentsUnion,
+    };
+    let mut out = vec![];
+    if !dir.is_dir() {
+        return Ok(out);
+    }
+    for device in list_snapshot_devices(dir)? {
+        let Some((_, generations)) = read_device_overview(dir, &device)? else {
+            continue;
+        };
+        // Task 1 helper: drops the requester's own generations, concurrent
+        // post-boot clients (A16), AND stale clients (A15).
+        let foreign =
+            select_foreign_recent_generation_ids(&generations, exclude_client, boot_cutoff);
+        if foreign.is_empty() {
+            continue;
+        }
+        match read_generations_union_by_ids(dir, &device, &foreign)? {
+            ComponentsUnion::Found(union_doc) => out.push(DeviceUnion {
+                device_id: device,
+                union_doc,
+            }),
+            // A component pruned between the overview scan and the union read:
+            // zero surviving generations for this device — skip it.
+            ComponentsUnion::Missing(_) => continue,
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

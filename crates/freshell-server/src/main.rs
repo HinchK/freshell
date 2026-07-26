@@ -794,6 +794,20 @@ async fn main() -> ExitCode {
             restore_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             restore_ack_timeout: std::time::Duration::from_secs(5),
         }))
+        // B3/P1.9 Task 2: the recovery-inventory read surface. Joins the SAME
+        // tabs-snapshots store as `tabs_snapshots` above (read-only), the
+        // pane-identity ledger (`:427`), and the shared terminal registry
+        // (`:249`, the D7 liveness join).
+        .merge(recovery_inventory::router(
+            recovery_inventory::RecoveryInventoryState {
+                auth_token: auth_token.as_ref().clone(),
+                snapshots_dir: home
+                    .as_ref()
+                    .map(|h| h.join(".freshell").join("tabs-snapshots")),
+                ledger: std::sync::Arc::clone(&pane_ledger),
+                registry: registry.clone(),
+            },
+        ))
         .merge(network::router(network_state))
         .merge(session_directory::router(session_directory_state))
         .merge(sessions::router(sessions::SessionsState {
