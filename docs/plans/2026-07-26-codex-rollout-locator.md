@@ -343,7 +343,12 @@ corpus; see "Validated Premises" above):
 Create `crates/freshell-sessions/src/codex_locator.rs` with ONLY the test
 module and a `#![allow(dead_code)]`-free skeleton that does not yet exist —
 i.e. write the tests first; the file will not compile until Step 3 adds the
-implementation above the tests. Test module:
+implementation above the tests. In this SAME step, register the module so
+cargo actually compiles it: add `pub mod codex_locator;` to
+`crates/freshell-sessions/src/lib.rs` (alphabetically among the existing
+`pub mod` lines). An unregistered `.rs` file is invisible to cargo — without
+this line, Step 2's test filter would exit green with 0 tests instead of the
+COMPILE ERROR the RED gate asserts. Test module:
 
 ```rust
 #[cfg(test)]
@@ -1021,8 +1026,9 @@ fn is_uuid_shaped(s: &str) -> bool {
 }
 ```
 
-Also add to `crates/freshell-sessions/src/lib.rs`: `pub mod codex_locator;`
-and in `crates/freshell-sessions/src/opencode_locator.rs` change
+(`pub mod codex_locator;` was already added to
+`crates/freshell-sessions/src/lib.rs` in Step 1.)
+Also in `crates/freshell-sessions/src/opencode_locator.rs` change
 `fn normalize_cwd(input: &str) -> String` to
 `pub(crate) fn normalize_cwd(input: &str) -> String`.
 
@@ -1572,7 +1578,12 @@ pub codex_locator: Option<Arc<freshell_sessions::codex_locator::CodexLocator>>,
 
 - [ ] **Step 1: Write the failing controller unit tests**
 
-Create `codex_association.rs` containing (initially) only the test module.
+Create `codex_association.rs` containing (initially) only the test module,
+and in this SAME step register it so cargo actually compiles it: add
+`pub mod codex_association;` to `crates/freshell-ws/src/lib.rs` (next to
+`opencode_association` at `:36`-ish, alphabetical). An unregistered `.rs`
+file is invisible to cargo — without this line, Step 2's test filter would
+exit green with 0 tests instead of the COMPILE ERROR the RED gate asserts.
 Mirror `opencode_association.rs`'s test harness EXACTLY: copy its
 `state_with_locator(...)` helper (`opencode_association.rs:227+` builds a full
 literal `WsState` with `pane_ledger: PaneLedger::disabled()`), adapting the
@@ -1624,7 +1635,10 @@ exact form — the harness copy is authoritative over this sketch.)
 - [ ] **Step 2: Run to verify RED**
 
 Run: `cargo test -p freshell-ws codex_association`
-Expected: COMPILE ERROR (module functions and `codex_locator` field missing).
+Expected: COMPILE ERROR — the module's functions (`is_submit_input`,
+`maybe_arm`, `note_possible_submit`, …) do not exist yet, and the test
+harness's `codex_locator:` field is not yet declared on `WsState`. Both
+error families are the RED for this task.
 
 - [ ] **Step 3: Implement the controller + wiring**
 
@@ -1753,7 +1767,7 @@ disagree, the transplant wins.
 Wiring edits:
 
 1. `crates/freshell-ws/src/lib.rs`:
-   - `pub mod codex_association;` (next to `opencode_association` at `:36`-ish, alphabetical)
+   - (`pub mod codex_association;` was already added in Step 1.)
    - Add the `codex_locator` field to `WsState` next to `opencode_locator`
      (~`:242`), doc comment mirroring opencode's shape but Enter-anchored
      ("correlates a fresh codex PTY's first Enter with the new rollout JSONL
