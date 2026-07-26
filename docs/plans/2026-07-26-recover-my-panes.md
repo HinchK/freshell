@@ -28,9 +28,9 @@ Within Option A, per the directive "reuse what serves the UI flow, DELETE what d
 
 Consequences: *empty-never* and *empty-cleared* browsers (both have no layout key) get the offer — correct, both are genuinely new-browser situations. *Same-browser reload with intact localStorage* (key present) never sees the offer — even if the user deliberately closed all tabs (key present, zero tabs). Principle 4 ("never ask when we can act") is not violated: an empty client layout gives the server no client claim to adjudicate; silently materializing another device's layout onto a possibly-brand-new user's browser would be "silently wrong," so offering is the correct reading (the campaign plan's §4.4 itself says "offer"). `serverInstanceId` is NOT part of the trigger — snapshots and the ledger persist across restarts, and `restoreLayout` strips live-attach fields anyway.
 
-**D2 — Self-pollution filter.** A fresh browser context mints a fresh per-window `clientInstanceId` (sessionStorage) and starts pushing snapshots (auto shell tab) within seconds. The inventory request carries `?clientInstanceId=<current>`; the server excludes that client's generations when building each device union, so the requester's own junk pushes never appear as "recoverable." (A fresh browser also mints a fresh `deviceId`, so its pushes usually land in a different device dir — the filter covers the selective-clear case where the deviceId survived.)
+**D2 — Self-pollution filter.** A fresh browser context mints a fresh per-window `clientInstanceId` (sessionStorage) and starts pushing snapshots (auto shell tab) within seconds. The inventory request carries `?clientInstanceId=<current>`; the server excludes that client's generations when building each device union, so the requester's own junk pushes never appear as "recoverable." (A fresh browser also mints a fresh `deviceId`, so its pushes usually land in a different device dir — the filter covers the selective-clear case where the deviceId survived.) The per-window exclusion alone is NOT enough: opening the fresh browser with TWO windows (routine — session-restore of pinned tabs) makes each window's junk pushes *foreign* to the other window's request, and since they carry the newest `capturedAt` by construction they would win primary-device selection and demote the genuinely lost device to `otherDevices` (which accept does not restore). Therefore the request ALSO carries `bootAgoMs` — the elapsed milliseconds since the D1 boot-state capture (a DURATION, so client/server clock skew is irrelevant; for a D3 pending re-offer, elapsed since the ORIGINAL capture time persisted with the pending flag). The server computes `boot_cutoff = now_ms() - bootAgoMs` and drops every client ALL of whose retained generations have `capturedAt >= boot_cutoff` (the A16 concurrent-client rule in Task 1): a client that first pushed after this browser session booted is by definition not lost data — it is a concurrently-opened fresh window (or other concurrently-born client), never the lost device, whose clients' pushes ALL predate the fresh boot (so generation-retention depth cannot misclassify a real client). `capturedAt` is server-stamped at generation write time (`tabs_persist.rs:812-821`), so the comparison is server-clock-only.
 
-**D3 — Dismissal + pending persistence.** Decline writes the inventory `contentId` to `localStorage["freshell.recovery.dismissed.v1"]` (array, capped at 20). While the offer is shown but undecided, `localStorage["freshell.recovery.pending.v1"] = contentId` so a reload mid-decision (which by then has a persisted auto-tab layout) re-offers instead of silently losing the recovery chance; accept/decline clears it. "Decline is remembered" means: remembered until the recoverable SUBSTANCE changes. The `contentId` is a sha256 over timestamp-free substance (Task 1), so a dismissal survives server heartbeat re-pushes (which stamp a new `capturedAt` every ≤5 min whenever a second client is connected), server restarts, and Rust upgrades; only a real change to the recoverable panes/sessions re-offers.
+**D3 — Dismissal + pending persistence.** Decline writes the inventory `contentId` to `localStorage["freshell.recovery.dismissed.v1"]` (array, capped at 20). While the offer is shown but undecided, `localStorage["freshell.recovery.pending.v1"] = JSON.stringify({contentId, bootAt})` (where `bootAt` is the boot-state capture `Date.now()`) so a reload mid-decision (which by then has a persisted auto-tab layout) re-offers instead of silently losing the recovery chance — and the re-offer derives `bootAgoMs` from the ORIGINAL `bootAt`, keeping D2's concurrent-client filter anchored to the pre-junk moment; accept/decline clears it. "Decline is remembered" means: remembered until the recoverable SUBSTANCE changes. The `contentId` is a sha256 over timestamp-free substance (Task 1), so a dismissal survives server heartbeat re-pushes (which stamp a new `capturedAt` every ≤5 min whenever a second client is connected), server restarts, and Rust upgrades; only a real change to the recoverable panes/sessions re-offers.
 
 **D4 — Authority chain (§4.2): ledger identity beats snapshot claim.** For each snapshot pane with a `sessionRef`, the server joins the ledger and reports a verdict; the client uses `effectiveSessionRef`:
 - ledger row chain (following `supersededBy`, max 10 hops) ends at a `bound` row → resume the **ledger's** `{provider, sessionId}` (snapshot claim overridden).
@@ -40,7 +40,7 @@ Consequences: *empty-never* and *empty-cleared* browsers (both have no layout ke
 
 Claude resume requires canonical-UUID session ids (`is_canonical_claude_session_id`, `terminal.rs:1652-1660`): a non-canonical claude ref fails LOUD per-pane with `RestoreUnavailable` (`terminal.rs:1104-1117`) — acceptable, not silent.
 
-Bound ledger rows whose `(provider, sessionId)` matches no **effective** pane ref in ANY device union (not just the primary) and that are not owned by a currently-Running terminal (see D7) are returned as `ledgerOnly` and recreated in an extra "Recovered sessions" tab, so ledger-known sessions are never dropped just because layout was lost. Residual: primary-device selection is argmax `capturedAt` and can pick a device the user didn't lose; mitigation — the offer shows `deviceLabel` + `otherDevices`, and decline is cheap.
+Bound ledger rows whose `(provider, sessionId)` matches no **effective** pane ref in ANY device union (not just the primary) and that are not owned by a currently-Running terminal (see D7) are returned as `ledgerOnly` and recreated in an extra "Recovered sessions" tab, so ledger-known sessions are never dropped just because layout was lost. Residual: primary-device selection is argmax `capturedAt` and can pick a device the user didn't lose. Same-fresh-browser multi-window junk can NOT win primary — every concurrent window's client is born after the boot cutoff and is dropped by D2's `bootAgoMs` concurrent-client filter — so the residual is only a genuinely pre-existing OTHER device (e.g. a second machine still connected) out-winning the lost one; mitigation — the offer shows `deviceLabel` + `otherDevices`, and decline is cheap.
 
 **D5 — Recreation path.** Accept dispatches, per inventory tab: `addTab({id: nanoid(), title: tabName})` then `restoreLayout({tabId, layout, paneTitles})` — the exact path `reopenClosedTab` already exercises. `restoreLayout` re-mints `createRequestId`/`status` and strips `terminalId`, so after dispatch we read the post-normalization layout back from the store and arm terminal restore via `addTerminalRestoreRequestId(...)` for every terminal leaf carrying a `sessionRef` (the `App.tsx:1069` / `terminal-restore.ts` pattern) so the create goes out as a restore. Panes the inventory marks `live: true` carry no `sessionRef` after Task 4's strip, so they are recreated fresh and never armed (see D7). Terminal panes get the D4 treatment; non-terminal kinds (`browser`, `editor`, `fresh-agent`, `extension`, `picker`) are recreated by passing the snapshot pane payload through as content (`{kind, ...payload}`) with a minimal per-kind adapter (Task 4/A10: `editor` gains the required `content: ''` default per D6; `fresh-agent` drops `restoreError` so normalize keeps the sessionRef) — the same normalize/strip path handles them, exactly as it does for `reopenClosedTab`. The auto-created empty shell tab from `App.tsx:1423` is left in place (deliberate: removing it would touch tab-lifecycle code other lanes own; it is one empty shell tab).
 
@@ -109,7 +109,7 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 **Interfaces:**
 - Consumes: `freshell_ws::pane_ledger::BindingRow` (fields serialize camelCase: `provider`, `sessionId`, `mode`, `cwd`, `state: bound|retired`, `retiredReason?: superseded|closed|gc_expired`, `supersededBy?: {provider, sessionId}`, `updatedAt`). Snapshot union doc shape (from `tabs_persist.rs`): `{deviceId, deviceLabel, capturedAt, records: [{tabKey, tabId, tabName, revision, updatedAt, paneCount, panes: [{paneId, kind, payload: {mode?, shell?, initialCwd?, sessionRef?: {provider, sessionId}, createRequestId?, ...}}]}]}`.
-- Produces: `pub struct DeviceUnion { pub device_id: String, pub union_doc: serde_json::Value }`, `pub fn select_foreign_recent_generation_ids(generations: &[serde_json::Value], exclude_client: &str) -> Vec<String>` (the A15 staleness filter, consumed by Task 2), and `pub fn build_inventory(device_unions: Vec<DeviceUnion>, bindings: Vec<BindingRow>, live_session_keys: HashSet<(String, String)>) -> serde_json::Value` — the third input is the set of `(provider, sessionId)` pairs owned by a currently-Running terminal (Task 2 feeds it from the terminal registry, read-only) — returning:
+- Produces: `pub struct DeviceUnion { pub device_id: String, pub union_doc: serde_json::Value }`, `pub fn select_foreign_recent_generation_ids(generations: &[serde_json::Value], exclude_client: &str, boot_cutoff_ms: u64) -> Vec<String>` (the A15 staleness + A16 concurrent-client filter, consumed by Task 2), and `pub fn build_inventory(device_unions: Vec<DeviceUnion>, bindings: Vec<BindingRow>, live_session_keys: HashSet<(String, String)>) -> serde_json::Value` — the third input is the set of `(provider, sessionId)` pairs owned by a currently-Running terminal (Task 2 feeds it from the terminal registry, read-only) — returning:
 
 ```json
 {
@@ -139,7 +139,7 @@ Rules encoded:
 - `ledgerOnly` = `state == bound` rows whose `(provider, sessionId)` matches no effective pane ref in ANY device union (not just the primary — a two-device steady state must not report the other device's sessions as orphaned) AND that is not in the live set (D7).
 - `contentId` = sha256 truncated to 16 hex chars (reuse the repo's digest convention — `digest_value`/`snapshot_content_id`, `tabs_persist.rs:70-87`) over the TIMESTAMP-FREE canonical substance: the sorted list of `(deviceId, tabKey, paneId, kind, effective provider:sessionId or "-")` for every pane in every included device union, plus sorted `provider:sessionId` for the `ledgerOnly` rows. `capturedAt`/`updatedAt` are EXCLUDED by design: the server heartbeat re-pushes stamp a new `capturedAt` every ≤5 min with any second connected client, and that churn must not defeat dismissal (D3).
 - `recoverable` = primary device exists OR `ledgerOnly` non-empty. Empty input ⇒ `{"recoverable": false, "contentId": "...", "device": null, "otherDevices": [], "ledgerOnly": []}`.
-- `select_foreign_recent_generation_ids` (A15 staleness rule, applied by Task 2 when composing each device's union): drop the requester's own generations, then drop every client whose newest generation `capturedAt` is more than 15 minutes older than that device's max `capturedAt` **computed over the remaining foreign clients** (the requester's just-pushed junk must never stale-out real recovery data). Rationale: every connected window force-pushes a heartbeat at least every 5 min (`tabRegistrySync.ts:21, 475-477`), so any client silent for >15 min is closed or rotated; this suppresses resurrection of closed tabs via the purely-additive union (closed tabs leave no durable trace — only open records are persisted). Post-filtering generations here leaves the `tabs_persist` write path untouched.
+- `select_foreign_recent_generation_ids` (A15 staleness + A16 concurrent-client rules, applied by Task 2 when composing each device's union): drop the requester's own generations; drop every client ALL of whose retained generations have `capturedAt >= boot_cutoff_ms` (A16, D2 — a client born after this browser session booted is a concurrently-opened fresh window, never lost data; a real lost client's generations all predate the fresh boot); then drop every client whose newest generation `capturedAt` is more than 15 minutes older than that device's max `capturedAt` **computed over the remaining clients** (junk must never stale-out real recovery data). Rationale: every connected window force-pushes a heartbeat at least every 5 min (`tabRegistrySync.ts:21, 475-477`), so any client silent for >15 min is closed or rotated; this suppresses resurrection of closed tabs via the purely-additive union (closed tabs leave no durable trace — only open records are persisted). Post-filtering generations here leaves the `tabs_persist` write path untouched.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -297,10 +297,28 @@ fn stale_clients_generations_are_dropped() {
         json!({"generationId": "gC", "clientInstanceId": "stale", "capturedAt": t_max - 16 * 60 * 1000}),
         json!({"generationId": "gD", "clientInstanceId": "me",    "capturedAt": t_max}),
     ];
-    let ids = select_foreign_recent_generation_ids(&gens, "me");
+    // boot cutoff AFTER every push: the A16 concurrent-client rule drops nothing here.
+    let ids = select_foreign_recent_generation_ids(&gens, "me", t_max + 1);
     assert!(ids.contains(&"gA".to_string()) && ids.contains(&"gB".to_string()));
     assert!(!ids.contains(&"gC".to_string()), "stale rotated client must not resurrect closed tabs");
     assert!(!ids.contains(&"gD".to_string()), "requester's own generations are excluded");
+}
+
+#[test]
+fn concurrent_fresh_windows_generations_are_dropped() {
+    // A16/D2: a client whose ENTIRE retained history postdates the requester's boot is a
+    // concurrently-opened fresh window (junk auto shell tab) - it must never demote the
+    // genuinely lost device by winning primary-device selection.
+    let boot: u64 = 100_000_000;
+    let gens = vec![
+        json!({"generationId": "gJ1", "clientInstanceId": "sibling-window", "capturedAt": boot + 2_000}),
+        json!({"generationId": "gJ2", "clientInstanceId": "sibling-window", "capturedAt": boot + 300_000}),
+        json!({"generationId": "gR",  "clientInstanceId": "lost",           "capturedAt": boot - 30_000}),
+    ];
+    let ids = select_foreign_recent_generation_ids(&gens, "me", boot);
+    assert!(ids.contains(&"gR".to_string()), "pre-boot client is real lost data - kept");
+    assert!(!ids.contains(&"gJ1".to_string()) && !ids.contains(&"gJ2".to_string()),
+        "post-boot-only client is a concurrent fresh window - dropped");
 }
 ```
 
@@ -334,24 +352,33 @@ pub struct DeviceUnion { pub device_id: String, pub union_doc: Value }
 
 const STALE_CLIENT_MS: u64 = 15 * 60 * 1000; // heartbeat cadence is 5 min (tabRegistrySync.ts:21, 475-477)
 
-/// A15 staleness rule: drop the requester's own generations, then drop clients whose
-/// newest generation is >15 min older than the device max over the REMAINING foreign
-/// clients (the requester's just-pushed junk must never stale-out real recovery data).
-pub fn select_foreign_recent_generation_ids(generations: &[Value], exclude_client: &str) -> Vec<String> {
+/// A15 staleness + A16 concurrent-client rules (D2): drop the requester's own generations;
+/// drop clients ALL of whose retained generations postdate boot_cutoff_ms (a client born
+/// after this browser session booted is a concurrently-opened fresh window, never lost
+/// data - a lost client's pushes all predate the fresh boot, so retention depth cannot
+/// misclassify it); then drop clients whose newest generation is >15 min older than the
+/// device max over the REMAINING clients (junk must never stale-out real recovery data).
+pub fn select_foreign_recent_generation_ids(generations: &[Value], exclude_client: &str, boot_cutoff_ms: u64) -> Vec<String> {
     let foreign: Vec<&Value> = generations.iter()
         .filter(|g| g["clientInstanceId"].as_str() != Some(exclude_client)).collect();
+    let mut oldest_by_client: HashMap<&str, u64> = HashMap::new();
     let mut newest_by_client: HashMap<&str, u64> = HashMap::new();
     for g in &foreign {
         let c = g["clientInstanceId"].as_str().unwrap_or("");
         let t = g["capturedAt"].as_u64().unwrap_or(0);
+        let o = oldest_by_client.entry(c).or_insert(u64::MAX);
+        if t < *o { *o = t; }
         let e = newest_by_client.entry(c).or_insert(0);
         if t > *e { *e = t; }
     }
-    let device_max = newest_by_client.values().copied().max().unwrap_or(0);
+    let pre_boot = |c: &str| oldest_by_client.get(c).copied().unwrap_or(u64::MAX) < boot_cutoff_ms;
+    let device_max = newest_by_client.iter()
+        .filter(|(c, _)| pre_boot(c))
+        .map(|(_, t)| *t).max().unwrap_or(0);
     foreign.iter()
         .filter(|g| {
             let c = g["clientInstanceId"].as_str().unwrap_or("");
-            newest_by_client.get(c).copied().unwrap_or(0) + STALE_CLIENT_MS >= device_max
+            pre_boot(c) && newest_by_client.get(c).copied().unwrap_or(0) + STALE_CLIENT_MS >= device_max
         })
         .filter_map(|g| g["generationId"].as_str().map(String::from))
         .collect()
@@ -511,9 +538,9 @@ git commit -m "feat(server): pure recovery-inventory builder joining snapshots w
 
 **Interfaces:**
 - Consumes: `freshell_ws::tabs_persist::{list_snapshot_devices, read_device_overview, read_generations_union_by_ids}` (sync `io::Result`, must run in `spawn_blocking`); `freshell_ws::pane_ledger::PaneLedger::list_bindings()` (sync, memory-only, callable directly); the shared terminal-registry handle (read-only — the same instance the WS server state receives; copy the exact type + binding name from `main.rs`) for the liveness join; `select_foreign_recent_generation_ids` and `build_inventory` from Task 1; the per-handler auth helper used by `tabs_snapshots.rs` handlers (`is_authed(&headers, &state.auth_token)` — copy the exact import from that file).
-- Produces: `pub struct RecoveryInventoryState { pub auth_token: String, pub snapshots_dir: Option<std::path::PathBuf>, pub ledger: std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>, pub registry: /* shared terminal-registry handle, same type main.rs wires into the WS state */ }` (`#[derive(Clone)]`) and `pub fn router(state: RecoveryInventoryState) -> axum::Router`. Route: `GET /api/recovery/inventory?clientInstanceId=<id>`.
+- Produces: `pub struct RecoveryInventoryState { pub auth_token: String, pub snapshots_dir: Option<std::path::PathBuf>, pub ledger: std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>, pub registry: /* shared terminal-registry handle, same type main.rs wires into the WS state */ }` (`#[derive(Clone)]`) and `pub fn router(state: RecoveryInventoryState) -> axum::Router`. Route: `GET /api/recovery/inventory?clientInstanceId=<id>&bootAgoMs=<elapsed-ms>` (`bootAgoMs` optional; missing/unparsable ⇒ `0`, i.e. `boot_cutoff = now` and the A16 concurrent-client filter drops nothing that predates the request).
 
-Handler behavior: 401 without valid token (same check as every other handler); with `snapshots_dir: None` or missing dir → inventory built from ledger only; snapshot reads: `spawn_blocking` over `(dir, exclude_client)` doing — `list_snapshot_devices(&dir)` → for each device `read_device_overview(&dir, &device)` → select generation ids via `select_foreign_recent_generation_ids(&generations, &exclude_client)` (Task 1 — drops the requester's own generations AND stale clients per the A15 recency rule) → `read_generations_union_by_ids(&dir, &device, &ids)` → collect `DeviceUnion`. Devices with zero surviving generations are skipped. IO errors and `JoinError` → 500 + `tracing::error!` (fail-loud, three-arm match, same shape as the dryRun path at `tabs_snapshots.rs:330`). Then build the live set from the registry (read-only): `live_session_keys(&state.registry)` collects `(provider = mode, sessionId)` for every currently-Running terminal row — the same row fields the ladder's A13 guard reads at `terminal.rs:1690-1745`; if the registry lacks a public row-listing accessor, add a read-only one to `freshell-terminal` (no behavior change). Finally `build_inventory(unions, state.ledger.list_bindings(), live)` → `Json(...)`.
+Handler behavior: 401 without valid token (same check as every other handler); with `snapshots_dir: None` or missing dir → inventory built from ledger only; parse `bootAgoMs` from the query (u64; missing/unparsable ⇒ 0) and compute `let boot_cutoff = now_ms().saturating_sub(boot_ago_ms);` (same `now_ms` helper convention as `tabs_persist.rs`); snapshot reads: `spawn_blocking` over `(dir, exclude_client, boot_cutoff)` doing — `list_snapshot_devices(&dir)` → for each device `read_device_overview(&dir, &device)` → select generation ids via `select_foreign_recent_generation_ids(&generations, &exclude_client, boot_cutoff)` (Task 1 — drops the requester's own generations, concurrent post-boot clients per the A16 rule, AND stale clients per the A15 recency rule) → `read_generations_union_by_ids(&dir, &device, &ids)` → collect `DeviceUnion`. Devices with zero surviving generations are skipped. IO errors and `JoinError` → 500 + `tracing::error!` (fail-loud, three-arm match, same shape as the dryRun path at `tabs_snapshots.rs:330`). Then build the live set from the registry (read-only): `live_session_keys(&state.registry)` collects `(provider = mode, sessionId)` for every currently-Running terminal row — the same row fields the ladder's A13 guard reads at `terminal.rs:1690-1745`; if the registry lacks a public row-listing accessor, add a read-only one to `freshell-terminal` (no behavior change). Finally `build_inventory(unions, state.ledger.list_bindings(), live)` → `Json(...)`.
 
 - [ ] **Step 1: Write the failing route tests**
 
@@ -674,14 +701,15 @@ fn live_session_keys(registry: &/* registry handle type */) -> std::collections:
     /* iterate rows; keep Running rows with a session identity; collect (mode, session_id) */
 }
 
-fn read_foreign_unions(dir: &std::path::Path, exclude_client: &str) -> std::io::Result<Vec<DeviceUnion>> {
+fn read_foreign_unions(dir: &std::path::Path, exclude_client: &str, boot_cutoff: u64) -> std::io::Result<Vec<DeviceUnion>> {
     use freshell_ws::tabs_persist::{list_snapshot_devices, read_device_overview, read_generations_union_by_ids};
     let mut out = vec![];
     if !dir.is_dir() { return Ok(out); }
     for device in list_snapshot_devices(dir)? {
         let Some((_, generations)) = read_device_overview(dir, &device)? else { continue };
-        // Task 1 helper: drops the requester's own generations AND stale clients (A15)
-        let foreign: Vec<String> = select_foreign_recent_generation_ids(&generations, exclude_client);
+        // Task 1 helper: drops the requester's own generations, concurrent post-boot
+        // clients (A16), AND stale clients (A15)
+        let foreign: Vec<String> = select_foreign_recent_generation_ids(&generations, exclude_client, boot_cutoff);
         if foreign.is_empty() { continue; }
         match read_generations_union_by_ids(dir, &device, &foreign) {
             Ok(union) => out.push(DeviceUnion { device_id: device, union_doc: union_value(union) }),
@@ -779,8 +807,8 @@ git commit -m "feat(ws): refuse sessionRef restore while a Running terminal owns
 **Interfaces:**
 - Consumes: `window.localStorage` (jsdom provides it in tests; clear it yourself — `console.error` throws in `afterEach`).
 - Produces:
-  - `boot-state.ts`: `export function computeHadPersistedLayout(storage: Pick<Storage, 'getItem'>): boolean` and `export const hadPersistedLayoutAtBoot: boolean` (evaluated at module import).
-  - `dismissal.ts`: `export function isDismissed(contentId: string): boolean`, `export function recordDismissal(contentId: string): void` (cap 20, newest kept), `export function getPendingOffer(): string | null`, `export function setPendingOffer(contentId: string): void`, `export function clearPendingOffer(): void`.
+  - `boot-state.ts`: `export function computeHadPersistedLayout(storage: Pick<Storage, 'getItem'>): boolean`, `export const hadPersistedLayoutAtBoot: boolean`, and `export const bootCapturedAtMs: number` (both constants evaluated at module import; `bootCapturedAtMs = Date.now()` — the anchor for D2's `bootAgoMs`).
+  - `dismissal.ts`: `export function isDismissed(contentId: string): boolean`, `export function recordDismissal(contentId: string): void` (cap 20, newest kept), `export interface PendingOffer { contentId: string; bootAt: number }`, `export function getPendingOffer(): PendingOffer | null`, `export function setPendingOffer(contentId: string, bootAt: number): void`, `export function clearPendingOffer(): void`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -888,11 +916,16 @@ describe('recovery dismissal persistence', () => {
     expect(isDismissed('abc')).toBe(true)
   })
 
-  it('pending offer round-trips and clears', () => {
+  it('pending offer round-trips (with its bootAt anchor) and clears', () => {
     expect(getPendingOffer()).toBeNull()
-    setPendingOffer('abc')
-    expect(getPendingOffer()).toBe('abc')
+    setPendingOffer('abc', 12345)
+    expect(getPendingOffer()).toEqual({ contentId: 'abc', bootAt: 12345 })
     clearPendingOffer()
+    expect(getPendingOffer()).toBeNull()
+  })
+
+  it('tolerates corrupt pending JSON', () => {
+    localStorage.setItem('freshell.recovery.pending.v1', '{not json')
     expect(getPendingOffer()).toBeNull()
   })
 })
@@ -929,6 +962,11 @@ export function computeHadPersistedLayout(storage: Pick<Storage, 'getItem'>): bo
 // land long after module eval (see docs/plans/2026-07-26-recover-my-panes.md D1).
 export const hadPersistedLayoutAtBoot: boolean =
   typeof window !== 'undefined' && computeHadPersistedLayout(window.localStorage)
+
+// Paired with the capture above: the moment this boot's "had layout" signal was taken.
+// Anchor for the inventory request's bootAgoMs (D2's concurrent-client filter) - sent as
+// an elapsed DURATION so client/server clock skew cannot corrupt the server-side cutoff.
+export const bootCapturedAtMs: number = Date.now()
 ```
 
 In `src/main.tsx`, add a comment on the existing `import '@/store/storage-migration'` line (no code change):
@@ -966,12 +1004,24 @@ export function recordDismissal(contentId: string): void {
   localStorage.setItem(DISMISSED_KEY, JSON.stringify(next))
 }
 
-export function getPendingOffer(): string | null {
-  return localStorage.getItem(PENDING_KEY)
+export interface PendingOffer { contentId: string; bootAt: number }
+
+export function getPendingOffer(): PendingOffer | null {
+  try {
+    const raw = localStorage.getItem(PENDING_KEY)
+    if (!raw) return null
+    const parsed: unknown = JSON.parse(raw)
+    const p = parsed as { contentId?: unknown; bootAt?: unknown }
+    return typeof p?.contentId === 'string' && typeof p?.bootAt === 'number'
+      ? { contentId: p.contentId, bootAt: p.bootAt }
+      : null
+  } catch {
+    return null
+  }
 }
 
-export function setPendingOffer(contentId: string): void {
-  localStorage.setItem(PENDING_KEY, contentId)
+export function setPendingOffer(contentId: string, bootAt: number): void {
+  localStorage.setItem(PENDING_KEY, JSON.stringify({ contentId, bootAt }))
 }
 
 export function clearPendingOffer(): void {
@@ -1002,10 +1052,10 @@ git commit -m "feat(client): recovery trigger eligibility (boot-captured) and di
 - Create: `test/unit/client/lib/recovery/build-recovery-plan.test.ts`
 
 **Interfaces:**
-- Consumes: `PaneNode` / `TerminalPaneContent` from `@/store/paneTypes` (`PaneNode = leaf{id, content} | split{id, direction, children:[PaneNode,PaneNode], sizes:[number,number]}`, `paneTypes.ts:274-276`; terminal content fields incl. `initialCwd`, `sessionRef: {provider, sessionId}`, non-optional `createRequestId`/`status`); `nanoid`; `api.get` + `buildQueryString` (`api.ts:276-285`).
+- Consumes: `PaneNode` / `TerminalPaneContent` from `@/store/paneTypes` (`PaneNode = leaf{id, content} | split{id, direction, children:[PaneNode,PaneNode], sizes:[number,number]}`, `paneTypes.ts:274-276`; terminal content fields incl. `initialCwd`, `sessionRef: {provider, sessionId}`, non-optional `createRequestId`/`status`); `nanoid`; `api.get` + `buildQueryString(entries: Array<[string, string | number | undefined]>)` (`api.ts:273-285` — it takes an ARRAY OF `[key, value]` TUPLES, not an object; passing an object fails typecheck and would throw at runtime iterating a non-iterable).
 - Produces:
   - `types.ts`: `RecoveryInventory`, `RecoveryPane` (`{paneId, kind, mode: string|null, shell: string|null, cwd: string|null, payload: Record<string, unknown>, sessionRef: {provider, sessionId}|null, ledgerState: 'bound'|'closed'|'gc_expired'|'unknown', live: boolean}`), `RecoveryTab`, `LedgerOnlyEntry` — mirroring Task 1's response shape.
-  - `api.ts`: `export async function getRecoveryInventory(clientInstanceId: string): Promise<RecoveryInventory>` → `api.get<RecoveryInventory>('/api/recovery/inventory' + buildQueryString({ clientInstanceId }))`.
+  - `api.ts`: `export async function getRecoveryInventory(clientInstanceId: string, bootAgoMs: number): Promise<RecoveryInventory>` → `api.get<RecoveryInventory>('/api/recovery/inventory' + buildQueryString([['clientInstanceId', clientInstanceId], ['bootAgoMs', Math.max(0, Math.round(bootAgoMs))]]))` (tuple-entries call shape — see Consumes; `bootAgoMs` feeds D2's server-side concurrent-client cutoff).
   - `build-recovery-plan.ts`:
 
 ```ts
@@ -1199,8 +1249,10 @@ export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
 In `src/lib/api.ts`, next to `getBootstrap`:
 
 ```ts
-export async function getRecoveryInventory(clientInstanceId: string): Promise<RecoveryInventory> {
-  return api.get<RecoveryInventory>(`/api/recovery/inventory${buildQueryString({ clientInstanceId })}`)
+export async function getRecoveryInventory(clientInstanceId: string, bootAgoMs: number): Promise<RecoveryInventory> {
+  return api.get<RecoveryInventory>(
+    `/api/recovery/inventory${buildQueryString([['clientInstanceId', clientInstanceId], ['bootAgoMs', Math.max(0, Math.round(bootAgoMs))]])}`,
+  )
 }
 ```
 
@@ -1228,11 +1280,11 @@ git commit -m "feat(client): recovery inventory types, API helper, and recovery-
 - Create: `test/unit/client/components/RecoveryOfferPanel.test.tsx`
 
 **Interfaces:**
-- Consumes: `hadPersistedLayoutAtBoot`, dismissal module (Task 3), `getRecoveryInventory` (Task 4), `buildRecoveryPlan`/`countRecoverablePanes` (Task 4), `addTab` (`tabsSlice.ts:274-290` — payload accepts `id`; `activeTabId` set unconditionally), `restoreLayout` (`panesSlice.ts:910-926` — no-ops if the tab already has a layout), `addTerminalRestoreRequestId` (`src/lib/terminal-restore.ts`), `getClientInstanceId`.
+- Consumes: `hadPersistedLayoutAtBoot` + `bootCapturedAtMs`, dismissal module (Task 3), `getRecoveryInventory` (Task 4), `buildRecoveryPlan`/`countRecoverablePanes` (Task 4), `addTab` (`tabsSlice.ts:274-290` — payload accepts `id`; `activeTabId` set unconditionally), `restoreLayout` (`panesSlice.ts:910-926` — no-ops if the tab already has a layout), `addTerminalRestoreRequestId` (`src/lib/terminal-restore.ts`), `getClientInstanceId`.
 - Produces: `export function RecoveryOfferPanel(): JSX.Element | null` — fully self-gating (no props), rendered unconditionally from App. Also `export function armRecoveredTerminalRestores(state: RootState, tabIds: string[]): void` — walks each tab's post-normalization layout in `state.panes`, and for every terminal leaf whose content has a `sessionRef`, calls `addTerminalRestoreRequestId(content.createRequestId)`.
 
 Behavior:
-1. On mount: if `(hadPersistedLayoutAtBoot && !getPendingOffer())` → render null forever. Otherwise fetch `getRecoveryInventory(getClientInstanceId())` once; on error or `recoverable: false` or `isDismissed(contentId)` → render null; else `setPendingOffer(contentId)` and show the panel.
+1. On mount: `const pending = getPendingOffer()`; if `(hadPersistedLayoutAtBoot && !pending)` → render null forever. Otherwise `const bootAt = pending?.bootAt ?? bootCapturedAtMs` and fetch `getRecoveryInventory(getClientInstanceId(), Date.now() - bootAt)` once (D2: `bootAgoMs` anchors the server's concurrent-client cutoff to the ORIGINAL pre-junk boot, also across pending re-offers); on error or `recoverable: false` or `isDismissed(contentId)` → render null; else `setPendingOffer(contentId, bootAt)` and show the panel.
 2. Panel (modal-style, reuse the portal/overlay/focus pattern of `src/components/ui/confirm-modal.tsx`): heading `Restore N panes from server memory?` (N = `countRecoverablePanes`), the device label (`inventory.device.deviceLabel`, when a device is present), a list of recoverable items — for device panes: `{tabName}: {mode ?? kind}` plus cwd when present; for ledgerOnly: `{mode} session — {cwd ?? 'unknown directory'}`; buttons `Restore` and `Not now`. When any device pane has `live: true`, also render a note with `data-testid="recovery-live-note"` (copy flexible, e.g. `Some sessions are still running on the server — they were left untouched; their panes reopen without resuming.`) per D7.
 3. Accept: `clearPendingOffer()`; for each `RecoveryTabPlan`: `dispatch(addTab({ id: plan.tabId, title: plan.title }))`, `dispatch(restoreLayout({ tabId: plan.tabId, layout: plan.layout, paneTitles: plan.paneTitles }))`; then `armRecoveredTerminalRestores(store.getState(), planTabIds)`; hide panel. (Live panes carry no `sessionRef` after Task 4's strip, so the walk never arms them — no component-level special-casing needed.)
 4. Decline: `recordDismissal(contentId)`; `clearPendingOffer()`; hide panel. No further renders this or future visits for this contentId.
@@ -1255,6 +1307,7 @@ vi.mock('@/lib/api', async (importOriginal) => ({
 vi.mock('@/lib/recovery/boot-state', () => ({
   computeHadPersistedLayout: () => false,
   hadPersistedLayoutAtBoot: false, // simulate empty boot; per-test override via vi.mocked where needed
+  bootCapturedAtMs: 0,
 }))
 vi.mock('@/store/tabRegistrySync', async (importOriginal) => ({
   ...(await importOriginal<object>()),
@@ -1343,13 +1396,15 @@ export function RecoveryOfferPanel() {
   const [resolved, setResolved] = useState(false)
 
   useEffect(() => {
-    if (hadPersistedLayoutAtBoot && !getPendingOffer()) { setResolved(true); return }
+    const pending = getPendingOffer()
+    if (hadPersistedLayoutAtBoot && !pending) { setResolved(true); return }
+    const bootAt = pending?.bootAt ?? bootCapturedAtMs
     let cancelled = false
-    getRecoveryInventory(getClientInstanceId())
+    getRecoveryInventory(getClientInstanceId(), Date.now() - bootAt)
       .then((inv) => {
         if (cancelled) return
         if (!inv.recoverable || isDismissed(inv.contentId)) { setResolved(true); return }
-        setPendingOffer(inv.contentId)
+        setPendingOffer(inv.contentId, bootAt)
         setInventory(inv)
       })
       .catch(() => { if (!cancelled) setResolved(true) })
@@ -1466,7 +1521,7 @@ git add -A && git commit -m "test: stabilize recover-my-panes unit/integration c
 - Modify: the two registration lists that `pane-ledger-restart-rust.spec.ts` appears in — `RUST_ONLY_SPECS` and the `rust-chromium` project `testMatch` (grep for `pane-ledger-restart-rust` to find both; add this spec the same way)
 
 **Interfaces:**
-- Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts` — `homeDir` defaults to a fresh mkdtemp; `findFreePort()`; `restart()`), the fake-CLI installation + claude-pane creation pattern from `test/e2e-browser/specs/pane-ledger-restart-rust.spec.ts:1-80` (`installFakeCli()` + fixtures `fake-claude-cli.mjs`), the `FAKE_CLAUDE_ARGV_LOG` JSONL and the `--session-id` extraction pattern (`pane-ledger-restart-rust.spec.ts:162-168`), the adjacent-pair `hasResumePair(argv, sessionId)` helper pattern from `snapshot-restore-rust.spec.ts:66-70` (COPY it into this spec now — Task 9 deletes that file), the fake CLI's resume marker `claude: resumed session <id>` (`fake-claude-cli.mjs:26-30`), fresh-context storage-wipe pattern from `tabs-client-retire.spec.ts:6-38` (`browser.newContext()` = empty localStorage), `?token=<t>&e2e=1` URL scheme, `data-testid="recovery-offer-panel"` / `recovery-accept` / `recovery-decline` / `recovery-live-note` from Task 5.
+- Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts` — `homeDir` defaults to a fresh mkdtemp; `findFreePort()`; `restart()`), the fake-CLI installation + claude-pane creation pattern from `test/e2e-browser/specs/pane-ledger-restart-rust.spec.ts:1-80` (`installFakeCli()` + fixtures `fake-claude-cli.mjs`), the `FAKE_CLAUDE_ARGV_LOG` JSONL and the `--session-id` extraction pattern (`pane-ledger-restart-rust.spec.ts:162-168`), a claude-adapted adjacent-pair helper DEFINED IN THIS SPEC: `const hasClaudeResumePair = (argv: string[], sessionId: string) => { const i = argv.indexOf('--resume'); return i !== -1 && argv[i + 1] === sessionId }` — do NOT copy `hasResumePair` from `snapshot-restore-rust.spec.ts:66-70` verbatim: that helper matches codex's bare `resume` subcommand token (its only caller, `:273`, drives the codex CLI) and would NEVER match the fake claude CLI's `--resume <id>` flag (`fake-claude-cli.mjs:26-30`), which would make Scenario 1's accept-resume poll unpassable and Scenario 3's D7 negative assertion vacuous, the fake CLI's resume marker `claude: resumed session <id>` (`fake-claude-cli.mjs:26-30`), fresh-context storage-wipe pattern from `tabs-client-retire.spec.ts:6-38` (`browser.newContext()` = empty localStorage), `?token=<t>&e2e=1` URL scheme, `data-testid="recovery-offer-panel"` / `recovery-accept` / `recovery-decline` / `recovery-live-note` from Task 5.
 - Produces: the campaign's first browser-loss recovery e2e.
 
 Scenarios (all inside one spec file sharing one owned `RustServer` on an ephemeral port — NEVER 3001/3002; ESM imports use `.js` extensions):
@@ -1480,7 +1535,7 @@ Scenarios (all inside one spec file sharing one owned `RustServer` on an ephemer
 6. Context B: fresh `browser.newContext()` (empty storage = new machine) → `goto` the same URL.
 7. `await expect(pageB.getByTestId('recovery-offer-panel')).toBeVisible({ timeout: 15000 })` and assert the heading matches `/restore \d+ pane/i`.
 8. `await pageB.getByTestId('recovery-accept').click()` → panel disappears → assert a recreated terminal pane renders, then build the resume proof directly (`pane-ledger-restart-rust.spec.ts` has NO resume assertion to reuse — it only polls ledger files and checks `--session-id` preallocation):
-   - PRIMARY: poll the `FAKE_CLAUDE_ARGV_LOG` JSONL until an entry's argv contains the adjacent pair `--resume <sessionId>` for the sessionId recorded in step 2 (the `hasResumePair` pattern copied from `snapshot-restore-rust.spec.ts:66-70`).
+   - PRIMARY: poll the `FAKE_CLAUDE_ARGV_LOG` JSONL until an entry's argv contains the adjacent pair `--resume <sessionId>` for the sessionId recorded in step 2 (the `hasClaudeResumePair` helper from Interfaces — it searches for the `--resume` FLAG the fake claude CLI receives, not codex's bare `resume` token).
    - SECONDARY: the recreated pane's xterm text shows `claude: resumed session <id>` (`fake-claude-cli.mjs:26-30` emits it at CLI startup; scrollback replay delivers it to the late-attaching context).
    Also assert the browser pane from step 2 was recreated in context B (a browser-kind pane rendering `example.com` — assert via its testid/iframe src the way existing browser-pane specs do).
 9. Same-browser reload guard: `await pageB.reload()` → wait for app ready → `await expect(pageB.getByTestId('recovery-offer-panel')).toHaveCount(0)` (localStorage now has a layout — no offer).
@@ -1495,7 +1550,7 @@ Dismissal-across-reload persistence is proven at unit level (Task 3/5); e2e scen
 1. Fresh context D against the SAME still-running server (do NOT restart): create a new fake-claude pane (scenario 1's pattern), record its `sessionId` from the argv log (`--session-id` extraction) and the argv log's current entry count, and wait for a snapshot generation that includes it.
 2. `await contextD.close()` WITHOUT restarting the server — the claude PTY stays Running (registry-owned, not connection-owned).
 3. Fresh context E → the offer appears (the new session changed the recoverable substance, so scenario 2's dismissal does not suppress it) → assert the live-session note `recovery-live-note` is visible.
-4. `recovery-accept` click → panel disappears → a terminal pane is recreated → assert NO new `--resume <thatSessionId>` adjacent pair was appended to `FAKE_CLAUDE_ARGV_LOG` beyond the entry count recorded in step 1 (the live pane was recreated WITHOUT resume; the running session was left untouched — D7).
+4. `recovery-accept` click → panel disappears → a terminal pane is recreated → assert NO new `--resume <thatSessionId>` adjacent pair was appended to `FAKE_CLAUDE_ARGV_LOG` beyond the entry count recorded in step 1 — check with `hasClaudeResumePair` over the entries past that count (this negative assertion cannot pass vacuously: Scenario 1's PRIMARY poll already proves the same matcher matches a real `--resume` pair) (the live pane was recreated WITHOUT resume; the running session was left untouched — D7).
 
 - [ ] **Step 1: Write the failing spec**
 
@@ -1628,10 +1683,10 @@ The final report must ALSO state:
 
 ## Self-Review Record
 
-**1. Spec coverage:** (1) recover-my-panes flow — offer/trigger D1-D3 + Tasks 3/5/6 (boot-capture rationale corrected per A8, with the import-order invariants pinned and tested in Task 3); accept recreation honoring §4.2 D4-D5 + Tasks 1/4/5, including the A10 per-kind adapter (editor `content: ''` default, fresh-agent `restoreError` strip) with unit tests for editor/extension/picker; decline remembered Task 3/5, with the A5/A6 fix — `contentId` is sha256 over timestamp-free substance, so dismissal survives heartbeats, restarts, and Rust upgrades (tested: capturedAt/updatedAt bumps don't change it). (2) Liveness (A2/D7) — Task 1's third `live_session_keys` input + per-pane `live` flag, Task 2's read-only registry join, Task 2b's server-side guard on the direct sessionRef rung (failing integration test first), Task 4's sessionRef strip for live panes, Task 5's live note, Task 8 Scenario 3's no-restart proof (no new `--resume` pair). (3) Inventory correctness — `ledgerOnly` matched against effective refs across ALL device unions and excluding live rows (A4, tested), the A15 staleness rule dropping >15-min-silent clients (pure helper test + route test), self-pollution filter, auth'd. (4) kata h9vt — disposition section + Task 9 (Option A kept; Option B rejected with reason: ledger has no layout; the GET read API + `parse_selector` explicitly REUSED per A11; deploy-tab-diff remediation + spec reworked per A12; freshell-ws screenshot broker handled via the explicit A13 audit table since the compiler is silent for pub library items). TDD red-first for trigger conditions, inventory API, authority chain, liveness guard, dismissal — Tasks 1-5 + 2b all test-first; Task 8's e2e includes an explicit red-verification step. E2E — Task 8: three scenarios (restart accept-resume with argv-pair proof + browser-pane mixed-kind recreation, decline, no-restart live loss) with own RustServer/ephemeral ports/fresh contexts/same-browser-reload guard. Scope fence, a11y lint, PR policy — Global Constraints + Task 10 (which also carries the AD-1 §4.4 ratification statement and the B4 flag).
+**1. Spec coverage:** (1) recover-my-panes flow — offer/trigger D1-D3 + Tasks 3/5/6 (boot-capture rationale corrected per A8, with the import-order invariants pinned and tested in Task 3); accept recreation honoring §4.2 D4-D5 + Tasks 1/4/5, including the A10 per-kind adapter (editor `content: ''` default, fresh-agent `restoreError` strip) with unit tests for editor/extension/picker; decline remembered Task 3/5, with the A5/A6 fix — `contentId` is sha256 over timestamp-free substance, so dismissal survives heartbeats, restarts, and Rust upgrades (tested: capturedAt/updatedAt bumps don't change it). (2) Liveness (A2/D7) — Task 1's third `live_session_keys` input + per-pane `live` flag, Task 2's read-only registry join, Task 2b's server-side guard on the direct sessionRef rung (failing integration test first), Task 4's sessionRef strip for live panes, Task 5's live note, Task 8 Scenario 3's no-restart proof (no new `--resume` pair). (3) Inventory correctness — `ledgerOnly` matched against effective refs across ALL device unions and excluding live rows (A4, tested), the A15 staleness rule dropping >15-min-silent clients (pure helper test + route test), the self-pollution filter including the A16 concurrent-client rule (same-fresh-browser multi-window junk can never win primary-device selection; pure helper test), auth'd. (4) kata h9vt — disposition section + Task 9 (Option A kept; Option B rejected with reason: ledger has no layout; the GET read API + `parse_selector` explicitly REUSED per A11; deploy-tab-diff remediation + spec reworked per A12; freshell-ws screenshot broker handled via the explicit A13 audit table since the compiler is silent for pub library items). TDD red-first for trigger conditions, inventory API, authority chain, liveness guard, dismissal — Tasks 1-5 + 2b all test-first; Task 8's e2e includes an explicit red-verification step. E2E — Task 8: three scenarios (restart accept-resume with argv-pair proof + browser-pane mixed-kind recreation, decline, no-restart live loss) with own RustServer/ephemeral ports/fresh contexts/same-browser-reload guard. Scope fence, a11y lint, PR policy — Global Constraints + Task 10 (which also carries the AD-1 §4.4 ratification statement and the B4 flag).
 
 **1b. No silent deferrals:** no stubs or fake providers stand in for required behavior — the e2e uses the repo's established fake-CLI fixture (the same production-path proof used by the existing ledger restart e2e; it exercises the real create/resume path), and the Task 8 resume proof is built from the argv log + fixture marker (the previously-cited assertion did not exist — A14). Non-terminal pane recreation reuses the production `reopenClosedTab` restore path with a minimal per-kind adapter (D5/A10) — recreated, not deferred. Split geometry (D6) and editor buffer content (D6/A5) are not in the store — data facts, not deferrals. Two DOCUMENTED decisions with recorded rationale, not silent deferrals: (a) the freshopencode fresh-start limitation (Known-limitation note: fenced B4 crate owns the `opencode_ws.rs` bug; sessionRef passthrough kept forward-compatible; flagged to B4 in Task 10 Step 3); (b) live sessions are surfaced but NOT resumed (D7: attach-to-live rejected as unverified and colliding with Lane B1 ownership; server guard as defense-in-depth). No UNRESOLVED COVERAGE GAPS.
 
 **2. Placeholder scan:** the `row_*` accessors, `digest16`, and `select_foreign_recent_generation_ids` (Task 1), `union_value`, `live_session_keys`, and the registry-handle type (Task 2), and the guard's row-matching (Task 2b) are named adapters against real definitions the implementer opens — each is bound to a concrete file/line source (`pane_ledger.rs:93`, `tabs_persist.rs:70-87`, `terminal.rs:1690-1745`, main.rs wiring), with tests as the arbiter. Task 9's freshell-ws deletions are an explicit per-method audit table, not a "compiler will say" hope. No TBD/TODO/"handle edge cases" items remain.
 
-**3. Type consistency:** `DeviceUnion`/`select_foreign_recent_generation_ids`/`build_inventory` (Task 1, 3-arg signature) consumed verbatim in Task 2; the `live` field appears in Task 1's output schema, Task 4's `RecoveryPane` type and test fixtures, Task 5's `INVENTORY` fixture and live-note behavior, and Task 8 Scenario 3's assertions; `RecoveryInventory`/`RecoveryPane`/`RecoveryTabPlan` (Task 4) consumed in Task 5; `getClientInstanceId` exported in Task 5 and consumed there; testids `recovery-offer-panel`/`recovery-accept`/`recovery-decline`/`recovery-live-note` defined in Task 5, consumed in Task 8; `ledgerState` values (`bound|closed|gc_expired|unknown`) match between Task 1 output, Task 4 types, and tests; Task 2b's refusal frame mirrors the existing `RestoreUnavailable` shape consumed by the harness Task 2b's test copies.
+**3. Type consistency:** `DeviceUnion`/`select_foreign_recent_generation_ids`/`build_inventory` (Task 1, 3-arg signature) consumed verbatim in Task 2; the `live` field appears in Task 1's output schema, Task 4's `RecoveryPane` type and test fixtures, Task 5's `INVENTORY` fixture and live-note behavior, and Task 8 Scenario 3's assertions; `RecoveryInventory`/`RecoveryPane`/`RecoveryTabPlan` (Task 4) consumed in Task 5; `getClientInstanceId` exported in Task 5 and consumed there; testids `recovery-offer-panel`/`recovery-accept`/`recovery-decline`/`recovery-live-note` defined in Task 5, consumed in Task 8; `ledgerState` values (`bound|closed|gc_expired|unknown`) match between Task 1 output, Task 4 types, and tests; Task 2b's refusal frame mirrors the existing `RestoreUnavailable` shape consumed by the harness Task 2b's test copies; the D2 `bootAgoMs` chain is type-consistent end-to-end — `bootCapturedAtMs` (Task 3 boot-state) → `PendingOffer.bootAt` (Task 3 dismissal) → `getRecoveryInventory(clientInstanceId, bootAgoMs)` using the tuple-entries `buildQueryString` call shape that matches the REAL `api.ts:273` signature (Task 4) → `bootAgoMs` query param → `boot_cutoff` → `select_foreign_recent_generation_ids(_, _, boot_cutoff)` (Tasks 1/2, route param optional-default-0 so Task 2's existing route tests hold); Task 8's argv matcher `hasClaudeResumePair` targets the fake claude CLI's `--resume` flag, not codex's bare `resume` token, so the accept-resume poll can pass and the D7 negative assertion is non-vacuous.
