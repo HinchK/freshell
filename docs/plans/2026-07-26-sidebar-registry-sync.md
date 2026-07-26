@@ -993,3 +993,10 @@ PR POLICY: NOT approved — do NOT run `gh pr create`. Final output: branch name
 ## Verification Report
 
 (Appended per task during execution. Baseline in Task 1; cases c/b/a/d in Tasks 2–8; final consolidation in Task 9.)
+
+### Baseline (Task 1)
+- Worktree feat/sidebar-registry-sync @ bf6242a1: clean.
+- cargo test -p freshell-server session_directory: PASS (52 tests).
+- cargo test -p freshell-freshagent: PASS.
+- sidebarSelectors + SidebarItem.running-state vitest: PASS (39 tests).
+- Disk headroom: 17G available.
