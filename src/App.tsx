@@ -64,7 +64,7 @@ import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
-import { clearDeadTerminals, clearTerminalLiveHandles } from '@/store/panesSlice'
+import { clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles } from '@/store/panesSlice'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId, setPaneReconcileActive } from '@/lib/terminal-restore'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
@@ -1060,6 +1060,22 @@ export default function App() {
           if (outcome.cardinalityViolation) {
             console.error('[reconcile] cardinality violation — falling back to legacy census')
             fallBackToLegacyCensus()
+            return
+          }
+          // Final-review finding 2: foldVerdicts only SETS the batched
+          // warming/dead-adjudication state (counts > 0) — it never clears
+          // it, so a later clean round (e.g. after a WS reconnect) would
+          // leave the warming banner or dead-sessions dialog up forever.
+          // App's request covers EVERY terminal pane, so its outcome is
+          // authoritative — clear whichever batched state this round
+          // reported none of. Deliberately NOT inside foldVerdicts:
+          // single-pane requesters (TerminalView exhaustion auto-resolve,
+          // warming-banner Retry) must not clear state about other panes.
+          if (outcome.warming === 0) {
+            dispatch(clearReconcileWarming())
+          }
+          if (outcome.dead === 0) {
+            dispatch(clearDeadSessionAdjudication())
           }
           return
         }

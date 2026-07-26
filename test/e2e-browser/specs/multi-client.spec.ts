@@ -272,11 +272,13 @@ test.describe('Multi-Client', () => {
     // either way. So the specific intent value is an internal implementation
     // choice, not the behavior this test is meant to guard -- asserting the
     // exact intent was over-constraining an implementation detail rather than
-    // the contract. What DOES matter, and is still asserted: page2 issued
-    // exactly one re-attach for this terminal (not zero -- a silently dropped
-    // reconnect -- and not a runaway retry storm), using a reconnect-shaped
-    // intent (not a cold 'keepalive_delta', which would mean it never
-    // recognized this as a reconnect at all).
+    // the contract. What DOES matter, and is still asserted: page2 issued a
+    // BOUNDED 1..2 re-attaches for this terminal (not zero -- a silently
+    // dropped reconnect -- and not a runaway retry storm; the 2 covers the
+    // reconnect attach plus at most one designed pane.reconcile fold
+    // re-fire via the reconcileEpoch bump, detailed below), using a
+    // reconnect-shaped intent (not a cold 'keepalive_delta', which would
+    // mean it never recognized this as a reconnect at all).
     await page2.waitForFunction((id) => {
       const sent = window.__FRESHELL_TEST_HARNESS__?.getSentWsMessages?.() ?? []
       return sent.some((msg: any) =>

@@ -579,8 +579,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const lastSessionActivityAtRef = useRef(0)
   const paneLastInputAtRef = useRef<number | undefined>(paneLastInputAt)
   const rateLimitRetryRef = useRef<{ count: number; timer: ReturnType<typeof setTimeout> | null }>({ count: 0, timer: null })
-  // Task 12 bounded re-drive state. reserveWindowStart is wall-clock so a
-  // remount mid-standoff cannot refund the SESSION_RESERVED window.
+  // Task 12 bounded re-drive state. reserveWindowStart is wall-clock so an
+  // effect re-fire mid-standoff (deps change on the still-mounted pane)
+  // cannot refund the SESSION_RESERVED window. A full unmount/remount DOES
+  // reset it — the ref dies with the component — so the window is bounded
+  // per component instance, not per pane lifetime.
   const reconcileRedriveRef = useRef<{
     reserveWindowStart: number | null
     invalidAttempts: number

@@ -1792,12 +1792,56 @@ impl TerminalRegistry {
             }
         }
 
+        self.claim_session_ref_lease_phase(locator, holder_create_request_id, holder_conn, now_ms)
+    }
+
+    /// Lease phase of [`Self::claim_session_ref`] (steps 2-4: held /
+    /// expired / free). Split out so the claim-side TOCTOU re-check
+    /// (final review finding 1) can be pinned by a test that stages
+    /// "loser passed checks 1a/1b before the winner registered" without
+    /// threads: a full `claim_session_ref` call is always caught by step
+    /// 1b while a binding exists, so only a direct entry here can
+    /// exercise the under-lock re-check.
+    fn claim_session_ref_lease_phase(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+        holder_conn: u64,
+        now_ms: u64,
+    ) -> SessionRefClaim {
+        let key = session_ref_key(locator);
         let mut leases = self
             .session_ref_leases
             .lock()
             .expect("session-ref lease lock");
         match leases.get_mut(&key) {
             None => {
+                // Claim-side TOCTOU (final review finding 1): checks 1a/1b
+                // ran BEFORE this lock was taken. A loser preempted across
+                // the winner's register -> `complete_session_ref_claim`
+                // window arrives here after complete removed the winner's
+                // lease -- seeing no lease -- while only the bindings map
+                // records the winner. Re-check bindings WHILE HOLDING the
+                // leases lock: a recorded binding means a winner already
+                // completed, so answer `BoundElsewhere` instead of
+                // double-acquiring (a second spawn on one sessionRef is the
+                // duplicate-writer shape D8 exists to close). Lock order
+                // leases -> bindings matches `complete_session_ref_claim`
+                // and is acyclic: step 1b's bindings block ends before the
+                // leases lock is taken, and no path acquires the leases
+                // lock while holding bindings. A binding observed here is
+                // either freshly completed (live winner) or, if its winner
+                // has since died, handled on the loser's retry claim, whose
+                // step 1b prunes known-dead winners.
+                let bound = self
+                    .session_ref_bindings
+                    .lock()
+                    .expect("session-ref bindings lock")
+                    .get(&key)
+                    .cloned();
+                if let Some(terminal_id) = bound {
+                    return SessionRefClaim::BoundElsewhere { terminal_id };
+                }
                 leases.insert(
                     key,
                     SessionRefLease {
@@ -4119,6 +4163,51 @@ mod tests {
         assert!(matches!(
             reg.claim_session_ref(&s, "cr-B", 2, 2000),
             SessionRefClaim::Acquired
+        ));
+    }
+
+    /// Final-review finding 1 (claim-side TOCTOU): loser B passes checks
+    /// 1a/1b while both maps are still empty, is preempted across the
+    /// winner's register -> `complete_session_ref_claim` window, then takes
+    /// the leases lock AFTER complete removed the lease. Pre-fix the lease
+    /// phase saw "no lease" and answered `Acquired` -> a second spawn for
+    /// the same sessionRef (the duplicate-writer shape D8 exists to close).
+    ///
+    /// Staged sequentially, no threads: the winner claims, registers its
+    /// row, and completes (binding recorded, lease gone); B then enters the
+    /// lease phase DIRECTLY -- exactly the state B is in after its early
+    /// (empty) 1a/1b pass. A full `claim_session_ref` call from B cannot
+    /// pin the fix: while the binding exists, step 1b always intercepts it,
+    /// so only direct entry exercises the under-lock bindings re-check.
+    #[test]
+    fn lease_phase_rechecks_bindings_under_leases_lock() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-A", 1, 1000),
+            SessionRefClaim::Acquired
+        ));
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-win".to_string(),
+            stream_id: "S-win".to_string(),
+            mode: "claude".to_string(),
+            resume_session_id: Some("s1".to_string()),
+            create_request_id: Some("cr-A".to_string()),
+            created_at: Some(1_000),
+        });
+        assert!(reg.complete_session_ref_claim(&s, "cr-A", "T-win"));
+        // B resumes at the lease phase; its 1a/1b ran before the winner
+        // existed, so neither check fired. It must NOT acquire.
+        match reg.claim_session_ref_lease_phase(&s, "cr-B", 2, 2000) {
+            SessionRefClaim::BoundElsewhere { terminal_id } => {
+                assert_eq!(terminal_id, "T-win")
+            }
+            other => panic!("expected BoundElsewhere, got {other:?}"),
+        }
+        // The full claim path agrees (step 1a/1b catch it sequentially).
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 2000),
+            SessionRefClaim::BoundElsewhere { .. }
         ));
     }
 
