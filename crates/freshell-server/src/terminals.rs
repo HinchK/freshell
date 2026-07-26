@@ -1238,7 +1238,9 @@ mod sidebar_projection_tests {
         let dir = dir();
         std::fs::create_dir_all(dir.join(".freshell")).unwrap();
         let state = state(&dir);
-        state.registry.register_headless(headless("term-codex", "codex"));
+        state
+            .registry
+            .register_headless(headless("term-codex", "codex"));
         state.identity.upsert(
             "term-codex",
             Some("codex"),
@@ -1269,9 +1271,13 @@ mod sidebar_projection_tests {
         std::fs::create_dir_all(dir.join(".freshell")).unwrap();
         let state = state(&dir);
         // No identity entry at all.
-        state.registry.register_headless(headless("term-no-entry", "codex"));
+        state
+            .registry
+            .register_headless(headless("term-no-entry", "codex"));
         // Entry exists but carries no session id yet (pre-adoption window).
-        state.registry.register_headless(headless("term-idless", "codex"));
+        state
+            .registry
+            .register_headless(headless("term-idless", "codex"));
         state
             .identity
             .upsert("term-idless", Some("codex"), None, None, 1000);
