@@ -251,6 +251,125 @@ fn client_claims_superseded_ref_is_answered_from_the_chain_terminus() {
 }
 
 #[test]
+fn pending_marker_roundtrips_and_reader_rule_prefers_binding() {
+    let root = temp_root("pending");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending("t1", "opencode", Some("/tmp/p"), 1_000)
+        .unwrap();
+    let marker = ledger.pending_for_terminal("t1").expect("marker readable");
+    assert_eq!(marker.terminal_id, "t1");
+    assert_eq!(marker.mode, "opencode");
+    assert_eq!(marker.cwd.as_deref(), Some("/tmp/p"));
+    assert_eq!(marker.spawned_at, 1_000);
+
+    // Reader rule (spec §4.2): "binding row wins; a marker whose terminalId
+    // already has a binding row is stale."
+    ledger
+        .record_binding(&write("opencode", "ses-1", "t1", 2_000))
+        .unwrap();
+    assert_eq!(ledger.pending_for_terminal("t1"), None);
+    // The raw file still exists until the boot sweep (Task 4) removes it.
+    assert_eq!(ledger.list_pending_raw().len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn resolve_pending_writes_binding_first_then_deletes_marker() {
+    let root = temp_root("resolve");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .unwrap();
+    ledger
+        .resolve_pending(&write("codex", "th-1", "t1", 2_000))
+        .unwrap();
+    assert!(ledger.load_binding("codex", "th-1").is_some());
+    assert!(ledger.list_pending_raw().is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn pending_resolution_collision_is_idempotent() {
+    // Red test `pending-resolution-collision` (spec §4.2 / decision 5): a
+    // second racing resolution for the same terminalId finds the marker
+    // gone or already-bound and no-ops — one binding row, no error.
+    let root = temp_root("collision");
+    let ledger = std::sync::Arc::new(PaneLedger::new(Some(root.clone())));
+    ledger
+        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .unwrap();
+
+    // Sequential double-resolution.
+    ledger
+        .resolve_pending(&write("codex", "th-1", "t1", 2_000))
+        .unwrap();
+    ledger
+        .resolve_pending(&write("codex", "th-1", "t1", 2_001))
+        .expect("second resolve no-ops");
+    assert_eq!(
+        ledger
+            .list_bindings()
+            .iter()
+            .filter(|r| r.session_id == "th-1")
+            .count(),
+        1
+    );
+
+    // Concurrent resolution from two threads (the actual race shape).
+    ledger
+        .record_pending("t2", "codex", Some("/tmp/p"), 3_000)
+        .unwrap();
+    let a = std::sync::Arc::clone(&ledger);
+    let b = std::sync::Arc::clone(&ledger);
+    let ha = std::thread::spawn(move || a.resolve_pending(&write("codex", "th-2", "t2", 3_001)));
+    let hb = std::thread::spawn(move || b.resolve_pending(&write("codex", "th-2", "t2", 3_002)));
+    ha.join().unwrap().expect("racer A ok");
+    hb.join().unwrap().expect("racer B ok");
+    assert_eq!(
+        ledger
+            .list_bindings()
+            .iter()
+            .filter(|r| r.session_id == "th-2")
+            .count(),
+        1
+    );
+    assert!(ledger.pending_for_terminal("t2").is_none());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn sigkill_inside_locator_window_leaves_a_durable_marker() {
+    // Red test `SIGKILL-inside-locator-window` (unit shape): a marker
+    // written pre-resolution survives "process death" (a second PaneLedger
+    // instance over the same dir) so a restarted server can answer
+    // "fresh by race, not by intent" instead of silent fresh.
+    let root = temp_root("sigkill-window");
+    {
+        let gen1 = PaneLedger::new(Some(root.clone()));
+        gen1.record_pending("t1", "opencode", Some("/tmp/p"), 1_000)
+            .unwrap();
+        // gen1 "dies" here — dropped without resolving.
+    }
+    let gen2 = PaneLedger::new(Some(root.clone()));
+    let marker = gen2
+        .pending_for_terminal("t1")
+        .expect("marker survived the crash");
+    assert_eq!(marker.mode, "opencode");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn delete_pending_is_a_noop_when_missing() {
+    let root = temp_root("del-missing");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .delete_pending("never-existed")
+        .expect("missing marker is Ok");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn rebind_to_the_same_identity_is_not_a_supersession() {
     let root = temp_root("samebind");
     let ledger = PaneLedger::new(Some(root.clone()));

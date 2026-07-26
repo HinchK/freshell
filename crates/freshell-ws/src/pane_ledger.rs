@@ -506,6 +506,102 @@ impl PaneLedger {
             })
             .max_by_key(|r| r.updated_at)
     }
+
+    fn pending_path(root: &Path, terminal_id: &str) -> PathBuf {
+        Self::pending_dir(root).join(format!("{}.json", encode_segment(terminal_id)))
+    }
+
+    /// Durable evidence that identity establishment is in flight for this
+    /// terminal (spec §4.2): written at spawn of an identity-bearing pane
+    /// whose identity is not yet known. File first, then index (write-through).
+    pub fn record_pending(
+        &self,
+        terminal_id: &str,
+        mode: &str,
+        cwd: Option<&str>,
+        now_ms: i64,
+    ) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let marker = PendingMarker {
+            ledger_version: LEDGER_VERSION,
+            terminal_id: terminal_id.to_string(),
+            mode: mode.to_string(),
+            cwd: cwd.map(str::to_string),
+            spawned_at: now_ms,
+        };
+        write_row_atomic(&Self::pending_path(root, terminal_id), &marker)?;
+        index.pending.insert(terminal_id.to_string(), marker);
+        Ok(())
+    }
+
+    /// Identity resolved: two independent atomic operations in a PINNED,
+    /// load-bearing order — write the sessionRef-keyed binding row FIRST,
+    /// then delete the pending marker (spec §4.2, G1/decision 5). A crash
+    /// between the two leaves both, which is safe: the reader rule prefers
+    /// the binding row and the boot sweep (Task 4) deletes the stale marker.
+    /// Idempotent: a second racing resolution finds the marker gone or the
+    /// row already bound and no-ops.
+    pub fn resolve_pending(&self, w: &BindingWrite<'_>) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        self.record_binding_locked(root, &mut index, w)?; // binding row FIRST
+        Self::remove_pending(root, &mut index, w.terminal_id) // THEN the marker
+    }
+
+    /// Best-effort marker removal (missing file == already resolved/GC'd).
+    pub fn delete_pending(&self, terminal_id: &str) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        Self::remove_pending(root, &mut index, terminal_id)
+    }
+
+    fn remove_pending(
+        root: &Path,
+        index: &mut LedgerIndex,
+        terminal_id: &str,
+    ) -> std::io::Result<()> {
+        let result = match std::fs::remove_file(Self::pending_path(root, terminal_id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+        if result.is_ok() {
+            index.pending.remove(terminal_id);
+        }
+        result
+    }
+
+    /// Reader-rule lookup: `None` when no marker exists OR when a binding
+    /// row already covers this terminal ("binding row wins; such a marker is
+    /// stale"). Memory-only (V1.md read policy).
+    pub fn pending_for_terminal(&self, terminal_id: &str) -> Option<PendingMarker> {
+        self.root.as_ref()?;
+        let index = self.guard();
+        let marker = index.pending.get(terminal_id).cloned()?;
+        let has_binding = index
+            .bindings
+            .values()
+            .any(|r| r.live_terminal_id.as_deref() == Some(terminal_id));
+        if has_binding {
+            return None;
+        }
+        Some(marker)
+    }
+
+    /// Raw markers (no reader rule) — boot-sweep + test surface. Memory-only.
+    pub fn list_pending_raw(&self) -> Vec<PendingMarker> {
+        if self.root.is_none() {
+            return Vec::new();
+        }
+        self.guard().pending.values().cloned().collect()
+    }
 }
 
 /// Path-segment encoding: `[A-Za-z0-9._-]` pass through, everything else
