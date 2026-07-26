@@ -20,9 +20,10 @@
 - E2E: own `RustServer` instances on ephemeral ports only. NEVER ports 3001/3002. NEVER touch the user's self-hosted server. No broad kill patterns.
 - SCOPE FENCE — do NOT touch: the rest of `crates/freshell-ws/src/reconcile.rs` beyond the single dispatch arm + one `ReconcileDeps` field + inverting the `unsupported_kind` unit test (Lane B1 owns the rest, incl. retry-verdict deletion — a trivial merge conflict at the arm is expected and fine); `crates/freshell-ws/src/existence.rs` (B1; read-only use is fine); codex_candidate/rollout locator (B2); tabs_snapshots + recovery UI (B3); ALL client code (`src/`, ws-client, App.tsx) — client folding of fresh-agent verdicts is the NEXT wave. No kimi/gemini work.
 - `LEDGER_VERSION` stays `1`. All new `BindingRow` fields are `Option` with `skip_serializing_if` — no `deny_unknown_fields`, no required non-defaulted fields.
-- Ledger writes are sync + fsync: async call sites MUST wrap them in `tokio::task::spawn_blocking` (module doc `pane_ledger.rs:34-43`).
+- Ledger writes are sync + fsync: async call sites MUST wrap them in `tokio::task::spawn_blocking` AND `.await` the handle before replying/proceeding — durable-before-answer, the wave-A rule every shipped async write site already follows (`terminal.rs:1589/1613/2252`; module doc `pane_ledger.rs:34-43`). Write failures are never silent warn-and-drop: surface them user-visibly at the call site, then proceed (a failed write never blocks the identity event — campaign §4.2 policy, per V8/A11).
+- B1 COEXISTENCE (V9/A12 — evidence is B1's written plan in worktree `reconcile-client-adoption`; B1 has NO code commits yet): B1 will DELETE `ReconcileVerdict::Retry` + `PaneVerdict.retry_after_ms` and ADD `SessionExistence::ProviderUnavailable`; both lanes edit `handle_pane_reconcile`. Hardening rules for this lane: keep exactly ONE `PaneVerdict` construction point in `reconcile_freshagent.rs` (`base()`), with its `retry_after_ms: None` line annotated `// DELETE-AT-MERGE: B1 removes this field`; NEVER construct/match `ReconcileVerdict::Retry` or assert `retryAfterMs` in any B4 test; keep every `SessionExistence` match exhaustive (no catch-all) with the pre-decided merge mapping `SessionExistence::ProviderUnavailable => FreshAgentPresence::Unknown`; the fresh-agent snapshot is built ONCE per reconcile request and REUSED if deps are re-derived (B1's warming deferral re-derives via `rebuild_deps` — rebuilding the snapshot would double-burn the respawn counter). Merge order: B1 lands first, B4 rebases (expected fixes: one field line + one match arm + one `fresh_agent` field in B1's `rebuild_deps`).
 - TypeScript (e2e specs): NodeNext/ESM — relative imports include `.js` where the repo convention requires (spec files follow the sibling specs' import style).
-- Alarm/degradation frames use `freshAgent.error` event codes that are NOT `INVALID_SESSION_ID` and do NOT start with `RESTORE_` (that combination renders the persistent amber `role="alert"` banner in today's frozen client, `src/lib/fresh-agent-ws.ts:307-318` → `FreshAgentView.tsx:2046`).
+- Alarm/degradation frames use `freshAgent.error` event codes that are NOT `INVALID_SESSION_ID` (that code dispatches `markSessionLost`, not the banner) and do NOT start with `RESTORE_` (RESTORE_-prefixed codes ALSO render the banner but additionally trip the client's restore-failure state — wrong semantics for our alarms; V1/A1). Frozen-client chain (verified, V1): `src/lib/fresh-agent-ws.ts:325-335` → `src/store/freshAgentSlice.ts:444` (`lastError`, set unconditionally, never cleared by any reducer) → `src/components/fresh-agent/FreshAgentView.tsx:1700/2046` → `FreshAgentApprovalBanner` (amber, `role="alert"`). Every alarm frame MUST carry top-level `sessionType` + `provider` (locator resolution, V1/A2) and a user-facing `message` (the banner shows the message, never the code; code-only frames render "Agent error: Unknown error"). The banner is in-memory Redux state: it does NOT survive page reload — e2e must assert before any reload.
 - PR POLICY: NOT approved. Push the branch, STOP before `gh pr create`.
 - ~78GB disk free — halt on ENOSPC.
 - Reference (read-only context, do not commit): campaign plan at `/home/dan/code/freshell/docs/plans/2026-07-24-restart-resilience-architecture-analysis.md` (untracked, absolute path).
@@ -33,20 +34,21 @@
 
 | File | Change | Responsibility |
 |---|---|---|
-| `crates/freshell-ws/src/pane_ledger.rs` | Modify | `BindingRow` optional resume-settings fields; `FreshAgentBindingWrite` + `record_fresh_agent_binding` upsert |
-| `crates/freshell-freshagent/src/identity_sink.rs` | Create | `PaneIdentitySink` trait, `FreshAgentSettings`, `FreshAgentBindingUpsert`, `FakeIdentitySink` (cfg(test)) |
-| `crates/freshell-freshagent/src/lib.rs` | Modify | `pub mod identity_sink;` + re-exports |
-| `crates/freshell-freshagent/src/codex.rs` | Modify | sink field/setter; ledger writes at identity events; settings-from-ledger on R1/R2/R3; degradation frame |
-| `crates/freshell-freshagent/src/opencode_ws.rs` | Modify | sink field/setter; pending + binding writes; settings-from-ledger resume |
+| `crates/freshell-ws/src/pane_ledger.rs` | Modify | `BindingRow` optional resume-settings fields; `FreshAgentBindingWrite` (incl. `supersedes`) + `record_fresh_agent_binding` upsert with G3 supersession retire |
+| `crates/freshell-freshagent/src/identity_sink.rs` | Create | `PaneIdentitySink` trait (awaited writes), `FreshAgentSettings`, `FreshAgentBindingUpsert`, `FakeIdentitySink` (cfg(test)) |
+| `crates/freshell-freshagent/src/lib.rs` | Modify | `pub mod identity_sink;` + re-exports; `FreshAgentState` sink field/setter; REST send-keys materialization binding write |
+| `crates/freshell-freshagent/src/codex.rs` | Modify | sink field/setter; awaited ledger writes at identity events (crash-respawn supersedes); `emit_fresh_agent_error`; settings-from-ledger on R1/R2/R3; degradation frame |
+| `crates/freshell-freshagent/src/opencode_ws.rs` | Modify | sink field/setter; pending + binding writes; `handle_create` honors `resumeSessionId`; settings-from-ledger resume |
 | `crates/freshell-freshagent/src/claude.rs` | Modify | sink field/setter; binding write at `sdk.session.init`; settings-from-ledger resume |
-| `crates/freshell-server/src/identity_sink.rs` | Create | `LedgerIdentitySink: PaneIdentitySink` over `Arc<PaneLedger>` |
-| `crates/freshell-server/src/main.rs` | Modify | construct + inject the sink into the three states |
-| `crates/freshell-ws/src/reconcile_freshagent.rs` | Create | snapshot types, async snapshot builder, pure verdict mapping, respawn cap, dedupe |
+| `crates/freshell-server/src/identity_sink.rs` | Create | `LedgerIdentitySink: PaneIdentitySink` over `Arc<PaneLedger>` (awaited spawn_blocking writes) |
+| `crates/freshell-server/src/main.rs` | Modify | construct + inject the sink into the three provider states + `FreshAgentState` (REST surface) |
+| `crates/freshell-ws/src/reconcile_freshagent.rs` | Create | snapshot types, async snapshot builder (supersession-chain resolution, respawn cap w/ reset-on-live), pure verdict mapping, dedupe |
 | `crates/freshell-ws/src/reconcile.rs` | Modify (minimal) | one `ReconcileDeps` field + one match arm + invert one unit test |
 | `crates/freshell-ws/src/lib.rs` | Modify | `mod reconcile_freshagent;`, `paneReconcileFreshAgentV1` capability parse/echo, `WsState.fresh_agent_respawn_counts` |
 | `crates/freshell-ws/src/terminal.rs` | Modify | thread capability bool; build fresh-agent snapshot in `handle_pane_reconcile` |
 | `crates/freshell-ws/tests/pane_reconcile_freshagent.rs` | Create | direct-WS integration tests for the fresh-agent arm |
-| `test/e2e-browser/fixtures/coding-cli/…/fake-app-server.mjs` (`test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`) | Modify | crash-on-marker behavior knob |
+| `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` | Modify | `crashOnPromptMarker` + cross-process once-marker knob (crash ONCE, exit 1) |
+| `test/e2e-browser/fixtures/fake-opencode.cjs` | Modify | audit the parsed `prompt_async` body (model/effort) — today it is discarded (V4) |
 | `test/e2e-browser/specs/freshagent-settings-resume-rust.spec.ts` | Create | per-provider settings-survive-restart + codex degradation banner |
 | `test/e2e-browser/playwright.config.ts` | Modify | register new spec in `RUST_ONLY_SPECS` + `rust-chromium` `testMatch` |
 | `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` | Modify | flip/narrow the P1.13 freshopencode pin |
@@ -63,8 +65,8 @@
 - Consumes: existing `BindingRow`, `RowState`, `PaneLedger` internals (`record_binding` at `pane_ledger.rs:315` is the structural donor).
 - Produces (later tasks rely on these EXACT names):
   - `BindingRow` new pub fields: `pane_kind: Option<String>`, `model: Option<String>`, `sandbox: Option<String>`, `permission_mode: Option<String>`, `effort: Option<String>` (serde camelCase: `paneKind`, `model`, `sandbox`, `permissionMode`, `effort`).
-  - `pub struct FreshAgentBindingWrite<'a>` (fields below).
-  - `pub fn PaneLedger::record_fresh_agent_binding(&self, w: &FreshAgentBindingWrite<'_>) -> std::io::Result<()>`.
+  - `pub struct FreshAgentBindingWrite<'a>` (fields below, incl. `supersedes: Option<&'a str>` — the OLD session id this binding replaces; G3 supersession per V8/A14).
+  - `pub fn PaneLedger::record_fresh_agent_binding(&self, w: &FreshAgentBindingWrite<'_>) -> std::io::Result<()>` — upsert + (when `supersedes` is Some) retire-and-link of the old row.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -85,6 +87,7 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
             sandbox: Some("workspace-write"),
             permission_mode: Some("on-request"),
             effort: Some("high"),
+            supersedes: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -111,6 +114,7 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
         sandbox: None,
         permission_mode: None,
         effort: Some("low"),
+        supersedes: None,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -123,6 +127,49 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
     assert_eq!(row.model.as_deref(), Some("m2"));
     assert_eq!(row.effort, None, "settings are a full snapshot, not a merge");
 }
+
+#[test]
+fn supersedes_retires_the_old_row_and_links_the_chain() {
+    // G3 supersession (V8/A14): codex crash-respawn must retire the OLD
+    // thread row and link it to the new one — never leave two Bound rows.
+    let (ledger, _tmp) = test_ledger();
+    let base = FreshAgentBindingWrite {
+        provider: "codex",
+        session_id: "old-thread",
+        mode: "freshcodex",
+        cwd: Some("/w"),
+        create_request_id: None,
+        model: Some("m"),
+        sandbox: None,
+        permission_mode: None,
+        effort: None,
+        supersedes: None,
+        now_ms: 1_000,
+    };
+    ledger.record_fresh_agent_binding(&base).unwrap();
+    ledger
+        .record_fresh_agent_binding(&FreshAgentBindingWrite {
+            session_id: "new-thread",
+            supersedes: Some("old-thread"),
+            now_ms: 2_000,
+            ..base
+        })
+        .unwrap();
+    let old = ledger.load_binding("codex", "old-thread").expect("old row kept");
+    assert_eq!(old.state, RowState::Retired, "old row retired, never left Bound");
+    assert_eq!(
+        old.superseded_by.as_ref().map(|l| l.session_id.as_str()),
+        Some("new-thread"),
+        "supersededBy links old → new"
+    );
+    let res = ledger.lookup_by_session("codex", "old-thread").expect("chain resolves");
+    assert!(res.corrected, "claiming the old id is a corrected resolution");
+    assert_eq!(res.row.session_id, "new-thread", "resolution lands at the terminus");
+}
+// (Match the EXACT `RowState`/`RetiredReason` variant names and `Resolution`
+// field names from pane_ledger.rs:107-148 / :450-484 — verify at implementation;
+// the retire semantics donor is record_binding_locked's supersession block at
+// pane_ledger.rs:372-388.)
 
 #[test]
 fn old_terminal_rows_without_settings_fields_still_deserialize() {
@@ -182,6 +229,10 @@ pub struct FreshAgentBindingWrite<'a> {
     pub sandbox: Option<&'a str>,
     pub permission_mode: Option<&'a str>,
     pub effort: Option<&'a str>,
+    /// G3 supersession (V8/A14): the OLD session id this binding replaces
+    /// (codex crash-respawn). When `Some`, the old `(provider, supersedes)`
+    /// row is retired and linked AFTER the new row persists.
+    pub supersedes: Option<&'a str>,
     pub now_ms: i64,
 }
 ```
@@ -189,6 +240,8 @@ pub struct FreshAgentBindingWrite<'a> {
 (c) Implement `record_fresh_agent_binding` by duplicating the structure of `record_binding` (`pane_ledger.rs:315`) — same disabled-root no-op, same in-memory index update, same atomic temp+rename+fsync persist path via the module's existing private row-persist helper — with these differences:
 - Upsert keyed `(provider, session_id)`: if a row exists, keep its `created_at`; otherwise `created_at = w.now_ms`.
 - Always set: `state: RowState::Bound`, `retired_reason: None`, `pane_kind: Some("fresh-agent".into())`, `updated_at = w.now_ms`, `last_observed_at = w.now_ms`, `live_terminal_id: None` (fresh-agent panes have no terminal), full settings snapshot from `w` (`model/sandbox/permission_mode/effort/cwd`), `create_request_id` from `w` (preserve the existing row's value when `w.create_request_id` is `None`), `superseded_by: None`.
+
+(d) Supersession (G3, V8/A14): when `w.supersedes` is `Some(old)` and `old != w.session_id`, AFTER the new Bound row is persisted (G3 order pinned: write the new bound row FIRST, then retire the old), retire the old `(provider, old)` row exactly as `record_binding_locked`'s supersession block does at `pane_ledger.rs:372-388` — `state: Retired`, `retired_reason: Superseded`, `superseded_by: Some(SessionLocator { provider, session_id: <new id> })`, persisted through the same row-persist helper. A missing old row is a silent no-op. Do this inside the same locked section as the upsert. (Readers: `load_binding` is state-agnostic so the retired row keeps serving settings; `lookup_by_session` at `pane_ledger.rs:450-484` follows the chain — the verdict arm consumes it in Task 13.)
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -209,7 +262,7 @@ git commit -m "feat(ledger): resume-invocation record fields + fresh-agent bindi
 
 **Files:**
 - Create: `crates/freshell-freshagent/src/identity_sink.rs`
-- Modify: `crates/freshell-freshagent/src/lib.rs` (module decl + re-export)
+- Modify: `crates/freshell-freshagent/src/lib.rs` (module decl + re-export; `FreshAgentState` field + setter — the opencode REST surface state also needs the sink, see Task 7's REST materialization site)
 - Modify: `crates/freshell-freshagent/src/codex.rs`, `crates/freshell-freshagent/src/opencode_ws.rs`, `crates/freshell-freshagent/src/claude.rs` (field + setter only in this task)
 - Test: `#[cfg(test)]` in `identity_sink.rs`
 
@@ -218,6 +271,12 @@ git commit -m "feat(ledger): resume-invocation record fields + fresh-agent bindi
 - Produces (exact, used by Tasks 3-10):
 
 ```rust
+/// Write-completion future. Boxed-future trait methods are this repo's
+/// established dyn-compatible async-trait style (`BoxFuture` aliases at
+/// freshell-opencode/src/serve.rs:44 and freshell-codex/src/app_server.rs:62);
+/// the workspace has NO `async-trait` dependency — do not add one.
+pub type SinkWrite = std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>>;
+
 pub struct FreshAgentSettings {
     pub model: Option<String>,
     pub sandbox: Option<String>,
@@ -231,15 +290,25 @@ pub struct FreshAgentBindingUpsert {
     pub mode: String,
     pub create_request_id: Option<String>,
     pub resolves_pending: Option<String>,
+    /// G3 supersession (V8/A14): OLD session id this binding replaces
+    /// (codex crash-respawn passes the old thread id; everyone else None).
+    pub supersedes: Option<String>,
     pub settings: FreshAgentSettings,
 }
 pub trait PaneIdentitySink: Send + Sync {
-    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>);
-    fn record_binding(&self, upsert: FreshAgentBindingUpsert);
+    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite;
+    fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite;
     fn load_settings(&self, provider: &str, session_id: &str) -> Option<FreshAgentSettings>;
+    /// True iff a fresh-agent binding row was EVER recorded for this key —
+    /// the SETTINGS_RESET alarm gate (V7/A10): alarm only when the ledger
+    /// proves prior recording; never for never-recorded sessions.
+    fn was_recorded(&self, provider: &str, session_id: &str) -> bool;
 }
 ```
-- Produces on each of `FreshCodexState`, `FreshOpencodeState`, `FreshClaudeState`:
+
+WRITE CONTRACT (V8/A11 — conforms to wave-A's durable-before-answer policy): callers `.await` the returned future BEFORE replying/broadcasting/proceeding past the identity event. Implementations run the fsync work on `spawn_blocking` and propagate failures as `Err` — never swallow them. All planned call sites (Tasks 4-10) are in async contexts (verified by V8: codex `codex.rs:462/:565/:1064/:1283/:1675`; opencode REST send + WS `handle_send`; claude's async consumer task), so awaiting is always legal.
+
+- Produces on each of `FreshCodexState`, `FreshOpencodeState`, `FreshClaudeState`, AND `FreshAgentState` (the opencode REST surface in `lib.rs` — its send-keys materialization is an identity event, Task 7):
   - `pub fn set_identity_sink(&self, sink: std::sync::Arc<dyn PaneIdentitySink>)`
   - private `fn identity_sink(&self) -> Option<std::sync::Arc<dyn PaneIdentitySink>>`
 
@@ -253,16 +322,19 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    #[test]
-    fn fake_sink_records_and_serves_settings() {
+    #[tokio::test]
+    async fn fake_sink_records_and_serves_settings() {
         let fake = Arc::new(FakeIdentitySink::default());
-        fake.record_pending("freshopencode-r1", "freshopencode", Some("/w"));
+        fake.record_pending("freshopencode-r1", "freshopencode", Some("/w"))
+            .await
+            .expect("pending write ok");
         fake.record_binding(FreshAgentBindingUpsert {
             provider: "opencode".into(),
             session_id: "ses_1".into(),
             mode: "freshopencode".into(),
             create_request_id: Some("r1".into()),
             resolves_pending: Some("freshopencode-r1".into()),
+            supersedes: None,
             settings: FreshAgentSettings {
                 model: Some("m".into()),
                 sandbox: None,
@@ -270,13 +342,27 @@ mod tests {
                 effort: Some("low".into()),
                 cwd: Some("/w".into()),
             },
-        });
+        })
+        .await
+        .expect("binding write ok");
         let s = fake.load_settings("opencode", "ses_1").expect("settings");
         assert_eq!(s.model.as_deref(), Some("m"));
         assert_eq!(s.effort.as_deref(), Some("low"));
         assert_eq!(fake.pendings.lock().unwrap().len(), 1);
         assert_eq!(fake.bindings.lock().unwrap().len(), 1);
         assert!(fake.load_settings("opencode", "nope").is_none());
+        assert!(fake.was_recorded("opencode", "ses_1"));
+        assert!(!fake.was_recorded("opencode", "nope"));
+    }
+
+    #[tokio::test]
+    async fn fake_sink_failure_knob_returns_err() {
+        let fake = Arc::new(FakeIdentitySink::default());
+        fake.fail_writes.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(fake
+            .record_pending("p", "freshopencode", None)
+            .await
+            .is_err(), "failure must surface as Err, never be swallowed");
     }
 }
 ```
@@ -322,53 +408,95 @@ pub struct FreshAgentBindingUpsert {
     pub settings: FreshAgentSettings,
 }
 
-/// Fire-and-forget writes (implementations must not block the caller;
-/// ledger fsync work belongs on `spawn_blocking`), memory-fast reads.
+/// Write-completion future (see Interfaces block for the style citation:
+/// BoxFuture aliases at freshell-opencode/src/serve.rs:44 /
+/// freshell-codex/src/app_server.rs:62; no async-trait dep in the workspace).
+pub type SinkWrite =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'static>>;
+
+/// AWAITED writes (wave-A durable-before-answer policy, V8/A11): callers
+/// `.await` the returned future before replying/broadcasting/proceeding.
+/// Implementations run fsync work on `spawn_blocking` and propagate failures
+/// as `Err` — call sites surface them user-visibly, then proceed (a write
+/// failure never blocks the identity event). Reads are memory-fast + sync.
 pub trait PaneIdentitySink: Send + Sync {
-    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>);
-    fn record_binding(&self, upsert: FreshAgentBindingUpsert);
+    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite;
+    fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite;
     fn load_settings(&self, provider: &str, session_id: &str) -> Option<FreshAgentSettings>;
+    fn was_recorded(&self, provider: &str, session_id: &str) -> bool;
 }
 
 pub type SharedPaneIdentitySink = Arc<dyn PaneIdentitySink>;
 
-/// In-memory sink for tests, crate-wide.
+/// In-memory sink for tests, crate-wide. Mutations happen synchronously
+/// before the (already-completed) future is returned, so tests can assert
+/// immediately after `.await`.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct FakeIdentitySink {
     pub pendings: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
     pub bindings: std::sync::Mutex<Vec<FreshAgentBindingUpsert>>,
     pub settings: std::sync::Mutex<std::collections::HashMap<(String, String), FreshAgentSettings>>,
+    /// Keys ever recorded (or seeded) — backs `was_recorded`.
+    pub recorded: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// When true, write futures resolve to Err — for failure-surfacing tests.
+    pub fail_writes: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
 impl FakeIdentitySink {
     pub fn seed(&self, provider: &str, session_id: &str, s: FreshAgentSettings) {
+        self.recorded.lock().unwrap().insert((provider.into(), session_id.into()));
         self.settings.lock().unwrap().insert((provider.into(), session_id.into()), s);
+    }
+    /// Mark a key as previously recorded WITHOUT a recoverable snapshot —
+    /// the SETTINGS_RESET-alarm-positive fixture (V7/A10 gating).
+    pub fn seed_recorded_only(&self, provider: &str, session_id: &str) {
+        self.recorded.lock().unwrap().insert((provider.into(), session_id.into()));
+    }
+    fn write_result(&self) -> SinkWrite {
+        if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            Box::pin(std::future::ready(Err(std::io::Error::other("fake write failure"))))
+        } else {
+            Box::pin(std::future::ready(Ok(())))
+        }
     }
 }
 
 #[cfg(test)]
 impl PaneIdentitySink for FakeIdentitySink {
-    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) {
-        self.pendings.lock().unwrap().push((placeholder_id.into(), mode.into(), cwd.map(Into::into)));
+    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.pendings.lock().unwrap().push((placeholder_id.into(), mode.into(), cwd.map(Into::into)));
+        }
+        self.write_result()
     }
-    fn record_binding(&self, upsert: FreshAgentBindingUpsert) {
-        self.settings
-            .lock()
-            .unwrap()
-            .insert((upsert.provider.clone(), upsert.session_id.clone()), upsert.settings.clone());
-        self.bindings.lock().unwrap().push(upsert);
+    fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
+        if !self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+            self.recorded
+                .lock()
+                .unwrap()
+                .insert((upsert.provider.clone(), upsert.session_id.clone()));
+            self.settings
+                .lock()
+                .unwrap()
+                .insert((upsert.provider.clone(), upsert.session_id.clone()), upsert.settings.clone());
+            self.bindings.lock().unwrap().push(upsert);
+        }
+        self.write_result()
     }
     fn load_settings(&self, provider: &str, session_id: &str) -> Option<FreshAgentSettings> {
         self.settings.lock().unwrap().get(&(provider.into(), session_id.into())).cloned()
     }
+    fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
+        self.recorded.lock().unwrap().contains(&(provider.into(), session_id.into()))
+    }
 }
 ```
 
-In `lib.rs`: `pub mod identity_sink;` and `pub use identity_sink::{FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink};`
+In `lib.rs`: `pub mod identity_sink;` and `pub use identity_sink::{FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink, SinkWrite};`
 
-On EACH of the three states (`FreshCodexState`, `FreshOpencodeState`, `FreshClaudeState`) add a clone-shared, set-once field (states are cloned into consumer tasks, so the `OnceLock` must sit behind an `Arc`):
+On EACH of the four states (`FreshCodexState`, `FreshOpencodeState`, `FreshClaudeState`, and `FreshAgentState` in `lib.rs` — the opencode REST surface, whose materialization site Task 7 instruments) add a clone-shared, set-once field (states are cloned into consumer tasks, so the `OnceLock` must sit behind an `Arc`):
 
 ```rust
 identity_sink: std::sync::Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
@@ -412,8 +540,8 @@ git commit -m "feat(freshagent): PaneIdentitySink trait - crate-boundary bridge 
 - Test: `#[cfg(test)]` in `crates/freshell-server/src/identity_sink.rs`
 
 **Interfaces:**
-- Consumes: `PaneLedger::{record_pending, record_fresh_agent_binding, delete_pending, load_binding}` (Task 1), `freshell_freshagent::{PaneIdentitySink, FreshAgentBindingUpsert, FreshAgentSettings}` (Task 2).
-- Produces: `pub struct LedgerIdentitySink; pub fn LedgerIdentitySink::new(ledger: Arc<PaneLedger>) -> Self`.
+- Consumes: `PaneLedger::{record_pending, record_fresh_agent_binding, delete_pending, load_binding}` (Task 1), `freshell_freshagent::{PaneIdentitySink, FreshAgentBindingUpsert, FreshAgentSettings, SinkWrite}` (Task 2).
+- Produces: `pub struct LedgerIdentitySink; pub fn LedgerIdentitySink::new(ledger: Arc<PaneLedger>) -> Self`. Writes are AWAITED `spawn_blocking` (durable-before-answer, V8/A11) — the returned future completes only after the fsync, and failures come back as `Err`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -425,7 +553,6 @@ mod tests {
     use super::*;
     use freshell_freshagent::{FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink};
     use std::sync::Arc;
-    use std::time::Duration;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn writes_through_to_ledger_and_reads_back() {
@@ -438,6 +565,7 @@ mod tests {
             mode: "freshcodex".into(),
             create_request_id: None,
             resolves_pending: None,
+            supersedes: None,
             settings: FreshAgentSettings {
                 model: Some("gpt-5.3-codex".into()),
                 sandbox: Some("workspace-write".into()),
@@ -445,16 +573,15 @@ mod tests {
                 effort: None,
                 cwd: Some("/w".into()),
             },
-        });
-        // record_binding is fire-and-forget via spawn_blocking: poll.
-        let mut got = None;
-        for _ in 0..50 {
-            if let Some(s) = sink.load_settings("codex", "t1") { got = Some(s); break; }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let s = got.expect("binding visible within 1s");
+        })
+        .await
+        .expect("awaited write succeeds");
+        // Awaited write => durable and readable IMMEDIATELY, no polling.
+        let s = sink.load_settings("codex", "t1").expect("binding visible after await");
         assert_eq!(s.model.as_deref(), Some("gpt-5.3-codex"));
         assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
+        assert!(sink.was_recorded("codex", "t1"));
+        assert!(!sink.was_recorded("codex", "nope"));
         let row = ledger.load_binding("codex", "t1").unwrap();
         assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
     }
@@ -477,7 +604,7 @@ Expected: COMPILE ERROR (module/type not defined).
 //! freshell-freshagent cannot see the ledger (crate cycle), so main.rs
 //! injects this adapter at wiring time.
 
-use freshell_freshagent::{FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink};
+use freshell_freshagent::{FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SinkWrite};
 use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use std::sync::Arc;
 
@@ -501,53 +628,84 @@ fn now_ms() -> i64 {
 }
 
 impl PaneIdentitySink for LedgerIdentitySink {
-    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) {
+    // Writes are AWAITED spawn_blocking (durable-before-answer, V8/A11) —
+    // exactly the shape terminal.rs:1589 already ships. Timestamps are taken
+    // at EVENT time (before the hop), so `updated_at` reflects event order
+    // (V8's out-of-order aggravator).
+    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite {
         let ledger = self.ledger.clone();
         let (p, m, c) = (placeholder_id.to_string(), mode.to_string(), cwd.map(str::to_string));
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = ledger.record_pending(&p, &m, c.as_deref(), now_ms()) {
-                tracing::warn!(error = %e, placeholder = %p, "pane_ledger.fresh_agent.pending_write_failed");
-            }
-        });
+        let now = now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.record_pending(&p, &m, c.as_deref(), now))
+                .await
+                .map_err(std::io::Error::other)? // JoinError (incl. closure panic) surfaces as Err
+        })
     }
 
-    fn record_binding(&self, upsert: FreshAgentBindingUpsert) {
+    fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
         let ledger = self.ledger.clone();
-        tokio::task::spawn_blocking(move || {
-            let w = FreshAgentBindingWrite {
-                provider: &upsert.provider,
-                session_id: &upsert.session_id,
-                mode: &upsert.mode,
-                cwd: upsert.settings.cwd.as_deref(),
-                create_request_id: upsert.create_request_id.as_deref(),
-                model: upsert.settings.model.as_deref(),
-                sandbox: upsert.settings.sandbox.as_deref(),
-                permission_mode: upsert.settings.permission_mode.as_deref(),
-                effort: upsert.settings.effort.as_deref(),
-                now_ms: now_ms(),
-            };
-            if let Err(e) = ledger.record_fresh_agent_binding(&w) {
-                tracing::warn!(error = %e, provider = %upsert.provider, session = %upsert.session_id,
-                    "pane_ledger.fresh_agent.binding_write_failed");
-            }
-            if let Some(p) = upsert.resolves_pending.as_deref() {
-                if let Err(e) = ledger.delete_pending(p) {
-                    tracing::warn!(error = %e, placeholder = %p, "pane_ledger.fresh_agent.pending_delete_failed");
+        let now = now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let w = FreshAgentBindingWrite {
+                    provider: &upsert.provider,
+                    session_id: &upsert.session_id,
+                    mode: &upsert.mode,
+                    cwd: upsert.settings.cwd.as_deref(),
+                    create_request_id: upsert.create_request_id.as_deref(),
+                    model: upsert.settings.model.as_deref(),
+                    sandbox: upsert.settings.sandbox.as_deref(),
+                    permission_mode: upsert.settings.permission_mode.as_deref(),
+                    effort: upsert.settings.effort.as_deref(),
+                    supersedes: upsert.supersedes.as_deref(),
+                    now_ms: now,
+                };
+                ledger.record_fresh_agent_binding(&w)?; // binding-write failure propagates
+                if let Some(p) = upsert.resolves_pending.as_deref() {
+                    // Cosmetic on failure: an orphaned marker is TTL-swept at 30d
+                    // (V6/A15) — warn, do not fail the identity event over it.
+                    if let Err(e) = ledger.delete_pending(p) {
+                        tracing::warn!(error = %e, placeholder = %p, "pane_ledger.fresh_agent.pending_delete_failed");
+                    }
                 }
-            }
-        });
+                Ok(())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
     }
 
     fn load_settings(&self, provider: &str, session_id: &str) -> Option<FreshAgentSettings> {
         // Reads are memory-only against the write-through index — safe inline.
         let row = self.ledger.load_binding(provider, session_id)?;
-        Some(FreshAgentSettings {
+        // Terminal-lineage rows (wave-A codex_candidate etc.) are NOT resume
+        // records — only fresh-agent rows serve settings (V7/A10 gating).
+        if row.pane_kind.as_deref() != Some("fresh-agent") {
+            return None;
+        }
+        let s = FreshAgentSettings {
             model: row.model,
             sandbox: row.sandbox,
             permission_mode: row.permission_mode,
             effort: row.effort,
             cwd: row.cwd,
-        })
+        };
+        // A fully blank snapshot is "nothing recoverable" (real creates always
+        // carry at least cwd): None here + was_recorded()==true is exactly the
+        // SETTINGS_RESET alarm condition (V7/A10).
+        if s == FreshAgentSettings::default() {
+            return None;
+        }
+        Some(s)
+    }
+
+    fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
+        // State-agnostic (load_binding serves Retired/GcExpired rows too, V6/A9).
+        self.ledger
+            .load_binding(provider, session_id)
+            .map(|r| r.pane_kind.as_deref() == Some("fresh-agent"))
+            .unwrap_or(false)
     }
 }
 ```
@@ -560,9 +718,10 @@ let fresh_agent_identity_sink: freshell_freshagent::SharedPaneIdentitySink =
 fresh_codex.set_identity_sink(fresh_agent_identity_sink.clone());
 fresh_claude.set_identity_sink(fresh_agent_identity_sink.clone());
 fresh_opencode.set_identity_sink(fresh_agent_identity_sink.clone());
+fresh_agent_state.set_identity_sink(fresh_agent_identity_sink.clone()); // opencode REST surface (Task 7's materialization site; V10 A13-N1)
 ```
 
-(Use the actual local variable names from main.rs — the states are the ones placed into `WsState` fields `fresh_codex` / `fresh_claude` / `fresh_opencode`; if `WsState` is already constructed by line 426, call the setters on the state handles before they're moved, or via `state.fresh_codex.set_identity_sink(...)` — the field is `Arc<OnceLock>` so either handle works. `pane_ledger` in main.rs may be a value, not `Arc` — wrap once: `let pane_ledger = Arc::new(pane_ledger);` mirroring how `session_existence` receives it at `main.rs:440-449`, adapting the `WsState` field if it takes the Arc.)
+(Use the actual local variable names from main.rs — the states are the ones placed into `WsState` fields `fresh_codex` / `fresh_claude` / `fresh_opencode`, plus the `FreshAgentState` handed to `freshell_freshagent::router(...)` (constructed ~`main.rs:234`, V10). If `WsState` is already constructed by line 426, call the setters on the state handles before they're moved, or via `state.fresh_codex.set_identity_sink(...)` — the field is `Arc<OnceLock>` so either handle works. `pane_ledger` is ALREADY `Arc<PaneLedger>` in main.rs (`Arc::new(PaneLedger::new_locked(...))` at ~`:431`, verified by V10) — `LedgerIdentitySink::new(pane_ledger.clone())` works as written. All clones of each state share the `Arc<OnceLock>` field, so setter injection covers every route's clone — main.rs:209/219/239 are the ONLY production constructions (V10/A13).)
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -587,8 +746,11 @@ git commit -m "feat(server): wire pane ledger into fresh-agent states via Ledger
 - Test: inline `#[cfg(test)]` tests in `codex.rs` (harness: `ENV_LOCK` + `configure_fake_codex_cmd` at `codex.rs:4975/4979`, `create_real_fake_session` at `:4988`)
 
 **Interfaces:**
-- Consumes: `FakeIdentitySink` / `set_identity_sink` (Task 2). `CodexSession` fields (`codex.rs:163-199`): `model: String`, `effort: Option<String>`, `cwd: Option<String>`, `sandbox: Option<String>`, `permission_mode: Option<String>`.
-- Produces: private helper `fn record_codex_binding(&self, session_id: &str, create_request_id: Option<&str>, model: &str, sandbox: Option<&str>, permission_mode: Option<&str>, effort: Option<&str>, cwd: Option<&str>)` on `FreshCodexState`, called at all five identity sites. Codex ledger rows use `provider: "codex"`, `mode: "freshcodex"`.
+- Consumes: `FakeIdentitySink` / `set_identity_sink` (Task 2; writes are AWAITED — all five sites below are `async fn`, verified by V8: `codex.rs:462/:565/:1064/:1283/:1675`). `CodexSession` fields (`codex.rs:163-199`): `model: String`, `effort: Option<String>`, `cwd: Option<String>`, `sandbox: Option<String>`, `permission_mode: Option<String>`.
+- Produces:
+  - private helper `async fn record_codex_binding(&self, session_id: &str, create_request_id: Option<&str>, model: &str, sandbox: Option<&str>, permission_mode: Option<&str>, effort: Option<&str>, cwd: Option<&str>, supersedes: Option<&str>)` on `FreshCodexState`, called (`.await`ed) at all five identity sites. Codex ledger rows use `provider: "codex"`, `mode: "freshcodex"`.
+  - `fn emit_fresh_agent_error(&self, session_id: &str, code: &str, message: &str)` on `FreshCodexState` (defined HERE — Tasks 5/6 consume it): builds the same outer envelope the consumer uses to forward sidecar `freshAgent.error` events, byte-compatible so the frozen client's banner path fires. Required wire shape (V1/A2, verified against `fresh-agent-ws.ts:182-193`): `{ "type": "freshAgent.event", "sessionId": "<id>", "sessionType": "freshcodex", "provider": "codex", "event": { "type": "freshAgent.error", "code": "<code>", "message": "<message>" } }` — top-level `sessionType`/`provider` are REQUIRED (locator resolution) and `message` must be user-facing (the banner shows the message, never the code). Locate the consumer's existing sidecar-event forwarding and reuse its envelope construction; verify byte-compatibility during implementation.
+  - Alarm code `"LEDGER_WRITE_FAILED"` (write-failure surfacing, Global Constraints awaited-writes policy).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -624,17 +786,31 @@ async fn create_records_fresh_agent_binding_with_settings() {
 
 (The comment lines describe which existing helper to reuse — the implementer replaces them with the harness's real invocation, keeping the four explicit settings values and all five assertions exactly as written. The existing create tests in `codex.rs` show the exact `freshAgent.create` message shape; wire params are camelCase: `requestId`, `sessionType`, `cwd`, `model`, `permissionMode`, `sandbox`, `effort`, `resumeSessionId`.)
 
+Also add the write-failure surfacing test (awaited-writes policy — failures are user-visible, never warn-and-drop):
+
+```rust
+#[tokio::test(flavor = "multi_thread")]
+async fn ledger_write_failure_is_surfaced_as_a_live_frame() {
+    // Same harness as above, but with a bus receiver and
+    // fake.fail_writes.store(true, SeqCst) BEFORE driving the create.
+    // Drive the create; then drain the bus (bounded, as in the alarm tests)
+    // and assert a frame containing "LEDGER_WRITE_FAILED" was broadcast,
+    // AND the create still succeeded (the session exists / created frame sent)
+    // — a write failure never blocks the identity event.
+}
+```
+
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p freshell-freshagent create_records_fresh_agent_binding`
-Expected: FAIL — `bindings` is empty (no ledger write exists yet).
+Expected: FAIL — `bindings` is empty (no ledger write exists yet). The write-failure test fails with no `LEDGER_WRITE_FAILED` frame.
 
 - [ ] **Step 3: Implement**
 
-(a) Add the shared helper on `FreshCodexState`:
+(a) Add the shared helper on `FreshCodexState` (async — the write is AWAITED per the Global Constraints durable-before-answer policy; failures are surfaced live, then the identity event proceeds):
 
 ```rust
-fn record_codex_binding(
+async fn record_codex_binding(
     &self,
     session_id: &str,
     create_request_id: Option<&str>,
@@ -643,31 +819,52 @@ fn record_codex_binding(
     permission_mode: Option<&str>,
     effort: Option<&str>,
     cwd: Option<&str>,
+    supersedes: Option<&str>,
 ) {
     let Some(sink) = self.identity_sink() else { return };
-    sink.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-        provider: "codex".into(),
-        session_id: session_id.into(),
-        mode: "freshcodex".into(),
-        create_request_id: create_request_id.map(Into::into),
-        resolves_pending: None,
-        settings: crate::identity_sink::FreshAgentSettings {
-            model: if model.is_empty() { None } else { Some(model.into()) },
-            sandbox: sandbox.map(Into::into),
-            permission_mode: permission_mode.map(Into::into),
-            effort: effort.map(Into::into),
-            cwd: cwd.map(Into::into),
-        },
-    });
+    let settings = crate::identity_sink::FreshAgentSettings {
+        model: if model.is_empty() { None } else { Some(model.into()) },
+        sandbox: sandbox.map(Into::into),
+        permission_mode: permission_mode.map(Into::into),
+        effort: effort.map(Into::into),
+        cwd: cwd.map(Into::into),
+    };
+    // No-laundering guard (V7/A10): never persist an all-blank snapshot —
+    // it would mask a genuine record miss forever. Real creates always carry
+    // at least cwd; a supersession write always goes through (G3 linkage).
+    if settings == crate::identity_sink::FreshAgentSettings::default() && supersedes.is_none() {
+        return;
+    }
+    if let Err(e) = sink
+        .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "codex".into(),
+            session_id: session_id.into(),
+            mode: "freshcodex".into(),
+            create_request_id: create_request_id.map(Into::into),
+            resolves_pending: None,
+            supersedes: supersedes.map(Into::into),
+            settings,
+        })
+        .await
+    {
+        tracing::warn!(error = %e, session = %session_id, "freshagent.codex.ledger_write_failed");
+        self.emit_fresh_agent_error(
+            session_id,
+            "LEDGER_WRITE_FAILED",
+            "Failed to persist this session's resume record - settings may not survive a server restart.",
+        );
+    }
 }
 ```
 
-(b) Call it immediately after each of the five `sessions.insert` construction sites, passing that site's just-inserted values:
-1. `finish_create` (`codex.rs:603-619`) — the healthy create; `session_id` = `started.thread_id` (durable at create, born at `codex.rs:398`); `create_request_id` = the create message's `requestId`.
-2. `handle_create_resume` (R1, `codex.rs:462`…).
-3. `ensure_session_alive` (R2, `codex.rs:1064`…) — refresh write, same id.
-4. `ensure_session_resumable` (R3, `codex.rs:1675`…) — refresh write (its settings become real in Task 5).
-5. `respawn_as_new_thread_after_crash` (`codex.rs:1283`, re-key at `:1325-1347`) — NEW row under the new thread id (`codex.rs:1307`).
+Also define `emit_fresh_agent_error` here (exact wire shape + byte-compat requirement in the Interfaces block above; built on the state's broadcast path).
+
+(b) Call it (`.await`) immediately after each of the five `sessions.insert` construction sites, passing that site's just-inserted values (all five enclosing fns are `async fn` — V8: `:565/:462/:1064/:1675/:1283`) and BEFORE the site's reply/broadcast goes out (durable-before-answer):
+1. `finish_create` (`codex.rs:603-619`) — the healthy create; `session_id` = `started.thread_id` (durable at create, born at `codex.rs:398`); `create_request_id` = the create message's `requestId`; `supersedes: None`.
+2. `handle_create_resume` (R1, `codex.rs:462`…) — `supersedes: None`.
+3. `ensure_session_alive` (R2, `codex.rs:1064`…) — refresh write, same id, `supersedes: None`. Refresh writes snapshot the LIVE in-session values (which originate from a real create/user change); the no-laundering guard in (a) skips the write if they are all blank.
+4. `ensure_session_resumable` (R3, `codex.rs:1675`…) — refresh write, `supersedes: None`. Until Task 5 lands, R3 registers blanks, so the guard makes this call a no-op; Task 5 supplies the recovered values (and additionally gates this call on `recovered.is_some()` — never write a defaults row for a never-recorded historical session, V7).
+5. `respawn_as_new_thread_after_crash` (`codex.rs:1283`, re-key at `:1325-1347`) — NEW row under the new thread id (`codex.rs:1307`), with `supersedes: Some(&old_thread_id)` — the G3 supersession linkage (V8/A14): the ledger retires the old row and links it to the new one. This is the ONLY site that ever knows both ids; the edge is unrecoverable if not written here.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -691,8 +888,8 @@ git commit -m "feat(codex): write fresh-agent ledger binding rows at every ident
 - Test: inline `#[cfg(test)]` in `codex.rs`
 
 **Interfaces:**
-- Consumes: `identity_sink().load_settings("codex", id)` (Task 2); fake app server request recorder (`appendThreadOperationLogPath` → JSONL `{method, threadId, params}` per `thread/*` RPC, `fake-app-server.mjs:360-374`; behavior via `FAKE_CODEX_APP_SERVER_BEHAVIOR`).
-- Produces: private `fn emit_fresh_agent_error(&self, session_id: &str, code: &str, message: &str)` on `FreshCodexState`; alarm code string `"SETTINGS_RESET"` (shared vocabulary with Tasks 8 and 10).
+- Consumes: `identity_sink().load_settings("codex", id)` + `was_recorded("codex", id)` (Task 2); `emit_fresh_agent_error` (Task 4); fake app server request recorder (`appendThreadOperationLogPath` → JSONL `{method, threadId, params}` per `thread/*` RPC, `fake-app-server.mjs:360-374`; behavior via `FAKE_CODEX_APP_SERVER_BEHAVIOR`).
+- Produces: alarm code string `"SETTINGS_RESET"` (shared vocabulary with Tasks 8 and 10), GATED per V7/A10: emitted ONLY when the ledger proves the session was previously recorded as a fresh-agent session (`was_recorded` true) yet no snapshot is recoverable (`load_settings` None). NEVER for never-recorded sessions (pre-ship, historical, sidebar-opened — `snapshot_runtime_for`'s own doc, `codex.rs:1574-1581`, says R3 exists FOR historical sessions): those resume silently with defaults exactly as today.
 
 **Known defect being fixed:** `ensure_session_resumable` (`codex.rs:1675`, restart/reload path — reached from attach-untracked `:1017` and REST snapshot `:1584`) resumes with `model/sandbox/approval_policy = None` (`:1721-1727`) and registers `model: String::new(), effort/sandbox/permission_mode: None` (`:1791-1799`); every post-restart turn silently runs on defaults forever.
 
@@ -741,22 +938,57 @@ async fn resume_after_restart_reapplies_settings_from_ledger() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn resume_with_no_ledger_record_emits_settings_reset_alarm() {
+async fn resume_of_a_never_recorded_session_is_silent_and_writes_no_defaults_row() {
+    // V7/A10: record misses are ROUTINE (pre-ship sessions, sidebar-opened
+    // historical threads — R3 exists FOR them, codex.rs:1574-1581). They must
+    // resume silently with defaults exactly as today, and must NOT launder a
+    // defaults row into the ledger.
     let _guard = ENV_LOCK.lock().await;
     configure_fake_codex_cmd(/* resume-succeeds behavior */);
     let (state, mut bus_rx) = state_with_bus(); // subscribe to the broadcast bus
     let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default()); // deliberately empty
-    state.set_identity_sink(fake);
+    state.set_identity_sink(fake.clone());
 
     // Same R3 entry point as above for an untracked "thread-x".
 
-    // Drain broadcast frames (bounded) and find the alarm:
+    // Bounded drain: NO SETTINGS_RESET frame may appear.
+    while let Ok(frame) = tokio::time::timeout(std::time::Duration::from_secs(1), bus_rx.recv()).await {
+        let Ok(text) = frame else { break };
+        assert!(!text.contains("SETTINGS_RESET"), "never-recorded resume must stay silent");
+    }
+    // No defaults laundering (V7 §2): no binding row was written for thread-x.
+    assert!(
+        !fake.bindings.lock().unwrap().iter().any(|b| b.session_id == "thread-x"),
+        "a load_settings miss must not write a defaults row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_with_a_prior_record_but_unrecoverable_settings_alarms_settings_reset() {
+    // The genuine anomaly: the ledger PROVES prior fresh-agent recording,
+    // yet no snapshot is recoverable — the only case that alarms (V7/A10).
+    let _guard = ENV_LOCK.lock().await;
+    configure_fake_codex_cmd(/* resume-succeeds behavior */);
+    let (state, mut bus_rx) = state_with_bus();
+    let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+    fake.seed_recorded_only("codex", "thread-y"); // was_recorded=true, load_settings=None
+    state.set_identity_sink(fake);
+
+    // Same R3 entry point, attaching untracked "thread-y".
+
     let mut found = false;
     while let Ok(frame) = tokio::time::timeout(std::time::Duration::from_secs(2), bus_rx.recv()).await {
         let Ok(text) = frame else { break };
-        if text.contains("SETTINGS_RESET") { found = true; break; }
+        if text.contains("SETTINGS_RESET") {
+            // A2 qualification (V1): the frame must carry top-level
+            // sessionType/provider and a user-facing message.
+            assert!(text.contains("freshcodex") && text.contains("codex"));
+            assert!(text.contains("Reconfirm your settings"));
+            found = true;
+            break;
+        }
     }
-    assert!(found, "missing-record resume must broadcast a SETTINGS_RESET freshAgent.error");
+    assert!(found, "recorded-but-unrecoverable resume must broadcast SETTINGS_RESET");
 }
 ```
 
@@ -765,40 +997,34 @@ async fn resume_with_no_ledger_record_emits_settings_reset_alarm() {
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p freshell-freshagent resume_after_restart_reapplies_settings`
-Expected: FAIL — registered session has `model == ""` and the op-log resume params lack model/sandbox. The alarm test FAILS with no SETTINGS_RESET frame.
+Expected: FAIL — registered session has `model == ""` and the op-log resume params lack model/sandbox. The recorded-but-unrecoverable test FAILS with no SETTINGS_RESET frame. (The silent-defaults test may pass trivially pre-implementation — keep it as the permanent regression guard for V7's no-spam rule.)
 
 - [ ] **Step 3: Implement**
 
-(a) Alarm helper on `FreshCodexState` — deliver through the same broadcast path the consumer already uses to forward sidecar-originated `freshAgent.error` events to clients (locate the consumer's event forwarding; the frame on the wire must be byte-compatible with a sidecar-produced error event so the frozen client's banner path fires). The event payload is exactly:
-
-```json
-{ "type": "freshAgent.error", "sessionId": "<id>", "code": "<code>", "message": "<message>" }
-```
+(a) `ensure_session_resumable` (R3): before issuing `thread/resume`, load the record with the V7/A10 gate (`emit_fresh_agent_error` comes from Task 4):
 
 ```rust
-fn emit_fresh_agent_error(&self, session_id: &str, code: &str, message: &str) {
-    // Build the envelope the same way the consumer forwards sidecar events
-    // (same outer frame the client's fresh-agent-ws.ts event router reads),
-    // with the payload above, and send it via self.broadcast / broadcast_tx.
-}
-```
-
-(b) `ensure_session_resumable` (R3): before issuing `thread/resume`, load the record:
-
-```rust
-let recovered = self.identity_sink().and_then(|s| s.load_settings("codex", durable_id));
+let sink = self.identity_sink();
+let recovered = sink.as_ref().and_then(|s| s.load_settings("codex", durable_id));
 if recovered.is_none() {
-    tracing::warn!(session = %durable_id, "freshagent.codex.settings_record_missing");
-    self.emit_fresh_agent_error(
-        durable_id,
-        "SETTINGS_RESET",
-        "Session settings could not be recovered after restart - the agent is running with default model and permissions. Reconfirm your settings.",
-    );
+    if sink.as_ref().is_some_and(|s| s.was_recorded("codex", durable_id)) {
+        // The ledger PROVES prior fresh-agent recording, yet nothing is
+        // recoverable — the genuine "never-happens" anomaly. Alarm.
+        tracing::warn!(session = %durable_id, "freshagent.codex.settings_record_unrecoverable");
+        self.emit_fresh_agent_error(
+            durable_id,
+            "SETTINGS_RESET",
+            "Session settings could not be recovered after restart - the agent is running with default model and permissions. Reconfirm your settings.",
+        );
+    }
+    // else: never recorded (pre-ship / historical / sidebar-opened — the
+    // populations R3 exists to serve, codex.rs:1574-1581) → resume silently
+    // with defaults exactly as today. NO alarm, NO defaults write (V7).
 }
-let rec = recovered.unwrap_or_default();
+let rec = recovered.clone().unwrap_or_default();
 ```
 
-Then replace the three `None`s at `:1721-1727` with `rec.model` / `rec.sandbox` / `rec.permission_mode` (the resume request's approval-policy param) — and pass `rec.effort` wherever the healthy create passes effort. Replace the blank registration at `:1791-1799` with `model: rec.model.clone().unwrap_or_default(), sandbox: rec.sandbox.clone(), permission_mode: rec.permission_mode.clone(), effort: rec.effort.clone(), cwd: <existing cwd source>.or(rec.cwd.clone())`. Delete the stale comment claiming `handle_send` repairs settings (it only reads, `:733-777`). The Task-4 `record_codex_binding` call at this site now persists the recovered values.
+(b) Then replace the three `None`s at `:1721-1727` with `rec.model` / `rec.sandbox` / `rec.permission_mode` (the resume request's approval-policy param) — and pass `rec.effort` wherever the healthy create passes effort. Replace the blank registration at `:1791-1799` with `model: rec.model.clone().unwrap_or_default(), sandbox: rec.sandbox.clone(), permission_mode: rec.permission_mode.clone(), effort: rec.effort.clone(), cwd: <existing cwd source>.or(rec.cwd.clone())`. Delete the stale comment claiming `handle_send` repairs settings (it only reads, `:733-777`). Gate the Task-4 `record_codex_binding` call at this site on `recovered.is_some()` — the refresh write re-persists the RECOVERED live values; on a miss it must not run (writing would launder blank defaults into the ledger and permanently mask the miss — V7 §2's laundering finding).
 
 (c) `ensure_session_alive` (R2): where it forwards stored settings, add a ledger fallback for the blank case:
 
@@ -844,7 +1070,7 @@ git commit -m "fix(codex): resume paths reapply model/sandbox/permission/effort 
 - Test: extend the existing crash tests (`send_after_crash_falls_back_to_mint_new_thread…` at `codex.rs:5145`, siblings at `:5224/:4625`)
 
 **Interfaces:**
-- Consumes: `emit_fresh_agent_error` (Task 5), `record_codex_binding` (Task 4).
+- Consumes: `emit_fresh_agent_error` (Task 4 — frame carries top-level `sessionType: "freshcodex"` / `provider: "codex"` + user-facing `message`, the A2 qualification; e2e test 4's banner matches on the message text), `record_codex_binding` (Task 4 — the crash-respawn call at this site passes `supersedes: Some(&old_thread_id)`, writing the G3 retire+link).
 - Produces: alarm code string `"THREAD_MEMORY_LOST"`.
 
 **Known defect being fixed:** `respawn_as_new_thread_after_crash` (`codex.rs:1283`) silently discards conversation memory — the only signal is `tracing::warn!(… "freshagent.crash_recovery.minted_new")` at `:1362-1366`, server-log only.
@@ -908,11 +1134,12 @@ git commit -m "feat(codex): user-visible THREAD_MEMORY_LOST degradation frame on
 
 **Files:**
 - Modify: `crates/freshell-freshagent/src/opencode_ws.rs`
-- Test: inline `#[cfg(test)]` using the existing in-crate trait fakes (`FakeHttp` etc. at `opencode_ws.rs:866-1076`, harnesses `:1080-1111`)
+- Modify: `crates/freshell-freshagent/src/lib.rs` (REST send-keys materialization write — `FreshAgentState` got its sink field in Task 2, injected in Task 3)
+- Test: inline `#[cfg(test)]` using the existing in-crate trait fakes (`FakeHttp` etc. at `opencode_ws.rs:866-1076`, harnesses `:1080-1111`); REST-path test in `lib.rs`'s existing test module
 
 **Interfaces:**
-- Consumes: `set_identity_sink`/`FakeIdentitySink` (Task 2). Sites: create `handle_create` (`opencode_ws.rs:243-247`, placeholder `freshopencode-<requestId>` at `:245`); materialization (durable `ses_*` id assigned `:359`, cwd upgraded `:360-364`, `freshAgent.session.materialized` broadcast `:373-384`); settings commit in `handle_send` (`session.model = model; session.effort = effort;` at `:397-398`).
-- Produces: opencode ledger rows use `provider: "opencode"`, `mode: "freshopencode"`.
+- Consumes: `set_identity_sink`/`FakeIdentitySink` (Task 2; writes AWAITED — all sites are async: WS `handle_create`/`handle_send`, REST send-keys handler). Sites: create `handle_create` (`opencode_ws.rs:243-247`, placeholder `freshopencode-<requestId>` at `:245`); WS materialization (durable `ses_*` id assigned `:359`, cwd upgraded `:360-364`, `freshAgent.session.materialized` broadcast `:373-384`); settings commit in `handle_send` (`session.model = model; session.effort = effort;` at `:397-398`); REST materialization (`lib.rs` send-keys handler — durable id persisted onto the pane + `FreshAgentSessionMaterialized` broadcast, the block near `lib.rs:1477-1516`; REST-created sessions otherwise bypass the sink entirely, V10 A13-N1 — and e2e Task 14 test 2 seeds via REST, so this site is load-bearing).
+- Produces: opencode ledger rows use `provider: "opencode"`, `mode: "freshopencode"`; `fn emit_fresh_agent_error(&self, session_id: &str, code: &str, message: &str)` on `FreshOpencodeState` (same envelope contract as Task 4's codex helper — top-level `sessionType: "freshopencode"` / `provider: "opencode"` + user-facing message — built on `FreshOpencodeState::broadcast`, `opencode_ws.rs:194-196`; Task 8 consumes it).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -966,33 +1193,48 @@ Expected: FAIL — no pendings, no bindings recorded.
 
 - [ ] **Step 3: Implement**
 
-1. `handle_create` (`:243-247`): after registering the placeholder session:
+All writes are AWAITED before the site's broadcast/reply goes out (durable-before-answer); on `Err`, `tracing::warn!` + `emit_fresh_agent_error(<id>, "LEDGER_WRITE_FAILED", ...)` (define the opencode helper in this task — envelope contract in the Interfaces block), then proceed.
+
+1. `handle_create` (`:243-247`): after registering the placeholder session, BEFORE the `FreshAgentCreated` broadcast:
 ```rust
 if let Some(sink) = self.identity_sink() {
-    sink.record_pending(&placeholder_id, "freshopencode", session_cwd.as_deref());
+    if let Err(e) = sink.record_pending(&placeholder_id, "freshopencode", session_cwd.as_deref()).await {
+        tracing::warn!(error = %e, placeholder = %placeholder_id, "freshagent.opencode.pending_write_failed");
+        self.emit_fresh_agent_error(&placeholder_id, "LEDGER_WRITE_FAILED",
+            "Failed to persist this pane's identity marker - identity may not survive a crash.");
+    }
 }
 ```
-2. Materialization (`:359-369`, right after the durable id is assigned and cwd upgraded, before/alongside the `materialized` broadcast):
+2. WS materialization (`:359-369`, right after the durable id is assigned and cwd upgraded, BEFORE the `materialized` broadcast):
 ```rust
 if let Some(sink) = self.identity_sink() {
-    sink.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-        provider: "opencode".into(),
-        session_id: durable_id.clone(),
-        mode: "freshopencode".into(),
-        create_request_id: Some(request_id.clone()),
-        resolves_pending: Some(placeholder_id.clone()),
-        settings: crate::identity_sink::FreshAgentSettings {
-            model: session.model.clone(),
-            sandbox: None,
-            permission_mode: None,
-            effort: session.effort.clone(),
-            cwd: session.cwd.clone(),
-        },
-    });
+    if let Err(e) = sink
+        .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: durable_id.clone(),
+            mode: "freshopencode".into(),
+            create_request_id: Some(request_id.clone()),
+            resolves_pending: Some(placeholder_id.clone()),
+            supersedes: None,
+            settings: crate::identity_sink::FreshAgentSettings {
+                model: session.model.clone(),
+                sandbox: None,
+                permission_mode: None,
+                effort: session.effort.clone(),
+                cwd: session.cwd.clone(),
+            },
+        })
+        .await
+    {
+        tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.binding_write_failed");
+        self.emit_fresh_agent_error(&durable_id, "LEDGER_WRITE_FAILED",
+            "Failed to persist this session's resume record - settings may not survive a server restart.");
+    }
 }
 ```
 (Adapt local variable names at the site; opencode has no sandbox/permission concepts — always `None`.)
-3. `handle_send` commit (`:397-398`): after `session.model = model.clone(); session.effort = effort.clone();`, if the session id is durable (`starts_with("ses_")`), record a refresh binding (same construction as above with `resolves_pending: None`, `create_request_id: None`).
+3. `handle_send` commit (`:397-398`): after `session.model = model.clone(); session.effort = effort.clone();`, if the session id is durable (`starts_with("ses_")`), record a refresh binding (same awaited construction as above with `resolves_pending: None`, `create_request_id: None`, `supersedes: None`).
+4. REST materialization (`crates/freshell-freshagent/src/lib.rs`, the send-keys handler's cold-start block that persists `entry.durable_id` and broadcasts `FreshAgentSessionMaterialized`, near `lib.rs:1477-1516`): record the same binding through `FreshAgentState`'s sink (field added in Task 2, injected in Task 3) — `session_id: durable_id`, `mode: "freshopencode"`, `create_request_id: None`, `resolves_pending: Some(pane.placeholder_id.clone())`, settings from the pane record (`pane.model` / `pane.effort` / `pane.cwd`), awaited BEFORE the materialized broadcast (the handler is async). On `Err`, warn + broadcast the same `LEDGER_WRITE_FAILED` error-frame shape via `state.broadcast`. Without this site, REST-created sessions (Task 14 e2e test 2's seeding surface) never get a resume record (V10 A13-N1). Add an inline test in `lib.rs`'s existing test module, modeled on the existing send-keys materialization (AGENT-08 continuity) test — locate the donor at implementation time — asserting the `FakeIdentitySink` received a binding carrying the REST create's model/effort.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1016,10 +1258,12 @@ git commit -m "feat(opencode): pending marker at create, binding row at ses_* ma
 - Test: inline `#[cfg(test)]`
 
 **Interfaces:**
-- Consumes: `load_settings("opencode", id)` (Task 2); `emit`-style broadcast via `FreshOpencodeState::broadcast` (`opencode_ws.rs:194-196`); alarm code `"SETTINGS_RESET"` (same vocabulary as Task 5).
-- Site: `resume_durable_session` (`opencode_ws.rs:662-696`) — sole caller `handle_attach` (`:598-600`).
+- Consumes: `load_settings("opencode", id)` + `was_recorded` (Task 2); `emit_fresh_agent_error` (Task 7); alarm code `"SETTINGS_RESET"` (same vocabulary + same V7/A10 gating as Task 5: alarm ONLY when `was_recorded` is true and `load_settings` misses; never-recorded sessions resume silently with defaults).
+- Sites: `resume_durable_session` (`opencode_ws.rs:662-696`) — caller `handle_attach` (`:598-600`); AND `handle_create` (`opencode_ws.rs:216-280`).
 
-**Known defect being fixed:** `resume_durable_session` builds `OpencodeSession::new(session_id, cwd.map(...), None, None)` at `:681` — model and effort hard-`None`; `cwd` comes from the attach message, not the session's real directory; the serve `GET /session/:id` body is fetched then discarded at `:678` (`let _ = info;`).
+**Known defects being fixed:**
+1. `resume_durable_session` builds `OpencodeSession::new(session_id, cwd.map(...), None, None)` at `:681` — model and effort hard-`None`; `cwd` comes from the attach message, not the session's real directory; the serve `GET /session/:id` body is fetched then discarded at `:678` (`let _ = info;`).
+2. `handle_create` IGNORES `resume_session_id` entirely (zero non-test reads of the field in the file — V2/A4) and always mints a fresh `freshopencode-{requestId}` placeholder. This is THE P1.13 wall-pin mechanism: after `page.reload()` the frozen client never sends `freshAgent.attach` — it sends `freshAgent.create{resumeSessionId: ses_*}` (persistMiddleware strips `sessionId`, so both attach effects are gated off; `persistMiddleware.ts:245-264`, `FreshAgentView.tsx:1099-1154`). Attach fires only on `ws.onReconnect` WITHOUT reload. Codex/claude already honor resume-in-create; opencode does not — fixing it here is what makes Task 15's pin flip achievable.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1049,11 +1293,37 @@ async fn resume_durable_session_reapplies_settings_from_ledger() {
 }
 
 #[tokio::test]
-async fn resume_without_record_emits_settings_reset_and_uses_serve_directory() {
-    // Same harness; NO seed. RealisticServeHttp's GET /session/:id returns a
-    // directory — assert it is now used instead of being discarded, and that
-    // a SETTINGS_RESET freshAgent.error frame was broadcast.
-    // (bus subscription pattern as in Task 5's alarm test)
+async fn resume_without_record_is_silent_and_uses_serve_directory() {
+    // Same harness; NO seed (never-recorded session — the ROUTINE case, V7:
+    // handle_attach's own doc at opencode_ws.rs:581-590 describes it).
+    // Assert: RealisticServeHttp's GET /session/:id directory is now used
+    // instead of being discarded; NO SETTINGS_RESET frame was broadcast
+    // (bounded bus drain finds none — pattern from Task 5); and NO refresh
+    // binding was written for the session (no defaults laundering).
+}
+
+#[tokio::test]
+async fn resume_with_prior_record_but_unrecoverable_settings_alarms() {
+    // fake.seed_recorded_only("opencode", DURABLE_ID) — was_recorded=true,
+    // load_settings=None. Drive the same attach; assert a SETTINGS_RESET
+    // freshAgent.error frame WITH top-level sessionType "freshopencode" +
+    // provider "opencode" and a user-facing message (bus pattern from Task 5).
+}
+
+#[tokio::test]
+async fn create_with_resume_session_id_rebinds_the_durable_session() {
+    // V2/A4: the frozen client's ONLY post-reload resume vehicle is
+    // freshAgent.create{resumeSessionId: ses_*} — donor shape: codex's
+    // handle_create_with_resume_session_id_resumes_the_same_thread (codex.rs:4381).
+    // Same RealisticServeHttp harness; seed the ledger fake with settings for
+    // DURABLE_ID; drive handle_create with resume_session_id: Some(DURABLE_ID).
+    let sessions = state.sessions.lock().await;
+    assert!(sessions.contains_key(DURABLE_ID), "rebound to the surviving ses_*");
+    let s = sessions.get(DURABLE_ID).unwrap().lock().await;
+    assert_eq!(s.model.as_deref(), Some("big-model"), "settings-from-ledger applied on the create path");
+    drop(s); drop(sessions);
+    // And the FreshAgentCreated broadcast answered with the ses_* id (not a
+    // freshopencode-* placeholder) — capture it via the bus receiver.
 }
 ```
 
@@ -1064,26 +1334,32 @@ Expected: FAIL — model/effort are `None`, cwd is the attach message's.
 
 - [ ] **Step 3: Implement**
 
-In `resume_durable_session` (`:662-696`):
+(a) In `resume_durable_session` (`:662-696`), with the V7/A10 alarm gate:
 
 ```rust
-let recovered = self.identity_sink().and_then(|s| s.load_settings("opencode", &session_id));
-if recovered.is_none() {
-    tracing::warn!(session = %session_id, "freshagent.opencode.settings_record_missing");
+let sink = self.identity_sink();
+let recovered = sink.as_ref().and_then(|s| s.load_settings("opencode", &session_id));
+if recovered.is_none() && sink.as_ref().is_some_and(|s| s.was_recorded("opencode", &session_id)) {
+    // Recorded before, unrecoverable now — the genuine anomaly. Never-recorded
+    // sessions (pre-ship / serve-known-but-ledger-unknown, the ROUTINE attach
+    // population per opencode_ws.rs:581-590) resume silently with defaults.
+    tracing::warn!(session = %session_id, "freshagent.opencode.settings_record_unrecoverable");
     self.emit_fresh_agent_error(
         &session_id,
         "SETTINGS_RESET",
         "Session settings could not be recovered after restart - the agent is running with default model and effort. Reconfirm your settings.",
     );
 }
-let rec = recovered.unwrap_or_default();
+let rec = recovered.clone().unwrap_or_default();
 // :678 — stop discarding the serve body; parse its `directory` field:
 let serve_dir = info_directory; // extract from `info` instead of `let _ = info;`
 let cwd = rec.cwd.clone().or(serve_dir).or(attach_msg_cwd);
 let session = OpencodeSession::new(session_id.clone(), cwd, rec.model.clone(), rec.effort.clone());
 ```
 
-(`emit_fresh_agent_error` is a small helper mirroring Task 5's codex helper — same name, same `freshAgent.error` payload shape — built on `FreshOpencodeState::broadcast`. Model/effort take effect on the next turn because opencode sends them per-turn in the `prompt_async` body, `serve.rs:936-953` — the session fields are the source those sends read, plus Task 7's refresh keeps the ledger current.) After a successful resume, record a refresh binding (Task 7 construction, `resolves_pending: None`).
+(`emit_fresh_agent_error` comes from Task 7. Model/effort take effect on the next turn because opencode sends them per-turn in the `prompt_async` body, `serve.rs:936-953` — the session fields are the source those sends read, plus Task 7's refresh keeps the ledger current.) After a successful resume, record a refresh binding (Task 7's awaited construction, `resolves_pending: None`) ONLY when `recovered.is_some()` — never launder a defaults row for a never-recorded session (V7).
+
+(b) In `handle_create` (`:216-280`) — honor `resume_session_id` (V2/A4; this is the actual P1.13 pin-flip target): when `msg.resume_session_id` (or `msg.session_ref.as_ref().map(|r| &r.session_id)`) names a durable id (`starts_with("ses_")`), do NOT mint a `freshopencode-{requestId}` placeholder. Instead rebind to the surviving `ses_*`: route through the same resume machinery as (a) (`resume_durable_session`, which applies settings-from-ledger), register the session under the durable id, and answer `FreshAgentCreated` with `session_id`/`session_ref` = the durable id (keep the requestId dedup-cache behavior, recording the durable id). Explicit client params on the create win over the ledger record (mirror Task 5(d)'s precedence). Verify the exact created/materialized frame sequence the frozen client expects against the wall test's assertions (`restore-contract-wall-rust.spec.ts:1006-1020`) during implementation — the client must end up re-keyed to the `ses_*` id, not a placeholder.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1107,8 +1383,10 @@ git commit -m "fix(opencode): resume reapplies model/effort/cwd from the ledger 
 - Test: inline `#[cfg(test)]` using `FakeClaudeSidecarEnv` (`claude.rs:1518-1578`) + `CLAUDE_ENV_LOCK` (`:1463`)
 
 **Interfaces:**
-- Consumes: Task 2 sink. Sites: healthy create request built inline in `handle_create` (`claude.rs:216-225`, keys `cwd`, `model`, `permissionMode`, `effort`, `resumeSessionId`); `sdk.session.init` handled in `spawn_consumer`'s task (cliSessionId recorded into `cli_index`, `claude.rs:605-618`; in scope there: `broadcast_tx`, `sessions`, `cli_index` clones at `:593-595`).
-- Produces: `spawn_consumer` gains two params: `mode: String` (from `session_type_str`, `claude.rs:700-705` — preserves the `"freshclaude"` vs `"kilroy"` flavour; provider is always `"claude"`, `claude.rs:66`) and `settings: crate::identity_sink::FreshAgentSettings`. All `spawn_consumer` call sites updated.
+- Consumes: Task 2 sink (writes AWAITED — the `sdk.session.init` arm runs on the async consumer task, so `.await` is legal there; V8). Sites: healthy create request built inline in `handle_create` (`claude.rs:216-225`, keys `cwd`, `model`, `permissionMode`, `effort`, `resumeSessionId`); `sdk.session.init` handled in `spawn_consumer`'s task (cliSessionId recorded into `cli_index`, `claude.rs:605-618`; in scope there: `broadcast_tx`, `sessions`, `cli_index` clones at `:593-595`).
+- Produces:
+  - `spawn_consumer` gains two params: `mode: String` (from `session_type_str`, `claude.rs:700-705` — preserves the `"freshclaude"` vs `"kilroy"` flavour; provider is always `"claude"`, `claude.rs:66`) and `settings: Option<crate::identity_sink::FreshAgentSettings>` — `Some` = record a binding at init (create path / resume-with-record); `None` = do NOT record (resume of a never-recorded session — writing would launder a blank row under the new cliSessionId, V7/A10). All `spawn_consumer` call sites updated.
+  - `fn emit_fresh_agent_error(&self, session_id: &str, session_type: &str, code: &str, message: &str)` on `FreshClaudeState` (same envelope contract as Task 4's codex helper — top-level `sessionType` param preserves the freshclaude/kilroy flavour, `provider: "claude"` — built on claude's direct broadcast, `claude.rs:173-177`; Task 10 consumes it).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1147,21 +1425,30 @@ Expected: FAIL — no bindings recorded.
 
 - [ ] **Step 3: Implement**
 
-1. In `handle_create`: build `let settings = crate::identity_sink::FreshAgentSettings { model: msg.model.clone(), sandbox: None, permission_mode: msg.permission_mode.clone(), effort: msg.effort.clone(), cwd: resolved_cwd.clone() };` (claude has no sandbox concept — always `None`; use the resolved cwd the create request actually sends at `:216-225`). Pass `session_type_str(&msg).to_string()` and `settings` into `spawn_consumer`.
-2. In `spawn_consumer`'s `sdk.session.init` arm (`:605-618`), after `cli_index` is updated:
+1. In `handle_create`: build `let settings = crate::identity_sink::FreshAgentSettings { model: msg.model.clone(), sandbox: None, permission_mode: msg.permission_mode.clone(), effort: msg.effort.clone(), cwd: resolved_cwd.clone() };` (claude has no sandbox concept — always `None`; use the resolved cwd the create request actually sends at `:216-225`). Pass `session_type_str(&msg).to_string()` and `Some(settings)` into `spawn_consumer`.
+2. In `spawn_consumer`'s `sdk.session.init` arm (`:605-618`), after `cli_index` is updated — the arm runs on the async consumer task, so the write is AWAITED there (durable before the init-driven broadcasts proceed), and failures are surfaced:
 ```rust
-if let Some(sink) = identity_sink.clone() { // clone the Option<Arc> into the task alongside broadcast_tx/sessions/cli_index
-    sink.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-        provider: "claude".into(),
-        session_id: cli_session_id.clone(),
-        mode: mode.clone(),
-        create_request_id: None,
-        resolves_pending: None,
-        settings: settings.clone(),
-    });
+if let (Some(sink), Some(settings)) = (identity_sink.clone(), settings.as_ref()) {
+    // clone the Option<Arc> + settings into the task alongside broadcast_tx/sessions/cli_index
+    if let Err(e) = sink
+        .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: cli_session_id.clone(),
+            mode: mode.clone(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            settings: settings.clone(),
+        })
+        .await
+    {
+        tracing::warn!(error = %e, session = %cli_session_id, "freshagent.claude.binding_write_failed");
+        // emit_fresh_agent_error(cli_session_id, &mode, "LEDGER_WRITE_FAILED", ...) — helper defined in this task
+    }
 }
 ```
-3. Update every `spawn_consumer` call site (create and resume paths) — the resume path passes the settings it resolves in Task 10; until Task 10 lands, pass `FreshAgentSettings::default()` there so this task compiles and its test passes.
+(`settings: None` ⇒ no write — the resume-of-a-never-recorded-session case, Task 10: recording there would launder a blank row under the new cliSessionId, V7/A10.)
+3. Update every `spawn_consumer` call site (create and resume paths) — the resume path passes the `Option` it resolves in Task 10; until Task 10 lands, pass `None` there so this task compiles, its test passes, and no blank rows are written.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1185,7 +1472,7 @@ git commit -m "feat(claude): record fresh-agent binding row with create settings
 - Test: inline `#[cfg(test)]`
 
 **Interfaces:**
-- Consumes: `load_settings("claude", durable)` (Task 2); the fake sidecar spawn log — the scripted Node fake logs the WHOLE create-request JSON per spawn to `FRESHELL_TEST_CLAUDE_SPAWN_LOG` (`claude.rs:1474-1516`), so asserting reapplied settings needs no new plumbing.
+- Consumes: `load_settings("claude", durable)` + `was_recorded` (Task 2); `emit_fresh_agent_error` (Task 9); alarm code `"SETTINGS_RESET"` with the same V7/A10 gating as Tasks 5/8 (alarm ONLY when `was_recorded` is true and `load_settings` misses — never-recorded transcripts, including every claude-CLI-created and pre-ship session in the shared `~/.claude/projects` store, resume silently with nulls exactly as today); the fake sidecar spawn log — the scripted Node fake logs the WHOLE create-request JSON per spawn to `FRESHELL_TEST_CLAUDE_SPAWN_LOG` (`claude.rs:1474-1516`), so asserting reapplied settings needs no new plumbing.
 - Site: `resume_for_attach` (`claude.rs:470-562`; signature `(&self, msg: &FreshAgentAttach, durable: &str) -> Result<(), ResumeClaudeError>`; sole caller `handle_attach` `:454` under the `resuming` single-flight). The Null-settings create request is built at `:502-511` (`"model": Null, "permissionMode": Null, "effort": Null`) — an independent duplicate of the create-path `json!` at `:216-225`.
 
 **Known defect being fixed:** `ClaudeSession` (`claude.rs:112-134`) tracks no settings at all; resume-in-place sends Nulls, so a restarted freshclaude/kilroy pane silently reverts model/permissionMode/effort.
@@ -1220,11 +1507,22 @@ async fn resume_for_attach_reapplies_settings_from_ledger() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn resume_without_record_emits_settings_reset_and_sends_nulls() {
-    // Same flow, no seed: assert the spawn-logged create request has null
-    // model/permissionMode/effort (today's behavior preserved as fallback)
-    // AND a SETTINGS_RESET freshAgent.error frame was broadcast
-    // (bus subscription pattern from Task 5).
+async fn resume_without_record_is_silent_and_sends_nulls() {
+    // Same flow, no seed (never-recorded transcript — the ROUTINE case:
+    // resume_for_attach exists precisely to serve never-tracked transcripts,
+    // claude.rs:430-436/:495-499; V7). Assert the spawn-logged create request
+    // has null model/permissionMode/effort (today's behavior preserved as the
+    // silent fallback), NO SETTINGS_RESET frame was broadcast (bounded bus
+    // drain, pattern from Task 5), and NO binding was recorded under the new
+    // cliSessionId (settings: None ⇒ no laundered blank row — Task 9).
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_with_prior_record_but_unrecoverable_settings_alarms() {
+    // fake.seed_recorded_only("claude", DURABLE) — was_recorded=true,
+    // load_settings=None. Same resume flow; assert a SETTINGS_RESET
+    // freshAgent.error frame WITH top-level sessionType/provider and a
+    // user-facing message (bus pattern from Task 5).
 }
 ```
 
@@ -1235,22 +1533,27 @@ Expected: FAIL — logged create request has nulls despite the seeded record.
 
 - [ ] **Step 3: Implement**
 
-In `resume_for_attach`, before building the create request at `:502-511`:
+In `resume_for_attach`, before building the create request at `:502-511`, with the V7/A10 alarm gate:
 
 ```rust
-let recovered = self.identity_sink().and_then(|s| s.load_settings("claude", durable));
-if recovered.is_none() {
-    tracing::warn!(session = %durable, "freshagent.claude.settings_record_missing");
+let sink = self.identity_sink();
+let recovered = sink.as_ref().and_then(|s| s.load_settings("claude", durable));
+if recovered.is_none() && sink.as_ref().is_some_and(|s| s.was_recorded("claude", durable)) {
+    // Recorded before, unrecoverable now — the genuine anomaly. Never-recorded
+    // transcripts (the entire pre-existing ~/.claude/projects population,
+    // claude.rs:430-436 — resume_for_attach exists FOR them) stay silent.
+    tracing::warn!(session = %durable, "freshagent.claude.settings_record_unrecoverable");
     self.emit_fresh_agent_error(
         durable,
+        session_type_str(msg.session_type), // preserves freshclaude vs kilroy in the frame
         "SETTINGS_RESET",
         "Session settings could not be recovered after restart - the agent is running with default model and permissions. Reconfirm your settings.",
     );
 }
-let rec = recovered.unwrap_or_default();
+let rec = recovered.clone().unwrap_or_default();
 ```
 
-Replace the three `Null`s: `"model": rec.model, "permissionMode": rec.permission_mode, "effort": rec.effort` (`serde_json::json!` serializes `None` as `null`, preserving today's fallback wire shape exactly). Keep the existing deliberate cwd handling (`:487-497`) as the primary, with `rec.cwd` as a final fallback only if both existing sources are absent. Pass `mode:` derived via the existing `session_type_str` helper (`claude.rs:700-705`) applied to the attach message's sessionType (defaulting to `"freshclaude"` when absent) and `settings: rec.clone()` into this path's `spawn_consumer` call (Task 9 threading), so the re-init re-records the row under any new cliSessionId. `emit_fresh_agent_error` is the same helper shape as Task 5's, built on claude's direct broadcast (`claude.rs:173-177`).
+Replace the three `Null`s: `"model": rec.model, "permissionMode": rec.permission_mode, "effort": rec.effort` (`serde_json::json!` serializes `None` as `null`, preserving today's fallback wire shape exactly). Keep the existing deliberate cwd handling (`:487-497`) as the primary, with `rec.cwd` as a final fallback only if both existing sources are absent. Pass `mode:` = `session_type_str(msg.session_type).to_string()` — `sessionType` is a REQUIRED typed field on `FreshAgentAttach` (`client_messages.rs:492-502`, verified by V2/A17: a frame without it fails deserialization), so there is NO "absent → default freshclaude" branch to write — and `settings: recovered.clone()` (the `Option` itself, Task 9 threading) into this path's `spawn_consumer` call: `Some(rec)` re-records the row under any new cliSessionId (the old durable's row keeps serving `load_settings`, so later attaches with the old id still resolve — no repeat-fire, V7 §4); `None` records nothing (no laundered blank row under the new id).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1280,7 +1583,7 @@ git commit -m "fix(claude): resume-in-place reapplies model/permissionMode/effor
 
 - [ ] **Step 1: Write the failing test**
 
-Create `crates/freshell-ws/tests/pane_reconcile_freshagent.rs`. Copy the harness from `crates/freshell-ws/tests/pane_reconcile.rs` (`spawn_server()` at `:62-125` — full `WsState` literal, `NoIndexProbe`, `PaneLedger::disabled()`, ephemeral `127.0.0.1:0` axum; `connect()` at `:133-165`; `next_frame_of_type()`; `reconcile_request()`), with `connect` extended:
+Create `crates/freshell-ws/tests/pane_reconcile_freshagent.rs` — this file does NOT exist on main; it is CREATED here from the donors and extended in Task 13 (V10/A16). Copy the harness from `crates/freshell-ws/tests/pane_reconcile.rs` (`spawn_server()` at `:62-125` — full `WsState` literal, `NoIndexProbe`, `PaneLedger::disabled()`, ephemeral `127.0.0.1:0` axum; `connect()` at `:133-165`; `next_frame_of_type()`; `reconcile_request()`), with `connect` extended:
 
 ```rust
 async fn connect(url: &str, pane_reconcile_v1: bool, fresh_agent_v1: bool) -> (TestWs, serde_json::Value) {
@@ -1354,7 +1657,7 @@ git commit -m "feat(ws): paneReconcileFreshAgentV1 capability - parsed, threaded
 - Test: unit tests inline in the new module
 
 **Interfaces:**
-- Consumes: `freshell_protocol` types `ReconcilePane`, `PaneVerdict`, `ReconcileVerdict`, `SessionLocator` (verdict wire names: `attach`/`respawn`/`fresh`/`dead_session`/`invalid`; `PaneVerdict` fields `pane_key`, `verdict`, `terminal_id`, `session_ref`, `corrected`, `reason`, `retry_after_ms`, `duplicate` — optionals absent, never null).
+- Consumes: `freshell_protocol` types `ReconcilePane`, `PaneVerdict`, `ReconcileVerdict`, `SessionLocator` (verdict wire names: `attach`/`respawn`/`fresh`/`dead_session`/`invalid`; `PaneVerdict` fields `pane_key`, `verdict`, `terminal_id`, `session_ref`, `corrected`, `reason`, `retry_after_ms` (B1 deletes this field at merge — see Global Constraints), `duplicate` — optionals absent, never null; never construct/match `ReconcileVerdict::Retry`).
 - Produces (exact, used by Task 13):
 
 ```rust
@@ -1362,12 +1665,19 @@ pub const FRESH_AGENT_RESPAWN_CAP: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreshAgentPresence { Live, OnDisk, GoneObserved, NeverObserved, Unknown }
+// B1 pre-decision (V9/A12): when B1's `SessionExistence::ProviderUnavailable`
+// lands, it maps to FreshAgentPresence::Unknown (conservative: respawn-with-cap,
+// never dead_session). Keep every SessionExistence match exhaustive, no catch-all.
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FreshAgentPaneFacts {
     pub presence: FreshAgentPresence,
     pub duplicate_of: Option<String>, // paneKey of the earlier pane claiming the same session
     pub respawn_exhausted: bool,
+    /// G3 supersession terminus (V8/A14): when the claimed sessionRef resolved
+    /// through the ledger's supersededBy chain to a DIFFERENT id, this is the
+    /// terminus id — the verdict answers with it + `corrected: true`.
+    pub resolved_session_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1462,8 +1772,27 @@ mod tests {
         assert_eq!(v.verdict, ReconcileVerdict::DeadSession);
         assert_eq!(v.reason.as_deref(), Some("respawn_exhausted"));
     }
+
+    #[test]
+    fn superseded_claim_is_answered_from_the_chain_terminus_with_corrected() {
+        // G3 reader rule (V8/A14): a client claiming a superseded ref is
+        // answered from the chain terminus — never respawn the retired ref.
+        // Facts built directly: presence OnDisk, resolved_session_id Some("t2").
+        let mut s = snap(&[("p", FreshAgentPresence::OnDisk, None, false)]);
+        s.facts.get_mut("p").unwrap().resolved_session_id = Some("t2".into());
+        let v = verdict_for_pane(Some(&s), &pane("p", Some(("codex", "t1"))));
+        assert_eq!(v.verdict, ReconcileVerdict::Respawn);
+        assert_eq!(
+            v.session_ref.as_ref().unwrap().session_id,
+            "t2",
+            "answer carries the terminus id, not the retired claim"
+        );
+        assert_eq!(v.corrected, Some(true));
+    }
 }
 ```
+
+(The `snap` helper keeps its 4-tuple shape and fills `resolved_session_id: None`; tests that need the terminus mutate the entry, as above. `PaneVerdict.corrected` already exists on the wire — `server_messages.rs:697-722`; donor semantics `contradicting_claim_is_corrected_on_respawn`, `reconcile.rs:671-674` — no new wire field is added.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -1479,12 +1808,26 @@ Expected: COMPILE ERROR (module doesn't exist).
 //! states. All async work (session maps, probes) happens in the snapshot
 //! builder (Task 13); this module is pure + sync so it stays legal inside
 //! derive_verdicts' catch_unwind.
+//!
+//! Verdict-mapping caveats (V5/A8, documented here for future readers):
+//! - Zero-turn codex threads have NO rollout file until the first PERSISTED
+//!   user message (vendor deferred materialization, verified at rust-v0.145.0)
+//!   → the probe answers Absent → verdict `fresh` (identity never observed)
+//!   or `dead_session` (ledger already bound it). Acceptable either way:
+//!   zero turns means there is no conversation content to lose.
+//! - WATCH: codex `.jsonl.zst` cold-rollout compression (vendor feature,
+//!   default-OFF today) would hide ≥7-day-old sessions from the `.jsonl`-only
+//!   index walk → false Absent. Revisit if the vendor flag graduates.
+//! - WATCH: CLAUDE_CONFIG_DIR/CLAUDE_HOME reader/writer split (pre-existing
+//!   wave-A exposure, out of scope this lane).
 
-use freshell_protocol::/* the same paths reconcile.rs imports for */ {PaneVerdict, ReconcilePane, ReconcileVerdict};
+use freshell_protocol::/* the same paths reconcile.rs imports for */ {PaneVerdict, ReconcilePane, ReconcileVerdict, SessionLocator};
 
 pub const FRESH_AGENT_RESPAWN_CAP: u32 = 3;
 // … types exactly as the Interfaces block above …
 
+/// The SINGLE PaneVerdict construction point in this module (B1-coexistence
+/// hardening, V9/A12 — keep it that way).
 fn base(pane: &ReconcilePane, verdict: ReconcileVerdict) -> PaneVerdict {
     PaneVerdict {
         pane_key: pane.pane_key.clone(),
@@ -1493,7 +1836,7 @@ fn base(pane: &ReconcilePane, verdict: ReconcileVerdict) -> PaneVerdict {
         session_ref: None,
         corrected: None,
         reason: None,
-        retry_after_ms: None,
+        retry_after_ms: None, // DELETE-AT-MERGE: B1 removes this field
         duplicate: None,
     }
 }
@@ -1521,10 +1864,21 @@ pub fn verdict_for_pane(snapshot: Option<&FreshAgentReconcileSnapshot>, pane: &R
         v.duplicate = Some(winner.clone());
         return v;
     }
+    // G3 reader rule (V8/A14): when the claim resolved through the ledger's
+    // supersession chain, every echoed session_ref carries the TERMINUS id
+    // and the verdict is marked corrected (never answer the retired ref).
+    let (sref, corrected) = match &facts.resolved_session_id {
+        Some(terminus) if *terminus != sref.session_id => (
+            SessionLocator { provider: sref.provider.clone(), session_id: terminus.clone() },
+            Some(true),
+        ),
+        _ => (sref, None),
+    };
     match facts.presence {
         FreshAgentPresence::Live => {
             let mut v = base(pane, ReconcileVerdict::Attach);
             v.session_ref = Some(sref);
+            v.corrected = corrected;
             v
         }
         FreshAgentPresence::OnDisk | FreshAgentPresence::Unknown => {
@@ -1532,10 +1886,12 @@ pub fn verdict_for_pane(snapshot: Option<&FreshAgentReconcileSnapshot>, pane: &R
                 let mut v = base(pane, ReconcileVerdict::DeadSession);
                 v.reason = Some("respawn_exhausted".into());
                 v.session_ref = Some(sref);
+                v.corrected = corrected;
                 v
             } else {
                 let mut v = base(pane, ReconcileVerdict::Respawn);
                 v.session_ref = Some(sref);
+                v.corrected = corrected;
                 v
             }
         }
@@ -1543,6 +1899,7 @@ pub fn verdict_for_pane(snapshot: Option<&FreshAgentReconcileSnapshot>, pane: &R
             let mut v = base(pane, ReconcileVerdict::DeadSession);
             v.reason = Some("session_not_on_disk".into());
             v.session_ref = Some(sref);
+            v.corrected = corrected;
             v
         }
         FreshAgentPresence::NeverObserved => {
@@ -1559,7 +1916,7 @@ pub fn verdict_for_pane(snapshot: Option<&FreshAgentReconcileSnapshot>, pane: &R
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p freshell-ws reconcile_freshagent`
-Expected: PASS (9 unit tests).
+Expected: PASS (10 unit tests).
 
 - [ ] **Step 5: Commit**
 
@@ -1579,16 +1936,16 @@ git commit -m "feat(ws): reconcile_freshagent - pure fresh-agent verdict mapping
 - Test: `crates/freshell-ws/tests/pane_reconcile_freshagent.rs` (extend)
 
 **Interfaces:**
-- Consumes: `SessionExistenceProbe` (`crates/freshell-ws/src/existence.rs:23-44`, READ-ONLY — B1 owns the file): `enum SessionExistence { Present, Absent, Unknown }`; sync `fn exists(&self, provider: &str, session_id: &str) -> SessionExistence` and `fn ever_observed(&self, provider: &str, session_id: &str) -> bool`. `PaneLedger::ever_bound`. Task 12 types. `ReconcileDeps` (`reconcile.rs:28-32`: `registry`, `identity`, `existence`), built at `terminal.rs:1932-1936`.
+- Consumes: `SessionExistenceProbe` (`crates/freshell-ws/src/existence.rs:23-44`, READ-ONLY — B1 owns the file): `enum SessionExistence { Present, Absent, Unknown }`; sync `fn exists(&self, provider: &str, session_id: &str) -> SessionExistence` and `fn ever_observed(&self, provider: &str, session_id: &str) -> bool`. `PaneLedger::ever_bound` AND `PaneLedger::lookup_by_session` (`pane_ledger.rs:450-484` — public, memory-only, follows the `supersededBy` chain with a 32-hop cap; returns `Resolution { row, corrected }`). Task 12 types. `ReconcileDeps` (`reconcile.rs:28-32`: `registry`, `identity`, `existence`), built at `terminal.rs:1932-1936`. Probe/ledger inject via the pub `WsState.session_existence` / `WsState.pane_ledger` fields — confirmed by V10/A16, no new injection point needed.
 - Produces:
-  - `pub async fn FreshCodexState::has_live_session(&self, session_id: &str) -> bool` (map contains id AND `!exited.load(SeqCst)`), `pub async fn FreshOpencodeState::has_live_session(&self, session_id: &str) -> bool` (sessions map contains the durable key — it is keyed by placeholder AND durable id, `opencode_ws.rs:96`), `pub async fn FreshClaudeState::has_live_session(&self, session_id: &str) -> bool` (`cli_index` durable → mapkey → sessions contains, `claude.rs:81-86`).
+  - `pub async fn FreshCodexState::has_live_session(&self, session_id: &str) -> bool` (map contains id AND `!exited.load(SeqCst)`), `pub async fn FreshOpencodeState::has_live_session(&self, session_id: &str) -> bool` (sessions map contains the durable key — it is keyed by placeholder AND durable id, `opencode_ws.rs:96`), `pub async fn FreshClaudeState::has_live_session(&self, session_id: &str) -> bool` (`cli_index` durable → mapkey → sessions contains, `claude.rs:81-86`; read the sessions map UNFILTERED — no session_type filter, so kilroy sessions count for free, V2 N-A17-1).
   - `pub async fn reconcile_freshagent::build_snapshot(state: &WsState, panes: &[ReconcilePane]) -> FreshAgentReconcileSnapshot`.
-  - `WsState.fresh_agent_respawn_counts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), u32>>>` (per-boot, in-memory).
+  - `WsState.fresh_agent_respawn_counts: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), u32>>>` (per-boot, in-memory; counts RESPAWN ANSWERS only, cleared when presence resolves Live — V2/A7).
   - `ReconcileDeps.fresh_agent: Option<&'a FreshAgentReconcileSnapshot>`.
 
 - [ ] **Step 1: Write the failing integration tests**
 
-Extend `crates/freshell-ws/tests/pane_reconcile_freshagent.rs`. Add a scripted probe (the trait is public in freshell-ws) and pass it into `spawn_server` (extend the donor's `spawn_server` to accept a probe + a real temp-root `PaneLedger`, exposing both on the returned `Server` — same pattern as it already exposes `registry`/`identity`):
+Extend `crates/freshell-ws/tests/pane_reconcile_freshagent.rs` (CREATED in Task 11 from the donors — it does not exist on main; V10/A16). Harness notes (V10, confirmed): the probe and ledger inject via the pub `WsState.session_existence` / `WsState.pane_ledger` fields at the test's struct-literal construction — NO new injection point is needed; the live-session tests drive the fake claude sidecar via env vars (`FRESHELL_CLAUDE_SIDECAR` etc.), which are process-global — replicate `freshagent_claude_attach.rs`'s file-local `CLAUDE_ENV_LOCK` mutex serialization (attach donor `:24`; env installer `:64-99`; it also flips `settings.freshAgent.enabled: true` in BOTH seeding spots, `:120/:151`). Add a scripted probe (the trait is public in freshell-ws) and pass it into `spawn_server` (extend the donor's `spawn_server` to accept a probe + a real temp-root `PaneLedger` (`PaneLedger::new_locked(Some(temp_root))`), exposing both — plus a clone of the `fresh_agent_respawn_counts` Arc — on the returned `Server`, same pattern as it already exposes `registry`/`identity`):
 
 ```rust
 #[derive(Default)]
@@ -1664,7 +2021,9 @@ async fn duplicate_session_claims_dedupe_within_one_request() {
 
 #[tokio::test]
 async fn respawn_cap_turns_the_fourth_answer_into_dead_session() {
-    // probe: ("codex","cap") Present; 4 sequential single-pane requests:
+    // probe: ("codex","cap") Present — the session stays Present-but-never-live,
+    // so every answer maps to respawn; only RESPAWN ANSWERS burn the cap (V2/A7).
+    // 4 sequential single-pane requests:
     for i in 0..4 {
         let verdicts = reconcile_request(&mut ws, serde_json::json!([
             { "paneKey": "p", "kind": "fresh-agent", "sessionRef": {"provider": "codex", "sessionId": "cap"} }
@@ -1676,6 +2035,49 @@ async fn respawn_cap_turns_the_fourth_answer_into_dead_session() {
             assert_eq!(verdicts[0]["reason"], "respawn_exhausted");
         }
     }
+}
+
+#[tokio::test]
+async fn a_session_resolving_live_clears_the_respawn_counter() {
+    // Reset-on-live (V2/A7): a successful respawn is OBSERVED as the session
+    // going live; the counter must clear so healthy sessions are never
+    // exhausted by reconnect/reload storms.
+    // 1. Fake claude sidecar env (donor freshagent_claude_attach.rs, under
+    //    CLAUDE_ENV_LOCK) whose scripted sdk.session.init emits a cliSessionId
+    //    the test controls (or read it from the created frame).
+    // 2. Probe: ("claude", <id>) Present. TWO reconcile requests while the
+    //    session is NOT yet live → both answer "respawn"; assert
+    //    server.respawn_counts contains ("claude", <id>) == 2.
+    // 3. Drive freshAgent.create through the fake sidecar (donor flow from
+    //    live_fresh_agent_session_gets_attach) so has_live_session is true.
+    // 4. Reconcile again → "attach"; assert server.respawn_counts no longer
+    //    contains the key (cleared, not merely un-incremented).
+}
+
+#[tokio::test]
+async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
+    // G3 reader rule end-to-end (V8/A14). Seed the REAL temp-root ledger:
+    let now = 1_000;
+    server.pane_ledger.record_fresh_agent_binding(&FreshAgentBindingWrite {
+        provider: "codex", session_id: "old-t", mode: "freshcodex",
+        cwd: Some("/w"), create_request_id: None, model: Some("m"),
+        sandbox: None, permission_mode: None, effort: None,
+        supersedes: None, now_ms: now,
+    }).unwrap();
+    server.pane_ledger.record_fresh_agent_binding(&FreshAgentBindingWrite {
+        provider: "codex", session_id: "new-t", mode: "freshcodex",
+        cwd: Some("/w"), create_request_id: None, model: Some("m"),
+        sandbox: None, permission_mode: None, effort: None,
+        supersedes: Some("old-t"), now_ms: now + 1,
+    }).unwrap();
+    // probe: ("codex","new-t") Present (the old rollout may ALSO still exist
+    // on disk — the point is we never answer the retired ref).
+    let verdicts = reconcile_request(&mut ws, serde_json::json!([
+        { "paneKey": "p", "kind": "fresh-agent", "sessionRef": {"provider": "codex", "sessionId": "old-t"} }
+    ])).await;
+    assert_eq!(verdicts[0]["verdict"], "respawn");
+    assert_eq!(verdicts[0]["sessionRef"]["sessionId"], "new-t", "answer from the chain terminus");
+    assert_eq!(verdicts[0]["corrected"], true);
 }
 ```
 
@@ -1701,30 +2103,44 @@ pub async fn build_snapshot(
     let mut claimed: std::collections::HashMap<(String, String), String> = std::collections::HashMap::new();
     for pane in panes.iter().filter(|p| p.kind.as_deref() == Some("fresh-agent")) {
         let Some(sref) = pane.session_ref.as_ref() else { continue }; // verdict fn answers no_recoverable_identity
-        let key = (sref.provider.clone(), sref.session_id.clone());
+        // G3 reader rule (V8/A14): resolve the CLAIM through the ledger's
+        // supersession chain FIRST — dedupe, liveness, existence, and the
+        // respawn counter all key on the TERMINUS id (lookup_by_session is
+        // public + memory-only, pane_ledger.rs:450-484).
+        let resolved = state
+            .pane_ledger
+            .lookup_by_session(&sref.provider, &sref.session_id)
+            .filter(|r| r.corrected)
+            .map(|r| r.row.session_id);
+        let session_id = resolved.clone().unwrap_or_else(|| sref.session_id.clone());
+        let key = (sref.provider.clone(), session_id.clone());
         if let Some(winner) = claimed.get(&key) {
             facts.insert(pane.pane_key.clone(), FreshAgentPaneFacts {
                 presence: FreshAgentPresence::Unknown,
                 duplicate_of: Some(winner.clone()),
                 respawn_exhausted: false,
+                resolved_session_id: resolved,
             });
             continue;
         }
         claimed.insert(key.clone(), pane.pane_key.clone());
         let live = match sref.provider.as_str() {
-            "codex" => state.fresh_codex.has_live_session(&sref.session_id).await,
-            "claude" => state.fresh_claude.has_live_session(&sref.session_id).await,
-            "opencode" => state.fresh_opencode.has_live_session(&sref.session_id).await,
+            "codex" => state.fresh_codex.has_live_session(&session_id).await,
+            "claude" => state.fresh_claude.has_live_session(&session_id).await,
+            "opencode" => state.fresh_opencode.has_live_session(&session_id).await,
             _ => false,
         };
         use crate::existence::SessionExistence as E;
         let presence = if live {
             FreshAgentPresence::Live
         } else {
-            match state.session_existence.exists(&sref.provider, &sref.session_id) {
+            // Exhaustive match, NO catch-all (B1 hardening: when B1 adds
+            // E::ProviderUnavailable this goes non-exhaustive — add the
+            // pre-decided arm `E::ProviderUnavailable => FreshAgentPresence::Unknown`).
+            match state.session_existence.exists(&sref.provider, &session_id) {
                 E::Present => FreshAgentPresence::OnDisk,
                 E::Absent => {
-                    if state.session_existence.ever_observed(&sref.provider, &sref.session_id) {
+                    if state.session_existence.ever_observed(&sref.provider, &session_id) {
                         FreshAgentPresence::GoneObserved
                     } else {
                         FreshAgentPresence::NeverObserved
@@ -1732,7 +2148,7 @@ pub async fn build_snapshot(
                 }
                 E::Unknown => {
                     // The ledger is positive evidence the session existed.
-                    if state.pane_ledger.ever_bound(&sref.provider, &sref.session_id) {
+                    if state.pane_ledger.ever_bound(&sref.provider, &session_id) {
                         FreshAgentPresence::OnDisk
                     } else {
                         FreshAgentPresence::Unknown
@@ -1740,25 +2156,54 @@ pub async fn build_snapshot(
                 }
             }
         };
-        let respawn_exhausted = if matches!(presence, FreshAgentPresence::OnDisk | FreshAgentPresence::Unknown) {
-            let mut counts = state.fresh_agent_respawn_counts.lock().expect("respawn counts poisoned");
-            let c = counts.entry(key).or_insert(0);
-            *c += 1;
-            *c > FRESH_AGENT_RESPAWN_CAP
-        } else {
-            false
+        // Respawn cap (V2/A7 — reworked): count only answers that actually
+        // come back `respawn`, and CLEAR the counter when presence resolves
+        // Live (a successful respawn is OBSERVED as the session going live).
+        // The counting lives HERE because for non-duplicate panes the verdict
+        // is fully determined by presence: OnDisk/Unknown + !exhausted ⇒
+        // respawn (see verdict_for_pane) — so "this answer will be respawn"
+        // is known at increment time. Mutation stays in this async builder,
+        // OUTSIDE derive_verdicts' catch_unwind.
+        let respawn_exhausted = match presence {
+            FreshAgentPresence::Live => {
+                state
+                    .fresh_agent_respawn_counts
+                    .lock()
+                    .expect("respawn counts poisoned")
+                    .remove(&key); // reset-on-live
+                false
+            }
+            FreshAgentPresence::OnDisk | FreshAgentPresence::Unknown => {
+                let mut counts = state.fresh_agent_respawn_counts.lock().expect("respawn counts poisoned");
+                let c = counts.entry(key).or_insert(0);
+                if *c >= FRESH_AGENT_RESPAWN_CAP {
+                    true // this answer becomes dead_session{respawn_exhausted}; no burn
+                } else {
+                    *c += 1; // this answer goes out as `respawn` — burn one
+                    false
+                }
+            }
+            FreshAgentPresence::GoneObserved | FreshAgentPresence::NeverObserved => false,
         };
-        facts.insert(pane.pane_key.clone(), FreshAgentPaneFacts { presence, duplicate_of: None, respawn_exhausted });
+        facts.insert(pane.pane_key.clone(), FreshAgentPaneFacts {
+            presence,
+            duplicate_of: None,
+            respawn_exhausted,
+            resolved_session_id: resolved,
+        });
     }
     FreshAgentReconcileSnapshot { facts }
 }
 ```
 
-(Adapt the `state.pane_ledger` access to how `WsState` actually holds the ledger — direct field per `pane_ledger: :476` in main.rs wiring. Cap semantics: each respawn-candidate ANSWER burns one attempt per (provider, sessionId) per boot; after `FRESH_AGENT_RESPAWN_CAP` answers, `dead_session{respawn_exhausted}` — mirroring the terminal wall's protection so a client stuck in a respawn loop cannot spin forever.)
+(Adapt the `state.pane_ledger` access to how `WsState` actually holds the ledger — direct field per `pane_ledger: :476` in main.rs wiring. Cap rationale (V2/A7): the terminal donor counts actual process exits within a liveness window and RESETS on survival (`registry.rs:1271-1283`) — per-answer burning without decay would let 3 reloads kill a healthy session. Counting respawn ANSWERS with reset-on-live means only a genuinely non-recovering loop trips the cap. Residual A19 (accepted): the next-wave client's reconcile cadence is unpinned — REVISIT the cap value/semantics when that client lands; leave this note in the module.)
 
 (d) `terminal.rs` `handle_pane_reconcile` (before the `catch_unwind` at `:1932`):
 
 ```rust
+// Built ONCE per reconcile request and reused for any re-derivation of deps
+// (B1's warming deferral re-derives via rebuild_deps — rebuilding the
+// snapshot would double-burn the respawn counter; V9 §3.6).
 let fresh_agent_snapshot = if pane_reconcile_fresh_agent_v1
     && request.panes.iter().any(|p| p.kind.as_deref() == Some("fresh-agent"))
 {
@@ -1768,7 +2213,7 @@ let fresh_agent_snapshot = if pane_reconcile_fresh_agent_v1
 };
 ```
 
-and add `fresh_agent: fresh_agent_snapshot.as_ref()` to the `ReconcileDeps` literal.
+and add `fresh_agent: fresh_agent_snapshot.as_ref()` to the `ReconcileDeps` literal. ALSO update the `pane.reconcile.request` doc comment above `handle_pane_reconcile` (`terminal.rs:1905-1910`, "a PURE READ over the terminal registry × identity registry × disk index"): the terminal sources remain a pure read, but the capability-gated fresh-agent snapshot now mutates the per-boot respawn counter (bounded per (provider, sessionId); reset when the session resolves Live) — say exactly that in the comment so the documented invariant stays truthful (V2/A7's secondary finding).
 
 (e) `reconcile.rs` — the WHOLE diff (plus the field):
 
@@ -1802,74 +2247,107 @@ git commit -m "feat(ws): fresh-agent panes enter the reconcile verdict system be
 ### Task 14: E2E — settings survive restart (3 providers) + codex crash degradation banner
 
 **Files:**
-- Modify: `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` (crash knob)
+- Modify: `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` (crash-once knob)
+- Modify: `test/e2e-browser/fixtures/fake-opencode.cjs` (audit the parsed prompt body — V4/A5)
 - Create: `test/e2e-browser/specs/freshagent-settings-resume-rust.spec.ts`
 - Modify: `test/e2e-browser/playwright.config.ts` (add the spec to BOTH `RUST_ONLY_SPECS` (~line 90) and the `rust-chromium` project `testMatch` (~line 250))
 
 **Interfaces:**
-- Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts`): `start()`, `restartAbrupt()` (SIGKILL + reboot on same home/port/token), `{env, setupHome}` options. `bootWall(page, {env, setupHome})` from the wall spec's helper pattern. Fakes: `CODEX_CMD="node <fake-app-server.mjs>"` + `FAKE_CODEX_APP_SERVER_BEHAVIOR` (JSON, supports `appendThreadOperationLogPath` → JSONL `{method, threadId, params}`); `OPENCODE_CMD` + `FAKE_OPENCODE_AUDIT_LOG`; `FRESHELL_CLAUDE_SIDECAR` + `FAKE_CLAUDE_SIDECAR_LOG` (JSONL of every inbound message). REST agent API: `POST /api/tabs` with `agent`/`model`/`effort` params; `POST /api/panes/:id/send-keys`.
-- Primary donor spec: `test/e2e-browser/specs/freshclaude-restart-parity-rust.spec.ts:212-310` — copy its boot, pane-creation, send, restart, and re-attach patterns verbatim; the NEW content of each test is its final assertion block, given below in full.
+- Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts`): `start()`, `restartAbrupt()` (SIGKILL + reboot on same home/port/token), `{env, setupHome}` options. `bootWall(page, {env, setupHome})` from the wall spec's helper pattern (test 4 only — tests 1-3 drive the server directly, no browser page needed). Fakes: `CODEX_CMD="node <fake-app-server.mjs>"` + `FAKE_CODEX_APP_SERVER_BEHAVIOR` (inline env JSON, STATIC per server boot — nothing can be rewritten between sidecar spawns, V4/A6; supports `appendThreadOperationLogPath` → JSONL `{method, threadId, params}`); `OPENCODE_CMD` + `FAKE_OPENCODE_AUDIT_LOG` (JSONL entries keyed by `event` field — there is NO `path` field, V4/A5); `FRESHELL_CLAUDE_SIDECAR` + `FAKE_CLAUDE_SIDECAR_LOG` (JSONL of every inbound message).
+- SEEDING SURFACES (V3/A3 — REST `POST /api/tabs` rejects `agent != "opencode"` with 400, `crates/freshell-freshagent/src/lib.rs:1268`; REST send-keys/capture 404 for codex/claude sessions, which never enter the REST `panes` map):
+  - **codex + claude (tests 1/3/4 creation):** raw WS `freshAgent.create` (schema `crates/freshell-protocol/src/client_messages.rs:457-488`, camelCase: `requestId`, `sessionType`, `cwd`, `model`, `effort`, `permissionMode`, `sandbox`, `resumeSessionId`; codex carries model/sandbox/approvalPolicy on `thread/start` and effort per `turn/start`; claude forwards model/permissionMode/effort to the sidecar verbatim), driven via `freshAgent.send`. Dispatch is gated on `settings.freshAgent.enabled=true` (`terminal.rs:567`) — PATCH settings first. Donor for the whole flow (settings-PATCH + raw create + created-wait): `crates/freshell-ws/tests/freshagent_claude_kill_interrupt.rs` (raw create at `:295`); port the same message sequence to the spec's Node context (`fetch` + `WebSocket`), following the hello/ready handshake the sibling specs use — verify exact PATCH endpoint shape against the donor during implementation.
+  - **opencode (test 2):** keeps REST `POST /api/tabs` `{ agent: 'opencode', model, effort }` + `POST /api/panes/:id/send-keys` (the REST surface is opencode-only and honors model/effort per-turn, V3 §2).
+- RESUME TOPOLOGY (V2/A4 — after `page.reload()` the frozen client NEVER sends `freshAgent.attach`; it sends `freshAgent.create{resumeSessionId, sessionRef}` (persistMiddleware strips `sessionId`). Attach fires only on `ws.onReconnect` WITHOUT reload. Each test below states which path it exercises and why.)
+- Donor spec for boot/env/restart plumbing: `test/e2e-browser/specs/freshclaude-restart-parity-rust.spec.ts:212-310`; donor for banner/UI flow (test 4): the wall/restore-matrix pane-creation patterns.
 
-- [ ] **Step 1: Add the crash knob to the codex fake (test infra, no prod code)**
+- [ ] **Step 1: Extend the two fakes (test infra, no prod code)**
 
-In `fake-app-server.mjs`, where inbound prompt/turn requests are handled, honor a new behavior field:
+(a) `fake-app-server.mjs` — crash-ONCE knob (V4/A6: behavior is inline env JSON, static per server boot; the existing `exitProcessAfterMethodsOnce` is unsuitable — it exits 0 AFTER responding and its per-process "once" set makes the respawned sidecar exit again, looping). In the single socket message handler (`:415-572`), before dispatching `turn/start`:
 
 ```js
-// behavior.crashOnPromptMarker: if the inbound turn text contains this
-// marker, hard-exit to simulate a sidecar crash mid-session.
-if (behavior.crashOnPromptMarker && promptText.includes(behavior.crashOnPromptMarker)) {
+// behavior.crashOnPromptMarker + behavior.crashOnPromptMarkerOnceMarkerPath:
+// if the inbound turn input contains the marker AND this process wins the
+// cross-process once-claim (reuse the existing claimCrossProcessOnce helper,
+// :376-391 — 'wx' marker file), hard-exit(1) to simulate a mid-turn crash.
+// The respawned process finds the marker file and proceeds normally.
+if (
+  method === 'turn/start' &&
+  behavior.crashOnPromptMarker &&
+  JSON.stringify(message.params?.input ?? '').includes(behavior.crashOnPromptMarker) &&
+  claimCrossProcessOnce(behavior.crashOnPromptMarkerOnceMarkerPath, 'crashOnPromptMarker')
+) {
   process.exit(1);
 }
 ```
+
+(b) `fake-opencode.cjs` — audit the parsed prompt body (V4/A5: today the `prompt_async` handler parses the body but audits only `{event:'prompt_async', sessionId, routeDirectory, directory, prompt}`; `model`/`effort`/`reasoningEffort` are DISCARDED). In the prompt POST handler (`:776-809`), add the parsed body fields to the `appendAudit` payload at `:793-799`, e.g. `body: { model: body.model, effort: body.effort, reasoningEffort: body.reasoningEffort }` (~2 lines).
 
 - [ ] **Step 2: Write the four e2e tests (they fail against pre-fix behavior only where the fix is server-side; write them to assert the FIXED contract)**
 
 `freshagent-settings-resume-rust.spec.ts` — one `test.describe` with four tests, each booting its own `RustServer` on an ephemeral port with the provider's fake wired via env (donor patterns), each cleaning up in `finally`/`afterEach`:
 
-1. **`codex: restart → attach resumes with the user's model, not defaults`**
-   - Boot with `CODEX_CMD` fake + behavior including `appendThreadOperationLogPath: <tmp>/codex-ops.jsonl` and a resume-succeeds script.
-   - Create a codex fresh-agent pane WITH an explicit model (donor pane-creation pattern; if the creation surface in the donor doesn't carry model, use the REST agent API: `POST ${baseUrl}/api/tabs` with `{ agent: 'codex', model: 'gpt-5.3-codex' }` and the auth token).
-   - Send one message; wait for the reply (donor wait pattern).
-   - `await server.restartAbrupt()`; `await page.reload()`; wait for the pane to re-attach (donor wait).
+1. **`codex: create-shaped resume after restart carries the recorded model`** — exercises the CREATE-resume path (R1 + ledger-fill), the exact wire shape the frozen client sends after `page.reload()` (V2/A4). No browser page.
+   - Boot with `CODEX_CMD` fake + static behavior including `appendThreadOperationLogPath: <tmp>/codex-ops.jsonl` (resume succeeds by default).
+   - PATCH `settings.freshAgent.enabled=true`; open a raw WS; `freshAgent.create` with `{ sessionType: 'freshcodex', model: 'gpt-5.3-codex', sandbox: 'workspace-write', cwd: <tmp> }`; await `freshAgent.created` (capture the durable thread id); one `freshAgent.send`; await the turn.
+   - `await server.restartAbrupt()`; open a NEW raw WS; send `freshAgent.create` with `{ sessionType: 'freshcodex', resumeSessionId: <thread id> }` and NO model/sandbox — proving the values come from the LEDGER (R1 fills gaps, Task 5(d)), not from the message; await the created/attach-equivalent reply.
    - Assertion block:
    ```ts
    const ops = fs.readFileSync(opLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
    const resume = ops.find((o) => o.method === 'thread/resume')
    expect(resume, 'restart must resume the durable thread').toBeTruthy()
    expect(resume.params.model, 'resume must carry the recorded model, not null').toBe('gpt-5.3-codex')
+   expect(resume.params.sandbox, 'resume must carry the recorded sandbox').toBe('workspace-write')
    ```
-   (Sandbox/permissionMode reapplication is pinned at the Rust layer in Task 5 — the creation surface here only carries `model`/`effort`.)
 
-2. **`opencode: restart → attach → next send carries the recorded model/effort`**
+2. **`opencode: create-shaped resume after restart → next send carries the recorded model/effort`** — REST seeding (V3: opencode-only surface) + the create-shaped resume the frozen client sends post-reload (V2/A4; honored server-side by Task 8(b) — the P1.13 pin mechanism). No browser page.
    - Boot with `OPENCODE_CMD` fake + `FAKE_OPENCODE_AUDIT_LOG`.
-   - Create an opencode pane with `{ agent: 'opencode', model: 'big-model', effort: 'high' }`; send once (materializes `ses_*`); `restartAbrupt()`; reload; wait for re-attach; send a second message.
+   - REST `POST /api/tabs` `{ agent: 'opencode', model: 'big-model', effort: 'high' }`; REST send-keys once (materializes `ses_*` — Task 7's REST-site ledger write records the settings; read the `ses_*` id from the audit log's `prompt_async` entry `sessionId`).
+   - `restartAbrupt()` (the REST panes map is in-memory and gone — post-restart driving is via WS). Open a raw WS (settings PATCH as in test 1); send `freshAgent.create{ sessionType: 'freshopencode', resumeSessionId: <ses_*> }` with NO model/effort; await created (must answer the `ses_*` id, not a placeholder); `freshAgent.send` one message with NO per-send settings.
    - Assertion block:
    ```ts
    const audit = fs.readFileSync(auditLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
-   const prompts = audit.filter((e) => e.path && String(e.path).includes('/message')) // the prompt_async POSTs (match the fake's actual audit shape)
+   const prompts = audit.filter((e) => e.event === 'prompt_async') // V4: entries have `event`, never `path`
    const afterRestart = prompts[prompts.length - 1]
-   expect(JSON.stringify(afterRestart), 'post-restart send must carry the recorded model').toContain('big-model')
-   expect(JSON.stringify(afterRestart), 'post-restart send must carry the recorded effort').toContain('high')
+   expect(afterRestart.body?.model ? JSON.stringify(afterRestart.body.model) : '', 'post-restart send must carry the recorded model').toContain('big-model')
+   expect(JSON.stringify(afterRestart.body ?? {}), 'post-restart send must carry the recorded effort').toContain('high')
    ```
+   (`body` is the field added in Step 1(b); assert on the audited body fields, matching the fake's actual shape at implementation time.)
 
-3. **`claude: restart → attach resume request carries model/permissionMode`**
+3. **`claude: attach resume request carries model/permissionMode`** — exercises the ATTACH path (`resume_for_attach`, Task 10's fix target). Attach is the no-reload restart topology: the frozen client sends it on `ws.onReconnect` without reload (V2/A4), and the donor spec proves attach-on-the-wire for claude. No browser page.
    - Boot with `FRESHELL_CLAUDE_SIDECAR` fake + `FAKE_CLAUDE_SIDECAR_LOG` (exactly the donor's env, `rust-server.ts` + donor `:212-310`).
-   - Create a freshclaude pane with an explicit model (donor creation; REST `{ agent: 'claude', model: 'opus-x' }` if the donor path doesn't carry model); send once; `restartAbrupt()`; reload; wait for the resume (donor wait — it already proves transcript parity).
+   - Settings PATCH; raw WS `freshAgent.create` `{ sessionType: 'freshclaude', model: 'opus-x', permissionMode: 'plan', cwd: <tmp> }`; await created + `sdk.session.init` handling (donor wait); capture the durable session id; one send.
+   - `restartAbrupt()`; new raw WS; send `freshAgent.attach { sessionId: <durable>, sessionType: 'freshclaude' }` (raw-attach donor: `crates/freshell-ws/tests/freshagent_claude_attach.rs:112`); await the resume.
    - Assertion block:
    ```ts
    const msgs = fs.readFileSync(sidecarLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
    const resumeCreate = msgs.filter((m) => m.msg && m.msg.resumeSessionId).pop()
    expect(resumeCreate, 'restart must issue a resume create').toBeTruthy()
    expect(resumeCreate.msg.model, 'resume must carry the recorded model, not null').toBe('opus-x')
+   expect(resumeCreate.msg.permissionMode, 'resume must carry the recorded permissionMode').toBe('plan')
    ```
 
-4. **`codex: crash respawn shows a visible memory-loss notice`**
-   - Boot with the codex fake, behavior `{ crashOnPromptMarker: 'CRASH_NOW', … }` and a follow-up behavior (rewritten between spawns, as the Rust tests do via the behavior file) whose `thread/resume` answers not-found so the respawn mints a new thread.
-   - Create a codex pane; send `CRASH_NOW` (sidecar exits); send another message (triggers crash-recovery respawn).
+4. **`codex: crash respawn shows a visible memory-loss notice`** — browser test (the banner is client UI); NO reload anywhere (the banner is in-memory Redux and does not survive reload — V1 N3).
+   - Boot with the codex fake and ONE static behavior for the whole test (V4/A6):
+   ```json
+   {
+     "overrides": { "thread/resume": { "error": { "code": -32602, "message": "thread not found" } } },
+     "crashOnPromptMarker": "CRASH_NOW",
+     "crashOnPromptMarkerOnceMarkerPath": "<tmp>/crash.once",
+     "appendThreadOperationLogPath": "<tmp>/thread-ops.jsonl"
+   }
+   ```
+   (The static `thread/resume` error is fine: the first spawn goes through `thread/start` — a fresh session never resumes — and the only resume attempt is the post-crash one, which must fail so the respawn mints a new thread.)
+   - `bootWall(page, …)`; create a codex fresh-agent pane through the client UI (donor pane-creation pattern from the wall/restore-matrix specs — no model needed here); send `CRASH_NOW` via the pane composer (sidecar exits 1, once); send another message (triggers crash-recovery respawn: `thread/resume` → not-found → new `thread/start`).
    - Assertion block:
    ```ts
    const banner = page.getByRole('alert').filter({ hasText: 'no longer has memory' })
    await expect(banner, 'memory loss must be user-visible, not just a server warn').toBeVisible({ timeout: 15000 })
+   // "New thread minted" = TWO thread/start entries in the op log. The fake
+   // reuses the same thread id (threadStartThreadId default) and errored
+   // thread/resume ops are NOT logged — do NOT assert id inequality or a
+   // logged resume (V4/A6).
+   const ops = fs.readFileSync(threadOpsPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+   expect(ops.filter((o) => o.method === 'thread/start').length, 'respawn must mint a second thread').toBe(2)
    ```
 
 - [ ] **Step 3: Register the spec and run it**
@@ -1883,6 +2361,7 @@ Expected: ALL FOUR PASS (the server-side fixes landed in Tasks 4-10/13). If a te
 
 ```bash
 git add test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs \
+        test/e2e-browser/fixtures/fake-opencode.cjs \
         test/e2e-browser/specs/freshagent-settings-resume-rust.spec.ts \
         test/e2e-browser/playwright.config.ts
 git commit -m "test(e2e): per-provider settings survive restart + codex crash memory-loss banner (P1.13)"
@@ -1905,8 +2384,8 @@ npx playwright test --config test/e2e-browser/playwright.config.ts \
   --project=rust-chromium restore-contract-wall-rust -g "freshopencode: SIGKILL restore keeps"
 ```
 
-- If it reports an UNEXPECTED PASS (the pin now fails the run): the server-side fixes flipped it — go to Step 2a.
-- If it still fails inside the pin: read the failure; if the residual cause is client-side re-mint folding (next wave's scope), go to Step 2b.
+- EXPECTED OUTCOME (V2/A4): an UNEXPECTED PASS (the pin now fails the run) — the pin's mechanism is exactly Task 8(b)'s server-side fix: post-reload the frozen client sends `freshAgent.create{resumeSessionId: ses_*}` (never attach), and opencode's `handle_create` previously ignored `resume_session_id` and re-minted a placeholder. With the create path honoring it, the flip is achievable server-side. Go to Step 2a.
+- If it still fails inside the pin: read the failure; if the residual cause is genuinely client-side (next wave's scope), go to Step 2b — but do NOT narrow without evidence from the failure output; the attach-path story is no longer a valid reason (the client does not attach after reload).
 
 - [ ] **Step 2a: Flip — delete the pin**
 
@@ -1914,7 +2393,7 @@ Delete the `test.fail(e2eServerKind === 'rust', 'P1.8/P1.13 …')` line (and its
 
 - [ ] **Step 2b: Narrow — server side fixed, client folding pending**
 
-Update the pin's reason string to: `'P1.8 (§2.7, client folding — next wave): server resume now reapplies the ledger record (P1.13 done); post-reload client still re-mints a freshopencode-* placeholder'` and update the pin comment's dated observation + FLIP clause to name the client-folding lane. Re-run Step 1's command; expected: the pinned test is an expected failure (suite green).
+Only if Step 1 showed a genuinely client-side residual failure (NOT the placeholder re-mint — Task 8(b) fixed that server-side; V2): update the pin's reason string to name the ACTUAL observed residual cause, prefixed `'P1.8 (§2.7, client folding — next wave): server create-path resume + settings-from-ledger landed (P1.13 done); residual: <observed cause>'`, and update the pin comment's dated observation + FLIP clause to name the client-folding lane. Re-run Step 1's command; expected: the pinned test is an expected failure (suite green).
 
 - [ ] **Step 3: Full verification gates**
 
@@ -1944,12 +2423,14 @@ git commit -m "test(wall): flip/narrow P1.13 freshopencode settings pin - fresh-
 |---|---|
 | Ledger rows at codex thread/start, opencode session.materialized (+pending before), claude sdk.session.init | Tasks 4/7/9 Rust tests |
 | Resume-invocation record persisted + updated on user change (§4.2) | Task 1 round-trip; Task 7 `send_with_changed_settings_refreshes_the_binding` |
-| Codex resume-after-restart runs with user's model/sandbox (defect §2.6c) | Task 5 wire-level op-log test + Task 14 e2e test 1 |
-| Opencode resume keeps model/effort/cwd (defect §2.7b) | Task 8 Rust test + Task 14 e2e test 2 |
-| Claude resume keeps model/permissionMode/effort | Task 10 spawn-log test + Task 14 e2e test 3 |
-| "settings reset — reconfirm" breadcrumb = missing-record ALARM only | Tasks 5/8/10 SETTINGS_RESET alarm tests (frame emitted ONLY when the record is absent) |
+| Codex resume-after-restart runs with user's model/sandbox (defect §2.6c) | Task 5 wire-level op-log test + Task 14 e2e test 1 (create-shaped resume) |
+| Opencode resume keeps model/effort/cwd (defect §2.7b) + create path honors `resumeSessionId` (V2/A4) | Task 8 Rust tests (`resume_durable_session_reapplies…`, `create_with_resume_session_id_rebinds…`) + Task 14 e2e test 2 |
+| Claude resume keeps model/permissionMode/effort | Task 10 spawn-log test + Task 14 e2e test 3 (attach path) |
+| "settings reset — reconfirm" breadcrumb = anomaly ALARM only (V7/A10) | Tasks 5/8/10 tests: frame emitted ONLY when the ledger proves prior fresh-agent recording (`was_recorded` true) yet no snapshot is recoverable; never-recorded sessions (pre-ship/historical/sidebar) resume silently with defaults and write no defaults row |
+| Ledger write failures surfaced live, never silent (awaited-writes policy, V8/A11) | Task 2 fake Err test + Task 3 awaited round-trip + Task 4 `ledger_write_failure_is_surfaced…` |
+| G3 supersession on codex crash-respawn: retire+link written, claims answered from the chain terminus with `corrected` (V8/A14) | Task 1 `supersedes_retires_the_old_row…` + Task 12 `superseded_claim_is_answered…` + Task 13 `old_thread_claim_after_crash_respawn…` |
 | reconcile accepts kind:fresh-agent with attach/respawn/dead_session/fresh | Task 12 unit + Task 13 direct-WS tests (live / killed-resumable / transcript-deleted / never-existed) |
-| Dedupe + respawn caps for fresh agents | Task 13 `duplicate_session_claims…` + `respawn_cap_turns_the_fourth…` |
+| Dedupe + respawn cap (respawn ANSWERS only, reset-on-live — V2/A7; revisit cadence with next-wave client, residual A19) | Task 13 `duplicate_session_claims…` + `respawn_cap_turns_the_fourth…` + `a_session_resolving_live_clears…` |
 | Capability-gated; frozen client unaffected | Task 11 `without_the_capability…` (permanent regression guard) |
 | Codex crash-respawn degradation frame, user-visible TODAY | Task 6 broadcast test + Task 14 e2e banner test |
 | Flip P1.13-tagged wall pins this lane fixes | Task 15 |
