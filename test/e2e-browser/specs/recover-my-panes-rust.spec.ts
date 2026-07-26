@@ -105,8 +105,8 @@ async function readArgvLog(logPath: string): Promise<Array<{ argv: string[] }>> 
 /**
  * Claude-adapted adjacent-pair matcher (per the task brief's Interfaces): the
  * fake claude CLI receives the `--resume <id>` FLAG (fake-claude-cli.mjs:26-30)
- * — NOT codex's bare `resume` subcommand token, so snapshot-restore-rust's
- * `hasResumePair` would never match here.
+ * — NOT codex's bare `resume` subcommand token, so a codex-style
+ * `resume <id>` adjacent-pair matcher would never match here.
  */
 const hasClaudeResumePair = (argv: string[], sessionId: string) => {
   const i = argv.indexOf('--resume')
@@ -121,7 +121,7 @@ function sessionIdsOf(entries: Array<{ argv: string[] }>): string[] {
   })
 }
 
-/** Donor: snapshot-restore-rust.spec.ts:74 — boot a page against the server. */
+/** Boot a page against the server (donor: the retired snapshot-restore-rust spec). */
 async function connect(page: Page, info: { baseUrl: string; token: string }): Promise<TestHarness> {
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const harness = new TestHarness(page)

@@ -788,11 +788,6 @@ async fn main() -> ExitCode {
             snapshots_dir: home
                 .as_ref()
                 .map(|h| h.join(".freshell").join("tabs-snapshots")),
-            fresh_agent: fresh_agent_state.clone(),
-            screenshots: screenshots.clone(),
-            terminals: registry.clone(), // the SAME TerminalRegistry from main.rs:246
-            restore_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            restore_ack_timeout: std::time::Duration::from_secs(5),
         }))
         // B3/P1.9 Task 2: the recovery-inventory read surface. Joins the SAME
         // tabs-snapshots store as `tabs_snapshots` above (read-only), the

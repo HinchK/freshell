@@ -79,7 +79,6 @@ const MATRIX_SPECS = [
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
 // (their e2eServerKind:'rust' guard FAILS under the fixture-default 'legacy').
 const RUST_ONLY_SPECS = [
-  /snapshot-restore-rust\.spec\.ts$/,
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,
   // COMPOUND-RESTART: drives RustServer.restartAbrupt() (SIGKILL + reboot),
@@ -237,10 +236,6 @@ export default defineConfig({
         // frozen legacy server/ tree has no equivalent. See
         // diag03-rotation-redaction-rust.spec.ts.
         /diag03-rotation-redaction-rust\.spec\.ts$/,
-        // CONTINUITY TRIO deliverable 1 (docs/plans/2026-07-22-continuity-safety-trio.md):
-        // snapshot generations + one-command restore round-trip. Rust-only:
-        // legacy has no persisted snapshot generations or restore endpoint.
-        /snapshot-restore-rust\.spec\.ts$/,
         // CONTINUITY TRIO deliverable 3: deploy tab-diff ritual acceptance
         // (capture -> restart -> verify OK; identity loss fails loudly + remediates).
         /deploy-tab-diff-rust\.spec\.ts$/,
