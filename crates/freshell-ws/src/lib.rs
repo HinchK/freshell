@@ -31,6 +31,7 @@ pub mod identity;
 pub(crate) mod invariants;
 pub mod opencode_association;
 pub mod origin;
+pub mod pane_ledger;
 pub mod reconcile;
 pub mod screenshot;
 pub mod spawn_gate;
@@ -246,6 +247,12 @@ pub struct WsState {
     /// its registry observer). `*.activity.list` requests answer with empty
     /// lists when `None` — same wire shape as "no busy terminals".
     pub activity: Option<crate::activity::ActivityHub>,
+    /// P1.8: the durable pane-identity ledger (spec §4.2). Constructed once
+    /// in `freshell-server::main` (root `<home>/.freshell/pane-ledger`,
+    /// `PaneLedger::disabled()` when no home resolves) and shared with the
+    /// existence probe. Arc'd: identity events write it durably before they
+    /// are answered (async paths wrap the sync API in awaited spawn_blocking).
+    pub pane_ledger: std::sync::Arc<crate::pane_ledger::PaneLedger>,
 }
 
 /// The `/ws` sub-router, pre-bound to its state (mergeable into the server app).
@@ -399,6 +406,14 @@ pub fn build_handshake_with_capabilities(
     for terminal in &mut terminals {
         if terminal.session_ref.is_none() {
             terminal.session_ref = state.identity.session_ref_for(&terminal.terminal_id);
+        }
+        if terminal.session_ref.is_none() {
+            // P1.8 (spec §4.2 reads + precedence): the ledger's bound rows
+            // are the durable second rung of the identity authority chain —
+            // consulted only when live process truth is absent.
+            terminal.session_ref = state
+                .pane_ledger
+                .bound_session_ref_for_terminal(&terminal.terminal_id);
         }
     }
     messages.push(ServerMessage::TerminalInventory(TerminalInventory {
@@ -691,6 +706,7 @@ mod tests {
         let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),

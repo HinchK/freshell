@@ -98,6 +98,7 @@ pub async fn spawn_server_with_specs(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
@@ -149,6 +150,90 @@ pub async fn spawn_server_with_specs(
     (format!("ws://{addr}/ws", addr = addr), registry)
 }
 
+/// [`spawn_server_with_specs`], with a REAL pane ledger rooted at
+/// `ledger_dir` (P1.8 tests). Two servers pointed at the same dir model a
+/// restart. Returns the server's own `Arc<PaneLedger>` too: with the
+/// write-through in-memory index (Task 1 / V1.md), only writes routed
+/// through the SERVER'S instance are visible to its reads — tests that
+/// seed or poll the live server's ledger must use this Arc, while
+/// durability assertions may still construct fresh read-only instances
+/// (whose construction-time scan sees whatever is on disk). Uses the
+/// lock-free `PaneLedger::new` (the flock single-writer guard is a
+/// production `main.rs` concern — `new_locked`).
+pub async fn spawn_server_with_ledger(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    ledger_dir: &std::path::Path,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>,
+) {
+    let auth_token = Arc::new(AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings =
+        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let pane_ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+        ledger_dir.to_path_buf(),
+    )));
+
+    let state = WsState {
+        pane_ledger: std::sync::Arc::clone(&pane_ledger),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+            ),
+        ),
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(cli_commands),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        config_fallback: None,
+        amplifier_locator: None,
+        opencode_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+    };
+
+    let router = freshell_ws::router(state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (
+        format!("ws://{addr}/ws", addr = addr),
+        registry,
+        pane_ledger,
+    )
+}
+
 /// Activity-enabled variant of [`spawn_server_with_specs`]: identical body,
 /// except a real `ActivityHub` is constructed, tapped into the registry, and
 /// handed to `WsState` (mirroring `freshell-server/src/main.rs`). Kept as a
@@ -169,6 +254,7 @@ pub async fn spawn_server_with_specs_and_activity(
     registry.set_activity_observer(activity_hub.registry_observer());
 
     let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
@@ -233,6 +319,7 @@ pub async fn spawn_server_with_create_protect(
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),

@@ -115,6 +115,9 @@ const RUST_ONLY_SPECS = [
   // ingress mints the key (Uuid::simple format), so it must run against the
   // rust server only.
   /createrequestid-stabilization-rust\.spec\.ts$/,
+  // P1.8 pane-identity ledger SIGKILL durability walls: imports RustServer
+  // directly for restartAbrupt(). See docs/plans/2026-07-25-pane-identity-ledger.md
+  /pane-ledger-restart-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -254,10 +257,18 @@ export default defineConfig({
         /launch-retry-restart-rust\.spec\.ts$/,
         /double-restart-terminal-restore-rust\.spec\.ts$/,
         /turn-complete-restart-resume-rust\.spec\.ts$/,
+<<<<<<< HEAD
         // Lane A1 (P1.6): createRequestId stabilization — asserts the Rust REST
         // ingress mints the key (Uuid::simple format), so it must run against the
         // rust server only.
         /createrequestid-stabilization-rust\.spec\.ts$/,
+=======
+        // P1.8 pane-identity ledger SIGKILL durability walls (spec §4.2):
+        // identity rows/pending markers are durable within seconds of pane
+        // creation and survive an abrupt SIGKILL + boot scan. Rust-only:
+        // imports RustServer directly for restartAbrupt().
+        /pane-ledger-restart-rust\.spec\.ts$/,
+>>>>>>> feat/pane-identity-ledger
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

@@ -116,7 +116,7 @@ pub fn codex_sessions_root() -> Option<PathBuf> {
 /// Handle one `terminal.codex.candidate.persisted` frame. No reply frame on
 /// any path; rejects are WARN logs, accepts bind BOTH identity homes and
 /// broadcast (mirrors `opencode_association.rs`'s resolve path).
-pub(crate) fn handle_codex_candidate_persisted(
+pub(crate) async fn handle_codex_candidate_persisted(
     state: &WsState,
     msg: TerminalCodexCandidatePersisted,
 ) {
@@ -217,6 +217,18 @@ pub(crate) fn handle_codex_candidate_persisted(
         Some("codex".to_string()),
         Some(thread_id.to_string()),
     );
+    // P1.8 (trigger b): the verified adoption is an identity event -- durable
+    // binding row first, then the spawn-time pending marker is deleted.
+    // Awaited spawn_blocking inside the helper: the fsync completes before
+    // the associated broadcast, without pinning the dispatch worker (V1.md).
+    crate::pane_ledger::ledger_resolve_identity(
+        state,
+        &msg.terminal_id,
+        "codex",
+        thread_id,
+        row.cwd.as_deref(),
+    )
+    .await;
     broadcast_terminal_session_associated(state, &msg.terminal_id, thread_id, row.cwd.clone());
     // G3: adopted identity also feeds the activity tracker, so this
     // terminal's `codex.activity.updated` records and subsequent

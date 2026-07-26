@@ -117,6 +117,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
     let registry = freshell_terminal::TerminalRegistry::new();
 
     let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-e2e".to_string()),

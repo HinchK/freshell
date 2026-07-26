@@ -147,6 +147,21 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             Some("amplifier".to_string()),
             Some(located.session_id.clone()),
         );
+        // P1.8 (trigger d): locator resolution is an identity event —
+        // durable binding row first, then the spawn-time pending marker is
+        // deleted (Task 6's MARKER_MODES allowlist writes markers for
+        // exactly codex/opencode/amplifier, so every allowlisted mode's
+        // resolver must also resolve the marker). Registry-truth cwd, same
+        // as the in-memory binds above. Awaited (drain_and_associate is
+        // async; the helper spawn_blockings the fsync off this sweep task).
+        crate::pane_ledger::ledger_resolve_identity(
+            state,
+            &located.terminal_id,
+            "amplifier",
+            &located.session_id,
+            entry.cwd.as_deref(),
+        )
+        .await;
         broadcast_terminal_session_associated(
             state,
             &located.terminal_id,
@@ -249,6 +264,7 @@ mod tests {
         let broadcast_tx = StdArc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: StdArc::clone(&auth_token),
             server_instance_id: StdArc::new("srv-1111".to_string()),
@@ -303,6 +319,21 @@ mod tests {
             opencode_locator: None,
             activity: None,
         };
+        (state, rx)
+    }
+
+    /// Sibling of `state_with_locator` with a REAL (enabled) pane ledger
+    /// rooted at `ledger_dir` — added rather than churning every existing
+    /// caller of the disabled-ledger fixture. Mirrors
+    /// `opencode_association::tests::state_with_locator_and_ledger`.
+    fn state_with_locator_and_ledger(
+        amplifier_home: std::path::PathBuf,
+        ledger_dir: &std::path::Path,
+    ) -> (WsState, tokio::sync::broadcast::Receiver<String>) {
+        let (mut state, rx) = state_with_locator(amplifier_home);
+        state.pane_ledger = std::sync::Arc::new(crate::pane_ledger::PaneLedger::new(Some(
+            ledger_dir.to_path_buf(),
+        )));
         (state, rx)
     }
 
@@ -382,7 +413,8 @@ mod tests {
     #[tokio::test]
     async fn drain_and_associate_binds_identity_and_broadcasts_on_location() {
         let home = unique_temp_dir("drain-associate");
-        let (state, mut rx) = state_with_locator(home.clone());
+        let ledger_dir = unique_temp_dir("drain-associate-ledger");
+        let (state, mut rx) = state_with_locator_and_ledger(home.clone(), &ledger_dir);
 
         // A running amplifier terminal the locator can validate against at
         // association time (mode/status/resume_session_id all read from
@@ -417,6 +449,15 @@ mod tests {
             .set_meta("t1", None, None, Some("amplifier".to_string()), None);
 
         maybe_arm(&state, "t1", "amplifier", Some("/proj"), None);
+
+        // The spawn-time pending marker (written by handle_create in
+        // production — Task 6; written directly here because this test
+        // drives the module, not the WS handler).
+        state
+            .pane_ledger
+            .record_pending("t1", "amplifier", Some("/proj"), crate::terminal::now_ms())
+            .unwrap();
+
         note_possible_submit(&state, "t1", "\r");
 
         let dir = home
@@ -475,7 +516,18 @@ mod tests {
         );
         assert!(saw_meta, "expected a terminal.meta.updated broadcast");
 
+        // P1.8 (trigger d): locator resolution wrote the durable binding row
+        // and deleted the spawn-time pending marker (pinned order).
+        let hit = state
+            .pane_ledger
+            .lookup_by_session("amplifier", "sess-drain")
+            .expect("binding row written at resolution");
+        assert_eq!(hit.row.live_terminal_id.as_deref(), Some("t1"));
+        assert!(state.pane_ledger.pending_for_terminal("t1").is_none());
+        assert!(state.pane_ledger.list_pending_raw().is_empty());
+
         state.registry.kill("t1");
         let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ledger_dir);
     }
 }

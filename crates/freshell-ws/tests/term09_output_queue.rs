@@ -48,6 +48,7 @@ async fn spawn_server(term09: Term09Config) -> String {
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
 
     let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),

@@ -89,6 +89,17 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The modes that get a spawn-time pending marker: EXACTLY the modes with a
+/// registered post-spawn identity resolver (codex candidate adoption,
+/// opencode/amplifier locator sweeps). NOT "any non-shell mode" (V7.md):
+/// claude has create-time identity (pre-allocation) and NO resolver — its
+/// degenerate no-identity payloads (mismatched-provider sessionRef,
+/// empty-string session id; V5.md) spawn un-resumable and stay ledgerless
+/// by design; kimi/gemini/custom extension modes have no resolver, so a
+/// marker for them could never resolve and would only leak until the TTL
+/// sweep. Every mode listed here MUST have a resolution hook (Tasks 8-9).
+const MARKER_MODES: [&str; 3] = ["codex", "opencode", "amplifier"];
+
 /// Map the protocol `shell` enum to the platform `ShellType`.
 fn map_shell(shell: Shell) -> ShellType {
     match shell {
@@ -501,7 +512,7 @@ async fn handle_client_text(
         // candidate -- guarded (campaign plan §2.3.1); rejects are logged and
         // ignored, never answered (legacy parity ws-handler.ts:2951-2963).
         ClientMessage::TerminalCodexCandidatePersisted(candidate) => {
-            crate::codex_candidate::handle_codex_candidate_persisted(state, candidate);
+            crate::codex_candidate::handle_codex_candidate_persisted(state, candidate).await;
             true
         }
         ClientMessage::TerminalAttach(attach) => {
@@ -1330,6 +1341,8 @@ async fn handle_create(
         // -> `terminalMetadata.retire(terminalId)` (`server/index.ts:526-534`), so a
         // rename cascade still resolves after this terminal's process has exited.
         let identity = state.identity.clone();
+        // P1.8 exit hygiene: the pending-marker delete rides the same hook.
+        let pane_ledger = std::sync::Arc::clone(&state.pane_ledger);
         // Restore-across-restart fix: disarm the amplifier locator too, so an
         // exited (never-submitted, or already-associated) terminal's armed
         // entry is never left dangling (mirrors `handleExit`,
@@ -1348,6 +1361,16 @@ async fn handle_create(
             freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .notify_terminal_exit(&tid);
             identity.retire(&tid);
+            // P1.8: an observed PTY exit in this epoch ends any
+            // identity-in-flight window — the marker's job (distinguishing
+            // fresh-by-race from fresh-by-intent across a SERVER death) is
+            // over. Best-effort; never load-bearing. INLINE sync call is
+            // correct HERE: the ExitHook (`pty.rs:55`, `FnOnce + Send`) runs
+            // on the PTY's blocking/reader thread, not an async worker —
+            // the one truly-synchronous ledger call site (V1.md).
+            if let Err(err) = pane_ledger.delete_pending(&tid) {
+                tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_exit");
+            }
             if let Some(locator) = &amplifier_locator {
                 locator.disarm(&tid);
             }
@@ -1541,6 +1564,60 @@ async fn handle_create(
         );
     }
 
+    // P1.8 (spec §4.2 write triggers): the durable ledger write rides the
+    // SAME identity event that seeds the in-memory registry — atomic
+    // temp+rename, AWAITED before the create is answered (durable-before-
+    // answer). It runs on the blocking pool, not the per-connection
+    // dispatch task: each write costs ~15ms p50 / 21-64ms p99 in fsyncs
+    // (V1.md), 2-3 orders past tokio's async-worker budget — the same
+    // reasoning as the PTY spawn_blocking above. A failure never blocks
+    // the create but is surfaced LIVE (surface_write_failure).
+    if let Some(record) = &create_meta_record {
+        // Identity known at spawn: claude pre-allocation (trigger a) and
+        // every resume/restore create (all providers) — a binding row.
+        if let (Some(provider), Some(session_id)) =
+            (record.provider.as_deref(), record.session_id.as_deref())
+        {
+            let ledger = std::sync::Arc::clone(&state.pane_ledger);
+            let provider = provider.to_string();
+            let session_id = session_id.to_string();
+            let write_terminal_id = record.terminal_id.clone();
+            let write_mode = mode.clone();
+            let write_cwd = record.cwd.clone();
+            let write_request_id = create.request_id.clone();
+            let now = now_ms();
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.record_binding(&crate::pane_ledger::BindingWrite {
+                    provider: &provider,
+                    session_id: &session_id,
+                    terminal_id: &write_terminal_id,
+                    mode: &write_mode,
+                    cwd: write_cwd.as_deref(),
+                    create_request_id: Some(&write_request_id),
+                    now_ms: now,
+                })
+            })
+            .await
+            .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+            crate::pane_ledger::surface_write_failure(state, &record.terminal_id, result);
+        }
+    } else if MARKER_MODES.contains(&mode.as_str()) {
+        // Identity-bearing pane whose identity is still in flight (fresh
+        // codex/opencode/amplifier — trigger d): a durable pending marker
+        // from spawn until resolution deletes it (binding-first order).
+        let ledger = std::sync::Arc::clone(&state.pane_ledger);
+        let write_terminal_id = terminal_id_for_meta.clone();
+        let write_mode = mode.clone();
+        let write_cwd = spec.cwd.clone();
+        let now = now_ms();
+        let result = tokio::task::spawn_blocking(move || {
+            ledger.record_pending(&write_terminal_id, &write_mode, write_cwd.as_deref(), now)
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+        crate::pane_ledger::surface_write_failure(state, &terminal_id_for_meta, result);
+    }
+
     let created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
         request_id: create.request_id,
@@ -1582,39 +1659,98 @@ fn is_canonical_claude_session_id(s: &str) -> bool {
         })
 }
 
-/// P0.4 server-side resolution ladder (campaign plan §2.2; this slice is
-/// in-process only -- the durable-ledger and disk-scan rungs land in a later
-/// slice, P1.8). A `restore:true` claude create that carried no usable client
-/// id gets one more chance: the newest terminal generation for the same
-/// createRequestId, consulted in both identity homes -- the same two-home
-/// precedence `reconcile.rs::resolve_authoritative_ref` uses.
+/// P0.4 server-side resolution ladder (campaign plan §2.2; the in-process
+/// rungs landed with PR #530, the durable-ledger rung with P1.8 read 3 --
+/// only the disk-scan rung remains for a later slice). A `restore:true`
+/// claude create that carried no usable client id gets one more chance: the
+/// newest terminal generation for the same createRequestId, consulted in
+/// both identity homes -- the same two-home precedence
+/// `reconcile.rs::resolve_authoritative_ref` uses -- and, when the
+/// in-process homes have no lineage (a fresh boot), the durable pane ledger.
 ///
 /// GATED on the newest generation NOT being Running (ledger A13): if it is
 /// still live, auto-resuming would spawn a SECOND live claude on the same
 /// session id -- silently wrong. Return None and fail loud instead;
 /// capability-on clients get live adoption via the pane_reconcile dedupe.
-/// Lineage exists only for NATURAL exits: `registry.kill()` removes the row,
-/// so a restore after an explicit user-kill also fails loud -- correct under
-/// "never silently wrong".
+/// The ledger rung applies the equivalent guard against BOTH identity homes
+/// (a live identity-registry owner AND a REST-shaped live registry row).
+/// An explicit user-kill removes the registry row AND retires the ledger
+/// row `closed`, so a restore after user-kill still fails loud -- correct
+/// under "never silently wrong".
 fn resolve_claude_restore_session_id(state: &WsState, create_request_id: &str) -> Option<String> {
-    let newest = state
+    // Rungs 1-2 (in-process, PR #530) -- unchanged, except the early-return
+    // structure now falls THROUGH to the ledger when the in-process homes
+    // simply have no lineage (a fresh boot), while the A13 live-guard stays
+    // a HARD stop the ledger must never reverse.
+    if let Some(newest) = state
         .registry
-        .newest_by_create_request_id(create_request_id)?;
-    let row = state.registry.probe(&newest)?;
-    if row.status == freshell_protocol::TerminalRunStatus::Running {
+        .newest_by_create_request_id(create_request_id)
+    {
+        if let Some(row) = state.registry.probe(&newest) {
+            if row.status == freshell_protocol::TerminalRunStatus::Running {
+                return None; // A13 live-guard: never a second live claude on one session id
+            }
+            if let Some(sref) = state.identity.session_ref_for(&newest) {
+                // Retired entries included -- an exited claude's identity is
+                // exactly what a same-lineage restore needs.
+                if sref.provider == "claude" {
+                    return Some(sref.session_id);
+                }
+            }
+            // Registry-side identity home (REST-created resumes carry
+            // identity only on the registry row).
+            if row.mode == "claude" {
+                if let Some(sid) = row.resume_session_id.filter(|s| !s.is_empty()) {
+                    return Some(sid);
+                }
+            }
+        }
+    }
+    // Rung 3 (P1.8): the durable ledger -- the rung that survives restarts.
+    // `lookup_by_create_request_id` answers only `bound` rows and
+    // `gc_expired` tombstones (auto-resume is a legal transition); a row
+    // retired `closed` (user-kill) or `superseded` is never resurrected.
+    // The lookup is memory-only (write-through index) -- cheap inline.
+    let row = state
+        .pane_ledger
+        .lookup_by_create_request_id("claude", create_request_id)?;
+    // A13-equivalent guard, part 1: if ANY live identity-registry entry
+    // currently owns this session id, fail loud rather than double-resume.
+    if let Some(owner) = state.identity.find_by_session("claude", &row.session_id) {
+        if state
+            .registry
+            .probe(&owner.terminal_id)
+            .is_some_and(|r| r.status == freshell_protocol::TerminalRunStatus::Running)
+        {
+            return None;
+        }
+    }
+    // A13-equivalent guard, part 2 (V6.md): REST-resumed claudes are
+    // invisible to the identity registry AND to createRequestId lineage --
+    // their only footprint is a registry row {mode:"claude",
+    // resume_session_id, Running}. Scan the live registry so the ledger
+    // rung can never green-light a second live claude on one session id.
+    let rest_shaped_live = state.registry.directory().into_iter().any(|entry| {
+        entry.mode == "claude"
+            && entry.resume_session_id.as_deref() == Some(row.session_id.as_str())
+            && entry.status == freshell_protocol::TerminalRunStatus::Running
+    });
+    if rest_shaped_live {
+        tracing::warn!(
+            target: "freshell_ws::pane_ledger",
+            session_id = %row.session_id,
+            "claude_restore_refused: a live (REST-shaped) claude already owns this session id"
+        );
         return None;
     }
-    if let Some(sref) = state.identity.session_ref_for(&newest) {
-        // Retired entries included -- an exited claude's identity is exactly
-        // what a same-lineage restore needs.
-        return (sref.provider == "claude").then_some(sref.session_id);
+    if row.retired_reason == Some(crate::pane_ledger::RetiredReason::GcExpired) {
+        tracing::info!(
+            target: "freshell_ws::pane_ledger",
+            session_id = %row.session_id,
+            "pane_ledger_auto_resume: gc_expired tombstone revived by restore (never-ask-when-we-can-act)"
+        );
     }
-    // Registry-side identity home (REST-created resumes carry identity only
-    // on the registry row).
-    if row.mode != "claude" {
-        return None;
-    }
-    row.resume_session_id.filter(|s| !s.is_empty())
+    Some(row.session_id)
 }
 
 /// Build the create-time `TerminalMetaRecord` for the port-side closure of
@@ -2102,6 +2238,28 @@ async fn handle_detach(
 /// silently).
 async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) -> bool {
     if kill_and_broadcast(state, &kill.terminal_id) {
+        // P1.8 trigger (e): explicit user close — best-effort retire of the
+        // binding (`closed`) + marker cleanup. Best-effort by spec: SIGKILL
+        // is the tested mode, so retire-on-close must never be load-bearing.
+        // `session_ref_for` is retired-INCLUSIVE, so it still answers after
+        // the retire() inside kill_and_broadcast. Awaited spawn_blocking:
+        // fsync must not pin the dispatch task (V1.md; the PTY-spawn
+        // precedent above).
+        let sref = state.identity.session_ref_for(&kill.terminal_id);
+        let ledger = std::sync::Arc::clone(&state.pane_ledger);
+        let tid = kill.terminal_id.clone();
+        let now = now_ms();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(sref) = sref {
+                if let Err(err) = ledger.retire_closed(&sref.provider, &sref.session_id, now) {
+                    tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_retire_failed_on_kill");
+                }
+            }
+            if let Err(err) = ledger.delete_pending(&tid) {
+                tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_kill");
+            }
+        })
+        .await;
         return true;
     }
     let msg = ServerMessage::Error(ErrorMsg {
@@ -2915,6 +3073,7 @@ mod terminals_changed_tests {
         let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: Arc::clone(&auth_token),
             server_instance_id: Arc::new("srv-1111".to_string()),
@@ -3116,6 +3275,7 @@ mod terminal_meta_created_tests {
         let broadcast_tx = std::sync::Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: std::sync::Arc::clone(&auth_token),
             server_instance_id: std::sync::Arc::new("srv-1111".to_string()),
