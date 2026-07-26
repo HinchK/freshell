@@ -779,7 +779,15 @@ Then register the module in `crates/freshell-ws/src/lib.rs` — in the alphabeti
 pub mod pane_ledger;
 ```
 
-And add the flock dependency to `crates/freshell-ws/Cargo.toml` — the same unix-only `libc` dependency `freshell-server` declares for `ConfigLock` (see its Cargo.toml comment "`flock(2)` for `settings_store.rs`'s advisory cross-process config lock"):
+And add two dependencies to `crates/freshell-ws/Cargo.toml`.
+
+First, `serde` with derive — the module's five `#[derive(Serialize, Deserialize)]` types and `serde::de::DeserializeOwned` bound need the `serde` crate itself, which freshell-ws does NOT yet declare (it currently has only `serde_json`). The workspace root already defines `serde = { version = "1", features = ["derive"] }` in `[workspace.dependencies]` (root `Cargo.toml:32`), so add to freshell-ws's `[dependencies]` table (alphabetical, next to the existing `serde_json`):
+
+```toml
+serde = { workspace = true }
+```
+
+Second, the flock dependency — the same unix-only `libc` dependency `freshell-server` declares for `ConfigLock` (see its Cargo.toml comment "`flock(2)` for `settings_store.rs`'s advisory cross-process config lock"):
 
 ```toml
 [target.'cfg(unix)'.dependencies]
@@ -1357,6 +1365,26 @@ fn aged_out_marker_is_swept_after_its_ttl() {
 }
 
 #[test]
+fn periodic_gc_sweeps_aged_markers_without_a_restart() {
+    // The `gc` contract includes the aged-marker sweep (see the Interfaces
+    // note and the PENDING_MARKER_TTL_MS doc): the leaked-marker lifetime
+    // bound must hold on a LONG-RUNNING server, so the periodic path — not
+    // just boot_scan — must sweep aged markers.
+    let root = temp_root("marker-ttl-gc");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger.record_pending("t1", "codex", Some("/tmp/p"), 1_000).unwrap();
+    // A fresh marker survives a GC pass (never swept merely for age < TTL)...
+    let report = ledger.gc(2_000, &never_absent);
+    assert!(report.stale_markers_removed.is_empty());
+    assert!(ledger.pending_for_terminal("t1").is_some());
+    // ...but an aged-out one is swept by gc() alone — no boot_scan involved.
+    let report = ledger.gc(1_000 + PENDING_MARKER_TTL_MS + 1, &never_absent);
+    assert_eq!(report.stale_markers_removed, vec!["t1".to_string()]);
+    assert!(ledger.list_pending_raw().is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
     // Red test `crash-mid-supersession-two-bound-rows`: the new bound row
     // was written but the crash landed before the old row was retired ->
@@ -1596,10 +1624,12 @@ And to `impl PaneLedger`:
         report
     }
 
-    /// The periodic subset: expire unobserved bound rows TO TOMBSTONES and
+    /// The periodic subset: expire unobserved bound rows TO TOMBSTONES,
     /// delete old tombstones ONLY when the transcript is definitively gone —
     /// per the caller's DIRECT-STAT closure (V10.md: probe Absent alone is
-    /// not definitive; see the boot_scan contract).
+    /// not definitive; see the boot_scan contract) — and sweep aged-out
+    /// pending markers (the leaked-marker lifetime bound must hold on a
+    /// long-running server, not only across restarts).
     pub fn gc(
         &self,
         now_ms: i64,
@@ -1620,6 +1650,27 @@ And to `impl PaneLedger`:
         transcript_absent: &dyn Fn(&str, &str) -> bool,
     ) -> BootScanReport {
         let mut report = BootScanReport::default();
+
+        // Aged-marker sweep (A8/V7): part of the periodic subset per the
+        // `gc` contract, so a long-running server bounds leaked-marker
+        // lifetime WITHOUT a restart. Only the TTL case runs here — the
+        // covered-by-binding case is boot-only crash-window residue
+        // (boot_scan step 2, which also handles the TTL case at boot, so
+        // this loop finds nothing on the boot path).
+        let markers: Vec<PendingMarker> = index.pending.values().cloned().collect();
+        for marker in markers {
+            if now_ms - marker.spawned_at > PENDING_MARKER_TTL_MS
+                && Self::remove_pending(root, index, &marker.terminal_id).is_ok()
+            {
+                tracing::warn!(
+                    target: "freshell_ws::pane_ledger",
+                    terminal_id = %marker.terminal_id,
+                    "pane_ledger_stale_marker_swept: aged past TTL (periodic GC)"
+                );
+                report.stale_markers_removed.push(marker.terminal_id);
+            }
+        }
+
         let rows: Vec<BindingRow> = index.bindings.values().cloned().collect();
         for mut row in rows {
             let sref = SessionLocator {
