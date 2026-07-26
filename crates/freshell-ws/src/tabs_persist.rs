@@ -290,10 +290,12 @@ fn all_generations_parsed(
     Ok(order_generations_newest_first(files))
 }
 
-/// The RAW device ids that have at least one persisted generation (read from
-/// each device's stored `deviceId`, so the API never leaks the encoded folder
-/// name). Sorted + deduped. FAIL-LOUD: a missing root is absence (`Ok(empty)`);
-/// an unreadable dir or a corrupt device file is an ERROR (`Err`).
+/// The RAW device ids that have at least one persisted generation. Every
+/// generation in a device dir must agree on `deviceId` (verify-all-agree):
+/// a half-migrated or hand-edited dir is an ERROR, never a nondeterministic
+/// first-file-wins identity. Sorted + deduped. FAIL-LOUD: a missing root is
+/// absence (`Ok(empty)`); an unreadable dir, a corrupt device file, or an
+/// identity conflict is an ERROR (`Err`).
 pub fn list_snapshot_devices(dir: &Path) -> std::io::Result<Vec<String>> {
     with_persist_lock(|| list_snapshot_devices_locked(dir))
 }
@@ -309,19 +311,36 @@ fn list_snapshot_devices_locked(dir: &Path) -> std::io::Result<Vec<String>> {
         if !dpath.is_dir() {
             continue;
         }
-        // First readable *.json in the device dir carries the raw deviceId.
-        let first_json = std::fs::read_dir(&dpath)?
-            .flatten()
-            .map(|f| f.path())
-            .find(|p| p.extension().is_some_and(|x| x == "json"));
-        if let Some(p) = first_json {
+        let mut dir_id: Option<String> = None;
+        for p in std::fs::read_dir(&dpath)?.flatten().map(|f| f.path()) {
+            if !p.extension().is_some_and(|x| x == "json") {
+                continue;
+            }
             let v = read_generation_file(&p)?;
-            ids.push(
-                v.get("deviceId")
-                    .and_then(Value::as_str)
-                    .expect("validated deviceId")
-                    .to_string(),
-            );
+            let id = v
+                .get("deviceId")
+                .and_then(Value::as_str)
+                .expect("validated deviceId")
+                .to_string();
+            match &dir_id {
+                None => dir_id = Some(id),
+                Some(existing) if *existing == id => {}
+                Some(existing) => {
+                    tracing::error!(target: "freshell_ws::invariants",
+                        dir = %dpath.display(), first = %existing, conflicting = %id,
+                        "tabs_snapshot_device_identity_conflict: generations in one device dir disagree on deviceId; refusing to guess an identity");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "tabs_snapshot_device_identity_conflict: {} holds generations with conflicting deviceIds ({existing} vs {id})",
+                            dpath.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some(id) = dir_id {
+            ids.push(id);
         }
     }
     ids.sort();

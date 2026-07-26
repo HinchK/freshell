@@ -1395,3 +1395,53 @@ fn cap_unenforceable_fails_the_write_and_preserves_all_evidence() {
         "must alarm loudly: {events:?}"
     );
 }
+
+#[test]
+fn mixed_device_id_dir_is_a_loud_error_not_first_file_wins() {
+    // Defect 3: identity used to come from whatever *.json read_dir returned
+    // first — nondeterministic for a half-migrated/hand-edited dir. Now every
+    // generation must agree, or the read fails loudly.
+    let (events, _guard) = crate::invariants::capture::capture();
+    let dir = tempfile::tempdir().unwrap();
+    put(dir.path(), "dev", "c1", 1, 1000, vec![open_record("dev:t", "t", 1)]);
+    // Hand-craft a second, fully VALID generation in the same dir whose
+    // embedded deviceId disagrees.
+    let ddir = device_dir_for(dir.path(), "dev").unwrap();
+    let existing = std::fs::read_dir(&ddir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "json"))
+        .unwrap();
+    let mut doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&existing).unwrap()).unwrap();
+    doc["deviceId"] = json!("dev-other");
+    std::fs::write(
+        ddir.join("zzz-imposter.json"),
+        serde_json::to_vec_pretty(&doc).unwrap(),
+    )
+    .unwrap();
+
+    let err = list_snapshot_devices(dir.path())
+        .expect_err("conflicting deviceIds in one dir must be an error");
+    assert!(
+        err.to_string().contains("tabs_snapshot_device_identity_conflict"),
+        "{err}"
+    );
+    let events = events.lock().unwrap();
+    assert!(
+        events.iter().any(|e| e.target == "freshell_ws::invariants"
+            && e.message.contains("tabs_snapshot_device_identity_conflict")),
+        "identity conflict must alarm loudly: {events:?}"
+    );
+}
+
+#[test]
+fn agreeing_multi_generation_dir_lists_exactly_one_device_id() {
+    // Regression guard for the fix: reading ALL files (not just the first)
+    // must still dedupe agreeing generations to one id.
+    let dir = tempfile::tempdir().unwrap();
+    put(dir.path(), "dev", "c1", 1, 1000, vec![open_record("dev:t", "a", 1)]);
+    put(dir.path(), "dev", "c2", 1, 2000, vec![open_record("dev:t2", "b", 1)]);
+    assert_eq!(devices(dir.path()), vec!["dev".to_string()]);
+}
