@@ -667,6 +667,44 @@ pub(crate) fn surface_write_failure(
     }
 }
 
+/// The shared post-locator/candidate resolution hook (write trigger b/c):
+/// binding row FIRST, then the pending marker is deleted (`resolve_pending`'s
+/// pinned order). `create_request_id` is deliberately None here — it is an
+/// advisory field captured at create time; resolution never joins on it (D4).
+/// Failures never block the identity event; they surface LIVE.
+///
+/// `async` + awaited spawn_blocking (V1.md / A1): every caller is an async
+/// dispatch/sweep task, and the fsyncing write (~15ms p50) must complete
+/// BEFORE the associated broadcast without pinning an async worker.
+pub(crate) async fn ledger_resolve_identity(
+    state: &crate::WsState,
+    terminal_id: &str,
+    provider: &str,
+    session_id: &str,
+    cwd: Option<&str>,
+) {
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let provider_owned = provider.to_string();
+    let session_id_owned = session_id.to_string();
+    let terminal_id_owned = terminal_id.to_string();
+    let cwd_owned = cwd.map(str::to_string);
+    let now = crate::terminal::now_ms();
+    let result = tokio::task::spawn_blocking(move || {
+        ledger.resolve_pending(&BindingWrite {
+            provider: &provider_owned,
+            session_id: &session_id_owned,
+            terminal_id: &terminal_id_owned,
+            mode: &provider_owned,
+            cwd: cwd_owned.as_deref(),
+            create_request_id: None,
+            now_ms: now,
+        })
+    })
+    .await
+    .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+    surface_write_failure(state, terminal_id, result);
+}
+
 /// Path-segment encoding: `[A-Za-z0-9._-]` pass through, everything else
 /// (including `%`) becomes `%XX` uppercase hex. Injective and containment-
 /// safe (no `/`, and the `.`/`..` specials are fully escaped).

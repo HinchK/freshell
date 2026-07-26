@@ -494,7 +494,7 @@ async fn handle_client_text(
         // candidate -- guarded (campaign plan §2.3.1); rejects are logged and
         // ignored, never answered (legacy parity ws-handler.ts:2951-2963).
         ClientMessage::TerminalCodexCandidatePersisted(candidate) => {
-            crate::codex_candidate::handle_codex_candidate_persisted(state, candidate);
+            crate::codex_candidate::handle_codex_candidate_persisted(state, candidate).await;
             true
         }
         ClientMessage::TerminalAttach(attach) => {
