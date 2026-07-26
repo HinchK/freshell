@@ -201,9 +201,16 @@ Expected: FAIL to compile — `cli_index` field does not exist. (Compile failure
 
 3. In `handle_create` (insert site claude.rs:224–232), set `sidecar_session_id: created.clone(), cli_session_id: None` on the inserted `ClaudeSession`. Same for the test helper `insert_fake_claude_session` (claude.rs:765–783): `sidecar_session_id: id.to_string(), cli_session_id: None`.
 
-4. In `spawn_consumer` (claude.rs:421–442), clone `self.sessions` and `self.cli_index` into the task, intercept session-init lines before the generic rebroadcast, and EVICT on loop exit (ledger A9: consumer exit was the missing eviction path — without it a dead-but-tracked session strands panes against Task 6's "tracked ⇒ no-op" attach row). `spawn_consumer` gains a `sidecar_session_id: String` parameter (the id this consumer's sidecar is keyed by — pass `created.clone()` at the existing `handle_create` call site) used as the eviction identity guard:
+4. In `spawn_consumer` (claude.rs:421–442), clone `self.sessions` and `self.cli_index` into the task, intercept session-init lines before the generic rebroadcast, and EVICT on loop exit (ledger A9: consumer exit was the missing eviction path — without it a dead-but-tracked session strands panes against Task 6's "tracked ⇒ no-op" attach row). `spawn_consumer` gains a 4th parameter, `sidecar_session_id: String` (the id this consumer's sidecar is keyed by), used as the eviction identity guard: on loop exit the consumer removes the sessions-map entry for its map key ONLY IF the entry's `sidecar_session_id` still matches its own — so a consumer left over from a dead sidecar can never evict a NEWER session that was re-registered under the same map key (Task 6 registers resumed sessions under the client's original id). At the existing `handle_create` call site, pass `created.clone()` as the new 4th argument. New shape (keep the existing signature's parameter style for the first three params; only the 4th is new):
 
 ```rust
+    fn spawn_consumer(
+        &self,
+        mut reader: /* existing reader type unchanged */,
+        session_id: String,
+        session_type: String,
+        sidecar_session_id: String,
+    ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
         let sessions = self.sessions.clone();
         let cli_index = self.cli_index.clone();
@@ -234,8 +241,29 @@ Expected: FAIL to compile — `cli_index` field does not exist. (Compile failure
                     let _ = broadcast_tx.send(frame);
                 }
             }
+            // Consumer exit == this sidecar's stdout closed == sidecar death
+            // (ledger A9). Evict the dead session and its cli_index entries,
+            // identity-guarded: a newer session re-registered under the same
+            // map key (attach-resume, Task 6) has a DIFFERENT
+            // sidecar_session_id and must not be evicted by this stale consumer.
+            let evicted = {
+                let mut map = sessions.lock().await;
+                match map.get(&session_id) {
+                    Some(s) if s.sidecar_session_id == sidecar_session_id => {
+                        map.remove(&session_id);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if evicted {
+                cli_index.lock().await.retain(|_, mapped| mapped != &session_id);
+            }
         })
+    }
 ```
+
+(Adapt the reader parameter type and `&self` vs `&Arc<Self>` receiver to the EXISTING `spawn_consumer` signature at claude.rs:421 — copy it verbatim and only add the 4th parameter plus the post-loop eviction block.)
 
 5. In `handle_kill` (claude.rs:279–311), after removing the session from the map, evict its index entries (retain covers the init-raced-before-insert case):
 
@@ -605,7 +633,7 @@ Then create the golden by hand at `test/fixtures/fresh-agent/claude-snapshot-gol
   "threadId": "44444444-4444-4444-8444-444444444444",
   "sessionId": "44444444-4444-4444-8444-444444444444",
   "revision": 1753437600000,
-  "latestTurnId": "44444444-4444-4444-8444-444444444444:4",
+  "latestTurnId": "44444444-4444-4444-8444-444444444444:5",
   "status": "idle",
   "capabilities": { "send": true, "interrupt": true, "approvals": false, "questions": false, "fork": false },
   "tokenUsage": { "inputTokens": 0, "outputTokens": 0, "totalTokens": 0 },
@@ -659,11 +687,11 @@ Then create the golden by hand at `test/fixtures/fresh-agent/claude-snapshot-gol
       "turnId": "44444444-4444-4444-8444-444444444444:3",
       "ordinal": 3,
       "source": "durable",
-      "role": "assistant",
-      "timestamp": "2026-07-25T10:00:03.000Z",
-      "summary": "bash",
+      "role": "user",
+      "timestamp": "2026-07-25T10:00:02.500Z",
+      "summary": "cli string content question",
       "items": [
-        { "id": "44444444-4444-4444-8444-444444444444:3-i0", "kind": "tool_use", "toolUseId": "toolu_01", "name": "bash", "input": { "command": "ls" } }
+        { "id": "44444444-4444-4444-8444-444444444444:3-i0", "kind": "text", "text": "cli string content question" }
       ]
     },
     {
@@ -671,11 +699,23 @@ Then create the golden by hand at `test/fixtures/fresh-agent/claude-snapshot-gol
       "turnId": "44444444-4444-4444-8444-444444444444:4",
       "ordinal": 4,
       "source": "durable",
+      "role": "assistant",
+      "timestamp": "2026-07-25T10:00:03.000Z",
+      "summary": "bash",
+      "items": [
+        { "id": "44444444-4444-4444-8444-444444444444:4-i0", "kind": "tool_use", "toolUseId": "toolu_01", "name": "bash", "input": { "command": "ls" } }
+      ]
+    },
+    {
+      "id": "44444444-4444-4444-8444-444444444444:5",
+      "turnId": "44444444-4444-4444-8444-444444444444:5",
+      "ordinal": 5,
+      "source": "durable",
       "role": "user",
       "timestamp": "2026-07-25T10:00:04.000Z",
       "summary": "[tool result]",
       "items": [
-        { "id": "44444444-4444-4444-8444-444444444444:4-i0", "kind": "tool_result", "toolUseId": "toolu_01", "content": "file-a\nfile-b", "isError": false }
+        { "id": "44444444-4444-4444-8444-444444444444:5-i0", "kind": "tool_result", "toolUseId": "toolu_01", "content": "file-a\nfile-b", "isError": false }
       ]
     }
   ],
@@ -1463,7 +1503,14 @@ enum ResumeClaudeError {
         // Register under the CLIENT's id: the consumer stamps the map key on every
         // envelope and the frozen client routes by envelope sessionId
         // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane.
-        let consumer = self.spawn_consumer(reader, msg.session_id.clone(), session_type.clone());
+        // 4-arg spawn_consumer (Task 1): the sidecar's created id is the eviction
+        // identity guard for this consumer.
+        let consumer = self.spawn_consumer(
+            reader,
+            msg.session_id.clone(),
+            session_type.clone(),
+            sidecar_session_id.clone(),
+        );
         self.sessions.lock().await.insert(
             msg.session_id.clone(),
             ClaudeSession {
@@ -1720,7 +1767,20 @@ Expected: clean build.
 
 - [ ] **Step 2: Write the spec**
 
-Create `test/e2e-browser/specs/freshclaude-restart-parity-rust.spec.ts`. Copy these helpers VERBATIM from `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts`: `seedWallConfig` (:131–155, claude flavor), `bootWall` (:156–170), `selectShellIfPickerShowing`, `waitForWsReady`, `flushPersistence`, `collectLeaves`/`findFreshAgentLeaf`, `leafDurableIdentity` (:245–251), `createFreshclaudePane` (:436–464), `sendFreshAgentTurn` (:373–393). Then the tests:
+Create `test/e2e-browser/specs/freshclaude-restart-parity-rust.spec.ts`. Copy these helpers VERBATIM from `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts`: `seedWallConfig` (:131–155, claude flavor), `bootWall` (:156–170), `selectShellIfPickerShowing`, `waitForWsReady`, `flushPersistence`, `collectLeaves`/`findFreshAgentLeaf`, `createFreshclaudePane` (:436–464), `sendFreshAgentTurn` (:373–393). Do NOT copy the wall's `leafDurableIdentity` (:245–251): its first fallback arm is `content.sessionId`, which for a live claude pane is the create-time `fc-e2e-*` nanoid FOREVER (claude never rekeys it; the snapshot-fetch sessionId adoption in `FreshAgentView.tsx:1338-1343` is opencode-only, and this spec never reloads the page) — it would return the nanoid, not the durable UUID. Instead define locally:
+
+```ts
+// Durable identity for a LIVE (no-reload) claude pane. The sdk.session.init
+// merge writes the durable UUID to sessionRef.sessionId + resumeSessionId
+// (FreshAgentView.tsx mergePaneContent, ~:1497-1503); content.sessionId stays
+// the create-time nanoid. sessionRef.sessionId also survives persistence
+// (persistMiddleware strips sessionId AND resumeSessionId), so this expression
+// is reload-symmetric too.
+const liveDurableIdentity = (leaf: any): string =>
+  leaf?.content?.sessionRef?.sessionId ?? leaf?.content?.resumeSessionId ?? ''
+```
+
+Then the tests:
 
 ```ts
 // FRESHCLAUDE RESTART PARITY -- restart-resilience plan §2.8 items 2-4 (Lane A2).
@@ -1766,12 +1826,13 @@ test.describe('freshclaude restart parity (rust)', () => {
       await sendFreshAgentTurn(page, harness, prompt)
       await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn')
 
-      // Durable identity = the fixture's canonical UUID.
+      // Durable identity = the fixture's canonical UUID (via liveDurableIdentity;
+      // content.sessionId stays the create-time nanoid on a live claude pane).
       let originalDurable = ''
       await expect
         .poll(async () => {
           const layout = await harness.getPaneLayout()
-          originalDurable = leafDurableIdentity(findFreshAgentLeaf(layout)) ?? ''
+          originalDurable = liveDurableIdentity(findFreshAgentLeaf(layout))
           return originalDurable
         })
         .toBe('44444444-4444-4444-8444-444444444444')
@@ -1830,7 +1891,7 @@ test.describe('freshclaude restart parity (rust)', () => {
       await sendFreshAgentTurn(page, harness, secondPrompt)
       await expect(page.locator('[data-context="fresh-agent"]').last()).toContainText('Fixture claude turn')
       const layout = await harness.getPaneLayout()
-      expect(leafDurableIdentity(findFreshAgentLeaf(layout))).toBe(originalDurable)
+      expect(liveDurableIdentity(findFreshAgentLeaf(layout))).toBe(originalDurable)
     } finally {
       await server.stop().catch(() => {})
       await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
@@ -1942,9 +2003,9 @@ Delete the `test.fail(e2eServerKind === 'rust', 'P0.2 (§2.8): claude identity n
 ```bash
 npx playwright test --config test/e2e-browser/playwright.config.ts \
   --project=rust-chromium specs/restore-contract-wall-rust.spec.ts --workers=1 --reporter=list \
-  -g "all pane types survive one SIGKILL restart"
+  -g "THE RULER: all pane types live, one SIGKILL"
 ```
-Its pin reason is `P0.1: … red until P0.2 (freshclaude identity) + remaining P1.x land` — other lanes' P1.x items likely still block it. If Playwright reports an unexpected pass → delete that `test.fail` too; otherwise leave it and update its reason string to drop the satisfied `P0.2` clause: `'P0.1: composed all-pane ruler; red until remaining P1.x land (P0.2 freshclaude identity landed)'`. Leave the ~line 1674 claude-terminal pin strictly alone (Lane A3).
+(That `-g` substring matches the actual test title at ~line 1328: `'THE RULER: all pane types live, one SIGKILL, every §2 contract holds'` — verify with `--list` first if the run reports 0 tests.) Its pin reason is `P0.1: … red until P0.2 (freshclaude identity) + remaining P1.x land` — other lanes' P1.x items likely still block it. If Playwright reports an unexpected pass → delete that `test.fail` too; otherwise leave it and update its reason string to drop the satisfied `P0.2` clause: `'P0.1: composed all-pane ruler; red until remaining P1.x land (P0.2 freshclaude identity landed)'`. Leave the ~line 1674 claude-terminal pin strictly alone (Lane A3).
 
 - [ ] **Step 4: Full verification sweep**
 
@@ -1992,6 +2053,6 @@ Then STOP. Do NOT run `gh pr create` (not approved). The final report must inclu
 
 **2. Placeholder scan:** no TBD/TODO/"handle edge cases"/"similar to Task N" steps; every code step shows code; the two "verify against the donor/actual file" notes are adaptation instructions with named authoritative sources (donor spec lines, zod file lines), not omissions.
 
-**3. Type consistency:** `cli_index: Arc<TokioMutex<HashMap<String,String>>>` (Task 1) is what Task 6 reads/writes; `sidecar_session_id`/`cli_session_id` fields introduced in Task 1 are the ones Task 6's `ClaudeSession` literal sets; `claude_snapshot::{claude_home_candidates, locate_transcript, transcript_cwd}` (Task 2) match Task 5/6 call sites; `build_claude_snapshot_json(session_type, thread_id, transcript, revision)` and `get_claude_snapshot(session_type, thread_id)` signatures match between Tasks 3 and 5; `ClaudeSnapshotError::{NotFound, Io}` matches the Task 5 match arms; fixture env knob names in Task 7 match Task 8's spec env exactly.
+**3. Type consistency:** `cli_index: Arc<TokioMutex<HashMap<String,String>>>` (Task 1) is what Task 6 reads/writes; `spawn_consumer(reader, session_id, session_type, sidecar_session_id)` — the 4-arg shape with post-loop identity-guarded eviction shown in Task 1 — is exactly what Task 6's `resume_for_attach` calls (4 args, `sidecar_session_id.clone()` as the guard); `sidecar_session_id`/`cli_session_id` fields introduced in Task 1 are the ones Task 6's `ClaudeSession` literal sets; `claude_snapshot::{claude_home_candidates, locate_transcript, transcript_cwd}` (Task 2) match Task 5/6 call sites; `build_claude_snapshot_json(session_type, thread_id, transcript, revision)` and `get_claude_snapshot(session_type, thread_id)` signatures match between Tasks 3 and 5; `ClaudeSnapshotError::{NotFound, Io}` matches the Task 5 match arms; fixture env knob names in Task 7 match Task 8's spec env exactly.
 
 **4. Load-bearing validation pass (post-writing):** 18 assumptions surfaced, 12 verified / 7 falsified, all falsifications planned around (full ledger: `.worktrees/.the-usual-logs/freshclaude-restart-parity/load-bearing-ledger.md`, with per-topic evidence reports alongside). The falsifications and their fixes, now reflected in the tasks above: **A3** (CLI ignores CLAUDE_HOME; honors CLAUDE_CONFIG_DIR) → candidate-root resolver + deny-only-if-absent-everywhere + tests pin CLAUDE_CONFIG_DIR; **A15** (resume lookup is cwd-scoped) → resume with the transcript's original `cwd`, `.jsonl`-path resume fallback, fixture transcripts carry `cwd`; **A5** (real prompts are object-with-string-content; meta lines exist) → parser skips isMeta/isSidechain/isCompactSummary/isVisibleInTranscriptOnly, sample+golden exercise the content-string shape; **A9** (sidecar death never evicted the sessions map) → identity-guarded consumer-exit eviction + test, making the attach table's no-op rows safe; **A13** (two per-file env locks don't serialize) → single shared `CLAUDE_ENV_LOCK` (pub(crate)); **A17e** (tempfile dev-dep missing) → unconditional Cargo.toml add, fence updated; **A16** (SDK does expose local history readers) → rationale text corrected, architecture unchanged. Verified load-bearing facts the plan now leans on explicitly: resume preserves the durable UUID by default (fork is opt-in) with a warn+reindex guard for the rare silent-rotation failure mode (GH claude-agent-sdk-python#555); the frozen client ignores unknown top-level error codes, runs no attach watchdog, folds the codex-shape idle snapshot provider-agnostically, and adopts `timelineSessionId`/`cliSessionId` UNVALIDATED into persisted state (so the server must only ever emit durable UUIDs there — pinned in Task 6's tests). Accepted residuals (recorded in the ledger): live-probe confirmation of resume behavior (needs ~$0.05 of real API spend — probe commands recorded in the ledger's v2 report for the user to run at will), possible one-turn API spend on mid-turn resume, and p99 multi-MB transcript serialization cost.
