@@ -14,6 +14,7 @@ import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import {
   clearPaneReconcileNotice,
+  clearReconcilePendingPane,
   consumePaneRefreshRequest,
   repairCodexIdentityMismatch,
   splitPane,
@@ -31,7 +32,7 @@ import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
-import { getWsClient } from '@/lib/ws-client'
+import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { sendTerminalKill } from '@/lib/terminal-kill'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import {
@@ -538,6 +539,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const paneLastInputAt = useAppSelector((s) => s.tabRecency?.paneLastInputAt?.[paneId])
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
+  // Pre-verdict create wait (Task 8): while this pane is named in an outgoing
+  // pane.reconcile request (map entry = startedAt), defer the mount-time
+  // create until its verdict folds -- bounded by RECONCILE_VERDICT_WAIT_MS,
+  // then fall back to the legacy eager create. Defense-in-depth on top of the
+  // authoritative ws-client sender-level hold; this layer also owns the
+  // per-pane timeout that releases the Redux pending flag.
+  const reconcilePendingSince = useAppSelector(
+    (s) => s.panes.reconcilePendingPanes?.[`${tabId}:${paneId}`],
+  )
+  const reconcilePendingSinceRef = useRef<number | undefined>(reconcilePendingSince)
+  reconcilePendingSinceRef.current = reconcilePendingSince
+  const verdictWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
 
@@ -4573,6 +4586,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             && !current.terminalId
             && current.status === 'creating'
           ) {
+            // Pre-verdict create wait (Task 8, V3 caveat): a mid-window WS
+            // flap must not fire this re-drive while the pane is
+            // reconcile-pending and young -- the post-flap reconcile
+            // round-trip (or the bounded timeout) drives the pane instead.
+            if (
+              reconcilePendingSinceRef.current !== undefined
+              && Date.now() - reconcilePendingSinceRef.current < RECONCILE_VERDICT_WAIT_MS
+            ) {
+              return
+            }
             sendCreate(current.createRequestId)
           }
           return
@@ -4659,6 +4682,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
         }
       } else {
+        // Pre-verdict create wait (Task 8): a reconcile-pending pane defers
+        // its mount-time create until the verdict folds (the fold's
+        // clearReconcilePendingPane re-fires this effect), bounded by
+        // RECONCILE_VERDICT_WAIT_MS wall-clock -- on timeout the pending flag
+        // is released and the legacy eager create proceeds (never a silent
+        // wedge, same createRequestId, never re-minted). The attach branch
+        // above is NEVER gated.
+        if (reconcilePendingSinceRef.current !== undefined) {
+          const elapsed = Date.now() - reconcilePendingSinceRef.current
+          if (elapsed < RECONCILE_VERDICT_WAIT_MS) {
+            if (verdictWaitTimerRef.current === null) {
+              const paneKey = `${tabId}:${paneIdRef.current}`
+              verdictWaitTimerRef.current = setTimeout(() => {
+                verdictWaitTimerRef.current = null
+                // Timeout: verdict never folded -- release the gate; the
+                // effect re-fires (reconcilePendingSince is a dep) and the
+                // legacy drive proceeds.
+                dispatch(clearReconcilePendingPane({ paneKey }))
+              }, RECONCILE_VERDICT_WAIT_MS - elapsed)
+            }
+            return
+          }
+        }
         deferredAttachStateRef.current = {
           mode: 'none',
           pendingIntent: null,
@@ -4676,6 +4722,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       // Cancel only the timer: the reserve window and the invalid-terminal
       // attempt budget must survive effect re-fires (no refunds).
       clearReconcileRedriveTimer()
+      // Pre-verdict wait timer: never leak across re-runs/unmounts. ensure()
+      // reschedules with the REMAINING window (elapsed from startedAt), so
+      // the wait stays bounded wall-clock across effect re-fires.
+      if (verdictWaitTimerRef.current !== null) {
+        clearTimeout(verdictWaitTimerRef.current)
+        verdictWaitTimerRef.current = null
+      }
       unsub()
       unsubReconnect()
       if (hydrationRegisteredRef.current) {
@@ -4711,6 +4764,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     shouldWaitForProviderBehavior,
     terminalContent?.createRequestId,
     terminalContent?.reconcileEpoch,
+    // reconcilePendingSince: re-run when the pane's pre-verdict wait state
+    // changes -- the verdict fold (or the bounded timeout) clears the entry
+    // and the deferred mount-create must then proceed (Task 8).
+    reconcilePendingSince,
     updateContent,
     ws,
     dispatch,
