@@ -501,6 +501,75 @@ async fn live_fresh_agent_session_gets_attach() {
     assert!(verdicts[0].get("terminalId").is_none());
 }
 
+/// WAVE-B B1xB4 seam pin (V9 3.6): a mixed request whose TERMINAL pane
+/// triggers B1's bounded index-warming deferral re-derives the verdicts ONCE
+/// -- and that re-derivation must REUSE the fresh-agent snapshot built at
+/// request start, so the fresh-agent respawn counter burns exactly once per
+/// request (never once per derivation).
+#[tokio::test]
+async fn warming_deferral_rederivation_burns_the_respawn_counter_once() {
+    let probe = std::sync::Arc::new(StubProbe::default());
+    probe.answers.lock().unwrap().insert(
+        ("codex".into(), "fa-once".into()),
+        SessionExistence::Present,
+    );
+    // The terminal claim "warm-x" stays unset => Unknown => error{index_warming}
+    // on BOTH derivations, so the deferral + re-derive path definitely runs.
+    let server = spawn_server_with_probe(probe).await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "t", "kind": "terminal", "mode": "codex", "createRequestId": "cr-warm",
+              "sessionRef": {"provider": "codex", "sessionId": "warm-x"} },
+            { "paneKey": "fa", "kind": "fresh-agent",
+              "sessionRef": {"provider": "codex", "sessionId": "fa-once"} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "error");
+    assert_eq!(verdicts[0]["reason"], "index_warming");
+    assert_eq!(verdicts[1]["verdict"], "respawn");
+    let counts = server.respawn_counts.lock().expect("counts lock");
+    assert_eq!(
+        counts.get(&("codex".into(), "fa-once".into())).copied(),
+        Some(1),
+        "the deferral's re-derivation must not double-burn the respawn counter"
+    );
+}
+
+/// WAVE-B B1xB4 seam pin: B1's `ProviderUnavailable` existence answer maps to
+/// the B4 pre-decision (V9/A12): presence Unknown => conservative
+/// respawn-with-cap -- never dead_session, and never the terminal arm's
+/// error{provider_unavailable} shape (fresh-agent liveness does not depend on
+/// the disk index being able to warm).
+#[tokio::test]
+async fn provider_unavailable_existence_maps_to_respawn_with_cap() {
+    let probe = std::sync::Arc::new(StubProbe::default());
+    probe.answers.lock().unwrap().insert(
+        ("codex".into(), "pu-1".into()),
+        SessionExistence::ProviderUnavailable,
+    );
+    let server = spawn_server_with_probe(probe).await;
+    let (mut ws, _ready) = connect(&server.url, true, true).await;
+    let verdicts = reconcile_request(
+        &mut ws,
+        serde_json::json!([
+            { "paneKey": "pu", "kind": "fresh-agent",
+              "sessionRef": {"provider": "codex", "sessionId": "pu-1"} }
+        ]),
+    )
+    .await;
+    assert_eq!(verdicts[0]["verdict"], "respawn");
+    assert_eq!(verdicts[0]["sessionRef"]["sessionId"], "pu-1");
+    let counts = server.respawn_counts.lock().expect("counts lock");
+    assert_eq!(
+        counts.get(&("codex".into(), "pu-1".into())).copied(),
+        Some(1),
+        "the answer counted against the respawn cap"
+    );
+}
+
 #[tokio::test]
 async fn duplicate_session_claims_dedupe_within_one_request() {
     let probe = std::sync::Arc::new(StubProbe::default());
