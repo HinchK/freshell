@@ -157,6 +157,11 @@ function normalizePaneContent(
         showTools: typeof input.showTools === 'boolean' ? input.showTools : undefined,
         showTimecodes: typeof input.showTimecodes === 'boolean' ? input.showTimecodes : undefined,
         ...(pendingLocalEcho ? { pendingLocalEcho } : {}),
+        ...(typeof input.reconcileNotice === 'string' ? { reconcileNotice: input.reconcileNotice } : {}),
+        ...(input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
+          ? { pendingReconcile: input.pendingReconcile }
+          : {}),
+        ...(typeof input.reconcileEpoch === 'number' ? { reconcileEpoch: input.reconcileEpoch } : {}),
       }
     }
 
@@ -201,6 +206,11 @@ function normalizePaneContent(
       showTools: typeof input.showTools === 'boolean' ? input.showTools : undefined,
       showTimecodes: typeof input.showTimecodes === 'boolean' ? input.showTimecodes : undefined,
       ...(pendingLocalEcho ? { pendingLocalEcho } : {}),
+      ...(typeof input.reconcileNotice === 'string' ? { reconcileNotice: input.reconcileNotice } : {}),
+      ...(input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
+        ? { pendingReconcile: input.pendingReconcile }
+        : {}),
+      ...(typeof input.reconcileEpoch === 'number' ? { reconcileEpoch: input.reconcileEpoch } : {}),
     }
   }
   if (input.kind === 'extension') {
@@ -882,6 +892,9 @@ function stripStaleIds(content: PaneContent): PaneContentInput {
       status: _status,
       serverInstanceId: _serverInstanceId,
       createError: _createError,
+      reconcileEpoch: _reconcileEpoch,
+      pendingReconcile: _pendingReconcile,
+      reconcileNotice: _reconcileNotice,
       ...rest
     } = content
     return rest

@@ -200,6 +200,12 @@ export type FreshAgentPaneContent = {
   showTimecodes?: boolean
   /** Persisted optimistic user turn that has not yet appeared in a durable provider snapshot. */
   pendingLocalEcho?: FreshAgentPendingLocalEcho
+  /** One-shot user-visible reconcile notice; rendered + cleared by FreshAgentView. VOLATILE. */
+  reconcileNotice?: string
+  /** Set by verdict folds; consumed when freshAgent.created lands. VOLATILE. */
+  pendingReconcile?: 'respawn' | 'fresh'
+  /** VOLATILE fold counter — re-fires FreshAgentView's create effect on same-createRequestId folds. */
+  reconcileEpoch?: number
 }
 
 /**
