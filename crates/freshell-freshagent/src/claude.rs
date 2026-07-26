@@ -79,6 +79,11 @@ pub struct FreshClaudeState {
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
     /// placeholder-nanoid → live claude session (sidecar stdin + owned child + consumer).
     sessions: Arc<TokioMutex<HashMap<String, ClaudeSession>>>,
+    /// durable Claude UUID (`cliSessionId` from `sdk.session.init`) -> sessions-map key.
+    /// THE restart-parity index (plan §2.8 item 2): lets attach/snapshot find a live
+    /// session by its durable identity instead of the process-ephemeral placeholder.
+    /// pub(crate) so in-crate tests (and snapshot wiring) can inspect it.
+    pub(crate) cli_index: Arc<TokioMutex<HashMap<String, String>>>,
     /// `freshAgent.create` requestId dedup (parity gap fix -- see the module doc on
     /// [`crate::FreshAgentCreateDedup`]): single-flight + replay cache so a client
     /// resending the SAME `requestId` on every reconnect while a pane is
@@ -109,6 +114,16 @@ struct ClaudeSession {
     ownership_id: String,
     /// The stdout-consumer task (aborted on shutdown).
     consumer: tokio::task::JoinHandle<()>,
+    /// The id the SIDECAR keys this session by (`created.sessionId`). Equal to the
+    /// sessions-map key for created sessions; DIFFERENT for resumed-on-attach sessions
+    /// (Task 6), where the map key is the CLIENT's original id. `handle_send`/
+    /// `handle_interrupt` MUST address the sidecar with this id, never the map key.
+    sidecar_session_id: String,
+    /// Best-effort copy of the durable Claude UUID once `sdk.session.init` arrives.
+    /// Written by the stdout consumer; consumed by the snapshot adapter (later task in
+    /// the restart-parity plan) — until then it is only read from in-crate tests.
+    #[allow(dead_code)]
+    cli_session_id: Option<String>,
 }
 
 impl FreshClaudeState {
@@ -117,6 +132,7 @@ impl FreshClaudeState {
         Self {
             broadcast_tx,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
+            cli_index: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
         }
     }
@@ -143,6 +159,7 @@ impl FreshClaudeState {
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&session.ownership_id);
         }
+        self.cli_index.lock().await.clear();
     }
 
     fn broadcast(&self, msg: &ServerMessage) {
@@ -219,7 +236,12 @@ impl FreshClaudeState {
         };
 
         // Start the stdout consumer (the completion edge normalization lives here).
-        let consumer = self.spawn_consumer(reader, created.clone(), session_type.to_string());
+        let consumer = self.spawn_consumer(
+            reader,
+            created.clone(),
+            session_type.to_string(),
+            created.clone(),
+        );
 
         self.sessions.lock().await.insert(
             created.clone(),
@@ -228,6 +250,8 @@ impl FreshClaudeState {
                 child,
                 ownership_id,
                 consumer,
+                sidecar_session_id: created.clone(),
+                cli_session_id: None,
             },
         );
 
@@ -302,6 +326,13 @@ impl FreshClaudeState {
             .clear_for_session(|record| record.session_id == session_id)
             .await;
 
+        // Evict the killed session's durable-id index entries (retain covers the case
+        // where `sdk.session.init` raced in before the session-map insert).
+        self.cli_index
+            .lock()
+            .await
+            .retain(|_, mapped| mapped != &session_id);
+
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
             session_id,
@@ -326,13 +357,15 @@ impl FreshClaudeState {
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_id = msg.session_id.clone();
 
-        let interrupt_req = json!({ "type": "interrupt", "sessionId": session_id });
         let mut guard = self.sessions.lock().await;
         let Some(session) = guard.get_mut(&session_id) else {
             drop(guard);
             self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
             return;
         };
+        // Address the sidecar by ITS id for this session (== the map key for created
+        // sessions; differs for resumed-on-attach sessions, Task 6).
+        let interrupt_req = json!({ "type": "interrupt", "sessionId": session.sidecar_session_id });
         if let Err(err) = write_line(&mut session.stdin, &interrupt_req).await {
             drop(guard);
             self.send_error(&None, "CLAUDE_INTERRUPT_FAILED", &err);
@@ -351,13 +384,16 @@ impl FreshClaudeState {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
-        let send_req = json!({ "type": "send", "sessionId": session_id, "text": msg.text });
         let mut guard = self.sessions.lock().await;
         let Some(session) = guard.get_mut(&session_id) else {
             drop(guard);
             self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
             return;
         };
+        // Address the sidecar by ITS id for this session (== the map key for created
+        // sessions; differs for resumed-on-attach sessions, Task 6).
+        let send_req =
+            json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": msg.text });
         if let Err(err) = write_line(&mut session.stdin, &send_req).await {
             drop(guard);
             self.send_error(&request_id, "CLAUDE_SEND_FAILED", &err);
@@ -417,14 +453,21 @@ impl FreshClaudeState {
 
     /// Consume the sidecar's stdout event stream (one `sdk.*` JSON per line), normalize
     /// each `sdk.* → freshAgent.*` and broadcast it wrapped in a `freshAgent.event`. On EOF
-    /// (a clean end OR a mid-turn death) the loop just stops — never a false completion.
+    /// (a clean end OR a mid-turn death) the loop stops — never a false completion — and
+    /// the dead session is evicted from both maps (identity-guarded, ledger A9).
+    /// `sidecar_session_id` is the id THIS consumer's sidecar is keyed by; it guards the
+    /// eviction so a stale consumer can never evict a newer session re-registered under
+    /// the same map key (attach-resume, Task 6).
     fn spawn_consumer(
         &self,
         mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
         session_id: String,
         session_type: String,
+        sidecar_session_id: String,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
+        let sessions = self.sessions.clone();
+        let cli_index = self.cli_index.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
@@ -434,9 +477,44 @@ impl FreshClaudeState {
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                     continue;
                 };
+                // Restart-parity (plan §2.8 item 2): record the durable Claude UUID.
+                // The index insert is load-bearing; the session-field copy is
+                // best-effort (the map entry may not exist yet during create).
+                if value.get("type").and_then(Value::as_str) == Some("sdk.session.init") {
+                    if let Some(cli_id) = value.get("cliSessionId").and_then(Value::as_str) {
+                        cli_index
+                            .lock()
+                            .await
+                            .insert(cli_id.to_string(), session_id.clone());
+                        if let Some(session) = sessions.lock().await.get_mut(&session_id) {
+                            session.cli_session_id = Some(cli_id.to_string());
+                        }
+                    }
+                }
                 if let Some(frame) = sdk_line_to_frame(&value, &session_id, &session_type) {
                     let _ = broadcast_tx.send(frame);
                 }
+            }
+            // Consumer exit == this sidecar's stdout closed == sidecar death
+            // (ledger A9). Evict the dead session and its cli_index entries,
+            // identity-guarded: a newer session re-registered under the same
+            // map key (attach-resume, Task 6) has a DIFFERENT
+            // sidecar_session_id and must not be evicted by this stale consumer.
+            let evicted = {
+                let mut map = sessions.lock().await;
+                match map.get(&session_id) {
+                    Some(s) if s.sidecar_session_id == sidecar_session_id => {
+                        map.remove(&session_id);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if evicted {
+                cli_index
+                    .lock()
+                    .await
+                    .retain(|_, mapped| mapped != &session_id);
             }
         })
     }
@@ -778,6 +856,8 @@ mod tests {
                 child,
                 ownership_id: format!("test-{session_id}"),
                 consumer,
+                sidecar_session_id: session_id.to_string(),
+                cli_session_id: None,
             },
         );
     }
@@ -1010,9 +1090,6 @@ import fs from 'node:fs'
 import readline from 'node:readline'
 
 const spawnLog = process.env.FRESHELL_TEST_CLAUDE_SPAWN_LOG
-if (spawnLog) {
-  fs.appendFileSync(spawnLog, `${process.pid}\n`)
-}
 
 let counter = 0
 const rl = readline.createInterface({ input: process.stdin, terminal: false })
@@ -1026,9 +1103,23 @@ rl.on('line', (line) => {
     return
   }
   if (msg.type === 'create') {
+    // Log the WHOLE create request (one line per create) so tests can both count
+    // spawns AND assert what the sidecar received (e.g. resumeSessionId).
+    if (spawnLog) {
+      fs.appendFileSync(spawnLog, `${JSON.stringify(msg)}\n`)
+    }
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
     process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
+    // Mirror the real sidecar's post-create init: echo resumeSessionId as the durable
+    // id when present (resume continuity), else a fixed fake uuid.
+    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    console.log(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }))
+    console.log(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }))
+  } else if (msg.type === 'send') {
+    // Test hook: lets tests kill the sidecar THROUGH the public API to exercise
+    // the consumer-exit eviction path (ledger A9).
+    if (msg.text === '__exit__') process.exit(0)
   } else if (msg.type === 'interrupt') {
     const interruptLog = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
     if (interruptLog) fs.appendFileSync(interruptLog, `${msg.sessionId}\n`)
@@ -1091,6 +1182,19 @@ rl.on('line', (line) => {
             std::env::remove_var("FRESHELL_CLAUDE_NODE");
             std::env::remove_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG");
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn send_msg(session_id: &str, text: &str) -> FreshAgentSend {
+        FreshAgentSend {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            text: text.to_string(),
+            cwd: None,
+            images: None,
+            request_id: None,
+            settings: None,
         }
     }
 
@@ -1293,6 +1397,87 @@ rl.on('line', (line) => {
         assert_eq!(frame["sessionId"], "unknown-session");
     }
 
+    // ── cliSessionId recording (restart-parity plan §2.8 item 2) ──────────────────
+
+    /// The stdout consumer must record `sdk.session.init`'s durable `cliSessionId` in
+    /// [`FreshClaudeState::cli_index`] (durable id → sessions-map key), and an explicit
+    /// kill must evict the index entry along with the session.
+    #[tokio::test]
+    async fn session_init_records_cli_session_id_in_the_index() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-cli-idx-1")).await;
+        let created_frame = await_claude_created(&mut rx, "req-cli-idx-1").await;
+        let created = created_frame["sessionId"].as_str().unwrap().to_string();
+
+        // The fake emits sdk.session.init with the durable uuid; poll until the
+        // consumer has recorded it (bounded).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            {
+                let idx = st.cli_index.lock().await;
+                if idx.get("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa") == Some(&created) {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cli_index never recorded the durable id"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // The session carries the best-effort copy of the durable id.
+        assert_eq!(
+            st.sessions
+                .lock()
+                .await
+                .get(&created)
+                .unwrap()
+                .cli_session_id
+                .as_deref(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
+        // Kill evicts the index entry.
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: created.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+        assert!(st.cli_index.lock().await.is_empty());
+        drop(env);
+    }
+
+    /// Ledger A9: consumer exit (== sidecar death) must evict the dead session AND its
+    /// `cli_index` entries — kill/shutdown are NOT the only eviction paths. Without this,
+    /// a dead-but-tracked session makes the tracked⇒no-op attach row strand panes forever.
+    #[tokio::test]
+    async fn consumer_exit_evicts_dead_session_and_index() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-evict-1")).await;
+        let created_frame = await_claude_created(&mut rx, "req-evict-1").await;
+        let created = created_frame["sessionId"].as_str().unwrap().to_string();
+        // Kill the sidecar through the public API (fake exits on text "__exit__"),
+        // then poll (bounded) until the consumer-exit eviction clears BOTH maps.
+        st.handle_send(send_msg(&created, "__exit__")).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if st.sessions.lock().await.is_empty() && st.cli_index.lock().await.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "consumer exit must evict the dead session and its cli_index entries"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        drop(env);
+    }
+
     // ── freshAgent.interrupt (parity gap fix -- see terminal.rs's dispatch arm) ────
 
     /// A missing session mirrors the `SESSION_NOT_FOUND` convention already
@@ -1363,10 +1548,20 @@ rl.on('line', (line) => {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // Success is silent -- no `error`/other frame was broadcast for this interrupt.
-        assert!(
-            rx.try_recv().is_err(),
-            "a successful interrupt must not broadcast"
-        );
+        // Success is silent -- no `error` frame was broadcast for this interrupt. The
+        // fake sidecar also emits `sdk.session.init`/`sdk.status` after `created`
+        // (Task 1); those unrelated `freshAgent.event` frames are skipped rather than
+        // miscounted as an interrupt response.
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                frame["type"], "freshAgent.event",
+                "a successful interrupt must not broadcast: {frame}"
+            );
+            assert_ne!(
+                frame["event"]["type"], "freshAgent.error",
+                "a successful interrupt must not broadcast an error: {frame}"
+            );
+        }
     }
 }
