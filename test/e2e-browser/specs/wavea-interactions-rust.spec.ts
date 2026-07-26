@@ -342,6 +342,27 @@ test.describe('wave-A cross-lane interactions', () => {
           }, { timeout: 30_000 })
           .toBe(FRESH_DURABLE)
 
+        // FIXTURE REALISM (reconcile adoption): real claude writes
+        // ~/.claude/projects/<proj>/<sessionId>.jsonl as soon as the session
+        // starts; the fake CLI does not. Under the adopted client the
+        // post-restart verdict is derived from DISK truth (a claimed session
+        // with no file is a loud dead_session, never an optimistic silent
+        // respawn), so mirror what real claude persists before the kill --
+        // same precedent as restore-contract-wall-rust.spec.ts's claude
+        // scenario.
+        const claudeProjDir = path.join(capturedHome, '.claude', 'projects', 'wavea-a2a3-proj')
+        await fs.mkdir(claudeProjDir, { recursive: true })
+        await fs.writeFile(
+          path.join(claudeProjDir, `${terminalSession}.jsonl`),
+          `${JSON.stringify({
+            type: 'user',
+            message: 'wavea a2a3 fixture transcript',
+            uuid: 'msg-1',
+            cwd: capturedHome,
+            timestamp: '2026-07-21T08:00:00.000Z',
+          })}\n`,
+        )
+
         // ── ONE abrupt restart; both stores must restore, independently. ──
         await server.restartAbrupt()
         await waitForWsReady(page)
