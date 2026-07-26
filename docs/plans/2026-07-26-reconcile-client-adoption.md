@@ -28,7 +28,7 @@ Every task's requirements implicitly include this section.
   `🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)` + `Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>`.
 
 **Scope fence (sibling lanes are working concurrently on other branches):**
-- You own: `src/lib/ws-client.ts`, client verdict folding (`App.tsx` recovery region + new `src/lib/pane-reconcile.ts` + minimal support edits in `panesSlice.ts` / `paneTypes.ts` / `terminal-restore.ts` / `TerminalView.tsx` / `shared/ws-protocol.ts` + the new `DeadSessionPanel` component), `crates/freshell-ws/src/reconcile.rs`, `crates/freshell-ws/src/existence.rs` (+ the concrete probe in `crates/freshell-server/src/existence.rs` for warming/provider-unavailable), `crates/freshell-ws/src/terminal.rs` create/reconcile paths, `crates/freshell-ws/src/registry.rs` reservation, and the ledger WRITE at respawn-winner bind (the wave-A ledger API).
+- You own: `src/lib/ws-client.ts`, client verdict folding (`App.tsx` recovery region + new `src/lib/pane-reconcile.ts` + minimal support edits in `panesSlice.ts` / `paneTypes.ts` / `terminal-restore.ts` / `TerminalView.tsx` / `shared/ws-protocol.ts` + the new `DeadSessionPanel` component), `crates/freshell-ws/src/reconcile.rs`, `crates/freshell-ws/src/existence.rs` (+ the concrete probe in `crates/freshell-server/src/existence.rs` for warming/provider-unavailable), `crates/freshell-ws/src/terminal.rs` create/reconcile paths, `crates/freshell-terminal/src/registry.rs` reservation, and the REGISTRY sessionRef→terminalId binding at respawn-winner bind (the ledger write already exists on the create path — `terminal.rs:1575-1603` — this lane does NOT add one).
 - Do NOT touch: `codex_candidate.rs` / rollout locator (Lane B2), `tabs_snapshots.rs` + tabs-snapshot recovery UI (Lane B3), `freshell-freshagent` crates + fresh-agent verdict support (Lane B4). `reconcile.rs` keeps rejecting `kind: fresh-agent` (`reconcile.rs:169` `unsupported_kind`) this slice — keep edits near that dispatch match-arm minimal and tight (B4 merges a new arm there; expect a trivial merge conflict). No kimi/gemini work.
 
 **Council-gated behavioral invariants (from the restart-resilience analysis §4.3 — every rule here is binding):**
@@ -38,7 +38,7 @@ Every task's requirements implicitly include this section.
 4. A known provider with no home on this machine is NOT warming — it gets `error` with `reason: "provider_unavailable"`, immediately (no deferral).
 5. Under a post-restart storm, warming notices batch into ONE banner ("Waiting for session index — N panes"), same anti-N-modal rule as `dead_session`.
 6. Multi-client single-flight is per `sessionRef`, not just per `createRequestId`. The first respawn winner binds `sessionRef → new terminalId` (registry + ledger); every other client's reconcile/create for the same `sessionRef` — regardless of `createRequestId` — receives `attach {terminalId}` to the winner.
-7. The sessionRef reservation is a liveness-bound LEASE: released on spawn complete (bind), spawn fail (error), or holder connection death; a wall-clock TTL (~2× spawn budget) backstops a hung holder. TTL expiry is KILL-BEFORE-RELEASE: kill the holder's in-flight spawn and confirm death before releasing; if the kill cannot be confirmed, the lease is NOT released (fail loud, hold closed).
+7. The sessionRef reservation is a liveness-bound LEASE: released on spawn complete (bind), spawn fail (error), or holder connection death; a wall-clock TTL (an explicit 20s backstop constant, env-tunable — NOT derived from any spawn budget; see Tasks 5/6) backstops a hung holder. TTL expiry is KILL-BEFORE-RELEASE: kill the holder's in-flight spawn (via the registry's PTY handle — group-kill discipline, never a raw single-pid SIGKILL) and confirm death before releasing; if the kill cannot be confirmed, the lease is NOT released (fail loud, hold closed). NOTE (refined mechanics): the DOMINANT hung-spawn case — stuck in `spawn_blocking` (`terminal.rs:1411-1415`) — is pid-less and resolves HOLD-CLOSED or via holder-connection-death release; the kill path covers only the spawn-returned→complete window.
 8. Losers get an `error` frame `{code: SESSION_RESERVED, retryAfterMs}`; the client retries via a bounded re-drive loop whose total window exceeds the lease TTL + margin. Exhaustion resolves AUTOMATICALLY against current state: binding exists → silently attach; winner failed → dead_session/fresh-recovery flow with a visible notice. Never a dead button, never a silent wedge, never a duplicate.
 9. A ≥2-live-PTYs-per-sessionRef backstop detector alarms (ERROR-level invariant log).
 10. `corrected: true` on any verdict is ALWAYS user-visible (a pane notice), never a silent identity switch. `duplicate` on an attach verdict is a non-destructive "duplicate detected and ignored" notice; the client is never switched off its live terminal (I6).
@@ -65,8 +65,9 @@ Every task's requirements implicitly include this section.
 - Modify: `crates/freshell-ws/src/reconcile.rs` — verdict derivation: `error` reasons, sessionRef-level attach, keep the `unsupported_kind` arm untouched.
 - Modify: `crates/freshell-ws/src/existence.rs` — `SessionExistence::ProviderUnavailable` variant.
 - Modify: `crates/freshell-server/src/existence.rs` — concrete probe returns `ProviderUnavailable` when a known provider's session root is missing.
-- Modify: `crates/freshell-ws/src/registry.rs` — sessionRef lease + binding map + duplicate-PTY detector.
-- Modify: `crates/freshell-ws/src/terminal.rs` — bounded warming deferral in `handle_pane_reconcile`; lease acquire/release in the create path; ledger `record_binding` at winner bind.
+- Modify: `crates/freshell-terminal/src/registry.rs` — sessionRef lease + binding map + duplicate-PTY detector (`TerminalRegistry` struct :409, impl :485; `keyed_create_inflight` field :452, init :502; `begin_keyed_create` :1599-1604, `end_keyed_create` :1608-1613; existing duplicate detector `warn_on_duplicate_live_ptys` :1618).
+  PLACEMENT NOTE: dep direction is freshell-ws → freshell-terminal → freshell-protocol. The lease/binding map/detector live in freshell-terminal (`SessionLocator` comes from freshell-protocol, which freshell-terminal already deps); anything needing `TerminalIdentityRegistry` (`crates/freshell-ws/src/identity.rs`) stays in freshell-ws.
+- Modify: `crates/freshell-ws/src/terminal.rs` — bounded warming deferral in `handle_pane_reconcile`; lease acquire/release in the create path; REGISTRY sessionRef→terminalId binding at winner bind (the ledger `record_binding` write already exists on the create path — `terminal.rs:1575-1603`).
 - Modify: `crates/freshell-ws/tests/pane_reconcile.rs` — updated retry-era tests + warming tests.
 - Create: `crates/freshell-ws/tests/session_ref_singleflight.rs` — D8 wire-level tests.
 
@@ -82,10 +83,11 @@ Every task's requirements implicitly include this section.
 - Create: `src/components/DeadSessionPanel.tsx` — the ONE batched adjudication panel.
 - Create: `src/components/ReconcileWarmingBanner.tsx` — the ONE warming banner (small; may be folded into App if <40 lines, implementer's call, but it must remain a single banner).
 
-**Tests (client/e2e):**
-- Create: `test/unit/lib/pane-reconcile.test.ts`, `test/unit/store/panesSlice.reconcile.test.ts`, `test/unit/lib/ws-client.reconcile.test.ts`, `test/unit/App.reconcile-adoption.test.tsx`, `test/unit/components/DeadSessionPanel.test.tsx`, `test/unit/components/TerminalView.session-reserved.test.tsx`.
+**Tests (client/e2e):** (client tests follow the live convention `test/unit/client/{lib,store,components}/`; existing suites live there too — e.g. `test/unit/client/store/panesSlice.test.ts`; `test/unit/lib/terminal-restore.test.ts` is the one legacy-bucket exception, correct as-is)
+- Create: `test/unit/client/lib/pane-reconcile.test.ts`, `test/unit/client/store/panesSlice.reconcile.test.ts`, `test/unit/client/lib/ws-client.reconcile.test.ts`, `test/unit/client/components/App.reconcile-adoption.test.tsx`, `test/unit/client/components/DeadSessionPanel.test.tsx`, `test/unit/client/components/TerminalView.session-reserved.test.tsx`.
 - Modify: `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` — flip the P1.7 pin (:1877-1880), update the double-restart guard (:2042).
 - Create: `test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts`.
+- Modify: `test/e2e-browser/playwright.config.ts` — register the new spec in `RUST_ONLY_SPECS` (:81+) AND the `rust-chromium` project's explicit `testMatch` (:183+).
 
 ---
 
@@ -117,7 +119,7 @@ Expected: all green (2dfbba58 is a merged main state).
 - [ ] **Step 3: Focused client baseline (cheap sanity, not the coordinated suite)**
 
 ```bash
-npm run test:vitest -- run test/unit/lib/terminal-restore.test.ts test/unit/store/panesSlice.test.ts
+npm run test:vitest -- run test/unit/lib/terminal-restore.test.ts test/unit/client/store/panesSlice.test.ts
 ```
 Expected: PASS. (The full coordinated suite runs in Task 15; the workspace stage already verified base green.)
 
@@ -222,14 +224,26 @@ let warming = |vs: &[PaneVerdict]| vs.iter().any(|v|
     matches!(v.verdict, ReconcileVerdict::Error)
         && v.reason.as_deref() == Some("index_warming"));
 if warming(&verdicts) {
-    // SINGLE deferral: release any locks held for derivation, wait the
-    // budget once, re-derive once. Never loop.
-    tokio::time::sleep(Duration::from_millis(state.reconcile_deferral_budget_ms)).await;
+    // SINGLE deferral: release any locks held for derivation, wait ONCE
+    // bounded by the budget, re-derive once. Never loop.
+    //
+    // PREFERRED shape: AWAIT the in-flight index sweep completion, bounded
+    // by the budget (e.g. tokio::time::timeout(budget, index.sweep_complete())
+    // or whatever completion signal the SessionIndex API exposes) — a single
+    // bounded await, NOT a blind fixed sleep. Inspect the SessionIndex API
+    // first; if no sweep-completion signal is observable, fall back to:
+    //     tokio::time::sleep(Duration::from_millis(state.reconcile_deferral_budget_ms)).await;
+    // The budget knob default stays 2000ms (council-pinned single deferral).
+    defer_bounded(&state).await;
     verdicts = derive_verdicts(&rebuild_deps(&state), &request.panes);
 }
 // send pane.reconcile.result as before
 ```
-IMPORTANT: `derive_verdicts` is a pure read over `ReconcileDeps { registry, identity, existence }` — make sure no registry/identity lock is held across the `sleep` (rebuild the deps after the await; the existing call site shows how they are built).
+IMPORTANT: `derive_verdicts` is a pure read over `ReconcileDeps { registry, identity, existence }` — make sure no registry/identity lock is held across the await (rebuild the deps after the await; the existing call site shows how they are built).
+
+HONEST EXPECTATION (evidence: truly-cold index scan is minutes — `directory_index.rs:574,1073`; typical warm restart ≈2.0–3.5s, dominated by the opencode sqlite marker query at 1.16–2.66s every boot): the 2s single deferral will often NOT be enough. The warming banner is EXPECTED on cold boots (not exceptional), and the manual Retry affordance (Task 13) is the recovery path. opencode cache persistence is an out-of-scope follow-up.
+
+STALL SCOPE (verified, with caveat): the inline deferral stalls only THIS connection's `tokio::select!` loop (inbound + fan-out + ping arm). Keepalive interval is 30s, so nothing false-kills; `conn_rx` is unbounded, so the stall is delay-only. CAUTION: the bounded output queue can evict frames under heavy output during the stall (`backpressure.rs:30-33`) — acceptable because reconcile precedes attaches post-restart, but keep the stall bounded (never exceed the budget).
 
 - [ ] **Step 4: Run the full crate test suite**
 
@@ -322,12 +336,15 @@ git commit -m "feat(ws): provider_unavailable existence state yields immediate h
 ### Task 4: Server — sessionRef-level attach in verdict derivation + duplicate-PTY backstop detector
 
 **Files:**
-- Modify: `crates/freshell-ws/src/registry.rs`
+- Modify: `crates/freshell-terminal/src/registry.rs` (`TerminalRegistry` struct :409, impl :485; existing duplicate detector `warn_on_duplicate_live_ptys` :1618 — extend/mirror its pattern)
 - Modify: `crates/freshell-ws/src/reconcile.rs`
-- Test: `crates/freshell-ws/tests/pane_reconcile.rs` and `registry.rs` `#[cfg(test)]`
+- Possibly modify: `crates/freshell-ws/src/identity.rs` (if the lookup goes through the identity registry — see Step 3)
+- Test: `crates/freshell-ws/tests/pane_reconcile.rs` and `crates/freshell-terminal/src/registry.rs` `#[cfg(test)]`
+
+PLACEMENT NOTE: dep direction is freshell-ws → freshell-terminal → freshell-protocol. Registry-side code lives in freshell-terminal (`SessionLocator` comes from freshell-protocol, which freshell-terminal already deps); anything needing `TerminalIdentityRegistry` (`crates/freshell-ws/src/identity.rs`) stays in freshell-ws.
 
 **Interfaces:**
-- Consumes: the identity registry (`ReconcileDeps.identity`) mapping live terminals ↔ `SessionLocator` (stamping landed in commit 80772ff2 — locate the live lookup with `rg -n "SessionLocator" crates/freshell-ws/src/identity.rs crates/freshell-ws/src/registry.rs`).
+- Consumes: the identity registry (`ReconcileDeps.identity`) mapping live terminals ↔ `SessionLocator` (stamping landed in commit 80772ff2 — locate the live lookup with `rg -n "SessionLocator" crates/freshell-ws/src/identity.rs crates/freshell-terminal/src/registry.rs`). VALIDATOR-CORRECTED FACT: registry rows do NOT carry a `session_ref` field usable here — `inventory()` hardcodes `session_ref: None` (`registry.rs:269`; the :834/:889 mentions are attach params). Row identity = `mode` + `resume_session_id: Option<String>`.
 - Produces: `TerminalRegistry::live_terminal_for_session_ref(&SessionLocator) -> Option<String>`; `derive_verdicts` returns `attach{terminalId}` for a pane claiming a `sessionRef` that a live terminal already carries, regardless of `createRequestId`; `TerminalRegistry::alarm_if_duplicate_session_ref(&SessionLocator)` ERROR-logs when ≥2 live PTYs carry one sessionRef. Task 5/6 use both.
 
 - [ ] **Step 1: Write the failing tests**
@@ -352,22 +369,29 @@ async fn different_create_request_id_same_session_ref_gets_attach_to_winner() {
 }
 ```
 
-And a registry unit test: seed two live terminals stamped with the same sessionRef → `alarm_if_duplicate_session_ref` returns `true` (and, by inspection, emits `tracing::error!` with target `"invariant"` and message containing `duplicate_pty_for_session_ref`); with one live terminal → `false`.
+And a registry unit test (in `crates/freshell-terminal/src/registry.rs` `#[cfg(test)]`): seed two live terminals stamped with the same sessionRef → `alarm_if_duplicate_session_ref` returns `true` (and, by inspection, emits `tracing::error!` with target `"invariant"` and message containing `duplicate_pty_for_session_ref`); with one live terminal → `false`. Mirror the pattern of the existing duplicate detector `warn_on_duplicate_live_ptys` (`registry.rs:1618`) — extend it rather than duplicating its scan if it already counts per resume_session_id.
 
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
 cargo test -p freshell-ws --test pane_reconcile different_create_request_id
-cargo test -p freshell-ws duplicate_session_ref
+cargo test -p freshell-terminal duplicate_session_ref
 ```
 Expected: FAIL (today derivation keys on `createRequestId` only — `newest_live_by_create_request_id`).
 
 - [ ] **Step 3: Implement**
-  - `registry.rs`:
+  - `crates/freshell-terminal/src/registry.rs`:
 
 ```rust
-/// Live terminal currently identity-stamped with this sessionRef, if any.
-pub fn live_terminal_for_session_ref(&self, locator: &SessionLocator) -> Option<String> { /* scan live rows joined with identity */ }
+/// Live terminal currently carrying this sessionRef, if any.
+/// LOOKUP DESIGN (validator-corrected): registry rows have NO usable
+/// session_ref field (inventory() hardcodes session_ref: None, :269).
+/// Either join over registry rows on
+///   (mode == locator.provider && resume_session_id == Some(locator.session_id) && status Running),
+/// or (in freshell-ws/src/identity.rs) add a LIVE-ONLY variant of
+/// `find_by_session_including_retired` (only the retired-inclusive variant
+/// exists today) and route the lookup through ReconcileDeps.identity.
+pub fn live_terminal_for_session_ref(&self, locator: &SessionLocator) -> Option<String> { /* join per above */ }
 
 /// D8 backstop: >=2 live PTYs carrying one sessionRef is the two-writers
 /// corruption shape. Alarm loudly; never kill silently.
@@ -382,13 +406,13 @@ pub fn alarm_if_duplicate_session_ref(&self, locator: &SessionLocator) -> bool {
     false
 }
 ```
-Where identity lives (registry rows vs the separate identity registry) — follow how `derive_verdicts`' existing rows resolve identity today (`ReconcileDeps.identity`); put the lookup where the data actually is and expose it through whichever of the two structs `ReconcileDeps` already carries.
+Where identity lives (registry rows vs the separate identity registry) — follow how `derive_verdicts`' existing rows resolve identity today (`ReconcileDeps.identity`); put the lookup where the data actually is and expose it through whichever of the two structs `ReconcileDeps` already carries. Remember the crate boundary: the row-join variant lives on `TerminalRegistry` in freshell-terminal; an identity-registry variant lives in `crates/freshell-ws/src/identity.rs` (freshell-terminal cannot depend on freshell-ws).
   - `reconcile.rs`: in the per-pane derivation for `kind: terminal`, BEFORE the existing `createRequestId`-keyed resolution: if the pane claims a `sessionRef` and `live_terminal_for_session_ref` returns `Some(tid)` → verdict `attach{terminalId: tid, sessionRef: <server's ref>}`, with `corrected: true` iff the client's claimed `sessionRef`/`terminalId` disagreed with the server's truth (follow the existing corrected-computation pattern used by the current attach arm). Do NOT touch the `unsupported_kind` arm at :169.
 
 - [ ] **Step 4: Run tests**
 
 ```bash
-cargo test -p freshell-ws
+cargo test -p freshell-terminal && cargo test -p freshell-ws
 ```
 Expected: PASS (all existing decision-table tests still green — the new branch only fires when a live terminal carries the claimed ref, which previously produced `attach` via the createRequestId path or a wrong `respawn`; if any existing test asserted `respawn` in that situation, that test was pinning D8 itself — update it and say so in the commit).
 
@@ -405,22 +429,33 @@ git commit -m "feat(ws): sessionRef-level attach in verdict derivation + duplica
 ### Task 5: Server — sessionRef liveness-bound lease in the registry
 
 **Files:**
-- Modify: `crates/freshell-ws/src/registry.rs`
-- Test: `crates/freshell-ws/src/registry.rs` `#[cfg(test)]` (unit level; wire level is Task 6)
+- Modify: `crates/freshell-terminal/src/registry.rs` (`TerminalRegistry` struct :409, impl :485)
+- Test: `crates/freshell-terminal/src/registry.rs` `#[cfg(test)]` (unit level; wire level is Task 6)
+
+PLACEMENT NOTE: the lease lives in freshell-terminal (dep direction ws → terminal → protocol; `SessionLocator` comes from freshell-protocol, which freshell-terminal already deps). Anything needing `TerminalIdentityRegistry` (`crates/freshell-ws/src/identity.rs`) stays in freshell-ws.
 
 **Interfaces:**
-- Consumes: `TerminalRegistry` internals (existing `keyed_create_inflight` pattern at `registry.rs:1599-1608` is the shape to mirror), `SessionLocator`.
+- Consumes: `TerminalRegistry` internals (existing `keyed_create_inflight` pattern is the shape to mirror — field `registry.rs:452`, init :502, `begin_keyed_create` :1599-1604, `end_keyed_create` :1608-1613), `SessionLocator`.
 - Produces (exact API Task 6 calls):
 
 ```rust
-pub const SESSION_REF_LEASE_TTL_MS: u64 = 20_000; // ~2x the 10s spawn budget
+/// Explicit wall-clock backstop for a hung holder. NOT derived from any
+/// "spawn budget" — the 10s constant at create_limit.rs:49 (spawn_timeout_ms,
+/// env FRESHELL_SPAWN_GATE_TIMEOUT_MS) bounds the spawn-GATE PERMIT wait,
+/// not spawn duration; spawns run unbounded in spawn_blocking. Task 6 makes
+/// this env-tunable and adds spawn-duration instrumentation to tune it on
+/// evidence.
+pub const SESSION_REF_LEASE_TTL_MS: u64 = 20_000;
 pub const SESSION_RESERVED_RETRY_AFTER_MS: u64 = 1_000;
 
 pub enum SessionRefClaim {
     Acquired,
     Held { retry_after_ms: u64 },
-    /// TTL expired on a holder with a recorded child: caller must kill pid,
-    /// CONFIRM death, then call force_release_after_confirmed_kill and re-claim.
+    /// TTL expired on a holder with a recorded child: caller must kill the
+    /// holder's spawn via the REGISTRY handle (group-kill discipline,
+    /// pty.rs:352-386 — never a raw single-pid SIGKILL), CONFIRM death, then
+    /// call force_release_after_confirmed_kill and re-claim. The pid is for
+    /// ESRCH-confirmation, not for raw kill().
     ExpiredNeedsKill { pid: u32 },
     BoundElsewhere { terminal_id: String },
 }
@@ -511,12 +546,14 @@ fn hung_holder_without_pid_is_revoked_and_held_closed() {
     assert!(!reg.complete_session_ref_claim(&s, "cr-A", "term-late"));
 }
 ```
-(`test_registry()`/`locator()` helpers: copy the construction pattern from the existing registry tests — `rg -n "fn test" crates/freshell-ws/src/registry.rs`.)
+(`test_registry()`/`locator()` helpers: copy the construction pattern from the existing registry tests — `rg -n "fn test" crates/freshell-terminal/src/registry.rs`.)
+
+KILL-MECHANICS NOTE (verified with load-bearing caveats, applies here and in Task 6): TTL-expiry kills go through the REGISTRY's PTY handle (group-kill discipline, `pty.rs:352-386`), never a raw single-pid SIGKILL. ESRCH polling is a viable confirmation because a dedicated waiter thread reaps children promptly (`pty.rs:260-269`). The DOMINANT hung-spawn case — stuck in `spawn_blocking` (`terminal.rs:1411-1415`) — is pid-less and resolves HOLD-CLOSED (fail loud) or via holder-connection-death release; the kill path covers only the spawn-returned→complete window. (Wire-level D8 spawns are Task 6; its test recipe uses the claude sleeper-spec harness.)
 
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
-cargo test -p freshell-ws claim_session_ref -- --nocapture || cargo test -p freshell-ws session_ref
+cargo test -p freshell-terminal claim_session_ref -- --nocapture || cargo test -p freshell-terminal session_ref
 ```
 Expected: FAIL — compile errors (API absent).
 
@@ -525,7 +562,7 @@ Expected: FAIL — compile errors (API absent).
 - [ ] **Step 4: Run tests**
 
 ```bash
-cargo test -p freshell-ws
+cargo test -p freshell-terminal && cargo test -p freshell-ws
 ```
 Expected: PASS.
 
@@ -534,35 +571,40 @@ Expected: PASS.
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 git add -A crates/
-git commit -m "feat(ws): sessionRef liveness-bound lease with TTL kill-before-release semantics"
+git commit -m "feat(terminal): sessionRef liveness-bound lease with TTL kill-before-release semantics"
 ```
 
 ---
 
-### Task 6: Server — create-path lease integration, `SESSION_RESERVED` error, ledger write at winner bind
+### Task 6: Server — create-path lease integration, `SESSION_RESERVED` error, registry binding at winner bind
 
 **Files:**
 - Modify: `crates/freshell-protocol/src/` (add `SESSION_RESERVED` error code + additive `retryAfterMs: Option<u64>` on `ErrorMsg`, `skip_serializing_if = "Option::is_none"`)
 - Modify: `crates/freshell-ws/src/terminal.rs` (create path around the `KeyedCreateGuard` at :907 and adopt loop :937-976; connection-close cleanup site)
+- Modify: `crates/freshell-terminal/src/registry.rs` (make `SESSION_REF_LEASE_TTL_MS` env-tunable — Step 3 item 7)
 - Test: Create `crates/freshell-ws/tests/session_ref_singleflight.rs`
 
 **Interfaces:**
-- Consumes: Task 5 lease API; `KeyedCreateGuard` (`terminal.rs:907`); pane-ledger write API from wave A — `record_binding(&BindingWrite) -> io::Result<()>` with `BindingWrite { provider, session_id, terminal_id, mode, cwd, create_request_id, now_ms }` (locate the handle the inventory-stamping read path already uses: `rg -n "record_binding\|pane_ledger\|lookup_by_session" crates/`).
-- Produces: on a `paneReconcileV1`-negotiated connection, a `terminal.create` carrying a resume `sessionRef` runs the lease discipline; losers receive `error{code: SESSION_RESERVED, requestId: <createRequestId>, retryAfterMs: 1000}`; the winner's successful spawn binds sessionRef→terminalId in registry AND ledger. Non-negotiated (frozen legacy) connections are byte-for-byte unchanged.
+- Consumes: Task 5 lease API (from `crates/freshell-terminal/src/registry.rs`); `KeyedCreateGuard` (`terminal.rs:907`). VALIDATOR-CORRECTED FACT: the pane-ledger write is NOT new work — the create path ALREADY calls `ledger.record_binding` for EVERY resume/restore create, awaited before `terminal.created` (`crates/freshell-ws/src/terminal.rs:1575-1603`). This task does NOT add a ledger write.
+- Produces: on a `paneReconcileV1`-negotiated connection, a `terminal.create` carrying a resume `sessionRef` runs the lease discipline; losers receive `error{code: SESSION_RESERVED, requestId: <createRequestId>, retryAfterMs: 1000}`; the winner's successful spawn binds sessionRef→terminalId in the REGISTRY binding map (the ledger write already happens on the create path — pre-existing behavior, not this task's). Also: `SESSION_REF_LEASE_TTL_MS` made env-tunable alongside the gate timeout, plus spawn-duration instrumentation (log elapsed spawn time at winner bind) so the TTL constant can be tuned on evidence. Non-negotiated (frozen legacy) connections are byte-for-byte unchanged.
 
-- [ ] **Step 1: Write the failing wire-level tests** in the new `tests/session_ref_singleflight.rs` (copy the helper mod from `tests/pane_reconcile.rs`):
+- [ ] **Step 1: Write the failing wire-level tests** in the new `tests/session_ref_singleflight.rs` (copy the helper mod from `tests/pane_reconcile.rs`).
+
+TEST RECIPE (verified viable, V7): `mod common;` + `spawn_server_with_specs(vec![sleeper_cli_spec("claude")])` (`tests/common/mod.rs:45-91`) spawns real resume-create→live-PTY round trips; existing precedent `claude_restore_with_session_ref_resumes` (`tests/claude_restore_unavailable.rs:79`, verified passing). REQUIREMENTS: (a) shared sessionIds in these D8 tests MUST be canonical-UUID-shaped — the restore gate rejects non-UUID with `RESTORE_UNAVAILABLE` before spawn; (b) prefer the claude sleeper-spec path over codex `CODEX_CMD` env mutation (process-global env races in concurrent tests); (c) count live PTYs per sessionRef via `registry.identity_probe_rows()` (`crates/freshell-terminal/src/registry.rs:1322`), counting Running rows with the `resume_session_id`.
 
 ```rust
 /// two-clients-same-sessionRef (council red test): two negotiated
 /// connections, DIFFERENT createRequestIds, same sessionRef resume ->
 /// exactly one PTY; the loser is reserved then attaches to the winner.
+/// SessionIds are UUID-shaped (restore gate rejects non-UUID pre-spawn).
 #[tokio::test]
 async fn two_clients_same_session_ref_yield_exactly_one_pty() {
-    let server = spawn_server_default().await;
+    const SESS_DUP: &str = "11111111-1111-4111-8111-111111111111";
+    let server = spawn_server_with_specs(vec![sleeper_cli_spec("claude")]).await;
     let mut a = connect(&server.url, true).await;
     let mut b = connect(&server.url, true).await;
-    a.send_json(terminal_create_resume("cr-A", "claude", "sess-dup")).await;
-    b.send_json(terminal_create_resume("cr-B", "claude", "sess-dup")).await;
+    a.send_json(terminal_create_resume("cr-A", "claude", SESS_DUP)).await;
+    b.send_json(terminal_create_resume("cr-B", "claude", SESS_DUP)).await;
     // One connection gets terminal.created (spawn); collect both outcomes.
     let (created, other) = race_created_and_error(&mut a, &mut b).await;
     let tid = created["terminalId"].as_str().unwrap().to_string();
@@ -576,33 +618,43 @@ async fn two_clients_same_session_ref_yield_exactly_one_pty() {
     } else {
         assert_eq!(other["terminalId"], tid);
     }
-    assert_eq!(server.live_pty_count_for_session("claude", "sess-dup").await, 1);
+    assert_eq!(server.live_pty_count_for_session("claude", SESS_DUP).await, 1);
 }
 
 /// Legacy connections (no capability) never see SESSION_RESERVED — the
 /// frozen-client create path is byte-for-byte unchanged.
 #[tokio::test]
 async fn legacy_connection_create_path_unchanged() {
-    let server = spawn_server_default().await;
+    const SESS_LEGACY: &str = "22222222-2222-4222-8222-222222222222";
+    let server = spawn_server_with_specs(vec![sleeper_cli_spec("claude")]).await;
     let mut legacy = connect(&server.url, false).await;
-    legacy.send_json(terminal_create_resume("cr-L", "claude", "sess-legacy")).await;
+    legacy.send_json(terminal_create_resume("cr-L", "claude", SESS_LEGACY)).await;
     let created = next_frame_of_type(&mut legacy, "terminal.created").await;
     assert!(created["terminalId"].is_string());
 }
 
-/// Winner bind writes the ledger: after the winner's terminal.created,
-/// lookup_by_session resolves sessionRef -> that terminalId.
+/// Winner bind populates the REGISTRY binding map: after the winner's
+/// terminal.created, a second client's claim for the same sessionRef gets
+/// BoundElsewhere/attach to that terminalId. This is the NEW behavior this
+/// task adds (RED first). The pane-ledger write is PRE-EXISTING create-path
+/// behavior (terminal.rs:1575-1603) — optionally pin it below as an
+/// existing-behavior assertion, but it is NOT part of the red test.
 #[tokio::test]
-async fn winner_bind_writes_ledger_binding() {
-    let server = spawn_server_default().await;
+async fn winner_bind_populates_registry_binding() {
+    const SESS_LED: &str = "33333333-3333-4333-8333-333333333333";
+    let server = spawn_server_with_specs(vec![sleeper_cli_spec("claude")]).await;
     let mut a = connect(&server.url, true).await;
-    a.send_json(terminal_create_resume("cr-A", "claude", "sess-led")).await;
+    a.send_json(terminal_create_resume("cr-A", "claude", SESS_LED)).await;
     let created = next_frame_of_type(&mut a, "terminal.created").await;
-    let resolved = server.ledger_lookup("claude", "sess-led").await;
-    assert_eq!(resolved.as_deref(), Some(created["terminalId"].as_str().unwrap()));
+    let tid = created["terminalId"].as_str().unwrap();
+    // NEW behavior (red): the registry binding map answers for this sessionRef.
+    assert_eq!(server.registry_binding_for("claude", SESS_LED).await.as_deref(), Some(tid));
+    // Existing behavior pin (should already pass — NOT the red assertion):
+    // let resolved = server.ledger_lookup("claude", SESS_LED).await;
+    // assert_eq!(resolved.as_deref(), Some(tid));
 }
 ```
-Helper notes: `terminal_create_resume` builds the same `terminal.create` JSON the client sends for resume (copy field names from an existing create-with-resume test or `shared/ws-protocol.ts` `TerminalCreateSchema:301` — it is `.strict()`, so it IS the wire truth). `live_pty_count_for_session` / `ledger_lookup` are small test accessors — expose them via the existing test-server handle pattern (the harness owns the state). Headless mode (`headless()`) keeps spawns cheap.
+Helper notes: `terminal_create_resume` builds the same `terminal.create` JSON the client sends for resume (copy field names from an existing create-with-resume test or `shared/ws-protocol.ts` `TerminalCreateSchema:301` — it is `.strict()`, so it IS the wire truth). `live_pty_count_for_session` counts Running rows carrying the `resume_session_id` via `registry.identity_probe_rows()` (`crates/freshell-terminal/src/registry.rs:1322`); `registry_binding_for` (and the optional `ledger_lookup`) are small test accessors — expose them via the existing test-server handle pattern (the harness owns the state). The `sleeper_cli_spec("claude")` harness keeps spawns cheap and real.
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -617,19 +669,11 @@ Expected: FAIL — today both creates spawn (two PTYs), no SESSION_RESERVED code
     1. If the create carries a resume `sessionRef` (provider + sessionId resolvable from the create body): `claim_session_ref(...)` with the connection's id and `now_ms`.
     2. `BoundElsewhere{terminal_id}` → emit `terminal.created` for that existing terminal (mirror the adopt loop's emission — attach to the winner, spawn nothing).
     3. `Held{retry_after_ms}` → send `error{SESSION_RESERVED, requestId: create.request_id, retryAfterMs}`; do not spawn; do not charge the rate limiter (adopt precedent: `create_protection.rs:250`).
-    4. `ExpiredNeedsKill{pid}` → kill the pid (SIGKILL), confirm death by polling `kill(pid, 0)` for ESRCH up to 500ms; confirmed → `force_release_after_confirmed_kill` then re-claim and proceed; NOT confirmed → treat as `Held` + `tracing::error!` (hold closed).
-    5. `Acquired` → proceed to spawn; immediately after the PTY child exists call `set_session_ref_lease_pid`; on success call `complete_session_ref_claim` — if it returns `false` (revoked), kill the just-spawned child, confirm, and answer the create with a plain error (fail loud); on spawn failure call `fail_session_ref_claim`.
-    6. On `complete_session_ref_claim == true`, write the ledger binding (best-effort, NEVER blocks the create):
-
-```rust
-if let Err(e) = ledger.record_binding(&BindingWrite {
-    provider, session_id, terminal_id, mode, cwd, create_request_id, now_ms,
-}) {
-    tracing::error!(target: "invariant", error = %e,
-        "pane-ledger record_binding failed at respawn-winner bind");
-}
-```
-  - Connection-close cleanup (find where the ws connection teardown already releases per-conn resources): call `release_session_ref_leases_for_conn(conn)`; for returned pid-carrying entries, kill + confirm + `force_release_after_confirmed_kill` (same discipline as step 4).
+    4. `ExpiredNeedsKill{pid}` → kill the holder's spawn via the REGISTRY handle (group-kill discipline, `pty.rs:352-386` — NEVER a raw single-pid SIGKILL), confirm death by polling `kill(pid, 0)` for ESRCH up to 500ms (viable: a dedicated waiter thread reaps promptly, `pty.rs:260-269`); confirmed → `force_release_after_confirmed_kill` then re-claim and proceed; NOT confirmed → treat as `Held` + `tracing::error!` (hold closed). NOTE: the DOMINANT hung-spawn case — stuck in `spawn_blocking` (`terminal.rs:1411-1415`) — is pid-less and resolves HOLD-CLOSED (fail loud) or via holder-connection-death release; this kill path covers only the spawn-returned→complete window.
+    5. `Acquired` → proceed to spawn; immediately after the PTY child exists call `set_session_ref_lease_pid`; on success call `complete_session_ref_claim` — if it returns `false` (revoked), kill the just-spawned child via the registry handle, confirm, and answer the create with a plain error (fail loud); on spawn failure call `fail_session_ref_claim`.
+    6. On `complete_session_ref_claim == true`, the REGISTRY sessionRef→terminalId binding is recorded (inside `complete_session_ref_claim`, Task 5). Do NOT add a ledger write here — the create path ALREADY calls `ledger.record_binding` for every resume/restore create, awaited before `terminal.created` (`terminal.rs:1575-1603`). At winner bind, log the elapsed spawn duration (`tracing::info!` with the ms since claim) — this is the instrumentation that lets `SESSION_REF_LEASE_TTL_MS` be tuned on evidence.
+    7. Make `SESSION_REF_LEASE_TTL_MS` env-tunable (e.g. `FRESHELL_SESSION_REF_LEASE_TTL_MS`) alongside the spawn-gate timeout (`FRESHELL_SPAWN_GATE_TIMEOUT_MS`, `create_limit.rs:49`), constants co-located so the client's 30s re-drive window derivation (Task 12: window > TTL + margin) stays visible.
+  - Connection-close cleanup (find where the ws connection teardown already releases per-conn resources): call `release_session_ref_leases_for_conn(conn)`; for returned pid-carrying entries, kill via the registry handle + confirm + `force_release_after_confirmed_kill` (same discipline as step 4).
 
 - [ ] **Step 4: Run tests**
 
@@ -643,7 +687,7 @@ Expected: PASS including `create_protection.rs` and `pane_reconcile.rs` suites.
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings
 git add -A crates/
-git commit -m "feat(ws): per-sessionRef single-flight on the create path with SESSION_RESERVED + ledger bind (closes D8 server-side)"
+git commit -m "feat(ws): per-sessionRef single-flight on the create path with SESSION_RESERVED + registry bind (closes D8 server-side)"
 ```
 
 ---
@@ -663,7 +707,7 @@ git commit -m "feat(ws): per-sessionRef single-flight on the create path with SE
   - `PaneVerdictSchema` with `verdict: z.enum(['attach','respawn','fresh','dead_session','invalid','error'])`, `PaneReconcileResultSchema`, types `PaneVerdict`, `PaneReconcileResultMessage` (+ in the `ServerMessage` union),
   - `ReadyCapabilitiesSchema = z.object({ paneReconcileV1: z.literal(true).optional() }).optional()` merged into the ready message type,
   - error-frame type gains optional `retryAfterMs?: number` and the `SESSION_RESERVED` code string.
-  - `TerminalPaneContent` gains: `reconcileNotice?: string` and `pendingReconcile?: 'respawn' | 'fresh'`.
+  - `TerminalPaneContent` gains: `reconcileNotice?: string`, `pendingReconcile?: 'respawn' | 'fresh'`, and `reconcileEpoch?: number` (volatile fold counter — VALIDATOR-CORRECTED FACT: same-`createRequestId` folds do NOT re-fire TerminalView's create-or-attach effect, whose deps key on `terminalContent?.createRequestId` only (`TerminalView.tsx:4486`; ":4471 terminalId intentionally NOT in dependencies"); legacy recovery works only because `clearTerminalContentForRecreate` mints a NEW id (`panesSlice.ts:551,556`). Reconcile folds must NOT re-mint (council rule 2), so they bump `reconcileEpoch` instead and Task 12 adds it to the effect dependency array).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -714,20 +758,22 @@ npm run test:vitest -- run test/unit/shared/ws-protocol.reconcile.test.ts
 ```
 Expected: FAIL — exports don't exist.
 
-- [ ] **Step 3: Implement** the schemas per the Produces block (follow the file's existing style; the request schema mirrors the Rust wire exactly — field names camelCase, `panes: z.array(ReconcilePaneSchema).max(200)`). Add the two `TerminalPaneContent` fields with doc comments:
+- [ ] **Step 3: Implement** the schemas per the Produces block (follow the file's existing style; the request schema mirrors the Rust wire exactly — field names camelCase, `panes: z.array(ReconcilePaneSchema).max(200)`). Add the three `TerminalPaneContent` fields with doc comments:
 
 ```ts
 /** One-shot user-visible reconcile notice (corrected identity, fresh-by-reason, duplicate ignored). Rendered then cleared by TerminalView. */
 reconcileNotice?: string
 /** Set by verdict folding; consumed by TerminalView when it sends terminal.create. 'respawn' = create-with-resume from sessionRef; 'fresh' = clean create. */
 pendingReconcile?: 'respawn' | 'fresh'
+/** VOLATILE fold counter. Incremented by applyReconcileAttach / resetPaneForReconcileCreate so a fold on an already-mounted pane (same createRequestId — never re-minted) re-fires TerminalView's create-or-attach effect (Task 12 adds it to the dep array). Stripped from persistence (Task 8). */
+reconcileEpoch?: number
 ```
-Check `normalizePaneContent` (`panesSlice.ts:61`) — if it whitelists fields, add both.
+Check `normalizePaneContent` (`panesSlice.ts:61`) — if it whitelists fields, add all three.
 
 - [ ] **Step 4: Run tests**
 
 ```bash
-npm run test:vitest -- run test/unit/shared/ws-protocol.reconcile.test.ts test/unit/store/panesSlice.test.ts
+npm run test:vitest -- run test/unit/shared/ws-protocol.reconcile.test.ts test/unit/client/store/panesSlice.test.ts
 ```
 Expected: PASS.
 
@@ -744,7 +790,8 @@ git commit -m "feat(protocol): pane.reconcile client schemas, ready capabilities
 
 **Files:**
 - Modify: `src/store/panesSlice.ts`
-- Test: Create `test/unit/store/panesSlice.reconcile.test.ts`
+- Modify: `src/store/persistMiddleware.ts` (volatile-field stripping)
+- Test: Create `test/unit/client/store/panesSlice.reconcile.test.ts`
 
 **Interfaces:**
 - Consumes: `TerminalPaneContent` fields from Task 7; existing helpers in `panesSlice.ts` for locating a pane's content by `(tabId, paneId)` (see how `clearTerminalContentForRecreate` :544-568 walks the layout — reuse its lookup, NOT its body).
@@ -755,8 +802,11 @@ git commit -m "feat(protocol): pane.reconcile client schemas, ready capabilities
   - `setDeadSessionAdjudication(entries: DeadSessionEntry[])` / `resolveDeadSessionEntry({tabId, paneId})` / `clearDeadSessionAdjudication()` — non-persisted state field `deadSessionAdjudication: DeadSessionEntry[]` where `DeadSessionEntry = {tabId, paneId, title: string, mode: string, sessionRef?: {provider, sessionId}, reason?: string}`
   - `setReconcileWarming({count, paneRefs: {tabId, paneId}[]})` / `clearReconcileWarming()` — non-persisted field `reconcileWarming: {count: number, paneRefs: {tabId: string, paneId: string}[]} | null`
 - CRITICAL: none of these reducers may mint a `createRequestId`. `resetPaneForReconcileCreate` PRESERVES the existing `createRequestId` (this is the load-bearing difference from `clearTerminalContentForRecreate`, which mints — D4).
+- CRITICAL (A1 fix): `applyReconcileAttach` and `resetPaneForReconcileCreate` each INCREMENT the pane's volatile `reconcileEpoch` (`(content.reconcileEpoch ?? 0) + 1`). Same-`createRequestId` folds do NOT re-fire TerminalView's create-or-attach effect on their own (deps key on `createRequestId` only, `TerminalView.tsx:4486`); the epoch bump is what makes the fold observable — Task 12 adds it to the effect dep array. `createRequestId` is still never re-minted (council rule 2 intact).
+- Persistence (A19 decision): `pendingReconcile`, `reconcileNotice`, and `reconcileEpoch` are VOLATILE — strip all three in the persistence path (`stripTabVolatileFields`, `persistMiddleware.ts:75`) alongside the slice-level strips. AND clear `pendingReconcile` when `terminal.created` lands for the pane (belt and braces — stale respawn-intent must not survive a reload): extend the existing reducer that folds `terminal.created` into pane content (locate with `rg -n "terminal.created\|setTerminalId" src/store/panesSlice.ts`).
+- Invariant (respawn folds, shared with Task 12): a `respawn` fold must guarantee `sessionRef.provider === pane mode` — the server create path filters on it (`terminal.rs:1047`) and a mismatch spawns identity-less. `resetPaneForReconcileCreate({intent:'respawn'})` should assert/guard this (loud console.error + treat as fresh-with-notice rather than silently mismatching).
 
-- [ ] **Step 1: Write the failing tests** (copy store-construction boilerplate from `test/unit/store/panesSlice.test.ts`):
+- [ ] **Step 1: Write the failing tests** (copy store-construction boilerplate from `test/unit/client/store/panesSlice.test.ts`):
 
 ```ts
 describe('reconcile reducers', () => {
@@ -768,6 +818,15 @@ describe('reconcile reducers', () => {
     expect(c.status).toBe('running')
     expect(c.createRequestId).toBe('cr-keep')   // council rule: never re-minted
     expect(c.restoreError).toBeUndefined()
+    expect(c.reconcileEpoch).toBe(1)            // A1 fix: fold bumps the volatile epoch
+  })
+  it('every fold bumps reconcileEpoch monotonically (createRequestId untouched)', () => {
+    let s = stateWithTerminalPane({ createRequestId: 'cr-keep' })
+    s = panesReducer(s, applyReconcileAttach({ tabId: 'tab1', paneId: 'p1', terminalId: 't1' }))
+    s = panesReducer(s, resetPaneForReconcileCreate({ tabId: 'tab1', paneId: 'p1', intent: 'fresh' }))
+    const c = terminalContent(s, 'tab1', 'p1')
+    expect(c.reconcileEpoch).toBe(2)
+    expect(c.createRequestId).toBe('cr-keep')
   })
   it('applyReconcileAttach with corrected sets a visible notice', () => {
     const next = panesReducer(stateWithTerminalPane({}), applyReconcileAttach({ tabId: 'tab1', paneId: 'p1', terminalId: 't', corrected: true }))
@@ -807,7 +866,7 @@ describe('reconcile reducers', () => {
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
-npm run test:vitest -- run test/unit/store/panesSlice.reconcile.test.ts
+npm run test:vitest -- run test/unit/client/store/panesSlice.reconcile.test.ts
 ```
 Expected: FAIL — actions don't exist.
 
@@ -815,19 +874,19 @@ Expected: FAIL — actions don't exist.
   - corrected: `Session identity corrected by server — this pane now points at its live session.`
   - duplicate: `A duplicate terminal for this session was detected and ignored.`
   - fresh with reason: `` `Started fresh (${reason}).` ``
-  Ensure `deadSessionAdjudication` and `reconcileWarming` are stripped from persistence (check `persistMiddleware.ts:484`'s strip list — it already strips `restoreFallbackAttemptsByPane`; add these two the same way).
+  Ensure `deadSessionAdjudication` and `reconcileWarming` are stripped from persistence (check `persistMiddleware.ts:484`'s strip list — it already strips `restoreFallbackAttemptsByPane`; add these two the same way). ALSO strip the three per-pane volatile fields — `pendingReconcile`, `reconcileNotice`, `reconcileEpoch` — in `stripTabVolatileFields` (`persistMiddleware.ts:75`), AND clear `pendingReconcile` in the reducer that folds `terminal.created` into pane content (A19: stale respawn-intent must never survive a reload). Add tests for both (persist strip + clear-on-created).
 
 - [ ] **Step 4: Run tests**
 
 ```bash
-npm run test:vitest -- run test/unit/store/panesSlice.reconcile.test.ts test/unit/store/panesSlice.test.ts test/unit/store/createRequestIdStability.test.ts
+npm run test:vitest -- run test/unit/client/store/panesSlice.reconcile.test.ts test/unit/client/store/panesSlice.test.ts test/unit/client/store/createRequestIdStability.test.ts
 ```
 Expected: PASS (the stability suite proves we didn't regress P1.6).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/panesSlice.ts src/store/persistMiddleware.ts test/unit/store/panesSlice.reconcile.test.ts
+git add src/store/panesSlice.ts src/store/persistMiddleware.ts test/unit/client/store/panesSlice.reconcile.test.ts
 git commit -m "feat(store): reconcile verdict fold reducers - attach/reset without createRequestId re-mint, batched dead-session state"
 ```
 
@@ -837,7 +896,7 @@ git commit -m "feat(store): reconcile verdict fold reducers - attach/reset witho
 
 **Files:**
 - Create: `src/lib/pane-reconcile.ts`
-- Test: Create `test/unit/lib/pane-reconcile.test.ts`
+- Test: Create `test/unit/client/lib/pane-reconcile.test.ts`
 
 **Interfaces:**
 - Consumes: Task 7 schemas/types; Task 8 actions; the pane-tree walk — reuse/extract the logic of `collectTerminalPaneTargets` (`App.tsx:811`) rather than re-deriving it (either import it if exported, or move it into this module and re-export for App).
@@ -851,6 +910,7 @@ export function foldVerdicts(dispatch: AppDispatch, request: PaneReconcileReques
 export function paneKeyFor(tabId: string, paneId: string): string   // `${tabId}:${paneId}`
 ```
 - Rules: panes without a terminal content or without `createRequestId` are skipped; >200 panes → `console.error` breadcrumb + first 200 sent; `foldVerdicts` FIRST checks cardinality (`verdicts.length === request.panes.length` AND every `paneKey` matches 1:1) — on violation it dispatches NOTHING except the outcome flag (the caller falls back to the legacy census, Task 11); `paneKey` is parsed back via the request's own pane list (index paneKey→{tabId,paneId} from the request, never by string-splitting server input).
+- FOLD-OWNERSHIP RULE (pinned; applies to every consumer — Tasks 11/12/13): the correlation mechanism is the EXISTING `ws.onMessage` broadcast subscription (`src/lib/ws-client.ts:616-618`), already used by components to correlate self-initiated requests (e.g. `TerminalView.tsx:3044`) — NO new correlator module. Each requester (App boot reconcile, TerminalView exhaustion auto-resolve, warming-banner Retry) folds ONLY results whose `reconcileId` it minted, silently skipping foreign ones — this prevents double-folds.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -912,7 +972,7 @@ describe('foldVerdicts', () => {
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
-npm run test:vitest -- run test/unit/lib/pane-reconcile.test.ts
+npm run test:vitest -- run test/unit/client/lib/pane-reconcile.test.ts
 ```
 Expected: FAIL — module doesn't exist.
 
@@ -928,14 +988,14 @@ Expected: FAIL — module doesn't exist.
 - [ ] **Step 4: Run tests**
 
 ```bash
-npm run test:vitest -- run test/unit/lib/pane-reconcile.test.ts
+npm run test:vitest -- run test/unit/client/lib/pane-reconcile.test.ts
 ```
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/lib/pane-reconcile.ts test/unit/lib/pane-reconcile.test.ts src/store/panesSlice.ts
+git add src/lib/pane-reconcile.ts test/unit/client/lib/pane-reconcile.test.ts src/store/panesSlice.ts
 git commit -m "feat(client): pane-reconcile module - request builder, verdict folding, cardinality invariant"
 ```
 
@@ -945,11 +1005,13 @@ git commit -m "feat(client): pane-reconcile module - request builder, verdict fo
 
 **Files:**
 - Modify: `src/lib/ws-client.ts` (hello :343, ready handling in `handleIncomingMessage` :148, replay :195-205)
-- Test: Create `test/unit/lib/ws-client.reconcile.test.ts`
+- Modify: `shared/ws-protocol.ts` (`HelloSchema` capabilities object :267-279)
+- Test: Create `test/unit/client/lib/ws-client.reconcile.test.ts`
 
 **Interfaces:**
 - Consumes: `getWsClient()` (:643), `resetWsClientForTests()` (:652), `receiveMessageForTest` (:631) — the existing test seams.
 - Produces: hello carries `paneReconcileV1: true`; `getWsClient().getServerCapabilities(): {paneReconcileV1?: true}` (empty object until a ready with capabilities arrives; RESET on disconnect so a downgraded server is honored); when `paneReconcileV1` was acked on the CURRENT socket's ready, the blind `inFlightCreates` replay is skipped (verdicts, not resends, decide — `preReadyCreateQueue` flush is unchanged: those are new user-initiated creates).
+- REQUIRED (A20 corollary): the `paneReconcileV1` key must be EXPLICITLY added to `HelloSchema`'s `capabilities` object in `shared/ws-protocol.ts` (:267-279) — Zod's default (non-strict) objects silently STRIP unknown keys, so without the schema addition the capability would silently no-op. The legacy TS server then simply ignores the key (verified safe: `ws-handler.ts` `safeParse` is non-strict). `test/server/ws-handshake-snapshot.test.ts` does NOT pin the client hello shape (it constructs its own hello) — no update needed there.
 
 - [ ] **Step 1: Write the failing tests** (drive with `resetWsClientForTests` + `receiveMessageForTest`; mock the WebSocket the way existing ws-client tests do — `rg -l "resetWsClientForTests" test/` and copy the newest pattern):
 
@@ -980,11 +1042,12 @@ it('keeps the legacy replay when the server does not ack (old server)', () => {
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
-npm run test:vitest -- run test/unit/lib/ws-client.reconcile.test.ts
+npm run test:vitest -- run test/unit/client/lib/ws-client.reconcile.test.ts
 ```
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
+  - `shared/ws-protocol.ts` `HelloSchema` capabilities (:267-279): add `paneReconcileV1: z.literal(true).optional()` next to the existing `uiScreenshotV1`/`terminalOutputBatchV1` keys (REQUIRED — non-strict Zod strips unknown keys silently).
   - `:343`: `capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, paneReconcileV1: true },`
   - In the `ready` branch of `handleIncomingMessage`: `this.serverCapabilities = msg.capabilities ?? {}` BEFORE the replay block; clear it in the disconnect path (`onDisconnect`/`scheduleReconnect` entry).
   - Wrap the `inFlightCreates` replay (:195-205): `if (!this.serverCapabilities.paneReconcileV1) { /* existing replay */ }`.
@@ -993,14 +1056,14 @@ Expected: FAIL.
 - [ ] **Step 4: Run tests** (new + any existing ws-client/bootstrap suites)
 
 ```bash
-npm run test:vitest -- run test/unit/lib/ws-client.reconcile.test.ts test/unit/App.ws-bootstrap.test.tsx
+npm run test:vitest -- run test/unit/client/lib/ws-client.reconcile.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx
 ```
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/lib/ws-client.ts test/unit/lib/ws-client.reconcile.test.ts
+git add src/lib/ws-client.ts shared/ws-protocol.ts test/unit/client/lib/ws-client.reconcile.test.ts
 git commit -m "feat(client): advertise paneReconcileV1, surface ready capabilities, gate blind create replay"
 ```
 
@@ -1011,13 +1074,18 @@ git commit -m "feat(client): advertise paneReconcileV1, surface ready capabiliti
 **Files:**
 - Modify: `src/App.tsx` (ReadyMessageSchema :149; inventory census block :1018-1091)
 - Modify: `src/lib/terminal-restore.ts`
-- Test: Create `test/unit/App.reconcile-adoption.test.tsx`; Modify `test/unit/lib/terminal-restore.test.ts`
+- Test: Create `test/unit/client/components/App.reconcile-adoption.test.tsx`; Modify `test/unit/lib/terminal-restore.test.ts`
 
 **Interfaces:**
 - Consumes: Task 9 `buildReconcileRequest`/`foldVerdicts`, Task 10 capabilities, Task 8 actions.
-- Produces: on every `ready` whose `capabilities.paneReconcileV1 === true`: `setPaneReconcileActive(true)` + build & send `pane.reconcile.request` + register the one-shot result fold (matched on `reconcileId`); the destructive census (`clearDeadTerminals` + restore-arming walk) runs ONLY when the capability is absent (`setLiveTerminalIds` + `setServerRestarted(false)` stay unconditional); cardinality violation → `console.error` + run the legacy census once for THIS inventory cycle (fail-safe); `terminal-restore.ts` exports `setPaneReconcileActive(v: boolean)` and, when active, `consumeTerminalRestoreRequestId` / `consumeTerminalFreshRecoveryRequest` report not-armed.
+- Produces: on every `ready` whose `capabilities.paneReconcileV1 === true`: `setPaneReconcileActive(true)` + build & send `pane.reconcile.request` + register the one-shot result fold (matched on `reconcileId`; fold-ownership rule from Task 9 — App folds only reconcileIds IT minted, skipping foreign ones); the destructive census (`clearDeadTerminals` + restore-arming walk) runs ONLY when the capability is absent (`setLiveTerminalIds` + `setServerRestarted(false)` stay unconditional); cardinality violation → `console.error` + run the legacy census once for THIS inventory cycle (fail-safe); `terminal-restore.ts` exports `setPaneReconcileActive(v: boolean)` and, when active, `consumeTerminalRestoreRequestId` / `consumeTerminalFreshRecoveryRequest` report not-armed.
+- A RESULT IS NOT GUARANTEED (A2 falsified — server has live-socket error-instead-of-result paths: `RECONCILE_TOO_LARGE` at `terminal.rs:1917` and `RECONCILE_UNAVAILABLE` on derivation panic at :1936-1950, both carrying `requestId = reconcileId`):
+  - (a) an error frame with `requestId === pendingReconcileRef.current?.reconcileId` is TERMINAL for that reconcile — loud `console.error` + fall back to the legacy census (same path as a cardinality violation);
+  - (b) the census fallback MUST run from the CACHED `liveTerminalIds` — on the real wire `terminal.inventory` ALWAYS precedes any reconcile result (handshake order: ready → settings.updated → perf.logging → [config.fallback] → terminal.inventory, `lib.rs:368-427`), so the inventory has already arrived by the time the error lands;
+  - (c) the reconcile request is re-sent on EVERY `ready` (capability re-captured per connection) — reconnect covers loss windows;
+  - (d) NO wall-clock timeout on the pending reconcile — it would false-trip on legitimate 2s deferrals.
 
-- [ ] **Step 1: Write the failing tests.** App-level: copy the store/ws mocking scaffold from `test/unit/App.ws-bootstrap.test.tsx` (it already boots App against a scripted ws).
+- [ ] **Step 1: Write the failing tests.** App-level: copy the store/ws mocking scaffold from `test/unit/client/components/App.ws-bootstrap.test.tsx` (it already boots App against a scripted ws).
 
 ```ts
 it('sends pane.reconcile.request after ready-with-capability and does NOT run the census', async () => {
@@ -1042,15 +1110,34 @@ it('folds a matching pane.reconcile.result', async () => {
   await receiveServerFrame(attachResultFor(req, 'term-77'))
   expect(dispatched.types).toContain(applyReconcileAttach.type)
 })
-it('cardinality violation falls back to the census, loudly', async () => {
+it('cardinality violation falls back to the census, loudly (real wire order: inventory BEFORE result)', async () => {
   seedPersistedTerminalPane({ createRequestId: 'cr-1' })
   const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
   const { sentFrames, dispatched } = await bootAppWithReady({ capabilities: { paneReconcileV1: true } })
   const req = sentFrames.find(f => f.type === 'pane.reconcile.request')!
-  await receiveServerFrame({ type: 'pane.reconcile.result', reconcileId: req.reconcileId, bootId: 'b', serverInstanceId: 's', verdicts: [] })
+  // Real handshake order (lib.rs:368-427): terminal.inventory ALWAYS precedes
+  // any reconcile result — inject it FIRST; the fallback census must run from
+  // the CACHED liveTerminalIds.
   await receiveInventory({ liveTerminalIds: [] })
+  await receiveServerFrame({ type: 'pane.reconcile.result', reconcileId: req.reconcileId, bootId: 'b', serverInstanceId: 's', verdicts: [] })
   expect(errSpy).toHaveBeenCalled()
   expect(dispatched.types).toContain(clearDeadTerminals.type)
+})
+it('a correlated error frame is TERMINAL for the reconcile — census fallback from cached inventory', async () => {
+  seedPersistedTerminalPane({ createRequestId: 'cr-1' })
+  const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+  const { sentFrames, dispatched } = await bootAppWithReady({ capabilities: { paneReconcileV1: true } })
+  const req = sentFrames.find(f => f.type === 'pane.reconcile.request')!
+  await receiveInventory({ liveTerminalIds: [] })  // inventory first — real wire order
+  await receiveServerFrame({ type: 'error', code: 'RECONCILE_UNAVAILABLE', requestId: req.reconcileId })
+  expect(errSpy).toHaveBeenCalled()
+  expect(dispatched.types).toContain(clearDeadTerminals.type)  // census ran from cached liveTerminalIds
+})
+it('re-sends the reconcile request on EVERY ready (reconnect covers loss windows)', async () => {
+  seedPersistedTerminalPane({ createRequestId: 'cr-1' })
+  const { sentFrames } = await bootAppWithReady({ capabilities: { paneReconcileV1: true } })
+  await simulateReconnectWithReady({ capabilities: { paneReconcileV1: true } })
+  expect(sentFrames.filter(f => f.type === 'pane.reconcile.request')).toHaveLength(2)
 })
 ```
 `terminal-restore.test.ts` additions: after `setPaneReconcileActive(true)`, `addTerminalRestoreRequestId('cr-x')` then `consumeTerminalRestoreRequestId('cr-x')` → falsy; after `setPaneReconcileActive(false)` the latch behaves as before.
@@ -1058,7 +1145,7 @@ it('cardinality violation falls back to the census, loudly', async () => {
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
-npm run test:vitest -- run test/unit/App.reconcile-adoption.test.tsx test/unit/lib/terminal-restore.test.ts
+npm run test:vitest -- run test/unit/client/components/App.reconcile-adoption.test.tsx test/unit/lib/terminal-restore.test.ts
 ```
 Expected: FAIL.
 
@@ -1077,7 +1164,8 @@ if (paneReconcile) {
   }
 }
 ```
-  - Message handler: on `pane.reconcile.result` with `reconcileId === pendingReconcileRef.current?.reconcileId` → `const outcome = foldVerdicts(dispatch, pendingReconcileRef.current, msg)`; clear the ref; if `outcome.cardinalityViolation` → `console.error('[reconcile] cardinality violation — falling back to legacy census')` + `paneReconcileActiveRef.current = false` + `setPaneReconcileActive(false)` (re-set true on the next ready).
+  - Message handler: on `pane.reconcile.result` with `reconcileId === pendingReconcileRef.current?.reconcileId` → `const outcome = foldVerdicts(dispatch, pendingReconcileRef.current, msg)`; clear the ref; results with a foreign `reconcileId` are SKIPPED (fold-ownership rule, Task 9); if `outcome.cardinalityViolation` → `console.error('[reconcile] cardinality violation — falling back to legacy census')` + `paneReconcileActiveRef.current = false` + `setPaneReconcileActive(false)` (re-set true on the next ready).
+  - Error-frame handler (A2): on an `error` frame with `requestId === pendingReconcileRef.current?.reconcileId` (e.g. `RECONCILE_TOO_LARGE`, `RECONCILE_UNAVAILABLE`) → treat as TERMINAL for that reconcile: `console.error('[reconcile] server error — falling back to legacy census', msg.code)`, clear the ref, and run the legacy census from the CACHED `liveTerminalIds` (inventory has already arrived — real wire order) via the same fallback path as the cardinality violation. Do NOT add a wall-clock timeout (it would false-trip on legitimate 2s deferrals); the request is re-sent on every ready, so reconnect covers loss windows.
   - Census block (:1018-1091): wrap ONLY the destructive part (`clearDeadTerminals` dispatch + the `addTerminalRestoreRequestId`/`addTerminalFreshRecoveryRequestId` walk) in `if (!paneReconcileActiveRef.current) { ... }`.
   - `terminal-restore.ts`:
 
@@ -1091,14 +1179,14 @@ if (paneReconcileActive) return undefined  // (or false — match each fn's retu
 - [ ] **Step 4: Run tests**
 
 ```bash
-npm run test:vitest -- run test/unit/App.reconcile-adoption.test.tsx test/unit/lib/terminal-restore.test.ts test/unit/App.ws-bootstrap.test.tsx test/unit/App.restart-signals.test.tsx
+npm run test:vitest -- run test/unit/client/components/App.reconcile-adoption.test.tsx test/unit/lib/terminal-restore.test.ts test/unit/client/components/App.ws-bootstrap.test.tsx test/unit/client/components/App.restart-signals.test.tsx
 ```
 Expected: PASS (existing App suites prove the legacy path is intact).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/App.tsx src/lib/terminal-restore.ts test/unit/App.reconcile-adoption.test.tsx test/unit/lib/terminal-restore.test.ts
+git add src/App.tsx src/lib/terminal-restore.ts test/unit/client/components/App.reconcile-adoption.test.tsx test/unit/lib/terminal-restore.test.ts
 git commit -m "feat(client): reconcile on ready-with-capability; census becomes the capability-gated fallback (F3/F4)"
 ```
 
@@ -1107,21 +1195,39 @@ git commit -m "feat(client): reconcile on ready-with-capability; census becomes 
 ### Task 12: Client — TerminalView: verdict-driven create, SESSION_RESERVED + INVALID_TERMINAL_ID bounded retry, exhaustion auto-resolve
 
 **Files:**
-- Modify: `src/components/TerminalView.tsx` (create send site :2789-2825; error-frame handling — locate with `rg -n "INVALID_TERMINAL_ID" src/`)
-- Test: Create `test/unit/components/TerminalView.session-reserved.test.tsx`
+- Modify: `src/components/TerminalView.tsx` (create send site :2789-2825; create-or-attach effect dependency array :4486; error-frame handling — locate with `rg -n "INVALID_TERMINAL_ID" src/`)
+- Test: Create `test/unit/client/components/TerminalView.session-reserved.test.tsx`
 
 **Interfaces:**
 - Consumes: `pendingReconcile`/`reconcileNotice` (Task 7/8), `getCreateSessionStateFromRef` (`src/components/terminal-view-utils.ts:9`), `buildReconcileRequestForPanes` + `foldVerdicts` (Task 9), `writeLocalXtermNotice` (:909), server error frames `{code: 'SESSION_RESERVED', requestId, retryAfterMs}` (Task 6).
 - Produces:
-  - Create args: when `pendingReconcile === 'respawn'` → resume args come from `content.sessionRef` (the server-named ref — precedence over any other inference) with `restore: true`; when `'fresh'` → no resume fields; field cleared when `terminal.created` arrives.
-  - `RESERVE_RETRY_WINDOW_MS = 30_000` (> lease TTL 20s + margin, council rule) and `RESERVE_RETRY_FLOOR_MS = 250`: on `SESSION_RESERVED` matching this pane's `createRequestId`, re-send the same `terminal.create` after `max(retryAfterMs, floor)`, until the window is spent.
-  - Exhaustion auto-resolve: after the window, send `buildReconcileRequestForPanes(state, [thisPane])` and fold the single verdict — binding exists → attach silently; winner failed → dead_session/fresh flow with visible notice. Never a permanent error, never a dead button. (This is the client half of `loser-exhausts-then-holder-fails`.)
+  - EFFECT RE-FIRE (A1 fix, load-bearing): add `terminalContent?.reconcileEpoch` to the create-or-attach effect dependency array (`TerminalView.tsx:4486`; the file notes ":4471 terminalId intentionally NOT in dependencies" — keep that; `createRequestId` is still NEVER re-minted, council rule 2 intact). Without this, folding a verdict into an already-mounted pane (same `createRequestId`) does NOT re-fire the effect and the fold is inert. KNOWN SIDE EFFECTS of the re-run: teardown/reattach (`:4455-4463`) and parser resets (`:2735-2740`) — desired for respawn/fresh, acceptable for attach. VERIFY AT IMPLEMENTATION: the ref-sync effect (`:960-990`) must run before the create-or-attach effect (declaration order).
+  - Create args: when `pendingReconcile === 'respawn'` → resume args come from `content.sessionRef` (the server-named ref — precedence over any other inference) with `restore: true`; when `'fresh'` → no resume fields; field cleared when `terminal.created` arrives. Invariant (shared with Task 8): a respawn create must have `sessionRef.provider === pane mode` (`terminal.rs:1047` filters on it — mismatch spawns identity-less); guard loudly.
+  - `RESERVE_RETRY_WINDOW_MS = 30_000` (> lease TTL 20s + margin; the TTL is an explicit wall-clock backstop constant, env-tunable — NOT "2× a spawn budget"; keep the window > TTL + margin if the TTL env knob changes defaults) and `RESERVE_RETRY_FLOOR_MS = 250`: on `SESSION_RESERVED` matching this pane's `createRequestId`, re-send the same `terminal.create` after `max(retryAfterMs, floor)`, until the window is spent.
+  - Exhaustion auto-resolve: after the window, send `buildReconcileRequestForPanes(state, [thisPane])` via the EXISTING `ws.onMessage` broadcast subscription (`ws-client.ts:616-618`, the same mechanism TerminalView already uses at `:3044` — no new correlator module) and fold ONLY the result whose `reconcileId` this pane minted (fold-ownership rule, Task 9) — binding exists → attach silently; winner failed → dead_session/fresh flow with visible notice. Never a permanent error, never a dead button. (This is the client half of `loser-exhausts-then-holder-fails`.)
   - F9: launch-time `INVALID_TERMINAL_ID` for this pane → bounded retry (5 attempts, 500ms apart) through the same re-drive helper before surfacing `status:'error'`.
   - `reconcileNotice` rendered once via `writeLocalXtermNotice` after attach, then `clearPaneReconcileNotice`.
 
-- [ ] **Step 1: Write the failing tests** (fake timers; mock ws-client send; copy mounting scaffold from `test/unit/components/TerminalView.restore-flag-persistence.test.tsx`):
+- [ ] **Step 1: Write the failing tests** (fake timers; mock ws-client send; copy mounting scaffold from `test/unit/client/components/TerminalView.restore-flag-persistence.test.tsx`):
 
 ```ts
+/// REQUIRED red test (A1 fix): folding a verdict into an ALREADY-MOUNTED pane
+/// (same createRequestId — never re-minted) must re-fire the create-or-attach
+/// effect via the reconcileEpoch bump. Without the dep-array change this is
+/// inert (deps key on createRequestId only, TerminalView.tsx:4486).
+it('respawn fold into a mounted pane re-fires the effect (second terminal.create sent)', async () => {
+  const { store } = mountPane({ status: 'running', createRequestId: 'cr-1', terminalId: 'term-old' })
+  store.dispatch(resetPaneForReconcileCreate({ tabId: 'tab1', paneId: 'p1', intent: 'respawn', sessionRef: { provider: 'claude', sessionId: 'server-truth' } }))
+  await flushEffects()
+  expect(countSentOfType('terminal.create')).toBe(2)              // effect re-fired
+  expect(lastSentOfType('terminal.create').requestId).toBe('cr-1') // never re-minted
+})
+it('attach fold into a mounted pane re-fires the effect (xterm attaches to the new terminalId)', async () => {
+  const { store } = mountPane({ status: 'running', createRequestId: 'cr-1', terminalId: 'term-old' })
+  store.dispatch(applyReconcileAttach({ tabId: 'tab1', paneId: 'p1', terminalId: 'term-new' }))
+  await flushEffects()
+  expect(lastAttachedTerminalId()).toBe('term-new')
+})
 it('respawn create uses the server-named sessionRef with restore:true', () => {
   mountPane({ pendingReconcile: 'respawn', sessionRef: { provider: 'claude', sessionId: 'server-truth' }, status: 'creating', createRequestId: 'cr-1' })
   const create = lastSentOfType('terminal.create')
@@ -1158,9 +1264,9 @@ it('INVALID_TERMINAL_ID at launch is retried bounded (F9), not a permanent error
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
-npm run test:vitest -- run test/unit/components/TerminalView.session-reserved.test.tsx
+npm run test:vitest -- run test/unit/client/components/TerminalView.session-reserved.test.tsx
 ```
-Expected: FAIL.
+Expected: FAIL (the two fold-on-mounted tests fail specifically because `reconcileEpoch` is not yet in the effect deps — proving the red is real, not vacuous).
 
 - [ ] **Step 3: Implement.** One small internal helper owns both retries:
 
@@ -1170,18 +1276,19 @@ Expected: FAIL.
 // On exhaustion: single-pane reconcile -> fold (auto-resolve, council rule 8).
 ```
 At the create site, resume-arg precedence: `pendingReconcile === 'respawn'` → `getCreateSessionStateFromRef(content.sessionRef)` result wins; `'fresh'` → omit resume fields entirely. Clear `pendingReconcile` on `terminal.created`. After attach, if `content.reconcileNotice` → `writeLocalXtermNotice(term, content.reconcileNotice)` + dispatch `clearPaneReconcileNotice`.
+Dep-array change (A1 fix): add `terminalContent?.reconcileEpoch` to the create-or-attach effect dependency array at `TerminalView.tsx:4486` — do NOT add `terminalId` (the ":4471" comment stays true) and NEVER re-mint `createRequestId`. Before landing, verify the ref-sync effect (`:960-990`) is declared BEFORE the create-or-attach effect so it runs first on each re-fire.
 
 - [ ] **Step 4: Run tests**
 
 ```bash
-npm run test:vitest -- run test/unit/components/TerminalView.session-reserved.test.tsx test/unit/components/TerminalView.restore-flag-persistence.test.tsx
+npm run test:vitest -- run test/unit/client/components/TerminalView.session-reserved.test.tsx test/unit/client/components/TerminalView.restore-flag-persistence.test.tsx
 ```
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/components/TerminalView.tsx test/unit/components/TerminalView.session-reserved.test.tsx
+git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.session-reserved.test.tsx
 git commit -m "feat(client): verdict-driven create args; bounded SESSION_RESERVED/INVALID_TERMINAL_ID re-drive with auto-resolve exhaustion"
 ```
 
@@ -1193,11 +1300,11 @@ git commit -m "feat(client): verdict-driven create args; bounded SESSION_RESERVE
 - Create: `src/components/DeadSessionPanel.tsx`
 - Create: `src/components/ReconcileWarmingBanner.tsx`
 - Modify: `src/App.tsx` (render both near the existing modal/banner region)
-- Test: Create `test/unit/components/DeadSessionPanel.test.tsx` (covers both components)
+- Test: Create `test/unit/client/components/DeadSessionPanel.test.tsx` (covers both components)
 
 **Interfaces:**
 - Consumes: `deadSessionAdjudication` / `reconcileWarming` state + `resolveDeadSessionEntry` / `clearDeadSessionAdjudication` / `clearReconcileWarming` / `resetPaneForReconcileCreate` (Task 8); pane-close action (locate the existing close-pane dispatch: `rg -n "closePane" src/store/panesSlice.ts`); `buildReconcileRequestForPanes` (Task 9).
-- Produces: `DeadSessionPanel` — a single `role="dialog"` (aria-label "Dead sessions") listing ALL entries with per-row semantic `<button>`s **Start fresh here** (dispatch `resetPaneForReconcileCreate({intent:'fresh'})` — same `createRequestId`, I7) and **Close pane**, plus **Dismiss** (keeps per-pane restoreError cards; nothing auto-closed). `ReconcileWarmingBanner` — one `role="status"` banner: `Waiting for session index — N pane(s)` + **Retry now** button that re-sends a reconcile request for exactly the warming panes. A11y rules from AGENTS.md apply (semantic buttons, aria-labels, no div-onClick).
+- Produces: `DeadSessionPanel` — a single `role="dialog"` (aria-label "Dead sessions") listing ALL entries with per-row semantic `<button>`s **Start fresh here** (dispatch `resetPaneForReconcileCreate({intent:'fresh'})` — same `createRequestId`, I7) and **Close pane**, plus **Dismiss** (keeps per-pane restoreError cards; nothing auto-closed). `ReconcileWarmingBanner` — one `role="status"` banner: `Waiting for session index — N pane(s)` + **Retry now** button that re-sends a reconcile request for exactly the warming panes (via the EXISTING `ws.onMessage` broadcast subscription — no new correlator module; the banner folds ONLY results whose `reconcileId` its own Retry minted, skipping foreign ones — fold-ownership rule, Task 9). The banner is EXPECTED on cold boots (the index scan can take minutes; see Task 2) — Retry is the recovery path, so it must be prominent, not an edge-case afterthought. A11y rules from AGENTS.md apply (semantic buttons, aria-labels, no div-onClick).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1236,7 +1343,7 @@ it('Retry now re-sends a reconcile request for exactly the warming panes', async
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
-npm run test:vitest -- run test/unit/components/DeadSessionPanel.test.tsx
+npm run test:vitest -- run test/unit/client/components/DeadSessionPanel.test.tsx
 ```
 Expected: FAIL.
 
@@ -1245,7 +1352,7 @@ Expected: FAIL.
 - [ ] **Step 4: Run tests + lint (a11y is CI-gated)**
 
 ```bash
-npm run test:vitest -- run test/unit/components/DeadSessionPanel.test.tsx
+npm run test:vitest -- run test/unit/client/components/DeadSessionPanel.test.tsx
 npm run lint
 ```
 Expected: PASS, no new a11y violations.
@@ -1253,7 +1360,7 @@ Expected: PASS, no new a11y violations.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/components/DeadSessionPanel.tsx src/components/ReconcileWarmingBanner.tsx src/App.tsx test/unit/components/DeadSessionPanel.test.tsx
+git add src/components/DeadSessionPanel.tsx src/components/ReconcileWarmingBanner.tsx src/App.tsx test/unit/client/components/DeadSessionPanel.test.tsx
 git commit -m "feat(client): batched dead-session adjudication panel + single warming banner with manual retry"
 ```
 
@@ -1264,6 +1371,7 @@ git commit -m "feat(client): batched dead-session adjudication panel + single wa
 **Files:**
 - Create: `test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts`
 - Modify: `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` (:1877-1880 pin; :2042 guard)
+- Modify: `test/e2e-browser/playwright.config.ts` (register the new spec — `RUST_ONLY_SPECS` :81+ AND rust-chromium `testMatch` :183+)
 
 **Interfaces:**
 - Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts` — `start()`, `restart()`, `restartAbrupt()`, `stop()`, `info {port, baseUrl, wsUrl, token, homeDir}`); the wall spec's existing fixture-session + `browser.newContext()` patterns (read the wall spec's two-clients test at :1867-1961 and its fixture setup before writing anything).
@@ -1305,7 +1413,9 @@ test('double-restart mid-reconcile converges with no duplicates', async ({ brows
 ```
 These comments are the scenario contract; the bodies must be real Playwright code following the wall spec's helpers (settle-loops, `expect.poll` on `/api/terminals`). Robust additional experiments (e.g. killing one browser context mid-retry) are encouraged as extra tests, not replacements.
 
-- [ ] **Step 4: Run the touched e2e suites**
+- [ ] **Step 4: Register the new spec in the playwright config.** Edit `test/e2e-browser/playwright.config.ts`: add `/reconcile-client-adoption-rust\.spec\.ts$/` to BOTH the `RUST_ONLY_SPECS` array (config line ~81) AND the `rust-chromium` project's explicit `testMatch` (config :183+). WARNING: unregistered = ZERO tests collected under `--project=rust-chromium` (a silent false green for this task) AND the spec would wrongly run under the legacy `chromium` project (match-all minus `RUST_ONLY_SPECS`). Verify collection with `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium --list test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts` — it must list a non-zero test count.
+
+- [ ] **Step 5: Run the touched e2e suites**
 
 ```bash
 npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium \
@@ -1315,10 +1425,12 @@ npx playwright test --config test/e2e-browser/playwright.config.ts --project=rus
 ```
 Expected: new spec PASS; wall spec PASS including the unpinned two-clients test (this is the headline red→green) and the rewritten double-restart guard. Iterate here until green — this task is the integration proof of the whole lane.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Wall audit (A12 mitigation).** After flipping the P1.7 pin, the Step-5 full wall-spec run doubles as an audit: if any OTHER `test.fail` pin in `restore-contract-wall-rust.spec.ts` unexpectedly PASSES (an unexpected pass is a HARD suite failure — never leave it), delete that pin in the same commit with a one-line justification, and record the cross-lane ownership note in the task report (the behavior it pinned may belong to a sibling lane).
+
+- [ ] **Step 7: Commit**
 
 ```bash
-git add test/e2e-browser/specs/
+git add test/e2e-browser/specs/ test/e2e-browser/playwright.config.ts
 git commit -m "test(e2e): reconcile client adoption proofs; flip P1.7 D8 pin - two clients one sessionRef now yields exactly 1 PTY"
 ```
 
@@ -1381,8 +1493,8 @@ Do NOT run `gh pr create` (not approved). Report: branch name, commit list, and 
 | PROVIDER_UNAVAILABLE for known provider w/o home | 3 |
 | Warming storm → ONE banner | 13 (`restart-storm-all-panes-warming`) |
 | Red test warming-never-completes | 2 |
-| SessionRef-level single-flight; winner binds registry + ledger; others attach | 4, 5, 6 |
-| Liveness-bound lease, TTL kill-before-release, hold-closed on unconfirmed kill | 5, 6 |
+| SessionRef-level single-flight; winner binds the REGISTRY binding map (ledger write pre-exists on the create path, `terminal.rs:1575-1603` — not added by this lane); others attach | 4, 5, 6 |
+| Liveness-bound lease, TTL kill-before-release (registry-handle group-kill; pid-less hang → hold-closed), hold-closed on unconfirmed kill | 5, 6 |
 | Losers: SESSION_RESERVED + retryAfterMs; client window > TTL + margin | 6, 12 |
 | Exhaustion auto-resolves (attach silently / dead-fresh with notice) | 12 (`loser-exhausts-then-holder-fails`) |
 | ≥2-live-PTYs-per-sessionRef alarm | 4 |
@@ -1391,5 +1503,13 @@ Do NOT run `gh pr create` (not approved). Report: branch name, commit list, and 
 | Flip P1.7 pins | 14 |
 | E2E: mixed restart / two contexts one sessionRef / dead-session panel / double restart | 14 (two-contexts = the unpinned wall test) |
 | B4 conflict kept tight (reconcile.rs dispatch arm untouched) | 2, 3, 4 (explicit non-goals) |
+| Same-createRequestId folds re-fire the mounted pane (volatile `reconcileEpoch` bump in reducers + effect dep-array add + red fold-on-mounted tests) | 7, 8, 12 |
+| Result-not-guaranteed fallback: correlated error frame is terminal → census from CACHED liveTerminalIds; request re-sent per ready; NO wall-clock timeout | 11 |
+| Volatile reconcile fields stripped from persistence; `pendingReconcile` cleared on `terminal.created` | 8 |
+| respawn folds guarantee `sessionRef.provider === pane mode` (terminal.rs:1047) | 8, 12 |
+| Fold ownership: requesters fold only their own reconcileId (no double-folds; existing ws.onMessage broadcast, no new correlator) | 9, 11, 12, 13 |
+| New e2e spec registered in playwright config (RUST_ONLY_SPECS + rust-chromium testMatch — no false green) | 14 |
+| Wall audit: any OTHER unexpectedly-passing `test.fail` pin deleted in the same commit with justification | 14 |
+| Lease TTL is an explicit env-tunable backstop constant + spawn-duration instrumentation at winner bind | 5, 6 |
 
 No unresolved coverage gaps.
