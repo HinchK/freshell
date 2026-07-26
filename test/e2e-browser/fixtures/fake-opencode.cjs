@@ -796,6 +796,10 @@ const server = http.createServer(async (req, res) => {
         routeDirectory: directory,
         directory: session.directory,
         prompt: appended.promptText,
+        // Parsed prompt-body settings (V4/A5): on the wire (build_prompt_body,
+        // crates/freshell-opencode/src/serve.rs) `model` is an OBJECT
+        // `{providerID, modelID}` and effort is the string field `variant`.
+        body: { model: body.model, variant: body.variant },
       })
       sendJson(res, 200, { ok: true })
       setTimeout(() => {

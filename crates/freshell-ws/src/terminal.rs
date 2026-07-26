@@ -122,6 +122,7 @@ pub async fn run(
     terminal_output_batch_v1: bool,
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
     origin_kind: &'static str,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -259,6 +260,7 @@ pub async fn run(
                             &conn_sink,
                             terminal_output_batch_v1,
                             pane_reconcile_v1,
+                            pane_reconcile_fresh_agent_v1,
                             &mut create_limiter,
                         )
                         .await
@@ -467,6 +469,7 @@ async fn handle_client_text(
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
     pane_reconcile_v1: bool,
+    pane_reconcile_fresh_agent_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
@@ -749,7 +752,8 @@ async fn handle_client_text(
             // byte-inertness does not depend on this, since it never sends
             // the request at all (§3).
             if pane_reconcile_v1 {
-                return handle_pane_reconcile(request, ws_tx, state).await;
+                return handle_pane_reconcile(request, ws_tx, state, pane_reconcile_fresh_agent_v1)
+                    .await;
             }
             true
         }
@@ -2296,16 +2300,21 @@ pub fn broadcast_sessions_changed(state: &WsState) {
 
 /// Send the reference's `sendError` frame for a failed `terminal.create`
 /// (`ws-handler.ts:2606-2614`): `{ code, message, requestId }`.
-/// `pane.reconcile.request` (reconciliation design §5): a PURE READ over the
-/// terminal registry × identity registry × disk index — one verdict per
-/// presented pane. Safe to receive N times on N sockets (§7); the only error
-/// paths are the explicit `RECONCILE_TOO_LARGE` cap and the
+/// `pane.reconcile.request` (reconciliation design §5): the terminal sources
+/// remain a PURE READ over the terminal registry × identity registry × disk
+/// index — one verdict per presented pane, safe to receive N times on N
+/// sockets (§7). The capability-gated fresh-agent snapshot is the ONE
+/// exception: it mutates the per-boot respawn counter
+/// (`WsState.fresh_agent_respawn_counts`, bounded per `(provider,
+/// sessionId)`; reset when the session resolves Live — V2/A7). The only
+/// error paths are the explicit `RECONCILE_TOO_LARGE` cap and the
 /// `RECONCILE_UNAVAILABLE` derivation-failure frame, both carrying the
 /// `reconcileId` for correlation.
 async fn handle_pane_reconcile(
     request: freshell_protocol::PaneReconcileRequest,
     ws_tx: &mut WsSink,
     state: &WsState,
+    pane_reconcile_fresh_agent_v1: bool,
 ) -> bool {
     if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
         return send_create_error(
@@ -2320,6 +2329,25 @@ async fn handle_pane_reconcile(
         )
         .await;
     }
+    // Built ONCE per reconcile request and reused for any re-derivation of deps
+    // (B1's warming deferral re-derives via rebuild_deps — rebuilding the
+    // snapshot would double-burn the respawn counter; V9 §3.6).
+    let fresh_agent_snapshot = if pane_reconcile_fresh_agent_v1
+        && request
+            .panes
+            .iter()
+            .any(|p| p.kind.as_deref() == Some("fresh-agent"))
+    {
+        Some(crate::reconcile_freshagent::build_snapshot(state, &request.panes).await)
+    } else {
+        None
+    };
+    let deps = crate::reconcile::ReconcileDeps {
+        registry: &state.registry,
+        identity: &state.identity,
+        existence: state.session_existence.as_ref(),
+        fresh_agent: fresh_agent_snapshot.as_ref(),
+    };
     // §8 frame-level failure: a panicking derivation (poisoned lock) must
     // surface as an explicit error frame, never silence. The deps are rebuilt
     // per derivation so nothing borrowed for the pure read is ever held
@@ -3634,6 +3662,7 @@ mod terminals_changed_tests {
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
         };
         (state, rx)
     }
@@ -3843,6 +3872,7 @@ mod terminal_meta_created_tests {
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
         };
         (state, rx)
     }

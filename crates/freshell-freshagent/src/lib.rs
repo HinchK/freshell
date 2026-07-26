@@ -39,6 +39,7 @@
 pub mod claude;
 pub(crate) mod claude_snapshot;
 pub mod codex;
+pub mod identity_sink;
 pub mod opencode_ws;
 pub mod pane_ops;
 pub mod snapshot;
@@ -46,6 +47,10 @@ pub mod terminal_tabs;
 
 pub use claude::FreshClaudeState;
 pub use codex::FreshCodexState;
+pub use identity_sink::{
+    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink,
+    SinkWrite,
+};
 pub use opencode_ws::FreshOpencodeState;
 pub use snapshot::SnapshotState;
 
@@ -72,7 +77,8 @@ use freshell_opencode::{
     ServeDeps, ServeError,
 };
 use freshell_protocol::{
-    FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged, UiCommand,
+    FreshAgentEvent, FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged,
+    UiCommand,
 };
 
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`, `router.ts:541`).
@@ -171,6 +177,11 @@ pub struct FreshAgentState {
     /// restore fix -- the SAME shared instance
     /// `freshell_ws::opencode_association::maybe_arm` arms.
     pub(crate) opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
+    /// P1.13 identity-event sink (the pane-ledger bridge, [`identity_sink`]).
+    /// Clone-shared + set-once: the state is cloned into consumer tasks, so
+    /// the `OnceLock` sits behind an `Arc`. Wired post-construction by
+    /// `freshell-server` (precedent: `TerminalRegistry::set_activity_observer`).
+    identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
 }
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
@@ -235,7 +246,19 @@ impl FreshAgentState {
             cli_commands: Arc::new(Vec::new()),
             amplifier_locator: None,
             opencode_locator: None,
+            identity_sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
+    pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
+        let _ = self.identity_sink.set(sink);
+    }
+
+    /// The wired identity sink, if any. Used by the REST send-keys
+    /// materialization site ([`send_keys`]'s cold-start block).
+    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+        self.identity_sink.get().cloned()
     }
 
     /// Record what a `restoreKey`-tagged create produced (continuity trio,
@@ -1496,6 +1519,46 @@ async fn send_keys(
             entry.durable_id = Some(durable_id.clone());
         }
 
+        // P1.13: binding row at REST materialization (AWAITED BEFORE the materialized
+        // broadcast -- durable-before-answer), resolving the pane's placeholder id.
+        // Without this site, REST-created sessions (the e2e seeding surface) never get
+        // a resume record (V10 A13-N1). Opencode has no sandbox/permission concepts.
+        if let Some(sink) = state.identity_sink() {
+            if let Err(e) = sink
+                .record_binding(identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: durable_id.clone(),
+                    mode: SESSION_TYPE.into(),
+                    create_request_id: None,
+                    resolves_pending: Some(pane.placeholder_id.clone()),
+                    supersedes: None,
+                    settings: identity_sink::FreshAgentSettings {
+                        model: pane.model.clone(),
+                        sandbox: None,
+                        permission_mode: None,
+                        effort: pane.effort.clone(),
+                        cwd: pane.cwd.clone(),
+                    },
+                })
+                .await
+            {
+                tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.rest_binding_write_failed");
+                // Same LEDGER_WRITE_FAILED frame shape the WS sites emit (top-level
+                // sessionType/provider + user-facing message), via state.broadcast.
+                state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                    event: json!({
+                        "type": "freshAgent.error",
+                        "sessionId": durable_id,
+                        "code": "LEDGER_WRITE_FAILED",
+                        "message": "Failed to persist this session's resume record - settings may not survive a server restart.",
+                    }),
+                    provider: PROVIDER.to_string(),
+                    session_id: durable_id.clone(),
+                    session_type: SESSION_TYPE.to_string(),
+                }));
+            }
+        }
+
         let session_ref = SessionLocator {
             provider: PROVIDER.to_string(),
             session_id: durable_id.clone(),
@@ -2363,6 +2426,90 @@ mod tests {
             .await
             .expect_err("unknown session");
         assert!(matches!(err, OpencodeSnapshotError::NotFound));
+    }
+
+    // -- P1.13 Task 7: REST send-keys materialization writes a binding row --
+
+    /// Like `opencode_ws::tests::FakeHttp`: `POST /session` mints `ses_1`; everything
+    /// else (health, prompt, status) answers a benign `{}`.
+    struct CreateCapableHttp;
+    impl ServeHttp for CreateCapableHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let body = if is_create {
+                serde_json::to_vec(&json!({ "id": "ses_1", "directory": null })).unwrap()
+            } else {
+                b"{}".to_vec()
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+        }
+    }
+
+    /// The REST half of the Task 7 identity-event coverage (V10 A13-N1): a REST-created
+    /// pane (POST /api/tabs seeds model/effort) whose first `send-keys` cold-start
+    /// materializes the durable `ses_*` id must record a binding through the pane
+    /// ledger sink -- without this site, REST-created sessions never get a resume record.
+    #[tokio::test]
+    async fn rest_send_keys_materialization_records_binding() {
+        let st = state();
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(CreateCapableHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+
+        let fake = Arc::new(identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // A REST-created pane carrying model/effort (what POST /api/tabs records).
+        st.panes.lock().expect("panes mutex").insert(
+            "pane-1".to_string(),
+            PaneEntry {
+                placeholder_id: "freshopencode-r1".to_string(),
+                cwd: Some("/w".to_string()),
+                model: Some("big-model".to_string()),
+                effort: Some("high".to_string()),
+                durable_id: None,
+            },
+        );
+
+        // Drive the REST send-keys cold-start materialization. `timeout: 0` bounds the
+        // inline `run_turn` idle-wait (the fake never reports activity); the
+        // materialization + binding write happen BEFORE the turn is driven.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let _resp = send_keys(
+            State(st.clone()),
+            Path("pane-1".to_string()),
+            headers,
+            Json(json!({ "text": "hello", "timeout": 0 })),
+        )
+        .await;
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == "ses_1")
+            .expect("binding recorded at REST send-keys materialization");
+        assert_eq!(b.provider, "opencode");
+        assert_eq!(b.mode, "freshopencode");
+        assert_eq!(b.resolves_pending.as_deref(), Some("freshopencode-r1"));
+        assert_eq!(b.settings.model.as_deref(), Some("big-model"));
+        assert_eq!(b.settings.effort.as_deref(), Some("high"));
+        assert_eq!(b.settings.cwd.as_deref(), Some("/w"));
     }
 
     // -- Batch D PR-6: rich transcript items for the opencode snapshot endpoint --

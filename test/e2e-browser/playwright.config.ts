@@ -136,6 +136,9 @@ const RUST_ONLY_SPECS = [
   // GET /api/recovery/inventory + RecoveryOfferPanel; imports RustServer
   // directly for restart(). See docs/plans/2026-07-26-recover-my-panes.md
   /recover-my-panes-rust\.spec\.ts$/,
+  // P1.13 (Lane B4 Task 14): per-provider settings survive restart + codex
+  // crash memory-loss banner. Imports RustServer directly for restartAbrupt().
+  /freshagent-settings-resume-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -301,6 +304,10 @@ export default defineConfig({
         // mixed-kind, reload guard, decline, live no-restart). Rust-only:
         // drives GET /api/recovery/inventory; imports RustServer for restart().
         /recover-my-panes-rust\.spec\.ts$/,
+        // P1.13 (Lane B4 Task 14): per-provider settings survive restart +
+        // codex crash memory-loss banner. Imports RustServer directly for
+        // restartAbrupt().
+        /freshagent-settings-resume-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

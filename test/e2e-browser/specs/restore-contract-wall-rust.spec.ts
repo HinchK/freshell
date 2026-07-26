@@ -1023,21 +1023,25 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // PINNED (observed failure mode, run of 2026-07-24): after
-    // SIGKILL+restart+RELOAD the rehydrated pane does NOT carry the durable
-    // ses_* identity -- leafDurableIdentity returns a freshly minted
-    // `freshopencode-<requestId>` placeholder (the lazy-create shape,
-    // server/fresh-agent/adapters/opencode/adapter.ts:75 /
-    // crates/freshell-freshagent/src/opencode_ws.rs:245) and no message
-    // history is visible, even though the durable ses_http_* session
-    // SURVIVED the kill (it still lists in the sidebar). The serve-DB
-    // survival half of §2.7 holds; the pane rebind half does not. The donor
-    // (freshopencode-restart-recovery.spec.ts) stays green because it never
-    // reloads the page -- live reconnect preserves in-memory pane state.
-    test.fail(
-      e2eServerKind === 'rust',
-      'P1.8/P1.13 (§2.7): post-reload freshopencode pane re-mints a freshopencode-* placeholder instead of rebinding the surviving ses_* session',
-    )
+    // HISTORY: this test was pinned `test.fail()` as P1.8/P1.13 (observed
+    // 2026-07-24): after SIGKILL+restart+RELOAD the pane re-minted a
+    // lazy-create `freshopencode-<requestId>` placeholder instead of
+    // rebinding the surviving ses_* session, and no history was visible.
+    // Fixed by this lane's settings-from-ledger resume work (run of
+    // 2026-07-26): post-reload the frozen client sends
+    // `freshAgent.create{resumeSessionId: ses_*}` (never attach), and
+    // opencode's `handle_create` now honors `resume_session_id`
+    // (crates/freshell-freshagent/src/opencode_ws.rs, unit pin
+    // `create_with_resume_session_id_rebinds_the_durable_session`), so
+    // the pane rebinds the durable identity and rehydrates history -- the
+    // pin is removed (flip pattern: restore-matrix.spec.ts TERM-25).
+    // NOTE: the flip unmasked a latent strict-mode locator ambiguity in
+    // the history assertion below -- the prompt text renders in THREE
+    // places post-rehydrate (pane-header detail span, transcript "You"
+    // turn, and the response line), so `page.getByText(prompt)` was never
+    // satisfiable once rehydration worked. The assertion now targets the
+    // transcript's "You" turn explicitly, a strictly stronger check
+    // (history in the transcript, not merely the prompt echoed anywhere).
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshopencode-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -1105,7 +1109,9 @@ test.describe('Restore Contract Wall (P0.1)', () => {
           timeout: 30_000,
         })
         .toBe(sessionId)
-      await expect(page.getByText(prompt)).toBeVisible({ timeout: 30_000 })
+      await expect(page.getByLabel('You transcript turn').getByText(prompt)).toBeVisible({
+        timeout: 30_000,
+      })
       await expect(page.getByText(`Fake OpenCode response: ${prompt}`)).toBeVisible({
         timeout: 30_000,
       })
