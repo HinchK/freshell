@@ -1031,3 +1031,18 @@ PR POLICY: NOT approved — do NOT run `gh pr create`. Final output: branch name
   `expect(sessionId?.startsWith('terminal:')).toBe(false)` received `true`;
   no arming -> no adoption, the ghost never collapses to the real rollout
   id) -- red->green proven.
+
+### Case (b) REST-created tabs / Incident 4 (Task 6)
+- claude REST resume tab: PASS as-is (row green, `data-has-tab="true"`, count 1).
+- codex REST resume tab: PASS as-is (canonical sessionRef body; row green, count 1).
+- click-dedupe: PASS (product behavior needed no fix; none of the brief's
+  contingency branches fired). One test-side suite-order fix was required:
+  in full-suite order, case-c's panes persist in server memory, so case-b's
+  fresh browser context raises RecoveryOfferPanel ("Restore 2 panes from
+  server memory?") -- a fixed inset-0 z-[60] overlay that intercepted the
+  sidebar row click and timed the test out (case-b passed standalone, where
+  server memory is empty at boot). Fixed by declining the offer after
+  bootAndConnect (donor idiom: recover-my-panes-rust.spec.ts:377); recovery
+  semantics themselves are case-d territory (Task 8). Full spec then green:
+  2 passed (case-c + case-b), 1.1m.
+- amplifier variant: covered by remote-tab-linkage-rust.spec.ts (re-run in Task 9).

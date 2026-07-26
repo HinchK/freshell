@@ -90,6 +90,42 @@ function buildClaudeSessionJsonl(sessionId: string, cwd: string, title: string):
   ].join('\n') + '\n'
 }
 
+const SEEDED_CODEX_THREAD_ID = randomUUID()
+
+async function seedCodexRollout(homeDir: string, threadId: string, cwd: string): Promise<void> {
+  // Donor shape: sidebar-click-resume.spec.ts ~:175-185 -- verify field
+  // names (session_meta payload.id/payload.cwd + a message record) there.
+  // VALIDATED: the cwd field is mandatory -- a rollout that does not parse
+  // with a cwd is excluded from the index (R10b) and will NEVER appear.
+  const day = '2026/07/20'
+  const dir = path.join(homeDir, '.codex', 'sessions', day)
+  await fs.mkdir(dir, { recursive: true })
+  const lines = [
+    JSON.stringify({ timestamp: '2026-07-20T08:00:00.000Z', type: 'session_meta', payload: { id: threadId, cwd } }),
+    JSON.stringify({ timestamp: '2026-07-20T08:00:01.000Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'P114 seeded codex session' }] } }),
+  ]
+  await fs.writeFile(path.join(dir, `rollout-2026-07-20T08-00-00-${threadId}.jsonl`), lines.join('\n') + '\n')
+}
+
+// Decline idiom from recover-my-panes-rust.spec.ts:377 (recovery-decline).
+// Why: case-c leaves its panes in server memory, and case-b's FRESH browser
+// context (no client state) makes RecoveryOfferPanel offer to restore them
+// ("Restore N panes from server memory?"). That dialog is a fixed inset-0
+// z-[60] overlay that intercepts EVERY sidebar click, so case-b's row.click()
+// retries forever and the test times out (observed on full-suite runs; the
+// scenario passes standalone where server memory is empty at boot). Recovery
+// semantics themselves are case-d territory (Task 8) -- here we just decline.
+async function declineRecoveryOfferIfShowing(page: import('@playwright/test').Page): Promise<void> {
+  const panel = page.getByTestId('recovery-offer-panel')
+  const appeared = await panel.waitFor({ state: 'visible', timeout: 10_000 }).then(
+    () => true,
+    () => false, // standalone run: no panes in server memory, no offer
+  )
+  if (!appeared) return
+  await page.getByTestId('recovery-decline').click()
+  await panel.waitFor({ state: 'hidden', timeout: 5_000 })
+}
+
 test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
   test.setTimeout(240_000)
   let server: RustServer
@@ -190,5 +226,53 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
       const sessionId = await rows.first().getAttribute('data-session-id')
       expect(sessionId?.startsWith('terminal:')).toBe(false)
     }).toPass({ timeout: 45_000 })
+  })
+
+  test('case-b: REST-created resume tabs are green and dedupe on click', async ({ page }) => {
+    const harness = await bootAndConnect(page, info) // keep the TestHarness -- the dedupe gate below needs it
+    await declineRecoveryOfferIfShowing(page) // case-c's server-memory panes trigger the offer overlay
+    await seedCodexRollout(info.homeDir, SEEDED_CODEX_THREAD_ID, PROJECT_DIR)
+
+    for (const [mode, sessionId] of [
+      ['claude', SEEDED_CLAUDE_ID],
+      ['codex', SEEDED_CODEX_THREAD_ID],
+    ] as const) {
+      const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
+        headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
+        // VALIDATED: raw codex resumeSessionId is deliberately 400-rejected at
+        // HEAD (terminal_tabs.rs:124-131, pinned by
+        // create_codex_tab_rejects_raw_resume_session_id_without_session_ref);
+        // the canonical sessionRef shape IS accepted (pinned by
+        // create_codex_tab_accepts_session_ref_and_derives_resume_args). Do NOT
+        // "fix" the rejection -- use the canonical shape for codex.
+        data: mode === 'codex'
+          ? { mode, cwd: PROJECT_DIR, sessionRef: { provider: 'codex', sessionId } }
+          : { mode, cwd: PROJECT_DIR, resumeSessionId: sessionId },
+      })
+      expect(res.ok()).toBe(true)
+
+      const row = page.locator(`[data-session-id="${sessionId}"][data-provider="${mode}"]`)
+      // Incident-4 contract: the row exists and is GREEN, not grey.
+      await expect(row).toHaveAttribute('data-has-tab', 'true', { timeout: 30_000 })
+      await expect(row).toHaveCount(1)
+
+      // Dedupe contract: clicking the green row focuses the existing pane
+      // instead of opening a second tab (donor: remote-tab-linkage:252-255).
+      // getTabCount() is a NODE-SIDE TestHarness method
+      // (helpers/test-harness.ts:150-155) that reads
+      // window.__FRESHELL_TEST_HARNESS__?.getState() inside the page. The
+      // window global itself has NO getTabCount method (src/lib/test-harness.ts
+      // exposes getState/dispatch/getWsReadyState/...), so never call
+      // getTabCount via page.evaluate -- that throws on every run.
+      // Fail-loud guard: getTabCount() returns 0 when the harness is missing,
+      // so pin tabsBefore > 0 (this loop just created tabs) to make a vacuous
+      // 0 === 0 pass impossible.
+      const tabsBefore = await harness.getTabCount()
+      expect(tabsBefore).toBeGreaterThan(0)
+      await row.click()
+      await page.waitForTimeout(500)
+      const tabsAfter = await harness.getTabCount()
+      expect(tabsAfter).toBe(tabsBefore)
+    }
   })
 })
