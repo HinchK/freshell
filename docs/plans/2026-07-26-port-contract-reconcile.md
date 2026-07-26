@@ -140,6 +140,51 @@ task). Task 5 adds the anti-rot + regen-idempotency guard. **Note:** between the
 and Task 3 commits, `cargo test -p freshell-protocol` is intentionally red — Tasks 2 and
 3 must be executed back-to-back on this branch; neither is independently mergeable.
 
+### Load-bearing validation findings (2026-07-26, pre-execution)
+
+Six load-bearing assumptions were validated before execution (ledger:
+`.worktrees/.the-usual-logs/port-contract-reconcile/load-bearing-ledger.md`; evidence in
+`reports/validator-clone-suite.md` and `reports/validator-ci-actions.md`; sandbox left at
+`/tmp/pcr-validate`). What executors can now rely on:
+
+- **Generator is deterministic** (verified): two regens after a fresh `npm ci` in a clean
+  clone are byte-identical (sha256-proven); source inspection found zero
+  environment-dependent output sources (code-point sorts only, no locale/Date/paths/env;
+  deps exact-pinned by the lockfile: typescript 5.9.3, tsx 4.21.0, zod 4.3.6). The
+  committed `\u2014` escape is a one-time artifact of the original freeze. The CI
+  regen-idempotency gate is sound **provided CI installs with `npm ci`** (it does).
+- **Rust base is green; post-regen red is confined** (verified by execution): at base,
+  `cargo test -p freshell-protocol --locked` passes all 34 tests (~40s cold build,
+  sub-second warm); after the regen ONLY `tests/inventory.rs` fails (28→29, 53→56).
+  `roundtrip.rs`, `version.rs`, `pane_reconcile.rs`, and `activity_extension.rs` all
+  still pass against the regenerated bundles. Task 3 Step 1's expectations match
+  observed reality. `--locked` is clean (no lockfile drift) and the dep tree is 100%
+  pure Rust (no `-sys` crates) — safe for a clean ubuntu runner.
+- **Regen diff is semantically additive but NOT line-level clean** (assumption falsified,
+  plan adjusted): beyond count/title lines, the diff removes 12 more lines — 8 are a
+  diff-anchoring artifact (an `activePane` block re-emitted verbatim after an anyOf
+  insertion) and 4 are trailing-comma artifacts of enum APPENDS to pre-existing schemas
+  (`SESSION_RESERVED` joins the error-code enum in both schema files; `amplifier` joins
+  the CLI-provider enums in both schema files). No constraint is removed or tightened;
+  `wsProtocolVersion` stays 7. Task 2 Step 2 enumerates the exact tolerance list.
+- **Oracle suite is regen-neutral but NOT green at base** (assumption falsified, no new
+  task needed): `npm run test:oracle` in a fresh clone fails 4 / passes 171 both BEFORE
+  and AFTER the regen (identical failure set — the regenerated artifacts pin nothing the
+  oracle checks differently). The 4 failures are pre-existing and out of this lane's
+  scope: mutation-e2e ×2 (stale buildinfo path — `test/oracle/mutation-e2e.test.ts:45`
+  clears `node_modules/.cache/...` but `tsconfig.server.json:12` moved buildinfo to
+  `dist/` in `1de2258d`, making the rebuild a no-op) and rust-equivalence ×2
+  (machine-sensitive: TS discovers an installed `amplifier` CLI into `enabledProviders`,
+  Rust does not). Do NOT add `test:oracle` to the new CI workflow; the follow-up is
+  recorded in Task 6 Step 5.
+- **GitHub Actions policy verified** (read-only `gh api`): repo actions policy is
+  `allowed_actions: "all"`; `rust-clippy.yml` already uses
+  `dtolnay/rust-toolchain@master` (with a deliberate 1.96.0 toolchain pin — see its
+  comment at lines 23-26) and `Swatinem/rust-cache@v2`, and its 8 most recent runs all
+  concluded `success` on both `push` (main) and `pull_request` events. Note: the new
+  workflow will NOT run on this lane's branch push (its triggers are `pull_request` +
+  `push: branches: [main]`); its first execution happens when the user opens the PR.
+
 ---
 
 ## File Structure
@@ -287,10 +332,19 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - [ ] **Step 1: Regenerate**
 
 Run: `npm run contract:generate`
-Expected: exits 0, prints a summary including 29 client→server and 56 server→client
-discriminants and a schema count of 66 (if the printed schema count differs slightly,
-that is tolerable ONLY if Step 2's checks pass — the counts inside the files are what
-the tests pin). `wsProtocolVersion` must be 7.
+Expected (validated 2026-07-26 by running the generator after a fresh `npm ci` in a
+clean clone — see `.worktrees/.the-usual-logs/port-contract-reconcile/reports/validator-clone-suite.md`):
+exits 0 and prints exactly:
+
+```
+WS_PROTOCOL_VERSION: 7
+Schemas frozen:      66 (zod-native=66)
+Client→Server types: 29 · Server→Client types: 56
+Server shapes frozen: 56/56 · Zod cross-check: 12 overlapping, 0 required-field mismatch(es)
+```
+
+(If any of these numbers differ, another lane has moved `shared/ws-protocol.ts` —
+STOP and re-investigate.)
 
 - [ ] **Step 2: Verify the diff is purely additive and version is unchanged**
 
@@ -307,13 +361,33 @@ grep -c 'pane.reconcile' port/contract/ws-message-inventory.json
 # Version unchanged:
 grep '"wsProtocolVersion"' port/contract/ws-message-inventory.json
 ```
-Expected: only the three JSON files changed; the removed-lines grep prints **nothing**
-(only `count` bumps and possibly the `title` em-dash `\u2014` → literal `—`
-serialization flip, which is a known generator-encoding artifact — see the stash
-analysis); candidate grep prints `1`; pane.reconcile grep prints `2`;
-version line shows `7`.
-If any message type line is REMOVED: STOP — that would change what's pinned beyond the
-documented drift; re-investigate before committing.
+Expected (validated 2026-07-26 by executing this exact regen in a clean clone —
+full classification in
+`.worktrees/.the-usual-logs/port-contract-reconcile/reports/validator-clone-suite.md`):
+
+- `--stat`: only the three JSON files changed, `925 insertions(+), 17 deletions(-)`
+  (approximately — the shape matters, not the exact insertion count).
+- The inventory removed-lines grep prints **nothing** (its only removed lines are the
+  two `count` bumps and the `title` em-dash `\u2014` → literal `—` serialization flip,
+  which the grep filters).
+- candidate grep prints `1`; pane.reconcile grep prints `2`; version line shows `7`.
+
+**Known benign removed lines in the two SCHEMA files** (do NOT stop on these; all are
+semantically additive — verified by line-level diff analysis):
+- `"schemaCount": 55,` / `"messageCount": 52,` — count bumps to 66 / 56.
+- An 8-line `"activePane": {...}` block in `ws-protocol.schema.json` — a
+  **diff-anchoring artifact**: the new `amplifier.activity.list` variant is inserted
+  into an anyOf array before it, and the identical block reappears verbatim on the `+`
+  side (check with `-U6` context if in doubt).
+- Trailing-comma artifact lines from **enum appends to pre-existing schemas**:
+  `"PROTOCOL_MISMATCH"` gains a following `"SESSION_RESERVED"` in the error-code enum
+  (both schema files), and the CLI-provider enums gain `"amplifier"` (both schema
+  files). These are additive enum growth, not constraint changes.
+
+STOP only if: a message **type** line is removed from the inventory, an enum LOSES a
+value, a schema body changes beyond the enum appends above, or `wsProtocolVersion`
+changes — that would be drift beyond the documented evidence; re-investigate before
+committing.
 
 - [ ] **Step 3: Run the freeze suite — expect exactly ONE remaining failure**
 
@@ -755,9 +829,13 @@ jobs:
         run: cargo test -p freshell-protocol --locked
 ```
 
-(If Step 1 showed the repo uses different toolchain/cache actions for Rust in
-`rust-clippy.yml`, use THOSE actions/versions instead of `dtolnay/rust-toolchain` /
-`Swatinem/rust-cache` — mirroring the working precedent beats novelty.)
+(Validated 2026-07-26: `rust-clippy.yml` uses `dtolnay/rust-toolchain@master` with a
+**deliberate toolchain pin — `1.96.0`** (see its comment at lines 23-26) plus
+`Swatinem/rust-cache@v2`, and its recent runs all succeed on push + PR; the repo's
+Actions policy is `allowed_actions: "all"`. Mirror the pin: replace the
+`dtolnay/rust-toolchain@stable` step above with the exact toolchain action + pinned
+version rust-clippy.yml uses — mirroring the working precedent beats novelty. If Step 1
+shows the file has changed since, follow what it does now.)
 
 - [ ] **Step 3: Validate the YAML parses**
 
@@ -798,7 +876,11 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 ```
 
 Note for the final report: making `port-contract` a *required* branch-protection check
-is a GitHub settings change the user must make; flag it, don't attempt it.
+is a GitHub settings change the user must make; flag it, don't attempt it. Two verified
+timing facts to include: the workflow will NOT run on this lane's branch push (its
+triggers are `pull_request` + `push: branches: [main]`), so its first execution happens
+when the user opens the PR; and GitHub only offers a check as "required" after it has
+run at least once — so the branch-protection step follows the first PR run.
 
 ---
 
@@ -893,6 +975,14 @@ Append to `docs/plans/2026-07-26-port-contract-reconcile.md`:
   server — prohibited by this lane's no-behavior-change fence. FOLLOW-UP for user:
   decide alongside legacy-Node retirement. `terminal.codex.candidate.persisted`
   remains fully pinned.
+- **Oracle suite (pre-execution validation finding):** `npm run test:oracle` is
+  regen-NEUTRAL (identical failure set before/after regen) but NOT green at base in a
+  fresh clone: 4 pre-existing failures — mutation-e2e ×2 (stale buildinfo path:
+  `test/oracle/mutation-e2e.test.ts:45` clears `node_modules/.cache/...` but
+  `tsconfig.server.json:12` moved buildinfo to `dist/` in `1de2258d`) and
+  rust-equivalence ×2 (machine-sensitive discovery of an installed `amplifier` CLI).
+  Out of this lane's scope. FOLLOW-UP for user: one-line mutation-e2e path fix as a
+  separate change; do not gate anything on a fully-green oracle until then.
 ```
 
 Replace the `<replace this line ...>` placeholder with the real observed evidence
@@ -956,6 +1046,15 @@ settings).
 observed evidence before committing — it is an evidence slot, not a plan gap. All
 code steps show complete code; doc steps give exact replacement text or a concrete
 locate-and-mirror procedure with the authoritative field source named.
+
+**2b. Load-bearing validation pass (2026-07-26).** Six assumptions validated
+pre-execution (see the "Load-bearing validation findings" section): generator
+determinism, Rust base-green + confined post-regen red, CI actions policy \u2014 verified
+by execution/inspection; the "line-level additive diff" and "oracle green at base"
+assumptions were falsified and Task 2 Step 2 / Task 6 Step 5 updated accordingly (real
+tolerance list enumerated; oracle finding recorded as a user follow-up, no new task
+needed since the oracle is regen-neutral). Task 5 now mirrors rust-clippy.yml's
+deliberate 1.96.0 toolchain pin.
 
 **3. Type consistency.** `test:port` script name is identical in Tasks 1, 2, 4, 5, 6
 and the workflow. Counts are consistent throughout: 29/56/85 (inventory+Rust),
