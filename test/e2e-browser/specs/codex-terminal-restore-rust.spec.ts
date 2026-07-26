@@ -328,10 +328,18 @@ test.describe('Codex Terminal Restore (Rust only)', () => {
           expect(leaf?.content?.terminalId).toBeTruthy()
         }).toPass({ timeout: 30_000 })
 
-        const restoredTerminalId: string | undefined = (await findLeafById(tabId!, positivePaneId))?.content?.terminalId
-        expect(restoredTerminalId).toBeTruthy()
+        // WAVE-B INTEGRATION NOTE (B1 reconcile adoption x this spec): on the
+        // page.reload path the pane's terminalId can change ONCE MORE after
+        // it first turns truthy -- a transient pre-verdict create is replaced
+        // when the pane.reconcile respawn verdict folds (reconcileEpoch bump,
+        // panesSlice.resetPaneForReconcileCreate). Poll the pane's CURRENT
+        // terminal each iteration instead of sampling the first terminalId,
+        // so the assertion targets the converged state the verdict produces.
         await expect.poll(async () => {
-          const buffer = await harness.getTerminalBuffer(restoredTerminalId)
+          const leaf = await findLeafById(tabId!, positivePaneId)
+          const currentTerminalId = leaf?.content?.terminalId
+          if (!currentTerminalId) return false
+          const buffer = await harness.getTerminalBuffer(currentTerminalId)
           const unwrapped = typeof buffer === 'string' ? buffer.replace(/\n/g, '') : ''
           return unwrapped.includes(`codex: resumed session ${associatedSessionId}`)
         }, { timeout: 20_000 }).toBe(true)
