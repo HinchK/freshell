@@ -1641,39 +1641,98 @@ fn is_canonical_claude_session_id(s: &str) -> bool {
         })
 }
 
-/// P0.4 server-side resolution ladder (campaign plan §2.2; this slice is
-/// in-process only -- the durable-ledger and disk-scan rungs land in a later
-/// slice, P1.8). A `restore:true` claude create that carried no usable client
-/// id gets one more chance: the newest terminal generation for the same
-/// createRequestId, consulted in both identity homes -- the same two-home
-/// precedence `reconcile.rs::resolve_authoritative_ref` uses.
+/// P0.4 server-side resolution ladder (campaign plan §2.2; the in-process
+/// rungs landed with PR #530, the durable-ledger rung with P1.8 read 3 --
+/// only the disk-scan rung remains for a later slice). A `restore:true`
+/// claude create that carried no usable client id gets one more chance: the
+/// newest terminal generation for the same createRequestId, consulted in
+/// both identity homes -- the same two-home precedence
+/// `reconcile.rs::resolve_authoritative_ref` uses -- and, when the
+/// in-process homes have no lineage (a fresh boot), the durable pane ledger.
 ///
 /// GATED on the newest generation NOT being Running (ledger A13): if it is
 /// still live, auto-resuming would spawn a SECOND live claude on the same
 /// session id -- silently wrong. Return None and fail loud instead;
 /// capability-on clients get live adoption via the pane_reconcile dedupe.
-/// Lineage exists only for NATURAL exits: `registry.kill()` removes the row,
-/// so a restore after an explicit user-kill also fails loud -- correct under
-/// "never silently wrong".
+/// The ledger rung applies the equivalent guard against BOTH identity homes
+/// (a live identity-registry owner AND a REST-shaped live registry row).
+/// An explicit user-kill removes the registry row AND retires the ledger
+/// row `closed`, so a restore after user-kill still fails loud -- correct
+/// under "never silently wrong".
 fn resolve_claude_restore_session_id(state: &WsState, create_request_id: &str) -> Option<String> {
-    let newest = state
+    // Rungs 1-2 (in-process, PR #530) -- unchanged, except the early-return
+    // structure now falls THROUGH to the ledger when the in-process homes
+    // simply have no lineage (a fresh boot), while the A13 live-guard stays
+    // a HARD stop the ledger must never reverse.
+    if let Some(newest) = state
         .registry
-        .newest_by_create_request_id(create_request_id)?;
-    let row = state.registry.probe(&newest)?;
-    if row.status == freshell_protocol::TerminalRunStatus::Running {
+        .newest_by_create_request_id(create_request_id)
+    {
+        if let Some(row) = state.registry.probe(&newest) {
+            if row.status == freshell_protocol::TerminalRunStatus::Running {
+                return None; // A13 live-guard: never a second live claude on one session id
+            }
+            if let Some(sref) = state.identity.session_ref_for(&newest) {
+                // Retired entries included -- an exited claude's identity is
+                // exactly what a same-lineage restore needs.
+                if sref.provider == "claude" {
+                    return Some(sref.session_id);
+                }
+            }
+            // Registry-side identity home (REST-created resumes carry
+            // identity only on the registry row).
+            if row.mode == "claude" {
+                if let Some(sid) = row.resume_session_id.filter(|s| !s.is_empty()) {
+                    return Some(sid);
+                }
+            }
+        }
+    }
+    // Rung 3 (P1.8): the durable ledger -- the rung that survives restarts.
+    // `lookup_by_create_request_id` answers only `bound` rows and
+    // `gc_expired` tombstones (auto-resume is a legal transition); a row
+    // retired `closed` (user-kill) or `superseded` is never resurrected.
+    // The lookup is memory-only (write-through index) -- cheap inline.
+    let row = state
+        .pane_ledger
+        .lookup_by_create_request_id("claude", create_request_id)?;
+    // A13-equivalent guard, part 1: if ANY live identity-registry entry
+    // currently owns this session id, fail loud rather than double-resume.
+    if let Some(owner) = state.identity.find_by_session("claude", &row.session_id) {
+        if state
+            .registry
+            .probe(&owner.terminal_id)
+            .is_some_and(|r| r.status == freshell_protocol::TerminalRunStatus::Running)
+        {
+            return None;
+        }
+    }
+    // A13-equivalent guard, part 2 (V6.md): REST-resumed claudes are
+    // invisible to the identity registry AND to createRequestId lineage --
+    // their only footprint is a registry row {mode:"claude",
+    // resume_session_id, Running}. Scan the live registry so the ledger
+    // rung can never green-light a second live claude on one session id.
+    let rest_shaped_live = state.registry.directory().into_iter().any(|entry| {
+        entry.mode == "claude"
+            && entry.resume_session_id.as_deref() == Some(row.session_id.as_str())
+            && entry.status == freshell_protocol::TerminalRunStatus::Running
+    });
+    if rest_shaped_live {
+        tracing::warn!(
+            target: "freshell_ws::pane_ledger",
+            session_id = %row.session_id,
+            "claude_restore_refused: a live (REST-shaped) claude already owns this session id"
+        );
         return None;
     }
-    if let Some(sref) = state.identity.session_ref_for(&newest) {
-        // Retired entries included -- an exited claude's identity is exactly
-        // what a same-lineage restore needs.
-        return (sref.provider == "claude").then_some(sref.session_id);
+    if row.retired_reason == Some(crate::pane_ledger::RetiredReason::GcExpired) {
+        tracing::info!(
+            target: "freshell_ws::pane_ledger",
+            session_id = %row.session_id,
+            "pane_ledger_auto_resume: gc_expired tombstone revived by restore (never-ask-when-we-can-act)"
+        );
     }
-    // Registry-side identity home (REST-created resumes carry identity only
-    // on the registry row).
-    if row.mode != "claude" {
-        return None;
-    }
-    row.resume_session_id.filter(|s| !s.is_empty())
+    Some(row.session_id)
 }
 
 /// Build the create-time `TerminalMetaRecord` for the port-side closure of
