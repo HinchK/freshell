@@ -838,7 +838,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join(format!("rollout-2026-07-26T08-00-00-{TID}.jsonl")),
-            format!(r#"{{"type":"event_msg","payload":{{"id":"{TID}"}}}}"#),
+            format!(
+                "{}
+",
+                r#"{{"type":"event_msg","payload":{{"id":"{TID}"}}}}"#
+            ),
         )
         .unwrap();
         std::fs::write(
