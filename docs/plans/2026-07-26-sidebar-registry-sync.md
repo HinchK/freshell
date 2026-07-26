@@ -1067,3 +1067,31 @@ PR POLICY: NOT approved — do NOT run `gh pr create`. Final output: branch name
   from server-restart-recovery.spec.ts:106-111. Product needed no fix (pinning
   PASS on the first full-suite run; no Step-2 diagnostic branch fired). Full
   spec green in suite order: 3 passed (case-c + case-b + case-a), 1.6m.
+
+### Case (d) recover-my-panes (Task 8)
+- Recovered claude pane joins green: PASS (`data-has-tab="true"` within the
+  45s window after `server.restartAbrupt()` + fresh-context boot + recovery
+  offer ACCEPT, row count exactly 1). Product needed no fix (no contingency
+  branch fired; recovery internals untouched -- Lane C2).
+- Lost-client simulation: the boot context is closed WHOLE before the abrupt
+  restart and the recovery runs in a FRESH browser context (donor idiom,
+  recover-my-panes-rust.spec.ts:290 + :236-246) -- empty localStorage AND
+  empty sessionStorage, honoring the validated clientInstanceId requirement
+  (tabRegistrySync.ts:42-92; recovery_inventory.rs:30-33 self-pollution
+  filter would otherwise suppress the offer). Service workers blocked in the
+  fresh context (donor :215-226 race).
+- Decline-vs-accept: the PRE-restart boot declines the suite-order offer from
+  earlier cases' server-memory panes (same overlay as case-b/case-a); the
+  offer case-d ACCEPTS appears post-restart in the fresh context, whose empty
+  storage the decline dismissal cannot touch.
+- Disk-settle before the kill: ledger binding row + a snapshot generation
+  needled on BOTH the sessionId AND this test's restTabId (sessionId alone
+  matches earlier cases' stale generations -- vacuous wait).
+- One test-side adaptation vs the donor: post-accept "panes recreated" gate is
+  `.xterm` ATTACHED, not visible -- on this shared serial server the recovery
+  set includes picker-bearing "New Tab" generations and the active tab after
+  accept can be a picker while the recovered claude terminal mounts in a
+  background tab (first full-suite run failed visible with the terminal
+  mounted-but-hidden; TabContent kept alive per App.tsx:1611).
+- Full spec green in suite order: 4 passed (case-c + case-b + case-a +
+  case-d), 1.8m.

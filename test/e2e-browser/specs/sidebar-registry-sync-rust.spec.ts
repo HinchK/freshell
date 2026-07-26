@@ -126,6 +126,33 @@ async function declineRecoveryOfferIfShowing(page: import('@playwright/test').Pa
   await panel.waitFor({ state: 'hidden', timeout: 5_000 })
 }
 
+// Copied VERBATIM from recover-my-panes-rust.spec.ts:125-131 (its `connect`).
+// NOT bootAndConnect: the fresh recovery context boots UNDER the offer
+// overlay, so shell-picker clicking must not run before the accept.
+async function connectWithoutShellPick(
+  page: import('@playwright/test').Page,
+  info: { baseUrl: string; token: string },
+): Promise<TestHarness> {
+  await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+  const harness = new TestHarness(page)
+  await harness.waitForHarness()
+  await harness.waitForConnection()
+  return harness
+}
+
+// Copied VERBATIM from recover-my-panes-rust.spec.ts:134-143.
+/** Triage aid: log inventory request failures/non-200s (kept quiet on success). */
+function traceInventoryFailures(page: import('@playwright/test').Page, label: string): void {
+  page.on('response', (r) => {
+    if (!r.url().includes('/api/recovery/inventory') || r.status() === 200) return
+    console.log(`[${label}] inventory response ${r.status()} ${r.url()}`)
+  })
+  page.on('requestfailed', (req) => {
+    if (!req.url().includes('/api/recovery/inventory')) return
+    console.log(`[${label}] inventory request FAILED: ${req.failure()?.errorText}`)
+  })
+}
+
 test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
   test.setTimeout(240_000)
   let server: RustServer
@@ -173,6 +200,66 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
   test.afterAll(async () => {
     await server?.stop()
   })
+
+  // Copied VERBATIM from recover-my-panes-rust.spec.ts:175-191 (capturedHome
+  // -> info.homeDir; this suite's RustServer exposes the isolated HOME there).
+  /**
+   * Wait until SOME persisted snapshot generation contains every needle.
+   * Stronger than a bare "a device dir with >=1 .json" check: pushes fire on
+   * ready + every 5s, so an early generation may predate the panes under
+   * test -- matching CONTENT guarantees the recoverable state actually
+   * includes them before we kill the process.
+   */
+  async function waitForSnapshotContaining(needles: string[], timeoutMs = 30_000): Promise<void> {
+    const snapshotsDir = path.join(info.homeDir, '.freshell', 'tabs-snapshots')
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const devices = await fs.readdir(snapshotsDir).catch(() => [] as string[])
+      for (const device of devices) {
+        const deviceDir = path.join(snapshotsDir, device)
+        const files = await fs.readdir(deviceDir).catch(() => [] as string[])
+        for (const f of files.filter((f) => f.endsWith('.json'))) {
+          const body = await fs.readFile(path.join(deviceDir, f), 'utf8').catch(() => '')
+          if (needles.every((n) => body.includes(n))) return
+        }
+      }
+      await new Promise((r) => setTimeout(r, 500))
+    }
+    throw new Error(`No tabs-snapshot generation contained [${needles.join(', ')}] within ${timeoutMs}ms`)
+  }
+
+  // Copied VERBATIM from recover-my-panes-rust.spec.ts:215-226.
+  /**
+   * SERVICE WORKERS ARE BLOCKED in the fresh recovery context: the production
+   * client registers /sw.js and RELOADS on `controllerchange` (pwa.ts). On a
+   * FRESH context that reload races App mount, aborting in-flight boot fetches
+   * (observed in the donor: the recovery-inventory fetch dying with
+   * net::ERR_ABORTED) -- and the panel's fetch is deliberately one-shot
+   * best-effort, so a lost race means no offer for that boot. Blocking the SW
+   * removes the reload entirely; recovery behavior never depends on the SW.
+   */
+  const FRESH_CONTEXT_OPTIONS = { serviceWorkers: 'block' as const }
+
+  // Copied VERBATIM from recover-my-panes-rust.spec.ts:228-246 (its
+  // openFreshContextWithOffer; connect -> connectWithoutShellPick).
+  /**
+   * Open a FRESH context (empty storage) and REQUIRE the recovery offer --
+   * one context, one hard `toBeVisible` assertion. No retry loop: with
+   * service workers blocked (above) the only known cause of transient offer
+   * suppression is gone, and a retry here would quietly absorb exactly the
+   * flaky-offer regression class this feature already exhibited once.
+   */
+  async function openFreshContextWithOffer(
+    browser: import('@playwright/test').Browser,
+    label: string,
+  ): Promise<{ ctx: import('@playwright/test').BrowserContext; page: import('@playwright/test').Page; harness: TestHarness }> {
+    const ctx = await browser.newContext(FRESH_CONTEXT_OPTIONS)
+    const page = await ctx.newPage()
+    traceInventoryFailures(page, label)
+    const harness = await connectWithoutShellPick(page, info)
+    await expect(page.getByTestId('recovery-offer-panel')).toBeVisible({ timeout: 15_000 })
+    return { ctx, page, harness }
+  }
 
   test('case-c: fresh codex terminal collapses to a single green row', async ({ page }) => {
     const harness = await bootAndConnect(page, info)
@@ -367,5 +454,76 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     // prove nothing about the respawn).
     const resumesAfter = countResumes(await readArgvLog(path.join(sharedRoot, 'claude-argv.jsonl')))
     expect(resumesAfter).toBeGreaterThan(resumesBefore)
+  })
+
+  // KEEP THIS SCENARIO LAST in the serial suite: it destroys the local
+  // client layout (the "lost client" is simulated by abandoning the boot
+  // context entirely) and SIGKILLs the server.
+  test('case-d: recovered panes join green in the sidebar', async ({ page, browser }) => {
+    await bootAndConnect(page, info)
+    // Pre-restart boot offer: earlier cases' panes are still in server memory,
+    // so THIS boot gets a recovery offer too. Decline it -- it is suite-order
+    // noise, NOT the offer under test. The offer case-d ACCEPTS is the
+    // post-abrupt-restart one, which appears in the FRESH context below; the
+    // decline dismissal lives only in this page's storage, which that fresh
+    // context never sees (donor scenario 3 relies on the same isolation).
+    await declineRecoveryOfferIfShowing(page)
+
+    // Open a claude resume pane so there is something to lose + recover.
+    const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
+      headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
+      data: { mode: 'claude', cwd: PROJECT_DIR, resumeSessionId: SEEDED_CLAUDE_ID },
+    })
+    expect(res.ok()).toBe(true)
+    const restTabId: string = (await res.json())?.data?.tabId
+    expect(restTabId).toBeTruthy()
+    await expect(page.locator(`[data-session-id="${SEEDED_CLAUDE_ID}"][data-provider="claude"]`))
+      .toHaveAttribute('data-has-tab', 'true', { timeout: 30_000 })
+
+    // Disk-settle before the kill (donor: recover-my-panes-rust.spec.ts:275-287):
+    // the ledger binding row for the session, then a snapshot generation whose
+    // CONTENT includes THIS test's pane. Needle on restTabId too: earlier
+    // cases' generations already contain SEEDED_CLAUDE_ID, so the sessionId
+    // alone would match a stale generation and the wait would be vacuous.
+    await expect(async () => {
+      const dir = path.join(info.homeDir, '.freshell', 'pane-ledger', 'bindings', 'claude')
+      const rows = await fs.readdir(dir, { recursive: true }).catch(() => [] as string[])
+      expect(rows.map(String).some((f) => f.includes(SEEDED_CLAUDE_ID))).toBe(true)
+    }).toPass({ timeout: 15_000 })
+    await waitForSnapshotContaining([SEEDED_CLAUDE_ID, restTabId])
+
+    // Lost client + abrupt server death. Closing the WHOLE context (donor
+    // :290) is the validated lost-client simulation: the fresh context below
+    // starts with empty localStorage (no freshell.layout.*) AND empty
+    // sessionStorage -- the clientInstanceId persists in sessionStorage
+    // (tabRegistrySync.ts:42-92), and if it survived, the server's
+    // self-pollution filter (recovery_inventory.rs:30-33) would drop this
+    // client's own generations and NO recovery offer would ever appear.
+    await page.context().close()
+    await server.restartAbrupt()
+
+    // Fresh context = new machine; the offer is REQUIRED. ACCEPT it.
+    const { ctx, page: page2 } = await openFreshContextWithOffer(browser, 'case-d')
+    const panel = page2.getByTestId('recovery-offer-panel')
+    await expect(panel.getByRole('heading')).toHaveText(/restore \d+ pane/i)
+    await page2.getByTestId('recovery-accept').click()
+    await expect(panel).toHaveCount(0)
+
+    // Panes recreated: a recovered terminal pane MOUNTS. The donor (:305)
+    // asserts visibility, but there the recovered tab is the active one; on
+    // this shared serial server the recovery set includes earlier cases'
+    // picker-bearing "New Tab" generations, and the active tab after accept
+    // can be one of those pickers while the recovered claude terminal mounts
+    // in a background tab. Every tab's TabContent stays alive (App.tsx:1611),
+    // so ATTACHMENT is the recreate signal here -- visibility would fail on a
+    // mounted-but-backgrounded terminal (observed on the first full-suite run).
+    await expect(page2.locator('.xterm').first()).toBeAttached({ timeout: 30_000 })
+
+    // THE CONTRACT: the recovered session is green again, exactly once.
+    const row = page2.locator(`[data-session-id="${SEEDED_CLAUDE_ID}"][data-provider="claude"]`)
+    await expect(row).toHaveAttribute('data-has-tab', 'true', { timeout: 45_000 })
+    await expect(row).toHaveCount(1)
+
+    await ctx.close()
   })
 })
