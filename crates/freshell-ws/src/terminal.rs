@@ -1350,6 +1350,61 @@ async fn handle_create(
         }
     }
 
+    // D7 liveness guard on the DIRECT wire-sessionRef rung (recover-my-panes
+    // Task 2b, defense-in-depth). Every other live-guard lives inside the
+    // createRequestId-keyed ladder (`resolve_claude_restore_session_id`), which
+    // the direct rung above bypasses entirely -- and the D5 recovery path
+    // re-mints the createRequestId, so a session that goes live between the
+    // inventory fetch and the user's accept would otherwise silently spawn a
+    // SECOND `<cli> --resume S` while the original live PTY owns S (the
+    // one-JSONL-writer doctrine: "silently wrong"). Mirrors the ladder's A13
+    // row-matching -- the identity-registry owner check plus the REST-shaped
+    // live-registry-row scan -- but MODE-GENERIC: codex/opencode/amplifier had
+    // no live-guard on ANY path, so this closes their gap too. Applies only
+    // when the resume id was derived from the wire `sessionRef` (the
+    // resumeSessionId fallback and ladder-resolved ids keep their existing
+    // guards).
+    if let Some(live_sid) = create
+        .session_ref
+        .as_ref()
+        .filter(|r| r.provider == mode)
+        .map(|r| r.session_id.as_str())
+        .filter(|sid| !sid.is_empty() && resume_session_id.as_deref() == Some(*sid))
+    {
+        let identity_owner_live =
+            state
+                .identity
+                .find_by_session(&mode, live_sid)
+                .is_some_and(|owner| {
+                    state
+                        .registry
+                        .probe(&owner.terminal_id)
+                        .is_some_and(|r| r.status == freshell_protocol::TerminalRunStatus::Running)
+                });
+        let registry_row_live = identity_owner_live
+            || state.registry.directory().into_iter().any(|entry| {
+                entry.mode == mode
+                    && entry.resume_session_id.as_deref() == Some(live_sid)
+                    && entry.status == freshell_protocol::TerminalRunStatus::Running
+            });
+        if registry_row_live {
+            tracing::warn!(
+                target: "freshell_ws::terminal",
+                mode = %mode,
+                session_id = %live_sid,
+                request_id = %create.request_id,
+                "create_refused: a Running terminal already owns this session (D7 live-guard)"
+            );
+            return send_create_error(
+                ws_tx,
+                ErrorCode::RestoreUnavailable,
+                format!("Session {live_sid} is still running on the server."),
+                &create.request_id,
+            )
+            .await;
+        }
+    }
+
     // Provider settings `codingCli.providers[mode]` (`ws:2317-2319`), with the
     // codex strip (`ws:2464-2465` — model/sandbox/permissionMode route to the
     // app-server plan instead). Boot-snapshot settings (same documented caveat

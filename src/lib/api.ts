@@ -9,6 +9,7 @@ import { getClientPerfConfig, isClientPerfLoggingEnabled, logClientPerf } from '
 import { getAuthToken } from '@/lib/auth'
 import { sanitizeSessionLocators } from '@/lib/session-utils'
 import type { SessionLocator } from '@/store/paneTypes'
+import type { RecoveryInventory } from '@/lib/recovery/types'
 import {
   type FreshAgentModelCapabilitiesResponse,
 } from '@shared/fresh-agent-model-capabilities'
@@ -282,6 +283,12 @@ function buildQueryString(entries: Array<[string, string | number | undefined]>)
 
 export async function getBootstrap(options: ApiRequestOptions = {}): Promise<any> {
   return api.get('/api/bootstrap', options)
+}
+
+export async function getRecoveryInventory(clientInstanceId: string, bootAgoMs: number): Promise<RecoveryInventory> {
+  return api.get<RecoveryInventory>(
+    `/api/recovery/inventory${buildQueryString([['clientInstanceId', clientInstanceId], ['bootAgoMs', Math.max(0, Math.round(bootAgoMs))]])}`,
+  )
 }
 
 export async function getFreshAgentModelCapabilities(

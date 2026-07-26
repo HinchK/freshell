@@ -130,6 +130,7 @@ const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn())
 const getTerminalDirectoryPage = vi.hoisted(() => vi.fn())
 const searchTerminalView = vi.hoisted(() => vi.fn())
 vi.mock('@/lib/api', () => ({
+  getRecoveryInventory: async () => ({ recoverable: false, contentId: 'test', device: null, otherDevices: [], ledgerOnly: [] }),
   api: {
     get: (url: string) => apiGet(url),
     patch: vi.fn().mockResolvedValue({}),

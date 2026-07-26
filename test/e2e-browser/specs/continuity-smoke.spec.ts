@@ -106,8 +106,8 @@ async function selectShellIfPickerShowing(page: import('@playwright/test').Page)
 
 // Find a provider pane's Redux content by scanning every tab's pane layout
 // (uniform same-session evidence -- GET /api/terminals DELIBERATELY omits
-// `sessionRef` for codex/shell items, see terminals.rs). Same shape as
-// snapshot-restore-rust.spec.ts's codexPane, parameterized by mode.
+// `sessionRef` for codex/shell items, see terminals.rs). Same shape as the
+// retired snapshot-restore-rust spec's codexPane, parameterized by mode.
 async function paneByMode(harness: TestHarness, mode: Provider): Promise<any | null> {
   const state = await harness.getState()
   for (const tab of state?.tabs?.tabs ?? []) {
