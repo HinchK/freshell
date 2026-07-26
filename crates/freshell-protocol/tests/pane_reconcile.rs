@@ -164,7 +164,6 @@ fn reconcile_result_serializes_verdicts_with_optional_fields_omitted() {
                 }),
                 corrected: Some(true),
                 reason: None,
-                retry_after_ms: None,
                 duplicate: None,
             },
             PaneVerdict {
@@ -174,7 +173,6 @@ fn reconcile_result_serializes_verdicts_with_optional_fields_omitted() {
                 session_ref: None,
                 corrected: None,
                 reason: Some("no_recoverable_identity".to_string()),
-                retry_after_ms: None,
                 duplicate: None,
             },
         ],
@@ -201,7 +199,7 @@ fn reconcile_verdict_wire_names_are_snake_case() {
         (ReconcileVerdict::Respawn, "respawn"),
         (ReconcileVerdict::Fresh, "fresh"),
         (ReconcileVerdict::DeadSession, "dead_session"),
-        (ReconcileVerdict::Retry, "retry"),
+        (ReconcileVerdict::Error, "error"),
         (ReconcileVerdict::Invalid, "invalid"),
     ] {
         assert_eq!(serde_json::to_value(verdict).unwrap(), json!(name));
@@ -209,20 +207,23 @@ fn reconcile_verdict_wire_names_are_snake_case() {
 }
 
 #[test]
-fn retry_verdict_carries_retry_after_ms() {
+fn error_verdict_carries_reason_and_no_retry_after_ms() {
+    // `retry` is deleted from the wire: the terminal per-pane error state
+    // replaces it and carries only a machine-readable reason — never a
+    // `retryAfterMs` cadence hint.
     let verdict = PaneVerdict {
         pane_key: "p".to_string(),
-        verdict: ReconcileVerdict::Retry,
+        verdict: ReconcileVerdict::Error,
         terminal_id: None,
         session_ref: None,
         corrected: None,
         reason: Some("index_warming".to_string()),
-        retry_after_ms: Some(2000),
         duplicate: None,
     };
     let wire = serde_json::to_value(&verdict).expect("serializes");
-    assert_eq!(wire["retryAfterMs"], 2000);
+    assert_eq!(wire["verdict"], "error");
     assert_eq!(wire["reason"], "index_warming");
+    assert!(wire.get("retryAfterMs").is_none());
 }
 
 // --- error codes --------------------------------------------------------------

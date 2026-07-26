@@ -18,10 +18,11 @@ use crate::identity::TerminalIdentityRegistry;
 /// never silently truncated.
 pub const MAX_RECONCILE_PANES: usize = 200;
 
-/// §5.3 row 5 placeholder cadence for `retry(index_warming)` (the retry
-/// mechanism itself is an OPEN user decision, design §8.0 — this implements
-/// the documented placeholder).
-pub const RETRY_AFTER_MS: i64 = 2000;
+/// §5.3 row 5 default budget for the handler's ONE bounded deferral before
+/// re-deriving verdicts once (council-pinned single deferral): when a
+/// derivation comes back `error{index_warming}`, `handle_pane_reconcile`
+/// waits at most this long, re-derives once, and answers — never loops.
+pub const RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT: u64 = 2000;
 
 /// The read-only inputs of the derivation (§5.1) — all shared handles that
 /// already live on [`crate::WsState`].
@@ -60,7 +61,6 @@ fn invalid(pane: &ReconcilePane, reason: &str) -> PaneVerdict {
         session_ref: None,
         corrected: None,
         reason: Some(reason.to_string()),
-        retry_after_ms: None,
         duplicate: None,
     }
 }
@@ -73,7 +73,6 @@ fn base(pane: &ReconcilePane, verdict: ReconcileVerdict) -> PaneVerdict {
         session_ref: None,
         corrected: None,
         reason: None,
-        retry_after_ms: None,
         duplicate: None,
     }
 }
@@ -248,8 +247,7 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
         }
         SessionExistence::Unknown => PaneVerdict {
             reason: Some("index_warming".to_string()),
-            retry_after_ms: Some(RETRY_AFTER_MS),
-            ..base(pane, ReconcileVerdict::Retry)
+            ..base(pane, ReconcileVerdict::Error)
         },
     }
 }
@@ -477,18 +475,19 @@ mod tests {
         );
     }
 
-    /// Row 5 (§9.1 test 6): cold index on a known provider → honest retry,
-    /// never dead_session, never optimistic respawn.
+    /// Row 5 (§9.1 test 6): cold index on a known provider → honest
+    /// error{index_warming}, never dead_session, never optimistic respawn.
+    /// (`retry` is deleted from the wire; the handler's bounded single
+    /// deferral is the recovery attempt, `terminal.rs`.)
     #[test]
-    fn row5_unknown_existence_yields_retry_with_backoff() {
+    fn row5_unknown_existence_yields_error_index_warming() {
         let f = Fixture::new();
         f.probe.set("claude", "s-cold", SessionExistence::Unknown);
         let mut p = pane("cr-5");
         p.session_ref = Some(sref("claude", "s-cold"));
         let v = f.one(p);
-        assert_eq!(v.verdict, ReconcileVerdict::Retry);
+        assert_eq!(v.verdict, ReconcileVerdict::Error);
         assert_eq!(v.reason.as_deref(), Some("index_warming"));
-        assert_eq!(v.retry_after_ms, Some(RETRY_AFTER_MS));
     }
 
     /// Row 6: no terminalId at all, just a claim that IS on disk → respawn

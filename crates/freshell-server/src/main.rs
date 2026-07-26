@@ -447,6 +447,9 @@ async fn main() -> ExitCode {
             )),
             None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         },
+        // §5.3 row 5: the ONE bounded index-warming deferral's budget
+        // (council-pinned single deferral, default 2000ms).
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),

@@ -1926,16 +1926,21 @@ async fn handle_pane_reconcile(
         )
         .await;
     }
-    let deps = crate::reconcile::ReconcileDeps {
-        registry: &state.registry,
-        identity: &state.identity,
-        existence: state.session_existence.as_ref(),
-    };
     // §8 frame-level failure: a panicking derivation (poisoned lock) must
-    // surface as an explicit error frame, never silence.
-    let verdicts = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::reconcile::derive_verdicts(&deps, &request.panes)
-    })) {
+    // surface as an explicit error frame, never silence. The deps are rebuilt
+    // per derivation so nothing borrowed for the pure read is ever held
+    // across the deferral await below.
+    let derive = || {
+        let deps = crate::reconcile::ReconcileDeps {
+            registry: &state.registry,
+            identity: &state.identity,
+            existence: state.session_existence.as_ref(),
+        };
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::reconcile::derive_verdicts(&deps, &request.panes)
+        }))
+    };
+    let mut verdicts = match derive() {
         Ok(verdicts) => verdicts,
         Err(_) => {
             return send_create_error(
@@ -1947,6 +1952,41 @@ async fn handle_pane_reconcile(
             .await;
         }
     };
+    // §5.3 row 5: ONE bounded deferral when the index is still warming, then
+    // exactly one re-derivation — never a loop. The wait is a plain bounded
+    // sleep: the `SessionIndex` behind the probe exposes no sweep-completion
+    // signal to await (`peek()`/`is_fresh()` are sync and non-blocking by
+    // design, and `snapshot().await` on a truly cold index runs the sweep
+    // inline for potentially minutes — unbounded, so unusable here). The
+    // honest expectation stands: a truly cold scan takes far longer than the
+    // budget, so `error{index_warming}` is EXPECTED on cold boots and the
+    // client's manual retry affordance is the recovery path. The stall is
+    // delay-only and scoped to THIS connection's select loop, bounded by the
+    // budget (default 2000ms, shrunk in tests).
+    let warming = |vs: &[freshell_protocol::PaneVerdict]| {
+        vs.iter().any(|v| {
+            matches!(v.verdict, freshell_protocol::ReconcileVerdict::Error)
+                && v.reason.as_deref() == Some("index_warming")
+        })
+    };
+    if warming(&verdicts) {
+        tokio::time::sleep(std::time::Duration::from_millis(
+            state.reconcile_deferral_budget_ms,
+        ))
+        .await;
+        verdicts = match derive() {
+            Ok(verdicts) => verdicts,
+            Err(_) => {
+                return send_create_error(
+                    ws_tx,
+                    ErrorCode::ReconcileUnavailable,
+                    "reconcile derivation failed; keep current state and re-send".to_string(),
+                    &request.reconcile_id,
+                )
+                .await;
+            }
+        };
+    }
     let result = ServerMessage::PaneReconcileResult(freshell_protocol::PaneReconcileResult {
         reconcile_id: request.reconcile_id,
         boot_id: state.boot_id.as_ref().clone(),
@@ -3195,6 +3235,7 @@ mod terminals_changed_tests {
             opencode_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         };
         (state, rx)
     }
@@ -3402,6 +3443,7 @@ mod terminal_meta_created_tests {
             opencode_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         };
         (state, rx)
     }

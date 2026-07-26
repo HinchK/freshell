@@ -229,6 +229,14 @@ pub struct WsState {
     /// of `identity` and the locator handles); [`crate::existence::NoIndexProbe`]
     /// when no provider home resolves.
     pub session_existence: crate::existence::SharedExistenceProbe,
+    /// Reconciliation handshake (design §5.3 row 5): the budget, in
+    /// milliseconds, for `handle_pane_reconcile`'s ONE bounded deferral when
+    /// a derivation comes back `error{index_warming}` — wait at most this
+    /// long, re-derive once, answer. Never loops. Default
+    /// [`crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT`] (2000ms);
+    /// tests shrink it so the warming paths are observable without a real
+    /// 2s wait (mirrors `ping_interval_ms` / `hello_timeout_ms`).
+    pub reconcile_deferral_budget_ms: u64,
     /// The opencode terminal-pane session locator (restore-across-restart fix,
     /// `docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): correlates a
     /// fresh opencode PTY's first Enter/submit (or a row written at spawn) with
@@ -741,6 +749,7 @@ mod tests {
             opencode_locator: None,
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         }
     }
 

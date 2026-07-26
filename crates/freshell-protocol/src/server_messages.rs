@@ -688,8 +688,10 @@ pub enum ReconcileVerdict {
     Respawn,
     Fresh,
     DeadSession,
-    Retry,
     Invalid,
+    /// Terminal per-pane error state (replaces the deleted `retry`):
+    /// reason is one of "index_warming" | "provider_unavailable".
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -708,12 +710,9 @@ pub struct PaneVerdict {
     /// Present iff the server overrode a differing client claim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub corrected: Option<bool>,
-    /// fresh / dead_session / retry / invalid: machine-readable code.
+    /// fresh / dead_session / error / invalid: machine-readable code.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    /// retry only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub retry_after_ms: Option<i64>,
     /// Row 2b (invariant I6): a newer duplicate generation exists for the same
     /// `createRequestId`; the client stays on its live attachment and this
     /// merely flags the duplicate `terminalId`.
