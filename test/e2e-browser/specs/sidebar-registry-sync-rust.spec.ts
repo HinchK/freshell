@@ -1,7 +1,7 @@
 /**
  * P1.14 sidebar/tab-registry sync re-verification (Lane C1).
  * Pins the Incident-4 sidebar contract against ledger-backed identity:
- *  case-c: fresh codex duplicate collapse (this task)
+ *  case-c: fresh codex duplicate collapse          (Task 5)
  *  case-b: REST-created tabs are green + dedupe   (Task 6)
  *  case-a: joins survive server restart            (Task 7)
  *  case-d: joins correct after recover-my-panes    (Task 8)
@@ -274,5 +274,98 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
       const tabsAfter = await harness.getTabCount()
       expect(tabsAfter).toBe(tabsBefore)
     }
+  })
+
+  test('case-a: sidebar joins survive a graceful server restart', async ({ page }) => {
+    await bootAndConnect(page, info)
+    // Server memory still holds panes from case-b/case-c on this shared
+    // serial server, so the fresh browser context gets the recovery offer
+    // overlay -- decline it (same reasoning as case-b; recovery semantics
+    // are case-d territory).
+    await declineRecoveryOfferIfShowing(page)
+
+    // Panes from case-b/case-c are still open in this serial suite's page state?
+    // No -- each test gets a fresh page. Re-establish: open both resume tabs.
+    // NOTE (shared serial server, validated): re-POSTing a resume tab for a
+    // session whose earlier terminal is still alive is NOT rejected
+    // (TerminalRegistry::create spawns unconditionally); it only ERROR-logs
+    // via alarm_if_duplicate_session_ref. That log line is EXPECTED here,
+    // not a failure.
+    for (const [mode, sessionId] of [
+      ['claude', SEEDED_CLAUDE_ID],
+      ['codex', SEEDED_CODEX_THREAD_ID],
+    ] as const) {
+      const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
+        headers: { 'x-auth-token': info.token, 'content-type': 'application/json' },
+        // VALIDATED: raw codex resumeSessionId is deliberately 400-rejected at
+        // HEAD (terminal_tabs.rs:124-131, pinned by
+        // create_codex_tab_rejects_raw_resume_session_id_without_session_ref);
+        // the canonical sessionRef shape IS accepted (pinned by
+        // create_codex_tab_accepts_session_ref_and_derives_resume_args). Do NOT
+        // "fix" the rejection -- use the canonical shape for codex.
+        data: mode === 'codex'
+          ? { mode, cwd: PROJECT_DIR, sessionRef: { provider: 'codex', sessionId } }
+          : { mode, cwd: PROJECT_DIR, resumeSessionId: sessionId },
+      })
+      expect(res.ok()).toBe(true)
+      await expect(page.locator(`[data-session-id="${sessionId}"][data-provider="${mode}"]`))
+        .toHaveAttribute('data-has-tab', 'true', { timeout: 30_000 })
+    }
+
+    // Persist the layout before the restart (donor VERBATIM:
+    // remote-tab-linkage-rust.spec.ts:277-281). The dispatch goes through the
+    // window harness global __FRESHELL_TEST_HARNESS__ -- there is NO
+    // __freshellStore global anywhere in src/ or test/. The layout assertion
+    // immediately after makes the flush observable: if the harness were
+    // missing and the dispatch silently no-opped, persistedLayout would be
+    // null and this fails loudly instead of riding on debounced persist timing.
+    await page.evaluate(() => {
+      (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
+    })
+    const persistedLayout = await page.evaluate(() => localStorage.getItem('freshell.layout.v3'))
+    expect(persistedLayout, 'persisted layout must exist after flush').toBeTruthy()
+
+    // Snapshot the --resume count BEFORE the restart. The argv log is shared
+    // across the whole serial suite (case-b already resumed SEEDED_CLAUDE_ID
+    // once, and this test's own pre-restart create adds another), so any
+    // absolute threshold is satisfied before the restart even happens and
+    // would pass vacuously. Only a before/after increase proves the respawn.
+    const countResumes = (entries: Array<{ argv: string[] }>) =>
+      entries.filter((e) => {
+        const i = e.argv.indexOf('--resume')
+        return i !== -1 && e.argv[i + 1] === SEEDED_CLAUDE_ID
+      }).length
+    const resumesBefore = countResumes(await readArgvLog(path.join(sharedRoot, 'claude-argv.jsonl')))
+
+    await server.restart()
+    await page.reload({ waitUntil: 'domcontentloaded' })
+
+    // Wait for WS to reconnect and reach 'ready' state
+    // (copied VERBATIM from server-restart-recovery.spec.ts:106-111).
+    await expect(async () => {
+      const status = await page.evaluate(() =>
+        window.__FRESHELL_TEST_HARNESS__?.getWsReadyState()
+      )
+      expect(status).toBe('ready')
+    }).toPass({ timeout: 30_000 })
+
+    // THE CONTRACT: every session is green again, exactly once.
+    for (const [mode, sessionId] of [
+      ['claude', SEEDED_CLAUDE_ID],
+      ['codex', SEEDED_CODEX_THREAD_ID],
+    ] as const) {
+      const row = page.locator(`[data-session-id="${sessionId}"][data-provider="${mode}"]`)
+      await expect(row).toHaveAttribute('data-has-tab', 'true', { timeout: 45_000 })
+      await expect(row).toHaveCount(1)
+    }
+    // No provisional ghosts left over from respawned terminals.
+    await expect(page.locator('[data-provider="codex"][data-session-id^="terminal:"]')).toHaveCount(0, { timeout: 45_000 })
+
+    // Respawn proof: the fake claude CLI was relaunched with --resume AFTER the
+    // restart -- assert the count INCREASED relative to the pre-restart
+    // snapshot (an absolute >=N threshold would already be met pre-restart and
+    // prove nothing about the respawn).
+    const resumesAfter = countResumes(await readArgvLog(path.join(sharedRoot, 'claude-argv.jsonl')))
+    expect(resumesAfter).toBeGreaterThan(resumesBefore)
   })
 })

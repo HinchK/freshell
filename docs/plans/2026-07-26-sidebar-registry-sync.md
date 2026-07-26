@@ -1046,3 +1046,24 @@ PR POLICY: NOT approved — do NOT run `gh pr create`. Final output: branch name
   semantics themselves are case-d territory (Task 8). Full spec then green:
   2 passed (case-c + case-b), 1.1m.
 - amplifier variant: covered by remote-tab-linkage-rust.spec.ts (re-run in Task 9).
+
+### Case (a) restart survival (Task 7)
+- claude resume pane green after restart: PASS (`data-has-tab="true"` within the
+  45s window after `server.restart()` + reload + WS-ready wait, row count
+  exactly 1).
+- codex resume pane green after restart: PASS (canonical sessionRef body on the
+  re-POST; row green, count exactly 1).
+- no provisional terminal:<id> ghosts: PASS (zero
+  `[data-provider="codex"][data-session-id^="terminal:"]` rows post-restart).
+- respawn proven via argv log: PASS via the before/after discipline -- the
+  `--resume <SEEDED_CLAUDE_ID>` count in the shared claude-argv.jsonl strictly
+  increased across the restart (an absolute threshold would already have been
+  met pre-restart by case-b's resume plus this test's own pre-restart create,
+  and would have passed vacuously).
+- Test-side notes: recovery offer declined after boot (same suite-order overlay
+  as case-b; server memory holds case-b/case-c panes); persist flush via
+  `__FRESHELL_TEST_HARNESS__.dispatch({type:'persist/flushNow'})` with the
+  fail-loud `persistedLayout` truthy assertion; reconnect wait copied verbatim
+  from server-restart-recovery.spec.ts:106-111. Product needed no fix (pinning
+  PASS on the first full-suite run; no Step-2 diagnostic branch fired). Full
+  spec green in suite order: 3 passed (case-c + case-b + case-a), 1.6m.
