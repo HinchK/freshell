@@ -731,9 +731,16 @@ impl FreshClaudeState {
                         // BEFORE the init-driven broadcast below proceeds (V8/A11).
                         // A failed write is surfaced user-visibly, never
                         // warn-and-drop, then the identity event proceeds.
-                        if let (Some(sink), Some(settings)) =
-                            (identity_sink.clone(), settings.as_ref())
-                        {
+                        // No-laundering guard (V7/A10, parity with codex's
+                        // `record_codex_binding`): never persist an all-blank
+                        // snapshot — it would make `was_recorded` true while
+                        // `load_settings` returns None (the server sink's
+                        // blank-snapshot guard), arming a FALSE SETTINGS_RESET
+                        // for a legitimately-default create on a later resume.
+                        let recordable = settings
+                            .as_ref()
+                            .filter(|s| **s != crate::identity_sink::FreshAgentSettings::default());
+                        if let (Some(sink), Some(settings)) = (identity_sink.clone(), recordable) {
                             if let Err(e) = sink
                                 .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
                                     provider: PROVIDER.into(),
@@ -2031,6 +2038,48 @@ rl.on('line', (line) => {
         assert_eq!(b.settings.permission_mode.as_deref(), Some("plan"));
         assert_eq!(b.settings.effort.as_deref(), Some("high"));
         assert!(b.settings.cwd.is_some());
+    }
+
+    /// No-laundering guard (V7/A10, parity with codex's `record_codex_binding`):
+    /// a create carrying NO optional settings (model/permissionMode/effort/cwd all
+    /// None) must NOT persist an all-blank binding row at `sdk.session.init`. A blank
+    /// row makes `was_recorded` true while `load_settings` returns None (the server
+    /// sink's blank-snapshot guard) — the exact SETTINGS_RESET alarm condition — so a
+    /// legitimately-default session would false-alarm on a later resume. The init
+    /// frame itself still broadcasts; only the ledger write is skipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_init_with_all_blank_settings_records_no_binding() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // dedup_create_msg carries no model/permissionMode/effort/cwd — the
+        // all-blank snapshot shape.
+        state
+            .handle_create(dedup_create_msg("req-binding-blank"))
+            .await;
+        await_claude_created(&mut rx, "req-binding-blank").await;
+
+        // The init frame still broadcasts (the skip affects ONLY the ledger write).
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.session.init" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("freshAgent.session.init consumed within budget");
+
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "an all-blank settings snapshot must not be persisted \
+             (it would arm a false SETTINGS_RESET on resume)"
+        );
+        drop(env);
     }
 
     // ── resume settings-from-ledger (P1.13, Task 10) ─────────────────────────────

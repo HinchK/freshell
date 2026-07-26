@@ -1012,7 +1012,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // `freshAgent.create{resumeSessionId: ses_*}` (never attach), and
     // opencode's `handle_create` now honors `resume_session_id`
     // (crates/freshell-freshagent/src/opencode_ws.rs, unit pin
-    // `create_with_resume_session_id_rebinds_the_surviving_session`), so
+    // `create_with_resume_session_id_rebinds_the_durable_session`), so
     // the pane rebinds the durable identity and rehydrates history -- the
     // pin is removed (flip pattern: restore-matrix.spec.ts TERM-25).
     // NOTE: the flip unmasked a latent strict-mode locator ambiguity in

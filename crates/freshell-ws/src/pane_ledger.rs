@@ -409,24 +409,61 @@ impl PaneLedger {
         };
         self.write_binding(root, index, &row)?; // new bound row FIRST (pinned)
 
-        if let Some(mut old) = previous {
-            old.state = RowState::Retired;
-            old.retired_reason = Some(RetiredReason::Superseded);
-            old.superseded_by = Some(SessionLocator {
-                provider: w.provider.to_string(),
-                session_id: w.session_id.to_string(),
-            });
-            old.updated_at = w.now_ms;
-            tracing::info!(
-                target: "freshell_ws::pane_ledger",
-                terminal_id = %w.terminal_id,
-                old_session_id = %old.session_id,
-                new_session_id = %w.session_id,
-                "pane_ledger_superseded: binding moved; old row retired, never defended"
-            );
-            self.write_binding(root, index, &old)?; // THEN retire the old
+        if let Some(old) = previous {
+            self.retire_and_link_locked(
+                root,
+                index,
+                old,
+                SessionLocator {
+                    provider: w.provider.to_string(),
+                    session_id: w.session_id.to_string(),
+                },
+                w.now_ms,
+                Some(w.terminal_id),
+            )?;
         }
         Ok(())
+    }
+
+    /// Retire an old bound row and link it to the session that superseded it
+    /// (G3 retire-never-defend; the ONE supersession block shared by
+    /// [`Self::record_binding_locked`] and [`Self::record_fresh_agent_binding`]
+    /// so the two sites can never drift): state→Retired,
+    /// retired_reason→Superseded, superseded_by→the new session's locator,
+    /// updated_at→now, one info log, then persist. Callers write the new bound
+    /// row FIRST and call this AFTER (order pinned). `terminal_id` is `Some`
+    /// for terminal-pane rows (logged) and `None` for fresh-agent rows (which
+    /// own no terminal).
+    fn retire_and_link_locked(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        mut old: BindingRow,
+        superseded_by: SessionLocator,
+        now_ms: i64,
+        terminal_id: Option<&str>,
+    ) -> std::io::Result<()> {
+        old.state = RowState::Retired;
+        old.retired_reason = Some(RetiredReason::Superseded);
+        old.updated_at = now_ms;
+        match terminal_id {
+            Some(terminal_id) => tracing::info!(
+                target: "freshell_ws::pane_ledger",
+                terminal_id = %terminal_id,
+                old_session_id = %old.session_id,
+                new_session_id = %superseded_by.session_id,
+                "pane_ledger_superseded: binding moved; old row retired, never defended"
+            ),
+            None => tracing::info!(
+                target: "freshell_ws::pane_ledger",
+                old_session_id = %old.session_id,
+                new_session_id = %superseded_by.session_id,
+                "pane_ledger_superseded: fresh-agent binding moved; \
+                 old row retired, never defended"
+            ),
+        }
+        old.superseded_by = Some(superseded_by);
+        self.write_binding(root, index, &old) // THEN retire the old
     }
 
     /// Record (or refresh) a `bound` row for a fresh-agent identity event
