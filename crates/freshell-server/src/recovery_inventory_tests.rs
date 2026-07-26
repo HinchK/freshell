@@ -72,6 +72,11 @@ fn binding_row_at(
         state,
         retired_reason,
         superseded_by,
+        pane_kind: None,
+        model: None,
+        sandbox: None,
+        permission_mode: None,
+        effort: None,
     }
 }
 

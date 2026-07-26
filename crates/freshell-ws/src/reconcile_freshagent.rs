@@ -111,11 +111,12 @@ pub async fn build_snapshot(
         let presence = if live {
             FreshAgentPresence::Live
         } else {
-            // Exhaustive match, NO catch-all (B1 hardening: when B1 adds
-            // E::ProviderUnavailable this goes non-exhaustive — add the
-            // pre-decided arm `E::ProviderUnavailable => FreshAgentPresence::Unknown`).
+            // Exhaustive match, NO catch-all (B1 hardening). ProviderUnavailable
+            // arm is the B4 pre-decision (V9/A12, module doc above): conservative
+            // respawn-with-cap via Unknown, never dead_session.
             match state.session_existence.exists(&sref.provider, &session_id) {
                 E::Present => FreshAgentPresence::OnDisk,
+                E::ProviderUnavailable => FreshAgentPresence::Unknown,
                 E::Absent => {
                     if state
                         .session_existence

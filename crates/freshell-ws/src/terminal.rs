@@ -2342,21 +2342,18 @@ async fn handle_pane_reconcile(
     } else {
         None
     };
-    let deps = crate::reconcile::ReconcileDeps {
-        registry: &state.registry,
-        identity: &state.identity,
-        existence: state.session_existence.as_ref(),
-        fresh_agent: fresh_agent_snapshot.as_ref(),
-    };
     // §8 frame-level failure: a panicking derivation (poisoned lock) must
     // surface as an explicit error frame, never silence. The deps are rebuilt
     // per derivation so nothing borrowed for the pure read is ever held
-    // across the deferral await below.
+    // across the deferral await below. The fresh-agent snapshot is NOT
+    // rebuilt — it was built once above (rebuilding would double-burn the
+    // respawn counter; V9 §3.6) and each rebuilt deps borrows the same one.
     let derive = || {
         let deps = crate::reconcile::ReconcileDeps {
             registry: &state.registry,
             identity: &state.identity,
             existence: state.session_existence.as_ref(),
+            fresh_agent: fresh_agent_snapshot.as_ref(),
         };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::reconcile::derive_verdicts(&deps, &request.panes)

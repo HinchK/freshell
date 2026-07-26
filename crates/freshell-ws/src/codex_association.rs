@@ -226,6 +226,8 @@ mod tests {
             codex_locator: Some(StdArc::new(CodexLocator::new(data_home))),
             activity: None,
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
         };
         (state, rx)
     }
