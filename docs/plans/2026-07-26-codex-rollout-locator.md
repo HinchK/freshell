@@ -73,7 +73,8 @@ Node .mjs fake-CLI fixture.
    server share ONE sessions tree:
    `<CODEX_HOME|~/.codex>/sessions/YYYY/MM/DD/rollout-<ts>-<threadId>.jsonl`
    (flat `<id>.jsonl` also supported, used by tests). Pane↔rollout attribution
-   therefore needs a disambiguator set: arm-time known-files snapshot +
+   therefore needs a disambiguator set: known-files snapshot (taken at arm,
+   re-snapshotted at the first Enter) +
    Enter-anchored windows + REQUIRED-cwd match + pending-first-line
    bind-blocking + contested-cwd refusal (see Validated Premises below).
 2. **"One watcher, two consumers" is not feasible for discovery.** The wave-2
@@ -129,19 +130,33 @@ A codex upgrade re-opens every codex-behavior item below.
    The original snapshot+cwd+same-tick-ambiguity trio allowed clean misbinds
    (same-cwd foreign codex/exec/fork, staggered same-cwd panes, the
    spawn-window pure-foreign capture). Mandatory hardenings, all encoded in
-   Tasks 1-3: Enter-only windows (item 7); cwd REQUIRED — a no-cwd
+   Tasks 1-4: Enter-only windows (item 7); cwd REQUIRED — a no-cwd
    session_meta NEVER binds (`SessionMeta.cwd` is non-optional at 0.145.0,
    3,858/3,858 corpus; a permissive no-cwd rule is pure attack surface);
    pending-candidate bind-blocking (item 8); CROSS-TICK contested-cwd
    refusal — while ≥2 armed terminals share a normalized cwd nothing binds
-   for any of them; and the adoption tail refuses a thread id already bound
+   for any of them; the adoption tail refuses a thread id already bound
    to another terminal (retired-inclusive; idempotent same-terminal re-adopt
-   allowed).
-10. **(A4 residual risk — documented, NOT solvable in this lane.)** A
-    freshell-freshagent codex agent session started in the SAME cwd during a
-    pane's open window can still misbind as a sole candidate: freshagent's
-    `codex app-server` sidecar writes rollouts into the same
-    `$HOME/.codex/sessions` root. Recommended future fix (Lane B4
+   allowed); and a FIRST-SUBMIT `known_files` re-snapshot — the first
+   `note_submit` replaces the arm-time snapshot with a fresh scan, strictly
+   safe by item 7 (the pane's own rollout cannot exist before its first
+   Enter), closing the arm→first-Enter foreign-capture gap. The re-snapshot
+   is sound ONLY if it completes BEFORE the Enter byte is written to the
+   PTY (codex materializes the rollout in response to that very Enter) —
+   Task 4's submit seam encodes this ordering; later window re-opens NEVER
+   re-snapshot (the pane's own slow-materializing rollout must stay a
+   candidate).
+10. **(A4 residual risk — documented, NOT solvable in this lane.)** The
+    first-submit re-snapshot (item 9) closes the arm→first-Enter capture
+    gap, but a foreign same-cwd rollout created AFTER the pane's first
+    Enter can still misbind as a sole candidate: every window from the
+    first Enter onward diffs against the first-submit snapshot, and there
+    is deliberately no time bound (item 7's re-open mitigation depends on
+    that). Realistic same-cwd writer: a freshell-freshagent codex agent
+    session — freshagent's `codex app-server` sidecar writes rollouts into
+    the same `$HOME/.codex/sessions` root — combined with a later bare
+    Enter on the pane (empty composer or a codex dialog; `is_submit_input`
+    treats any pure CR/LF as a submit). Recommended future fix (Lane B4
     coordination): exclude freshagent-known thread ids (`thread/start`
     results) at adoption. Recorded here so the risk is owned, not silent.
 11. **(A5) The post-spawn arm site is safe — but only because of item 7.**
@@ -153,7 +168,8 @@ A codex upgrade re-opens every codex-behavior item below.
     (3,858 files): 7-9 ms warm. Synthetic 100k files: p95 96 ms warm, worst
     117 ms under 8-way concurrency (native ext4, WSL2). The earlier
     "35-55 ms on an 8k-file tree" figure did NOT reproduce — do not cite it.
-    Cold cache is unmeasured (needs sudo): run BOTH `arm()` and `tick()`
+    Cold cache is unmeasured (needs sudo): run the `arm()`, first-submit
+    `note_submit()`, and `tick()`
     scans inside `spawn_blocking`, never on the WS dispatch path.
 13. **(A2/A9, confirmed) cwd + shape + resume argv.** `payload.cwd` is the
     codex process's physical `getcwd` path recorded verbatim (no
@@ -193,6 +209,7 @@ A codex upgrade re-opens every codex-behavior item below.
 | `crates/freshell-ws/src/terminal.rs` | Modify | arm-at-create, submit seam, exit disarm, candidate match arm → debug log |
 | `crates/freshell-ws/src/invariants.rs` | Modify (docs) | identity-unresolved alarm doc names the codex locator |
 | `crates/freshell-server/src/main.rs` | Modify | Locator construction + WsState field + sweep spawn |
+| `crates/freshell-ws/tests/common/mod.rs` | Modify (Task 6) | New spawn helper wiring a codex locator + 150 ms sweep (existing helpers have no locator and spawn no sweep) |
 | `crates/freshell-ws/tests/codex_locator_activity.rs` | Create | Fresh pane → locator → turn.complete carries sessionId |
 | `crates/freshell-ws/tests/codex_candidate_inert.rs` | Create | Candidate frame is accepted, ignored, logged; no identity written |
 | `crates/freshell-ws/tests/codex_candidate_persisted.rs` | Delete (Task 7) | Superseded by inert test + locator tests |
@@ -258,14 +275,27 @@ corpus; see "Validated Premises" above):
 - Substrate is a filesystem snapshot-diff, not SQLite row-diff: codex persists
   one JSONL rollout file per session under the sessions root.
 - There is NO `pre_epsilon_ms` and NO created-at time bound: filesystems have
-  no reliable cross-platform creation time. The arm-time `known_files`
-  snapshot is the sole (and primary — same as opencode's `known_ids`) safety:
-  a file already present at arm can never bind to this terminal. The locator
+  no reliable cross-platform creation time. The `known_files` snapshot is the
+  primary safety (same as opencode's `known_ids`): a file already present in
+  the snapshot can never bind to this terminal. The locator
   also never filters by the FILENAME timestamp or by today's `YYYY/MM/DD`
   directory: the filename timestamp is precomputed at codex session
   construction and can predate on-disk creation by the entire user idle gap,
   and the dated dir can be a previous day across midnight — the full-tree
   snapshot-diff sidesteps both.
+- FIRST-SUBMIT re-snapshot (A4 hardening; fresh-eyes iteration 1): the first
+  `note_submit` replaces `known_files` with a fresh scan. Strictly safe by
+  the Enter-anchored premise — the pane's own rollout cannot exist before its
+  first Enter, so everything that appeared between arm and the first Enter is
+  foreign by construction (freshagent sidecar, `codex exec`, codex outside
+  freshell). SOUNDNESS PRECONDITION: the caller must complete the first
+  `note_submit` BEFORE the Enter byte is written to the PTY — codex
+  materializes the rollout in response to that very Enter, so a re-snapshot
+  racing after the write could capture (and permanently exclude) the pane's
+  own file. Task 4's submit seam encodes this ordering. Later window
+  re-opens NEVER re-snapshot: the slow-materialization mitigation (a >2 s
+  Enter→creation latency recovered by a later Enter) depends on the pane's
+  own late file staying a candidate.
 - Windows are ENTER-ANCHORED ONLY — there is NO spawn-anchored window (a
   deliberate deviation from opencode). Real codex (0.145.0) defers rollout
   file creation until the first user prompt is recorded (`RolloutRecorder`
@@ -298,7 +328,8 @@ corpus; see "Validated Premises" above):
   — consistent with the arm gate refusing resume panes. Compressed rollout
   artifacts (`.jsonl.zst`, present in 0.145.0 source) are excluded by the
   `.jsonl` suffix filter; fresh sessions always write plain `.jsonl`.
-- Scans happen ONLY at arm time and at deadline evaluations (never on idle
+- Scans happen ONLY at arm time, at the FIRST `note_submit` (the re-snapshot
+  above), and at deadline evaluations (never on idle
   ticks — proven by `fs_scan_count`; a pending candidate keeps its window's
   evaluation due, so re-probes ride the same gate), bounded to walk depth 5
   (the tree is `sessions/YYYY/MM/DD/rollout-*.jsonl`; flat `<id>.jsonl` in
@@ -407,6 +438,27 @@ mod tests {
     }
 
     #[test]
+    fn rollout_created_between_arm_and_first_enter_never_binds() {
+        // A4 hardening (first-submit re-snapshot): Premise 7 guarantees the
+        // pane's own rollout cannot exist before its first Enter, so EVERY
+        // file that appears between arm and the first submit is foreign by
+        // construction (freshagent sidecar, `codex exec`, codex outside
+        // freshell in the same cwd). The FIRST note_submit re-snapshots
+        // known_files, so a bare Enter (empty composer, trust dialog) can
+        // never hand the window to that foreign file as a sole candidate.
+        let root = unique_temp_dir("resnapshot");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        // Foreign rollout lands AFTER arm but BEFORE the first Enter.
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        assert!(locator.note_submit("t1", 1_000)); // first submit re-snapshots
+        assert_eq!(locator.fs_scan_count(), 2); // arm + first-submit scans
+        assert!(locator.tick(1_000 + CODEX_WINDOW_MS).is_empty());
+        assert_eq!(locator.armed_count(), 1); // zero candidates → keep watching
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn arm_admission_gates() {
         let root = unique_temp_dir("gates");
         let locator = CodexLocator::new(root.clone());
@@ -497,13 +549,23 @@ module is the RED state for a new module.
 //!   `note_submit`.
 //! - NO `pre_epsilon_ms` and NO created-at time bound: filesystems have no
 //!   reliable cross-platform creation time (mtime moves on every append).
-//!   The arm-time `known_files` snapshot is the primary safety — a file
-//!   already present at arm can never bind to this terminal. The FILENAME
+//!   The `known_files` snapshot is the primary safety — a file
+//!   already present in the snapshot can never bind to this terminal. The FILENAME
 //!   timestamp and the dated `YYYY/MM/DD` dir are never used as filters
 //!   either: both are precomputed at codex session construction and can
 //!   predate on-disk creation by the entire user idle gap (the dir can even
 //!   be "yesterday" across midnight). The full-tree snapshot-diff sidesteps
 //!   both.
+//! - FIRST-SUBMIT re-snapshot (A4 hardening): the first `note_submit`
+//!   replaces `known_files` with a fresh scan — strictly safe because the
+//!   pane's own rollout cannot exist before its first Enter, so everything
+//!   that appeared between arm and the first Enter is foreign by
+//!   construction. SOUNDNESS PRECONDITION: the caller completes the first
+//!   `note_submit` BEFORE the Enter byte is written to the PTY (codex
+//!   materializes the rollout in response to that very Enter) — the
+//!   `codex_association` submit seam encodes this ordering. Later window
+//!   re-opens NEVER re-snapshot: a >2 s Enter→creation latency is recovered
+//!   by a later Enter only if the pane's own late file stays a candidate.
 //! - Attribution disambiguator: the rollout's own first-line
 //!   `session_meta.payload.cwd` is REQUIRED and must match the armed
 //!   terminal's cwd (`SessionMeta.cwd` is non-optional at 0.145.0;
@@ -532,11 +594,12 @@ module is the RED state for a new module.
 //!   artifacts (`.jsonl.zst`, present in 0.145.0 source) fail the `.jsonl`
 //!   suffix filter; fresh sessions always write plain `.jsonl`.
 //!
-//! Zero cost when idle: scans happen only at arm and at due Enter-anchored
+//! Zero cost when idle: scans happen only at arm, at the FIRST `note_submit`
+//! (the re-snapshot), and at due Enter-anchored
 //! evaluations (a pending candidate keeps its evaluation due, so re-probes
-//! ride the same gate), proven by `fs_scan_count`. Callers run BOTH `arm()`
-//! and `tick()` inside `tokio::task::spawn_blocking` (cold dentry cache is
-//! the one unmeasured tail — A6).
+//! ride the same gate), proven by `fs_scan_count`. Callers run `arm()`,
+//! `note_submit()`, and `tick()` inside `tokio::task::spawn_blocking` (cold
+//! dentry cache is the one unmeasured tail — A6).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -665,10 +728,15 @@ impl CodexLocator {
     }
 
     /// The FIRST submit is what opens a window at all (windows are
-    /// Enter-anchored — arm schedules no deadline). Re-open semantics mirror
+    /// Enter-anchored — arm schedules no deadline), and it RE-SNAPSHOTS
+    /// `known_files` (see module doc: strictly safe because the pane's own
+    /// rollout cannot exist before its first Enter; the caller must complete
+    /// this call BEFORE the Enter byte reaches the PTY, and must run it on
+    /// the blocking pool — the re-snapshot walks the sessions tree).
+    /// Re-open semantics mirror
     /// opencode: a mid-turn Enter never re-opens a still-pending evaluation;
     /// a resolved (zero-candidate / ambiguous / contested) terminal gets a
-    /// fresh Enter-anchored deadline.
+    /// fresh Enter-anchored deadline. Re-opens NEVER re-snapshot.
     pub fn note_submit(&self, terminal_id: &str, at_ms: i64) -> bool {
         let mut inner = self.inner.lock().unwrap();
         let Some(armed) = inner.armed.get_mut(terminal_id) else {
@@ -676,6 +744,15 @@ impl CodexLocator {
         };
         if !armed.resolved && armed.enter_ms.is_some() {
             return false;
+        }
+        if armed.enter_ms.is_none() {
+            // FIRST submit: everything that appeared between arm and this
+            // Enter is foreign by construction (A1/A4) — replace the
+            // snapshot. Holding the lock across the scan is deliberate and
+            // bounded (warm walks are 7-9 ms — A6; callers are on the
+            // blocking pool); it also keeps the re-snapshot atomic with the
+            // window open.
+            armed.known_files = self.scan_rollout_files();
         }
         armed.enter_ms = Some(at_ms);
         armed.resolved = false;
@@ -1113,6 +1190,31 @@ git commit -m "feat(sessions): CodexLocator skeleton - arm gates, fs-snapshot su
     }
 
     #[test]
+    fn later_enter_reopen_keeps_the_first_submit_snapshot() {
+        // Slow materialization (>2 s Enter→creation) is recovered by a later
+        // Enter ONLY if re-opens never re-snapshot: the pane's own late
+        // rollout appears between the first window's close and the second
+        // Enter, and must STAY a candidate. Only the FIRST submit
+        // re-snapshots (pinned via fs_scan_count).
+        let root = unique_temp_dir("reopen-snapshot");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
+        assert!(locator.note_submit("t1", 0)); // first submit: re-snapshot
+        // First window closes empty.
+        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
+        // The pane's own rollout lands LATE — after the window, before the
+        // next Enter.
+        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
+        let scans_before = locator.fs_scan_count();
+        assert!(locator.note_submit("t1", 10_000)); // re-open: NO re-snapshot
+        assert_eq!(locator.fs_scan_count(), scans_before);
+        let located = locator.tick(10_000 + CODEX_WINDOW_MS);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].thread_id, TID);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn mid_turn_enter_never_reopens_a_pending_evaluation() {
         let root = unique_temp_dir("midturn");
         let locator = CodexLocator::new(root.clone());
@@ -1455,7 +1557,10 @@ git commit -m "refactor(ws): extract adopt_codex_identity shared adoption tail f
 pub(crate) fn is_submit_input(data: &str) -> bool;
 pub(crate) fn maybe_arm(state: &WsState, terminal_id: &str, mode: &str,
                         cwd: Option<&str>, resume_session_id: Option<&str>);
-pub(crate) fn note_possible_submit(state: &WsState, terminal_id: &str, data: &str);
+// async, unlike the opencode sibling: the FIRST submit re-snapshots
+// known_files on the blocking pool, and the caller must await completion
+// BEFORE writing the Enter to the PTY (see the submit seam below).
+pub(crate) async fn note_possible_submit(state: &WsState, terminal_id: &str, data: &str);
 pub(crate) async fn drain_and_associate(state: &WsState);
 pub fn spawn_codex_locator_sweep(state: WsState, interval: std::time::Duration);
 ```
@@ -1499,13 +1604,13 @@ locator field to `codex_locator: Some(Arc::new(CodexLocator::new(data_home)))`
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn note_possible_submit_feeds_only_enter_sequences() {
+    #[tokio::test]
+    async fn note_possible_submit_feeds_only_enter_sequences() {
         let dir = unique_temp_dir("assoc-submit");
         let (state, _rx) = state_with_locator(dir.clone());
         let locator = state.codex_locator.as_ref().unwrap().clone();
         maybe_arm(&state, "t1", "codex", Some("/tmp"), None);
-        note_possible_submit(&state, "t1", "hello");
+        note_possible_submit(&state, "t1", "hello").await;
         // Observable proof via the locator's own seam: "hello" must not have
         // consumed the window — a direct note_submit still returns true.
         assert!(locator.note_submit("t1", freshell_sessions::time::now_ms()));
@@ -1536,7 +1641,9 @@ Expected: COMPILE ERROR (module functions and `codex_locator` field missing).
 //! deviation: the locator's windows are ENTER-ANCHORED ONLY (no spawn
 //! window) — real codex materializes its rollout only at the first user
 //! prompt, so `maybe_arm` only takes the snapshot and `note_possible_submit`
-//! is what opens a correlation window.
+//! is what opens a correlation window (async: the FIRST submit re-snapshots
+//! `known_files` on the blocking pool and MUST complete before the Enter is
+//! written to the PTY — see the terminal.rs seam).
 
 use crate::WsState;
 
@@ -1560,12 +1667,26 @@ pub(crate) fn maybe_arm(
     }
 }
 
-pub(crate) fn note_possible_submit(state: &WsState, terminal_id: &str, data: &str) {
+/// Async, unlike the opencode sibling: the FIRST `note_submit` re-snapshots
+/// `known_files` (a bounded sessions-tree walk), so it runs on the blocking
+/// pool, and the CALLER MUST AWAIT this BEFORE writing the Enter to the PTY
+/// — codex materializes the rollout in response to that very Enter, and a
+/// re-snapshot racing after the write could capture (permanently exclude)
+/// the pane's own file. Non-submit data returns immediately; later submits
+/// are a cheap mutex hop.
+pub(crate) async fn note_possible_submit(state: &WsState, terminal_id: &str, data: &str) {
     if !is_submit_input(data) {
         return;
     }
-    if let Some(locator) = &state.codex_locator {
-        locator.note_submit(terminal_id, now_ms());
+    let Some(locator) = state.codex_locator.clone() else {
+        return;
+    };
+    let terminal_id = terminal_id.to_string();
+    let at_ms = now_ms();
+    if let Err(err) =
+        tokio::task::spawn_blocking(move || locator.note_submit(&terminal_id, at_ms)).await
+    {
+        tracing::warn!(error = %err, "codex_note_submit_panicked");
     }
 }
 
@@ -1641,9 +1762,11 @@ Wiring edits:
      `terminal.rs`'s generic resume derivation can drive `codex resume <id>`
      on restart").
    - The compiler will enumerate every literal `WsState` constructor that now
-     misses the field (association tests, other in-crate tests, main.rs).
-     Add `codex_locator: None,` everywhere except the sites Tasks 4-5 say
-     otherwise.
+     misses the field (association tests, other in-crate tests, the
+     `tests/common/mod.rs` spawn helpers, main.rs).
+     Add `codex_locator: None,` everywhere except the sites Tasks 4-6 say
+     otherwise (Task 6 adds ONE locator-wired spawn helper to
+     `tests/common/mod.rs`; that file's existing helpers stay `None`).
 2. `crates/freshell-server/src/main.rs`:
    - Next to the opencode locator construction (`:340-345` area):
      ```rust
@@ -1707,10 +1830,26 @@ Wiring edits:
      — the compile-truth is the surrounding function; the requirement is that
      `maybe_arm` executes on the blocking pool and completes before the
      create handler returns.)
-   - Submit seam — after the opencode `note_possible_submit` (`:542-546`):
+   - Submit seam — ORDERING IS LOAD-BEARING, do NOT copy the opencode seam
+     placement. In the `TerminalInput` match arm of `handle_client_text`
+     (`terminal.rs:526-548`), the PTY write
+     (`state.registry.input(&input.terminal_id, input.data.as_bytes())`,
+     `:527-529`) is currently the FIRST statement, and the amplifier/opencode
+     `note_possible_submit` calls come after it. The codex call must go
+     BEFORE the `registry.input(...)` line and be awaited:
      ```rust
-     crate::codex_association::note_possible_submit(state, &input.terminal_id, &input.data);
+     // Lane B2: MUST complete before the Enter reaches the PTY — the codex
+     // locator's FIRST-submit re-snapshot has to finish before codex can
+     // materialize the rollout this very Enter triggers (else the pane's
+     // own file could land in the snapshot and be permanently excluded).
+     // Sound here: this socket task processes frames sequentially, and the
+     // enclosing handler is already async. Non-submit data returns
+     // immediately; only the first Enter of an armed codex pane scans
+     // (7-9 ms warm — A6).
+     crate::codex_association::note_possible_submit(state, &input.terminal_id, &input.data).await;
      ```
+     Leave the amplifier/opencode seams where they are (they are in-memory
+     and order-insensitive).
    - Exit disarm — in the `ExitHook` closure (`:1354`, `:1377-1379` pattern):
      clone `let codex_locator = state.codex_locator.clone();` next to the
      opencode clone, and inside the closure after the opencode disarm add
@@ -1769,16 +1908,21 @@ REAL `PaneLedger::new(Some(dir))`. The codex adaptations, per test:
         // opencode sibling test does; maybe_arm(&state, "t1", "codex",
         // Some(&cwd), None).
         //
-        // Then write the rollout the locator must find:
+        // Then OPEN THE WINDOW FIRST:
+        // note_possible_submit(&state, "t1", "\r").await — windows are
+        // Enter-anchored (no spawn window), so resolution requires a submit,
+        // and the FIRST submit re-snapshots known_files, so the rollout MUST
+        // be seeded AFTER this call (a pre-seeded file would be captured by
+        // the re-snapshot and never bind — that exclusion is the Task 1/2
+        // hardening, not a bug).
+        //
+        // THEN write the rollout the locator must find:
         //   write a file <sessions_root>/2026/07/26/rollout-2026-07-26T08-00-00-<TID>.jsonl
         //   whose first line is {"timestamp":"...","type":"session_meta",
         //   "payload":{"id":"<TID>","cwd":"<the pane's cwd>"}}
-        // (reuse the write_rollout shape from codex_locator.rs tests inline).
-        //
-        // Then OPEN THE WINDOW: note_possible_submit(&state, "t1", "\r") —
-        // windows are Enter-anchored (no spawn window), so resolution
-        // requires a submit. The 40×100 ms drain poll comfortably covers the
-        // 2 s Enter-anchored deadline.
+        // (reuse the write_rollout shape from codex_locator.rs tests inline;
+        // the file lands well inside the 2 s window, and the 40×100 ms drain
+        // poll comfortably covers the Enter-anchored deadline).
         //
         // Poll drain_and_associate until resolution, then assert:
         //   state.identity.session_ref_for("t1") == Some(codex/<TID>)  (provider + id)
@@ -1800,8 +1944,9 @@ REAL `PaneLedger::new(Some(dir))`. The codex adaptations, per test:
         // "codex" in the ledger lookups. Record the pending marker via
         // state.pane_ledger.record_pending("t1", "codex", Some(cwd), now)
         // before resolution, exactly as the sibling does. As in the first
-        // test, add note_possible_submit(&state, "t1", "\r") after seeding
-        // the rollout — Enter-anchored windows need the submit.
+        // test, call note_possible_submit(&state, "t1", "\r").await BEFORE
+        // seeding the rollout — Enter-anchored windows need the submit, and
+        // the first-submit re-snapshot would exclude a pre-seeded file.
     }
 
     /// One-writer defense survives the channel swap: a session already bound
@@ -1812,9 +1957,11 @@ REAL `PaneLedger::new(Some(dir))`. The codex adaptations, per test:
         // with ("codex", <TID>) via state.identity.upsert(...), then retire it
         // via state.identity.retire("victim") (the exit-path call —
         // terminal.rs:1370 area shows the exact form).
-        // Register a real PTY "t1" (codex mode), arm it, seed the rollout for
-        // <TID>, note_possible_submit(&state, "t1", "\r") to open the
-        // Enter-anchored window, poll drain_and_associate past the window.
+        // Register a real PTY "t1" (codex mode), arm it, then
+        // note_possible_submit(&state, "t1", "\r").await to open the
+        // Enter-anchored window, THEN seed the rollout for <TID> (after the
+        // submit — the first-submit re-snapshot would exclude a pre-seeded
+        // file), and poll drain_and_associate past the window.
         // Assert: t1 gained NO identity (state.identity.session_ref_for("t1")
         // is None) and its registry entry's resume_session_id is None.
     }
@@ -1857,21 +2004,63 @@ git commit -m "test(ws): codex drain_and_associate binds identity+ledger+broadca
 
 **Files:**
 - Create: `crates/freshell-ws/tests/codex_locator_activity.rs`
+- Modify: `crates/freshell-ws/tests/common/mod.rs` (ONE new spawn helper — see Step 1; without it this test CANNOT pass)
 - Test: same file
 
 **Interfaces:**
-- Consumes: the full server harness helpers in
-  `crates/freshell-ws/tests/codex_candidate_activity.rs` (`spawn_server`,
-  `write_fake_codex()` + `codex_capture_spec()`, frame-await helpers — copy
-  them; that file is deleted next task, so this new file must be
-  self-contained) and the locator pipeline from Tasks 1-5.
+- Consumes: the per-test helpers in
+  `crates/freshell-ws/tests/codex_candidate_activity.rs` (`write_fake_codex`
+  `:24`, `codex_capture_spec` `:44`, `send_create` `:64`, `wait_for_frame`
+  `:110` — all local to that file; copy them, that file is deleted next
+  task, so the new file must be self-contained), the shared harness in
+  `tests/common/mod.rs`, and the locator pipeline from Tasks 1-5.
+- HARNESS GAP (load-bearing): every existing `spawn_server_*` helper in
+  `tests/common/mod.rs` builds its `WsState` literal with
+  `amplifier_locator: None, opencode_locator: None` (`:135/:215/:291/:356`)
+  — after Task 4's compile sweep they all get `codex_locator: None` too —
+  and NO test harness spawns any locator sweep (sweeps live only in
+  `main.rs:626/:636`). A test spawned through the unmodified harness has no
+  locator and no sweep, so identity can never resolve and every await below
+  would time out. Step 1 therefore adds a locator-wired helper.
 - Produces: the closing pin for the identity-less status gap — fresh codex
   panes' `codex.activity.updated` / `terminal.turn.complete` carry
   `sessionId` with NO client candidate frame.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test (and the harness helper it needs)**
 
-Create `crates/freshell-ws/tests/codex_locator_activity.rs`:
+First, in `crates/freshell-ws/tests/common/mod.rs`, add ONE new spawn helper
+following that file's established copy-a-variant convention: copy
+`spawn_server_with_specs_and_activity` (`:243-307`) into a sibling
+
+```rust
+pub async fn spawn_server_with_specs_activity_and_codex_locator(
+    specs: /* same as the donor */,
+    codex_sessions_root: &std::path::Path,
+) -> /* same return type as the donor */
+```
+
+with exactly two deltas from the copied body (everything else identical):
+1. In the `WsState` literal, set
+   `codex_locator: Some(std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(codex_sessions_root.to_path_buf()))),`
+   instead of `None`.
+2. Immediately BEFORE the `freshell_ws::router(state)` line, spawn the sweep
+   on a clone (`WsState` is `Clone` with shared-`Arc` fields, so the sweep
+   and the router see the same locator/registry/identity):
+   ```rust
+   // Mirrors main.rs's sweep wiring; 150 ms is re-declared here because
+   // main.rs's AMPLIFIER_LOCATOR_SWEEP_INTERVAL is private to the server
+   // binary.
+   freshell_ws::codex_association::spawn_codex_locator_sweep(
+       state.clone(),
+       std::time::Duration::from_millis(150),
+   );
+   ```
+The other spawn helpers in `common/mod.rs` keep `codex_locator: None`
+(Task 4's compile sweep). The test passes
+`<CODEX_HOME>/sessions` as `codex_sessions_root` — the same root
+`codex_sessions_root()` resolves in the real server.
+
+Then create `crates/freshell-ws/tests/codex_locator_activity.rs`:
 
 ```rust
 //! Lane B2: a FRESH codex terminal (no resume id, NO client candidate frame)
@@ -1890,20 +2079,35 @@ from `codex_candidate_activity.rs::adopted_candidate_identity_reaches_codex_acti
 1. Keep: `CODEX_HOME` tempdir env, server spawn, fake codex
    binary/`codex_capture_spec()`, creating a FRESH codex terminal over the
    socket, the `codex.activity.updated` await helper.
-2. DELETE the candidate-frame send. Instead, AFTER the terminal is created
-   (locator armed at create), write the rollout file the locator must find:
-   `<CODEX_HOME>/sessions/2026/07/24/rollout-2026-07-24T12-00-00-<THREAD>.jsonl`
-   with first line
-   `{"timestamp":"2026-07-24T12:00:00.000Z","type":"session_meta","payload":{"id":"<THREAD>","cwd":"<terminal cwd>"}}`
-   — the terminal's cwd is whatever the harness passed to terminal.create;
-   use that same value. THEN send a single `terminal.input` of `"\r"` over
-   the socket: windows are Enter-anchored (validated A1 — real codex
-   materializes the rollout only at the first user prompt; there is no spawn
-   window), so the submit is what opens the 2 s evaluation window.
-3. Await `codex.activity.updated` carrying `sessionId == <THREAD>` (the sweep
-   runs every 150 ms in the real server; give the await the same generous
-   timeout the donor test used).
-4. Then append two task-event lines to the SAME rollout file (copy the
+2. SPAWN through the new helper: set the `CODEX_HOME` tempdir env exactly as
+   the donor does, then call
+   `spawn_server_with_specs_activity_and_codex_locator(vec![codex_capture_spec()], &codex_home.join("sessions"))`
+   instead of `spawn_server_with_specs_and_activity(...)`.
+3. DELETE the candidate-frame send. Instead, AFTER the terminal is created
+   (locator armed at create), run this exact sequence — the order is
+   load-bearing because the FIRST submit re-snapshots `known_files` (Task 1
+   hardening), so the rollout must NOT exist yet at the first Enter:
+   a. Send a single `terminal.input` of `"\r"` over the socket: windows are
+      Enter-anchored (validated A1 — real codex materializes the rollout
+      only at the first user prompt; there is no spawn window), and this
+      first Enter takes the re-snapshot and opens the 2 s window.
+   b. Sleep ~3 s (`tokio::time::sleep`) so that first window resolves with
+      zero candidates (deadline 2 s + 150 ms sweep, with margin).
+   c. Write the rollout file the locator must find:
+      `<CODEX_HOME>/sessions/2026/07/24/rollout-2026-07-24T12-00-00-<THREAD>.jsonl`
+      with first line
+      `{"timestamp":"2026-07-24T12:00:00.000Z","type":"session_meta","payload":{"id":"<THREAD>","cwd":"<terminal cwd>"}}`
+      — the terminal's cwd is whatever the harness passed to
+      terminal.create; use that same value.
+   d. Send a second `terminal.input` of `"\r"`: a later Enter re-opens a
+      resolved window WITHOUT re-snapshotting (pinned by Task 2's
+      `later_enter_reopen_keeps_the_first_submit_snapshot`), so the file
+      written in (c) is deterministically the sole new candidate.
+4. Await `codex.activity.updated` carrying `sessionId == <THREAD>` (the
+   harness helper spawns the same 150 ms sweep main.rs uses; give the await
+   the same generous timeout the donor test used — it must cover the ~2 s
+   Enter-anchored deadline after (d)).
+5. Then append two task-event lines to the SAME rollout file (copy the
    `event_msg` line shapes from `activity.rs`'s `codex_event_line` helper,
    `:2381-2385` — `task_started` then `task_complete`, timestamps now-ish),
    and await a `terminal.turn.complete` frame asserting
@@ -1911,12 +2115,17 @@ from `codex_candidate_activity.rs::adopted_candidate_identity_reaches_codex_acti
    locator's `attach_codex_rollout` handed the file to the status watcher and
    completions are stamped.
 
-Note on determinism: resolution REQUIRES the Enter — there is no spawn
-window. Write the rollout file first, then send the `"\r"`; the
-Enter-anchored deadline (2 s later, swept every 150 ms) evaluates and binds.
-If flake appears because of ordering, send another `"\r"` — a later Enter
-re-opens the window (pinned by Task 2's
-`zero_candidate_window_keeps_watching_and_later_enter_reopens`).
+Note on determinism: resolution REQUIRES an Enter — there is no spawn
+window — and the rollout must be written strictly BETWEEN the first Enter's
+re-snapshot and a later Enter's re-opened window; the two-Enter sequence in
+step 3 guarantees that ordering without racing the server (the test cannot
+observe when the server finishes processing an input frame, so "write the
+file right after sending the first `\r`" would race the re-snapshot and
+could permanently exclude the file). If flake appears, lengthen the (b)
+sleep or send another `"\r"` — every later Enter re-opens the window against
+the same frozen snapshot (pinned by Task 2's
+`zero_candidate_window_keeps_watching_and_later_enter_reopens` and
+`later_enter_reopen_keeps_the_first_submit_snapshot`).
 
 - [ ] **Step 2: Run to verify it fails for the right reason**
 
@@ -1925,7 +2134,10 @@ Expected: with Tasks 1-5 landed this may already PASS — apply the inversion
 check (assert `session_id` is `None`, watch it fail, restore). If it fails
 for a REAL reason (e.g. `turn.complete` lacks sessionId because
 `attach_codex_rollout` wasn't reached), that is the red this task exists to
-fix — fix in the Task 3/4 modules, minimally.
+fix — fix in the Task 3/4 modules, minimally. If instead the awaits time out
+with identity never resolving at all, first suspect THIS task's harness
+wiring (the new `common/mod.rs` helper: locator field set, sweep spawned,
+root == `<CODEX_HOME>/sessions`) before touching Task 3/4 code.
 
 - [ ] **Step 3: Run to GREEN**
 
@@ -1937,8 +2149,8 @@ Expected: PASS.
 ```bash
 cargo fmt --all
 cargo clippy -p freshell-ws --all-targets -- -D warnings
-git add crates/freshell-ws/tests/codex_locator_activity.rs
-git commit -m "test(ws): fresh codex pane turn.complete carries sessionId via server-side locator"
+git add crates/freshell-ws/tests/codex_locator_activity.rs crates/freshell-ws/tests/common/mod.rs
+git commit -m "test(ws): fresh codex pane turn.complete carries sessionId via server-side locator (adds locator-wired spawn helper to the shared harness)"
 ```
 
 ---
@@ -2084,10 +2296,16 @@ codex_candidate_inert.rs and codex_locator_activity.rs)."
 - Consumes: env `CODEX_HOME` (set per-server by the RustServer harness),
   `FAKE_CODEX_TERMINAL_ARGV_LOG`, `FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH`.
 - Produces (Tasks 9-10 rely on these EXACT behaviors):
-  - fresh mode: prints `codex> `, and on FIRST stdin data writes
+  - fresh mode: prints `codex> `, and on the FIRST stdin chunk containing an
+    Enter (CR or LF) writes
     `<CODEX_HOME|~/.codex>/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`
     (first line `session_meta` with `payload.id` + `payload.cwd`) then prints
-    `codex: session <uuid> started`;
+    `codex: session <uuid> started`. Enter-gating (NOT first-data) is
+    load-bearing: it mirrors validated Premise 7 (real codex materializes
+    the rollout only at the first user prompt), and the server re-snapshots
+    `known_files` before forwarding the first Enter to the PTY — a fixture
+    that wrote on mere typing would land its rollout PRE-snapshot and be
+    permanently excluded;
   - gate: when `FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH` is set, the write
     waits (50 ms poll) until that file exists — a never-created gate makes
     "identity never resolves" deterministic;
@@ -2104,9 +2322,14 @@ codex_candidate_inert.rs and codex_locator_activity.rs)."
 // identity artifact is a rollout JSONL under CODEX_HOME/sessions whose FIRST
 // line is the session_meta ownership record (payload.id — never the
 // filename — is the identity; payload.cwd is the locator's disambiguator).
-// - fresh: prints `codex> `; on FIRST stdin data writes the rollout (gated
-//   by FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH when set) and prints
-//   `codex: session <uuid> started`.
+// - fresh: prints `codex> `; on the FIRST stdin chunk containing an Enter
+//   (CR/LF) writes the rollout (gated by
+//   FAKE_CODEX_TERMINAL_ROLLOUT_GATE_PATH when set) and prints
+//   `codex: session <uuid> started`. Enter-gating mirrors real codex
+//   (Premise 7: the rollout materializes only at the first user prompt) and
+//   keeps the fixture on the safe side of the server's first-submit
+//   known_files re-snapshot, which completes before the Enter reaches this
+//   process.
 // - resume (`resume` ANYWHERE in argv — resumeArgs are appended LAST after
 //   `-c` overrides): prints `codex: resumed session <id>`, writes nothing.
 // - argv mirrored to FAKE_CODEX_TERMINAL_ARGV_LOG as JSONL.
@@ -2156,8 +2379,12 @@ if (resumeIndex !== -1) {
 } else {
   process.stdout.write('codex> \r\n')
   let wrote = false
-  process.stdin.on('data', () => {
+  process.stdin.on('data', (chunk) => {
     if (wrote) return
+    const s = String(chunk)
+    // Enter-anchored, like real codex (Premise 7): typing alone must not
+    // create the rollout — only the first Enter does.
+    if (!s.includes('\r') && !s.includes('\n')) return
     wrote = true
     const threadId = crypto.randomUUID()
     const finish = () => {
@@ -2477,8 +2704,10 @@ results incl. wall disposition, and the scope-fence note that REST-lane
   takes only the snapshot) → Tasks 1-2, 4.
 - Misbind hardenings from the A4 adversarial validation (required cwd,
   pending-first-line bind-blocking grace, cross-tick contested-cwd refusal,
-  bound-elsewhere adoption refusal) → Tasks 1-3, pinned by Task 2's guard
-  tests and Task 5 test 3; the freshagent same-cwd residual is documented in
+  bound-elsewhere adoption refusal, first-submit known_files re-snapshot with
+  Task 4's before-PTY-write seam ordering) → Tasks 1-4, pinned by Task 1/2's
+  guard tests and Task 5 test 3; the post-first-Enter same-cwd residual
+  (freshagent sidecar) is documented in
   Validated Premise 10 and named in Task 11's report, not silently absorbed.
 - Reuse-don't-duplicate the wave-2 watcher → Premise Correction 2: discovery
   cannot ride the per-file status watcher (verified structural fact); the
