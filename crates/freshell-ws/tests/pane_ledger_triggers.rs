@@ -12,6 +12,28 @@ use freshell_ws::pane_ledger::{PaneLedger, RetiredReason, RowState};
 use futures_util::SinkExt;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+/// Next text frame of ANY type. The harness's `next_frame_of_type` drops
+/// mismatched frames, which the write-failure test cannot afford (it must
+/// capture two frames whose relative order is not guaranteed).
+#[cfg(unix)]
+async fn next_any_frame(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> serde_json::Value {
+    use futures_util::StreamExt;
+    loop {
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("frame within 10s")
+            .expect("stream open")
+            .expect("ws ok");
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+            return serde_json::from_str(&text).expect("json frame");
+        }
+    }
+}
+
 fn unique_ledger_dir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "pane-ledger-it-{label}-{}-{}",
@@ -177,5 +199,58 @@ async fn resume_create_writes_binding_and_kill_retires_it_closed() {
         },
         "binding retired closed on user kill",
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn ledger_write_failure_surfaces_live_and_never_blocks_the_create() {
+    // Red test `ledger-write-failure-surfaces-live` (spec §4.2): break the
+    // store (read-only dir), create a claude pane. The create MUST succeed
+    // (fail loud, degrade to status quo) and a `durability.degraded` frame
+    // MUST arrive at failure time — before any restart could make the
+    // warning posthumous.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = unique_ledger_dir("write-fail");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let (url, registry, _ledger_arc) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-fail-1",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+
+    // Both frames arrive; capture order-independently (broadcast vs direct
+    // send interleave). next_frame_of_type drops mismatches, so scan for
+    // the degraded frame FIRST, then the created frame cannot have been
+    // consumed... instead: collect frames until both seen.
+    let mut created: Option<serde_json::Value> = None;
+    let mut degraded: Option<serde_json::Value> = None;
+    for _ in 0..20 {
+        let frame = next_any_frame(&mut ws).await; // helper above
+        match frame["type"].as_str() {
+            Some("terminal.created") => created = Some(frame),
+            Some("durability.degraded") => degraded = Some(frame),
+            _ => {}
+        }
+        if created.is_some() && degraded.is_some() {
+            break;
+        }
+    }
+    let created = created.expect("create succeeded despite ledger failure");
+    let degraded = degraded.expect("durability.degraded pushed LIVE at failure time");
+    assert_eq!(degraded["reason"], "ledger_write_failed");
+    assert_eq!(degraded["terminalId"], created["terminalId"]);
+
+    let tid = created["terminalId"].as_str().unwrap();
+    registry.kill(tid);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).ok();
     std::fs::remove_dir_all(&dir).ok();
 }
