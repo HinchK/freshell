@@ -7,15 +7,17 @@
 
 **Goal:** Re-verify the Incident-4 sidebar contract (correct pane↔session joins: across restarts, for REST-created tabs, for fresh codex terminals, and after recover-my-panes) against the new ledger-backed identity truth, pin each contract case with a test that would have caught Incident 4, and fix the cases that fail by making joins consult the identity registry/ledger per the §4.2 authority chain.
 
-**Architecture:** All fixes are server-side; the client join machinery (`sessionsSlice`, `sidebarSelectors`, `Sidebar.tsx`) is verified but expected unchanged. Three server fixes: (1) `session_directory.rs` join functions gain a `PaneLedger` read fallback so a live terminal whose in-memory identity lacks a `session_id` resolves through the ledger's `Bound` row instead of minting a provisional `terminal:<id>` key (authority chain rung 1 → rung 2); (2) the `sessions.changed` sweep signature gains an identity-registry digest so locator adoptions push a sidebar refetch; (3) the REST `/api/tabs` create path arms the codex locator (it already arms amplifier/opencode), making REST-created codex panes adoptable. Verification is pinned by new Rust unit tests plus one new rust-only Playwright spec covering all four contract cases.
+**Architecture:** All fixes are server-side; the client join machinery (`sessionsSlice`, `sidebarSelectors`, `Sidebar.tsx`) is verified but expected unchanged (the adoption→green fold path was validated end-to-end: `terminal.session.associated` → `App.tsx:1118` → `panesSlice.ts:1753-1789` → `hasTab`). Three server fixes: (1) the `GET /api/terminals` sidebar projection (`crates/freshell-server/src/terminals.rs:676-683`) stamps `sessionRef` from the `TerminalIdentityRegistry` (authority rung 1) instead of hard-coding `None` for codex — without this, the client's Phase-E synthesis (`sidebarSelectors.ts:437-490`) mints a `terminal:<id>` ghost row that no session-directory change can suppress; (2) the `sessions.changed` sweep signature gains an identity-registry digest so locator adoptions push a sidebar refetch; (3) the REST `/api/tabs` create path arms the codex locator (it already arms amplifier/opencode), making REST-created codex panes adoptable. VALIDATED PLAN CHANGE (load-bearing pass; ledger at `.worktrees/.the-usual-logs/sidebar-registry-sync/load-bearing-ledger.md`): the originally planned `PaneLedger` read fallback in `session_directory.rs` joins was investigated and its premise FALSIFIED — no production window exists where a live terminal's identity has a provider but no `session_id` while the ledger holds a Bound row for its CURRENT terminal id (every Bound writer upserts the registry with the session id first; terminal ids are never re-minted across restarts). `session_directory.rs`'s existing rung-1 registry consultation already collapses post-adoption duplicates (`:706-725`, dedupe `:786`); a rung-2 fallback would be dormant machinery (the historical D2 failure mode), so it is deliberately NOT built. Verification is pinned by new Rust unit tests plus one new rust-only Playwright spec covering all four contract cases.
 
 **Tech Stack:** Rust (axum server, crates/freshell-server + freshell-ws + freshell-freshagent), React/Redux client (verified, not modified), Playwright e2e (`test/e2e-browser`), Vitest, cargo test/clippy.
 
 ## Global Constraints
 
 - Base: `origin/main @ bf6242a1`. Work only in the worktree `/home/dan/code/freshell/.worktrees/sidebar-registry-sync` on branch `feat/sidebar-registry-sync`.
-- SCOPE FENCE (from the lane spec, verbatim intent): you own sidebar/sessions client code (`sessionsSlice`, sidebar components), `crates/freshell-server/src/session_directory.rs`, and sessions-revision push seams. Do NOT touch: client reconcile fold / `TerminalView` / `FreshAgentView` pane-recovery internals (Lane C2 owns those), port/contract tooling + `shared/ws-protocol.ts` (Lane C3), `reconcile*.rs`, ledger WRITES (ledger READS are allowed and required). Read anything. No kimi/gemini work.
+- SCOPE FENCE (from the lane spec, verbatim intent): you own sidebar/sessions client code (`sessionsSlice`, sidebar components), `crates/freshell-server/src/session_directory.rs`, and sessions-revision push seams. Do NOT touch: client reconcile fold / `TerminalView` / `FreshAgentView` pane-recovery internals (Lane C2 owns those), port/contract tooling + `shared/ws-protocol.ts` (Lane C3), `reconcile*.rs`, ledger WRITES (ledger READS are allowed; after the load-bearing pass none are required — the rung-2 fallback was validated out). Read anything. No kimi/gemini work.
   - One narrow, spec-mandated exception (case b/c: "identity now arrives via the B2 locator — is it now fixable with locator identity? If yes, fix it"): minimal codex-locator ARMING on the REST create path in `crates/freshell-freshagent` (Task 4), mirroring the existing amplifier/opencode wiring byte-for-byte in shape. Arming a locator is not a ledger write.
+  - VALIDATION NOTE (load-bearing pass): the lane-spec exception text could not be located in any persisted document (the spec was an unpersisted pipeline prompt). Decision recorded as ACCEPTABLE with this interpretation: `arm()` adds no new ledger writer (the shared locator sweep remains the single pre-existing writer), and sanctioned campaign work already touched REST-path freshagent binding behavior (B4 fast-follow `2b3b4fa9`). The Verification Report MUST record this interpretation so the campaign owner can overrule at review.
+- Scope note for Task 2 (validated plan change): `crates/freshell-server/src/terminals.rs` (the sidebar's terminal-directory feed projection) is treated as owned by this lane — it is not on the forbidden list, it is the sidebar-contract seam this lane exists to fix, and the fix is a registry READ (authority rung 1). Record this interpretation in the Verification Report alongside the Task 4 note.
 - E2E: own `RustServer` instances via `test/e2e-browser/helpers/rust-server.ts`, ephemeral ports only — NEVER 3001/3002. `await server.stop()` in `finally`.
 - NEVER restart the user's self-hosted Freshell server. NEVER use broad kill patterns (`pkill -f`, `pkill node`).
 - `cargo clippy --workspace --all-targets -- -D warnings` must pass (required CI).
@@ -37,12 +39,13 @@ Incident 4 (docs/plans/2026-07-19-state-sync-resilience-assessment.md): REST-cre
 How the sidebar joins today (verified at HEAD `bf6242a1`):
 
 - Client: green vs grey is `item.hasTab` (`src/components/Sidebar.tsx:877`), derived from `collectSessionRefsFromTabs(tabs, panes)` (`src/lib/session-utils.ts:294`) reading canonical `content.sessionRef` on local pane trees. Server running-state arrives via `GET /api/session-directory` and `terminalDirectory`. DOM contract: `[data-session-id]`, `[data-provider]`, `[data-has-tab]`, `[data-is-running]` (`Sidebar.tsx:863-869`).
-- Server: `crates/freshell-server/src/session_directory.rs` joins live terminals to indexed session files keyed ONLY on `provider:sessionId`, with `TerminalIdentityRegistry` as its sole identity source (`SessionDirectoryState`, `:66-84`). A live identity with no `session_id` mints a provisional key `terminal:<terminal_id>` (`:735-738`).
+- Server: `crates/freshell-server/src/session_directory.rs` joins live terminals to indexed session files keyed ONLY on `provider:sessionId`, with `TerminalIdentityRegistry` as its sole identity source (`SessionDirectoryState`, `:66-84`). A live identity with no `session_id` mints a provisional key `terminal:<terminal_id>` (`:735-738`); post-adoption, this rung-1 registry consultation already joins and dedupes correctly (`:706-725`, dedupe `:786`) — validated.
+- Terminal-directory feed: the sidebar ALSO reads `GET /api/terminals` (`src/lib/api.ts:353-366` → `terminalDirectorySlice`, consumed at `Sidebar.tsx:212-213`); its projection hard-codes `session_ref: None` for codex mode (`crates/freshell-server/src/terminals.rs:676-683`), never consulting identity. The client's Phase-E synthesis (`sidebarSelectors.ts:437-490`) mints `terminal:<id>` rows for running sessionRef-less non-shell terminals from THIS feed — the deciding seam for the "no ghost" assertions.
 - Push: `sessions.changed` is emitted by `freshell_ws::terminal::broadcast_sessions_changed` (`crates/freshell-ws/src/terminal.rs:2292`); the periodic sweep (`crates/freshell-server/src/main.rs:1490`) fires it when `sessions_sweep_signature` (`main.rs:1445`) changes — a signature derived ONLY from disk-indexed sessions, blind to identity-registry changes.
 
 Known defects this plan fixes (found in exploration, each pinned by a task):
 
-1. **Case (c) join:** `session_directory.rs` never consults the `PaneLedger` (authority rung 2). The stale fence comment (`:682-690`) and pinning test (`:949-974`, asserts `joined.len() == 2`) still describe the pre-locator world. → Task 2.
+1. **Case (c) ghost row (the validated join gap):** the `/api/terminals` sidebar projection (`terminals.rs:676-683`) hard-codes `session_ref = None` for codex terminals, so even after adoption the client Phase-E synthesis (`sidebarSelectors.ts:437-490`) mints a `terminal:<id>` ghost row (`:462`) — its `:464` dedupe keys on the provisional key and it inherits `hasTab: true` (`:479`); adoption's own `terminal.meta.updated` triggers a refetch of exactly this unstamped feed. Also stale: `session_directory.rs` fence comment (`:682-690`), module doc (`:20-34`) and residual pinning test (`:949-974`) describe the pre-locator world. → Task 2. (The originally suspected defect here — "session_directory never consults the PaneLedger" — was validated and REJECTED as a fix target: no production rung-2 window exists; see the Architecture note.)
 2. **Case (c) push:** locator adoption (`codex_identity.rs:138`) upserts identity + ledger but broadcasts no `sessions.changed`; the sweep signature can't see it either. The collapsed duplicate never renders. → Task 3.
 3. **Case (b)/(c) REST:** `arm_locators_for_fresh_pane` (`crates/freshell-freshagent/src/terminal_tabs.rs:458-471`) arms only amplifier + opencode; a codex pane created via `POST /api/tabs` is never armed, so its provisional identity can never be superseded. → Task 4.
 
@@ -59,8 +62,9 @@ Contract-case → task map:
 
 ## File Structure
 
-- Modify: `crates/freshell-server/src/session_directory.rs` — `SessionDirectoryState.ledger`, `effective_session_id()`, ledger-aware join fns, rewritten residual test, refreshed stale module docs. (Owned by this lane.)
-- Modify: `crates/freshell-server/src/main.rs` — wire ledger into `SessionDirectoryState`; identity digest in `sessions_sweep_signature`; `spawn_sessions_sweep` new param; sweep tests. (Sessions-revision push seam — owned.)
+- Modify: `crates/freshell-server/src/terminals.rs` — identity-stamped `session_ref` in the sidebar terminal projection + unit tests. (Sidebar directory feed seam — treated as owned; see Global Constraints scope note.)
+- Modify: `crates/freshell-server/src/session_directory.rs` — rewritten residual pinning test, refreshed stale fence comment + module docs ONLY (no behavior change; the ledger-fallback was validated out).
+- Modify: `crates/freshell-server/src/main.rs` — identity digest in `sessions_sweep_signature`; `spawn_sessions_sweep` new param; sweep tests. (Sessions-revision push seam — owned.)
 - Modify: `crates/freshell-freshagent/src/lib.rs` — `FreshAgentState.codex_locator` field + `with_codex_locator` builder (mirror of amplifier/opencode). (Narrow scope exception.)
 - Modify: `crates/freshell-freshagent/src/terminal_tabs.rs` — arm codex locator in `arm_locators_for_fresh_pane`; unit test. (Narrow scope exception.)
 - Create: `test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts` — the four contract-case scenarios.
@@ -140,154 +144,47 @@ git commit -m "docs(p1.14): record verification baseline for sidebar-registry-sy
 
 ---
 
-### Task 2: Ledger-backed join in session_directory (authority rung 2)
+### Task 2: Identity-stamped /api/terminals sidebar feed (rung-1 truth to the client)
 
-The server-side heart of "joins should consult the identity registry/ledger rather than client-pushed guesses". A live terminal whose in-memory identity has no `session_id` must resolve through the ledger's newest `Bound` row for that terminal before minting a provisional `terminal:<id>` key. This both fixes the running-state join and collapses the codex duplicate whenever a durable binding exists.
+VALIDATED REPLACEMENT for the original "ledger-backed join" task — that task's premise was falsified during the load-bearing pass (no production window for a rung-2 fallback; see the Architecture note). The REAL case-(c) join gap: the sidebar's terminal-directory feed, `GET /api/terminals`, hard-codes `session_ref = None` for codex-mode terminals in its sidebar projection (`crates/freshell-server/src/terminals.rs:676-683`) and never consults the `TerminalIdentityRegistry` — even after locator adoption has given the terminal a real session id. The client's Phase-E synthesis (`src/store/selectors/sidebarSelectors.ts:437-490`) then mints a `terminal:<id>` ghost row for the running, sessionRef-less non-shell terminal (`:462`); the `:464` dedupe keys on the provisional key (so the real indexed row cannot suppress the ghost) and the ghost even inherits `hasTab: true` (`:479`). Adoption's own `terminal.meta.updated` broadcast triggers a refetch of exactly this unstamped feed. Fix: stamp the projection from the identity registry (authority rung 1) so an adopted terminal's row carries its real session identity — Phase-E only synthesizes for sessionRef-less terminals, so the ghost then never materializes. Precedent: the wave-A WS-handshake inventory stamping (`crates/freshell-ws/src/lib.rs:441-450`) did exactly this for the WS path; this task does it for the REST feed the sidebar actually polls.
 
 **Files:**
-- Modify: `crates/freshell-server/src/session_directory.rs` (state at `:66-84`, handler at `:363-414`, join fns at `:706-793`, fence comment at `:673-690`, stale module doc at `:20-34`, tests in `mod join_tests` at `:795-975`)
-- Modify: `crates/freshell-server/src/main.rs:698-703` (state construction)
+- Modify: `crates/freshell-server/src/terminals.rs` (sidebar projection at `:676-683` + the file's existing test module — follow its current test conventions)
+- Modify: `crates/freshell-server/src/session_directory.rs` (Step 5 stale-doc/test refresh ONLY — no behavior change)
+- Possibly Modify: `crates/freshell-server/src/main.rs` (only if the GET route's state lacks the registry handle — follow the compiler)
 
 **Interfaces:**
-- Consumes: `freshell_ws::pane_ledger::PaneLedger::bound_session_ref_for_terminal(&self, terminal_id: &str) -> Option<SessionLocator>` (`pane_ledger.rs:652`, READ-only); `freshell_ws::identity::TerminalIdentity` (`identity.rs:33-44`); the `Arc<PaneLedger>` minted at `main.rs:434` (the same binding already cloned into `RecoveryInventoryState` at `main.rs:855` — reuse that variable).
-- Produces (later tasks and the e2e rely on these exact shapes):
-  - `SessionDirectoryState` gains `pub ledger: Option<Arc<freshell_ws::pane_ledger::PaneLedger>>`.
-  - `fn effective_session_id(identity: &TerminalIdentity, ledger: Option<&PaneLedger>) -> Option<String>`
-  - `fn join_running_state(item: DirItem, identities: &[TerminalIdentity], ledger: Option<&PaneLedger>) -> DirItem`
-  - `fn build_live_terminal_session_item(identity: &TerminalIdentity, ledger: Option<&PaneLedger>) -> Option<DirItem>`
-  - `fn join_live_terminals(items: Vec<DirItem>, identities: &[TerminalIdentity], ledger: Option<&PaneLedger>) -> Vec<DirItem>`
+- Consumes: `freshell_ws::identity::TerminalIdentityRegistry` — the route already reaches identity state (the PATCH rename handler in the same file uses it at `terminals.rs:985-994`; reuse that handle/state field for the GET projection). The same registry is cloned into `SessionDirectoryState` at `main.rs:703`.
+- Produces (Tasks 5 and 7's "no `terminal:<id>` ghost" e2e assertions rely on this): the sidebar terminal projection emits `session_ref: Some(...)` (provider + session id taken from the registry identity) for any live terminal whose identity carries a `session_id`; terminals with no identity or an identityless entry keep `session_ref: None` (today's behavior); any existing non-`None` stamping for other modes is preserved byte-for-byte.
 
 - [ ] **Step 1: Write the failing tests (RED)**
 
-In `mod join_tests` (`session_directory.rs:795`), add (reuse the existing `file_item` helper; for the `BindingWrite` construction mirror the `write(provider, session_id, terminal_id, now_ms)` helper from `crates/freshell-ws/src/pane_ledger_tests.rs:22` — copy its exact field set):
+In `terminals.rs`'s test module, next to the existing projection tests (mirror their construction helpers — if no test exists for the sidebar projection helper, test the smallest function that builds the sidebar item for a live terminal):
 
-```rust
-fn temp_ledger_root(label: &str) -> std::path::PathBuf {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "session-dir-ledger-{label}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp ledger root");
-    dir
-}
+1. `adopted_codex_terminal_is_stamped_with_its_registry_session_ref` — registry contains `("term-codex", Some("codex"), Some("real-codex-session-id"))`; the projected sidebar item for that terminal carries `session_ref` with provider `codex` and session id `real-codex-session-id` (today: hard-coded `None` → RED).
+2. `identityless_codex_terminal_projection_is_unchanged` — registry has no entry (or an entry with `session_id: None`) for the terminal; the projected item's `session_ref` is `None` (byte-identical to today — this pins that we did not invent identity).
 
-/// Authority chain §4.2, rung 1 -> rung 2: an identityless live terminal
-/// resolves through the ledger's Bound row instead of minting a
-/// provisional `terminal:<id>` key. The indexed file item and the live
-/// terminal therefore share one join key and the duplicate collapses.
-#[test]
-fn ledger_bound_row_resolves_identityless_terminal_to_its_real_session() {
-    let reg = TerminalIdentityRegistry::new();
-    reg.upsert("term-codex", Some("codex"), None, None, 5000);
-    let ledger = freshell_ws::pane_ledger::PaneLedger::new(Some(temp_ledger_root("resolve")));
-    // BindingWrite: provider "codex", session_id "real-codex-session-id",
-    // live_terminal_id "term-codex" -- mirror pane_ledger_tests.rs:22.
-    ledger.record_binding(&binding_write("codex", "real-codex-session-id", "term-codex", 4000))
-        .expect("ledger write");
-    let items = vec![file_item("codex", "real-codex-session-id", 4500)];
-
-    let joined = join_live_terminals(items, &reg.list(), Some(&ledger));
-
-    assert_eq!(joined.len(), 1, "ledger-resolved terminal must merge with its file item");
-    assert!(joined[0].is_running);
-    assert_eq!(joined[0].running_terminal_id.as_deref(), Some("term-codex"));
-    assert!(!joined[0].live_terminal_only);
-}
-
-/// Provider mismatch guard: a ledger row for a DIFFERENT provider than the
-/// live identity must not be adopted (a codex terminal never wears a
-/// claude binding).
-#[test]
-fn ledger_row_with_mismatched_provider_is_ignored() {
-    let reg = TerminalIdentityRegistry::new();
-    reg.upsert("term-codex", Some("codex"), None, None, 5000);
-    let ledger = freshell_ws::pane_ledger::PaneLedger::new(Some(temp_ledger_root("mismatch")));
-    ledger.record_binding(&binding_write("claude", "some-claude-id", "term-codex", 4000))
-        .expect("ledger write");
-
-    let joined = join_live_terminals(vec![], &reg.list(), Some(&ledger));
-
-    assert_eq!(joined.len(), 1);
-    assert!(joined[0].live_terminal_only, "mismatched ledger row must fall back to provisional");
-    assert!(joined[0].session_id.starts_with("terminal:"));
-}
-
-/// No ledger / no row: behavior is byte-identical to today (provisional key).
-#[test]
-fn without_ledger_row_the_provisional_key_behavior_is_unchanged() {
-    let reg = TerminalIdentityRegistry::new();
-    reg.upsert("term-codex", Some("codex"), None, None, 5000);
-
-    let joined = join_live_terminals(vec![], &reg.list(), None);
-
-    assert_eq!(joined.len(), 1);
-    assert!(joined[0].live_terminal_only);
-    assert_eq!(joined[0].session_id, "terminal:term-codex");
-}
-```
-
-Add the small local helper `binding_write(provider, session_id, terminal_id, now_ms) -> BindingWrite<'static>` by copying the field set from `pane_ledger_tests.rs:22` (state `Bound`, `pane_kind: "terminal"`, and whatever mandatory fields that helper sets — keep them identical).
+Use the registry's real `upsert` API (`TerminalIdentityRegistry::new()` + `upsert(id, provider, session_id, cwd, now_ms)` — same shape the `session_directory.rs` join tests use).
 
 - [ ] **Step 2: Run to verify they fail for the right reason**
 
-Run: `cargo test -p freshell-server session_directory 2>&1 | tail -30`
-Expected: compile FAILURE — `join_live_terminals` takes 2 args, `PaneLedger` not imported. (A compile-level RED is the correct failure here: the seam doesn't exist yet.)
+Run: `cargo test -p freshell-server terminals 2>&1 | tail -30`
+Expected: test 1 FAILS on the `None` assertion (or a compile failure if the projection helper must first gain a registry parameter — both are correct REDs; the seam may not exist yet). Test 2 passes.
 
 - [ ] **Step 3: Implement (GREEN)**
 
-In `session_directory.rs`:
-
-1. Add to `SessionDirectoryState` (`:66-84`):
-```rust
-    /// Authority chain §4.2 rung 2: durable pane<->session bindings.
-    /// READ-only here; `None` in tests/minimal wiring keeps legacy behavior.
-    pub ledger: Option<std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>>,
-```
-
-2. Add the resolver (next to the join fns, `:700` area):
-```rust
-/// Resolve a live terminal's session id per the §4.2 authority chain:
-/// in-memory identity first (rung 1), then the ledger's newest Bound row
-/// for this terminal (rung 2). A ledger row only counts when its provider
-/// agrees with the live identity's provider.
-fn effective_session_id(
-    identity: &freshell_ws::identity::TerminalIdentity,
-    ledger: Option<&freshell_ws::pane_ledger::PaneLedger>,
-) -> Option<String> {
-    if identity.session_id.is_some() {
-        return identity.session_id.clone();
-    }
-    let locator = ledger?.bound_session_ref_for_terminal(&identity.terminal_id)?;
-    if identity.provider.as_deref() == Some(locator.provider.as_str()) {
-        Some(locator.session_id)
-    } else {
-        None
-    }
-}
-```
-
-3. Thread `ledger: Option<&PaneLedger>` through the three join fns:
-   - `join_running_state` (`:706`): the match predicate becomes
-     `identity.provider.as_deref() == Some(item.provider.as_str()) && effective_session_id(identity, ledger).as_deref() == Some(item.session_id.as_str())`.
-   - `build_live_terminal_session_item` (`:731`): compute `let effective = effective_session_id(identity, ledger);` then
-     `let session_id = effective.clone().unwrap_or_else(|| format!("terminal:{}", identity.terminal_id));` and set `live_terminal_only: effective.is_none()`.
-   - `join_live_terminals` (`:770`): accept and forward the param to both callees.
-
-4. Handler (`:404`): pass `state.ledger.as_deref()` into `join_live_terminals` (and to `join_running_state` if called separately in `apply_query` — follow the compiler).
-
-5. Update every existing `join_tests` call site to pass `None` (behavior-preserving), EXCEPT the residual-duplicate test — see Step 5.
-
-6. Wire `main.rs:698-703`: add `ledger: Some(std::sync::Arc::clone(&<pane_ledger_binding>)),` using the same `Arc<PaneLedger>` binding cloned into `RecoveryInventoryState` at `main.rs:855` (minted at `main.rs:434`). If the binding has moved by construction time, clone it earlier as the surrounding code does for other shared handles.
+In `terminals.rs`, in the sidebar projection (`:676-683` area): where `session_ref` is currently hard-coded `None` for codex mode, consult the identity registry for the terminal's id; if the identity has both a provider and a `session_id`, emit the stamped `session_ref`; otherwise keep `None`. Thread the registry handle from the route state the PATCH handler already uses (`:985-994`); if the specific projection helper is a pure function, add a registry (or resolved-identity) parameter and pass it from the handler — follow the compiler. Do NOT touch reconcile code or write to the ledger/registry anywhere in this task (reads only).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p freshell-server session_directory 2>&1 | tail -30`
-Expected: all PASS, including the three new tests and all pre-existing join tests.
+Run: `cargo test -p freshell-server terminals 2>&1 | tail -30`
+Expected: all PASS, including both new tests and all pre-existing terminals tests.
 
-- [ ] **Step 5: Rewrite the stale residual pinning test and stale docs (REFACTOR)**
+- [ ] **Step 5: Refresh the stale session_directory docs + residual pinning test (REFACTOR — no behavior change)**
 
-1. The test at `:949-974` (`codex_fresh_terminal_and_its_eventual_session_file_are_a_documented_residual_duplicate`) pins the OLD contract. Rename it to `codex_fresh_terminal_pre_adoption_duplicate_is_transient_pending_locator_adoption`, keep the `joined.len() == 2` assertion for the no-identity-no-ledger input (pass `None` for the ledger), and rewrite its doc comment: the duplicate is now a TRANSIENT pre-adoption window — the B2 codex locator adopts the identity (`codex_identity.rs`), the ledger fallback (this file) and the identity-aware sweep (`main.rs`) collapse and push it; it is no longer a permanent residual.
-2. Update the fence comment at `:682-690` the same way (delete the "this port doesn't associate the two after the fact" claim; describe the rung-1/rung-2 resolution and the transient window).
+In `crates/freshell-server/src/session_directory.rs`:
+1. The test at `:949-974` (`codex_fresh_terminal_and_its_eventual_session_file_are_a_documented_residual_duplicate`) pins the OLD contract. Rename it to `codex_fresh_terminal_pre_adoption_duplicate_is_transient_pending_locator_adoption`, keep the `joined.len() == 2` assertion for the no-identity input, and rewrite its doc comment: the duplicate is a TRANSIENT pre-adoption window — the B2 codex locator adopts the identity (`codex_identity.rs`), after which the EXISTING rung-1 registry consultation here (`:706-725`, dedupe `:786`) collapses it and the identity-aware sweep (`main.rs`, Task 3) pushes it; it is no longer a permanent residual.
+2. Update the fence comment at `:682-690` the same way (delete the "this port doesn't associate the two after the fact" claim; describe rung-1 resolution, the transient window, and note that a rung-2 ledger fallback was evaluated during planning and deliberately rejected — no production window exists where a live identity lacks a session_id while a Bound row covers its current terminal id).
 3. Fix the stale module doc claims at `:20-34` ("claude only", "no live terminal join" — both false since long before this plan; say what the module actually does today).
 
 - [ ] **Step 6: Full crate check + clippy**
@@ -303,24 +200,29 @@ Expected: PASS / no warnings.
 
 Append to the Verification Report:
 ```markdown
-### Case (c) join, server unit level (Task 2)
-- VERIFIED FAILING then FIXED: identityless live terminal + ledger Bound row
-  previously produced 2 sidebar items (provisional key); now resolves via
-  ledger to 1 running item. RED proof: compile-level (seam absent), then
-  assertion-level on first green run.
-- Residual pinning test rewritten: pre-adoption duplicate is transient, not permanent.
+### Case (c) join/ghost, server unit level (Task 2)
+- VERIFIED FAILING then FIXED: /api/terminals sidebar projection hard-coded
+  session_ref = None for codex; an adopted terminal's row now carries its
+  registry session identity (rung 1), so the client Phase-E terminal:<id>
+  ghost never materializes. RED proof: assertion-level (or compile-level if
+  the seam was threaded), then green.
+- Validated non-change: the rung-2 PaneLedger fallback in session_directory
+  joins was evaluated and REJECTED (no production window; dormant-machinery
+  risk). Existing rung-1 consultation already collapses post-adoption
+  duplicates. Residual pinning test rewritten: pre-adoption duplicate is
+  transient, not permanent.
 ```
 
 ```bash
-git add crates/freshell-server/src/session_directory.rs crates/freshell-server/src/main.rs docs/plans/2026-07-26-sidebar-registry-sync.md
-git commit -m "feat(server): session-directory join consults the pane ledger (P1.14, authority rung 2)"
+git add crates/freshell-server/src/terminals.rs crates/freshell-server/src/session_directory.rs crates/freshell-server/src/main.rs docs/plans/2026-07-26-sidebar-registry-sync.md
+git commit -m "feat(server): stamp /api/terminals sidebar projection from the identity registry (P1.14)"
 ```
 
 ---
 
 ### Task 3: Identity-aware sessions.changed sweep (the push seam)
 
-Even a perfect join is invisible if nothing pushes. The sweep signature is currently blind to `TerminalIdentityRegistry` changes, so a locator adoption (or any terminal open/close of a coding CLI) never triggers a sidebar refetch. Fold an identity digest into the signature. (This deliberately routes through the existing single emit point `broadcast_sessions_changed` and stays inside the sweep — the documented push seam this lane owns — rather than adding a second producer in the adoption tail.)
+Even a perfect join is invisible if nothing pushes. The sweep signature is currently blind to `TerminalIdentityRegistry` changes, so a locator adoption (or any terminal open/close of a coding CLI) never triggers a sidebar refetch. Fold an identity digest into the signature. (This deliberately routes through the existing single emit point `broadcast_sessions_changed` and stays inside the sweep — the documented push seam this lane owns — rather than adding a second producer in the adoption tail.) Validated attribution caveat: for FRESH codex panes the rollout write itself usually also moves the disk signature within ~≤4s, so this digest is what guarantees a push for adoptions that do NOT touch disk (e.g. adoption against an already-indexed rollout) and for terminal open/close — credit it accordingly in the report, not for row collapse.
 
 **Files:**
 - Modify: `crates/freshell-server/src/main.rs` (`sessions_sweep_signature` at `:1445-1450`, `spawn_sessions_sweep` at `:1490-1509`, spawn site at `:664`, gap docs at `:1390-1444`, `mod sessions_sweep_tests` at `:1512`)
@@ -541,7 +443,7 @@ Append to the Verification Report:
 
 ### Task 5: E2E pinning spec — scenario 1: fresh codex duplicate collapses (case c)
 
-Create the new rust-only Playwright spec and its first scenario: a codex pane created via the REST agent API, driven with Enter in the browser, must end as exactly ONE green sidebar row — the provisional live-only row and the indexed rollout row must collapse without a manual refresh. This test fails on `bf6242a1` (duplicate persists) and passes with Tasks 2–4. This is the "would have caught Incident 4" test for the codex shape.
+Create the new rust-only Playwright spec and its first scenario: a codex pane created via the REST agent API, driven with Enter in the browser, must end as exactly ONE green sidebar row carrying the real session id — no grey row, no client-minted `terminal:<id>` ghost — without a manual refresh. VALIDATED RED PREDICTION for `bf6242a1`: the deterministic failure is the `data-has-tab='true'` timeout (the pre-fix REST path never arms the codex locator, so adoption never fires and the row never turns green); the count/`startsWith('terminal:')` assertions may ADDITIONALLY fail via a client Phase-E ghost from the unstamped `/api/terminals` feed. It passes with Tasks 2–4 plus the verified existing client fold (`terminal.session.associated` → `panesSlice.ts:1753-1789` → `hasTab`). This is the "would have caught Incident 4" test for the codex shape.
 
 **Files:**
 - Create: `test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts`
@@ -657,7 +559,8 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
 
     // THE CONTRACT: eventually exactly ONE codex sidebar row, green, and
     // no provisional `terminal:<id>` row left behind -- WITHOUT a reload
-    // (proves the sessions.changed push, Task 3, and adoption, Tasks 2+4).
+    // (proves arming+adoption (Task 4), the stamped feed (Task 2), the
+    //  verified client fold, and the no-reload push (Task 3)).
     await expect(async () => {
       const rows = page.locator('[data-provider="codex"][data-session-id]')
       const count = await rows.count()
@@ -692,7 +595,7 @@ FRESHELL_E2E_RUST_SERVER_BIN=$PWD/target/release/freshell-server \
 git stash pop
 cargo build --release -p freshell-server
 ```
-Expected: FAIL on the stashed (pre-fix) binary — the duplicate persists / row count is 2 or the row stays `terminal:<id>`. Record both outcomes (this is the e2e red→green proof). If the stash dance is impractical (e.g. conflicts), an acceptable substitute proof: check out `bf6242a1` of `crates/` in a temp build dir and point `FRESHELL_E2E_RUST_SERVER_BIN` at that binary.
+Expected: FAIL on the stashed (pre-fix) binary — validated deterministic symptom: the `data-has-tab='true'` wait times out (no arming → no adoption → never green); a green `terminal:<id>` ghost row may ALSO appear (client Phase-E on the unstamped feed). Record the exact symptom observed plus both run outcomes (this is the e2e red→green proof). Attribution note for the report: this scenario's red→green primarily proves Task 4 (arming) and Task 2 (feed stamping); Task 3 is evidenced by the no-reload constraint, not by row collapse. If the stash dance is impractical (e.g. conflicts), an acceptable substitute proof: check out `bf6242a1` of `crates/` in a temp build dir and point `FRESHELL_E2E_RUST_SERVER_BIN` at that binary.
 
 - [ ] **Step 3: Record + commit**
 
@@ -725,7 +628,7 @@ The literal Incident-4 re-verification: a tab created via the REST agent API wit
 
 - [ ] **Step 1: Write the scenario (pinning test)**
 
-Add to the serial suite, after case-c. Seed a codex rollout at runtime (the index TTL is 1s, so a post-boot seed is picked up; donor shape: `sidebar-click-resume.spec.ts` ~`:175-185`):
+Add to the serial suite, after case-c. Seed a codex rollout at runtime (VALIDATED: the index TTL is 1s — `directory_index.rs:50` — and every sweep re-discovers NEW files, pinned by the `new_file_added` test; allow ~2-4s worst-case stale-while-revalidate visibility in waits; donor shape: `sidebar-click-resume.spec.ts` ~`:175-185`):
 
 ```ts
 const SEEDED_CODEX_THREAD_ID = randomUUID()
@@ -733,6 +636,8 @@ const SEEDED_CODEX_THREAD_ID = randomUUID()
 async function seedCodexRollout(homeDir: string, threadId: string, cwd: string): Promise<void> {
   // Donor shape: sidebar-click-resume.spec.ts ~:175-185 -- verify field
   // names (session_meta payload.id/payload.cwd + a message record) there.
+  // VALIDATED: the cwd field is mandatory -- a rollout that does not parse
+  // with a cwd is excluded from the index (R10b) and will NEVER appear.
   const day = '2026/07/20'
   const dir = path.join(homeDir, '.codex', 'sessions', day)
   await fs.mkdir(dir, { recursive: true })
@@ -753,7 +658,15 @@ test('case-b: REST-created resume tabs are green and dedupe on click', async ({ 
   ] as const) {
     const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
       headers: { authorization: `Bearer ${info.token}`, 'content-type': 'application/json' },
-      data: { mode, cwd: PROJECT_DIR, resumeSessionId: sessionId },
+      // VALIDATED: raw codex resumeSessionId is deliberately 400-rejected at
+      // HEAD (terminal_tabs.rs:124-131, pinned by
+      // create_codex_tab_rejects_raw_resume_session_id_without_session_ref);
+      // the canonical sessionRef shape IS accepted (pinned by
+      // create_codex_tab_accepts_session_ref_and_derives_resume_args). Do NOT
+      // "fix" the rejection — use the canonical shape for codex.
+      data: mode === 'codex'
+        ? { mode, cwd: PROJECT_DIR, sessionRef: { provider: 'codex', sessionId } }
+        : { mode, cwd: PROJECT_DIR, resumeSessionId: sessionId },
     })
     expect(res.ok()).toBe(true)
 
@@ -809,13 +722,13 @@ git commit -m "test(e2e): pin Incident-4 REST-created-tab sidebar contract (P1.1
 
 ### Task 7: E2E pinning — scenario 3: joins survive a server restart (case a)
 
-After a graceful restart (same home/port/token — the deploy-cycle shape), the reconnected client's sidebar must show the same sessions green with no duplicates: reconcile re-attaches the panes, the identity registry repopulates, and the ledger backstops the gap.
+After a graceful restart (same home/port/token — the deploy-cycle shape), the reconnected client's sidebar must show the same sessions green with no duplicates: reconcile re-attaches the panes and the identity registry repopulates at respawn (VALIDATED: the client opts into `paneReconcileV1` unconditionally — `ws-client.ts:360` — respawn verdicts carry provider-correct sessionRef including codex — `reconcile.rs:286-290` — and the WS create re-upserts identity + ledger binding — `terminal.rs:1905-1950`). Validated caveats: re-POSTing a resume tab for a session whose earlier terminal is still alive is NOT rejected (`TerminalRegistry::create` spawns unconditionally; duplicates only ERROR-log via `alarm_if_duplicate_session_ref`) — expect that ERROR log line on the shared serial server, it is not a failure; the codex leg must use the `sessionRef` body shape, as in Task 6.
 
 **Files:**
 - Modify: `test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts`
 
 **Interfaces:**
-- Consumes: Task 6's state (open claude + codex resume tabs from case-b, plus case-c's fresh codex pane); `server.restart()` (`rust-server.ts:322`); reconnect-wait idiom from `server-restart-recovery.spec.ts:106-111` (`getWsReadyState() === 'ready'` poll — copy the exact harness call).
+- Consumes: Task 6's state (open claude + codex resume tabs from case-b, plus case-c's fresh codex pane); `server.restart()` (`rust-server.ts:322`); reconnect-wait idiom from `server-restart-recovery.spec.ts:106-111` (`getWsReadyState() === 'ready'` poll — copy the exact harness call). NOTE (validated): `server-restart-recovery.spec.ts` is shell-only legacy recreate — the resume-respawn precedent to consult for expectations is `reconcile-client-adoption-rust.spec.ts:293-383` (post-restart `claude --resume`).
 - Produces: scenario `case-a: sidebar joins survive a graceful server restart`.
 
 - [ ] **Step 1: Write the scenario (pinning test)**
@@ -831,7 +744,15 @@ test('case-a: sidebar joins survive a graceful server restart', async ({ page })
   ] as const) {
     const res = await page.request.post(`${info.baseUrl}/api/tabs`, {
       headers: { authorization: `Bearer ${info.token}`, 'content-type': 'application/json' },
-      data: { mode, cwd: PROJECT_DIR, resumeSessionId: sessionId },
+      // VALIDATED: raw codex resumeSessionId is deliberately 400-rejected at
+      // HEAD (terminal_tabs.rs:124-131, pinned by
+      // create_codex_tab_rejects_raw_resume_session_id_without_session_ref);
+      // the canonical sessionRef shape IS accepted (pinned by
+      // create_codex_tab_accepts_session_ref_and_derives_resume_args). Do NOT
+      // "fix" the rejection — use the canonical shape for codex.
+      data: mode === 'codex'
+        ? { mode, cwd: PROJECT_DIR, sessionRef: { provider: 'codex', sessionId } }
+        : { mode, cwd: PROJECT_DIR, resumeSessionId: sessionId },
     })
     expect(res.ok()).toBe(true)
     await expect(page.locator(`[data-session-id="${sessionId}"][data-provider="${mode}"]`))
@@ -895,7 +816,7 @@ git commit -m "test(e2e): pin sidebar join survival across server restart (P1.14
 
 ### Task 8: E2E pinning — scenario 4: joins correct after recover-my-panes (case d)
 
-After an abrupt restart with lost client layout, the user runs the recover-my-panes flow; recovered panes must join green in the sidebar. This drives the EXISTING recovery UI only (Lane C2 owns its internals — we assert the sidebar contract around it).
+After an abrupt restart with lost client layout, the user runs the recover-my-panes flow; recovered panes must join green in the sidebar. This drives the EXISTING recovery UI only (Lane C2 owns its internals — we assert the sidebar contract around it). (Validated: the REST-created pane's synthesized sessionRef reaches the tabs-snapshot and `build_inventory` has no per-pane identity filter — the pane is recoverable PROVIDED the requesting client is not filtered as its own creator; see the sessionStorage note in Step 1.)
 
 **Files:**
 - Modify: `test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts`
@@ -930,6 +851,11 @@ test('case-d: recovered panes join green in the sidebar', async ({ page }) => {
   // [copy from recover-my-panes-rust.spec.ts: clear the freshell.layout.*
   //  localStorage keys, reload, wait for the recovery offer UI, accept it,
   //  wait for panes to be recreated -- its exact selectors and waits]
+  // VALIDATED REQUIREMENT: ALSO clear sessionStorage (or use a fresh browser
+  // context): the clientInstanceId persists in sessionStorage
+  // (tabRegistrySync.ts:42-92); if it survives, the server's self-pollution
+  // filter (recovery_inventory.rs:30-33) drops this client's own generations
+  // and NO recovery offer ever appears (the donor spec uses fresh contexts).
 
   // THE CONTRACT: the recovered session is green again, exactly once.
   const row = page.locator(`[data-session-id="${SEEDED_CLAUDE_ID}"][data-provider="claude"]`)
@@ -1004,7 +930,7 @@ Expected: all PASS. (These cover the amplifier Incident-4 variant, the generic r
 Finalize the `## Verification Report` section so it answers the spec's deliverable directly:
 - Table of the four contract cases → PASS-as-is / FIXED (with commit shas) / FAIL-with-evidence (cross-lane, routed).
 - The fixes list: ledger-backed join (Task 2), identity-aware sweep push (Task 3), REST codex arming (Task 4), plus any contingencies that fired.
-- "What remains" with justification. Expected residuals to document honestly (both are outside this lane's contract cases, documented not deferred-from-scope): (1) tabs open ONLY in another client/device still render grey locally — `hasTab` means "open in THIS client"; the registry pane payload carries `sessionRef` (untyped) and a semantics decision (green vs a third state) is a user-facing design call the campaign must make; (2) REST-created terminal identities are never retired on exit (documented at `terminal_tabs.rs:839-853`, a crate-cycle constraint predating this lane).
+- "What remains" with justification. Expected residuals to document honestly (both are outside this lane's contract cases, documented not deferred-from-scope): (1) tabs open ONLY in another client/device still render grey locally — `hasTab` means "open in THIS client"; the registry pane payload carries `sessionRef` (untyped) and a semantics decision (green vs a third state) is a user-facing design call the campaign must make; (2) REST-created terminal identities are never retired on exit (documented at `terminal_tabs.rs:839-853`, a crate-cycle constraint predating this lane); (3) the §4.2 rung-2 ledger fallback in the sidebar join has NO production window (validated this workflow: every Bound-row writer upserts the registry with the session id first; terminal ids are never re-minted across restarts) — the sidebar consults rung 1 only, deliberately; record this so future lanes don't re-plan it; (4) `paneReconcileFreshAgentV1` is shipped-but-dormant (the client never sends it) — fresh-agent verdict entries are inert; this lane's terminal-pane cases are unaffected. Also record the Task 4 scope interpretation and the Task 2 `terminals.rs` ownership interpretation (see Global Constraints) for the campaign owner.
 - Red→green proof pointers: Task 2/3/4 RED steps + Task 5 Step 2's pre-fix binary run.
 
 - [ ] **Step 5: Commit + push, STOP before PR**
