@@ -427,3 +427,25 @@ fn accept_and_strip_ignores_unknown_fields() {
         other => panic!("expected PerfLogging, got {other:?}"),
     }
 }
+
+#[test]
+fn tabs_sync_ack_roundtrips_with_and_without_persist_fields() {
+    // Success shape: fields omitted — byte-identical to today's ack on the wire.
+    let base = r#"{"type":"tabs.sync.ack","accepted":true,"closedRecords":0,"openRecords":3}"#;
+    match server_roundtrip(base, "tabs.sync.ack") {
+        ServerMessage::TabsSyncAck(ack) => {
+            assert_eq!(ack.persisted, None);
+            assert_eq!(ack.persist_reason, None);
+        }
+        other => panic!("expected TabsSyncAck, got {other:?}"),
+    }
+    // The honest-failure shape must conform to the frozen contract too.
+    let failed = r#"{"type":"tabs.sync.ack","accepted":true,"closedRecords":0,"openRecords":3,"persisted":false,"persistReason":"oversize"}"#;
+    match server_roundtrip(failed, "tabs.sync.ack") {
+        ServerMessage::TabsSyncAck(ack) => {
+            assert_eq!(ack.persisted, Some(false));
+            assert_eq!(ack.persist_reason.as_deref(), Some("oversize"));
+        }
+        other => panic!("expected TabsSyncAck, got {other:?}"),
+    }
+}

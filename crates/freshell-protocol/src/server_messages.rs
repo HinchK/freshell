@@ -808,6 +808,16 @@ pub struct TabsSyncAck {
     pub accepted: bool,
     pub closed_records: i64,
     pub open_records: i64,
+    /// `false` when the accepted push was NOT durably persisted (fail-loud
+    /// honesty, campaign P2.17). Omitted when persisted normally or when
+    /// persistence was skipped by design (empty push, persistence disabled),
+    /// keeping pre-change acks byte-identical on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted: Option<bool>,
+    /// Machine-readable reason accompanying `persisted:false`
+    /// (e.g. "oversize"). Serializes as `persistReason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_reason: Option<String>,
 }
 
 // --- tabs.sync.snapshot -----------------------------------------------------

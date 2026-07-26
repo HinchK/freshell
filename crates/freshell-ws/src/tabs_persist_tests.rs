@@ -29,7 +29,7 @@ fn put(
     captured: i64,
     recs: Vec<Value>,
 ) {
-    persist_generation(dir, "srv-1", device, "Dev", client, rev, &recs, captured);
+    let _ = persist_generation(dir, "srv-1", device, "Dev", client, rev, &recs, captured);
 }
 // Result-unwrapping helpers so the tests read cleanly (readers are fail-loud).
 fn union(dir: &std::path::Path, device: &str) -> Option<Value> {
@@ -797,7 +797,7 @@ fn concurrent_pushes_same_and_different_devices_stay_consistent() {
             };
             let client = format!("client-{n}");
             for rev in 1..=6i64 {
-                persist_generation(
+                let _ = persist_generation(
                     &root,
                     "srv",
                     &device,
@@ -1236,4 +1236,263 @@ fn every_supported_pane_kind_passes_semantic_generation_validation() {
         read_device_union(dir.path(), "dev").unwrap().is_some(),
         "all supported pane schemas should be readable"
     );
+}
+
+#[test]
+fn oversize_drop_returns_skipped_and_fires_invariant_alarm() {
+    // Campaign fail-loud: an oversize drop must be an ERROR-class invariant
+    // alarm and an honest non-Persisted outcome — never a silent WARN + Ok.
+    let (events, _guard) = crate::invariants::capture::capture();
+    let dir = tempfile::tempdir().unwrap();
+    let big = "x".repeat(MAX_SNAPSHOT_BYTES + 10);
+    let mut rec = open_record("dev:t1", "big", 1);
+    rec["blob"] = json!(big);
+    let outcome = persist_generation(dir.path(), "srv-1", "dev", "Dev", "c1", 1, &[rec], 1000);
+    assert_eq!(outcome, PersistOutcome::Skipped { reason: "oversize" });
+    let events = events.lock().unwrap();
+    assert!(
+        events.iter().any(|e| e.target == "freshell_ws::invariants"
+            && e.message.contains("tabs_snapshot_dropped_oversize")),
+        "oversize drop must fire the invariant alarm, got: {events:?}"
+    );
+}
+
+#[test]
+fn successful_persist_returns_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = persist_generation(
+        dir.path(),
+        "srv-1",
+        "dev",
+        "Dev",
+        "c1",
+        1,
+        &[open_record("dev:t1", "t", 1)],
+        1000,
+    );
+    assert_eq!(outcome, PersistOutcome::Persisted);
+    assert_eq!(list_generations(dir.path(), "dev", "c1").len(), 1);
+}
+
+// Corrupt every generation file in a device dir (defect-1 fixtures) and
+// return the dir path.
+fn corrupt_all_files(dir: &std::path::Path, device: &str) -> std::path::PathBuf {
+    let ddir = device_dir_for(dir, device).unwrap();
+    for path in std::fs::read_dir(&ddir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+    {
+        if path.extension().is_some_and(|x| x == "json") {
+            std::fs::write(&path, b"{ not valid json").unwrap();
+        }
+    }
+    ddir
+}
+
+#[test]
+fn corrupt_device_dir_is_exempt_from_cap_eviction() {
+    // Fail-loud: a dir with >=1 unreadable file is forensic evidence and must
+    // NEVER be the eviction victim. The oldest CLEAN dir evicts instead.
+    // (Old scoring gave an all-corrupt dir capturedAt=0 -> evicted FIRST.)
+    let (events, _guard) = crate::invariants::capture::capture();
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..MAX_SNAPSHOT_DEVICES {
+        let dev = format!("dev-{n:03}");
+        put(
+            dir.path(),
+            &dev,
+            "c1",
+            1,
+            1000 + n as i64,
+            vec![open_record(&format!("{dev}:t"), "t", 1)],
+        );
+    }
+    // dev-001 is nearly the oldest AND fully corrupt: the old code evicts it
+    // first (score 0). It must survive; clean oldest dev-000 evicts instead.
+    let corrupt_dir = corrupt_all_files(dir.path(), "dev-001");
+
+    put(
+        dir.path(),
+        "dev-new",
+        "c1",
+        1,
+        9000,
+        vec![open_record("dev-new:t", "new", 1)],
+    );
+
+    assert!(
+        corrupt_dir.exists(),
+        "corrupt dir must be exempt from eviction"
+    );
+    assert!(
+        !device_dir_for(dir.path(), "dev-000").unwrap().exists(),
+        "the oldest CLEAN dir must be the victim instead"
+    );
+    assert!(
+        device_dir_for(dir.path(), "dev-new").unwrap().exists(),
+        "the new write must land"
+    );
+    let events = events.lock().unwrap();
+    assert!(
+        events.iter().any(|e| e.target == "freshell_ws::invariants"
+            && e.message
+                .contains("tabs_snapshot_corrupt_dir_exempt_from_eviction")),
+        "exempting a corrupt dir must be loud, got: {events:?}"
+    );
+}
+
+#[test]
+fn cap_unenforceable_fails_the_write_and_preserves_all_evidence() {
+    // When every candidate holds unreadable files, refuse to evict: fail the
+    // incoming write loudly rather than destroy evidence.
+    let (events, _guard) = crate::invariants::capture::capture();
+    let dir = tempfile::tempdir().unwrap();
+    for n in 0..MAX_SNAPSHOT_DEVICES {
+        let dev = format!("dev-{n:03}");
+        put(
+            dir.path(),
+            &dev,
+            "c1",
+            1,
+            1000 + n as i64,
+            vec![open_record(&format!("{dev}:t"), "t", 1)],
+        );
+        corrupt_all_files(dir.path(), &dev);
+    }
+    let outcome = persist_generation(
+        dir.path(),
+        "srv-1",
+        "dev-new",
+        "Dev",
+        "c1",
+        1,
+        &[open_record("dev-new:t", "new", 1)],
+        9000,
+    );
+    assert!(
+        matches!(outcome, PersistOutcome::Failed { .. }),
+        "unenforceable cap must fail the incoming write, got {outcome:?}"
+    );
+    assert!(
+        !device_dir_for(dir.path(), "dev-new").unwrap().exists(),
+        "no new dir may be created past the cap"
+    );
+    let surviving = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .count();
+    assert_eq!(
+        surviving, MAX_SNAPSHOT_DEVICES,
+        "no corrupt dir may be destroyed"
+    );
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message.contains("tabs_snapshot_device_cap_unenforceable")),
+        "must alarm loudly: {events:?}"
+    );
+}
+
+#[test]
+fn mixed_device_id_dir_is_a_loud_error_not_first_file_wins() {
+    // Defect 3: identity used to come from whatever *.json read_dir returned
+    // first — nondeterministic for a half-migrated/hand-edited dir. Now every
+    // generation must agree, or the read fails loudly.
+    let (events, _guard) = crate::invariants::capture::capture();
+    let dir = tempfile::tempdir().unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "c1",
+        1,
+        1000,
+        vec![open_record("dev:t", "t", 1)],
+    );
+    // Hand-craft a second, fully VALID generation in the same dir whose
+    // embedded deviceId disagrees.
+    let ddir = device_dir_for(dir.path(), "dev").unwrap();
+    let existing = std::fs::read_dir(&ddir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "json"))
+        .unwrap();
+    let mut doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&existing).unwrap()).unwrap();
+    doc["deviceId"] = json!("dev-other");
+    std::fs::write(
+        ddir.join("zzz-imposter.json"),
+        serde_json::to_vec_pretty(&doc).unwrap(),
+    )
+    .unwrap();
+
+    let err = list_snapshot_devices(dir.path())
+        .expect_err("conflicting deviceIds in one dir must be an error");
+    assert!(
+        err.to_string()
+            .contains("tabs_snapshot_device_identity_conflict"),
+        "{err}"
+    );
+    let events = events.lock().unwrap();
+    assert!(
+        events.iter().any(|e| e.target == "freshell_ws::invariants"
+            && e.message.contains("tabs_snapshot_device_identity_conflict")),
+        "identity conflict must alarm loudly: {events:?}"
+    );
+}
+
+#[test]
+fn agreeing_multi_generation_dir_lists_exactly_one_device_id() {
+    // Regression guard for the fix: reading ALL files (not just the first)
+    // must still dedupe agreeing generations to one id.
+    let dir = tempfile::tempdir().unwrap();
+    put(
+        dir.path(),
+        "dev",
+        "c1",
+        1,
+        1000,
+        vec![open_record("dev:t", "a", 1)],
+    );
+    put(
+        dir.path(),
+        "dev",
+        "c2",
+        1,
+        2000,
+        vec![open_record("dev:t2", "b", 1)],
+    );
+    assert_eq!(devices(dir.path()), vec!["dev".to_string()]);
+}
+
+#[test]
+fn persist_lock_recovers_from_poison() {
+    // `with_persist_lock` is documented poison-tolerant: a panic while
+    // persisting must not wedge all future pushes/restores. NOTE: this
+    // deliberately poisons the process-global PERSIST_LOCK; every later
+    // acquisition goes through the same into_inner() recovery, which is
+    // exactly the property under test.
+    let _ = std::thread::spawn(|| with_persist_lock(|| panic!("deliberately poison PERSIST_LOCK")))
+        .join();
+    let value = with_persist_lock(|| 42);
+    assert_eq!(
+        value, 42,
+        "a poisoned persist lock must still be acquirable"
+    );
+    // And a real write still works end-to-end after poisoning.
+    let dir = tempfile::tempdir().unwrap();
+    let outcome = persist_generation(
+        dir.path(),
+        "srv-1",
+        "dev",
+        "Dev",
+        "c1",
+        1,
+        &[open_record("dev:t", "t", 1)],
+        1000,
+    );
+    assert_eq!(outcome, PersistOutcome::Persisted);
 }

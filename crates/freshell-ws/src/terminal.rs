@@ -2178,6 +2178,8 @@ async fn tabs_push_response(
                 accepted: ack.accepted,
                 open_records: ack.open_records,
                 closed_records: ack.closed_records,
+                persisted: ack.persisted,
+                persist_reason: ack.persist_reason,
             },
         ))),
         Err(message) => TabsPushResponse::Error(tabs_error_frame(&message)),
@@ -2388,6 +2390,43 @@ mod tabs_push_validation_tests {
     }
 
     #[tokio::test]
+    async fn empty_push_ack_is_unchanged_and_omits_persist_fields() {
+        // The empty-push skip is BY DESIGN (wipe/unload protection) and its
+        // semantics belong to kata h9vt — pin that it is NOT reported as a
+        // persistence failure and the ack shape is byte-identical to before.
+        let snapshots = tempfile::tempdir().unwrap();
+        let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
+        let frame = serde_json::json!({
+            "type": "tabs.sync.push",
+            "deviceId": "dev-1",
+            "deviceLabel": "Device 1",
+            "clientInstanceId": "client-1",
+            "snapshotRevision": 1,
+            "records": []
+        });
+        match tabs_push_response(&frame, tabs, "srv-test".to_string()).await {
+            TabsPushResponse::Ack(message) => {
+                let wire = serde_json::to_value(&*message).unwrap();
+                assert_eq!(wire["type"], "tabs.sync.ack");
+                assert_eq!(wire["accepted"], true);
+                assert_eq!(wire["openRecords"], 0);
+                assert!(
+                    wire.get("persisted").is_none(),
+                    "by-design empty-push skip must not read as a persistence failure: {wire}"
+                );
+                assert!(wire.get("persistReason").is_none(), "{wire}");
+            }
+            TabsPushResponse::Error(error) => panic!("empty push must be accepted: {error}"),
+        }
+        assert!(
+            crate::tabs_persist::list_snapshot_devices(snapshots.path())
+                .unwrap()
+                .is_empty(),
+            "empty push must not create a persisted generation"
+        );
+    }
+
+    #[tokio::test]
     async fn custom_extension_mode_push_is_accepted_and_persisted() {
         let snapshots = tempfile::tempdir().unwrap();
         let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
@@ -2445,6 +2484,113 @@ mod tabs_push_validation_tests {
             "dev-1:tab-1",
             "accepted push must update the in-memory registry"
         );
+    }
+
+    #[tokio::test]
+    async fn oversize_push_acks_persisted_false_with_reason() {
+        let snapshots = tempfile::tempdir().unwrap();
+        let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
+        // Inflate via tabName (a plain validated string field) so the frame
+        // stays schema-valid while the persisted document exceeds the cap.
+        let big = "x".repeat(crate::tabs_persist::MAX_SNAPSHOT_BYTES + 10);
+        let frame = serde_json::json!({
+            "type": "tabs.sync.push",
+            "deviceId": "dev-1",
+            "deviceLabel": "Device 1",
+            "clientInstanceId": "client-1",
+            "snapshotRevision": 1,
+            "records": [{
+                "tabKey": "dev-1:tab-1",
+                "tabId": "tab-1",
+                "tabName": big,
+                "status": "open",
+                "revision": 1,
+                "updatedAt": 1,
+                "paneCount": 1,
+                "panes": [{
+                    "paneId": "pane-1",
+                    "kind": "terminal",
+                    "payload": {
+                        "mode": "acme-custom-cli",
+                        "shell": "system",
+                        "sessionRef": {
+                            "provider": "acme-custom-cli",
+                            "sessionId": "session-1"
+                        }
+                    }
+                }]
+            }]
+        });
+
+        match tabs_push_response(&frame, tabs, "srv-test".to_string()).await {
+            TabsPushResponse::Ack(message) => match *message {
+                ServerMessage::TabsSyncAck(ack) => {
+                    assert!(ack.accepted, "accepted semantics must not change");
+                    assert_eq!(ack.persisted, Some(false), "the ack must stop lying");
+                    assert_eq!(ack.persist_reason.as_deref(), Some("oversize"));
+                }
+                other => panic!("unexpected acknowledgement frame: {other:?}"),
+            },
+            TabsPushResponse::Error(error) => {
+                panic!("oversize push must still be accepted: {error}")
+            }
+        }
+        assert!(
+            crate::tabs_persist::read_generation(snapshots.path(), "dev-1", 0)
+                .unwrap()
+                .is_none(),
+            "oversize generation must not be written"
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_push_ack_omits_persist_fields_on_the_wire() {
+        // Wire-compat: when the write succeeds the ack must stay byte-identical
+        // to the pre-change shape (fields OMITTED, not null) for the frozen
+        // client and contract.
+        let snapshots = tempfile::tempdir().unwrap();
+        let tabs = crate::tabs::TabsRegistry::with_persist_dir(snapshots.path().to_path_buf());
+        let frame = serde_json::json!({
+            "type": "tabs.sync.push",
+            "deviceId": "dev-1",
+            "deviceLabel": "Device 1",
+            "clientInstanceId": "client-1",
+            "snapshotRevision": 1,
+            "records": [{
+                "tabKey": "dev-1:tab-1",
+                "tabId": "tab-1",
+                "tabName": "small",
+                "status": "open",
+                "revision": 1,
+                "updatedAt": 1,
+                "paneCount": 1,
+                "panes": [{
+                    "paneId": "pane-1",
+                    "kind": "terminal",
+                    "payload": {
+                        "mode": "acme-custom-cli",
+                        "shell": "system",
+                        "sessionRef": {
+                            "provider": "acme-custom-cli",
+                            "sessionId": "session-1"
+                        }
+                    }
+                }]
+            }]
+        });
+        match tabs_push_response(&frame, tabs, "srv-test".to_string()).await {
+            TabsPushResponse::Ack(message) => {
+                let wire = serde_json::to_value(&*message).unwrap();
+                assert_eq!(wire["type"], "tabs.sync.ack");
+                assert_eq!(wire["accepted"], true);
+                assert!(
+                    wire.get("persisted").is_none(),
+                    "persisted must be omitted on the wire when the write succeeded: {wire}"
+                );
+                assert!(wire.get("persistReason").is_none(), "{wire}");
+            }
+            TabsPushResponse::Error(error) => panic!("must be accepted: {error}"),
+        }
     }
 }
 
