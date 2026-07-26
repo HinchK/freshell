@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: port-contract-${{ github.ref }}
+  cancel-in-progress: true
+
 # The WS contract must never drift silently again (it did: PR #498 era
 # amplifier.activity.*, 317e2ea1 terminal.idle, eef9b344 partial regen).
 # No path filter on purpose: generator output also depends on the
@@ -12,6 +19,7 @@ on:
 jobs:
   contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
