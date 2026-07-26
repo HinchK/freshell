@@ -272,6 +272,9 @@ export const HelloSchema = z.object({
   capabilities: z.object({
     uiScreenshotV1: z.boolean().optional(),
     terminalOutputBatchV1: z.boolean().optional(),
+    // REQUIRED here (not just in the sent object): Zod non-strict objects silently
+    // STRIP unknown keys, so without this the capability would silently no-op.
+    paneReconcileV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
