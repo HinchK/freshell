@@ -240,9 +240,13 @@ enumerated via the repo's own generator):
 Run:
 ```bash
 cd /home/dan/code/freshell/.worktrees/port-contract-reconcile
-git status --porcelain && git log --oneline -1
+git status --porcelain && git merge-base HEAD origin/main
 ```
-Expected: no output from status; `bf6242a1 Merge pull request #537 ...`.
+Expected: no output from status; the merge-base hash starts with `bf6242a1`
+(Merge pull request #537). Note: `HEAD` itself is NOT `bf6242a1` — the branch
+carries `docs(plan)` commits for this plan document on top of that base. That
+is expected and is not lane contamination; only commits touching files other
+than `docs/plans/` would indicate a contaminated lane.
 If `node_modules` is missing: `npm ci` (may take a few minutes).
 
 - [ ] **Step 2: Observe the pre-existing RED (the failing test this lane fixes)**
