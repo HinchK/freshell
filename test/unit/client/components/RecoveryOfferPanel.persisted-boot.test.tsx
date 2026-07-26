@@ -2,7 +2,7 @@
 // found a persisted layout, so nothing was lost). Split from the main test file
 // because the boot-state capture is a module constant — one mock per module graph.
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
+import { render, screen, cleanup } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 

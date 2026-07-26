@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useAppDispatch, useAppStore } from '@/store/hooks'
 import type { RootState } from '@/store/store'
@@ -22,6 +22,20 @@ import { OVERLAY_Z } from '@/components/ui/overlay'
 import { Button } from '@/components/ui/button'
 
 const HEADING_ID = 'recovery-offer-heading'
+
+// Focus pattern shared with src/components/ui/confirm-modal.tsx
+function getFocusable(container: HTMLElement): HTMLElement[] {
+  const selectors = [
+    'button',
+    '[href]',
+    'input',
+    'select',
+    'textarea',
+    '[tabindex]:not([tabindex="-1"])',
+  ]
+  return Array.from(container.querySelectorAll<HTMLElement>(selectors.join(',')))
+    .filter((el) => !el.hasAttribute('disabled') && !el.getAttribute('aria-hidden'))
+}
 
 function walkArmingRestores(node: PaneNode | undefined): void {
   if (!node) return
@@ -56,6 +70,11 @@ export function RecoveryOfferPanel(): JSX.Element | null {
   const dispatch = useAppDispatch()
   const store = useAppStore()
   const [inventory, setInventory] = useState<RecoveryInventory | null>(null)
+  const dialogRef = useRef<HTMLDivElement>(null)
+  const acceptRef = useRef<HTMLButtonElement>(null)
+  const previousFocusRef = useRef<HTMLElement | null>(null)
+  const previousOverflowRef = useRef<string | null>(null)
+  const open = inventory !== null
 
   useEffect(() => {
     const pending = getPendingOffer()
@@ -69,7 +88,13 @@ export function RecoveryOfferPanel(): JSX.Element | null {
     getRecoveryInventory(getCurrentTabRegistryClientInstanceId(), Date.now() - bootAt)
       .then((inv) => {
         if (cancelled) return
-        if (!inv.recoverable || isDismissed(inv.contentId)) return
+        if (!inv.recoverable || isDismissed(inv.contentId)) {
+          // A dead offer (nothing recoverable / already dismissed) must not
+          // leave a stale pending record causing pointless fetches every boot.
+          // Fetch ERRORS deliberately keep the flag set (retry next boot).
+          clearPendingOffer()
+          return
+        }
         setPendingOffer(inv.contentId, bootAt)
         setInventory(inv)
       })
@@ -80,6 +105,44 @@ export function RecoveryOfferPanel(): JSX.Element | null {
       cancelled = true
     }
   }, [])
+
+  // Focus management + body scroll-lock while the dialog is open
+  // (confirm-modal.tsx pattern).
+  useEffect(() => {
+    if (!open) return
+    previousFocusRef.current = document.activeElement as HTMLElement | null
+    previousOverflowRef.current = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+
+    const focusTimer = window.setTimeout(() => {
+      acceptRef.current?.focus()
+    }, 0)
+
+    return () => {
+      window.clearTimeout(focusTimer)
+      document.body.style.overflow = previousOverflowRef.current || ''
+      previousFocusRef.current?.focus()
+    }
+  }, [open])
+
+  // Escape closes WITHOUT deciding: unlike decline (which permanently records
+  // dismissal), an undecided close keeps the pending flag set so the offer
+  // re-appears next boot (D3) — matching confirm-modal's "cancel" semantics.
+  useEffect(() => {
+    if (!open) return
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        setInventory(null)
+      }
+    }
+    document.addEventListener('keydown', handleKey)
+    return () => document.removeEventListener('keydown', handleKey)
+  }, [open])
+
+  const closeWithoutDecision = () => {
+    setInventory(null)
+  }
 
   const accept = () => {
     if (!inventory) return
@@ -108,14 +171,47 @@ export function RecoveryOfferPanel(): JSX.Element | null {
   return createPortal(
     <div
       className={`fixed inset-0 flex items-center justify-center bg-black/50 ${OVERLAY_Z.modal}`}
+      onClick={closeWithoutDecision}
+      onKeyDown={(e) => {
+        if (e.key === 'Escape') {
+          e.preventDefault()
+          closeWithoutDecision()
+        }
+      }}
       role="presentation"
+      tabIndex={-1}
     >
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions */}
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby={HEADING_ID}
         data-testid="recovery-offer-panel"
         className="bg-background border border-border rounded-lg shadow-lg w-full max-w-md mx-4 p-5"
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => {
+          if (e.key !== 'Tab') return
+          const dialog = dialogRef.current
+          if (!dialog) return
+          const focusables = getFocusable(dialog)
+          if (focusables.length === 0) {
+            e.preventDefault()
+            return
+          }
+          const first = focusables[0]
+          const last = focusables[focusables.length - 1]
+          const active = document.activeElement as HTMLElement | null
+          if (e.shiftKey) {
+            if (active === first || !dialog.contains(active)) {
+              e.preventDefault()
+              last.focus()
+            }
+          } else if (active === last) {
+            e.preventDefault()
+            first.focus()
+          }
+        }}
       >
         <h2 id={HEADING_ID} className="text-lg font-semibold">
           Restore {paneCount} {paneCount === 1 ? 'pane' : 'panes'} from server memory?
@@ -146,7 +242,13 @@ export function RecoveryOfferPanel(): JSX.Element | null {
           <Button variant="ghost" size="sm" data-testid="recovery-decline" onClick={decline}>
             Not now
           </Button>
-          <Button variant="default" size="sm" data-testid="recovery-accept" onClick={accept}>
+          <Button
+            ref={acceptRef}
+            variant="default"
+            size="sm"
+            data-testid="recovery-accept"
+            onClick={accept}
+          >
             Restore
           </Button>
         </div>

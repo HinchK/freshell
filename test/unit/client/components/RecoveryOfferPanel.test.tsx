@@ -20,7 +20,7 @@ vi.mock('@/store/tabRegistrySync', async (importOriginal) => ({
 
 import { getRecoveryInventory } from '@/lib/api'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
-import { getPendingOffer } from '@/lib/recovery/dismissal'
+import { getPendingOffer, setPendingOffer, isDismissed, recordDismissal } from '@/lib/recovery/dismissal'
 import { consumeTerminalRestoreRequestId } from '@/lib/terminal-restore'
 import type { RecoveryInventory } from '@/lib/recovery/types'
 import type { PaneNode } from '@/store/paneTypes'
@@ -130,7 +130,8 @@ describe('RecoveryOfferPanel', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
-  it('renders nothing when inventory is not recoverable', async () => {
+  it('renders nothing when inventory is not recoverable and clears a stale pending offer', async () => {
+    setPendingOffer('cid-1', 0)
     vi.mocked(getRecoveryInventory).mockResolvedValue({
       ...INVENTORY,
       recoverable: false,
@@ -139,13 +140,79 @@ describe('RecoveryOfferPanel', () => {
     render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
     await waitFor(() => expect(vi.mocked(getRecoveryInventory)).toHaveBeenCalled())
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    // A dead offer must not leave a pending record causing pointless fetches every boot
+    await waitFor(() => expect(getPendingOffer()).toBeNull())
   })
 
-  it('renders nothing when the inventory fetch fails', async () => {
+  it('clears a stale pending offer when the fetched inventory is already dismissed', async () => {
+    recordDismissal('cid-1')
+    setPendingOffer('cid-1', 0)
+    vi.mocked(getRecoveryInventory).mockResolvedValue(INVENTORY)
+    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+    await waitFor(() => expect(vi.mocked(getRecoveryInventory)).toHaveBeenCalled())
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await waitFor(() => expect(getPendingOffer()).toBeNull())
+  })
+
+  it('renders nothing when the inventory fetch fails, keeping any pending offer for retry', async () => {
+    setPendingOffer('cid-1', 0)
     vi.mocked(getRecoveryInventory).mockRejectedValue(new Error('boom'))
     render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
     await waitFor(() => expect(vi.mocked(getRecoveryInventory)).toHaveBeenCalled())
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    // Fetch errors are transient: the pending flag stays so the next boot retries
+    expect(getPendingOffer()).toEqual({ contentId: 'cid-1', bootAt: 0 })
+  })
+
+  it('moves initial focus to the Restore button and locks body scroll while open', async () => {
+    vi.mocked(getRecoveryInventory).mockResolvedValue(INVENTORY)
+    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+    const dialog = await screen.findByRole('dialog')
+    await waitFor(() => expect(screen.getByTestId('recovery-accept')).toHaveFocus())
+    expect(dialog.contains(document.activeElement)).toBe(true)
+    expect(document.body.style.overflow).toBe('hidden')
+  })
+
+  it('traps Tab focus inside the dialog', async () => {
+    vi.mocked(getRecoveryInventory).mockResolvedValue(INVENTORY)
+    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+    await screen.findByRole('dialog')
+    await waitFor(() => expect(screen.getByTestId('recovery-accept')).toHaveFocus())
+    // accept is the last focusable; Tab wraps to the first (decline)
+    await userEvent.tab()
+    expect(screen.getByTestId('recovery-decline')).toHaveFocus()
+    // decline is the first focusable; Shift+Tab wraps back to the last (accept)
+    await userEvent.tab({ shift: true })
+    expect(screen.getByTestId('recovery-accept')).toHaveFocus()
+  })
+
+  it('Escape closes without deciding: no dismissal recorded, pending offer kept, re-offers on remount', async () => {
+    vi.mocked(getRecoveryInventory).mockResolvedValue(INVENTORY)
+    const first = render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+    await screen.findByRole('dialog')
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    // Undecided close (D3): pending survives so the offer re-appears next boot
+    expect(getPendingOffer()).toEqual({ contentId: 'cid-1', bootAt: 0 })
+    expect(isDismissed('cid-1')).toBe(false)
+    first.unmount()
+
+    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+    expect(await screen.findByRole('dialog')).toBeInTheDocument()
+  })
+
+  it('overlay click closes without deciding; clicks inside the dialog do not close', async () => {
+    vi.mocked(getRecoveryInventory).mockResolvedValue(INVENTORY)
+    render(<Provider store={makeTestStore()}><RecoveryOfferPanel /></Provider>)
+    const dialog = await screen.findByRole('dialog')
+    // Clicking inside the dialog body must NOT close it
+    await userEvent.click(screen.getByText(/restore 1 pane/i))
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    // Clicking the overlay closes without recording a decision
+    await userEvent.click(dialog.parentElement as HTMLElement)
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument())
+    expect(getPendingOffer()).toEqual({ contentId: 'cid-1', bootAt: 0 })
+    expect(isDismissed('cid-1')).toBe(false)
   })
 
   it('shows the live note for live panes and recreates them without sessionRef (D7)', async () => {
