@@ -5,24 +5,26 @@
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
 > for tracking.
 
-**Goal:** Build the server-side pane-identity ledger — a durable per-row disk store under `~/.freshell/pane-ledger/` written synchronously at identity events — wire it into all terminal-pane identity write triggers (claude pre-allocation, codex candidate adoption, opencode/amplifier locator resolution, pending markers at spawn, best-effort retire), and ship the three reads in the same slice (inventory sessionRef stamping, ledger-backed `ever_observed`, the claude restore-resolution ladder), plus P1.10: pin opencode locator arming for restore-created panes that lack identity.
+**Goal:** Build the server-side pane-identity ledger — a durable per-row disk store under `~/.freshell/pane-ledger/` written durably AT identity events, awaited before the event is answered — wire it into all terminal-pane identity write triggers (claude pre-allocation, codex candidate adoption, opencode/amplifier locator resolution, pending markers at spawn, best-effort retire), and ship the three reads in the same slice (inventory sessionRef stamping, ledger-backed `ever_observed`, the claude restore-resolution ladder), plus P1.10: pin opencode locator arming for restore-created panes that lack identity.
 
-**Architecture:** A new `pane_ledger` module in `crates/freshell-ws` holding two row types with different keys and different rights: **binding rows** keyed on server-minted `sessionRef` (provider, sessionId) with `terminalId` as a secondary index, and **pending markers** keyed on `terminalId` that are NEVER promoted or joined — resolution writes a fresh binding row FIRST, then deletes the marker (pinned order). Each row is its own JSON file written via the existing `atomic_write_durable` (temp+rename+fsync). A boot scan quarantines corrupt rows per-row (never per-store), sweeps stale markers, repairs the supersession crash window, and GCs bound rows to tombstones (never deletion; tombstone deletion is conditioned on transcript absence). The ledger is constructed once in `freshell-server::main`, hangs off `WsState` as an `Arc`, and is consulted by three reads that ship in this slice.
+**Architecture:** A new `pane_ledger` module in `crates/freshell-ws` holding two row types with different keys and different rights: **binding rows** keyed on server-minted `sessionRef` (provider, sessionId) with `terminalId` as a secondary index, and **pending markers** keyed on `terminalId` that are NEVER promoted or joined — resolution writes a fresh binding row FIRST, then deletes the marker (pinned order). Each row is its own JSON file written via the existing `atomic_write_durable` (temp+rename+fsync); `PaneLedger` additionally maintains an **in-memory write-through index**, loaded once at construction with a single directory scan, so ALL steady-state reads answer from memory — never a per-call directory scan (V1.md measured full-store scans at 21ms@1k / 108ms@5k / 426ms@20k rows, and the TTL math yields 1.2k–12k rows; the single-writer process makes invalidation trivial). Because each durable write costs ~15ms p50 / 21–64ms p99 in fsyncs on this host (V1.md), every ledger **write on an async path** (the `handle_create` tail, kill hygiene, the codex/opencode/amplifier resolution hooks) runs via `tokio::task::spawn_blocking(...)` and is **AWAITED before the reply / subsequent processing** — durable-before-answer is fully preserved; only the thread that blocks changes (the codebase's own PTY-spawn precedent, `terminal.rs:1369-1379`). `PaneLedger`'s API stays synchronous (`Arc<PaneLedger>` is Send+Sync); call sites wrap. Truly-synchronous contexts (the PTY `on_exit` hook, which runs on a blocking thread; the pre-serve boot scan in `main`) may call it inline. A boot scan quarantines corrupt rows per-row (never per-store), sweeps stale markers (crash-window residue AND markers aged past `PENDING_MARKER_TTL_MS` — bounds leaked-marker lifetime), repairs the supersession crash window, and GCs bound rows to tombstones (never deletion; tombstone DELETION requires transcript absence established by a **direct filesystem check by provider path convention** — never by `probe.exists()==Absent` alone, whose Absent can be transiently stale, permanently wrong for index-filtered transcripts, or mass-wrong on a provider I/O hiccup, V10.md; probe Absent remains fine for non-destructive decisions). The ledger is constructed once in `freshell-server::main` under an exclusive advisory flock (single-writer guard, the `ConfigLock` pattern — V2.md), hangs off `WsState` as an `Arc`, and is consulted by three reads that ship in this slice. REST/freshagent-created terminal panes are OUT of this slice's write triggers (deferred to P1.13 — see Global Constraints).
 
 **Tech Stack:** Rust (serde/serde_json, tokio, tracing), existing `freshell-ws` test harness (`tests/common/mod.rs`, real axum server on ephemeral loopback ports), Playwright e2e (`RustServer` fixture, fake CLIs).
 
 ## Global Constraints
 
 - **Worktree:** all work happens in `/home/dan/code/freshell/.worktrees/pane-identity-ledger`, branch `feat/pane-identity-ledger`, based on `origin/main @ c491aee0`.
+- **Drift/rebase:** proceed on the current base (`c491aee0`). The known drift `c491aee0..c3b468b0` (#534 client-only, #535 deploy-tab-diff script/spec) touches ZERO plan anchor files (V4.md — exhaustive file-set diff). Rebase onto `origin/main` before the final push (Task 14) — expected conflict-free (disjoint files) — and re-verify the plan's `file:line` anchors after any rebase.
 - **The spec** is §4.2 of `/home/dan/code/freshell/docs/plans/2026-07-24-restart-resilience-architecture-analysis.md` (UNTRACKED — read via that absolute path; **never commit that file**). Every pinned rule there is a requirement.
 - **TDD:** Red-Green-Refactor for every task; never skip the failing-test run, never skip the refactor pass.
 - **Store location:** `~/.freshell/pane-ledger/` (user-approved), resolved via `resolve_home()` precedence (`FRESHELL_HOME` → `HOME`) ONCE in `main.rs` and dependency-injected as a path — the module itself never reads env vars.
-- **Scope: TERMINAL panes only.** Fresh-agent ledger wiring is a later slice (P1.13). The resume-invocation record for a terminal pane is `{provider, sessionId, mode, cwd}` — everything `resolve_coding_cli_command` needs to re-issue the resume. Extended settings fields (model/sandbox/permissionMode/effort) are fresh-agent resume parameters and land with P1.13 per the campaign roadmap (spec §5 items 8 vs 13) — not stored dormant here (Principle 6).
+- **Scope: TERMINAL panes only.** Fresh-agent ledger wiring is a later slice (P1.13). The resume-invocation record for a terminal pane is `{provider, sessionId, mode, cwd}` — everything `resolve_coding_cli_command` needs to re-issue the resume. The extended settings fields (model/sandbox/permissionMode/effort) ARE consumed by `resolve_coding_cli_command` for terminal panes too (`cli_launch.rs:106-124`, V11.md) — but they are sourced from the durable per-provider `ProviderSettings` store, not per-pane state, which is exactly why omitting them from v1 rows loses nothing; a restart-resume re-resolves from the same durable settings store the original launch used. Duplicating them per-row would be a write with no read in this slice (Principle 6). P1.13 may add them (and `paneKind`, deferred with them) as `Option` fields under `LEDGER_VERSION 1` losslessly — serde ignores unknown fields and missing `Option`s deserialize as `None`; quarantine keys on version mismatch only — and P1.13 must NOT add `deny_unknown_fields` or non-defaulted required fields under version 1 (V11.md).
+- **Scope: REST/freshagent-created terminal panes are OUT of this slice's ledger write triggers**, deferred to P1.13. The freshagent REST API (`POST /api/tabs` → `freshell-freshagent/src/lib.rs:1176`; `POST /api/panes/{id}/split` → `pane_ops.rs:57`) spawns terminal panes via `registry.create` + `set_meta` (`terminal_tabs.rs:866,:926`), supports claude resume, performs no `identity.upsert`, and CANNOT reach freshell-ws hooks (documented circular-dep gap, `terminal_tabs.rs:833-840`; V6.md, V7.md). Crate-placement consequence, accepted: `pane_ledger` lives in `freshell-ws`, unreachable from `freshell-freshagent` — P1.13 will need to move/hoist it to a crate both can reach; the module is self-contained, so the move is mechanical. Task 12's restore live-guard compensates for the REST hole on the read side (see Task 12).
 - **Scope fence — do NOT touch:** freshagent crates' `claude.rs`/`snapshot.rs` (Lane A2), `tabs_persist*`/`tabs_snapshots*`/persistMiddleware (A1/A6 — *calling* the already-`pub` `atomic_write_durable` is fine; do not edit it), `TerminalView`/`FreshAgentView` (A4), `registry.rs` scrollback (A5), `reconcile.rs` verdict-derivation logic (only the `ever_observed` INPUT changes, indirectly, via the probe impl in `freshell-server`). Lane A2 also touches `terminal.rs` (FreshAgentAttach arm) — keep all `terminal.rs` edits confined to the create/identity path (`handle_create` tail, exit/kill hooks, the restore ladder helpers). No kimi/gemini work.
 - **Full-verdict wiring is Phase 3:** quarantine-in-verdict (`ledger_quarantined` breadcrumb) and superseded-claim `corrected:true` verdicts are exposed **at the ledger API level** here (chain-terminus lookup, quarantine query, loud ERROR logs); reconcile-verdict plumbing lands with the Phase 3 lane that owns verdict derivation. The frozen client does not yet render `durability.degraded`; the load-bearing pinned property shipped here is that the warning frame is pushed LIVE at failure time (wire-asserted by test), never posthumously.
 - **Tests:** `cargo test` and Playwright are NOT coordinator-gated. `npm test`/`npm run check` ARE — set `FRESHELL_TEST_SUMMARY`, check `npm run test:status` first, WAIT if a sibling holds the gate (5 sibling lanes run concurrently).
 - **Ports:** never bind or touch 3001/3002. Rust integration tests bind `127.0.0.1:0`; e2e uses `RustServer`'s `findFreePort()`.
-- **Process safety:** NEVER restart the user's self-hosted server; never broad kill patterns; record PIDs. Disk is ~36 GB free — on ENOSPC, HALT and report rather than deleting anything outside this worktree.
+- **Process safety:** NEVER restart the user's self-hosted server; never broad kill patterns; record PIDs. Disk is TIGHT: the root fs is ~96% full with only ~5.6 GB free to non-root (V2.md statfs) — the Task 1 Step 0 baseline build (`cargo test` target artifacts) is the main disk consumer. On ENOSPC, HALT and report rather than deleting anything outside this worktree.
 - **CI gates:** `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` are enforced by CI; every task's code must be fmt- and clippy-clean. Rust tests are NOT in CI — local `cargo test` is the only test gate.
 - **Structural limits:** ≤1K lines per file (hence `pane_ledger_tests.rs` as a `#[path]` submodule, mirroring `tabs_persist_tests.rs`).
 - **PR policy: NOT approved.** Commit locally per task, push the branch at the end, **STOP before `gh pr create`**.
@@ -37,8 +39,10 @@
 | `crates/freshell-ws/src/pane_ledger.rs` | Create | The ledger: row types, key encoding, atomic per-row writes, reader rules (chain-terminus, marker-vs-binding), boot scan / GC, write-failure surfacing helpers |
 | `crates/freshell-ws/src/pane_ledger_tests.rs` | Create | Unit tests for the ledger (kept out of the main file for the ≤1K-lines limit, `#[path]` submodule like `tabs_persist_tests.rs`) |
 | `crates/freshell-ws/src/lib.rs` | Modify | `pub mod pane_ledger;` registration; `WsState.pane_ledger` field; inventory-stamping ledger fallback (~:398-403) |
+| `crates/freshell-ws/Cargo.toml` | Modify | unix-only `libc` dependency (flock single-writer guard, ConfigLock pattern) |
 | `crates/freshell-ws/src/invariants.rs` | Modify | `error_pane_ledger_write_failed` structured ERROR emitter |
-| `crates/freshell-protocol/src/server_messages.rs` | Modify | `durability.degraded` server message (live write-failure warning frame) |
+| `crates/freshell-protocol/src/server_messages.rs` | Modify | `durability.degraded` server message (live write-failure warning frame) + `EXTENSION_SERVER_MESSAGE_TYPES` entry |
+| `crates/freshell-protocol/tests/activity_extension.rs` | Modify | extend the exact-array pin on `EXTENSION_SERVER_MESSAGE_TYPES` (V8.md) |
 | `crates/freshell-ws/src/terminal.rs` | Modify | Create-path write triggers (binding at create, pending marker at spawn), exit/kill ledger hygiene, ledger rung in `resolve_claude_restore_session_id` |
 | `crates/freshell-ws/src/codex_candidate.rs` | Modify | Ledger resolution at candidate adoption (`:206-220` bind block) |
 | `crates/freshell-ws/src/opencode_association.rs` | Modify | Ledger resolution at locator resolve (`:135-154` bind block); P1.10 restore-re-arm pinning tests |
@@ -75,6 +79,7 @@
 - Create: `crates/freshell-ws/src/pane_ledger.rs`
 - Create: `crates/freshell-ws/src/pane_ledger_tests.rs`
 - Modify: `crates/freshell-ws/src/lib.rs` (mod registration only — the `pub mod` block at `lib.rs:23-39`, alphabetical order)
+- Modify: `crates/freshell-ws/Cargo.toml` (unix-only `libc` dependency for the flock guard)
 
 **Interfaces:**
 - Consumes: `freshell_protocol::SessionLocator` (`crates/freshell-protocol/src/common.rs:174-177`, `{provider: String, session_id: String}`, serde camelCase); `crate::tabs_persist::atomic_write_durable(destination: &Path, temporary: &Path, bytes: &[u8]) -> std::io::Result<()>` (already `pub`, `tabs_persist.rs:706-732`).
@@ -83,9 +88,10 @@
   - `pub struct BindingRow { pub ledger_version: u32, pub provider: String, pub session_id: String, pub mode: String, pub cwd: Option<String>, pub live_terminal_id: Option<String>, pub create_request_id: Option<String>, pub created_at: i64, pub updated_at: i64, pub last_observed_at: i64, pub state: RowState, pub retired_reason: Option<RetiredReason>, pub superseded_by: Option<SessionLocator> }`
   - `pub enum RowState { Bound, Retired }`, `pub enum RetiredReason { Superseded, Closed, GcExpired }`
   - `pub struct BindingWrite<'a> { pub provider: &'a str, pub session_id: &'a str, pub terminal_id: &'a str, pub mode: &'a str, pub cwd: Option<&'a str>, pub create_request_id: Option<&'a str>, pub now_ms: i64 }`
-  - `pub struct PaneLedger` with `pub fn new(root: Option<PathBuf>) -> Self`, `pub fn disabled() -> Self`, `pub fn record_binding(&self, w: &BindingWrite<'_>) -> std::io::Result<()>`, `pub fn load_binding(&self, provider: &str, session_id: &str) -> Option<BindingRow>`, `pub fn ever_bound(&self, provider: &str, session_id: &str) -> bool`, `pub fn list_bindings(&self) -> Vec<BindingRow>`, `pub fn bound_session_ref_for_terminal(&self, terminal_id: &str) -> Option<SessionLocator>`, `pub fn lookup_by_create_request_id(&self, provider: &str, create_request_id: &str) -> Option<BindingRow>`
+  - `pub struct PaneLedger` with `pub fn new(root: Option<PathBuf>) -> Self` (lock-free; tests + harness), `pub fn new_locked(root: Option<PathBuf>) -> Self` (production: exclusive flock single-writer guard, degrades to disabled), `pub fn disabled() -> Self`, `pub fn record_binding(&self, w: &BindingWrite<'_>) -> std::io::Result<()>`, `pub fn load_binding(&self, provider: &str, session_id: &str) -> Option<BindingRow>`, `pub fn ever_bound(&self, provider: &str, session_id: &str) -> bool`, `pub fn list_bindings(&self) -> Vec<BindingRow>`, `pub fn bound_session_ref_for_terminal(&self, terminal_id: &str) -> Option<SessionLocator>`, `pub fn lookup_by_create_request_id(&self, provider: &str, create_request_id: &str) -> Option<BindingRow>`
+  - **Read policy (V1.md / A15):** `PaneLedger` holds an in-memory write-through index (`LedgerIndex`, private) loaded ONCE in `new()` by a single directory scan. ALL steady-state reads — `load_binding`, `ever_bound`, `list_bindings`, `bound_session_ref_for_terminal`, `lookup_by_create_request_id`, later `pending_for_terminal` and supersession detection — answer from memory; no API does a per-call directory scan. Every file mutation updates the index in the same locked section (write-through). Reads are therefore cheap enough to call inline on async paths; only WRITES fsync and need `spawn_blocking` at async call sites (Tasks 6/8).
 
-- [ ] **Step 0: Baseline green.** Run: `cargo test -p freshell-ws` (from the worktree root; generous timeout — real PTY spawns). Expected: PASS. If the base suite is red, STOP and report — do not build on a red base.
+- [ ] **Step 0: Baseline green.** FIRST run `npm ci` in the worktree root — this is dependency install only, NOT the coordinator-gated `npm test`/`npm run check` (no gate needed). The worktree ships without `node_modules/`, and `mcp_inject.rs:123-126`'s tsx check then deterministically fails ALL provider PTY spawns — 14 failures on the untouched base with this single environmental root cause (V3.md). THEN run: `cargo test -p freshell-ws` (from the worktree root; generous timeout — real PTY spawns). Expected: PASS. If any failure survives `npm ci`, STOP and report — do not build on a red base.
 
 - [ ] **Step 1: Write the failing tests.** Create `crates/freshell-ws/src/pane_ledger_tests.rs`:
 
@@ -205,6 +211,40 @@ fn key_encoding_is_path_safe_and_injective() {
 }
 
 #[test]
+fn index_loads_existing_rows_at_construction() {
+    // The write-through index is seeded by ONE directory scan in new()
+    // (V1.md read policy); a second instance over the same dir answers
+    // from its own fresh load — the restart-equivalent shape.
+    let root = temp_root("index-reload");
+    {
+        let gen1 = PaneLedger::new(Some(root.clone()));
+        gen1.record_binding(&write("claude", "sess-a", "t1", 1_000)).unwrap();
+    }
+    let gen2 = PaneLedger::new(Some(root.clone()));
+    assert!(gen2.ever_bound("claude", "sess-a"));
+    assert_eq!(gen2.list_bindings().len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_locked_degrades_to_disabled_when_another_holder_exists() {
+    // Single-writer guard (V2.md): never two writers on one store. The
+    // second locked construction logs a loud ERROR and comes up DISABLED;
+    // dropping the holder frees the flock (kernel-released on death too).
+    let root = temp_root("lock");
+    let holder = PaneLedger::new_locked(Some(root.clone()));
+    holder.record_binding(&write("claude", "s1", "t1", 1)).unwrap();
+    let loser = PaneLedger::new_locked(Some(root.clone()));
+    loser.record_binding(&write("claude", "s2", "t2", 2)).expect("disabled no-op");
+    assert!(!loser.ever_bound("claude", "s2"), "loser is disabled");
+    drop(holder);
+    let next = PaneLedger::new_locked(Some(root.clone()));
+    assert!(next.ever_bound("claude", "s1"), "flock freed on drop");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn secondary_index_reads_by_terminal_and_request_id() {
     let root = temp_root("secondary");
     let ledger = PaneLedger::new(Some(root.clone()));
@@ -231,7 +271,7 @@ Expected: FAIL to compile — `pane_ledger` module does not exist (`unresolved i
 ```rust
 //! P1.8 — the server-side pane-identity ledger (restart-resilience campaign
 //! §4.2): a small per-row disk store under `<home>/.freshell/pane-ledger/`,
-//! written synchronously at identity events with atomic temp+rename
+//! written durably at identity events with atomic temp+rename
 //! (`crate::tabs_persist::atomic_write_durable`).
 //!
 //! Two row types with different keys and different rights:
@@ -250,7 +290,9 @@ Expected: FAIL to compile — `pane_ledger` module does not exist (`unresolved i
 //!
 //! Deliberately NOT stored: scrollback (own store, P2.19), transcripts
 //! (provider-owned), layout (client-owned). NOT keyed on `createRequestId`
-//! (re-minted on every hydrate today, D4) — stored only as an advisory field.
+//! (D4/V9.md: every restore path that re-creates an anchored pane re-mints
+//! it first; only the orphaned in-flight-create replay preserves it) —
+//! stored only as an advisory field, never an identity join key.
 //!
 //! Corruption policy: fail loud PER-ROW, never per-store — an unparsable row
 //! is quarantined (renamed aside + logged), never silently dropped, and never
@@ -259,6 +301,17 @@ Expected: FAIL to compile — `pane_ledger` module does not exist (`unresolved i
 //! Write-failure policy: a ledger write failure never blocks the
 //! create/identity event, but it is never silent — see
 //! [`surface_write_failure`].
+//!
+//! Read/scan policy (V1.md / A15): a write-through in-memory index, loaded
+//! ONCE at construction by a single directory scan, answers ALL steady-state
+//! reads — no API does a per-call directory scan (full-store scans measured
+//! at 21ms@1k / 426ms@20k rows; TTL math yields 1.2k-12k rows). Files stay
+//! the durable source of truth; this process is the only writer
+//! (single-writer flock, [`PaneLedger::new_locked`]), so write-through
+//! invalidation is trivial. Reads never touch the fs and may run inline on
+//! async paths; WRITES fsync (~15ms p50 on this host) and must be wrapped in
+//! `spawn_blocking` at async call sites (the `terminal.rs:1369-1379`
+//! PTY-spawn precedent) — the sync API here stays call-site-agnostic.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
@@ -352,24 +405,105 @@ pub struct QuarantinedRow {
     pub error: String,
 }
 
+/// The in-memory write-through index (V1.md / A15). Loaded ONCE at
+/// construction by a single directory scan; every successful file write
+/// updates it in the same locked section. Unparsable / wrong-version files
+/// are skipped here silently — the boot scan (Task 4) is what quarantines
+/// them loudly.
+#[derive(Default)]
+struct LedgerIndex {
+    /// (provider, session_id) -> row. Bound AND retired (tombstones stay).
+    bindings: std::collections::HashMap<(String, String), BindingRow>,
+    /// terminal_id -> marker.
+    pending: std::collections::HashMap<String, PendingMarker>,
+}
+
 /// The ledger store. `root: None` ⇒ feature disabled (no resolvable home) —
 /// every write is an `Ok(())` no-op and every read answers empty, mirroring
 /// the tabs-snapshots `Option`-wrapped-root precedent (`main.rs:709-711`).
 pub struct PaneLedger {
     root: Option<PathBuf>,
-    /// Serializes read-modify-write cycles (supersession lookup + write).
-    lock: Mutex<()>,
+    /// ONE lock: serializes read-modify-write cycles AND owns the
+    /// write-through index — no cache-vs-file races by construction.
+    index: Mutex<LedgerIndex>,
+    /// Held for the process lifetime by `new_locked` (single-writer guard,
+    /// V2.md); the kernel releases the flock on process death.
+    #[allow(dead_code)] // read only by the kernel (flock lifetime)
+    lock_file: Option<std::fs::File>,
     /// Rows quarantined by the boot scan, retained for API surfacing.
     quarantined: RwLock<Vec<QuarantinedRow>>,
 }
 
 impl PaneLedger {
+    /// Lock-free construction — tests and the integration harness use this
+    /// (verification handles over a live server's dir must not fight the
+    /// server's flock). Production uses [`PaneLedger::new_locked`].
     pub fn new(root: Option<PathBuf>) -> Self {
+        let index = root
+            .as_ref()
+            .map(|r| Self::load_index(r))
+            .unwrap_or_default();
         Self {
             root,
-            lock: Mutex::new(()),
+            index: Mutex::new(index),
+            lock_file: None,
             quarantined: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Production construction (V2.md single-writer guard): acquire an
+    /// exclusive advisory `flock(2)` on `<root>/lock` (the `ConfigLock`
+    /// pattern, `settings_store.rs:385-417`). If another process holds it,
+    /// log a loud structured ERROR and come up DISABLED (no-op) — never two
+    /// writers on one store. Non-unix: no flock primitive is wired;
+    /// construct normally (ConfigLock's non-unix parity).
+    pub fn new_locked(root: Option<PathBuf>) -> Self {
+        let Some(r) = root.clone() else {
+            return Self::new(None);
+        };
+        match Self::acquire_store_lock(&r) {
+            Ok(lock_file) => {
+                let mut ledger = Self::new(root);
+                ledger.lock_file = lock_file;
+                ledger
+            }
+            Err(err) => {
+                tracing::error!(
+                    target: "freshell_ws::pane_ledger",
+                    root = %r.display(),
+                    error = %err,
+                    "pane_ledger_lock_unavailable: another writer holds <root>/lock; \
+                     ledger DISABLED for this process (never two writers on one store)"
+                );
+                Self::new(None)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn acquire_store_lock(root: &Path) -> std::io::Result<Option<std::fs::File>> {
+        use std::os::unix::io::AsRawFd;
+        std::fs::create_dir_all(root)?;
+        // Content irrelevant (only existence + flock state matter);
+        // truncate(false) avoids clippy's suspicious_open_options.
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(root.join("lock"))?;
+        // SAFETY: `fd` is a valid open descriptor owned by `file` for the
+        // duration of the call; flock only mutates kernel lock state.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            Ok(Some(file))
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn acquire_store_lock(_root: &Path) -> std::io::Result<Option<std::fs::File>> {
+        Ok(None) // no advisory-lock primitive on this platform (ConfigLock parity)
     }
 
     /// A ledger that stores nothing — the test/default construction.
@@ -391,9 +525,49 @@ impl PaneLedger {
             .join(format!("{}.json", encode_segment(session_id)))
     }
 
-    /// Poison-tolerant lock (the `with_persist_lock` idiom).
-    fn guard(&self) -> std::sync::MutexGuard<'_, ()> {
-        self.lock.lock().unwrap_or_else(|p| p.into_inner())
+    /// The ONE directory scan — construction-time only (V1.md).
+    fn load_index(root: &Path) -> LedgerIndex {
+        let mut index = LedgerIndex::default();
+        if let Ok(providers) = std::fs::read_dir(Self::bindings_dir(root)) {
+            for provider in providers.flatten() {
+                let Ok(files) = std::fs::read_dir(provider.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let path = file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue; // *.tmp-* and *.quarantined-* residue
+                    }
+                    if let Ok(row) = load_row::<BindingRow>(&path) {
+                        if row.ledger_version == LEDGER_VERSION {
+                            index
+                                .bindings
+                                .insert((row.provider.clone(), row.session_id.clone()), row);
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) {
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Ok(marker) = load_row::<PendingMarker>(&path) {
+                    if marker.ledger_version == LEDGER_VERSION {
+                        index.pending.insert(marker.terminal_id.clone(), marker);
+                    }
+                }
+            }
+        }
+        index
+    }
+
+    /// Poison-tolerant lock (the `with_persist_lock` idiom) over the
+    /// write-through index.
+    fn guard(&self) -> std::sync::MutexGuard<'_, LedgerIndex> {
+        self.index.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Record (or refresh) a `bound` row for this identity event.
@@ -401,17 +575,20 @@ impl PaneLedger {
         let Some(root) = &self.root else {
             return Ok(());
         };
-        let _guard = self.guard();
-        self.record_binding_locked(root, w)
+        let mut index = self.guard();
+        self.record_binding_locked(root, &mut index, w)
     }
 
-    fn record_binding_locked(&self, root: &Path, w: &BindingWrite<'_>) -> std::io::Result<()> {
-        let existing = self.load_binding_at(root, w.provider, w.session_id);
-        let created_at = existing.as_ref().map(|r| r.created_at).unwrap_or(w.now_ms);
-        if existing
-            .as_ref()
-            .is_some_and(|r| r.retired_reason == Some(RetiredReason::GcExpired))
-        {
+    fn record_binding_locked(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        w: &BindingWrite<'_>,
+    ) -> std::io::Result<()> {
+        let key = (w.provider.to_string(), w.session_id.to_string());
+        let existing = index.bindings.get(&key);
+        let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
+        if existing.is_some_and(|r| r.retired_reason == Some(RetiredReason::GcExpired)) {
             // `retired/gc_expired -> bound` is a LEGAL transition, taken
             // automatically and loudly logged (spec §4.2 lifecycle).
             tracing::info!(
@@ -436,79 +613,53 @@ impl PaneLedger {
             retired_reason: None,
             superseded_by: None,
         };
-        self.write_binding(root, &row)
+        self.write_binding(root, index, &row)
     }
 
-    fn write_binding(&self, root: &Path, row: &BindingRow) -> std::io::Result<()> {
+    /// One row: durable file FIRST, then the write-through index — in the
+    /// same locked section, so readers never see index-ahead-of-disk.
+    fn write_binding(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        row: &BindingRow,
+    ) -> std::io::Result<()> {
         let dest = Self::binding_path(root, &row.provider, &row.session_id);
-        write_row_atomic(&dest, row)
+        write_row_atomic(&dest, row)?;
+        index
+            .bindings
+            .insert((row.provider.clone(), row.session_id.clone()), row.clone());
+        Ok(())
     }
 
-    /// Raw single-row read (no chain following — that is `lookup_by_session`,
-    /// Task 2). Steady-state parse failures are skipped with a WARN; the boot
-    /// scan is what quarantines.
+    /// Raw single-row read from the index (no chain following — that is
+    /// `lookup_by_session`, Task 2). Memory-only (V1.md read policy).
     pub fn load_binding(&self, provider: &str, session_id: &str) -> Option<BindingRow> {
-        let root = self.root.as_ref()?;
-        self.load_binding_at(root, provider, session_id)
-    }
-
-    fn load_binding_at(&self, root: &Path, provider: &str, session_id: &str) -> Option<BindingRow> {
-        let path = Self::binding_path(root, provider, session_id);
-        load_row::<BindingRow>(&path)
-            .map_err(|err| {
-                if !matches!(err, RowLoadError::Missing) {
-                    tracing::warn!(
-                        target: "freshell_ws::pane_ledger",
-                        path = %path.display(),
-                        error = %err,
-                        "pane_ledger_row_unreadable: skipping row (boot scan quarantines)"
-                    );
-                }
-            })
-            .ok()
-            .filter(|row: &BindingRow| row.ledger_version == LEDGER_VERSION)
+        self.root.as_ref()?;
+        self.guard()
+            .bindings
+            .get(&(provider.to_string(), session_id.to_string()))
+            .cloned()
     }
 
     /// Whether this server has EVER durably bound this identity — bound or
     /// retired, tombstones included. This is the ledger-backed
-    /// `ever_observed` input (spec §4.2 reads).
+    /// `ever_observed` input (spec §4.2 reads). Memory-only.
     pub fn ever_bound(&self, provider: &str, session_id: &str) -> bool {
-        let Some(root) = &self.root else {
+        if self.root.is_none() {
             return false;
-        };
-        Self::binding_path(root, provider, session_id).is_file()
-    }
-
-    /// All parseable binding rows (bound AND retired).
-    pub fn list_bindings(&self) -> Vec<BindingRow> {
-        let Some(root) = &self.root else {
-            return Vec::new();
-        };
-        self.list_bindings_at(root)
-    }
-
-    fn list_bindings_at(&self, root: &Path) -> Vec<BindingRow> {
-        let mut out = Vec::new();
-        let Ok(providers) = std::fs::read_dir(Self::bindings_dir(root)) else {
-            return out;
-        };
-        for provider in providers.flatten() {
-            let Ok(files) = std::fs::read_dir(provider.path()) else {
-                continue;
-            };
-            for file in files.flatten() {
-                let path = file.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue; // *.tmp-* and *.quarantined-* residue
-                }
-                if let Ok(row) = load_row::<BindingRow>(&path) {
-                    if row.ledger_version == LEDGER_VERSION {
-                        out.push(row);
-                    }
-                }
-            }
         }
-        out
+        self.guard()
+            .bindings
+            .contains_key(&(provider.to_string(), session_id.to_string()))
+    }
+
+    /// All indexed binding rows (bound AND retired). Memory-only.
+    pub fn list_bindings(&self) -> Vec<BindingRow> {
+        if self.root.is_none() {
+            return Vec::new();
+        }
+        self.guard().bindings.values().cloned().collect()
     }
 
     /// Secondary-index read: the newest BOUND row owned by this terminal.
@@ -628,16 +779,26 @@ Then register the module in `crates/freshell-ws/src/lib.rs` — in the alphabeti
 pub mod pane_ledger;
 ```
 
+And add the flock dependency to `crates/freshell-ws/Cargo.toml` — the same unix-only `libc` dependency `freshell-server` declares for `ConfigLock` (see its Cargo.toml comment "`flock(2)` for `settings_store.rs`'s advisory cross-process config lock"):
+
+```toml
+[target.'cfg(unix)'.dependencies]
+# `flock(2)` for pane_ledger's single-writer store lock (ConfigLock pattern).
+libc = "0.2"
+```
+
+(If freshell-ws already has a unix-only dependency table, merge into it.)
+
 - [ ] **Step 4: Run to verify pass.** Run: `cargo test -p freshell-ws pane_ledger`
-Expected: PASS (6 tests).
+Expected: PASS (8 tests; the flock test is unix-only).
 
 - [ ] **Step 5: Refactor + gates.** Re-read the new module for duplication and naming; run `cargo fmt --all` and `cargo clippy -p freshell-ws --all-targets -- -D warnings`. Fix everything.
 
 - [ ] **Step 6: Commit.**
 
 ```bash
-git add crates/freshell-ws/src/pane_ledger.rs crates/freshell-ws/src/pane_ledger_tests.rs crates/freshell-ws/src/lib.rs
-git commit -m "feat(ws): pane-identity ledger core - binding rows, atomic per-row writes, basic reads (P1.8)"
+git add crates/freshell-ws/src/pane_ledger.rs crates/freshell-ws/src/pane_ledger_tests.rs crates/freshell-ws/src/lib.rs crates/freshell-ws/Cargo.toml Cargo.lock
+git commit -m "feat(ws): pane-identity ledger core - binding rows, atomic per-row writes, indexed reads, single-writer lock (P1.8)"
 ```
 
 ---
@@ -740,27 +901,31 @@ pub struct Resolution {
 Extend `record_binding_locked` — replace its body's opening with supersession detection (final body):
 
 ```rust
-    fn record_binding_locked(&self, root: &Path, w: &BindingWrite<'_>) -> std::io::Result<()> {
+    fn record_binding_locked(
+        &self,
+        root: &Path,
+        index: &mut LedgerIndex,
+        w: &BindingWrite<'_>,
+    ) -> std::io::Result<()> {
         // Supersession (G3, retire-never-defend): if this terminal already
         // owns a DIFFERENT bound identity, the order is pinned — write the
         // new `bound` row FIRST, then retire the old. A crash between the
         // two leaves two bound rows; the boot-scan repair (Task 4) closes
-        // that window.
-        let previous = self
-            .list_bindings_at(root)
-            .into_iter()
+        // that window. Detection is a memory scan over the index (V1.md).
+        let previous = index
+            .bindings
+            .values()
             .find(|r| {
                 r.state == RowState::Bound
                     && r.live_terminal_id.as_deref() == Some(w.terminal_id)
                     && (r.provider != w.provider || r.session_id != w.session_id)
-            });
+            })
+            .cloned();
 
-        let existing = self.load_binding_at(root, w.provider, w.session_id);
-        let created_at = existing.as_ref().map(|r| r.created_at).unwrap_or(w.now_ms);
-        if existing
-            .as_ref()
-            .is_some_and(|r| r.retired_reason == Some(RetiredReason::GcExpired))
-        {
+        let key = (w.provider.to_string(), w.session_id.to_string());
+        let existing = index.bindings.get(&key);
+        let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
+        if existing.is_some_and(|r| r.retired_reason == Some(RetiredReason::GcExpired)) {
             tracing::info!(
                 target: "freshell_ws::pane_ledger",
                 provider = %w.provider,
@@ -783,7 +948,7 @@ Extend `record_binding_locked` — replace its body's opening with supersession 
             retired_reason: None,
             superseded_by: None,
         };
-        self.write_binding(root, &row)?; // new bound row FIRST (pinned)
+        self.write_binding(root, index, &row)?; // new bound row FIRST (pinned)
 
         if let Some(mut old) = previous {
             old.state = RowState::Retired;
@@ -800,7 +965,7 @@ Extend `record_binding_locked` — replace its body's opening with supersession 
                 new_session_id = %w.session_id,
                 "pane_ledger_superseded: binding moved; old row retired, never defended"
             );
-            self.write_binding(root, &old)?; // THEN retire the old
+            self.write_binding(root, index, &old)?; // THEN retire the old
         }
         Ok(())
     }
@@ -814,8 +979,12 @@ Add the chain-terminus reader to `impl PaneLedger`:
     /// and retires its predecessor in the same act) — the hop cap is a
     /// corruption backstop, loud when hit.
     pub fn lookup_by_session(&self, provider: &str, session_id: &str) -> Option<Resolution> {
-        let root = self.root.as_ref()?;
-        let mut row = self.load_binding_at(root, provider, session_id)?;
+        self.root.as_ref()?;
+        let index = self.guard(); // memory-only chain walk (V1.md read policy)
+        let mut row = index
+            .bindings
+            .get(&(provider.to_string(), session_id.to_string()))
+            .cloned()?;
         let mut corrected = false;
         let mut hops = 0u32;
         while row.state == RowState::Retired {
@@ -832,7 +1001,10 @@ Add the chain-terminus reader to `impl PaneLedger`:
                 );
                 return None;
             }
-            let Some(next_row) = self.load_binding_at(root, &next.provider, &next.session_id)
+            let Some(next_row) = index
+                .bindings
+                .get(&(next.provider.clone(), next.session_id.clone()))
+                .cloned()
             else {
                 break;
             };
@@ -976,7 +1148,7 @@ fn delete_pending_is_a_noop_when_missing() {
 
     /// Durable evidence that identity establishment is in flight for this
     /// terminal (spec §4.2): written at spawn of an identity-bearing pane
-    /// whose identity is not yet known.
+    /// whose identity is not yet known. File first, then index (write-through).
     pub fn record_pending(
         &self,
         terminal_id: &str,
@@ -987,7 +1159,7 @@ fn delete_pending_is_a_noop_when_missing() {
         let Some(root) = &self.root else {
             return Ok(());
         };
-        let _guard = self.guard();
+        let mut index = self.guard();
         let marker = PendingMarker {
             ledger_version: LEDGER_VERSION,
             terminal_id: terminal_id.to_string(),
@@ -995,7 +1167,9 @@ fn delete_pending_is_a_noop_when_missing() {
             cwd: cwd.map(str::to_string),
             spawned_at: now_ms,
         };
-        write_row_atomic(&Self::pending_path(root, terminal_id), &marker)
+        write_row_atomic(&Self::pending_path(root, terminal_id), &marker)?;
+        index.pending.insert(terminal_id.to_string(), marker);
+        Ok(())
     }
 
     /// Identity resolved: two independent atomic operations in a PINNED,
@@ -1009,9 +1183,9 @@ fn delete_pending_is_a_noop_when_missing() {
         let Some(root) = &self.root else {
             return Ok(());
         };
-        let _guard = self.guard();
-        self.record_binding_locked(root, w)?; // binding row FIRST
-        Self::remove_pending_file(root, w.terminal_id) // THEN the marker
+        let mut index = self.guard();
+        self.record_binding_locked(root, &mut index, w)?; // binding row FIRST
+        Self::remove_pending(root, &mut index, w.terminal_id) // THEN the marker
     }
 
     /// Best-effort marker removal (missing file == already resolved/GC'd).
@@ -1019,29 +1193,36 @@ fn delete_pending_is_a_noop_when_missing() {
         let Some(root) = &self.root else {
             return Ok(());
         };
-        let _guard = self.guard();
-        Self::remove_pending_file(root, terminal_id)
+        let mut index = self.guard();
+        Self::remove_pending(root, &mut index, terminal_id)
     }
 
-    fn remove_pending_file(root: &Path, terminal_id: &str) -> std::io::Result<()> {
-        match std::fs::remove_file(Self::pending_path(root, terminal_id)) {
+    fn remove_pending(
+        root: &Path,
+        index: &mut LedgerIndex,
+        terminal_id: &str,
+    ) -> std::io::Result<()> {
+        let result = match std::fs::remove_file(Self::pending_path(root, terminal_id)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
+        };
+        if result.is_ok() {
+            index.pending.remove(terminal_id);
         }
+        result
     }
 
     /// Reader-rule lookup: `None` when no marker exists OR when a binding
     /// row already covers this terminal ("binding row wins; such a marker is
-    /// stale").
+    /// stale"). Memory-only (V1.md read policy).
     pub fn pending_for_terminal(&self, terminal_id: &str) -> Option<PendingMarker> {
-        let root = self.root.as_ref()?;
-        let marker = load_row::<PendingMarker>(&Self::pending_path(root, terminal_id))
-            .ok()
-            .filter(|m: &PendingMarker| m.ledger_version == LEDGER_VERSION)?;
-        let has_binding = self
-            .list_bindings_at(root)
-            .iter()
+        self.root.as_ref()?;
+        let index = self.guard();
+        let marker = index.pending.get(terminal_id).cloned()?;
+        let has_binding = index
+            .bindings
+            .values()
             .any(|r| r.live_terminal_id.as_deref() == Some(terminal_id));
         if has_binding {
             return None;
@@ -1049,27 +1230,12 @@ fn delete_pending_is_a_noop_when_missing() {
         Some(marker)
     }
 
-    /// Raw markers (no reader rule) — boot-sweep + test surface.
+    /// Raw markers (no reader rule) — boot-sweep + test surface. Memory-only.
     pub fn list_pending_raw(&self) -> Vec<PendingMarker> {
-        let Some(root) = &self.root else {
+        if self.root.is_none() {
             return Vec::new();
-        };
-        let mut out = Vec::new();
-        let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) else {
-            return out;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(marker) = load_row::<PendingMarker>(&path) {
-                if marker.ledger_version == LEDGER_VERSION {
-                    out.push(marker);
-                }
-            }
         }
-        out
+        self.guard().pending.values().cloned().collect()
     }
 ```
 
@@ -1095,9 +1261,10 @@ git commit -m "feat(ws): ledger pending markers - pinned binding-first resolutio
 **Interfaces:**
 - Consumes: Tasks 1–3.
 - Produces:
+  - `pub const PENDING_MARKER_TTL_MS: i64` — bounds leaked-marker lifetime (A8/V7: resolver-less crash residue must not accumulate forever).
   - `pub struct BootScanReport { pub quarantined: Vec<QuarantinedRow>, pub stale_markers_removed: Vec<String>, pub supersession_repairs: Vec<(SessionLocator, SessionLocator)>, pub gc_tombstoned: Vec<SessionLocator>, pub tombstones_deleted: Vec<SessionLocator> }`
-  - `pub fn boot_scan(&self, now_ms: i64, transcript_absent: &dyn Fn(&str, &str) -> bool) -> BootScanReport` — `transcript_absent(provider, session_id)` must return `true` ONLY when the transcript is definitively absent (an `Unknown`/cold index answers `false`, which safely defers tombstone deletion).
-  - `pub fn gc(&self, now_ms: i64, transcript_absent: &dyn Fn(&str, &str) -> bool) -> BootScanReport` — the periodic subset (GC-to-tombstone + conditional tombstone deletion only).
+  - `pub fn boot_scan(&self, now_ms: i64, transcript_absent: &dyn Fn(&str, &str) -> bool) -> BootScanReport` — **closure contract (V10.md):** `transcript_absent(provider, session_id)` must return `true` ONLY when the transcript is definitively absent, established by a DIRECT filesystem check by provider path convention (Task 5 supplies that closure). `probe.exists()==Absent` alone is NOT an acceptable implementation — the index's Absent can be transiently stale (stale-while-revalidate), permanently wrong (cwd-less/unreadable/amplifier-metadata exclusions), or mass-wrong for a whole provider (discover() swallows I/O errors and the refresh prunes everything). Anything uncertain/cold answers `false`, which safely defers tombstone deletion.
+  - `pub fn gc(&self, now_ms: i64, transcript_absent: &dyn Fn(&str, &str) -> bool) -> BootScanReport` — the periodic subset (GC-to-tombstone + conditional tombstone deletion + aged-marker sweep). Same closure contract.
   - `pub fn quarantined_rows(&self) -> Vec<QuarantinedRow>` — Phase-3 verdict surfacing consumes this; here it is the API + loud-ERROR surface.
 
 - [ ] **Step 1: Write the failing tests.** Append to `pane_ledger_tests.rs`:
@@ -1174,14 +1341,31 @@ fn boot_scan_never_sweeps_a_marker_merely_because_the_terminal_is_not_live() {
 }
 
 #[test]
+fn aged_out_marker_is_swept_after_its_ttl() {
+    // A8/V7: a marker can leak (e.g. its pane died with a dead server and
+    // the terminal id is never re-minted). Lifetime is BOUNDED: a marker
+    // older than PENDING_MARKER_TTL_MS is swept, loudly. Fresh-by-race
+    // evidence matters at the boots NEAR the crash — a 30-day-old marker
+    // is stale noise, not evidence.
+    let root = temp_root("marker-ttl");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger.record_pending("t1", "codex", Some("/tmp/p"), 1_000).unwrap();
+    let report = ledger.boot_scan(1_000 + PENDING_MARKER_TTL_MS + 1, &never_absent);
+    assert_eq!(report.stale_markers_removed, vec!["t1".to_string()]);
+    assert!(ledger.list_pending_raw().is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
     // Red test `crash-mid-supersession-two-bound-rows`: the new bound row
     // was written but the crash landed before the old row was retired ->
     // two bound rows share a pane lineage (liveTerminalId). Boot repair:
     // newer updatedAt wins, older auto-retired as superseded, loudly.
     let root = temp_root("two-bound");
-    let ledger = PaneLedger::new(Some(root.clone()));
-    // Forge the crash shape directly (record_binding would retire the old).
+    // Forge the crash shape directly on disk (record_binding would retire
+    // the old); the ledger is constructed AFTER, so its construction-time
+    // index load sees the forged rows — the actual post-crash boot shape.
     for (sid, at) in [("th-old", 1_000i64), ("th-new", 2_000i64)] {
         let row = BindingRow {
             ledger_version: LEDGER_VERSION,
@@ -1279,6 +1463,13 @@ fn gc_expired_tombstone_rebinds_on_a_live_identity_event() {
 - [ ] **Step 3: Implement.** Add to `pane_ledger.rs`:
 
 ```rust
+/// Pending markers older than this are swept (boot scan + periodic GC),
+/// bounding leaked-marker lifetime (A8/V7: a pane that dies WITH the server
+/// leaves a marker no exit hook will ever delete — terminal ids are never
+/// re-minted). Fresh-by-race evidence matters at the boots near the crash;
+/// a month-old marker is stale noise.
+pub const PENDING_MARKER_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
 /// What one boot scan / GC pass did — every field is also loudly logged.
 #[derive(Debug, Default)]
 pub struct BootScanReport {
@@ -1296,7 +1487,8 @@ And to `impl PaneLedger`:
 ```rust
     /// Boot-time hygiene (spec §4.2): per-row quarantine, stale-marker
     /// sweep, supersession crash-window repair, then a GC pass. Fail loud
-    /// per-row, never per-store.
+    /// per-row, never per-store. The directory walks here are BOOT-ONLY —
+    /// steady-state reads stay on the in-memory index (V1.md).
     pub fn boot_scan(
         &self,
         now_ms: i64,
@@ -1305,31 +1497,42 @@ And to `impl PaneLedger`:
         let Some(root) = self.root.clone() else {
             return BootScanReport::default();
         };
-        let _guard = self.guard();
+        let mut index = self.guard();
         let mut report = BootScanReport::default();
 
         // 1. Quarantine unparsable / wrong-version rows (bindings + pending).
+        //    These never made it into the index (load_index keeps only clean
+        //    current-version parses), so no index maintenance is needed here.
         self.quarantine_unparsable(&root, now_ms, &mut report);
         {
             let mut q = self.quarantined.write().unwrap_or_else(|p| p.into_inner());
             q.extend(report.quarantined.iter().cloned());
         }
 
-        // 2. Stale-marker sweep: a marker whose terminalId already has a
-        //    binding row is stale — the crash-between-write-and-delete shape.
-        //    Markers WITHOUT a binding row are PRESERVED (fresh-by-race
+        // 2. Stale-marker sweep — two cases, both loud:
+        //    (a) a marker whose terminalId already has a binding row is
+        //        stale — the crash-between-write-and-delete shape;
+        //    (b) a marker older than PENDING_MARKER_TTL_MS is aged out
+        //        (A8/V7: bounds leaked markers from panes that died WITH the
+        //        server — no exit hook will ever fire for them and terminal
+        //        ids are never re-minted).
+        //    Markers that are neither are PRESERVED (fresh-by-race
         //    evidence), never swept merely because the terminal isn't live.
-        let bindings = self.list_bindings_at(&root);
-        for marker in self.list_pending_raw_at(&root) {
-            let covered = bindings
-                .iter()
+        let markers: Vec<PendingMarker> = index.pending.values().cloned().collect();
+        for marker in markers {
+            let covered = index
+                .bindings
+                .values()
                 .any(|r| r.live_terminal_id.as_deref() == Some(marker.terminal_id.as_str()));
-            if covered {
-                if Self::remove_pending_file(&root, &marker.terminal_id).is_ok() {
+            let aged_out = now_ms - marker.spawned_at > PENDING_MARKER_TTL_MS;
+            if covered || aged_out {
+                if Self::remove_pending(&root, &mut index, &marker.terminal_id).is_ok() {
                     tracing::warn!(
                         target: "freshell_ws::pane_ledger",
                         terminal_id = %marker.terminal_id,
-                        "pane_ledger_stale_marker_swept: binding row exists; marker was the crash-window residue"
+                        covered_by_binding = covered,
+                        aged_out = aged_out,
+                        "pane_ledger_stale_marker_swept: crash-window residue or aged past TTL"
                     );
                     report.stale_markers_removed.push(marker.terminal_id);
                 }
@@ -1340,10 +1543,10 @@ And to `impl PaneLedger`:
         //    lineage — newer updatedAt wins, older auto-retired, loud.
         let mut by_terminal: std::collections::HashMap<String, Vec<BindingRow>> =
             std::collections::HashMap::new();
-        for row in self.list_bindings_at(&root) {
+        for row in index.bindings.values() {
             if row.state == RowState::Bound {
                 if let Some(tid) = &row.live_terminal_id {
-                    by_terminal.entry(tid.clone()).or_default().push(row);
+                    by_terminal.entry(tid.clone()).or_default().push(row.clone());
                 }
             }
         }
@@ -1351,6 +1554,12 @@ And to `impl PaneLedger`:
             if rows.len() < 2 {
                 continue;
             }
+            // Tiebreak rationale (A16, strategist report): both rows were
+            // written by a SINGLE process run, milliseconds apart — the only
+            // hazard is a wall-clock step landing INSIDE that ms-wide window.
+            // Accepted: wall-clock updatedAt is the tiebreak. If this ever
+            // bites, stamp an in-process AtomicU64 sequence into rows as a
+            // secondary tiebreak (schema addition, P1.13-compatible).
             rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
             let winner = SessionLocator {
                 provider: rows[0].provider.clone(),
@@ -1372,21 +1581,23 @@ And to `impl PaneLedger`:
                     provider: loser.provider.clone(),
                     session_id: loser.session_id.clone(),
                 };
-                if self.write_binding(&root, &loser).is_ok() {
+                if self.write_binding(&root, &mut index, &loser).is_ok() {
                     report.supersession_repairs.push((loser_ref, winner.clone()));
                 }
             }
         }
 
         // 4. GC pass (also runs periodically via `gc`).
-        let gc_report = self.gc_locked(&root, now_ms, transcript_absent);
+        let gc_report = self.gc_locked(&root, &mut index, now_ms, transcript_absent);
         report.gc_tombstoned = gc_report.gc_tombstoned;
         report.tombstones_deleted = gc_report.tombstones_deleted;
         report
     }
 
     /// The periodic subset: expire unobserved bound rows TO TOMBSTONES and
-    /// delete old tombstones ONLY when the transcript is definitively gone.
+    /// delete old tombstones ONLY when the transcript is definitively gone —
+    /// per the caller's DIRECT-STAT closure (V10.md: probe Absent alone is
+    /// not definitive; see the boot_scan contract).
     pub fn gc(
         &self,
         now_ms: i64,
@@ -1395,18 +1606,20 @@ And to `impl PaneLedger`:
         let Some(root) = self.root.clone() else {
             return BootScanReport::default();
         };
-        let _guard = self.guard();
-        self.gc_locked(&root, now_ms, transcript_absent)
+        let mut index = self.guard();
+        self.gc_locked(&root, &mut index, now_ms, transcript_absent)
     }
 
     fn gc_locked(
         &self,
         root: &Path,
+        index: &mut LedgerIndex,
         now_ms: i64,
         transcript_absent: &dyn Fn(&str, &str) -> bool,
     ) -> BootScanReport {
         let mut report = BootScanReport::default();
-        for mut row in self.list_bindings_at(root) {
+        let rows: Vec<BindingRow> = index.bindings.values().cloned().collect();
+        for mut row in rows {
             let sref = SessionLocator {
                 provider: row.provider.clone(),
                 session_id: row.session_id.clone(),
@@ -1423,7 +1636,7 @@ And to `impl PaneLedger`:
                             session_id = %sref.session_id,
                             "pane_ledger_gc_tombstoned: bound row expired to tombstone (never deleted by timer)"
                         );
-                        if self.write_binding(root, &row).is_ok() {
+                        if self.write_binding(root, index, &row).is_ok() {
                             report.gc_tombstoned.push(sref);
                         }
                     }
@@ -1433,11 +1646,14 @@ And to `impl PaneLedger`:
                     if old_enough && transcript_absent(&row.provider, &row.session_id) {
                         let path = Self::binding_path(root, &row.provider, &row.session_id);
                         if std::fs::remove_file(&path).is_ok() {
+                            index
+                                .bindings
+                                .remove(&(row.provider.clone(), row.session_id.clone()));
                             tracing::info!(
                                 target: "freshell_ws::pane_ledger",
                                 provider = %sref.provider,
                                 session_id = %sref.session_id,
-                                "pane_ledger_tombstone_deleted: transcript gone and tombstone TTL elapsed"
+                                "pane_ledger_tombstone_deleted: transcript gone (direct stat) and tombstone TTL elapsed"
                             );
                             report.tombstones_deleted.push(sref);
                         }
@@ -1525,27 +1741,9 @@ And to `impl PaneLedger`:
             .clone()
     }
 
-    fn list_pending_raw_at(&self, root: &Path) -> Vec<PendingMarker> {
-        let mut out = Vec::new();
-        let Ok(files) = std::fs::read_dir(Self::pending_dir(root)) else {
-            return out;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Ok(marker) = load_row::<PendingMarker>(&path) {
-                if marker.ledger_version == LEDGER_VERSION {
-                    out.push(marker);
-                }
-            }
-        }
-        out
-    }
 ```
 
-Refactor `list_pending_raw` to delegate to `list_pending_raw_at` (same body, root resolved first). Note `boot_scan`/`gc` take `&self` but mutate only files — the `Mutex` guard serializes them against writers.
+Note `boot_scan`/`gc` take `&self` and mutate files AND the write-through index under the ONE `Mutex<LedgerIndex>` guard — writers and readers are serialized against them by construction. `quarantine_unparsable`'s directory walk is boot-only (steady-state reads never scan, V1.md); quarantined/wrong-version files were never admitted to the index by `load_index`, so quarantine needs no index maintenance.
 
 - [ ] **Step 4: Run to verify pass.** `cargo test -p freshell-ws pane_ledger` — Expected: PASS (all tasks-1-4 tests).
 
@@ -1572,7 +1770,7 @@ git commit -m "feat(ws): ledger boot scan - per-row quarantine, stale-marker swe
 - Consumes: Task 1's `PaneLedger::{new, disabled}`, Task 4's `boot_scan`/`gc`.
 - Produces:
   - `WsState.pane_ledger: std::sync::Arc<crate::pane_ledger::PaneLedger>` — every later task's call sites use `state.pane_ledger`.
-  - `common::spawn_server_with_ledger(cli_commands: Vec<CliCommandSpec>, ledger_dir: &std::path::Path) -> (String, freshell_terminal::TerminalRegistry)` in `tests/common/mod.rs`.
+  - `common::spawn_server_with_ledger(cli_commands: Vec<CliCommandSpec>, ledger_dir: &std::path::Path) -> (String, freshell_terminal::TerminalRegistry, std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>)` in `tests/common/mod.rs` — the third element is the SERVER'S own ledger Arc (required by tests that seed or poll the live server's index-backed reads; Tasks 6, 10, 12).
 
 - [ ] **Step 1: RED — add the field and let the compiler drive.** In `crates/freshell-ws/src/lib.rs`, find the `WsState` struct (fields like `pub identity: crate::identity::TerminalIdentityRegistry` at ~`lib.rs:128`) and add, with a doc comment, keeping neighbors' style:
 
@@ -1580,7 +1778,8 @@ git commit -m "feat(ws): ledger boot scan - per-row quarantine, stale-marker swe
     /// P1.8: the durable pane-identity ledger (spec §4.2). Constructed once
     /// in `freshell-server::main` (root `<home>/.freshell/pane-ledger`,
     /// `PaneLedger::disabled()` when no home resolves) and shared with the
-    /// existence probe. Arc'd: identity events write it synchronously.
+    /// existence probe. Arc'd: identity events write it durably before they
+    /// are answered (async paths wrap the sync API in awaited spawn_blocking).
     pub pane_ledger: std::sync::Arc<crate::pane_ledger::PaneLedger>,
 ```
 
@@ -1593,8 +1792,11 @@ Expected: FAIL — every `WsState { … }` literal is missing the field. This IS
 ```rust
     // P1.8: the pane-identity ledger (spec §4.2). Root resolved ONCE here;
     // the module itself never reads env vars. No home => disabled no-op,
-    // same policy as tabs-snapshots.
-    let pane_ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(
+    // same policy as tabs-snapshots. `new_locked` = the single-writer
+    // guard (V2.md): exclusive flock on <root>/lock, ConfigLock pattern —
+    // a second server on the same home comes up with a DISABLED ledger and
+    // a loud ERROR instead of two writers corrupting one store.
+    let pane_ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(
         home.as_ref().map(|h| h.join(".freshell").join("pane-ledger")),
     ));
 ```
@@ -1604,21 +1806,65 @@ Expected: FAIL — every `WsState { … }` literal is missing the field. This IS
 
 Run: `cargo check --workspace --all-targets` until clean.
 
-- [ ] **Step 3: Boot scan + periodic GC in `main.rs`.** The existence probe is constructed around `main.rs:425-435`. AFTER the probe exists (its `exists()` is the transcript-truth source) and after `pane_ledger` is constructed, add:
+- [ ] **Step 3: Boot scan + periodic GC in `main.rs`.** First add the DIRECT-STAT transcript check (V10.md: `probe.exists()==Absent` is NOT definitive — it can be transiently stale under stale-while-revalidate, permanently wrong for transcripts the index filters out (cwd-less/unreadable/amplifier-metadata exclusions), and mass-wrong for a whole provider when `discover()` swallows an I/O error and the refresh prunes everything). Tombstone DELETION must never key on it. Add to `main.rs` (or a small helper module beside `existence.rs`):
+
+```rust
+/// P1.8 tombstone-deletion gate (V10.md): `true` ONLY when a DIRECT
+/// filesystem check by provider path convention finds no transcript.
+/// Mirror each provider's on-disk convention from its freshell-sessions
+/// source (claude discover: directory_index.rs:206; codex walk: :375 with
+/// filename-UUID extraction :414-421; amplifier: amplifier.rs session dirs).
+/// Providers without a cheap direct check (opencode: sqlite-backed) answer
+/// `false` — deletion deferred, never risked. Unknown providers: `false`.
+fn transcript_definitively_absent(home: &std::path::Path, provider: &str, session_id: &str) -> bool {
+    match provider {
+        "claude" => {
+            // ~/.claude/projects/<proj>/<session_id>.jsonl — any match means present.
+            let projects = home.join(".claude").join("projects");
+            let Ok(dirs) = std::fs::read_dir(&projects) else { return false }; // unreadable => defer
+            !dirs.flatten().any(|d| d.path().join(format!("{session_id}.jsonl")).is_file())
+        }
+        "codex" => {
+            // ~/.codex/sessions/** rollout files carry the session UUID in the
+            // filename — walk and match (bounded: sessions tree only).
+            let root = home.join(".codex").join("sessions");
+            if !root.is_dir() { return false; } // unreadable/missing home => defer
+            !walk_contains_filename_fragment(&root, session_id)
+        }
+        "amplifier" => {
+            // Amplifier session dir named by session id (mirror amplifier.rs's
+            // home resolution — the same provider_home() root main.rs already
+            // computes for the AmplifierSource).
+            let Some(dir) = amplifier_session_dir(home, session_id) else { return false };
+            !dir.exists()
+        }
+        _ => false, // opencode (sqlite) + unknown providers: defer deletion
+    }
+}
+```
+
+(`walk_contains_filename_fragment` = a small recursive walk returning whether any filename contains the fragment; `amplifier_session_dir` mirrors the path the `AmplifierSource` construction in `main.rs:373-386` uses. On ANY read error return "present" (`false` from the outer fn) — deletion is the destructive branch, so uncertainty always defers. Unit-test the claude arm at minimum: present ⇒ false, empty tree ⇒ true, unreadable root ⇒ false.)
+
+The existence probe is constructed around `main.rs:425-435`. AFTER `pane_ledger` is constructed, add:
 
 ```rust
     // P1.8 boot hygiene: quarantine, stale-marker sweep, supersession
-    // repair, GC. `transcript_absent` answers true ONLY on a definitive
-    // Absent — a cold index (Unknown) safely defers tombstone deletion.
+    // repair, GC. Tombstone deletion keys on the DIRECT stat above — never
+    // on probe.exists()==Absent (V10.md). Runs BEFORE the server accepts
+    // connections, so calling the blocking ledger API inline here is fine.
     {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let probe_for_scan = std::sync::Arc::clone(&existence_probe);
+        // `home` = the same Option<PathBuf> resolve_home() output the ledger
+        // root was derived from. No home => the ledger is disabled and the
+        // closure is never consulted; answering false (defer) is still safe.
+        let scan_home = home.clone();
         let report = pane_ledger.boot_scan(now, &move |provider, session_id| {
-            probe_for_scan.exists(provider, session_id)
-                == freshell_ws::existence::SessionExistence::Absent
+            scan_home
+                .as_deref()
+                .is_some_and(|h| transcript_definitively_absent(h, provider, session_id))
         });
         if !report.quarantined.is_empty() {
             tracing::error!(
@@ -1631,22 +1877,21 @@ Run: `cargo check --workspace --all-targets` until clean.
     // P1.8 periodic GC (boot-time + periodic, spec §4.2 lifecycle).
     {
         let ledger = std::sync::Arc::clone(&pane_ledger);
-        let probe = std::sync::Arc::clone(&existence_probe);
+        let gc_home = home.clone(); // same Option<PathBuf> as above
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
             ticker.tick().await; // the immediate first tick — boot_scan already ran
             loop {
                 ticker.tick().await;
                 let ledger = std::sync::Arc::clone(&ledger);
-                let probe = std::sync::Arc::clone(&probe);
+                let home = gc_home.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
                     ledger.gc(now, &|provider, session_id| {
-                        probe.exists(provider, session_id)
-                            == freshell_ws::existence::SessionExistence::Absent
+                        transcript_definitively_absent(&home, provider, session_id)
                     });
                 })
                 .await;
@@ -1655,23 +1900,35 @@ Run: `cargo check --workspace --all-targets` until clean.
     }
 ```
 
-    Adapt variable names to what `main.rs` actually calls its probe/home; keep the semantics exactly as written. If the probe is constructed AFTER the `WsState` literal today, construct the ledger first and move the boot-scan block after probe construction — construction order: ledger → probe (Task 11 hands it the ledger) → boot scan.
+    Adapt variable names to what `main.rs` actually calls its resolved home; keep the semantics exactly as written. If the probe is constructed AFTER the `WsState` literal today, construct the ledger first and move the boot-scan block after probe construction — construction order: ledger → probe (Task 11 hands it the ledger) → boot scan. (The probe is still used by Task 11's `ever_observed` and by reconcile — probe `Absent` remains fine for those NON-destructive decisions.)
 
 - [ ] **Step 4: Harness variant.** In `crates/freshell-ws/tests/common/mod.rs`, add next to `spawn_server_with_specs` (`:91`), mirroring its body exactly but parameterizing the ledger:
 
 ```rust
 /// [`spawn_server_with_specs`], with a REAL pane ledger rooted at
 /// `ledger_dir` (P1.8 tests). Two servers pointed at the same dir model a
-/// restart.
+/// restart. Returns the server's own `Arc<PaneLedger>` too: with the
+/// write-through in-memory index (Task 1 / V1.md), only writes routed
+/// through the SERVER'S instance are visible to its reads — tests that
+/// seed or poll the live server's ledger must use this Arc, while
+/// durability assertions may still construct fresh read-only instances
+/// (whose construction-time scan sees whatever is on disk). Uses the
+/// lock-free `PaneLedger::new` (the flock single-writer guard is a
+/// production `main.rs` concern — `new_locked`).
 pub async fn spawn_server_with_ledger(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
     ledger_dir: &std::path::Path,
-) -> (String, freshell_terminal::TerminalRegistry) {
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>,
+) {
     // Body: copy of spawn_server_with_specs with the WsState literal's
-    // `pane_ledger` field set to:
+    // `pane_ledger` field set to a locally-constructed
     //     std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(
     //         Some(ledger_dir.to_path_buf()),
     //     ))
+    // and that Arc (cloned) returned as the third tuple element.
     // If spawn_server_with_specs delegates to a shared builder, add the
     // ledger as a parameter to that builder instead of duplicating it.
 }
@@ -1692,18 +1949,20 @@ git commit -m "feat(server): construct pane ledger, boot scan + periodic GC, WsS
 
 **Files:**
 - Modify: `crates/freshell-protocol/src/server_messages.rs`
+- Modify: `crates/freshell-protocol/tests/activity_extension.rs` (the exact-array pin on `EXTENSION_SERVER_MESSAGE_TYPES`, `:138-145` — V8.md)
 - Modify: `crates/freshell-ws/src/invariants.rs`
 - Modify: `crates/freshell-ws/src/pane_ledger.rs` (the `surface_write_failure` helper)
 - Modify: `crates/freshell-ws/src/terminal.rs`
 - Create: `crates/freshell-ws/tests/pane_ledger_triggers.rs`
 
 **Interfaces:**
-- Consumes: `handle_create`'s tail (`terminal.rs:1504-1548`: `create_meta_record`, `state.identity.upsert`, `TerminalCreated`), the exit hook closure (`terminal.rs:1305-1340`), `kill_and_broadcast` (`terminal.rs:2106-2116`), `crate::terminal::now_ms`, Task 5's `state.pane_ledger`.
+- Consumes: `handle_create`'s tail (`terminal.rs:1504-1548`: `create_meta_record`, `state.identity.upsert`, `TerminalCreated`), the exit hook closure (`terminal.rs:1305-1340`), `handle_kill`/`kill_and_broadcast` (`terminal.rs:2085-2116`), `crate::terminal::now_ms`, Task 5's `state.pane_ledger`.
 - Produces:
-  - Protocol: `ServerMessage::DurabilityDegraded` (tag `"durability.degraded"`) with `pub struct DurabilityDegraded { pub terminal_id: String, pub reason: String, pub message: String }` (camelCase serde).
+  - Protocol: `ServerMessage::DurabilityDegraded` (tag `"durability.degraded"`) with `pub struct DurabilityDegraded { pub terminal_id: String, pub reason: String, pub message: String }` (camelCase serde) — registered in `EXTENSION_SERVER_MESSAGE_TYPES` (the sanctioned escape hatch that keeps the frozen 53-type `SERVER_MESSAGE_TYPES` contract untouched, V8.md).
   - `crate::pane_ledger::surface_write_failure(state: &crate::WsState, terminal_id: &str, result: std::io::Result<()>)` — every ledger write at an identity event goes through this.
   - `crate::invariants::error_pane_ledger_write_failed(terminal_id: &str, err: &std::io::Error)`.
-  - Behavior later tasks rely on: a non-shell create writes EITHER a binding row (identity known at spawn: claude pre-allocation, any restore/resume create) OR a pending marker (identity in flight); observed PTY exit deletes the terminal's pending marker; explicit kill additionally retires the binding (`closed`).
+  - Behavior later tasks rely on: a create writes EITHER a binding row (identity known at spawn: claude pre-allocation, any restore/resume create) OR — **only for modes with a registered post-spawn resolver: `codex`, `opencode`, `amplifier`** — a pending marker (identity in flight). Claude NEVER gets a marker (no resolver exists; mainline fresh claude always has create-time identity via pre-allocation, and the degenerate payloads that skip pre-allocation — a mismatched-provider `sessionRef` or an empty-string session id, V5.md — spawn un-resumable and stay ledgerless BY DESIGN: a marker for them would be permanently unresolvable). Kimi/gemini/custom-extension modes likewise get NO marker (no resolver — V7.md; a marker would leak until the Task 4 TTL sweep). Observed PTY exit deletes the terminal's pending marker; explicit kill additionally retires the binding (`closed`).
+  - **Write-path threading (V1.md / A1):** `handle_create` is async — its ledger writes (binding OR marker) run inside `tokio::task::spawn_blocking(...)` and are AWAITED before `terminal.created` is sent (durable-before-answer preserved; fsync ~15ms p50 must not pin the per-connection dispatch task — the `terminal.rs:1369-1379` PTY-spawn precedent). The PTY `on_exit` hook runs on a blocking thread — its `delete_pending` calls the sync API inline (truly-synchronous context). The kill-path hygiene runs in async `handle_kill` via an awaited `spawn_blocking` after the kill, before the handler returns.
 
 - [ ] **Step 1: Write the failing integration tests.** Create `crates/freshell-ws/tests/pane_ledger_triggers.rs`:
 
@@ -1747,9 +2006,11 @@ fn wait_for<F: Fn() -> bool>(check: F, what: &str) {
 async fn claude_preallocation_writes_a_binding_row_synchronously() {
     // Red test `SIGKILL-within-5s-of-pane-creation`, crate shape: by the
     // time terminal.created is answered, the binding row is on disk — a
-    // SIGKILL any moment later cannot lose the identity.
+    // SIGKILL any moment later cannot lose the identity. (The write runs
+    // in an AWAITED spawn_blocking before the reply — same guarantee,
+    // off the dispatch task; V1.md.)
     let dir = unique_ledger_dir("claude-prealloc");
-    let (url, registry) =
+    let (url, registry, _ledger_arc) =
         spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
     let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
 
@@ -1769,8 +2030,8 @@ async fn claude_preallocation_writes_a_binding_row_synchronously() {
     let terminal_id = created["terminalId"].as_str().unwrap().to_string();
     let session_id = created["sessionRef"]["sessionId"].as_str().unwrap().to_string();
 
-    // The row must already be durable (the create handler writes it
-    // synchronously before answering).
+    // The row must already be durable (the create handler awaits the
+    // write before answering).
     let ledger = PaneLedger::new(Some(dir.clone()));
     let row = ledger
         .load_binding("claude", &session_id)
@@ -1780,8 +2041,14 @@ async fn claude_preallocation_writes_a_binding_row_synchronously() {
     assert_eq!(row.create_request_id.as_deref(), Some("req-claude-1"));
     assert_eq!(row.mode, "claude");
 
+    // Claude NEVER gets a pending marker — no resolver exists to clear it
+    // (the marker trigger is an explicit resolver allowlist; V5.md/V7.md).
+    assert!(ledger.pending_for_terminal(&terminal_id).is_none());
+    assert!(ledger.list_pending_raw().is_empty());
+
     // "Restart": a brand-new ledger instance over the same dir still
-    // answers — process death cannot lose it.
+    // answers — process death cannot lose it (its construction-time index
+    // load reads the on-disk rows).
     drop(ledger);
     let gen2 = PaneLedger::new(Some(dir.clone()));
     assert!(gen2.ever_bound("claude", &session_id));
@@ -1795,7 +2062,7 @@ async fn fresh_identity_bearing_pane_gets_a_pending_marker_at_spawn() {
     // Trigger (d): identity in flight (fresh codex — no resume id) ->
     // durable pending marker from spawn until resolution.
     let dir = unique_ledger_dir("codex-pending");
-    let (url, registry) =
+    let (url, registry, server_ledger) =
         spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
     let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
 
@@ -1813,6 +2080,8 @@ async fn fresh_identity_bearing_pane_gets_a_pending_marker_at_spawn() {
     let created = next_frame_of_type(&mut ws, "terminal.created").await;
     let terminal_id = created["terminalId"].as_str().unwrap().to_string();
 
+    // Durability: a FRESH reader instance (constructed after the write —
+    // its index load scans the dir) sees the marker on disk.
     let ledger = PaneLedger::new(Some(dir.clone()));
     let marker = ledger
         .pending_for_terminal(&terminal_id)
@@ -1820,15 +2089,15 @@ async fn fresh_identity_bearing_pane_gets_a_pending_marker_at_spawn() {
     assert_eq!(marker.mode, "codex");
 
     // Observed exit IN THIS EPOCH ends the identity-in-flight window: the
-    // kill path must delete the marker (spec §4.2 marker GC rule).
-    // handle_kill runs synchronously on the dispatch loop — send + await a
-    // pong to prove consumption (silence-proof pattern).
+    // kill path must delete the marker (spec §4.2 marker GC rule). Poll the
+    // SERVER'S OWN ledger Arc — reads answer from the in-memory index, so
+    // only the mutating instance observes its own later deletions.
     let kill = serde_json::json!({ "type": "terminal.kill", "terminalId": terminal_id });
     ws.send(tokio_tungstenite::tungstenite::Message::Text(kill.to_string()))
         .await
         .unwrap();
     wait_for(
-        || ledger.pending_for_terminal(&terminal_id).is_none(),
+        || server_ledger.pending_for_terminal(&terminal_id).is_none(),
         "marker deleted on observed kill",
     );
 
@@ -1842,7 +2111,7 @@ async fn resume_create_writes_binding_and_kill_retires_it_closed() {
     // binding row; an explicit user kill best-effort retires it `closed` —
     // never load-bearing, but recorded.
     let dir = unique_ledger_dir("resume-retire");
-    let (url, _registry) =
+    let (url, _registry, server_ledger) =
         spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
     let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
 
@@ -1871,9 +2140,11 @@ async fn resume_create_writes_binding_and_kill_retires_it_closed() {
     ws.send(tokio_tungstenite::tungstenite::Message::Text(kill.to_string()))
         .await
         .unwrap();
+    // Poll the SERVER'S ledger Arc (reads are index-backed; only the
+    // mutating instance observes its own later writes).
     wait_for(
         || {
-            ledger
+            server_ledger
                 .load_binding("codex", "11111111-2222-3333-4444-555555555555")
                 .is_some_and(|r| {
                     r.state == RowState::Retired
@@ -1914,6 +2185,8 @@ and in the `ServerMessage` enum:
     #[serde(rename = "durability.degraded")]
     DurabilityDegraded(DurabilityDegraded),
 ```
+
+Then register the frame type (V8.md — REQUIRED, or the protocol pinning tests fail): append `"durability.degraded"` to `EXTENSION_SERVER_MESSAGE_TYPES` (`server_messages.rs:205-209` — the sanctioned escape hatch that keeps the frozen 53-type `SERVER_MESSAGE_TYPES` inventory contract untouched), and update the exact-array assertion in `crates/freshell-protocol/tests/activity_extension.rs:138-145` to include the new entry (it currently pins `["amplifier.activity.list.response", "amplifier.activity.updated", "terminal.idle"]` byte-exact, plus disjointness from the frozen set). Note in a comment near the const entry: the existing `terminal.codex.durability.updated` frame (`server_messages.rs:179`) is a DIFFERENT family (codex sidecar durability); the new frame is intentionally general pane-durability — the name collision is nearest-neighbor only, not overlap.
 
 - [ ] **Step 4: Implement — invariant + surfacing helper.** In `crates/freshell-ws/src/invariants.rs` (next to `error_claude_restore_unresolved`, `:89-97`):
 
@@ -1962,78 +2235,126 @@ pub(crate) fn surface_write_failure(
 
 (If `DurabilityDegraded` is not re-exported from `freshell_protocol`'s root, add it to the crate's existing re-export list.)
 
-- [ ] **Step 5: Implement — create-path triggers.** In `crates/freshell-ws/src/terminal.rs`, in `handle_create`'s tail, immediately AFTER the `if let Some(record) = &create_meta_record { state.identity.upsert(...) }` block (`:1511-1525`) and BEFORE `let created = ServerMessage::TerminalCreated(...)` (`:1526`):
+- [ ] **Step 5: Implement — create-path triggers.** In `crates/freshell-ws/src/terminal.rs`, in `handle_create`'s tail, immediately AFTER the `if let Some(record) = &create_meta_record { state.identity.upsert(...) }` block (`:1511-1525`) and BEFORE `let created = ServerMessage::TerminalCreated(...)` (`:1526`). First add, near the top of the file (module scope):
+
+```rust
+/// The modes that get a spawn-time pending marker: EXACTLY the modes with a
+/// registered post-spawn identity resolver (codex candidate adoption,
+/// opencode/amplifier locator sweeps). NOT "any non-shell mode" (V7.md):
+/// claude has create-time identity (pre-allocation) and NO resolver — its
+/// degenerate no-identity payloads (mismatched-provider sessionRef,
+/// empty-string session id; V5.md) spawn un-resumable and stay ledgerless
+/// by design; kimi/gemini/custom extension modes have no resolver, so a
+/// marker for them could never resolve and would only leak until the TTL
+/// sweep. Every mode listed here MUST have a resolution hook (Tasks 8-9).
+const MARKER_MODES: [&str; 3] = ["codex", "opencode", "amplifier"];
+```
+
+then the trigger block:
 
 ```rust
     // P1.8 (spec §4.2 write triggers): the durable ledger write rides the
-    // SAME identity event that seeds the in-memory registry — synchronous,
-    // atomic temp+rename, before the create is answered. A failure never
-    // blocks the create but is surfaced LIVE (surface_write_failure).
+    // SAME identity event that seeds the in-memory registry — atomic
+    // temp+rename, AWAITED before the create is answered (durable-before-
+    // answer). It runs on the blocking pool, not the per-connection
+    // dispatch task: each write costs ~15ms p50 / 21-64ms p99 in fsyncs
+    // (V1.md), 2-3 orders past tokio's async-worker budget — the same
+    // reasoning as the PTY spawn_blocking above (:1369-1379). A failure
+    // never blocks the create but is surfaced LIVE (surface_write_failure).
     if let Some(record) = &create_meta_record {
         // Identity known at spawn: claude pre-allocation (trigger a) and
         // every resume/restore create (all providers) — a binding row.
         if let (Some(provider), Some(session_id)) =
             (record.provider.as_deref(), record.session_id.as_deref())
         {
-            let result = state.pane_ledger.record_binding(&crate::pane_ledger::BindingWrite {
-                provider,
-                session_id,
-                terminal_id: &record.terminal_id,
-                mode: &mode,
-                cwd: record.cwd.as_deref(),
-                create_request_id: Some(&create.request_id),
-                now_ms: now_ms(),
-            });
+            let ledger = std::sync::Arc::clone(&state.pane_ledger);
+            let provider = provider.to_string();
+            let session_id = session_id.to_string();
+            let write_terminal_id = record.terminal_id.clone();
+            let write_mode = mode.clone();
+            let write_cwd = record.cwd.clone();
+            let write_request_id = create.request_id.clone();
+            let now = now_ms();
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.record_binding(&crate::pane_ledger::BindingWrite {
+                    provider: &provider,
+                    session_id: &session_id,
+                    terminal_id: &write_terminal_id,
+                    mode: &write_mode,
+                    cwd: write_cwd.as_deref(),
+                    create_request_id: Some(&write_request_id),
+                    now_ms: now,
+                })
+            })
+            .await
+            .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
             crate::pane_ledger::surface_write_failure(state, &record.terminal_id, result);
         }
-    } else if mode != "shell" {
+    } else if MARKER_MODES.contains(&mode.as_str()) {
         // Identity-bearing pane whose identity is still in flight (fresh
         // codex/opencode/amplifier — trigger d): a durable pending marker
         // from spawn until resolution deletes it (binding-first order).
-        let result = state.pane_ledger.record_pending(
-            &terminal_id_for_meta,
-            &mode,
-            spec.cwd.as_deref(),
-            now_ms(),
-        );
+        let ledger = std::sync::Arc::clone(&state.pane_ledger);
+        let write_terminal_id = terminal_id_for_meta.clone();
+        let write_mode = mode.clone();
+        let write_cwd = spec.cwd.clone();
+        let now = now_ms();
+        let result = tokio::task::spawn_blocking(move || {
+            ledger.record_pending(&write_terminal_id, &write_mode, write_cwd.as_deref(), now)
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
         crate::pane_ledger::surface_write_failure(state, &terminal_id_for_meta, result);
     }
 ```
 
-(`terminal_id_for_meta` and `spec.cwd` are already in scope at that point — see `:1504-1510`; keep whatever local names the file actually uses.)
+(`terminal_id_for_meta` and `spec.cwd` are already in scope at that point — see `:1504-1510`; keep whatever local names the file actually uses. If `spec.cwd` is `Option<String>` cloning is direct; adapt if it is a `&str`/`PathBuf` shape.)
 
-- [ ] **Step 6: Implement — exit/kill hygiene.** In the natural-exit `on_exit` hook (`terminal.rs:1305-1340`), clone the ledger alongside the other handles (`let pane_ledger = std::sync::Arc::clone(&state.pane_ledger);` next to `let identity = state.identity.clone();` at `:510-512` region) and inside the closure, after `identity.retire(&tid);`:
+- [ ] **Step 6: Implement — exit/kill hygiene.** In the natural-exit `on_exit` hook (`terminal.rs:1305-1340`), clone the ledger alongside the other handles (`let pane_ledger = std::sync::Arc::clone(&state.pane_ledger);` next to `let identity = state.identity.clone();`) and inside the closure, after `identity.retire(&tid);`:
 
 ```rust
             // P1.8: an observed PTY exit in this epoch ends any
             // identity-in-flight window — the marker's job (distinguishing
             // fresh-by-race from fresh-by-intent across a SERVER death) is
-            // over. Best-effort; never load-bearing.
+            // over. Best-effort; never load-bearing. INLINE sync call is
+            // correct HERE: the ExitHook (`pty.rs:55`, `FnOnce + Send`) runs
+            // on the PTY's blocking/reader thread, not an async worker —
+            // the one truly-synchronous ledger call site (V1.md).
             if let Err(err) = pane_ledger.delete_pending(&tid) {
                 tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_exit");
             }
 ```
 
-And in `kill_and_broadcast` (`terminal.rs:2106-2116`), after `state.identity.retire(terminal_id);`:
+The kill path: `kill_and_broadcast` (`terminal.rs:2106-2116`) is a SYNC fn invoked inline on the async dispatch task (`handle_kill`, `:2085-2087`) — do NOT put fsyncing ledger writes inside it (V1.md / A1). Instead, in `handle_kill`, after a successful `kill_and_broadcast(...)` and BEFORE returning, run the hygiene on the blocking pool and AWAIT it:
 
 ```rust
+async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) -> bool {
+    if kill_and_broadcast(state, &kill.terminal_id) {
         // P1.8 trigger (e): explicit user close — best-effort retire of the
         // binding (`closed`) + marker cleanup. Best-effort by spec: SIGKILL
         // is the tested mode, so retire-on-close must never be load-bearing.
         // `session_ref_for` is retired-INCLUSIVE, so it still answers after
-        // the retire() above.
-        if let Some(sref) = state.identity.session_ref_for(terminal_id) {
-            if let Err(err) =
-                state
-                    .pane_ledger
-                    .retire_closed(&sref.provider, &sref.session_id, now_ms())
-            {
-                tracing::warn!(terminal_id = %terminal_id, error = %err, "pane_ledger_retire_failed_on_kill");
+        // the retire() inside kill_and_broadcast. Awaited spawn_blocking:
+        // fsync must not pin the dispatch task (V1.md; :1369-1379 precedent).
+        let sref = state.identity.session_ref_for(&kill.terminal_id);
+        let ledger = std::sync::Arc::clone(&state.pane_ledger);
+        let tid = kill.terminal_id.clone();
+        let now = now_ms();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(sref) = sref {
+                if let Err(err) = ledger.retire_closed(&sref.provider, &sref.session_id, now) {
+                    tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_retire_failed_on_kill");
+                }
             }
-        }
-        if let Err(err) = state.pane_ledger.delete_pending(terminal_id) {
-            tracing::warn!(terminal_id = %terminal_id, error = %err, "pane_ledger_marker_delete_failed_on_kill");
-        }
+            if let Err(err) = ledger.delete_pending(&tid) {
+                tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_kill");
+            }
+        })
+        .await;
+        return true;
+    }
+    // ... existing INVALID_TERMINAL_ID error reply, unchanged ...
+}
 ```
 
 Add `retire_closed` to `impl PaneLedger` in `pane_ledger.rs`:
@@ -2050,8 +2371,12 @@ Add `retire_closed` to `impl PaneLedger` in `pane_ledger.rs`:
         let Some(root) = &self.root else {
             return Ok(());
         };
-        let _guard = self.guard();
-        let Some(mut row) = self.load_binding_at(root, provider, session_id) else {
+        let mut index = self.guard();
+        let Some(mut row) = index
+            .bindings
+            .get(&(provider.to_string(), session_id.to_string()))
+            .cloned()
+        else {
             return Ok(());
         };
         if row.state != RowState::Bound {
@@ -2060,7 +2385,7 @@ Add `retire_closed` to `impl PaneLedger` in `pane_ledger.rs`:
         row.state = RowState::Retired;
         row.retired_reason = Some(RetiredReason::Closed);
         row.updated_at = now_ms;
-        self.write_binding(root, &row)
+        self.write_binding(root, &mut index, &row)
     }
 ```
 
@@ -2071,7 +2396,7 @@ Add `retire_closed` to `impl PaneLedger` in `pane_ledger.rs`:
 - [ ] **Step 9: Commit.**
 
 ```bash
-git add crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/invariants.rs crates/freshell-ws/src/pane_ledger.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/tests/pane_ledger_triggers.rs
+git add crates/freshell-protocol/src/server_messages.rs crates/freshell-protocol/tests/activity_extension.rs crates/freshell-ws/src/invariants.rs crates/freshell-ws/src/pane_ledger.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/tests/pane_ledger_triggers.rs
 git commit -m "feat(ws): ledger write triggers - binding at create, pending marker at spawn, exit/kill hygiene (P1.8)"
 ```
 
@@ -2085,6 +2410,7 @@ git commit -m "feat(ws): ledger write triggers - binding at create, pending mark
 **Interfaces:**
 - Consumes: Task 6's `surface_write_failure` wiring and `durability.degraded` frame.
 - Produces: proof, on the wire, that the warning arrives at failure time and the create still succeeds.
+- **Delivery semantics note (V8.md / A10 — accepted residual):** the broadcast bus is subscribe-before-handshake ordered (`lib.rs:512-515`) with capacity 1024, so the creating client receives the frame live; a `Lagged` receiver is closed LOUDLY (4008 "Backpressure", `terminal.rs:361-377`) so loss is never silent — but the lagged frame is NOT re-delivered after reconnect (the handshake does not resync durability state). Accepted for this slice. If strict per-client delivery is ever pinned, the upgrade path is a direct `ws_tx` send on the creating connection or degraded-state resync in the handshake.
 
 - [ ] **Step 1: Write the failing test.** Append to `pane_ledger_triggers.rs`:
 
@@ -2101,7 +2427,7 @@ async fn ledger_write_failure_surfaces_live_and_never_blocks_the_create() {
     let dir = unique_ledger_dir("write-fail");
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let (url, registry) =
+    let (url, registry, _ledger_arc) =
         spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
     let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
 
@@ -2192,10 +2518,11 @@ git commit -m "test(ws): ledger-write-failure-surfaces-live - degraded frame at 
 
 **Interfaces:**
 - Consumes: the adoption bind block `codex_candidate.rs:204-220` (`identity.upsert` → `registry.set_meta` → `broadcast_terminal_session_associated`), Task 3's `resolve_pending`, Task 6's `surface_write_failure`.
-- Produces: `crate::pane_ledger::ledger_resolve_identity(state: &crate::WsState, terminal_id: &str, provider: &str, session_id: &str, cwd: Option<&str>)` — the ONE resolution hook all three association modules share (Task 9 reuses it).
+- Produces: `pub(crate) async fn ledger_resolve_identity(state: &crate::WsState, terminal_id: &str, provider: &str, session_id: &str, cwd: Option<&str>)` in `crate::pane_ledger` — the ONE resolution hook all three association modules share (Task 9 reuses it). It is `async` and wraps the fsyncing `resolve_pending` in an AWAITED `tokio::task::spawn_blocking` (V1.md / A1: resolution hooks run on async dispatch/sweep tasks; the write must not pin an async worker, and it must complete before the associated broadcast — durable-before-answer for resolution events).
+- Signature change this task carries: `handle_codex_candidate_persisted` (`codex_candidate.rs:119`, currently a sync fn) becomes `pub(crate) async fn`, and its dispatch call site (`terminal.rs:486`) gains `.await` — the dispatch arm is already async context.
 
 - [ ] **Step 1: Write the failing test.** `crates/freshell-ws/tests/codex_candidate_persisted.rs` runs a single sequential test (`codex_candidate_persisted_guards_and_happy_path`, `:143`) whose harness owns the process env. Extend it minimally:
-  1. At the top of the test, before the server spawns, create a ledger dir and switch the spawn to the Task 5 harness variant: `let ledger_dir = std::env::temp_dir().join(format!("codex-adopt-ledger-{}", std::process::id())); std::fs::create_dir_all(&ledger_dir).unwrap();` and replace the `spawn_server_with_specs(...)` call with `spawn_server_with_ledger(<same specs>, &ledger_dir)`. Also send the create with a pending-marker-producing shape (the existing fresh codex create already is one — no resume id).
+  1. At the top of the test, before the server spawns, create a ledger dir and switch the spawn to the Task 5 harness variant: `let ledger_dir = std::env::temp_dir().join(format!("codex-adopt-ledger-{}", std::process::id())); std::fs::create_dir_all(&ledger_dir).unwrap();` and replace the `spawn_server_with_specs(...)` call with `spawn_server_with_ledger(<same specs>, &ledger_dir)` — note it returns a 3-tuple; bind the third element (`_server_ledger` if unused, since this test verifies via a fresh reader instance constructed AFTER the adoption). Also send the create with a pending-marker-producing shape (the existing fresh codex create already is one — no resume id).
   2. Immediately after the existing happy-path assertions (the pinned `terminal.session.associated` → `terminal.meta.updated` order + `registry_resume_id(...) == Some(THREAD_A)` block at `:232-247`), add:
 
 ```rust
@@ -2227,40 +2554,55 @@ git commit -m "test(ws): ledger-write-failure-surfaces-live - degraded frame at 
 /// pinned order). `create_request_id` is deliberately None here — it is an
 /// advisory field captured at create time; resolution never joins on it (D4).
 /// Failures never block the identity event; they surface LIVE.
-pub(crate) fn ledger_resolve_identity(
+///
+/// `async` + awaited spawn_blocking (V1.md / A1): every caller is an async
+/// dispatch/sweep task, and the fsyncing write (~15ms p50) must complete
+/// BEFORE the associated broadcast without pinning an async worker.
+pub(crate) async fn ledger_resolve_identity(
     state: &crate::WsState,
     terminal_id: &str,
     provider: &str,
     session_id: &str,
     cwd: Option<&str>,
 ) {
-    let result = state.pane_ledger.resolve_pending(&BindingWrite {
-        provider,
-        session_id,
-        terminal_id,
-        mode: provider,
-        cwd,
-        create_request_id: None,
-        now_ms: crate::terminal::now_ms(),
-    });
+    let ledger = std::sync::Arc::clone(&state.pane_ledger);
+    let provider_owned = provider.to_string();
+    let session_id_owned = session_id.to_string();
+    let terminal_id_owned = terminal_id.to_string();
+    let cwd_owned = cwd.map(str::to_string);
+    let now = crate::terminal::now_ms();
+    let result = tokio::task::spawn_blocking(move || {
+        ledger.resolve_pending(&BindingWrite {
+            provider: &provider_owned,
+            session_id: &session_id_owned,
+            terminal_id: &terminal_id_owned,
+            mode: &provider_owned,
+            cwd: cwd_owned.as_deref(),
+            create_request_id: None,
+            now_ms: now,
+        })
+    })
+    .await
+    .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
     surface_write_failure(state, terminal_id, result);
 }
 ```
 
-- [ ] **Step 4: Wire the codex hook.** In `crates/freshell-ws/src/codex_candidate.rs`, after the `state.registry.set_meta(...)` call (`:213-219`) and BEFORE `broadcast_terminal_session_associated` (`:220`):
+- [ ] **Step 4: Wire the codex hook.** First make the handler async (V1.md / A1 — the fsyncing resolution write must be awaited off the dispatch worker, and `spawn_blocking(...).await` needs an async context): change `pub(crate) fn handle_codex_candidate_persisted` (`codex_candidate.rs:119`) to `pub(crate) async fn`, and add `.await` at its single dispatch call site (`terminal.rs:486`, already inside the async dispatch match). Then, after the `state.registry.set_meta(...)` call (`:213-219`) and BEFORE `broadcast_terminal_session_associated` (`:220`):
 
 ```rust
     // P1.8 (trigger b): the verified adoption is an identity event — durable
     // binding row first, then the spawn-time pending marker is deleted.
-    // Synchronous small-file write on the dispatch task, same budget class
-    // as guard 4's verify_rollout_path read.
+    // Awaited spawn_blocking inside the helper: the fsync completes before
+    // the associated broadcast, without pinning the dispatch worker (V1.md).
     crate::pane_ledger::ledger_resolve_identity(
         state,
         &msg.terminal_id,
         "codex",
         thread_id,
         row.cwd.as_deref(),
-    );
+    )
+    .await;
 ```
 
 - [ ] **Step 5: Run to verify pass.** `cargo test -p freshell-ws --test codex_candidate_persisted` then `cargo test -p freshell-ws`. Expected: PASS (rejected candidates must still write NOTHING — the guards all `return` before the hook, which the existing silence-proof phases keep pinned).
@@ -2354,7 +2696,7 @@ git commit -m "feat(ws): codex candidate adoption writes the ledger binding + re
 
   (Where the sketch says "copy … verbatim", copy from the sibling test in the same file — it is directly above. `armed_count` exists on the locator; if it is test-gated in `freshell-sessions`, assert arming the way `maybe_arm_arms_a_fresh_opencode_terminal` (`:356`) does instead.)
 
-  3. Amplifier: add the mirror-image ledger assertion to `amplifier_association.rs`'s existing resolve-path test (find the sibling of `drain_and_associate_binds_identity_and_broadcasts_on_location` around `amplifier_association.rs:330-430`; extend its state fixture with a real ledger the same way and assert the binding row + marker deletion). If that file has no full resolve-path test (only `maybe_arm` tests), add the ledger assertion to a new test cloned from the opencode one, or — if a real amplifier resolve fixture is disproportionate — assert at minimum that `ledger_resolve_identity` is called by code inspection parity and cover amplifier's marker lifecycle via the Task 6 integration test (markers are written for ANY non-shell mode). Prefer the real test.
+  3. Amplifier: add the mirror-image ledger assertion to `amplifier_association.rs`'s existing resolve-path test (find the sibling of `drain_and_associate_binds_identity_and_broadcasts_on_location` around `amplifier_association.rs:330-430`; extend its state fixture with a real ledger the same way and assert the binding row + marker deletion). If that file has no full resolve-path test (only `maybe_arm` tests), add the ledger assertion to a new test cloned from the opencode one, or — if a real amplifier resolve fixture is disproportionate — assert at minimum that `ledger_resolve_identity` is called by code inspection parity and cover amplifier's marker lifecycle via the Task 6 integration test (markers are written for the resolver allowlist modes — codex/opencode/amplifier — of which amplifier is one). Prefer the real test.
 
 - [ ] **Step 2: Run to verify failure.** `cargo test -p freshell-ws opencode_association` — Expected: FAIL at `expect("binding row written at resolution")`.
 
@@ -2364,16 +2706,19 @@ git commit -m "feat(ws): codex candidate adoption writes the ledger binding + re
         // P1.8 (trigger c) + P1.10: locator resolution is an identity event —
         // durable binding row first, then the spawn-time pending marker is
         // deleted. Registry-truth cwd, same as the in-memory binds above.
+        // Awaited (drain_and_associate is async; the helper spawn_blockings
+        // the fsync off this sweep task — V1.md).
         crate::pane_ledger::ledger_resolve_identity(
             state,
             &located.terminal_id,
             "opencode",
             &located.session_id,
             entry.cwd.as_deref(),
-        );
+        )
+        .await;
 ```
 
-In `amplifier_association.rs`, add the identical call in its bind block with provider `"amplifier"` and that block's registry-entry cwd (trigger (d) coherence: Task 6 writes markers for EVERY identity-bearing mode, so every locator that resolves identity must also resolve the marker).
+In `amplifier_association.rs`, add the identical `.await`ed call in its (equally async) bind block with provider `"amplifier"` and that block's registry-entry cwd (trigger (d) coherence: Task 6's `MARKER_MODES` allowlist writes markers for exactly codex/opencode/amplifier, so every allowlisted mode's resolver must also resolve the marker).
 
 - [ ] **Step 4: Run to verify pass.** `cargo test -p freshell-ws opencode_association && cargo test -p freshell-ws amplifier_association` then full `cargo test -p freshell-ws`. Expected: PASS.
 
@@ -2397,18 +2742,22 @@ git commit -m "feat(ws): opencode/amplifier locator resolution writes the ledger
 **Interfaces:**
 - Consumes: Task 1's `bound_session_ref_for_terminal`, Task 5's harness.
 - Produces: inventory rows whose in-memory identity is absent are stamped from the ledger's bound rows (authority chain: in-memory registry → ledger bound rows).
+- **Honesty note (V7.md / A21 — falsified as "non-dormant"):** no production window exists TODAY where a live terminal lacks in-memory identity while the ledger holds a bound row for its current terminalId — terminal ids are fresh UUIDs per create, and in-memory identity is written adjacent to every ledger write and survives retirement. Read 1 is a DEFENSIVE read whose mainline consumer arrives with Phase 3 / P1.13 (REST-created panes, verdict plumbing). It ships now because the authority-chain seam belongs in this slice; the test below FABRICATES the window (and says so in comments). The read is memory-only (index), so it costs nothing on the handshake path.
 
 - [ ] **Step 1: Write the failing test.** Create `crates/freshell-ws/tests/pane_ledger_restore.rs`:
 
 ```rust
-//! P1.8 read-side integration tests: the reads that make the ledger
-//! non-dormant (spec §4.2 / Principle 6), exercised across server
-//! "generations" sharing one ledger dir.
+//! P1.8 read-side integration tests, exercised across server "generations"
+//! sharing one ledger dir. Honesty (V7.md/V9.md): Read 1 (inventory
+//! stamping) has NO production window today and its test FABRICATES one;
+//! Read 3's ledger rung is production-reachable only via the orphaned
+//! in-flight-create replay shape until P1.6 — comments on each test say
+//! which. Read 2 (`ever_observed`) is live from day one.
 
 mod common;
 use common::*;
 
-use freshell_ws::pane_ledger::{BindingWrite, PaneLedger};
+use freshell_ws::pane_ledger::BindingWrite;
 
 fn unique_ledger_dir(label: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -2426,11 +2775,15 @@ fn unique_ledger_dir(label: &str) -> std::path::PathBuf {
 #[tokio::test(flavor = "multi_thread")]
 async fn inventory_stamping_falls_back_to_ledger_bound_rows() {
     // Authority chain (spec §4.2 precedence): in-memory registry first,
-    // ledger bound rows second. Model the fallback window: a live codex
-    // terminal whose in-memory identity is ABSENT (identity arrives only
-    // at candidate adoption) but whose binding a ledger already holds.
+    // ledger bound rows second. HONESTY (V7.md / A21): this window is
+    // FABRICATED — in production today, in-memory identity is written
+    // adjacent to every ledger write and survives retirement, so a live
+    // terminal with a ledger row but no in-memory identity does not occur;
+    // the mainline consumer of this read arrives with Phase 3 / P1.13
+    // (REST-created panes). The seam is pinned here so that consumer lands
+    // on tested ground.
     let dir = unique_ledger_dir("stamp");
-    let (url, registry) =
+    let (url, registry, server_ledger) =
         spawn_server_with_ledger(vec![sleeper_cli_spec("codex")], &dir).await;
     let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
 
@@ -2453,10 +2806,12 @@ async fn inventory_stamping_falls_back_to_ledger_bound_rows() {
         "fresh codex has no create-time identity (precondition)"
     );
 
-    // A previous generation resolved this terminal's identity into the
-    // ledger (write it via a second handle — the restart-equivalent shape).
-    let writer = PaneLedger::new(Some(dir.clone()));
-    writer
+    // FABRICATE the window (see the test-top comment): seed a bound row for
+    // this terminal WITHOUT the in-memory identity upsert that production
+    // always performs alongside it. Written through the SERVER'S OWN Arc —
+    // with the write-through index, only the server instance's writes are
+    // visible to its own reads.
+    server_ledger
         .record_binding(&BindingWrite {
             provider: "codex",
             session_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
@@ -2644,8 +2999,9 @@ git commit -m "feat(server): ever_observed consults the pane ledger - deleted-wh
 - Modify: `crates/freshell-ws/tests/pane_ledger_restore.rs`
 
 **Interfaces:**
-- Consumes: the existing ladder (rungs: identity registry → registry row, gated on newest-generation-not-Running, `terminal.rs:1581-1600` — its doc comment names this exact seam: "the durable-ledger and disk-scan rungs land in a later slice, P1.8"), Task 1's `lookup_by_create_request_id`, Task 4's revive-on-rebind semantics.
-- Produces: rung 3 — the ledger. Preserved judgments: (i) the A13 live-guard stays a HARD stop (a Running newest generation returns `None` before the ledger is consulted — the ledger must never reverse it); (ii) after an explicit user-kill IN THIS PROCESS, the binding is `retired/closed` (Task 6), which `lookup_by_create_request_id` excludes — the kill-then-restore case still fails loud.
+- Consumes: the existing ladder (rungs: identity registry → registry row, gated on newest-generation-not-Running, `terminal.rs:1581-1600` — its doc comment names this exact seam: "the durable-ledger and disk-scan rungs land in a later slice, P1.8"; the Running-gate documented at `terminal.rs:1574-1580` is PRESERVED), Task 1's `lookup_by_create_request_id`, Task 4's revive-on-rebind semantics, `registry.directory()` (`registry.rs:1402` — entries carry `mode`, `resume_session_id`, status).
+- Produces: rung 3 — the ledger. Preserved judgments: (i) the A13 live-guard stays a HARD stop (a Running newest generation returns `None` before the ledger is consulted — the ledger must never reverse it); (ii) after an explicit user-kill IN THIS PROCESS, the binding is `retired/closed` (Task 6), which `lookup_by_create_request_id` excludes — the kill-then-restore case still fails loud; (iii) **NEW, V6.md/A13:** the ledger rung's live-guard additionally scans REGISTRY rows — a claude resumed via the freshagent REST API is invisible to BOTH `identity.find_by_session` (never upserted) AND createRequestId lineage (REST mints none); its only footprint is a registry row with `mode=="claude" && resume_session_id==<id> && status Running`. Without the registry scan, the rung would green-light a double resume.
+- **Honesty (V9.md / A11 — production reach):** the mainline browser-closed / cleared-client restore RE-MINTS `createRequestId` before any create (`panesSlice.ts:525-549`, `TerminalView.tsx:4198/:4255`, `stripStaleIds` `:815-819`) — for that shape this rung is dormant until P1.6 stabilizes the key. The rung IS production-reachable today via one narrow real shape: an orphaned in-flight create (pane never anchored — no terminalId, status 'creating') replays the SAME persisted id across reconnect AND across browser close (`TerminalView.tsx:4309-4333`; `persistMiddleware.ts:229` preserves it). This is consistent with the spec's "NOT keyed on createRequestId (advisory)" ruling: the rung is an advisory LOOKUP over a stored advisory field — never an identity join key; binding rows stay keyed on sessionRef.
 
 - [ ] **Step 1: Write the failing test.** Append to `crates/freshell-ws/tests/pane_ledger_restore.rs`:
 
@@ -2653,17 +3009,25 @@ git commit -m "feat(server): ever_observed consults the pane ledger - deleted-wh
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_restore_resolves_via_the_ledger_across_a_restart() {
     // The P1.8 ladder rung: generation 1 pre-allocates a claude session id
-    // and durably records it; generation 2 (fresh process state — the
-    // browser-closed / cleared-client shape) receives restore:true with
-    // ONLY the createRequestId and must auto-resume via the ledger instead
-    // of rejecting with RESTORE_UNAVAILABLE.
+    // and durably records it; generation 2 (fresh process state) receives
+    // restore:true with ONLY the createRequestId and must auto-resume via
+    // the ledger instead of rejecting with RESTORE_UNAVAILABLE.
+    //
+    // HONESTY (V9.md / A11): the production shape that presents the SAME
+    // createRequestId across a restart is the ORPHANED IN-FLIGHT CREATE
+    // (pane never anchored — no terminalId — replays its persisted id,
+    // TerminalView.tsx:4309-4333 / persistMiddleware.ts:229). The mainline
+    // browser-closed/cleared-client restores RE-MINT the id and stay on
+    // RESTORE_UNAVAILABLE until P1.6. This test's wire shape matches the
+    // orphaned-create replay; the rung is an advisory lookup, never an
+    // identity join key (spec: "NOT keyed on createRequestId").
     let dir = unique_ledger_dir("ladder");
     use futures_util::SinkExt;
 
     // --- Generation 1 ---
     let session_id;
     {
-        let (url, registry) =
+        let (url, registry, _ledger1) =
             spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
         let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
         let create = serde_json::json!({
@@ -2681,14 +3045,15 @@ async fn claude_restore_resolves_via_the_ledger_across_a_restart() {
         // Kill the PTY so generation 1 dies "abruptly" from the ledger's
         // point of view (registry rows don't survive process death anyway;
         // the ledger row must). NOTE: registry.kill models the PROCESS
-        // dying with the server — the ledger row stays BOUND because
-        // kill_and_broadcast (the user-close path) was never invoked.
+        // dying with the server — the ledger row stays BOUND because the
+        // wire kill path (handle_kill's retire_closed hygiene) was never
+        // invoked.
         let tid = created["terminalId"].as_str().unwrap();
         registry.kill(tid);
     } // generation 1 dropped — its in-memory identity dies with it
 
     // --- Generation 2, same ledger dir, fresh everything else ---
-    let (url2, _registry2) =
+    let (url2, _registry2, _ledger2) =
         spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
     let (mut ws2, _inv2) = connect_and_capture_inventory(&url2).await;
     let restore = serde_json::json!({
@@ -2718,7 +3083,7 @@ async fn claude_restore_still_fails_loud_when_the_ledger_row_was_closed() {
     // like the in-process kill path today.
     let dir = unique_ledger_dir("ladder-closed");
     use futures_util::SinkExt;
-    let (url, _registry) =
+    let (url, _registry, _ledger) =
         spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
     let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
     let create = serde_json::json!({
@@ -2758,11 +3123,73 @@ async fn claude_restore_still_fails_loud_when_the_ledger_row_was_closed() {
     assert_eq!(error["code"], "RESTORE_UNAVAILABLE");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_restore_is_refused_while_a_rest_shaped_live_claude_owns_the_session() {
+    // A13 SAFETY red test (V6.md): a claude resumed via the freshagent REST
+    // API is invisible to identity.find_by_session (never upserted) AND to
+    // createRequestId lineage (REST mints none) — its ONLY footprint is a
+    // registry row {mode:"claude", resume_session_id:S, status:Running}.
+    // The ledger rung's live-guard must scan registry rows, or it would
+    // green-light a second live claude on S.
+    let dir = unique_ledger_dir("ladder-rest-live");
+    use futures_util::SinkExt;
+    let (url, registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    const SESSION: &str = "22222222-3333-4444-8555-666666666666";
+
+    // Forge the REST shape: a live registry row with resume_session_id set
+    // but NO identity-registry entry and NO createRequestId — drive the
+    // registry handle directly, the way freshagent's spawn_terminal_pane
+    // does (registry.create + set_meta, terminal_tabs.rs:866,:926). Copy
+    // the spawn-spec setup from an existing registry-driving test in this
+    // suite (e.g. opencode_association.rs's fixture) and then:
+    //     registry.set_meta(&rest_tid, None, None, Some("claude".into()), Some(SESSION.into()));
+    // (adapt to set_meta's actual arity — mode + resume_session_id are the
+    // load-bearing arguments; the PTY is a sleeper so status stays Running).
+
+    // Seed the ledger with a bound row for the same session, carrying a
+    // createRequestId a restore will present. Written via the SERVER'S Arc
+    // (write-through index visibility).
+    server_ledger
+        .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+            provider: "claude",
+            session_id: SESSION,
+            terminal_id: "gen1-terminal",
+            mode: "claude",
+            cwd: None,
+            create_request_id: Some("req-rest-live-1"),
+            now_ms: 1_000,
+        })
+        .unwrap();
+
+    // The restore presents the ledgered requestId. Without the registry
+    // scan the rung would answer SESSION and double-resume; with it, the
+    // live REST claude is detected -> RESTORE_UNAVAILABLE, fail loud.
+    let restore = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-rest-live-1",
+        "mode": "claude",
+        "shell": "bash",
+        "restore": true,
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(restore.to_string()))
+        .await
+        .unwrap();
+    let error = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(error["code"], "RESTORE_UNAVAILABLE");
+
+    // cleanup: kill the forged REST terminal via the registry handle.
+    std::fs::remove_dir_all(&dir).ok();
+}
 ```
 
-(Mirror the exact error-frame field spelling from `crates/freshell-ws/tests/claude_restore_unavailable.rs` — copy its assertion shape.)
+(Mirror the exact error-frame field spelling from `crates/freshell-ws/tests/claude_restore_unavailable.rs` — copy its assertion shape. For the REST-shaped row, adapt the `registry.create`/`set_meta` calls to their actual signatures — the essentials are: a Running row, `mode=="claude"`, `resume_session_id==SESSION`, no identity upsert, no createRequestId.)
 
-- [ ] **Step 2: Run to verify failure.** `cargo test -p freshell-ws --test pane_ledger_restore` — Expected: `claude_restore_resolves_via_the_ledger_across_a_restart` FAILS (generation 2 answers `error{RESTORE_UNAVAILABLE}`); the `closed` test may already pass (it pins existing judgment — keep it).
+- [ ] **Step 2: Run to verify failure.** `cargo test -p freshell-ws --test pane_ledger_restore` — Expected: `claude_restore_resolves_via_the_ledger_across_a_restart` FAILS (generation 2 answers `error{RESTORE_UNAVAILABLE}`) and `claude_restore_is_refused_while_a_rest_shaped_live_claude_owns_the_session` FAILS THE OTHER WAY once the rung exists without the registry scan — run it again after Step 3's first cut if you build the rung incrementally; in the red state (no rung at all) it passes vacuously, so its true red run is against a rung WITHOUT the registry-scan guard (comment the guard out once, watch it fail, restore — the Task 7 discipline). The `closed` test may already pass (it pins existing judgment — keep it).
 
 - [ ] **Step 3: Implement.** Replace `resolve_claude_restore_session_id` (`terminal.rs:1581-1600`) with (keep the existing doc comment, updating its "land in a later slice, P1.8" sentence to note the ledger rung now exists and only the disk-scan rung remains future):
 
@@ -2795,10 +3222,11 @@ fn resolve_claude_restore_session_id(state: &WsState, create_request_id: &str) -
     // `lookup_by_create_request_id` answers only `bound` rows and
     // `gc_expired` tombstones (auto-resume is a legal transition); a row
     // retired `closed` (user-kill) or `superseded` is never resurrected.
+    // The lookup is memory-only (write-through index) — cheap inline.
     let row = state
         .pane_ledger
         .lookup_by_create_request_id("claude", create_request_id)?;
-    // A13-equivalent guard against the ledger rung: if ANY live terminal
+    // A13-equivalent guard, part 1: if ANY live identity-registry entry
     // currently owns this session id, fail loud rather than double-resume.
     if let Some(owner) = state.identity.find_by_session("claude", &row.session_id) {
         if state
@@ -2808,6 +3236,24 @@ fn resolve_claude_restore_session_id(state: &WsState, create_request_id: &str) -
         {
             return None;
         }
+    }
+    // A13-equivalent guard, part 2 (V6.md): REST-resumed claudes are
+    // invisible to the identity registry AND to createRequestId lineage —
+    // their only footprint is a registry row {mode:"claude",
+    // resume_session_id, Running}. Scan the live registry so the ledger
+    // rung can never green-light a second live claude on one session id.
+    let rest_shaped_live = state.registry.directory().into_iter().any(|entry| {
+        entry.mode.as_deref() == Some("claude")
+            && entry.resume_session_id.as_deref() == Some(row.session_id.as_str())
+            && entry.status == freshell_protocol::TerminalRunStatus::Running
+    });
+    if rest_shaped_live {
+        tracing::warn!(
+            target: "freshell_ws::pane_ledger",
+            session_id = %row.session_id,
+            "claude_restore_refused: a live (REST-shaped) claude already owns this session id"
+        );
+        return None;
     }
     if row.retired_reason == Some(crate::pane_ledger::RetiredReason::GcExpired) {
         tracing::info!(
@@ -2820,7 +3266,7 @@ fn resolve_claude_restore_session_id(state: &WsState, create_request_id: &str) -
 }
 ```
 
-(`find_by_session` returns `Option<TerminalIdentity>` — `identity.rs:157-166`, live-only, which is exactly the guard's need.)
+(`find_by_session` returns `Option<TerminalIdentity>` — `identity.rs:157-166`, live-only, which is exactly part 1's need. For part 2, adapt the field access to `registry.directory()`'s actual entry shape — `registry.rs:1402`; entries carry `mode`, `resume_session_id` (e.g. `registry.rs:1340,1420,1571`) and a run status. If cloning the whole directory proves heavy, add a dedicated `registry.find_running_by_resume_session_id(mode, sid) -> bool` finder instead — same semantics. Note the pre-existing rung-1/2 Running-gate (`terminal.rs:1574-1580`) is untouched above.)
 
 - [ ] **Step 4: Run to verify pass.** `cargo test -p freshell-ws --test pane_ledger_restore` then FULL `cargo test -p freshell-ws` — `claude_restore_unavailable.rs` (the PR #530 contract) must stay green: its unresolvable cases use identities the ledger has never seen, so the new rung returns `None` and the loud reject is preserved. Expected: PASS.
 
@@ -2960,16 +3406,18 @@ test.describe('pane-identity ledger restart durability', () => {
         const ledgerDir = path.join(capturedHome, '.freshell', 'pane-ledger')
 
         // Claude pane: identity is pre-allocated at create — the binding
-        // row must hit disk within the 5s wall.
-        await openCliPane(page, /^Claude$/i)
+        // row must hit disk within the 5s wall. Button label is the
+        // extension manifest's "Claude CLI" (V12.md — /^Claude$/ matches
+        // nothing; siblings use /^Claude CLI$/i).
+        await openCliPane(page, /^Claude CLI$/i)
         await within5s(
           async () => (await listFiles(path.join(ledgerDir, 'bindings', 'claude'))).some((f) => f.endsWith('.json')),
           'claude binding row on disk',
         )
 
         // Codex pane: identity in flight — the pending marker must hit
-        // disk within the same wall.
-        await openCliPane(page, /^Codex$/i)
+        // disk within the same wall. Manifest label is "Codex CLI" (V12.md).
+        await openCliPane(page, /^Codex CLI$/i)
         await within5s(
           async () => (await listFiles(path.join(ledgerDir, 'pending'))).some((f) => f.endsWith('.json')),
           'codex pending marker on disk',
@@ -3018,8 +3466,15 @@ test.describe('pane-identity ledger restart durability', () => {
     try {
       const fakeOpencode = await installFakeCli(path.join(sharedRoot, 'bin'), 'opencode', 'fake-opencode-terminal.mjs')
       const seed = seedConfig()
+      // ROW GATE (V12.md — REQUIRED for this wall's premise): the fake
+      // opencode WRITES a real sqlite identity row on its FIRST stdin data
+      // unless FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH is set and the gate
+      // file never exists. Point it at a path we NEVER create, so identity
+      // deterministically never resolves and the pending marker is the only
+      // evidence — no race against the SIGKILL.
+      const rowGate = path.join(sharedRoot, 'row-gate-never-created')
       const server = new RustServer({
-        env: { OPENCODE_CMD: fakeOpencode },
+        env: { OPENCODE_CMD: fakeOpencode, FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH: rowGate },
         setupHome: async (homeDir: string) => {
           capturedHome = homeDir
           await seed(homeDir)
@@ -3066,9 +3521,12 @@ test.describe('pane-identity ledger restart durability', () => {
 })
 ```
 
-Implementer notes (bindings to reality — reconcile each against the named source before first run):
+Implementer notes (bindings to reality — reconcile each against the named source before first run; V12.md verified the load-bearing ones):
   - Copy the exact `test`/`expect` import + fixture line from `compound-restart-rust.spec.ts` (`fixtures-or-base.js` above is a placeholder for whatever that spec imports).
-  - `RustServer`'s option names (`env`, `setupHome`) and `restartAbrupt()` are as used at `compound-restart-rust.spec.ts:275-298`.
+  - `RustServer`'s option names (`env`, `setupHome`) and `restartAbrupt()` are as used at `compound-restart-rust.spec.ts:275-298`; `restartAbrupt()` reboots on the SAME home/port/token (`rust-server.ts:344-378`), which is why the browser's WS auto-reconnect recovers without a reload.
+  - **Picker buttons render ONLY when the `availableClis` gate passes** (`PanePicker.tsx:117`) — server-side CLI detection honors the `*_CMD` env overrides, so the `CLAUDE_CMD`/`CODEX_CMD`/`OPENCODE_CMD` values in `RustServer({ env })` above are load-bearing, not decorative (V12.md). Button names come from extension manifest labels: `/^Claude CLI$/i`, `/^Codex CLI$/i`, `/^OpenCode$/i`. The directory-combobox locators are fine as written (unanchored `/Starting directory/i` matches "Starting directory for Claude CLI" etc.).
+  - `getWsReadyState` exists on `window.__FRESHELL_TEST_HARNESS__` ONLY when the page loads with `e2e=1` (V12.md/A19a) — both `page.goto` calls above include it; match `compound-restart-rust.spec.ts:298-303`'s post-restart choreography verbatim.
+  - Wall 2's `FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH` must point at a file that is NEVER created (see the in-spec comment) — without it the fake writes its sqlite identity row on first stdin data and the "identity never resolves" premise races the SIGKILL.
   - If `fs.readdir(..., { recursive: true })` is unavailable on the repo's Node version, replace `listFiles` with a small manual walk.
   - After a pane-picker create, dismiss/settle any picker state the same way sibling specs do (`selectShellIfPickerShowing` pattern) if the second `openCliPane` cannot find the picker.
 
@@ -3134,22 +3592,24 @@ PR creation is NOT approved — report the branch name and the proof (test outpu
 | Two row types, different keys/rights; markers never promoted/joined (G1) | 1, 3 |
 | Pinned order: binding row FIRST, then marker delete; idempotent resolution | 3 (tests: `resolve_pending_writes_binding_first…`, `pending_resolution_collision…`) |
 | Marker readable exactly-one-read by terminalId; binding-row-wins reader rule | 3 |
-| Markers GC'd only on observed clean exit in-epoch; never swept at boot for not-live | 4 (`boot_scan_never_sweeps…`), 6 (exit/kill deletion) |
+| Markers GC'd on observed clean exit in-epoch; never swept at boot MERELY for not-live (crash-residue + TTL-aged sweeps are the two loud exceptions — V7.md leaked-marker bound) | 4 (`boot_scan_never_sweeps…`, `aged_out_marker…`), 6 (exit/kill deletion) |
 | Supersession retires-never-defends; new bound FIRST then retire; boot repair + tiebreak | 2, 4 |
 | Reader follows `supersededBy` chain to terminus, `corrected:true`; no cycles | 2 (verdict-level wiring is Phase 3, stated in Global Constraints) |
-| GC-to-tombstone; `gc_expired → bound` legal + auto + loud; tombstone delete conditioned on transcript absence | 4, 12 (auto-resume rung) |
+| GC-to-tombstone; `gc_expired → bound` legal + auto + loud; tombstone delete conditioned on transcript absence via DIRECT filesystem stat by provider path convention (never probe Absent alone — V10.md) | 4, 5 (the direct-stat closure), 12 (auto-resume rung) |
 | Corruption quarantine: per-row rename-aside + ERROR, healthy rows served, API surface | 4 (`corrupt_ledger_boot…`; verdict breadcrumb is Phase 3, stated) |
 | Write-failure: never blocks, live frame at failure time + ERROR + counter | 6, 7 |
 | Atomic temp+rename per row; `ledgerVersion` field gates migration | 1, 4 |
 | Precedence: in-memory registry → ledger bound rows (→ client claim → snapshot) | 10 (the two server-side rungs; the client-claim/snapshot rungs live in reconcile, Phase 3) |
-| Write triggers: (a) claude pre-allocation, (b) codex adoption, (c) opencode resolution, (d) pending at spawn, (e) retire on close | 6, 8, 9 |
-| Reads ship in-slice: inventory stamping, `ever_observed`, claude ladder rung | 10, 11, 12 |
+| Write triggers: (a) claude pre-allocation, (b) codex adoption, (c) opencode resolution, (d) pending at spawn — RESOLVER ALLOWLIST codex/opencode/amplifier only (V5.md/V7.md), (e) retire on close. WS `handle_create` only; REST/freshagent creates deferred to P1.13 (Global Constraints; V6.md) | 6, 8, 9 |
+| Reads ship in-slice: inventory stamping (defensive — window fabricated in test, mainline consumer P1.13, V7.md), `ever_observed` (live day one), claude ladder rung (production-reachable via orphaned in-flight-create replay; mainline restore shapes re-mint the id until P1.6, V9.md) | 10, 11, 12 |
+| Async-path writes via awaited `spawn_blocking` (durable-before-answer preserved); reads memory-only via write-through index | 1 (index), 5 (boot/GC), 6, 8, 9 (V1.md) |
+| Single-writer store guard (exclusive flock, disabled-on-conflict) | 1 (`new_locked` + unit test), 5 (main.rs wiring) (V2.md) |
 | Resume-invocation record (terminal panes: provider/sessionId/mode/cwd) | 1 (schema), Global Constraints (P1.13 boundary for freshagent settings) |
 | P1.10: restore-created opencode w/o identity arms + pending marker until resolution | 9 (+6 for the marker) |
 | Red tests named by the task | mapping table in File Structure section |
 | E2E: SIGKILL walls on own RustServer, ephemeral ports | 13; browser-closed/cleared-client variant is delivered as the two-generation fresh-connection integration tests (10, 12) because the frozen client cannot express verdict-driven recovery until Phase 3 — the server-side behavior ("inventory stamping can still resolve", ladder resolution with only a requestId) is fully proven |
 
-No placeholder patterns remain (checked for TBD/TODO/"handle edge cases"/"similar to Task N"); type names cross-checked: `PaneLedger`, `BindingRow`, `BindingWrite`, `RowState`, `RetiredReason`, `PendingMarker`, `Resolution`, `QuarantinedRow`, `BootScanReport`, `record_binding`, `record_pending`, `resolve_pending`, `delete_pending`, `pending_for_terminal`, `list_pending_raw`, `retire_closed`, `ever_bound`, `load_binding`, `list_bindings`, `lookup_by_session`, `lookup_by_create_request_id`, `bound_session_ref_for_terminal`, `boot_scan`, `gc`, `quarantined_rows`, `surface_write_failure`, `ledger_resolve_identity` are used consistently across Tasks 1–13.
+No placeholder patterns remain (checked for TBD/TODO/"handle edge cases"/"similar to Task N"); type names cross-checked: `PaneLedger`, `LedgerIndex`, `BindingRow`, `BindingWrite`, `RowState`, `RetiredReason`, `PendingMarker`, `Resolution`, `QuarantinedRow`, `BootScanReport`, `MARKER_MODES`, `PENDING_MARKER_TTL_MS`, `new`, `new_locked`, `record_binding`, `record_pending`, `resolve_pending`, `delete_pending`, `pending_for_terminal`, `list_pending_raw`, `retire_closed`, `ever_bound`, `load_binding`, `list_bindings`, `lookup_by_session`, `lookup_by_create_request_id`, `bound_session_ref_for_terminal`, `boot_scan`, `gc`, `quarantined_rows`, `surface_write_failure`, `ledger_resolve_identity` (async), `transcript_definitively_absent` are used consistently across Tasks 1–13.
 
 
 
