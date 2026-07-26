@@ -950,7 +950,7 @@ describe('hydration queue — post-startup rebind drain (F8)', () => {
   it('a bare register() after startup never triggers (documents why queueIfStarted is required)', () => {
     const queue = createHydrationQueue()
     const calls: string[] = []
-    queue.onActiveTabReady('tab-1') // started = true; one-shot
+    queue.onActiveTabReady('tab-1', ['tab-1']) // started = true; one-shot
     queue.register(makeEntry('pane-a', calls))
     expect(calls).toEqual([])
   })
@@ -958,7 +958,7 @@ describe('hydration queue — post-startup rebind drain (F8)', () => {
   it('register({ queueIfStarted: true }) after startup triggers with no further events', () => {
     const queue = createHydrationQueue()
     const calls: string[] = []
-    queue.onActiveTabReady('tab-1')
+    queue.onActiveTabReady('tab-1', ['tab-1'])
     queue.register(makeEntry('pane-a', calls), { queueIfStarted: true })
     expect(calls).toEqual(['pane-a'])
   })
@@ -966,7 +966,7 @@ describe('hydration queue — post-startup rebind drain (F8)', () => {
   it('onHydrationComplete(stalePane) un-wedges the queue for later registrations', () => {
     const queue = createHydrationQueue()
     const calls: string[] = []
-    queue.onActiveTabReady('tab-1')
+    queue.onActiveTabReady('tab-1', ['tab-1'])
     queue.register(makeEntry('pane-a', calls), { queueIfStarted: true }) // active, never completes (dead attach)
     queue.register(makeEntry('pane-b', calls), { queueIfStarted: true }) // held behind the wedge
     expect(calls).toEqual(['pane-a'])
@@ -1072,7 +1072,7 @@ git commit -m "fix(client): hidden terminal panes attach via background hydratio
 
 **Interfaces:**
 - Consumes: `RustServer` (`test/e2e-browser/helpers/rust-server.ts`) — `start()`, `restartAbrupt()`, `stop()`, ephemeral ports; `TestHarness`; fake sidecar fixture `test/e2e-browser/fixtures/fake-claude-sidecar.mjs`.
-- Produces: e2e proof of the user story: multi-tab layout (visible + hidden terminal + hidden fresh-agent), SIGKILL restart, hidden panes rebound WITHOUT reveal (asserted via harness Redux state), then reveal shows correct content/status instantly, and a busy-at-restart hidden pane un-wedges without reveal. Evidence validity (verified by enumerating all slice writers): client-side writers of `terminalId`/`status` DO exist (tab-open flows, persistence hydration), but none can mint a NEW terminalId on an existing pane without user action or a page reload — so the polls below are genuine server-round-trip evidence PROVIDED the spec (i) never reloads the page after restart and (ii) asserts the new id differs from the old (both already built into the tests below; do not weaken either).
+- Produces: e2e proof of the user story: multi-tab layout (visible + hidden terminal + hidden fresh-agent), SIGKILL restart, hidden panes rebound WITHOUT reveal (asserted via harness Redux state), then reveal shows correct content/status instantly, and a busy-at-restart hidden pane un-wedges without reveal. Evidence validity (verified by enumerating all slice writers): client-side writers of `terminalId`/`status` DO exist (tab-open flows, persistence hydration), but none can mint a NEW terminalId on an existing pane without user action or a page reload — so the polls below are genuine server-round-trip evidence PROVIDED the spec (i) never reloads the page after restart and (ii) asserts the new id differs from the old. CRITICALLY, new-terminalId-plus-`running` is NOT sufficient on its own: the census→re-create path already produces it while hidden on unfixed main (the wall's :2107 entry is green there). Each test therefore carries a discriminator that only this lane's fix can satisfy: test 1 requires `content.streamId` non-null and changed (written ONLY by the `terminal.attach.ready` handler, and explicitly reset to undefined by `terminal.created` — TerminalView.tsx:3708-3714 / :3799-3808 — so it proves the hidden BACKGROUND ATTACH completed), and test 2 requires `content.createRequestId` changed (minted ONLY by the `.lost` recovery, which pre-fix cannot run for a hidden pane and which itself requires the server's INVALID_SESSION_ID round trip). All discriminators are built into the tests below; do not weaken any of them.
 
 Per this suite's convention (documented in `restore-contract-wall-rust.spec.ts`'s header), helpers are COPIED into the spec, not imported from sibling specs. Copy these helpers verbatim from `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts`: `bootWall`, `selectShellIfPickerShowing`, `createTabViaRest`, `restApiHeaders`, `waitForWsReady`, `seedWallConfig`, `installFakeCli`, `createFreshclaudePane` (and its transitive helpers). Known gotcha to carry over: with >1 tab mounted, `.xterm` locators match HIDDEN tabs' still-mounted terminals — always use `.xterm:visible` (the wall spec documents this at :1390–1396).
 
@@ -1100,7 +1100,9 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       await expect
         .poll(async () => (await harness.getPaneLayout(hiddenTabId))?.content?.terminalId ?? null, { timeout: 20_000 })
         .not.toBeNull()
-      const terminalIdBefore = (await harness.getPaneLayout(hiddenTabId))?.content?.terminalId as string
+      const contentBefore = (await harness.getPaneLayout(hiddenTabId))?.content
+      const terminalIdBefore = contentBefore?.terminalId as string
+      const streamIdBefore = contentBefore?.streamId ?? null
 
       // Make the pane BUSY: run a long-lived foreground command.
       await page.locator('.xterm:visible').first().click()
@@ -1116,12 +1118,26 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       await server.restartAbrupt()
       await waitForWsReady(page)
 
-      // Session rebind WITHOUT reveal: new terminalId + status running.
+      // Session rebind WITHOUT reveal. DISCRIMINATING evidence -- this poll
+      // FAILS on the unfixed base: a new terminalId + 'running' alone only
+      // proves the census re-create path, which ALREADY works while hidden on
+      // main. What this lane adds is the hidden background terminal.attach,
+      // and its only Redux-visible footprint is content.streamId: the
+      // terminal.created handler explicitly resets streamId to undefined
+      // (TerminalView.tsx:3799-3808) and ONLY the terminal.attach.ready
+      // handler writes it back (:3708-3714), with a fresh server-minted
+      // stream id per PTY (crates/freshell-terminal/src/registry.rs:877-892).
+      // So require new terminalId AND a non-null streamId differing from the
+      // pre-restart one AND status 'running' -- unreachable without a
+      // completed hidden background attach. Do not weaken any conjunct.
       await expect
         .poll(async () => {
           const content = (await harness.getPaneLayout(hiddenTabId))?.content
           const tid = content?.terminalId ?? null
-          return tid && tid !== terminalIdBefore && content?.status === 'running' ? tid : null
+          const sid = content?.streamId ?? null
+          const rebound = tid && tid !== terminalIdBefore && content?.status === 'running'
+          const attached = sid && sid !== streamIdBefore
+          return rebound && attached ? `${tid}:${sid}` : null
         }, { timeout: 30_000 })
         .not.toBeNull()
 
@@ -1150,11 +1166,24 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       await selectShellIfPickerShowing(page)
       // Create a freshclaude pane in the current tab (helper copied from the wall).
       const freshTabId = (await harness.getActiveTabId())!
-      await createFreshclaudePane(page, harness)
-      const sessionIdBefore: string = await expect
-        .poll(async () => findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content?.sessionId ?? null, { timeout: 30_000 })
+      // Helper signature is (page, harness, cwd) -- the wall spec's call sites
+      // pass a project dir; any existing directory works for the fake sidecar.
+      await createFreshclaudePane(page, harness, os.tmpdir())
+      await expect
+        .poll(async () => {
+          const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
+          return c?.sessionId && c?.createRequestId ? true : null
+        }, { timeout: 30_000 })
         .not.toBeNull()
-        .then(async () => findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content?.sessionId)
+      const contentBefore = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))!.content!
+      // Recovery proof is createRequestId, NOT sessionId: the fake sidecar
+      // resumes with the SAME sessionId (fixtures/fake-claude-sidecar.mjs:39),
+      // so sessionId equality proves nothing either way. createRequestId is a
+      // fresh nanoid minted ONLY when the client's .lost recovery re-creates
+      // (FreshAgentView.tsx:1021), and that recovery only fires after the
+      // server round-trips freshAgent.error{INVALID_SESSION_ID} to this
+      // pane's post-restart attach.
+      const createRequestIdBefore = contentBefore.createRequestId as string
 
       // Hide it behind a new shell tab.
       await createTabViaRest(info, { mode: 'shell', cwd: os.tmpdir() })
@@ -1165,15 +1194,22 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       await waitForWsReady(page)
 
       // TARGET CONTRACT (F8): WITHOUT reveal, the hidden fresh-agent pane's
-      // session recovers to a usable state. Harness state only reaches this
-      // shape when the server has round-tripped attach/create for this pane.
+      // session recovers to a usable state. DISCRIMINATING evidence -- this
+      // poll FAILS on the unfixed base: pre-fix, a hidden pane sends nothing
+      // after restart and freshAgent status only mutates via server frames,
+      // so stale pre-restart state still shows `sessionId` + 'idle'. But that
+      // stale state carries the OLD createRequestId. A CHANGED createRequestId
+      // requires the .lost recovery to have run (which pre-fix is gated on
+      // !hidden), and that recovery only fires after the server round-trips
+      // INVALID_SESSION_ID; usable status then requires the re-created
+      // session's server frames. Do not weaken either conjunct.
       await expect
         .poll(async () => {
-          const leaf = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))
-          const status = leaf?.content?.status ?? null
-          const sessionId = leaf?.content?.sessionId ?? null
-          const usable = sessionId && ['connected', 'idle', 'running'].includes(status)
-          return usable ? `${sessionId}:${status}` : null
+          const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
+          const status = c?.status ?? ''
+          const usable = c?.sessionId && ['connected', 'idle', 'running'].includes(status)
+          const recovered = c?.createRequestId && c.createRequestId !== createRequestIdBefore
+          return usable && recovered ? `${c.createRequestId}:${status}` : null
         }, { timeout: 30_000 })
         .not.toBeNull()
 
@@ -1185,7 +1221,6 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
           return ['connected', 'idle', 'running'].includes(leaf?.content?.status ?? '')
         }, { timeout: 15_000 })
         .toBe(true)
-      void sessionIdBefore // recovery may resume the same session or mint a new one; usability is the contract
     } finally {
       await server.stop()
     }
@@ -1226,7 +1261,7 @@ Run:
 npm run build:client
 npm run test:e2e -- --project=rust-chromium specs/hidden-pane-rebind-rust.spec.ts
 ```
-Expected: with Tasks 3–5 already merged into the branch, tests 1 and 2 should PASS (green proof of the feature). If this spec had been written before Tasks 3–5 it would be red — if either test FAILS now, treat it as a real defect in the implementation tasks and fix there, not by weakening assertions.
+Expected: with Tasks 3–5 already merged into the branch, tests 1 and 2 should PASS (green proof of the feature). This spec WOULD be red before Tasks 3–5 — specifically because of the discriminators: pre-fix, test 1's `streamId` stays undefined after the census re-create (no hidden attach ever fires), and test 2's `createRequestId` never changes (the `.lost` recovery is gated on `!hidden` and no server frame reaches the pane) — stale pre-restart Redux state cannot satisfy either poll. If either test FAILS now, treat it as a real defect in the implementation tasks and fix there, not by weakening assertions.
 
 Contingency for test 2 (fresh-agent) — the dead-session attach contract is now VERIFIED, not unknown: all three providers reply to `freshAgent.attach` for an untracked session with `freshAgent.error{code:'INVALID_SESSION_ID'}` (claude `crates/freshell-freshagent/src/claude.rs:395-401,510-522`; codex `codex.rs:999-1002`; opencode `opencode_ws.rs:591-612`; wire-tested in `crates/freshell-ws/tests/freshagent_claude_attach.rs:178-230`), and the client already maps that frame to `markSessionLost` (`src/lib/fresh-agent-ws.ts:326-328`, routed visibility-blind via `App.tsx:1258`) → the `.lost` recovery at :1534–1563 re-creates. So test 2 failing does NOT mean "server sends nothing" — diagnose read-only with `readServerLogs(info.logsDir)` for what actually happened. Known gaps to check first: (1) codex's TRANSIENT failure frame (`CODEX_ATTACH_RESUME_FAILED`) maps to `sessionError`, not session-lost — recovery then rides the next reconnect's re-enqueued attach; (2) the `markSessionLost` missing-entry guard from Task 3 Step 4b must be in place (without it a reload+dead-session sequence throws in the handler loop). A server change should not be needed; if the logs nonetheless prove one is, STOP and report (this lane must not make it).
 
@@ -1311,3 +1346,12 @@ A validation pass (assumption ledger: `.worktrees/.the-usual-logs/hidden-pane-re
 - **Falsified A2 → Task 5 rewritten:** the hydration queue has NO reconnect pump; bare `register()` post-startup is inert. Task 5's insertions now clear the stale slot (`onHydrationComplete`), reset `hydrationRegisteredRef`, and register with `{ queueIfStarted: true }`; a new real-queue test file (`hydration-queue.rebind.test.ts`) pins the drain semantics the mocked-queue tests cannot see. Re-ran self-review items over Task 5: spec coverage intact (attach-without-reveal now actually drives); no silent deferrals (sites (c)/(d)'s latent inertness is explicitly out-of-scope, noted, and not needed for the F8 contract — the restart path flows through sites (a)/(b)); no placeholders (all inserted code shown; the queue test carries an explicit verify-exports instruction per the donor-copy convention); types consistent (wrapper's `options` parameter verified real at :2273–2282).
 - **Falsified A5 (partial) → Architecture corrected:** `freshAgent.attach` is not unconditionally cheap (post-restart codex attach spawns a sidecar; opencode broadcasts a snapshot per attach) — hidden attach pacing through the rebind queue is load-bearing and stays.
 - **Verified A3 → Task 6 contingency replaced** with the proven `INVALID_SESSION_ID` contract; **verified A4 edge → Task 3 Step 4b** adds the `markSessionLost` missing-entry guard (red→green, slice test); **verified A9 → Architecture rationale corrected** (creates serialize per WS connection; gate Timeout is NOT client-retried); **verified A10 → Global Constraints** documents #534/#535 merge cleanliness and the post-#534 layout-membership test hazard; **verified A12/A13 → create job keys include `createRequestId`** so stale queued jobs can't dedup-block a new requestId (ws-client buffering/flush semantics confirmed for queued sends).
+
+## Self-Review addendum (after fresh-eyes review, iteration 1)
+
+An independent cross-model review found the Task 6 e2e assertions non-discriminating (both would pass on the unfixed base) and two plan-provided code blocks broken as written. Fixes applied, with evidence re-verified against the codebase:
+
+- **Task 6 test 1 rewritten to discriminate:** new-terminalId-plus-`running` is the pre-existing census re-create path; the poll now also requires `content.streamId` non-null and changed — `terminal.created` resets streamId to undefined (TerminalView.tsx:3799-3808) and ONLY the `terminal.attach.ready` handler writes it back (:3708-3714) with a fresh server-minted stream id (crates/freshell-terminal/src/registry.rs:877-892) — so the poll is unreachable without a completed hidden background attach (the exact Task 5 behavior). Note: the Rust server emits NO attach log line (`TerminalRegistry::attach` registry.rs:826-905 has zero tracing calls), so Redux `streamId` is the only attach evidence; server logs can only prove the negative.
+- **Task 6 test 2 rewritten to discriminate:** the previous usable-status poll was satisfiable by stale pre-restart Redux state (freshAgent status mutates only via server frames; nothing degrades it on disconnect). The poll now also requires `content.createRequestId` changed — minted only by the `.lost` recovery (fresh nanoid at FreshAgentView.tsx:1021), which pre-fix is gated on `!hidden` and which itself requires the server's `INVALID_SESSION_ID` round trip. sessionId equality is deliberately NOT asserted: the fake sidecar resumes with the SAME sessionId (`fixtures/fake-claude-sidecar.mjs:39`), so it discriminates nothing.
+- **Broken call signatures fixed:** `createFreshclaudePane(page, harness, cwd)` requires the third `cwd` argument (wall spec :436; its `directoryInput.fill(cwd)` throws on undefined) — test 2 now passes `os.tmpdir()`; the hydration-queue pin tests now call `onActiveTabReady('tab-1', ['tab-1'])` matching the real two-argument API (`neighborFirstOrder` indexes into `tabOrder`), so the Step 2 STOP gate can no longer trip spuriously.
+- Re-ran self-review items over the edited Tasks 5/6: spec coverage intact (the e2e now proves the hidden attach and hidden recovery specifically, not just re-create); no silent deferrals; no placeholders (all changed test code shown in full); type consistency (`streamId`/`createRequestId` are real pane-content fields written by the cited handlers; evidence-validity note and Step 2 expectations updated to match the new discriminators).
