@@ -294,10 +294,28 @@ pub async fn run(
             // `OutputQueue::drain_all`).
             _ = output_queue.notified() => {
                 let mut send_failed = false;
-                for out in output_queue.drain_all() {
+                // Protocol-order guarantee: `attach.ready` (and every other
+                // non-output frame) travels the DIRECT `conn_rx` channel while
+                // replay/live output travels this bounded queue. This unbiased
+                // `select!` could otherwise deliver already-queued replay
+                // frames BEFORE the `attach.ready` enqueued ahead of them —
+                // inverting the documented "attach.ready, then replay, then
+                // live" order the client depends on (it arms its pendingReplay
+                // window only on ready; src/lib/terminal-attach-seq-state.ts:143,
+                // "attach.ready arrives before replay frames"). Drain every
+                // direct frame already pending before any queued output.
+                while let Ok(out) = conn_rx.try_recv() {
                     if !send(&mut ws_tx, &out).await {
                         send_failed = true;
                         break;
+                    }
+                }
+                if !send_failed {
+                    for out in output_queue.drain_all() {
+                        if !send(&mut ws_tx, &out).await {
+                            send_failed = true;
+                            break;
+                        }
                     }
                 }
                 if send_failed {
