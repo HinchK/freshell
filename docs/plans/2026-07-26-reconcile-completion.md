@@ -228,9 +228,11 @@ git commit -m "feat(reconcile): widen ReconcilePane kind to fresh-agent + hello 
 
 **Files:**
 - Modify: `src/store/paneTypes.ts` (`FreshAgentPaneContent`, ~:174-203)
-- Modify: `src/store/panesSlice.ts` (`stripStaleIds` ~:869-890)
-- NO change: `src/store/persistMiddleware.ts` — its kind-agnostic `stripTransientSessionFields` (:245-268) ALREADY applies to `kind === 'fresh-agent'` and ALREADY strips `pendingReconcile`/`reconcileNotice`/`reconcileEpoch` (the "A19: reconcile fold state is volatile — never persisted" destructure at :254-257). The only gap on base is the `stripStaleIds` restore path.
+- Modify: `src/store/panesSlice.ts` (`normalizePaneContent` fresh-agent branch :118-205 — BOTH returned object literals; `stripStaleIds` ~:869-890)
+- NO change: `src/store/persistMiddleware.ts` — its kind-agnostic `stripTransientSessionFields` (:245-268) ALREADY applies to `kind === 'fresh-agent'` and ALREADY strips `pendingReconcile`/`reconcileNotice`/`reconcileEpoch` (the "A19: reconcile fold state is volatile — never persisted" destructure at :254-257).
 - Test: `test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts` (create)
+
+The gaps on base are BOTH in `panesSlice.ts`: (a) `normalizePaneContent`'s fresh-agent branch fully ENUMERATES its output fields with no rest spread — in both returned literals, the restoreError early return (:129-160) and the main return (:174-204) — so the three fold fields are silently DROPPED by every normalization: `initLayout` (:933), `updatePaneContent` (:1378), `hydratePanes` (:407), and the `restoreLayout` path (:900). Without fixing (a), fold state written by Task 3's reducers is wiped by the next unrelated content patch (the created-ack patch, `freshAgent.session.materialized` patches, Task 14's nudge), a `corrected` notice can vanish before rendering, and Task 9's store-backed harness (which seeds via `initLayout`) can never seed the fields at all. (b) `stripStaleIds` does not strip the trio on restore — invisible today only because (a) drops them anyway; once (a) is fixed, (b) becomes the sole strip point on the restore path. (Contrast the terminal branch, which preserves the same trio at panesSlice.ts:98-102 — that parity was done for B1 and is what this task mirrors.)
 
 **Interfaces:**
 - Consumes: `FreshAgentPaneContent` (paneTypes.ts:174).
@@ -238,16 +240,58 @@ git commit -m "feat(reconcile): widen ReconcilePane kind to fresh-agent + hello 
 
 - [ ] **Step 1: Write the failing tests** — create `test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts`:
 
-The RED-gate test targets the ONLY gap on base: `stripStaleIds` (invoked solely by the `restoreLayout` reducer via `normalizeRestoredTree`, panesSlice.ts:900/:952) does not strip the three new fields from fresh-agent leaves. Model it on the existing `stripStaleIds` fresh-agent test at `test/unit/client/store/panesSlice.test.ts:4238-4292` ("strips stale fresh-agent runtime identity while preserving durable resume options") — plain `panesReducer(initialState, restoreLayout(...))`, no store/middleware needed (note `restoreLayout` early-returns if the tab already has a layout, which the model test's `initialState` handles):
+The RED gate targets gap (a): `normalizePaneContent`'s fresh-agent branch drops the trio on the live paths. The restore-strip test is NOT the red gate — it is GREEN on base, but for the WRONG reason (normalize drops the trio before `stripStaleIds` matters); after Step 3 it becomes load-bearing because `stripStaleIds` is then the sole strip point on the restore path. Model reducer mechanics on the existing `stripStaleIds` fresh-agent test at `test/unit/client/store/panesSlice.test.ts:4238-4292` ("strips stale fresh-agent runtime identity while preserving durable resume options") — plain `panesReducer(...)`, no store/middleware needed (note `restoreLayout` early-returns if the tab already has a layout, which the model test's `initialState` handles; pre-Step-3, seed the trio with the same `as`-cast trick the model uses — the fields land on the type in Step 3):
 
 ```ts
 import { describe, expect, it } from 'vitest'
 
 describe('fresh-agent reconcile volatile fields', () => {
+  it('the fold trio survives initLayout normalization on fresh-agent leaves (RED gate)', () => {
+    // RED on base: normalizePaneContent's fresh-agent branch enumerates its
+    // output fields (no rest spread) and silently drops all three.
+    const state = panesReducer(initialState, initLayout({
+      tabId: 'tab-1', paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+        createRequestId: 'req-1', status: 'connected',
+        reconcileEpoch: 3, pendingReconcile: 'respawn', reconcileNotice: 'x',
+      } as PaneContentInput,
+    }))
+    const content = leafContent(state, 'tab-1')
+    expect(content.reconcileEpoch).toBe(3)
+    expect(content.pendingReconcile).toBe('respawn')
+    expect(content.reconcileNotice).toBe('x')
+  })
+
+  it('the fold trio survives updatePaneContent normalization (live patch path, RED gate)', () => {
+    // RED on base for the same reason. This is the path the created-ack patch,
+    // session.materialized patches, and Task 14's nudge flow through (:1378) —
+    // preserving here is what stops unrelated patches wiping fold state.
+    let state = panesReducer(initialState, initLayout({
+      tabId: 'tab-1', paneId: 'pane-1',
+      content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', createRequestId: 'req-1', status: 'connected' },
+    }))
+    state = panesReducer(state, updatePaneContent({
+      tabId: 'tab-1', paneId: 'pane-1',
+      content: {
+        ...leafContent(state, 'tab-1'),
+        reconcileEpoch: 1, pendingReconcile: 'fresh', reconcileNotice: 'n',
+      } as PaneContentInput,
+    }))
+    const content = leafContent(state, 'tab-1')
+    expect(content.reconcileEpoch).toBe(1)
+    expect(content.pendingReconcile).toBe('fresh')
+    expect(content.reconcileNotice).toBe('n')
+  })
+
   it('restoreLayout strips reconcileEpoch/pendingReconcile/reconcileNotice from fresh-agent leaves', () => {
-    // Copy the reducer mechanics from panesSlice.test.ts:4238-4292 exactly,
-    // adding the three fold fields to the restored leaf's content (use the same
-    // `as PaneNode` cast as the model — the fields land on the type in Step 3):
+    // GREEN ON BASE — but vacuously (normalizePaneContent drops the trio before
+    // stripStaleIds is even consulted). NOT part of the red gate. After Step 3
+    // preserves the trio in normalizePaneContent, THIS test is what proves the
+    // stripStaleIds edit: it is then the only thing keeping volatile fold state
+    // out of restored layouts. Copy the reducer mechanics from
+    // panesSlice.test.ts:4238-4292 exactly, adding the three fold fields to the
+    // restored leaf's content (same `as PaneNode` cast as the model):
     const state = panesReducer(initialState, restoreLayout({
       tabId: 'tab-1',
       layout: leafWith({
@@ -285,14 +329,14 @@ describe('fresh-agent reconcile volatile fields', () => {
 })
 ```
 
-`leafWith`/`restoredLeafContent` are trivial local helpers copied from the model test's mechanics; `persistLeafWithContent` is a local helper copying the store+middleware setup from `test/unit/client/store/panesSlice.reconcile.test.ts:214-251` with a fresh-agent leaf swapped in.
+`leafWith`/`leafContent`/`restoredLeafContent` are trivial local helpers copied from the model test's mechanics (`leafContent(state, tabId)` reads the leaf's content back out of `state.layouts[tabId]`, throwing unless it is a fresh-agent leaf); `persistLeafWithContent` is a local helper copying the store+middleware setup from `test/unit/client/store/panesSlice.reconcile.test.ts:214-251` with a fresh-agent leaf swapped in.
 
 - [ ] **Step 2: Run to verify failure**
 
 ```bash
 npm run test:vitest -- run test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts
 ```
-Expected: the `restoreLayout` test FAILS at runtime — `stripStaleIds`'s fresh-agent arm only strips `sessionId`/`createRequestId`/`status`/`serverInstanceId`/`createError` today, so all three fold fields survive restore and the `in` assertions fail. That is the red state. (vitest does not typecheck, so the not-yet-declared fields cause no compile error.) The persistence test PASSES on base — that is expected; it is regression coverage, not the gate.
+Expected: the two SURVIVAL tests (`initLayout` and `updatePaneContent`) FAIL at runtime — `normalizePaneContent`'s fresh-agent branch enumerates its output fields with no rest spread, so the seeded trio is dropped and the equality assertions fail. That is the red state. (vitest does not typecheck, so the not-yet-declared fields cause no compile error.) The `restoreLayout` strip test PASSES on base — vacuously, because normalize drops the trio before `stripStaleIds` matters; it becomes load-bearing after Step 3. The persistence test PASSES on base — regression coverage, not the gate.
 
 - [ ] **Step 3: Implement**
 
@@ -307,7 +351,21 @@ Expected: the `restoreLayout` test FAILS at runtime — `stripStaleIds`'s fresh-
   reconcileEpoch?: number
 ```
 
-`src/store/panesSlice.ts` `stripStaleIds` fresh-agent arm (~:869-890) — add the three fields to the destructure:
+(Do the paneTypes edit FIRST — it makes the `input.reconcileNotice`/`input.pendingReconcile`/`input.reconcileEpoch` reads below typecheck; the fields propagate automatically to `FreshAgentPaneInput` (:234) and the `PaneContent` union.)
+
+`src/store/panesSlice.ts` `normalizePaneContent` fresh-agent branch — add the trio to BOTH returned object literals: the main return (insert after the `...(pendingLocalEcho ? { pendingLocalEcho } : {})` line at :203, before the closing `}` at :204) AND the restoreError early return (same trailing position, after :159, before the `}` at :160). Mirror the terminal branch's exact style for these same three fields (:98-102) — direct typed-guard assignment with `undefined` fallback, no `previous` merge:
+
+```ts
+      reconcileNotice: typeof input.reconcileNotice === 'string' ? input.reconcileNotice : undefined,
+      pendingReconcile: input.pendingReconcile === 'respawn' || input.pendingReconcile === 'fresh'
+        ? input.pendingReconcile
+        : undefined,
+      reconcileEpoch: typeof input.reconcileEpoch === 'number' ? input.reconcileEpoch : undefined,
+```
+
+This is the load-bearing edit of the task: it makes fold state survive every live normalization — `initLayout` (:933, also the path Task 9's store-backed test harness seeds through), `updatePaneContent` (:1378 — the created-ack patch, `session.materialized` patches, and Task 14's nudge), and `hydratePanes` (:407) — so a `corrected` reconcileNotice or an armed `pendingReconcile` is never wiped by an unrelated content patch (the binding "corrected is always user-visible" rule depends on this). Terminal precedent: the same trio in the same function, added for B1.
+
+`src/store/panesSlice.ts` `stripStaleIds` fresh-agent arm (~:869-890) — add the three fields to the destructure (with the normalize edit above in place, this becomes the SOLE strip point on the `restoreLayout` path — `stripStaleIds` runs before `normalizePaneContent` in `normalizeRestoredTree` (:900), so fields stripped here never reach the preserving literals):
 
 ```ts
 if (content.kind === 'fresh-agent') {
@@ -333,7 +391,7 @@ Expected: PASS (including the pre-existing fresh-agent persistence suite — no 
 
 ```bash
 git add src/store/paneTypes.ts src/store/panesSlice.ts test/unit/client/store/panesSlice.fresh-agent-reconcile.test.ts
-git commit -m "feat(reconcile): fresh-agent volatile fold fields (epoch/pending/notice) + restoreLayout strip"
+git commit -m "feat(reconcile): fresh-agent volatile fold fields survive normalization; stripped on restore + persist"
 ```
 
 ---
@@ -1143,7 +1201,7 @@ git commit -m "fix(reconcile): terminal mount create waits (bounded) for the pan
 - Test: `test/unit/client/components/FreshAgentView.reconcile.test.tsx` (create; reuse the harness from `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` — place the new file next to it: `test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx`)
 
 **Interfaces:**
-- Consumes: Task 2 fields, Task 3 reducers, Task 6 pending map, `RECONCILE_VERDICT_WAIT_MS` (import from `src/lib/ws-client.ts` — the one Task 6b definition).
+- Consumes: Task 2 fields AND Task 2's `normalizePaneContent` fresh-agent preservation — the store-backed harness seeds pane content via `store.dispatch(initLayout(...))`, which normalizes at panesSlice.ts:933; without Task 2's normalize change any seeded `pendingReconcile`/`reconcileNotice`/`reconcileEpoch` would be silently dropped before the component ever saw it. Also Task 3 reducers, Task 6 pending map, `RECONCILE_VERDICT_WAIT_MS` (import from `src/lib/ws-client.ts` — the one Task 6b definition).
 - Produces:
   1. A fold on a mounted fresh-agent pane re-fires the create effect via `reconcileEpoch` (same `createRequestId`).
   2. `freshAgent.created` consumes `pendingReconcile` (sets it `undefined`) — stale intent never survives a completed create.
@@ -1231,7 +1289,7 @@ it('a HIDDEN pane composes with the pending gate: nothing enqueues pre-verdict, 
 ```bash
 npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.reconcile.test.tsx
 ```
-Expected: FAIL on all five.
+Expected: FAIL on all six. Note the seeding dependency: the `freshAgent.created clears pendingReconcile` and `reconcileNotice renders once` tests only reach the component because Task 2's `normalizePaneContent` change lets the harness's `initLayout` seed carry `pendingReconcile`/`reconcileNotice` into the store — with that in place they fail for the RIGHT reason on this task's base (the created-ack patch does not yet clear `pendingReconcile`; nothing renders a `role="status"` notice yet). If either is unexpectedly GREEN here, suspect Task 2's normalize edit was skipped — HALT and re-check, do not weaken the assertions.
 
 - [ ] **Step 3: Implement** — in `FreshAgentView.tsx`:
 
