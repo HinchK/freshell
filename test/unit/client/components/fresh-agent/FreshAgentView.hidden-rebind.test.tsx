@@ -7,7 +7,7 @@ import settingsReducer from '@/store/settingsSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
-import { resetRebindQueueForTests } from '@/lib/rebind-queue'
+import { getRebindQueue, resetRebindQueueForTests } from '@/lib/rebind-queue'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 
 // Claude snapshot hydration is keyed by Claude's durable UUID
@@ -283,6 +283,67 @@ describe('FreshAgentView hidden-pane create rebind (F8)', () => {
     expect(createFramesSent().length).toBe(4)
     act(() => { vi.advanceTimersByTime(10_000) })
     expect(createFramesSent().length).toBe(6)
+  })
+
+  it('a hidden create queued behind a full queue does not send after unmount', () => {
+    // Fill all 4 slots with blocker jobs that never release (freed only by
+    // the 10s auto-release backstop).
+    const queue = getRebindQueue()
+    for (let i = 0; i < 4; i++) {
+      queue.enqueue({ key: `blocker-${i}`, run: () => {} })
+    }
+    act(() => { vi.advanceTimersByTime(500) })
+    const { unmount } = renderView({
+      paneContent: {
+        ...basePaneContent,
+        sessionId: undefined,
+        status: 'creating',
+        createRequestId: 'req-unmounted',
+      },
+      hidden: true,
+    })
+    act(() => { vi.advanceTimersByTime(100) })
+    // The create job is QUEUED behind the blockers -- nothing sent yet.
+    expect(createFramesSent().length).toBe(0)
+    unmount()
+    // Blockers auto-release at 10s; the queued create job then gets its turn.
+    act(() => { vi.advanceTimersByTime(11_000) })
+    const framesForUnmountedPane = createFramesSent()
+      .filter((frame: { requestId?: string }) => frame.requestId === 'req-unmounted')
+    expect(framesForUnmountedPane.length).toBe(0)
+  })
+
+  it('the freshAgent.create.failed ack releases the queue slot', () => {
+    for (let i = 0; i < 5; i++) {
+      renderView({
+        paneContent: {
+          ...basePaneContent,
+          sessionId: undefined,
+          status: 'creating',
+          createRequestId: `req-fail-${i}`,
+        },
+        paneId: `pane-fail-${i}`,
+        hidden: true,
+      })
+    }
+    act(() => { vi.advanceTimersByTime(1_000) })
+    expect(createFramesSent().length).toBe(4)
+    // Deliver the create-failed ack for the first pane through every
+    // registered onMessage handler (mirror the created-ack test above).
+    act(() => {
+      for (const call of wsMock.onMessage.mock.calls) {
+        call[0]({
+          type: 'freshAgent.create.failed',
+          requestId: 'req-fail-0',
+          code: 'SPAWN_FAILED',
+          message: 'boom',
+          retryable: false,
+        })
+      }
+    })
+    act(() => { vi.advanceTimersByTime(1_000) })
+    // Slot released well before the 10s backstop -- the 5th create goes out.
+    expect(createFramesSent().length).toBe(5)
   })
 
   it('the freshAgent.created ack releases the queue slot', () => {

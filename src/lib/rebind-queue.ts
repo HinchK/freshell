@@ -15,7 +15,9 @@ export interface RebindJob {
   /** Dedup key, e.g. `freshagent:<paneId>:attach`. */
   key: string
   /** Runs when a slot opens. MUST eventually call release() (auto-released
-   *  after releaseTimeoutMs as a backstop). */
+   *  after releaseTimeoutMs as a backstop). Note: release() may fire
+   *  synchronously on the caller's stack (direct pump) or asynchronously
+   *  (timer/backstop) -- callers must tolerate both. */
   run: (release: () => void) => void
 }
 
@@ -31,6 +33,10 @@ export class RebindQueue {
   private readonly minStartIntervalMs: number
   private readonly queued: RebindJob[] = []
   private readonly inFlightKeys = new Set<string>()
+  // Keys re-enqueued while IN-FLIGHT (reconnect flapping): the in-flight
+  // frame may have died with its connection, so the key is re-run once when
+  // its release fires instead of being dedup-dropped.
+  private readonly rerunOnRelease = new Map<string, RebindJob>()
   private lastStartAt = Number.NEGATIVE_INFINITY
   private pumpTimer: ReturnType<typeof setTimeout> | null = null
   private inPump = false
@@ -50,7 +56,11 @@ export class RebindQueue {
   }
 
   enqueue(job: RebindJob): void {
-    if (this.inFlightKeys.has(job.key)) return
+    if (this.inFlightKeys.has(job.key)) {
+      // Coalesce, don't drop: re-run once when the in-flight job releases.
+      this.rerunOnRelease.set(job.key, job)
+      return
+    }
     if (this.queued.some((queued) => queued.key === job.key)) return
     this.queued.push(job)
     this.schedulePump(0)
@@ -65,7 +75,10 @@ export class RebindQueue {
   }
 
   private pump(): void {
-    if (this.inPump) return  // Prevent reentrancy
+    // Defensive guard, believed unreachable: every pump entry point (the
+    // schedulePump timer and release's direct call) already checks
+    // inPump/pumpTimer first. Kept as cheap insurance.
+    if (this.inPump) return
     this.inPump = true
     try {
       while (this.queued.length > 0 && this.inFlightKeys.size < this.maxInFlight) {
@@ -93,6 +106,11 @@ export class RebindQueue {
       released = true
       if (timeout) clearTimeout(timeout)
       this.inFlightKeys.delete(job.key)
+      const rerun = this.rerunOnRelease.get(job.key)
+      if (rerun) {
+        this.rerunOnRelease.delete(job.key)
+        this.queued.push(rerun)
+      }
       // Directly call pump if not currently pumping, to handle fake timer edge case
       // where scheduled setTimeout(0) from within setTimeout callback doesn't fire
       if (!this.inPump && this.pumpTimer === null) {

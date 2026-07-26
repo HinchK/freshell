@@ -674,6 +674,10 @@ export function FreshAgentView({
   // Release callback for an in-flight queued CREATE rebind; released by the
   // freshAgent.created / create-failed ack (or the queue's 10s backstop).
   const pendingRebindReleaseRef = useRef<(() => void) | null>(null)
+  // Queued rebind jobs can outlive the pane (they sit in the shared
+  // RebindQueue). Jobs check this ref so a pane closed while its create job
+  // was queued does not spawn a server session no pane owns.
+  const isMountedRef = useRef(true)
   // Session-scoped "always allow" tool names; reset with the pane, never persisted.
   const alwaysAllowToolsRef = useRef<Set<string>>(new Set())
   // Auto-title state tracks four things:
@@ -770,6 +774,16 @@ export function FreshAgentView({
     pendingRebindReleaseRef.current = null
     release?.()
   }, [])
+
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+      // Free any slot held by an un-acked create so the shared queue does
+      // not wait out the 10s backstop for a pane that no longer exists.
+      releasePendingRebind()
+    }
+  }, [releasePendingRebind])
 
   const scheduleSnapshotRefresh = useCallback((options?: { followUpIfPending?: boolean }) => {
     if (snapshotRefreshTimerRef.current !== null) {
@@ -1093,6 +1107,12 @@ export function FreshAgentView({
     if (createSentRef.current) return
     createSentRef.current = true
     const runCreate = (release?: () => void) => {
+      if (!isMountedRef.current) {
+        // Pane closed while this job sat in the queue: creating the session
+        // now would orphan it server-side with no owning pane.
+        release?.()
+        return
+      }
       const current = paneContentRef.current
       if (current.sessionId) {
         release?.()
@@ -1105,7 +1125,13 @@ export function FreshAgentView({
         sessionRef: current.sessionRef,
         cwd: current.initialCwd,
       })
-      if (release) pendingRebindReleaseRef.current = release
+      if (release) {
+        // Free any slot still held by a prior un-acked create before taking
+        // ownership of the new one (otherwise the old slot leaks until the
+        // queue's 10s backstop).
+        releasePendingRebind()
+        pendingRebindReleaseRef.current = release
+      }
       sendFreshAgentMessage(buildCreateMessage(current))
     }
     if (hiddenRef.current) {
@@ -1123,6 +1149,7 @@ export function FreshAgentView({
     dispatch,
     paneId,
     paneContent,
+    releasePendingRebind,
     sendFreshAgentMessage,
   ])
 
@@ -1135,12 +1162,19 @@ export function FreshAgentView({
       if (current.sessionId) return
       if (current.status !== 'creating' && current.status !== 'starting') return
       const resend = (release?: () => void) => {
+        if (!isMountedRef.current) {
+          release?.()
+          return
+        }
         const latest = paneContentRef.current
         if (latest.sessionId) {
           release?.()
           return
         }
-        if (release) pendingRebindReleaseRef.current = release
+        if (release) {
+          releasePendingRebind()
+          pendingRebindReleaseRef.current = release
+        }
         sendFreshAgentMessage(buildCreateMessage(latest))
       }
       if (hiddenRef.current) {
@@ -1154,6 +1188,7 @@ export function FreshAgentView({
     paneId,
     paneContent.sessionId,
     paneContent.status,
+    releasePendingRebind,
     sendFreshAgentMessage,
     ws,
   ])

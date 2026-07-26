@@ -78,6 +78,38 @@ describe('RebindQueue', () => {
     expect(queue.queuedCount).toBe(0)
   })
 
+  it('re-runs a key once when it was re-enqueued while IN-FLIGHT (reconnect flapping)', () => {
+    const queue = new RebindQueue({ maxInFlight: 1, minStartIntervalMs: 0 })
+    const runs: string[] = []
+    let heldRelease: (() => void) | null = null
+    queue.enqueue({ key: 'k', run: (release) => { runs.push('first'); heldRelease = release } })
+    vi.advanceTimersByTime(0)
+    expect(runs).toEqual(['first'])
+    // Reconnect flapping: the in-flight frame may have died with its
+    // connection. This enqueue must coalesce (re-run on release), not drop.
+    queue.enqueue({ key: 'k', run: (release) => { runs.push('second'); release() } })
+    expect(runs).toEqual(['first'])
+    heldRelease!()
+    vi.advanceTimersByTime(0)
+    expect(runs).toEqual(['first', 'second'])
+    expect(queue.inFlightCount).toBe(0)
+  })
+
+  it('a key re-enqueued while merely QUEUED still runs only once', () => {
+    const queue = new RebindQueue({ maxInFlight: 1, minStartIntervalMs: 0 })
+    const runs: string[] = []
+    let blockerRelease: (() => void) | null = null
+    queue.enqueue({ key: 'blocker', run: (release) => { runs.push('blocker'); blockerRelease = release } })
+    queue.enqueue({ key: 'k', run: (release) => { runs.push('k'); release() } })
+    queue.enqueue({ key: 'k', run: (release) => { runs.push('k-dup'); release() } })
+    vi.advanceTimersByTime(0)
+    expect(runs).toEqual(['blocker'])
+    blockerRelease!()
+    vi.advanceTimersByTime(0)
+    expect(runs).toEqual(['blocker', 'k'])
+    expect(queue.queuedCount).toBe(0)
+  })
+
   it('getRebindQueue returns a singleton reset by resetRebindQueueForTests', () => {
     const first = getRebindQueue()
     expect(getRebindQueue()).toBe(first)
