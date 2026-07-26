@@ -609,6 +609,18 @@ pub(crate) async fn spawn_terminal_pane(
         .map(str::to_string);
     let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
 
+    // Stable pane identity key (reconciliation-handshake design §5.5,
+    // precondition 2): honor a caller-supplied key (snapshot restore passes
+    // the captured one through `pane_to_create_body`), else mint one so every
+    // REST-created terminal pane is keyed. Same Uuid::simple idiom as the
+    // fresh-agent path (lib.rs `create_tab`).
+    let create_request_id = body
+        .get("createRequestId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+
     // Validate `cwd` up front: a nonexistent directory would otherwise fail
     // INSIDE the spawned child (post-fork), which a synchronous `registry.create`
     // call cannot observe -- checking here keeps the atomic-rollback contract
@@ -870,10 +882,8 @@ pub(crate) async fn spawn_terminal_pane(
         stream_id,
         &mode,
         resume_session_id.as_deref(),
-        // REST ingress mints no createRequestId (reconciliation design §5.5
-        // precondition 2 — booked for the Phase-3 adoption change).
-        None,
-        None,
+        Some(create_request_id.as_str()), // create_request_id: REST accept-or-mint key (this task)
+        None,                             // ring_max_bytes: registry default
         on_exit,
     ) {
         // Nothing was recorded yet (no tab, no pane, no map entry) -> rollback
@@ -947,6 +957,7 @@ pub(crate) async fn spawn_terminal_pane(
     let mut pane_content = json!({
         "kind": "terminal",
         "terminalId": terminal_id,
+        "createRequestId": create_request_id,
         "status": "running",
         "mode": mode,
         "shell": shell_str.clone().unwrap_or_else(|| "system".to_string()),
@@ -1657,6 +1668,99 @@ mod tests {
         assert_eq!(payload["paneContent"]["kind"], json!("terminal"));
         assert_eq!(payload["paneContent"]["terminalId"], json!(terminal_id));
         assert_eq!(payload["paneContent"]["status"], json!("running"));
+    }
+
+    #[tokio::test]
+    async fn rest_create_terminal_tab_mints_and_stamps_create_request_id() {
+        let state = state_with_registry();
+        let mut rx = state.broadcast_tx.subscribe();
+        let router = app(state.clone());
+
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({ "mode": "shell", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create failed: {body}");
+
+        // Drain the broadcast bus for the ui.command{tab.create} frame.
+        let mut pane_content = None;
+        while let Ok(frame) = rx.try_recv() {
+            let msg: Value = serde_json::from_str(&frame).unwrap();
+            if msg["command"] == json!("tab.create") {
+                pane_content = msg
+                    .get("payload")
+                    .and_then(|p| p.get("paneContent"))
+                    .cloned();
+            }
+        }
+        let pane_content = pane_content.expect("no tab.create broadcast");
+        let crid = pane_content
+            .get("createRequestId")
+            .and_then(Value::as_str)
+            .expect("paneContent.createRequestId missing");
+        assert_eq!(crid.len(), 32, "expected Uuid::simple format, got {crid:?}");
+        assert!(crid.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // The registry row was stamped with the SAME key (atomic insert).
+        let terminal_id = pane_content
+            .get("terminalId")
+            .and_then(Value::as_str)
+            .expect("paneContent.terminalId missing");
+        let registry = state.terminal_registry.clone().expect("registry wired");
+        assert_eq!(
+            registry.probe_create_request_id(terminal_id).as_deref(),
+            Some(crid),
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_create_honors_caller_supplied_create_request_id() {
+        let state = state_with_registry();
+        let mut rx = state.broadcast_tx.subscribe();
+        let router = app(state.clone());
+
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "shell",
+                "cwd": tmp.to_string_lossy(),
+                "createRequestId": "crid-fixed-key",
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create failed: {body}");
+
+        let mut pane_content = None;
+        while let Ok(frame) = rx.try_recv() {
+            let msg: Value = serde_json::from_str(&frame).unwrap();
+            if msg["command"] == json!("tab.create") {
+                pane_content = msg
+                    .get("payload")
+                    .and_then(|p| p.get("paneContent"))
+                    .cloned();
+            }
+        }
+        let pane_content = pane_content.expect("no tab.create broadcast");
+        assert_eq!(
+            pane_content.get("createRequestId").and_then(Value::as_str),
+            Some("crid-fixed-key"),
+        );
+        let terminal_id = pane_content
+            .get("terminalId")
+            .and_then(Value::as_str)
+            .expect("paneContent.terminalId missing");
+        let registry = state.terminal_registry.clone().expect("registry wired");
+        assert_eq!(
+            registry.probe_create_request_id(terminal_id).as_deref(),
+            Some("crid-fixed-key"),
+        );
     }
 
     #[tokio::test]
