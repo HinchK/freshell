@@ -364,7 +364,10 @@ fn arm_locators_for_fresh_pane_arms_the_codex_locator() {
         freshell_sessions::codex_locator::CodexLocator::new(root));
     let state = /* construct the minimal FreshAgentState the sibling
                    create-path tests use */
-        .with_codex_locator(locator.clone());
+        .with_codex_locator(Some(locator.clone()));
+    // Some(...) matches the sibling test-helper convention: the existing
+    // locator tests pass Some(std::sync::Arc::new(...)) (terminal_tabs.rs:2327-2337)
+    // because the builders take Option (with_amplifier_locator, lib.rs:362-368).
 
     arm_locators_for_fresh_pane(&state, "term-codex-1", "codex", Some("/tmp/proj"), None);
 
@@ -381,26 +384,27 @@ Expected: compile FAILURE — no `with_codex_locator`, no `codex_locator` field.
 
 - [ ] **Step 3: Implement (GREEN)**
 
-1. `lib.rs`: add field + builder, byte-for-byte mirroring the amplifier pair:
+1. `lib.rs`: add field + builder, byte-for-byte mirroring the amplifier pair — the amplifier builder takes `Option<Arc<...>>` and assigns it directly (`with_amplifier_locator`, `lib.rs:362-368`), so the codex sibling must too:
 ```rust
     codex_locator: Option<std::sync::Arc<freshell_sessions::codex_locator::CodexLocator>>,
 ```
 ```rust
     pub fn with_codex_locator(
         mut self,
-        locator: std::sync::Arc<freshell_sessions::codex_locator::CodexLocator>,
+        locator: Option<std::sync::Arc<freshell_sessions::codex_locator::CodexLocator>>,
     ) -> Self {
-        self.codex_locator = Some(locator);
+        self.codex_locator = locator;
         self
     }
 ```
+Also add `codex_locator: None,` to the `Self::new` struct literal, alongside the existing `amplifier_locator: None` / `opencode_locator: None` defaults (`lib.rs:247-248`) — the struct will not compile without it.
 2. `terminal_tabs.rs:458-471`, extend `arm_locators_for_fresh_pane`:
 ```rust
     if let Some(locator) = &state.codex_locator {
         locator.arm(terminal_id, mode, true, resume_session_id, cwd /* + now_ms if the signature takes it -- match codex_association.rs */);
     }
 ```
-3. `main.rs:358-361`: chain `.with_codex_locator(codex_locator.clone())` where amplifier/opencode are wired, cloning the `Arc<CodexLocator>` from `main.rs:349-350`.
+3. `main.rs:358-361`: chain `.with_codex_locator(codex_locator.clone())` where amplifier/opencode are wired. This clones the whole `Option<Arc<CodexLocator>>` binding from `main.rs:349-350` — exactly the shape the existing `.with_amplifier_locator(amplifier_locator.clone())` call passes — and must sit BEFORE `codex_locator` is later moved into the `ws_state` construction.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -414,15 +418,24 @@ The codex locator is Enter-anchored (`note_submit`, `codex_locator.rs:212`). Ver
 grep -rn "note_submit" crates/ --include="*.rs" | grep -v "codex_locator.rs\|_tests\|tests/"
 ```
 - If the call sites live on the shared terminal-input/registry write path (reached by BOTH browser keystrokes and REST `POST /api/panes/:id/send-keys`): record "note_submit: shared path, REST covered" in the Verification Report. No change.
-- If the call sites are WS-handler-only (REST send-keys never anchors the window): add to the REST `send_keys` handler in `crates/freshell-freshagent` (where the keys are written to the terminal), gated to payloads containing `\r` or `\n`, mirroring the WS path's gating exactly:
+- If the codex call sites are WS-handler-only (REST send-keys never anchors the codex window — this is the expected grep outcome: `maybe_send_keys`, `terminal_tabs.rs:1238-1294`, feeds only the amplifier/opencode locators today): add a codex call to that handler with THREE constraints the existing amplifier/opencode calls do NOT share:
+  1. **Order — BEFORE the PTY write.** The codex locator's contract (`codex_association.rs:49-56`) requires the first `note_submit`'s `known_files` re-snapshot to COMPLETE before the Enter byte reaches the PTY — a re-snapshot racing after the write can capture (permanently exclude) the pane's own rollout file. `maybe_send_keys` is synchronous, so a plain call placed before `registry.input(&terminal_id, text.as_bytes())` (`terminal_tabs.rs:1275`) satisfies the ordering. Leave the existing after-write amplifier/opencode calls (`:1287/:1290`) exactly where they are — their `note_submit` is cheap and carries no such contract.
+  2. **Gate — the handler's existing crate-local `is_submit_input`** (`terminal_tabs.rs:1301-1303`, the same bare-CR/LF-run rule every WS association gate uses). Do NOT gate on `contains('\r')` (that matches `"hello\r\n"`, which is not a submit) and do NOT import the gate from `freshell-ws` (circular dependency — see `lib.rs:168-171`).
+  3. **No mode check.** There is no `mode` binding in this handler and none is needed: `CodexLocator::note_submit` no-ops for terminals the locator never armed, and only codex panes are armed.
 ```rust
-    if mode == "codex" && (keys.contains('\r') || keys.contains('\n')) {
+    // Insert BEFORE the existing `registry.input(&terminal_id, text.as_bytes());`
+    // at terminal_tabs.rs:1275:
+    if is_submit_input(text) {
         if let Some(locator) = &state.codex_locator {
+            // Contract (codex_association.rs:49-56): must complete before the
+            // Enter byte reaches the PTY. Synchronous call before the write =
+            // ordered. First submit does a bounded sessions-tree walk; later
+            // submits are a cheap mutex hop.
             locator.note_submit(&terminal_id, now_ms());
         }
     }
 ```
-  …with a sibling unit test asserting `note_submit` armed-window behavior (mirror the WS-path test if one exists), and record "note_submit: REST path added" in the report. Either branch MUST leave a report entry.
+  …with a sibling unit test asserting `note_submit` armed-window behavior (mirror the WS-path test if one exists), and record "note_submit: REST path added (before-write, is_submit_input-gated)" in the report. Either branch MUST leave a report entry.
 
 - [ ] **Step 6: Clippy (workspace — this task touched 2 crates) + commit**
 
@@ -651,7 +664,7 @@ async function seedCodexRollout(homeDir: string, threadId: string, cwd: string):
 }
 
 test('case-b: REST-created resume tabs are green and dedupe on click', async ({ page }) => {
-  await bootAndConnect(page, info)
+  const harness = await bootAndConnect(page, info) // keep the TestHarness -- the dedupe gate below needs it
   await seedCodexRollout(info.homeDir, SEEDED_CODEX_THREAD_ID, PROJECT_DIR)
 
   for (const [mode, sessionId] of [
@@ -678,20 +691,26 @@ test('case-b: REST-created resume tabs are green and dedupe on click', async ({ 
     await expect(row).toHaveCount(1)
 
     // Dedupe contract: clicking the green row focuses the existing pane
-    // instead of opening a second tab (donor: remote-tab-linkage:253).
-    // Harness global is window.__FRESHELL_TEST_HARNESS__ (helpers/test-harness.ts:150).
-    // Deliberately NO optional chaining and NO fallback value: if the harness
-    // is missing this evaluate must THROW, not have both sides default to the
-    // same sentinel and pass vacuously.
-    const tabsBefore = await page.evaluate(() => (window as any).__FRESHELL_TEST_HARNESS__.getTabCount())
+    // instead of opening a second tab (donor: remote-tab-linkage:252-255).
+    // getTabCount() is a NODE-SIDE TestHarness method
+    // (helpers/test-harness.ts:150-155) that reads
+    // window.__FRESHELL_TEST_HARNESS__?.getState() inside the page. The
+    // window global itself has NO getTabCount method (src/lib/test-harness.ts
+    // exposes getState/dispatch/getWsReadyState/...), so never call
+    // getTabCount via page.evaluate -- that throws on every run.
+    // Fail-loud guard: getTabCount() returns 0 when the harness is missing,
+    // so pin tabsBefore > 0 (this loop just created tabs) to make a vacuous
+    // 0 === 0 pass impossible.
+    const tabsBefore = await harness.getTabCount()
+    expect(tabsBefore).toBeGreaterThan(0)
     await row.click()
     await page.waitForTimeout(500)
-    const tabsAfter = await page.evaluate(() => (window as any).__FRESHELL_TEST_HARNESS__.getTabCount())
+    const tabsAfter = await harness.getTabCount()
     expect(tabsAfter).toBe(tabsBefore)
   }
 })
 ```
-(Copy the exact harness access idiom from the donor — `remote-tab-linkage-rust.spec.ts:253` — but keep it fail-loud: never add a `?? <sentinel>` fallback around `getTabCount()`, because a missing harness would then make before/after equal and the dedupe gate would pass without checking anything.)
+(Copy the exact harness access idiom from the donor — `remote-tab-linkage-rust.spec.ts:252-255` calls `await harness.getTabCount()` on the `TestHarness` instance `bootAndConnect` returns — and keep it fail-loud: never add a `?? <sentinel>` fallback around the calls, and keep the `tabsBefore > 0` pin, because a missing harness would otherwise make before/after equal (both 0) and the dedupe gate would pass without checking anything.)
 
 - [ ] **Step 2: Run it**
 
@@ -765,8 +784,18 @@ test('case-a: sidebar joins survive a graceful server restart', async ({ page })
       .toHaveAttribute('data-has-tab', 'true', { timeout: 30_000 })
   }
 
-  // Persist the layout before the restart (donor: remote-tab-linkage:277-285).
-  await page.evaluate(() => (window as any).__freshellStore?.dispatch?.({ type: 'persist/flushNow' }))
+  // Persist the layout before the restart (donor VERBATIM:
+  // remote-tab-linkage-rust.spec.ts:277-281). The dispatch goes through the
+  // window harness global __FRESHELL_TEST_HARNESS__ -- there is NO
+  // __freshellStore global anywhere in src/ or test/. The layout assertion
+  // immediately after makes the flush observable: if the harness were
+  // missing and the dispatch silently no-opped, persistedLayout would be
+  // null and this fails loudly instead of riding on debounced persist timing.
+  await page.evaluate(() => {
+    (window as any).__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
+  })
+  const persistedLayout = await page.evaluate(() => localStorage.getItem('freshell.layout.v3'))
+  expect(persistedLayout, 'persisted layout must exist after flush').toBeTruthy()
 
   // Snapshot the --resume count BEFORE the restart. The argv log is shared
   // across the whole serial suite (case-b already resumed SEEDED_CLAUDE_ID
