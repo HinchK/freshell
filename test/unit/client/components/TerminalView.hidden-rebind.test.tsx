@@ -126,7 +126,24 @@ function createStore() {
         activeTabId: 'tab-1',
       },
       panes: {
-        layouts: {},
+        // The layout MUST reference pane-1: #534's attach gate
+        // (TerminalView attachTerminal -> collectAllTerminalIds) refuses to
+        // attach any terminal the layouts don't reference. terminal.created
+        // writes the terminalId into this leaf via updatePaneContent, which
+        // is exactly what happens in production for hidden panes.
+        layouts: {
+          'tab-1': {
+            type: 'leaf' as const,
+            id: 'pane-1',
+            content: {
+              kind: 'terminal' as const,
+              mode: 'shell' as const,
+              shell: 'system' as const,
+              status: 'creating' as const,
+              createRequestId: 'req-1',
+            },
+          },
+        },
         activePane: {},
         paneTitles: {},
       },
