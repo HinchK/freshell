@@ -451,11 +451,23 @@ impl FreshCodexState {
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
 
-        let cwd = msg.cwd.clone();
-        let model = normalize_freshcodex_model(msg.model.as_deref());
-        let effort = normalize_freshcodex_effort(Some(&model), msg.effort.as_deref());
-        let sandbox = msg.sandbox.map(sandbox_wire_value);
-        let permission_mode = msg.permission_mode.clone();
+        // P1.13 (Task 5, R1): for a resume-create the client's explicit params win and
+        // the ledger record fills the gaps -- merged BEFORE normalization, so a missing
+        // model recovers the recorded one instead of being rewritten to the default.
+        let rec = match msg.resume_session_id.as_deref() {
+            Some(resume_id) => self
+                .identity_sink()
+                .and_then(|s| s.load_settings("codex", resume_id))
+                .unwrap_or_default(),
+            None => crate::identity_sink::FreshAgentSettings::default(),
+        };
+        let cwd = msg.cwd.clone().or(rec.cwd);
+        let raw_model = msg.model.clone().or(rec.model);
+        let model = normalize_freshcodex_model(raw_model.as_deref());
+        let raw_effort = msg.effort.clone().or(rec.effort);
+        let effort = normalize_freshcodex_effort(Some(&model), raw_effort.as_deref());
+        let sandbox = msg.sandbox.map(sandbox_wire_value).or(rec.sandbox);
+        let permission_mode = msg.permission_mode.clone().or(rec.permission_mode);
 
         // Validate the effort maps to the codex wire vocabulary (adapter create calls
         // toCodexReasoningEffort purely to reject unsupported efforts before spawning).
@@ -1179,7 +1191,7 @@ impl FreshCodexState {
         &self,
         session_id: &str,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
-        let (cwd, model, effort, sandbox, permission_mode) = {
+        let (cwd, session_model, session_effort, session_sandbox, session_permission_mode) = {
             let guard = self.sessions.lock().await;
             let session = guard.get(session_id).ok_or(EnsureAliveError::NotFound)?;
             if !session.exited.load(Ordering::SeqCst) {
@@ -1191,6 +1203,29 @@ impl FreshCodexState {
                 session.effort.clone(),
                 session.sandbox.clone(),
                 session.permission_mode.clone(),
+            )
+        };
+
+        // P1.13 (Task 5, R2): a blank stored model means this registration came from a
+        // settings-less resume (a record miss at R3 time) -- fall back to the ledger
+        // record so crash recovery doesn't silently respawn onto defaults.
+        let (model, sandbox, permission_mode, effort) = if session_model.is_empty() {
+            let rec = self
+                .identity_sink()
+                .and_then(|s| s.load_settings("codex", session_id))
+                .unwrap_or_default();
+            (
+                rec.model.unwrap_or_default(),
+                rec.sandbox,
+                rec.permission_mode,
+                rec.effort,
+            )
+        } else {
+            (
+                session_model,
+                session_sandbox,
+                session_permission_mode,
+                session_effort,
             )
         };
 
@@ -1862,14 +1897,41 @@ impl FreshCodexState {
             .await
             .map_err(ResumeSessionError::Transient)?;
 
+        // P1.13 (Task 5, R3): recover this thread's recorded settings snapshot BEFORE
+        // issuing `thread/resume`, gated per V7/A10.
+        let sink = self.identity_sink();
+        let recovered = sink
+            .as_ref()
+            .and_then(|s| s.load_settings("codex", thread_id));
+        // A record miss with NO prior recording (pre-ship / historical / sidebar-opened
+        // -- the populations this resume path exists to serve, see `snapshot_runtime_for`)
+        // is ROUTINE: resume silently with defaults exactly as before. NO alarm, NO
+        // defaults write (V7).
+        if recovered.is_none()
+            && sink
+                .as_ref()
+                .is_some_and(|s| s.was_recorded("codex", thread_id))
+        {
+            // The ledger PROVES prior fresh-agent recording, yet nothing is
+            // recoverable -- the genuine "never-happens" anomaly. Alarm.
+            tracing::warn!(session = %thread_id, "freshagent.codex.settings_record_unrecoverable");
+            self.emit_fresh_agent_error(
+                thread_id,
+                "SETTINGS_RESET",
+                "Session settings could not be recovered after restart - the agent is \
+                 running with default model and permissions. Reconfirm your settings.",
+            );
+        }
+        let rec = recovered.clone().unwrap_or_default();
+
         let resume_result = client
             .resume_thread(
                 thread_id,
                 StartThreadParams {
                     cwd: cwd.map(str::to_string),
-                    model: None,
-                    sandbox: None,
-                    approval_policy: None,
+                    model: rec.model.clone(),
+                    sandbox: rec.sandbox.clone(),
+                    approval_policy: rec.permission_mode.clone(),
                 },
             )
             .await;
@@ -1935,15 +1997,14 @@ impl FreshCodexState {
                 thread_id.to_string(),
                 CodexSession {
                     client: client.clone(),
-                    // Unknown until a `freshAgent.send` supplies one (matches the
-                    // reference's `settingsByThread` being unpopulated for a thread this
-                    // process has never created/sent to); `handle_send` overwrites these
-                    // via its own `rememberThreadSettings`-equivalent path when it runs.
-                    model: String::new(),
-                    effort: None,
-                    cwd: cwd.map(str::to_string),
-                    sandbox: None,
-                    permission_mode: None,
+                    // P1.13 (Task 5, R3): the ledger record's settings snapshot -- blank
+                    // only when no record was recoverable (never-recorded historical
+                    // sessions resume on defaults, exactly as before this fix).
+                    model: rec.model.clone().unwrap_or_default(),
+                    effort: rec.effort.clone(),
+                    cwd: cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
+                    sandbox: rec.sandbox.clone(),
+                    permission_mode: rec.permission_mode.clone(),
                     active_turn: active_turn.clone(),
                     consumer,
                     kill_tx: Some(kill_tx),
@@ -1953,13 +2014,24 @@ impl FreshCodexState {
             );
         }
 
-        // P1.13 identity event (Task 4, R3): refresh write, `supersedes: None`. Until
-        // Task 5 lands this registers blanks (plus any caller-supplied cwd), so the
-        // helper's no-laundering guard makes the all-blank case a no-op -- never a
-        // defaults row for a never-recorded historical session (V7). AWAITED before
-        // this fn returns (durable-before-answer).
-        self.record_codex_binding(thread_id, None, "", None, None, None, cwd, None)
+        // P1.13 identity event (Task 5, R3): refresh write re-persisting the RECOVERED
+        // live values, `supersedes: None` -- GATED on an actual recovery. On a miss it
+        // must NOT run: writing would launder blank defaults into the ledger and
+        // permanently mask the miss (V7 §2's laundering finding). AWAITED before this
+        // fn returns (durable-before-answer).
+        if recovered.is_some() {
+            self.record_codex_binding(
+                thread_id,
+                None,
+                rec.model.as_deref().unwrap_or(""),
+                rec.sandbox.as_deref(),
+                rec.permission_mode.as_deref(),
+                rec.effort.as_deref(),
+                cwd.or(rec.cwd.as_deref()),
+                None,
+            )
             .await;
+        }
 
         Ok(ResumedCodexSession {
             client,
@@ -4133,6 +4205,141 @@ pub(crate) mod tests {
                  the reference's no-op attach()), regardless of whether a turn is active"
             );
         }
+    }
+
+    /// Task 5 (R3): a restart/reload resume of a thread the ledger holds a full settings
+    /// record for must reapply model/sandbox/permission/effort -- on the registered
+    /// session AND on the `thread/resume` RPC itself (the wire is the contract).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_after_restart_reapplies_settings_from_ledger() {
+        let _guard = ENV_LOCK.lock().await;
+        let op_log = tempfile::NamedTempFile::new().unwrap();
+        configure_fake_codex_cmd(
+            &json!({ "appendThreadOperationLogPath": op_log.path().to_str().unwrap() }).to_string(),
+        );
+        let (state, _bus) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "codex",
+            "thread-9",
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("gpt-5.3-codex-spark".into()),
+                sandbox: Some("workspace-write".into()),
+                permission_mode: Some("on-request".into()),
+                effort: Some("high".into()),
+                cwd: Some("/w".into()),
+            },
+        );
+        state.set_identity_sink(fake.clone());
+
+        // Simulate the restart path exactly as the existing R3 tests above do
+        // (`handle_attach_unknown_session_*`): attach to "thread-9", which is NOT in
+        // the in-memory map.
+        state.handle_attach(attach_msg("thread-9")).await;
+
+        // (1) The registered session carries the recovered settings:
+        let sessions = state.sessions.lock().await;
+        let s = sessions.get("thread-9").expect("session registered");
+        assert_eq!(s.model, "gpt-5.3-codex-spark");
+        assert_eq!(s.sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(s.permission_mode.as_deref(), Some("on-request"));
+        assert_eq!(s.effort.as_deref(), Some("high"));
+        drop(sessions);
+
+        // The fake app-server's log write lands from a SEPARATE OS process (see the
+        // single-flight test above) -- poll briefly for it before the one real read.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !std::fs::read_to_string(op_log.path())
+                .unwrap_or_default()
+                .contains("\"thread/resume\"")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("thread/resume reaches the fake app-server's op log");
+
+        // (2) The thread/resume RPC itself carried them (the wire is the contract):
+        let log = std::fs::read_to_string(op_log.path()).unwrap();
+        let resume_line = log
+            .lines()
+            .find(|l| l.contains("\"thread/resume\""))
+            .expect("thread/resume logged");
+        let entry: serde_json::Value = serde_json::from_str(resume_line).unwrap();
+        assert_eq!(entry["params"]["model"], "gpt-5.3-codex-spark");
+        assert_eq!(entry["params"]["sandbox"], "workspace-write");
+    }
+
+    /// V7/A10: record misses are ROUTINE (pre-ship sessions, sidebar-opened historical
+    /// threads -- R3 exists FOR them, see `snapshot_runtime_for`'s doc). They must
+    /// resume silently with defaults exactly as today, and must NOT launder a defaults
+    /// row into the ledger. Permanent regression guard for V7's no-spam rule.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_of_a_never_recorded_session_is_silent_and_writes_no_defaults_row() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (state, mut bus_rx) = state_with_bus();
+        // Deliberately empty: no record, no snapshot.
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Same R3 entry point as above for an untracked "thread-x".
+        state.handle_attach(attach_msg("thread-x")).await;
+
+        // Bounded drain: NO SETTINGS_RESET frame may appear.
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), bus_rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            assert!(
+                !text.contains("SETTINGS_RESET"),
+                "never-recorded resume must stay silent"
+            );
+        }
+        // No defaults laundering (V7 §2): no binding row was written for thread-x.
+        assert!(
+            !fake
+                .bindings
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|b| b.session_id == "thread-x"),
+            "a load_settings miss must not write a defaults row"
+        );
+    }
+
+    /// The genuine anomaly: the ledger PROVES prior fresh-agent recording, yet no
+    /// snapshot is recoverable -- the only case that alarms (V7/A10).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_with_a_prior_record_but_unrecoverable_settings_alarms_settings_reset() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (state, mut bus_rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed_recorded_only("codex", "thread-y"); // was_recorded=true, load_settings=None
+        state.set_identity_sink(fake);
+
+        // Same R3 entry point, attaching untracked "thread-y".
+        state.handle_attach(attach_msg("thread-y")).await;
+
+        let mut found = false;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), bus_rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            if text.contains("SETTINGS_RESET") {
+                // A2 qualification (V1): the frame must carry top-level
+                // sessionType/provider and a user-facing message.
+                assert!(text.contains("freshcodex") && text.contains("codex"));
+                assert!(text.contains("Reconfirm your settings"));
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "recorded-but-unrecoverable resume must broadcast SETTINGS_RESET"
+        );
     }
 
     /// REVIEW FIX (Minor, item 3): `fail_create`'s `freshAgent.create.failed` frame must
