@@ -332,18 +332,22 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - [ ] **Step 1: Regenerate**
 
 Run: `npm run contract:generate`
-Expected (validated 2026-07-26 by running the generator after a fresh `npm ci` in a
-clean clone — see `.worktrees/.the-usual-logs/port-contract-reconcile/reports/validator-clone-suite.md`):
-exits 0 and prints exactly:
+Expected: exits 0. The exact console format is the generator's own (multi-line
+summary with dialect, file paths, and a `converters:` detail line — see
+`port/contract/generate-ws-contract.ts:666-692`); do NOT gate on formatting.
+Gate ONLY on these values, all of which MUST appear in the output:
 
-```
-WS_PROTOCOL_VERSION: 7
-Schemas frozen:      66 (zod-native=66)
-Client→Server types: 29 · Server→Client types: 56
-Server shapes frozen: 56/56 · Zod cross-check: 12 overlapping, 0 required-field mismatch(es)
-```
+- `WS_PROTOCOL_VERSION: 7`
+- Schemas frozen: **66** (all zod-native, i.e. `zod-native=66`)
+- Client→Server types: **29**
+- Server→Client types: **56**
+- Server shapes frozen: **56/56**
+- Zod cross-check: **12** overlapping, **0** required-field mismatch(es)
 
-(If any of these numbers differ, another lane has moved `shared/ws-protocol.ts` —
+(The values — not the formatting — were validated 2026-07-26 by running the
+generator after a fresh `npm ci` in a clean clone; see
+`.worktrees/.the-usual-logs/port-contract-reconcile/reports/validator-clone-suite.md`.
+If any of these NUMBERS differ, another lane has moved `shared/ws-protocol.ts` —
 STOP and re-investigate.)
 
 - [ ] **Step 2: Verify the diff is purely additive and version is unchanged**
