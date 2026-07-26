@@ -25,6 +25,20 @@ function collectCreateRequestIds(node: PaneNode | null | undefined): void {
   }
 }
 
+// While the pane.reconcile protocol owns pane adoption (server acked the
+// paneReconcileV1 capability on the CURRENT connection), the legacy
+// restore/fresh-recovery latches must report not-armed: reconcile verdicts
+// carry the authoritative restore intent, and a latch firing alongside them
+// would double-restore. The bypass is a first-line early return — armed
+// entries are preserved untouched, so deactivating (census fallback, or a
+// reconnect to a server without the capability) restores the exact previous
+// behavior.
+let paneReconcileActive = false
+
+export function setPaneReconcileActive(v: boolean): void {
+  paneReconcileActive = v
+}
+
 const persisted = loadPersistedPanes()
 if (persisted?.layouts && typeof persisted.layouts === 'object') {
   for (const node of Object.values(persisted.layouts)) {
@@ -49,6 +63,7 @@ if (persisted?.layouts && typeof persisted.layouts === 'object') {
 // happens, this keeps returning true for as many interrupted restore rounds
 // as it takes to anchor.
 export function consumeTerminalRestoreRequestId(requestId: string): boolean {
+  if (paneReconcileActive) return false
   if (freshRecoveryRequestIds.has(requestId)) return false
   return restoredCreateRequestIds.has(requestId)
 }
@@ -70,6 +85,7 @@ export function addTerminalRestoreRequestId(requestId: string): void {
 export function consumeTerminalFreshRecoveryRequest(
   requestId: string,
 ): TerminalFreshRecoveryIntent | undefined {
+  if (paneReconcileActive) return undefined
   const intent = freshRecoveryRequestIds.get(requestId)
   if (!intent) return undefined
   freshRecoveryRequestIds.delete(requestId)
