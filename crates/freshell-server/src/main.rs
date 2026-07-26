@@ -1141,9 +1141,19 @@ fn transcript_definitively_absent(
             let Ok(dirs) = std::fs::read_dir(&projects) else {
                 return false; // unreadable => defer
             };
-            !dirs
-                .flatten()
-                .any(|d| d.path().join(format!("{session_id}.jsonl")).is_file())
+            for entry in dirs {
+                let Ok(entry) = entry else {
+                    return false; // per-entry read error => defer
+                };
+                let candidate = entry.path().join(format!("{session_id}.jsonl"));
+                match std::fs::metadata(&candidate) {
+                    Ok(meta) if meta.is_file() => return false, // present => never delete
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // definitely not here
+                    Err(_) => return false, // couldn't tell (e.g. unreadable subdir) => defer
+                }
+            }
+            true
         }
         "codex" => {
             // ~/.codex/sessions/** rollout files carry the session UUID in the
@@ -1164,9 +1174,19 @@ fn transcript_definitively_absent(
             let Ok(dirs) = std::fs::read_dir(&projects) else {
                 return false; // unreadable => defer
             };
-            !dirs
-                .flatten()
-                .any(|d| d.path().join("sessions").join(session_id).is_dir())
+            for entry in dirs {
+                let Ok(entry) = entry else {
+                    return false; // per-entry read error => defer
+                };
+                let candidate = entry.path().join("sessions").join(session_id);
+                match std::fs::metadata(&candidate) {
+                    Ok(meta) if meta.is_dir() => return false, // present => never delete
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // definitely not here
+                    Err(_) => return false, // couldn't tell (e.g. unreadable subdir) => defer
+                }
+            }
+            true
         }
         _ => false, // opencode (sqlite) + unknown providers: defer deletion
     }
@@ -1671,6 +1691,27 @@ mod tests {
         assert!(
             !verdict,
             "an unreadable projects root must DEFER (false), never delete"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_unreadable_project_subdir_defers() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("tempdir");
+        let projects = home.path().join(".claude").join("projects");
+        let proj = projects.join("-p");
+        std::fs::create_dir_all(&proj).expect("mkdir projects/-p");
+        std::fs::set_permissions(&proj, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 subdir");
+        let verdict = transcript_definitively_absent(home.path(), "claude", "sess-1");
+        // Restore so the tempdir can be cleaned up regardless of the assert.
+        std::fs::set_permissions(&proj, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 755 subdir");
+        assert!(
+            !verdict,
+            "a readable projects root with an UNREADABLE project subdir must \
+             DEFER (false) - the transcript may live in exactly that subdir"
         );
     }
 
