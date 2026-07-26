@@ -127,6 +127,9 @@ const RUST_ONLY_SPECS = [
   // ledger-join coherence, A2xA3 dual claude identity stores). Imports
   // RustServer directly for restartAbrupt().
   /wavea-interactions-rust\.spec\.ts$/,
+  // Lane B2 codex rollout locator: rust-only (legacy has no codex terminal
+  // locator); imports the RustServer-backed harness for same-port restart.
+  /codex-terminal-restore-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -284,6 +287,9 @@ export default defineConfig({
         // ledger-join coherence, A2xA3 dual claude identity stores). Imports
         // RustServer directly for restartAbrupt().
         /wavea-interactions-rust\.spec\.ts$/,
+        // Lane B2 codex rollout locator: rust-only (legacy has no codex terminal
+        // locator); imports the RustServer-backed harness for same-port restart.
+        /codex-terminal-restore-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
