@@ -32,7 +32,7 @@ fn put(
     captured: i64,
     recs: Vec<Value>,
 ) {
-    persist_generation(dir, "srv-1", device, "Dev", client, rev, &recs, captured);
+    let _ = persist_generation(dir, "srv-1", device, "Dev", client, rev, &recs, captured);
 }
 
 fn keyed_panes(terminal_key: Value, fresh_key: Value) -> Value {
