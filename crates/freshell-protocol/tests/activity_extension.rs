@@ -140,6 +140,7 @@ fn extension_surface_is_disjoint_from_the_frozen_inventory() {
         [
             "amplifier.activity.list.response",
             "amplifier.activity.updated",
+            "durability.degraded",
             "terminal.idle",
         ]
     );

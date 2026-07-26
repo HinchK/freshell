@@ -4,7 +4,7 @@
 mod common;
 
 use common::{
-    connect_and_capture_inventory, next_frame_of_type, sleeper_cli_spec, spawn_server_with_specs,
+    connect_and_capture_inventory, next_frame_of_type, sleeper_cli_spec, spawn_server_with_ledger,
 };
 use futures_util::SinkExt;
 use serde_json::json;
@@ -159,8 +159,17 @@ async fn codex_candidate_persisted_guards_and_happy_path() {
     let _ = std::fs::remove_file(&capture);
     std::env::set_var("CODEX_ARGV_CAPTURE_PATH", &capture);
 
-    let (url, registry) =
-        spawn_server_with_specs(vec![sleeper_cli_spec("claude"), codex_capture_spec()]).await;
+    // P1.8: a REAL ledger dir -- adoption must durably record the identity.
+    // The third tuple element (the server's own Arc) is unused: durability is
+    // verified via a FRESH reader instance constructed AFTER the adoption.
+    let ledger_dir =
+        std::env::temp_dir().join(format!("codex-adopt-ledger-{}", std::process::id()));
+    std::fs::create_dir_all(&ledger_dir).unwrap();
+    let (url, registry, _server_ledger) = spawn_server_with_ledger(
+        vec![sleeper_cli_spec("claude"), codex_capture_spec()],
+        &ledger_dir,
+    )
+    .await;
     let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
 
     // A codex terminal with NO identity yet (fresh create, no resume).
@@ -249,6 +258,24 @@ async fn codex_candidate_persisted_guards_and_happy_path() {
         registry_resume_id(&registry, &codex_tid).as_deref(),
         Some(THREAD_A)
     );
+
+    // P1.8: adoption is an identity event -- the ledger must now hold a
+    // binding row for THREAD_A, and the spawn-time pending marker must be
+    // gone (binding-first pinned order, spec §4.2).
+    let ledger = freshell_ws::pane_ledger::PaneLedger::new(Some(ledger_dir.clone()));
+    let row = ledger
+        .load_binding("codex", THREAD_A)
+        .expect("adoption wrote a binding row");
+    assert_eq!(row.state, freshell_ws::pane_ledger::RowState::Bound);
+    assert_eq!(row.live_terminal_id.as_deref(), Some(codex_tid.as_str()));
+    assert!(
+        ledger.pending_for_terminal(&codex_tid).is_none(),
+        "pending marker resolved away"
+    );
+    assert!(ledger
+        .list_pending_raw()
+        .iter()
+        .all(|m| m.terminal_id != codex_tid));
 
     // ---- Guard 3b: cross-pane hijack -- THREAD_A is live-bound to codex_tid ----
     send_create(&mut ws, "req-codex-cand-2", "codex", json!({})).await;
@@ -350,4 +377,5 @@ async fn codex_candidate_persisted_guards_and_happy_path() {
     registry.kill(&claude_tid);
     std::env::remove_var("CODEX_HOME");
     std::env::remove_var("CODEX_ARGV_CAPTURE_PATH");
+    std::fs::remove_dir_all(&ledger_dir).ok();
 }

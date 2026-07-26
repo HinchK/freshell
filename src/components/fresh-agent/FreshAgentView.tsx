@@ -19,6 +19,7 @@ import { clearPendingCreateFailure, setSessionStatus } from '@/store/freshAgentS
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
+import { getRebindQueue } from '@/lib/rebind-queue'
 import {
   normalizeFreshAgentEffort,
   normalizeFreshAgentModel,
@@ -662,6 +663,21 @@ export function FreshAgentView({
   ])
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
+  // F8 hidden-pane rebind: mirror `hidden` into a ref for use inside queued
+  // jobs and ws callbacks (same pattern as TerminalView's hiddenRef).
+  const hiddenRef = useRef(hidden)
+  useEffect(() => {
+    hiddenRef.current = hidden
+  }, [hidden])
+  // Snapshot refresh owed at next reveal (set when a reconnect happens hidden).
+  const pendingRevealRefreshRef = useRef(false)
+  // Release callback for an in-flight queued CREATE rebind; released by the
+  // freshAgent.created / create-failed ack (or the queue's 10s backstop).
+  const pendingRebindReleaseRef = useRef<(() => void) | null>(null)
+  // Queued rebind jobs can outlive the pane (they sit in the shared
+  // RebindQueue). Jobs check this ref so a pane closed while its create job
+  // was queued does not spawn a server session no pane owns.
+  const isMountedRef = useRef(true)
   // Session-scoped "always allow" tool names; reset with the pane, never persisted.
   const alwaysAllowToolsRef = useRef<Set<string>>(new Set())
   // Auto-title state tracks four things:
@@ -752,6 +768,22 @@ export function FreshAgentView({
     }
     ws.send(message as never)
   }, [paneId, ws])
+
+  const releasePendingRebind = useCallback(() => {
+    const release = pendingRebindReleaseRef.current
+    pendingRebindReleaseRef.current = null
+    release?.()
+  }, [])
+
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+      // Free any slot held by an un-acked create so the shared queue does
+      // not wait out the 10s backstop for a pane that no longer exists.
+      releasePendingRebind()
+    }
+  }, [releasePendingRebind])
 
   const scheduleSnapshotRefresh = useCallback((options?: { followUpIfPending?: boolean }) => {
     if (snapshotRefreshTimerRef.current !== null) {
@@ -998,7 +1030,7 @@ export function FreshAgentView({
       const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
       sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
       setSnapshotRefreshNonce((value) => value + 1)
-    } else if (!hidden && (current.status === 'creating' || current.status === 'starting')) {
+    } else if (current.status === 'creating' || current.status === 'starting') {
       createSentRef.current = true
       registerFreshAgentCreate(dispatch, current.createRequestId, {
         sessionType: current.sessionType,
@@ -1011,7 +1043,7 @@ export function FreshAgentView({
     }
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: refreshRequest.requestId }))
-  }, [buildCreateMessage, commitSnapshot, dispatch, hidden, paneId, refreshRequest, sendFreshAgentMessage, tabId])
+  }, [buildCreateMessage, commitSnapshot, dispatch, paneId, refreshRequest, sendFreshAgentMessage, tabId])
 
   const triggerRecovery = useCallback(() => {
     if (restoreTimeoutRef.current !== null) {
@@ -1065,7 +1097,7 @@ export function FreshAgentView({
   }, [claudeSession, dispatch, paneId, tabId])
 
   useEffect(() => {
-    if (paneContent.sessionId || hidden) return
+    if (paneContent.sessionId) return
     if (paneContent.restoreError) return
     if (
       paneContent.status !== 'creating'
@@ -1074,24 +1106,54 @@ export function FreshAgentView({
     ) return
     if (createSentRef.current) return
     createSentRef.current = true
-    registerFreshAgentCreate(dispatch, paneContent.createRequestId, {
-      sessionType: paneContent.sessionType,
-      provider: paneContent.provider,
-      resumeSessionId: paneContent.resumeSessionId,
-      sessionRef: paneContent.sessionRef,
-      cwd: paneContent.initialCwd,
-    })
-    sendFreshAgentMessage(buildCreateMessage(paneContent))
+    const runCreate = (release?: () => void) => {
+      if (!isMountedRef.current) {
+        // Pane closed while this job sat in the queue: creating the session
+        // now would orphan it server-side with no owning pane.
+        release?.()
+        return
+      }
+      const current = paneContentRef.current
+      if (current.sessionId) {
+        release?.()
+        return
+      }
+      registerFreshAgentCreate(dispatch, current.createRequestId, {
+        sessionType: current.sessionType,
+        provider: current.provider,
+        resumeSessionId: current.resumeSessionId,
+        sessionRef: current.sessionRef,
+        cwd: current.initialCwd,
+      })
+      if (release) {
+        // Free any slot still held by a prior un-acked create before taking
+        // ownership of the new one (otherwise the old slot leaks until the
+        // queue's 10s backstop).
+        releasePendingRebind()
+        pendingRebindReleaseRef.current = release
+      }
+      sendFreshAgentMessage(buildCreateMessage(current))
+    }
+    if (hiddenRef.current) {
+      getRebindQueue().enqueue({
+        // requestId in the key: a stale queued job from a superseded/unmounted
+        // instance must never dedup-block a newly minted createRequestId.
+        key: `freshagent:${paneId}:create:${paneContent.createRequestId}`,
+        run: runCreate,
+      })
+    } else {
+      runCreate()
+    }
   }, [
     buildCreateMessage,
     dispatch,
-    hidden,
+    paneId,
     paneContent,
+    releasePendingRebind,
     sendFreshAgentMessage,
   ])
 
   useEffect(() => {
-    if (hidden) return
     if (paneContent.sessionId || !createSentRef.current) return
     if (paneContent.status !== 'creating' && paneContent.status !== 'starting') return
     if (typeof ws.onReconnect !== 'function') return
@@ -1099,23 +1161,63 @@ export function FreshAgentView({
       const current = paneContentRef.current
       if (current.sessionId) return
       if (current.status !== 'creating' && current.status !== 'starting') return
-      sendFreshAgentMessage(buildCreateMessage(current))
+      const resend = (release?: () => void) => {
+        if (!isMountedRef.current) {
+          release?.()
+          return
+        }
+        const latest = paneContentRef.current
+        if (latest.sessionId) {
+          release?.()
+          return
+        }
+        if (release) {
+          releasePendingRebind()
+          pendingRebindReleaseRef.current = release
+        }
+        sendFreshAgentMessage(buildCreateMessage(latest))
+      }
+      if (hiddenRef.current) {
+        getRebindQueue().enqueue({ key: `freshagent:${paneId}:create:${current.createRequestId}`, run: resend })
+      } else {
+        resend()
+      }
     })
   }, [
     buildCreateMessage,
-    hidden,
+    paneId,
     paneContent.sessionId,
     paneContent.status,
+    releasePendingRebind,
     sendFreshAgentMessage,
     ws,
   ])
 
   useEffect(() => {
-    if (!paneContent.sessionId || hidden) return
-    sendFreshAgentMessage(buildFreshAgentAttachMessage(paneContent, freshOpenCodeRouteCwd))
+    if (!paneContent.sessionId) return
+    const sendAttach = () => {
+      const current = paneContentRef.current
+      if (!current.sessionId) return
+      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+      sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
+    }
+    if (hiddenRef.current) {
+      // Hidden: cheap session rebind still happens, but paced through the
+      // rebind queue so 20 background panes do not stampede the server.
+      getRebindQueue().enqueue({
+        key: `freshagent:${paneId}:attach`,
+        run: (release) => {
+          sendAttach()
+          // attach has no ack frame -- hold the slot briefly for spacing.
+          setTimeout(release, 100)
+        },
+      })
+    } else {
+      sendAttach()
+    }
   }, [
     freshOpenCodeRouteCwd,
-    hidden,
+    paneId,
     paneContent.provider,
     paneContent.resumeSessionId,
     paneContent.sessionId,
@@ -1126,21 +1228,48 @@ export function FreshAgentView({
   ])
 
   useEffect(() => {
-    if (hidden || !paneContent.sessionId) return
+    if (!paneContent.sessionId) return
     if (typeof ws.onReconnect !== 'function') return
     return ws.onReconnect(() => {
       const current = paneContentRef.current
       if (!current.sessionId) return
-      const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-      sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
-      scheduleSnapshotRefresh()
+      const sendAttach = () => {
+        const latest = paneContentRef.current
+        if (!latest.sessionId) return
+        const cwd = getFreshOpenCodeRouteCwd(latest, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+        sendFreshAgentMessage(buildFreshAgentAttachMessage(latest, cwd))
+      }
+      if (hiddenRef.current) {
+        getRebindQueue().enqueue({
+          key: `freshagent:${paneId}:attach`,
+          run: (release) => {
+            sendAttach()
+            setTimeout(release, 100)
+          },
+        })
+        // Surface hydration (HTTP transcript snapshot fetch) is EXPENSIVE --
+        // defer it until reveal instead of fetching for every hidden pane.
+        pendingRevealRefreshRef.current = true
+      } else {
+        sendAttach()
+        scheduleSnapshotRefresh()
+      }
     })
-  }, [hidden, paneContent.sessionId, scheduleSnapshotRefresh, sendFreshAgentMessage, ws])
+  }, [paneId, paneContent.sessionId, scheduleSnapshotRefresh, sendFreshAgentMessage, ws])
+
+  // F8: consume the deferred snapshot refresh on reveal.
+  useEffect(() => {
+    if (hidden) return
+    if (!pendingRevealRefreshRef.current) return
+    pendingRevealRefreshRef.current = false
+    scheduleSnapshotRefresh()
+  }, [hidden, scheduleSnapshotRefresh])
 
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
     const unsubscribe = ws.onMessage((message) => {
       if (message.type === 'freshAgent.created' && message.requestId === paneContentRef.current.createRequestId) {
+        releasePendingRebind()
         const current = paneContentRef.current
         persistDurableFreshAgentFlavor(message)
         dispatch(updatePaneContent({
@@ -1161,6 +1290,7 @@ export function FreshAgentView({
         }))
       }
       if (message.type === 'freshAgent.create.failed' && message.requestId === paneContentRef.current.createRequestId) {
+        releasePendingRebind()
         dispatch(updatePaneContent({
           tabId,
           paneId,
@@ -1274,7 +1404,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [agentSession?.cwd, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, scheduleSnapshotRefresh, sendFreshAgentMessage, setLocalEcho, tabId, ws])
+  }, [agentSession?.cwd, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, releasePendingRebind, scheduleSnapshotRefresh, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return

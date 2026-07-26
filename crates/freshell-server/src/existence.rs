@@ -29,13 +29,21 @@ pub struct IndexExistenceProbe {
     index: Arc<SessionIndex>,
     /// `provider:sessionId` keys ever seen in ANY snapshot this boot.
     observed: Mutex<HashSet<String>>,
+    /// P1.8 (spec §4.2 read 2): the durable "ever bound by this server"
+    /// memory — survives restarts, so a transcript deleted while the server
+    /// was down yields loud dead_session, not silent fresh.
+    ledger: Option<Arc<freshell_ws::pane_ledger::PaneLedger>>,
 }
 
 impl IndexExistenceProbe {
-    pub fn new(index: Arc<SessionIndex>) -> Self {
+    pub fn new(
+        index: Arc<SessionIndex>,
+        ledger: Option<Arc<freshell_ws::pane_ledger::PaneLedger>>,
+    ) -> Self {
         Self {
             index,
             observed: Mutex::new(HashSet::new()),
+            ledger,
         }
     }
 
@@ -86,10 +94,17 @@ impl SessionExistenceProbe for IndexExistenceProbe {
     }
 
     fn ever_observed(&self, provider: &str, session_id: &str) -> bool {
-        self.observed
+        if self
+            .observed
             .lock()
             .expect("observed set lock")
             .contains(&format!("{provider}:{session_id}"))
+        {
+            return true;
+        }
+        self.ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.ever_bound(provider, session_id))
     }
 }
 
@@ -137,7 +152,72 @@ mod tests {
             Duration::from_millis(50),
             None, // no persistent parse-cache — fully isolated temp home
         ));
-        (IndexExistenceProbe::new(Arc::clone(&index)), index)
+        (IndexExistenceProbe::new(Arc::clone(&index), None), index)
+    }
+
+    /// Construct a probe exactly as `main.rs` does — over an index whose
+    /// provider home is an EMPTY temp dir (the transcript is gone) — with the
+    /// given ledger handle. The home leaks intentionally: it's a per-test
+    /// unique temp path and the OS temp cleaner owns it.
+    fn new_test_probe_with_ledger(
+        ledger: Option<std::sync::Arc<freshell_ws::pane_ledger::PaneLedger>>,
+    ) -> IndexExistenceProbe {
+        let home = temp_claude_home("with-ledger");
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(ClaudeSource::new(home)) as Arc<dyn SessionSource>],
+            Duration::from_millis(50),
+            None,
+        ));
+        IndexExistenceProbe::new(index, ledger)
+    }
+
+    #[test]
+    fn ever_observed_survives_a_restart_via_the_ledger() {
+        // Spec §4.2 read 2: a transcript deleted while the server was DOWN
+        // must yield loud dead_session, not silent fresh. The per-boot
+        // observed set is empty after a restart — the ledger is the durable
+        // memory. (The Absent+ever_observed => dead_session derivation is
+        // already pinned by reconcile.rs's
+        // `row4_absent_but_ever_observed_yields_dead_session`; this test
+        // covers the INPUT seam.)
+        let dir = std::env::temp_dir().join(format!(
+            "ledger-everobs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger =
+            std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone())));
+        // "Generation 1" bound this identity durably.
+        ledger
+            .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                provider: "claude",
+                session_id: "11111111-2222-3333-4444-555555555555",
+                terminal_id: "t1",
+                mode: "claude",
+                cwd: None,
+                create_request_id: None,
+                now_ms: 1_000,
+            })
+            .unwrap();
+
+        // "Generation 2": a brand-new probe with an EMPTY observed set —
+        // construct it exactly as main.rs does, over an index whose
+        // provider home is an empty temp dir (the transcript is gone).
+        let probe = new_test_probe_with_ledger(Some(std::sync::Arc::clone(&ledger)));
+        assert!(
+            probe.ever_observed("claude", "11111111-2222-3333-4444-555555555555"),
+            "durable ledger memory answers across restarts"
+        );
+        assert!(!probe.ever_observed("claude", "99999999-2222-3333-4444-555555555555"));
+
+        // Without a ledger, the old per-boot behavior is preserved.
+        let bare = new_test_probe_with_ledger(None);
+        assert!(!bare.ever_observed("claude", "11111111-2222-3333-4444-555555555555"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

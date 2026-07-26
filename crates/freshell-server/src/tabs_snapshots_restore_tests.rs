@@ -598,6 +598,32 @@ fn create_body_carries_full_terminal_state_including_codex_durability() {
     assert_eq!(body["sessionRef"]["sessionId"], "s-1");
 }
 
+#[test]
+fn create_body_carries_create_request_id_and_omits_when_absent() {
+    // Captured key passes through (P1.6: snapshot-restored panes keep identity).
+    let pane = json!({ "paneId": "p1", "kind": "terminal", "payload": {
+        "mode": "shell", "shell": "system",
+        "createRequestId": "crid-from-snapshot"
+    }});
+    let body = pane_to_create_body(None, &pane).unwrap();
+    assert_eq!(body["createRequestId"], "crid-from-snapshot");
+
+    // Legacy snapshot without the field: body omits it entirely (the REST
+    // ingress mints a fresh key in that case — never emit null/empty).
+    let legacy = json!({ "paneId": "p2", "kind": "terminal", "payload": {
+        "mode": "shell", "shell": "system"
+    }});
+    let legacy_body = pane_to_create_body(None, &legacy).unwrap();
+    assert!(legacy_body.get("createRequestId").is_none());
+
+    // Wrong-typed field is dropped, not an error (same tolerance as shell/cwd).
+    let wrong = json!({ "paneId": "p3", "kind": "terminal", "payload": {
+        "mode": "shell", "createRequestId": 42
+    }});
+    let wrong_body = pane_to_create_body(None, &wrong).unwrap();
+    assert!(wrong_body.get("createRequestId").is_none());
+}
+
 #[tokio::test]
 async fn restore_round_trips_non_default_pane_state_to_the_client() {
     // FULL PANE STATE (`:245`): NON-default captured values must reach the

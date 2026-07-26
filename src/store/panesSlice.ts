@@ -61,10 +61,15 @@ function readRestoreError(value: unknown): RestoreError | undefined {
 function normalizePaneContent(
   rawInput: PaneContentInput | PaneContent | Record<string, unknown>,
   previous?: PaneContent,
+  options?: { inheritCreateRequestId?: boolean },
 ): PaneContent {
   const input = migrateLegacyFreshAgentContent(rawInput as Record<string, unknown>) as LivePaneContentInput | PaneContent
   if (input.kind === 'terminal') {
     const mode = typeof input.mode === 'string' ? input.mode : 'shell'
+    const previousCreateRequestId =
+      options?.inheritCreateRequestId && previous?.kind === 'terminal'
+        ? previous.createRequestId
+        : undefined
     const inputResumeSessionId = typeof input.resumeSessionId === 'string'
       ? input.resumeSessionId
       : undefined
@@ -77,7 +82,7 @@ function normalizePaneContent(
       terminalId: typeof input.terminalId === 'string' ? input.terminalId : undefined,
       createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
         ? input.createRequestId
-        : nanoid(),
+        : previousCreateRequestId || nanoid(),
       status: typeof input.status === 'string' ? input.status : 'creating',
       mode,
       shell: typeof input.shell === 'string' ? input.shell : 'system',
@@ -105,6 +110,10 @@ function normalizePaneContent(
   }
   if (input.kind === 'fresh-agent') {
     const rawFreshAgent = input as Record<string, unknown>
+    const previousCreateRequestId =
+      options?.inheritCreateRequestId && previous?.kind === 'fresh-agent'
+        ? previous.createRequestId
+        : undefined
     const existingRestoreError = readRestoreError(rawFreshAgent.restoreError)
     const style = normalizeFreshAgentStyleOverride((input as { style?: unknown }).style)
     const pendingLocalEcho = normalizeFreshAgentPendingLocalEcho(rawFreshAgent.pendingLocalEcho)
@@ -115,7 +124,9 @@ function normalizePaneContent(
         sessionType: input.sessionType,
         provider: input.provider,
         sessionId: input.sessionId,
-        createRequestId: input.createRequestId || nanoid(),
+        createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
+          ? input.createRequestId
+          : previousCreateRequestId || nanoid(),
         status,
         ...(existingRestoreError.reason === 'invalid_legacy_restore_target'
           ? {}
@@ -158,7 +169,9 @@ function normalizePaneContent(
       sessionType: input.sessionType,
       provider: input.provider,
       sessionId: input.sessionId,
-      createRequestId: input.createRequestId || nanoid(),
+      createRequestId: typeof input.createRequestId === 'string' && input.createRequestId
+        ? input.createRequestId
+        : previousCreateRequestId || nanoid(),
       status,
       ...(typeof input.resumeSessionId === 'string' ? { resumeSessionId: input.resumeSessionId } : {}),
       ...(sessionRef ? { sessionRef } : {}),
@@ -374,7 +387,13 @@ function normalizePaneTree(node: PaneNode, previous?: PaneNode): PaneNode | null
     const previousLeaf = previousValid ? findLeaf(previousValid, node.id) : null
     const normalizedLeaf: Extract<PaneNode, { type: 'leaf' }> = {
       ...node,
-      content: normalizePaneContent(node.content, previousLeaf?.content),
+      // Hydrate-scoped: normalizePaneTree is reachable ONLY from hydratePanes,
+      // so this is the one place a key-less incoming pane may inherit the
+      // previous (local) same-kind pane's createRequestId instead of minting.
+      // updatePaneContent et al. pass no options and keep minting — the
+      // resume/repair rotation contract (tabsSlice.ts repairExistingTabLayout,
+      // ContextMenuProvider reopen-in-pane) depends on that.
+      content: normalizePaneContent(node.content, previousLeaf?.content, { inheritCreateRequestId: true }),
     }
     if (isWellFormedPaneTree(normalizedLeaf)) {
       return normalizedLeaf

@@ -371,6 +371,35 @@ describe('tabRegistrySync', () => {
     stop()
   })
 
+  it('tolerates tabs.sync.ack frames carrying the new persisted/persistReason fields', () => {
+    // Wire-compat pin (campaign P2.17 defect 2): the server may now attach
+    // optional persisted:false + persistReason to tabs.sync.ack. The frozen
+    // client has NO tabs.sync.ack handler and performs no runtime validation
+    // of server messages, so the extra fields must be inert — no throw, no
+    // dispatch, no state churn.
+    const store = createStore()
+    const stop = startTabRegistrySync(store as any, ws)
+    dispatch.mockClear()
+    ws.sendTabsSyncPush.mockClear()
+    ws.sendTabsSyncQuery.mockClear()
+
+    expect(() => {
+      wsMessageHandlers.forEach((handler) => handler({
+        type: 'tabs.sync.ack',
+        accepted: true,
+        openRecords: 1,
+        closedRecords: 0,
+        persisted: false,
+        persistReason: 'oversize',
+      }))
+    }).not.toThrow()
+
+    expect(dispatch).not.toHaveBeenCalled()
+    expect(ws.sendTabsSyncPush).not.toHaveBeenCalled()
+    expect(ws.sendTabsSyncQuery).not.toHaveBeenCalled()
+    stop()
+  })
+
   it('ignores stale tabs.sync.snapshot responses for older retention queries', () => {
     const mutatingDispatch = vi.fn((action: any) => {
       dispatch(action)

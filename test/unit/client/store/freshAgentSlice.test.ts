@@ -3,6 +3,7 @@ import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import reducer, {
   createFailed,
   freshAgentSnapshotReceived,
+  markSessionLost,
   materializeSession,
   registerPendingCreate,
   sessionCreated,
@@ -142,5 +143,12 @@ describe('freshAgentSlice', () => {
       retryable: true,
     })
     expect(state.sessions).toEqual({})
+  })
+
+  it('markSessionLost is a safe no-op when the session entry does not exist (reload + dead-session attach)', () => {
+    // Fresh state: sessions map empty (slice is unpersisted after reload).
+    const lostGhost = markSessionLost({ sessionId: 's-ghost', sessionType: 'freshclaude', provider: 'claude' })
+    expect(() => reducer(undefined, lostGhost)).not.toThrow()
+    expect(reducer(undefined, lostGhost).sessions).toEqual({})
   })
 })

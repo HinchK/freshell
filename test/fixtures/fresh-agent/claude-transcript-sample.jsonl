@@ -1,0 +1,9 @@
+{"type":"summary","summary":"ignored line type"}
+{"type":"user","timestamp":"2026-07-25T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"first question"}]}}
+{"type":"assistant","timestamp":"2026-07-25T10:00:01.000Z","message":{"id":"msg_01","role":"assistant","model":"claude-opus-4-6","content":[{"type":"thinking","thinking":"pondering"},{"type":"text","text":"first answer"}]}}
+{"type":"user","timestamp":"2026-07-25T10:00:02.000Z","message":"plain string question"}
+{"type":"user","timestamp":"2026-07-25T10:00:02.500Z","message":{"role":"user","content":"cli string content question"}}
+{"type":"user","isMeta":true,"timestamp":"2026-07-25T10:00:02.600Z","message":{"role":"user","content":"Caveat: synthetic meta line that must be skipped"}}
+{"type":"assistant","timestamp":"2026-07-25T10:00:03.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01","name":"bash","input":{"command":"ls"}}]}}
+{"type":"user","timestamp":"2026-07-25T10:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":[{"type":"text","text":"file-a\nfile-b"}],"is_error":false}]}}
+not json at all

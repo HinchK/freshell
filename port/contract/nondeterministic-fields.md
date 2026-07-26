@@ -42,7 +42,7 @@ layer can be built field-by-field.
 | `submittedTurnId` | turn id | freshAgent.send.accepted |
 | `previousSessionId` | prior session id | freshAgent.session.materialized |
 | `parentSessionId` | forked-from id | freshAgent.forked |
-| `createRequestId` | pane create correlation | ui.layout.sync (`layouts[*].content`) |
+| `createRequestId` | pane create correlation | ui.layout.sync (`layouts[*].content`), ui.command{tab.create} (`paneContent`) / {pane.split} (`newContent`) / {pane.attach} (`content`) — rust-only for tab.create/pane.split, see DEVIATIONS EDEV-08 |
 | `deviceId`, `deviceLabel`, `clientInstanceId` | device/client ids | tabs.sync.snapshot (`data.*Open[]`, `data.closed[]`, `data.devices[]`) |
 
 ## Timestamps (epoch millis unless noted)

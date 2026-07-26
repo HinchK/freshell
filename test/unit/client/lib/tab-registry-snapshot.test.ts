@@ -73,6 +73,7 @@ describe('collectPaneSnapshots', () => {
       kind: 'terminal',
       title: undefined,
       payload: {
+        createRequestId: 'req-codex',
         mode: 'codex',
         shell: 'system',
         sessionRef: undefined,
@@ -112,6 +113,7 @@ describe('collectPaneSnapshots', () => {
       kind: 'fresh-agent',
       title: undefined,
       payload: {
+        createRequestId: 'req-agent',
         provider: 'claude',
         sessionType: 'freshclaude',
         sessionRef: { provider: 'claude', sessionId: '00000000-0000-4000-8000-000000000123' },
@@ -151,6 +153,38 @@ describe('collectPaneSnapshots', () => {
         style: 'serif',
       },
     })
+  })
+
+  it('persists createRequestId in terminal and fresh-agent pane payloads', () => {
+    const terminalNode: PaneNode = {
+      type: 'leaf',
+      id: 'pane-term',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'req-stable-term',
+        status: 'running',
+        mode: 'shell',
+        shell: 'system',
+        terminalId: 'term-1',
+        serverInstanceId: 'server-1',
+      },
+    }
+    const termSnapshots = collectPaneSnapshots(terminalNode, 'server-1')
+    expect(termSnapshots[0].payload.createRequestId).toBe('req-stable-term')
+
+    const freshAgentNode: PaneNode = {
+      type: 'leaf',
+      id: 'pane-fa',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-stable-fa',
+        status: 'idle',
+      } as any,
+    }
+    const faSnapshots = collectPaneSnapshots(freshAgentNode, 'server-1')
+    expect(faSnapshots[0].payload.createRequestId).toBe('req-stable-fa')
   })
 
   describe('extension content', () => {

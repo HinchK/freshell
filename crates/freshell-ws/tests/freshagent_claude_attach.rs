@@ -18,6 +18,96 @@ use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
+/// Serializes every test in this file that mutates process-global env vars
+/// (`FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE` / `CLAUDE_CONFIG_DIR`),
+/// mirroring `freshagent_claude_kill_interrupt.rs`'s convention for the same hazard.
+static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+// ── fake claude sidecar (resume flavor: created + sdk.session.init + sdk.status) ──
+
+/// A minimal scripted fake claude sidecar (no real SDK, no network, no cost) speaking
+/// the SAME newline-JSON protocol `spawn_sidecar()` drives the vendored package with.
+/// On `create` it replies `created`, then `sdk.session.init` echoing `resumeSessionId`
+/// as the durable `cliSessionId` (resume continuity -- exactly what the real sidecar's
+/// SDK init does), then `sdk.status idle`; on `shutdown` it exits.
+const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
+import readline from 'node:readline'
+
+let counter = 0
+const rl = readline.createInterface({ input: process.stdin, terminal: false })
+rl.on('line', (line) => {
+  const trimmed = line.trim()
+  if (!trimmed) return
+  let msg
+  try {
+    msg = JSON.parse(trimmed)
+  } catch {
+    return
+  }
+  if (msg.type === 'create') {
+    counter += 1
+    const sessionId = `fake-claude-session-${process.pid}-${counter}`
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
+    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
+  } else if (msg.type === 'shutdown') {
+    process.exit(0)
+  }
+})
+"#;
+
+/// A fresh temp dir holding the fake sidecar script, with `FRESHELL_CLAUDE_SIDECAR`/
+/// `FRESHELL_CLAUDE_NODE` pointed at it, PLUS a seeded claude transcript store with
+/// `CLAUDE_CONFIG_DIR` pointed at it. Caller must hold [`CLAUDE_ENV_LOCK`] for the
+/// lifetime of the returned guard.
+struct FakeClaudeResumeEnv {
+    dir: std::path::PathBuf,
+}
+impl FakeClaudeResumeEnv {
+    fn install(durable: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-fake-claude-resume-ws-{}",
+            uuid_like_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
+        let script = dir.join("fake-claude-sidecar.mjs");
+        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
+        // Seed the transcript store: one user line carrying an EXISTING cwd ("/tmp"),
+        // so the resume request goes by durable UUID + original cwd (ledger A15).
+        let store = dir.join("claude-store");
+        let project = store.join("projects").join("-t");
+        std::fs::create_dir_all(&project).expect("create transcript project dir");
+        std::fs::write(
+            project.join(format!("{durable}.jsonl")),
+            r#"{"type":"user","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        )
+        .expect("seed transcript");
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &store);
+        Self { dir }
+    }
+}
+impl Drop for FakeClaudeResumeEnv {
+    fn drop(&mut self) {
+        std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
+        std::env::remove_var("FRESHELL_CLAUDE_NODE");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Dependency-free unique suffix (avoids pulling in `uuid` for this test crate).
+fn uuid_like_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{nanos}-{:?}", std::thread::current().id())
+}
+
 // ── server harness (duplicated from diag01_lifecycle_events.rs's convention, with
 //    `freshAgent.enabled: true` so `freshAgent.create` actually dispatches) ──
 
@@ -48,6 +138,7 @@ async fn spawn_server() -> String {
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
 
     let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
@@ -199,6 +290,46 @@ async fn claude_attach_for_untracked_session_emits_lost_session_frame_over_ws() 
     assert_eq!(frame["sessionType"], "freshclaude");
     assert_eq!(frame["event"]["type"], "freshAgent.error");
     assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+}
+
+/// Restart parity (Task 6): an attach for an untracked session that DOES carry a
+/// durable claude UUID with a resumable transcript must be resumed in place -- the
+/// server spawns a sidecar with `resumeSessionId` and emits the idle
+/// `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID (the
+/// frozen client persists it unvalidated -- NEVER a nanoid), all under the CLIENT's
+/// original session id. Before the fix this attach produced the lost frame instead
+/// (this test then fails with `await_frame` panicking on its timeout budget).
+#[tokio::test]
+async fn claude_attach_with_resumable_transcript_resumes_and_emits_snapshot_over_ws() {
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
+    let durable = "abababab-abab-4bab-8bab-abababababab";
+    let _env = FakeClaudeResumeEnv::install(durable);
+
+    let url = spawn_server().await;
+    let mut ws = connect_and_complete_handshake(&url).await;
+
+    send_json(
+        &mut ws,
+        &serde_json::json!({
+            "type": "freshAgent.attach",
+            "provider": "claude",
+            "sessionId": "gone-after-restart",
+            "sessionType": "freshclaude",
+            "resumeSessionId": durable,
+            "sessionRef": { "provider": "claude", "sessionId": durable },
+        }),
+    )
+    .await;
+
+    let frame = await_frame(&mut ws, Duration::from_secs(15), |v| {
+        v["type"] == "freshAgent.event" && v["event"]["type"] == "freshAgent.session.snapshot"
+    })
+    .await;
+
+    assert_eq!(frame["sessionId"], "gone-after-restart");
+    assert_eq!(frame["sessionType"], "freshclaude");
+    assert_eq!(frame["event"]["status"], "idle");
+    assert_eq!(frame["event"]["timelineSessionId"], durable);
 }
 
 /// Kilroy panes ride the same claude provider arm with `sessionType: "kilroy"`; the

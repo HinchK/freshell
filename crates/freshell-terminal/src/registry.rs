@@ -1575,7 +1575,7 @@ impl TerminalRegistry {
     }
 
     /// A terminal's stamped `createRequestId`, if any.
-    fn probe_create_request_id(&self, terminal_id: &str) -> Option<String> {
+    pub fn probe_create_request_id(&self, terminal_id: &str) -> Option<String> {
         let shared = {
             let inner = self.inner.lock().expect("registry lock");
             inner

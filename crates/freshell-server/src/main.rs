@@ -417,6 +417,16 @@ async fn main() -> ExitCode {
     // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
     // are guaranteed to come from the same env snapshot.
     let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();
+    // P1.8: the pane-identity ledger (spec §4.2). Root resolved ONCE here;
+    // the module itself never reads env vars. No home => disabled no-op,
+    // same policy as tabs-snapshots. `new_locked` = the single-writer
+    // guard (V2.md): exclusive flock on <root>/lock, ConfigLock pattern —
+    // a second server on the same home comes up with a DISABLED ledger and
+    // a loud ERROR instead of two writers corrupting one store.
+    let pane_ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(
+        home.as_ref()
+            .map(|h| h.join(".freshell").join("pane-ledger")),
+    ));
     let ws_state = WsState {
         activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
@@ -430,6 +440,10 @@ async fn main() -> ExitCode {
         session_existence: match &session_index {
             Some(index) => std::sync::Arc::new(existence::IndexExistenceProbe::new(
                 std::sync::Arc::clone(index),
+                // P1.8 read 2: the durable ledger backs `ever_observed`, so a
+                // transcript deleted while the server was DOWN still derives
+                // loud dead_session (per-boot observed set is empty then).
+                Some(std::sync::Arc::clone(&pane_ledger)),
             )),
             None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         },
@@ -459,7 +473,71 @@ async fn main() -> ExitCode {
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::from_config(
             &create_protect,
         )),
+        pane_ledger: std::sync::Arc::clone(&pane_ledger),
     };
+
+    // P1.8 boot hygiene: quarantine, stale-marker sweep, supersession
+    // repair, GC. Tombstone deletion keys on the DIRECT stat
+    // (`transcript_definitively_absent`) — never on probe.exists()==Absent
+    // (V10.md). Runs BEFORE the server accepts connections, so calling the
+    // blocking ledger API inline here is fine.
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // `home` = the same Option<PathBuf> resolve_home() output the ledger
+        // root was derived from. No home => the ledger is disabled and the
+        // closure is never consulted; answering false (defer) is still safe.
+        let scan_home = home.clone();
+        let report = pane_ledger.boot_scan(now, &move |provider, session_id| {
+            scan_home
+                .as_deref()
+                .is_some_and(|h| transcript_definitively_absent(h, provider, session_id))
+        });
+        if !report.quarantined.is_empty() {
+            tracing::error!(
+                count = report.quarantined.len(),
+                "pane_ledger_boot: rows quarantined (see per-row errors above)"
+            );
+        }
+    }
+
+    // P1.8 periodic GC (boot-time + periodic, spec §4.2 lifecycle).
+    {
+        let ledger = std::sync::Arc::clone(&pane_ledger);
+        let gc_home = home.clone(); // same Option<PathBuf> as above
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
+            ticker.tick().await; // the immediate first tick — boot_scan already ran
+            loop {
+                ticker.tick().await;
+                let ledger = std::sync::Arc::clone(&ledger);
+                let home = gc_home.clone();
+                let joined = tokio::task::spawn_blocking(move || {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    // Same Option handling as the boot-scan closure above:
+                    // no home => defer (false) — never the destructive branch.
+                    ledger.gc(now, &|provider, session_id| {
+                        home.as_deref().is_some_and(|h| {
+                            transcript_definitively_absent(h, provider, session_id)
+                        })
+                    });
+                })
+                .await;
+                if let Err(e) = joined {
+                    tracing::error!(
+                        error = %e,
+                        "pane_ledger_gc_join_failed: periodic GC task panicked or was cancelled"
+                    );
+                }
+            }
+        });
+    }
+
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
         ready: true,
@@ -1054,6 +1132,104 @@ fn resolve_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// P1.8 tombstone-deletion gate (V10.md): `true` ONLY when a DIRECT
+/// filesystem check by provider path convention finds no transcript.
+/// Mirror each provider's on-disk convention from its freshell-sessions
+/// source (claude discover: directory_index.rs:206; codex walk: :375 with
+/// filename-UUID extraction :414-421; amplifier: amplifier.rs session dirs).
+/// Providers without a cheap direct check (opencode: sqlite-backed) answer
+/// `false` — deletion deferred, never risked. Unknown providers: `false`.
+fn transcript_definitively_absent(
+    home: &std::path::Path,
+    provider: &str,
+    session_id: &str,
+) -> bool {
+    match provider {
+        "claude" => {
+            // ~/.claude/projects/<proj>/<session_id>.jsonl — any match means present.
+            let projects = home.join(".claude").join("projects");
+            let Ok(dirs) = std::fs::read_dir(&projects) else {
+                return false; // unreadable => defer
+            };
+            for entry in dirs {
+                let Ok(entry) = entry else {
+                    return false; // per-entry read error => defer
+                };
+                let candidate = entry.path().join(format!("{session_id}.jsonl"));
+                match std::fs::metadata(&candidate) {
+                    Ok(meta) if meta.is_file() => return false, // present => never delete
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // definitely not here
+                    Err(_) => return false, // couldn't tell (e.g. unreadable subdir) => defer
+                }
+            }
+            true
+        }
+        "codex" => {
+            // ~/.codex/sessions/** rollout files carry the session UUID in the
+            // filename — walk and match (bounded: sessions tree only).
+            let root = home.join(".codex").join("sessions");
+            if !root.is_dir() {
+                return false; // unreadable/missing home => defer
+            }
+            !walk_contains_filename_fragment(&root, session_id)
+        }
+        "amplifier" => {
+            // <amplifier_home>/projects/<slug>/sessions/<session_id>/ — the
+            // session dir named by session id. Mirrors the SAME
+            // `amplifier_home` resolution (`AMPLIFIER_HOME` env /
+            // `<home>/.amplifier`) main.rs already computes for the
+            // `AmplifierSource` construction above.
+            let projects = freshell_sessions::amplifier::amplifier_home(home).join("projects");
+            let Ok(dirs) = std::fs::read_dir(&projects) else {
+                return false; // unreadable => defer
+            };
+            for entry in dirs {
+                let Ok(entry) = entry else {
+                    return false; // per-entry read error => defer
+                };
+                let candidate = entry.path().join("sessions").join(session_id);
+                match std::fs::metadata(&candidate) {
+                    Ok(meta) if meta.is_dir() => return false, // present => never delete
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // definitely not here
+                    Err(_) => return false, // couldn't tell (e.g. unreadable subdir) => defer
+                }
+            }
+            true
+        }
+        _ => false, // opencode (sqlite) + unknown providers: defer deletion
+    }
+}
+
+/// Bounded recursive walk: does any filename under `root` contain `fragment`?
+/// Deletion-defer bias (V10.md): ANY read error answers `true` ("assume a
+/// match exists"), so [`transcript_definitively_absent`] reports the
+/// transcript as present and tombstone deletion is deferred, never risked.
+fn walk_contains_filename_fragment(root: &std::path::Path, fragment: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return true; // read error => "found" => outer fn defers deletion
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true; // read error => defer, same as above
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            if walk_contains_filename_fragment(&path, fragment) {
+                return true;
+            }
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(fragment))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Build the `{ platform, availableClis, hostName, featureFlags }` payload the
 /// SPA reads on boot (mirrors `server/platform-router.ts`). `platform` is the
 /// real `/proc/version`-derived string (`detect_platform_proc`); `availableClis`
@@ -1480,6 +1656,94 @@ mod sessions_sweep_tests {
 mod tests {
     use super::*;
     use freshell_platform::MapEnv;
+
+    // -- P1.8: `transcript_definitively_absent`, the tombstone-DELETION gate
+    // (V10.md). Deletion is the destructive branch, so every uncertain path
+    // must answer `false` (present => defer); only a readable tree with NO
+    // matching transcript answers `true`.
+
+    #[test]
+    fn claude_transcript_present_is_not_absent() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let proj = home.path().join(".claude").join("projects").join("-p");
+        std::fs::create_dir_all(&proj).expect("mkdir projects/-p");
+        std::fs::write(proj.join("sess-1.jsonl"), "{}\n").expect("write transcript");
+        assert!(
+            !transcript_definitively_absent(home.path(), "claude", "sess-1"),
+            "an existing <proj>/<sessionId>.jsonl means PRESENT (never delete)"
+        );
+    }
+
+    #[test]
+    fn claude_empty_projects_tree_is_definitively_absent() {
+        let home = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(home.path().join(".claude").join("projects"))
+            .expect("mkdir empty projects");
+        assert!(
+            transcript_definitively_absent(home.path(), "claude", "sess-1"),
+            "a readable projects tree with no match is DEFINITIVELY absent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_unreadable_projects_root_defers() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("tempdir");
+        let projects = home.path().join(".claude").join("projects");
+        std::fs::create_dir_all(&projects).expect("mkdir projects");
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        let verdict = transcript_definitively_absent(home.path(), "claude", "sess-1");
+        // Restore so the tempdir can be cleaned up regardless of the assert.
+        std::fs::set_permissions(&projects, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 755");
+        assert!(
+            !verdict,
+            "an unreadable projects root must DEFER (false), never delete"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_unreadable_project_subdir_defers() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().expect("tempdir");
+        let projects = home.path().join(".claude").join("projects");
+        let proj = projects.join("-p");
+        std::fs::create_dir_all(&proj).expect("mkdir projects/-p");
+        std::fs::set_permissions(&proj, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 subdir");
+        let verdict = transcript_definitively_absent(home.path(), "claude", "sess-1");
+        // Restore so the tempdir can be cleaned up regardless of the assert.
+        std::fs::set_permissions(&proj, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 755 subdir");
+        assert!(
+            !verdict,
+            "a readable projects root with an UNREADABLE project subdir must \
+             DEFER (false) - the transcript may live in exactly that subdir"
+        );
+    }
+
+    #[test]
+    fn missing_projects_root_defers() {
+        let home = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !transcript_definitively_absent(home.path(), "claude", "sess-1"),
+            "no ~/.claude/projects at all => defer (read error branch)"
+        );
+    }
+
+    #[test]
+    fn opencode_and_unknown_providers_always_defer() {
+        let home = tempfile::tempdir().expect("tempdir");
+        assert!(!transcript_definitively_absent(
+            home.path(),
+            "opencode",
+            "s"
+        ));
+        assert!(!transcript_definitively_absent(home.path(), "no-such", "s"));
+    }
 
     // `AI_CONFIG.enabled()` (`server/ai-prompts.ts:12-15`):
     // `enabled: () => Boolean(process.env.GOOGLE_GENERATIVE_AI_API_KEY)`.
