@@ -106,7 +106,7 @@ pub(crate) fn error_pane_ledger_write_failed(terminal_id: &str, err: &std::io::E
         terminal_id = %terminal_id,
         error = %err,
         "pane_ledger_write_failed: identity event could not be durably recorded; \
-         durability.degraded pushed live to attached clients"
+         durability.degraded broadcast live to all connected clients"
     );
 }
 

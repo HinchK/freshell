@@ -289,6 +289,35 @@ fn resolve_pending_writes_binding_first_then_deletes_marker() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[cfg(unix)]
+#[test]
+fn resolve_pending_marker_delete_failure_is_not_a_durability_error() {
+    // The binding row (the durable identity) was written — a failed marker
+    // delete is cleanup residue the boot sweep repairs, NOT a durability
+    // failure. resolve_pending must return Ok(()) (logging at WARN), so the
+    // caller never raises a false `durability.degraded` alarm.
+    use std::os::unix::fs::PermissionsExt;
+    let root = temp_root("marker-delete-fails");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
+        .unwrap();
+    // Make the pending dir read-only so the marker unlink fails (EACCES).
+    let pending_dir = root.join("pending");
+    std::fs::set_permissions(&pending_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = ledger.resolve_pending(&write("codex", "th-1", "t1", 2_000));
+    // Restore perms before asserting so cleanup always works.
+    std::fs::set_permissions(&pending_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    result.expect("binding written durably; marker-delete failure must not propagate");
+    // The durable identity IS recorded...
+    assert!(ledger.load_binding("codex", "th-1").is_some());
+    // ...and the stale marker survives (on disk and in the index) for the
+    // boot sweep to repair.
+    assert!(pending_dir.join("t1.json").exists());
+    assert_eq!(ledger.list_pending_raw().len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+}
+
 #[test]
 fn pending_resolution_collision_is_idempotent() {
     // Red test `pending-resolution-collision` (spec §4.2 / decision 5): a

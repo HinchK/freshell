@@ -575,13 +575,32 @@ impl PaneLedger {
     /// the binding row and the boot sweep (Task 4) deletes the stale marker.
     /// Idempotent: a second racing resolution finds the marker gone or the
     /// row already bound and no-ops.
+    ///
+    /// `Err` means the BINDING write failed — the real durability alarm. A
+    /// marker-delete failure after a successful binding write is NOT an
+    /// error: the durable identity was recorded and the stale marker is
+    /// exactly the crash-window shape the boot sweep repairs, so it is
+    /// logged at WARN and the fn returns `Ok(())` (never a false
+    /// `durability.degraded` alarm).
     pub fn resolve_pending(&self, w: &BindingWrite<'_>) -> std::io::Result<()> {
         let Some(root) = &self.root else {
             return Ok(());
         };
         let mut index = self.guard();
         self.record_binding_locked(root, &mut index, w)?; // binding row FIRST
-        Self::remove_pending(root, &mut index, w.terminal_id) // THEN the marker
+        if let Err(err) = Self::remove_pending(root, &mut index, w.terminal_id) {
+            // THEN the marker — cleanup only. The identity IS durably
+            // recorded; the leftover marker is swept at the next boot/GC
+            // pass (same repair as a crash between the two operations).
+            tracing::warn!(
+                target: "freshell_ws::pane_ledger",
+                terminal_id = %w.terminal_id,
+                error = %err,
+                "pane_ledger_marker_delete_failed_on_resolve: binding row durably \
+                 written; stale marker left for the boot/GC sweep to repair"
+            );
+        }
+        Ok(())
     }
 
     /// Best-effort marker removal (missing file == already resolved/GC'd).
@@ -646,8 +665,9 @@ impl PaneLedger {
 
 /// The write-failure policy (spec §4.2): a ledger write failure NEVER blocks
 /// the create/identity event, but it is never silent — structured ERROR +
-/// invariant counter + a LIVE `durability.degraded` frame to attached
-/// clients, at failure time (a verdict-time flag would be posthumous).
+/// invariant counter + a LIVE `durability.degraded` frame broadcast to all
+/// connected clients (frozen clients ignore unknown frame types), at failure
+/// time (a verdict-time flag would be posthumous).
 pub(crate) fn surface_write_failure(
     state: &crate::WsState,
     terminal_id: &str,
