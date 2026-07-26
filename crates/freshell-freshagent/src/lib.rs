@@ -39,6 +39,7 @@
 pub mod claude;
 pub(crate) mod claude_snapshot;
 pub mod codex;
+pub mod identity_sink;
 pub mod opencode_ws;
 pub mod pane_ops;
 pub mod snapshot;
@@ -46,6 +47,10 @@ pub mod terminal_tabs;
 
 pub use claude::FreshClaudeState;
 pub use codex::FreshCodexState;
+pub use identity_sink::{
+    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink,
+    SinkWrite,
+};
 pub use opencode_ws::FreshOpencodeState;
 pub use snapshot::SnapshotState;
 
@@ -171,6 +176,11 @@ pub struct FreshAgentState {
     /// restore fix -- the SAME shared instance
     /// `freshell_ws::opencode_association::maybe_arm` arms.
     pub(crate) opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
+    /// P1.13 identity-event sink (the pane-ledger bridge, [`identity_sink`]).
+    /// Clone-shared + set-once: the state is cloned into consumer tasks, so
+    /// the `OnceLock` sits behind an `Arc`. Wired post-construction by
+    /// `freshell-server` (precedent: `TerminalRegistry::set_activity_observer`).
+    identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
 }
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
@@ -235,7 +245,20 @@ impl FreshAgentState {
             cli_commands: Arc::new(Vec::new()),
             amplifier_locator: None,
             opencode_locator: None,
+            identity_sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
+    pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
+        let _ = self.identity_sink.set(sink);
+    }
+
+    /// The wired identity sink, if any. Used by identity-event tasks
+    /// (the REST send-keys materialization site, Task 7).
+    #[allow(dead_code)] // used by identity-event tasks (Tasks 4-10)
+    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+        self.identity_sink.get().cloned()
     }
 
     /// Record what a `restoreKey`-tagged create produced (continuity trio,

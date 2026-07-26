@@ -74,7 +74,9 @@ use freshell_protocol::{
     FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 
-use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState};
+use crate::{
+    FreshAgentCreateDedup, FreshAgentCreateOutcome, FreshAgentState, SharedPaneIdentitySink,
+};
 
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`).
 const SESSION_TYPE: &str = "freshopencode";
@@ -102,6 +104,12 @@ pub struct FreshOpencodeState {
     /// [`OpencodeSession`] object. Cleared for a session's entries only on an explicit
     /// `freshAgent.kill` ([`Self::handle_kill`]).
     create_dedup: Arc<FreshAgentCreateDedup<OpencodeCreateRecord>>,
+    /// P1.13 identity-event sink (the pane-ledger bridge,
+    /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
+    /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
+    /// post-construction by `freshell-server` (precedent:
+    /// `TerminalRegistry::set_activity_observer`).
+    identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -188,7 +196,19 @@ impl FreshOpencodeState {
             fresh_agent,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
+            identity_sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
+    pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
+        let _ = self.identity_sink.set(sink);
+    }
+
+    /// The wired identity sink, if any.
+    #[allow(dead_code)] // used by identity-event tasks (Tasks 4-10)
+    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+        self.identity_sink.get().cloned()
     }
 
     fn broadcast(&self, msg: &ServerMessage) {

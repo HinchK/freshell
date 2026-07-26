@@ -60,7 +60,7 @@ use freshell_protocol::{
     FreshAgentSend, FreshAgentSendAccepted, ServerMessage, SessionType,
 };
 
-use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome};
+use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
 const PROVIDER: &str = "claude";
@@ -97,6 +97,12 @@ pub struct FreshClaudeState {
     /// `resuming` analog, simplified: contenders return immediately instead of
     /// waiting -- the winner's frames broadcast to every client anyway).
     resuming: Arc<TokioMutex<std::collections::HashSet<String>>>,
+    /// P1.13 identity-event sink (the pane-ledger bridge,
+    /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
+    /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
+    /// post-construction by `freshell-server` (precedent:
+    /// `TerminalRegistry::set_activity_observer`).
+    identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
 }
 
 /// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
@@ -142,7 +148,19 @@ impl FreshClaudeState {
             cli_index: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             resuming: Arc::new(TokioMutex::new(std::collections::HashSet::new())),
+            identity_sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
+    pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
+        let _ = self.identity_sink.set(sink);
+    }
+
+    /// The wired identity sink, if any.
+    #[allow(dead_code)] // used by identity-event tasks (Tasks 4-10)
+    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+        self.identity_sink.get().cloned()
     }
 
     /// Reap every owned claude sidecar: SIGTERM the Node process (so it cleanly kills its

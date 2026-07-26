@@ -68,7 +68,7 @@ use freshell_protocol::{
     FreshAgentSend, FreshAgentSessionMaterialized, ServerMessage, SessionLocator,
 };
 
-use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome};
+use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
@@ -146,6 +146,12 @@ pub struct FreshCodexState {
     /// entries only on an explicit `freshAgent.kill` ([`Self::handle_kill`]); an
     /// unrequested sidecar exit does NOT evict (mirrors legacy, see the type doc).
     create_dedup: Arc<FreshAgentCreateDedup<CodexCreateRecord>>,
+    /// P1.13 identity-event sink (the pane-ledger bridge,
+    /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
+    /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
+    /// post-construction by `freshell-server` (precedent:
+    /// `TerminalRegistry::set_activity_observer`).
+    identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -272,7 +278,19 @@ impl FreshCodexState {
             dead_threads: Arc::new(TokioMutex::new(HashMap::new())),
             dead_thread_ttl: DEAD_THREAD_CACHE_TTL,
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
+            identity_sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
+    pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
+        let _ = self.identity_sink.set(sink);
+    }
+
+    /// The wired identity sink, if any.
+    #[allow(dead_code)] // used by identity-event tasks (Tasks 4-10)
+    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+        self.identity_sink.get().cloned()
     }
 
     /// The `PATCH /api/settings` sub-router (the fresh-clients enable toggle).
