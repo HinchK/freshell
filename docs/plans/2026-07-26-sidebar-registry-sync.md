@@ -1017,3 +1017,8 @@ PR POLICY: NOT approved — do NOT run `gh pr create`. Final output: branch name
 - VERIFIED FAILING then FIXED: sweep signature was blind to identity
   adoption; now includes a (terminal_id, provider, session_id) digest.
   Adoption/open/close push sessions.changed within one 2s tick.
+
+### Case (b)/(c) REST codex arming (Task 4)
+- VERIFIED FAILING then FIXED: REST-created codex panes were never armed for
+  B2 locator adoption. Now armed, mirroring amplifier/opencode.
+- note_submit REST coverage: REST path added (before-write, is_submit_input-gated) (Step 5 outcome).

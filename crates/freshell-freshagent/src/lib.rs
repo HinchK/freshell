@@ -177,6 +177,11 @@ pub struct FreshAgentState {
     /// restore fix -- the SAME shared instance
     /// `freshell_ws::opencode_association::maybe_arm` arms.
     pub(crate) opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
+    /// Sibling to [`Self::amplifier_locator`] for the P1.14 / Incident-4
+    /// codex hardening -- the SAME shared instance the WS
+    /// `codex_association` entry points arm and the B2 sweep polls.
+    pub(crate) codex_locator:
+        Option<std::sync::Arc<freshell_sessions::codex_locator::CodexLocator>>,
     /// P1.13 identity-event sink (the pane-ledger bridge, [`identity_sink`]).
     /// Clone-shared + set-once: the state is cloned into consumer tasks, so
     /// the `OnceLock` sits behind an `Arc`. Wired post-construction by
@@ -246,6 +251,7 @@ impl FreshAgentState {
             cli_commands: Arc::new(Vec::new()),
             amplifier_locator: None,
             opencode_locator: None,
+            codex_locator: None,
             identity_sink: Arc::new(std::sync::OnceLock::new()),
         }
     }
@@ -374,6 +380,16 @@ impl FreshAgentState {
         locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
     ) -> Self {
         self.opencode_locator = locator;
+        self
+    }
+
+    /// Sibling to [`Self::with_amplifier_locator`] for the P1.14 /
+    /// Incident-4 codex hardening's [`freshell_sessions::codex_locator::CodexLocator`].
+    pub fn with_codex_locator(
+        mut self,
+        locator: Option<std::sync::Arc<freshell_sessions::codex_locator::CodexLocator>>,
+    ) -> Self {
+        self.codex_locator = locator;
         self
     }
 

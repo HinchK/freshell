@@ -358,7 +358,8 @@ async fn main() -> ExitCode {
     let fresh_agent_state = fresh_agent_state
         .with_cli_commands(Arc::clone(&cli_commands))
         .with_amplifier_locator(amplifier_locator.clone())
-        .with_opencode_locator(opencode_locator.clone());
+        .with_opencode_locator(opencode_locator.clone())
+        .with_codex_locator(codex_locator.clone());
     // Batch B: `session_directory` no longer re-walks + re-parses every
     // transcript on every request -- it reads a cached, TTL-refreshed
     // `SessionIndex`. Batch C adds `CodexSource` (file-based, same shape as
