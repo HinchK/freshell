@@ -313,7 +313,7 @@ fn list_snapshot_devices_locked(dir: &Path) -> std::io::Result<Vec<String>> {
         }
         let mut dir_id: Option<String> = None;
         for p in std::fs::read_dir(&dpath)?.flatten().map(|f| f.path()) {
-            if !p.extension().is_some_and(|x| x == "json") {
+            if p.extension().is_none_or(|x| x != "json") {
                 continue;
             }
             let v = read_generation_file(&p)?;
