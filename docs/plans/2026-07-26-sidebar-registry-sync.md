@@ -1095,3 +1095,113 @@ PR POLICY: NOT approved — do NOT run `gh pr create`. Final output: branch name
   mounted-but-hidden; TabContent kept alive per App.tsx:1611).
 - Full spec green in suite order: 4 passed (case-c + case-b + case-a +
   case-d), 1.8m.
+
+### Final consolidation (Task 9)
+
+Execution note: Task 9 originally halted at the plan-mandated disk gate
+(8.0G available < 10G threshold, disk 99% full). Resumed after the disk was
+replaced (1005G available at re-verification). All gates re-run from
+Task 9 Step 1 on the unchanged branch tip `51488999`.
+
+#### Contract cases — spec deliverable
+
+| Spec case | Verdict | Evidence |
+|---|---|---|
+| (a) restarts | PASS as-is (with Tasks 2–3 server fixes already on branch) | Task 7 e2e: claude + codex rows green post-restart, count 1, zero `terminal:<id>` ghosts, respawn proven via argv-count increase |
+| (b) REST/MCP-created tabs (Incident 4) | PASS as-is (product); one test-side suite-order fix | Task 6 e2e: claude + codex REST resume tabs green, click-dedupe holds; amplifier variant re-run green via `remote-tab-linkage-rust.spec.ts` (Task 9 Step 3) |
+| (c) fresh codex duplicate | FIXED | `7be4a2d6` (identity-stamped `/api/terminals` projection), `d5a97167`+`b8b79cba` (identity digest in sweep signature), `8c37cfd6` (REST codex locator arming); pinned by `375e5f89` with red→green proof against a `bf6242a1` pre-fix server binary |
+| (d) recover-my-panes | PASS as-is | Task 8 e2e: recovered claude pane joins green in a fresh browser context after `restartAbrupt()` + recovery ACCEPT |
+
+#### The fixes list
+
+1. `GET /api/terminals` sidebar projection stamps `session_ref` from the
+   `TerminalIdentityRegistry` (authority rung 1) instead of hard-coding
+   `None` for codex (`7be4a2d6`). NOT a ledger-backed join — the rung-2
+   ledger-fallback premise was falsified during load-bearing validation.
+2. `sessions_sweep_signature` includes a (terminal_id, provider,
+   session_id) identity digest so locator adoptions push `sessions.changed`
+   within one sweep tick (`d5a97167`, review follow-up `b8b79cba`).
+3. REST `/api/tabs` create path arms the codex locator, mirroring
+   amplifier/opencode; REST-path `note_submit` added before-write,
+   `is_submit_input`-gated (`8c37cfd6`).
+4. Contingencies: none of Task 6/8's product contingency branches fired.
+   Client join machinery shipped unchanged, as the plan predicted.
+
+#### Red→green proof pointers
+
+- Task 2: unit-level RED on the unstamped projection, then green
+  (terminals.rs test module).
+- Task 3: sweep-signature RED (identity-blind digest), then green
+  (main.rs sweep tests).
+- Task 4: arming RED (codex pane never armed on REST path), then green
+  (terminal_tabs.rs unit test).
+- Task 5 Step 2: binary red→green — the case-c e2e FAILS against a
+  `bf6242a1` pre-fix server binary (45s no-reload wait times out with the
+  client-minted `terminal:<id>` ghost still present) and PASSES on the
+  fixed branch.
+
+#### Final gate results (Task 9, post-disk-fix re-run)
+
+- `cargo fmt --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: zero warnings.
+- `cargo test --workspace`: 1913 passed, 0 failed (75 suites). One
+  pre-existing intermittent failure observed during repeated runs — see
+  "What remains" item 5.
+- Coordinated `npm test` (full suite, gate acquired + released cleanly):
+  client 4156 passed | 8 skipped (390 files | 3 skipped), server 4548
+  passed | 16 skipped (296 files | 3 skipped), electron 350 passed
+  (34 files), exit 0.
+- `cargo build --release -p freshell-server`: success.
+- Playwright `rust-chromium` regression net (Task 9 Step 3): 11/11 passed
+  (1.9m) across `sidebar-registry-sync-rust.spec.ts` (4),
+  `remote-tab-linkage-rust.spec.ts`, `server-restart-recovery.spec.ts`,
+  `recover-my-panes-rust.spec.ts`, `sidebar-click-resume.spec.ts`.
+
+#### Scope interpretations for the campaign owner
+
+- Task 2 (`terminals.rs`): treated as lane-owned — the sidebar's
+  terminal-directory feed projection is the contract seam this lane exists
+  to fix; the change is a registry READ (authority rung 1). Not on the
+  forbidden list.
+- Task 4 (`crates/freshell-freshagent` codex-locator arming): the
+  lane-spec exception text ("is it now fixable with locator identity? If
+  yes, fix it") could not be located in a persisted document (unpersisted
+  pipeline prompt). Interpretation applied: `arm()` adds no new ledger
+  writer (the shared locator sweep remains the single pre-existing
+  writer), and sanctioned campaign work already touched REST-path
+  freshagent binding behavior (B4 fast-follow `2b3b4fa9`). Overrule at
+  review if this reading is wrong.
+
+#### What remains (documented honestly, with justification)
+
+1. Tabs open ONLY in another client/device still render grey locally —
+   `hasTab` means "open in THIS client". The registry pane payload carries
+   `sessionRef` (untyped); green-vs-third-state semantics is a user-facing
+   design call for the campaign, outside this lane's contract cases.
+2. REST-created terminal identities are never retired on exit
+   (`terminal_tabs.rs:839-853`, crate-cycle constraint predating this
+   lane).
+3. The §4.2 rung-2 ledger fallback in the sidebar join has NO production
+   window (validated this workflow: every Bound-row writer upserts the
+   registry with the session id first; terminal ids are never re-minted
+   across restarts). The sidebar consults rung 1 only, deliberately —
+   recorded so future lanes don't re-plan it.
+4. `paneReconcileFreshAgentV1` is shipped-but-dormant (the client never
+   sends it); fresh-agent verdict entries are inert. This lane's
+   terminal-pane cases are unaffected.
+5. Pre-existing flake (cross-lane, NOT touched by this branch):
+   `freshell-ws pane_ledger::tests::new_locked_degrades_to_disabled_when_another_holder_exists`
+   (`pane_ledger_tests.rs:163`, "flock freed on drop") failed twice during
+   repeated `cargo test --workspace` runs in one ~12-minute window, then
+   could not be reproduced across 21 consecutive full-workspace runs plus
+   22 targeted freshell-ws runs (peak fd usage measured at 143, ruling
+   out fd exhaustion at the default ulimit; an instrumented reproduction
+   loop never fired). The test file is unchanged from `origin/main`
+   (P1.13, `5745022d`). Mechanism unproven; left unfixed rather than
+   masked with a retry, because if the flake is real its production shape
+   is "a restarted server comes up with the pane ledger silently
+   DISABLED" — that deserves a P1.13-owner investigation, not a
+   test-side band-aid. One additional workspace run in the same
+   investigation failed (exit 101) in a test OTHER than the pane_ledger
+   one; its output was not preserved and 18 subsequent logged runs were
+   green.
