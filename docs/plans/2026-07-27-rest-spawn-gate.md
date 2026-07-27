@@ -73,19 +73,51 @@ construction compiling and behaving as before; production always wires it
 (proven by the e2e log assertion in Task 8).
 
 **D-C. Acquire scope on REST = whole spawn pipeline, before side effects.**
-The permit is acquired in `spawn_terminal_pane` after the cheap validation /
-lease guards and BEFORE the codex managed-launch plan block. Consequences:
-(1) gate rejection needs NO cleanup — nothing has been materialized yet (the
-`RestSessionRefLease` releases via its own `Drop`); (2) the REST-reachable
-codex sidecar launch (`freshell-codex/src/launch_lifecycle.rs:621`, reached
-via `plan_create_with_retry` at `terminal_tabs.rs:892-911` when
-`mode=="codex"` and `FRESHELL_CODEX_MANAGED_LAUNCH=1`) is bounded by the same
-permit — a REST codex burst can no longer spawn one sidecar+proxy per request
-at unbounded concurrency. The permit binding `_spawn_permit` lives to the end
+The permit is acquired in `spawn_terminal_pane` immediately after the D7/D8
+`RestSessionRefLease` block closes (~`terminal_tabs.rs:793`), BEFORE
+`let terminal_id = …` (~`:795`) — i.e. on the shared path of EVERY mode.
+VALIDATED (load-bearing check A1): the codex plan block at `:892` sits
+INSIDE the non-shell `else` branch (`if mode == "shell"` at `:807`, `else`
+at `:828`) and is preceded by real side effects — `generate_mcp_injection`
+at `:839-848` (tmp MCP config writes; opencode bumps the sidecar refcount,
+`mcp_inject.rs:509-525`) and the opencode loopback port allocation at
+`:852-860` — so an acquire anchored at `:892` would leave shell creates
+ungated AND leak MCP config on rejection. The `:793/:795` anchor precedes
+all of these. Consequences: (1) gate rejection needs NO cleanup — nothing
+has been materialized yet (the `RestSessionRefLease` releases via its own
+`Drop`); (2) the REST-reachable codex sidecar launch
+(`freshell-codex/src/launch_lifecycle.rs:621`, reached via
+`plan_create_with_retry` at `terminal_tabs.rs:892-911` when `mode=="codex"`
+and `FRESHELL_CODEX_MANAGED_LAUNCH=1`) is bounded by the same permit — a
+REST codex burst can no longer spawn one sidecar+proxy per request at
+unbounded concurrency. The permit binding `_spawn_permit` lives to the end
 of `spawn_terminal_pane` (RAII drop on every early-return `Err` path and on
 completion), mirroring WS.
 
-**D-D. Codex sidecar evaluation (kata item 2).** Two distinct sidecar spawn
+**D-C latency exposure (validated A2, decision recorded).** With
+`FRESHELL_CODEX_MANAGED_LAUNCH=1`, a permit held across
+`plan_create_with_retry` can last far longer than the 10s permit-wait:
+worst case 5 attempts × `SIDECAR_START_BUDGET` 45s (`launch_lifecycle.rs:64`)
++ 1s linear backoff ≈ 226s; even ONE slow attempt (45s) is 4.5× the wait, so
+4 concurrent flag-ON REST codex creates could starve WS creates into
+non-retried `PTY_SPAWN_FAILED` timeouts. Alternatives considered:
+(a) WS-mirror (plan the launch BEFORE the acquire + rejection-discard
+cleanup) — removes the starvation risk but re-opens the unbounded
+per-request sidecar storm the kata's "Also noted" aside flags, and imports
+the WS cleanup burden; (b) drop-and-reacquire around the plan — double-wait
+complexity, breaks FIFO fairness. DECISION: keep the plan under the permit.
+`FRESHELL_CODEX_MANAGED_LAUNCH` defaults OFF (requires exactly `"1"`), so
+the shipped default has zero exposure; the flag-ON exposure is accepted and
+documented here, and MUST be revisited if/when S5 flips the default ON
+(likely a separate sidecar budget covering both doors). Task 9's report
+carries this forward.
+
+**D-D. Codex sidecar evaluation.** (The kata has NO numbered items — its
+sidecar mention is the un-numbered aside *"Also noted: the codex-sidecar
+launch path bypasses the gate similarly"*, and it is NOT in the kata's
+acceptance line. Verified against the kata's full text, retrieved verbatim
+from `~/.kata/kata.db`; Task 9's closure summary must quote that actual
+sentence so the closer adjudicates against real text.) Two distinct sidecar spawn
 sites exist. (a) The REST-reachable managed-launch path — GATED by D-C.
 (b) `FreshCodexState::spawn_sidecar` (`codex.rs:1959/2001`) — NOT gated, and
 documented why not: it is WS-only (REST `create_tab` rejects every
@@ -610,18 +642,25 @@ fn spawn_gate_error_response(err: crate::spawn_gate::SpawnGateError) -> Response
 }
 ```
 2. In `spawn_terminal_pane` (declared at `:641`), insert the acquire
-   IMMEDIATELY BEFORE the codex managed-launch plan block
-   (`codex_launch = if codex_create_uses_managed_launch(…)` at ~`:892`) —
-   i.e. after the mode/cwd validation, resume-identity checks, and the
-   `RestSessionRefLease` acquisition, and before ANY side effect is
-   materialized:
+   IMMEDIATELY AFTER the D7/D8 `RestSessionRefLease` block closes
+   (~`:793`) and BEFORE `let terminal_id = …` (~`:795`) — i.e. after the
+   mode/cwd validation, resume-identity checks, and the lease acquisition,
+   on the shared path of EVERY mode, and before ANY side effect is
+   materialized. Do NOT anchor at the codex plan block (`:892`): it sits
+   inside the non-shell `else` branch (shell creates would bypass the
+   gate), and `generate_mcp_injection` (`:839`, tmp MCP config writes +
+   opencode sidecar refcount) and the opencode port allocation
+   (`:852-860`) precede it (rejection would leak MCP config). Validated:
+   load-bearing check A1, see D-C.
 ```rust
     // Server-wide spawn gate — the SAME instance the WS terminal.create path
     // uses (ONE global concurrency budget; wired by freshell-server main.rs;
-    // docs/plans/2026-07-27-rest-spawn-gate.md). Placed BEFORE the codex
-    // managed-launch plan so the permit also bounds the REST-reachable
-    // sidecar spawn, and before any other side effect, so rejection needs no
-    // cleanup (the session-ref lease above releases via its own Drop). RAII:
+    // docs/plans/2026-07-27-rest-spawn-gate.md). Placed on the shared path of
+    // EVERY mode, before terminal_id minting — i.e. before MCP config
+    // generation, opencode port allocation, and the codex managed-launch
+    // plan — so the permit also bounds the REST-reachable sidecar spawn and
+    // rejection needs NO cleanup (the session-ref lease above releases via
+    // its own Drop). RAII:
     // `_spawn_permit` drops on every early-return Err(...) below, on spawn
     // failure, and at fn end — never call `.forget()`. `None` (unwired) =
     // ungated: unit-test states without server wiring keep legacy behavior.
@@ -635,10 +674,11 @@ fn spawn_gate_error_response(err: crate::spawn_gate::SpawnGateError) -> Response
 ```
    IMPORTANT: bind to `_spawn_permit` (underscore-PREFIXED name), never
    `let _ = …` — the latter drops the permit immediately. Verify while placing
-   it that nothing between this point and `registry.create` (`:1034`)
-   materializes external side effects earlier than the codex plan; if
-   something does (e.g. MCP config generation), move the acquire above THAT
-   too — the invariant is "rejection needs no cleanup".
+   it that nothing BEFORE the acquire point (i.e. between the lease block and
+   your insertion) materializes an external side effect — the invariant is
+   "rejection needs no cleanup". (Everything after the acquire, including MCP
+   config generation at `:839` and port allocation at `:852-860`, is
+   intentionally under the permit.)
 
 - [ ] **Step 4: Run to verify pass + no regressions**
 
@@ -1005,13 +1045,13 @@ in this file, per-test-file ownership):
   `set_spawn_gate(gate, Duration::from_millis(cfg.spawn_timeout_ms))`, and
   (c) `.merge(freshell_freshagent::router(fresh_agent_state))` before binding.
   Return `(ws_url, base_url, token)`.
-- `reqwest_like_post`: the workspace may not have `reqwest` — use whatever
-  HTTP client the existing `freshell-ws` integration tests use for REST calls;
-  if none exists, a minimal raw `tokio::net::TcpStream` HTTP/1.1 POST with
-  `x-auth-token` and a JSON body (`{"mode":"shell","cwd":"<tmp>"}`) is fine —
-  keep it in this file. Do NOT add new workspace dependencies without checking
-  dev-deps first (`hyper`/`reqwest` may already be available transitively —
-  prefer what `Cargo.toml` already lists).
+- `reqwest_like_post`: VERIFIED (load-bearing check A8): `freshell-ws` has NO
+  `reqwest`/`hyper`/`tower` dev-dependency, `reqwest` in Cargo.lock is only a
+  transitive of `freshell-opencode` (not importable here), and no existing
+  `crates/*/tests` file makes real HTTP calls today. So: hand-roll a minimal
+  raw `tokio::net::TcpStream` HTTP/1.1 POST with `x-auth-token` and a JSON
+  body (`{"mode":"shell","cwd":"<tmp>"}`), kept in this file (tokio `net` is
+  already available). Do NOT add new workspace dependencies.
 - `ws_create_and_await_reply`: copy the `send_create_and_await_reply` shape
   from `tests/create_protection.rs:74-111` (hello → ready → `terminal.create`
   with a `requestId` → drain frames until `terminal.created`/`error` for that
@@ -1153,7 +1193,15 @@ function readServerLogs(info: TestServerInfo): string {
 
 test('REST create burst is gate-bounded, drains fully, and WS stays responsive', async () => {
   const server = new RustServer({
-    env: { RUST_LOG: 'info', FRESHELL_SPAWN_GATE_CONCURRENCY: '1' },
+    // FRESHELL_SPAWN_GATE_TIMEOUT_MS=60000: de-flake, not behavior change —
+    // 16 serialized spawns must all acquire within the permit-wait; on a
+    // loaded CI host the 10s default leaves little margin (load-bearing
+    // check A7). Production defaults (Global Constraints) are untouched.
+    env: {
+      RUST_LOG: 'info',
+      FRESHELL_SPAWN_GATE_CONCURRENCY: '1',
+      FRESHELL_SPAWN_GATE_TIMEOUT_MS: '60000',
+    },
   })
   const info = await server.start()
   try {
@@ -1352,5 +1400,39 @@ code step shows code. Steps that direct the implementer to "mirror the
 existing helper" also pin the exact source location and the load-bearing
 assertion, with fallback behavior specified (Task 5 Step 2, Task 6 Step 1,
 Task 8 Step 1).
+
+**1c. Load-bearing validation amendments (Stage 2, post-authoring).** The
+assumption ledger (`.worktrees/.the-usual-logs/rest-spawn-gate/load-bearing-ledger.md`)
+verified 6 assumptions and falsified 2; the falsified ones are fixed above:
+- A1 (falsified): the original acquire anchor (`:892`, the codex plan block)
+  was inside the non-shell `else` branch and AFTER real side effects. D-C and
+  Task 3 Step 3 now pin the corrected anchor (~`:793/:795`, shared path of
+  every mode, before `generate_mcp_injection`). Task 3's tests (shell-mode
+  0-permit 503s) discriminate: they would fail against the old anchor.
+- A2 (falsified for the flag-ON world): permit-hold across
+  `plan_create_with_retry` can reach ~226s worst-case vs the 10s wait. D-C
+  now records the exposure, the alternatives considered, and the decision
+  (flag defaults OFF; revisit at S5 default-flip).
+- Verified: kata text matches the plan's acceptance mapping (retrieved
+  verbatim; "kata item 2" wording corrected in D-D); CLI surfaces `message`
+  on non-2xx with no retry loop and exits cleanly (D-E holds, CLI prints
+  `message` only — never `code`); no caller fetch timeout < 10s (undici
+  headersTimeout default 300s; bare global fetch in both clients);
+  `spawn_gate_queued` is the literal INFO message string, serialized verbatim
+  as `"msg"` by JsonLayer and passes the RUST_LOG=info filter (Task 8's grep
+  is valid; it fires only on the contended path — guaranteed by
+  concurrency 1 × 16-burst); Task 6's harness is assemblable (WsState literal
+  provably constructible from tests/, zero route overlap on merge, WS Timeout
+  wire strings confirmed verbatim at `terminal.rs:2441-2444`) with the
+  hand-rolled HTTP client now pinned (no reqwest/hyper dev-deps exist);
+  fn-end RAII permit hold is cheap for the shipped default config (post-create
+  tail is sync in-memory work; the ≤500ms pid-death confirm is an error-path
+  rarity; only flag-ON managed codex holds across unbounded awaits — covered
+  by the A2 decision).
+- Accepted residual risks: A7 (burst-timing thresholds; mitigated with the
+  Task 8 explicit 60s test timeout env and Task 5's tolerant `>= 8`
+  threshold), A10 (knob sizing predates the second door; knobs stay
+  env-tunable and failures are loud, so inadequacy is observable — combined
+  WS+REST load re-derivation deferred, kata does not require it).
 
 **3. Type consistency.** `SpawnGate::new(usize, usize)`, `acquire(&self, Duration) -> Result<OwnedSemaphorePermit, SpawnGateError>`, counters `-> u64` — used identically in Tasks 1–8. `set_spawn_gate(Arc<SpawnGate>, Duration)` / `spawn_gate() -> Option<RestSpawnGate>` consistent across Tasks 2, 3, 6, 7. Error codes `SPAWN_QUEUE_FULL`(429)/`SPAWN_TIMEOUT`(503) and message strings identical in Task 3 impl, Task 3/5 tests, Task 6, and D-E.
