@@ -675,7 +675,7 @@ Then the regression test (place it near the top-level describe's other startup t
 - [ ] **Step 4: Run the test to verify it fails**
 
 Run: `npm run test:vitest -- run --config config/vitest/vitest.server.config.ts test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts -t "retries when the preallocated"`
-Expected: FAIL — first a type error (`portAllocator` not in `startProxy`'s options); after adding only the option pass-through (without retry), FAIL with `EADDRINUSE` rejected from `proxy.start()`.
+Expected: FAIL — immediately with `EADDRINUSE` rejected from `proxy.start()` on the very first run. No type-error stage occurs: vitest transforms via esbuild without typechecking (validated at Task 3 Step 3), and no pass-through needs to be added — the current `startProxy` harness already spreads its options into the constructor (`new CodexRemoteProxy({ upstreamWsUrl, ...options })`, `remote-proxy.test.ts:112`) and `CodexRemoteProxy` already consumes `options.portAllocator` (`remote-proxy.ts:137`), so the injected always-colliding allocator is live pre-implementation and the un-retried single `start()` attempt hits the occupied port and rejects.
 
 - [ ] **Step 5: Implement the harness retry**
 
