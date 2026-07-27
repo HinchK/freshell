@@ -339,20 +339,49 @@ async fn restore_creates_are_gated_and_non_restore_bypass() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn restore_create_holds_permit_until_settled() {
-    // Gate with ONE permit. Two restore creates on the same connection: if
-    // the permit were released at the spawn syscall (the da5d9b5c prior-art
-    // shape), both would complete near-instantly regardless of order; what
-    // we assert instead is the STRONGER wiring property that both complete
-    // AND the gate saw a queued waiter (the second create had to wait for
-    // the first create's FULL settle, not just its spawn).
+async fn restore_creates_queue_behind_held_permit_and_both_settle() {
+    // Deterministic rework of the former settled-hold race: the TEST holds
+    // the gate's single permit while both restore creates arrive, so "the
+    // second create had to queue" is structural instead of a race against
+    // the first create's few-ms spawn-to-settled window (see the Nagle
+    // comment in connect_and_hello). All original assertions preserved:
+    // both settle with their own requestId, the gate queued (now == 2,
+    // strictly stronger than the old >= 1), and exactly two PTYs exist.
+    // The "permit held until settled, not just spawn" ordering is pinned
+    // deterministically by create_gate's unit test
+    // permit_released_only_after_work_completes.
     let cfg = CreateProtectConfig::default();
     let (ws_url, registry, _shutdown, gate, _shutdown_started) =
         spawn_server(cfg, RestoreSpawnGate::new(1, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
 
+    // Hold the only permit so both creates MUST queue.
+    let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let permit = gate
+        .acquire(std::time::Duration::from_secs(5), &mut cancel_rx)
+        .await
+        .expect("test acquires the gate's only permit");
+
     send_text(&mut client, &create_frame("r1", true)).await;
     send_text(&mut client, &create_frame("r2", true)).await;
+
+    // Bounded poll (suite idiom, cf. the disconnect test): both creates
+    // observably queued behind the held permit.
+    for _ in 0..400 {
+        if gate.queued_total() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        gate.queued_total(),
+        2,
+        "with the only permit held by the test, both restore creates must queue"
+    );
+
+    // Release: with 1 permit the creates now run strictly one at a time.
+    drop(permit);
+
     let first = next_json_of_type(&mut client, "terminal.created").await;
     let second = next_json_of_type(&mut client, "terminal.created").await;
     let mut ids: Vec<String> = vec![
@@ -361,11 +390,18 @@ async fn restore_create_holds_permit_until_settled() {
     ];
     ids.sort();
     assert_eq!(ids, vec!["r1".to_string(), "r2".to_string()]);
+
+    // Permit-leak check: once both creates settled, the permit must be
+    // re-acquirable (released at settle, not retained).
+    let reacquired = gate
+        .acquire(std::time::Duration::from_secs(5), &mut cancel_rx)
+        .await;
     assert!(
-        gate.queued_total() >= 1,
-        "with 1 permit, the second concurrent restore create must have queued \
-         behind the first create's spawn-to-settled window"
+        reacquired.is_ok(),
+        "gate permit must be free again once both creates settled"
     );
+    drop(reacquired);
+
     assert_eq!(registry.kill_all(), 2);
 }
 

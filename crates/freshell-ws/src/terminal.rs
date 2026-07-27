@@ -488,7 +488,7 @@ async fn handle_client_text(
             match state.create_dedupe.begin(
                 &create.request_id,
                 conn_sink, // this connection's FrameSink, already in scope for Task 6's gated call
-                |tid| state.registry.exists(tid),
+                |tid| state.registry.is_pty_running(tid),
             ) {
                 crate::create_dedupe::DedupeDecision::DuplicateSettled(created) => {
                     // Re-send the original terminal.created (same requestId,
@@ -1312,7 +1312,9 @@ pub(crate) async fn handle_create(
     // both are non-blocking sink pushes, so ordering here is cosmetic.
     state
         .create_dedupe
-        .settle(&dedupe_request_id, &dedupe_terminal_id, &created);
+        .settle(&dedupe_request_id, &dedupe_terminal_id, &created, |tid| {
+            state.registry.is_pty_running(tid)
+        });
     let sent = out.send(&created).await;
     // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
     // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
