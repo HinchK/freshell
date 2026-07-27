@@ -9,11 +9,13 @@ import panesReducer, {
   setReconcilePendingPanes,
 } from '@/store/panesSlice'
 import settingsReducer from '@/store/settingsSlice'
-import freshAgentReducer from '@/store/freshAgentSlice'
+import freshAgentReducer, { markSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
 import { useAppSelector } from '@/store/hooks'
 import { resetRebindQueueForTests } from '@/lib/rebind-queue'
+import { setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
+import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 
 // Task 9: fresh-agent VIEW leg of pane reconcile -- verdict folds drive the
@@ -178,8 +180,9 @@ function leafContent(state: ReturnType<typeof store.getState>): FreshAgentPaneCo
   return layout.content
 }
 
-describe('FreshAgentView reconcile fold drive (Task 9)', () => {
-  beforeEach(() => {
+// Shared harness setup for both describes (Task 9 fold drive, Task 10
+// capability-gated .lost handling) -- file-level hooks apply to all tests.
+beforeEach(() => {
     vi.useFakeTimers()
     resetRebindQueueForTests()
     store = createStore()
@@ -220,8 +223,12 @@ describe('FreshAgentView reconcile fold drive (Task 9)', () => {
     })
     cleanup()
     vi.useRealTimers()
+    // The fresh-agent reconcile capability latch is module-global -- reset it
+    // so a Task 10 test can never leak the capability into another test.
+    setFreshAgentReconcileActive(false)
   })
 
+describe('FreshAgentView reconcile fold drive (Task 9)', () => {
   it('a respawn fold on a mounted pane re-sends freshAgent.create with the server-named ref and the SAME createRequestId', async () => {
     // Mount in 'creating' so the initial create CONSUMES createSentRef, then
     // land the created ack -- the pane is now live with the same
@@ -314,5 +321,94 @@ describe('FreshAgentView reconcile fold drive (Task 9)', () => {
       await vi.advanceTimersByTimeAsync(100) // rebind-queue pacing tick
     })
     expect(sentOfType('freshAgent.create')).toHaveLength(1) // enqueued then paced out, same createRequestId
+  })
+})
+
+// Task 10: capability-gated .lost handling -- when paneReconcileFreshAgentV1
+// was negotiated (isFreshAgentReconcileActive), a lost session triggers a
+// SINGLE-PANE reconcile owned by this view (fold-ownership rule) instead of
+// the heuristic triggerRecovery re-mint. The legacy path is the
+// capability-gated fallback (council rule: NEVER deleted).
+describe('FreshAgentView .lost capability gate (Task 10)', () => {
+  const ORIGINAL_CREATE_REQUEST_ID = baseContent.createRequestId
+
+  // markSessionLost no-ops when the session record does not exist, so seed
+  // it first (setSessionStatus routes through resolveOrEnsureSession) -- the
+  // exact shape fresh-agent-ws produces before dispatching markSessionLost.
+  function markSessionLostInStore(sessionId = 'live-1') {
+    act(() => {
+      store.dispatch(setSessionStatus({ sessionId, sessionType: 'freshclaude', provider: 'claude', status: 'running' }))
+      store.dispatch(markSessionLost({ sessionId, sessionType: 'freshclaude', provider: 'claude' }))
+    })
+  }
+
+  function sessionInStore(state: ReturnType<typeof store.getState>, sessionId: string) {
+    const key = makeFreshAgentSessionKey({ sessionId, sessionType: 'freshclaude', provider: 'claude' })
+    const session = state.freshAgent.sessions[key]
+    if (!session) throw new Error(`Missing freshAgent session ${sessionId}`)
+    return session
+  }
+
+  it('.lost with fresh-agent reconcile active sends a single-pane reconcile instead of heuristic recovery', async () => {
+    setFreshAgentReconcileActive(true)
+    renderFreshAgentPane({ sessionId: 'live-1', status: 'running', sessionRef: { provider: 'claude', sessionId: DURABLE } })
+    markSessionLostInStore()
+    await flush()
+    const reqs = sentOfType('pane.reconcile.request')
+    expect(reqs).toHaveLength(1)
+    expect(reqs[0].panes).toHaveLength(1)
+    expect((reqs[0].panes as Array<{ kind: string }>)[0].kind).toBe('fresh-agent')
+    // createRequestId unchanged -- no heuristic re-mint happened
+    expect(leafContent(store.getState()).createRequestId).toBe(ORIGINAL_CREATE_REQUEST_ID)
+  })
+
+  it('.lost with the capability inactive falls back to legacy triggerRecovery (new createRequestId)', async () => {
+    setFreshAgentReconcileActive(false)
+    // Realistic lost-session environment: the snapshot fetch against a dead
+    // thread 404s (see the snapshot-load effect's own comment). The default
+    // resolving mock would overwrite the recovery status with the snapshot's.
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new Error('lost thread'))
+    renderFreshAgentPane({ sessionId: 'live-1', status: 'running', sessionRef: { provider: 'claude', sessionId: DURABLE } })
+    markSessionLostInStore()
+    await flush()
+    expect(sentOfType('pane.reconcile.request')).toHaveLength(0)
+    expect(leafContent(store.getState()).createRequestId).not.toBe(ORIGINAL_CREATE_REQUEST_ID)
+    expect(leafContent(store.getState()).status).toBe('creating')
+  })
+
+  it('folds only its own reconcileId and applies the verdict (respawn re-drives create)', async () => {
+    setFreshAgentReconcileActive(true)
+    renderFreshAgentPane({ sessionId: 'live-1', status: 'running', sessionRef: { provider: 'claude', sessionId: DURABLE } })
+    markSessionLostInStore()
+    await flush()
+    const req = sentOfType('pane.reconcile.request')[0] as { reconcileId: string; panes: Array<{ paneKey: string }> }
+    receiveWs({ type: 'pane.reconcile.result', reconcileId: 'FOREIGN', bootId: 'b', serverInstanceId: 's', verdicts: [] }) // ignored
+    receiveWs({
+      type: 'pane.reconcile.result', reconcileId: req.reconcileId, bootId: 'b', serverInstanceId: 's',
+      verdicts: [{ paneKey: req.panes[0].paneKey, verdict: 'respawn', sessionRef: { provider: 'claude', sessionId: DURABLE } }],
+    })
+    await flush()
+    const creates = sentOfType('freshAgent.create')
+    expect(creates.length).toBeGreaterThan(0)
+    expect(creates[creates.length - 1].resumeSessionId).toBe(DURABLE)
+  })
+
+  it('an attach verdict for the SAME durable-as-sessionId clears the lost flag (no reconcile loop)', async () => {
+    // V3: the attach-path reducers never clear lost; when durable == old
+    // sessionId the same session entry keeps lost=true and the driver
+    // re-fires (loop). The fold arm must dispatch clearSessionLost for the
+    // pane's session.
+    setFreshAgentReconcileActive(true)
+    renderFreshAgentPane({ sessionId: DURABLE, status: 'running', sessionRef: { provider: 'claude', sessionId: DURABLE } })
+    markSessionLostInStore(DURABLE)
+    await flush()
+    const req = sentOfType('pane.reconcile.request')[0] as { reconcileId: string; panes: Array<{ paneKey: string }> }
+    receiveWs({
+      type: 'pane.reconcile.result', reconcileId: req.reconcileId, bootId: 'b', serverInstanceId: 's',
+      verdicts: [{ paneKey: req.panes[0].paneKey, verdict: 'attach', sessionRef: { provider: 'claude', sessionId: DURABLE } }],
+    })
+    await flush()
+    expect(sessionInStore(store.getState(), DURABLE).lost).toBe(false) // clearSessionLost landed
+    expect(sentOfType('pane.reconcile.request')).toHaveLength(1) // and no second reconcile fired
   })
 })

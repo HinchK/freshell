@@ -10,12 +10,14 @@ import {
 } from 'react'
 import { nanoid } from 'nanoid'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import type { PaneReconcileRequest } from '@shared/ws-protocol'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
-import { clearPendingCreateFailure, setSessionStatus } from '@/store/freshAgentSlice'
+import { clearPendingCreateFailure, clearSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
+import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
@@ -528,6 +530,7 @@ export function FreshAgentView({
 }) {
   const dispatch = useAppDispatch()
   const ws = getWsClient()
+  const appStore = useAppStore()
   const terminalFontSize = useAppSelector(
     (state) => state.settings.settings.terminal?.fontSize,
   ) ?? 16
@@ -1119,6 +1122,26 @@ export function FreshAgentView({
     }))
   }, [claudeSession, dispatch, paneId, tabId])
 
+  // Capability-gated .lost resolution (paneReconcileFreshAgentV1): a lost
+  // session asks the SERVER for the pane's true state via a single-pane
+  // reconcile owned by this view (fold-ownership rule: it folds only its own
+  // reconcileId) -- the verdict answers attach/respawn/dead instead of the
+  // triggerRecovery heuristics. Same pattern as TerminalView's exhaustion
+  // reconcile.
+  const lostReconcileRef = useRef<PaneReconcileRequest | null>(null)
+
+  const reconcileLostPane = useCallback(() => {
+    const request = buildReconcileRequestForPanes(appStore.getState(), [{ tabId, paneId }])
+    if (!request) {
+      // The pane lost its reconcilable state (no createRequestId) -- fall
+      // back to the legacy recovery path instead of wedging silently.
+      triggerRecovery()
+      return
+    }
+    lostReconcileRef.current = request
+    ws.send(request)
+  }, [appStore, paneId, tabId, triggerRecovery, ws])
+
   useEffect(() => {
     if (paneContent.sessionId) return
     if (paneContent.restoreError) return
@@ -1326,6 +1349,32 @@ export function FreshAgentView({
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
     const unsubscribe = ws.onMessage((message) => {
+      if (message.type === 'pane.reconcile.result') {
+        // Fold-ownership rule (pane-reconcile.ts): fold ONLY the result whose
+        // reconcileId this view minted for its .lost reconcile; foreign
+        // reconciles (App boot, other panes) are silently skipped.
+        const lostRequest = lostReconcileRef.current
+        if (lostRequest && message.reconcileId === lostRequest.reconcileId) {
+          lostReconcileRef.current = null
+          foldVerdicts(dispatch, lostRequest, message)
+          // markSessionLost's counterpart: an attach fold where the durable id
+          // equals the old sessionId leaves the SAME freshAgent session entry
+          // flagged lost=true (the attach-path reducers never clear it), which
+          // would re-trigger the .lost driver forever. Neutralize the flag for
+          // this pane's current session. Respawn folds are already safe (the
+          // reset clears sessionId; the later created ack clears lost), and an
+          // extra clear there is a harmless no-op.
+          const current = paneContentRef.current
+          if (current.sessionId) {
+            dispatch(clearSessionLost({
+              sessionId: current.sessionId,
+              sessionType: current.sessionType,
+              provider: current.provider,
+            }))
+          }
+        }
+        return
+      }
       if (message.type === 'freshAgent.created' && message.requestId === paneContentRef.current.createRequestId) {
         releasePendingRebind()
         const current = paneContentRef.current
@@ -1735,7 +1784,8 @@ export function FreshAgentView({
         restoreTimeoutRef.current = null
         if (paneContentRef.current.sessionId !== sessionIdForRecovery) return
         if (!agentSession?.lost) return
-        triggerRecovery()
+        if (isFreshAgentReconcileActive()) reconcileLostPane()
+        else triggerRecovery()
       }, 0)
       return () => {
         if (restoreTimeoutRef.current !== null) {
@@ -1744,13 +1794,15 @@ export function FreshAgentView({
         }
       }
     }
-    triggerRecovery()
+    if (isFreshAgentReconcileActive()) reconcileLostPane()
+    else triggerRecovery()
   }, [
     agentSession?.historyLoaded,
     agentSession?.latestTurnId,
     agentSession?.lost,
     paneContent.provider,
     paneContent.sessionId,
+    reconcileLostPane,
     triggerRecovery,
   ])
 

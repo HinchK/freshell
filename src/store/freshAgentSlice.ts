@@ -466,6 +466,17 @@ const freshAgentSlice = createSlice({
       session.lost = true
     },
 
+    /** markSessionLost's counterpart: a reconcile fold produced a working outcome --
+     *  neutralize the lost flag WITHOUT destroying the session record
+     *  (removeSession below deletes transcript/status state -- never use it here). */
+    clearSessionLost(state, action: PayloadAction<SessionMutationPayload>) {
+      const key = resolveSessionKey(state, action.payload)
+      if (!key) return
+      const session = state.sessions[key]
+      if (!session) return
+      session.lost = false
+    },
+
     removeSession(state, action: PayloadAction<SessionMutationPayload>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
@@ -617,6 +628,7 @@ export const {
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,
+  clearSessionLost,
   clearStreaming,
   createFailed,
   freshAgentSnapshotReceived,
