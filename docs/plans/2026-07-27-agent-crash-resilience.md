@@ -810,7 +810,7 @@ git commit -m "feat(ws): respawn_agent_terminal seam — server-side resume gene
 - Test: in-file `#[cfg(test)]` (fake-driver unit tests, `tokio::time::pause`) + `crates/freshell-ws/tests/auto_resume_e2e.rs` (real registry integration)
 
 **Interfaces:**
-- Consumes: `decide`/`auto_resume_delays`/`CrashEvent` (Task 1); `respawn_agent_terminal` (Task 4); `TerminalReplaced` frame (Task 3); `TerminalStatus` frame (existing, `server_messages.rs` — search `terminal.status` for the struct/variant names); guards: `registry.respawn_exhausted` (`registry.rs:733`), `registry.live_terminal_for_session_ref` (`registry.rs:2152`), `claim_session_ref`/`complete_session_ref_claim` (`registry.rs:469-486` vicinity); identity: `state.identity.session_ref_for(&terminal_id)` (retired-inclusive) with ledger fallback `state.pane_ledger.bound_session_ref_for_terminal` (`pane_ledger.rs:652`).
+- Consumes: `decide`/`auto_resume_delays`/`CrashEvent` (Task 1); `respawn_agent_terminal` (Task 4); `TerminalReplaced` frame (Task 3); `TerminalStatus` frame (existing, `server_messages.rs` — search `terminal.status` for the struct/variant names); guards: `registry.respawn_exhausted` (`registry.rs:733`), `registry.live_terminal_for_session_ref` (`registry.rs:2152`); lease: `claim_session_ref(locator, holder_create_request_id, holder_conn, now_ms) -> SessionRefClaim` (`registry.rs:1812`; enum variants `Acquired`/`Held{retry_after_ms}`/`ExpiredNeedsKill{pid}`/`BoundElsewhere{terminal_id}`, `registry.rs:467-486`; locator type is `SessionLocator { provider, session_id }`, `freshell-protocol/src/common.rs:176-182`), `complete_session_ref_claim(locator, holder_create_request_id, terminal_id) -> bool` (`registry.rs:1964`), `fail_session_ref_claim(locator, holder_create_request_id)` (`registry.rs:2007`); identity: `state.identity.session_ref_for(&terminal_id)` (retired-inclusive) with ledger fallback `state.pane_ledger.bound_session_ref_for_terminal` (`pane_ledger.rs:652`).
 - Produces: `pub fn spawn_auto_resume_hub(state: WsState, rx: UnboundedReceiver<CrashEvent>) -> tokio::task::JoinHandle<()>`; wire frames emitted on `broadcast_tx` (pre-serialized JSON, same as `terminals.changed`):
   - on each Resume decision, BEFORE the backoff sleep: `terminal.status { terminalId: <old>, status: "recovering", reason: "<mode> crashed (exit <code>) — auto-resuming, attempt <n>/<max>", attempt: <n> }`
   - after successful respawn: `terminal.replaced { oldTerminalId, newTerminalId, exitCode, attempt, maxAttempts }`
@@ -822,12 +822,34 @@ Append to `auto_resume.rs`'s test module. First define (in the impl section sign
 
 ```rust
 /// Orchestrator-facing effects, faked in unit tests.
+///
+/// LEASE-SHAPE NOTE (fresh-eyes fix): the trait mirrors the REAL registry
+/// lease API, which is asymmetric — success binds the lease to the NEW
+/// terminal via `complete_session_ref_claim(locator, holder_create_request_id,
+/// terminal_id) -> bool` (registry.rs:1964), failure releases it via
+/// `fail_session_ref_claim(locator, holder_create_request_id)` (registry.rs:2007).
+/// A single symmetric `release_claim` cannot implement that discipline, so the
+/// trait exposes `complete_claim` / `fail_claim` distinctly, and the claim call
+/// carries the holder create-request-id the registry keys the lease by.
 pub(crate) trait AutoResumeDriver: Send + 'static {
     fn cap_exhausted(&self, create_request_id: &str) -> bool;
     fn resumable_session_ref(&self, terminal_id: &str) -> Option<(String, String, Option<String>)>; // (provider, session_id, cwd)
-    fn session_owned_by_live_terminal(&self, provider: &str, session_id: &str) -> bool;
-    fn claim_session(&self, provider: &str, session_id: &str) -> bool; // false = lease held elsewhere → abort
-    fn release_claim(&self, provider: &str, session_id: &str);
+    /// Post-backoff guard. Some(reason) aborts the resume and settles with that
+    /// reason ("session_owned_live" when a live terminal already owns the
+    /// session-ref; "pane_closed" when the pane's ledger binding was retired
+    /// during the backoff). None = clear to claim.
+    fn pre_respawn_guard(&self, provider: &str, session_id: &str, old_terminal_id: &str) -> Option<&'static str>;
+    /// Acquire the session-ref lease for this holder; false = not acquirable → abort.
+    /// The PRODUCTION impl runs the create ingress's full bounded claim
+    /// discipline internally (Step 3 notes) — the hub only sees the outcome.
+    fn claim_session(&self, provider: &str, session_id: &str, create_request_id: &str) -> bool;
+    /// Bind the acquired lease to the freshly spawned terminal
+    /// (complete_session_ref_claim). false = the binding raced away; the
+    /// PRODUCTION impl has already killed its own orphan child before
+    /// returning (mirror of the ingress complete==false path).
+    fn complete_claim(&self, provider: &str, session_id: &str, create_request_id: &str, new_terminal_id: &str) -> bool;
+    /// Release a claim whose respawn failed (fail_session_ref_claim).
+    fn fail_claim(&self, provider: &str, session_id: &str, create_request_id: &str);
     fn respawn(
         &self,
         req: &RespawnSpec,
@@ -881,8 +903,14 @@ async fn healthy_generation_resets_attempts() {
 
 #[tokio::test(start_paused = true)]
 async fn live_session_owner_aborts_resume_silently() {
-    // session_owned_by_live_terminal -> true (user already relaunched):
-    // no respawn, no recovering frame after the guard, settled("session_owned_live").
+    // pre_respawn_guard -> Some("session_owned_live") (user already relaunched):
+    // no respawn, no claim, settled("session_owned_live").
+}
+
+#[tokio::test(start_paused = true)]
+async fn pane_closed_during_backoff_settles_pane_closed() {
+    // pre_respawn_guard -> Some("pane_closed") (ledger binding retired during
+    // the backoff): no respawn, no claim, settled("pane_closed").
 }
 
 #[tokio::test(start_paused = true)]
@@ -892,7 +920,15 @@ async fn lost_lease_claim_aborts_resume() {
 
 #[tokio::test(start_paused = true)]
 async fn failed_respawn_settles_loudly() {
-    // respawn -> Err("spawn failed"): release_claim called, settled("respawn_failed").
+    // respawn -> Err("spawn failed"): fail_claim called (NOT complete_claim),
+    // settled("respawn_failed").
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_lease_completion_settles_without_replaced_frame() {
+    // respawn -> Ok("t-new") but complete_claim -> false (binding raced away;
+    // production driver kills its own child before returning false):
+    // NO terminal.replaced emitted, settled("lease_completion_lost").
 }
 
 #[tokio::test(start_paused = true)]
@@ -950,25 +986,31 @@ pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver>(
                     driver.emit_recovering(&ev.terminal_id, &ev.mode, ev.exit_code, attempt, max_attempts);
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     // Guards AFTER the sleep — the world may have moved on.
-                    if driver.session_owned_by_live_terminal(&provider, &session_id) {
-                        driver.log_settled(&ev.terminal_id, "session_owned_live");
+                    if let Some(reason) = driver.pre_respawn_guard(&provider, &session_id, &ev.terminal_id) {
+                        driver.log_settled(&ev.terminal_id, reason);
                         continue;
                     }
-                    if !driver.claim_session(&provider, &session_id) {
+                    if !driver.claim_session(&provider, &session_id, &key) {
                         driver.log_settled(&ev.terminal_id, "session_lease_held");
                         continue;
                     }
                     let spec = RespawnSpec {
                         mode: ev.mode.clone(), provider: provider.clone(),
-                        session_id: session_id.clone(), create_request_id: key, cwd,
+                        session_id: session_id.clone(), create_request_id: key.clone(), cwd,
                     };
                     match driver.respawn(&spec).await {
                         Ok(new_tid) => {
-                            driver.release_claim(&provider, &session_id);
-                            driver.emit_replaced(&ev.terminal_id, &new_tid, ev.exit_code, attempt, max_attempts);
+                            if driver.complete_claim(&provider, &session_id, &key, &new_tid) {
+                                driver.emit_replaced(&ev.terminal_id, &new_tid, ev.exit_code, attempt, max_attempts);
+                            } else {
+                                // Binding raced away between claim and completion; the
+                                // driver already killed its own orphan child. No
+                                // terminal.replaced — the pane stays settled exited.
+                                driver.log_settled(&ev.terminal_id, "lease_completion_lost");
+                            }
                         }
                         Err(err) => {
-                            driver.release_claim(&provider, &session_id);
+                            driver.fail_claim(&provider, &session_id, &key);
                             tracing::warn!(terminal_id = %ev.terminal_id, error = %err, "terminal.auto_resume.respawn_failed");
                             driver.log_settled(&ev.terminal_id, "respawn_failed");
                         }
@@ -984,8 +1026,11 @@ pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver>(
 Production driver `WsAutoResumeDriver { state: WsState }` implements the trait by delegating:
 - `cap_exhausted` → `state.registry.respawn_exhausted(key)`
 - `resumable_session_ref` → `state.identity.session_ref_for(tid)` (retired-inclusive) with `state.pane_ledger.bound_session_ref_for_terminal(tid)` as fallback; map to `(provider, session_id, cwd)` (cwd from `BindingRow.cwd` / identity)
-- `session_owned_by_live_terminal` → `state.registry.live_terminal_for_session_ref(&locator).is_some()`, AND additionally re-check the pane's ledger binding is still Bound (`bound_session_ref_for_terminal`) — a user who closed the pane during the backoff retires it (`retire_closed`, terminal.rs:2716-2730); if retired, settle `pane_closed` instead of respawning (this also bounds the crash-then-immediately-killed race — pin with a unit test scenario)
-- `claim_session`/`release_claim` → `claim_session_ref` / `complete_session_ref_claim` (VERIFIED shape: `claim_session_ref(locator, request_id_str, holder_conn: u64, now_ms)` at registry.rs:1812 takes plain values — callable headlessly). Two hard requirements from validation: (i) mint `holder_conn` via `registry.new_connection_id()` — NEVER a literal that could collide with a real WS connection id, or a client disconnect sweep (terminal.rs:446-458) could release the orchestrator's lease mid-respawn; a minted id is never swept, so (ii) the orchestrator OWNS the full release discipline on every path — success, respawn failure, and completion failure (mirror the create ingress's exact discipline at terminal.rs:1149ff, including complete==false → kill own child; no connection-death safety net exists for this holder)
+- `pre_respawn_guard` → returns `Some("session_owned_live")` when `state.registry.live_terminal_for_session_ref(&locator).is_some()`; otherwise re-checks the pane's ledger binding is still Bound (`bound_session_ref_for_terminal`) — a user who closed the pane during the backoff retires it (`retire_closed`, called from the `terminal.kill` path, terminal.rs:2714-2739) — and returns `Some("pane_closed")` if retired (this also bounds the crash-then-immediately-killed race — pinned by the `pane_closed_during_backoff_settles_pane_closed` unit scenario); returns `None` when clear to claim. Ledger-disabled caveat: `bound_session_ref_for_terminal` returns `None` both when retired and when the ledger is disabled — only treat a retired binding as `pane_closed` when the ledger is enabled; with the ledger disabled, skip that sub-check (the live-owner check and the lease still guard).
+- `claim_session` → runs the create ingress's FULL bounded claim discipline headlessly, mirroring `terminal.rs:1147-1214` exactly: call `claim_session_ref(&SessionLocator{provider,session_id}, create_request_id, holder_conn, now_ms)` (registry.rs:1812) in the same bounded rounds (`for round in 0..2`); on `ExpiredNeedsKill{pid}` do the ingress's kill → confirm → `force_release_after_confirmed_kill` → retry round; treat `Held{..}`/`BoundElsewhere{..}` (and rounds exhausted) as `false`. VERIFIED: takes plain values — callable headlessly.
+- `complete_claim` → `complete_session_ref_claim(&locator, create_request_id, new_terminal_id)` (registry.rs:1964). When it returns `false`, mirror the ingress complete==false path (terminal.rs:1986-2029): kill the just-spawned child terminal, then return `false` to the hub (which settles `lease_completion_lost` and emits no `terminal.replaced`).
+- `fail_claim` → `fail_session_ref_claim(&locator, create_request_id)` (registry.rs:2007). NOTE: the WS ingress releases failed claims via the RAII `Drop for SessionRefLeaseGuard` (terminal.rs:1008-1016); the headless driver holds no guard, so this explicit call IS its failure-path release — do not also construct the guard.
+- Two hard requirements from validation: (i) mint `holder_conn` via `registry.new_connection_id()` — NEVER a literal that could collide with a real WS connection id, or a client disconnect sweep (terminal.rs:446-458) could release the orchestrator's lease mid-respawn; a minted id is never swept, so (ii) the orchestrator OWNS the full release discipline on every path — success (`complete_claim`), respawn failure (`fail_claim`), and completion failure (`complete_claim == false` → kill own child); no connection-death safety net exists for this holder
 - `respawn` → `respawn_agent_terminal(&state, &AgentRespawnRequest { … })`
 - `emit_recovering` → build the existing `ServerMessage` for `terminal.status` (struct name at `server_messages.rs` — search `"terminal.status"`) with `status: "recovering"`, `reason: format!("{mode} crashed (exit {code}) — auto-resuming, attempt {n}/{max}")`, `attempt: Some(n)`; serialize with `serde_json::to_string` and send on `state.broadcast_tx` (same as `broadcast_terminals_changed`, `terminal.rs:2255`)
 - `emit_replaced` → same bus, `ServerMessage::TerminalReplaced(…)`
@@ -1046,7 +1091,7 @@ export interface PaneLifecycleEntry {
 }
 // state: { byPaneId: Record<string, PaneLifecycleEntry> }
 // actions:
-recordTerminalExit({ paneId, terminalId, exitCode, at })          // sets exit + lastTerminalId
+recordTerminalExit({ paneId, terminalId, exitCode, at })          // sets exit + lastTerminalId; CLEARS any notice
 recordAutoResumeRecovering({ paneId, attempt, maxAttempts, exitCode, at })
 foldTerminalReplacement({ paneId, newTerminalId, exitCode, attempt, maxAttempts, at })
   // clears exit, sets a 'resumed' notice, advances lastTerminalId = newTerminalId
@@ -1091,6 +1136,16 @@ describe('terminalLifecycleSlice', () => {
     expect(selectExitRecordFrom(s, 'p1')).toBeUndefined() // pane is alive again — no error bar
     expect(selectActiveNoticeFrom(s, 'p1', 2000)).toEqual({ kind: 'resumed', attempt: 1, maxAttempts: 2, exitCode: 1, at: 2000 })
     expect(selectLastTerminalIdFrom(s, 'p1')).toBe('t2')
+  })
+
+  it('a later exit clears any active notice (exhaustion must not be masked by a stale resumed strip)', () => {
+    // fold sets a 'resumed' notice; the replacement then crashes and the hub
+    // settles retries_exhausted WITHOUT emitting any frame — the exit record
+    // must surface the alert immediately, not after the 30s TTL.
+    let s = reducer(empty, foldTerminalReplacement({ paneId: 'p1', newTerminalId: 't2', exitCode: 1, attempt: 2, maxAttempts: 2, at: 1000 }))
+    s = reducer(s, recordTerminalExit({ paneId: 'p1', terminalId: 't2', exitCode: 1, at: 2000 }))
+    expect(selectActiveNoticeFrom(s, 'p1', 2000)).toBeUndefined()
+    expect(selectExitRecordFrom(s, 'p1')).toEqual({ exitCode: 1, at: 2000 })
   })
 
   it('clearTerminalLifecycle wipes the pane entry', () => {
@@ -1157,6 +1212,14 @@ const slice = createSlice({
       const e = entry(state, a.payload.paneId)
       e.lastTerminalId = a.payload.terminalId
       e.exit = { exitCode: a.payload.exitCode, at: a.payload.at }
+      // Fresh-eyes fix: an exit is always NEWER truth than any notice. Without
+      // this, the exhaustion path (last crash -> settle, which emits no frame)
+      // leaves the previous 'resumed' notice masking the role=alert error bar
+      // for the 30s TTL — a success-toned banner on a dead pane. Clearing here
+      // makes the alert show immediately on the final crash; a genuine
+      // in-flight resume re-sets the notice when its `recovering` frame lands
+      // (which always follows the exit, per Task 5's emit order).
+      delete e.notice
     },
     recordAutoResumeRecovering(state, a: PayloadAction<{ paneId: string; attempt: number; maxAttempts: number; exitCode: number; at: number }>) {
       const { paneId, ...n } = a.payload
@@ -1197,10 +1260,11 @@ Register `terminalLifecycle: terminalLifecycleReducer` in the store-assembly fil
 
 In `src/components/TerminalView.tsx`. **Matching rule (VERIFIED constraint, D-2):** the `terminal.exit` handler clears `paneContent.terminalId`/`terminalIdRef` (`:4141-4148` — do NOT change that behavior), so the `recovering`/`replaced` handlers must match old-id frames against the pane's recorded `lastTerminalId` from the lifecycle slice, never against `paneContent.terminalId`:
 
-- In the existing `terminal.exit` handler (~`:4101-4160`), BEFORE the existing clearing of `terminalIdRef`/`terminalId` (this is the one moment paneId and the dying terminalId are both known), add (for all modes — the render layer applies the agent/non-zero policy):
+- In the existing `terminal.exit` handler (~`:4101-4160`), at the TOP of the matched-id path — immediately after the `msg.terminalId === tid` match, BEFORE the `pendingDurableReplacement` (`:4102-4106`) and `exitedDuringLaunch` (`:4108-4125`) early-return branches, and therefore before the tail's clearing of `terminalIdRef`/`terminalId` (`:4141-4148`) — add (for all modes — the render layer applies the agent/non-zero policy):
   ```ts
   dispatch(recordTerminalExit({ paneId, terminalId: msg.terminalId, exitCode: msg.exitCode, at: Date.now() }))
   ```
+  **Crash-during-launch analysis (fresh-eyes fix — placement is load-bearing, not stylistic).** A fast-crashing agent CLI (the e2e fixture dies within milliseconds) very plausibly exits BEFORE the `terminal.attach.ready` flip (`:3936-3941`), so the handler takes the `exitedDuringLaunch` branch into `failLaunch` (`:3024-3052`), which sets pane status `'error'` (not `'exited'`) and clears `terminalIdRef` (`:3042`) — an early-return path that never reaches `:4141`. Dispatching at the top of the matched path guarantees `lastTerminalId` (the frame-matching key) and the exit record are captured on EVERY exit path, including this dominant one. Recording in the `pendingDurableReplacement`/`exitedDuringLaunch` branches is presentation-inert (Task 7's banner additionally gates on pane status) but load-bearing for matching: the subsequent `terminal.status{recovering}` / `terminal.replaced` frames match via `lastTerminalId`, and `applyReconcileAttach` has no reconcile-flow preconditions (`panesSlice.ts:1886-1923`), so the fold rebinds a pane that settled `'error'` just as well as one that settled `'exited'`. Two supporting server facts (VERIFIED): (1) `finish_pty_exit` fans `TerminalExit` only to `s.subscribers` (`registry.rs:1436-1443`) — but a client that attaches to an already-dead terminal receives a synthesized exit replay on attach (`registry.rs:1064-1071`), so the fold→attach sequence still delivers the exit for every fast-crashing retry generation; (2) the auto-resume hub consumes `CrashEvent` from the exit hook, not from WS subscriptions, so server-side resume proceeds regardless of whether any client observed the exit frame.
 - In the existing `terminal.status` handler (~`:4087`), add (matching by live tid OR the recorded lastTerminalId, since the crash has usually already cleared tid by the time `recovering` arrives):
   ```ts
   const mine = msg.terminalId === terminalIdRef.current ||
@@ -1380,8 +1444,13 @@ export function TerminalExitBanner({ mode, exitCode, notice, onRelaunch }: Termi
 //    quiet rule, D-3).
 // 5. Agent pane, status 'exited', NO exit record (post-reload) → alert without
 //    a code, Relaunch present.
+// 6. Agent pane, status 'error' (crash-before-attach-ready settled via
+//    failLaunch), exit record {code:1} → alert visible with Relaunch (same
+//    user situation as 1; see Task 6's crash-during-launch analysis). A
+//    status-'error' pane with NO exit record → no alert (plain launch
+//    failure keeps today's presentation).
 ```
-Write all five out fully. Then wire in `TerminalView.tsx` near the JSX root (`:4838`ff), alongside the existing overlay/panel rendering:
+Write all six out fully. Then wire in `TerminalView.tsx` near the JSX root (`:4838`ff), alongside the existing overlay/panel rendering:
 
 ```tsx
 // Keyed by paneId (NOT terminalId — the exit handler clears paneContent.terminalId,
@@ -1390,10 +1459,17 @@ const exitRecord = useSelector((s: RootState) => selectExitRecord(s, paneId))
 const activeNotice = useSelector((s: RootState) => selectActiveNotice(s, paneId, Date.now()))
 
 const isAgentPane = paneContent.mode && paneContent.mode !== 'shell'
+// Fresh-eyes fix: a crash BEFORE terminal.attach.ready settles the pane via
+// failLaunch as status 'error', not 'exited' (TerminalView.tsx:4108-4125,
+// :3024-3052) — the dominant timing for a fast-crashing CLI. An agent pane in
+// 'error' WITH a recorded non-zero exit is the same user situation (agent
+// process died) and must show the same alert + Relaunch. Plain launch
+// failures (create rejected — no exit record) keep today's presentation.
 const showExitBanner = Boolean(
   isAgentPane && (
     activeNotice ||
-    (paneContent.status === 'exited' && (exitRecord ? exitRecord.exitCode !== 0 : true))
+    (paneContent.status === 'exited' && (exitRecord ? exitRecord.exitCode !== 0 : true)) ||
+    (paneContent.status === 'error' && exitRecord && exitRecord.exitCode !== 0)
   )
 )
 // … in the JSX, below the terminal surface:
@@ -1408,7 +1484,7 @@ const showExitBanner = Boolean(
   />
 )}
 ```
-(Use the exact `resetPaneForReconcileCreate` payload shape from `panesSlice.ts:1930` — if it differs from `{tabId, paneId, intent, sessionRef}`, mirror the reducer's actual contract; `sessionRef.provider === mode` is required for a resume, else the reducer degrades loudly to a fresh create — that existing behavior is the correct fallback for identity-less panes. The TTL selector uses `Date.now()` at render; the notice's disappearance at TTL doesn't need a re-render timer — any state change re-evaluates it, and the banner's stale-notice degradation to the error bar is what Task 5's frames guarantee within seconds. Add a `setTimeout`-based re-render ONLY if test 1's recovering→alert transition proves flaky without it.)
+(Use the exact `resetPaneForReconcileCreate` payload shape from `panesSlice.ts:1930` — if it differs from `{tabId, paneId, intent, sessionRef}`, mirror the reducer's actual contract; `sessionRef.provider === mode` is required for a resume, else the reducer degrades loudly to a fresh create — that existing behavior is the correct fallback for identity-less panes. The TTL selector uses `Date.now()` at render. Staleness handling (fresh-eyes fix — the previous note here wrongly claimed Task 5's frames force the degradation; the exhaustion settle emits NO frame): the exhaustion path needs no TTL at all, because Task 6's `recordTerminalExit` clears the notice on the final crash, so the alert shows immediately. The TTL is the backstop for a `recovering` notice orphaned by a SILENT settle (`respawn_failed` / `session_lease_held` / `session_owned_live` / `pane_closed` — none emits a frame), and since no state change is guaranteed to arrive on a dead pane, schedule one re-render when an active notice is present: `useEffect` with a `setTimeout` firing at `notice.at + AUTO_RESUME_NOTICE_TTL_MS - Date.now() + 1` that bumps a local `useState` counter (cleared on unmount/notice change). This makes the notice→alert degradation deterministic instead of "whenever something else re-renders".)
 
 - [ ] **Step 5: Run green + lint + commit**
 
@@ -1712,3 +1788,17 @@ Do NOT run `gh pr create`. Produce the lane report: branch name, base sha, per-t
 Verified-with-amendment items folded in: SpawnGate acquire added to the Task 4 seam (in-path for all creates); orchestrator lease discipline pinned (mint `holder_conn` via `new_connection_id()`, own every release path); binding-still-Bound pre-respawn guard added (bounds the crash-then-kill race); `corrected` flag semantics corrected in D-2 (None for same-session replacement) with a mandatory reconcile-after-replacement pin test in Task 5 step 4(d); `applyReconcileAttach` fold payload mirrors `pane-reconcile.ts:428-436` incl. `serverInstanceId`.
 
 Self-review re-run over the edited tasks (incl. 1b): every user-facing requirement still lands as production behavior proven by non-mocked tests — the paneId re-keying changes only the client data model, not what is proven (Task 9's e2e assertions are unchanged and remain the end-to-end proof); the REST-pane scope exclusion is a documented boundary of a fenced subsystem, not a silent deferral (WS-created agent panes — the product surface this feature targets — are fully covered); no new TBDs introduced; type/name consistency between Tasks 6/7/8 sketches re-checked after re-keying (`paneId` payloads, `selectExitRecord(root, paneId)`, `selectLastTerminalIdFrom`).
+
+---
+
+## Fresh-Eyes Review Fixes (iteration 1 addendum, 2026-07-27)
+
+An independent cross-model review found three blocking (major) executable defects; all three are fixed in this revision (evidence for the repo facts cited below: `.worktrees/.the-usual-logs/agent-crash-resilience/reports/fix-facts.md`):
+
+1. **Stale notice masked the settled error bar (Tasks 6/7/9).** The exhaustion settle emits no frame, so the previous `resumed` notice (30s TTL) would hide the `role=alert` bar and Relaunch button on a dead pane, making Task 9 tests 2 and 4 unpassable. Fixed: `recordTerminalExit` now clears any notice (an exit is always newer truth; pinned by a new slice test), and Task 7's wiring note was corrected — the old claim that "Task 5's frames guarantee degradation within seconds" was false for silent settles, so a deterministic TTL-expiry re-render (`setTimeout` in a `useEffect`) is now mandated as the backstop for orphaned `recovering` notices (`respawn_failed`/lease/guard settles emit nothing).
+
+2. **Crash-during-launch path was unanalyzed (Tasks 6/7).** A CLI that dies before `terminal.attach.ready` (the e2e fixture's dominant timing) takes the `exitedDuringLaunch` → `failLaunch` branch (status `'error'`, `terminalIdRef` cleared at `TerminalView.tsx:3042`) — an early return that never reached the previously-specified `recordTerminalExit` insertion point, orphaning the frame-matching key. Fixed: `recordTerminalExit` is dispatched at the TOP of the matched-id exit path (before the `pendingDurableReplacement`/`exitedDuringLaunch` early returns), with a written analysis of why that placement is load-bearing; `showExitBanner` now also covers agent panes settled `'error'` WITH a recorded non-zero exit (new Task 7 scenario 6); and the subscriber-only `TerminalExit` fan-out concern is closed by the verified synthesized-exit replay on attach (`registry.rs:1064-1071`) plus the hub consuming `CrashEvent` from the exit hook rather than WS subscriptions.
+
+3. **Task 5 driver trait could not implement the mandated lease discipline.** The real registry API is asymmetric — `complete_session_ref_claim(locator, holder_create_request_id, terminal_id) -> bool` (`registry.rs:1964`) vs `fail_session_ref_claim(locator, holder_create_request_id)` (`registry.rs:2007`) — and the claim returns a four-variant `SessionRefClaim` (`registry.rs:467-486`), so the old symmetric `release_claim(provider, session_id)` / boolean-only `claim_session` trait was unimplementable and its pinned tests would have frozen the wrong shape. Fixed: the trait now exposes `claim_session(..., create_request_id)` (production impl runs the ingress's full bounded claim rounds, `terminal.rs:1147-1214`, headlessly), `complete_claim(..., new_terminal_id) -> bool` (complete==false → kill own child, mirroring `terminal.rs:1986-2029`), `fail_claim(...)` (explicit — the headless driver holds no RAII `SessionRefLeaseGuard`), and `pre_respawn_guard(...) -> Option<&'static str>` (distinguishes `session_owned_live` from `pane_closed`, with a ledger-disabled caveat); the hub sketch and unit-test list were updated accordingly (two new scenarios: `pane_closed` guard and `lease_completion_lost`).
+
+Self-review re-run over the edited tasks (Tasks 5/6/7): no new placeholders; type/name consistency re-checked (`pre_respawn_guard`/`claim_session`/`complete_claim`/`fail_claim` names match across trait, hub sketch, test comments, and driver bullets; slice action behavior matches its tests and Task 7's wiring note); every user-facing requirement still lands as production behavior proven by non-mocked tests — Task 9's four e2e assertions are unchanged and are now achievable on both the post-attach (`'exited'`) and crash-during-launch (`'error'`) settle timings.
