@@ -33,6 +33,7 @@ mod session_metadata;
 mod sessions;
 mod settings;
 mod settings_store;
+mod shutdown_forensics;
 mod tabs_snapshots;
 mod terminals;
 mod updater;
