@@ -261,7 +261,19 @@ async fn main() -> ExitCode {
     // Agent-API's terminal-mode `POST /api/tabs` shares THIS SAME registry --
     // never a second one -- so an Agent-API-created shell terminal is a first-class
     // citizen of the one PTY registry the WS `terminal.create`/attach/kill paths use.
-    let fresh_agent_state = fresh_agent_state.with_terminal_registry(registry.clone());
+    // Fix Spec: Session Naming Cluster -- the shared terminal-identity registry
+    // (`freshell_ws::identity`, the port-side closure of
+    // `TerminalMetadataService`'s provider/sessionId association slice). Written
+    // by the WS terminal create/kill/exit paths (`ws_state`, below); read by the
+    // REST rename cascades (`terminals_state`/`sessions::SessionsState`) and the
+    // session-directory live-terminal join (`session_directory_state`).
+    // Constructed BEFORE the fresh-agent builder chain so the REST D7
+    // live-session guard can consume it through the `SessionIdentityLookup`
+    // seam (cheap-clone handle; `WsState` keeps using this same binding).
+    let terminal_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    let fresh_agent_state = fresh_agent_state
+        .with_terminal_registry(registry.clone())
+        .with_session_identity(std::sync::Arc::new(terminal_identity.clone()));
     // TERM-11 fix: honor `settings.safety.autoKillIdleMinutes` at boot (the
     // Rust registry previously never read it at all, so a config that raised
     // or lowered it from the default had no effect). See
@@ -275,12 +287,12 @@ async fn main() -> ExitCode {
         settings.terminal.scrollback,
     ));
     // Fix Spec: Session Naming Cluster -- the shared terminal-identity registry
-    // (`freshell_ws::identity`, the port-side closure of
-    // `TerminalMetadataService`'s provider/sessionId association slice). Written
-    // by the WS terminal create/kill/exit paths (`ws_state`, below); read by the
+    // (`freshell_ws::identity`, constructed ABOVE the fresh-agent builder chain
+    // since #540 so the REST D7 live-session guard can consume it). Written by
+    // the WS terminal create/kill/exit paths (`ws_state`, below); read by the
     // REST rename cascades (`terminals_state`/`sessions::SessionsState`) and the
     // session-directory live-terminal join (`session_directory_state`).
-    let terminal_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    //
     // Task 13b (cross-kind liveness): the terminal-liveness probe the fresh-agent
     // runtimes consult before any create/attach resume -- the SAME join the terminal
     // D7 create-rung guard performs (identity owner + Running registry row). Built

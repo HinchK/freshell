@@ -1375,22 +1375,13 @@ async fn handle_create(
         .map(|r| r.session_id.as_str())
         .filter(|sid| !sid.is_empty() && resume_session_id.as_deref() == Some(*sid))
     {
-        let identity_owner_live =
-            state
-                .identity
-                .find_by_session(&mode, live_sid)
-                .is_some_and(|owner| {
-                    state
-                        .registry
-                        .probe(&owner.terminal_id)
-                        .is_some_and(|r| r.status == freshell_protocol::TerminalRunStatus::Running)
-                });
-        let registry_row_live = identity_owner_live
-            || state.registry.directory().into_iter().any(|entry| {
-                entry.mode == mode
-                    && entry.resume_session_id.as_deref() == Some(live_sid)
-                    && entry.status == freshell_protocol::TerminalRunStatus::Running
-            });
+        // #540 (ks38): the identity-owner + Running-row join is now the shared
+        // `TerminalRegistry::live_session_owner` helper (the same join the REST
+        // resume paths consult), replacing the former inline two-arm check.
+        let registry_row_live = state
+            .registry
+            .live_session_owner(Some(&state.identity), &mode, live_sid)
+            .is_some();
         // Task 13b (cross-kind liveness): a live FRESH-AGENT sidecar owning
         // `(provider, S)` is just as much "the one writer on S's JSONL" as a live
         // PTY -- "Reopen as freshclaude"/"Reopen as Claude CLI" makes the same
