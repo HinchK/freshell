@@ -3,6 +3,7 @@
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 if (process.argv[2] === 'fake-native-child') {
