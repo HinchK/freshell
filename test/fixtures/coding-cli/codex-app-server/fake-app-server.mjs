@@ -33,7 +33,13 @@ function loadBehavior() {
 }
 
 function getCodexHome() {
-  return process.env.CODEX_HOME || '/tmp/fake-codex-home'
+  // Mirror the REAL codex CLI's resolution: CODEX_HOME env else ~/.codex.
+  // The old '/tmp/fake-codex-home' fallback wrote durable artifacts OUTSIDE
+  // the server's isolated HOME, so the Rust session-existence probe (which
+  // scans <home>/.codex/sessions and now gates reconcile verdicts) reported
+  // every fixture thread as artifact-missing -> dead_session, wiping the
+  // pane's durable identity across restart.
+  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
 }
 
 function getRolloutSessionDir() {
@@ -58,9 +64,13 @@ function ensureDurableArtifact(threadId) {
   const now = new Date()
   const sessionDir = path.dirname(thread.path)
   fs.mkdirSync(sessionDir, { recursive: true })
+  // session_meta first line, the shape the real codex rollout writer produces
+  // and the Rust indexer parses (parse_codex_session_content requires an id +
+  // cwd -- the R10b cwd-less exclusion gate skips files without one).
   fs.writeFileSync(thread.path, JSON.stringify({
-    threadId,
-    createdAt: now.toISOString(),
+    timestamp: now.toISOString(),
+    type: 'session_meta',
+    payload: { id: threadId, cwd: process.cwd(), createdAt: now.toISOString() },
   }) + '\n', 'utf8')
   return {
     codexHome,
