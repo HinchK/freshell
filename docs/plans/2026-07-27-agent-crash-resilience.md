@@ -89,9 +89,9 @@ The respawned terminal gets a NEW terminalId (`Uuid::new_v4()` per create, `crat
 | `src/components/TerminalExitBanner.tsx` | Create | Error bar + Relaunch button + notice strip (pure presentational) |
 | `src/components/TerminalView.tsx` | Modify | Handle `terminal.exit`/`terminal.status`/`terminal.replaced` → slice + fold; render banner |
 | `src/store/terminalDetachMiddleware.ts` | Modify (only if Task 8's test fails) | Skip-list entry for the fold action |
-| `src/store/terminalLifecycleSlice.test.ts` | Create | Slice unit tests |
-| `src/components/TerminalExitBanner.test.tsx` | Create | Banner/notice/a11y/click tests |
-| `src/components/TerminalView.exitBanner.test.tsx` | Create | Integration: banner + relaunch dispatch + fold + chime survival (place next to the existing `TerminalView.launchRetry.test.tsx`; if that file lives elsewhere — `glob '**/TerminalView.launchRetry.test.tsx'` — put all new client tests in the same directory) |
+| `test/unit/client/store/terminalLifecycleSlice.test.ts` | Create | Slice unit tests |
+| `test/unit/client/components/TerminalExitBanner.test.tsx` | Create | Banner/notice/a11y/click tests |
+| `test/unit/client/components/TerminalView.exitBanner.test.tsx` | Create | Integration: banner + relaunch dispatch + fold + chime survival (next to the existing `test/unit/client/components/TerminalView.launchRetry.test.tsx` — VERIFIED repo convention: zero `*.test.*` files exist under `src/`; ALL client unit tests live in `test/unit/client/{store,components}/` and the vitest default include picks them up there) |
 | `test/e2e-browser/fixtures/fake-crashing-claude-cli.mjs` | Create | Fake claude CLI: crash-once / crash-always / clean modes + argv JSONL log |
 | `test/e2e-browser/specs/agent-crash-autoresume-rust.spec.ts` | Create | E2E: auto-resume, exhaustion banner, clean exit, relaunch |
 | `test/e2e-browser/playwright.config.ts` | Modify | Two minimal regex appends (`RUST_ONLY_SPECS` + `rust-chromium` `testMatch`) |
@@ -1065,7 +1065,7 @@ git commit -m "feat(ws): auto-resume orchestrator — bounded retries, guards, r
 - Create: `src/store/terminalLifecycleSlice.ts`
 - Modify: the store-assembly file registering `panesSlice.reducer` (locate: `grep -rn "panesSlice.reducer\|panes:" src/store src/*.ts*`)
 - Modify: `src/components/TerminalView.tsx` (`terminal.exit` handler ~`:4101-4160`; `terminal.status` handler ~`:4087`; new `terminal.replaced` case beside them)
-- Test: `src/store/terminalLifecycleSlice.test.ts` (place beside the existing store tests — same directory as `turnCompletionSlice`'s tests if they exist, else next to the slice)
+- Test: `test/unit/client/store/terminalLifecycleSlice.test.ts` (beside the existing `test/unit/client/store/turnCompletionSlice.test.ts` — the VERIFIED home of client store tests; the repo has no co-located `src/**` tests)
 
 **Interfaces:**
 - Consumes: `TerminalReplacedMessage` + `terminal.status` message types from `shared/ws-protocol.ts`; `applyReconcileAttach` + `selectTabPaneByTerminalId` (`src/store/panesSlice.ts:1886`, selector used by `turnCompletionThunks.ts:25`).
@@ -1104,7 +1104,7 @@ selectLastTerminalIdFrom(sliceState, paneId): string | undefined     // frame ma
 
 - [ ] **Step 1: Write the failing slice tests**
 
-`src/store/terminalLifecycleSlice.test.ts`:
+`test/unit/client/store/terminalLifecycleSlice.test.ts`:
 
 ```ts
 import { describe, it, expect } from 'vitest'
@@ -1161,7 +1161,7 @@ describe('terminalLifecycleSlice', () => {
 - [ ] **Step 2: Run to verify red**
 
 ```bash
-npm run test:vitest -- run src/store/terminalLifecycleSlice.test.ts
+npm run test:vitest -- run test/unit/client/store/terminalLifecycleSlice.test.ts
 ```
 Expected: FAIL — module not found.
 
@@ -1304,9 +1304,9 @@ In `src/components/TerminalView.tsx`. **Matching rule (VERIFIED constraint, D-2)
 - [ ] **Step 5: Run green + lint + commit**
 
 ```bash
-npm run test:vitest -- run src/store/terminalLifecycleSlice.test.ts
+npm run test:vitest -- run test/unit/client/store/terminalLifecycleSlice.test.ts
 npm run lint
-git add src/store/terminalLifecycleSlice.ts src/store/terminalLifecycleSlice.test.ts src/components/TerminalView.tsx
+git add src/store/terminalLifecycleSlice.ts test/unit/client/store/terminalLifecycleSlice.test.ts src/components/TerminalView.tsx
 git add <store-assembly file from Step 3>
 git commit -m "feat(client): terminal lifecycle slice + crash/replace/notice ws handling"
 ```
@@ -1318,7 +1318,7 @@ git commit -m "feat(client): terminal lifecycle slice + crash/replace/notice ws 
 **Files:**
 - Create: `src/components/TerminalExitBanner.tsx`
 - Modify: `src/components/TerminalView.tsx` (render the banner in the JSX root, ~`:4838` onward)
-- Test: `src/components/TerminalExitBanner.test.tsx` + `src/components/TerminalView.exitBanner.test.tsx` (mirror the harness of `TerminalView.launchRetry.test.tsx` — note its `lucide-react` mock; and the click-button-assert-dispatch template in `DeadSessionPanel.test.tsx`)
+- Test: `test/unit/client/components/TerminalExitBanner.test.tsx` + `test/unit/client/components/TerminalView.exitBanner.test.tsx` (mirror the harness of `TerminalView.launchRetry.test.tsx` — note its `lucide-react` mock; and the click-button-assert-dispatch template in `DeadSessionPanel.test.tsx`)
 
 **Interfaces:**
 - Consumes: `selectExitRecord`/`selectActiveNotice` (Task 6); `resetPaneForReconcileCreate({ tabId, paneId, intent, sessionRef })` (`panesSlice.ts:1930` — preserves `createRequestId`, sets `status:'creating'`, `pendingReconcile:'respawn'`, bumps `reconcileEpoch`, which re-fires the create effect); `paneContent.sessionRef`/`mode`/`status` (read-only — no paneTypes changes).
@@ -1335,7 +1335,7 @@ export interface TerminalExitBannerProps {
 
 - [ ] **Step 1: Write the failing component tests**
 
-`src/components/TerminalExitBanner.test.tsx`:
+`test/unit/client/components/TerminalExitBanner.test.tsx`:
 
 ```tsx
 import { describe, it, expect, vi } from 'vitest'
@@ -1379,7 +1379,7 @@ describe('TerminalExitBanner', () => {
 - [ ] **Step 2: Run to verify red**
 
 ```bash
-npm run test:vitest -- run src/components/TerminalExitBanner.test.tsx
+npm run test:vitest -- run test/unit/client/components/TerminalExitBanner.test.tsx
 ```
 Expected: FAIL — module not found.
 
@@ -1429,7 +1429,7 @@ export function TerminalExitBanner({ mode, exitCode, notice, onRelaunch }: Termi
 
 - [ ] **Step 4: Write the failing TerminalView integration test, then wire the banner**
 
-`src/components/TerminalView.exitBanner.test.tsx` — copy the store+render harness from `TerminalView.launchRetry.test.tsx` (including its module mocks). Scenarios:
+`test/unit/client/components/TerminalView.exitBanner.test.tsx` — copy the store+render harness from `TerminalView.launchRetry.test.tsx` (including its module mocks). Scenarios:
 
 ```tsx
 // 1. Agent pane, status 'exited', exit record {code:1} in lifecycle slice:
@@ -1489,9 +1489,9 @@ const showExitBanner = Boolean(
 - [ ] **Step 5: Run green + lint + commit**
 
 ```bash
-npm run test:vitest -- run src/components/TerminalExitBanner.test.tsx src/components/TerminalView.exitBanner.test.tsx
+npm run test:vitest -- run test/unit/client/components/TerminalExitBanner.test.tsx test/unit/client/components/TerminalView.exitBanner.test.tsx
 npm run lint
-git add src/components/TerminalExitBanner.tsx src/components/TerminalExitBanner.test.tsx src/components/TerminalView.tsx src/components/TerminalView.exitBanner.test.tsx
+git add src/components/TerminalExitBanner.tsx test/unit/client/components/TerminalExitBanner.test.tsx src/components/TerminalView.tsx test/unit/client/components/TerminalView.exitBanner.test.tsx
 git commit -m "feat(client): loud exited-pane error bar with one-click relaunch for agent panes"
 ```
 
@@ -1500,7 +1500,7 @@ git commit -m "feat(client): loud exited-pane error bar with one-click relaunch 
 ### Task 8: Status-tracker + chime survival across replacement (pin with tests)
 
 **Files:**
-- Test: `src/store/turnCompletion.replacement.test.ts` (new; mirror the harness of the existing turn-completion tests — locate with `glob '**/turnCompletion*.test.*'`)
+- Test: `test/unit/client/store/turnCompletion.replacement.test.ts` (new; beside — and mirroring the harness of — the existing `test/unit/client/store/turnCompletionSlice.test.ts`)
 - Modify (only if a test fails): `src/store/terminalDetachMiddleware.ts:14-28` (skip-list entry), `src/lib/pane-activity.ts` (only if activity resolution fails — not expected)
 
 **Interfaces:**
@@ -1510,7 +1510,7 @@ git commit -m "feat(client): loud exited-pane error bar with one-click relaunch 
 - [ ] **Step 1: Write the failing/pinning tests**
 
 ```ts
-// src/store/turnCompletion.replacement.test.ts
+// test/unit/client/store/turnCompletion.replacement.test.ts
 // Lane D1: the busy/idle tracker and turn-complete dedupe survive the
 // terminal being replaced under the pane by server-driven auto-resume.
 describe('turn completion across terminal.replaced fold', () => {
@@ -1547,7 +1547,7 @@ Write all bodies out fully against the actual harness helpers.
 - [ ] **Step 2: Run to verify status**
 
 ```bash
-npm run test:vitest -- run src/store/turnCompletion.replacement.test.ts
+npm run test:vitest -- run test/unit/client/store/turnCompletion.replacement.test.ts
 ```
 Expected: tests 1–3 likely PASS immediately (they pin existing behavior — that is fine and intended); test 4 FAILS only if `applyReconcileAttach` is missing from the detach skip list.
 
@@ -1558,14 +1558,14 @@ If test 4 is red: add the fold action to the skip list in `src/store/terminalDet
 - [ ] **Step 4: Run green**
 
 ```bash
-npm run test:vitest -- run src/store/turnCompletion.replacement.test.ts
+npm run test:vitest -- run test/unit/client/store/turnCompletion.replacement.test.ts
 npm run lint
 ```
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/store/turnCompletion.replacement.test.ts src/store/terminalDetachMiddleware.ts
+git add test/unit/client/store/turnCompletion.replacement.test.ts src/store/terminalDetachMiddleware.ts
 git commit -m "test(client): pin chime/status survival across server-driven terminal replacement"
 ```
 
@@ -1587,10 +1587,15 @@ git commit -m "test(client): pin chime/status survival across server-driven term
 ```js
 #!/usr/bin/env node
 // test/e2e-browser/fixtures/fake-crashing-claude-cli.mjs
-// Fake claude CLI for crash-resilience e2e. Modes via FAKE_CRASH_MODE:
-//   once   — invocation #1 prints output then exits 1; later invocations stay alive
-//   always — every invocation prints then exits 1 immediately
-//   clean  — prints then exits 0
+// Fake claude CLI for crash-resilience e2e. Behavior selection:
+//   FAKE_CRASH_UNTIL=N — crash (exit 1) while invocation <= N, then SURVIVE.
+//                        Takes PRECEDENCE over FAKE_CRASH_MODE: when set, the
+//                        mode checks are never reached, so the 'clean' default
+//                        cannot make the surviving invocation exit 0.
+//   FAKE_CRASH_MODE (only when FAKE_CRASH_UNTIL is unset):
+//     once   — invocation #1 prints output then exits 1; later invocations stay alive
+//     always — every invocation prints then exits 1 immediately
+//     clean  — prints then exits 0 (the default when neither env is set)
 // Every invocation appends {pid,t,argv} to FAKE_CLAUDE_ARGV_LOG (JSONL) and
 // bumps the invocation counter in FAKE_CRASH_STATE_FILE.
 import fs from 'node:fs'
@@ -1608,14 +1613,25 @@ if (stateFile) {
 
 process.stdout.write(`fake-claude invocation ${invocation} argv=${argv.join(' ')}\r\n`)
 
-const mode = process.env.FAKE_CRASH_MODE || 'clean'
-if (mode === 'always' || (mode === 'once' && invocation === 1)) {
-  process.stdout.write('fake-claude: simulated crash\r\n')
-  process.exit(1)
-}
-if (mode === 'clean') {
-  process.stdout.write('fake-claude: clean exit\r\n')
-  process.exit(0)
+const crashUntil = Number(process.env.FAKE_CRASH_UNTIL || 0)
+if (crashUntil > 0) {
+  if (invocation <= crashUntil) {
+    process.stdout.write('fake-claude: simulated crash\r\n')
+    process.exit(1)
+  }
+  // invocation > N: fall through to the survive branch below WITHOUT
+  // consulting FAKE_CRASH_MODE (its 'clean' default would exit 0 and
+  // vacuously satisfy liveness assertions on a dead pane).
+} else {
+  const mode = process.env.FAKE_CRASH_MODE || 'clean'
+  if (mode === 'always' || (mode === 'once' && invocation === 1)) {
+    process.stdout.write('fake-claude: simulated crash\r\n')
+    process.exit(1)
+  }
+  if (mode === 'clean') {
+    process.stdout.write('fake-claude: clean exit\r\n')
+    process.exit(0)
+  }
 }
 // Survive: behave like a long-running interactive CLI.
 process.stdin.resume()
@@ -1632,7 +1648,7 @@ const server = new RustServer({
     CLAUDE_CMD: fakeCliPath,                    // installFakeCli(…'fake-crashing-claude-cli.mjs')
     FAKE_CLAUDE_ARGV_LOG: argvLogPath,
     FAKE_CRASH_STATE_FILE: stateFilePath,
-    FAKE_CRASH_MODE: '<per test>',
+    FAKE_CRASH_MODE: '<per test>',           // tests 1-3; test 4 sets FAKE_CRASH_UNTIL=3 instead (and no FAKE_CRASH_MODE)
     FRESHELL_AUTO_RESUME_DELAYS_MS: '100,200',  // fast retries for CI
   },
 })
@@ -1665,20 +1681,24 @@ test('clean exit (code 0) neither resumes nor alarms', async ({ page }) => {
 })
 
 test('Relaunch button drives a resume with the same session id', async ({ page }) => {
-  // FAKE_CRASH_MODE=always → settle exhausted (3 invocations, banner shown).
-  // Reset FAKE_CRASH_MODE cannot change per-process env: instead flip the
-  // behavior via the state file — the fixture crashes on 'always' regardless,
-  // so for THIS test boot the server with FAKE_CRASH_MODE=once and
-  // pre-seed FAKE_CRASH_STATE_FILE so invocations 1..3 crash and 4 survives:
-  // simplest deterministic arrangement — write the fixture to also honor
-  // FAKE_CRASH_UNTIL (crash while invocation <= N): boot with
-  // FAKE_CRASH_UNTIL=3, no FAKE_CRASH_MODE. Then: pane settles exhausted
-  // after 3 invocations; click the Relaunch button; assert invocation 4
-  // appears in the argv log with adjacent ['--resume', <same id>] and the
-  // alert bar disappears.
+  // Boot THIS test's server with FAKE_CRASH_UNTIL=3 and NO FAKE_CRASH_MODE.
+  // The fixture's FAKE_CRASH_UNTIL branch takes precedence over the mode
+  // checks, so invocations 1..3 crash (exit 1) and invocation 4 SURVIVES as
+  // a long-running process (it never reaches the 'clean' default, which
+  // would exit 0 and make the liveness assertions below vacuous).
+  // Create a claude pane → it settles exhausted after 3 invocations
+  // (1 original + 2 retries) with the role=alert bar and the
+  // 'Relaunch claude session' button. Click Relaunch. Assert:
+  //  - invocation 4 appears in the argv log with adjacent
+  //    ['--resume', <same id>];
+  //  - the alert bar disappears;
+  //  - the pane is genuinely LIVE: the argv log stays at EXACTLY 4
+  //    invocations for >=1s (a clean exit-0 would re-settle the pane; a
+  //    crash would append invocation 5), and no role=alert bar or
+  //    role=status auto-resume notice reappears in that window.
 })
 ```
-(The 4th test requires one small fixture addition — `FAKE_CRASH_UNTIL` — add it in Step 1's file: `if (process.env.FAKE_CRASH_UNTIL && invocation <= Number(process.env.FAKE_CRASH_UNTIL)) { crash }` placed above the mode checks. Keep both mechanisms.)
+(The 4th test's `FAKE_CRASH_UNTIL` mechanism is already part of Step 1's fixture code above — crash while `invocation <= N`, then survive, bypassing the mode checks entirely so the `'clean'` default cannot exit 0 on the surviving invocation.)
 
 Append to `playwright.config.ts` (both lists):
 ```ts
@@ -1802,3 +1822,15 @@ An independent cross-model review found three blocking (major) executable defect
 3. **Task 5 driver trait could not implement the mandated lease discipline.** The real registry API is asymmetric — `complete_session_ref_claim(locator, holder_create_request_id, terminal_id) -> bool` (`registry.rs:1964`) vs `fail_session_ref_claim(locator, holder_create_request_id)` (`registry.rs:2007`) — and the claim returns a four-variant `SessionRefClaim` (`registry.rs:467-486`), so the old symmetric `release_claim(provider, session_id)` / boolean-only `claim_session` trait was unimplementable and its pinned tests would have frozen the wrong shape. Fixed: the trait now exposes `claim_session(..., create_request_id)` (production impl runs the ingress's full bounded claim rounds, `terminal.rs:1147-1214`, headlessly), `complete_claim(..., new_terminal_id) -> bool` (complete==false → kill own child, mirroring `terminal.rs:1986-2029`), `fail_claim(...)` (explicit — the headless driver holds no RAII `SessionRefLeaseGuard`), and `pre_respawn_guard(...) -> Option<&'static str>` (distinguishes `session_owned_live` from `pane_closed`, with a ledger-disabled caveat); the hub sketch and unit-test list were updated accordingly (two new scenarios: `pane_closed` guard and `lease_completion_lost`).
 
 Self-review re-run over the edited tasks (Tasks 5/6/7): no new placeholders; type/name consistency re-checked (`pre_respawn_guard`/`claim_session`/`complete_claim`/`fail_claim` names match across trait, hub sketch, test comments, and driver bullets; slice action behavior matches its tests and Task 7's wiring note); every user-facing requirement still lands as production behavior proven by non-mocked tests — Task 9's four e2e assertions are unchanged and are now achievable on both the post-attach (`'exited'`) and crash-during-launch (`'error'`) settle timings.
+
+---
+
+## Fresh-Eyes Review Fixes (iteration 2 addendum, 2026-07-27)
+
+The second independent cross-model review found two blocking (major) executable defects; both are fixed in this revision (repo facts verified in `.worktrees/.the-usual-logs/agent-crash-resilience/reports/fix-facts-iter2.md`):
+
+1. **Task 9 e2e test 4's fixture arrangement made the relaunched invocation exit 0 instead of survive.** The old instruction "boot with FAKE_CRASH_UNTIL=3, no FAKE_CRASH_MODE" combined with a fixture whose mode defaulted to `'clean'` meant invocation 4 printed and exited 0 immediately — the alert-disappears assertion would pass *vacuously* (banner is status-gated at Relaunch's `'creating'` reset; code-0 death is clean-exit-quiet) without proving the Relaunch restores a LIVE pane. An incoherent alternative ("FAKE_CRASH_MODE=once + pre-seed the state file so 1..3 crash") was also given (`once` crashes only invocation #1; pre-seeding *raises* invocation numbers). Fixed: `FAKE_CRASH_UNTIL` is now part of Step 1's fixture code with explicit precedence semantics — crash while `invocation <= N`, then SURVIVE, bypassing the mode checks entirely so the `'clean'` default cannot fire; test 4's comment now states the arrangement plainly and adds an explicit liveness assertion (argv log stays at exactly 4 invocations for >=1s, no alert/notice reappears); the incoherent alternative and the stale "one small fixture addition" note were removed.
+
+2. **Client test paths contradicted the plan's own placement rules and the repo convention.** The File Structure table and every red/green/commit command in Tasks 6/7/8 hardcoded `src/store/**`/`src/components/**` test paths, while the plan's conditional placement rules (and the repo: VERIFIED zero `*.test.*` files under `src/`; all client unit tests under `test/unit/client/{store,components}/`; vitest default include + attested `npm run test:vitest -- run test/unit/client/...` invocation form) resolve to `test/unit/client/**`. Fixed: all 22 references across the File Structure table, Task 6 (slice tests, run/`git add` commands), Task 7 (banner + integration tests, run/`git add` commands), and Task 8 (turn-completion replacement test, run/`git add` commands) now use `test/unit/client/store/` / `test/unit/client/components/`, and the conditional hedges were replaced with the verified convention statement.
+
+Self-review re-run over the edited tasks (File Structure table, Tasks 6/7/8 commands, Task 9 steps 1-2): fixture code, test-4 comment, the RustServer env sketch, and the post-spec note all agree on FAKE_CRASH_UNTIL precedence; tests 1-3 still exercise the unchanged `FAKE_CRASH_MODE` branch (`crashUntil=0` falls to the mode checks); every `npm run test:vitest -- run <path>` / `git add <path>` names a path the same task creates; no new TBDs or placeholders introduced; Task 9's four e2e assertions remain the end-to-end proof of every user story, with test 4 now proving liveness non-vacuously.
