@@ -13,6 +13,7 @@ import { shallowEqual } from 'react-redux'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import {
+  applyReconcileAttach,
   clearPaneReconcileNotice,
   clearReconcilePendingPane,
   consumePaneRefreshRequest,
@@ -28,6 +29,12 @@ import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { recordTurnComplete } from '@/store/turnCompletionSlice'
+import {
+  foldTerminalReplacement,
+  recordAutoResumeRecovering,
+  recordTerminalExit,
+  selectLastTerminalIdFrom,
+} from '@/store/terminalLifecycleSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
@@ -4084,21 +4091,83 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
         }
 
-        if (msg.type === 'terminal.status' && msg.terminalId === tid) {
-          if (
-            msg.status === 'running'
-            || msg.status === 'recovering'
-          ) {
-            updateContent({ status: msg.status })
-            const statusTab = tabRef.current
-            if (statusTab) {
-              dispatch(updateTab({ id: statusTab.id, updates: { status: msg.status } }))
+        if (msg.type === 'terminal.status') {
+          // Auto-resume 'recovering' frames carry the OLD terminalId, and the
+          // crash has usually already cleared tid by the time they arrive —
+          // match against the recorded lastTerminalId from the lifecycle slice.
+          const statusMine = msg.terminalId === tid
+            || msg.terminalId === selectLastTerminalIdFrom(appStore.getState().terminalLifecycle, paneIdRef.current)
+          if (statusMine && msg.status === 'recovering' && typeof msg.attempt === 'number') {
+            dispatch(recordAutoResumeRecovering({
+              paneId: paneIdRef.current,
+              attempt: msg.attempt,
+              // reason text carries "attempt n/max" — parse max defensively; default 2:
+              maxAttempts: Number(msg.reason?.match(/attempt \d+\/(\d+)/)?.[1] ?? 2),
+              exitCode: Number(msg.reason?.match(/exit (-?\d+)/)?.[1] ?? 1),
+              at: Date.now(),
+            }))
+          }
+          if (msg.terminalId === tid) {
+            if (
+              msg.status === 'running'
+              || msg.status === 'recovering'
+            ) {
+              updateContent({ status: msg.status })
+              const statusTab = tabRef.current
+              if (statusTab) {
+                dispatch(updateTab({ id: statusTab.id, updates: { status: msg.status } }))
+              }
             }
           }
           return
         }
 
+        if (msg.type === 'terminal.replaced') {
+          // Server-driven crash auto-resume: this pane handles the frame when
+          // the old id matches its recorded lastTerminalId (tid was cleared by
+          // the preceding terminal.exit) or, defensively, a still-set live tid.
+          const replacedMine = msg.oldTerminalId === terminalIdRef.current
+            || msg.oldTerminalId === selectLastTerminalIdFrom(appStore.getState().terminalLifecycle, paneIdRef.current)
+          if (replacedMine) {
+            dispatch(foldTerminalReplacement({
+              paneId: paneIdRef.current,
+              newTerminalId: msg.newTerminalId,
+              exitCode: msg.exitCode,
+              attempt: msg.attempt,
+              maxAttempts: msg.maxAttempts,
+              at: Date.now(),
+            }))
+            // Fold the new terminalId into this pane via the ONE reducer built
+            // for server-supplied rebinds (mirrors pane-reconcile.ts:428-436).
+            // applyReconcileAttach unconditionally overwrites serverInstanceId
+            // (panesSlice.ts:1904), so supply the current one. The replaced
+            // frame carries no verdict data, so sessionRef/corrected/duplicate
+            // stay unset — the reducer preserves the pane's sessionRef.
+            // Bind-before-attach holds: the reducer's epoch bump re-fires the
+            // create-or-attach effect after this rebind.
+            dispatch(applyReconcileAttach({
+              tabId,
+              paneId: paneIdRef.current,
+              terminalId: msg.newTerminalId,
+              serverInstanceId: serverInstanceIdRef.current,
+            }))
+          }
+          return
+        }
+
         if (msg.type === 'terminal.exit' && msg.terminalId === tid) {
+          // Record on EVERY exit path (including the early-return branches
+          // below): this is the only moment both paneId and the dying
+          // terminalId are simultaneously known — the tail clears
+          // terminalIdRef/terminalId, and subsequent auto-resume frames
+          // (terminal.status 'recovering' / terminal.replaced) carry the old
+          // id and can only be matched via the recorded lastTerminalId.
+          dispatch(recordTerminalExit({
+            paneId: paneIdRef.current,
+            terminalId: msg.terminalId,
+            exitCode: msg.exitCode,
+            at: Date.now(),
+          }))
           const pendingReplacement = pendingDurableReplacementRef.current
           if (pendingReplacement?.terminalId === tid) {
             completeDurableReplacement(pendingReplacement)
