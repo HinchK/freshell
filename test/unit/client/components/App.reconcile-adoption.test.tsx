@@ -8,6 +8,7 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer, { setLiveTerminalIds } from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
 import panesReducer, { applyReconcileAttach, clearDeadTerminals, setDeadSessionAdjudication } from '@/store/panesSlice'
+import { isFreshAgentReconcileActive, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import extensionsReducer from '@/store/extensionsSlice'
@@ -67,6 +68,9 @@ const wsMocks = vi.hoisted(() => ({
   onReconnect: vi.fn().mockReturnValue(() => {}),
   onDisconnect: vi.fn().mockReturnValue(() => {}),
   setHelloExtensionProvider: vi.fn(),
+  cancelCreate: vi.fn(),
+  setReconcilePendingCreates: vi.fn(),
+  clearReconcileCreateHold: vi.fn(),
   isReady: false,
   serverInstanceId: undefined as string | undefined,
 }))
@@ -93,6 +97,9 @@ vi.mock('@/lib/ws-client', () => ({
     onReconnect: wsMocks.onReconnect,
     onDisconnect: wsMocks.onDisconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
+    cancelCreate: wsMocks.cancelCreate,
+    setReconcilePendingCreates: wsMocks.setReconcilePendingCreates,
+    clearReconcileCreateHold: wsMocks.clearReconcileCreateHold,
     get isReady() {
       return wsMocks.isReady
     },
@@ -126,9 +133,15 @@ const dispatchedTypes: string[] = []
 const dispatched = { types: dispatchedTypes }
 
 let seededPane: { createRequestId: string } | null = null
+let seededFreshAgentPane: { createRequestId: string } | null = null
 
 function seedPersistedTerminalPane(opts: { createRequestId: string }): void {
   seededPane = opts
+}
+
+function seedStoreWithTerminalAndFreshAgentLeaves(): void {
+  seededPane = { createRequestId: 'cr-term-1' }
+  seededFreshAgentPane = { createRequestId: 'cr-fa-1' }
 }
 
 function createSettingsState() {
@@ -143,22 +156,48 @@ function createSettingsState() {
 }
 
 function createStore() {
-  const layouts: Record<string, unknown> = seededPane
+  const terminalLeaf = seededPane
     ? {
-        'tab-1': {
-          type: 'leaf',
-          id: 'pane-1',
-          content: {
-            kind: 'terminal',
-            mode: 'shell',
-            shell: 'system',
-            status: 'running',
-            createRequestId: seededPane.createRequestId,
-            terminalId: 'term-old',
-          },
+        type: 'leaf',
+        id: 'pane-1',
+        content: {
+          kind: 'terminal',
+          mode: 'shell',
+          shell: 'system',
+          status: 'running',
+          createRequestId: seededPane.createRequestId,
+          terminalId: 'term-old',
         },
       }
-    : {}
+    : null
+  const freshAgentLeaf = seededFreshAgentPane
+    ? {
+        type: 'leaf',
+        id: 'pane-2',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          status: 'running',
+          createRequestId: seededFreshAgentPane.createRequestId,
+          sessionRef: { provider: 'claude', sessionId: 'sess-old' },
+        },
+      }
+    : null
+  const layouts: Record<string, unknown> =
+    terminalLeaf && freshAgentLeaf
+      ? {
+          'tab-1': {
+            type: 'split',
+            id: 'split-1',
+            direction: 'horizontal',
+            children: [terminalLeaf, freshAgentLeaf],
+            sizes: [50, 50],
+          },
+        }
+      : terminalLeaf
+        ? { 'tab-1': terminalLeaf }
+        : {}
   return configureStore({
     reducer: {
       settings: settingsReducer,
@@ -314,6 +353,24 @@ function attachResultFor(req: any, terminalId: string) {
   }
 }
 
+/** Kind-aware all-attach result: terminal panes get a terminalId, fresh-agent panes a sessionRef. */
+function mixedAttachResultFor(req: any) {
+  return {
+    type: 'pane.reconcile.result',
+    reconcileId: req.reconcileId,
+    bootId: 'boot-1',
+    serverInstanceId: 'srv-1',
+    verdicts: req.panes.map((pane: any) =>
+      pane.kind === 'fresh-agent'
+        ? { paneKey: pane.paneKey, verdict: 'attach', sessionRef: { provider: 'claude', sessionId: 'sess-live' } }
+        : { paneKey: pane.paneKey, verdict: 'attach', terminalId: 'term-live' }),
+  }
+}
+
+function lastSent(type: string): any {
+  return sentFrames.filter((f) => f.type === type).pop()
+}
+
 describe('App pane.reconcile adoption', () => {
   beforeEach(() => {
     cleanup()
@@ -322,6 +379,8 @@ describe('App pane.reconcile adoption', () => {
     sentFrames.length = 0
     dispatchedTypes.length = 0
     seededPane = null
+    seededFreshAgentPane = null
+    setFreshAgentReconcileActive(false)
     messageHandler = null
     wsMocks.isReady = false
     wsMocks.serverInstanceId = undefined
@@ -465,5 +524,93 @@ describe('App pane.reconcile adoption', () => {
     const { sentFrames } = await bootAppWithReady({ capabilities: { paneReconcileV1: true } })
     await simulateReconnectWithReady({ capabilities: { paneReconcileV1: true } })
     expect(sentFrames.filter((f) => f.type === 'pane.reconcile.request')).toHaveLength(2)
+  })
+
+  it('ready with both capabilities sends one request including fresh-agent panes and marks them pending', async () => {
+    seedStoreWithTerminalAndFreshAgentLeaves()
+    const { sentFrames, store } = await bootAppWithReady({
+      capabilities: { paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+    })
+    expect(sentFrames.filter((f) => f.type === 'pane.reconcile.request')).toHaveLength(1)
+    const req = lastSent('pane.reconcile.request')
+    expect(req.panes.some((p: any) => p.kind === 'fresh-agent')).toBe(true)
+    expect(req.panes.some((p: any) => p.kind === 'terminal')).toBe(true)
+    const pending = (store.getState().panes as any).reconcilePendingPanes!
+    for (const p of req.panes) expect(pending[p.paneKey]).toBeGreaterThan(0)
+  })
+
+  it('ready with only paneReconcileV1 sends a terminal-only request', async () => {
+    seedStoreWithTerminalAndFreshAgentLeaves()
+    await bootAppWithReady({ capabilities: { paneReconcileV1: true } })
+    const req = lastSent('pane.reconcile.request')
+    expect(req.panes.length).toBeGreaterThan(0)
+    expect(req.panes.every((p: any) => p.kind === 'terminal')).toBe(true)
+  })
+
+  it('folding the result clears all pending panes', async () => {
+    seedStoreWithTerminalAndFreshAgentLeaves()
+    const { store } = await bootAppWithReady({
+      capabilities: { paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+    })
+    const req = lastSent('pane.reconcile.request')
+    expect(Object.keys((store.getState().panes as any).reconcilePendingPanes ?? {})).not.toHaveLength(0)
+    await receiveServerFrame(mixedAttachResultFor(req))
+    expect((store.getState().panes as any).reconcilePendingPanes ?? {}).toEqual({})
+  })
+
+  it('a correlated error frame clears all pending panes', async () => {
+    seedStoreWithTerminalAndFreshAgentLeaves()
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const { store } = await bootAppWithReady({
+      capabilities: { paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+    })
+    const req = lastSent('pane.reconcile.request')
+    await receiveInventory({ liveTerminalIds: [] }) // inventory first — real wire order
+    expect(Object.keys((store.getState().panes as any).reconcilePendingPanes ?? {})).not.toHaveLength(0)
+    await receiveServerFrame({ type: 'error', code: 'RECONCILE_UNAVAILABLE', requestId: req.reconcileId })
+    expect((store.getState().panes as any).reconcilePendingPanes ?? {}).toEqual({})
+  })
+
+  it('capability-less ready clears pending and deactivates the fresh-agent latch', async () => {
+    seedStoreWithTerminalAndFreshAgentLeaves()
+    const { store } = await bootAppWithReady({
+      capabilities: { paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+    })
+    expect(isFreshAgentReconcileActive()).toBe(true)
+    expect(Object.keys((store.getState().panes as any).reconcilePendingPanes ?? {})).not.toHaveLength(0)
+    // Frozen-client invariant: a downgraded server (no capabilities) must land
+    // the client back on the legacy path with no stale pending state.
+    await simulateReconnectWithReady({ /* no capabilities */ })
+    expect(isFreshAgentReconcileActive()).toBe(false)
+    expect((store.getState().panes as any).reconcilePendingPanes ?? {}).toEqual({})
+  })
+
+  it('ready narrows the ws-client hold to the requested createRequestIds', async () => {
+    seedStoreWithTerminalAndFreshAgentLeaves()
+    await bootAppWithReady({
+      capabilities: { paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+    })
+    const req = lastSent('pane.reconcile.request')
+    expect(wsMocks.setReconcilePendingCreates).toHaveBeenCalledWith(
+      req.panes.map((p: any) => p.createRequestId),
+    )
+  })
+
+  it('folding retracts each folded pane at the sender then clears the hold', async () => {
+    seedStoreWithTerminalAndFreshAgentLeaves()
+    await bootAppWithReady({
+      capabilities: { paneReconcileV1: true, paneReconcileFreshAgentV1: true },
+    })
+    const req = lastSent('pane.reconcile.request')
+    await receiveServerFrame(mixedAttachResultFor(req))
+    const retracted = wsMocks.cancelCreate.mock.calls.map(([id]) => id).sort()
+    expect(retracted).toEqual(req.panes.map((p: any) => p.createRequestId).sort())
+    expect(wsMocks.cancelCreate).toHaveBeenCalledTimes(req.panes.length)
+    expect(wsMocks.clearReconcileCreateHold).toHaveBeenCalled()
+    // Retraction happens at the sender BEFORE the hold clears.
+    const lastClearOrder = wsMocks.clearReconcileCreateHold.mock.invocationCallOrder.at(-1)!
+    for (const order of wsMocks.cancelCreate.mock.invocationCallOrder) {
+      expect(order).toBeLessThan(lastClearOrder)
+    }
   })
 })

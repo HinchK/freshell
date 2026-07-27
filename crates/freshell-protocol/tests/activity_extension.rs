@@ -1,13 +1,13 @@
 //! TERM-15/TERM-16 extension surface: the amplifier activity family + the new
 //! `terminal.idle` truly-idle edge.
 //!
-//! The frozen T0 inventory (`port/contract/ws-message-inventory.json`, 27+52)
-//! predates the legacy amplifier provider's activity family
-//! (`shared/ws-protocol.ts` `AmplifierActivity*Schema`) and does not contain
-//! the NEW `terminal.idle` capability at all. These are deliberately declared
-//! as an EXTENSION surface (`EXTENSION_CLIENT_MESSAGE_TYPES` /
-//! `EXTENSION_SERVER_MESSAGE_TYPES`) so `tests/inventory.rs` keeps pinning the
-//! frozen contract untouched, while this file pins the extension wire shapes:
+//! The generated T0 inventory (`port/contract/ws-message-inventory.json`,
+//! 29+56) is generated-current as of the 2026-07-26 contract reconciliation:
+//! the legacy amplifier provider's activity family (`shared/ws-protocol.ts`
+//! `AmplifierActivity*Schema`) and the `terminal.idle` capability are now
+//! part of the frozen surface (`CLIENT_MESSAGE_TYPES` /
+//! `SERVER_MESSAGE_TYPES`), leaving `durability.degraded` as the only
+//! extension entry. This file still pins the wire shapes:
 //!
 //! * `amplifier.activity.list` / `.list.response` / `.updated` are
 //!   byte-shape-compatible with the legacy zod schemas (the frozen client
@@ -134,14 +134,9 @@ fn extension_surface_is_disjoint_from_the_frozen_inventory() {
             "{extension} must not collide with the frozen inventory"
         );
     }
-    assert_eq!(EXTENSION_CLIENT_MESSAGE_TYPES, ["amplifier.activity.list"]);
-    assert_eq!(
-        EXTENSION_SERVER_MESSAGE_TYPES,
-        [
-            "amplifier.activity.list.response",
-            "amplifier.activity.updated",
-            "durability.degraded",
-            "terminal.idle",
-        ]
+    assert!(
+        EXTENSION_CLIENT_MESSAGE_TYPES.is_empty(),
+        "no client extension types remain after the 2026-07-26 reconciliation"
     );
+    assert_eq!(EXTENSION_SERVER_MESSAGE_TYPES, ["durability.degraded"]);
 }

@@ -729,3 +729,71 @@ async fn warming_resolves_during_deferral_rederives() {
     let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
     assert_ne!(result["verdicts"][0]["verdict"], "error");
 }
+
+// --- waveC integration pin: idle-reap (#539) x reconcile verdicts (C2) ---------
+
+/// A detached terminal reaped by the idle sweep (#539 `enforce_idle_kills`,
+/// DEV-0009 meaningful-activity clock) while its pane is mid-reconcile must
+/// converge to a clean `respawn` verdict on the next reconcile round — never
+/// `attach` to the reaped id, never a wedge. Pins the cross-PR seam: the reap
+/// marks the terminal not-live, so the verdict scan
+/// (`newest_live_by_create_request_id` / `is_live`) falls through to the
+/// recovery rows instead of handing the client a dead terminal.
+#[tokio::test]
+async fn idle_reaped_terminal_mid_reconcile_converges_to_respawn_not_attach() {
+    // Disk truth: the session still exists -> the recovery row is respawn.
+    let probe = FlippingProbe::new(vec![freshell_ws::existence::SessionExistence::Present]);
+    let server = spawn_server_with_probe(std::sync::Arc::new(probe), |_| {}).await;
+
+    // A detached claude terminal whose meaningful-activity clock is 20 minutes
+    // stale — eligible for the sweep (registry default autoKillIdleMinutes=15).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64;
+    headless(
+        &server,
+        "T-reaped",
+        Some("cr-reaped"),
+        "claude",
+        now_ms - 20 * 60_000,
+    );
+    assert!(
+        server.registry.is_live("T-reaped"),
+        "precondition: the terminal is live before the sweep"
+    );
+
+    // Client connects negotiated (mid-reconcile state: it still believes in
+    // T-reaped), then the sweep fires before its request lands.
+    let (mut ws, _ready) = connect(&server.url, true).await;
+    let killed = server.registry.enforce_idle_kills();
+    assert_eq!(
+        killed,
+        vec!["T-reaped".to_string()],
+        "the idle sweep must actually reap the stale detached terminal"
+    );
+    assert!(!server.registry.is_live("T-reaped"));
+
+    // The pane re-presents pointing at the reaped terminal.
+    ws.send(reconcile_request(
+        "rec-reap",
+        serde_json::json!([{
+            "paneKey": "pk-reap",
+            "kind": "terminal",
+            "mode": "claude",
+            "createRequestId": "cr-reaped",
+            "terminalId": "T-reaped",
+            "sessionRef": { "provider": "claude", "sessionId": "sess-reaped" }
+        }]),
+    ))
+    .await
+    .expect("send request");
+
+    let result = next_frame_of_type(&mut ws, "pane.reconcile.result").await;
+    let v = &result["verdicts"][0];
+    assert_eq!(
+        v["verdict"], "respawn",
+        "a reaped-mid-reconcile terminal must yield a clean respawn, got: {v}"
+    );
+    assert_eq!(v["sessionRef"]["sessionId"], "sess-reaped");
+}

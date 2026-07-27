@@ -129,6 +129,9 @@ const RUST_ONLY_SPECS = [
   // Reconcile client adoption (Task 14): verdict-driven recovery with the
   // real SPA. Imports RustServer directly (restart()/restartAbrupt()).
   /reconcile-client-adoption-rust\.spec\.ts$/,
+  // Lane C2 reconcile completion: fresh-agent verdict folding + D8 lease +
+  // pre-verdict create hold. Imports RustServer directly (restartAbrupt()).
+  /reconcile-completion-rust\.spec\.ts$/,
   // Lane B2 codex rollout locator: rust-only (legacy has no codex terminal
   // locator); imports the RustServer-backed harness for same-port restart.
   /codex-terminal-restore-rust\.spec\.ts$/,
@@ -139,6 +142,8 @@ const RUST_ONLY_SPECS = [
   // P1.13 (Lane B4 Task 14): per-provider settings survive restart + codex
   // crash memory-loss banner. Imports RustServer directly for restartAbrupt().
   /freshagent-settings-resume-rust\.spec\.ts$/,
+  // imports RustServer directly; restart()/ledger semantics are rust-only (P1.14)
+  /sidebar-registry-sync-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -221,6 +226,8 @@ export default defineConfig({
         // through the same unmodified legacy MCP stdio binary. See
         // mcp-qa-smoke-rust.spec.ts's own doc comment.
         /mcp-qa-smoke-rust\.spec\.ts$/,
+        // Lane C2 reconcile completion (see RUST_ONLY_SPECS entry above).
+        /reconcile-completion-rust\.spec\.ts$/,
         // TERM-28 (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`):
         // proves the Rust `freshell-terminal`/`freshell-platform` PATH-only
         // bare-command resolution fix. Rust-only -- the bug is in the Rust
@@ -308,6 +315,9 @@ export default defineConfig({
         // codex crash memory-loss banner. Imports RustServer directly for
         // restartAbrupt().
         /freshagent-settings-resume-rust\.spec\.ts$/,
+        // P1.14 (Lane C1): sidebar/tab-registry sync pinning suite -- imports
+        // RustServer directly; restart()/ledger semantics are rust-only.
+        /sidebar-registry-sync-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

@@ -17,7 +17,7 @@ import {
 } from '@/store/sessionsThunks'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
-import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts } from '@/lib/pane-reconcile'
+import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { PaneReconcileResultSchema, type PaneReconcileRequest } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
@@ -65,7 +65,7 @@ import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
-import { clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles } from '@/store/panesSlice'
+import { clearAllReconcilePendingPanes, clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles, setReconcilePendingPanes } from '@/store/panesSlice'
 import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId, setPaneReconcileActive } from '@/lib/terminal-restore'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
@@ -1020,15 +1020,30 @@ export default function App() {
             // loss windows. While active, the destructive inventory census is
             // gated off and the terminal-restore latches report not-armed.
             const paneReconcile = ready.data.capabilities?.paneReconcileV1 === true
+            const freshAgentReconcile = ready.data.capabilities?.paneReconcileFreshAgentV1 === true
             paneReconcileActiveRef.current = paneReconcile
             setPaneReconcileActive(paneReconcile)
+            setFreshAgentReconcileActive(freshAgentReconcile)
             pendingReconcileRef.current = null
+            dispatch(clearAllReconcilePendingPanes())
             if (paneReconcile) {
-              const req = buildReconcileRequest(appStore.getState())
+              // ONE request covering terminal panes plus (iff the server
+              // advertised paneReconcileFreshAgentV1) fresh-agent panes.
+              // Frozen-client invariant: without the capability, fresh-agent
+              // panes stay on the legacy recovery path.
+              const req = buildReconcileRequest(appStore.getState(), { includeFreshAgent: freshAgentReconcile })
               if (req) {
                 pendingReconcileRef.current = req
+                // Exactly the requested paneKeys wait for verdicts (Redux),
+                // and the sender hold narrows to exactly their creates.
+                dispatch(setReconcilePendingPanes({ paneKeys: req.panes.map((p) => p.paneKey), startedAt: Date.now() }))
+                ws.setReconcilePendingCreates(req.panes.map((p) => p.createRequestId))
                 ws.send(req)
+              } else {
+                ws.clearReconcileCreateHold() // nothing to reconcile — release any held creates immediately
               }
+            } else {
+              ws.clearReconcileCreateHold()
             }
           }
           dispatch(resetWsSnapshotReceived())
@@ -1054,10 +1069,25 @@ export default function App() {
           const parsed = PaneReconcileResultSchema.safeParse(msg)
           if (!parsed.success) {
             console.error('[reconcile] malformed result — falling back to legacy census', parsed.error.issues)
+            // A malformed result is terminal for this reconcile: no verdicts
+            // will fold, so release the pending panes and the sender hold
+            // (never a silent wedge).
+            dispatch(clearAllReconcilePendingPanes())
+            ws.clearReconcileCreateHold()
             fallBackToLegacyCensus()
             return
           }
-          const outcome = foldVerdicts(dispatch, pending, parsed.data)
+          // Every folded pane's stale held create is retracted at the sender
+          // BEFORE the hold clears below (the fold-corrected create is re-sent
+          // by the view with the same requestId).
+          const outcome = foldVerdicts(dispatch, pending, parsed.data, {
+            onVerdictFolded: (createRequestId) => ws.cancelCreate(createRequestId),
+          })
+          // Fold reducers self-clear per-pane pending flags; these two catch
+          // what they can't — skipped verdicts and cardinality-violation
+          // outcomes where nothing folded.
+          dispatch(clearAllReconcilePendingPanes())
+          ws.clearReconcileCreateHold()
           if (outcome.cardinalityViolation) {
             console.error('[reconcile] cardinality violation — falling back to legacy census')
             fallBackToLegacyCensus()
@@ -1090,6 +1120,10 @@ export default function App() {
             // census from the cached inventory (which always precedes the
             // result on the real wire).
             console.error('[reconcile] server error — falling back to legacy census', (msg as { code?: unknown }).code)
+            // Terminal for this reconcile: no verdicts are coming — release
+            // the pending panes and the sender hold before the census.
+            dispatch(clearAllReconcilePendingPanes())
+            ws.clearReconcileCreateHold()
             fallBackToLegacyCensus()
           }
         }

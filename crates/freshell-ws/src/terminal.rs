@@ -1375,18 +1375,44 @@ async fn handle_create(
         .map(|r| r.session_id.as_str())
         .filter(|sid| !sid.is_empty() && resume_session_id.as_deref() == Some(*sid))
     {
-        if state
+        // #540 (ks38): the identity-owner + Running-row join is now the shared
+        // `TerminalRegistry::live_session_owner` helper (the same join the REST
+        // resume paths consult), replacing the former inline two-arm check.
+        let registry_row_live = state
             .registry
             .live_session_owner(Some(&state.identity), &mode, live_sid)
-            .is_some()
-        {
+            .is_some();
+        // Task 13b (cross-kind liveness): a live FRESH-AGENT sidecar owning
+        // `(provider, S)` is just as much "the one writer on S's JSONL" as a live
+        // PTY -- "Reopen as freshclaude"/"Reopen as Claude CLI" makes the same
+        // session reachable from both kinds, and the terminal-only join above is
+        // blind to sidecars. Same rejection frame as a live PTY.
+        let fresh_agent_live = !registry_row_live
+            && match mode.as_str() {
+                "claude" => state.fresh_claude.has_live_session(live_sid).await,
+                "codex" => state.fresh_codex.has_live_session(live_sid).await,
+                "opencode" => state.fresh_opencode.has_live_session(live_sid).await,
+                _ => false,
+            };
+        if fresh_agent_live {
             tracing::warn!(
                 target: "freshell_ws::terminal",
                 mode = %mode,
                 session_id = %live_sid,
                 request_id = %create.request_id,
-                "create_refused: a Running terminal already owns this session (D7 live-guard)"
+                "create_refused: a live fresh-agent sidecar already owns this session (Task 13b cross-kind live-guard)"
             );
+        }
+        if registry_row_live || fresh_agent_live {
+            if registry_row_live {
+                tracing::warn!(
+                    target: "freshell_ws::terminal",
+                    mode = %mode,
+                    session_id = %live_sid,
+                    request_id = %create.request_id,
+                    "create_refused: a Running terminal already owns this session (D7 live-guard)"
+                );
+            }
             return send_create_error(
                 ws_tx,
                 ErrorCode::RestoreUnavailable,

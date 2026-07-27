@@ -81,7 +81,8 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 28] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 29] = [
+    "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
     "codex.activity.list",
@@ -112,10 +113,11 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 28] = [
     "ui.screenshot.result",
 ];
 
-/// Extension client→server discriminants declared BEYOND the frozen T0
-/// inventory — see `EXTENSION_SERVER_MESSAGE_TYPES` (server_messages.rs) for
-/// the rationale; shapes pinned by `tests/activity_extension.rs`.
-pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 1] = ["amplifier.activity.list"];
+/// Extension client→server discriminants declared beyond the generated
+/// inventory. Empty since the 2026-07-26 contract reconciliation folded
+/// `amplifier.activity.list` into the frozen surface (it has been a
+/// first-class `shared/ws-protocol.ts` union member since PR #498).
+pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 0] = [];
 
 // --- hello ------------------------------------------------------------------
 

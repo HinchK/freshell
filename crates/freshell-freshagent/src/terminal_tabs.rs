@@ -470,6 +470,13 @@ fn arm_locators_for_fresh_pane(
     if let Some(locator) = &state.opencode_locator {
         locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
     }
+    // P1.14 / Incident-4: same shape as the WS-path codex arming call
+    // (`crates/freshell-ws/src/codex_association.rs:46`) -- `CodexLocator::arm`
+    // takes no timestamp (windows are Enter-anchored; arming schedules no
+    // deadline, see `codex_locator.rs:166`).
+    if let Some(locator) = &state.codex_locator {
+        locator.arm(terminal_id, mode, true, resume_session_id, cwd);
+    }
 }
 
 /// `sanitizeSessionRef` (`shared/session-contract.ts:55-62`) + `acceptedSessionRefForMode` /
@@ -1480,6 +1487,21 @@ pub(crate) fn maybe_send_keys(
             StatusCode::NOT_FOUND,
             "terminal not found".to_string(),
         ));
+    }
+    // P1.14 / Incident-4: feed the codex locator BEFORE the PTY write.
+    // Contract (`codex_association.rs:49-56`): the first `note_submit`'s
+    // `known_files` re-snapshot must COMPLETE before the Enter byte reaches
+    // the PTY -- a re-snapshot racing after the write can capture
+    // (permanently exclude) the pane's own rollout file. `maybe_send_keys`
+    // is synchronous, so a plain call placed before `registry.input`
+    // satisfies the ordering. First submit does a bounded sessions-tree
+    // walk; later submits are a cheap mutex hop. No mode check needed:
+    // `note_submit` no-ops for terminals the locator never armed, and only
+    // codex panes are armed.
+    if is_submit_input(text) {
+        if let Some(locator) = &state.codex_locator {
+            locator.note_submit(&terminal_id, now_ms());
+        }
     }
     registry.input(&terminal_id, text.as_bytes());
     // Feed the amplifier/opencode locator's Enter<->session correlation
@@ -2545,6 +2567,29 @@ mod tests {
         )))
     }
 
+    /// P1.14 / Incident-4 hardening: the REST create path must arm the codex
+    /// locator exactly like amplifier/opencode, or a REST-created codex pane's
+    /// provisional identity can never be superseded by B2 adoption.
+    #[test]
+    fn arm_locators_for_fresh_pane_arms_the_codex_locator() {
+        let root = std::env::temp_dir().join(format!("codex-arm-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let locator =
+            std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(root));
+        let state = state_with_registry().with_codex_locator(Some(locator.clone()));
+        // Some(...) matches the sibling test-helper convention: the existing
+        // locator tests pass Some(std::sync::Arc::new(...)) (terminal_tabs.rs:2327-2337)
+        // because the builders take Option (with_amplifier_locator, lib.rs:362-368).
+
+        arm_locators_for_fresh_pane(&state, "term-codex-1", "codex", Some("/tmp/proj"), None);
+
+        assert_eq!(
+            locator.armed_count(),
+            1,
+            "codex mode must arm the codex locator"
+        );
+    }
+
     #[tokio::test]
     async fn create_amplifier_tab_fresh_spawns_recorded_argv_with_no_resume_and_arms_locator() {
         let home = unique_temp_home("amplifier-fresh");
@@ -3526,6 +3571,85 @@ mod tests {
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
         let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// P1.14 / Incident-4 hardening, Step 5: a REST `send-keys` Enter must
+    /// feed the codex locator's `note_submit` (the codex window is
+    /// Enter-anchored -- without this, a REST-driven codex pane's window
+    /// never opens). Observable via the locator's own seams, mirroring the
+    /// WS-path test (`codex_association.rs:311-321`): the first submit
+    /// re-snapshots `known_files` (`fs_scan_count` 1 -> 2), and a direct
+    /// `note_submit` afterwards returns false (a still-pending window never
+    /// re-opens); non-submit text must not touch either.
+    #[tokio::test]
+    async fn send_keys_enter_feeds_codex_locator() {
+        let root = unique_temp_home("codex-submit");
+        let argv_file = unique_argv_file("codex-submit");
+        let locator = std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(
+            root.clone(),
+        ));
+        let state = state_with_registry()
+            .with_codex_locator(Some(locator.clone()))
+            .with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "codex", &argv_file,
+            )]));
+        let router = app(state.clone());
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({ "mode": "codex", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+        assert_eq!(
+            locator.armed_count(),
+            1,
+            "REST codex create must arm the codex locator"
+        );
+        assert_eq!(locator.fs_scan_count(), 1); // the arm snapshot
+
+        // Non-submit text (the `is_submit_input` gate): no window, no rescan.
+        let (send_status, _) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/send-keys"),
+            json!({ "data": "hello" }),
+            true,
+        )
+        .await;
+        assert_eq!(send_status, StatusCode::OK);
+        assert_eq!(
+            locator.fs_scan_count(),
+            1,
+            "non-submit input must not open the codex window"
+        );
+
+        // A lone Enter: the FIRST submit re-snapshots known_files.
+        let (send_status, _) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/send-keys"),
+            json!({ "data": "\r" }),
+            true,
+        )
+        .await;
+        assert_eq!(send_status, StatusCode::OK);
+        assert_eq!(
+            locator.fs_scan_count(),
+            2,
+            "the REST Enter must feed note_submit (first-submit re-snapshot)"
+        );
+        assert!(
+            !locator.note_submit(&terminal_id, now_ms()),
+            "the REST Enter already opened a still-pending window -- a direct \
+             note_submit must not re-open it"
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&argv_file);
     }
 

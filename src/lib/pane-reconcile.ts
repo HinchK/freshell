@@ -20,9 +20,16 @@ import type {
 } from '@shared/ws-protocol'
 import { buildRestoreError } from '@shared/session-contract'
 import type { AppDispatch, RootState } from '@/store/store'
-import type { DeadSessionEntry, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import type {
+  DeadSessionEntry,
+  FreshAgentPaneContent,
+  PaneNode,
+  TerminalPaneContent,
+} from '@/store/paneTypes'
 import {
+  applyFreshAgentReconcileAttach,
   applyReconcileAttach,
+  resetFreshAgentPaneForReconcileCreate,
   resetPaneForReconcileCreate,
   setDeadSessionAdjudication,
   setPaneReconcileNotice,
@@ -38,15 +45,16 @@ export function paneKeyFor(tabId: string, paneId: string): string {
   return `${tabId}:${paneId}`
 }
 
-function forEachTerminalPane(
+/** ONE shared tree walk visiting every reconcilable leaf (terminal or fresh-agent). */
+function forEachReconcilablePane(
   layouts: Record<string, PaneNode>,
-  visit: (tabId: string, paneId: string, content: TerminalPaneContent) => void,
+  visit: (tabId: string, paneId: string, content: TerminalPaneContent | FreshAgentPaneContent) => void,
 ): void {
   for (const [tabId, layout] of Object.entries(layouts)) {
     ;(function walk(node: PaneNode | undefined) {
       if (!node) return
       if (node.type === 'leaf') {
-        if (node.content?.kind === 'terminal') {
+        if (node.content?.kind === 'terminal' || node.content?.kind === 'fresh-agent') {
           visit(tabId, node.id, node.content)
         }
         return
@@ -56,6 +64,36 @@ function forEachTerminalPane(
       }
     })(layout)
   }
+}
+
+function forEachTerminalPane(
+  layouts: Record<string, PaneNode>,
+  visit: (tabId: string, paneId: string, content: TerminalPaneContent) => void,
+): void {
+  forEachReconcilablePane(layouts, (tabId, paneId, content) => {
+    if (content.kind === 'terminal') visit(tabId, paneId, content)
+  })
+}
+
+function forEachFreshAgentPane(
+  layouts: Record<string, PaneNode>,
+  visit: (tabId: string, paneId: string, content: FreshAgentPaneContent) => void,
+): void {
+  forEachReconcilablePane(layouts, (tabId, paneId, content) => {
+    if (content.kind === 'fresh-agent') visit(tabId, paneId, content)
+  })
+}
+
+// Capability latch for the fresh-agent widening (mirrors
+// setPaneReconcileActive in src/lib/terminal-restore.ts). App sets it on
+// every ready from `capabilities.paneReconcileFreshAgentV1`, and resets it
+// to false on a capability-less ready.
+let freshAgentReconcileActive = false
+export function setFreshAgentReconcileActive(active: boolean): void {
+  freshAgentReconcileActive = active
+}
+export function isFreshAgentReconcileActive(): boolean {
+  return freshAgentReconcileActive
 }
 
 /**
@@ -94,12 +132,35 @@ function toReconcilePane(tabId: string, paneId: string, content: TerminalPaneCon
   }
 }
 
+/**
+ * Fresh-agent request entry. `mode` carries the runtime provider
+ * (claude/codex/opencode) — informational to the server (verdicts key on
+ * sessionRef), required non-empty by the wire schema.
+ */
+function toFreshAgentReconcilePane(
+  tabId: string,
+  paneId: string,
+  content: FreshAgentPaneContent,
+): ReconcilePane | null {
+  // Panes without a createRequestId cannot be reconciled — skip.
+  if (!content.createRequestId) return null
+  return {
+    paneKey: paneKeyFor(tabId, paneId),
+    kind: 'fresh-agent',
+    mode: content.provider,
+    createRequestId: content.createRequestId,
+    ...(content.sessionRef ? { sessionRef: content.sessionRef } : {}),
+    ...(content.resumeSessionId ? { resumeSessionId: content.resumeSessionId } : {}),
+    ...(content.status ? { status: content.status } : {}),
+  }
+}
+
 function buildRequestFromPanes(panes: ReconcilePane[]): PaneReconcileRequest | null {
   if (panes.length === 0) return null
   let capped = panes
   if (panes.length > MAX_RECONCILE_PANES) {
     console.error(
-      `pane-reconcile: ${panes.length} terminal panes exceed the protocol cap of ${MAX_RECONCILE_PANES}; sending the first ${MAX_RECONCILE_PANES} only`,
+      `pane-reconcile: ${panes.length} panes exceed the protocol cap of ${MAX_RECONCILE_PANES}; sending the first ${MAX_RECONCILE_PANES} only`,
     )
     capped = panes.slice(0, MAX_RECONCILE_PANES)
   }
@@ -110,26 +171,45 @@ function buildRequestFromPanes(panes: ReconcilePane[]): PaneReconcileRequest | n
   }
 }
 
-/** Build a reconcile request covering every terminal pane in the store, or null if there are none. */
-export function buildReconcileRequest(state: RootState): PaneReconcileRequest | null {
+/**
+ * Build a reconcile request covering every terminal pane in the store —
+ * plus every fresh-agent pane when `includeFreshAgent` is set (capability
+ * gated by the caller) — or null if there are none.
+ */
+export function buildReconcileRequest(
+  state: RootState,
+  opts?: { includeFreshAgent?: boolean },
+): PaneReconcileRequest | null {
   const panes: ReconcilePane[] = []
   forEachTerminalPane(state.panes.layouts, (tabId, paneId, content) => {
     const pane = toReconcilePane(tabId, paneId, content)
     if (pane) panes.push(pane)
   })
+  if (opts?.includeFreshAgent) {
+    forEachFreshAgentPane(state.panes.layouts, (tabId, paneId, content) => {
+      const pane = toFreshAgentReconcilePane(tabId, paneId, content)
+      if (pane) panes.push(pane)
+    })
+  }
   return buildRequestFromPanes(panes)
 }
 
-/** Build a reconcile request for specific panes only (e.g. a single exhausted pane), or null if none resolve. */
+/**
+ * Build a reconcile request for specific panes only (e.g. a single exhausted
+ * pane), or null if none resolve. Kind-agnostic: each target folds by its
+ * own content kind (terminal or fresh-agent).
+ */
 export function buildReconcileRequestForPanes(
   state: RootState,
   targets: { tabId: string; paneId: string }[],
 ): PaneReconcileRequest | null {
   const wanted = new Set(targets.map((t) => paneKeyFor(t.tabId, t.paneId)))
   const panes: ReconcilePane[] = []
-  forEachTerminalPane(state.panes.layouts, (tabId, paneId, content) => {
+  forEachReconcilablePane(state.panes.layouts, (tabId, paneId, content) => {
     if (!wanted.has(paneKeyFor(tabId, paneId))) return
-    const pane = toReconcilePane(tabId, paneId, content)
+    const pane = content.kind === 'terminal'
+      ? toReconcilePane(tabId, paneId, content)
+      : toFreshAgentReconcilePane(tabId, paneId, content)
     if (pane) panes.push(pane)
   })
   return buildRequestFromPanes(panes)
@@ -157,12 +237,126 @@ function paneRefFromOwnKey(paneKey: string): { tabId: string; paneId: string } {
 }
 
 function deadSessionTitle(pane: ReconcilePane): string {
+  if (pane.kind === 'fresh-agent') {
+    // The true sessionType is not derivable from the provider (kilroy and
+    // freshclaude both run provider 'claude'), so use a stable human label
+    // built from the provider instead of derivePaneTitle.
+    return `${pane.mode.charAt(0).toUpperCase()}${pane.mode.slice(1)} session`
+  }
   return derivePaneTitle({
     kind: 'terminal',
     mode: pane.mode as TerminalPaneContent['mode'],
     createRequestId: pane.createRequestId,
     status: 'running',
   })
+}
+
+/**
+ * Fold one fresh-agent verdict. Routing mirrors the terminal arms:
+ * attach → applyFreshAgentReconcileAttach (skipped without a sessionRef —
+ * malformed, the reducer would no-op); respawn/fresh →
+ * resetFreshAgentPaneForReconcileCreate; dead_session → batched entry +
+ * loud per-pane restoreError; invalid → restoreError + notice; error →
+ * warming batch or restoreError. Returns true iff the verdict was folded.
+ */
+function foldFreshAgentVerdict(
+  dispatch: AppDispatch,
+  pane: ReconcilePane,
+  verdict: PaneReconcileResultMessage['verdicts'][number],
+  result: PaneReconcileResultMessage,
+  deadEntries: DeadSessionEntry[],
+  warmingRefs: Array<{ tabId: string; paneId: string }>,
+  outcome: FoldOutcome,
+): boolean {
+  const { tabId, paneId } = paneRefFromOwnKey(pane.paneKey)
+
+  switch (verdict.verdict) {
+    case 'attach': {
+      // Contract: a fresh-agent attach carries the durable sessionRef
+      // (there is no terminalId). Missing one is malformed — skip entirely.
+      if (!verdict.sessionRef) return false
+      dispatch(applyFreshAgentReconcileAttach({
+        tabId,
+        paneId,
+        sessionRef: verdict.sessionRef,
+        serverInstanceId: result.serverInstanceId,
+        corrected: verdict.corrected,
+        duplicate: verdict.duplicate ? true : undefined,
+      }))
+      outcome.attached++
+      return true
+    }
+    case 'respawn': {
+      dispatch(resetFreshAgentPaneForReconcileCreate({
+        tabId,
+        paneId,
+        intent: 'respawn',
+        sessionRef: verdict.sessionRef,
+        corrected: verdict.corrected,
+      }))
+      outcome.respawned++
+      return true
+    }
+    case 'fresh': {
+      dispatch(resetFreshAgentPaneForReconcileCreate({
+        tabId,
+        paneId,
+        intent: 'fresh',
+        reason: verdict.reason,
+      }))
+      outcome.fresh++
+      return true
+    }
+    case 'dead_session': {
+      deadEntries.push({
+        tabId,
+        paneId,
+        title: deadSessionTitle(pane),
+        mode: pane.mode,
+        kind: 'fresh-agent',
+        sessionRef: verdict.sessionRef,
+        reason: verdict.reason,
+      })
+      dispatch(setPaneRestoreError({
+        tabId,
+        paneId,
+        restoreError: buildRestoreError('durable_artifact_missing'),
+      }))
+      outcome.dead++
+      return true
+    }
+    case 'invalid': {
+      dispatch(setPaneRestoreError({
+        tabId,
+        paneId,
+        restoreError: buildRestoreError('missing_canonical_identity'),
+      }))
+      if (verdict.reason) {
+        dispatch(setPaneReconcileNotice({
+          tabId,
+          paneId,
+          notice: `Reconcile rejected this pane (${verdict.reason}).`,
+        }))
+      }
+      outcome.invalid++
+      return true
+    }
+    case 'error': {
+      // Fresh-agent verdicts never emit 'error' today, but the fold must
+      // not crash if one arrives — identical handling to the terminal arm.
+      if (verdict.reason === 'index_warming') {
+        warmingRefs.push({ tabId, paneId })
+        outcome.warming++
+      } else {
+        dispatch(setPaneRestoreError({
+          tabId,
+          paneId,
+          restoreError: buildRestoreError('provider_runtime_failed'),
+        }))
+      }
+      return true
+    }
+  }
 }
 
 /**
@@ -173,11 +367,18 @@ function deadSessionTitle(pane: ReconcilePane): string {
  * Cardinality invariant comes FIRST: verdicts must match the request's
  * panes 1:1 in order. On violation NOTHING is dispatched — the caller
  * sees `cardinalityViolation: true` and falls back to the legacy census.
+ *
+ * Each verdict routes by `request.panes[i].kind` (terminal vs fresh-agent).
+ * The optional `onVerdictFolded` hook fires once per successfully-folded
+ * pane (all kinds) with that pane's createRequestId, so callers can retract
+ * a held/queued create at the sender. Skipped verdicts (malformed attach)
+ * and cardinality violations never fire it.
  */
 export function foldVerdicts(
   dispatch: AppDispatch,
   request: PaneReconcileRequest,
   result: PaneReconcileResultMessage,
+  opts?: { onVerdictFolded?: (createRequestId: string) => void },
 ): FoldOutcome {
   const outcome: FoldOutcome = {
     attached: 0,
@@ -206,13 +407,24 @@ export function foldVerdicts(
   for (let i = 0; i < request.panes.length; i++) {
     const pane = request.panes[i]
     const verdict = result.verdicts[i]
+
+    if (pane.kind === 'fresh-agent') {
+      const folded = foldFreshAgentVerdict(dispatch, pane, verdict, result, deadEntries, warmingRefs, outcome)
+      if (folded) opts?.onVerdictFolded?.(pane.createRequestId)
+      continue
+    }
+
     const { tabId, paneId } = paneRefFromOwnKey(pane.paneKey)
+    let folded = true
 
     switch (verdict.verdict) {
       case 'attach': {
         // Contract: attach carries the live terminalId. A missing one is a
         // malformed verdict — the reducer would no-op, so skip it entirely.
-        if (!verdict.terminalId) break
+        if (!verdict.terminalId) {
+          folded = false
+          break
+        }
         dispatch(applyReconcileAttach({
           tabId,
           paneId,
@@ -300,6 +512,8 @@ export function foldVerdicts(
         break
       }
     }
+
+    if (folded) opts?.onVerdictFolded?.(pane.createRequestId)
   }
 
   // Council rule 1: ONE batched adjudication list — never N dispatches.

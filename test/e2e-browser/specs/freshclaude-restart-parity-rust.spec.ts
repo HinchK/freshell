@@ -277,9 +277,23 @@ test.describe('freshclaude restart parity (rust)', () => {
         }, { timeout: 30_000 })
         .toBe('idle')
 
-      // ...with NO client-driven re-create (the lost->triggerRecovery FALLBACK).
+      // ...with NO identity-LOSING client re-create. HISTORY (2026-07-26,
+      // reconcile-completion): this originally asserted ZERO freshAgent.create
+      // frames, pinning the attach-only mechanism. With fresh-agent reconcile
+      // verdicts live (paneReconcileFreshAgentV1), a SIGKILL'd session folds a
+      // RESPAWN verdict, which re-drives ONE create carrying the durable
+      // resumeSessionId + sessionRef (the D8 lease serializes it against the
+      // reconnect attach -- one sidecar either way). The invariant this
+      // assertion guards is unchanged: never the lost->triggerRecovery
+      // fallback's identity-less re-mint.
       const sentAfterRestart = await harness.getSentWsMessages()
-      expect(sentAfterRestart.filter((m: any) => m.type === 'freshAgent.create')).toHaveLength(0)
+      const createsAfterRestart = sentAfterRestart.filter((m: any) => m.type === 'freshAgent.create')
+      for (const create of createsAfterRestart as any[]) {
+        expect(
+          create.resumeSessionId ?? create.sessionRef?.sessionId,
+          `post-restart create must carry the durable identity: ${JSON.stringify(create)}`,
+        ).toBe(originalDurable)
+      }
 
       // Server-side resume proof: the post-restart sidecar create carried
       // options.resume = the original durable UUID (spec item 2 verification).

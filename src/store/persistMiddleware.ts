@@ -599,6 +599,7 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             restoreFallbackAttemptsByPane: _rfabp,
             deadSessionAdjudication: _dsa,
             reconcileWarming: _rw,
+            reconcilePendingPanes: _rpp,
             ...persistablePanes
           } = state.panes
           persistablePanesSection = {

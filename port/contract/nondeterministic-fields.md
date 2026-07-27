@@ -29,16 +29,17 @@ layer can be built field-by-field.
 
 | Field | Kind | Appears in (`type`) |
 |-------|------|---------------------|
-| `terminalId` | nanoid | terminal.create, terminal.attach, terminal.detach, terminal.input, terminal.resize, terminal.kill, terminal.codex.candidate.persisted, terminal.created, terminal.attach.ready, terminal.stream.changed, terminal.detached, terminal.exit, terminal.status, terminal.output, terminal.output.batch, terminal.output.gap, terminal.title.updated, terminal.session.associated, terminal.codex.durability.updated, terminal.input.blocked, terminal.meta.updated, terminal.turn.complete, terminal.inventory, terminals.changed (`recoverableTerminalIds[]`), {codex,opencode,claude}.activity.updated / .list.response |
-| `requestId` | correlation id | terminal.create, {codex,opencode,claude}.activity.list(+.response), ui.screenshot.result, codingcli.create/.created, freshAgent.create/.send/.fork(+.created/.create.failed/.send.accepted/.forked), tabs.sync.snapshot, error |
-| `sessionId` | provider session id (`ses_…`, Claude UUID, opencode id) | codingcli.input/.kill/.created/.event/.exit/.stderr/.killed, freshAgent.* (attach/send/interrupt/compact/approval.respond/question.respond/kill/fork + created/.event/.materialized/.forked/.killed/.send.accepted), session.status, session.repair.activity, terminal.turn.complete, terminal metadata, {codex,opencode,claude} activity records |
+| `terminalId` | nanoid | terminal.create, terminal.attach, terminal.detach, terminal.input, terminal.resize, terminal.kill, terminal.codex.candidate.persisted, terminal.created, terminal.attach.ready, terminal.stream.changed, terminal.detached, terminal.exit, terminal.status, terminal.output, terminal.output.batch, terminal.output.gap, terminal.title.updated, terminal.session.associated, terminal.codex.durability.updated, terminal.input.blocked, terminal.meta.updated, terminal.turn.complete, terminal.idle, terminal.inventory, terminals.changed (`recoverableTerminalIds[]`), pane.reconcile.result (`verdicts[].terminalId`, `verdicts[].duplicate`), {codex,opencode,claude,amplifier}.activity.updated / .list.response |
+| `requestId` | correlation id | terminal.create, {codex,opencode,claude,amplifier}.activity.list(+.response), ui.screenshot.result, codingcli.create/.created, freshAgent.create/.send/.fork(+.created/.create.failed/.send.accepted/.forked), tabs.sync.snapshot, error |
+| `sessionId` | provider session id (`ses_…`, Claude UUID, opencode id) | codingcli.input/.kill/.created/.event/.exit/.stderr/.killed, freshAgent.* (attach/send/interrupt/compact/approval.respond/question.respond/kill/fork + created/.event/.materialized/.forked/.killed/.send.accepted), session.status, session.repair.activity, terminal.turn.complete, terminal metadata, pane.reconcile.result (`verdicts[].sessionRef.sessionId`), {codex,opencode,claude,amplifier} activity records |
 | `resumeSessionId` | references a prior session id | codingcli.create, freshAgent.create/.attach |
 | `streamId` | pty stream id | terminal.attach.ready, terminal.stream.changed, terminal.output, terminal.output.batch, terminal.output.gap |
 | `attachRequestId` | attach correlation id | terminal.attach, terminal.attach.ready, terminal.stream.changed, terminal.output, terminal.output.batch, terminal.output.gap |
 | `tabId`, `paneId` | client layout ids | client.diagnostic, terminal.create |
 | `candidateThreadId`, `durableThreadId` | codex thread ids | terminal.codex.candidate.persisted, terminal.codex.durability.updated (`durability.candidate.candidateThreadId`, `durability.durableThreadId`) |
-| `serverInstanceId` | per-boot server id | ready, terminal.create (`liveTerminal.serverInstanceId`) |
-| `bootId` | per-boot id | ready, terminal.inventory |
+| `serverInstanceId` | per-boot server id | ready, terminal.create (`liveTerminal.serverInstanceId`), pane.reconcile.result |
+| `bootId` | per-boot id | ready, terminal.inventory, pane.reconcile.result |
+| `reconcileId` | client-minted correlation id | pane.reconcile.request, pane.reconcile.result |
 | `submittedTurnId` | turn id | freshAgent.send.accepted |
 | `previousSessionId` | prior session id | freshAgent.session.materialized |
 | `parentSessionId` | forked-from id | freshAgent.forked |
@@ -51,11 +52,11 @@ layer can be built field-by-field.
 |-------|------------|
 | `timestamp` | ready (ISO string), pong (ISO string), error (ISO string), ui.layout.sync (number) |
 | `createdAt` | terminal.created, terminal.inventory (`terminals[].createdAt`), freshAgent.create (`legacyRestoreContext.createdAt`) |
-| `updatedAt` | terminal.meta.updated (`upsert[].updatedAt`), {codex,opencode,claude} activity records, freshAgent.create (`legacyRestoreContext.updatedAt`) |
+| `updatedAt` | terminal.meta.updated (`upsert[].updatedAt`), {codex,opencode,claude,amplifier} activity records, freshAgent.create (`legacyRestoreContext.updatedAt`) |
 | `capturedAt` | terminal.codex.candidate.persisted, terminal.codex.durability.updated (`durability.candidate.capturedAt`) |
 | `checkedAt` | terminal.codex.durability.updated (`durability.lastProofFailure.checkedAt`) |
 | `turnCompletedAt` | terminal.codex.durability.updated (`durability.turnCompletedAt`) |
-| `at` | terminal.turn.complete, {codex,opencode,claude}.activity.list.response (`latestTurnCompletions[].at`) |
+| `at` | terminal.turn.complete, terminal.idle, {codex,opencode,claude,amplifier}.activity.list.response (`latestTurnCompletions[].at`) |
 | `lastActivityAt` | terminal.inventory (`terminals[].lastActivityAt`) |
 | `lastSeenAt` | tabs.sync.snapshot (`data.devices[].lastSeenAt`) |
 
@@ -67,7 +68,7 @@ layer can be built field-by-field.
 | `headSeq`, `replayFromSeq`, `replayToSeq`, `requestedSinceSeq`, `effectiveSinceSeq`, `geometryEpoch` | terminal.attach.ready |
 | `sinceSeq` | terminal.attach |
 | `fromSeq`, `toSeq` | terminal.output.gap |
-| `completionSeq` | terminal.turn.complete, {codex,opencode,claude}.activity.list.response (`latestTurnCompletions[].completionSeq`) |
+| `completionSeq` | terminal.turn.complete, {codex,opencode,claude,amplifier}.activity.list.response (`latestTurnCompletions[].completionSeq`) |
 | `revision` | terminals.changed, sessions.changed |
 | `endOffset`, `rawFrameCount`, `serializedBytes` | terminal.output.batch (+ `segments[]`) |
 | `chainDepth`, `orphansFixed`, `orphanCount` | session.status, session.repair.activity |

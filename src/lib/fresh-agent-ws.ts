@@ -133,6 +133,14 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
     }
     case 'freshAgent.create.failed': {
       const failed = msg as FreshAgentCreateFailedMessage
+      if (failed.code === 'SESSION_RESERVED' && failed.retryable) {
+        // Task 14: transient reservation -- no pendingCreateFailures entry (no
+        // error card / no Retry racing the same-requestId re-drive), and the
+        // create route stays alive so the re-driven create's eventual
+        // created/failed still routes to this pane. The pane-level handler in
+        // FreshAgentView owns the bounded re-drive.
+        return true
+      }
       consumeCreateRoute(failed.requestId)
       dispatch(createFailed({
         requestId: failed.requestId,

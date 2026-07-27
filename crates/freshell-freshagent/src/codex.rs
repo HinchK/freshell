@@ -152,6 +152,13 @@ pub struct FreshCodexState {
     /// post-construction by `freshell-server` (precedent:
     /// `TerminalRegistry::set_activity_observer`).
     identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
+    /// The per-sessionRef create/resume lease (D8 for fresh agents, Task 12) —
+    /// ALWAYS ON at this runtime seam (never capability-gated). `main.rs` replaces the
+    /// default with the ONE server-wide shared map via [`Self::set_session_leases`].
+    leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
+    /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
+    terminal_liveness: crate::TerminalLivenessProbe,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -232,6 +239,9 @@ enum EnsureAliveError {
     /// WS connect, `initialize`, or `thread/start` all failed) -- the session is left
     /// mapped under its OLD id, still marked exited, for a future retry.
     RespawnFailed(String),
+    /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
+    /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
+    Reserved,
 }
 
 /// A codex thread this process now has a live, registered runtime for -- either it was
@@ -254,6 +264,9 @@ enum ResumeSessionError {
     /// thread doesn't exist" (sidecar unreachable, RPC timeout, transport error, ...) --
     /// safe to retry; the thread may still be resumable.
     Transient(String),
+    /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
+    /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
+    Reserved,
 }
 
 impl FreshCodexState {
@@ -279,7 +292,26 @@ impl FreshCodexState {
             dead_thread_ttl: DEAD_THREAD_CACHE_TTL,
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
+            leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+            terminal_liveness: Arc::new(|_, _| false),
         }
+    }
+
+    /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
+    /// before this state is cloned into the router).
+    pub fn set_terminal_liveness(&mut self, probe: crate::TerminalLivenessProbe) {
+        self.terminal_liveness = probe;
+    }
+
+    /// Replace the default lease map with the ONE server-wide shared map (Task 12;
+    /// called by `main.rs` before this state is cloned into the router). Keys are
+    /// provider-namespaced, so a default per-runtime map is semantically identical —
+    /// the shared map exists for observability and Task 13b's cross-kind wiring.
+    pub fn set_session_leases(
+        &mut self,
+        leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    ) {
+        self.leases = leases;
     }
 
     /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
@@ -487,6 +519,77 @@ impl FreshCodexState {
         // an EMPTY new conversation under a brand-new id -- connected, no error, just quiet
         // data loss.
         if let Some(resume_session_id) = msg.resume_session_id.clone() {
+            // Task 13b (cross-kind liveness): a live terminal PTY owning
+            // `(codex, thread)` is the one writer on that rollout -- refuse the resume
+            // with the retryable loser answer; NO lease claim, NO spawn.
+            if (self.terminal_liveness)(PROVIDER, &resume_session_id) {
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    session_id = %resume_session_id, request_id = %request_id,
+                    "fresh_agent_create_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+                self.fail_create_session_reserved(&request_id);
+                return;
+            }
+            // Task 12 (D8 for fresh agents): claim the per-sessionRef lease BEFORE any
+            // spawn -- exactly one in-flight resume (and one live rollout writer) per
+            // thread. ALWAYS ON (never capability-gated).
+            // Fast-path ADOPT (V1): the thread is already live -- answer created
+            // naming it, spawn nothing (base checked only the dead-thread negative
+            // cache here, never the live sessions map).
+            if self.has_live_session(&resume_session_id).await {
+                self.adopt_live_create(&request_id, &resume_session_id)
+                    .await;
+                return;
+            }
+            let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+            for round in 0..2u8 {
+                match self.leases.claim(
+                    PROVIDER,
+                    &resume_session_id,
+                    &request_id,
+                    crate::session_lease::now_epoch_ms(),
+                ) {
+                    crate::session_lease::FreshSessionClaim::Acquired => {
+                        lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
+                            Arc::clone(&self.leases),
+                            PROVIDER,
+                            &resume_session_id,
+                            &request_id,
+                        ));
+                        break;
+                    }
+                    crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
+                        // Under-lock ADOPT (the V5 TOCTOU window).
+                        self.adopt_live_create(&request_id, &resume_session_id)
+                            .await;
+                        return;
+                    }
+                    crate::session_lease::FreshSessionClaim::Held { .. } => {
+                        self.fail_create_session_reserved(&request_id);
+                        return;
+                    }
+                    crate::session_lease::FreshSessionClaim::ExpiredNeedsKill {
+                        pid,
+                        ownership_id,
+                    } => {
+                        if round == 0
+                            && crate::session_lease::kill_and_confirm_tree_dead(
+                                pid,
+                                CODEX_SIDECAR_OWNERSHIP_ENV,
+                                &ownership_id,
+                            )
+                            .await
+                        {
+                            self.leases
+                                .force_release_after_confirmed_kill(PROVIDER, &resume_session_id);
+                            continue;
+                        }
+                        tracing::error!(target: "invariant", pid, session_id = %resume_session_id,
+                            "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
+                        self.fail_create_session_reserved(&request_id);
+                        return;
+                    }
+                }
+            }
             self.handle_create_resume(
                 request_id,
                 resume_session_id,
@@ -495,6 +598,7 @@ impl FreshCodexState {
                 effort,
                 sandbox,
                 permission_mode,
+                lease_guard,
             )
             .await;
             return;
@@ -542,6 +646,7 @@ impl FreshCodexState {
             cwd,
             sandbox,
             permission_mode,
+            None,
         )
         .await;
     }
@@ -578,8 +683,12 @@ impl FreshCodexState {
         effort: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
     ) {
         if self.is_known_dead_thread(&resume_session_id).await {
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
             self.fail_create(
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
@@ -591,10 +700,19 @@ impl FreshCodexState {
         let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
             Ok(parts) => parts,
             Err(err) => {
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
                 self.fail_create(&request_id, "CODEX_APP_SERVER_START_FAILED", &err);
                 return;
             }
         };
+        // Task 12: arm the TTL tree-kill path now that the child + its tag exist.
+        if let Some(g) = lease_guard.as_mut() {
+            if let Some(pid) = child.id() {
+                g.set_kill_handle(pid, &ownership_id);
+            }
+        }
 
         let resume_result = client
             .resume_thread(
@@ -614,6 +732,10 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                // Own tree torn down above -- releasing the lease is safe.
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
                 if is_codex_thread_not_found(&err) {
                     self.mark_thread_dead(&resume_session_id).await;
                 }
@@ -630,6 +752,9 @@ impl FreshCodexState {
             let mut child = child;
             let _ = child.start_kill();
             reap_owned_codex_sidecars(&ownership_id);
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
             tracing::error!(
                 requested = %resume_session_id,
                 returned = %started.thread_id,
@@ -661,6 +786,7 @@ impl FreshCodexState {
             cwd,
             sandbox,
             permission_mode,
+            lease_guard,
         )
         .await;
     }
@@ -685,7 +811,34 @@ impl FreshCodexState {
         cwd: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
     ) {
+        // Task 12 EVICTION GUARD: on base this tail REPLACED a live incumbent under the
+        // same threadId -- orphaning the winner's sidecar and stealing its binding
+        // (strictly worse than a duplicate). If a LIVE entry already occupies the
+        // threadId, do NOT insert: tear down our own sidecar and answer the create as
+        // an ADOPT of the incumbent. (An `exited` incumbent is legitimately replaced --
+        // that is the PR-4 lazy-respawn path.)
+        let incumbent_live = self
+            .sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .is_some_and(|s| !s.exited.load(Ordering::SeqCst));
+        if incumbent_live {
+            client.close().await;
+            let mut child = child;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            reap_owned_codex_sidecars(&ownership_id);
+            // Own tree confirmed torn down -- releasing the lease is safe.
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
+            self.adopt_live_create(&request_id, &thread_id).await;
+            return;
+        }
+
         // Legacy `activeTurnByThread` mirror for THIS session (adapter.ts:295) -- set on
         // `handle_send`, read/cleared by `handle_interrupt`, cleared by the consumer below.
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
@@ -722,6 +875,7 @@ impl FreshCodexState {
             self.broadcast_tx.clone(),
             kill_rx,
             exited.clone(),
+            Arc::clone(&self.leases),
         );
 
         self.sessions.lock().await.insert(
@@ -740,6 +894,29 @@ impl FreshCodexState {
                 exited,
             },
         );
+
+        // Task 12: bind the durable thread id to this live session + release the lease
+        // in ONE lock scope. A revoked lease means we must NOT keep the session -- tear
+        // down our own tree and answer failed.
+        if let Some(mut g) = lease_guard.take() {
+            if !g.complete(&thread_id) {
+                if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
+                    session.consumer.abort();
+                    session.client.close().await;
+                    if let Some(kill_tx) = session.kill_tx {
+                        let _ = kill_tx.send(());
+                    }
+                    let _ = session.watcher.await;
+                }
+                g.fail(); // own tree torn down -- reopen the key
+                self.fail_create(
+                    &request_id,
+                    "FRESH_AGENT_CREATE_FAILED",
+                    "session lease revoked during create; torn down",
+                );
+                return;
+            }
+        }
 
         // P1.13 identity event (Task 4): the ledger binding row for this create,
         // AWAITED before the `freshAgent.created` reply below goes out
@@ -823,6 +1000,41 @@ impl FreshCodexState {
         ));
     }
 
+    /// The D8 loser answer (Task 12): reuses the existing create-failed frame with the
+    /// fixed reservation code — NO new protocol fields.
+    fn fail_create_session_reserved(&self, request_id: &str) {
+        self.fail_create(
+            request_id,
+            "SESSION_RESERVED",
+            "Another resume for this session is in flight",
+        );
+    }
+
+    /// The HAS-LIVE→ADOPT arm (Task 12, V1): answer a loser's create-with-resume with a
+    /// `freshAgent.created` naming the live durable threadId under the loser's own
+    /// `requestId` — no spawn, no rollout clobber.
+    async fn adopt_live_create(&self, request_id: &str, thread_id: &str) {
+        self.create_dedup
+            .record_success(
+                request_id,
+                CodexCreateRecord {
+                    session_id: thread_id.to_string(),
+                },
+            )
+            .await;
+        self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
+            provider: PROVIDER.to_string(),
+            request_id: request_id.to_string(),
+            runtime_provider: PROVIDER.to_string(),
+            session_id: thread_id.to_string(),
+            session_type: SESSION_TYPE.to_string(),
+            session_ref: Some(SessionLocator {
+                provider: PROVIDER.to_string(),
+                session_id: thread_id.to_string(),
+            }),
+        }));
+    }
+
     // ── freshAgent.send (WS) ─────────────────────────────────────────────────
 
     /// Handle a `freshAgent.send` for codex: `turn/start` (effort VERBATIM — DEV-0003), then
@@ -852,6 +1064,16 @@ impl FreshCodexState {
             }
             Err(EnsureAliveError::RespawnFailed(err)) => {
                 self.send_error(&request_id, "CODEX_RESPAWN_FAILED", &err);
+                return;
+            }
+            Err(EnsureAliveError::Reserved) => {
+                // Task 13 (D8): another create/attach holds this sessionRef -- the
+                // retryable non-lost error channel; the client re-drive converges.
+                self.emit_fresh_agent_error(
+                    &session_id,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                );
                 return;
             }
         }
@@ -1018,6 +1240,9 @@ impl FreshCodexState {
             // for it so the sidecar is actually gone before we broadcast success.
             let _ = session.watcher.await;
         }
+        // Task 12: an explicitly-killed session must reopen its durable id (the watcher
+        // also clears it; idempotent -- this covers watcher-less test sessions too).
+        self.leases.clear_binding(PROVIDER, &session_id);
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
         // `clearFreshAgentCreateCachesForSession`, `ws-handler.ts:1044-1050`, called from
@@ -1112,6 +1337,15 @@ impl FreshCodexState {
                         self.send_error(&None, "CODEX_ATTACH_RESPAWN_FAILED", &err);
                         return;
                     }
+                    Err(EnsureAliveError::Reserved) => {
+                        // Task 13 (D8): loser answer -- retryable, never lost.
+                        self.emit_fresh_agent_error(
+                            &msg.session_id,
+                            "SESSION_RESERVED",
+                            "Another resume for this session is in flight",
+                        );
+                        return;
+                    }
                 };
             let active_turn_present = {
                 let guard = self.sessions.lock().await;
@@ -1140,6 +1374,15 @@ impl FreshCodexState {
                 }
                 Err(ResumeSessionError::Transient(err)) => {
                     self.send_error(&None, "CODEX_ATTACH_RESUME_FAILED", &err);
+                    return;
+                }
+                Err(ResumeSessionError::Reserved) => {
+                    // Task 13 (D8): loser answer -- retryable, never lost.
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
                     return;
                 }
             }
@@ -1267,6 +1510,70 @@ impl FreshCodexState {
             }
         }
 
+        // Task 13b (cross-kind liveness): a live terminal PTY owning `(codex, thread)`
+        // is the one writer on that rollout -- refuse the respawn (retryable).
+        if (self.terminal_liveness)(PROVIDER, session_id) {
+            tracing::warn!(target: "freshell_freshagent::codex", session_id = %session_id,
+                "fresh_agent_respawn_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+            return Err(EnsureAliveError::Reserved);
+        }
+        // Task 13 (D8): the exited->respawn arm SPAWNS -- claim the per-sessionRef
+        // lease first (the per-thread lock above covers in-process races; the lease
+        // serializes against CREATE-path holders for the same durable id).
+        let alive_request_id = format!("attach-alive-{}", uuid::Uuid::new_v4());
+        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+        for round in 0..2u8 {
+            match self.leases.claim(
+                PROVIDER,
+                session_id,
+                &alive_request_id,
+                crate::session_lease::now_epoch_ms(),
+            ) {
+                crate::session_lease::FreshSessionClaim::Acquired => {
+                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
+                        Arc::clone(&self.leases),
+                        PROVIDER,
+                        session_id,
+                        &alive_request_id,
+                    ));
+                    break;
+                }
+                crate::session_lease::FreshSessionClaim::BoundLive { live_session_key } => {
+                    // The winner bound while we contended: adopt its live session.
+                    let live = self.sessions.lock().await.get(&live_session_key).is_some();
+                    if live {
+                        if live_session_key == session_id {
+                            return Ok(EnsureAliveOutcome::Recovered);
+                        }
+                        return Ok(EnsureAliveOutcome::Respawned {
+                            new_session_id: live_session_key,
+                        });
+                    }
+                    return Err(EnsureAliveError::Reserved);
+                }
+                crate::session_lease::FreshSessionClaim::Held { .. } => {
+                    return Err(EnsureAliveError::Reserved);
+                }
+                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
+                    if round == 0
+                        && crate::session_lease::kill_and_confirm_tree_dead(
+                            pid,
+                            CODEX_SIDECAR_OWNERSHIP_ENV,
+                            &ownership_id,
+                        )
+                        .await
+                    {
+                        self.leases
+                            .force_release_after_confirmed_kill(PROVIDER, session_id);
+                        continue;
+                    }
+                    tracing::error!(target: "invariant", pid, session_id = %session_id,
+                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
+                    return Err(EnsureAliveError::Reserved);
+                }
+            }
+        }
+
         // FIX (CODEX-FIRST triage Finding 2): this exact thread id was already confirmed
         // genuinely gone within its negative-cache TTL window -- skip the doomed resume
         // attempt (and the sidecar it would burn to re-prove it) and go straight to the
@@ -1280,14 +1587,26 @@ impl FreshCodexState {
                     effort,
                     sandbox,
                     permission_mode,
+                    lease_guard,
                 )
                 .await;
         }
 
-        let (client, notifs, ownership_id, child) = self
-            .spawn_sidecar(cwd.as_deref())
-            .await
-            .map_err(EnsureAliveError::RespawnFailed)?;
+        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
+            Ok(parts) => parts,
+            Err(err) => {
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                return Err(EnsureAliveError::RespawnFailed(err));
+            }
+        };
+        // Arm the lease's TTL tree-kill path now that the child + its tag exist.
+        if let Some(g) = lease_guard.as_mut() {
+            if let Some(pid) = child.id() {
+                g.set_kill_handle(pid, &ownership_id);
+            }
+        }
 
         // `toCodexResumeInput` (adapter.ts:151-162): forward only settings this process
         // actually has recorded for the thread. An empty `model` means `handle_send` never
@@ -1350,6 +1669,7 @@ impl FreshCodexState {
                         effort,
                         sandbox,
                         permission_mode,
+                        lease_guard,
                     )
                     .await;
             }
@@ -1358,6 +1678,10 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                // Own tree torn down above -- releasing the lease is safe.
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
                 return Err(EnsureAliveError::RespawnFailed(err.to_string()));
             }
         };
@@ -1375,6 +1699,9 @@ impl FreshCodexState {
                 returned = %started.thread_id,
                 "freshagent.codex.wrong_thread_resume_rejected"
             );
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
             return Err(EnsureAliveError::RespawnFailed(format!(
                 "codex thread/resume returned wrong thread id {} (requested {session_id}); \
                  refusing to adopt the wrong thread",
@@ -1393,6 +1720,7 @@ impl FreshCodexState {
             self.broadcast_tx.clone(),
             kill_rx,
             exited.clone(),
+            Arc::clone(&self.leases),
         );
 
         // `HashMap::insert` on an existing key overwrites in place, dropping the old (dead
@@ -1441,6 +1769,17 @@ impl FreshCodexState {
         // -- clear any stale "recently gone" marking so it doesn't linger.
         self.clear_dead_thread(session_id).await;
 
+        // Task 13: bind the durable id to the recovered live session + release the
+        // lease (registration above precedes the bind -- no no-lease/no-binding window).
+        if let Some(mut g) = lease_guard.take() {
+            if !g.complete(session_id) {
+                // Revoked mid-recovery: we are still the only writer (contenders were
+                // held closed) -- keep the recovered session, reopen the key; the
+                // has-live fast paths adopt it from here.
+                g.fail();
+            }
+        }
+
         // DIAG-01: crash recovery took the resume-first path -- the durable
         // session_id is unchanged, conversation memory survives.
         tracing::info!(session_id = %session_id, "freshagent.crash_recovery.resumed_same_thread");
@@ -1457,6 +1796,7 @@ impl FreshCodexState {
     /// memory for it is lost. Callers must use the returned `new_session_id` for anything
     /// session-scoped afterward.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     async fn respawn_as_new_thread_after_crash(
         &self,
         old_session_id: &str,
@@ -1465,11 +1805,23 @@ impl FreshCodexState {
         effort: Option<String>,
         sandbox: Option<String>,
         permission_mode: Option<String>,
+        mut lease_guard: Option<crate::FreshSessionLeaseGuard>,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
-        let (client, notifs, ownership_id, child) = self
-            .spawn_sidecar(cwd.as_deref())
-            .await
-            .map_err(EnsureAliveError::RespawnFailed)?;
+        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd.as_deref()).await {
+            Ok(parts) => parts,
+            Err(err) => {
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                return Err(EnsureAliveError::RespawnFailed(err));
+            }
+        };
+        // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
+        if let Some(g) = lease_guard.as_mut() {
+            if let Some(pid) = child.id() {
+                g.set_kill_handle(pid, &ownership_id);
+            }
+        }
 
         let started = client
             .start_thread(StartThreadParams {
@@ -1486,6 +1838,10 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                // Own tree torn down above -- releasing the lease is safe.
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
                 return Err(EnsureAliveError::RespawnFailed(err.to_string()));
             }
         };
@@ -1501,6 +1857,7 @@ impl FreshCodexState {
             self.broadcast_tx.clone(),
             kill_rx,
             exited.clone(),
+            Arc::clone(&self.leases),
         );
 
         {
@@ -1522,6 +1879,16 @@ impl FreshCodexState {
                     exited,
                 },
             );
+        }
+
+        // Task 13: bind the OLD durable id to the NEW live key (the identity moved) --
+        // contenders holding the old id adopt the new session via BoundLive.
+        if let Some(mut g) = lease_guard.take() {
+            if !g.complete(&new_thread_id) {
+                // Revoked mid-respawn: keep the live session (we are the only writer);
+                // reopen the key -- has-live fast paths adopt from here.
+                g.fail();
+            }
         }
 
         // P1.13 identity event (Task 4): NEW ledger row under the new thread id with
@@ -1800,6 +2167,10 @@ impl FreshCodexState {
             Err(ResumeSessionError::Transient(message)) => {
                 Err(CodexSnapshotError::Protocol(message))
             }
+            // Task 13 (D8): a reserved sessionRef is transient at the REST layer.
+            Err(ResumeSessionError::Reserved) => Err(CodexSnapshotError::Protocol(
+                "SESSION_RESERVED: another resume for this session is in flight".to_string(),
+            )),
         }
     }
 
@@ -1916,10 +2287,79 @@ impl FreshCodexState {
             return Err(ResumeSessionError::NotFound);
         }
 
-        let (client, notifs, ownership_id, child) = self
-            .spawn_sidecar(cwd)
-            .await
-            .map_err(ResumeSessionError::Transient)?;
+        // Task 13b (cross-kind liveness): a live terminal PTY owning `(codex, thread)`
+        // is the one writer on that rollout -- refuse the resume (retryable).
+        if (self.terminal_liveness)(PROVIDER, thread_id) {
+            tracing::warn!(target: "freshell_freshagent::codex", session_id = %thread_id,
+                "fresh_agent_attach_resume_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+            return Err(ResumeSessionError::Reserved);
+        }
+        // Task 13 (D8): this arm SPAWNS -- claim the per-sessionRef lease first. The
+        // per-thread lock above covers in-process attach-vs-attach; the lease
+        // serializes against CREATE-path holders for the same durable id.
+        let resume_request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
+        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+        for round in 0..2u8 {
+            match self.leases.claim(
+                PROVIDER,
+                thread_id,
+                &resume_request_id,
+                crate::session_lease::now_epoch_ms(),
+            ) {
+                crate::session_lease::FreshSessionClaim::Acquired => {
+                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
+                        Arc::clone(&self.leases),
+                        PROVIDER,
+                        thread_id,
+                        &resume_request_id,
+                    ));
+                    break;
+                }
+                crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
+                    // The winner completed while we contended -- adopt its live session.
+                    if let Some(resumed) = self.live_resumed_session(thread_id).await {
+                        return Ok(resumed);
+                    }
+                    return Err(ResumeSessionError::Reserved);
+                }
+                crate::session_lease::FreshSessionClaim::Held { .. } => {
+                    return Err(ResumeSessionError::Reserved);
+                }
+                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
+                    if round == 0
+                        && crate::session_lease::kill_and_confirm_tree_dead(
+                            pid,
+                            CODEX_SIDECAR_OWNERSHIP_ENV,
+                            &ownership_id,
+                        )
+                        .await
+                    {
+                        self.leases
+                            .force_release_after_confirmed_kill(PROVIDER, thread_id);
+                        continue;
+                    }
+                    tracing::error!(target: "invariant", pid, session_id = %thread_id,
+                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
+                    return Err(ResumeSessionError::Reserved);
+                }
+            }
+        }
+
+        let (client, notifs, ownership_id, child) = match self.spawn_sidecar(cwd).await {
+            Ok(parts) => parts,
+            Err(err) => {
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                return Err(ResumeSessionError::Transient(err));
+            }
+        };
+        // Arm the lease's TTL tree-kill path now that the child + its tag exist.
+        if let Some(g) = lease_guard.as_mut() {
+            if let Some(pid) = child.id() {
+                g.set_kill_handle(pid, &ownership_id);
+            }
+        }
 
         // P1.13 (Task 5, R3): recover this thread's recorded settings snapshot BEFORE
         // issuing `thread/resume`, gated per V7/A10.
@@ -1966,6 +2406,10 @@ impl FreshCodexState {
                 let mut child = child;
                 let _ = child.start_kill();
                 reap_owned_codex_sidecars(&ownership_id);
+                // Own tree torn down above -- releasing the lease is safe.
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
                 if is_codex_thread_not_found(&err) {
                     // FIX (CODEX-FIRST triage Finding 2): remember this id as genuinely gone
                     // so a later attach/snapshot-read against it fails fast instead of
@@ -1992,6 +2436,9 @@ impl FreshCodexState {
                 returned = %started.thread_id,
                 "freshagent.codex.wrong_thread_resume_rejected"
             );
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
             return Err(ResumeSessionError::Transient(format!(
                 "codex thread/resume returned wrong thread id {} (requested {thread_id}); \
                  refusing to adopt the wrong thread",
@@ -2014,6 +2461,7 @@ impl FreshCodexState {
             self.broadcast_tx.clone(),
             kill_rx,
             exited.clone(),
+            Arc::clone(&self.leases),
         );
         {
             let mut guard = self.sessions.lock().await;
@@ -2025,6 +2473,7 @@ impl FreshCodexState {
                     // only when no record was recoverable (never-recorded historical
                     // sessions resume on defaults, exactly as before this fix).
                     model: rec.model.clone().unwrap_or_default(),
+                    // (lease completion happens right after this insert -- see below)
                     effort: rec.effort.clone(),
                     cwd: cwd.map(str::to_string).or_else(|| rec.cwd.clone()),
                     sandbox: rec.sandbox.clone(),
@@ -2036,6 +2485,26 @@ impl FreshCodexState {
                     exited,
                 },
             );
+        }
+
+        // Task 13: bind the durable thread id to this live session + release the lease.
+        if let Some(mut g) = lease_guard.take() {
+            if !g.complete(thread_id) {
+                // Revoked mid-resume (expired holder): tear our own session down and
+                // reopen the key -- never keep a session a contender may replace.
+                if let Some(session) = self.sessions.lock().await.remove(thread_id) {
+                    session.consumer.abort();
+                    session.client.close().await;
+                    if let Some(kill_tx) = session.kill_tx {
+                        let _ = kill_tx.send(());
+                    }
+                    let _ = session.watcher.await;
+                }
+                g.fail();
+                return Err(ResumeSessionError::Transient(
+                    "session lease revoked during attach-resume; torn down".to_string(),
+                ));
+            }
         }
 
         // P1.13 identity event (Task 5, R3): refresh write re-persisting the RECOVERED
@@ -2101,6 +2570,7 @@ impl FreshCodexState {
             self.broadcast_tx.clone(),
             kill_rx,
             exited.clone(),
+            Arc::clone(&self.leases),
         );
         self.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -2797,6 +3267,7 @@ fn spawn_exit_watcher(
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
     kill_rx: oneshot::Receiver<()>,
     exited: Arc<AtomicBool>,
+    leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
@@ -2812,10 +3283,16 @@ fn spawn_exit_watcher(
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 reap_owned_codex_sidecars(&ownership_id);
+                // Task 12: the bound session is gone -- reopen its durable id.
+                leases.clear_binding(PROVIDER, &thread_id);
                 tracing::info!(session_id = %thread_id, "freshagent.sidecar.reaped");
             }
             _ = child.wait() => {
                 reap_owned_codex_sidecars(&ownership_id);
+                // Task 12: a crashed sidecar is no longer a live writer -- reopen the
+                // durable id (the entry stays mapped for PR-4 lazy respawn, which
+                // re-claims through the attach/send seams).
+                leases.clear_binding(PROVIDER, &thread_id);
                 tracing::info!(session_id = %thread_id, "freshagent.sidecar.reaped");
                 // DIAG-01: an UNREQUESTED exit -- the crash/disconnect self-heal
                 // edge (`kill_rx` firing instead would mean a requested kill,
@@ -3600,6 +4077,7 @@ pub(crate) mod tests {
             state.broadcast_tx.clone(),
             kill_rx,
             exited.clone(),
+            Arc::clone(&state.leases),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
@@ -3654,6 +4132,7 @@ pub(crate) mod tests {
             state.broadcast_tx.clone(),
             kill_rx,
             exited.clone(),
+            Arc::clone(&state.leases),
         );
         state.sessions.lock().await.insert(
             thread_id.to_string(),
