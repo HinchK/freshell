@@ -1088,7 +1088,7 @@ impl Drop for SessionRefLeaseGuard {
 
 /// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
 /// thread reaps promptly — `pty.rs` reader/waiter). `true` = death CONFIRMED.
-async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
+pub(crate) async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
     for _ in 0..20u8 {
         if !freshell_terminal::registry::pid_alive(pid) {
             return true;
@@ -1104,7 +1104,7 @@ async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
 /// confirm death. `true` = confirmed dead — only then may the caller
 /// `force_release_after_confirmed_kill`. Unconfirmed (or a pid no registry
 /// terminal owns, where nothing can be group-killed) holds the lease closed.
-async fn kill_session_ref_holder_and_confirm(
+pub(crate) async fn kill_session_ref_holder_and_confirm(
     registry: &freshell_terminal::TerminalRegistry,
     pid: u32,
 ) -> bool {
