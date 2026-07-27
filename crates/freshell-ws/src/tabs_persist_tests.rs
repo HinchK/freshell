@@ -686,40 +686,6 @@ fn device_delete_failure_does_not_create_over_cap_directory() {
 }
 
 #[test]
-fn all_lease_protected_devices_make_new_write_retryable_without_exceeding_cap() {
-    let dir = tempfile::tempdir().unwrap();
-    for index in 0..MAX_SNAPSHOT_DEVICES {
-        put(
-            dir.path(),
-            &format!("dev-{index:03}"),
-            "c1",
-            1,
-            1000 + index as i64,
-            vec![open_record(&format!("dev-{index:03}:t"), "t", 1)],
-        );
-    }
-    let leases: Vec<_> = (0..MAX_SNAPSHOT_DEVICES)
-        .map(|index| {
-            protect_snapshot_device(dir.path(), &format!("dev-{index:03}"))
-                .expect("seeded device gets a lease")
-        })
-        .collect();
-
-    put(
-        dir.path(),
-        "dev-blocked",
-        "c1",
-        1,
-        9999,
-        vec![open_record("dev-blocked:t", "blocked", 1)],
-    );
-
-    assert_eq!(leases.len(), MAX_SNAPSHOT_DEVICES);
-    assert!(!device_dir_for(dir.path(), "dev-blocked").unwrap().exists());
-    assert_eq!(devices(dir.path()).len(), MAX_SNAPSHOT_DEVICES);
-}
-
-#[test]
 fn generation_id_is_stable_and_selects_the_right_generation() {
     let dir = tempfile::tempdir().unwrap();
     put(

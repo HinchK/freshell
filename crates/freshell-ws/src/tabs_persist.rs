@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 
 use serde_json::{json, Value};
@@ -627,9 +628,8 @@ fn read_device_overview_locked(
 /// this module. Held across the ENTIRE read-plan-mutate cycle, so concurrent
 /// pushes to the SAME or DIFFERENT devices can never race directory
 /// enumeration, eviction, or removal — the critical data-loss defect (`:678`)
-/// — and so each reader cannot observe a half-pruned directory. A restore's
-/// eviction lease bridges its separately locked selection, marker, create,
-/// and acknowledgement operations. `Mutex::new(())` needs no lazy init.
+/// — and so each reader cannot observe a half-pruned directory.
+/// `Mutex::new(())` needs no lazy init.
 /// Restores/pushes are low-frequency and this lock guards only the filesystem
 /// cycle (in-memory registry work already dropped its own lock), so contention
 /// is negligible.
@@ -639,11 +639,6 @@ fn read_device_overview_locked(
 /// that acquires it (the pub readers self-lock and only call lock-free private
 /// helpers), so there is no nested acquisition to deadlock on.
 static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Device directories protected by a restore that spans multiple individually
-/// locked filesystem operations and async process/delivery work.
-static ACTIVE_RESTORE_DIRS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
 static INJECTED_DELETE_FAILURES: LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
@@ -663,44 +658,6 @@ fn injected_delete_failure(_path: &Path) -> Option<std::io::Error> {
         ));
     }
     None
-}
-
-/// Restore-scoped eviction lease. It holds no mutex across await points; the
-/// eviction planner consults the counted directory set while holding its own
-/// short persistence lock.
-#[must_use]
-pub struct SnapshotRestoreLease {
-    device_dir: PathBuf,
-}
-
-pub fn protect_snapshot_device(root: &Path, device_id: &str) -> Option<SnapshotRestoreLease> {
-    let device_dir = device_dir_for(root, device_id)?;
-    let mut active = ACTIVE_RESTORE_DIRS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *active.entry(device_dir.clone()).or_default() += 1;
-    Some(SnapshotRestoreLease { device_dir })
-}
-
-impl Drop for SnapshotRestoreLease {
-    fn drop(&mut self) {
-        let mut active = ACTIVE_RESTORE_DIRS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = active.get_mut(&self.device_dir) {
-            *count -= 1;
-            if *count == 0 {
-                active.remove(&self.device_dir);
-            }
-        }
-    }
-}
-
-fn restore_protects(device_dir: &Path) -> bool {
-    ACTIVE_RESTORE_DIRS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains_key(device_dir)
 }
 
 /// Run `f` under the process-wide snapshot-persistence lock. This is THE ONE
