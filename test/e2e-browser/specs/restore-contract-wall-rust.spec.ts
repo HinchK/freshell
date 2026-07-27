@@ -2065,6 +2065,15 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
+    // DEFLAKE (f3wp): this test's serial gate budget (20+45+60+30+60+30 s
+    // = 245 s) plus 3 serialized boot/health budgets (~91 s bootWall +
+    // 2 x 65 s restartAbrupt) structurally exceeds the describe-level 180 s
+    // under full parallel-suite load. Post-fix worst case (with the new
+    // 60 s WS gate and the 30 s explicit click) is ~556 s, so 300 s would
+    // recreate the same sum-of-gates > timeout defect at a higher threshold.
+    // 600 s covers the strict worst case with margin. Same per-test override
+    // pattern THE RULER uses (:1364).
+    test.setTimeout(600_000)
     // ADOPTED REALITY (reconcile-client-adoption lane): the client advertises
     // capabilities.paneReconcileV1 in hello and sends pane.reconcile.request
     // after EVERY ready, so a restart landing mid-recovery is answered by a
@@ -2088,7 +2097,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     })
     try {
       await selectShellIfPickerShowing(page)
-      await page.getByText(SESSION_TITLE, { exact: false }).first().click()
+      await page.getByText(SESSION_TITLE, { exact: false }).first().click({ timeout: 30_000 })
       const tabId = (await harness.getActiveTabId())!
       await expect
         .poll(async () => (await harness.getPaneLayout(tabId))?.content?.terminalId ?? null, {
@@ -2106,6 +2115,12 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // First SIGKILL; wait until recovery is IN FLIGHT (a new spawn hit the
       // argv log), then SIGKILL again mid-recovery.
       await server.restartAbrupt()
+      // DEFLAKE (f3wp): gate the reconnect BEFORE polling for the recovery
+      // spawn -- under load the client can still be mid-reconnect here, and
+      // the argv poll silently burns its 45 s budget waiting on a spawn that
+      // cannot start until the WS is ready. The second SIGKILL still lands
+      // mid-recovery: the argv-growth poll below remains the trigger.
+      await waitForWsReady(page)
       await expect
         .poll(async () => (await readArgvLog(argLogPath)).length, { timeout: 45_000 })
         .toBeGreaterThan(argvCountBeforeKill)
