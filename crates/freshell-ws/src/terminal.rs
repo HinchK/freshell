@@ -68,11 +68,11 @@ use freshell_terminal::{build_child_env_from_process, FrameSink};
 use crate::WsState;
 
 /// The write half of a split axum WebSocket.
-type WsSink = SplitSink<WebSocket, Message>;
+pub(crate) type WsSink = SplitSink<WebSocket, Message>;
 
 /// Serialize + send one server→client message. Returns `false` if the socket is
 /// closed/errored (the caller then tears the connection down).
-async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
+pub(crate) async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
     match serde_json::to_string(msg) {
         Ok(json) => ws_tx.send(Message::Text(json.into())).await.is_ok(),
         Err(_) => false,
@@ -151,6 +151,19 @@ pub async fn run(
             }
         })
     };
+    // Per-connection `terminal.create` sliding-window rate limiter (legacy
+    // parity: `ClientState.terminalCreateTimestamps`, ws-handler.ts:2376-2389)
+    // — fresh/empty on every (re)connect, exactly like the original.
+    let mut create_limiter = crate::create_limit::CreateRateLimiter::new(
+        state.create_protect.rate_limit,
+        state.create_protect.rate_window_ms,
+    );
+    // Per-connection cancel signal for gated restore creates. The sender
+    // lives in this function's scope, so queued gated creates are cancelled
+    // when the loop exits for ANY reason — client disconnect, socket error,
+    // keepalive timeout, or server shutdown (4009): the explicit send below
+    // plus the sender drop at return both unblock waiters.
+    let (create_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
     if ui_screenshot_v1 {
         let tx = conn_tx.clone();
         state
@@ -238,6 +251,8 @@ pub async fn run(
                             conn_id,
                             &conn_sink,
                             terminal_output_batch_v1,
+                            &mut create_limiter,
+                            &create_cancel_rx,
                         )
                         .await
                         {
@@ -396,10 +411,15 @@ pub async fn run(
         state.screenshots.remove_capable_client(conn_id);
     }
     state.registry.remove_connection(conn_id);
+    // Abandon any restore creates still queued on the spawn gate for this
+    // connection (RCA hardening: never spawn a PTY for a client that is
+    // gone). Redundant with the sender drop at return; explicit for clarity.
+    let _ = create_cancel_tx.send(true);
 }
 
 /// Parse + dispatch one inbound client text frame. Returns `false` to close the
 /// connection (only on an unrecoverable send failure).
+#[allow(clippy::too_many_arguments)] // Connection-scoped plumbing, one call site.
 async fn handle_client_text(
     text: &str,
     ws_tx: &mut WsSink,
@@ -407,6 +427,8 @@ async fn handle_client_text(
     conn_id: u64,
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
+    create_limiter: &mut crate::create_limit::CreateRateLimiter,
+    create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -462,7 +484,70 @@ async fn handle_client_text(
             true
         }
         ClientMessage::ClientDiagnostic(_) => true,
-        ClientMessage::TerminalCreate(create) => handle_create(create, ws_tx, state).await,
+        ClientMessage::TerminalCreate(create) => {
+            match state.create_dedupe.begin(
+                &create.request_id,
+                conn_sink, // this connection's FrameSink, already in scope for Task 6's gated call
+                |tid| state.registry.exists(tid),
+            ) {
+                crate::create_dedupe::DedupeDecision::DuplicateSettled(created) => {
+                    // Re-send the original terminal.created (same requestId,
+                    // same terminalId) — never spawn a duplicate.
+                    let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                    return out.send(&created).await;
+                }
+                crate::create_dedupe::DedupeDecision::DuplicateInFlight => {
+                    // Same connection: the in-flight create replies on this
+                    // very sink. Different connection: begin() registered
+                    // this connection's sink as a waiter — settle() or
+                    // clear_if_in_flight() forwards the reply. Either way a
+                    // live client always gets an answer; never silence.
+                    return true;
+                }
+                crate::create_dedupe::DedupeDecision::Proceed => {}
+            }
+            if create.restore == Some(true) {
+                // restore:true bypasses the per-connection rate limiter —
+                // neither checked nor recorded (legacy `if (!m.restore)`) —
+                // and goes through the server-wide restore-spawn gate on a
+                // spawned task (spawn-to-settled permit, cancellable).
+                crate::create_gate::spawn_gated_restore_create(
+                    create,
+                    state,
+                    conn_sink,
+                    create_cancel_rx.clone(),
+                );
+                true
+            } else {
+                if !create_limiter.try_acquire(crate::create_limit::epoch_ms()) {
+                    tracing::warn!(
+                        target: "freshell_ws::create_limit",
+                        request_id = %create.request_id,
+                        "terminal_create_rate_limited"
+                    );
+                    // The dedupe sentinel was registered at the top of this
+                    // arm, BEFORE the limiter: clear it or the client's 2s
+                    // same-requestId retry is swallowed as DuplicateInFlight
+                    // forever (A2).
+                    state.create_dedupe.clear_if_in_flight(&create.request_id);
+                    let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                    return send_create_error(
+                        &mut out,
+                        ErrorCode::RateLimited,
+                        "Too many terminal.create requests".to_string(),
+                        &create.request_id,
+                    )
+                    .await;
+                }
+                let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                let request_id = create.request_id.clone();
+                let sent = handle_create(create, &mut out, state).await;
+                // No-op on success (the entry is Settled); drops the InFlight
+                // sentinel on a failed create so a retry proceeds fresh.
+                state.create_dedupe.clear_if_in_flight(&request_id);
+                sent
+            }
+        }
         ClientMessage::TerminalAttach(attach) => {
             handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
             true
@@ -742,7 +827,11 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
-async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsState) -> bool {
+pub(crate) async fn handle_create(
+    create: TerminalCreate,
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    state: &WsState,
+) -> bool {
     // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle validator);
     // `streamId` via UUIDv4 (the reference's randomUUID()).
     let terminal_id = Uuid::new_v4().simple().to_string();
@@ -766,7 +855,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             .collect::<Vec<_>>()
             .join(", ");
         return send_create_error(
-            ws_tx,
+            out,
             ErrorCode::PtySpawnFailed,
             format!("Invalid terminal mode: '{mode}'. Valid: {valid}"),
             &create.request_id,
@@ -855,7 +944,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
             Ok(ep) => Some(ep),
             Err(e) => {
-                return send_create_error(ws_tx, ErrorCode::PtySpawnFailed, e, &create.request_id)
+                return send_create_error(out, ErrorCode::PtySpawnFailed, e, &create.request_id)
                     .await
             }
         }
@@ -905,7 +994,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
                 // A thrown planCodexLaunch surfaces through the generic create catch
                 // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
                 return send_create_error(
-                    ws_tx,
+                    out,
                     ErrorCode::PtySpawnFailed,
                     message,
                     &create.request_id,
@@ -942,7 +1031,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             Ok(i) => i,
             Err(e) => {
                 return send_create_error(
-                    ws_tx,
+                    out,
                     ErrorCode::PtySpawnFailed,
                     e.message,
                     &create.request_id,
@@ -972,7 +1061,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         Ok(l) => l,
         Err(e) => {
             return send_create_error(
-                ws_tx,
+                out,
                 ErrorCode::PtySpawnFailed,
                 e.message(),
                 &create.request_id,
@@ -1111,13 +1200,8 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             env_var.as_deref(),
             resume_session_id.is_some(),
         );
-        return send_create_error(
-            ws_tx,
-            ErrorCode::PtySpawnFailed,
-            message,
-            &create.request_id,
-        )
-        .await;
+        return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+            .await;
     }
 
     // DEV-0006 S4: adopt the managed codex launch for this terminal
@@ -1132,13 +1216,8 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             .await
         {
             state.registry.kill(&terminal_id);
-            return send_create_error(
-                ws_tx,
-                ErrorCode::PtySpawnFailed,
-                message,
-                &create.request_id,
-            )
-            .await;
+            return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+                .await;
         }
     }
 
@@ -1210,6 +1289,12 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         );
     }
 
+    // Dedupe settle needs both ids, but the `TerminalCreated` literal below
+    // MOVES `create.request_id` and `terminal_id` into the struct — clone
+    // into locals first (mirrors Task 6's explicit `request_id` clone).
+    let dedupe_request_id = create.request_id.clone();
+    let dedupe_terminal_id = terminal_id.clone();
+
     let created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
         request_id: create.request_id,
@@ -1222,7 +1307,13 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         // identity-stamped frame reads (shell creates have no entry -> `None`).
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
     });
-    let sent = send(ws_tx, &created).await;
+    // Record the settled create (server-wide requestId dedupe) and forward
+    // the frame to any cross-connection waiters BEFORE the origin reply —
+    // both are non-blocking sink pushes, so ordering here is cosmetic.
+    state
+        .create_dedupe
+        .settle(&dedupe_request_id, &dedupe_terminal_id, &created);
+    let sent = out.send(&created).await;
     // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
     // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
     // exists this is unconditional. Live-pinned frame order (exit-orig.json):
@@ -1383,8 +1474,8 @@ pub fn broadcast_sessions_changed(state: &WsState) {
 
 /// Send the reference's `sendError` frame for a failed `terminal.create`
 /// (`ws-handler.ts:2606-2614`): `{ code, message, requestId }`.
-async fn send_create_error(
-    ws_tx: &mut WsSink,
+pub(crate) async fn send_create_error(
+    out: &mut crate::create_gate::CreateOutput<'_>,
     code: ErrorCode,
     message: String,
     request_id: &str,
@@ -1399,7 +1490,7 @@ async fn send_create_error(
         terminal_exit_code: None,
         terminal_id: None,
     });
-    send(ws_tx, &msg).await
+    out.send(&msg).await
 }
 
 /// `getModeLabel` (`terminal-registry.ts:439-443`): `'Shell'` for shell, the CLI
@@ -2274,6 +2365,10 @@ mod terminals_changed_tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::RestoreSpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
@@ -2476,6 +2571,10 @@ mod terminal_meta_created_tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::RestoreSpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,

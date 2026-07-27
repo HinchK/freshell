@@ -33,6 +33,7 @@ mod session_metadata;
 mod sessions;
 mod settings;
 mod settings_store;
+mod shutdown_forensics;
 mod tabs_snapshots;
 mod terminals;
 mod updater;
@@ -107,6 +108,12 @@ async fn main() -> ExitCode {
     if let Err(err) = logging::init(logging_config) {
         eprintln!("freshell-server: structured logging disabled: {err}");
     }
+
+    // Boot-time parent chain for the shutdown-forensics comparison (V5:
+    // WSL2 orphans reparent to the Relay subreaper, not pid 1 — the
+    // discriminator is parent-changed-vs-boot, so the boot chain must be
+    // captured now).
+    shutdown_forensics::record_boot_parent_chain();
 
     // Boot-scoped identifiers. `server_instance_id` is shared (Arc::clone) into
     // BOTH the WS handshake (`ready.serverInstanceId`) AND `GET /api/health`
@@ -348,6 +355,11 @@ async fn main() -> ExitCode {
         .with_cli_commands(Arc::clone(&cli_commands))
         .with_amplifier_locator(amplifier_locator.clone())
         .with_opencode_locator(opencode_locator.clone());
+    // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
+    // are guaranteed to come from the same env snapshot.
+    let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();
+    // Shutdown latch shared with shutdown_signal (Task 7 wires the setter).
+    let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ws_state = WsState {
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),
@@ -374,6 +386,12 @@ async fn main() -> ExitCode {
         allowed_origins: Arc::new(resolve_allowed_origins()),
         ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
         term09: freshell_ws::backpressure::Term09Config::from_env(),
+        create_protect,
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::RestoreSpawnGate::from_config(
+            &create_protect,
+        )),
+        shutdown_started: std::sync::Arc::clone(&shutdown_started),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
@@ -745,7 +763,10 @@ async fn main() -> ExitCode {
     // Serve with graceful shutdown on SIGTERM/SIGINT so every owned child (PTY
     // terminals, the Codex/claude/opencode sidecars) is reaped — no orphans.
     let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown_notify)))
+        .with_graceful_shutdown(shutdown_signal(
+            Arc::clone(&shutdown_notify),
+            std::sync::Arc::clone(&shutdown_started),
+        ))
         .await;
     // SAFE-11/TERM-22: reap every owned child tree before exit. Legacy parity
     // (`server/index.ts:981-1049`'s `shutdown()`): after the HTTP/WS surface is
@@ -767,6 +788,16 @@ async fn main() -> ExitCode {
     //   * `fresh_codex_state.shutdown()` / `fresh_claude_state.shutdown()` —
     //     the Codex app-server and claude Node sidecars (already implemented).
     registry.kill_all();
+    // A10 re-sweep (V3): kill_all() snapshots the id set ONCE
+    // (registry.rs:889-892); a detached gated create settling during the
+    // drain can insert AFTER that snapshot, and neither registry-Drop (the
+    // PTY reader thread's exit hook holds a registry Arc — terminal.rs:1047,
+    // pty.rs:464/512, circular) nor the watchdog's std::process::exit(1)
+    // (skips Drops) would ever reap it. Give in-flight create tasks a short
+    // settling window, then sweep again. Second line of defense behind
+    // create_gate.rs's shutdown_started checks.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let _ = registry.kill_all();
     fresh_agent_state.shutdown().await;
     // Reap every owned codex app-server sidecar (SIGKILL + `/proc` ownership sweep) so a
     // freshcodex T2 run leaves no orphaned app-server.
@@ -803,7 +834,10 @@ const SHUTDOWN_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// `stop()`, or Ctrl-C). Drives `axum`'s graceful shutdown so every owned
 /// child (PTY terminals, the Codex/claude/opencode sidecars) is reaped before
 /// exit.
-async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
+async fn shutdown_signal(
+    notify_ws: Arc<tokio::sync::Notify>,
+    shutdown_started: Arc<std::sync::atomic::AtomicBool>,
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -822,10 +856,35 @@ async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-    }
+    // RCA 2026-07-06 §6.4: SIGHUP is what a dying terminal/session host
+    // sends; without a handler the process dies immediately with no
+    // shutdown log at all.
+    #[cfg(unix)]
+    let hangup = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let hangup = std::future::pending::<()>();
+
+    let signal_name: &'static str = tokio::select! {
+        _ = ctrl_c => "SIGINT",
+        _ = terminate => "SIGTERM",
+        _ = hangup => "SIGHUP",
+    };
+
+    // Latch FIRST (Task 7 wired this — keep it before any teardown): gated
+    // creates consult this flag around registry.create.
+    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Forensics FIRST, before any teardown step, so the record survives even
+    // if teardown hangs. Sync + bounded (a handful of tiny /proc reads) —
+    // it cannot meaningfully delay arming the watchdog below.
+    shutdown_forensics::log_shutdown_forensics(signal_name);
 
     // SAFE-11 fail-safe watchdog: arm the hard timeout THE INSTANT the signal
     // arrives (not at process boot — a long-lived server must never carry a

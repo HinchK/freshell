@@ -895,6 +895,19 @@ impl TerminalRegistry {
             .count()
     }
 
+    /// Read-only liveness probe: is a terminal with this id currently in the
+    /// registry? Used by `freshell-ws`'s `terminal.create` requestId-dedupe
+    /// guard for lazy eviction of settled entries whose terminal is gone
+    /// (killed/exited). Registry-lock + `contains_key` — no tokio, no
+    /// side effects.
+    pub fn exists(&self, terminal_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock")
+            .terminals
+            .contains_key(terminal_id)
+    }
+
     /// `finishTerminalPtyExit` (`terminal-registry.ts:1479-1510`), non-codex core —
     /// the NATURAL-exit path (the kill path stays in [`kill`](Self::kill), which
     /// removes the record first so this lookup misses, mirroring the original's
