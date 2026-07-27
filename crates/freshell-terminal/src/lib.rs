@@ -40,6 +40,7 @@ pub mod chunk_ring;
 pub mod decode;
 pub mod fragment;
 pub mod framing;
+mod idle_noise;
 pub mod output_queue;
 pub mod pty;
 pub mod registry;
