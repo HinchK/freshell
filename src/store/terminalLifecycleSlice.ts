@@ -70,15 +70,21 @@ const slice = createSlice({
 export const { recordTerminalExit, recordAutoResumeRecovering, foldTerminalReplacement, clearTerminalLifecycle } = slice.actions
 export default slice.reducer
 
-export const selectExitRecordFrom = (s: TerminalLifecycleState, paneId: string) => s.byPaneId[paneId]?.exit
-export const selectLastTerminalIdFrom = (s: TerminalLifecycleState, paneId: string) => s.byPaneId[paneId]?.lastTerminalId
-export const selectActiveNoticeFrom = (s: TerminalLifecycleState, paneId: string, now: number) => {
-  const n = s.byPaneId[paneId]?.notice
+// Selectors tolerate an absent slice state (`s?.`): many pre-existing client
+// tests build partial Redux stores without this reducer and render
+// TerminalView, which calls these on every render. Mirrors the defensive
+// access convention of paneRuntimeActivity consumers
+// (`s.paneRuntimeActivity?.byPaneId ?? EMPTY`). Production stores always
+// include the reducer (store.ts), so this never changes runtime behavior.
+export const selectExitRecordFrom = (s: TerminalLifecycleState | undefined, paneId: string) => s?.byPaneId[paneId]?.exit
+export const selectLastTerminalIdFrom = (s: TerminalLifecycleState | undefined, paneId: string) => s?.byPaneId[paneId]?.lastTerminalId
+export const selectActiveNoticeFrom = (s: TerminalLifecycleState | undefined, paneId: string, now: number) => {
+  const n = s?.byPaneId[paneId]?.notice
   return n && now - n.at <= AUTO_RESUME_NOTICE_TTL_MS ? n : undefined
 }
 // Root-state wrappers — match the RootState typing convention of the sibling
 // selectors in this directory (see turnCompletionSlice.ts for the pattern):
-export const selectExitRecord = (root: { terminalLifecycle: TerminalLifecycleState }, paneId: string) =>
+export const selectExitRecord = (root: { terminalLifecycle?: TerminalLifecycleState }, paneId: string) =>
   selectExitRecordFrom(root.terminalLifecycle, paneId)
-export const selectActiveNotice = (root: { terminalLifecycle: TerminalLifecycleState }, paneId: string, now: number) =>
+export const selectActiveNotice = (root: { terminalLifecycle?: TerminalLifecycleState }, paneId: string, now: number) =>
   selectActiveNoticeFrom(root.terminalLifecycle, paneId, now)

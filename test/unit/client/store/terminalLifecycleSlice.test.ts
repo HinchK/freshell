@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest'
 import reducer, {
   recordTerminalExit, recordAutoResumeRecovering, foldTerminalReplacement,
   clearTerminalLifecycle, selectExitRecordFrom, selectActiveNoticeFrom,
-  selectLastTerminalIdFrom, AUTO_RESUME_NOTICE_TTL_MS,
+  selectLastTerminalIdFrom, selectExitRecord, selectActiveNotice,
+  AUTO_RESUME_NOTICE_TTL_MS,
 } from '@/store/terminalLifecycleSlice'
 
 const empty = reducer(undefined, { type: '@@init' })
@@ -37,6 +38,19 @@ describe('terminalLifecycleSlice', () => {
     s = reducer(s, recordTerminalExit({ paneId: 'p1', terminalId: 't2', exitCode: 1, at: 2000 }))
     expect(selectActiveNoticeFrom(s, 'p1', 2000)).toBeUndefined()
     expect(selectExitRecordFrom(s, 'p1')).toEqual({ exitCode: 1, at: 2000 })
+  })
+
+  it('selectors tolerate a root store without the slice (partial test stores must not crash)', () => {
+    // Regression pin: 44 pre-existing client test files build partial Redux
+    // stores (no terminalLifecycle reducer) and render TerminalView, which
+    // calls these selectors on every render. They must degrade to undefined,
+    // mirroring the paneRuntimeActivity defensive-access convention.
+    const bare = {} as Parameters<typeof selectExitRecord>[0]
+    expect(selectExitRecord(bare, 'p1')).toBeUndefined()
+    expect(selectActiveNotice(bare, 'p1', Date.now())).toBeUndefined()
+    expect(selectExitRecordFrom(undefined, 'p1')).toBeUndefined()
+    expect(selectLastTerminalIdFrom(undefined, 'p1')).toBeUndefined()
+    expect(selectActiveNoticeFrom(undefined, 'p1', 0)).toBeUndefined()
   })
 
   it('clearTerminalLifecycle wipes the pane entry', () => {
