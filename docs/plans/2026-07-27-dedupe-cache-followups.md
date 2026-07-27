@@ -7,7 +7,7 @@
 
 **Goal:** Land the two recorded follow-ups from the WSL crash-hardening merge: bound the unbounded settled create-dedupe cache in `crates/freshell-ws`, and make the one timing-sensitive test in the restore/dedupe acceptance suite deterministic — without weakening any dedupe semantics or test assertion.
 
-**Architecture:** The settled cache (`CreateDedupe` in `crates/freshell-ws/src/create_dedupe.rs`) becomes **liveness-anchored** (legacy parity): a settled entry lives exactly as long as its terminal is running. `settle()` gains an `is_running` closure and prunes dead entries on access (house prune-on-access pattern, as in `CreateRateLimiter`); `begin()`'s existing liveness closure is tightened from `registry.exists()` to a corrected `TerminalRegistry::is_running()` that reads `TerminalRunStatus` (the existing method at `registry.rs:1112` is presence-only and must be fixed — see Task 1). **No new dependencies, no clock injection, no constants** — an originally drafted TTL+cap design was falsified during pre-execution load-bearing validation (the frozen client re-sends persisted requestIds at arbitrary delay; see Task 1 preamble). The racy acceptance test `restore_create_holds_permit_until_settled` is replaced by two deterministic tests: an acceptance test where the test itself holds the gate's single permit (structural queueing, no wall-clock race), plus a unit test in `create_gate.rs` pinning the "permit released only after the create settles" ordering via a tiny extracted `hold_permit_across` helper.
+**Architecture:** The settled cache (`CreateDedupe` in `crates/freshell-ws/src/create_dedupe.rs`) becomes **liveness-anchored** (legacy parity): a settled entry lives exactly as long as its terminal is running. `settle()` gains an `is_running` closure and prunes dead entries on access (house prune-on-access pattern, as in `CreateRateLimiter`); `begin()`'s existing liveness closure is tightened from `registry.exists()` to a NEW `TerminalRegistry::is_pty_running()` that reads `TerminalRunStatus` (the existing `is_running` at `registry.rs:1112` is presence-only AND has production callers in `freshell-server`/`freshell-freshagent`, so it is left untouched — see Task 1). **No new dependencies, no clock injection, no constants** — an originally drafted TTL+cap design was falsified during pre-execution load-bearing validation (the frozen client re-sends persisted requestIds at arbitrary delay; see Task 1 preamble). The racy acceptance test `restore_create_holds_permit_until_settled` is replaced by two deterministic tests: an acceptance test where the test itself holds the gate's single permit (structural queueing, no wall-clock race), plus a unit test in `create_gate.rs` pinning the "permit released only after the create settles" ordering via a tiny extracted `hold_permit_across` helper.
 
 **Tech Stack:** Rust (edition 2021), tokio, cargo test/fmt/clippy. No new crates.
 
@@ -28,7 +28,7 @@ If an implementer finds either finding no longer true (e.g. a bound already adde
 - **No new dependencies** — no workspace deps, no crate deps, no dev-deps. Hand-roll in house style (`create_limit.rs` / `spawn_gate.rs` are the templates).
 - **Frozen read-only paths:** `server/`, `shared/`, `src/`, `dist/client`. Touch only `crates/` + `docs/plans/`.
 - **Process safety:** never broad-kill; only signal PIDs the tests spawned; never bind ports 3001/3002 (user's live freshell runs on :3001).
-- **Quality gates (delta vs baseline, never absolute green):** `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets` with no NEW warnings vs the baseline recorded in Task 1 Step 1; `cargo test -p freshell-ws` with no NEW failures vs baseline. Two failures are known-allowed by name: `codex_session_ref_resume::codex_create_derives_resume_from_session_ref` (environmental — no `node_modules` in this worktree) and `session_identity_frames::fresh_claude_create_frames_carry_preallocated_session_ref` (pre-existing defect).
+- **Quality gates (delta vs baseline, never absolute green):** `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets` with no NEW warnings vs the baseline recorded in Task 1 Step 1; `cargo test -p freshell-ws`, `cargo test -p freshell-terminal`, and `cargo test -p freshell-server -p freshell-freshagent` (the two downstream crates that consume `freshell-terminal`'s registry API — all baselined in Task 1 Step 1) with no NEW failures vs their baselines. Two failures are known-allowed by name: `codex_session_ref_resume::codex_create_derives_resume_from_session_ref` (environmental — no `node_modules` in this worktree) and `session_identity_frames::fresh_claude_create_frames_carry_preallocated_session_ref` (pre-existing defect).
 - **TDD:** Red-Green-Refactor for every task; never skip the failing-test step.
 - **Commits:** Conventional Commits with crate scope, ASCII subject, bullet body, a `Verification:` paragraph naming the exact commands run, and the Amplifier footer — via four separate `-m` args. Explicit `git add <paths>`, never `-A`. No PR (port campaign rule).
 - **Build note:** this worktree has no `target/`; the first cargo invocation is a cold full build — budget long timeouts. (Measured during pre-execution validation with a warm `~/.cargo` cache: ~25 s for the freshell-ws test target, zero downloads. Still budget 10+ minutes in case the cache is cold.)
@@ -39,8 +39,8 @@ If an implementer finds either finding no longer true (e.g. a bound already adde
 | File | Change | Responsibility |
 |---|---|---|
 | `crates/freshell-ws/src/create_dedupe.rs` (331 lines) | Modify | The bounding change: `settle()` gains an `is_running` closure and prunes dead entries on access; doc updates; updated + new inline unit tests. |
-| `crates/freshell-terminal/src/registry.rs` | Modify (1 method + 1 test) | Fix the presence-only `is_running()` body (`:1112-1119`) to read `TerminalRunStatus::Running`; pin with a unit test on an exited-retained terminal. |
-| `crates/freshell-ws/src/terminal.rs` (2,619 lines — **surgical edits only**, file is over the size waiver) | Modify (2 call sites) | Swap `begin()`'s closure to `is_running` (`:488-492`); pass the closure into `settle()` (`:1313-1315`). |
+| `crates/freshell-terminal/src/registry.rs` | Modify (1 new method + 1 new test) | Add `is_pty_running()` reading `TerminalRunStatus::Running`; the presence-only `is_running()` (`:1112-1119`) is left untouched (it has production callers in freshell-server/freshell-freshagent); pin with a unit test on an exited-retained terminal. |
+| `crates/freshell-ws/src/terminal.rs` (2,619 lines — **surgical edits only**, file is over the size waiver) | Modify (2 call sites) | Swap `begin()`'s closure to `is_pty_running` (`:488-492`); pass the closure into `settle()` (`:1313-1315`). |
 | `crates/freshell-ws/src/create_gate.rs` | Modify | Extract `hold_permit_across` permit-scope helper + new `#[cfg(test)]` unit test pinning release-after-settle. |
 | `crates/freshell-ws/tests/restore_spawn_gate.rs` | Modify (1 test) | Replace the racy settled-hold test with the deterministic test-held-permit version. |
 
@@ -56,18 +56,18 @@ This also FIXES an unintended superset vs legacy: the current liveness closure i
 
 **Explicit post-eviction semantics (spec requirement):** a duplicate arriving after its terminal stopped running finds no settled entry (or a displaceable one), gets `DedupeDecision::Proceed`, and runs as a **fresh create — spawning a NEW terminal** with the same requestId and a new terminalId. This is exactly legacy's post-exit behavior, and it is already pinned by the existing `dead_terminal_evicts_settled_entry` test (whose closure semantics this task makes real at the call site). The "duplicates never spawn a second terminal" guarantee holds for the terminal's whole running lifetime — strictly stronger than any fixed window.
 
-**CRITICAL naming trap (validated):** `TerminalRegistry::is_running` ALREADY EXISTS at `crates/freshell-terminal/src/registry.rs:1112-1119` but is presence-only (`terminals.contains_key(...)` — semantically identical to `exists()`). Wiring it up unmodified would compile and change NOTHING. Step 5(a) fixes its body to check `TerminalRunStatus::Running`. Its only current callers are 5 registry unit tests, none exercising exited-retained terminals (verified), so they keep passing.
+**CRITICAL naming trap (re-validated after independent review):** `TerminalRegistry::is_running` ALREADY EXISTS at `crates/freshell-terminal/src/registry.rs:1112-1119` but is presence-only (`terminals.contains_key(...)` — byte-identical to `exists()` at `:903-909`). Wiring it up unmodified would compile and change NOTHING. It is also NOT test-only: a redone workspace-wide caller survey found 4 PRODUCTION callers — `crates/freshell-server/src/tabs_snapshots.rs:632,709,714` (tab-restore reconciliation of write-ahead markers against the same shared registry) and `crates/freshell-freshagent/src/terminal_tabs.rs:1256` (REST send-keys 404 gate) — plus 14 test callers (`registry.rs:1789,1904,1936,1937,2054`, `pane_ops.rs`, `terminal_tabs.rs` tests, `tabs_snapshots_tests.rs:882`, `tabs_snapshots_restore_tests.rs:678`). Changing `is_running`'s semantics would silently flip those production behaviors (tabs-sync restore would stop treating exited-but-retained terminals as live and take the recreate branch; REST send-keys to them would flip from accepted to 404). Therefore this task does NOT touch `is_running` or any of its callers: Step 5(a) ADDS a new method `is_pty_running()` that checks `TerminalRunStatus::Running`, and only the two dedupe call sites use it. Whether those 4 production call sites SHOULD check run-status — and the misleading `is_running` name/doc itself — are recorded as out-of-scope follow-ups for the final report. No `is_pty_running` symbol exists anywhere in the workspace today (verified — no collision); note `session_directory.rs` has an unrelated `is_running: bool` struct field, so never sweep-rename anything.
 
 **Files:**
-- Modify: `crates/freshell-terminal/src/registry.rs` (fix `is_running` body at `:1112-1119` + doc comment at `:1111`; extend/adjust the exited-retained unit test near `:1995`)
+- Modify: `crates/freshell-terminal/src/registry.rs` (ADD `is_pty_running` directly below the untouched presence-only `is_running` at `:1112-1119`; ADD a new exited-retained unit test as a sibling of the natural-exit test at `:1962-2025`)
 - Modify: `crates/freshell-ws/src/create_dedupe.rs` (`settle` at `:153-166` gains a liveness closure + prune; doc updates; tests mod at `:195-331`)
-- Modify: `crates/freshell-ws/src/terminal.rs:491` (begin closure: `exists` -> `is_running`) and `:1313-1315` (settle call gains the closure)
+- Modify: `crates/freshell-ws/src/terminal.rs:491` (begin closure: `exists` -> `is_pty_running`) and `:1313-1315` (settle call gains the closure)
 - Test: inline `#[cfg(test)]` mods in `create_dedupe.rs` and `registry.rs`
 
 **Interfaces:**
-- Consumes: `TerminalRunStatus { Running, Exited }` (`crates/freshell-protocol/src/server_messages.rs:214-218`); the private `TerminalShared.status` field (`registry.rs:202`); the established lock-inner -> clone-shared -> read-status pattern at `registry.rs:457-466`; `FrameSink` (`freshell_terminal`); `ServerMessage` (`freshell_protocol`).
+- Consumes: `TerminalRunStatus { Running, Exited }` (`crates/freshell-protocol/src/server_messages.rs:214-218`); the private `TerminalShared.status` field (`registry.rs:202`); the established lock-inner -> clone-shared -> unlock -> read-status pattern in `finish_pty_exit` at `registry.rs:928-953`; `FrameSink` (`freshell_terminal`); `ServerMessage` (`freshell_protocol`).
 - Produces (later tasks rely on these exact shapes):
-  - `pub fn is_running(&self, terminal_id: &str) -> bool` on `TerminalRegistry` (existing name, corrected body: `true` only while status is `Running`; map-miss => `false`)
+  - `pub fn is_pty_running(&self, terminal_id: &str) -> bool` on `TerminalRegistry` (NEW method: `true` only while status is `Running`; map-miss => `false`; the existing presence-only `is_running` and `exists` are untouched)
   - `pub fn begin(&self, request_id: &str, sink: &FrameSink, is_running: impl Fn(&str) -> bool) -> DedupeDecision` (signature unchanged from today; parameter renamed from `is_live`, semantics now "running")
   - `pub fn settle(&self, request_id: &str, terminal_id: &str, created: &ServerMessage, is_running: impl Fn(&str) -> bool)` (new final parameter)
   - `pub fn clear_if_in_flight(&self, request_id: &str)` (unchanged)
@@ -82,9 +82,10 @@ cd /home/dan/code/freshell/.worktrees/rust-tauri-port/.worktrees/dedupe-cache-fo
 cargo clippy --workspace --all-targets 2>&1 | tee /tmp/dedupe-followups-baseline-clippy.txt | grep -c "^warning"
 cargo test -p freshell-ws 2>&1 | tee /tmp/dedupe-followups-baseline-test.txt | tail -30
 cargo test -p freshell-terminal 2>&1 | tee /tmp/dedupe-followups-baseline-terminal-test.txt | tail -15
+cargo test -p freshell-server -p freshell-freshagent 2>&1 | tee /tmp/dedupe-followups-baseline-server-agent-test.txt | tail -20
 ```
 
-Expected: clippy completes with a NON-ZERO baseline count (pre-existing warnings exist in freshell-ws lib, freshell-platform, freshell-freshagent — verified); tests complete with at most the two known-allowed freshell-ws failures named in Global Constraints. These files are the comparison baseline for every later task. If other tests fail at baseline, note their names — they are pre-existing, not yours to fix, but they must not be *joined* by new ones.
+Expected: clippy completes with a NON-ZERO baseline count (pre-existing warnings exist in freshell-ws lib, freshell-platform, freshell-freshagent — verified); tests complete with at most the two known-allowed freshell-ws failures named in Global Constraints. These files are the comparison baseline for every later task (the server/freshagent baseline exists because those crates consume `freshell-terminal`'s registry API; record any pre-existing failures there by name). If other tests fail at baseline, note their names — they are pre-existing, not yours to fix, but they must not be *joined* by new ones.
 
 - [ ] **Step 2: Verify the issue still exists (halt condition)**
 
@@ -92,27 +93,28 @@ Run:
 
 ```bash
 grep -n "is_running\|retain" crates/freshell-ws/src/create_dedupe.rs
+grep -n "is_pty_running" crates/freshell-terminal/src/registry.rs
 sed -n '1108,1122p' crates/freshell-terminal/src/registry.rs
 ```
 
-Expected: **no matches** for the grep, and the `sed` output shows `is_running` implemented via `contains_key` (presence-only). If the grep matches or `is_running` already checks run-status, the cache has already been bounded — STOP this task and report instead of changing anything.
+Expected: **no matches** for either grep, and the `sed` output shows `is_running` implemented via `contains_key` (presence-only — it stays that way; this plan does not touch it). If the first grep matches or `is_pty_running` already exists, the cache has already been bounded — STOP this task and report instead of changing anything.
 
 - [ ] **Step 3: Write the failing tests**
 
-(a) In `crates/freshell-terminal/src/registry.rs`, locate the existing unit test near `:1995` whose comment documents that naturally-exited terminals are retained (it observes presence via `exists()`/`is_running` after a natural exit). Extend it (or add a sibling test `is_running_false_for_exited_retained_terminal` reusing that test's exact spawn-and-wait-for-exit harness) so that after the natural exit is observed it asserts:
+(a) In `crates/freshell-terminal/src/registry.rs`, locate the existing unit test `kill_all_never_group_signals_a_terminal_that_already_exited_naturally` (`:1962-2025`) — it spawns `/bin/sh -c "exit 0"` with an `on_exit` closure that calls `finish_pty_exit`, then polls `reg.inventory()` under a bounded 5 s deadline until the terminal's status is `Exited` (note: it observes the exit via `inventory()`, NOT via `exists()`/`is_running`; its bindings are `reg` for the registry and `terminal_id` for the id). Do NOT modify that test. ADD a sibling test named `is_pty_running_false_for_exited_retained_terminal` — the name MUST contain `is_pty_running`, because Step 4's test filter selects on it — reusing that test's exact spawn-and-wait-for-natural-exit harness (same `reg`/`terminal_id` bindings), and after the natural exit is observed via the same `inventory()` poll, assert:
 
 ```rust
         assert!(
-            registry.exists(&id),
+            reg.exists(terminal_id),
             "exited terminal record is retained for restore"
         );
         assert!(
-            !registry.is_running(&id),
-            "is_running must go false at natural exit even though the record is retained"
+            !reg.is_pty_running(terminal_id),
+            "is_pty_running must go false at natural exit even though the record is retained"
         );
 ```
 
-If any pre-existing assertion in that test pins the old presence-only `is_running` semantics for an exited terminal, update it to the corrected semantics with a comment — that flip is the intended behavior change of this task.
+No pre-existing test needs changes: `is_running`/`exists` keep their presence-only semantics, so every existing caller — production and test — keeps passing unmodified.
 
 (b) In `crates/freshell-ws/src/create_dedupe.rs`, inside the existing `#[cfg(test)] mod tests` (after the `recording_sink` helper), add two new tests:
 
@@ -169,25 +171,25 @@ Also update the seven existing tests in the same mod — every `d.settle(...)` c
 Run:
 
 ```bash
-cargo test -p freshell-terminal is_running
+cargo test -p freshell-terminal is_pty_running
 cargo test -p freshell-ws create_dedupe
 ```
 
-Expected: the registry assertion **FAILS** (presence-only `is_running` returns `true` for the exited-retained terminal), and freshell-ws hits a **compile error** — `settle` does not yet take a closure. A compile failure is the RED state for a signature-changing step.
+Expected: freshell-terminal hits a **compile error** — no method named `is_pty_running` exists yet (a compile failure is the RED state for an API-adding step; once Step 5 lands, the `is_pty_running` filter matches exactly the one new test, so this same command turns GREEN with `1 passed`), and freshell-ws hits a **compile error** — `settle` does not yet take a closure.
 
 - [ ] **Step 5: Implement liveness-anchored eviction**
 
-(a) In `crates/freshell-terminal/src/registry.rs`, fix `is_running` (`:1112-1119`): replace its `contains_key` body following the established pattern at `registry.rs:457-466` (lock the registry inner map, clone the terminal's `TerminalShared` handle, read its `status` under that handle's own lock) and return `status == TerminalRunStatus::Running`; a map miss returns `false`. Update the doc comment at `:1111` to:
+(a) In `crates/freshell-terminal/src/registry.rs`, ADD `pub fn is_pty_running(&self, terminal_id: &str) -> bool` directly below the existing `is_running` (`:1112-1119`, which stays byte-for-byte unchanged): following the established pattern in `finish_pty_exit` at `registry.rs:928-953` (lock the registry inner map, clone the terminal's `shared` handle — `Arc<Mutex<TerminalShared>>` — drop the registry lock, then read `status` under the shared handle's own lock), return `status == TerminalRunStatus::Running`; a map miss returns `false`. Give the new method this doc comment:
 
 ```rust
-    /// True only while the terminal's PTY is still running. Unlike
-    /// `exists()`, this goes false when the terminal exits naturally, even
-    /// though the record is retained (restore/replay can still see it via
-    /// `exists()`). Drives create-dedupe eviction: legacy parity with the
-    /// Node server's delete-at-exit requestId pruning.
+    /// True only while the terminal's PTY is still running. Unlike the
+    /// presence-only `exists()`/`is_running`, this goes false when the
+    /// terminal exits naturally, even though the record is retained for
+    /// restore/replay. Drives create-dedupe eviction: legacy parity with
+    /// the Node server's delete-at-exit requestId pruning.
 ```
 
-(This is deliberately an instruction to mirror existing in-file code at `:457-466` rather than a fabricated snippet — the reaper there already does exactly this lock-clone-read-status sequence; reuse its field and lock names verbatim.)
+(This is deliberately an instruction to mirror existing in-file code in `finish_pty_exit` at `:928-953` rather than a fabricated snippet — it already does exactly this lock-clone-unlock-read-status sequence; reuse its field, type, and expect-string names verbatim: `inner`/`terminals`/`shared`, `"registry lock"`/`"terminal lock"`.)
 
 (b) In `crates/freshell-ws/src/create_dedupe.rs`, replace `settle()` (`:153-166`) with (waiters still invoked WITHOUT the lock held, as before):
 
@@ -234,8 +236,8 @@ Preserve `settle()`'s original doc comment, adding: `/// Also prunes settled ent
 (d) In `clear_if_in_flight()` (`:174-192`): no code change. Amend its doc line *"Settled entries stay: that IS the dedupe"* to *"Settled entries stay while their terminal runs: that IS the dedupe (legacy parity)."*
 
 (e) Update the two production call sites in `crates/freshell-ws/src/terminal.rs` (surgical, two lines):
-- The `begin` dispatch (`:488-492`): change the closure `|tid| state.registry.exists(tid)` to `|tid| state.registry.is_running(tid)`.
-- The `settle` call (`:1313-1315`): `.settle(&dedupe_request_id, &dedupe_terminal_id, &created, |tid| state.registry.is_running(tid))`.
+- The `begin` dispatch (`:488-492`): change the closure `|tid| state.registry.exists(tid)` to `|tid| state.registry.is_pty_running(tid)`.
+- The `settle` call (`:1313-1315`): `.settle(&dedupe_request_id, &dedupe_terminal_id, &created, |tid| state.registry.is_pty_running(tid))`.
 
 (f) Update the module doc comment (`create_dedupe.rs:1-27`): find the sentences describing settled-entry lifetime/lazy eviction and amend so the doc states: settled entries are retained for replay for exactly as long as their terminal is running (legacy parity with the Node server's delete-at-exit requestId pruning); eviction is lazy — `settle()` prunes all dead entries on access and `begin()` displaces per-id — with no background task; within a terminal's running lifetime a duplicate replays the original `terminal.created` and never spawns a second terminal; after the terminal stops running a re-sent requestId is indistinguishable from a fresh create and spawns a new terminal, exactly as legacy behaves after terminal exit. Also update the sizing comment above `#[allow(clippy::large_enum_variant)]` (`:35-40`): change "small settled cache" to "liveness-bounded settled cache".
 
@@ -253,7 +255,7 @@ cargo test -p freshell-terminal
 cargo test -p freshell-ws create_dedupe
 ```
 
-Expected: PASS — freshell-terminal including the corrected `is_running` test (the 5 pre-existing `is_running` callers keep passing: none exercises exited-retained); freshell-ws `create_dedupe` shows 9 tests (7 updated + 2 new).
+Expected: PASS — freshell-terminal including the new `is_pty_running_false_for_exited_retained_terminal` test (every pre-existing `is_running`/`exists` caller keeps passing untouched); freshell-ws `create_dedupe` shows 9 tests (7 updated + 2 new).
 
 - [ ] **Step 8: Format, lint, and full-crate delta check**
 
@@ -263,9 +265,10 @@ Run:
 cargo fmt --all
 cargo clippy --workspace --all-targets 2>&1 | grep -c "^warning"
 cargo test -p freshell-ws 2>&1 | tail -30
+cargo test -p freshell-server -p freshell-freshagent 2>&1 | tail -20
 ```
 
-Expected: `cargo fmt --all -- --check` is clean afterward; clippy warning count <= the Step 1 baseline count (no NEW warnings); test failures are only the known-allowed names from Step 1.
+Expected: `cargo fmt --all -- --check` is clean afterward; clippy warning count <= the Step 1 baseline count (no NEW warnings); test failures are only the known-allowed names from Step 1. In the server/freshagent run, failures (if any) must be exactly a subset of the Step 1 baseline — these downstream registry-API consumers are run here to prove the additive `is_pty_running` changed nothing they depend on.
 
 - [ ] **Step 9: Commit**
 
@@ -274,10 +277,10 @@ git add crates/freshell-ws/src/create_dedupe.rs crates/freshell-ws/src/terminal.
 git commit \
   -m "fix(freshell-ws): anchor settled create-dedupe entries to terminal liveness" \
   -m "- Follow-up from the crash-hardening reviews: the settled requestId cache grew one immortal ~0.5 KB entry per successful create for the server process lifetime
-- Eviction now matches legacy's model (ws-handler.ts createdTerminalByRequestId is pruned at terminal exit, not by time): settle() prunes entries for non-running terminals via retain (prune-on-access, no background task, no new deps), and the begin() liveness closure is tightened from registry.exists() (which stays true for exited-retained terminals) to a corrected registry.is_running() that reads TerminalRunStatus
+- Eviction now matches legacy's model (ws-handler.ts createdTerminalByRequestId is pruned at terminal exit, not by time): settle() prunes entries for non-running terminals via retain (prune-on-access, no background task, no new deps), and the begin() liveness closure is tightened from registry.exists() (which stays true for exited-retained terminals) to a new registry.is_pty_running() that reads TerminalRunStatus (the presence-only is_running keeps its semantics: it has production callers in freshell-server tab-restore reconciliation and freshell-freshagent REST send-keys)
 - A fixed TTL+cap design was validated and rejected pre-execution: the frozen client persists createRequestId in localStorage and re-sends it on every reconnect until the pane anchors, so any time-based eviction could double-spawn a terminal beside the live original - weaker dedupe than legacy
 - Cache is now structurally bounded: after every settle it holds at most one entry per running terminal plus in-flight creates; post-eviction duplicates proceed as fresh creates, exactly legacy's post-exit behavior" \
-  -m "Verification: cargo test -p freshell-terminal (is_running exited-retained test); cargo test -p freshell-ws create_dedupe (9 passed); cargo test -p freshell-ws; cargo fmt --all -- --check; cargo clippy --workspace --all-targets (no new warnings; no new failures vs recorded baseline)." \
+  -m "Verification: cargo test -p freshell-terminal (is_pty_running exited-retained test); cargo test -p freshell-ws create_dedupe (9 passed); cargo test -p freshell-ws; cargo test -p freshell-server -p freshell-freshagent (no new failures vs baseline); cargo fmt --all -- --check; cargo clippy --workspace --all-targets (no new warnings; no new failures vs recorded baseline)." \
   -m "$(printf '\xf0\x9f\xa4\x96 Generated with [Amplifier](https://github.com/microsoft/amplifier)\n\nCo-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>')"
 ```
 
@@ -614,7 +617,7 @@ Workspace-wide delta check against the Task 1 Step 1 baseline. This task produce
 - None (verification only; conditional fixes commit under the scope they belong to)
 
 **Interfaces:**
-- Consumes: `/tmp/dedupe-followups-baseline-clippy.txt`, `/tmp/dedupe-followups-baseline-test.txt` from Task 1 Step 1 (if missing, the known-allowed failure names in Global Constraints are the fallback baseline).
+- Consumes: `/tmp/dedupe-followups-baseline-clippy.txt`, `/tmp/dedupe-followups-baseline-test.txt`, `/tmp/dedupe-followups-baseline-terminal-test.txt`, `/tmp/dedupe-followups-baseline-server-agent-test.txt` from Task 1 Step 1 (if missing, the known-allowed failure names in Global Constraints are the fallback baseline).
 
 - [ ] **Step 1: Format check**
 
@@ -635,8 +638,15 @@ Expected: `NO NEW WARNINGS`.
 
 - [ ] **Step 3: Test delta**
 
-Run: `cargo test -p freshell-ws 2>&1 | tail -40`
-Expected: failing tests (if any) are exactly a subset of the baseline failures recorded in Task 1 Step 1 (the two known-allowed names in Global Constraints). Test count is baseline + 3 new in freshell-ws (2 dedupe-prune + 1 permit-scope) with 1 renamed acceptance test; also run `cargo test -p freshell-terminal` — baseline + 1 new/extended `is_running` exited-retained test, no new failures.
+Run:
+
+```bash
+cargo test -p freshell-ws 2>&1 | tail -40
+cargo test -p freshell-terminal 2>&1 | tail -15
+cargo test -p freshell-server -p freshell-freshagent 2>&1 | tail -20
+```
+
+Expected: failing tests (if any) are exactly a subset of the baseline failures recorded in Task 1 Step 1 (for freshell-ws, the two known-allowed names in Global Constraints; for the other crates, whatever Step 1's baseline files recorded). Test count is baseline + 3 new in freshell-ws (2 dedupe-prune + 1 permit-scope) with 1 renamed acceptance test; freshell-terminal is baseline + 1 new `is_pty_running` exited-retained test; freshell-server and freshell-freshagent are exactly baseline (this branch adds a registry method but changes no semantics they consume).
 
 - [ ] **Step 4: Fix-or-report**
 
@@ -650,12 +660,15 @@ If any gate fails: fix minimally, re-run Steps 1-3, and commit the fix with the 
 - "Verify first, then fix" (follow-up 1) → verification recorded in "Verification of the reported issues" (+ Stage-2 validation addendum) + re-checked as Task 1 Step 2 halt condition. Covered.
 - "Bound the cache while preserving dedupe semantics" → Task 1: liveness-anchored eviction bounds the cache structurally (≤ one entry per running terminal + in-flight after every settle, pinned by `settle_prunes_entries_for_non_running_terminals`) while replay-during-running-lifetime is pinned by the updated existing tests + `prune_keeps_running_and_in_flight_entries`; never-double-spawn while the terminal runs is UNCHANGED and now time-unlimited (`begin` still returns `DuplicateSettled`/`DuplicateInFlight`) — strictly stronger than any TTL window. Covered.
 - "Justify the strategy and the bound" → Task 1 preamble: legacy-parity rationale with validated evidence (frozen-client persisted-requestId re-send path; legacy delete-at-exit model at `ws-handler.ts:580-587`; registry retention facts), house prune-on-access pattern, no-deps policy, and the falsified TTL+cap alternative recorded with reasons. Covered.
-- "Duplicate after eviction: explicit and tested" → Task 1 preamble contract (post-eviction duplicate = fresh create = legacy post-exit behavior) + existing `dead_terminal_evicts_settled_entry` (made real at the call site by the corrected `is_running`) + the registry exited-retained test. No DEVIATIONS entry needed — the change matches legacy (Parity note in Global Constraints). Covered.
+- "Duplicate after eviction: explicit and tested" → Task 1 preamble contract (post-eviction duplicate = fresh create = legacy post-exit behavior) + existing `dead_terminal_evicts_settled_entry` (made real at the call site by the new `is_pty_running`) + the registry exited-retained test. No DEVIATIONS entry needed — the change matches legacy (Parity note in Global Constraints). Covered.
 - "Find the timing-sensitive test, replace timing dependence with deterministic mechanism, no weakened assertions" → Task 2 (identified at `tests/restore_spawn_gate.rs:341-370`; RED reproduction — validated 11/11 deterministic on this host; structural test-held-permit rework; assertions preserved, one strengthened) + Task 3 (the probabilistic held-until-settled residue made deterministic at unit level; rewire compile-validated pre-execution). Covered.
-- "Repo conventions, TDD, fmt+clippy clean, no new failures, minimal surface" → Global Constraints + per-task RED steps + Task 4 sweep; change surface is 5 source files (4 in freshell-ws, 1 method + 1 test in freshell-terminal). Covered.
+- "Repo conventions, TDD, fmt+clippy clean, no new failures, minimal surface" → Global Constraints + per-task RED steps + Task 4 sweep; change surface is 5 source files (4 in freshell-ws, 1 new method + 1 new test in freshell-terminal). Covered.
 
 **1b. No silent deferrals:** No stubs, mocks-standing-in-for-behavior, TODOs, or deferred requirements. The only test double (`DropFlag` in Task 3) observes a production-equivalent ownership property and is complemented by the real-gate acceptance test; `created_frame()`'s `Pong` stand-in is the module's pre-existing opaque-payload convention. The pre-existing divergences and missing population-bound ports listed in the verification addendum are explicitly recorded as OUT-OF-SCOPE follow-ups (surfaced to the user in the final report), not silent deferrals of this plan's requirements. No UNRESOLVED COVERAGE GAPS.
 
-**2. Placeholder scan:** Two intentional elisions, both instructions to mirror existing file content rather than placeholders for new content: Task 1 Step 5(a) directs the `is_running` body to reuse the registry's own lock-clone-read-status sequence at `registry.rs:457-466` verbatim (field/lock names live in that file; fabricating them here would be less reliable than pointing at the validated pattern), and Task 3 Step 3(b) says "(existing comment verbatim)" for the A10 comment block. All other steps carry complete code/commands.
+**2. Placeholder scan:** Two intentional elisions, both instructions to mirror existing file content rather than placeholders for new content: Task 1 Step 5(a) directs the `is_pty_running` body to reuse the registry's own lock-clone-unlock-read-status sequence in `finish_pty_exit` (`registry.rs:928-953`) verbatim (field/lock names live in that file; fabricating them here would be less reliable than pointing at the validated pattern), and Task 3 Step 3(b) says "(existing comment verbatim)" for the A10 comment block. All other steps carry complete code/commands.
 
-**3. Type consistency:** `is_running: impl Fn(&str) -> bool` identical across `begin`/`settle` in Task 1 Interfaces, implementation, both `terminal.rs` call sites, and all tests; `settle`'s 5-parameter shape identical in Interfaces, Step 5(b), Step 5(e), and every test call; `TerminalRegistry::is_running(&self, terminal_id: &str) -> bool` consistent between Interfaces, Step 5(a), and the registry test; no `now_ms`/TTL/cap symbols remain anywhere in the plan; Task 2's renamed test `restore_creates_queue_behind_held_permit_and_both_settle` matches the name referenced in Task 3's test comment and both commit messages; `hold_permit_across<G, F>` signature identical in Task 3 Interfaces, test, and implementation (compile-validated pre-execution).
+**3. Type consistency:** `is_running: impl Fn(&str) -> bool` identical across `begin`/`settle` in Task 1 Interfaces, implementation, both `terminal.rs` call sites, and all tests; `settle`'s 5-parameter shape identical in Interfaces, Step 5(b), Step 5(e), and every test call; `TerminalRegistry::is_pty_running(&self, terminal_id: &str) -> bool` consistent between Interfaces, Step 5(a), and the registry test (the pre-existing presence-only `is_running` is referenced only as untouched); no `now_ms`/TTL/cap symbols remain anywhere in the plan; Task 2's renamed test `restore_creates_queue_behind_held_permit_and_both_settle` matches the name referenced in Task 3's test comment and both commit messages; `hold_permit_across<G, F>` signature identical in Task 3 Interfaces, test, and implementation (compile-validated pre-execution).
+
+
+**4. Caller-survey correction (fresheyes iteration 1):** the original draft changed `is_running`'s semantics based on a claim that its only callers were 5 registry unit tests. A redone workspace-wide survey falsified that: 4 production callers exist (`freshell-server/src/tabs_snapshots.rs:632,709,714`; `freshell-freshagent/src/terminal_tabs.rs:1256`) plus 14 test callers across four crates. The plan now ADDS `is_pty_running` instead (purely additive; `is_running`/`exists` and all their callers untouched), baselines and delta-checks `freshell-server`/`freshell-freshagent` tests in the quality gates so downstream registry-API consumers are covered, and mandates the new registry test name `is_pty_running_false_for_exited_retained_terminal` so Task 1 Step 4's RED filter (`cargo test -p freshell-terminal is_pty_running`) can never select zero tests.
