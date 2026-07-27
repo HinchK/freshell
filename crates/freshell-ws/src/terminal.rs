@@ -151,6 +151,13 @@ pub async fn run(
             }
         })
     };
+    // Per-connection `terminal.create` sliding-window rate limiter (legacy
+    // parity: `ClientState.terminalCreateTimestamps`, ws-handler.ts:2376-2389)
+    // — fresh/empty on every (re)connect, exactly like the original.
+    let mut create_limiter = crate::create_limit::CreateRateLimiter::new(
+        state.create_protect.rate_limit,
+        state.create_protect.rate_window_ms,
+    );
     if ui_screenshot_v1 {
         let tx = conn_tx.clone();
         state
@@ -238,6 +245,7 @@ pub async fn run(
                             conn_id,
                             &conn_sink,
                             terminal_output_batch_v1,
+                            &mut create_limiter,
                         )
                         .await
                         {
@@ -407,6 +415,7 @@ async fn handle_client_text(
     conn_id: u64,
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
+    create_limiter: &mut crate::create_limit::CreateRateLimiter,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -463,8 +472,32 @@ async fn handle_client_text(
         }
         ClientMessage::ClientDiagnostic(_) => true,
         ClientMessage::TerminalCreate(create) => {
-            let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
-            handle_create(create, &mut out, state).await
+            if create.restore == Some(true) {
+                // restore:true bypasses the per-connection rate limiter —
+                // neither checked nor recorded (legacy `if (!m.restore)`).
+                // It goes through the server-wide restore-spawn gate instead
+                // (wired in the next task; until then, inline like before).
+                let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                handle_create(create, &mut out, state).await
+            } else {
+                if !create_limiter.try_acquire(crate::create_limit::epoch_ms()) {
+                    tracing::warn!(
+                        target: "freshell_ws::create_limit",
+                        request_id = %create.request_id,
+                        "terminal_create_rate_limited"
+                    );
+                    let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                    return send_create_error(
+                        &mut out,
+                        ErrorCode::RateLimited,
+                        "Too many terminal.create requests".to_string(),
+                        &create.request_id,
+                    )
+                    .await;
+                }
+                let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                handle_create(create, &mut out, state).await
+            }
         }
         ClientMessage::TerminalAttach(attach) => {
             handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
