@@ -59,6 +59,19 @@ task implicitly includes these:
 - Structural limits: ≤1,000 lines per file, ≤10,000 LOC per crate. New
   behavior goes in NEW modules (`terminal.rs` is already 2,520 lines — only
   surgical edits there).
+  - **Recorded deviation (crate LOC, decided 2026-07-27):**
+    `crates/freshell-ws/src` is 9,438 raw lines today; this plan's four new
+    modules (~1,000 lines including their inline unit tests) plus ~75 lines
+    of lib.rs/terminal.rs edits push the crate to ~10,500 — past the ≤10K
+    crate limit. This overage is ACCEPTED for this plan and is NOT a task
+    failure: every new file stays well under the 1,000-line per-file limit,
+    the overage is dominated by test fixtures, and folding a structural
+    split of `terminal.rs` into behavior-changing commits would defeat
+    review. Implementers and per-task quality reviewers must treat
+    freshell-ws crate-LOC overage as waived (flag only per-file >1,000
+    violations); the sanctioned remedy is a FOLLOW-UP structural task after
+    this plan lands — split `terminal.rs` (2,520 lines) into `terminal/`
+    submodules — recorded here so the debt is owned, not discovered.
 - `crates/freshell-terminal` is contractually tokio-free. Do not add tokio or
   the gate to it. The gate lives in `crates/freshell-ws`.
 - No new workspace dependencies. `tokio::sync::{Semaphore, watch, Notify}`
@@ -1643,10 +1656,14 @@ async fn gated_create_racing_shutdown_leaves_no_live_pty() {
 - [ ] **Step 2: Run — expect FAIL**
 
 Run: `cargo test -p freshell-ws --test restore_spawn_gate`
-Expected: `restore_creates_are_gated_and_non_restore_bypass` FAILS (the
-restore create currently succeeds inline — the gate is never consulted) and
-`gated_create_racing_shutdown_leaves_no_live_pty` FAILS (the create succeeds
-and leaves one live PTY despite the latched shutdown).
+Expected: all THREE new tests FAIL —
+- `restore_creates_are_gated_and_non_restore_bypass` FAILS (the restore
+  create currently succeeds inline — the gate is never consulted);
+- `restore_create_holds_permit_until_settled` FAILS (both creates succeed
+  inline without ever touching the gate, so `gate.queued_total()` is 0 and
+  the `>= 1` assertion trips);
+- `gated_create_racing_shutdown_leaves_no_live_pty` FAILS (the create
+  succeeds and leaves one live PTY despite the latched shutdown).
 
 - [ ] **Step 3: Implement `spawn_gated_restore_create`**
 
@@ -2157,10 +2174,29 @@ exists to fight.
 
 **Scope note:** server-global map keyed by requestId (the client resends on
 a NEW connection after reconnect, so a per-connection map would never see
-the original entry; server-global with legacy-equivalent eviction — entries
-dropped on create failure and, lazily, when the settled terminal no longer
-exists — matches the frozen client's expectations). RequestIds are
-client-generated UUIDs, so cross-client collision is not a concern.
+the original entry). RequestIds are client-generated UUIDs, so cross-client
+collision is not a concern.
+
+**In-flight reply path (required, not optional):** legacy never silently
+drops a duplicate — its in-flight sentinel is per-connection
+(`ws-handler.ts:1166`), duplicates serialize on the create lock
+(`ws-handler.ts:2159-2161`), and the resend is answered on the NEW socket
+from the server-global settled cache (`ws-handler.ts:2168-2199`). This
+port's map is server-global with an `InFlight` sentinel instead, so the
+sentinel itself MUST carry a reply path: a duplicate arriving from a
+DIFFERENT connection while the original is in flight registers that
+connection's `FrameSink` as a waiter; `settle` forwards the
+`terminal.created` to every waiter, and every non-settled exit
+(`clear_if_in_flight`) forwards a fail-loud error so the frozen client's
+retry ladder re-drives. Without this, a reconnect resend landing in the
+in-flight window (PTY spawn, meta, opencode O_EXCL lock retries — exactly
+the storm conditions this plan targets) would receive NOTHING: the
+original's reply goes to the dead old connection's dropped sink and the
+pane wedges in 'creating' (A2, TerminalView.tsx:3995-3999). Eviction:
+entries dropped on create failure and, lazily, when the settled terminal
+no longer exists (legacy deletes eagerly on kill,
+ws-handler.ts:2286/:2372 — lazy eviction is a deliberate simplification;
+the map retains only small settled frames for requestIds never re-sent).
 
 **Files:**
 - Create: `crates/freshell-ws/src/create_dedupe.rs`
@@ -2176,12 +2212,17 @@ client-generated UUIDs, so cross-client collision is not a concern.
 
 **Interfaces:**
 - Consumes: `WsState`, `handle_create` (Task 4 shape), the gated path
-  (Task 6), `ServerMessage`.
+  (Task 6), `ServerMessage`, `freshell_terminal::FrameSink`.
 - Produces:
   - `pub struct CreateDedupe` with
-    `pub fn begin(&self, request_id: &str, is_live: impl Fn(&str) -> bool) -> DedupeDecision`,
-    `pub fn settle(&self, request_id: &str, terminal_id: &str, created: &ServerMessage)`,
+    `pub fn begin(&self, request_id: &str, sink: &freshell_terminal::FrameSink, is_live: impl Fn(&str) -> bool) -> DedupeDecision`
+    (`sink` is the calling connection's frame sink — registered as a
+    waiter when the decision is `DuplicateInFlight` for a different
+    connection),
+    `pub fn settle(&self, request_id: &str, terminal_id: &str, created: &ServerMessage)`
+    (also forwards `created` to registered waiters),
     `pub fn clear_if_in_flight(&self, request_id: &str)`
+    (also forwards a fail-loud error frame to registered waiters)
   - `pub enum DedupeDecision { Proceed, DuplicateInFlight, DuplicateSettled(ServerMessage) }`
   - `WsState` field `pub create_dedupe: std::sync::Arc<crate::create_dedupe::CreateDedupe>`
 
@@ -2283,12 +2324,94 @@ async fn rate_limited_retry_same_requestid_proceeds() {
     );
     assert_eq!(registry.kill_all(), 2, "rl-1 plus the retried rl-2");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_on_new_connection_returns_same_terminal() {
+    // The A20 reconnect shape end-to-end: the frozen client re-sends an
+    // unanswered create with the SAME requestId on a NEW connection
+    // (ws-client.ts inFlightCreates resend). The resend must be answered
+    // WHICHEVER window it lands in: Settled -> stored-frame replay;
+    // InFlight -> waiter registration, forwarded on settle. Either way the
+    // new connection receives terminal.created for the SAME terminal and
+    // exactly one PTY exists.
+    let cfg = CreateProtectConfig::default();
+    let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(1, 64)).await;
+    // connect + hello (client1)
+    // connect + hello (client2 -- a SECOND connection to the same server)
+    send_text(&mut client1, &create_frame("xconn", true)).await;
+    // Deliberately do NOT await client1's reply first: let the resend race
+    // into the in-flight window when the scheduler allows.
+    send_text(&mut client2, &create_frame("xconn", true)).await;
+
+    let first = next_json_of_type(&mut client1, "terminal.created").await;
+    let second = next_json_of_type(&mut client2, "terminal.created").await;
+    assert_eq!(second["requestId"], "xconn");
+    assert_eq!(
+        second["terminalId"], first["terminalId"],
+        "a cross-connection resend must be answered with the SAME terminal"
+    );
+    assert_eq!(registry.kill_all(), 1, "exactly one PTY for one requestId");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_on_new_connection_never_swallowed_while_inflight() {
+    // The A2 wedge guard: a duplicate landing while the original is in
+    // flight must NEVER be silently dropped -- the original's reply goes to
+    // the ORIGINAL connection's sink (dead after a real reconnect), so the
+    // waiter path is the resend's ONLY reply path. A zero-permit gate plus
+    // a short timeout parks the original InFlight deterministically; when
+    // it exits non-settled, the waiter must receive the fail-loud error
+    // (which re-drives the frozen client's retry ladder).
+    let cfg = CreateProtectConfig {
+        restore_spawn_timeout_ms: 500,
+        ..CreateProtectConfig::default()
+    };
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+    // connect + hello (client1)
+    // connect + hello (client2)
+    send_text(&mut client1, &create_frame("xq", true)).await;
+    for _ in 0..200 {
+        if gate.queued_total() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(gate.queued_total(), 1, "original must be queued");
+
+    send_text(&mut client2, &create_frame("xq", true)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        gate.queued_total(),
+        1,
+        "a cross-connection duplicate registers as a waiter, never enqueues"
+    );
+
+    let err1 = next_json_of_type(&mut client1, "error").await;
+    assert_eq!(err1["requestId"], "xq");
+    let err2 = next_json_of_type(&mut client2, "error").await;
+    assert_eq!(err2["code"], "PTY_SPAWN_FAILED");
+    assert_eq!(
+        err2["requestId"], "xq",
+        "the waiter must receive a fail-loud reply -- silence wedges the pane"
+    );
+    assert_eq!(registry.kill_all(), 0);
+}
 ```
 
-Run: `cargo test -p freshell-ws --test restore_spawn_gate same_requestid`
-Expected: FAIL — today the resend spawns a second PTY with a new terminalId
-(`registry.kill_all()` returns 2) and the queued duplicate enqueues a second
-gated create.
+Run: `cargo test -p freshell-ws --test restore_spawn_gate`
+Expected at RED — the four dedupe tests FAIL, every earlier gate test still
+passes:
+- `same_requestid_resend_returns_existing_terminal` FAILS: the resend spawns
+  a second PTY with a new terminalId (`registry.kill_all()` returns 2);
+- `duplicate_while_queued_does_not_double_spawn` FAILS: the duplicate
+  enqueues a second gated create (`gate.queued_total()` reaches 2);
+- `resend_on_new_connection_returns_same_terminal` FAILS: the
+  cross-connection resend spawns a second PTY (terminalIds differ,
+  `kill_all()` returns 2);
+- `resend_on_new_connection_never_swallowed_while_inflight` FAILS: the
+  resend enqueues a second gated create (`gate.queued_total()` reaches 2).
 
 Also run: `cargo test -p freshell-ws --test restore_spawn_gate rate_limited_retry`
 Expected: PASS at RED — with no dedupe map there is no sentinel to leak, so
@@ -2304,28 +2427,49 @@ Create `crates/freshell-ws/src/create_dedupe.rs`:
 
 ```rust
 //! Server-wide `terminal.create` requestId -> terminal dedupe guard
-//! (legacy parity: `server/ws-handler.ts` `createdByRequestId` map —
-//! declaration :469, lookup :2167-2172, REPAIR_PENDING_SENTINEL :2436).
-//! The Rust port had no equivalent (fresh UUIDs minted unconditionally,
-//! terminal.rs:748; omission self-documented at :805-807), and the frozen
-//! client re-sends unanswered creates with the SAME requestId on every
-//! reconnect — without this guard every resend spawns a duplicate PTY and
-//! orphans the original as a detached background session.
+//! (legacy: `server/ws-handler.ts` — server-global `createdByRequestId`
+//! settled cache (declaration :467, lookup :2167-2172), per-connection
+//! in-flight sentinel (`ClientState`, :1166; set :2434), create-lock
+//! serialization (:2159-2161)). The Rust port had no equivalent (fresh
+//! UUIDs minted unconditionally, terminal.rs:748; omission self-documented
+//! at :805-807), and the frozen client re-sends unanswered creates with
+//! the SAME requestId on every reconnect — without this guard every
+//! resend spawns a duplicate PTY and orphans the original as a detached
+//! background session.
 //!
-//! Eviction semantics (legacy-equivalent):
+//! Mechanism divergence, same wire outcome: legacy serializes duplicates
+//! on the create lock and answers them from the settled cache on the NEW
+//! socket. Here the map is server-global with an `InFlight` sentinel, so
+//! the sentinel carries the reply path itself: cross-connection
+//! duplicates register their `FrameSink` as waiters; `settle` forwards
+//! the stored `terminal.created` to every waiter; every non-settled exit
+//! (`clear_if_in_flight`) forwards a fail-loud error instead. A silently
+//! swallowed duplicate would wedge the reconnected pane in 'creating'
+//! (A2, TerminalView.tsx:3995-3999).
+//!
+//! Eviction semantics:
 //! - failed create -> the wrapper calls `clear_if_in_flight` (legacy
-//!   sentinel cleanup, ws-handler.ts:2460)
+//!   sentinel cleanup, ws-handler.ts:2460), which also notifies waiters
 //! - killed/exited terminal -> lazily evicted at lookup time via the
-//!   `is_live` probe (legacy deletes on kill, ws-handler.ts:2286/:2372)
+//!   `is_live` probe (legacy deletes eagerly on kill,
+//!   ws-handler.ts:2286/:2372)
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use freshell_protocol::ServerMessage;
+use freshell_protocol::{ErrorCode, ErrorMsg, ServerMessage}; // match terminal.rs's ErrorMsg import path if it differs
+use freshell_terminal::FrameSink;
 
 enum Entry {
     /// A create with this requestId is currently gated/queued/in flight.
-    InFlight,
+    InFlight {
+        /// The sink of the connection running the create (it receives the
+        /// reply through the normal create path — never as a waiter).
+        origin: FrameSink,
+        /// OTHER connections that re-sent this requestId and are owed a
+        /// reply when the create settles or exits non-settled.
+        waiters: Vec<FrameSink>,
+    },
     /// The create settled: replay this exact `terminal.created` frame.
     Settled {
         terminal_id: String,
@@ -2336,12 +2480,33 @@ enum Entry {
 pub enum DedupeDecision {
     /// First sighting (or stale settled entry evicted): proceed to create.
     Proceed,
-    /// A create with this requestId is in flight: drop this duplicate
-    /// silently — the in-flight one will answer with this requestId.
+    /// A create with this requestId is in flight. Same connection: dropped
+    /// (the in-flight create replies on this very sink). Different
+    /// connection: its sink is now a registered waiter and WILL receive
+    /// the settle frame or a fail-loud error — never silence.
     DuplicateInFlight,
     /// Already settled and the terminal is live: re-send the stored
     /// `terminal.created` frame instead of spawning.
     DuplicateSettled(ServerMessage),
+}
+
+/// The fail-loud frame forwarded to waiters on a non-settled exit — the
+/// same `{ code, message, requestId }` shape `send_create_error` builds
+/// (Task 4 Step 5), so the frozen client's requestId match
+/// (TerminalView.tsx:3995-3999) fails the pane loud and its retry ladder
+/// re-drives with the same requestId (the sentinel is gone by then, so
+/// the retry proceeds as a fresh create).
+fn waiter_error(request_id: &str) -> ServerMessage {
+    ServerMessage::Error(ErrorMsg {
+        code: ErrorCode::PtySpawnFailed,
+        message: "terminal.create did not complete; retry".to_string(),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: Some(request_id.to_string()),
+        terminal_exit_code: None,
+        terminal_id: None,
+    })
 }
 
 #[derive(Default)]
@@ -2350,15 +2515,26 @@ pub struct CreateDedupe {
 }
 
 impl CreateDedupe {
-    /// Look up `request_id`, registering an InFlight sentinel on `Proceed`.
+    /// Look up `request_id`. Registers an InFlight sentinel (with `sink`
+    /// as origin) on `Proceed`; registers `sink` as a waiter on
+    /// `DuplicateInFlight` when it belongs to a different connection
+    /// (compared by `Arc::ptr_eq` — the per-connection sink is one Arc).
     pub fn begin(
         &self,
         request_id: &str,
+        sink: &FrameSink,
         is_live: impl Fn(&str) -> bool,
     ) -> DedupeDecision {
         let mut map = self.entries.lock().expect("create_dedupe lock");
-        match map.get(request_id) {
-            Some(Entry::InFlight) => DedupeDecision::DuplicateInFlight,
+        match map.get_mut(request_id) {
+            Some(Entry::InFlight { origin, waiters }) => {
+                let already_known = Arc::ptr_eq(origin, sink)
+                    || waiters.iter().any(|w| Arc::ptr_eq(w, sink));
+                if !already_known {
+                    waiters.push(Arc::clone(sink));
+                }
+                DedupeDecision::DuplicateInFlight
+            }
             Some(Entry::Settled {
                 terminal_id,
                 created,
@@ -2367,38 +2543,72 @@ impl CreateDedupe {
                     DedupeDecision::DuplicateSettled(created.clone())
                 } else {
                     // Terminal was killed/exited: evict and treat as fresh.
-                    map.insert(request_id.to_string(), Entry::InFlight);
+                    let origin = Arc::clone(sink);
+                    map.insert(
+                        request_id.to_string(),
+                        Entry::InFlight {
+                            origin,
+                            waiters: Vec::new(),
+                        },
+                    );
                     DedupeDecision::Proceed
                 }
             }
             None => {
-                map.insert(request_id.to_string(), Entry::InFlight);
+                map.insert(
+                    request_id.to_string(),
+                    Entry::InFlight {
+                        origin: Arc::clone(sink),
+                        waiters: Vec::new(),
+                    },
+                );
                 DedupeDecision::Proceed
             }
         }
     }
 
     /// Record a successful create (called where `handle_create` builds and
-    /// sends the `terminal.created` frame).
+    /// sends the `terminal.created` frame) and forward the frame to every
+    /// registered waiter (non-blocking `FrameSink` call; a waiter whose
+    /// connection died simply drops the frame).
     pub fn settle(&self, request_id: &str, terminal_id: &str, created: &ServerMessage) {
-        self.entries.lock().expect("create_dedupe lock").insert(
+        let prev = self.entries.lock().expect("create_dedupe lock").insert(
             request_id.to_string(),
             Entry::Settled {
                 terminal_id: terminal_id.to_string(),
                 created: created.clone(),
             },
         );
+        if let Some(Entry::InFlight { waiters, .. }) = prev {
+            for w in waiters {
+                w(created.clone());
+            }
+        }
     }
 
     /// Drop the InFlight sentinel if (and only if) the create did NOT
     /// settle — gate rejection, cancellation, shutdown abandon, or
-    /// handle_create failure. Settled entries stay: that IS the dedupe.
+    /// handle_create failure — and forward a fail-loud error to any
+    /// registered waiters. Settled entries stay: that IS the dedupe.
     /// This is what lets the client's 2s RATE_LIMITED retry (same
     /// requestId) proceed as a fresh create.
     pub fn clear_if_in_flight(&self, request_id: &str) {
-        let mut map = self.entries.lock().expect("create_dedupe lock");
-        if matches!(map.get(request_id), Some(Entry::InFlight)) {
-            map.remove(request_id);
+        let removed = {
+            let mut map = self.entries.lock().expect("create_dedupe lock");
+            if matches!(map.get(request_id), Some(Entry::InFlight { .. })) {
+                map.remove(request_id)
+            } else {
+                None
+            }
+        };
+        if let Some(Entry::InFlight { waiters, .. }) = removed {
+            if waiters.is_empty() {
+                return;
+            }
+            let err = waiter_error(request_id);
+            for w in waiters {
+                w(err.clone());
+            }
         }
     }
 }
@@ -2412,12 +2622,26 @@ mod tests {
         ServerMessage::Pong // adjust like Task 4's CreateOutput test if needed
     }
 
+    /// A FrameSink that records every frame it is handed.
+    fn recording_sink() -> (FrameSink, Arc<Mutex<Vec<ServerMessage>>>) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&frames);
+        let sink: FrameSink = Arc::new(move |msg| {
+            recorder.lock().expect("frames lock").push(msg);
+        });
+        (sink, frames)
+    }
+
     #[test]
     fn first_begin_proceeds_and_registers_sentinel() {
         let d = CreateDedupe::default();
-        assert!(matches!(d.begin("r1", |_| true), DedupeDecision::Proceed));
+        let (s1, _f1) = recording_sink();
         assert!(matches!(
-            d.begin("r1", |_| true),
+            d.begin("r1", &s1, |_| true),
+            DedupeDecision::Proceed
+        ));
+        assert!(matches!(
+            d.begin("r1", &s1, |_| true),
             DedupeDecision::DuplicateInFlight
         ));
     }
@@ -2425,10 +2649,11 @@ mod tests {
     #[test]
     fn settled_entry_replays_frame_while_live() {
         let d = CreateDedupe::default();
-        let _ = d.begin("r1", |_| true);
+        let (s1, _f1) = recording_sink();
+        let _ = d.begin("r1", &s1, |_| true);
         d.settle("r1", "t1", &created_frame());
         assert!(matches!(
-            d.begin("r1", |_| true),
+            d.begin("r1", &s1, |_| true),
             DedupeDecision::DuplicateSettled(_)
         ));
     }
@@ -2436,22 +2661,88 @@ mod tests {
     #[test]
     fn dead_terminal_evicts_settled_entry() {
         let d = CreateDedupe::default();
-        let _ = d.begin("r1", |_| true);
+        let (s1, _f1) = recording_sink();
+        let _ = d.begin("r1", &s1, |_| true);
         d.settle("r1", "t1", &created_frame());
-        assert!(matches!(d.begin("r1", |_| false), DedupeDecision::Proceed));
+        assert!(matches!(
+            d.begin("r1", &s1, |_| false),
+            DedupeDecision::Proceed
+        ));
     }
 
     #[test]
     fn clear_if_in_flight_removes_sentinel_but_not_settled() {
         let d = CreateDedupe::default();
-        let _ = d.begin("r1", |_| true);
+        let (s1, _f1) = recording_sink();
+        let _ = d.begin("r1", &s1, |_| true);
         d.clear_if_in_flight("r1");
-        assert!(matches!(d.begin("r1", |_| true), DedupeDecision::Proceed));
+        assert!(matches!(
+            d.begin("r1", &s1, |_| true),
+            DedupeDecision::Proceed
+        ));
         d.settle("r1", "t1", &created_frame());
         d.clear_if_in_flight("r1");
         assert!(matches!(
-            d.begin("r1", |_| true),
+            d.begin("r1", &s1, |_| true),
             DedupeDecision::DuplicateSettled(_)
+        ));
+    }
+
+    #[test]
+    fn cross_connection_waiter_receives_settle_frame() {
+        let d = CreateDedupe::default();
+        let (origin, origin_frames) = recording_sink();
+        let (other, other_frames) = recording_sink();
+        let _ = d.begin("r1", &origin, |_| true);
+        assert!(matches!(
+            d.begin("r1", &other, |_| true),
+            DedupeDecision::DuplicateInFlight
+        ));
+        d.settle("r1", "t1", &created_frame());
+        assert_eq!(
+            other_frames.lock().expect("frames").len(),
+            1,
+            "cross-connection waiter must receive the settled frame"
+        );
+        assert!(
+            origin_frames.lock().expect("frames").is_empty(),
+            "the origin replies through the create path, never as a waiter"
+        );
+    }
+
+    #[test]
+    fn same_connection_duplicate_is_not_a_waiter() {
+        let d = CreateDedupe::default();
+        let (origin, origin_frames) = recording_sink();
+        let _ = d.begin("r1", &origin, |_| true);
+        let _ = d.begin("r1", &origin, |_| true);
+        d.settle("r1", "t1", &created_frame());
+        assert!(
+            origin_frames.lock().expect("frames").is_empty(),
+            "same-sink duplicates must not be double-answered"
+        );
+    }
+
+    #[test]
+    fn waiters_get_fail_loud_error_on_non_settled_exit() {
+        let d = CreateDedupe::default();
+        let (origin, _f1) = recording_sink();
+        let (other, other_frames) = recording_sink();
+        let _ = d.begin("r1", &origin, |_| true);
+        let _ = d.begin("r1", &other, |_| true);
+        d.clear_if_in_flight("r1");
+        {
+            let frames = other_frames.lock().expect("frames");
+            assert_eq!(frames.len(), 1, "waiter must receive a fail-loud error");
+            assert!(matches!(
+                &frames[0],
+                ServerMessage::Error(err) if err.request_id.as_deref() == Some("r1")
+            ));
+        }
+        // Sentinel is gone: the client's retry proceeds fresh.
+        assert!(matches!(
+            d.begin("r1", &other, |_| true),
+            DedupeDecision::Proceed
         ));
     }
 }
@@ -2478,7 +2769,7 @@ registered). RED confirmed.
    (`crate::` paths inside the crate; `main.rs` uses the `freshell_ws::`
    path). Re-run `cargo test -p freshell-ws -p freshell-server --no-run`
    until clean; then `cargo test -p freshell-ws create_dedupe` — expect
-   `4 passed`.
+   `7 passed`.
 
 - [ ] **Step 4: Wire the guard into the create paths**
 
@@ -2489,10 +2780,11 @@ registered). RED confirmed.
 
 ```rust
         ClientMessage::TerminalCreate(create) => {
-            match state
-                .create_dedupe
-                .begin(&create.request_id, |tid| state.registry.exists(tid))
-            {
+            match state.create_dedupe.begin(
+                &create.request_id,
+                conn_sink, // this connection's FrameSink, already in scope for Task 6's gated call
+                |tid| state.registry.exists(tid),
+            ) {
                 crate::create_dedupe::DedupeDecision::DuplicateSettled(created) => {
                     // Re-send the original terminal.created (same requestId,
                     // same terminalId) — never spawn a duplicate.
@@ -2500,7 +2792,11 @@ registered). RED confirmed.
                     return out.send(&created).await;
                 }
                 crate::create_dedupe::DedupeDecision::DuplicateInFlight => {
-                    // The in-flight create will answer this requestId.
+                    // Same connection: the in-flight create replies on this
+                    // very sink. Different connection: begin() registered
+                    // this connection's sink as a waiter — settle() or
+                    // clear_if_in_flight() forwards the reply. Either way a
+                    // live client always gets an answer; never silence.
                     return true;
                 }
                 crate::create_dedupe::DedupeDecision::Proceed => {}
@@ -2545,15 +2841,17 @@ registered). RED confirmed.
    (QueueFull/Timeout — required so the client's 2s same-requestId retry
    is not swallowed), the shutdown pre-check abandon, and after
    `handle_create` returns (covers create failure; Task 6 already cloned
-   `request_id`).
+   `request_id`). Waiter notification (settle frame / fail-loud error) is
+   INTERNAL to `settle`/`clear_if_in_flight` — no extra call-site work.
 
 - [ ] **Step 5: Run — expect pass**
 
 Run: `cargo test -p freshell-ws --test restore_spawn_gate`
-Expected: all three Step 1 tests PASS — including
+Expected: all five Step 1 tests PASS — including
 `rate_limited_retry_same_requestid_proceeds`, which fails here if the
-RATE_LIMITED early return leaked the InFlight sentinel; all earlier gate
-tests still pass.
+RATE_LIMITED early return leaked the InFlight sentinel, and both
+`resend_on_new_connection_*` tests, which fail if a cross-connection
+duplicate is silently swallowed; all earlier gate tests still pass.
 
 - [ ] **Step 6: Full crate suite + quality gates**
 
@@ -2568,9 +2866,9 @@ git add crates/freshell-ws crates/freshell-terminal
 git commit \
   -m "feat(freshell-ws): dedupe terminal.create by requestId (legacy parity)" \
   -m "- A20: frozen client re-sends in-flight creates with the same requestId on every reconnect; without a guard each resend spawned a duplicate PTY and orphaned the original
-- CreateDedupe: server-global requestId map with InFlight sentinel; settled entries replay the original terminal.created; lazy eviction when the terminal is gone; sentinel cleared on rate-limit rejection, gate rejection, cancel, and create failure so the client's 2s same-requestId retry ladder still works
-- Legacy parity: createdByRequestId + REPAIR_PENDING_SENTINEL (server/ws-handler.ts:2167-2172, 2436)" \
-  -m "Verification: cargo test -p freshell-ws --test restore_spawn_gate; cargo test -p freshell-ws create_dedupe (4 passed); cargo test -p freshell-ws; cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings; no new failures vs recorded baseline)." \
+- CreateDedupe: server-global requestId map with InFlight sentinel; cross-connection duplicates register their FrameSink as waiters and are forwarded the settled terminal.created (or a fail-loud error on any non-settled exit) so a reconnect resend is never silently swallowed; settled entries replay the original terminal.created; lazy eviction when the terminal is gone; sentinel cleared on rate-limit rejection, gate rejection, cancel, and create failure so the client's 2s same-requestId retry ladder still works
+- Legacy parity in outcome: createdByRequestId settled cache + per-connection sentinel + create-lock serialization (server/ws-handler.ts:467, 1166, 2159-2199, 2434) — replaced by register-then-forward waiters with the same wire result (a resend's connection always receives a reply)" \
+  -m "Verification: cargo test -p freshell-ws --test restore_spawn_gate; cargo test -p freshell-ws create_dedupe (7 passed); cargo test -p freshell-ws; cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings; no new failures vs recorded baseline)." \
   -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
 Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
