@@ -208,7 +208,7 @@ async fn main() -> ExitCode {
     // The freshcodex WS fresh-agent slice: shares the auth token + the broadcast bus so its
     // freshAgent.created/send.accepted/event frames reach every WS client (incl. the oracle's
     // capture socket). Seeded with the settings tree so `PATCH /api/settings` returns/merges it.
-    let fresh_codex_state = freshell_freshagent::FreshCodexState::new(
+    let mut fresh_codex_state = freshell_freshagent::FreshCodexState::new(
         Arc::clone(&auth_token),
         Arc::clone(&broadcast_tx),
         serde_json::to_value(settings.as_ref()).unwrap_or_else(|_| serde_json::json!({})),
@@ -218,7 +218,17 @@ async fn main() -> ExitCode {
     // freshAgent.created/send.accepted/event frames reach every WS client (incl. the
     // oracle's capture socket). It drives the ONE sanctioned Node claude sidecar; the
     // create gate is the SHARED settings.freshAgent.enabled flag (owned by fresh_codex).
-    let fresh_claude_state = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+    let mut fresh_claude_state =
+        freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+
+    // Task 12 (D8 for fresh agents): the ONE server-wide per-sessionRef create/resume
+    // lease map, shared by every fresh-agent runtime (keys are provider-namespaced).
+    let fresh_agent_leases =
+        Arc::new(freshell_freshagent::session_lease::FreshAgentSessionLeases::new());
+    fresh_codex_state.set_session_leases(Arc::clone(&fresh_agent_leases));
+    fresh_claude_state.set_session_leases(Arc::clone(&fresh_agent_leases));
+    let fresh_codex_state = fresh_codex_state;
+    let fresh_claude_state = fresh_claude_state;
 
     // SESSION-09 fix-forward: mint the shared `sessions.changed` revision
     // counter BEFORE `fresh_agent_state` so it can be wired into both
