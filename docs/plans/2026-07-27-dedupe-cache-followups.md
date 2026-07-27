@@ -105,11 +105,11 @@ Expected: **no matches** for either grep, and the `sed` output shows `is_running
 
 ```rust
         assert!(
-            reg.exists(terminal_id),
+            reg.exists(&terminal_id),
             "exited terminal record is retained for restore"
         );
         assert!(
-            !reg.is_pty_running(terminal_id),
+            !reg.is_pty_running(&terminal_id),
             "is_pty_running must go false at natural exit even though the record is retained"
         );
 ```
