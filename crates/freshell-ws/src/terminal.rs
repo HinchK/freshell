@@ -68,11 +68,11 @@ use freshell_terminal::{build_child_env_from_process, FrameSink};
 use crate::WsState;
 
 /// The write half of a split axum WebSocket.
-type WsSink = SplitSink<WebSocket, Message>;
+pub(crate) type WsSink = SplitSink<WebSocket, Message>;
 
 /// Serialize + send one server→client message. Returns `false` if the socket is
 /// closed/errored (the caller then tears the connection down).
-async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
+pub(crate) async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
     match serde_json::to_string(msg) {
         Ok(json) => ws_tx.send(Message::Text(json.into())).await.is_ok(),
         Err(_) => false,
@@ -462,7 +462,10 @@ async fn handle_client_text(
             true
         }
         ClientMessage::ClientDiagnostic(_) => true,
-        ClientMessage::TerminalCreate(create) => handle_create(create, ws_tx, state).await,
+        ClientMessage::TerminalCreate(create) => {
+            let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+            handle_create(create, &mut out, state).await
+        }
         ClientMessage::TerminalAttach(attach) => {
             handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
             true
@@ -742,7 +745,11 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
-async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsState) -> bool {
+pub(crate) async fn handle_create(
+    create: TerminalCreate,
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    state: &WsState,
+) -> bool {
     // `terminalId` via UUID (nanoid-alphabet-compatible for the oracle validator);
     // `streamId` via UUIDv4 (the reference's randomUUID()).
     let terminal_id = Uuid::new_v4().simple().to_string();
@@ -766,7 +773,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             .collect::<Vec<_>>()
             .join(", ");
         return send_create_error(
-            ws_tx,
+            out,
             ErrorCode::PtySpawnFailed,
             format!("Invalid terminal mode: '{mode}'. Valid: {valid}"),
             &create.request_id,
@@ -855,7 +862,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
             Ok(ep) => Some(ep),
             Err(e) => {
-                return send_create_error(ws_tx, ErrorCode::PtySpawnFailed, e, &create.request_id)
+                return send_create_error(out, ErrorCode::PtySpawnFailed, e, &create.request_id)
                     .await
             }
         }
@@ -905,7 +912,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
                 // A thrown planCodexLaunch surfaces through the generic create catch
                 // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
                 return send_create_error(
-                    ws_tx,
+                    out,
                     ErrorCode::PtySpawnFailed,
                     message,
                     &create.request_id,
@@ -942,7 +949,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             Ok(i) => i,
             Err(e) => {
                 return send_create_error(
-                    ws_tx,
+                    out,
                     ErrorCode::PtySpawnFailed,
                     e.message,
                     &create.request_id,
@@ -972,7 +979,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         Ok(l) => l,
         Err(e) => {
             return send_create_error(
-                ws_tx,
+                out,
                 ErrorCode::PtySpawnFailed,
                 e.message(),
                 &create.request_id,
@@ -1111,13 +1118,8 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             env_var.as_deref(),
             resume_session_id.is_some(),
         );
-        return send_create_error(
-            ws_tx,
-            ErrorCode::PtySpawnFailed,
-            message,
-            &create.request_id,
-        )
-        .await;
+        return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+            .await;
     }
 
     // DEV-0006 S4: adopt the managed codex launch for this terminal
@@ -1132,13 +1134,8 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
             .await
         {
             state.registry.kill(&terminal_id);
-            return send_create_error(
-                ws_tx,
-                ErrorCode::PtySpawnFailed,
-                message,
-                &create.request_id,
-            )
-            .await;
+            return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+                .await;
         }
     }
 
@@ -1222,7 +1219,7 @@ async fn handle_create(create: TerminalCreate, ws_tx: &mut WsSink, state: &WsSta
         // identity-stamped frame reads (shell creates have no entry -> `None`).
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
     });
-    let sent = send(ws_tx, &created).await;
+    let sent = out.send(&created).await;
     // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
     // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
     // exists this is unconditional. Live-pinned frame order (exit-orig.json):
@@ -1383,8 +1380,8 @@ pub fn broadcast_sessions_changed(state: &WsState) {
 
 /// Send the reference's `sendError` frame for a failed `terminal.create`
 /// (`ws-handler.ts:2606-2614`): `{ code, message, requestId }`.
-async fn send_create_error(
-    ws_tx: &mut WsSink,
+pub(crate) async fn send_create_error(
+    out: &mut crate::create_gate::CreateOutput<'_>,
     code: ErrorCode,
     message: String,
     request_id: &str,
@@ -1399,7 +1396,7 @@ async fn send_create_error(
         terminal_exit_code: None,
         terminal_id: None,
     });
-    send(ws_tx, &msg).await
+    out.send(&msg).await
 }
 
 /// `getModeLabel` (`terminal-registry.ts:439-443`): `'Shell'` for shell, the CLI
