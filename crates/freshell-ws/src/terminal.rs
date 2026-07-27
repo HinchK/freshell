@@ -945,6 +945,76 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
     mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
 }
 
+/// Provider settings `codingCli.providers[mode]` (`ws:2317-2319`) as
+/// `(permission_mode, model, sandbox)`, with the codex strip (`ws:2464-2465`
+/// — model/sandbox/permissionMode route to the app-server plan instead).
+/// Boot-snapshot settings. Extracted from `handle_create` so the auto-resume
+/// respawn seam (Task 4) derives launch params identically.
+fn cli_provider_settings(
+    state: &WsState,
+    mode: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if mode == "shell" || mode == "codex" {
+        return (None, None, None);
+    }
+    let Some(p) = state.settings.coding_cli.providers.get(mode) else {
+        return (None, None, None);
+    };
+    let pick = |key: &str| p.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    (pick("permissionMode"), pick("model"), pick("sandbox"))
+}
+
+/// codex `--remote <wsUrl>` planning (DEV-0006 S4, FLAG-GATED default OFF —
+/// council fence): with `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed
+/// app-server launch (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote
+/// proxy, 5-attempt initial budget); the codex provider settings route through
+/// the PLAN, not argv (the `ws:2464-2465` strip). Flag OFF: `Ok(None)` —
+/// today's plain-CLI launch, byte-identical to the shipped deviation shape
+/// (golden G-X0) — DEV-0006 stays open until S5 flips the default.
+///
+/// Extracted from `handle_create` so the auto-resume respawn seam (Task 4)
+/// plans identically. `Err` carries the thrown planCodexLaunch message —
+/// `handle_create` surfaces it as `error{code:PTY_SPAWN_FAILED}`, the respawn
+/// seam as `RespawnError::LaunchUnresolvable`.
+async fn plan_codex_managed_launch(
+    state: &WsState,
+    mode: &str,
+    raw_cwd: Option<&str>,
+    resume_session_id: Option<&str>,
+) -> Result<Option<freshell_codex::launch_lifecycle::CodexTerminalLaunch>, String> {
+    let managed_flag =
+        std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
+    if !codex_create_uses_managed_launch(mode, managed_flag.as_deref()) {
+        return Ok(None);
+    }
+    let codex_provider = state.settings.coding_cli.providers.get("codex");
+    let provider_str = |key: &str| {
+        codex_provider
+            .and_then(|p| p.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let plan_model = provider_str("model");
+    let plan_sandbox = provider_str("sandbox");
+    // `approvalPolicy: providerSettings?.permissionMode` (`ws:942`).
+    let plan_approval = provider_str("permissionMode");
+    let input = freshell_codex::launch_plan::CodexLaunchPlanInput {
+        cwd: raw_cwd,
+        resume_session_id,
+        model: plan_model.as_deref(),
+        sandbox: plan_sandbox.as_deref(),
+        approval_policy: plan_approval.as_deref(),
+    };
+    freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+        .plan_create_with_retry(
+            &input,
+            freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+        )
+        .await
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
 /// RAII release of a §5.4 keyed-create reservation
 /// ([`freshell_terminal::TerminalRegistry::begin_keyed_create`]): dropped on
 /// EVERY exit path of `handle_create`'s spawn — success, spawn error, or the
@@ -1520,23 +1590,9 @@ async fn handle_create(
     // Provider settings `codingCli.providers[mode]` (`ws:2317-2319`), with the
     // codex strip (`ws:2464-2465` — model/sandbox/permissionMode route to the
     // app-server plan instead). Boot-snapshot settings (same documented caveat
-    // as `defaultCwd` above).
-    let mut permission_mode: Option<String> = None;
-    let mut model: Option<String> = None;
-    let mut sandbox: Option<String> = None;
-    if mode != "shell" && mode != "codex" {
-        if let Some(p) = state.settings.coding_cli.providers.get(&mode) {
-            permission_mode = p
-                .get("permissionMode")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            model = p.get("model").and_then(|v| v.as_str()).map(str::to_string);
-            sandbox = p
-                .get("sandbox")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-        }
-    }
+    // as `defaultCwd` above). Shared with the auto-resume respawn seam
+    // (Task 4) via `cli_provider_settings`.
+    let (permission_mode, model, sandbox) = cli_provider_settings(state, &mode);
 
     // opencode: allocate the loopback control endpoint BEFORE building the launch
     // (`ws:2471-2473`; `local-port.ts:13-41`), via the freshell-opencode
@@ -1562,51 +1618,29 @@ async fn handle_create(
     // settings route through the PLAN, not argv (the `ws:2464-2465` strip above).
     // Flag OFF: today's plain-CLI launch, byte-identical to the shipped deviation
     // shape (golden G-X0) — DEV-0006 stays open until S5 flips the default.
-    let managed_flag =
-        std::env::var(freshell_codex::launch_plan::FRESHELL_CODEX_MANAGED_LAUNCH_ENV).ok();
-    let codex_launch = if codex_create_uses_managed_launch(&mode, managed_flag.as_deref()) {
-        let codex_provider = state.settings.coding_cli.providers.get("codex");
-        let provider_str = |key: &str| {
-            codex_provider
-                .and_then(|p| p.get(key))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-        };
-        let plan_model = provider_str("model");
-        let plan_sandbox = provider_str("sandbox");
-        // `approvalPolicy: providerSettings?.permissionMode` (`ws:942`).
-        let plan_approval = provider_str("permissionMode");
-        let input = freshell_codex::launch_plan::CodexLaunchPlanInput {
-            // Legacy plans with the RAW create cwd (`ws:2444` passes `m.cwd`).
-            cwd: create.cwd.as_deref(),
-            resume_session_id: resume_session_id.as_deref(),
-            model: plan_model.as_deref(),
-            sandbox: plan_sandbox.as_deref(),
-            approval_policy: plan_approval.as_deref(),
-        };
-        match freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-            .plan_create_with_retry(
-                &input,
-                freshell_codex::launch_plan::CODEX_INITIAL_LAUNCH_ATTEMPTS,
+    // Extracted to `plan_codex_managed_launch` (shared with the auto-resume
+    // respawn seam, Task 4). Legacy plans with the RAW create cwd (`ws:2444`
+    // passes `m.cwd`).
+    let codex_launch = match plan_codex_managed_launch(
+        state,
+        &mode,
+        create.cwd.as_deref(),
+        resume_session_id.as_deref(),
+    )
+    .await
+    {
+        Ok(launch) => launch,
+        Err(message) => {
+            // A thrown planCodexLaunch surfaces through the generic create catch
+            // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
+            return send_create_error(
+                ws_tx,
+                ErrorCode::PtySpawnFailed,
+                message,
+                &create.request_id,
             )
-            .await
-        {
-            Ok(launch) => Some(launch),
-            Err(error) => {
-                let message = error.to_string();
-                // A thrown planCodexLaunch surfaces through the generic create catch
-                // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
-                return send_create_error(
-                    ws_tx,
-                    ErrorCode::PtySpawnFailed,
-                    message,
-                    &create.request_id,
-                )
-                .await;
-            }
+            .await;
         }
-    } else {
-        None
     };
     let codex_remote_ws_url: Option<String> =
         codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
@@ -2102,6 +2136,395 @@ async fn handle_create(
         broadcast_terminal_meta_created(state, record);
     }
     sent
+}
+
+/// One auto-resume respawn request (Task 4 seam, consumed by the Task 5
+/// orchestrator): everything needed to spawn a replacement agent terminal
+/// from a server-side identity — no client message, no connection.
+///
+/// `pub` + `#[doc(hidden)]` (not `pub(crate)`) so the crate's integration
+/// tests (`tests/auto_resume_respawn.rs`) can drive the seam directly; this
+/// is test plumbing, not public API.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct AgentRespawnRequest {
+    /// "claude" | "codex" | "opencode" | "amplifier"
+    pub mode: String,
+    /// sessionRef.provider (== mode for terminal panes)
+    pub provider: String,
+    /// sessionRef.sessionId → `--resume <id>`
+    pub session_id: String,
+    /// SAME as the dead generation (cap continuity)
+    pub create_request_id: String,
+    pub cwd: Option<String>,
+}
+
+/// Why a respawn could not produce a terminal. The orchestrator (Task 5)
+/// settles "respawn_failed" and releases its lease on either variant.
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum RespawnError {
+    /// No CLI spec / resume template for this mode — or any other
+    /// pre-spawn resolution failure (MCP injection, spawn-gate rejection,
+    /// codex managed-launch planning/adoption).
+    LaunchUnresolvable(String),
+    /// The PTY spawn itself failed.
+    Spawn(std::io::Error),
+}
+
+/// Spawns a replacement agent terminal from a server-side identity.
+/// Returns the NEW terminal id. Does NOT guard/lease — the orchestrator does.
+///
+/// Mirrors `handle_create`'s CLI branch step-for-step — same call order, same
+/// error handling, same `spawn_blocking` boundaries — minus the
+/// connection-bound concerns (no `ws_tx` replies, no client `requestId`
+/// correlation, no preallocation ladder: intent is always `Resume`).
+///
+/// Known deviation (task-4 brief step 1, verified): `FRESHELL_TAB_ID` /
+/// `FRESHELL_PANE_ID` come from the create request's wire fields and are not
+/// derivable from the pane-ledger binding (BindingRow carries no tab/pane
+/// ids), so auto-resumed generations OMIT them.
+#[doc(hidden)]
+pub async fn respawn_agent_terminal(
+    state: &WsState,
+    req: &AgentRespawnRequest,
+) -> Result<String, RespawnError> {
+    let host_os = host_os_live();
+    let is_wsl = is_wsl_env_live();
+    // Headless respawn: no wire `shell` field — the system shell, exactly
+    // what `map_shell` yields for the default `terminal.create` shape.
+    let shell = ShellType::System;
+    let mode = req.mode.clone();
+
+    // Mirror of `handle_create`'s `cli_spec_known` reject (minus 'shell' —
+    // a respawn is always a coding-CLI launch).
+    if !state.cli_commands.iter().any(|s| s.name == mode) {
+        return Err(RespawnError::LaunchUnresolvable(format!(
+            "no CLI spec registered for mode '{mode}'"
+        )));
+    }
+
+    // `terminalId`/`streamId` minted the same way `handle_create` mints them.
+    let terminal_id = Uuid::new_v4().simple().to_string();
+    let stream_id = Uuid::new_v4().to_string();
+
+    // Same cwd ladder as `handle_create` (`resolve_create_cwd`): the binding's
+    // recorded cwd, else `settings.defaultCwd`, else (non-Windows) `$HOME`.
+    let resolved_cwd = resolve_create_cwd(
+        req.cwd.as_deref(),
+        state.settings.default_cwd.as_deref(),
+        host_os,
+    );
+
+    // Spawn-time resume identity: intent is ALWAYS `Resume` on this path.
+    let launch_intent = LaunchIntent::Resume;
+    let resume_session_id = Some(req.session_id.clone());
+
+    // Launch params from state.settings EXACTLY as handle_create derives them
+    // (BindingRow launch fields are hardcoded None for terminal panes —
+    // pane_ledger.rs:405-408).
+    let (permission_mode, model, sandbox) = cli_provider_settings(state, &mode);
+
+    // opencode: allocate the loopback control endpoint BEFORE building the
+    // launch, same seam as `handle_create`.
+    let opencode_endpoint = if mode == "opencode" {
+        use freshell_opencode::serve::PortAllocator as _;
+        match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
+            Ok(ep) => Some(ep),
+            Err(e) => return Err(RespawnError::LaunchUnresolvable(e)),
+        }
+    } else {
+        None
+    };
+
+    // codex `--remote <wsUrl>` (DEV-0006 S4, FLAG-GATED default OFF) — the
+    // same shared planner `handle_create` uses.
+    let codex_launch = match plan_codex_managed_launch(
+        state,
+        &mode,
+        req.cwd.as_deref(),
+        resume_session_id.as_deref(),
+    )
+    .await
+    {
+        Ok(launch) => launch,
+        Err(message) => return Err(RespawnError::LaunchUnresolvable(message)),
+    };
+    let codex_remote_ws_url: Option<String> =
+        codex_launch.as_ref().map(|l| l.remote_ws_url.clone());
+
+    // ProviderTarget + host-native mcp cwd, then the MCP injection — same
+    // order and same IO layer as `handle_create` (a throw here propagates
+    // before the pty spawn; no cleanup call on this path, matching
+    // `handle_create`'s error arm).
+    let target = cli_provider_target(shell, host_os, is_wsl, resolved_cwd.as_deref(), &RealEnv);
+    let mcp_cwd = resolve_mcp_cwd(resolved_cwd.as_deref(), &RealEnv, host_os, is_wsl);
+    let mcp_injection = match generate_mcp_injection(
+        &RealMcpRuntime,
+        &mode,
+        &terminal_id,
+        mcp_cwd.as_deref(),
+        target,
+    ) {
+        Ok(i) => i,
+        Err(e) => return Err(RespawnError::LaunchUnresolvable(e.message)),
+    };
+
+    // The full `resolveCodingCliCommand` — typed throws surface as
+    // `LaunchUnresolvable`; never a bare-command launch.
+    let inputs = CliLaunchInputs {
+        mode: &mode,
+        target,
+        resume_session_id: resume_session_id.as_deref(),
+        launch_intent,
+        permission_mode: permission_mode.as_deref(),
+        model: model.as_deref(),
+        sandbox: sandbox.as_deref(),
+        codex_remote_ws_url: codex_remote_ws_url.as_deref(),
+        opencode_server: opencode_endpoint
+            .as_ref()
+            .map(|ep| (ep.hostname.as_str(), ep.port as i64)),
+        mcp_injection,
+    };
+    let cli = match resolve_coding_cli_command(&state.cli_commands, &inputs, &RealEnv) {
+        Ok(l) => l,
+        Err(e) => return Err(RespawnError::LaunchUnresolvable(e.message())),
+    };
+    let Some(launch) = &cli else {
+        // Unreachable given the spec-list guard above; belt-and-suspenders so
+        // a respawn can never silently fall back to a plain shell spawn.
+        return Err(RespawnError::LaunchUnresolvable(format!(
+            "mode '{mode}' resolved no CLI launch"
+        )));
+    };
+
+    // `buildTerminalBaseEnv` — FRESHELL_TAB_ID/FRESHELL_PANE_ID deliberately
+    // omitted (see the fn doc comment: not derivable server-side).
+    let overrides = build_terminal_base_env(&RealEnv, &terminal_id, None, None);
+
+    // Branch selection mirrors `handle_create`/`buildSpawnSpec`.
+    let effective_shell = resolve_shell(shell, host_os, is_wsl);
+    let windows_like = is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
+    let spec = if windows_like {
+        build_windows_cli_spawn_spec(
+            launch,
+            shell,
+            host_os,
+            is_wsl,
+            resolved_cwd.as_deref(),
+            &RealEnv,
+            &overrides,
+            None,
+            None,
+        )
+    } else {
+        build_cli_spawn_spec(
+            launch,
+            is_wsl,
+            resolved_cwd.as_deref(),
+            &RealEnv,
+            &overrides,
+            None,
+            None,
+        )
+    };
+    let child_env = build_child_env_from_process(&spec);
+
+    // The SAME exit hook `handle_create` builds — so respawned generations
+    // report their own crashes (load-bearing for retry #2, Task 2).
+    let on_exit: Option<freshell_terminal::pty::ExitHook> = Some(build_pty_exit_hook(
+        ExitHookDeps {
+            registry: state.registry.clone(),
+            identity: state.identity.clone(),
+            pane_ledger: std::sync::Arc::clone(&state.pane_ledger),
+            amplifier_locator: state.amplifier_locator.clone(),
+            opencode_locator: state.opencode_locator.clone(),
+            codex_locator: state.codex_locator.clone(),
+            auto_resume_tx: state.auto_resume_tx.clone(),
+        },
+        terminal_id.clone(),
+        mode.clone(),
+        mcp_cwd.clone(),
+    ));
+
+    // Server-wide spawn gate (restart-storm protection): acquired BEFORE
+    // spawning, RAII permit released at scope end — mirror of
+    // `handle_create`'s acquire + rejection cleanup. (The per-connection
+    // CreateRateLimiter is connection-loop-local and does not apply here.)
+    let _spawn_permit = match state
+        .spawn_gate
+        .acquire(std::time::Duration::from_millis(
+            state.create_protect.spawn_timeout_ms,
+        ))
+        .await
+    {
+        Ok(permit) => permit,
+        Err(err) => {
+            if let Some(launch) = codex_launch {
+                freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                    .discard(launch)
+                    .await;
+            }
+            cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+            let (_code, msg) = spawn_gate_error_parts(err);
+            return Err(RespawnError::LaunchUnresolvable(msg.to_string()));
+        }
+    };
+
+    // Synchronous PTY spawn on the blocking pool (permit held throughout) —
+    // the `handle_create` precedent.
+    let registry = state.registry.clone();
+    let spawn_spec = spec.clone();
+    let spawn_terminal_id = terminal_id.clone();
+    let spawn_mode = mode.clone();
+    let spawn_resume_session_id = resume_session_id.clone();
+    let spawn_create_request_id = req.create_request_id.clone();
+    let create_result = match tokio::task::spawn_blocking(move || {
+        registry.create(
+            &spawn_spec,
+            &child_env,
+            spawn_terminal_id,
+            stream_id,
+            &spawn_mode,
+            spawn_resume_session_id.as_deref(),
+            // Cap continuity: the SAME createRequestId as the dead generation.
+            Some(&spawn_create_request_id),
+            None,
+            on_exit,
+        )
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(join_err) => Err(std::io::Error::other(format!(
+            "terminal spawn task panicked: {join_err}"
+        ))),
+    };
+    if let Err(err) = create_result {
+        // Failed-spawn parity: discard a planned-but-unadopted codex launch,
+        // clean up MCP side-effects with the mcpCwd (NOT procCwd).
+        if let Some(launch) = codex_launch {
+            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                .discard(launch)
+                .await;
+        }
+        cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+        return Err(RespawnError::Spawn(err));
+    }
+
+    // DEV-0006 S4: adopt the managed codex launch for this terminal, same as
+    // `handle_create` — a failed adopt kills the just-spawned pty.
+    if let Some(launch) = codex_launch {
+        if let Err(message) = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+            .adopt(&terminal_id, launch, 0)
+            .await
+        {
+            state.registry.kill(&terminal_id);
+            return Err(RespawnError::LaunchUnresolvable(message));
+        }
+    }
+
+    // Post-insert bookkeeping, same order as `handle_create`.
+    state.registry.set_meta(
+        &terminal_id,
+        Some(format!(
+            "{} (auto-resumed)",
+            mode_label(&mode, cli.as_ref())
+        )),
+        None,
+        Some(mode.clone()),
+        resume_session_id.clone(),
+    );
+
+    // Arm the provider locators the way `handle_create` does for this mode
+    // (all three gate on a FRESH — non-resuming — pane, so they no-op for a
+    // respawn's always-`Some` resume id; kept for step-for-step fidelity).
+    crate::amplifier_association::maybe_arm(
+        state,
+        &terminal_id,
+        &mode,
+        resolved_cwd.as_deref(),
+        resume_session_id.as_deref(),
+    );
+    crate::opencode_association::maybe_arm(
+        state,
+        &terminal_id,
+        &mode,
+        resolved_cwd.as_deref(),
+        resume_session_id.as_deref(),
+    );
+    {
+        let state = state.clone();
+        let terminal_id = terminal_id.clone();
+        let mode = mode.clone();
+        let cwd = resolved_cwd.clone();
+        let resume = resume_session_id.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::codex_association::maybe_arm(
+                &state,
+                &terminal_id,
+                &mode,
+                cwd.as_deref(),
+                resume.as_deref(),
+            );
+        })
+        .await;
+    }
+
+    // Identity record for the new terminal (provider/session_id/cwd) + the
+    // durable ledger binding (fsync — blocking pool, pane_ledger.rs:363
+    // doctrine), riding the same record shape `handle_create` seeds. A
+    // respawn always has a session id, so the record is always `Some`.
+    let create_meta_record = terminal_meta_record_for_create(
+        &terminal_id,
+        &mode,
+        resume_session_id.as_deref(),
+        spec.cwd.as_deref(),
+        now_ms(),
+    );
+    if let Some(record) = &create_meta_record {
+        state.identity.upsert(
+            &record.terminal_id,
+            record.provider.as_deref(),
+            record.session_id.as_deref(),
+            record.cwd.as_deref(),
+            record.updated_at,
+        );
+        if let (Some(provider), Some(session_id)) =
+            (record.provider.as_deref(), record.session_id.as_deref())
+        {
+            let ledger = std::sync::Arc::clone(&state.pane_ledger);
+            let provider = provider.to_string();
+            let session_id = session_id.to_string();
+            let write_terminal_id = record.terminal_id.clone();
+            let write_mode = mode.clone();
+            let write_cwd = record.cwd.clone();
+            let write_request_id = req.create_request_id.clone();
+            let now = now_ms();
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.record_binding(&crate::pane_ledger::BindingWrite {
+                    provider: &provider,
+                    session_id: &session_id,
+                    terminal_id: &write_terminal_id,
+                    mode: &write_mode,
+                    cwd: write_cwd.as_deref(),
+                    create_request_id: Some(&write_request_id),
+                    now_ms: now,
+                })
+            })
+            .await
+            .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+            crate::pane_ledger::surface_write_failure(state, &record.terminal_id, result);
+        }
+    }
+
+    // "Notify all clients that list changed" so sidebars refresh, then the
+    // meta slice — the same closing pair as `handle_create`.
+    broadcast_terminals_changed(state);
+    if let Some(record) = create_meta_record {
+        broadcast_terminal_meta_created(state, record);
+    }
+    Ok(terminal_id)
 }
 
 /// Rust port of `isValidClaudeSessionId` (`shared/session-contract.ts:34,44-46`;
