@@ -22,6 +22,7 @@
 
 pub mod amplifier_association;
 pub mod backpressure;
+pub mod create_limit;
 pub mod identity;
 pub(crate) mod invariants;
 pub mod opencode_association;
