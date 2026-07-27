@@ -2811,13 +2811,32 @@ registered). RED confirmed.
    `contains_key` — read-only, no tokio, honors the crate contract).
 
 2. `terminal.rs` `handle_create` — at the single success point where the
-   `created` frame is built (before `out.send(&created)`, ~:1215-1226):
+   `created` frame is built (~:1213-1226). BORROW-CHECK NOTE: the
+   `TerminalCreated` literal MOVES both `create.request_id` (:1215) and
+   `terminal_id` (:1216) into the struct, so `&create.request_id` /
+   `&terminal_id` after the literal is E0382 (borrow of moved value).
+   Clone both into locals immediately BEFORE the literal; call `settle`
+   AFTER the literal (it needs `&created`), immediately before
+   `out.send(&created)`:
 
 ```rust
+    // Immediately BEFORE the existing
+    // `let created = ServerMessage::TerminalCreated(TerminalCreated { ... })`
+    // literal (~:1213) — the literal itself is unchanged:
+    let dedupe_request_id = create.request_id.clone();
+    let dedupe_terminal_id = terminal_id.clone();
+
+    // ... existing `created` literal, unchanged ...
+
+    // Immediately AFTER the literal, before `out.send(&created)`:
     state
         .create_dedupe
-        .settle(&create.request_id, &terminal_id, &created);
+        .settle(&dedupe_request_id, &dedupe_terminal_id, &created);
 ```
+
+   (Two `String` clones at a once-per-successful-create success point —
+   negligible; mirrors Task 6's explicit `request_id` clone in
+   `create_gate.rs`.)
 
 3. Non-restore inline path — TWO cleanup sites, both required because
    `begin` registered the sentinel at the very top of the arm, BEFORE the
