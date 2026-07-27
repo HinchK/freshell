@@ -109,6 +109,12 @@ async fn main() -> ExitCode {
         eprintln!("freshell-server: structured logging disabled: {err}");
     }
 
+    // Boot-time parent chain for the shutdown-forensics comparison (V5:
+    // WSL2 orphans reparent to the Relay subreaper, not pid 1 — the
+    // discriminator is parent-changed-vs-boot, so the boot chain must be
+    // captured now).
+    shutdown_forensics::record_boot_parent_chain();
+
     // Boot-scoped identifiers. `server_instance_id` is shared (Arc::clone) into
     // BOTH the WS handshake (`ready.serverInstanceId`) AND `GET /api/health`
     // (`instanceId`), so the id an Electron discovery candidate records matches
@@ -850,15 +856,35 @@ async fn shutdown_signal(
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
 
-    tokio::select! {
-        _ = ctrl_c => {}
-        _ = terminate => {}
-    }
+    // RCA 2026-07-06 §6.4: SIGHUP is what a dying terminal/session host
+    // sends; without a handler the process dies immediately with no
+    // shutdown log at all.
+    #[cfg(unix)]
+    let hangup = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let hangup = std::future::pending::<()>();
 
-    // Latch BEFORE any teardown step: gated creates consult this around
-    // registry.create (create_gate.rs, Task 6) so a create racing shutdown
-    // never leaves a live PTY.
+    let signal_name: &'static str = tokio::select! {
+        _ = ctrl_c => "SIGINT",
+        _ = terminate => "SIGTERM",
+        _ = hangup => "SIGHUP",
+    };
+
+    // Latch FIRST (Task 7 wired this — keep it before any teardown): gated
+    // creates consult this flag around registry.create.
     shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Forensics FIRST, before any teardown step, so the record survives even
+    // if teardown hangs. Sync + bounded (a handful of tiny /proc reads) —
+    // it cannot meaningfully delay arming the watchdog below.
+    shutdown_forensics::log_shutdown_forensics(signal_name);
 
     // SAFE-11 fail-safe watchdog: arm the hard timeout THE INSTANT the signal
     // arrives (not at process boot — a long-lived server must never carry a

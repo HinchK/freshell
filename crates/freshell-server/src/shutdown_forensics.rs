@@ -98,7 +98,6 @@ fn format_chain(chain: &[ProcessChainEntry]) -> String {
 
 /// Capture the boot-time parent chain for signal-time comparison.
 /// Idempotent; call once from `main` after logging init (Task 9).
-#[allow(dead_code)] // consumed by shutdown_signal in the next commit
 pub fn record_boot_parent_chain() {
     let _ = BOOT_PARENT_CHAIN.get_or_init(|| {
         match collect_parent_chain(Path::new("/proc"), std::process::id() as i64, 10) {
@@ -111,7 +110,6 @@ pub fn record_boot_parent_chain() {
 /// Emit the single structured shutdown-forensics record. Never panics.
 /// MUST stay at INFO or above: the default EnvFilter is `info` (A14/V5),
 /// and the line only lands if `logging::init` succeeded at boot.
-#[allow(dead_code)] // consumed by shutdown_signal in the next commit
 pub fn log_shutdown_forensics(signal: &str) {
     let chain = collect_parent_chain(Path::new("/proc"), std::process::id() as i64, 10);
     let parent_chain = match &chain {
