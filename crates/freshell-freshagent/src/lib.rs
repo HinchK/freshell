@@ -42,6 +42,7 @@ pub mod codex;
 pub mod identity_sink;
 pub mod opencode_ws;
 pub mod pane_ops;
+pub mod session_lease;
 pub mod snapshot;
 pub mod terminal_tabs;
 
