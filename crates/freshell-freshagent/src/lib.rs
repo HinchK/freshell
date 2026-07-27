@@ -305,11 +305,7 @@ impl FreshAgentState {
     /// Wire the server-wide spawn gate (set-once; later calls are no-ops).
     /// `timeout` bounds PERMIT ACQUISITION only, not spawn duration —
     /// identical semantics to the WS door.
-    pub fn set_spawn_gate(
-        &self,
-        gate: Arc<spawn_gate::SpawnGate>,
-        timeout: std::time::Duration,
-    ) {
+    pub fn set_spawn_gate(&self, gate: Arc<spawn_gate::SpawnGate>, timeout: std::time::Duration) {
         let _ = self.spawn_gate.set(RestSpawnGate { gate, timeout });
     }
 
