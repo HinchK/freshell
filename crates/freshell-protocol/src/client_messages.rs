@@ -200,15 +200,27 @@ pub struct TerminalCreate {
     pub request_id: String,
     pub mode: String,
     pub shell: Shell,
+    /// Legacy client repair hint (Codex durability state). Consumed by the
+    /// legacy TS server (`server/ws-handler.ts:351-354`); deliberately ignored
+    /// by the Rust server, superseded by `pane.reconcile` verdicts. Retained
+    /// for frozen-wire compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_durability: Option<CodexDurability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Legacy client repair hint (same-instance live-terminal reattach ref).
+    /// Consumed by the legacy TS server; deliberately ignored by the Rust
+    /// server, superseded by `pane.reconcile` verdicts. Retained for
+    /// frozen-wire compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_terminal: Option<LiveTerminalRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
-    /// const `"fresh_after_restore_unavailable"`.
+    /// const `"fresh_after_restore_unavailable"`. Legacy client repair hint;
+    /// consumed by the legacy TS server; deliberately ignored by the Rust
+    /// server, superseded by `pane.reconcile` verdicts (intent documented at
+    /// `freshell-ws/src/terminal.rs:506-513`). Retained for frozen-wire
+    /// compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_intent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
