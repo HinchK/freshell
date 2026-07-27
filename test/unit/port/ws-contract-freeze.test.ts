@@ -19,12 +19,16 @@ import {
  * cross-check below (and the contract's authority story) must be revisited.
  */
 const ZOD_BACKED_SERVER_MESSAGES = [
+  'amplifier.activity.list.response',
+  'amplifier.activity.updated',
   'claude.activity.list.response',
   'claude.activity.updated',
   'codex.activity.list.response',
   'codex.activity.updated',
   'opencode.activity.list.response',
   'opencode.activity.updated',
+  'pane.reconcile.result',
+  'terminal.idle',
   'terminal.meta.updated',
   'terminal.turn.complete',
 ].sort()

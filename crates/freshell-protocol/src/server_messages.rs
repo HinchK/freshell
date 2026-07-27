@@ -144,7 +144,9 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 53] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 56] = [
+    "amplifier.activity.list.response",
+    "amplifier.activity.updated",
     "claude.activity.list.response",
     "claude.activity.updated",
     "codex.activity.list.response",
@@ -185,6 +187,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 53] = [
     "terminal.created",
     "terminal.detached",
     "terminal.exit",
+    "terminal.idle",
     "terminal.input.blocked",
     "terminal.inventory",
     "terminal.meta.updated",
@@ -200,24 +203,19 @@ pub const SERVER_MESSAGE_TYPES: [&str; 53] = [
     "ui.command",
 ];
 
-/// Extension server→client discriminants declared BEYOND the frozen T0
-/// inventory (`port/contract/ws-message-inventory.json`), which predates the
-/// legacy amplifier provider's activity family (`shared/ws-protocol.ts`
-/// `AmplifierActivity*Schema`) and the NEW `terminal.idle` capability
-/// (TERM-15/TERM-16 follow-on). Kept out of [`SERVER_MESSAGE_TYPES`] so
-/// `tests/inventory.rs` keeps pinning the frozen contract untouched; the
-/// extension shapes are pinned by `tests/activity_extension.rs`.
-pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 4] = [
-    "amplifier.activity.list.response",
-    "amplifier.activity.updated",
-    // P1.8 pane-identity ledger: live per-pane durability warning. NOT the
-    // same family as the frozen `terminal.codex.durability.updated`
-    // (`SERVER_MESSAGE_TYPES`), which is codex-sidecar durability; this frame
-    // is intentionally general pane-durability — the name collision is
-    // nearest-neighbor only, not overlap.
-    "durability.degraded",
-    "terminal.idle",
-];
+/// Extension server→client discriminants declared BEYOND the generated
+/// inventory (`port/contract/ws-message-inventory.json`). Since the
+/// 2026-07-26 reconciliation the only entry is `durability.degraded` — a
+/// Rust-server-only frame (P1.8 pane-identity ledger, emitted by
+/// `crates/freshell-ws/src/pane_ledger.rs`) with no TypeScript
+/// counterpart: the inventory is generated from `shared/ws-protocol.ts`,
+/// so it cannot carry it. NOT the same family as the frozen
+/// `terminal.codex.durability.updated` (codex-sidecar durability); the
+/// name collision is nearest-neighbor only. If the client ever grows a
+/// consumer, add the Zod schema to `shared/ws-protocol.ts`, run
+/// `npm run contract:generate`, and promote this into
+/// [`SERVER_MESSAGE_TYPES`]. Shape pinned by `tests/activity_extension.rs`.
+pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 1] = ["durability.degraded"];
 
 // ---------------------------------------------------------------------------
 // Server-only enums.

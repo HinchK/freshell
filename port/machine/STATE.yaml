@@ -160,6 +160,7 @@ phases:
       - "DONE: closed T0 outbound gap — all 52 server→client messages schematized from the TS
          unions via the TS compiler API (port/contract/ws-server-messages.schema.json); drift-guard
          13/13, mutation-validated; zod-vs-TS cross-check clean on the 8 overlapping messages."
+      - "DONE 2026-07-26: reconciled contract freeze to the live surface — regen 29 c2s / 56 s2c / 66 schemas (v7 unchanged); Rust EXTENSION_* buffer folded into the frozen arrays (85 combined; durability.degraded is the only extension); freeze suite wired as npm run test:port + port-contract CI (regen idempotency enforced)"
       - "DONE: external-process capture harness + first LIVE T0 test — boots the ORIGINAL server
          isolated (ephemeral loopback port, isolated HOME, ownership sentinels), captures the real
          WS handshake, validates every server→client message against the frozen contract (5/5,
