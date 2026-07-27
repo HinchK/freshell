@@ -776,6 +776,17 @@ export type TerminalStatusMessage = {
   attempt?: number
 }
 
+/** Lane D1: server-initiated crash auto-resume replaced a pane's terminal.
+ * The client folds newTerminalId into the pane that owns oldTerminalId. */
+export type TerminalReplacedMessage = {
+  type: 'terminal.replaced'
+  oldTerminalId: string
+  newTerminalId: string
+  exitCode: number
+  attempt: number
+  maxAttempts: number
+}
+
 export type TerminalOutputMessage = {
   type: 'terminal.output'
   terminalId: string
@@ -1083,6 +1094,7 @@ export type ServerMessage =
   | TerminalDetachedMessage
   | TerminalExitMessage
   | TerminalStatusMessage
+  | TerminalReplacedMessage
   | TerminalOutputMessage
   | TerminalOutputBatchMessage
   | TerminalOutputGapMessage

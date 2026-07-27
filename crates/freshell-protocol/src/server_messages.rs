@@ -126,6 +126,8 @@ pub enum ServerMessage {
     TerminalOutputBatch(TerminalOutputBatch),
     #[serde(rename = "terminal.output.gap")]
     TerminalOutputGap(TerminalOutputGap),
+    #[serde(rename = "terminal.replaced")]
+    TerminalReplaced(TerminalReplaced),
     #[serde(rename = "terminal.session.associated")]
     TerminalSessionAssociated(TerminalSessionAssociated),
     #[serde(rename = "terminal.status")]
@@ -144,7 +146,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 56] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 57] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -194,6 +196,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 56] = [
     "terminal.output",
     "terminal.output.batch",
     "terminal.output.gap",
+    "terminal.replaced",
     "terminal.session.associated",
     "terminal.status",
     "terminal.stream.changed",
@@ -1059,6 +1062,16 @@ pub struct TerminalOutputGap {
     pub to_seq: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach_request_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalReplaced {
+    pub old_terminal_id: String,
+    pub new_terminal_id: String,
+    pub exit_code: i64,
+    pub attempt: u32,
+    pub max_attempts: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
