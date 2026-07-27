@@ -336,7 +336,7 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
           ? { mode, cwd: PROJECT_DIR, sessionRef: { provider: 'codex', sessionId } }
           : { mode, cwd: PROJECT_DIR, resumeSessionId: sessionId },
       })
-      expect(res.ok()).toBe(true)
+      expect(res.ok(), `POST /api/tabs ${mode} resume: ${res.status()} ${await res.text()}`).toBe(true)
 
       const row = page.locator(`[data-session-id="${sessionId}"][data-provider="${mode}"]`)
       // Incident-4 contract: the row exists and is GREEN, not grey.
@@ -373,11 +373,33 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
 
     // Panes from case-b/case-c are still open in this serial suite's page state?
     // No -- each test gets a fresh page. Re-establish: open both resume tabs.
-    // NOTE (shared serial server, validated): re-POSTing a resume tab for a
-    // session whose earlier terminal is still alive is NOT rejected
-    // (TerminalRegistry::create spawns unconditionally); it only ERROR-logs
-    // via alarm_if_duplicate_session_ref. That log line is EXPECTED here,
-    // not a failure.
+    // NOTE (#540, ks38): re-POSTing a resume tab for a session whose earlier
+    // terminal is still alive is now 409-REJECTED by the D7 live-session guard
+    // on the REST resume path (one-JSONL-writer doctrine) -- the pre-#540
+    // "spawns unconditionally + ERROR-log" behavior this test originally
+    // leaned on is gone. Kill the earlier cases' live owners first (WS
+    // terminal.kill through the harness socket), then resume cleanly.
+    // Kill EVERY running terminal, not just those whose directory item carries
+    // a sessionRef: a pre-adoption codex terminal hides its resume id from the
+    // REST directory JSON (sessionRef omitted until the B2 locator adopts),
+    // yet the D7 guard's row arm still sees it as the live owner.
+    const liveOwners = async (): Promise<string[]> => {
+      const res = await page.request.get(`${info.baseUrl}/api/terminals`, {
+        headers: { 'x-auth-token': info.token },
+      })
+      expect(res.ok()).toBe(true)
+      const items: Array<{ terminalId: string; status: string }> = await res.json()
+      return items.filter((i) => i.status === 'running').map((i) => i.terminalId)
+    }
+    for (const terminalId of await liveOwners()) {
+      await page.evaluate((tid) => {
+        (window as any).__FRESHELL_TEST_HARNESS__?.sendWsMessage({ type: 'terminal.kill', terminalId: tid })
+      }, terminalId)
+    }
+    await expect(async () => {
+      expect(await liveOwners()).toHaveLength(0)
+    }).toPass({ timeout: 15_000 })
+
     for (const [mode, sessionId] of [
       ['claude', SEEDED_CLAUDE_ID],
       ['codex', SEEDED_CODEX_THREAD_ID],
@@ -394,7 +416,7 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
           ? { mode, cwd: PROJECT_DIR, sessionRef: { provider: 'codex', sessionId } }
           : { mode, cwd: PROJECT_DIR, resumeSessionId: sessionId },
       })
-      expect(res.ok()).toBe(true)
+      expect(res.ok(), `POST /api/tabs ${mode} resume: ${res.status()} ${await res.text()}`).toBe(true)
       await expect(page.locator(`[data-session-id="${sessionId}"][data-provider="${mode}"]`))
         .toHaveAttribute('data-has-tab', 'true', { timeout: 30_000 })
     }
