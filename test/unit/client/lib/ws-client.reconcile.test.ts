@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { WsClient, getWsClient, resetWsClientForTests } from '../../../../src/lib/ws-client'
+import { RECONCILE_VERDICT_WAIT_MS, WsClient, getWsClient, resetWsClientForTests } from '../../../../src/lib/ws-client'
 
 class MockWebSocket {
   static OPEN = 1
@@ -137,15 +137,144 @@ describe('WsClient pane-reconcile capability', () => {
     expect(creates).toHaveLength(1)
   })
 
-  it('flushes the pre-ready create queue even when the capability is acked', async () => {
+  it('holds the pre-ready create queue when the capability is acked; timeout fallback flushes it', async () => {
+    // (was: "flushes the pre-ready create queue even when the capability is acked")
     const c = new WsClient('ws://example/ws')
-    // Queued while offline: this is a NEW user-initiated create, not a replay.
+    // Queued while offline: still a NEW user-initiated create, but under the
+    // sender-level pre-verdict hold it waits for a verdict (or the bound).
     c.send({ type: 'terminal.create', requestId: 'cr-new', mode: 'shell' } as any)
 
     const instance = await connectAndReady(c, { capabilities: { paneReconcileV1: true } })
+    expect(framesOf(instance).filter((f) => f.type === 'terminal.create')).toHaveLength(0)
+
+    vi.advanceTimersByTime(RECONCILE_VERDICT_WAIT_MS + 50)
     const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
     expect(creates).toEqual([
       expect.objectContaining({ type: 'terminal.create', requestId: 'cr-new' }),
     ])
+  })
+
+  describe('sender-level pre-verdict create hold', () => {
+    it('exports RECONCILE_VERDICT_WAIT_MS = 4000 (the ONE definition Tasks 8/9 import)', () => {
+      expect(RECONCILE_VERDICT_WAIT_MS).toBe(4_000)
+    })
+
+    it('holds queued pane creates on ready when paneReconcileV1 is acked (nothing on the wire)', async () => {
+      const c = new WsClient('ws://example/ws')
+      c.send({ type: 'terminal.create', requestId: 'req-t' } as any)
+      c.send({ type: 'freshAgent.create', requestId: 'req-f' } as any)
+
+      const instance = await connectAndReady(c, { capabilities: { paneReconcileV1: true } })
+      expect(framesOf(instance).filter((f) => f.type === 'terminal.create')).toHaveLength(0)
+      expect(framesOf(instance).filter((f) => f.type === 'freshAgent.create')).toHaveLength(0)
+    })
+
+    it('setReconcilePendingCreates releases creates OUTSIDE the pending set immediately', async () => {
+      const c = new WsClient('ws://example/ws')
+      c.send({ type: 'terminal.create', requestId: 'req-a' } as any)
+      c.send({ type: 'terminal.create', requestId: 'req-b' } as any)
+
+      const instance = await connectAndReady(c, { capabilities: { paneReconcileV1: true } })
+      c.setReconcilePendingCreates(['req-a'])
+
+      const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
+      expect(creates).toEqual([
+        expect.objectContaining({ type: 'terminal.create', requestId: 'req-b' }),
+      ])
+    })
+
+    it('after setReconcilePendingCreates, new creates outside the set send immediately; ones inside are held', async () => {
+      const c = new WsClient('ws://example/ws')
+      const instance = await connectAndReady(c, { capabilities: { paneReconcileV1: true } })
+      c.setReconcilePendingCreates(['req-pending'])
+
+      c.send({ type: 'terminal.create', requestId: 'req-pending' } as any)
+      c.send({ type: 'terminal.create', requestId: 'req-other' } as any)
+
+      const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
+      expect(creates).toEqual([
+        expect.objectContaining({ type: 'terminal.create', requestId: 'req-other' }),
+      ])
+    })
+
+    it('cancelCreate retracts a held create (attach-fold path) — it never reaches the wire', async () => {
+      const c = new WsClient('ws://example/ws')
+      c.send({ type: 'terminal.create', requestId: 'req-a' } as any)
+      c.send({ type: 'terminal.create', requestId: 'req-b' } as any)
+
+      const instance = await connectAndReady(c, { capabilities: { paneReconcileV1: true } })
+      c.cancelCreate('req-a')
+      c.clearReconcileCreateHold()
+
+      const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
+      expect(creates.filter((f) => f.requestId === 'req-a')).toHaveLength(0)
+      // Still-held creates flush on clearReconcileCreateHold (cardinality-gap fallback).
+      expect(creates).toEqual([
+        expect.objectContaining({ type: 'terminal.create', requestId: 'req-b' }),
+      ])
+    })
+
+    it('flushes remaining held creates after RECONCILE_VERDICT_WAIT_MS (legacy fallback)', async () => {
+      const c = new WsClient('ws://example/ws')
+      const instance = await connectAndReady(c, { capabilities: { paneReconcileV1: true } })
+
+      // Mount effect committing after ready: held while the hold is active.
+      c.send({ type: 'terminal.create', requestId: 'req-a' } as any)
+      expect(framesOf(instance).filter((f) => f.type === 'terminal.create')).toHaveLength(0)
+
+      vi.advanceTimersByTime(RECONCILE_VERDICT_WAIT_MS + 50)
+      const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
+      expect(creates).toEqual([
+        expect.objectContaining({ type: 'terminal.create', requestId: 'req-a' }),
+      ])
+    })
+
+    it('without paneReconcileV1 the pre-ready flush is byte-identical (regression)', async () => {
+      const c = new WsClient('ws://example/ws')
+      c.send({ type: 'terminal.create', requestId: 'req-a' } as any)
+
+      const instance = await connectAndReady(c, { /* no capabilities */ })
+      const creates = framesOf(instance).filter((f) => f.type === 'terminal.create')
+      expect(creates).toEqual([
+        expect.objectContaining({ type: 'terminal.create', requestId: 'req-a' }),
+      ])
+    })
+
+    it('disconnect mid-hold re-queues held creates for the next connection (sent exactly once, same requestId)', async () => {
+      const c = new WsClient('ws://example/ws')
+      c.send({ type: 'terminal.create', requestId: 'req-a' } as any)
+
+      await connectAndReady(c, { capabilities: { paneReconcileV1: true } })
+      // Held, never on the wire; connection drops mid-hold.
+      MockWebSocket.instances[MockWebSocket.instances.length - 1]._close(1006, 'drop-mid-hold')
+
+      // Downgraded server: no capability, the create flushes via the normal
+      // preReadyCreateQueue path — exactly once, never a duplicate.
+      const reconnectInstance = await connectAndReady(c, { /* no capabilities */ })
+      const creates = framesOf(reconnectInstance).filter((f) => f.type === 'terminal.create')
+      expect(creates).toEqual([
+        expect.objectContaining({ type: 'terminal.create', requestId: 'req-a' }),
+      ])
+    })
+  })
+
+  it('hello opts into paneReconcileFreshAgentV1', async () => {
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    expect(MockWebSocket.instances).toHaveLength(1)
+    MockWebSocket.instances[0]._open()
+
+    const sentMessages = framesOf(MockWebSocket.instances[0])
+    const hello = sentMessages.find((m) => m.type === 'hello') as { capabilities?: Record<string, unknown> }
+    expect(hello?.capabilities?.paneReconcileFreshAgentV1).toBe(true)
+
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p
+  })
+
+  it('getServerCapabilities exposes paneReconcileFreshAgentV1 from ready', async () => {
+    const client = getWsClient()
+    await connectAndReady(client, { capabilities: { paneReconcileV1: true, paneReconcileFreshAgentV1: true } })
+    expect(client.getServerCapabilities().paneReconcileFreshAgentV1).toBe(true)
   })
 })

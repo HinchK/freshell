@@ -24,6 +24,7 @@ import type { PanesState } from '@/store/panesSlice'
 import type { TerminalPaneContent, PaneNode } from '@/store/paneTypes'
 import type { AppDispatch, RootState } from '@/store/store'
 import type { PaneVerdict, PaneReconcileRequest, PaneReconcileResultMessage } from '@shared/ws-protocol'
+import { ReconcilePaneSchema, ReadyCapabilitiesSchema } from '@shared/ws-protocol'
 import {
   buildReconcileRequest,
   buildReconcileRequestForPanes,
@@ -341,5 +342,26 @@ describe('setPaneRestoreError reducer', () => {
     expect(leaf?.restoreError).toEqual({ code: 'RESTORE_UNAVAILABLE', reason: 'durable_artifact_missing' })
     expect(leaf?.terminalId).toBe('t-1')
     expect(leaf?.createRequestId).toBe('cr-p1')
+  })
+})
+
+describe('schema tests for reconcile v1 widening', () => {
+  it('ReconcilePaneSchema accepts kind fresh-agent', () => {
+    const parsed = ReconcilePaneSchema.safeParse({
+      paneKey: 't1:p1', kind: 'fresh-agent', mode: 'claude', createRequestId: 'req-1',
+      sessionRef: { provider: 'claude', sessionId: '11111111-1111-4111-8111-111111111111' },
+    })
+    expect(parsed.success).toBe(true)
+  })
+
+  it('ReadyCapabilitiesSchema preserves paneReconcileFreshAgentV1 through parsing', () => {
+    const parsed = ReadyCapabilitiesSchema.safeParse({ paneReconcileV1: true, paneReconcileFreshAgentV1: true })
+    expect(parsed.success).toBe(true)
+    // Load-bearing assertion: Zod non-strict objects STRIP unknown keys — they do
+    // NOT reject (see the comment at shared/ws-protocol.ts:274-276). So
+    // `.success` is true even on base and proves nothing. App consumes the
+    // Zod-PARSED ready.data.capabilities (src/App.tsx:1022); if the key is
+    // stripped, the feature silently never activates. Assert the key SURVIVES:
+    expect(parsed.success ? parsed.data?.paneReconcileFreshAgentV1 : undefined).toBe(true)
   })
 })

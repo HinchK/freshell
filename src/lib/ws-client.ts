@@ -70,6 +70,14 @@ type InFlightCreate = {
 }
 
 const CONNECTION_TIMEOUT_MS = 10_000
+
+// Bounded pre-verdict create hold: when the server acks paneReconcileV1, pane
+// creates are held until their pane's reconcile verdict folds — or this
+// wall-clock bound elapses and every still-held create flushes (legacy-eager
+// fallback; never a silent wedge). Must exceed the server's single 2s warming
+// deferral plus round-trip margin. The ONE definition — view layers import it.
+export const RECONCILE_VERDICT_WAIT_MS = 4_000
+
 const perfConfig = getClientPerfConfig()
 
 function isTerminalInputMessage(msg: unknown): msg is TerminalInputClientMessage {
@@ -127,6 +135,15 @@ export class WsClient {
   private reconnectEpoch = 0
   private inFlightCreates = new Map<string, InFlightCreate>()
   private preReadyCreateQueue = new Map<string, unknown>()
+  // Sender-level pre-verdict create hold (only when paneReconcileV1 is acked):
+  // pane creates wait here until their pane's verdict folds (cancelCreate
+  // retracts, or the view re-sends with fold-corrected fields), the boot
+  // reconcile request narrows the set, clearReconcileCreateHold() flushes, or
+  // the RECONCILE_VERDICT_WAIT_MS bound elapses. Bounded — never a silent wedge.
+  private heldCreates = new Map<string, unknown>()
+  private reconcileHoldActive = false
+  private reconcileHoldPendingSet: Set<string> | null = null
+  private reconcileHoldTimer: number | null = null
   // Per-connection: {} until a ready with capabilities arrives on the CURRENT
   // socket; reset on disconnect so a downgraded server is honored.
   private serverCapabilities: NonNullable<ReadyCapabilities> = {}
@@ -136,16 +153,79 @@ export class WsClient {
   private clearTrackedCreate(requestId: string): void {
     this.inFlightCreates.delete(requestId)
     this.preReadyCreateQueue.delete(requestId)
+    this.heldCreates.delete(requestId)
   }
 
   private clearQueuedMessagesAfterProtocolMismatch(): void {
     this.pendingMessages = []
     this.inFlightCreates.clear()
     this.preReadyCreateQueue.clear()
+    this.resetReconcileHold({ requeueHeld: false })
   }
 
   cancelCreate(requestId: string): void {
     this.clearTrackedCreate(requestId)
+  }
+
+  /**
+   * Narrow the pre-verdict hold to exactly the createRequestIds named in the
+   * boot reconcile request. Held creates NOT in the set have no verdict coming
+   * — they are released (sent) immediately, same requestId (never re-minted).
+   */
+  setReconcilePendingCreates(requestIds: string[]): void {
+    if (!this.reconcileHoldActive) return
+    const pendingSet = new Set(requestIds)
+    this.reconcileHoldPendingSet = pendingSet
+    for (const [requestId, msg] of this.heldCreates.entries()) {
+      if (pendingSet.has(requestId)) continue
+      this.heldCreates.delete(requestId)
+      if (!this.inFlightCreates.has(requestId)) continue
+      this.sendNow(msg)
+    }
+  }
+
+  /**
+   * End the pre-verdict hold: flush any still-held creates (legacy-eager
+   * fallback for cardinality gaps and the timeout path) and cancel the timer.
+   * Idempotent; safe to call when no hold is active.
+   */
+  clearReconcileCreateHold(): void {
+    if (this.reconcileHoldTimer !== null) {
+      window.clearTimeout(this.reconcileHoldTimer)
+      this.reconcileHoldTimer = null
+    }
+    const held = this.heldCreates
+    this.heldCreates = new Map()
+    this.reconcileHoldActive = false
+    this.reconcileHoldPendingSet = null
+    for (const [requestId, msg] of held.entries()) {
+      if (!this.inFlightCreates.has(requestId)) continue
+      if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
+        this.sendNow(msg)
+      } else {
+        // Socket gone mid-flush: re-enter the normal pre-ready path so the
+        // create is delivered exactly once on the next connection.
+        this.preReadyCreateQueue.set(requestId, msg)
+      }
+    }
+  }
+
+  private resetReconcileHold(opts: { requeueHeld: boolean }): void {
+    if (this.reconcileHoldTimer !== null) {
+      window.clearTimeout(this.reconcileHoldTimer)
+      this.reconcileHoldTimer = null
+    }
+    if (opts.requeueHeld) {
+      // Connection dropped mid-hold: held creates were never on the wire —
+      // re-enter via the normal preReadyCreateQueue path on the next connection.
+      for (const [requestId, msg] of this.heldCreates.entries()) {
+        if (!this.inFlightCreates.has(requestId)) continue
+        this.preReadyCreateQueue.set(requestId, msg)
+      }
+    }
+    this.heldCreates.clear()
+    this.reconcileHoldActive = false
+    this.reconcileHoldPendingSet = null
   }
 
   private handleIncomingMessage(msg: ServerMessage): void {
@@ -180,11 +260,34 @@ export class WsClient {
         }
       }
 
+      const reconcileHold = this.serverCapabilities.paneReconcileV1 === true
       const createRequestIdsFlushed = new Set<string>()
-      for (const [requestId, createMsg] of this.preReadyCreateQueue.entries()) {
-        if (!this.inFlightCreates.has(requestId)) continue
-        this.sendNow(createMsg)
-        createRequestIdsFlushed.add(requestId)
+      if (reconcileHold) {
+        // Sender-level pre-verdict hold (the authoritative gate): queued pane
+        // creates move to heldCreates instead of the wire. They flush when a
+        // verdict folds (via cancelCreate retraction / view re-send), when
+        // setReconcilePendingCreates narrows the set, when
+        // clearReconcileCreateHold() fires, or at the wall-clock bound below.
+        this.reconcileHoldActive = true
+        this.reconcileHoldPendingSet = null
+        for (const [requestId, createMsg] of this.preReadyCreateQueue.entries()) {
+          if (!this.inFlightCreates.has(requestId)) continue
+          this.heldCreates.set(requestId, createMsg)
+        }
+        if (this.reconcileHoldTimer !== null) {
+          window.clearTimeout(this.reconcileHoldTimer)
+        }
+        this.reconcileHoldTimer = window.setTimeout(() => {
+          this.reconcileHoldTimer = null
+          // Bounded wait: degrade to today's eager behavior, never a silent wedge.
+          this.clearReconcileCreateHold()
+        }, RECONCILE_VERDICT_WAIT_MS)
+      } else {
+        for (const [requestId, createMsg] of this.preReadyCreateQueue.entries()) {
+          if (!this.inFlightCreates.has(requestId)) continue
+          this.sendNow(createMsg)
+          createRequestIdsFlushed.add(requestId)
+        }
       }
       this.preReadyCreateQueue.clear()
 
@@ -199,8 +302,10 @@ export class WsClient {
       }
 
       // When paneReconcileV1 was acked on THIS socket's ready, verdicts (not blind
-      // resends) decide the fate of in-flight creates. The preReadyCreateQueue
-      // flush above is unchanged: those are new user-initiated creates.
+      // resends) decide the fate of in-flight creates — and the preReadyCreateQueue
+      // creates above were moved into the pre-verdict hold rather than flushed:
+      // mount-time creates are queued/flushed before any App/Redux handler runs,
+      // so this sender-level hold is the only gate that closes the reload race.
       if (isReconnect && !this.serverCapabilities.paneReconcileV1) {
         for (const [requestId, entry] of this.inFlightCreates.entries()) {
           if (entry.lastResendEpoch === this.reconnectEpoch) continue
@@ -357,7 +462,7 @@ export class WsClient {
           type: 'hello',
           token,
           protocolVersion: WS_PROTOCOL_VERSION,
-          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, paneReconcileV1: true },
+          capabilities: { uiScreenshotV1: true, terminalOutputBatchV1: true, paneReconcileV1: true, paneReconcileFreshAgentV1: true },
           ...helloExtensions,
         })
       }
@@ -401,6 +506,9 @@ export class WsClient {
         // Capabilities are per-connection: reset so a downgraded server (next
         // ready without the ack) is honored.
         this.serverCapabilities = {}
+        // Hold state is per-connection too: held creates were never on the
+        // wire, so re-queue them for the next connection's pre-ready path.
+        this.resetReconcileHold({ requeueHeld: true })
         this.disconnectHandlers.forEach((handler) => handler())
 
         // Close codes:
@@ -535,6 +643,7 @@ export class WsClient {
     this.pendingMessages = []
     this.inFlightCreates.clear()
     this.preReadyCreateQueue.clear()
+    this.resetReconcileHold({ requeueHeld: false })
     this.serverCapabilities = {}
     this._serverInstanceId = undefined
     this.connectPromise = null
@@ -576,6 +685,17 @@ export class WsClient {
     }
 
     if (this._state === 'ready' && this.ws?.readyState === WebSocket.OPEN) {
+      // Pre-verdict hold: mount effects that commit after ready still race the
+      // reconcile verdicts. Before setReconcilePendingCreates arrives, hold ALL
+      // creates; after, hold only requestIds the boot reconcile request named.
+      if (
+        this.reconcileHoldActive
+        && isCreateMessage(msg)
+        && (this.reconcileHoldPendingSet === null || this.reconcileHoldPendingSet.has(msg.requestId))
+      ) {
+        this.heldCreates.set(msg.requestId, msg)
+        return
+      }
       this.sendNow(msg)
       return
     }

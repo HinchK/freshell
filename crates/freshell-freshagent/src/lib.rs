@@ -42,6 +42,7 @@ pub mod codex;
 pub mod identity_sink;
 pub mod opencode_ws;
 pub mod pane_ops;
+pub mod session_lease;
 pub mod snapshot;
 pub mod terminal_tabs;
 
@@ -53,6 +54,13 @@ pub use identity_sink::{
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use snapshot::SnapshotState;
+
+/// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
+/// true when a live terminal PTY currently owns that session. Constructed by
+/// `freshell-server`'s `main.rs` over the SAME probes the terminal D7 create-rung guard
+/// uses (identity owner + registry row), so this crate never imports `freshell-ws`.
+/// Defaults to "always false" (behavior-preserving for constructors that don't wire it).
+pub type TerminalLivenessProbe = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -1855,6 +1863,94 @@ pub enum FreshAgentCreateOutcome<T> {
 /// the lock so a queued duplicate (or a fresh retry) can proceed.
 pub struct FreshAgentCreateGuard {
     _permit: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// RAII holder for a claimed fresh-agent session lease (Task 12, mirror of
+/// `SessionRefLeaseGuard` in `freshell-ws/src/terminal.rs`). `Drop` calls `fail()` ONLY
+/// while armed AND no kill handle was recorded: once a live child exists (kill handle
+/// set), a panic between `set_kill_handle` and `complete` must never release un-killed —
+/// the lease stays held (TTL + tree-kill is the recovery path).
+pub struct FreshSessionLeaseGuard {
+    leases: Arc<session_lease::FreshAgentSessionLeases>,
+    provider: &'static str,
+    session_id: String,
+    request_id: String,
+    armed: bool,
+    kill_handle_set: bool,
+}
+
+impl FreshSessionLeaseGuard {
+    /// Wrap a just-acquired claim ([`session_lease::FreshSessionClaim::Acquired`]).
+    pub fn armed(
+        leases: Arc<session_lease::FreshAgentSessionLeases>,
+        provider: &'static str,
+        session_id: &str,
+        request_id: &str,
+    ) -> Self {
+        Self {
+            leases,
+            provider,
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            armed: true,
+            kill_handle_set: false,
+        }
+    }
+
+    /// Record the spawned sidecar's pid + ownership tag on the lease (arms the
+    /// TTL tree-kill path).
+    pub fn set_kill_handle(&mut self, pid: u32, ownership_id: &str) {
+        self.leases.set_kill_handle(
+            self.provider,
+            &self.session_id,
+            &self.request_id,
+            pid,
+            ownership_id,
+        );
+        self.kill_handle_set = true;
+    }
+
+    /// Winner registered its session: bind + release in one lock scope. Returns `false`
+    /// when the lease was revoked/foreign — the caller must tear down its own child and
+    /// then call [`Self::fail`] (the guard stays armed).
+    pub fn complete(&mut self, live_session_key: &str) -> bool {
+        let ok = self.leases.complete(
+            self.provider,
+            &self.session_id,
+            &self.request_id,
+            live_session_key,
+        );
+        if ok {
+            self.armed = false;
+        }
+        ok
+    }
+
+    /// Spawn/resume failed AND the caller's own tree is (being) torn down: release.
+    pub fn fail(&mut self) {
+        if self.armed {
+            self.leases
+                .fail(self.provider, &self.session_id, &self.request_id);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for FreshSessionLeaseGuard {
+    fn drop(&mut self) {
+        if self.armed && !self.kill_handle_set {
+            self.leases
+                .fail(self.provider, &self.session_id, &self.request_id);
+        } else if self.armed {
+            // A live child may exist (kill handle set) — never blanket-release; the
+            // TTL + tree-kill path recovers this lease.
+            tracing::warn!(
+                provider = self.provider,
+                session_id = %self.session_id,
+                "fresh_agent_lease_guard_dropped_armed_with_kill_handle: holding for TTL recovery"
+            );
+        }
+    }
 }
 
 impl<T: Clone + Send + 'static> Default for FreshAgentCreateDedup<T> {

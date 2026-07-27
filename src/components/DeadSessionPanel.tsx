@@ -2,6 +2,7 @@ import { createPortal } from 'react-dom'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import {
   clearDeadSessionAdjudication,
+  resetFreshAgentPaneForReconcileCreate,
   resetPaneForReconcileCreate,
   resolveDeadSessionEntry,
 } from '@/store/panesSlice'
@@ -25,9 +26,15 @@ export function DeadSessionPanel() {
   if (entries.length === 0) return null
 
   const handleStartFresh = (entry: DeadSessionEntry) => {
-    // I7: same createRequestId — the reducer preserves it; only intent
-    // resets to a fresh, identity-less create.
-    dispatch(resetPaneForReconcileCreate({ tabId: entry.tabId, paneId: entry.paneId, intent: 'fresh' }))
+    // I7: same createRequestId — both reducers preserve it; only intent
+    // resets to a fresh, identity-less create. The reducer must match the
+    // pane kind: the terminal reducer no-ops on fresh-agent content (and
+    // vice versa), which would silently wedge the row.
+    if (entry.kind === 'fresh-agent') {
+      dispatch(resetFreshAgentPaneForReconcileCreate({ tabId: entry.tabId, paneId: entry.paneId, intent: 'fresh' }))
+    } else {
+      dispatch(resetPaneForReconcileCreate({ tabId: entry.tabId, paneId: entry.paneId, intent: 'fresh' }))
+    }
     dispatch(resolveDeadSessionEntry({ tabId: entry.tabId, paneId: entry.paneId }))
   }
 

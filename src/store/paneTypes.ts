@@ -200,6 +200,12 @@ export type FreshAgentPaneContent = {
   showTimecodes?: boolean
   /** Persisted optimistic user turn that has not yet appeared in a durable provider snapshot. */
   pendingLocalEcho?: FreshAgentPendingLocalEcho
+  /** One-shot user-visible reconcile notice; rendered + cleared by FreshAgentView. VOLATILE. */
+  reconcileNotice?: string
+  /** Set by verdict folds; consumed when freshAgent.created lands. VOLATILE. */
+  pendingReconcile?: 'respawn' | 'fresh'
+  /** VOLATILE fold counter — re-fires FreshAgentView's create effect on same-createRequestId folds. */
+  reconcileEpoch?: number
 }
 
 /**
@@ -282,6 +288,8 @@ export type DeadSessionEntry = {
   paneId: string
   title: string
   mode: string
+  /** Absent = terminal (backwards compatible). */
+  kind?: 'terminal' | 'fresh-agent'
   sessionRef?: { provider: string; sessionId: string }
   reason?: string
 }
@@ -351,6 +359,9 @@ export interface PanesState {
    * Ephemeral UI state — must never be persisted.
    */
   reconcileWarming?: ReconcileWarmingState | null
+  /** Ephemeral: paneKey -> wall-clock ms when a reconcile request naming this pane went out.
+   *  While present (and young), the pane's mount drive defers its create until the verdict folds. */
+  reconcilePendingPanes?: Record<string, number>
 }
 
 /**

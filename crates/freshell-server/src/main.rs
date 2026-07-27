@@ -208,7 +208,7 @@ async fn main() -> ExitCode {
     // The freshcodex WS fresh-agent slice: shares the auth token + the broadcast bus so its
     // freshAgent.created/send.accepted/event frames reach every WS client (incl. the oracle's
     // capture socket). Seeded with the settings tree so `PATCH /api/settings` returns/merges it.
-    let fresh_codex_state = freshell_freshagent::FreshCodexState::new(
+    let mut fresh_codex_state = freshell_freshagent::FreshCodexState::new(
         Arc::clone(&auth_token),
         Arc::clone(&broadcast_tx),
         serde_json::to_value(settings.as_ref()).unwrap_or_else(|_| serde_json::json!({})),
@@ -218,7 +218,15 @@ async fn main() -> ExitCode {
     // freshAgent.created/send.accepted/event frames reach every WS client (incl. the
     // oracle's capture socket). It drives the ONE sanctioned Node claude sidecar; the
     // create gate is the SHARED settings.freshAgent.enabled flag (owned by fresh_codex).
-    let fresh_claude_state = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+    let mut fresh_claude_state =
+        freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+
+    // Task 12 (D8 for fresh agents): the ONE server-wide per-sessionRef create/resume
+    // lease map, shared by every fresh-agent runtime (keys are provider-namespaced).
+    let fresh_agent_leases =
+        Arc::new(freshell_freshagent::session_lease::FreshAgentSessionLeases::new());
+    fresh_codex_state.set_session_leases(Arc::clone(&fresh_agent_leases));
+    fresh_claude_state.set_session_leases(Arc::clone(&fresh_agent_leases));
 
     // SESSION-09 fix-forward: mint the shared `sessions.changed` revision
     // counter BEFORE `fresh_agent_state` so it can be wired into both
@@ -238,8 +246,9 @@ async fn main() -> ExitCode {
             .with_shared_sessions_revision(Arc::clone(&sessions_revision));
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
-    let fresh_opencode_state =
+    let mut fresh_opencode_state =
         freshell_freshagent::FreshOpencodeState::new(fresh_agent_state.clone());
+    fresh_opencode_state.set_session_leases(Arc::clone(&fresh_agent_leases));
 
     // The shared, connection-independent terminal registry: terminals are owned by
     // `terminalId` here (not by the socket that created them), so a second/reconnected
@@ -272,6 +281,36 @@ async fn main() -> ExitCode {
     // REST rename cascades (`terminals_state`/`sessions::SessionsState`) and the
     // session-directory live-terminal join (`session_directory_state`).
     let terminal_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    // Task 13b (cross-kind liveness): the terminal-liveness probe the fresh-agent
+    // runtimes consult before any create/attach resume -- the SAME join the terminal
+    // D7 create-rung guard performs (identity owner + Running registry row). Built
+    // here as a closure so `freshell-freshagent` never imports `freshell-ws`.
+    let terminal_liveness: freshell_freshagent::TerminalLivenessProbe = {
+        let identity = terminal_identity.clone();
+        let registry = registry.clone();
+        std::sync::Arc::new(move |provider: &str, session_id: &str| {
+            let identity_owner_live =
+                identity
+                    .find_by_session(provider, session_id)
+                    .is_some_and(|owner| {
+                        registry.probe(&owner.terminal_id).is_some_and(|r| {
+                            r.status == freshell_protocol::TerminalRunStatus::Running
+                        })
+                    });
+            identity_owner_live
+                || registry.directory().into_iter().any(|entry| {
+                    entry.mode == provider
+                        && entry.resume_session_id.as_deref() == Some(session_id)
+                        && entry.status == freshell_protocol::TerminalRunStatus::Running
+                })
+        })
+    };
+    fresh_claude_state.set_terminal_liveness(std::sync::Arc::clone(&terminal_liveness));
+    fresh_codex_state.set_terminal_liveness(std::sync::Arc::clone(&terminal_liveness));
+    fresh_opencode_state.set_terminal_liveness(terminal_liveness);
+    let fresh_claude_state = fresh_claude_state;
+    let fresh_codex_state = fresh_codex_state;
+    let fresh_opencode_state = fresh_opencode_state;
     // The shared in-memory tabs registry — cloned into both the WS handler
     // (`tabs.sync.*`) and the boot REST surface (`/api/tabs-sync/client-retire`),
     // so the unload beacon and the socket path retire against ONE cross-device view.

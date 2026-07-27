@@ -113,6 +113,9 @@ vi.mock('@/lib/ws-client', () => ({
     onReconnect: wsMocks.onReconnect,
     onDisconnect: wsMocks.onDisconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
+    cancelCreate: vi.fn(),
+    setReconcilePendingCreates: vi.fn(),
+    clearReconcileCreateHold: vi.fn(),
     get isReady() {
       return wsMocks.isReady
     },
