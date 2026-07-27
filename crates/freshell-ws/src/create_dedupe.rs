@@ -22,9 +22,17 @@
 //! Eviction semantics:
 //! - failed create -> the wrapper calls `clear_if_in_flight` (legacy
 //!   sentinel cleanup, ws-handler.ts:2460), which also notifies waiters
-//! - killed/exited terminal -> lazily evicted at lookup time via the
-//!   `is_live` probe (legacy deletes eagerly on kill,
-//!   ws-handler.ts:2286/:2372)
+//! - settled entries are retained for replay for exactly as long as their
+//!   terminal is running (legacy parity with the Node server's
+//!   delete-at-exit requestId pruning: `createdTerminalByRequestId` is
+//!   pruned eagerly at terminal exit, ws-handler.ts:580-587, and lazily
+//!   on registry miss, :914-921). Eviction is lazy -- `settle()` prunes
+//!   all dead entries on access and `begin()` displaces per-id via the
+//!   `is_running` probe -- with no background task. Within a terminal's
+//!   running lifetime a duplicate replays the original `terminal.created`
+//!   and never spawns a second terminal; after the terminal stops running
+//!   a re-sent requestId is indistinguishable from a fresh create and
+//!   spawns a new terminal, exactly as legacy behaves after terminal exit.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,7 +42,7 @@ use freshell_terminal::FrameSink;
 
 // A `terminal.created` frame (~440 bytes) rides inline in both enums below.
 // These are transient, once-per-create values (never bulk-stored beyond the
-// small settled cache), so boxing would add indirection for no measurable
+// liveness-bounded settled cache), so boxing would add indirection for no measurable
 // win — and `DuplicateSettled(ServerMessage)` is the task's specified
 // interface shape.
 #[allow(clippy::large_enum_variant)]
@@ -102,7 +110,7 @@ impl CreateDedupe {
         &self,
         request_id: &str,
         sink: &FrameSink,
-        is_live: impl Fn(&str) -> bool,
+        is_running: impl Fn(&str) -> bool,
     ) -> DedupeDecision {
         let mut map = self.entries.lock().expect("create_dedupe lock");
         match map.get_mut(request_id) {
@@ -118,10 +126,11 @@ impl CreateDedupe {
                 terminal_id,
                 created,
             }) => {
-                if is_live(terminal_id) {
+                if is_running(terminal_id) {
                     DedupeDecision::DuplicateSettled(created.clone())
                 } else {
-                    // Terminal was killed/exited: evict and treat as fresh.
+                    // Terminal exited or killed: evict and treat as fresh
+                    // (legacy delete-at-exit parity).
                     let origin = Arc::clone(sink);
                     map.insert(
                         request_id.to_string(),
@@ -150,25 +159,47 @@ impl CreateDedupe {
     /// sends the `terminal.created` frame) and forward the frame to every
     /// registered waiter (non-blocking `FrameSink` call; a waiter whose
     /// connection died simply drops the frame).
-    pub fn settle(&self, request_id: &str, terminal_id: &str, created: &ServerMessage) {
-        let prev = self.entries.lock().expect("create_dedupe lock").insert(
-            request_id.to_string(),
-            Entry::Settled {
-                terminal_id: terminal_id.to_string(),
-                created: created.clone(),
-            },
-        );
-        if let Some(Entry::InFlight { waiters, .. }) = prev {
-            for w in waiters {
-                w(created.clone());
+    /// Also prunes settled entries whose terminal is no longer running
+    /// (prune-on-access; no background task).
+    pub fn settle(
+        &self,
+        request_id: &str,
+        terminal_id: &str,
+        created: &ServerMessage,
+        is_running: impl Fn(&str) -> bool,
+    ) {
+        let waiters = {
+            let mut map = self.entries.lock().expect("create_dedupe lock");
+            let prev = map.insert(
+                request_id.to_string(),
+                Entry::Settled {
+                    terminal_id: terminal_id.to_string(),
+                    created: created.clone(),
+                },
+            );
+            // Prune-on-access (house pattern; no background task): a settled
+            // entry lives exactly as long as its terminal is running -- the
+            // legacy liveness-anchored model. Entries for exited or killed
+            // terminals are swept on every successful create's settle.
+            map.retain(|_, e| match e {
+                Entry::InFlight { .. } => true,
+                Entry::Settled { terminal_id, .. } => is_running(terminal_id),
+            });
+            match prev {
+                Some(Entry::InFlight { waiters, .. }) => waiters,
+                _ => Vec::new(),
             }
+        };
+        for w in waiters {
+            w(created.clone());
         }
     }
 
     /// Drop the InFlight sentinel if (and only if) the create did NOT
     /// settle — gate rejection, cancellation, shutdown abandon, or
     /// handle_create failure — and forward a fail-loud error to any
-    /// registered waiters. Settled entries stay: that IS the dedupe.
+    /// registered waiters. Settled entries stay while their terminal runs:
+    /// that IS the dedupe (legacy parity).
     /// This is what lets the client's 2s RATE_LIMITED retry (same
     /// requestId) proceed as a fresh create.
     pub fn clear_if_in_flight(&self, request_id: &str) {
@@ -216,6 +247,50 @@ mod tests {
     }
 
     #[test]
+    fn settle_prunes_entries_for_non_running_terminals() {
+        let d = CreateDedupe::default();
+        let (s, _f) = recording_sink();
+        let _ = d.begin("r1", &s, |_| true);
+        d.settle("r1", "t1", &created_frame(), |_| true);
+        // t1's terminal has since exited: the next successful create's
+        // settle sweeps its entry out (prune-on-access; legacy parity with
+        // ws-handler's eager delete-at-exit).
+        let _ = d.begin("r2", &s, |_| true);
+        d.settle("r2", "t2", &created_frame(), |tid| tid != "t1");
+        let map = d.entries.lock().expect("lock");
+        assert_eq!(
+            map.len(),
+            1,
+            "entry for the exited terminal must be physically evicted on the next settle"
+        );
+        assert!(map.contains_key("r2"));
+    }
+
+    #[test]
+    fn prune_keeps_running_and_in_flight_entries() {
+        let d = CreateDedupe::default();
+        let (s, _f) = recording_sink();
+        let _ = d.begin("r1", &s, |_| true);
+        d.settle("r1", "t1", &created_frame(), |_| true);
+        let _ = d.begin("r2", &s, |_| true); // still in flight
+        let _ = d.begin("r3", &s, |_| true);
+        d.settle("r3", "t3", &created_frame(), |_| true); // prune runs; all running
+        {
+            let map = d.entries.lock().expect("lock");
+            assert_eq!(
+                map.len(),
+                3,
+                "running settled entries and in-flight sentinels survive the prune"
+            );
+        }
+        // r1 still replays after the prune.
+        assert!(matches!(
+            d.begin("r1", &s, |_| true),
+            DedupeDecision::DuplicateSettled(_)
+        ));
+    }
+
+    #[test]
     fn first_begin_proceeds_and_registers_sentinel() {
         let d = CreateDedupe::default();
         let (s1, _f1) = recording_sink();
@@ -234,7 +309,7 @@ mod tests {
         let d = CreateDedupe::default();
         let (s1, _f1) = recording_sink();
         let _ = d.begin("r1", &s1, |_| true);
-        d.settle("r1", "t1", &created_frame());
+        d.settle("r1", "t1", &created_frame(), |_| true);
         assert!(matches!(
             d.begin("r1", &s1, |_| true),
             DedupeDecision::DuplicateSettled(_)
@@ -246,7 +321,7 @@ mod tests {
         let d = CreateDedupe::default();
         let (s1, _f1) = recording_sink();
         let _ = d.begin("r1", &s1, |_| true);
-        d.settle("r1", "t1", &created_frame());
+        d.settle("r1", "t1", &created_frame(), |_| true);
         assert!(matches!(
             d.begin("r1", &s1, |_| false),
             DedupeDecision::Proceed
@@ -263,7 +338,7 @@ mod tests {
             d.begin("r1", &s1, |_| true),
             DedupeDecision::Proceed
         ));
-        d.settle("r1", "t1", &created_frame());
+        d.settle("r1", "t1", &created_frame(), |_| true);
         d.clear_if_in_flight("r1");
         assert!(matches!(
             d.begin("r1", &s1, |_| true),
@@ -281,7 +356,7 @@ mod tests {
             d.begin("r1", &other, |_| true),
             DedupeDecision::DuplicateInFlight
         ));
-        d.settle("r1", "t1", &created_frame());
+        d.settle("r1", "t1", &created_frame(), |_| true);
         assert_eq!(
             other_frames.lock().expect("frames").len(),
             1,
@@ -299,7 +374,7 @@ mod tests {
         let (origin, origin_frames) = recording_sink();
         let _ = d.begin("r1", &origin, |_| true);
         let _ = d.begin("r1", &origin, |_| true);
-        d.settle("r1", "t1", &created_frame());
+        d.settle("r1", "t1", &created_frame(), |_| true);
         assert!(
             origin_frames.lock().expect("frames").is_empty(),
             "same-sink duplicates must not be double-answered"
