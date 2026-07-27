@@ -214,6 +214,51 @@ async fn next_json_of_type(ws: &mut TestWs, wanted: &str) -> serde_json::Value {
     panic!("no {wanted} frame within 20 messages");
 }
 
+/// Read frames until `Message::Close(Some(frame))` arrives (bounded) — the
+/// same way the `keepalive.rs`-family tests read server close codes.
+async fn next_close_frame(
+    ws: &mut TestWs,
+) -> tokio_tungstenite::tungstenite::protocol::CloseFrame<'static> {
+    for _ in 0..20u8 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("close frame within timeout")
+            .expect("stream not ended")
+            .expect("no ws error");
+        if let WsMessage::Close(Some(frame)) = msg {
+            return frame;
+        }
+    }
+    panic!("no close frame within 20 messages");
+}
+
+/// [`next_json_of_type`] variant that PANICS on any output-family frame
+/// (`terminal.output` / `terminal.outputBatch`) while waiting. Used while
+/// draining the storm's `terminal.created` replies: nothing is attached yet,
+/// so output before attach would break the A21 causal invariant (create
+/// never auto-attaches, registry.rs:548).
+async fn next_json_of_type_failing_on_output(ws: &mut TestWs, wanted: &str) -> serde_json::Value {
+    for _ in 0..40u8 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for a {wanted} frame"))
+            .expect("stream not ended")
+            .expect("no ws error");
+        if let WsMessage::Text(text) = &msg {
+            let value: serde_json::Value = serde_json::from_str(text).expect("json frame");
+            let frame_type = value["type"].as_str().unwrap_or("");
+            assert!(
+                frame_type != "terminal.output" && frame_type != "terminal.outputBatch",
+                "output frame before any attach breaks the A21 causal invariant: {value}"
+            );
+            if frame_type == wanted {
+                return value;
+            }
+        }
+    }
+    panic!("no {wanted} frame within 40 messages");
+}
+
 /// Plain-JSON `terminal.create` frame; a shell create needs no CLI spec.
 fn create_frame(request_id: &str, restore: bool) -> String {
     if restore {
@@ -350,4 +395,163 @@ async fn gated_create_racing_shutdown_leaves_no_live_pty() {
         0,
         "a create racing shutdown must not leave a live PTY"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_restore_create_is_abandoned_on_disconnect_without_spawning() {
+    // Zero-permit gate + long timeout: the restore create parks in the queue.
+    let cfg = CreateProtectConfig {
+        restore_spawn_timeout_ms: 30_000,
+        ..CreateProtectConfig::default()
+    };
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+    let mut client = connect_and_hello(&ws_url).await;
+    send_text(&mut client, &create_frame("doomed", true)).await;
+
+    // Wait until the create is actually queued on the gate.
+    for _ in 0..200 {
+        if gate.queued_total() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(gate.queued_total(), 1, "restore create must be queued");
+
+    // Client disconnects while queued.
+    drop(client);
+
+    // The queued create must unblock as Cancelled — not sit out its 30s
+    // timeout, and not spawn.
+    for _ in 0..200 {
+        if gate.cancellations() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        gate.cancellations(),
+        1,
+        "disconnect must cancel the queued create"
+    );
+    assert_eq!(registry.kill_all(), 0, "no PTY may have been spawned");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_restore_creates_drain_without_spawning_on_shutdown() {
+    let cfg = CreateProtectConfig {
+        restore_spawn_timeout_ms: 30_000,
+        ..CreateProtectConfig::default()
+    };
+    let (ws_url, registry, shutdown, gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+    let mut client = connect_and_hello(&ws_url).await;
+    send_text(&mut client, &create_frame("draining-1", true)).await;
+    send_text(&mut client, &create_frame("draining-2", true)).await;
+
+    for _ in 0..200 {
+        if gate.queued_total() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        gate.queued_total(),
+        2,
+        "both restore creates must be queued"
+    );
+
+    // Server-side graceful shutdown: every connection loop closes 4009,
+    // which must drain the queued creates without spawning.
+    shutdown.notify_waiters();
+
+    // The client observes the 4009 close frame.
+    let close = next_close_frame(&mut client).await;
+    assert_eq!(close.code, 4009_u16.into());
+
+    for _ in 0..200 {
+        if gate.cancellations() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(gate.cancellations(), 2, "shutdown must drain the queue");
+    assert_eq!(registry.kill_all(), 0, "no PTY may have been spawned");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_storm_drains_bounded_with_per_terminal_ordering() {
+    // N restore creates > gate limit: every create must settle with its own
+    // requestId, exactly once, with no duplicate PTYs; and no terminal may
+    // emit output before the client attaches (the A21 causal invariant —
+    // create never auto-attaches, registry.rs:548).
+    let cfg = CreateProtectConfig::default();
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(2, 64)).await;
+    let mut client = connect_and_hello(&ws_url).await;
+
+    const N: usize = 12; // > gate limit 2: forces real FIFO queueing
+    for i in 0..N {
+        send_text(&mut client, &create_frame(&format!("storm-{i}"), true)).await;
+    }
+
+    // Drain N terminal.created frames. While draining, FAIL on any
+    // terminal.output / terminal.outputBatch frame — nothing is attached
+    // yet, so output before attach would break the A21 invariant. (Use a
+    // next_json_of_type variant that panics on output-family frames.)
+    let mut seen = std::collections::HashMap::<String, String>::new();
+    for _ in 0..N {
+        let created = next_json_of_type_failing_on_output(&mut client, "terminal.created").await;
+        let req = created["requestId"]
+            .as_str()
+            .expect("requestId")
+            .to_string();
+        let tid = created["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        assert!(
+            seen.insert(req, tid).is_none(),
+            "duplicate terminal.created for one requestId"
+        );
+    }
+    assert_eq!(seen.len(), N, "every requestId settled exactly once");
+    assert!(
+        seen.keys().all(|k| k.starts_with("storm-")),
+        "only the storm requestIds replied"
+    );
+    assert!(
+        gate.queued_total() >= (N as u64) - 2,
+        "with 2 permits the storm must actually queue FIFO behind the gate"
+    );
+
+    // Per-terminal created -> attach -> output: attach ONE storm terminal
+    // (the session_identity_frames.rs attach frame shape) and assert
+    // terminal.attach.ready arrives for that terminalId — output for it may
+    // only follow now.
+    let attach_tid = seen
+        .get("storm-0")
+        .expect("storm-0 settled with a terminalId")
+        .clone();
+    send_text(
+        &mut client,
+        &serde_json::json!({
+            "type": "terminal.attach",
+            "terminalId": attach_tid,
+            "intent": "viewport_hydrate",
+            "cols": 120,
+            "rows": 30,
+            "attachRequestId": "att-storm-0",
+        })
+        .to_string(),
+    )
+    .await;
+    let ready = next_json_of_type(&mut client, "terminal.attach.ready").await;
+    assert_eq!(
+        ready["terminalId"].as_str().expect("terminalId"),
+        attach_tid,
+        "terminal.attach.ready must arrive for the attached storm terminal"
+    );
+
+    assert_eq!(registry.kill_all(), N, "exactly N PTYs, no duplicates");
 }

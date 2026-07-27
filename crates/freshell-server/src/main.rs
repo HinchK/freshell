@@ -755,7 +755,10 @@ async fn main() -> ExitCode {
     // Serve with graceful shutdown on SIGTERM/SIGINT so every owned child (PTY
     // terminals, the Codex/claude/opencode sidecars) is reaped — no orphans.
     let serve_result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(Arc::clone(&shutdown_notify)))
+        .with_graceful_shutdown(shutdown_signal(
+            Arc::clone(&shutdown_notify),
+            std::sync::Arc::clone(&shutdown_started),
+        ))
         .await;
     // SAFE-11/TERM-22: reap every owned child tree before exit. Legacy parity
     // (`server/index.ts:981-1049`'s `shutdown()`): after the HTTP/WS surface is
@@ -777,6 +780,16 @@ async fn main() -> ExitCode {
     //   * `fresh_codex_state.shutdown()` / `fresh_claude_state.shutdown()` —
     //     the Codex app-server and claude Node sidecars (already implemented).
     registry.kill_all();
+    // A10 re-sweep (V3): kill_all() snapshots the id set ONCE
+    // (registry.rs:889-892); a detached gated create settling during the
+    // drain can insert AFTER that snapshot, and neither registry-Drop (the
+    // PTY reader thread's exit hook holds a registry Arc — terminal.rs:1047,
+    // pty.rs:464/512, circular) nor the watchdog's std::process::exit(1)
+    // (skips Drops) would ever reap it. Give in-flight create tasks a short
+    // settling window, then sweep again. Second line of defense behind
+    // create_gate.rs's shutdown_started checks.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let _ = registry.kill_all();
     fresh_agent_state.shutdown().await;
     // Reap every owned codex app-server sidecar (SIGKILL + `/proc` ownership sweep) so a
     // freshcodex T2 run leaves no orphaned app-server.
@@ -813,7 +826,10 @@ const SHUTDOWN_HARD_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// `stop()`, or Ctrl-C). Drives `axum`'s graceful shutdown so every owned
 /// child (PTY terminals, the Codex/claude/opencode sidecars) is reaped before
 /// exit.
-async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
+async fn shutdown_signal(
+    notify_ws: Arc<tokio::sync::Notify>,
+    shutdown_started: Arc<std::sync::atomic::AtomicBool>,
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -836,6 +852,11 @@ async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
+
+    // Latch BEFORE any teardown step: gated creates consult this around
+    // registry.create (create_gate.rs, Task 6) so a create racing shutdown
+    // never leaves a live PTY.
+    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // SAFE-11 fail-safe watchdog: arm the hard timeout THE INSTANT the signal
     // arrives (not at process boot — a long-lived server must never carry a
