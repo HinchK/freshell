@@ -3391,6 +3391,113 @@ mod tests {
         registry.kill(&shell_tid);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fifteen_plus_rest_create_burst_is_bounded_and_all_complete() {
+        // Concurrency-1 gate: at most ONE request may hold the spawn permit
+        // at a time, so a 16-burst must serialize through the gate — the
+        // queued_total counter proves the burst actually queued (bounded
+        // in-flight) instead of spawning in parallel, and every request
+        // still completes (FIFO drain, nothing dropped).
+        let state = state_with_registry();
+        let registry = state.terminal_registry.clone().unwrap();
+        let gate = Arc::new(crate::spawn_gate::SpawnGate::new(1, 64));
+        state.set_spawn_gate(Arc::clone(&gate), std::time::Duration::from_secs(30));
+        let router = app(state);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let r = router.clone();
+            handles.push(tokio::spawn(async move {
+                post(r, "/api/tabs", shell_create_body(), true).await
+            }));
+        }
+        let mut terminal_ids = Vec::new();
+        for h in handles {
+            let (status, body) = h.await.expect("request task");
+            assert_eq!(status, StatusCode::OK, "{body}");
+            terminal_ids.push(body["data"]["terminalId"].as_str().unwrap().to_string());
+        }
+        // With 16 near-simultaneous arrivals and 1 permit, the overwhelming
+        // majority must have queued. (The fast path skips the counter when
+        // the queue is momentarily empty, hence >= 8, not == 15.)
+        assert!(
+            gate.queued_total() >= 8,
+            "burst did not queue through the gate: queued_total={}",
+            gate.queued_total()
+        );
+        assert_eq!(gate.queue_rejections(), 0, "no loud rejections expected");
+        assert_eq!(gate.timeouts(), 0, "no permit-wait timeouts expected");
+
+        for tid in &terminal_ids {
+            registry.kill(tid);
+        }
+    }
+
+    #[tokio::test]
+    async fn held_permit_blocks_rest_create_until_released() {
+        // End-to-end permit accounting at the REST seam: while the single
+        // permit is held (here by the test itself — in production, by the
+        // OTHER door), REST creates time out; after release they succeed.
+        let state = state_with_registry();
+        let registry = state.terminal_registry.clone().unwrap();
+        let gate = Arc::new(crate::spawn_gate::SpawnGate::new(1, 64));
+        state.set_spawn_gate(Arc::clone(&gate), std::time::Duration::from_millis(200));
+        let router = app(state);
+
+        let held = gate
+            .acquire(std::time::Duration::from_secs(1))
+            .await
+            .expect("test holds the only permit");
+        let (status, body) = post(router.clone(), "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], json!("SPAWN_TIMEOUT"));
+
+        drop(held);
+        let (status, body) = post(router, "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        registry.kill(body["data"]["terminalId"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_spawn_releases_its_permit() {
+        // Concurrency-1 gate: if a FAILED spawn leaked its permit, the next
+        // create could never acquire and would 503. Force the failure with a
+        // registered CLI whose command does not exist (reuses the local
+        // recording_cli_spec helper, pointing default_cmd at a nonexistent
+        // path instead of its script).
+        let argv_file = unique_argv_file("gate-broken-spawn");
+        let broken = {
+            let mut spec = recording_cli_spec("brokencli", &argv_file);
+            spec.default_cmd = "/nonexistent/definitely-missing-binary".to_string();
+            spec
+        };
+        let state = state_with_registry().with_cli_commands(Arc::new(vec![broken]));
+        let registry = state.terminal_registry.clone().unwrap();
+        state.set_spawn_gate(
+            Arc::new(crate::spawn_gate::SpawnGate::new(1, 64)),
+            std::time::Duration::from_millis(500),
+        );
+        let router = app(state);
+
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({
+                "mode": "brokencli",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "spawn should fail: {body}");
+
+        // The failed spawn's RAII permit must be back: a healthy create
+        // succeeds instead of hitting SPAWN_TIMEOUT on the 1-permit gate.
+        let (status, body) = post(router, "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::OK, "permit leaked? {body}");
+        registry.kill(body["data"]["terminalId"].as_str().unwrap());
+    }
+
     // ── D8 session-ref lease, REST rung (ks38) ──────────────────────────────
 
     /// `claim_session_ref` takes a u64 wall-clock ms; reuse the module's
