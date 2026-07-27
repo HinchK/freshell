@@ -499,7 +499,15 @@ async fn main() -> ExitCode {
     fresh_opencode_state.set_identity_sink(fresh_agent_identity_sink.clone());
     // opencode REST surface (Task 7's materialization site; V10 A13-N1)
     fresh_agent_state.set_identity_sink(fresh_agent_identity_sink.clone());
+    // Lane D1: the crash-event channel for terminal auto-resume. The receiver
+    // is consumed by `auto_resume::spawn_auto_resume_hub` (Task 5); until that
+    // lands it is dropped here, so the exit hook's best-effort sends are
+    // no-ops (no unread events accumulate in an unconsumed channel).
+    let (auto_resume_tx, _auto_resume_rx) =
+        tokio::sync::mpsc::unbounded_channel::<freshell_ws::auto_resume::CrashEvent>();
+    drop(_auto_resume_rx);
     let ws_state = WsState {
+        auto_resume_tx,
         activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),

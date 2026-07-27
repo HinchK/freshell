@@ -1069,6 +1069,100 @@ async fn send_session_reserved(ws_tx: &mut WsSink, request_id: &str, retry_after
     send(ws_tx, &msg).await
 }
 
+/// Everything a PTY exit hook needs. Built once per spawned generation —
+/// by `handle_create` AND by the auto-resume respawn seam (Task 4), so
+/// respawned generations report their own crashes.
+pub(crate) struct ExitHookDeps {
+    pub registry: freshell_terminal::TerminalRegistry,
+    /// Fix Spec: Session Naming Cluster -- retire (not remove) the identity
+    /// entry on NATURAL exit too, mirroring `registry.on('terminal.exit', ...)`
+    /// -> `terminalMetadata.retire(terminalId)` (`server/index.ts:526-534`), so a
+    /// rename cascade still resolves after this terminal's process has exited.
+    pub identity: crate::identity::TerminalIdentityRegistry,
+    /// P1.8 exit hygiene: the pending-marker delete rides the same hook.
+    pub pane_ledger: std::sync::Arc<crate::pane_ledger::PaneLedger>,
+    /// Restore-across-restart fix: disarm the amplifier locator too, so an
+    /// exited (never-submitted, or already-associated) terminal's armed
+    /// entry is never left dangling (mirrors `handleExit`,
+    /// `amplifier-session-locator.ts:220-223`).
+    pub amplifier_locator:
+        Option<std::sync::Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
+    /// Restore-across-restart fix (opencode): sibling disarm, so an exited
+    /// (never-submitted, or already-associated) opencode terminal's armed
+    /// entry is never left dangling.
+    pub opencode_locator:
+        Option<std::sync::Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
+    /// Lane B2: sibling disarm for the codex rollout locator, so an
+    /// exited (never-submitted, or already-associated) codex terminal's
+    /// armed entry is never left dangling.
+    pub codex_locator: Option<std::sync::Arc<freshell_sessions::codex_locator::CodexLocator>>,
+    /// Lane D1: where genuine natural exits report their CrashEvent.
+    pub auto_resume_tx: tokio::sync::mpsc::UnboundedSender<crate::auto_resume::CrashEvent>,
+}
+
+/// Exit hook (`tr:1479-1510` finishTerminalPtyExit): fires once when the PTY
+/// stream ends — natural exit AND kill both funnel there. Order matches the
+/// reference: cleanupMcpConfig (`tr:1491`) BEFORE the terminal.exit fan-out
+/// (`tr:1495`). On the kill path the registry already removed the record and
+/// sent terminal.exit, so finish_pty_exit no-ops (tr:1760 parity).
+///
+/// Lane D1 addition: genuine natural exits (`finish_pty_exit` returned
+/// `true`) additionally send one [`crate::auto_resume::CrashEvent`] —
+/// filtering to agent modes happens in `auto_resume::decide()` (Task 5).
+pub(crate) fn build_pty_exit_hook(
+    deps: ExitHookDeps,
+    terminal_id: String,
+    mode: String,
+    mcp_cwd: Option<String>,
+) -> freshell_terminal::pty::ExitHook {
+    Box::new(move |exit_code: i64| {
+        cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+        // Lane D1: read identity/probe BEFORE finish/retire mutate state.
+        let probe = deps.registry.probe(&terminal_id);
+        let create_request_id = deps.registry.probe_create_request_id(&terminal_id);
+        let finished = deps.registry.finish_pty_exit(&terminal_id, exit_code);
+        // DEV-0006 S4: tear down this pane's managed codex sidecar + remote proxy
+        // (no-op for terminals without a managed launch). Sync-safe: hands the
+        // handle to the manager's async teardown worker.
+        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+            .notify_terminal_exit(&terminal_id);
+        deps.identity.retire(&terminal_id);
+        // P1.8: an observed PTY exit in this epoch ends any
+        // identity-in-flight window — the marker's job (distinguishing
+        // fresh-by-race from fresh-by-intent across a SERVER death) is
+        // over. Best-effort; never load-bearing. INLINE sync call is
+        // correct HERE: the ExitHook (`pty.rs:55`, `FnOnce + Send`) runs
+        // on the PTY's blocking/reader thread, not an async worker —
+        // the one truly-synchronous ledger call site (V1.md).
+        if let Err(err) = deps.pane_ledger.delete_pending(&terminal_id) {
+            tracing::warn!(terminal_id = %terminal_id, error = %err, "pane_ledger_marker_delete_failed_on_exit");
+        }
+        if let Some(locator) = &deps.amplifier_locator {
+            locator.disarm(&terminal_id);
+        }
+        if let Some(locator) = &deps.opencode_locator {
+            locator.disarm(&terminal_id);
+        }
+        if let Some(locator) = &deps.codex_locator {
+            locator.disarm(&terminal_id);
+        }
+        // Lane D1: genuine natural exits only (kill removed the row → false).
+        if finished {
+            let lifetime_ms = probe
+                .as_ref()
+                .map(|p| now_ms() - p.created_at)
+                .unwrap_or(i64::MAX);
+            let _ = deps.auto_resume_tx.send(crate::auto_resume::CrashEvent {
+                terminal_id: terminal_id.clone(),
+                exit_code,
+                mode: mode.clone(),
+                create_request_id,
+                lifetime_ms,
+            });
+        }
+    })
+}
+
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
@@ -1633,66 +1727,23 @@ async fn handle_create(
     };
     let child_env = build_child_env_from_process(&spec);
 
-    // Exit hook (`tr:1479-1510` finishTerminalPtyExit): fires once when the PTY
-    // stream ends — natural exit AND kill both funnel there. Order matches the
-    // reference: cleanupMcpConfig (`tr:1491`) BEFORE the terminal.exit fan-out
-    // (`tr:1495`). On the kill path the registry already removed the record and
-    // sent terminal.exit, so finish_pty_exit no-ops (tr:1760 parity).
-    let on_exit: Option<freshell_terminal::pty::ExitHook> = {
-        let tid = terminal_id.clone();
-        let cleanup_mode = mode.clone();
-        let cleanup_cwd = mcp_cwd.clone();
-        let registry = state.registry.clone();
-        // Fix Spec: Session Naming Cluster -- retire (not remove) the identity
-        // entry on NATURAL exit too, mirroring `registry.on('terminal.exit', ...)`
-        // -> `terminalMetadata.retire(terminalId)` (`server/index.ts:526-534`), so a
-        // rename cascade still resolves after this terminal's process has exited.
-        let identity = state.identity.clone();
-        // P1.8 exit hygiene: the pending-marker delete rides the same hook.
-        let pane_ledger = std::sync::Arc::clone(&state.pane_ledger);
-        // Restore-across-restart fix: disarm the amplifier locator too, so an
-        // exited (never-submitted, or already-associated) terminal's armed
-        // entry is never left dangling (mirrors `handleExit`,
-        // `amplifier-session-locator.ts:220-223`).
-        let amplifier_locator = state.amplifier_locator.clone();
-        // Restore-across-restart fix (opencode): sibling disarm, so an exited
-        // (never-submitted, or already-associated) opencode terminal's armed
-        // entry is never left dangling.
-        let opencode_locator = state.opencode_locator.clone();
-        // Lane B2: sibling disarm for the codex rollout locator, so an
-        // exited (never-submitted, or already-associated) codex terminal's
-        // armed entry is never left dangling.
-        let codex_locator = state.codex_locator.clone();
-        Some(Box::new(move |exit_code: i64| {
-            cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
-            registry.finish_pty_exit(&tid, exit_code);
-            // DEV-0006 S4: tear down this pane's managed codex sidecar + remote proxy
-            // (no-op for terminals without a managed launch). Sync-safe: hands the
-            // handle to the manager's async teardown worker.
-            freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-                .notify_terminal_exit(&tid);
-            identity.retire(&tid);
-            // P1.8: an observed PTY exit in this epoch ends any
-            // identity-in-flight window — the marker's job (distinguishing
-            // fresh-by-race from fresh-by-intent across a SERVER death) is
-            // over. Best-effort; never load-bearing. INLINE sync call is
-            // correct HERE: the ExitHook (`pty.rs:55`, `FnOnce + Send`) runs
-            // on the PTY's blocking/reader thread, not an async worker —
-            // the one truly-synchronous ledger call site (V1.md).
-            if let Err(err) = pane_ledger.delete_pending(&tid) {
-                tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_exit");
-            }
-            if let Some(locator) = &amplifier_locator {
-                locator.disarm(&tid);
-            }
-            if let Some(locator) = &opencode_locator {
-                locator.disarm(&tid);
-            }
-            if let Some(locator) = &codex_locator {
-                locator.disarm(&tid);
-            }
-        }))
-    };
+    // Exit hook: built by `build_pty_exit_hook` (see its doc comment for the
+    // reference anchors) so the auto-resume respawn seam (Task 4) reuses the
+    // exact same hook for respawned generations.
+    let on_exit: Option<freshell_terminal::pty::ExitHook> = Some(build_pty_exit_hook(
+        ExitHookDeps {
+            registry: state.registry.clone(),
+            identity: state.identity.clone(),
+            pane_ledger: std::sync::Arc::clone(&state.pane_ledger),
+            amplifier_locator: state.amplifier_locator.clone(),
+            opencode_locator: state.opencode_locator.clone(),
+            codex_locator: state.codex_locator.clone(),
+            auto_resume_tx: state.auto_resume_tx.clone(),
+        },
+        terminal_id.clone(),
+        mode.clone(),
+        mcp_cwd.clone(),
+    ));
 
     // Server-wide spawn gate (restart-storm protection; WSL-outage RCA prior
     // art). restore creates go THROUGH the gate. RAII permit: released on
@@ -3643,6 +3694,7 @@ mod terminals_changed_tests {
                 .unwrap(),
             ),
             broadcast_tx: Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             fresh_codex: freshell_freshagent::FreshCodexState::new(
                 Arc::clone(&auth_token),
                 Arc::clone(&broadcast_tx),
@@ -3848,6 +3900,7 @@ mod terminal_meta_created_tests {
                 .unwrap(),
             ),
             broadcast_tx: std::sync::Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             fresh_codex: freshell_freshagent::FreshCodexState::new(
                 std::sync::Arc::clone(&auth_token),
                 std::sync::Arc::clone(&broadcast_tx),

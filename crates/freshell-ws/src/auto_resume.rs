@@ -8,8 +8,15 @@
 //! CrashEvent is ever sent) NEVER auto-resume. The registry's
 //! respawn-generation cap is the outer loop bound (campaign plan §7.5).
 //! Schedule shape mirrors the repo exemplar `activity.rs::lane_retry_delay_ms`.
+//!
+//! Coverage boundary: only WS-created terminals feed CrashEvents — their exit
+//! hook is built by `terminal::build_pty_exit_hook`. REST/freshagent-created
+//! agent panes (`freshell-freshagent/src/terminal_tabs.rs`'s own exit hook)
+//! are out of scope for auto-resume in this lane and keep today's behavior.
+//! (Both hooks funnel through `finish_pty_exit`, so a future registry-layer
+//! observation could cover all paths; recorded as future work.)
 
-#[allow(dead_code)] // consumed in Task 2
+#[allow(dead_code)] // consumed by the auto-resume hub (Task 5)
 pub(crate) const AUTO_RESUME_MODES: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
 
 /// Backoff before retry N (index = attempts already made). 2 retries max
@@ -19,14 +26,15 @@ pub(crate) const AUTO_RESUME_DEFAULT_DELAYS_MS: [u64; 2] = [2_000, 10_000];
 /// A crashed generation that lived at least this long proves the previous
 /// resume was healthy — the attempt counter resets (mirrors
 /// `DEFAULT_RESPAWN_LIVENESS_WINDOW_MS` in freshell-terminal).
-#[allow(dead_code)] // consumed in Task 2
+#[allow(dead_code)] // consumed by the auto-resume hub (Task 5)
 pub(crate) const AUTO_RESUME_HEALTHY_LIFETIME_MS: i64 = 30_000;
 
 /// Crash notification from the PTY exit hook. Only sent for NATURAL exits
 /// (`finish_pty_exit` returned `true`) — user kills never produce one.
+/// `pub` (not `pub(crate)`): it rides the public `WsState.auto_resume_tx`
+/// field, and integration tests drain it until the hub (Task 5) exists.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // consumed in Task 2
-pub(crate) struct CrashEvent {
+pub struct CrashEvent {
     pub terminal_id: String,
     pub exit_code: i64,
     pub mode: String,
@@ -36,7 +44,7 @@ pub(crate) struct CrashEvent {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // consumed in Task 2
+#[allow(dead_code)] // consumed by the auto-resume hub (Task 5)
 pub(crate) struct CrashContext<'a> {
     pub exit_code: i64,
     pub mode: &'a str,
@@ -50,13 +58,13 @@ pub(crate) struct CrashContext<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // consumed in Task 2
+#[allow(dead_code)] // consumed by the auto-resume hub (Task 5)
 pub(crate) enum AutoResumeDecision {
     Resume { attempt: u32, delay_ms: u64 },
     SettleExited { reason: &'static str },
 }
 
-#[allow(dead_code)] // consumed in Task 2
+#[allow(dead_code)] // consumed by the auto-resume hub (Task 5)
 pub(crate) fn decide(ctx: &CrashContext<'_>, delays: &[u64]) -> AutoResumeDecision {
     use AutoResumeDecision::SettleExited;
     if ctx.exit_code == 0 {
@@ -109,7 +117,7 @@ pub(crate) fn parse_delays_env(raw: &str) -> Option<Vec<u64>> {
     parsed.filter(|v| !v.is_empty())
 }
 
-#[allow(dead_code)] // consumed in Task 2
+#[allow(dead_code)] // consumed by the auto-resume hub (Task 5)
 pub(crate) fn auto_resume_delays() -> Vec<u64> {
     std::env::var("FRESHELL_AUTO_RESUME_DELAYS_MS")
         .ok()
