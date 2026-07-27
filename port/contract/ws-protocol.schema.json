@@ -442,7 +442,10 @@
                     "type": "string"
                   },
                   "kind": {
-                    "const": "terminal",
+                    "enum": [
+                      "terminal",
+                      "fresh-agent"
+                    ],
                     "type": "string"
                   },
                   "mode": {
@@ -519,6 +522,10 @@
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "paneReconcileFreshAgentV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "paneReconcileV1": {
                   "const": true,
                   "type": "boolean"
@@ -3633,6 +3640,10 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "paneReconcileFreshAgentV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "paneReconcileV1": {
               "const": true,
               "type": "boolean"
@@ -3906,7 +3917,10 @@
                 "type": "string"
               },
               "kind": {
-                "const": "terminal",
+                "enum": [
+                  "terminal",
+                  "fresh-agent"
+                ],
                 "type": "string"
               },
               "mode": {
@@ -4143,6 +4157,10 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "paneReconcileFreshAgentV1": {
+          "const": true,
+          "type": "boolean"
+        },
         "paneReconcileV1": {
           "const": true,
           "type": "boolean"
@@ -4159,7 +4177,10 @@
           "type": "string"
         },
         "kind": {
-          "const": "terminal",
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
           "type": "string"
         },
         "mode": {

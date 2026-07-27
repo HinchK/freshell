@@ -1379,6 +1379,9 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "paneReconcileFreshAgentV1": {
+              "type": "boolean"
+            },
             "paneReconcileV1": {
               "type": "boolean"
             }
