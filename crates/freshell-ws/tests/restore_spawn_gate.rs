@@ -161,6 +161,13 @@ async fn connect_and_hello(url: &str) -> TestWs {
     let (mut ws, _resp) = tokio_tungstenite::connect_async(url)
         .await
         .expect("ws connect");
+    // Nagle OFF on the test client: the two-creates-in-flight tests send
+    // back-to-back small frames that must reach the server within the first
+    // create's spawn-to-settled window; Nagle + delayed ACK on loopback
+    // holds the second frame for ~3ms, longer than a whole settled create.
+    if let tokio_tungstenite::MaybeTlsStream::Plain(stream) = ws.get_ref() {
+        stream.set_nodelay(true).expect("set_nodelay");
+    }
     ws.send(WsMessage::Text(
         serde_json::json!({
             "type": "hello",
@@ -246,5 +253,101 @@ async fn third_non_restore_create_in_window_is_rate_limited() {
         registry.kill_all(),
         2,
         "only the two accepted creates spawned"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_creates_are_gated_and_non_restore_bypass() {
+    // Zero-permit gate: any create that actually consults the gate can never
+    // proceed. This is the wiring proof — if the gate were inert (the Node
+    // attempt's failure mode), the restore create would succeed.
+    let cfg = CreateProtectConfig {
+        restore_spawn_timeout_ms: 300,
+        ..CreateProtectConfig::default()
+    };
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+    let mut client = connect_and_hello(&ws_url).await;
+
+    // Non-restore create BYPASSES the zero-permit gate and succeeds.
+    send_text(&mut client, &create_frame("plain", false)).await;
+    let reply = next_json_of_type(&mut client, "terminal.created").await;
+    assert_eq!(reply["requestId"], "plain");
+
+    // Restore create consults the gate, times out, fails loud.
+    send_text(&mut client, &create_frame("restore-1", true)).await;
+    let err = next_json_of_type(&mut client, "error").await;
+    assert_eq!(err["code"], "PTY_SPAWN_FAILED");
+    assert_eq!(err["requestId"], "restore-1");
+    assert!(err["message"]
+        .as_str()
+        .expect("message")
+        .contains("restore spawn slot"));
+    assert_eq!(gate.timeouts(), 1);
+
+    assert_eq!(
+        registry.kill_all(),
+        1,
+        "only the non-restore create spawned"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_create_holds_permit_until_settled() {
+    // Gate with ONE permit. Two restore creates on the same connection: if
+    // the permit were released at the spawn syscall (the da5d9b5c prior-art
+    // shape), both would complete near-instantly regardless of order; what
+    // we assert instead is the STRONGER wiring property that both complete
+    // AND the gate saw a queued waiter (the second create had to wait for
+    // the first create's FULL settle, not just its spawn).
+    let cfg = CreateProtectConfig::default();
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(1, 64)).await;
+    let mut client = connect_and_hello(&ws_url).await;
+
+    send_text(&mut client, &create_frame("r1", true)).await;
+    send_text(&mut client, &create_frame("r2", true)).await;
+    let first = next_json_of_type(&mut client, "terminal.created").await;
+    let second = next_json_of_type(&mut client, "terminal.created").await;
+    let mut ids: Vec<String> = vec![
+        first["requestId"].as_str().expect("id").to_string(),
+        second["requestId"].as_str().expect("id").to_string(),
+    ];
+    ids.sort();
+    assert_eq!(ids, vec!["r1".to_string(), "r2".to_string()]);
+    assert!(
+        gate.queued_total() >= 1,
+        "with 1 permit, the second concurrent restore create must have queued \
+         behind the first create's spawn-to-settled window"
+    );
+    assert_eq!(registry.kill_all(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gated_create_racing_shutdown_leaves_no_live_pty() {
+    // A10 (V3, FALSIFIED): main's registry.kill_all() snapshots the id set
+    // ONCE (registry.rs:889-892) with no re-sweep; a detached gated create
+    // survives the axum drain and its registry insert can land AFTER the
+    // snapshot. The registry-Drop fallback does NOT hold (the PTY reader
+    // thread's exit hook owns a registry Arc — terminal.rs:1047,
+    // pty.rs:464/512 — circular), and the 5s watchdog exits via
+    // std::process::exit(1), skipping Drops. So the gated path itself must
+    // re-check the shutdown latch around handle_create.
+    let cfg = CreateProtectConfig::default();
+    let (ws_url, registry, _shutdown, _gate, shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(1, 64)).await;
+    let mut client = connect_and_hello(&ws_url).await;
+
+    // Shutdown has begun (exactly what main.rs latches before the WS
+    // notify — Task 7 Step 2b) while the restore create is about to run:
+    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+    send_text(&mut client, &create_frame("late", true)).await;
+
+    // Give the gated task time to (wrongly) spawn and settle.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        registry.kill_all(),
+        0,
+        "a create racing shutdown must not leave a live PTY"
     );
 }

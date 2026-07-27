@@ -158,6 +158,12 @@ pub async fn run(
         state.create_protect.rate_limit,
         state.create_protect.rate_window_ms,
     );
+    // Per-connection cancel signal for gated restore creates. The sender
+    // lives in this function's scope, so queued gated creates are cancelled
+    // when the loop exits for ANY reason — client disconnect, socket error,
+    // keepalive timeout, or server shutdown (4009): the explicit send below
+    // plus the sender drop at return both unblock waiters.
+    let (create_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
     if ui_screenshot_v1 {
         let tx = conn_tx.clone();
         state
@@ -246,6 +252,7 @@ pub async fn run(
                             &conn_sink,
                             terminal_output_batch_v1,
                             &mut create_limiter,
+                            &create_cancel_rx,
                         )
                         .await
                         {
@@ -404,10 +411,15 @@ pub async fn run(
         state.screenshots.remove_capable_client(conn_id);
     }
     state.registry.remove_connection(conn_id);
+    // Abandon any restore creates still queued on the spawn gate for this
+    // connection (RCA hardening: never spawn a PTY for a client that is
+    // gone). Redundant with the sender drop at return; explicit for clarity.
+    let _ = create_cancel_tx.send(true);
 }
 
 /// Parse + dispatch one inbound client text frame. Returns `false` to close the
 /// connection (only on an unrecoverable send failure).
+#[allow(clippy::too_many_arguments)] // Connection-scoped plumbing, one call site.
 async fn handle_client_text(
     text: &str,
     ws_tx: &mut WsSink,
@@ -416,6 +428,7 @@ async fn handle_client_text(
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
+    create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -474,11 +487,16 @@ async fn handle_client_text(
         ClientMessage::TerminalCreate(create) => {
             if create.restore == Some(true) {
                 // restore:true bypasses the per-connection rate limiter —
-                // neither checked nor recorded (legacy `if (!m.restore)`).
-                // It goes through the server-wide restore-spawn gate instead
-                // (wired in the next task; until then, inline like before).
-                let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
-                handle_create(create, &mut out, state).await
+                // neither checked nor recorded (legacy `if (!m.restore)`) —
+                // and goes through the server-wide restore-spawn gate on a
+                // spawned task (spawn-to-settled permit, cancellable).
+                crate::create_gate::spawn_gated_restore_create(
+                    create,
+                    state,
+                    conn_sink,
+                    create_cancel_rx.clone(),
+                );
+                true
             } else {
                 if !create_limiter.try_acquire(crate::create_limit::epoch_ms()) {
                     tracing::warn!(
