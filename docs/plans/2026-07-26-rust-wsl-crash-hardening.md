@@ -499,7 +499,11 @@ pub mod create_limit;
 - [ ] **Step 4: Run tests — expect pass**
 
 Run: `cargo test -p freshell-ws create_limit`
-Expected: `8 passed` (all tests in `create_limit::tests`).
+Expected: `7 passed` (all tests in `create_limit::tests`:
+`accepts_up_to_limit_then_rejects`, `rejection_consumes_no_budget`,
+`prune_boundary_is_strict_legacy_parity`, `window_slides_per_entry`,
+`config_defaults`, `config_from_env_overrides_and_zero_falls_back`,
+`epoch_ms_returns_nonzero`).
 
 - [ ] **Step 5: Quality gates**
 
@@ -516,7 +520,7 @@ git commit \
   -m "- CreateProtectConfig: TERMINAL_CREATE_RATE_LIMIT/RATE_WINDOW_MS (legacy names) + TERMINAL_RESTORE_SPAWN_CONCURRENCY/QUEUE_CAP/TIMEOUT_MS knobs, sanitizing env parse
 - CreateRateLimiter: legacy-parity sliding window (strict prune, rejects cost no budget)
 - Ported from feat/rust-create-protection with gate knobs renamed to the TERMINAL_RESTORE_SPAWN_* family" \
-  -m "Verification: cargo test -p freshell-ws create_limit (8 passed); cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings)." \
+  -m "Verification: cargo test -p freshell-ws create_limit (7 passed); cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings)." \
   -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
 Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
@@ -1198,11 +1202,14 @@ Note for the implementer: if `ServerMessage` has no `Pong`-like unit variant,
 construct the cheapest existing variant (e.g. the same `ServerMessage::Error`
 shape `send_create_error` builds) — the test only asserts forwarding.
 
-- [ ] **Step 2: Run — expect RED (module not registered / visibility errors)**
+- [ ] **Step 2: Run — expect RED (module not registered)**
 
 Run: `cargo test -p freshell-ws create_gate`
-Expected: compile error (`crate::terminal::WsSink` is private / module not
-declared). RED confirmed.
+Expected: 0 tests run — the new file is not declared in `lib.rs`, so cargo
+does not compile it at all (an undeclared module produces NO compile error;
+the `crate::terminal::WsSink` visibility errors surface only in Step 3, the
+moment the `mod` line is added, and the same step's `pub(crate)` widening
+resolves them). RED confirmed by the 0-tests result.
 
 - [ ] **Step 3: Register module + widen visibility**
 
@@ -2165,7 +2172,7 @@ client-generated UUIDs, so cross-client collision is not a concern.
   hooks on every non-settled exit of the gated path)
 - Modify: every `WsState { ... }` literal the compiler flags (same site list
   as Task 3)
-- Modify: `crates/freshell-ws/tests/restore_spawn_gate.rs` (two new tests)
+- Modify: `crates/freshell-ws/tests/restore_spawn_gate.rs` (three new tests)
 
 **Interfaces:**
 - Consumes: `WsState`, `handle_create` (Task 4 shape), the gated path
@@ -2239,12 +2246,57 @@ async fn duplicate_while_queued_does_not_double_spawn() {
     );
     assert_eq!(registry.kill_all(), 0, "no PTY spawned for either copy");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limited_retry_same_requestid_proceeds() {
+    // A2 hard requirement: a rate-limited create must NOT leave an InFlight
+    // sentinel behind. The dedupe `begin` runs at the TOP of the dispatch
+    // arm — BEFORE the rate limiter — so the RATE_LIMITED early return must
+    // clear the sentinel; otherwise the frozen client's 2s retry with the
+    // SAME requestId (TerminalView.tsx:155-157, :3995-3999) is swallowed as
+    // DuplicateInFlight forever and the pane wedges.
+    let cfg = CreateProtectConfig {
+        rate_limit: 1,
+        rate_window_ms: 300,
+        ..CreateProtectConfig::default()
+    };
+    let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(4, 64)).await;
+    // connect + hello
+    // First non-restore create consumes the whole 1-token budget.
+    send_text(&mut client, &create_frame("rl-1", false)).await;
+    let _ = next_json_of_type(&mut client, "terminal.created").await;
+
+    // Second non-restore create is rate-limited.
+    send_text(&mut client, &create_frame("rl-2", false)).await;
+    let err = next_json_of_type(&mut client, "error").await;
+    assert_eq!(err["code"], "RATE_LIMITED");
+    assert_eq!(err["requestId"], "rl-2");
+
+    // Client-style retry: SAME requestId after the window slides.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    send_text(&mut client, &create_frame("rl-2", false)).await;
+    let retried = next_json_of_type(&mut client, "terminal.created").await;
+    assert_eq!(
+        retried["requestId"], "rl-2",
+        "same-requestId retry after RATE_LIMITED must proceed as a fresh create"
+    );
+    assert_eq!(registry.kill_all(), 2, "rl-1 plus the retried rl-2");
+}
 ```
 
 Run: `cargo test -p freshell-ws --test restore_spawn_gate same_requestid`
 Expected: FAIL — today the resend spawns a second PTY with a new terminalId
 (`registry.kill_all()` returns 2) and the queued duplicate enqueues a second
 gated create.
+
+Also run: `cargo test -p freshell-ws --test restore_spawn_gate rate_limited_retry`
+Expected: PASS at RED — with no dedupe map there is no sentinel to leak, so
+the retry trivially proceeds. This test is the regression guard for Step 4's
+wiring: it FAILS (`next_json_of_type` never sees the retried
+`terminal.created` because the retry is swallowed as DuplicateInFlight) if
+the RATE_LIMITED early return forgets its `clear_if_in_flight` call, and
+stays green once Step 4.3 is wired correctly. Keep it in the suite.
 
 - [ ] **Step 2: Write the dedupe module (RED via unregistered module)**
 
@@ -2471,9 +2523,21 @@ registered). RED confirmed.
         .settle(&create.request_id, &terminal_id, &created);
 ```
 
-3. Non-restore inline path: after `handle_create` returns, call
-   `state.create_dedupe.clear_if_in_flight(&create.request_id);` (no-op on
-   success — the entry is Settled; removes the sentinel on failure).
+3. Non-restore inline path — TWO cleanup sites, both required because
+   `begin` registered the sentinel at the very top of the arm, BEFORE the
+   rate limiter:
+   - Rate-limited rejection: inside Task 5's
+     `if !create_limiter.try_acquire(...)` block, insert
+     `state.create_dedupe.clear_if_in_flight(&create.request_id);`
+     immediately BEFORE the
+     `return send_create_error(..., ErrorCode::RateLimited, ...)`. Without
+     this the sentinel leaks and the frozen client's 2s same-requestId
+     RATE_LIMITED retry (TerminalView.tsx:155-157, :3995-3999) is swallowed
+     as `DuplicateInFlight` forever — the A2 hard requirement fails. Covered
+     by Step 1's `rate_limited_retry_same_requestid_proceeds`.
+   - After `handle_create` returns, call
+     `state.create_dedupe.clear_if_in_flight(&create.request_id);` (no-op on
+     success — the entry is Settled; removes the sentinel on failure).
 
 4. Gated path (`create_gate.rs`): call
    `state.create_dedupe.clear_if_in_flight(&request_id)` on EVERY
@@ -2486,7 +2550,10 @@ registered). RED confirmed.
 - [ ] **Step 5: Run — expect pass**
 
 Run: `cargo test -p freshell-ws --test restore_spawn_gate`
-Expected: both Step 1 tests PASS; all earlier gate tests still pass.
+Expected: all three Step 1 tests PASS — including
+`rate_limited_retry_same_requestid_proceeds`, which fails here if the
+RATE_LIMITED early return leaked the InFlight sentinel; all earlier gate
+tests still pass.
 
 - [ ] **Step 6: Full crate suite + quality gates**
 
@@ -2501,7 +2568,7 @@ git add crates/freshell-ws crates/freshell-terminal
 git commit \
   -m "feat(freshell-ws): dedupe terminal.create by requestId (legacy parity)" \
   -m "- A20: frozen client re-sends in-flight creates with the same requestId on every reconnect; without a guard each resend spawned a duplicate PTY and orphaned the original
-- CreateDedupe: server-global requestId map with InFlight sentinel; settled entries replay the original terminal.created; lazy eviction when the terminal is gone; sentinel cleared on gate rejection/cancel/failure so the client retry ladder still works
+- CreateDedupe: server-global requestId map with InFlight sentinel; settled entries replay the original terminal.created; lazy eviction when the terminal is gone; sentinel cleared on rate-limit rejection, gate rejection, cancel, and create failure so the client's 2s same-requestId retry ladder still works
 - Legacy parity: createdByRequestId + REPAIR_PENDING_SENTINEL (server/ws-handler.ts:2167-2172, 2436)" \
   -m "Verification: cargo test -p freshell-ws --test restore_spawn_gate; cargo test -p freshell-ws create_dedupe (4 passed); cargo test -p freshell-ws; cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings; no new failures vs recorded baseline)." \
   -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
