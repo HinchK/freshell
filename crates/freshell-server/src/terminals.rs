@@ -673,13 +673,29 @@ async fn directory_items(state: &TerminalsState) -> Vec<Value> {
             };
             // buildDirectoryItem: sessionRef = terminal.sessionRef ?? (mode==='codex'
             // ? undefined : buildSessionRef(mode, resumeSessionId)).
+            //
+            // P1.14 case (c): when that derivation yields None (codex terminals
+            // hard-coded it; other modes lack a resume id), consult the identity
+            // registry — rung 1 of the identity authority chain — so a
+            // locator-ADOPTED terminal's row carries its real session identity
+            // and the client's Phase-E synthesis never mints a `terminal:<id>`
+            // ghost for it. Same stamping the WS handshake inventory does
+            // (`crates/freshell-ws/src/lib.rs:441-450`); `session_ref_for` is
+            // Some only when BOTH provider and session_id are present, so an
+            // identityless (pre-adoption) terminal keeps today's `None`.
             let session_ref: Option<Value> = if e.mode == "codex" || e.mode == "shell" {
                 None
             } else {
                 e.resume_session_id
                     .as_ref()
                     .map(|sid| json!({ "provider": e.mode, "sessionId": sid }))
-            };
+            }
+            .or_else(|| {
+                state
+                    .identity
+                    .session_ref_for(&e.terminal_id)
+                    .map(|loc| json!({ "provider": loc.provider, "sessionId": loc.session_id }))
+            });
             let last_line = last_emitted_line(&e.snapshot);
 
             // Exact key order of the original's JSON (undefined keys omitted):
@@ -1173,6 +1189,110 @@ mod cascade_tests {
         let resp = patch_terminal_title(state.clone(), "term-3", "Shell Renamed").await;
         assert_eq!(resp["titleOverride"], json!("Shell Renamed"));
         assert!(state.settings.session_overrides().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod sidebar_projection_tests {
+    use super::*;
+    use freshell_terminal::registry::HeadlessTerminal;
+
+    fn dir() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "frs-terminals-projection-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn state(dir: &std::path::Path) -> TerminalsState {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+        TerminalsState {
+            auth_token: Arc::new("tok".to_string()),
+            settings: SettingsStore::load(Some(dir), vec!["claude".into()]),
+            registry: TerminalRegistry::new(),
+            broadcast_tx: Arc::new(tx),
+            terminals_revision: Arc::new(AtomicI64::new(0)),
+            identity: TerminalIdentityRegistry::new(),
+        }
+    }
+
+    fn headless(terminal_id: &str, mode: &str) -> HeadlessTerminal {
+        HeadlessTerminal {
+            terminal_id: terminal_id.to_string(),
+            stream_id: format!("stream-{terminal_id}"),
+            mode: mode.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// P1.14 case (c): after locator adoption gives a codex terminal a real
+    /// session id in the identity registry (rung 1 of the identity authority
+    /// chain), the `/api/terminals` sidebar projection carries that identity
+    /// as `sessionRef` instead of the old hard-coded `None` — so the client's
+    /// Phase-E synthesis (`sidebarSelectors.ts:437-490`) never mints a
+    /// `terminal:<id>` ghost row for it.
+    #[tokio::test]
+    async fn adopted_codex_terminal_is_stamped_with_its_registry_session_ref() {
+        let dir = dir();
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = state(&dir);
+        state
+            .registry
+            .register_headless(headless("term-codex", "codex"));
+        state.identity.upsert(
+            "term-codex",
+            Some("codex"),
+            Some("real-codex-session-id"),
+            None,
+            1000,
+        );
+
+        let items = directory_items(&state).await;
+        let item = items
+            .iter()
+            .find(|i| i["terminalId"] == json!("term-codex"))
+            .expect("codex terminal projected");
+        assert_eq!(
+            item["sessionRef"],
+            json!({ "provider": "codex", "sessionId": "real-codex-session-id" })
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Pins that the stamping does NOT invent identity: a codex terminal with
+    /// no registry entry at all, and one whose entry has `session_id: None`
+    /// (pre-adoption), both keep today's byte shape — the `sessionRef` key is
+    /// omitted entirely.
+    #[tokio::test]
+    async fn identityless_codex_terminal_projection_is_unchanged() {
+        let dir = dir();
+        std::fs::create_dir_all(dir.join(".freshell")).unwrap();
+        let state = state(&dir);
+        // No identity entry at all.
+        state
+            .registry
+            .register_headless(headless("term-no-entry", "codex"));
+        // Entry exists but carries no session id yet (pre-adoption window).
+        state
+            .registry
+            .register_headless(headless("term-idless", "codex"));
+        state
+            .identity
+            .upsert("term-idless", Some("codex"), None, None, 1000);
+
+        let items = directory_items(&state).await;
+        for id in ["term-no-entry", "term-idless"] {
+            let item = items
+                .iter()
+                .find(|i| i["terminalId"] == json!(id))
+                .expect("codex terminal projected");
+            assert!(
+                item.get("sessionRef").is_none(),
+                "sessionRef must stay omitted for {id}, got {item:?}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
