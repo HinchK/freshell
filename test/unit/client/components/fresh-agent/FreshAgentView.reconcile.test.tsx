@@ -11,7 +11,12 @@ import panesReducer, {
 import settingsReducer from '@/store/settingsSlice'
 import freshAgentReducer, { markSessionLost, setSessionStatus } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
-import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
+import {
+  FreshAgentView,
+  FRESH_AGENT_RESERVE_RETRY_FLOOR_MS,
+  FRESH_AGENT_RESERVE_RETRY_WINDOW_MS,
+} from '@/components/fresh-agent/FreshAgentView'
+import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { useAppSelector } from '@/store/hooks'
 import { resetRebindQueueForTests } from '@/lib/rebind-queue'
 import { setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
@@ -410,5 +415,106 @@ describe('FreshAgentView .lost capability gate (Task 10)', () => {
     await flush()
     expect(sessionInStore(store.getState(), DURABLE).lost).toBe(false) // clearSessionLost landed
     expect(sentOfType('pane.reconcile.request')).toHaveLength(1) // and no second reconcile fired
+  })
+})
+
+// Task 14: SESSION_RESERVED bounded re-drive + automatic exhaustion
+// resolution. Delivery goes through BOTH the global handleFreshAgentMessage
+// projection AND the mounted view's ws listener (pane-only delivery would let
+// these tests pass while the real app still renders the error card from
+// state.freshAgent.pendingCreateFailures -- two independent writers feed one
+// card).
+describe('FreshAgentView SESSION_RESERVED re-drive (Task 14)', () => {
+  function receiveWsBoth(message: Record<string, unknown>) {
+    act(() => {
+      handleFreshAgentMessage(store.dispatch, message)
+      for (const call of wsMock.onMessage.mock.calls) {
+        call[0](message)
+      }
+    })
+  }
+
+  it('create.failed SESSION_RESERVED re-drives the same create after the floor (no error card, no create-failed)', async () => {
+    renderFreshAgentPane({ status: 'creating', createRequestId: 'req-1', sessionRef: { provider: 'claude', sessionId: DURABLE } })
+    await flush()
+    expect(sentOfType('freshAgent.create')).toHaveLength(1)
+
+    receiveWsBoth({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SESSION_RESERVED', message: 'reserved', retryable: true })
+    await flush()
+    // Never create-failed for a transient reservation. (The snapshot-hydration
+    // effect may legitimately land 'idle' for a durable ref -- the contract is
+    // the absence of the failure state, the error card, and createError.)
+    expect(leafContent(store.getState()).status).not.toBe('create-failed')
+    expect(leafContent(store.getState()).createError).toBeUndefined()
+    // the GLOBAL projection must not have minted an error-card entry either:
+    expect(store.getState().freshAgent.pendingCreateFailures['req-1']).toBeUndefined()
+    expect(document.querySelector('.fresh-agent-error-card')).toBeNull()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
+    })
+    const creates = sentOfType('freshAgent.create')
+    expect(creates).toHaveLength(2)
+    expect(creates[1].requestId).toBe('req-1') // SAME createRequestId -- never re-minted
+  })
+
+  it('exhaustion auto-resolves via a single-pane reconcile (silent attach, no stale error card)', async () => {
+    setFreshAgentReconcileActive(true)
+    renderFreshAgentPane({ status: 'creating', createRequestId: 'req-1', sessionRef: { provider: 'claude', sessionId: DURABLE } })
+    await flush()
+
+    // hammer SESSION_RESERVED past the window
+    for (let t = 0; t <= FRESH_AGENT_RESERVE_RETRY_WINDOW_MS + 2_000; t += FRESH_AGENT_RESERVE_RETRY_FLOOR_MS) {
+      receiveWsBoth({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SESSION_RESERVED', message: 'reserved', retryable: true })
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS)
+      })
+    }
+    const reqs = sentOfType('pane.reconcile.request') as Array<{ reconcileId: string; panes: Array<{ paneKey: string }> }>
+    expect(reqs.length).toBeGreaterThanOrEqual(1)
+
+    // fold attach -> silent attach to the winner
+    const req = reqs[reqs.length - 1]
+    receiveWsBoth({
+      type: 'pane.reconcile.result', reconcileId: req.reconcileId, bootId: 'b', serverInstanceId: 's',
+      verdicts: [{ paneKey: req.panes[0].paneKey, verdict: 'attach', sessionRef: { provider: 'claude', sessionId: DURABLE } }],
+    })
+    await flush()
+    expect(leafContent(store.getState()).sessionId).toBe(DURABLE)
+    // council rule 8: SILENT attach -- no stale error card may survive the auto-resolve
+    expect(store.getState().freshAgent.pendingCreateFailures).toEqual({})
+    expect(document.querySelector('.fresh-agent-error-card')).toBeNull()
+  })
+
+  it('non-reserved create.failed still lands create-failed status (regression)', async () => {
+    renderFreshAgentPane({ status: 'creating', createRequestId: 'req-1' })
+    await flush()
+    receiveWsBoth({ type: 'freshAgent.create.failed', requestId: 'req-1', code: 'SPAWN_FAILED', message: 'x', retryable: false })
+    await flush()
+    expect(leafContent(store.getState()).status).toBe('create-failed')
+    expect(store.getState().freshAgent.pendingCreateFailures['req-1']).toEqual({ code: 'SPAWN_FAILED', message: 'x', retryable: false })
+  })
+
+  it('freshAgent.error SESSION_RESERVED (attach loser) re-sends the attach after the floor and suppresses the error banner', async () => {
+    renderFreshAgentPane({ sessionId: DURABLE, status: 'connected', sessionRef: { provider: 'claude', sessionId: DURABLE } })
+    await flush()
+    const attachesBefore = sentOfType('freshAgent.attach').length
+    expect(attachesBefore).toBeGreaterThanOrEqual(1)
+
+    receiveWsBoth({
+      type: 'freshAgent.event',
+      sessionId: DURABLE,
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      event: { type: 'freshAgent.error', code: 'SESSION_RESERVED', message: 'Another resume for this session is in flight' },
+    })
+    await flush()
+    // suppressed: the transient reservation must not surface as "Agent error"
+    expect(screen.queryByText(/Agent error/i)).toBeNull()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(FRESH_AGENT_RESERVE_RETRY_FLOOR_MS + 20)
+    })
+    expect(sentOfType('freshAgent.attach').length).toBeGreaterThan(attachesBefore) // re-driven
   })
 })

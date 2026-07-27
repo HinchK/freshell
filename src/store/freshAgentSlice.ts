@@ -442,6 +442,9 @@ const freshAgentSlice = createSlice({
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
       session.lastError = action.payload.message
+      // Task 14: the view filters SESSION_RESERVED out of the pane-level
+      // error banner (a transient reservation is re-driven, never surfaced).
+      session.lastErrorCode = action.payload.code
       if (action.payload.code?.startsWith('RESTORE_')) {
         session.awaitingDurableHistory = false
         session.historyLoaded = true

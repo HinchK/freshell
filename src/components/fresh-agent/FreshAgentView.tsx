@@ -59,6 +59,13 @@ import { FreshAgentSidebar } from './FreshAgentSidebar'
 
 const EARLY_STATES = new Set(['creating', 'starting'])
 const BUSY_STATES = new Set(['running', 'compacting'])
+
+// Task 14: SESSION_RESERVED bounded re-drive. The window must outlast the
+// server lease TTL (20s) with margin -- same arithmetic as TerminalView's
+// reserve-retry constants; the floor is the fixed re-drive cadence (the
+// server's create.failed carries no retry-after field by design).
+export const FRESH_AGENT_RESERVE_RETRY_WINDOW_MS = 30_000
+export const FRESH_AGENT_RESERVE_RETRY_FLOOR_MS = 1_000
 const SNAPSHOT_REFRESH_COALESCE_MS = 50
 const SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS = new Set([
   'freshAgent.session.changed',
@@ -1142,6 +1149,53 @@ export function FreshAgentView({
     ws.send(request)
   }, [appStore, paneId, tabId, triggerRecovery, ws])
 
+  // Task 14: SESSION_RESERVED bounded re-drive. A transient reservation (the
+  // server's D8 lease loser answer) re-drives the SAME create/attach after a
+  // fixed floor; when the window exhausts, a single-pane reconcile resolves
+  // the pane automatically (attach verdict -> silent attach to the winner;
+  // dead -> the visible dead-session panel/fresh flow). Never create-failed,
+  // never an error card, never a re-minted createRequestId.
+  const reserveRedriveRef = useRef<{
+    windowStart: number | null
+    timer: ReturnType<typeof setTimeout> | null
+  }>({ windowStart: null, timer: null })
+
+  const clearReserveRedrive = useCallback(() => {
+    const state = reserveRedriveRef.current
+    state.windowStart = null
+    if (state.timer !== null) {
+      clearTimeout(state.timer)
+      state.timer = null
+    }
+  }, [])
+
+  useEffect(() => clearReserveRedrive, [clearReserveRedrive]) // unmount
+
+  const redriveAfterSessionReserved = useCallback(() => {
+    const state = reserveRedriveRef.current
+    if (state.windowStart === null) state.windowStart = Date.now()
+    if (Date.now() - state.windowStart >= FRESH_AGENT_RESERVE_RETRY_WINDOW_MS) {
+      clearReserveRedrive()
+      reconcileLostPane() // Task 10's single-pane reconcile + fold = the auto-resolve
+      return
+    }
+    if (state.timer !== null) return
+    state.timer = setTimeout(() => {
+      state.timer = null
+      const current = paneContentRef.current
+      if (current.sessionId) {
+        // Attach loser: re-send the attach directly (the attach effect keys on
+        // sessionId, which has not changed -- a content nudge cannot re-fire it).
+        const cwd = getFreshOpenCodeRouteCwd(current, { sessionCwd: freshOpenCodeRouteCwdRef.current })
+        sendFreshAgentMessage(buildFreshAgentAttachMessage(current, cwd))
+        return
+      }
+      createSentRef.current = false // re-arm the create effect
+      lastCreateArmKeyRef.current = '' // force the render-phase re-arm
+      dispatch(updatePaneContent({ tabId, paneId, content: { ...paneContentRef.current } })) // nudge the effect
+    }, FRESH_AGENT_RESERVE_RETRY_FLOOR_MS)
+  }, [clearReserveRedrive, dispatch, paneId, reconcileLostPane, sendFreshAgentMessage, tabId])
+
   useEffect(() => {
     if (paneContent.sessionId) return
     if (paneContent.restoreError) return
@@ -1377,6 +1431,7 @@ export function FreshAgentView({
       }
       if (message.type === 'freshAgent.created' && message.requestId === paneContentRef.current.createRequestId) {
         releasePendingRebind()
+        clearReserveRedrive() // Task 14: a completed create ends the reservation window
         const current = paneContentRef.current
         persistDurableFreshAgentFlavor(message)
         dispatch(updatePaneContent({
@@ -1402,6 +1457,12 @@ export function FreshAgentView({
       }
       if (message.type === 'freshAgent.create.failed' && message.requestId === paneContentRef.current.createRequestId) {
         releasePendingRebind()
+        if (message.code === 'SESSION_RESERVED' && message.retryable) {
+          // Task 14: transient reservation -- keep status 'creating' (never
+          // create-failed) and re-drive the SAME create after the floor.
+          redriveAfterSessionReserved()
+          return
+        }
         dispatch(updatePaneContent({
           tabId,
           paneId,
@@ -1443,6 +1504,18 @@ export function FreshAgentView({
             restoreError: undefined,
           },
         }))
+      }
+      if (
+        message.type === 'freshAgent.event'
+        && message.sessionId === paneContentRef.current.sessionId
+        && (message.event as { type?: string; code?: string } | undefined)?.type === 'freshAgent.error'
+        && (message.event as { code?: string }).code === 'SESSION_RESERVED'
+      ) {
+        // Task 14 (attach loser): a transient reservation re-drives the attach
+        // after the floor; exhaustion resolves via the single-pane reconcile.
+        // The banner is suppressed via lastErrorCode (never surfaced).
+        redriveAfterSessionReserved()
+        return
       }
       if (
         message.type === 'freshAgent.send.accepted'
@@ -1515,7 +1588,7 @@ export function FreshAgentView({
       }
     })
     return unsubscribe
-  }, [agentSession?.cwd, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, releasePendingRebind, scheduleSnapshotRefresh, sendFreshAgentMessage, setLocalEcho, tabId, ws])
+  }, [agentSession?.cwd, clearReserveRedrive, commitSnapshot, dispatch, migratePendingAutoTitle, paneContent, paneContent.createRequestId, paneId, recordPendingSendMetadata, redriveAfterSessionReserved, releasePendingRebind, scheduleSnapshotRefresh, sendFreshAgentMessage, setLocalEcho, tabId, ws])
 
   useEffect(() => {
     if (!snapshotThreadId) return
@@ -1811,7 +1884,11 @@ export function FreshAgentView({
     : (agentSession?.status ?? paneContent.status)
   const isBusy = BUSY_STATES.has(effectiveStatus)
   const sessionEnded = effectiveStatus === 'exited' || effectiveStatus === 'create-failed'
-  const sessionErrorMessage = (agentSession as { lastError?: string } | undefined)?.lastError ?? null
+  // Task 14: SESSION_RESERVED is a transient reservation the view re-drives
+  // through -- never surfaced as a pane-level error banner.
+  const sessionErrorMessage = (agentSession as { lastError?: string; lastErrorCode?: string } | undefined)?.lastErrorCode === 'SESSION_RESERVED'
+    ? null
+    : (agentSession as { lastError?: string } | undefined)?.lastError ?? null
   // sessionEnded gates everything: a stale snapshot can still claim
   // capabilities.send after the provider process died.
   const canSend = !sessionEnded && (snapshot?.capabilities?.send === true || (

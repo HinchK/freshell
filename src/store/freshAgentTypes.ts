@@ -75,6 +75,9 @@ export type FreshAgentSessionState = FreshAgentSessionLocator & {
   totalInputTokens: number
   totalOutputTokens: number
   lastError?: string
+  /// Task 14: the code that produced lastError -- the view filters
+  /// SESSION_RESERVED out of the pane-level error banner (transient, re-driven).
+  lastErrorCode?: string
   historyLoaded?: boolean
   awaitingDurableHistory?: boolean
   lost?: boolean
