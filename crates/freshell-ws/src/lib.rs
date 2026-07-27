@@ -28,6 +28,7 @@ pub(crate) mod invariants;
 pub mod opencode_association;
 pub mod origin;
 pub mod screenshot;
+pub mod spawn_gate;
 pub mod tabs;
 pub mod tabs_persist;
 pub mod terminal;
