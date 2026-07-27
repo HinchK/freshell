@@ -11,10 +11,10 @@ import {
 import { nanoid } from 'nanoid'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
-import { getWsClient } from '@/lib/ws-client'
+import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { createLogger } from '@/lib/client-logger'
 import { api, getFreshAgentThreadSnapshot, setSessionMetadata } from '@/lib/api'
-import { consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
+import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { clearPendingCreateFailure, setSessionStatus } from '@/store/freshAgentSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
@@ -663,6 +663,18 @@ export function FreshAgentView({
   ])
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
+  // Pre-verdict create wait (fresh-agent leg of Task 8's pattern): a pane
+  // named in an outgoing pane.reconcile request defers its mount-time create
+  // until its verdict folds -- bounded by RECONCILE_VERDICT_WAIT_MS, then the
+  // legacy eager create proceeds (never a silent wedge). The Task 6b sender
+  // hold is the authoritative gate; this view layer avoids burning the
+  // rebind-queue slot / send on a pane whose verdict is in flight.
+  const reconcilePendingSince = useAppSelector(
+    (s) => s.panes.reconcilePendingPanes?.[`${tabId}:${paneId}`],
+  )
+  const reconcilePendingSinceRef = useRef<number | undefined>(reconcilePendingSince)
+  reconcilePendingSinceRef.current = reconcilePendingSince
+  const verdictWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // F8 hidden-pane rebind: mirror `hidden` into a ref for use inside queued
   // jobs and ws callbacks (same pattern as TerminalView's hiddenRef).
   const hiddenRef = useRef(hidden)
@@ -782,6 +794,11 @@ export function FreshAgentView({
       // Free any slot held by an un-acked create so the shared queue does
       // not wait out the 10s backstop for a pane that no longer exists.
       releasePendingRebind()
+      // Pre-verdict wait timer: never leak past unmount.
+      if (verdictWaitTimerRef.current !== null) {
+        clearTimeout(verdictWaitTimerRef.current)
+        verdictWaitTimerRef.current = null
+      }
     }
   }, [releasePendingRebind])
 
@@ -857,9 +874,15 @@ export function FreshAgentView({
     }))
   }, [dispatch, paneId, tabId])
 
-  const prevCreateRequestIdRef = useRef(paneContent.createRequestId)
-  if (prevCreateRequestIdRef.current !== paneContent.createRequestId) {
-    prevCreateRequestIdRef.current = paneContent.createRequestId
+  // Re-arm the create effect when EITHER the createRequestId changes (legacy
+  // retry paths mint a new id) OR a pane.reconcile verdict folds into this
+  // pane (reconcileEpoch bump). Verdict folds PRESERVE createRequestId
+  // (council rule 2 — never re-minted), so the epoch is the ONLY signal that
+  // a fold needs a fresh create round.
+  const createArmKey = `${paneContent.createRequestId}:${paneContent.reconcileEpoch ?? 0}`
+  const lastCreateArmKeyRef = useRef(createArmKey)
+  if (lastCreateArmKeyRef.current !== createArmKey) {
+    lastCreateArmKeyRef.current = createArmKey
     createSentRef.current = false
   }
 
@@ -1104,6 +1127,24 @@ export function FreshAgentView({
       && paneContent.status !== 'starting'
       && !paneContent.sessionRef
     ) return
+    // Pre-verdict create wait: a reconcile-pending pane defers its mount-time
+    // create until its verdict folds (the fold's clearReconcilePendingPane
+    // re-fires this effect via the reconcilePendingSince dep), bounded by
+    // RECONCILE_VERDICT_WAIT_MS wall-clock -- on timeout the pending flag is
+    // released and the legacy eager create proceeds (never a silent wedge,
+    // same createRequestId, never re-minted). Returns BEFORE createSentRef is
+    // consumed and BEFORE the hidden rebind-queue enqueue.
+    const pendingSince = reconcilePendingSinceRef.current
+    if (pendingSince !== undefined && Date.now() - pendingSince < RECONCILE_VERDICT_WAIT_MS) {
+      if (verdictWaitTimerRef.current === null) {
+        const paneKey = `${tabId}:${paneId}`
+        verdictWaitTimerRef.current = setTimeout(() => {
+          verdictWaitTimerRef.current = null
+          dispatch(clearReconcilePendingPane({ paneKey }))
+        }, RECONCILE_VERDICT_WAIT_MS - (Date.now() - pendingSince))
+      }
+      return
+    }
     if (createSentRef.current) return
     createSentRef.current = true
     const runCreate = (release?: () => void) => {
@@ -1149,8 +1190,13 @@ export function FreshAgentView({
     dispatch,
     paneId,
     paneContent,
+    // reconcilePendingSince: re-run when the pane's pre-verdict wait state
+    // changes -- the verdict fold (or the bounded timeout) clears the entry
+    // and the deferred mount-create must then proceed.
+    reconcilePendingSince,
     releasePendingRebind,
     sendFreshAgentMessage,
+    tabId,
   ])
 
   useEffect(() => {
@@ -1265,6 +1311,18 @@ export function FreshAgentView({
     scheduleSnapshotRefresh()
   }, [hidden, scheduleSnapshotRefresh])
 
+  // reconcileNotice is a one-shot: visible for 5s, then consumed from the
+  // pane content (a chat pane has no xterm write-notice channel; a timed
+  // dismiss keeps it user-visible without persisting -- council rule:
+  // `corrected: true` is always user-visible).
+  useEffect(() => {
+    if (!paneContent.reconcileNotice) return
+    const t = setTimeout(() => {
+      dispatch(updatePaneContent({ tabId, paneId, content: { ...paneContentRef.current, reconcileNotice: undefined } }))
+    }, 5_000)
+    return () => clearTimeout(t)
+  }, [dispatch, paneContent.reconcileNotice, paneId, tabId])
+
   useEffect(() => {
     if (typeof ws.onMessage !== 'function') return
     const unsubscribe = ws.onMessage((message) => {
@@ -1286,6 +1344,10 @@ export function FreshAgentView({
             status: 'connected',
             createError: undefined,
             restoreError: undefined,
+            // A19 (fresh-agent leg): a completed create consumes the
+            // reconcile intent -- stale respawn/fresh intent must never
+            // survive past a created ack.
+            pendingReconcile: undefined,
           },
         }))
       }
@@ -2043,6 +2105,11 @@ export function FreshAgentView({
               {visibleRestoreFailure ? <FreshAgentApprovalBanner text={visibleRestoreFailure} /> : null}
               {visiblePaneRestoreFailure ? <FreshAgentApprovalBanner text={visiblePaneRestoreFailure} /> : null}
               {visibleLoadError ? <FreshAgentApprovalBanner text={visibleLoadError} /> : null}
+              {paneContent.reconcileNotice ? (
+                <div role="status" className="px-3 py-1 text-xs text-amber-600 dark:text-amber-400">
+                  {paneContent.reconcileNotice}
+                </div>
+              ) : null}
               {sessionErrorMessage ? <FreshAgentApprovalBanner text={`Agent error: ${sessionErrorMessage}`} /> : null}
               {sessionEnded ? (
                 <div className="fresh-agent-session-ended-card flex items-center justify-between gap-2 rounded-md border border-destructive/50 bg-destructive/10 px-3 py-2 text-sm">
