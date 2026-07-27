@@ -485,6 +485,27 @@ async fn handle_client_text(
         }
         ClientMessage::ClientDiagnostic(_) => true,
         ClientMessage::TerminalCreate(create) => {
+            match state.create_dedupe.begin(
+                &create.request_id,
+                conn_sink, // this connection's FrameSink, already in scope for Task 6's gated call
+                |tid| state.registry.exists(tid),
+            ) {
+                crate::create_dedupe::DedupeDecision::DuplicateSettled(created) => {
+                    // Re-send the original terminal.created (same requestId,
+                    // same terminalId) — never spawn a duplicate.
+                    let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                    return out.send(&created).await;
+                }
+                crate::create_dedupe::DedupeDecision::DuplicateInFlight => {
+                    // Same connection: the in-flight create replies on this
+                    // very sink. Different connection: begin() registered
+                    // this connection's sink as a waiter — settle() or
+                    // clear_if_in_flight() forwards the reply. Either way a
+                    // live client always gets an answer; never silence.
+                    return true;
+                }
+                crate::create_dedupe::DedupeDecision::Proceed => {}
+            }
             if create.restore == Some(true) {
                 // restore:true bypasses the per-connection rate limiter —
                 // neither checked nor recorded (legacy `if (!m.restore)`) —
@@ -504,6 +525,11 @@ async fn handle_client_text(
                         request_id = %create.request_id,
                         "terminal_create_rate_limited"
                     );
+                    // The dedupe sentinel was registered at the top of this
+                    // arm, BEFORE the limiter: clear it or the client's 2s
+                    // same-requestId retry is swallowed as DuplicateInFlight
+                    // forever (A2).
+                    state.create_dedupe.clear_if_in_flight(&create.request_id);
                     let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
                     return send_create_error(
                         &mut out,
@@ -514,7 +540,12 @@ async fn handle_client_text(
                     .await;
                 }
                 let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
-                handle_create(create, &mut out, state).await
+                let request_id = create.request_id.clone();
+                let sent = handle_create(create, &mut out, state).await;
+                // No-op on success (the entry is Settled); drops the InFlight
+                // sentinel on a failed create so a retry proceeds fresh.
+                state.create_dedupe.clear_if_in_flight(&request_id);
+                sent
             }
         }
         ClientMessage::TerminalAttach(attach) => {
@@ -1258,6 +1289,12 @@ pub(crate) async fn handle_create(
         );
     }
 
+    // Dedupe settle needs both ids, but the `TerminalCreated` literal below
+    // MOVES `create.request_id` and `terminal_id` into the struct — clone
+    // into locals first (mirrors Task 6's explicit `request_id` clone).
+    let dedupe_request_id = create.request_id.clone();
+    let dedupe_terminal_id = terminal_id.clone();
+
     let created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
         request_id: create.request_id,
@@ -1270,6 +1307,12 @@ pub(crate) async fn handle_create(
         // identity-stamped frame reads (shell creates have no entry -> `None`).
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
     });
+    // Record the settled create (server-wide requestId dedupe) and forward
+    // the frame to any cross-connection waiters BEFORE the origin reply —
+    // both are non-blocking sink pushes, so ordering here is cosmetic.
+    state
+        .create_dedupe
+        .settle(&dedupe_request_id, &dedupe_terminal_id, &created);
     let sent = out.send(&created).await;
     // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
     // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
@@ -2325,6 +2368,7 @@ mod terminals_changed_tests {
             create_protect: crate::create_limit::CreateProtectConfig::default(),
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::RestoreSpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
@@ -2530,6 +2574,7 @@ mod terminal_meta_created_tests {
             create_protect: crate::create_limit::CreateProtectConfig::default(),
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::RestoreSpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,

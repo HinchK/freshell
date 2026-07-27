@@ -384,6 +384,7 @@ async fn main() -> ExitCode {
             &create_protect,
         )),
         shutdown_started: std::sync::Arc::clone(&shutdown_started),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),

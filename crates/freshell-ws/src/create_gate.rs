@@ -84,6 +84,9 @@ pub(crate) fn spawn_gated_restore_create(
                     request_id = %create.request_id,
                     "restore_create_cancelled"
                 );
+                // Non-settled exit: drop the dedupe sentinel (and fail any
+                // cross-connection waiters loud) so a resend proceeds fresh.
+                state.create_dedupe.clear_if_in_flight(&create.request_id);
                 return; // Client gone or server shutting down: no PTY, no reply.
             }
             Err(err) => {
@@ -96,6 +99,9 @@ pub(crate) fn spawn_gated_restore_create(
                     &create.request_id,
                 )
                 .await;
+                // Non-settled exit (QueueFull/Timeout): required so the
+                // client's 2s same-requestId retry is not swallowed.
+                state.create_dedupe.clear_if_in_flight(&create.request_id);
                 return;
             }
         };
@@ -107,6 +113,8 @@ pub(crate) fn spawn_gated_restore_create(
                 request_id = %create.request_id,
                 "restore_create_cancelled"
             );
+            // Non-settled exit: see the Cancelled arm above.
+            state.create_dedupe.clear_if_in_flight(&create.request_id);
             return;
         }
         // A10 shutdown-race pre-check (V3): kill_all snapshots ids once
@@ -122,6 +130,8 @@ pub(crate) fn spawn_gated_restore_create(
                 request_id = %create.request_id,
                 "restore_create_abandoned_for_shutdown"
             );
+            // Non-settled exit: see the Cancelled arm above.
+            state.create_dedupe.clear_if_in_flight(&create.request_id);
             return;
         }
         // Permit held across the WHOLE async create: PTY spawn -> registry
@@ -133,6 +143,9 @@ pub(crate) fn spawn_gated_restore_create(
         let mut out = CreateOutput::Channel(&sink);
         let request_id = create.request_id.clone();
         let _ = crate::terminal::handle_create(create, &mut out, &state).await;
+        // Covers create failure: no-op when handle_create settled the entry,
+        // drops the InFlight sentinel (failing waiters loud) when it did not.
+        state.create_dedupe.clear_if_in_flight(&request_id);
         // A10 shutdown-race post-check (V3): shutdown may have begun DURING
         // the create, after main's kill_all snapshot. The server is reaping
         // everything anyway, so an idempotent kill_all here reaps our own

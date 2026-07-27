@@ -22,6 +22,7 @@
 
 pub mod amplifier_association;
 pub mod backpressure;
+pub mod create_dedupe;
 pub(crate) mod create_gate;
 pub mod create_limit;
 pub mod identity;
@@ -193,6 +194,10 @@ pub struct WsState {
     /// `terminal.create` protection knobs (per-connection rate limit +
     /// restore-spawn gate). See [`crate::create_limit::CreateProtectConfig`].
     pub create_protect: crate::create_limit::CreateProtectConfig,
+    /// Server-wide requestId -> terminal dedupe for `terminal.create`
+    /// (legacy `createdByRequestId` parity — see
+    /// [`crate::create_dedupe::CreateDedupe`]).
+    pub create_dedupe: std::sync::Arc<crate::create_dedupe::CreateDedupe>,
     /// Server-wide restore-spawn gate (WSL-outage RCA §6.3). One per server
     /// process, shared across all WS connections.
     /// See [`crate::spawn_gate::RestoreSpawnGate`].
@@ -683,6 +688,7 @@ mod tests {
             create_protect: crate::create_limit::CreateProtectConfig::default(),
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::RestoreSpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,

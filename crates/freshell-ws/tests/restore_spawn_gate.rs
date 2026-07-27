@@ -128,6 +128,7 @@ async fn spawn_server(
         create_protect,
         spawn_gate: std::sync::Arc::clone(&gate),
         shutdown_started: std::sync::Arc::clone(&shutdown_started),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
@@ -554,4 +555,175 @@ async fn restore_storm_drains_bounded_with_per_terminal_ordering() {
     );
 
     assert_eq!(registry.kill_all(), N, "exactly N PTYs, no duplicates");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn same_requestid_resend_returns_existing_terminal() {
+    // A20: the frozen client re-sends terminal.create with the SAME
+    // requestId on reconnect (TerminalView.tsx:4227-4262; ws-client.ts
+    // inFlightCreates). The server must answer with the EXISTING terminal,
+    // not spawn a duplicate.
+    let cfg = CreateProtectConfig::default();
+    let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(4, 64)).await;
+    let mut client = connect_and_hello(&ws_url).await;
+    send_text(&mut client, &create_frame("dup", true)).await;
+    let first = next_json_of_type(&mut client, "terminal.created").await;
+    let tid = first["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    send_text(&mut client, &create_frame("dup", true)).await;
+    let second = next_json_of_type(&mut client, "terminal.created").await;
+    assert_eq!(second["requestId"], "dup");
+    assert_eq!(
+        second["terminalId"],
+        tid.as_str(),
+        "same-requestId resend must return the EXISTING terminal"
+    );
+    assert_eq!(registry.kill_all(), 1, "exactly one PTY for one requestId");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_while_queued_does_not_double_spawn() {
+    // Zero-permit gate + long timeout: the first create parks in the gate
+    // queue; a duplicate arriving meanwhile must be swallowed by the
+    // InFlight sentinel (the queued original will answer), never enqueued
+    // as a second spawn.
+    let cfg = CreateProtectConfig {
+        restore_spawn_timeout_ms: 30_000,
+        ..CreateProtectConfig::default()
+    };
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+    let mut client = connect_and_hello(&ws_url).await;
+    send_text(&mut client, &create_frame("dup-q", true)).await;
+    for _ in 0..200 {
+        if gate.queued_total() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(gate.queued_total(), 1, "first create must be queued");
+
+    send_text(&mut client, &create_frame("dup-q", true)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        gate.queued_total(),
+        1,
+        "duplicate must not enqueue a second gated create"
+    );
+    assert_eq!(registry.kill_all(), 0, "no PTY spawned for either copy");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rate_limited_retry_same_requestid_proceeds() {
+    // A2 hard requirement: a rate-limited create must NOT leave an InFlight
+    // sentinel behind. The dedupe `begin` runs at the TOP of the dispatch
+    // arm — BEFORE the rate limiter — so the RATE_LIMITED early return must
+    // clear the sentinel; otherwise the frozen client's 2s retry with the
+    // SAME requestId (TerminalView.tsx:155-157, :3995-3999) is swallowed as
+    // DuplicateInFlight forever and the pane wedges.
+    let cfg = CreateProtectConfig {
+        rate_limit: 1,
+        rate_window_ms: 300,
+        ..CreateProtectConfig::default()
+    };
+    let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(4, 64)).await;
+    let mut client = connect_and_hello(&ws_url).await;
+    // First non-restore create consumes the whole 1-token budget.
+    send_text(&mut client, &create_frame("rl-1", false)).await;
+    let _ = next_json_of_type(&mut client, "terminal.created").await;
+
+    // Second non-restore create is rate-limited.
+    send_text(&mut client, &create_frame("rl-2", false)).await;
+    let err = next_json_of_type(&mut client, "error").await;
+    assert_eq!(err["code"], "RATE_LIMITED");
+    assert_eq!(err["requestId"], "rl-2");
+
+    // Client-style retry: SAME requestId after the window slides.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    send_text(&mut client, &create_frame("rl-2", false)).await;
+    let retried = next_json_of_type(&mut client, "terminal.created").await;
+    assert_eq!(
+        retried["requestId"], "rl-2",
+        "same-requestId retry after RATE_LIMITED must proceed as a fresh create"
+    );
+    assert_eq!(registry.kill_all(), 2, "rl-1 plus the retried rl-2");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_on_new_connection_returns_same_terminal() {
+    // The A20 reconnect shape end-to-end: the frozen client re-sends an
+    // unanswered create with the SAME requestId on a NEW connection
+    // (ws-client.ts inFlightCreates resend). The resend must be answered
+    // WHICHEVER window it lands in: Settled -> stored-frame replay;
+    // InFlight -> waiter registration, forwarded on settle. Either way the
+    // new connection receives terminal.created for the SAME terminal and
+    // exactly one PTY exists.
+    let cfg = CreateProtectConfig::default();
+    let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(1, 64)).await;
+    let mut client1 = connect_and_hello(&ws_url).await;
+    let mut client2 = connect_and_hello(&ws_url).await;
+    send_text(&mut client1, &create_frame("xconn", true)).await;
+    // Deliberately do NOT await client1's reply first: let the resend race
+    // into the in-flight window when the scheduler allows.
+    send_text(&mut client2, &create_frame("xconn", true)).await;
+
+    let first = next_json_of_type(&mut client1, "terminal.created").await;
+    let second = next_json_of_type(&mut client2, "terminal.created").await;
+    assert_eq!(second["requestId"], "xconn");
+    assert_eq!(
+        second["terminalId"], first["terminalId"],
+        "a cross-connection resend must be answered with the SAME terminal"
+    );
+    assert_eq!(registry.kill_all(), 1, "exactly one PTY for one requestId");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resend_on_new_connection_never_swallowed_while_inflight() {
+    // The A2 wedge guard: a duplicate landing while the original is in
+    // flight must NEVER be silently dropped -- the original's reply goes to
+    // the ORIGINAL connection's sink (dead after a real reconnect), so the
+    // waiter path is the resend's ONLY reply path. A zero-permit gate plus
+    // a short timeout parks the original InFlight deterministically; when
+    // it exits non-settled, the waiter must receive the fail-loud error
+    // (which re-drives the frozen client's retry ladder).
+    let cfg = CreateProtectConfig {
+        restore_spawn_timeout_ms: 500,
+        ..CreateProtectConfig::default()
+    };
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+    let mut client1 = connect_and_hello(&ws_url).await;
+    let mut client2 = connect_and_hello(&ws_url).await;
+    send_text(&mut client1, &create_frame("xq", true)).await;
+    for _ in 0..200 {
+        if gate.queued_total() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(gate.queued_total(), 1, "original must be queued");
+
+    send_text(&mut client2, &create_frame("xq", true)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        gate.queued_total(),
+        1,
+        "a cross-connection duplicate registers as a waiter, never enqueues"
+    );
+
+    let err1 = next_json_of_type(&mut client1, "error").await;
+    assert_eq!(err1["requestId"], "xq");
+    let err2 = next_json_of_type(&mut client2, "error").await;
+    assert_eq!(err2["code"], "PTY_SPAWN_FAILED");
+    assert_eq!(
+        err2["requestId"], "xq",
+        "the waiter must receive a fail-loud reply -- silence wedges the pane"
+    );
+    assert_eq!(registry.kill_all(), 0);
 }

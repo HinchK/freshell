@@ -885,6 +885,19 @@ impl TerminalRegistry {
     /// while killing) so a `kill()` reentered from a terminal's own exit
     /// fan-out can't deadlock against this call. Returns the number of
     /// terminals actually killed, for shutdown logging/tests.
+    /// Read-only liveness probe: is a terminal with this id currently in the
+    /// registry? Used by `freshell-ws`'s `terminal.create` requestId-dedupe
+    /// guard for lazy eviction of settled entries whose terminal is gone
+    /// (killed/exited). Registry-lock + `contains_key` — no tokio, no
+    /// side effects.
+    pub fn exists(&self, terminal_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock")
+            .terminals
+            .contains_key(terminal_id)
+    }
+
     pub fn kill_all(&self) -> usize {
         let ids: Vec<String> = {
             let inner = self.inner.lock().expect("registry lock");
