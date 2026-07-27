@@ -56,6 +56,20 @@ pub(crate) fn spawn_gate_error_parts(err: SpawnGateError) -> (ErrorCode, &'stati
     }
 }
 
+/// Run `work` (the whole settled-create section: handle_create through the
+/// shutdown post-check) while holding `permit`, releasing it only after
+/// `work` completes. Extracted so the spawn-to-settled permit scope - the
+/// ordering the da5d9b5c prior art got wrong by releasing at the spawn
+/// syscall - is deterministically unit-testable instead of being pinned
+/// only by a wall-clock race in the acceptance suite.
+async fn hold_permit_across<G, F>(permit: G, work: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    work.await;
+    drop(permit);
+}
+
 /// Run one `restore:true` create through the server-wide gate on a spawned
 /// task, holding the permit from BEFORE the PTY spawn until the terminal is
 /// settled (`terminal.created` + broadcasts queued — the end of
@@ -140,31 +154,33 @@ pub(crate) fn spawn_gated_restore_create(
         // conn sink, so no stalled client can wedge the permit — the exact
         // hazard prior art's da5d9b5c early release worked around does not
         // exist on this path.
-        let mut out = CreateOutput::Channel(&sink);
         let request_id = create.request_id.clone();
-        let _ = crate::terminal::handle_create(create, &mut out, &state).await;
-        // Covers create failure: no-op when handle_create settled the entry,
-        // drops the InFlight sentinel (failing waiters loud) when it did not.
-        state.create_dedupe.clear_if_in_flight(&request_id);
-        // A10 shutdown-race post-check (V3): shutdown may have begun DURING
-        // the create, after main's kill_all snapshot. The server is reaping
-        // everything anyway, so an idempotent kill_all here reaps our own
-        // just-inserted terminal (and any other late insert). Belt to the
-        // pre-check's braces; main.rs adds a drain re-sweep too (Task 7
-        // Step 2b).
-        if state
-            .shutdown_started
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            let killed = state.registry.kill_all();
-            tracing::info!(
-                target: "freshell_ws::spawn_gate",
-                request_id = %request_id,
-                killed,
-                "restore_create_settled_during_shutdown_reaped"
-            );
-        }
-        drop(permit);
+        hold_permit_across(permit, async {
+            let mut out = CreateOutput::Channel(&sink);
+            let _ = crate::terminal::handle_create(create, &mut out, &state).await;
+            // Covers create failure: no-op when handle_create settled the entry,
+            // drops the InFlight sentinel (failing waiters loud) when it did not.
+            state.create_dedupe.clear_if_in_flight(&request_id);
+            // A10 shutdown-race post-check (V3): shutdown may have begun DURING
+            // the create, after main's kill_all snapshot. The server is reaping
+            // everything anyway, so an idempotent kill_all here reaps our own
+            // just-inserted terminal (and any other late insert). Belt to the
+            // pre-check's braces; main.rs adds a drain re-sweep too (Task 7
+            // Step 2b).
+            if state
+                .shutdown_started
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                let killed = state.registry.kill_all();
+                tracing::info!(
+                    target: "freshell_ws::spawn_gate",
+                    request_id = %request_id,
+                    killed,
+                    "restore_create_settled_during_shutdown_reaped"
+                );
+            }
+        })
+        .await;
     });
 }
 
@@ -189,5 +205,42 @@ mod tests {
         });
         assert!(out.send(&msg).await);
         assert_eq!(captured.lock().expect("lock").len(), 1);
+    }
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Stand-in for the gate permit whose release is observable.
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Pins the spawn-to-settled permit scope deterministically: the permit
+    /// must stay held while the create work is still running (the da5d9b5c
+    /// prior-art bug released it at the spawn syscall) and be released once
+    /// the work - which ends at settle - completes. The work future is
+    /// parked on a oneshot, so "mid-create" is a synchronization point, not
+    /// a timing window.
+    #[tokio::test]
+    async fn permit_released_only_after_work_completes() {
+        let released = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let flag = DropFlag(Arc::clone(&released));
+        let task = tokio::spawn(hold_permit_across(flag, async move {
+            let _ = rx.await;
+        }));
+        tokio::task::yield_now().await;
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "permit must be held while the create is still running"
+        );
+        tx.send(()).expect("release the parked work");
+        task.await.expect("task");
+        assert!(
+            released.load(Ordering::SeqCst),
+            "permit must be released once the work (settle) completes"
+        );
     }
 }
