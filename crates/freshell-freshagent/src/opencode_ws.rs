@@ -117,6 +117,9 @@ pub struct FreshOpencodeState {
     /// lease (it hosts other sessions) — a hung resume resolves via the bounded
     /// `get_session` (below) failing → `fail()` → the key reopens.
     pub(crate) leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
+    /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
+    terminal_liveness: crate::TerminalLivenessProbe,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -208,7 +211,14 @@ impl FreshOpencodeState {
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+            terminal_liveness: Arc::new(|_, _| false),
         }
+    }
+
+    /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
+    /// before this state is cloned into the router).
+    pub fn set_terminal_liveness(&mut self, probe: crate::TerminalLivenessProbe) {
+        self.terminal_liveness = probe;
     }
 
     /// Replace the default lease map with the ONE server-wide shared map (Task 13;
@@ -961,6 +971,13 @@ impl FreshOpencodeState {
         // by the lease), so a hung holder resolves via the BOUNDED `get_session`
         // below failing -> the guard's `fail()` reopening the key -- never a tree-kill
         // and never a permanent hold.
+        // Task 13b (cross-kind liveness): a live terminal PTY owning
+        // `(opencode, session)` is the one writer -- refuse the resume (retryable).
+        if (self.terminal_liveness)(PROVIDER, session_id) {
+            tracing::warn!(target: "freshell_freshagent::opencode", session_id = %session_id,
+                "fresh_agent_resume_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+            return Err(ResumeOpencodeError::Reserved);
+        }
         let resume_request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
         let mut lease_guard = match self.leases.claim(
             PROVIDER,

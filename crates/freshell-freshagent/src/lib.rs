@@ -55,6 +55,13 @@ pub use identity_sink::{
 pub use opencode_ws::FreshOpencodeState;
 pub use snapshot::SnapshotState;
 
+/// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
+/// true when a live terminal PTY currently owns that session. Constructed by
+/// `freshell-server`'s `main.rs` over the SAME probes the terminal D7 create-rung guard
+/// uses (identity owner + registry row), so this crate never imports `freshell-ws`.
+/// Defaults to "always false" (behavior-preserving for constructors that don't wire it).
+pub type TerminalLivenessProbe = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};

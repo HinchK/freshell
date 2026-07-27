@@ -156,6 +156,9 @@ pub struct FreshCodexState {
     /// ALWAYS ON at this runtime seam (never capability-gated). `main.rs` replaces the
     /// default with the ONE server-wide shared map via [`Self::set_session_leases`].
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
+    /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
+    terminal_liveness: crate::TerminalLivenessProbe,
 }
 
 /// The cached result of a completed codex `freshAgent.create`, keyed by `requestId` in
@@ -290,7 +293,14 @@ impl FreshCodexState {
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+            terminal_liveness: Arc::new(|_, _| false),
         }
+    }
+
+    /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
+    /// before this state is cloned into the router).
+    pub fn set_terminal_liveness(&mut self, probe: crate::TerminalLivenessProbe) {
+        self.terminal_liveness = probe;
     }
 
     /// Replace the default lease map with the ONE server-wide shared map (Task 12;
@@ -509,6 +519,16 @@ impl FreshCodexState {
         // an EMPTY new conversation under a brand-new id -- connected, no error, just quiet
         // data loss.
         if let Some(resume_session_id) = msg.resume_session_id.clone() {
+            // Task 13b (cross-kind liveness): a live terminal PTY owning
+            // `(codex, thread)` is the one writer on that rollout -- refuse the resume
+            // with the retryable loser answer; NO lease claim, NO spawn.
+            if (self.terminal_liveness)(PROVIDER, &resume_session_id) {
+                tracing::warn!(target: "freshell_freshagent::codex",
+                    session_id = %resume_session_id, request_id = %request_id,
+                    "fresh_agent_create_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+                self.fail_create_session_reserved(&request_id);
+                return;
+            }
             // Task 12 (D8 for fresh agents): claim the per-sessionRef lease BEFORE any
             // spawn -- exactly one in-flight resume (and one live rollout writer) per
             // thread. ALWAYS ON (never capability-gated).
@@ -1490,6 +1510,13 @@ impl FreshCodexState {
             }
         }
 
+        // Task 13b (cross-kind liveness): a live terminal PTY owning `(codex, thread)`
+        // is the one writer on that rollout -- refuse the respawn (retryable).
+        if (self.terminal_liveness)(PROVIDER, session_id) {
+            tracing::warn!(target: "freshell_freshagent::codex", session_id = %session_id,
+                "fresh_agent_respawn_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+            return Err(EnsureAliveError::Reserved);
+        }
         // Task 13 (D8): the exited->respawn arm SPAWNS -- claim the per-sessionRef
         // lease first (the per-thread lock above covers in-process races; the lease
         // serializes against CREATE-path holders for the same durable id).
@@ -2260,6 +2287,13 @@ impl FreshCodexState {
             return Err(ResumeSessionError::NotFound);
         }
 
+        // Task 13b (cross-kind liveness): a live terminal PTY owning `(codex, thread)`
+        // is the one writer on that rollout -- refuse the resume (retryable).
+        if (self.terminal_liveness)(PROVIDER, thread_id) {
+            tracing::warn!(target: "freshell_freshagent::codex", session_id = %thread_id,
+                "fresh_agent_attach_resume_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+            return Err(ResumeSessionError::Reserved);
+        }
         // Task 13 (D8): this arm SPAWNS -- claim the per-sessionRef lease first. The
         // per-thread lock above covers in-process attach-vs-attach; the lease
         // serializes against CREATE-path holders for the same durable id.

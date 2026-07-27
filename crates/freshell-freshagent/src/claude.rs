@@ -109,6 +109,9 @@ pub struct FreshClaudeState {
     /// replaces the default with the ONE server-wide shared map via
     /// [`Self::set_session_leases`]; keys are provider-namespaced either way.
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
+    /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
+    terminal_liveness: crate::TerminalLivenessProbe,
 }
 
 /// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
@@ -161,7 +164,14 @@ impl FreshClaudeState {
             resuming: Arc::new(TokioMutex::new(std::collections::HashSet::new())),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
             leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+            terminal_liveness: Arc::new(|_, _| false),
         }
+    }
+
+    /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
+    /// before this state is cloned into the router).
+    pub fn set_terminal_liveness(&mut self, probe: crate::TerminalLivenessProbe) {
+        self.terminal_liveness = probe;
     }
 
     /// Replace the default lease map with the ONE server-wide shared map (Task 12;
@@ -277,6 +287,16 @@ impl FreshClaudeState {
         let resume_sid = msg.resume_session_id.clone().filter(|s| !s.is_empty());
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
         if let Some(sid) = resume_sid.as_deref() {
+            // Task 13b (cross-kind liveness): a live terminal PTY owning `(claude, sid)`
+            // is the one writer on that JSONL -- refuse the resume with the retryable
+            // loser answer (the terminal may be closing); NO lease claim, NO spawn.
+            if (self.terminal_liveness)(PROVIDER, sid) {
+                tracing::warn!(target: "freshell_freshagent::claude", session_id = sid,
+                    request_id = %request_id,
+                    "fresh_agent_create_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+                self.fail_create_session_reserved(&request_id);
+                return;
+            }
             // Fast-path ADOPT (V1: new server behavior): the durable id already has a
             // live session -- answer created against it, spawn nothing.
             if self.has_live_session(sid).await {
@@ -750,6 +770,21 @@ impl FreshClaudeState {
         // attach-vs-attach window; the lease serializes against CREATE-path holders).
         // Losers get `freshAgent.error { code: "SESSION_RESERVED" }` -- the established
         // non-lost error channel (never INVALID_SESSION_ID, which would kill the pane).
+        //
+        // Task 13b (cross-kind liveness): a live terminal PTY owning `(claude, durable)`
+        // is the one writer on that JSONL -- refuse the attach-resume the same way.
+        if (self.terminal_liveness)(PROVIDER, &durable) {
+            tracing::warn!(target: "freshell_freshagent::claude", session_id = %durable,
+                "fresh_agent_attach_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+            self.resuming.lock().await.remove(&durable);
+            self.emit_fresh_agent_error(
+                &msg.session_id,
+                session_type_str(msg.session_type),
+                "SESSION_RESERVED",
+                "Another resume for this session is in flight",
+            );
+            return;
+        }
         let attach_request_id = format!("attach-{}", uuid::Uuid::new_v4());
         let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
         for round in 0..2u8 {
