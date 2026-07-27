@@ -726,12 +726,14 @@ The affected suite is the file's real home, `npm run test:server -- --run` (the 
 cd /home/dan/code/freshell/.worktrees/deflake-load-flakes
 for i in 1 2 3 4 5 6 7 8 9 10; do
   env -u FRESHELL_BIND_HOST FRESHELL_TEST_SUMMARY="f3wp flake3 proof $i/10" npm run test:server -- --run \
-    2>&1 | tail -5 | tee -a /tmp/deflake-logs/flake3-10x.log
-  test "${PIPESTATUS[0]}" -eq 0 || { echo "RUN $i FAILED" | tee -a /tmp/deflake-logs/flake3-10x.log; break; }
+    > /tmp/deflake-logs/flake3-10x-run$i.log 2>&1
+  status=$?
+  tail -5 /tmp/deflake-logs/flake3-10x-run$i.log | tee -a /tmp/deflake-logs/flake3-10x.log
+  test "$status" -eq 0 || { echo "RUN $i FAILED (full log: /tmp/deflake-logs/flake3-10x-run$i.log)" | tee -a /tmp/deflake-logs/flake3-10x.log; break; }
 done
 grep -c "FAILED" /tmp/deflake-logs/flake3-10x.log || true
 ```
-(VALIDATED: without pipefail, `cmd | tail | tee || …` takes `tee`'s exit status and logs every failure as green — the `${PIPESTATUS[0]}` gate above is mandatory, in the same shell invocation as the pipe.)
+(VALIDATED: without pipefail, `cmd | tail | tee || …` takes `tee`'s exit status and logs every failure as green. The redirect-then-tail shape above sidesteps the pipeline hazard entirely — `$status` is the test run's real exit code — AND preserves each run's FULL output in `flake3-10x-run$i.log`, which the blast-radius rule below needs: classifying WHICH test failed and whether its message matches rule (c) is impossible from a 5-line summary tail.)
 
 Expected: 10 consecutive green runs, zero "RUN n FAILED" lines. Blast-radius rule (VALIDATED, updated): a failure is INSIDE this flake's blast radius if it is (a) any EADDRINUSE anywhere, (b) any remote-proxy test, OR (c) a `client.test.ts` failure with "Timed out waiting for fake Codex app-server" — that harness has 28 ungated `startFakeCodexAppServer` calls per pass riding the same alloc→spawn→bind race, and a lost bind there surfaces as that 5 s timeout, never as an EADDRINUSE code. If (c) fires, apply the same allocator-contract retry to that harness helper (same loop shape as startProxy's) before continuing the count. Only failures demonstrably outside (a)-(c) may be noted and counted past — otherwise investigate before counting.
 
@@ -846,13 +848,15 @@ cd /home/dan/code/freshell/.worktrees/deflake-load-flakes
 cargo test --workspace > /tmp/deflake-logs/flake4-load-generator.log 2>&1 &
 LOADPID=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do
-  cargo test -p freshell-ws 2>&1 | tail -5 | tee -a /tmp/deflake-logs/flake4-10x.log
-  test "${PIPESTATUS[0]}" -eq 0 || echo "RUN $i FAILED" | tee -a /tmp/deflake-logs/flake4-10x.log
+  cargo test -p freshell-ws > /tmp/deflake-logs/flake4-10x-run$i.log 2>&1
+  status=$?
+  tail -5 /tmp/deflake-logs/flake4-10x-run$i.log | tee -a /tmp/deflake-logs/flake4-10x.log
+  test "$status" -eq 0 || echo "RUN $i FAILED (full log: /tmp/deflake-logs/flake4-10x-run$i.log)" | tee -a /tmp/deflake-logs/flake4-10x.log
 done
 wait $LOADPID
 ls /tmp/pane-ledger-test-lock-* 2>/dev/null | tee -a /tmp/deflake-logs/flake4-10x.log || echo "no new fossils" | tee -a /tmp/deflake-logs/flake4-10x.log
 ```
-(Each `cargo test -p freshell-ws` is a few minutes; budget ~60-90 min with the workspace run alongside. Use `timeout: 7200`. The `${PIPESTATUS[0]}` gate is mandatory — VALIDATED: without it, `cmd | tail | tee || …` takes `tee`'s exit status and logs every failure as green.)
+(Each `cargo test -p freshell-ws` is a few minutes; budget ~60-90 min with the workspace run alongside. Use `timeout: 7200`. VALIDATED: `cmd | tail | tee || …` takes `tee`'s exit status and logs every failure as green — the redirect-then-tail shape above sidesteps that hazard (`$status` is cargo's real exit code) AND preserves each run's FULL output in `flake4-10x-run$i.log`. That full capture is load-bearing for the decision gate below: the deliverable is the new errno/probe diagnostic text, which prints in the failures section that a 5-line tail would discard — on a nondeterministic failure that may never recur.)
 
 **Fossil attribution (VALIDATED risk — /tmp is host-shared and other lanes run cargo concurrently):** before Step 1's `rm -rf`, check whether the tests' `temp_root` helper builds its path via `std::env::temp_dir()` (which honors `TMPDIR`). If it does, export a lane-private `TMPDIR="$(mktemp -d /tmp/f3wp-flake4-XXXX)"` for BOTH the load generator and the 10x loop above — then any fossil in plain `/tmp` during the window is known-foreign, and only fossils under the lane-private dir feed the decision gate. If `temp_root` hardcodes `/tmp`, attribute each new fossil instead: the dir name embeds the creating PID (`pane-ledger-test-lock-<pid>-<counter>`) — check `ps -fp <pid>` immediately and compare the fossil's mtime against this lane's run window. Foreign/unattributable fossils are recorded in the report but do NOT trigger the STOP path; only a fossil from this lane's own runs (or a red run with the new diagnostics firing) does.
 
@@ -909,10 +913,14 @@ Attribution rule (VALIDATED risk: no e2e baseline exists for the branch base, so
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/deflake-load-flakes
-env -u FRESHELL_BIND_HOST FRESHELL_TEST_SUMMARY="f3wp deflake final" npm test 2>&1 | tail -10 | tee /tmp/deflake-logs/final-npm-test.log
-cargo test --workspace 2>&1 | tail -10 | tee /tmp/deflake-logs/final-cargo.log
+env -u FRESHELL_BIND_HOST FRESHELL_TEST_SUMMARY="f3wp deflake final" npm test > /tmp/deflake-logs/final-npm-test.log 2>&1; npm_status=$?
+tail -10 /tmp/deflake-logs/final-npm-test.log
+cargo test --workspace > /tmp/deflake-logs/final-cargo.log 2>&1; cargo_status=$?
+tail -10 /tmp/deflake-logs/final-cargo.log
+echo "npm_status=$npm_status cargo_status=$cargo_status"
+test "$npm_status" -eq 0 && test "$cargo_status" -eq 0
 ```
-Expected: both exit 0.
+Expected: the final `test` line exits 0 and the echo prints `npm_status=0 cargo_status=0`. (Same hazard as Tasks 6/7 — VALIDATED: `cmd | tail | tee` exits with `tee`'s status, so the previous piped form could log a red run as green. The redirect captures each run's real exit code AND the full output in the log files, not just the last 10 lines.)
 
 - [ ] **Step 4: Append the verification report**
 
