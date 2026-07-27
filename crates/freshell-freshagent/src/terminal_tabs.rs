@@ -547,6 +547,30 @@ fn codex_launch_error_response(
     fail_json(status, error.to_string())
 }
 
+/// REST mapping of a spawn-gate rejection (WS analogue:
+/// `spawn_gate_error_parts` in freshell-ws/src/terminal.rs).
+/// QueueFull -> 429: the caller should back off and retry.
+/// Timeout   -> 503: spawn capacity unavailable right now.
+/// The retry guidance lives in the MESSAGE because the MCP bridge
+/// (server/mcp/freshell-tool.ts) surfaces only the message text, not the
+/// HTTP status. Body key is `code`+`message` (never `error`) so the MCP
+/// http-client's `data.error || data.message` precedence keeps showing the
+/// human message.
+fn spawn_gate_error_response(err: crate::spawn_gate::SpawnGateError) -> Response {
+    match err {
+        crate::spawn_gate::SpawnGateError::QueueFull => crate::fail_json_code(
+            StatusCode::TOO_MANY_REQUESTS,
+            "SPAWN_QUEUE_FULL",
+            "Too many concurrent terminal spawns; retry shortly".to_string(),
+        ),
+        crate::spawn_gate::SpawnGateError::Timeout => crate::fail_json_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SPAWN_TIMEOUT",
+            "Timed out waiting for a terminal spawn slot".to_string(),
+        ),
+    }
+}
+
 /// The resumeSessionId ECHO (`router.ts:177`):
 /// `opts.resumeSessionId ? (plan.sessionId ?? opts.resumeSessionId) : undefined`.
 /// The registry record (and everything keyed off it — set_meta, paneContent
@@ -791,6 +815,25 @@ pub(crate) async fn spawn_terminal_pane(
             }
         }
     }
+
+    // Server-wide spawn gate — the SAME instance the WS terminal.create path
+    // uses (ONE global concurrency budget; wired by freshell-server main.rs;
+    // docs/plans/2026-07-27-rest-spawn-gate.md). Placed on the shared path of
+    // EVERY mode, before terminal_id minting — i.e. before MCP config
+    // generation, opencode port allocation, and the codex managed-launch
+    // plan — so the permit also bounds the REST-reachable sidecar spawn and
+    // rejection needs NO cleanup (the session-ref lease above releases via
+    // its own Drop). RAII:
+    // `_spawn_permit` drops on every early-return Err(...) below, on spawn
+    // failure, and at fn end — never call `.forget()`. `None` (unwired) =
+    // ungated: unit-test states without server wiring keep legacy behavior.
+    let _spawn_permit = match state.spawn_gate() {
+        Some(rest_gate) => match rest_gate.gate.acquire(rest_gate.timeout).await {
+            Ok(permit) => Some(permit),
+            Err(err) => return Err(spawn_gate_error_response(err)),
+        },
+        None => None,
+    };
 
     let terminal_id = Uuid::new_v4().to_string();
     let stream_id = Uuid::new_v4().to_string();
@@ -3230,6 +3273,94 @@ mod tests {
         assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
 
         registry.kill("t-live-owner-split");
+        registry.kill(&shell_tid);
+    }
+
+    // ── REST spawn-gate tests (kata enn3) ──────────────────────────────────
+
+    fn shell_create_body() -> Value {
+        json!({
+            "mode": "shell",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        })
+    }
+
+    #[tokio::test]
+    async fn zero_permit_gate_times_out_rest_create_with_503() {
+        // 0 permits => acquire can never succeed => deterministic Timeout.
+        // The cheapest "gate is actually on the REST path" pin (same trick
+        // as crates/freshell-ws/tests/create_protection.rs).
+        let state = state_with_registry();
+        state.set_spawn_gate(
+            Arc::new(crate::spawn_gate::SpawnGate::new(0, 64)),
+            std::time::Duration::from_millis(100),
+        );
+        let (status, body) = post(app(state), "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(body["code"], json!("SPAWN_TIMEOUT"));
+        assert_eq!(
+            body["message"],
+            json!("Timed out waiting for a terminal spawn slot")
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_cap_exceeded_rest_create_is_429_spawn_queue_full() {
+        // 0 permits AND 0 queue slots => the very first waiter is rejected
+        // loudly with QueueFull (no wait at all).
+        let state = state_with_registry();
+        state.set_spawn_gate(
+            Arc::new(crate::spawn_gate::SpawnGate::new(0, 0)),
+            std::time::Duration::from_secs(5),
+        );
+        let (status, body) = post(app(state), "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(body["code"], json!("SPAWN_QUEUE_FULL"));
+        assert_eq!(
+            body["message"],
+            json!("Too many concurrent terminal spawns; retry shortly")
+        );
+    }
+
+    #[tokio::test]
+    async fn split_and_respawn_also_flow_through_the_gate() {
+        // Create a real pane while UNGATED (OnceLock unset), then wire a
+        // 0-permit gate and prove split AND respawn hit it too — the gate
+        // lives in spawn_terminal_pane, the one shared seam.
+        let state = state_with_registry();
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state.clone());
+        let (_tab_id, pane_id, shell_tid) = create_shell_tab(router.clone()).await;
+
+        state.set_spawn_gate(
+            Arc::new(crate::spawn_gate::SpawnGate::new(0, 64)),
+            std::time::Duration::from_millis(100),
+        );
+
+        let mut split_body = shell_create_body();
+        split_body["direction"] = json!("vertical");
+        let (status, body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/split"),
+            split_body,
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "split: {body}");
+        assert_eq!(body["code"], json!("SPAWN_TIMEOUT"));
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/respawn"),
+            shell_create_body(),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "respawn: {body}");
+        assert_eq!(body["code"], json!("SPAWN_TIMEOUT"));
+
         registry.kill(&shell_tid);
     }
 
