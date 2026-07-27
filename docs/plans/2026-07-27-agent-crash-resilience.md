@@ -1112,7 +1112,7 @@ import reducer, {
   recordTerminalExit, recordAutoResumeRecovering, foldTerminalReplacement,
   clearTerminalLifecycle, selectExitRecordFrom, selectActiveNoticeFrom,
   selectLastTerminalIdFrom, AUTO_RESUME_NOTICE_TTL_MS,
-} from './terminalLifecycleSlice'
+} from '@/store/terminalLifecycleSlice'
 
 const empty = reducer(undefined, { type: '@@init' })
 
@@ -1340,7 +1340,7 @@ export interface TerminalExitBannerProps {
 ```tsx
 import { describe, it, expect, vi } from 'vitest'
 import { render, screen, fireEvent } from '@testing-library/react'
-import { TerminalExitBanner } from './TerminalExitBanner'
+import { TerminalExitBanner } from '@/components/TerminalExitBanner'
 
 describe('TerminalExitBanner', () => {
   it('renders a loud error bar with the exit code and an accessible relaunch button', () => {
@@ -1834,3 +1834,13 @@ The second independent cross-model review found two blocking (major) executable 
 2. **Client test paths contradicted the plan's own placement rules and the repo convention.** The File Structure table and every red/green/commit command in Tasks 6/7/8 hardcoded `src/store/**`/`src/components/**` test paths, while the plan's conditional placement rules (and the repo: VERIFIED zero `*.test.*` files under `src/`; all client unit tests under `test/unit/client/{store,components}/`; vitest default include + attested `npm run test:vitest -- run test/unit/client/...` invocation form) resolve to `test/unit/client/**`. Fixed: all 22 references across the File Structure table, Task 6 (slice tests, run/`git add` commands), Task 7 (banner + integration tests, run/`git add` commands), and Task 8 (turn-completion replacement test, run/`git add` commands) now use `test/unit/client/store/` / `test/unit/client/components/`, and the conditional hedges were replaced with the verified convention statement.
 
 Self-review re-run over the edited tasks (File Structure table, Tasks 6/7/8 commands, Task 9 steps 1-2): fixture code, test-4 comment, the RustServer env sketch, and the post-spec note all agree on FAKE_CRASH_UNTIL precedence; tests 1-3 still exercise the unchanged `FAKE_CRASH_MODE` branch (`crashUntil=0` falls to the mode checks); every `npm run test:vitest -- run <path>` / `git add <path>` names a path the same task creates; no new TBDs or placeholders introduced; Task 9's four e2e assertions remain the end-to-end proof of every user story, with test 4 now proving liveness non-vacuously.
+
+## Fresh-Eyes Review Fixes (iteration 3 addendum, 2026-07-27)
+
+The third independent cross-model review found two blocking (major) executable defects — both residues of the iteration-2 path relocation; both are fixed in this revision:
+
+1. **Task 6's fully-written slice test imported `./terminalLifecycleSlice` relative to its own file.** With the test at `test/unit/client/store/terminalLifecycleSlice.test.ts` and the module at `src/store/terminalLifecycleSlice.ts`, a relative `./` import can never resolve — the test fails with module-not-found both before AND after implementation, making Step 5's "run green" gate unachievable and the red state indistinguishable from the intended one. Fixed: the import is now `@/store/terminalLifecycleSlice`, matching the repo convention (VERIFIED: `tsconfig.json:25` maps `@/*`; sibling `test/unit/client/store/turnCompletionSlice.test.ts` imports `@/store/turnCompletionSlice`). Step 2's "Expected: FAIL — module not found" remains true pre-implementation (the alias target does not exist yet) and Step 5's green run becomes achievable once `src/store/terminalLifecycleSlice.ts` lands.
+
+2. **Task 7's fully-written banner test imported `./TerminalExitBanner` relative to its own file.** Same defect: test at `test/unit/client/components/TerminalExitBanner.test.tsx`, component at `src/components/TerminalExitBanner.tsx`. Fixed: the import is now `@/components/TerminalExitBanner` (sibling component tests under `test/unit/client/components/` use the same `@/` alias form). Red/green semantics preserved as in fix 1.
+
+Self-review re-run over the edited tasks (Task 6 Step 1, Task 7 Step 1): the only remaining relative import in plan code is `../store/terminalLifecycleSlice` inside the `src/components/TerminalExitBanner.tsx` implementation sketch (line ~1393), which is CORRECT — it resolves from `src/components/` to `src/store/`, matching how the component will actually import the slice; Task 8's test is a prose sketch with no import lines; Task 6's TerminalView wiring snippets reference slice symbols only; no run/`git add` command paths changed; no new TBDs or placeholders introduced.
