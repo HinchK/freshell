@@ -262,6 +262,11 @@ export interface RustServerOptions {
   startTimeoutMs?: number
   /** Pipe the spawned server's stdout/stderr to this process's console. */
   verbose?: boolean
+  /**
+   * Test seam (kata f3wp): overrides how start() picks its port.
+   * Default: findFreePort. restart paths intentionally reuse the prior port.
+   */
+  portPicker?: () => Promise<number>
 }
 
 /**
@@ -300,15 +305,56 @@ export class RustServer implements E2eServerHandle {
     }
     this.homeDir = homeDir
 
-    try {
-      const port = await findFreePort()
-      const token = this.options.token ?? randomUUID()
-      const info = await this.boot(homeDir, port, token)
-      return info
-    } catch (error) {
-      await this.stopProcess(true)
-      throw error
+    const pickPort = this.options.portPicker ?? findFreePort
+    const token = this.options.token ?? randomUUID()
+    const maxBootAttempts = 3
+    let lastError: unknown
+    for (let attempt = 1; attempt <= maxBootAttempts; attempt++) {
+      const port = await pickPort()
+      try {
+        const info = await this.boot(homeDir, port, token)
+        // DEFLAKE (f3wp, validated): /api/health is UNAUTHENTICATED and
+        // instance-anonymous (200 {"ok":true,...} regardless of token), so a
+        // FOREIGN test server that stole the port satisfies the health poll
+        // while our child dies -- a silent false-positive boot. Confirm the
+        // server that answered is OURS via a token-gated endpoint before
+        // declaring success; a foreign server rejects our token.
+        const identity = await fetch(`${info.baseUrl}/api/server-info`, {
+          headers: { 'x-auth-token': token },
+        })
+        if (!identity.ok) {
+          throw new Error(
+            `bind race: foreign server answered health on port ${port} (server-info ${identity.status})`,
+          )
+        }
+        return info
+      } catch (error) {
+        lastError = error
+        // Between attempts: PROCESS-ONLY cleanup. Do NOT call
+        // stopProcess(true) here -- it deletes the owned home dir and nulls
+        // this.homeDir/this._info (rust-server.ts:575-588), so any retried
+        // boot would leave restart()/restartAbrupt() throwing "RustServer
+        // not started" and leak the home dir on stop(). killCurrentProcess()
+        // (rust-server.ts:504-541) kills only the child and touches neither.
+        await this.killCurrentProcess()
+        // Retry ONLY the bind-race shape (kata f3wp): the child exited or
+        // never became healthy because the probed port was stolen between
+        // findFreePort's close and the server's bind -- or a foreign server
+        // answered the health poll (identity check above). Everything else
+        // is a genuine boot failure -- clean up fully and rethrow immediately
+        // (preserving the original single-attempt failure semantics).
+        const message = error instanceof Error ? error.message : String(error)
+        const bindRace = /EADDRINUSE|address (?:already )?in use|bind race/i.test(message)
+        if (!bindRace) {
+          await this.stopProcess(true)
+          throw error
+        }
+      }
     }
+    // All attempts exhausted: full cleanup (home dir included), as the
+    // original pre-retry catch did.
+    await this.stopProcess(true)
+    throw lastError
   }
 
   /**
@@ -598,13 +644,20 @@ export class RustServer implements E2eServerHandle {
         )
       }
       try {
-        const res = await fetch(`${baseUrl}/api/health`)
+        // Per-poll bound (f3wp, validated): a bind-race occupier that ACCEPTS
+        // the TCP connection but never answers HTTP makes an unbounded fetch
+        // hang indefinitely (Node 22 fetch has no default timeout), blocking
+        // the child-exit check above for the entire health budget and beyond.
+        // A healthy server answers in milliseconds; 2s is generous.
+        const res = await fetch(`${baseUrl}/api/health`, {
+          signal: AbortSignal.timeout(2000),
+        })
         if (res.ok) {
           const body = (await res.json()) as { ok?: boolean }
           if (body.ok) return
         }
       } catch {
-        // Not listening yet — expected during boot.
+        // Not listening yet (or a wedged occupier) — expected during boot.
       }
       await new Promise((r) => setTimeout(r, 200))
     }
