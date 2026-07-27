@@ -7,7 +7,7 @@
 
 **Goal:** Land the two recorded follow-ups from the WSL crash-hardening merge: bound the unbounded settled create-dedupe cache in `crates/freshell-ws`, and make the one timing-sensitive test in the restore/dedupe acceptance suite deterministic — without weakening any dedupe semantics or test assertion.
 
-**Architecture:** The settled cache (`CreateDedupe` in `crates/freshell-ws/src/create_dedupe.rs`) gains a TTL + oldest-first cap using the crate's established house patterns: an injectable `now_ms: i64` parameter (as in `create_limit.rs:116` and `invariants.rs:51`) and prune-on-access (as in `CreateRateLimiter`), with **no new dependencies**. The racy acceptance test `restore_create_holds_permit_until_settled` is replaced by two deterministic tests: an acceptance test where the test itself holds the gate's single permit (structural queueing, no wall-clock race), plus a unit test in `create_gate.rs` pinning the "permit released only after the create settles" ordering via a tiny extracted `hold_permit_across` helper.
+**Architecture:** The settled cache (`CreateDedupe` in `crates/freshell-ws/src/create_dedupe.rs`) becomes **liveness-anchored** (legacy parity): a settled entry lives exactly as long as its terminal is running. `settle()` gains an `is_running` closure and prunes dead entries on access (house prune-on-access pattern, as in `CreateRateLimiter`); `begin()`'s existing liveness closure is tightened from `registry.exists()` to a corrected `TerminalRegistry::is_running()` that reads `TerminalRunStatus` (the existing method at `registry.rs:1112` is presence-only and must be fixed — see Task 1). **No new dependencies, no clock injection, no constants** — an originally drafted TTL+cap design was falsified during pre-execution load-bearing validation (the frozen client re-sends persisted requestIds at arbitrary delay; see Task 1 preamble). The racy acceptance test `restore_create_holds_permit_until_settled` is replaced by two deterministic tests: an acceptance test where the test itself holds the gate's single permit (structural queueing, no wall-clock race), plus a unit test in `create_gate.rs` pinning the "permit released only after the create settles" ordering via a tiny extracted `hold_permit_across` helper.
 
 **Tech Stack:** Rust (edition 2021), tokio, cargo test/fmt/clippy. No new crates.
 
@@ -18,322 +18,178 @@ Both issues were re-verified against this worktree's checked-out branch (`fix/de
 1. **Unbounded settled cache: CONFIRMED.** `CreateDedupe { entries: Mutex<HashMap<String, Entry>> }` (`crates/freshell-ws/src/create_dedupe.rs:91-94`). `settle()` unconditionally inserts an `Entry::Settled` (`create_dedupe.rs:154-160`) on every successful create (sole production caller: `terminal.rs:1312-1315`, reached by both the inline and gated-restore create paths). The only `remove` (`create_dedupe.rs:178`) is guarded to `InFlight` (`:177` — doc: *"Settled entries stay: that IS the dedupe"*). No capacity constant, no TTL, no timestamp stored, no background reaper, no `retain`/`clear`/`shrink` anywhere. The lazy displacement (`create_dedupe.rs:121-134`) fires only when the *same* requestId is re-sent AND the terminal is not live — and `is_live` is `registry.exists()` (`registry.rs:903-909`), which stays `true` for naturally-exited-but-retained terminals (`registry.rs:911-915`), so it only ever catches *killed* terminals. Growth: one immortal ~440-byte entry per successful create for the server process lifetime.
 2. **Timing-sensitive test: CONFIRMED, exactly one.** `restore_create_holds_permit_until_settled` (`crates/freshell-ws/tests/restore_spawn_gate.rs:341-370`) contains no sleep but is a pure unsynchronized wall-clock race: its `gate.queued_total() >= 1` assertion holds only if the `r2` frame reaches the server while `r1` still holds the single permit — a few-millisecond window. The harness's own Nagle comment (`tests/restore_spawn_gate.rs:165-171`) documents that ~3 ms of extra latency exceeds a whole settled create. It fails toward **false-FAIL** under load. Every other sleep in the suite is a bounded poll tick, a negative-assertion window (fails toward false-PASS), or semantically required — out of scope.
 
+**Pre-execution load-bearing validation (Stage 2) addendum:** the plan's originally drafted fix (30-min TTL + 4096 cap) was validated against the frozen client and legacy server before execution and **falsified**: (a) the frozen client persists `createRequestId` in localStorage pane layouts and re-sends it on every reconnect until the pane anchors (`src/lib/terminal-restore.ts:28-33`, `src/components/TerminalView.tsx:4334-4342`), so duplicates can arrive at arbitrary delay while the terminal is live; (b) legacy's real dedupe structure is the process-wide `createdTerminalByRequestId` (`server/ws-handler.ts:564`), pruned eagerly at terminal exit (`:580-587`) — liveness-anchored, not process-lifetime (the per-connection map at `:467` dies with the socket); (c) the Rust registry retains naturally-exited terminals indefinitely (`registry.rs:927-967`; no port of legacy's `MAX_TERMINALS`/`reapExitedTerminals`), so eviction must anchor to RUNNING status, not `exists()`. The plan below reflects the corrected, legacy-parity design. Known pre-existing divergences surfaced by validation (recorded as out-of-scope follow-ups, NOT to be changed here): Rust replays a stored `terminal.created` frame without legacy's `expectedSessionKey` gate (`ws-handler.ts:904-909`); the Rust port lacks legacy's terminal-population bounds (`MAX_TERMINALS` 50 / `MAX_EXITED_TERMINALS` 200 / `reapExitedTerminals`).
+
 If an implementer finds either finding no longer true (e.g. a bound already added), STOP that task and report instead of changing anything.
 
 ## Global Constraints
 
 - **Base:** all work on the current worktree branch `fix/dedupe-cache-followups` (based on `f065cf58`, the crash-hardening merge) — NOT `main`. Worktree: `/home/dan/code/freshell/.worktrees/rust-tauri-port/.worktrees/dedupe-cache-followups`.
 - **No new dependencies** — no workspace deps, no crate deps, no dev-deps. Hand-roll in house style (`create_limit.rs` / `spawn_gate.rs` are the templates).
-- **Frozen read-only paths:** `server/`, `shared/`, `src/`, `dist/client`. Touch only `crates/` + `docs/plans/` + `port/oracle/DEVIATIONS.md`.
+- **Frozen read-only paths:** `server/`, `shared/`, `src/`, `dist/client`. Touch only `crates/` + `docs/plans/`.
 - **Process safety:** never broad-kill; only signal PIDs the tests spawned; never bind ports 3001/3002 (user's live freshell runs on :3001).
 - **Quality gates (delta vs baseline, never absolute green):** `cargo fmt --all -- --check` clean; `cargo clippy --workspace --all-targets` with no NEW warnings vs the baseline recorded in Task 1 Step 1; `cargo test -p freshell-ws` with no NEW failures vs baseline. Two failures are known-allowed by name: `codex_session_ref_resume::codex_create_derives_resume_from_session_ref` (environmental — no `node_modules` in this worktree) and `session_identity_frames::fresh_claude_create_frames_carry_preallocated_session_ref` (pre-existing defect).
 - **TDD:** Red-Green-Refactor for every task; never skip the failing-test step.
 - **Commits:** Conventional Commits with crate scope, ASCII subject, bullet body, a `Verification:` paragraph naming the exact commands run, and the Amplifier footer — via four separate `-m` args. Explicit `git add <paths>`, never `-A`. No PR (port campaign rule).
-- **Build note:** this worktree has no `target/`; the first cargo invocation is a cold full build — budget long timeouts (10+ minutes).
-- **Wire-visible deviation rule:** the cache bound is a deliberate divergence from the legacy Node server (whose `createdByRequestId` settled cache in `server/ws-handler.ts` is process-lifetime). It requires a `port/oracle/DEVIATIONS.md` entry + pinning test (Task 2 Step 5).
+- **Build note:** this worktree has no `target/`; the first cargo invocation is a cold full build — budget long timeouts. (Measured during pre-execution validation with a warm `~/.cargo` cache: ~25 s for the freshell-ws test target, zero downloads. Still budget 10+ minutes in case the cache is cold.)
+- **Parity note (replaces the earlier wire-visible-deviation rule):** liveness-anchored eviction MATCHES legacy's model (`createdTerminalByRequestId` pruned at terminal exit, `server/ws-handler.ts:580-587`), so **no new `port/oracle/DEVIATIONS.md` entry is required** — this change removes an undocumented divergence (replay-after-exit via `exists()`) rather than adding one. The pre-existing divergences listed in the verification addendum above are recorded follow-ups, out of scope.
 
 ## File Structure
 
 | File | Change | Responsibility |
 |---|---|---|
-| `crates/freshell-ws/src/create_dedupe.rs` (331 lines) | Modify | The bounding change lives here entirely: timestamped settled entries, settle-order queue, TTL + cap prune, updated inline unit tests. |
-| `crates/freshell-ws/src/terminal.rs` (2,619 lines — **surgical edits only**, file is over the size waiver) | Modify (2 call sites) | Pass wall-clock `now_ms()` into `begin()` (~`:487-492`) and `settle()` (~`:1312-1315`). |
+| `crates/freshell-ws/src/create_dedupe.rs` (331 lines) | Modify | The bounding change: `settle()` gains an `is_running` closure and prunes dead entries on access; doc updates; updated + new inline unit tests. |
+| `crates/freshell-terminal/src/registry.rs` | Modify (1 method + 1 test) | Fix the presence-only `is_running()` body (`:1112-1119`) to read `TerminalRunStatus::Running`; pin with a unit test on an exited-retained terminal. |
+| `crates/freshell-ws/src/terminal.rs` (2,619 lines — **surgical edits only**, file is over the size waiver) | Modify (2 call sites) | Swap `begin()`'s closure to `is_running` (`:488-492`); pass the closure into `settle()` (`:1313-1315`). |
 | `crates/freshell-ws/src/create_gate.rs` | Modify | Extract `hold_permit_across` permit-scope helper + new `#[cfg(test)]` unit test pinning release-after-settle. |
 | `crates/freshell-ws/tests/restore_spawn_gate.rs` | Modify (1 test) | Replace the racy settled-hold test with the deterministic test-held-permit version. |
-| `port/oracle/DEVIATIONS.md` | Modify (append) | Record the deliberate bounded-cache divergence from legacy. |
 
 No new files. No module split (new behavior stays out of `terminal.rs` per the size waiver; `create_dedupe.rs` stays well under 1K lines).
 
 ---
 
-### Task 1: TTL-bound the settled dedupe cache
+### Task 1: Anchor settled dedupe entries to terminal liveness (bounded, legacy parity)
 
-Settled entries expire `SETTLED_TTL_MS` after they settle. Strategy justification (recorded here so reviewers don't re-litigate): a settled entry exists so a **reconnecting client's re-send of a recently settled create** gets the original `terminal.created` replayed instead of spawning a second terminal. The frozen client's retry ladder re-sends within ~2 seconds; reconnect/restore storms play out over seconds to minutes. A TTL of **30 minutes** is orders of magnitude beyond any real reconnect window while making entries mortal on a long-lived server. TTL alone doesn't bound a burst *within* one window, so Task 2 adds a hard cap as a backstop. LRU crates (`lru`, `moka`, `hashlink`) are ruled out: zero cache crates anywhere in the workspace/lockfile as direct deps, and repo policy is hand-rolled small mechanisms with no new dependency edges. The house pattern is prune-on-access with an injectable `now_ms` parameter (`create_limit.rs:116`, `invariants.rs:51`) — no background reaper needed.
+A settled entry now lives exactly as long as its terminal is **running** — the legacy model. Strategy justification (recorded here so reviewers don't re-litigate; validated during the pre-execution load-bearing review): the originally drafted fix (30-min TTL + 4096 cap) was **falsified** before execution. The frozen client persists `createRequestId` inside pane layouts (localStorage via persistMiddleware; `src/lib/terminal-restore.ts:28-33`) and re-sends the SAME requestId on every reconnect/restart "for as many interrupted restore rounds as it takes to anchor" (`src/components/TerminalView.tsx:4334-4342`, whose comment relies on the invariant that the re-send "cannot spawn a duplicate terminal"). A pane persisted as `{status:'creating', createRequestId}` (reply lost in transit, or processed inside the 500 ms persist debounce before a crash) can therefore re-send its requestId at ARBITRARY delay — laptop closed overnight — so **any fixed time window can double-spawn a terminal beside the live original**, weakening dedupe vs legacy. Legacy Node's actual model (verified in `server/ws-handler.ts`): the process-wide `createdTerminalByRequestId` map (`:564`) is pruned eagerly when the terminal exits (`:580-587`, registered `:650`, fires for ALL exit categories) and lazily on registry miss (`:914-921`) — dedupe anchored to terminal running-lifetime, with **no time limit**, bounded by the running-terminal count. This task adopts the same anchor: prune-on-access at `settle()` (house pattern — no background task, no new deps, no clock injection) removes every settled entry whose terminal is no longer running, so after each successful create the cache holds at most one entry per running terminal plus in-flight creates. No immortal entries; the confirmed leak (one immortal ~0.5 KB entry per successful create, forever) is gone.
 
-**Explicit post-eviction semantics (spec requirement):** a duplicate arriving AFTER its settled entry was evicted finds no entry, gets `DedupeDecision::Proceed`, and runs as a **fresh create — spawning a NEW terminal** and replying with the same requestId but a new terminalId. This is the same observable outcome the code already produces for the killed-terminal displacement path, and it is unreachable in practice inside any real reconnect window (30 min TTL). It is pinned by `duplicate_after_ttl_eviction_proceeds_as_fresh_create` below. The "duplicates never spawn a second terminal" guarantee holds for the full TTL/cap window.
+This also FIXES an unintended superset vs legacy: the current liveness closure is `registry.exists()`, which stays `true` for naturally-exited-but-retained terminals (`crates/freshell-terminal/src/registry.rs:911-921`), so today a duplicate replays `terminal.created` for an already-exited terminal — legacy never replays for an exited terminal (eager delete at exit). Anchoring to running-status matches legacy exactly.
+
+**Explicit post-eviction semantics (spec requirement):** a duplicate arriving after its terminal stopped running finds no settled entry (or a displaceable one), gets `DedupeDecision::Proceed`, and runs as a **fresh create — spawning a NEW terminal** with the same requestId and a new terminalId. This is exactly legacy's post-exit behavior, and it is already pinned by the existing `dead_terminal_evicts_settled_entry` test (whose closure semantics this task makes real at the call site). The "duplicates never spawn a second terminal" guarantee holds for the terminal's whole running lifetime — strictly stronger than any fixed window.
+
+**CRITICAL naming trap (validated):** `TerminalRegistry::is_running` ALREADY EXISTS at `crates/freshell-terminal/src/registry.rs:1112-1119` but is presence-only (`terminals.contains_key(...)` — semantically identical to `exists()`). Wiring it up unmodified would compile and change NOTHING. Step 5(a) fixes its body to check `TerminalRunStatus::Running`. Its only current callers are 5 registry unit tests, none exercising exited-retained terminals (verified), so they keep passing.
 
 **Files:**
-- Modify: `crates/freshell-ws/src/create_dedupe.rs` (struct at `:91-94`, `Entry` at `:41-56`, `begin` at `:101-147`, `settle` at `:153-166`, `clear_if_in_flight` at `:174-192`, tests mod at `:195-331`)
-- Modify: `crates/freshell-ws/src/terminal.rs:487-492` (begin call) and `:1312-1315` (settle call)
-- Test: inline `#[cfg(test)] mod tests` in `crates/freshell-ws/src/create_dedupe.rs`
+- Modify: `crates/freshell-terminal/src/registry.rs` (fix `is_running` body at `:1112-1119` + doc comment at `:1111`; extend/adjust the exited-retained unit test near `:1995`)
+- Modify: `crates/freshell-ws/src/create_dedupe.rs` (`settle` at `:153-166` gains a liveness closure + prune; doc updates; tests mod at `:195-331`)
+- Modify: `crates/freshell-ws/src/terminal.rs:491` (begin closure: `exists` -> `is_running`) and `:1313-1315` (settle call gains the closure)
+- Test: inline `#[cfg(test)]` mods in `create_dedupe.rs` and `registry.rs`
 
 **Interfaces:**
-- Consumes: `crate::terminal::now_ms() -> i64` (already `pub(crate)`, `terminal.rs:85-88`); `FrameSink` (`freshell_terminal`); `ServerMessage` (`freshell_protocol`).
+- Consumes: `TerminalRunStatus { Running, Exited }` (`crates/freshell-protocol/src/server_messages.rs:214-218`); the private `TerminalShared.status` field (`registry.rs:202`); the established lock-inner -> clone-shared -> read-status pattern at `registry.rs:457-466`; `FrameSink` (`freshell_terminal`); `ServerMessage` (`freshell_protocol`).
 - Produces (later tasks rely on these exact shapes):
-  - `pub fn begin(&self, request_id: &str, sink: &FrameSink, is_live: impl Fn(&str) -> bool, now_ms: i64) -> DedupeDecision`
-  - `pub fn settle(&self, request_id: &str, terminal_id: &str, created: &ServerMessage, now_ms: i64)`
-  - `pub fn clear_if_in_flight(&self, request_id: &str)` (unchanged signature)
-  - `const SETTLED_TTL_MS: i64` (module-private, visible to inline tests)
-  - Private `struct Inner { entries: HashMap<String, Entry>, settled_order: VecDeque<(String, i64)> }` behind `CreateDedupe { inner: Mutex<Inner> }`; `Inner::prune_settled(&mut self, now_ms: i64)` (Task 2 extends this fn).
+  - `pub fn is_running(&self, terminal_id: &str) -> bool` on `TerminalRegistry` (existing name, corrected body: `true` only while status is `Running`; map-miss => `false`)
+  - `pub fn begin(&self, request_id: &str, sink: &FrameSink, is_running: impl Fn(&str) -> bool) -> DedupeDecision` (signature unchanged from today; parameter renamed from `is_live`, semantics now "running")
+  - `pub fn settle(&self, request_id: &str, terminal_id: &str, created: &ServerMessage, is_running: impl Fn(&str) -> bool)` (new final parameter)
+  - `pub fn clear_if_in_flight(&self, request_id: &str)` (unchanged)
+  - `CreateDedupe { entries: Mutex<HashMap<String, Entry>> }` (struct unchanged — no Inner wrapper, no VecDeque, no timestamps, no constants)
 
 - [ ] **Step 1: Record the quality-gate baseline (before any change)**
 
-Run (long timeout — cold build):
+Run (first cargo invocation on this worktree is a cold build; with a warm `~/.cargo` it measured ~25 s during pre-execution validation, but budget long timeouts anyway):
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/rust-tauri-port/.worktrees/dedupe-cache-followups
 cargo clippy --workspace --all-targets 2>&1 | tee /tmp/dedupe-followups-baseline-clippy.txt | grep -c "^warning"
 cargo test -p freshell-ws 2>&1 | tee /tmp/dedupe-followups-baseline-test.txt | tail -30
+cargo test -p freshell-terminal 2>&1 | tee /tmp/dedupe-followups-baseline-terminal-test.txt | tail -15
 ```
 
-Expected: clippy completes (previously recorded baseline: ~60 warnings); tests complete with at most the two known-allowed failures named in Global Constraints. These files are the comparison baseline for every later task. If other tests fail at baseline, note their names — they are pre-existing, not yours to fix, but they must not be *joined* by new ones.
+Expected: clippy completes with a NON-ZERO baseline count (pre-existing warnings exist in freshell-ws lib, freshell-platform, freshell-freshagent — verified); tests complete with at most the two known-allowed freshell-ws failures named in Global Constraints. These files are the comparison baseline for every later task. If other tests fail at baseline, note their names — they are pre-existing, not yours to fix, but they must not be *joined* by new ones.
 
 - [ ] **Step 2: Verify the issue still exists (halt condition)**
 
 Run:
 
 ```bash
-grep -n "settled_at_ms\|SETTLED_TTL\|SETTLED_MAX\|VecDeque" crates/freshell-ws/src/create_dedupe.rs
+grep -n "is_running\|retain" crates/freshell-ws/src/create_dedupe.rs
+sed -n '1108,1122p' crates/freshell-terminal/src/registry.rs
 ```
 
-Expected: **no matches.** If any match, the cache has already been bounded — STOP this task and report instead of changing anything.
+Expected: **no matches** for the grep, and the `sed` output shows `is_running` implemented via `contains_key` (presence-only). If the grep matches or `is_running` already checks run-status, the cache has already been bounded — STOP this task and report instead of changing anything.
 
 - [ ] **Step 3: Write the failing tests**
 
-In `crates/freshell-ws/src/create_dedupe.rs`, inside the existing `#[cfg(test)] mod tests` (after the `recording_sink` helper), add a shared time origin and four new tests:
+(a) In `crates/freshell-terminal/src/registry.rs`, locate the existing unit test near `:1995` whose comment documents that naturally-exited terminals are retained (it observes presence via `exists()`/`is_running` after a natural exit). Extend it (or add a sibling test `is_running_false_for_exited_retained_terminal` reusing that test's exact spawn-and-wait-for-exit harness) so that after the natural exit is observed it asserts:
 
 ```rust
-    /// Arbitrary wall-clock origin for injectable-now tests.
-    const T0: i64 = 1_000_000;
-
-    #[test]
-    fn settled_entry_replays_until_ttl_boundary() {
-        let d = CreateDedupe::default();
-        let (s, _f) = recording_sink();
-        let _ = d.begin("r1", &s, |_| true, T0);
-        d.settle("r1", "t1", &created_frame(), T0);
-        // One ms before expiry: still replayed.
-        assert!(matches!(
-            d.begin("r1", &s, |_| true, T0 + SETTLED_TTL_MS - 1),
-            DedupeDecision::DuplicateSettled(_)
-        ));
-    }
-
-    #[test]
-    fn duplicate_after_ttl_eviction_proceeds_as_fresh_create() {
-        let d = CreateDedupe::default();
-        let (s, _f) = recording_sink();
-        let _ = d.begin("r1", &s, |_| true, T0);
-        d.settle("r1", "t1", &created_frame(), T0);
-        // At/after expiry the entry is gone even though the terminal is
-        // live: the duplicate re-enters the normal create lifecycle (a
-        // fresh create spawns a NEW terminal, same requestId, new
-        // terminalId). This is the explicit post-eviction contract.
-        assert!(matches!(
-            d.begin("r1", &s, |_| true, T0 + SETTLED_TTL_MS),
-            DedupeDecision::Proceed
-        ));
-        // ...and it is a real InFlight sentinel again: a duplicate from
-        // another connection queues as a waiter instead of replaying.
-        let (other, _f2) = recording_sink();
-        assert!(matches!(
-            d.begin("r1", &other, |_| true, T0 + SETTLED_TTL_MS),
-            DedupeDecision::DuplicateInFlight
-        ));
-    }
-
-    #[test]
-    fn settle_prunes_entries_past_ttl() {
-        let d = CreateDedupe::default();
-        let (s, _f) = recording_sink();
-        let _ = d.begin("r1", &s, |_| true, T0);
-        d.settle("r1", "t1", &created_frame(), T0);
-        let _ = d.begin("r2", &s, |_| true, T0 + SETTLED_TTL_MS);
-        d.settle("r2", "t2", &created_frame(), T0 + SETTLED_TTL_MS);
-        let inner = d.inner.lock().expect("lock");
-        assert_eq!(
-            inner.entries.len(),
-            1,
-            "expired r1 must be physically evicted on the next settle"
+        assert!(
+            registry.exists(&id),
+            "exited terminal record is retained for restore"
         );
-        assert!(inner.entries.contains_key("r2"));
-        assert_eq!(inner.settled_order.len(), 1);
-    }
-
-    #[test]
-    fn prune_skips_stale_queue_rows_for_resettled_ids() {
-        let d = CreateDedupe::default();
-        let (s, _f) = recording_sink();
-        // Settle r1 at T0, displace it (dead terminal), re-settle at T0+TTL/2.
-        let _ = d.begin("r1", &s, |_| true, T0);
-        d.settle("r1", "t1", &created_frame(), T0);
-        let later = T0 + SETTLED_TTL_MS / 2;
-        assert!(matches!(
-            d.begin("r1", &s, |_| false, later),
-            DedupeDecision::Proceed
-        ));
-        d.settle("r1", "t1b", &created_frame(), later);
-        // Past T0's expiry but not later's: pruning (triggered by a fresh
-        // settle) pops the stale T0 queue row but must NOT evict the
-        // re-settled entry.
-        let probe = T0 + SETTLED_TTL_MS;
-        let _ = d.begin("r9", &s, |_| true, probe);
-        d.settle("r9", "t9", &created_frame(), probe);
-        assert!(matches!(
-            d.begin("r1", &s, |_| true, probe),
-            DedupeDecision::DuplicateSettled(_)
-        ));
-    }
+        assert!(
+            !registry.is_running(&id),
+            "is_running must go false at natural exit even though the record is retained"
+        );
 ```
 
-Also update the seven existing tests in the same mod — every `d.begin(...)` gains `, T0` as a final argument and every `d.settle(...)` gains `, T0` as a final argument. The seven tests (all in `create_dedupe.rs:218-330`): `first_begin_proceeds_and_registers_sentinel`, `settled_entry_replays_frame_while_live`, `dead_terminal_evicts_settled_entry`, `clear_if_in_flight_removes_sentinel_but_not_settled`, `cross_connection_waiter_receives_settle_frame`, `same_connection_duplicate_is_not_a_waiter`, `waiters_get_fail_loud_error_on_non_settled_exit`. Example — `clear_if_in_flight_removes_sentinel_but_not_settled` fully updated:
+If any pre-existing assertion in that test pins the old presence-only `is_running` semantics for an exited terminal, update it to the corrected semantics with a comment — that flip is the intended behavior change of this task.
+
+(b) In `crates/freshell-ws/src/create_dedupe.rs`, inside the existing `#[cfg(test)] mod tests` (after the `recording_sink` helper), add two new tests:
 
 ```rust
     #[test]
-    fn clear_if_in_flight_removes_sentinel_but_not_settled() {
+    fn settle_prunes_entries_for_non_running_terminals() {
         let d = CreateDedupe::default();
-        let (s1, _f1) = recording_sink();
-        let _ = d.begin("r1", &s1, |_| true, T0);
-        d.clear_if_in_flight("r1");
+        let (s, _f) = recording_sink();
+        let _ = d.begin("r1", &s, |_| true);
+        d.settle("r1", "t1", &created_frame(), |_| true);
+        // t1's terminal has since exited: the next successful create's
+        // settle sweeps its entry out (prune-on-access; legacy parity with
+        // ws-handler's eager delete-at-exit).
+        let _ = d.begin("r2", &s, |_| true);
+        d.settle("r2", "t2", &created_frame(), |tid| tid != "t1");
+        let map = d.entries.lock().expect("lock");
+        assert_eq!(
+            map.len(),
+            1,
+            "entry for the exited terminal must be physically evicted on the next settle"
+        );
+        assert!(map.contains_key("r2"));
+    }
+
+    #[test]
+    fn prune_keeps_running_and_in_flight_entries() {
+        let d = CreateDedupe::default();
+        let (s, _f) = recording_sink();
+        let _ = d.begin("r1", &s, |_| true);
+        d.settle("r1", "t1", &created_frame(), |_| true);
+        let _ = d.begin("r2", &s, |_| true); // still in flight
+        let _ = d.begin("r3", &s, |_| true);
+        d.settle("r3", "t3", &created_frame(), |_| true); // prune runs; all running
+        {
+            let map = d.entries.lock().expect("lock");
+            assert_eq!(
+                map.len(),
+                3,
+                "running settled entries and in-flight sentinels survive the prune"
+            );
+        }
+        // r1 still replays after the prune.
         assert!(matches!(
-            d.begin("r1", &s1, |_| true, T0),
-            DedupeDecision::Proceed
-        ));
-        d.settle("r1", "t1", &created_frame(), T0);
-        d.clear_if_in_flight("r1");
-        assert!(matches!(
-            d.begin("r1", &s1, |_| true, T0),
+            d.begin("r1", &s, |_| true),
             DedupeDecision::DuplicateSettled(_)
         ));
     }
 ```
+
+Also update the seven existing tests in the same mod — every `d.settle(...)` call gains `, |_| true` as a final argument (or `|_| false` where a test's scenario needs the pruned outcome — none of the existing seven does; they all pass `|_| true`). `d.begin(...)` calls are unchanged (same arity as today). The seven tests (all in `create_dedupe.rs:218-330`): `first_begin_proceeds_and_registers_sentinel`, `settled_entry_replays_frame_while_live`, `dead_terminal_evicts_settled_entry`, `clear_if_in_flight_removes_sentinel_but_not_settled`, `cross_connection_waiter_receives_settle_frame`, `same_connection_duplicate_is_not_a_waiter`, `waiters_get_fail_loud_error_on_non_settled_exit`.
 
 - [ ] **Step 4: Run tests to verify they fail**
 
-Run: `cargo test -p freshell-ws create_dedupe`
-Expected: **compile error** — `begin`/`settle` do not yet take `now_ms`, and `SETTLED_TTL_MS` / `inner` / `settled_order` do not exist. A compile failure is the RED state for a signature-changing step.
+Run:
 
-- [ ] **Step 5: Implement TTL expiry**
-
-In `crates/freshell-ws/src/create_dedupe.rs`:
-
-(a) Change the imports line `use std::collections::HashMap;` to:
-
-```rust
-use std::collections::{HashMap, VecDeque};
+```bash
+cargo test -p freshell-terminal is_running
+cargo test -p freshell-ws create_dedupe
 ```
 
-(b) Add the TTL constant above `enum Entry`:
+Expected: the registry assertion **FAILS** (presence-only `is_running` returns `true` for the exited-retained terminal), and freshell-ws hits a **compile error** — `settle` does not yet take a closure. A compile failure is the RED state for a signature-changing step.
+
+- [ ] **Step 5: Implement liveness-anchored eviction**
+
+(a) In `crates/freshell-terminal/src/registry.rs`, fix `is_running` (`:1112-1119`): replace its `contains_key` body following the established pattern at `registry.rs:457-466` (lock the registry inner map, clone the terminal's `TerminalShared` handle, read its `status` under that handle's own lock) and return `status == TerminalRunStatus::Running`; a map miss returns `false`. Update the doc comment at `:1111` to:
 
 ```rust
-/// How long a settled create stays replayable to a duplicate requester.
-/// The frozen client's same-requestId retry ladder re-sends within ~2 s and
-/// reconnect/restore storms play out over seconds to minutes; 30 minutes is
-/// orders of magnitude beyond any real reconnect window while keeping
-/// settled entries mortal on a long-lived server.
-const SETTLED_TTL_MS: i64 = 30 * 60 * 1000;
+    /// True only while the terminal's PTY is still running. Unlike
+    /// `exists()`, this goes false when the terminal exits naturally, even
+    /// though the record is retained (restore/replay can still see it via
+    /// `exists()`). Drives create-dedupe eviction: legacy parity with the
+    /// Node server's delete-at-exit requestId pruning.
 ```
 
-(c) Add a timestamp field to the `Settled` variant (`Entry` at `:41-56`):
+(This is deliberately an instruction to mirror existing in-file code at `:457-466` rather than a fabricated snippet — the reaper there already does exactly this lock-clone-read-status sequence; reuse its field and lock names verbatim.)
 
-```rust
-    /// The create settled: replay this exact `terminal.created` frame.
-    Settled {
-        terminal_id: String,
-        created: ServerMessage,
-        /// Injected wall-clock settle time (epoch ms) — drives TTL expiry.
-        settled_at_ms: i64,
-    },
-```
-
-(d) Replace the `CreateDedupe` struct (`:91-94`) with:
-
-```rust
-#[derive(Default)]
-struct Inner {
-    entries: HashMap<String, Entry>,
-    /// Settle-order queue driving eviction (oldest first): one
-    /// `(request_id, settled_at_ms)` row pushed per `settle()`. A row whose
-    /// map entry was since displaced or re-settled (timestamp mismatch) is
-    /// stale bookkeeping — prune pops and skips it.
-    settled_order: VecDeque<(String, i64)>,
-}
-
-impl Inner {
-    /// Evict settled entries that aged past `SETTLED_TTL_MS`, oldest first.
-    fn prune_settled(&mut self, now_ms: i64) {
-        while let Some((_, settled_at)) = self.settled_order.front() {
-            if now_ms - *settled_at < SETTLED_TTL_MS {
-                break;
-            }
-            let (id, settled_at) = self
-                .settled_order
-                .pop_front()
-                .expect("front() checked above");
-            if let Some(Entry::Settled { settled_at_ms, .. }) = self.entries.get(&id) {
-                if *settled_at_ms == settled_at {
-                    self.entries.remove(&id);
-                }
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-pub struct CreateDedupe {
-    inner: Mutex<Inner>,
-}
-```
-
-(e) Replace `begin()` (`:101-147`) with (structure identical to the original, plus the `now_ms` param, the `inner` lock, and the expiry check):
-
-```rust
-    pub fn begin(
-        &self,
-        request_id: &str,
-        sink: &FrameSink,
-        is_live: impl Fn(&str) -> bool,
-        now_ms: i64,
-    ) -> DedupeDecision {
-        let mut inner = self.inner.lock().expect("create_dedupe lock");
-        match inner.entries.get_mut(request_id) {
-            Some(Entry::InFlight { origin, waiters }) => {
-                let already_known =
-                    Arc::ptr_eq(origin, sink) || waiters.iter().any(|w| Arc::ptr_eq(w, sink));
-                if !already_known {
-                    waiters.push(Arc::clone(sink));
-                }
-                DedupeDecision::DuplicateInFlight
-            }
-            Some(Entry::Settled {
-                terminal_id,
-                created,
-                settled_at_ms,
-            }) => {
-                let expired = now_ms - *settled_at_ms >= SETTLED_TTL_MS;
-                if !expired && is_live(terminal_id) {
-                    DedupeDecision::DuplicateSettled(created.clone())
-                } else {
-                    // Terminal killed/exited, or the settled entry aged out
-                    // of the dedupe window: evict and treat as fresh.
-                    let origin = Arc::clone(sink);
-                    inner.entries.insert(
-                        request_id.to_string(),
-                        Entry::InFlight {
-                            origin,
-                            waiters: Vec::new(),
-                        },
-                    );
-                    DedupeDecision::Proceed
-                }
-            }
-            None => {
-                inner.entries.insert(
-                    request_id.to_string(),
-                    Entry::InFlight {
-                        origin: Arc::clone(sink),
-                        waiters: Vec::new(),
-                    },
-                );
-                DedupeDecision::Proceed
-            }
-        }
-    }
-```
-
-Preserve the original doc comments on `begin()` verbatim, amending any sentence that claims settled entries live forever.
-
-(f) Replace `settle()` (`:153-166`) with (waiters still invoked WITHOUT the lock held, as before):
+(b) In `crates/freshell-ws/src/create_dedupe.rs`, replace `settle()` (`:153-166`) with (waiters still invoked WITHOUT the lock held, as before):
 
 ```rust
     pub fn settle(
@@ -341,22 +197,25 @@ Preserve the original doc comments on `begin()` verbatim, amending any sentence 
         request_id: &str,
         terminal_id: &str,
         created: &ServerMessage,
-        now_ms: i64,
+        is_running: impl Fn(&str) -> bool,
     ) {
         let waiters = {
-            let mut inner = self.inner.lock().expect("create_dedupe lock");
-            let prev = inner.entries.insert(
+            let mut map = self.entries.lock().expect("create_dedupe lock");
+            let prev = map.insert(
                 request_id.to_string(),
                 Entry::Settled {
                     terminal_id: terminal_id.to_string(),
                     created: created.clone(),
-                    settled_at_ms: now_ms,
                 },
             );
-            inner
-                .settled_order
-                .push_back((request_id.to_string(), now_ms));
-            inner.prune_settled(now_ms);
+            // Prune-on-access (house pattern; no background task): a settled
+            // entry lives exactly as long as its terminal is running -- the
+            // legacy liveness-anchored model. Entries for exited or killed
+            // terminals are swept on every successful create's settle.
+            map.retain(|_, e| match e {
+                Entry::InFlight { .. } => true,
+                Entry::Settled { terminal_id, .. } => is_running(terminal_id),
+            });
             match prev {
                 Some(Entry::InFlight { waiters, .. }) => waiters,
                 _ => Vec::new(),
@@ -368,38 +227,33 @@ Preserve the original doc comments on `begin()` verbatim, amending any sentence 
     }
 ```
 
-Preserve `settle()`'s original doc comment, adding: `/// Also prunes settled entries older than SETTLED_TTL_MS (prune-on-access; no background task).`
+Preserve `settle()`'s original doc comment, adding: `/// Also prunes settled entries whose terminal is no longer running (prune-on-access; no background task).`
 
-(g) In `clear_if_in_flight()` (`:174-192`), only the lock line changes — replace:
+(c) In `begin()` (`:101-147`): rename the `is_live` parameter to `is_running` (body structure unchanged — the existing `Settled` arm already displaces and returns `Proceed` when the closure is false, which is exactly the post-eviction contract). Amend its doc comments: any sentence claiming settled entries live forever now states they live while their terminal is running; the displacement comment ("Terminal killed...") becomes "Terminal exited or killed: evict and treat as fresh (legacy delete-at-exit parity)."
 
-```rust
-            let mut map = self.entries.lock().expect("create_dedupe lock");
-```
+(d) In `clear_if_in_flight()` (`:174-192`): no code change. Amend its doc line *"Settled entries stay: that IS the dedupe"* to *"Settled entries stay while their terminal runs: that IS the dedupe (legacy parity)."*
 
-with:
+(e) Update the two production call sites in `crates/freshell-ws/src/terminal.rs` (surgical, two lines):
+- The `begin` dispatch (`:488-492`): change the closure `|tid| state.registry.exists(tid)` to `|tid| state.registry.is_running(tid)`.
+- The `settle` call (`:1313-1315`): `.settle(&dedupe_request_id, &dedupe_terminal_id, &created, |tid| state.registry.is_running(tid))`.
 
-```rust
-            let mut inner = self.inner.lock().expect("create_dedupe lock");
-            let map = &mut inner.entries;
-```
-
-(the rest of the fn body keeps using `map` unchanged). Amend its doc line *"Settled entries stay: that IS the dedupe"* to *"Settled entries stay (until TTL/cap eviction): that IS the dedupe."*
-
-(h) Update the two production call sites in `crates/freshell-ws/src/terminal.rs` (surgical, two lines):
-- The `begin` dispatch (~`:487-492`): add `now_ms()` as the fourth argument after the `|tid| state.registry.exists(tid)` closure (the free fn `now_ms()` is defined in this same file at `:85-88`).
-- The `settle` call (~`:1312-1315`): `.settle(&dedupe_request_id, &dedupe_terminal_id, &created, now_ms())`.
-
-(i) Update the module doc comment (`create_dedupe.rs:1-27`): find the sentences describing settled-entry lifetime/lazy eviction and amend so the doc states: settled entries are retained for replay for a bounded window — each expires `SETTLED_TTL_MS` after settling (Task 2 adds the `SETTLED_MAX` cap sentence); within the window a duplicate replays the original `terminal.created` and never spawns a second terminal; after eviction a re-sent requestId is indistinguishable from a fresh create and spawns a new terminal, which is unreachable in practice because the window is sized far beyond any real reconnect/retry storm. Also update the sizing comment above `#[allow(clippy::large_enum_variant)]` (`:35-40`): change "small settled cache" to "bounded settled cache".
+(f) Update the module doc comment (`create_dedupe.rs:1-27`): find the sentences describing settled-entry lifetime/lazy eviction and amend so the doc states: settled entries are retained for replay for exactly as long as their terminal is running (legacy parity with the Node server's delete-at-exit requestId pruning); eviction is lazy — `settle()` prunes all dead entries on access and `begin()` displaces per-id — with no background task; within a terminal's running lifetime a duplicate replays the original `terminal.created` and never spawns a second terminal; after the terminal stops running a re-sent requestId is indistinguishable from a fresh create and spawns a new terminal, exactly as legacy behaves after terminal exit. Also update the sizing comment above `#[allow(clippy::large_enum_variant)]` (`:35-40`): change "small settled cache" to "liveness-bounded settled cache".
 
 - [ ] **Step 6: Verify no other callers were missed**
 
 Run: `cargo check -p freshell-ws --all-targets && cargo check --workspace --all-targets`
-Expected: clean compile. If any other `begin(`/`settle(` caller errors, add `crate::terminal::now_ms()` (or a local `now_ms()`) as the final argument there too — but per the verified survey there are exactly two production call sites, both in `terminal.rs`.
+Expected: clean compile. The `settle` arity change surfaces any missed caller as a compile error — per the verified survey there are exactly two production call sites, both in `terminal.rs`, and only `settle`'s changes shape.
 
 - [ ] **Step 7: Run tests to verify they pass**
 
-Run: `cargo test -p freshell-ws create_dedupe`
-Expected: PASS — 11 tests (7 updated + 4 new).
+Run:
+
+```bash
+cargo test -p freshell-terminal
+cargo test -p freshell-ws create_dedupe
+```
+
+Expected: PASS — freshell-terminal including the corrected `is_running` test (the 5 pre-existing `is_running` callers keep passing: none exercises exited-retained); freshell-ws `create_dedupe` shows 9 tests (7 updated + 2 new).
 
 - [ ] **Step 8: Format, lint, and full-crate delta check**
 
@@ -407,7 +261,7 @@ Run:
 
 ```bash
 cargo fmt --all
-cargo clippy -p freshell-ws --all-targets 2>&1 | grep -c "^warning"
+cargo clippy --workspace --all-targets 2>&1 | grep -c "^warning"
 cargo test -p freshell-ws 2>&1 | tail -30
 ```
 
@@ -416,161 +270,22 @@ Expected: `cargo fmt --all -- --check` is clean afterward; clippy warning count 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add crates/freshell-ws/src/create_dedupe.rs crates/freshell-ws/src/terminal.rs
+git add crates/freshell-ws/src/create_dedupe.rs crates/freshell-ws/src/terminal.rs crates/freshell-terminal/src/registry.rs
 git commit \
-  -m "fix(freshell-ws): expire settled create-dedupe entries after a TTL" \
-  -m "- Follow-up from the crash-hardening reviews: the settled requestId cache grew one immortal ~440-byte entry per successful create for the server lifetime
-- Entry::Settled now carries settled_at_ms (injected now_ms parameter, house pattern from create_limit.rs); begin() treats entries older than SETTLED_TTL_MS (30 min) as evicted; settle() prunes expired entries oldest-first via a settle-order queue (prune-on-access, no background task, no new deps)
-- Post-eviction contract made explicit and pinned: a duplicate after expiry proceeds as a fresh create (new terminal, same requestId) - unreachable inside any real reconnect window" \
-  -m "Verification: cargo test -p freshell-ws create_dedupe (11 passed); cargo test -p freshell-ws; cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings; no new failures vs recorded baseline)." \
+  -m "fix(freshell-ws): anchor settled create-dedupe entries to terminal liveness" \
+  -m "- Follow-up from the crash-hardening reviews: the settled requestId cache grew one immortal ~0.5 KB entry per successful create for the server process lifetime
+- Eviction now matches legacy's model (ws-handler.ts createdTerminalByRequestId is pruned at terminal exit, not by time): settle() prunes entries for non-running terminals via retain (prune-on-access, no background task, no new deps), and the begin() liveness closure is tightened from registry.exists() (which stays true for exited-retained terminals) to a corrected registry.is_running() that reads TerminalRunStatus
+- A fixed TTL+cap design was validated and rejected pre-execution: the frozen client persists createRequestId in localStorage and re-sends it on every reconnect until the pane anchors, so any time-based eviction could double-spawn a terminal beside the live original - weaker dedupe than legacy
+- Cache is now structurally bounded: after every settle it holds at most one entry per running terminal plus in-flight creates; post-eviction duplicates proceed as fresh creates, exactly legacy's post-exit behavior" \
+  -m "Verification: cargo test -p freshell-terminal (is_running exited-retained test); cargo test -p freshell-ws create_dedupe (9 passed); cargo test -p freshell-ws; cargo fmt --all -- --check; cargo clippy --workspace --all-targets (no new warnings; no new failures vs recorded baseline)." \
   -m "$(printf '\xf0\x9f\xa4\x96 Generated with [Amplifier](https://github.com/microsoft/amplifier)\n\nCo-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>')"
 ```
 
 ---
 
-### Task 2: Cap the settled dedupe cache (oldest-first eviction) and record the deviation
+### Task 2: Make the settled-hold acceptance test deterministic
 
-TTL alone still allows unbounded growth *within* one 30-minute window under a pathological create rate (the requestId key space is client-controlled). Add a hard cap: `SETTLED_MAX = 4096` settled entries, evicting oldest-settled first. Bound justification: at ~440 bytes per retained frame that is < 2 MiB worst case, while 4096 recent creates inside one TTL window is far beyond any legitimate restore storm (the gate + rate limiter throttle real clients well below that). Eviction order is settle-time FIFO — settled entries are never "refreshed" by replay because a duplicate's relevance window is anchored to the original create, so FIFO is equivalent to LRU here at zero extra bookkeeping.
-
-**Files:**
-- Modify: `crates/freshell-ws/src/create_dedupe.rs` (constant, `Inner::prune_settled`, module doc, new test)
-- Modify: `port/oracle/DEVIATIONS.md` (append entry)
-- Test: inline `#[cfg(test)] mod tests` in `crates/freshell-ws/src/create_dedupe.rs`
-
-**Interfaces:**
-- Consumes: `Inner`, `Entry::Settled { settled_at_ms }`, `prune_settled(&mut self, now_ms: i64)`, `const SETTLED_TTL_MS: i64`, test helpers `created_frame()` / `recording_sink()` / `const T0: i64` — all from Task 1.
-- Produces: `const SETTLED_MAX: usize = 4096;` (module-private); `prune_settled` now also enforces the cap.
-
-- [ ] **Step 1: Write the failing test**
-
-Add to the tests mod in `crates/freshell-ws/src/create_dedupe.rs`:
-
-```rust
-    #[test]
-    fn settled_cache_is_capped_evicting_oldest_first() {
-        let d = CreateDedupe::default();
-        let (s, _f) = recording_sink();
-        // Settle SETTLED_MAX + 10 distinct requestIds at the same instant
-        // (same instant so TTL cannot be what evicts).
-        for i in 0..(SETTLED_MAX + 10) {
-            let rid = format!("r{i}");
-            let _ = d.begin(&rid, &s, |_| true, T0);
-            d.settle(&rid, &format!("t{i}"), &created_frame(), T0);
-        }
-        {
-            let inner = d.inner.lock().expect("lock");
-            assert_eq!(inner.entries.len(), SETTLED_MAX);
-            assert_eq!(inner.settled_order.len(), SETTLED_MAX);
-        }
-        // Oldest evicted: r0's duplicate proceeds as a fresh create (the
-        // explicit post-eviction contract, same as TTL expiry).
-        assert!(matches!(
-            d.begin("r0", &s, |_| true, T0),
-            DedupeDecision::Proceed
-        ));
-        // Newest retained: the most recent id still replays.
-        let last = format!("r{}", SETTLED_MAX + 9);
-        assert!(matches!(
-            d.begin(&last, &s, |_| true, T0),
-            DedupeDecision::DuplicateSettled(_)
-        ));
-    }
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cargo test -p freshell-ws create_dedupe`
-Expected: **compile error** — `SETTLED_MAX` not defined. (After Step 3's constant exists but before the prune change, the test would FAIL on `assert_eq!(inner.entries.len(), SETTLED_MAX)` with left = 4106.)
-
-- [ ] **Step 3: Implement the cap**
-
-(a) Add below `SETTLED_TTL_MS` in `create_dedupe.rs`:
-
-```rust
-/// Hard cap on retained settled entries (oldest-first eviction) — backstop
-/// for pathological create rates within one TTL window. The requestId key
-/// space is client-controlled, so TTL alone is not a bound. At ~440 bytes
-/// per retained terminal.created frame this is < 2 MiB worst case.
-const SETTLED_MAX: usize = 4096;
-```
-
-(b) Replace `Inner::prune_settled` (from Task 1) with:
-
-```rust
-    /// Evict settled entries that aged past `SETTLED_TTL_MS`, then enforce
-    /// `SETTLED_MAX` — both oldest-settled first. Stale queue rows (map
-    /// entry displaced or re-settled since; timestamp mismatch) are popped
-    /// and skipped without touching the map.
-    fn prune_settled(&mut self, now_ms: i64) {
-        loop {
-            let evict = match self.settled_order.front() {
-                None => false,
-                Some((_, settled_at)) => {
-                    now_ms - *settled_at >= SETTLED_TTL_MS
-                        || self.settled_order.len() > SETTLED_MAX
-                }
-            };
-            if !evict {
-                break;
-            }
-            let (id, settled_at) = self
-                .settled_order
-                .pop_front()
-                .expect("front() checked above");
-            if let Some(Entry::Settled { settled_at_ms, .. }) = self.entries.get(&id) {
-                if *settled_at_ms == settled_at {
-                    self.entries.remove(&id);
-                }
-            }
-        }
-    }
-```
-
-(Known, accepted imprecision: stale queue rows inflate `settled_order.len()` until popped, so the cap can transiently evict slightly earlier than a perfect live-entry count would — eviction is still strictly oldest-first and the semantics degrade gracefully. Stale rows only arise from the rare displace-then-resettle path.)
-
-(c) Extend the module doc sentence from Task 1 Step 5(i) to mention the cap: "...and the cache holds at most `SETTLED_MAX` settled entries, evicting oldest-settled first."
-
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `cargo test -p freshell-ws create_dedupe`
-Expected: PASS — 12 tests.
-
-- [ ] **Step 5: Record the deviation from legacy**
-
-Read `port/oracle/DEVIATIONS.md` first and match its existing entry format exactly. Append an entry with this content (adapted to the file's format):
-
-> **Bounded settled create-dedupe cache.** Legacy Node (`server/ws-handler.ts` `createdByRequestId` settled cache, ~`:467`) retains settled create replies for the process lifetime. The Rust port bounds the equivalent `CreateDedupe` settled cache: entries expire 30 minutes after settling (`SETTLED_TTL_MS`) and at most 4096 are retained (`SETTLED_MAX`, oldest-first). Wire-visible only for a duplicate `terminal.create` re-sent after eviction, which then spawns a fresh terminal instead of replaying the original `terminal.created` — unreachable inside any real reconnect/retry window. Deliberate fix (reviewer-adjudicated follow-up to the crash-hardening merge: unbounded server-lifetime growth). Pinning tests: `create_dedupe::tests::duplicate_after_ttl_eviction_proceeds_as_fresh_create`, `create_dedupe::tests::settled_cache_is_capped_evicting_oldest_first`.
-
-- [ ] **Step 6: Format, lint, delta check**
-
-Run:
-
-```bash
-cargo fmt --all
-cargo clippy -p freshell-ws --all-targets 2>&1 | grep -c "^warning"
-cargo test -p freshell-ws 2>&1 | tail -30
-```
-
-Expected: no new clippy warnings vs `/tmp/dedupe-followups-baseline-clippy.txt`; only known-allowed test failures.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add crates/freshell-ws/src/create_dedupe.rs port/oracle/DEVIATIONS.md
-git commit \
-  -m "fix(freshell-ws): cap the settled create-dedupe cache (oldest-first)" \
-  -m "- SETTLED_MAX 4096 backstops the TTL: the requestId key space is client-controlled, so TTL alone is not a bound; ~440 bytes/frame keeps worst case under 2 MiB
-- FIFO-by-settle-time eviction (equivalent to LRU here: replay never refreshes an entry's relevance window); stale queue rows from displace-then-resettle are skipped by timestamp guard
-- Deliberate divergence from legacy's process-lifetime createdByRequestId cache recorded in port/oracle/DEVIATIONS.md with pinning tests" \
-  -m "Verification: cargo test -p freshell-ws create_dedupe (12 passed); cargo test -p freshell-ws; cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings; no new failures vs recorded baseline)." \
-  -m "$(printf '\xf0\x9f\xa4\x96 Generated with [Amplifier](https://github.com/microsoft/amplifier)\n\nCo-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>')"
-```
-
----
-
-### Task 3: Make the settled-hold acceptance test deterministic
-
-Replace the wall-clock race in `restore_create_holds_permit_until_settled` with structural synchronization: the test acquires the gate's single permit itself (the server's real `Arc<RestoreSpawnGate>` is already returned by `spawn_server`), sends both restore creates, and bounded-polls the gate counter until both are observably queued — only then releases. Every original assertion is preserved and one is strengthened: both creates settle with their own requestId (unchanged), `queued_total()` is now asserted `== 2` (was `>= 1`, and was racy), and exactly two PTYs exist (unchanged). A permit-leak check is added (post-settle re-acquire succeeds). The "permit held until settled, not just spawn" discrimination — which the racy original only covered probabilistically (its `queued_total` counter increments on ANY failed try_acquire, so it never structurally distinguished settle-hold from spawn-hold) — moves to a deterministic unit test in Task 4. An injected virtual clock was evaluated and rejected: `start_paused` implies a current-thread runtime and auto-advances on idle, incompatible with this suite's `multi_thread` flavor and real TCP/PTY I/O; the flake source is I/O latency, not a timer.
+Replace the wall-clock race in `restore_create_holds_permit_until_settled` with structural synchronization: the test acquires the gate's single permit itself (the server's real `Arc<RestoreSpawnGate>` is already returned by `spawn_server`), sends both restore creates, and bounded-polls the gate counter until both are observably queued — only then releases. Every original assertion is preserved and one is strengthened: both creates settle with their own requestId (unchanged), `queued_total()` is now asserted `== 2` (was `>= 1`, and was racy), and exactly two PTYs exist (unchanged). A permit-leak check is added (post-settle re-acquire succeeds). The "permit held until settled, not just spawn" discrimination — which the racy original only covered probabilistically (its `queued_total` counter increments on ANY failed try_acquire, so it never structurally distinguished settle-hold from spawn-hold) — moves to a deterministic unit test in Task 3. An injected virtual clock was evaluated and rejected: `start_paused` implies a current-thread runtime and auto-advances on idle, incompatible with this suite's `multi_thread` flavor and real TCP/PTY I/O; the flake source is I/O latency, not a timer.
 
 **Files:**
 - Modify: `crates/freshell-ws/tests/restore_spawn_gate.rs:341-370` (the one test; nothing else in the suite)
@@ -578,7 +293,7 @@ Replace the wall-clock race in `restore_create_holds_permit_until_settled` with 
 
 **Interfaces:**
 - Consumes (all already in `tests/restore_spawn_gate.rs`): `spawn_server(cfg, gate) -> (ws_url, registry, shutdown, Arc<RestoreSpawnGate>, shutdown_started)` (`:75-153`); `connect_and_hello(&ws_url)` (`:161-191`); `send_text` (`:194-198`); `next_json_of_type` (`:201-216`); `create_frame(request_id, restore)` (`:264-274`); `RestoreSpawnGate::new(permits, queue)` and `RestoreSpawnGate::acquire(timeout, &mut watch::Receiver<bool>)` (public — same call shape as the unit test at `src/spawn_gate.rs:222-227`); `queued_total()` accessor (`src/spawn_gate.rs:159-173`).
-- Produces: the renamed test `restore_creates_queue_behind_held_permit_and_both_settle` (Task 4's suite run relies on it passing).
+- Produces: the renamed test `restore_creates_queue_behind_held_permit_and_both_settle` (Task 3's suite run relies on it passing).
 
 - [ ] **Step 1: RED — deterministically demonstrate the race in the existing test**
 
@@ -720,9 +435,9 @@ git commit \
 
 ---
 
-### Task 4: Deterministically pin the spawn-to-settled permit scope (unit level)
+### Task 3: Deterministically pin the spawn-to-settled permit scope (unit level)
 
-The racy original test's residual value was probabilistic protection against the `da5d9b5c` prior-art bug shape (permit released at the PTY spawn instead of after settle). Task 3's structural rework cannot observe that ordering from outside the server. Pin it deterministically at the unit level: extract the permit-scoped tail of `spawn_gated_restore_create` into a tiny generic helper `hold_permit_across(permit, work)` and unit-test that the permit is dropped only after `work` completes, using a oneshot-parked work future and a drop-observable guard. No behavior change: the helper preserves the exact "run the whole settled create, then drop the permit" ordering of the current code (`create_gate.rs:137-167`).
+The racy original test's residual value was probabilistic protection against the `da5d9b5c` prior-art bug shape (permit released at the PTY spawn instead of after settle). Task 2's structural rework cannot observe that ordering from outside the server. Pin it deterministically at the unit level: extract the permit-scoped tail of `spawn_gated_restore_create` into a tiny generic helper `hold_permit_across(permit, work)` and unit-test that the permit is dropped only after `work` completes, using a oneshot-parked work future and a drop-observable guard. No behavior change: the helper preserves the exact "run the whole settled create, then drop the permit" ordering of the current code (`create_gate.rs:137-167`).
 
 **Files:**
 - Modify: `crates/freshell-ws/src/create_gate.rs` (helper fn + rewire the tail of `spawn_gated_restore_create` at `:137-167`; add `#[cfg(test)] mod tests` if the file has none)
@@ -891,7 +606,7 @@ git commit \
 
 ---
 
-### Task 5: Final verification sweep
+### Task 4: Final verification sweep
 
 Workspace-wide delta check against the Task 1 Step 1 baseline. This task produces no code change unless a gate fails; it exists so the branch tip is verified as a whole, not just per-task.
 
@@ -921,7 +636,7 @@ Expected: `NO NEW WARNINGS`.
 - [ ] **Step 3: Test delta**
 
 Run: `cargo test -p freshell-ws 2>&1 | tail -40`
-Expected: failing tests (if any) are exactly a subset of the baseline failures recorded in Task 1 Step 1 (the two known-allowed names in Global Constraints). Test count is baseline + 6 new (4 TTL + 1 cap + 1 permit-scope) with 1 renamed acceptance test.
+Expected: failing tests (if any) are exactly a subset of the baseline failures recorded in Task 1 Step 1 (the two known-allowed names in Global Constraints). Test count is baseline + 3 new in freshell-ws (2 dedupe-prune + 1 permit-scope) with 1 renamed acceptance test; also run `cargo test -p freshell-terminal` — baseline + 1 new/extended `is_running` exited-retained test, no new failures.
 
 - [ ] **Step 4: Fix-or-report**
 
@@ -929,18 +644,18 @@ If any gate fails: fix minimally, re-run Steps 1-3, and commit the fix with the 
 
 ---
 
-## Self-Review (completed by the plan author)
+## Self-Review (completed by the plan author; re-run after the Stage-2 load-bearing rewrite)
 
 **1. Spec coverage:**
-- "Verify first, then fix" (follow-up 1) → verification recorded in "Verification of the reported issues" + re-checked as Task 1 Step 2 halt condition. Covered.
-- "Bound the cache while preserving dedupe semantics" → Tasks 1-2; replay-within-window pinned by updated existing tests + `settled_entry_replays_until_ttl_boundary`; never-double-spawn within window unchanged (`begin` still returns `DuplicateSettled`/`DuplicateInFlight`). Covered.
-- "Justify the strategy and the bound" → Task 1 preamble (TTL choice, house patterns, no-deps policy) + Task 2 preamble (cap size arithmetic, FIFO-equals-LRU argument). Covered.
-- "Duplicate after eviction: explicit and tested" → Task 1 preamble contract + `duplicate_after_ttl_eviction_proceeds_as_fresh_create` + cap-eviction `r0` assertion + DEVIATIONS.md entry. Covered.
-- "Find the timing-sensitive test, replace timing dependence with deterministic mechanism, no weakened assertions" → Task 3 (identified at `tests/restore_spawn_gate.rs:341-370`; RED reproduction; structural test-held-permit rework; assertions preserved, one strengthened) + Task 4 (the probabilistic held-until-settled residue made deterministic at unit level). Covered.
-- "Repo conventions, TDD, fmt+clippy clean, no new failures, minimal surface" → Global Constraints + per-task RED steps + Task 5 sweep; change surface is 4 source files + DEVIATIONS.md. Covered.
+- "Verify first, then fix" (follow-up 1) → verification recorded in "Verification of the reported issues" (+ Stage-2 validation addendum) + re-checked as Task 1 Step 2 halt condition. Covered.
+- "Bound the cache while preserving dedupe semantics" → Task 1: liveness-anchored eviction bounds the cache structurally (≤ one entry per running terminal + in-flight after every settle, pinned by `settle_prunes_entries_for_non_running_terminals`) while replay-during-running-lifetime is pinned by the updated existing tests + `prune_keeps_running_and_in_flight_entries`; never-double-spawn while the terminal runs is UNCHANGED and now time-unlimited (`begin` still returns `DuplicateSettled`/`DuplicateInFlight`) — strictly stronger than any TTL window. Covered.
+- "Justify the strategy and the bound" → Task 1 preamble: legacy-parity rationale with validated evidence (frozen-client persisted-requestId re-send path; legacy delete-at-exit model at `ws-handler.ts:580-587`; registry retention facts), house prune-on-access pattern, no-deps policy, and the falsified TTL+cap alternative recorded with reasons. Covered.
+- "Duplicate after eviction: explicit and tested" → Task 1 preamble contract (post-eviction duplicate = fresh create = legacy post-exit behavior) + existing `dead_terminal_evicts_settled_entry` (made real at the call site by the corrected `is_running`) + the registry exited-retained test. No DEVIATIONS entry needed — the change matches legacy (Parity note in Global Constraints). Covered.
+- "Find the timing-sensitive test, replace timing dependence with deterministic mechanism, no weakened assertions" → Task 2 (identified at `tests/restore_spawn_gate.rs:341-370`; RED reproduction — validated 11/11 deterministic on this host; structural test-held-permit rework; assertions preserved, one strengthened) + Task 3 (the probabilistic held-until-settled residue made deterministic at unit level; rewire compile-validated pre-execution). Covered.
+- "Repo conventions, TDD, fmt+clippy clean, no new failures, minimal surface" → Global Constraints + per-task RED steps + Task 4 sweep; change surface is 5 source files (4 in freshell-ws, 1 method + 1 test in freshell-terminal). Covered.
 
-**1b. No silent deferrals:** No stubs, mocks-standing-in-for-behavior, TODOs, or deferred requirements. The only test double (`DropFlag` in Task 4) observes a production-equivalent ownership property and is complemented by the real-gate acceptance test; `created_frame()`'s `Pong` stand-in is the module's pre-existing opaque-payload convention. No UNRESOLVED COVERAGE GAPS.
+**1b. No silent deferrals:** No stubs, mocks-standing-in-for-behavior, TODOs, or deferred requirements. The only test double (`DropFlag` in Task 3) observes a production-equivalent ownership property and is complemented by the real-gate acceptance test; `created_frame()`'s `Pong` stand-in is the module's pre-existing opaque-payload convention. The pre-existing divergences and missing population-bound ports listed in the verification addendum are explicitly recorded as OUT-OF-SCOPE follow-ups (surfaced to the user in the final report), not silent deferrals of this plan's requirements. No UNRESOLVED COVERAGE GAPS.
 
-**2. Placeholder scan:** One intentional elision — Task 4 Step 3(b) says "(existing comment verbatim)" for the A10 comment block: that is an instruction to preserve existing file content unchanged, with the surrounding code given in full, not a placeholder for new content. All other steps carry complete code/commands.
+**2. Placeholder scan:** Two intentional elisions, both instructions to mirror existing file content rather than placeholders for new content: Task 1 Step 5(a) directs the `is_running` body to reuse the registry's own lock-clone-read-status sequence at `registry.rs:457-466` verbatim (field/lock names live in that file; fabricating them here would be less reliable than pointing at the validated pattern), and Task 3 Step 3(b) says "(existing comment verbatim)" for the A10 comment block. All other steps carry complete code/commands.
 
-**3. Type consistency:** `now_ms: i64` everywhere (matches `terminal.rs::now_ms() -> i64`); `SETTLED_TTL_MS: i64` / `SETTLED_MAX: usize` consistent between Tasks 1-2 and their tests; `settled_order: VecDeque<(String, i64)>` consistent across `Inner`, `prune_settled`, and the size assertions; `begin`/`settle` signatures identical in Task 1 Interfaces, implementation, call sites, and all tests; Task 3's renamed test matches the name referenced in Task 4's comment and both commit messages; `hold_permit_across<G, F>` signature identical in Task 4 Interfaces, test, and implementation.
+**3. Type consistency:** `is_running: impl Fn(&str) -> bool` identical across `begin`/`settle` in Task 1 Interfaces, implementation, both `terminal.rs` call sites, and all tests; `settle`'s 5-parameter shape identical in Interfaces, Step 5(b), Step 5(e), and every test call; `TerminalRegistry::is_running(&self, terminal_id: &str) -> bool` consistent between Interfaces, Step 5(a), and the registry test; no `now_ms`/TTL/cap symbols remain anywhere in the plan; Task 2's renamed test `restore_creates_queue_behind_held_permit_and_both_settle` matches the name referenced in Task 3's test comment and both commit messages; `hold_permit_across<G, F>` signature identical in Task 3 Interfaces, test, and implementation (compile-validated pre-execution).
