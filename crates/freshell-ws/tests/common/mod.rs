@@ -447,7 +447,12 @@ pub async fn spawn_server_with_create_protect(
         ws_max_payload_bytes: 16 * 1024 * 1024,
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: cfg,
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::from_config(&cfg)),
+        // NOTE: SpawnGate::new passes 0 through (no sanitizing) — the
+        // zero-permit test in create_protection.rs depends on this.
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(
+            cfg.spawn_concurrency,
+            cfg.spawn_queue_cap,
+        )),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,

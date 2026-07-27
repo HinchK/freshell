@@ -569,8 +569,9 @@ async fn main() -> ExitCode {
         ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
         term09: freshell_ws::backpressure::Term09Config::from_env(),
         create_protect,
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::from_config(
-            &create_protect,
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(
+            create_protect.spawn_concurrency,
+            create_protect.spawn_queue_cap,
         )),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
     };

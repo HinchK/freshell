@@ -44,6 +44,7 @@ pub mod opencode_ws;
 pub mod pane_ops;
 pub mod session_lease;
 pub mod snapshot;
+pub mod spawn_gate;
 pub mod terminal_tabs;
 
 pub use claude::FreshClaudeState;
@@ -54,6 +55,7 @@ pub use identity_sink::{
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use snapshot::SnapshotState;
+pub use spawn_gate::{SpawnGate, SpawnGateError};
 
 /// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
 /// true when a live terminal PTY currently owns that session. Constructed by
