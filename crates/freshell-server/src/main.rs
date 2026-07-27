@@ -477,6 +477,22 @@ async fn main() -> ExitCode {
     // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
     // are guaranteed to come from the same env snapshot.
     let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();
+    // Kata enn3: ONE server-wide spawn gate shared by BOTH create doors —
+    // WS terminal.create AND the freshagent REST pipeline (/api/tabs,
+    // /api/panes/{id}/split, /api/panes/{id}/respawn). A single concurrency
+    // budget, never two parallel budgets; pinned by
+    // crates/freshell-ws/tests/rest_ws_shared_gate.rs. Post-construction
+    // setter (ledger precedent): create_protect resolves here, after the
+    // last fresh_agent_state builder rebinding. SpawnGate::new passes the
+    // (already env-sanitized) values straight through.
+    let spawn_gate = std::sync::Arc::new(freshell_freshagent::spawn_gate::SpawnGate::new(
+        create_protect.spawn_concurrency,
+        create_protect.spawn_queue_cap,
+    ));
+    fresh_agent_state.set_spawn_gate(
+        std::sync::Arc::clone(&spawn_gate),
+        std::time::Duration::from_millis(create_protect.spawn_timeout_ms),
+    );
     // P1.8: the pane-identity ledger (spec §4.2). Root resolved ONCE here;
     // the module itself never reads env vars. No home => disabled no-op,
     // same policy as tabs-snapshots. `new_locked` = the single-writer
@@ -569,10 +585,7 @@ async fn main() -> ExitCode {
         ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
         term09: freshell_ws::backpressure::Term09Config::from_env(),
         create_protect,
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(
-            create_protect.spawn_concurrency,
-            create_protect.spawn_queue_cap,
-        )),
+        spawn_gate: std::sync::Arc::clone(&spawn_gate),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
     };
 
