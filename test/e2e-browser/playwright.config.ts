@@ -129,6 +129,9 @@ const RUST_ONLY_SPECS = [
   // Reconcile client adoption (Task 14): verdict-driven recovery with the
   // real SPA. Imports RustServer directly (restart()/restartAbrupt()).
   /reconcile-client-adoption-rust\.spec\.ts$/,
+  // Lane C2 reconcile completion: fresh-agent verdict folding + D8 lease +
+  // pre-verdict create hold. Imports RustServer directly (restartAbrupt()).
+  /reconcile-completion-rust\.spec\.ts$/,
   // Lane B2 codex rollout locator: rust-only (legacy has no codex terminal
   // locator); imports the RustServer-backed harness for same-port restart.
   /codex-terminal-restore-rust\.spec\.ts$/,
@@ -221,6 +224,8 @@ export default defineConfig({
         // through the same unmodified legacy MCP stdio binary. See
         // mcp-qa-smoke-rust.spec.ts's own doc comment.
         /mcp-qa-smoke-rust\.spec\.ts$/,
+        // Lane C2 reconcile completion (see RUST_ONLY_SPECS entry above).
+        /reconcile-completion-rust\.spec\.ts$/,
         // TERM-28 (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`):
         // proves the Rust `freshell-terminal`/`freshell-platform` PATH-only
         // bare-command resolution fix. Rust-only -- the bug is in the Rust
