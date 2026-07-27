@@ -1074,17 +1074,44 @@ pub(crate) async fn spawn_terminal_pane(
         }))
     };
 
-    if let Err(err) = registry.create(
-        &spec,
-        &child_env,
-        terminal_id.clone(),
-        stream_id,
-        &mode,
-        resume_session_id.as_deref(),
-        Some(create_request_id.as_str()), // create_request_id: REST accept-or-mint key (this task)
-        None,                             // ring_max_bytes: registry default
-        on_exit,
-    ) {
+    // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
+    // spawns occupy a permit + a blocking thread, never an async worker (WS
+    // lane ledger A4: on hosts with nproc <= spawn_concurrency, N inline
+    // blocking spawns would wedge the runtime incl. the timer driver, and
+    // gate timeouts could never fire). Permit stays held throughout. Mirrors
+    // the WS door (`crates/freshell-ws/src/terminal.rs`). Values consumed by
+    // the call and unused afterwards (`child_env`, `stream_id`, `on_exit`)
+    // move in without cloning.
+    let spawn_registry = registry.clone();
+    let spawn_spec = spec.clone();
+    let spawn_terminal_id = terminal_id.clone();
+    let spawn_mode = mode.clone();
+    let spawn_resume = resume_session_id.clone();
+    let spawn_request_id = create_request_id.clone();
+    let create_result = match tokio::task::spawn_blocking(move || {
+        spawn_registry.create(
+            &spawn_spec,
+            &child_env,
+            spawn_terminal_id,
+            stream_id,
+            &spawn_mode,
+            spawn_resume.as_deref(),
+            Some(spawn_request_id.as_str()), // create_request_id: REST accept-or-mint key (this task)
+            None,                            // ring_max_bytes: registry default
+            on_exit,
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        // JoinError (incl. panic inside the closure) surfaces as a spawn
+        // failure into the unchanged rollback + 400 path below, same as the
+        // WS path.
+        Err(join_err) => Err(std::io::Error::other(format!(
+            "terminal spawn task panicked: {join_err}"
+        ))),
+    };
+    if let Err(err) = create_result {
         // Nothing was recorded yet (no tab, no pane, no map entry) -> rollback
         // is a no-op by construction, EXCEPT the MCP config file(s)
         // `generate_mcp_injection` may already have written -- clean those up
