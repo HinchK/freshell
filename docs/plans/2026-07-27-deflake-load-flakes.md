@@ -30,6 +30,11 @@ Full exploration reports (structural analysis, verbatim code, line numbers) live
 Key facts each task relies on are inlined in the task itself; consult the reports only if
 a step's premise doesn't match what you find in the file.
 
+The plan's load-bearing assumptions were validated post-write (5 verified, 6 falsified and
+fixed in this document, 8 accepted as residual risk); the ledger with per-assumption
+evidence is at `load-bearing-ledger.md` in the same directory (validator evidence in
+`V1-wall-gates.md` … `V6-store-lock.md`). Steps marked VALIDATED below cite that stage.
+
 Root-cause summary (structural, pre-reproduction):
 
 1. **Flake 1** (`restore-contract-wall-rust.spec.ts:2063-2169`): worst-case serial gate budget = 20+45+60+30+60+30 = **245 s of poll-gate timeouts against a 180 s test timeout**, plus 3 server boots (60 s health budget each). No WS-ready gate after the FIRST SIGKILL (the 45 s argv poll starts while the client may still be reconnecting). Fails as a test timeout under load — matching the reported symptom.
@@ -45,7 +50,7 @@ Root-cause summary (structural, pre-reproduction):
 | `test/e2e-browser/helpers/test-server.test.ts` | Add dedupe/injection unit tests (file exists) | 2 |
 | `test/e2e-browser/helpers/rust-server.ts` | Bind-race retry loop in `RustServer.start()` + `portPicker` test seam | 3 |
 | `test/e2e-browser/helpers/rust-server.test.ts` | Create: boot-retry regression test | 3 |
-| `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` | Double-restart test only (~2063-2169): 300 s budget, WS gate after first kill, explicit click timeout | 4 |
+| `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` | Double-restart test only (~2063-2169): 600 s worst-case budget, WS gate after first kill, explicit click timeout | 4 |
 | `test/e2e-browser/specs/sidebar-registry-sync-rust.spec.ts` | case-a legs: poll the respawn proof, explicit `toHaveCount` timeout, decline-helper window; picker helper only if evidence demands | 5 |
 | `test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts` | `startProxy` EADDRINUSE retry + `portAllocator` pass-through + regression test + local `occupyLoopbackPort` | 6 |
 | `test/unit/server/coding-cli/codex-app-server/remote-proxy-large-forward-child.ts` | Same retry in the forked child's `startProxy` | 6 |
@@ -82,8 +87,9 @@ Run (WAIT if the coordinator gate is held — check `npm run test:status` first;
 ```bash
 cd /home/dan/code/freshell/.worktrees/deflake-load-flakes
 env -u FRESHELL_BIND_HOST FRESHELL_TEST_SUMMARY="f3wp deflake baseline" npm test 2>&1 | tee /tmp/deflake-logs/baseline-npm-test.log
+test "${PIPESTATUS[0]}" -eq 0 && echo "BASELINE GREEN" || echo "BASELINE FAILED"
 ```
-Expected: exit 0, all vitest suites green. If the base is red, STOP — report the failure; do not build on a red base.
+Expected: `BASELINE GREEN` (all vitest suites green). VALIDATED (f3wp load-bearing check): without pipefail a pipeline's exit status is `tee`'s, so a plain `... | tee` hides failures — always gate on `${PIPESTATUS[0]}` as above, in the SAME shell invocation. If the base is red, STOP — report the failure; do not build on a red base.
 
 - [ ] **Step 3: Rust baseline for the affected crate**
 
@@ -91,8 +97,9 @@ Run:
 ```bash
 cd /home/dan/code/freshell/.worktrees/deflake-load-flakes
 cargo test -p freshell-ws 2>&1 | tail -40 | tee /tmp/deflake-logs/baseline-cargo-freshell-ws.log
+test "${PIPESTATUS[0]}" -eq 0 && echo "CARGO BASELINE GREEN" || echo "CARGO BASELINE FAILED"
 ```
-Expected: exit 0 (a pane_ledger flake here is possible — if `new_locked_degrades_to_disabled_when_another_holder_exists` fails, capture the full output to the log; that is Flake 4 evidence gold, and the run counts as baseline-establishing, not a blocker).
+Expected: `CARGO BASELINE GREEN` (a pane_ledger flake here is possible — if `new_locked_degrades_to_disabled_when_another_holder_exists` fails, capture the full output to the log; that is Flake 4 evidence gold, and the run counts as baseline-establishing, not a blocker).
 
 - [ ] **Step 4: Record durations**
 
@@ -256,18 +263,22 @@ describe('RustServer.start bind-race retry', () => {
     if (!addr || typeof addr === 'string') throw new Error('no blocker port')
     const stolenPort = addr.port
 
-    let first = true
+    // Count picker invocations: vitest does NOT typecheck, so an unknown
+    // `portPicker` option would be silently ignored pre-implementation and
+    // start() would boot on a fresh findFreePort() port -- making the port
+    // assertions below pass vacuously. The call-count assertion is what
+    // makes this test genuinely RED before the seam exists (f3wp validated).
+    let pickerCalls = 0
     const server = new RustServer({
       portPicker: async () => {
-        if (first) {
-          first = false
-          return stolenPort
-        }
+        pickerCalls++
+        if (pickerCalls === 1) return stolenPort
         return findFreePort()
       },
     })
     try {
       const info = await server.start()
+      expect(pickerCalls).toBeGreaterThanOrEqual(2) // seam consumed AND retried
       expect(info.port).not.toBe(stolenPort)
       expect(info.port).not.toBe(3001)
       expect(info.port).not.toBe(3002)
@@ -277,16 +288,16 @@ describe('RustServer.start bind-race retry', () => {
       await server.stop()
       await new Promise<void>((resolve) => blocker.close(() => resolve()))
     }
-  }, 180_000)
+  }, 600_000)
 })
 ```
 
-(If `rust-server.ts` exports the options type under a specific name, import it for the constructor arg if needed. `ensureRustServerBuilt` runs inside `start()` already — the first run may cargo-build; the 180 s test timeout plus the config's hookTimeout cover it.)
+(If `rust-server.ts` exports the options type under a specific name, import it for the constructor arg if needed. `ensureRustServerBuilt` runs inside `start()` already — the first run WILL cargo-build from cold (validated: this worktree has no `target/` at all), and vitest's `hookTimeout` does NOT apply to test-body code, hence the 600 s test timeout above — the same budget sibling e2e specs allot to this exact release build. If `ensureRustServerBuilt` is exported, optionally hoist it into a `beforeAll(..., 600_000)` instead and shrink the test timeout to 180 s.)
 
 - [ ] **Step 3: Run the test to verify it fails**
 
 Run: `npx vitest run --config test/e2e-browser/vitest.config.ts helpers/rust-server.test.ts` (allow `timeout: 1200` — release cargo build on first run)
-Expected: FAIL — `portPicker` is not an accepted option (type error) or, if structurally ignored, `start()` rejects when the child can't bind `stolenPort`.
+Expected: FAIL on `expect(pickerCalls).toBeGreaterThanOrEqual(2)` with `pickerCalls === 0`. VALIDATED (f3wp load-bearing check): vitest does NOT typecheck (esbuild transform only, no `typecheck` in this config), so the unknown `portPicker` option is silently ignored and `start()` boots on a fresh `findFreePort()` port — WITHOUT the call-count assertion the port/health assertions would pass vacuously pre-implementation. The pickerCalls assertion is the genuine red; do not expect a type error.
 
 - [ ] **Step 4: Implement**
 
@@ -311,23 +322,39 @@ In `test/e2e-browser/helpers/rust-server.ts`:
     for (let attempt = 1; attempt <= maxBootAttempts; attempt++) {
       const port = await pickPort()
       try {
-        return await this.boot(homeDir, port, token)
+        const info = await this.boot(homeDir, port, token)
+        // DEFLAKE (f3wp, validated): /api/health is UNAUTHENTICATED and
+        // instance-anonymous (200 {"ok":true,...} regardless of token), so a
+        // FOREIGN test server that stole the port satisfies the health poll
+        // while our child dies -- a silent false-positive boot. Confirm the
+        // server that answered is OURS via a token-gated endpoint before
+        // declaring success; a foreign server rejects our token.
+        const identity = await fetch(`${info.baseUrl}/api/server-info`, {
+          headers: { authorization: `Bearer ${token}` },
+        })
+        if (!identity.ok) {
+          throw new Error(
+            `bind race: foreign server answered health on port ${port} (server-info ${identity.status})`,
+          )
+        }
+        return info
       } catch (error) {
         lastError = error
         await this.stopProcess(true)
         // Retry ONLY the bind-race shape (kata f3wp): the child exited or
         // never became healthy because the probed port was stolen between
-        // findFreePort's close and the server's bind. Everything else is a
-        // genuine boot failure -- rethrow immediately.
+        // findFreePort's close and the server's bind -- or a foreign server
+        // answered the health poll (identity check above). Everything else
+        // is a genuine boot failure -- rethrow immediately.
         const message = error instanceof Error ? error.message : String(error)
-        const bindRace = /EADDRINUSE|address (?:already )?in use/i.test(message)
+        const bindRace = /EADDRINUSE|address (?:already )?in use|bind race/i.test(message)
         if (!bindRace) throw error
       }
     }
     throw lastError
 ```
 
-IMPORTANT (from Step 1's reading): if `boot()`'s failure message does NOT include the child's stderr (where the Rust server prints its "Address already in use" bind error), extend `boot()`/`waitForHealth`'s thrown Error to append the captured stderr tail — that change is confined to this test helper and is required for the predicate to see the bind error. Do not widen the predicate to "retry any failure".
+VALIDATED (from the load-bearing stage, empirically): `freshell-server` spawned onto an occupied port exits with code 1 in ~0.13 s and prints `failed to bind 127.0.0.1:<port>: Address already in use (os error 98)` to stderr (single bind attempt, no internal retry) — so failed attempts are fast, NOT a 60 s health burn. `waitForHealth` already embeds the child's stderr in its child-exit error (rust-server.ts:594-598), so the predicate sees the bind text via the "address in use" alternation (the literal `EADDRINUSE` never appears in Rust's message — keep both alternates). No stderr-appending contingency is needed; do not widen the predicate to "retry any failure". For the identity check: confirm in Step 1's reading the exact auth header/query shape the server expects for token-gated endpoints (`/api/server-info` returns 401 for a missing/wrong token — verified; mirror however the existing helpers pass the token) and adjust the fetch above to match.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -355,7 +382,7 @@ git commit -m "test(e2e-helpers): retry RustServer boot on bind race with fresh 
 
 ### Task 4: Flake 1 — wall-rust `double-restart mid-recovery`
 
-The test (`test/e2e-browser/specs/restore-contract-wall-rust.spec.ts:2063-2169`) carries 245 s of gate budget + 3 server boots inside a 180 s timeout, has no WS-ready gate after the FIRST SIGKILL, and its session click rides the 10 s default. Fix = give THIS test the 300 s budget (same pattern as THE RULER's `test.setTimeout(300_000)` at line 1364), gate the reconnect after the first kill, and make the click budget explicit. All edits stay inside the double-restart test body.
+The test (`test/e2e-browser/specs/restore-contract-wall-rust.spec.ts:2063-2169`) carries 245 s of gate budget + 3 server boots inside a 180 s timeout, has no WS-ready gate after the FIRST SIGKILL, and its session click has NO action timeout at all (validated: the config sets `expect.timeout: 10_000` but never `actionTimeout`, and expect timeouts do not apply to actions — the click is capped only by the test timeout). Fix = give THIS test a worst-case-covering 600 s budget (same per-test override pattern as THE RULER's `test.setTimeout(300_000)` at line 1364; 300 s is NOT enough — see the arithmetic in Step 2), gate the reconnect after the first kill, and make the click budget explicit. All edits stay inside the double-restart test body.
 
 **Files:**
 - Modify: `test/e2e-browser/specs/restore-contract-wall-rust.spec.ts` — ONLY inside the test at lines 2063-2169. Do not touch lines 1140-1252 (P0.2 pin — Lane D4), nor lines 1380-1383 / 1705 / 1829 (other pins), nor the shared helpers at the top of the file (other tests use them).
@@ -391,10 +418,15 @@ Three edits inside the test body (lines 2063-2169):
 
 (a) Immediately after `expect(e2eServerKind).toBe('rust')` (line 2067), add:
 ```ts
-    // DEFLAKE (f3wp): this test's serial gate budget (20+45+60+30+60+30 s)
-    // plus 3 server boots structurally exceeds the describe-level 180 s under
-    // full parallel-suite load. Same per-test override THE RULER uses (:1364).
-    test.setTimeout(300_000)
+    // DEFLAKE (f3wp): this test's serial gate budget (20+45+60+30+60+30 s
+    // = 245 s) plus 3 serialized boot/health budgets (~91 s bootWall +
+    // 2 x 65 s restartAbrupt) structurally exceeds the describe-level 180 s
+    // under full parallel-suite load. Post-fix worst case (with the new
+    // 60 s WS gate and the 30 s explicit click) is ~556 s, so 300 s would
+    // recreate the same sum-of-gates > timeout defect at a higher threshold.
+    // 600 s covers the strict worst case with margin. Same per-test override
+    // pattern THE RULER uses (:1364).
+    test.setTimeout(600_000)
 ```
 
 (b) Give the sidebar-session click (line ~2091) an explicit budget:
@@ -426,7 +458,7 @@ Expected: 7/7 passed in `/tmp/deflake-logs/flake1-proof.log`. (The full 10x acce
 
 ```bash
 git add test/e2e-browser/specs/restore-contract-wall-rust.spec.ts
-git commit -m "test(e2e): deflake wall double-restart -- 300s budget, WS gate after first SIGKILL (f3wp)"
+git commit -m "test(e2e): deflake wall double-restart -- 600s worst-case budget, WS gate after first SIGKILL (f3wp)"
 ```
 
 ---
@@ -568,6 +600,7 @@ for i in 1 2 3 4 5; do
   npm run test:vitest -- run --config config/vitest/vitest.server.config.ts \
     test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts \
     2>&1 | tail -20 | tee -a /tmp/deflake-logs/flake3-repro.log
+  test "${PIPESTATUS[0]}" -eq 0 || echo "REPRO RUN $i FAILED" | tee -a /tmp/deflake-logs/flake3-repro.log
 done
 ```
 Expected: usually green (the race is rare); an EADDRINUSE hit is a bonus, not a prerequisite — the deterministic regression test in Step 3 IS the reproduction (it forces the exact race).
@@ -680,11 +713,14 @@ The affected suite is the file's real home, `npm run test:server` (coordinated �
 cd /home/dan/code/freshell/.worktrees/deflake-load-flakes
 for i in 1 2 3 4 5 6 7 8 9 10; do
   env -u FRESHELL_BIND_HOST FRESHELL_TEST_SUMMARY="f3wp flake3 proof $i/10" npm run test:server \
-    2>&1 | tail -5 | tee -a /tmp/deflake-logs/flake3-10x.log || { echo "RUN $i FAILED" | tee -a /tmp/deflake-logs/flake3-10x.log; break; }
+    2>&1 | tail -5 | tee -a /tmp/deflake-logs/flake3-10x.log
+  test "${PIPESTATUS[0]}" -eq 0 || { echo "RUN $i FAILED" | tee -a /tmp/deflake-logs/flake3-10x.log; break; }
 done
 grep -c "FAILED" /tmp/deflake-logs/flake3-10x.log || true
 ```
-Expected: 10 consecutive exit-0 runs, zero "RUN n FAILED" lines. If a run fails on an UNRELATED test, note it, verify it's unrelated (not EADDRINUSE, not remote-proxy), and continue the count only if the failure is demonstrably outside this flake's blast radius — otherwise investigate before counting.
+(VALIDATED: without pipefail, `cmd | tail | tee || …` takes `tee`'s exit status and logs every failure as green — the `${PIPESTATUS[0]}` gate above is mandatory, in the same shell invocation as the pipe.)
+
+Expected: 10 consecutive green runs, zero "RUN n FAILED" lines. Blast-radius rule (VALIDATED, updated): a failure is INSIDE this flake's blast radius if it is (a) any EADDRINUSE anywhere, (b) any remote-proxy test, OR (c) a `client.test.ts` failure with "Timed out waiting for fake Codex app-server" — that harness has 28 ungated `startFakeCodexAppServer` calls per pass riding the same alloc→spawn→bind race, and a lost bind there surfaces as that 5 s timeout, never as an EADDRINUSE code. If (c) fires, apply the same allocator-contract retry to that harness helper (same loop shape as startProxy's) before continuing the count. Only failures demonstrably outside (a)-(c) may be noted and counted past — otherwise investigate before counting.
 
 - [ ] **Step 8: Commit**
 
@@ -782,6 +818,8 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
 
 If `acquire_store_lock` is not reachable as `PaneLedger::acquire_store_lock` from the tests module (check how the file accesses other `PaneLedger` items — e.g. `super::PaneLedger`), use the same path prefix the rest of the file uses. Do NOT change its visibility in `pane_ledger.rs`.
 
+VALIDATED (load-bearing stage): the probe design is sound — `acquire_store_lock` is at `pane_ledger.rs:260` (not :257), signature `-> std::io::Result<Option<std::fs::File>>`; on unix, contention maps to `Err(io::Error::last_os_error())` with errno intact (`libc::flock(LOCK_EX|LOCK_NB)` at :272-277), and `Ok(None)` exists only in the `#[cfg(not(unix))]` stub — so the two-arm `Ok(lock)/Err(err)` match cannot silently pass on contention on Linux. `new_locked` maps DISABLED from the `Err` arm only (:240-256). Caveat the panic message already handles: `Err` also covers `create_dir_all`/`open` failures (:262, :269), which is why it prints errno + kind rather than asserting "contention". The tests module is a child module (`use super::*;` at pane_ledger_tests.rs:5), so the private call compiles.
+
 - [ ] **Step 3: Run the test**
 
 Run: `cargo test -p freshell-ws --lib pane_ledger::tests::new_locked_degrades_to_disabled_when_another_holder_exists`
@@ -795,13 +833,15 @@ cd /home/dan/code/freshell/.worktrees/deflake-load-flakes
 cargo test --workspace > /tmp/deflake-logs/flake4-load-generator.log 2>&1 &
 LOADPID=$!
 for i in 1 2 3 4 5 6 7 8 9 10; do
-  cargo test -p freshell-ws 2>&1 | tail -5 | tee -a /tmp/deflake-logs/flake4-10x.log \
-    || echo "RUN $i FAILED" | tee -a /tmp/deflake-logs/flake4-10x.log
+  cargo test -p freshell-ws 2>&1 | tail -5 | tee -a /tmp/deflake-logs/flake4-10x.log
+  test "${PIPESTATUS[0]}" -eq 0 || echo "RUN $i FAILED" | tee -a /tmp/deflake-logs/flake4-10x.log
 done
 wait $LOADPID
 ls /tmp/pane-ledger-test-lock-* 2>/dev/null | tee -a /tmp/deflake-logs/flake4-10x.log || echo "no new fossils" | tee -a /tmp/deflake-logs/flake4-10x.log
 ```
-(Each `cargo test -p freshell-ws` is a few minutes; budget ~60-90 min with the workspace run alongside. Use `timeout: 7200`.)
+(Each `cargo test -p freshell-ws` is a few minutes; budget ~60-90 min with the workspace run alongside. Use `timeout: 7200`. The `${PIPESTATUS[0]}` gate is mandatory — VALIDATED: without it, `cmd | tail | tee || …` takes `tee`'s exit status and logs every failure as green.)
+
+**Fossil attribution (VALIDATED risk — /tmp is host-shared and other lanes run cargo concurrently):** before Step 1's `rm -rf`, check whether the tests' `temp_root` helper builds its path via `std::env::temp_dir()` (which honors `TMPDIR`). If it does, export a lane-private `TMPDIR="$(mktemp -d /tmp/f3wp-flake4-XXXX)"` for BOTH the load generator and the 10x loop above — then any fossil in plain `/tmp` during the window is known-foreign, and only fossils under the lane-private dir feed the decision gate. If `temp_root` hardcodes `/tmp`, attribute each new fossil instead: the dir name embeds the creating PID (`pane-ledger-test-lock-<pid>-<counter>`) — check `ps -fp <pid>` immediately and compare the fossil's mtime against this lane's run window. Foreign/unattributable fossils are recorded in the report but do NOT trigger the STOP path; only a fossil from this lane's own runs (or a red run with the new diagnostics firing) does.
 
 **Decision gate:**
 - **10/10 green, no new fossils** → done: the diagnostics are the deliverable; record in the report that the mechanism remains unproven, the "cross-lane flock contention" framing is corrected (PID-scoped path; evidence in flake4 report §3), and the production observability gap (`new_locked` Err conflation `pane_ledger.rs:236-256`; `load_index` error swallowing `:299-321` — a restarted server can come up with a silently DISABLED/blind ledger) is escalated as a P1.13-owner finding.
@@ -850,6 +890,8 @@ npx playwright test --config test/e2e-browser/playwright.config.ts --workers=2 \
 ```
 Expected: exit 0 (all projects, workers=2). This is the longest single run — `timeout: 7200`.
 
+Attribution rule (VALIDATED risk: no e2e baseline exists for the branch base, so a red here is not automatically ours): if the run is red, determine whether the failure touches this lane's blast radius (our four specs/helpers, or a port-race signature — EADDRINUSE / "address in use" / foreign-server identity). A failure inside the blast radius routes back to that flake's task. A failure demonstrably outside it is documented in the verification report as a pre-existing/unrelated finding with the log evidence — the CI-parity expectation is "no failures attributable to this lane", not a warranty over the whole suite.
+
 - [ ] **Step 3: Final coordinated + cargo green**
 
 ```bash
@@ -861,7 +903,9 @@ Expected: both exit 0.
 
 - [ ] **Step 4: Append the verification report**
 
-Append to this plan document a `## Verification report` section containing, per flake: reproduction evidence (or "did not reproduce in N supervised repeats" with the structural root cause), root cause, the fix, and the proof runs (counts + log paths); plus the findings ledger: (1) `CodexRemoteProxy.start()` unretried-allocator production gap (Task 6 Step 1 result), (2) pane_ledger production observability gap + corrected "cross-lane" framing (Task 7 decision-gate outcome), (3) any STOPPED items with their evidence. Copy the key numbers inline (don't just point at /tmp — it doesn't survive).
+Append to this plan document a `## Verification report` section containing, per flake: reproduction evidence (or "did not reproduce in N supervised repeats" with the structural root cause), root cause, the fix, and the proof runs (counts + log paths); plus the findings ledger: (1) `CodexRemoteProxy.start()` unretried-allocator production gap (Task 6 Step 1 result), (2) pane_ledger production observability gap + corrected "cross-lane" framing (Task 7 decision-gate outcome), (3) any STOPPED items with their evidence, (4) `client.test.ts` retry-hardening if Task 6 Step 7's blast-radius rule (c) fired. Copy the key numbers inline (don't just point at /tmp — it doesn't survive).
+
+Kata framing (VALIDATED against the kata store, `~/.kata/kata.db` issue `f3wp`): the kata's verbatim acceptance bar is *"full e2e suite 10x consecutive green at local unbounded parallelism"* — Step 1 is its literal proof; the coordinated + cargo runs (Step 3) satisfy the broader reading of "full suite". The report must also: (a) note that the kata enumerates THREE flakes and pane_ledger was an extra noted from C1's report, and (b) explicitly correct the kata's "none product bugs" assertion if the pane_ledger decision gate or the CodexRemoteProxy finding escalated a product defect.
 
 - [ ] **Step 5: Commit**
 
@@ -891,7 +935,7 @@ Expected: branch pushed. **STOP here — do NOT run `gh pr create` (PR policy: n
 
 - [ ] **Step 2: Final report**
 
-Produce the kata-closable summary: branch name, per-flake root cause (one paragraph each), the 10x/CI-parity proof numbers, the findings ledger (production gaps reported, framing corrections), and any STOPPED items. This is what lets `kata close f3wp` (or the operator's equivalent) happen with evidence.
+Produce the kata-closable summary: branch name, per-flake root cause (one paragraph each), the 10x/CI-parity proof numbers, the findings ledger (production gaps reported, framing corrections), and any STOPPED items. Lead with the kata's own verbatim bar — *"full e2e suite 10x consecutive green at local unbounded parallelism"* — and the evidence meeting it; that is the single criterion `kata close f3wp` (or the operator's equivalent) needs, with the findings ledger as the transparency layer.
 
 ---
 
@@ -900,4 +944,13 @@ Produce the kata-closable summary: branch name, per-flake root cause (one paragr
 1. **Spec coverage:** reproduce-first per flake (Tasks 4.1, 5.1, 6.2+6.3-deterministic, 7.4) — covered. Root-cause with evidence — structural analysis inlined + trace capture steps. Deterministic fixes: poll gates (4, 5), port hardening (2, 3, 6), self-diagnosing lock test (7) — covered. 10x acceptance per affected suite + full e2e at workers=2 (6.7, 7.4, 8.1, 8.2) — covered. Test-only fence with STOP-on-product-race gates (4.1, 5.1, 7.4 decision gate) — covered. findFreePort itself fixed as the kata suggests (Task 2) with the consumer retry the TOCTOU actually requires (Task 3). Kata-closable report + branch push, no PR (8.4, 9) — covered.
 2. **No silent deferrals:** the two production gaps discovered (CodexRemoteProxy unretried start; pane_ledger error swallowing) are OUT of this test-only lane's write scope by the spec's own fence — they are handled exactly as the spec mandates: reported as findings (Tasks 6.1, 7.4, 8.4), not silently deferred and not masked. No user-facing requirement of THIS lane lacks a covering task.
 3. **Placeholder scan:** every code step contains complete code or an explicit read-first instruction bound to concrete line ranges where the surrounding source is owned by another lane's unread region; no TBDs. The two "adjust to real names" notes (Task 3 Step 1, Task 7 Step 2) are verification instructions with concrete fallbacks, not deferrals.
-4. **Type consistency:** `findFreePort(probe?)` (Task 2) matches Task 3's no-arg use; `portPicker?: () => Promise<number>` consistent between Task 3's option and test; `portAllocator?: () => Promise<LoopbackServerEndpoint>` consistent between Task 6's harness signature, regression test, and `CodexRemoteProxy`'s existing option; Task 7 uses `PaneLedger::acquire_store_lock(&root) -> std::io::Result<Option<File>>` matching `pane_ledger.rs:257`.
+4. **Type consistency:** `findFreePort(probe?)` (Task 2) matches Task 3's no-arg use; `portPicker?: () => Promise<number>` consistent between Task 3's option and test; `portAllocator?: () => Promise<LoopbackServerEndpoint>` consistent between Task 6's harness signature, regression test, and `CodexRemoteProxy`'s existing option; Task 7 uses `PaneLedger::acquire_store_lock(&root) -> std::io::Result<Option<File>>` matching `pane_ledger.rs:260` (validated; contention returns `Err` with errno on unix).
+
+## Self-Review addendum (load-bearing validation stage)
+
+The plan's assumptions were validated post-write (ledger: `.the-usual-logs/deflake-load-flakes/load-bearing-ledger.md` — 5 verified, 6 falsified, 8 accepted). Edits applied and re-reviewed over the changed tasks:
+
+1. **Spec coverage unchanged** — no task was removed; every falsified assumption's fix strengthens an existing step (Task 4 budget 600 s with worst-case arithmetic; Task 3 identity check + genuine red step + 600 s cold-build budget; Task 6 blast-radius rule now catches client.test.ts's timeout-shaped port-loss; Tasks 1/6/7 proof loops gate on `${PIPESTATUS[0]}` so the 10x evidence is real; Task 7 fossil attribution isolates the decision gate from foreign lanes; Task 8 CI-parity red gets an attribution rule; Tasks 8/9 quote the kata's verbatim bar and correct its "none product bugs" framing when findings escalate).
+2. **No silent deferrals introduced** — the client.test.ts hardening is conditional-on-evidence with an explicit trigger (blast-radius rule c), and the `/api/server-info` auth-shape check is a read-first instruction with a concrete verified fallback (401-on-wrong-token behavior), not a TBD.
+3. **Placeholder scan** — all new code blocks are complete; the only conditional instruction (TMPDIR vs PID/mtime fossil attribution) carries both concrete branches.
+4. **Type consistency of new code** — `pickerCalls` assertion uses the same `portPicker` seam; the identity fetch reuses `info.baseUrl` + the loop's `token`; the widened retry predicate adds only the synthetic `bind race` prefix thrown two lines above it.
