@@ -2,7 +2,7 @@ import type { Middleware } from '@reduxjs/toolkit'
 import { getWsClient } from '@/lib/ws-client'
 import { collectAllTerminalIds } from '@/lib/pane-utils'
 import { consumeTerminalReleaseMark } from '@/lib/terminal-release-marks'
-import { clearDeadTerminals, clearTerminalLiveHandles } from './panesSlice'
+import { applyReconcileAttach, clearDeadTerminals, clearTerminalLiveHandles } from './panesSlice'
 import type { PaneNode } from './paneTypes'
 
 type PanesStateSlice = { panes: { layouts: Record<string, PaneNode | undefined> } }
@@ -25,6 +25,9 @@ type PanesStateSlice = { panes: { layouts: Record<string, PaneNode | undefined> 
 const skipDetachActionTypes = new Set<string>([
   clearDeadTerminals.type,
   clearTerminalLiveHandles.type,
+  // Lane D1: terminal.replaced fold rebinds the pane; the old terminal is
+  // already exited — never detach-storm it.
+  applyReconcileAttach.type,
 ])
 
 /**
