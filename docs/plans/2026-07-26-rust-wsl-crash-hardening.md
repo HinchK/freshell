@@ -10,12 +10,31 @@ concurrency gate in `freshell-ws`, and make `freshell-server` handle SIGHUP
 gracefully while logging best-effort shutdown forensics (signal + /proc
 parent-chain) so external kills become attributable.
 
+**Motivation & success criteria (per the 2026-07-06 WSL-outage RCA; validated
+2026-07-26, load-bearing-assumption pass, report V6):** The three 2026-07-06
+fleet deaths were WSL session teardown caused by wslservice-internal
+corruption (the WSL 2.6.3 `CollectCrashDumps()` OOB-read bug class — RCA
+§3.1/§3.3), NOT guest resource pressure: the RCA explicitly rules resource/
+port pressure "falsified as crash cause; real as chronic issue". Track 1's
+gate therefore does NOT prevent — and must never be framed as preventing —
+what killed WSL. It is the RCA's own endorsed fix (§6.3) for the CHRONIC
+restore-stampede problem: a ~20-tab fleet respawning ~50–70 agent processes
+in the same instant, the mechanism behind the post-reboot UDP-port-exhaustion
+spike (Tcpip event 4266, fired 2.5 min after boot during fleet restore).
+**Track 1 success metric: elimination of the boot-time Tcpip 4266 event and
+bounded, orderly stampede draining — not crash prevention.** The actual
+outage remediations — a systemd user service with lingering (RCA §6.1) and
+WSL ≥ 2.7.3 or `maxCrashDumpCount=-1` (RCA §6.2) — are environmental/
+out-of-repo and are NOT part of this plan. Track 2 makes external kills
+attributable after the fact.
+
 **Architecture:** Two independent hardening tracks against the WSL-outage RCA
 (`docs/plans/2026-07-06-wsl-outage-rca.md` on the `fix/wsl-crash-hardening`
-worktree). Track 1 adds three new modules to `crates/freshell-ws`
+worktree). Track 1 adds four new modules to `crates/freshell-ws`
 (`create_limit.rs` config + per-connection rate limiter, `spawn_gate.rs`
 server-wide FIFO semaphore gate with cancellable acquire, `create_gate.rs`
-the spawned gated-create path) and reroutes `restore:true` creates through a
+the spawned gated-create path, `create_dedupe.rs` server-wide
+requestId→terminal dedupe guard — legacy parity, Task 7b) and reroutes `restore:true` creates through a
 spawned task that holds a gate permit from before PTY spawn until the
 `terminal.created` frame + broadcasts are queued ("settled"). Track 2 adds
 `crates/freshell-server/src/shutdown_forensics.rs` (pure /proc walker,
@@ -45,10 +64,33 @@ task implicitly includes these:
 - No new workspace dependencies. `tokio::sync::{Semaphore, watch, Notify}`
   and `std::fs` cover everything.
 - TDD: Red-Green-Refactor for every non-trivial change; never skip refactor.
-- Checks that must pass before every commit:
-  - `cargo fmt --all -- --check`
-  - `cargo clippy --workspace --all-targets` (no NEW warnings)
-  - `cargo test -p <touched crates>` (workspace-wide in the final task)
+- Checks that must pass before every commit — judged as a DELTA against the
+  recorded baseline below, never as absolute "all green":
+  - `cargo fmt --all -- --check` (fully clean after Task 1 Step 0's one-time
+    baseline fix)
+  - `cargo clippy --workspace --all-targets` (no NEW warnings vs the 60
+    recorded baseline warnings)
+  - `cargo test -p <touched crates>` (workspace-wide in the final task): no
+    NEW failures vs the 2 recorded baseline failures.
+- **Recorded baseline (2026-07-26, HEAD a7dc03f4 — validator report V7):**
+  - `cargo fmt --all -- --check` FAILS with exactly 1 diff: a stray blank
+    line at `crates/freshell-sessions/src/directory_index.rs:898` (fixed as
+    a standalone pre-commit in Task 1 Step 0).
+  - `cargo clippy --workspace --all-targets` passes with **60 baseline
+    warnings**.
+  - `cargo test -p freshell-ws -p freshell-server` = **468 passed / 2
+    failed / 1 ignored**. Known failures: (1)
+    `codex_session_ref_resume::codex_create_derives_resume_from_session_ref`
+    — environmental (no node_modules in this worktree → `tsx` unresolvable);
+    can never pass here; (2)
+    `session_identity_frames::fresh_claude_create_frames_carry_preallocated_session_ref`
+    — deterministic pre-existing defect (reproduced in isolation; times out
+    waiting for `terminal.created`). Failure (2) sits on the exact
+    `terminal.created` frame path this plan touches — it MUST be triaged
+    BEFORE the final integration task (Task 10 Step 0) so this plan's
+    changes are not confused with it.
+  - Every "all green" / "all tests pass" phrase in this plan therefore means
+    "no regressions vs this recorded baseline".
 - Kill/destructive test suites run in the Docker sandbox:
   `scripts/sandbox-test.sh "cargo test -p <crate> --test <name>"`. If the
   sandbox is unavailable in the execution environment, running on host is
@@ -85,14 +127,38 @@ task implicitly includes these:
      `TERMINAL_*` family) instead of `FRESHELL_SPAWN_GATE_*`.
 
 **Non-goals (explicitly out of scope, with reasons — not silent deferrals):**
-- REST spawn paths (`POST /api/tabs`, `/split`, `/respawn` via
-  `freshell-freshagent`) do not carry a `restore` flag; restore-flagged
-  creates arrive only via the WS `terminal.create` message, so the WS gate
-  covers 100% of the spec's target ("restore-flagged terminal creates").
+- Gating the `POST /api/tabs-sync/restore` continuity pipeline (ledger
+  decision ACC-1). Verified fact (V1): the historical storm mechanism IS the
+  frozen client's WS `terminal.create restore:true` stampede — the client
+  folds `restore:true` into the WS create payload
+  (`src/components/TerminalView.tsx:2761` computes the flag, `:2793` sends
+  it) and mounts every persisted tab at once (RCA §6.3). The WS gate fully
+  covers that mechanism. It does NOT, however, cover every restore-flagged
+  spawn: `POST /api/tabs-sync/restore`
+  (`crates/freshell-server/src/tabs_snapshots.rs:820-826` →
+  `freshell_freshagent::terminal_tabs::create_terminal_or_content_tab_deferred`
+  → `registry.create` at `crates/freshell-freshagent/src/terminal_tabs.rs:867`)
+  spawns restore PTYs entirely outside `freshell-ws`. That pipeline is
+  DELIBERATELY DE-SCOPED: it is operator-triggered, serialized under
+  `restore_lock` (`tabs_snapshots.rs:32-35`, `:493`), fenced per pane by a
+  screenshot ack (`:296-315`), and refuses unless exactly one browser is
+  connected (`:499`) — structurally not storm-shaped. Recorded deviation:
+  the RCA (§6.3) prescribes the gate "in the terminal registry" (which would
+  also cover REST + tabs-sync); this plan places it in `freshell-ws` to keep
+  the blast radius in one crate (`freshell-terminal` is contractually
+  tokio-free). Future option, if REST/tabs-sync spawn volume ever grows:
+  move the gate into `TerminalRegistry::create`.
+- Plain REST spawn paths (`POST /api/tabs`, `/split`, `/respawn` via
+  `freshell-freshagent`) carry no `restore` flag and are low-volume
+  operator/automation actions; they share the ACC-1 de-scope rationale above.
 - Moving `registry.create` onto `spawn_blocking` (prior art did this) is not
   required by the spec and enlarges blast radius (exit-hook + borrow rework);
   the gate bounds how many blocking spawns can pile up, which is the spec's
-  requirement.
+  requirement. Measured basis (V4): inline blocking at concurrency 4 is safe
+  on ≥4-worker runtimes (this server uses plain `#[tokio::main]`, workers =
+  num_cpus); on ≤2-core machines a simultaneous burst adds ~2× the spawn
+  duration of latency to unrelated timers — acceptable, but revisit if WSL
+  PTY spawn latency ≫10ms is ever observed.
 - Forensics fields `uptimeSeconds`/`runningTerminals` from the Node reference
   are not ported: the spec requires "which signal was received, plus a /proc
   parent-chain walk", the reference is explicitly "design reference only, do
@@ -108,15 +174,16 @@ task implicitly includes these:
 | `crates/freshell-ws/src/create_limit.rs` | Create | `CreateProtectConfig` (env knobs) + `CreateRateLimiter` (per-connection sliding window) + `epoch_ms()` |
 | `crates/freshell-ws/src/spawn_gate.rs` | Create | `RestoreSpawnGate`: FIFO semaphore, queue cap, timeout, cancellable acquire, counters |
 | `crates/freshell-ws/src/create_gate.rs` | Create | `CreateOutput` reply sink + `spawn_gated_restore_create` (the spawned, permit-holding, cancellable restore path) + gate→error-frame mapping |
-| `crates/freshell-ws/src/lib.rs` | Modify | `pub mod` declarations; `WsState` gains `create_protect` + `spawn_gate`; `state()` test helper updated |
+| `crates/freshell-ws/src/create_dedupe.rs` | Create | `CreateDedupe`: server-wide requestId→terminal dedupe guard with in-flight sentinel (legacy `createdByRequestId` parity, Task 7b) |
+| `crates/freshell-ws/src/lib.rs` | Modify | `pub mod` declarations; `WsState` gains `create_protect` + `spawn_gate` + `shutdown_started` (Task 3) and `create_dedupe` (Task 7b); `state()` test helper updated |
 | `crates/freshell-ws/src/terminal.rs` | Modify | pub(crate) visibility for `WsSink`/`send`; `handle_create`/`send_create_error` take `CreateOutput`; per-connection cancel watch + rate-limit + dispatch branch in `run`/`handle_client_text` |
 | `crates/freshell-server/src/main.rs` | Modify | Boot wiring of config + gate; SIGHUP arm + forensics call in `shutdown_signal()`; `mod shutdown_forensics;` |
 | `crates/freshell-server/src/shutdown_forensics.rs` | Create | `/proc` stat parser + parent-chain walker (injectable proc root) + `log_shutdown_forensics` |
-| `crates/freshell-ws/tests/restore_spawn_gate.rs` | Create | Real-socket integration proof: gating, bypass, rate limit, disconnect cancellation, shutdown drain |
-| `crates/freshell-ws/tests/*.rs` (11 existing files) | Modify | Add the two new `WsState` fields to each literal |
+| `crates/freshell-ws/tests/restore_spawn_gate.rs` | Create | Real-socket integration proof: gating, bypass, rate limit, disconnect cancellation, shutdown drain, shutdown-race no-orphan, storm ordering, requestId dedupe |
+| `crates/freshell-ws/tests/*.rs` (11 existing files) | Modify | Add the new `WsState` fields (three in Task 3, one more in Task 7b) to each literal |
 | `crates/freshell-server/tests/sighup_forensics.rs` | Create | Real-binary integration proof: SIGHUP → graceful exit 0 + forensics JSONL line |
 
-Known `WsState` literal sites the compiler will flag (add the two fields to
+Known `WsState` literal sites the compiler will flag (add the new fields to
 every one; the list below is from a fresh audit — trust the compiler over the
 list): `crates/freshell-ws/src/lib.rs:636` (`fn state()`), inline
 `state_with_bus()` helpers in `crates/freshell-ws/src/terminal.rs` (~:2226
@@ -141,6 +208,17 @@ session_identity_frames.rs:97, term09_output_queue.rs:50}`.
   - `pub struct CreateProtectConfig { pub rate_limit: usize, pub rate_window_ms: u64, pub restore_spawn_concurrency: usize, pub restore_spawn_queue_cap: usize, pub restore_spawn_timeout_ms: u64 }` with `Default` (10 / 10_000 / 4 / 64 / 10_000) and `pub fn from_env() -> Self`
   - `pub struct CreateRateLimiter` with `pub fn new(limit: usize, window_ms: u64) -> Self` and `pub fn try_acquire(&mut self, now_ms: u64) -> bool`
   - `pub fn epoch_ms() -> u64`
+
+- [ ] **Step 0: One-time baseline fmt pre-commit**
+
+The recorded baseline (Global Constraints) has exactly one
+`cargo fmt --all -- --check` diff: a stray blank line at
+`crates/freshell-sessions/src/directory_index.rs:898`. Fix it now as a
+standalone pre-commit so every later fmt gate is meaningful: run
+`cargo fmt --all`, confirm the only change is that blank line, and commit it
+alone (`style(freshell-sessions): drop stray blank line flagged by rustfmt`,
+with the standard footer paragraphs). From this point on,
+`cargo fmt --all -- --check` must be fully clean.
 
 - [ ] **Step 1: Write the module with failing (RED) tests**
 
@@ -467,6 +545,12 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
   `true`, when the sender sends `true`, **or when the sender is dropped**
   (the connection loop exited — disconnect, socket error, keepalive timeout,
   or server shutdown 4009). Both drop and send count.
+- FIFO precision (A7/V4, tokio pinned =1.52.3, empirically probed): Semaphore
+  FIFO, `try_acquire` no-barge, and no-permit-leak on cancel-after-assignment
+  are all confirmed. Note: FIFO is first-POLL order — correct for this
+  spawn-task-per-create design; never build `acquire` futures eagerly and
+  poll them out of order (e.g. a reordered FuturesUnordered), or queue order
+  follows poll order instead of arrival order.
 
 - [ ] **Step 1: Write the module with tests (RED via unregistered module)**
 
@@ -924,9 +1008,11 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 **Interfaces:**
 - Consumes: `CreateProtectConfig` (Task 1), `RestoreSpawnGate` (Task 2).
-- Produces: two new `WsState` fields every later task reads:
+- Produces: three new `WsState` fields every later task reads:
   - `pub create_protect: crate::create_limit::CreateProtectConfig`
   - `pub spawn_gate: std::sync::Arc<crate::spawn_gate::RestoreSpawnGate>`
+  - `pub shutdown_started: std::sync::Arc<std::sync::atomic::AtomicBool>`
+    (the shutdown latch the gated-create path checks — A10, Tasks 6/7)
 
 - [ ] **Step 1: Add the fields to `WsState`**
 
@@ -942,13 +1028,20 @@ crate::backpressure::Term09Config,` field add:
     /// process, shared across all WS connections.
     /// See [`crate::spawn_gate::RestoreSpawnGate`].
     pub spawn_gate: std::sync::Arc<crate::spawn_gate::RestoreSpawnGate>,
+    /// Latched `true` the instant a shutdown signal is received (before the
+    /// WS notify — wired in Task 7). Gated restore creates re-check it
+    /// around `registry.create` so a create racing shutdown never leaves a
+    /// live PTY that `kill_all`'s one-shot id snapshot
+    /// (`freshell-terminal/src/registry.rs:889-892`) would miss (A10/V3).
+    pub shutdown_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ```
 
 - [ ] **Step 2: Let the compiler find every construction site (RED)**
 
 Run: `cargo test -p freshell-ws -p freshell-server --no-run`
-Expected: FAIL with `missing fields create_protect and spawn_gate` errors at
-every `WsState { ... }` literal (the sites listed in File Structure).
+Expected: FAIL with `missing fields create_protect, spawn_gate and
+shutdown_started` errors at every `WsState { ... }` literal (the sites listed
+in File Structure).
 
 - [ ] **Step 3: Fix the production site in `main.rs`**
 
@@ -959,6 +1052,8 @@ In `crates/freshell-server/src/main.rs`, immediately BEFORE the
     // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
     // are guaranteed to come from the same env snapshot.
     let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();
+    // Shutdown latch shared with shutdown_signal (Task 7 wires the setter).
+    let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 ```
 
 and inside the literal, after `term09: freshell_ws::backpressure::Term09Config::from_env(),`:
@@ -968,7 +1063,11 @@ and inside the literal, after `term09: freshell_ws::backpressure::Term09Config::
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::RestoreSpawnGate::from_config(
             &create_protect,
         )),
+        shutdown_started: std::sync::Arc::clone(&shutdown_started),
 ```
+
+Keep the `shutdown_started` local binding alive in `main` — Task 7 passes a
+clone into `shutdown_signal`.
 
 - [ ] **Step 4: Fix every test/helper construction site**
 
@@ -980,6 +1079,7 @@ At every other flagged `WsState { ... }` literal (the `fn state()` helper in
 ```rust
         create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::RestoreSpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
 ```
 
 Re-run `cargo test -p freshell-ws -p freshell-server --no-run` until it
@@ -988,7 +1088,8 @@ compiles clean.
 - [ ] **Step 5: Run the full crate test suites — expect pass (no behavior change yet)**
 
 Run: `cargo test -p freshell-ws && cargo test -p freshell-server`
-Expected: all existing tests pass unchanged.
+Expected: no NEW failures vs the recorded baseline (468 passed / 2 known
+failures / 1 ignored — see Global Constraints).
 
 - [ ] **Step 6: Quality gates**
 
@@ -1002,10 +1103,10 @@ cd /home/dan/code/freshell/.worktrees/rust-tauri-port/.worktrees/rust-wsl-crash-
 git add crates/freshell-ws crates/freshell-server
 git commit \
   -m "feat(freshell-ws): carry create-protection config and restore-spawn gate on WsState" \
-  -m "- WsState gains create_protect + spawn_gate (one gate per server process, Arc-shared across connections)
+  -m "- WsState gains create_protect + spawn_gate (one gate per server process, Arc-shared across connections) + shutdown_started (A10 shutdown latch, consumed by the gated create path)
 - main.rs resolves CreateProtectConfig::from_env() once at boot, next to the term09 wiring
 - All test WsState literals updated (lib.rs state(), terminal.rs state_with_bus x2, 11 tests/*.rs)" \
-  -m "Verification: cargo test -p freshell-ws; cargo test -p freshell-server (all pre-existing tests pass); cargo fmt --all -- --check; cargo clippy --workspace --all-targets (no new warnings)." \
+  -m "Verification: cargo test -p freshell-ws; cargo test -p freshell-server (no new failures vs the recorded baseline); cargo fmt --all -- --check; cargo clippy --workspace --all-targets (no new warnings)." \
   -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
 Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
@@ -1183,8 +1284,9 @@ Nothing else in the body changes.
 - [ ] **Step 6: Run the whole crate suite — pure refactor must stay green**
 
 Run: `cargo test -p freshell-ws`
-Expected: all tests pass (including the pre-existing terminal.rs inline
-suites and all 11 integration files).
+Expected: no NEW failures vs the recorded baseline (the pre-existing
+terminal.rs inline suites and all 11 integration files behave exactly as at
+baseline — including the 2 known baseline failures, see Global Constraints).
 
 - [ ] **Step 7: Quality gates**
 
@@ -1201,7 +1303,7 @@ git commit \
   -m "- CreateOutput::Socket keeps today's inline ws_tx semantics byte-for-byte; CreateOutput::Channel routes through the connection FrameSink (non-blocking) for the upcoming spawned restore path
 - handle_create/send_create_error now take CreateOutput; pub(crate) visibility for WsSink/send
 - Pure refactor: no wire-visible behavior change" \
-  -m "Verification: cargo test -p freshell-ws (all pre-existing tests pass + 1 new); cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings)." \
+  -m "Verification: cargo test -p freshell-ws (no new failures vs recorded baseline; +1 new test); cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings)." \
   -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
 Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
@@ -1249,7 +1351,7 @@ use freshell_ws::create_limit::CreateProtectConfig;
 use freshell_ws::spawn_gate::RestoreSpawnGate;
 
 /// Real server on an ephemeral loopback port with injectable protection
-/// knobs. Returns (ws_url, registry, shutdown_notify, gate).
+/// knobs. Returns (ws_url, registry, shutdown_notify, gate, shutdown_started).
 async fn spawn_server(
     create_protect: CreateProtectConfig,
     gate: RestoreSpawnGate,
@@ -1258,16 +1360,20 @@ async fn spawn_server(
     freshell_terminal::TerminalRegistry,
     std::sync::Arc<tokio::sync::Notify>,
     std::sync::Arc<RestoreSpawnGate>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let gate = std::sync::Arc::new(gate);
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let shutdown_started =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // ... construct WsState exactly as session_identity_frames.rs does,
     //     except:
     //         shutdown: std::sync::Arc::clone(&shutdown),
     //         create_protect,
     //         spawn_gate: std::sync::Arc::clone(&gate),
+    //         shutdown_started: std::sync::Arc::clone(&shutdown_started),
     // ... axum router + serve exactly as session_identity_frames.rs ...
-    (ws_url, registry, shutdown, gate)
+    (ws_url, registry, shutdown, gate, shutdown_started)
 }
 ```
 
@@ -1298,7 +1404,7 @@ async fn third_non_restore_create_in_window_is_rate_limited() {
         rate_limit: 2,
         ..CreateProtectConfig::default()
     };
-    let (ws_url, registry, _shutdown, _gate) =
+    let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
         spawn_server(cfg, RestoreSpawnGate::new(4, 64)).await;
     // connect + hello handshake (copy from session_identity_frames.rs)
 
@@ -1393,7 +1499,7 @@ Expected: PASS.
 - [ ] **Step 5: Full crate suite + quality gates**
 
 Run: `cargo test -p freshell-ws && cargo fmt --all && cargo clippy -p freshell-ws --all-targets`
-Expected: all green, no new warnings.
+Expected: no new failures vs the recorded baseline; no new warnings.
 
 - [ ] **Step 6: Commit**
 
@@ -1405,7 +1511,7 @@ git commit \
   -m "- Legacy parity (ws-handler.ts:2376-2389): 10 creates / 10s sliding window per connection, rejects cost no budget, RATE_LIMITED error frame feeds the frozen client's retry ladder
 - restore:true creates bypass the limiter (they are bounded by the restore-spawn gate)
 - New real-socket acceptance test: third create in window is rejected, only two PTYs exist" \
-  -m "Verification: cargo test -p freshell-ws --test restore_spawn_gate; cargo test -p freshell-ws (all green); cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings)." \
+  -m "Verification: cargo test -p freshell-ws --test restore_spawn_gate; cargo test -p freshell-ws (no new failures vs recorded baseline); cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings)." \
   -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
 Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
@@ -1443,7 +1549,7 @@ async fn restore_creates_are_gated_and_non_restore_bypass() {
         restore_spawn_timeout_ms: 300,
         ..CreateProtectConfig::default()
     };
-    let (ws_url, registry, _shutdown, gate) =
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
         spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
     // connect + hello
 
@@ -1475,7 +1581,7 @@ async fn restore_create_holds_permit_until_settled() {
     // AND the gate saw a queued waiter (the second create had to wait for
     // the first create's FULL settle, not just its spawn).
     let cfg = CreateProtectConfig::default();
-    let (ws_url, registry, _shutdown, gate) =
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
         spawn_server(cfg, RestoreSpawnGate::new(1, 64)).await;
     // connect + hello
 
@@ -1496,13 +1602,44 @@ async fn restore_create_holds_permit_until_settled() {
     );
     assert_eq!(registry.kill_all(), 2);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gated_create_racing_shutdown_leaves_no_live_pty() {
+    // A10 (V3, FALSIFIED): main's registry.kill_all() snapshots the id set
+    // ONCE (registry.rs:889-892) with no re-sweep; a detached gated create
+    // survives the axum drain and its registry insert can land AFTER the
+    // snapshot. The registry-Drop fallback does NOT hold (the PTY reader
+    // thread's exit hook owns a registry Arc — terminal.rs:1047,
+    // pty.rs:464/512 — circular), and the 5s watchdog exits via
+    // std::process::exit(1), skipping Drops. So the gated path itself must
+    // re-check the shutdown latch around handle_create.
+    let cfg = CreateProtectConfig::default();
+    let (ws_url, registry, _shutdown, _gate, shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(1, 64)).await;
+    // connect + hello
+
+    // Shutdown has begun (exactly what main.rs latches before the WS
+    // notify — Task 7 Step 2b) while the restore create is about to run:
+    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+    send_text(&mut client, &create_frame("late", true)).await;
+
+    // Give the gated task time to (wrongly) spawn and settle.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        registry.kill_all(),
+        0,
+        "a create racing shutdown must not leave a live PTY"
+    );
+}
 ```
 
 - [ ] **Step 2: Run — expect FAIL**
 
 Run: `cargo test -p freshell-ws --test restore_spawn_gate`
 Expected: `restore_creates_are_gated_and_non_restore_bypass` FAILS (the
-restore create currently succeeds inline — the gate is never consulted).
+restore create currently succeeds inline — the gate is never consulted) and
+`gated_create_racing_shutdown_leaves_no_live_pty` FAILS (the create succeeds
+and leaves one live PTY despite the latched shutdown).
 
 - [ ] **Step 3: Implement `spawn_gated_restore_create`**
 
@@ -1588,6 +1725,18 @@ pub(crate) fn spawn_gated_restore_create(
             );
             return;
         }
+        // A10 shutdown-race pre-check (V3): kill_all snapshots ids once
+        // (registry.rs:889-892); if shutdown already began, nothing has been
+        // spawned yet — abandon instead of inserting a PTY the snapshot will
+        // never visit.
+        if state.shutdown_started.load(std::sync::atomic::Ordering::SeqCst) {
+            tracing::info!(
+                target: "freshell_ws::spawn_gate",
+                request_id = %create.request_id,
+                "restore_create_abandoned_for_shutdown"
+            );
+            return;
+        }
         // Permit held across the WHOLE async create: PTY spawn -> registry
         // insert -> meta/identity -> terminal.created -> broadcasts (the
         // spawn-to-settled requirement). Replies go through the non-blocking
@@ -1595,7 +1744,23 @@ pub(crate) fn spawn_gated_restore_create(
         // hazard prior art's da5d9b5c early release worked around does not
         // exist on this path.
         let mut out = CreateOutput::Channel(&sink);
+        let request_id = create.request_id.clone();
         let _ = crate::terminal::handle_create(create, &mut out, &state).await;
+        // A10 shutdown-race post-check (V3): shutdown may have begun DURING
+        // the create, after main's kill_all snapshot. The server is reaping
+        // everything anyway, so an idempotent kill_all here reaps our own
+        // just-inserted terminal (and any other late insert). Belt to the
+        // pre-check's braces; main.rs adds a drain re-sweep too (Task 7
+        // Step 2b).
+        if state.shutdown_started.load(std::sync::atomic::Ordering::SeqCst) {
+            let killed = state.registry.kill_all();
+            tracing::info!(
+                target: "freshell_ws::spawn_gate",
+                request_id = %request_id,
+                killed,
+                "restore_create_settled_during_shutdown_reaped"
+            );
+        }
         drop(permit);
     });
 }
@@ -1654,12 +1819,46 @@ Expected: all tests in the file PASS.
 - [ ] **Step 6: Full crate suite + quality gates**
 
 Run: `cargo test -p freshell-ws && cargo fmt --all && cargo clippy -p freshell-ws --all-targets`
-Expected: all green, no new warnings. Known nuance to note (not fix): on the
+Expected: no new failures vs the recorded baseline; no new warnings. Known nuance to note (not fix): on the
 gated path the strict same-connection `terminal.created` → `terminals.changed`
 frame order is now best-effort (both drain through the connection loop from
 two channels); the creating connection enqueues `created` strictly first, and
-other connections already had this property. The Task 10 continuity smoke
-covers the client-visible behavior.
+other connections already had this property. The storm-shaped ordering test
+(Task 7 Step 2c) is the primary client-visible evidence; the npm continuity
+smoke (Task 10 Step 3) is optional best-effort corroboration on a
+provisioned machine.
+
+**Validation notes folded into this task (2026-07-26 load-bearing pass):**
+- (A2/V2 — HARD REQUIREMENT) Gate error frames (RATE_LIMITED on queue-full,
+  PTY_SPAWN_FAILED on timeout) MUST echo the client's `requestId`: the frozen
+  client matches errors on `msg.requestId === reqId`
+  (src/components/TerminalView.tsx:3995-3999) and silently ignores frames
+  without it — the pane wedges in 'creating'. The error-path tests in this
+  task and Task 7 assert `err["requestId"]`; keep those assertions. The
+  client's RATE_LIMITED retry ladder is exactly 38s (2+4+8+12+12s;
+  TerminalView.tsx:155-157, 2798-2815) with the FIRST retry after 2s — the
+  gate (and the Task 7b dedupe guard) must tolerate an immediate
+  same-requestId re-request.
+- (A21/V8 — DESIGN INVARIANT) The created-before-output guarantee on the
+  Channel reply path is CAUSAL, not structural: create never auto-attaches
+  (`freshell-terminal/src/registry.rs:548` — `subscribers: HashMap::new()`),
+  output flows only through attach-registered subscribers, and the client
+  attaches only after receiving `created` — a client round-trip the
+  connection loop's unbiased `select!` cannot reorder. NEVER add create-time
+  auto-attach or create-time replay to the channel-reply path, or output can
+  hit the wire before `created`.
+- (A5/V3) The spawned task needs `'static` captures — `state.clone()` above
+  covers it (WsState is Clone; all fields Arc-backed).
+- (A5/V3) Concurrent opencode creates sharing a cwd now contend on an O_EXCL
+  file lock with blocking `thread::sleep` retries on tokio workers
+  (mcp_inject.rs:329-375) — keep the default gate concurrency small (4 is
+  fine).
+- (A9/V3) The per-connection cancel sender drops when `run()` RETURNS —
+  i.e. AFTER `registry.remove_connection` — so do not assume
+  cancel-before-remove ordering (benign: create never subscribes).
+- (A19/V3) A create settling after its client disconnected leaves a detached
+  background terminal, reaped by the idle sweep (default 15 min) — or never,
+  if `autoKillIdleMinutes <= 0`. Accepted by design; do not "fix" it here.
 
 - [ ] **Step 7: Commit**
 
@@ -1670,8 +1869,9 @@ git commit \
   -m "feat(freshell-ws): route restore creates through the spawn-to-settled gate" \
   -m "- restore:true creates now run on a spawned task holding a RestoreSpawnGate permit from before the PTY spawn until terminal.created + broadcasts are queued (spec: permit spans the async create, not a sync call)
 - Per-connection watch cancel signal: loop exit (disconnect/shutdown) unblocks queued restore creates without spawning
-- QueueFull -> RATE_LIMITED (client retry ladder), Timeout -> PTY_SPAWN_FAILED; zero-permit wiring proof + bypass + queued-settle acceptance tests" \
-  -m "Verification: cargo test -p freshell-ws --test restore_spawn_gate; cargo test -p freshell-ws (all green); cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings)." \
+- QueueFull -> RATE_LIMITED (client retry ladder), Timeout -> PTY_SPAWN_FAILED, both echoing the client requestId; zero-permit wiring proof + bypass + queued-settle acceptance tests
+- A10 shutdown-race guard: gated path re-checks WsState.shutdown_started before and after handle_create; a create racing shutdown leaves no live PTY (new test)" \
+  -m "Verification: cargo test -p freshell-ws --test restore_spawn_gate; cargo test -p freshell-ws (no new failures vs recorded baseline); cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings)." \
   -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
 Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
@@ -1679,19 +1879,26 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 
 ---
 
-### Task 7: Cancellation acceptance tests — disconnect + shutdown drain
+### Task 7: Cancellation + shutdown-race + storm acceptance — disconnect, shutdown drain, kill_all re-sweep, storm ordering
 
-These are the spec's two REQUIRED cancellation outcomes, proven end-to-end
-against the real server. They exercise machinery Task 6 built; if either
+Steps 1-2 are the spec's two REQUIRED cancellation outcomes, proven
+end-to-end against the real server. Step 2b wires the A10 shutdown latch +
+`kill_all` re-sweep into `main.rs`; Step 2c is the storm-shaped ordering
+test that serves as the plan's PRIMARY client-visible acceptance evidence
+(ledger decision ACC-2). These exercise machinery Task 6 built; if a test
 fails, fix the implementation (do not weaken the test).
 
 **Files:**
-- Modify: `crates/freshell-ws/tests/restore_spawn_gate.rs` (two new tests)
+- Modify: `crates/freshell-ws/tests/restore_spawn_gate.rs` (three new tests)
+- Modify: `crates/freshell-server/src/main.rs` (shutdown latch wiring +
+  `kill_all` re-sweep — A10)
 
 **Interfaces:**
 - Consumes: `spawn_server` harness (Task 5), `RestoreSpawnGate` counters
-  (Task 2), the returned `shutdown` Notify (Task 5 harness).
-- Produces: nothing new.
+  (Task 2), the returned `shutdown` Notify + `shutdown_started` latch
+  (Task 5 harness / Task 3 field).
+- Produces: `shutdown_signal(notify_ws, shutdown_started)` signature Task 9
+  preserves.
 
 - [ ] **Step 1: Write the disconnect test, run it (RED-or-GREEN gate)**
 
@@ -1703,7 +1910,7 @@ async fn queued_restore_create_is_abandoned_on_disconnect_without_spawning() {
         restore_spawn_timeout_ms: 30_000,
         ..CreateProtectConfig::default()
     };
-    let (ws_url, registry, _shutdown, gate) =
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
         spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
     // connect + hello
     send_text(&mut client, &create_frame("doomed", true)).await;
@@ -1748,7 +1955,7 @@ async fn queued_restore_creates_drain_without_spawning_on_shutdown() {
         restore_spawn_timeout_ms: 30_000,
         ..CreateProtectConfig::default()
     };
-    let (ws_url, registry, shutdown, gate) =
+    let (ws_url, registry, shutdown, gate, _shutdown_started) =
         spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
     // connect + hello
     send_text(&mut client, &create_frame("draining-1", true)).await;
@@ -1788,22 +1995,515 @@ asserted the same way `keepalive.rs`-family tests read close frames.)
 Run: `cargo test -p freshell-ws --test restore_spawn_gate queued_restore_creates_drain`
 Expected: PASS (same debug-until-green rule as Step 1).
 
+- [ ] **Step 2b: Wire the shutdown latch + `kill_all` re-sweep in `main.rs` (A10)**
+
+Task 3 added `WsState.shutdown_started` and Task 6 made the gated path check
+it; this step makes production shutdown actually set it and adds the
+defense-in-depth re-sweep:
+
+1. Change `shutdown_signal`'s signature to also take the latch and set it
+   FIRST, before the watchdog/notify (Task 9 later rewrites this function's
+   signal arms and keeps this line):
+
+```rust
+async fn shutdown_signal(
+    notify_ws: Arc<tokio::sync::Notify>,
+    shutdown_started: Arc<std::sync::atomic::AtomicBool>,
+) {
+    // ... existing signal futures + select ...
+    // Latch BEFORE any teardown step: gated creates consult this around
+    // registry.create (create_gate.rs, Task 6) so a create racing shutdown
+    // never leaves a live PTY.
+    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+    // ... existing watchdog + notify_ws.notify_waiters() + 250ms sleep ...
+}
+```
+
+   Pass `std::sync::Arc::clone(&shutdown_started)` (the Task 3 binding in
+   `main`) at the call site.
+
+2. In `main()` teardown, immediately after the existing
+   `registry.kill_all()` call (~`main.rs:769`), add the re-sweep:
+
+```rust
+    // A10 re-sweep (V3): kill_all() snapshots the id set ONCE
+    // (registry.rs:889-892); a detached gated create settling during the
+    // drain can insert AFTER that snapshot, and neither registry-Drop (the
+    // PTY reader thread's exit hook holds a registry Arc — terminal.rs:1047,
+    // pty.rs:464/512, circular) nor the watchdog's std::process::exit(1)
+    // (skips Drops) would ever reap it. Give in-flight create tasks a short
+    // settling window, then sweep again. Second line of defense behind
+    // create_gate.rs's shutdown_started checks.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let _ = registry.kill_all();
+```
+
+Run: `cargo test -p freshell-ws --test restore_spawn_gate && cargo test -p freshell-server`
+Expected: gate suite green including
+`gated_create_racing_shutdown_leaves_no_live_pty` (Task 6); freshell-server
+shows no NEW failures vs the recorded baseline. The safe11 SIGTERM reaping
+suite must stay green (the re-sweep adds a bounded 300ms + an idempotent
+kill, well inside the 5s watchdog).
+
+- [ ] **Step 2c: Storm-shaped ordering + no-duplicates test (ACC-2 primary evidence)**
+
+The npm continuity smoke is only 3-tab, asserts NO frame ordering, and is
+unrunnable in this worktree (V7: no node_modules; needs provider CLIs +
+`~/.codex/auth.json`) — so THIS Rust-side test is the primary acceptance
+evidence for storm-shaped restores:
+
+```rust
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_storm_drains_bounded_with_per_terminal_ordering() {
+    // N restore creates > gate limit: every create must settle with its own
+    // requestId, exactly once, with no duplicate PTYs; and no terminal may
+    // emit output before the client attaches (the A21 causal invariant —
+    // create never auto-attaches, registry.rs:548).
+    let cfg = CreateProtectConfig::default();
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(2, 64)).await;
+    // connect + hello
+
+    const N: usize = 12; // > gate limit 2: forces real FIFO queueing
+    for i in 0..N {
+        send_text(&mut client, &create_frame(&format!("storm-{i}"), true)).await;
+    }
+
+    // Drain N terminal.created frames. While draining, FAIL on any
+    // terminal.output / terminal.outputBatch frame — nothing is attached
+    // yet, so output before attach would break the A21 invariant. (Use a
+    // next_json_of_type variant that panics on output-family frames.)
+    let mut seen = std::collections::HashMap::<String, String>::new();
+    for _ in 0..N {
+        let created = next_json_of_type(&mut client, "terminal.created").await;
+        let req = created["requestId"].as_str().expect("requestId").to_string();
+        let tid = created["terminalId"].as_str().expect("terminalId").to_string();
+        assert!(
+            seen.insert(req, tid).is_none(),
+            "duplicate terminal.created for one requestId"
+        );
+    }
+    assert_eq!(seen.len(), N, "every requestId settled exactly once");
+    assert!(
+        seen.keys().all(|k| k.starts_with("storm-")),
+        "only the storm requestIds replied"
+    );
+    assert!(
+        gate.queued_total() >= (N as u64) - 2,
+        "with 2 permits the storm must actually queue FIFO behind the gate"
+    );
+
+    // Per-terminal created -> attach -> output: attach ONE storm terminal
+    // (copy the attach frame shape from session_identity_frames.rs) and
+    // assert terminal.attach.ready arrives for that terminalId — output for
+    // it may only follow now.
+    // ... attach + read terminal.attach.ready for the chosen terminalId ...
+
+    assert_eq!(registry.kill_all(), N, "exactly N PTYs, no duplicates");
+}
+```
+
+Run: `cargo test -p freshell-ws --test restore_spawn_gate restore_storm_drains`
+Expected: PASS (debug-until-green; the gate + causal attach ordering already
+guarantee this if Tasks 2-6 are correct).
+
 - [ ] **Step 3: Full crate suite + quality gates**
 
-Run: `cargo test -p freshell-ws && cargo fmt --all && cargo clippy -p freshell-ws --all-targets`
-Expected: all green.
+Run: `cargo test -p freshell-ws && cargo fmt --all && cargo clippy --workspace --all-targets`
+Expected: no new failures vs the recorded baseline; no new warnings.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/rust-tauri-port/.worktrees/rust-wsl-crash-hardening
-git add crates/freshell-ws/tests/restore_spawn_gate.rs
+git add crates/freshell-ws/tests/restore_spawn_gate.rs crates/freshell-server/src/main.rs
 git commit \
   -m "test(freshell-ws): prove queued restore creates cancel on disconnect and shutdown" \
   -m "- Disconnect while queued: gate reports 1 cancellation, registry spawns 0 PTYs
 - notify_waiters shutdown: client sees 4009, both queued creates drain without spawning
-- These are the two flaw classes of the abandoned Node attempt, now pinned by real-socket tests" \
-  -m "Verification: cargo test -p freshell-ws --test restore_spawn_gate (all green); cargo test -p freshell-ws; cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings)." \
+- These are the two flaw classes of the abandoned Node attempt, now pinned by real-socket tests
+- A10: shutdown_signal latches WsState.shutdown_started first; main() re-sweeps registry.kill_all() after a 300ms settle window (kill_all snapshots ids once, registry.rs:889-892)
+- Storm test (ACC-2 primary evidence): 12 restore creates through a 2-permit gate all settle exactly once, no duplicates, no output before attach" \
+  -m "Verification: cargo test -p freshell-ws --test restore_spawn_gate; cargo test -p freshell-ws; cargo test -p freshell-server; cargo fmt --all -- --check; cargo clippy --workspace --all-targets (no new warnings; no new failures vs recorded baseline)." \
+  -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
+
+Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
+```
+
+---
+
+### Task 7b: requestId dedupe guard for `terminal.create` (legacy parity — A20)
+
+**Why (A20/V8, FALSIFIED):** the Rust server has NO requestId dedupe —
+`handle_create` mints a fresh terminalId unconditionally
+(`crates/freshell-ws/src/terminal.rs:748`), and the omission is
+self-documented in code (`terminal.rs:805-807`). The legacy server dedupes
+via `createdByRequestId` + `REPAIR_PENDING_SENTINEL`
+(`server/ws-handler.ts:2167-2172`, `:2436`). The frozen client re-sends
+in-flight creates with the SAME requestId on every reconnect (V2:
+`src/components/TerminalView.tsx:4227-4262` onReconnect re-drive +
+`src/lib/ws-client.ts:128,196-205` inFlightCreates resend) — and this plan's
+abandon-without-reply cancellation (Task 6) makes that resend MORE common.
+Without a guard, each resend spawns a duplicate PTY and orphans the original
+as a detached background session — exactly the resource regression the gate
+exists to fight.
+
+**Scope note:** server-global map keyed by requestId (the client resends on
+a NEW connection after reconnect, so a per-connection map would never see
+the original entry; server-global with legacy-equivalent eviction — entries
+dropped on create failure and, lazily, when the settled terminal no longer
+exists — matches the frozen client's expectations). RequestIds are
+client-generated UUIDs, so cross-client collision is not a concern.
+
+**Files:**
+- Create: `crates/freshell-ws/src/create_dedupe.rs`
+- Modify: `crates/freshell-ws/src/lib.rs` (`pub mod` line + `WsState` gains
+  `create_dedupe`)
+- Modify: `crates/freshell-ws/src/terminal.rs` (dispatch arm + `settle` call
+  in `handle_create`)
+- Modify: `crates/freshell-ws/src/create_gate.rs` (`clear_if_in_flight`
+  hooks on every non-settled exit of the gated path)
+- Modify: every `WsState { ... }` literal the compiler flags (same site list
+  as Task 3)
+- Modify: `crates/freshell-ws/tests/restore_spawn_gate.rs` (two new tests)
+
+**Interfaces:**
+- Consumes: `WsState`, `handle_create` (Task 4 shape), the gated path
+  (Task 6), `ServerMessage`.
+- Produces:
+  - `pub struct CreateDedupe` with
+    `pub fn begin(&self, request_id: &str, is_live: impl Fn(&str) -> bool) -> DedupeDecision`,
+    `pub fn settle(&self, request_id: &str, terminal_id: &str, created: &ServerMessage)`,
+    `pub fn clear_if_in_flight(&self, request_id: &str)`
+  - `pub enum DedupeDecision { Proceed, DuplicateInFlight, DuplicateSettled(ServerMessage) }`
+  - `WsState` field `pub create_dedupe: std::sync::Arc<crate::create_dedupe::CreateDedupe>`
+
+- [ ] **Step 1: Write the failing integration tests (RED)**
+
+Append to `crates/freshell-ws/tests/restore_spawn_gate.rs`:
+
+```rust
+#[tokio::test(flavor = "multi_thread")]
+async fn same_requestid_resend_returns_existing_terminal() {
+    // A20: the frozen client re-sends terminal.create with the SAME
+    // requestId on reconnect (TerminalView.tsx:4227-4262; ws-client.ts
+    // inFlightCreates). The server must answer with the EXISTING terminal,
+    // not spawn a duplicate.
+    let cfg = CreateProtectConfig::default();
+    let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(4, 64)).await;
+    // connect + hello
+    send_text(&mut client, &create_frame("dup", true)).await;
+    let first = next_json_of_type(&mut client, "terminal.created").await;
+    let tid = first["terminalId"].as_str().expect("terminalId").to_string();
+
+    send_text(&mut client, &create_frame("dup", true)).await;
+    let second = next_json_of_type(&mut client, "terminal.created").await;
+    assert_eq!(second["requestId"], "dup");
+    assert_eq!(
+        second["terminalId"],
+        tid.as_str(),
+        "same-requestId resend must return the EXISTING terminal"
+    );
+    assert_eq!(registry.kill_all(), 1, "exactly one PTY for one requestId");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_while_queued_does_not_double_spawn() {
+    // Zero-permit gate + long timeout: the first create parks in the gate
+    // queue; a duplicate arriving meanwhile must be swallowed by the
+    // InFlight sentinel (the queued original will answer), never enqueued
+    // as a second spawn.
+    let cfg = CreateProtectConfig {
+        restore_spawn_timeout_ms: 30_000,
+        ..CreateProtectConfig::default()
+    };
+    let (ws_url, registry, _shutdown, gate, _shutdown_started) =
+        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+    // connect + hello
+    send_text(&mut client, &create_frame("dup-q", true)).await;
+    for _ in 0..200 {
+        if gate.queued_total() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(gate.queued_total(), 1, "first create must be queued");
+
+    send_text(&mut client, &create_frame("dup-q", true)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        gate.queued_total(),
+        1,
+        "duplicate must not enqueue a second gated create"
+    );
+    assert_eq!(registry.kill_all(), 0, "no PTY spawned for either copy");
+}
+```
+
+Run: `cargo test -p freshell-ws --test restore_spawn_gate same_requestid`
+Expected: FAIL — today the resend spawns a second PTY with a new terminalId
+(`registry.kill_all()` returns 2) and the queued duplicate enqueues a second
+gated create.
+
+- [ ] **Step 2: Write the dedupe module (RED via unregistered module)**
+
+Create `crates/freshell-ws/src/create_dedupe.rs`:
+
+```rust
+//! Server-wide `terminal.create` requestId -> terminal dedupe guard
+//! (legacy parity: `server/ws-handler.ts` `createdByRequestId` map —
+//! declaration :469, lookup :2167-2172, REPAIR_PENDING_SENTINEL :2436).
+//! The Rust port had no equivalent (fresh UUIDs minted unconditionally,
+//! terminal.rs:748; omission self-documented at :805-807), and the frozen
+//! client re-sends unanswered creates with the SAME requestId on every
+//! reconnect — without this guard every resend spawns a duplicate PTY and
+//! orphans the original as a detached background session.
+//!
+//! Eviction semantics (legacy-equivalent):
+//! - failed create -> the wrapper calls `clear_if_in_flight` (legacy
+//!   sentinel cleanup, ws-handler.ts:2460)
+//! - killed/exited terminal -> lazily evicted at lookup time via the
+//!   `is_live` probe (legacy deletes on kill, ws-handler.ts:2286/:2372)
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use freshell_protocol::ServerMessage;
+
+enum Entry {
+    /// A create with this requestId is currently gated/queued/in flight.
+    InFlight,
+    /// The create settled: replay this exact `terminal.created` frame.
+    Settled {
+        terminal_id: String,
+        created: ServerMessage,
+    },
+}
+
+pub enum DedupeDecision {
+    /// First sighting (or stale settled entry evicted): proceed to create.
+    Proceed,
+    /// A create with this requestId is in flight: drop this duplicate
+    /// silently — the in-flight one will answer with this requestId.
+    DuplicateInFlight,
+    /// Already settled and the terminal is live: re-send the stored
+    /// `terminal.created` frame instead of spawning.
+    DuplicateSettled(ServerMessage),
+}
+
+#[derive(Default)]
+pub struct CreateDedupe {
+    entries: Mutex<HashMap<String, Entry>>,
+}
+
+impl CreateDedupe {
+    /// Look up `request_id`, registering an InFlight sentinel on `Proceed`.
+    pub fn begin(
+        &self,
+        request_id: &str,
+        is_live: impl Fn(&str) -> bool,
+    ) -> DedupeDecision {
+        let mut map = self.entries.lock().expect("create_dedupe lock");
+        match map.get(request_id) {
+            Some(Entry::InFlight) => DedupeDecision::DuplicateInFlight,
+            Some(Entry::Settled {
+                terminal_id,
+                created,
+            }) => {
+                if is_live(terminal_id) {
+                    DedupeDecision::DuplicateSettled(created.clone())
+                } else {
+                    // Terminal was killed/exited: evict and treat as fresh.
+                    map.insert(request_id.to_string(), Entry::InFlight);
+                    DedupeDecision::Proceed
+                }
+            }
+            None => {
+                map.insert(request_id.to_string(), Entry::InFlight);
+                DedupeDecision::Proceed
+            }
+        }
+    }
+
+    /// Record a successful create (called where `handle_create` builds and
+    /// sends the `terminal.created` frame).
+    pub fn settle(&self, request_id: &str, terminal_id: &str, created: &ServerMessage) {
+        self.entries.lock().expect("create_dedupe lock").insert(
+            request_id.to_string(),
+            Entry::Settled {
+                terminal_id: terminal_id.to_string(),
+                created: created.clone(),
+            },
+        );
+    }
+
+    /// Drop the InFlight sentinel if (and only if) the create did NOT
+    /// settle — gate rejection, cancellation, shutdown abandon, or
+    /// handle_create failure. Settled entries stay: that IS the dedupe.
+    /// This is what lets the client's 2s RATE_LIMITED retry (same
+    /// requestId) proceed as a fresh create.
+    pub fn clear_if_in_flight(&self, request_id: &str) {
+        let mut map = self.entries.lock().expect("create_dedupe lock");
+        if matches!(map.get(request_id), Some(Entry::InFlight)) {
+            map.remove(request_id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn created_frame() -> ServerMessage {
+        // Cheapest constructible variant; the guard treats it opaquely.
+        ServerMessage::Pong // adjust like Task 4's CreateOutput test if needed
+    }
+
+    #[test]
+    fn first_begin_proceeds_and_registers_sentinel() {
+        let d = CreateDedupe::default();
+        assert!(matches!(d.begin("r1", |_| true), DedupeDecision::Proceed));
+        assert!(matches!(
+            d.begin("r1", |_| true),
+            DedupeDecision::DuplicateInFlight
+        ));
+    }
+
+    #[test]
+    fn settled_entry_replays_frame_while_live() {
+        let d = CreateDedupe::default();
+        let _ = d.begin("r1", |_| true);
+        d.settle("r1", "t1", &created_frame());
+        assert!(matches!(
+            d.begin("r1", |_| true),
+            DedupeDecision::DuplicateSettled(_)
+        ));
+    }
+
+    #[test]
+    fn dead_terminal_evicts_settled_entry() {
+        let d = CreateDedupe::default();
+        let _ = d.begin("r1", |_| true);
+        d.settle("r1", "t1", &created_frame());
+        assert!(matches!(d.begin("r1", |_| false), DedupeDecision::Proceed));
+    }
+
+    #[test]
+    fn clear_if_in_flight_removes_sentinel_but_not_settled() {
+        let d = CreateDedupe::default();
+        let _ = d.begin("r1", |_| true);
+        d.clear_if_in_flight("r1");
+        assert!(matches!(d.begin("r1", |_| true), DedupeDecision::Proceed));
+        d.settle("r1", "t1", &created_frame());
+        d.clear_if_in_flight("r1");
+        assert!(matches!(
+            d.begin("r1", |_| true),
+            DedupeDecision::DuplicateSettled(_)
+        ));
+    }
+}
+```
+
+Run: `cargo test -p freshell-ws create_dedupe` — expect 0 tests (module not
+registered). RED confirmed.
+
+- [ ] **Step 3: Register module + `WsState` field**
+
+1. `crates/freshell-ws/src/lib.rs`: add `pub mod create_dedupe;`
+   alphabetically, and add to `WsState` (after `create_protect`):
+
+```rust
+    /// Server-wide requestId -> terminal dedupe for `terminal.create`
+    /// (legacy `createdByRequestId` parity — see
+    /// [`crate::create_dedupe::CreateDedupe`]).
+    pub create_dedupe: std::sync::Arc<crate::create_dedupe::CreateDedupe>,
+```
+
+2. Let the compiler flag every `WsState { ... }` literal (same sites as
+   Task 3, plus the Task 5 harness) and add
+   `create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),`
+   (`crate::` paths inside the crate; `main.rs` uses the `freshell_ws::`
+   path). Re-run `cargo test -p freshell-ws -p freshell-server --no-run`
+   until clean; then `cargo test -p freshell-ws create_dedupe` — expect
+   `4 passed`.
+
+- [ ] **Step 4: Wire the guard into the create paths**
+
+1. `terminal.rs` dispatch arm — at the very TOP of
+   `ClientMessage::TerminalCreate(create)`, BEFORE the restore branch and
+   the rate limiter (a deduped resend costs no limiter budget, matching
+   legacy's cached-binding return):
+
+```rust
+        ClientMessage::TerminalCreate(create) => {
+            match state
+                .create_dedupe
+                .begin(&create.request_id, |tid| state.registry.exists(tid))
+            {
+                crate::create_dedupe::DedupeDecision::DuplicateSettled(created) => {
+                    // Re-send the original terminal.created (same requestId,
+                    // same terminalId) — never spawn a duplicate.
+                    let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                    return out.send(&created).await;
+                }
+                crate::create_dedupe::DedupeDecision::DuplicateInFlight => {
+                    // The in-flight create will answer this requestId.
+                    return true;
+                }
+                crate::create_dedupe::DedupeDecision::Proceed => {}
+            }
+            // ... existing restore-gate / rate-limit branches (Tasks 5-6),
+            //     unchanged, follow here ...
+```
+
+   If `TerminalRegistry` has no public liveness lookup, add a trivial
+   `pub fn exists(&self, id: &str) -> bool` to
+   `crates/freshell-terminal/src/registry.rs` (registry-lock + HashMap
+   `contains_key` — read-only, no tokio, honors the crate contract).
+
+2. `terminal.rs` `handle_create` — at the single success point where the
+   `created` frame is built (before `out.send(&created)`, ~:1215-1226):
+
+```rust
+    state
+        .create_dedupe
+        .settle(&create.request_id, &terminal_id, &created);
+```
+
+3. Non-restore inline path: after `handle_create` returns, call
+   `state.create_dedupe.clear_if_in_flight(&create.request_id);` (no-op on
+   success — the entry is Settled; removes the sentinel on failure).
+
+4. Gated path (`create_gate.rs`): call
+   `state.create_dedupe.clear_if_in_flight(&request_id)` on EVERY
+   non-settled exit — the Cancelled return, the error-frame return
+   (QueueFull/Timeout — required so the client's 2s same-requestId retry
+   is not swallowed), the shutdown pre-check abandon, and after
+   `handle_create` returns (covers create failure; Task 6 already cloned
+   `request_id`).
+
+- [ ] **Step 5: Run — expect pass**
+
+Run: `cargo test -p freshell-ws --test restore_spawn_gate`
+Expected: both Step 1 tests PASS; all earlier gate tests still pass.
+
+- [ ] **Step 6: Full crate suite + quality gates**
+
+Run: `cargo test -p freshell-ws && cargo fmt --all && cargo clippy -p freshell-ws --all-targets`
+Expected: no new failures vs the recorded baseline; no new warnings.
+
+- [ ] **Step 7: Commit**
+
+```bash
+cd /home/dan/code/freshell/.worktrees/rust-tauri-port/.worktrees/rust-wsl-crash-hardening
+git add crates/freshell-ws crates/freshell-terminal
+git commit \
+  -m "feat(freshell-ws): dedupe terminal.create by requestId (legacy parity)" \
+  -m "- A20: frozen client re-sends in-flight creates with the same requestId on every reconnect; without a guard each resend spawned a duplicate PTY and orphaned the original
+- CreateDedupe: server-global requestId map with InFlight sentinel; settled entries replay the original terminal.created; lazy eviction when the terminal is gone; sentinel cleared on gate rejection/cancel/failure so the client retry ladder still works
+- Legacy parity: createdByRequestId + REPAIR_PENDING_SENTINEL (server/ws-handler.ts:2167-2172, 2436)" \
+  -m "Verification: cargo test -p freshell-ws --test restore_spawn_gate; cargo test -p freshell-ws create_dedupe (4 passed); cargo test -p freshell-ws; cargo fmt --all -- --check; cargo clippy -p freshell-ws --all-targets (no new warnings; no new failures vs recorded baseline)." \
   -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
 Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
@@ -1821,6 +2521,8 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Consumes: `std::fs`, `tracing` only. No new deps (`nix` stays out; tokio
   `signal` feature is already enabled — no Cargo.toml change in this plan).
 - Produces (Task 9 relies on):
+  - `pub fn record_boot_parent_chain()` — captures the boot-time parent
+    chain once, for signal-time comparison (A15/V5 subreaper correction)
   - `pub fn log_shutdown_forensics(signal: &str)` — synchronous, bounded
     (≤11 tiny /proc reads), never panics, never blocks on anything but local
     pseudo-filesystem reads; degrades to `parent_chain="unavailable"` on
@@ -1839,9 +2541,15 @@ Create `crates/freshell-server/src/shutdown_forensics.rs`:
 //!
 //! The 2026-07-06 WSL outages killed the server with external SIGTERMs whose
 //! sender could not be identified after the fact. On shutdown we log the
-//! parent-process chain: a chain already reparented to pid 1 indicates the
-//! login-session host died (RCA candidate A), while a live parent chain plus
-//! a SIGTERM indicates a directed kill.
+//! parent-process chain and compare it against the BOOT-TIME chain.
+//! Discriminator (V5, measured on WSL2): orphans reparent to the
+//! session-leader SUBREAPER "Relay" — NOT pid 1 — and reparenting completes
+//! BEFORE the SIGHUP handler runs (8/8 trials; walk ~0.2ms). So the signal
+//! is "parent CHANGED vs the boot-time parent / parent is a
+//! subreaper-family process (Relay/init/systemd)" — never a literal
+//! `ppid == 1` check. A changed parent indicates the login-session host
+//! died (RCA candidate A); an unchanged live chain plus SIGTERM indicates a
+//! directed kill.
 //!
 //! Best-effort by construction: pure sync `std::fs` reads of tiny /proc
 //! files, bounded hops, no retries, no timers, no awaits — it can never
@@ -1850,6 +2558,11 @@ Create `crates/freshell-server/src/shutdown_forensics.rs`:
 //! gracefully; no conditional compilation needed here).
 
 use std::path::Path;
+use std::sync::OnceLock;
+
+/// Boot-time parent chain, captured once at startup (Task 9 calls
+/// [`record_boot_parent_chain`] from `main` right after logging init).
+static BOOT_PARENT_CHAIN: OnceLock<String> = OnceLock::new();
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProcessChainEntry {
@@ -1918,20 +2631,40 @@ fn format_chain(chain: &[ProcessChainEntry]) -> String {
         .join(" <- ")
 }
 
+/// Capture the boot-time parent chain for signal-time comparison.
+/// Idempotent; call once from `main` after logging init (Task 9).
+pub fn record_boot_parent_chain() {
+    let _ = BOOT_PARENT_CHAIN.get_or_init(|| {
+        match collect_parent_chain(Path::new("/proc"), std::process::id() as i64, 10) {
+            Some(entries) => format_chain(&entries),
+            None => "unavailable".to_string(),
+        }
+    });
+}
+
 /// Emit the single structured shutdown-forensics record. Never panics.
+/// MUST stay at INFO or above: the default EnvFilter is `info` (A14/V5),
+/// and the line only lands if `logging::init` succeeded at boot.
 pub fn log_shutdown_forensics(signal: &str) {
     let chain = collect_parent_chain(Path::new("/proc"), std::process::id() as i64, 10);
     let parent_chain = match &chain {
         Some(entries) => format_chain(entries),
         None => "unavailable".to_string(),
     };
+    let boot_parent_chain = BOOT_PARENT_CHAIN
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "unrecorded".to_string());
     tracing::info!(
         event = "shutdown_forensics",
         signal = %signal,
         parent_chain = %parent_chain,
-        "shutdown forensics: parent chain walks toward init; a chain already \
-         reparented to pid 1 indicates the login-session host died, a live \
-         chain plus SIGTERM indicates a directed kill"
+        boot_parent_chain = %boot_parent_chain,
+        "shutdown forensics: compare parent_chain to boot_parent_chain. A \
+         CHANGED parent (typically a subreaper-family adopter: Relay/init/\
+         systemd — on WSL2 orphans reparent to the Relay subreaper, NOT \
+         pid 1) indicates the original parent/login-session host died; an \
+         unchanged live chain plus SIGTERM indicates a directed kill"
     );
 }
 
@@ -2016,6 +2749,15 @@ mod tests {
         ];
         assert_eq!(format_chain(&chain), "300:freshell-server <- 1:systemd");
     }
+
+    #[test]
+    fn record_boot_parent_chain_is_idempotent() {
+        record_boot_parent_chain();
+        let first = super::BOOT_PARENT_CHAIN.get().cloned();
+        assert!(first.is_some(), "boot chain must be recorded");
+        record_boot_parent_chain();
+        assert_eq!(super::BOOT_PARENT_CHAIN.get().cloned(), first);
+    }
 }
 ```
 
@@ -2041,7 +2783,7 @@ mod shutdown_forensics;
 - [ ] **Step 4: Run — expect pass**
 
 Run: `cargo test -p freshell-server shutdown_forensics`
-Expected: `8 passed`. (A `dead_code` warning on `log_shutdown_forensics` is
+Expected: `9 passed`. (A `dead_code` warning on `log_shutdown_forensics` is
 expected until Task 9 wires it; if clippy flags it, add `#[allow(dead_code)]`
 on `log_shutdown_forensics` with a `// consumed by shutdown_signal in the
 next commit` comment and remove it in Task 9.)
@@ -2051,6 +2793,20 @@ next commit` comment and remove it in Task 9.)
 Run: `cargo fmt --all && cargo clippy -p freshell-server --all-targets`
 Expected: no new warnings (subject to the dead-code note above).
 
+**Validation notes folded into this task (2026-07-26 load-bearing pass):**
+- (A14/V5) The logging pipeline is a hand-rolled synchronous
+  `JsonLayer`/`RotatingWriter` (write_all+flush on the caller's thread; NO
+  tracing-appender) — no extra flush/fsync work is needed here. BUT the
+  forensics line must be emitted at INFO or above (default EnvFilter is
+  `info`) and `logging::init` must have succeeded at boot, or the line goes
+  nowhere.
+- (A15/V5, measured) On WSL2, orphans reparent to the session-leader
+  subreaper "Relay" — NOT pid 1 — and reparenting completes BEFORE the
+  SIGHUP handler runs (8/8 trials; walk latency ~0.2ms, 50-250× under
+  budget). Hence the boot-chain comparison above; never reintroduce a
+  literal `ppid == 1` discriminator. (pid 1 remains only as a WALK
+  TERMINATOR in `collect_parent_chain`, which is fine.)
+
 - [ ] **Step 6: Commit**
 
 ```bash
@@ -2059,9 +2815,10 @@ git add crates/freshell-server
 git commit \
   -m "feat(freshell-server): add shutdown-forensics /proc parent-chain walker" \
   -m "- Pure std::fs stat parser (first-open/last-close comm delimiting) + bounded ppid walk (max 10 hops, truncate on mid-walk failure, None when /proc absent)
-- log_shutdown_forensics emits one tracing event=shutdown_forensics line with signal + pid:comm chain; sync, bounded, never panics, never delays shutdown
+- log_shutdown_forensics emits one tracing event=shutdown_forensics line with signal + pid:comm chain + boot-time chain comparison; sync, bounded, never panics, never delays shutdown
+- Discriminator is parent-changed-vs-boot / subreaper family (WSL2 orphans reparent to Relay, not pid 1 — V5 measured); record_boot_parent_chain captures the baseline at startup
 - Injectable proc root for tests (tempfile fixtures); non-Linux degrades to parent_chain=unavailable with no cfg gating" \
-  -m "Verification: cargo test -p freshell-server shutdown_forensics (8 passed); cargo fmt --all -- --check; cargo clippy -p freshell-server --all-targets (no new warnings)." \
+  -m "Verification: cargo test -p freshell-server shutdown_forensics (9 passed); cargo fmt --all -- --check; cargo clippy -p freshell-server --all-targets (no new warnings)." \
   -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
 Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
@@ -2162,6 +2919,10 @@ async fn sighup_triggers_graceful_shutdown_and_logs_forensics() {
         forensics_line.contains("parent_chain"),
         "line must carry the parent chain: {forensics_line}"
     );
+    assert!(
+        forensics_line.contains("boot_parent_chain"),
+        "line must carry the boot-time chain for comparison: {forensics_line}"
+    );
 }
 ```
 
@@ -2188,7 +2949,10 @@ flush are UNCHANGED — only the arms and the two lines after the select
 change):
 
 ```rust
-async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
+async fn shutdown_signal(
+    notify_ws: Arc<tokio::sync::Notify>,
+    shutdown_started: Arc<std::sync::atomic::AtomicBool>, // Task 7 latch — keep
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -2226,6 +2990,10 @@ async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
         _ = hangup => "SIGHUP",
     };
 
+    // Latch FIRST (Task 7 wired this — keep it before any teardown): gated
+    // creates consult this flag around registry.create.
+    shutdown_started.store(true, std::sync::atomic::Ordering::SeqCst);
+
     // Forensics FIRST, before any teardown step, so the record survives even
     // if teardown hangs. Sync + bounded (a handful of tiny /proc reads) —
     // it cannot meaningfully delay arming the watchdog below.
@@ -2234,6 +3002,16 @@ async fn shutdown_signal(notify_ws: Arc<tokio::sync::Notify>) {
     // SAFE-11 fail-safe watchdog: ... (existing code below this point is
     // UNCHANGED: tokio::spawn watchdog -> notify_ws.notify_waiters() ->
     // 250ms sleep)
+```
+
+Also add, in `main()` immediately after `logging::init(...)` succeeds:
+
+```rust
+    // Boot-time parent chain for the shutdown-forensics comparison (V5:
+    // WSL2 orphans reparent to the Relay subreaper, not pid 1 — the
+    // discriminator is parent-changed-vs-boot, so the boot chain must be
+    // captured now).
+    shutdown_forensics::record_boot_parent_chain();
 ```
 
 If Task 8 added a temporary `#[allow(dead_code)]` on
@@ -2254,7 +3032,20 @@ Expected: PASS — SIGTERM behavior unchanged (plus it now logs forensics too).
 - [ ] **Step 6: Full crate suite + quality gates**
 
 Run: `cargo test -p freshell-server && cargo fmt --all && cargo clippy -p freshell-server --all-targets`
-Expected: all green, no new warnings.
+Expected: no new failures vs the recorded baseline; no new warnings.
+
+**Validation notes folded into this task (2026-07-26 load-bearing pass):**
+- (A12/V6) 2 of the 3 RCA kill events were catchable external SIGTERMs — the
+  handler demonstrably ran ("Shutting down..."). The 17:29:04 death is
+  unattributed and possibly uncatchable (no shutdown log). Recommended
+  follow-up, NOT part of this plan: an unclean-shutdown marker — write a
+  marker file at boot, remove it on clean exit, log at the next boot if it
+  is still present — to attribute SIGKILL-class deaths.
+- (A13/V5) Footnote: installing the SIGHUP handler defeats inherited SIG_IGN
+  (nohup) — signal-hook-registry replaces the disposition unconditionally
+  and never chains SIG_IGN. Verified: no supported Rust-server launch mode
+  relies on nohup survival; the deprecated port/vm-bridge nohup pattern is
+  not a supported deployment mode.
 
 - [ ] **Step 7: Commit**
 
@@ -2264,7 +3055,8 @@ git add crates/freshell-server
 git commit \
   -m "feat(freshell-server): handle SIGHUP gracefully and log shutdown forensics" \
   -m "- shutdown_signal gains a cfg(unix) SignalKind::hangup() arm; select now yields the signal name (SIGINT/SIGTERM/SIGHUP)
-- One shutdown_forensics tracing line (signal + /proc pid:comm parent chain) emitted before the watchdog, WS 4009 drain, and registry reaping
+- One shutdown_forensics tracing line (signal + /proc pid:comm parent chain + boot-time chain) emitted before the watchdog, WS 4009 drain, and registry reaping
+- record_boot_parent_chain wired at boot; discriminator is parent-changed-vs-boot / subreaper family (WSL2 orphans reparent to Relay, never a literal ppid==1 check)
 - Real-binary acceptance test: SIGHUP -> exit 0 within 5s + forensics line in rust-server.jsonl; safe11 SIGTERM suite stays green
 - No Cargo changes: tokio signal feature and libc were already present" \
   -m "Verification: cargo test -p freshell-server --test sighup_forensics (sandbox); cargo test -p freshell-server --test safe11_term22_shutdown_reaping (sandbox); cargo test -p freshell-server; cargo fmt --all -- --check; cargo clippy -p freshell-server --all-targets (no new warnings)." \
@@ -2281,31 +3073,60 @@ Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.co
 - Modify: only whatever the checks flag (expected: nothing).
 
 **Interfaces:**
-- Consumes: everything above. Produces: a green workspace.
+- Consumes: everything above. Produces: a workspace with no regressions vs
+  the recorded baseline (Global Constraints).
+
+- [ ] **Step 0: Triage the known deterministic baseline failure FIRST**
+
+`session_identity_frames::fresh_claude_create_frames_carry_preallocated_session_ref`
+fails deterministically at the recorded baseline (V7: reproduced in
+isolation; times out waiting for `terminal.created`) — and it sits on the
+exact `terminal.created` frame path this plan modified. Before judging the
+sweep, triage it: reproduce at the pre-plan base commit (a clean worktree of
+the base branch) to confirm it predates this work, and record the finding in
+the task notes. If this plan's changes altered its behavior (e.g. turned a
+timeout into a different failure), treat that as a regression and fix it.
+If it is purely pre-existing, annotate it and EXCLUDE it — together with the
+node_modules-gated `codex_session_ref_resume` failure — from the pass/fail
+judgment below.
 
 - [ ] **Step 1: Formatting + lints across the workspace**
 
 Run: `cargo fmt --all -- --check && cargo clippy --workspace --all-targets`
-Expected: clean / no new warnings. Fix any fallout (formatting only via
-`cargo fmt --all`).
+Expected: fmt fully clean (the single baseline diff was fixed in Task 1
+Step 0); clippy shows no NEW warnings vs the 60 recorded baseline warnings.
+Fix any fallout (formatting only via `cargo fmt --all`).
 
 - [ ] **Step 2: Full workspace test run**
 
 Run: `cargo test --workspace`
-Expected: all green. (If any suite in the workspace is kill/destructive-
-flagged, run it via `scripts/sandbox-test.sh "cargo test -p <crate>"` per
-Global Constraints.)
+Expected: no NEW failures vs the recorded baseline — 468+new passed; only
+the two known baseline failures may remain (the env-gated
+`codex_session_ref_resume` one, and the Step 0-triaged
+`session_identity_frames` one if confirmed pre-existing). (If any suite in
+the workspace is kill/destructive-flagged, run it via
+`scripts/sandbox-test.sh "cargo test -p <crate>"` per Global Constraints.)
 
-- [ ] **Step 3: Continuity smoke (client-visible restore behavior)**
+- [ ] **Step 3: OPTIONAL continuity smoke (best-effort, provisioned machine only)**
 
+The PRIMARY client-visible acceptance evidence for storm-shaped restores is
+the Rust-side `restore_storm_drains_bounded_with_per_terminal_ordering`
+test (Task 7 Step 2c) — ledger decision ACC-2. The npm smoke is DOWNGRADED
+to optional corroboration: it is 3-tab only (not storm-shaped), asserts zero
+frame ordering (outcome-only polling), and is UNRUNNABLE in this worktree
+(no node_modules; npm install not permitted; requires real
+codex/amplifier/claude CLIs and a readable `~/.codex/auth.json`).
+
+If — and only if — a provisioned machine is available:
 Run: `npm run smoke:continuity`
-Expected: PASS within ~5 minutes. This is the end-user-story check that the
-restore flow (the thing the gate throttles) still restores every tab against
-the frozen client, covering the Task 6 frame-ordering nuance.
+Expected: PASS within ~5 minutes (end-user-story corroboration that the
+restore flow still restores every tab against the frozen client). If no
+such machine is available, record "smoke skipped: unprovisioned worktree
+(ACC-2)" in the task notes and rely on the Task 7 Step 2c evidence.
 
 - [ ] **Step 4: Commit (only if fixes were needed)**
 
-If Steps 1-3 required changes:
+If Steps 0-3 required changes:
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/rust-tauri-port/.worktrees/rust-wsl-crash-hardening
@@ -2313,7 +3134,7 @@ git add -A crates
 git commit \
   -m "fix(rust): workspace verification fallout for wsl crash hardening" \
   -m "- <describe each fix in one bullet>" \
-  -m "Verification: cargo fmt --all -- --check; cargo clippy --workspace --all-targets (no new warnings); cargo test --workspace (all green); npm run smoke:continuity (pass)." \
+  -m "Verification: cargo fmt --all -- --check; cargo clippy --workspace --all-targets (no new warnings vs 60-warning baseline); cargo test --workspace (no new failures vs recorded baseline); npm run smoke:continuity (optional — pass or skipped-unprovisioned per ACC-2)." \
   -m "🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
 Co-Authored-By: Amplifier <240397093+microsoft-amplifier@users.noreply.github.com>"
@@ -2340,7 +3161,11 @@ notes instead.
 | Forensics: signal received + /proc parent-chain (pid → ppid → comm up to init) | 8, 9 | unit fixtures (parser, walk, truncation, max hops) + JSONL line assertion in the SIGHUP test |
 | Non-Linux builds compile and degrade gracefully | 8, 9 | walker is platform-agnostic by return value (`None` → "unavailable"); signal arms use the existing `#[cfg(unix)]`/`#[cfg(not(unix))]` pairing |
 | Forensics best-effort, never delays/blocks shutdown | 8, 9 | sync bounded reads, no timers/awaits, emitted before the watchdog; SIGTERM regression suite still exits within 5s |
-| Repo conventions, TDD, fmt+clippy clean, standard checks | every task + 10 | per-task gates + workspace sweep + continuity smoke |
+| Same-requestId create idempotency (frozen-client reconnect resend; legacy `createdByRequestId` parity) | 7b | `same_requestid_resend_returns_existing_terminal` + `duplicate_while_queued_does_not_double_spawn` (real socket) |
+| Shutdown race: no orphaned PTY from an in-flight gated create (A10) | 3, 6, 7 | `gated_create_racing_shutdown_leaves_no_live_pty` + shutdown latch + main.rs `kill_all` re-sweep |
+| Storm-shaped restore acceptance (ACC-2 primary evidence) | 7 | `restore_storm_drains_bounded_with_per_terminal_ordering` (N=12 > gate limit, no duplicates, no output before attach) |
+| Forensics discriminator correct on WSL2 (subreaper, not pid 1) | 8, 9 | boot-chain capture + comparison fields in the forensics line; `record_boot_parent_chain` test |
+| Repo conventions, TDD, fmt+clippy clean vs recorded baseline, standard checks | every task + 10 | per-task delta-vs-baseline gates + workspace sweep + Task 7 storm test (npm smoke optional best-effort) |
 
 There are **no unresolved coverage gaps**: every spec requirement above has a
 covering task with a production-observable proof; nothing is deferred to
@@ -2354,4 +3179,15 @@ implementer reads directly. Type-consistency pass done: `CreateProtectConfig`
 field names (`restore_spawn_*`), `RestoreSpawnGate::acquire(timeout, &mut
 watch::Receiver<bool>)`, `SpawnGateError::{QueueFull, Timeout, Cancelled}`,
 `CreateOutput::{Socket, Channel}`, `handle_create(create, out, state)`,
-`log_shutdown_forensics(&str)` are used identically across Tasks 1-10.
+`CreateDedupe::{begin, settle, clear_if_in_flight}`,
+`log_shutdown_forensics(&str)` / `record_boot_parent_chain()` are used
+identically across Tasks 1-10 (incl. 7b).
+
+Validation traceability (2026-07-26 load-bearing-assumption pass; ledger at
+`.the-usual-logs/rust-wsl-crash-hardening/load-bearing-ledger.md`): A1
+(non-goals rewritten, tabs-sync de-scoped — ACC-1), A6 (Track 1 reframed to
+chronic-stampede/Tcpip-4266 success metric), A10 (shutdown latch + re-sweep,
+Tasks 3/6/7), A16 (smoke downgraded, Rust storm test added — ACC-2), A17
+(recorded-baseline delta gates + Task 10 Step 0 triage), A20 (Task 7b dedupe
+guard); verified-with-caveat notes folded into Tasks 2, 6, 8, 9 and the
+non-goals section.
