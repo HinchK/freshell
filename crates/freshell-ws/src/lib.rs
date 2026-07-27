@@ -189,6 +189,19 @@ pub struct WsState {
     /// tunables (legacy parity: `server/terminal-stream/constants.ts` +
     /// `client-output-queue.ts`). See [`crate::backpressure::Term09Config`].
     pub term09: crate::backpressure::Term09Config,
+    /// `terminal.create` protection knobs (per-connection rate limit +
+    /// restore-spawn gate). See [`crate::create_limit::CreateProtectConfig`].
+    pub create_protect: crate::create_limit::CreateProtectConfig,
+    /// Server-wide restore-spawn gate (WSL-outage RCA §6.3). One per server
+    /// process, shared across all WS connections.
+    /// See [`crate::spawn_gate::RestoreSpawnGate`].
+    pub spawn_gate: std::sync::Arc<crate::spawn_gate::RestoreSpawnGate>,
+    /// Latched `true` the instant a shutdown signal is received (before the
+    /// WS notify — wired in Task 7). Gated restore creates re-check it
+    /// around `registry.create` so a create racing shutdown never leaves a
+    /// live PTY that `kill_all`'s one-shot id snapshot
+    /// (`freshell-terminal/src/registry.rs:889-892`) would miss (A10/V3).
+    pub shutdown_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// SAFE-06: inbound WS frame/message size bound (legacy parity:
     /// `ws-handler.ts:226` `wsMaxPayloadBytes: Number(process.env.WS_MAX_PAYLOAD_BYTES
     /// || 16 * 1024 * 1024)`, passed to the `ws` library's `maxPayload` at
@@ -666,6 +679,9 @@ mod tests {
             allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::RestoreSpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,

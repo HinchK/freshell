@@ -348,6 +348,11 @@ async fn main() -> ExitCode {
         .with_cli_commands(Arc::clone(&cli_commands))
         .with_amplifier_locator(amplifier_locator.clone())
         .with_opencode_locator(opencode_locator.clone());
+    // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
+    // are guaranteed to come from the same env snapshot.
+    let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();
+    // Shutdown latch shared with shutdown_signal (Task 7 wires the setter).
+    let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let ws_state = WsState {
         identity: terminal_identity.clone(),
         amplifier_locator: amplifier_locator.clone(),
@@ -374,6 +379,11 @@ async fn main() -> ExitCode {
         allowed_origins: Arc::new(resolve_allowed_origins()),
         ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
         term09: freshell_ws::backpressure::Term09Config::from_env(),
+        create_protect,
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::RestoreSpawnGate::from_config(
+            &create_protect,
+        )),
+        shutdown_started: std::sync::Arc::clone(&shutdown_started),
     };
     let api_state = ApiState {
         auth_token: Arc::clone(&auth_token),
