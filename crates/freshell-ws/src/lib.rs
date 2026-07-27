@@ -22,6 +22,7 @@
 
 pub mod activity;
 pub mod amplifier_association;
+pub mod auto_resume;
 pub mod backpressure;
 pub mod codex_association;
 pub(crate) mod codex_identity;
