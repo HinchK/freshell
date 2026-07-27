@@ -39,14 +39,17 @@
 
 ### D-2. Frame shapes (evaluated per spec)
 
-- **Interim notice — reuse `terminal.status`** (`shared/ws-protocol.ts:771-776`): `{terminalId, status:'running'|'recovering', reason?: string, attempt?: number}`. It is already in the frozen inventory, already dispatched client-side (`TerminalView.tsx` ~`:4087`), and **currently emitted by nobody**. We emit `{status:'recovering', reason:'claude crashed (exit 1) — auto-resuming, attempt 1/2', attempt: 1}` on the OLD terminalId before each backoff sleep. Zero contract change. The missing `maxAttempts` rides in `reason` text; the client also learns it from `terminal.replaced`.
+- **Interim notice — reuse `terminal.status`** (`shared/ws-protocol.ts:771-777`): `{terminalId, status:'running'|'recovering', reason?: string, attempt?: number}`. It is already in the frozen inventory, already dispatched client-side (`TerminalView.tsx:4087-4099`), and **currently emitted by nobody** (verified: zero emitters repo-wide). We emit `{status:'recovering', reason:'claude crashed (exit 1) — auto-resuming, attempt 1/2', attempt: 1}` on the OLD terminalId before each backoff sleep. Zero contract change. The missing `maxAttempts` rides in `reason` text; the client also learns it from `terminal.replaced`.
+- **Client-side frame matching (VERIFIED constraint — drives Task 6's data model):** TerminalView's `terminal.exit` handler deliberately CLEARS `terminalIdRef` and `paneContent.terminalId` (`TerminalView.tsx:4141-4148`, commented as load-bearing). So frames targeting the OLD terminalId (`terminal.status{recovering}`, `terminal.replaced{oldTerminalId}`) arriving after exit processing can NOT be matched via `paneContent.terminalId`. The lifecycle slice is therefore keyed by **paneId** and records `lastTerminalId` at exit time (the pane's own exit handler still receives its `terminal.exit` while the id is set, and dispatches the record BEFORE clearing). Old-id frames are matched against the pane's recorded `lastTerminalId`, and the banner selectors are keyed by paneId (always available on an exited pane).
 - **Replacement — new frame `terminal.replaced`**: no server→client "your terminal was replaced" frame exists today (every respawn is client-initiated via `terminal.create`). Additive contract change per the documented Route-C procedure (Task 3): `{type:'terminal.replaced', oldTerminalId, newTerminalId, exitCode, attempt, maxAttempts}`. Broadcast on the `broadcast_tx` bus (same lane as `terminals.changed`).
 - **Exhaustion — nothing new**: the final generation's `terminal.exit{exitCode}` (already carries the code) + settled `exited` status drive the client error bar.
-- **Offline clients**: need no frame — on reconnect, `pane.reconcile` finds the live replacement by sessionRef and returns `attach{terminalId, corrected:true}`; the existing `applyReconcileAttach` folds it. (We do not touch verdict derivation.)
+- **Offline clients**: need no frame — on reconnect, `pane.reconcile` finds the live replacement and returns an attach verdict; the existing `applyReconcileAttach` folds it. (We do not touch verdict derivation.) VERIFIED by desk-check: two independent attach paths cover this input — the sessionRef claim path (rule 6, `reconcile.rs:224-242`, live-only lookup so the retired old identity can't shadow) and the `newest_live_by_create_request_id` row path (row 1, `reconcile.rs:245-256`) — and verdict derivation keys on NO creator/attach provenance. NOTE (corrected detail): the `corrected` flag fires only on a *differing* sessionRef (`reconcile.rs:85-94`); a nominal same-session replacement yields `corrected: None`. Harmless — the fold applies `terminalId` unconditionally — but do not key anything on `corrected:true`. Because this is a desk-checked novel composite input, Task 5's integration test MUST include the reconcile-after-replacement scenario (mandatory pin test). A client reconnecting *during* the backoff gap gets a `Respawn` verdict and may client-respawn — the sessionRef lease arbitrates that race (whoever claims first wins; the loser aborts), which is exactly the D-5 guard design.
 
 ### D-3. Clean-exit presentation (decision + justification)
 
-**Code 0 keeps today's quiet presentation** (grey icon + one-shot xterm message), for agent panes too. Typing `exit` / quitting claude is a deliberate end; a loud red bar on a deliberate quit is noise and would train users to ignore the bar. The incident was a *crash* (exit 1); loud is reserved for non-zero. User kills never reach the crash path at all (structural: `kill_internal` removes the registry row before `finish_pty_exit` runs, so it returns `false` — `registry.rs:1423`).
+**Code 0 keeps today's quiet presentation** (grey icon + one-shot xterm message), for agent panes too. Typing `exit` / quitting claude is a deliberate end; a loud red bar on a deliberate quit is noise and would train users to ignore the bar. The incident was a *crash* (exit 1); loud is reserved for non-zero. User kills never reach the crash path at all (VERIFIED structural: `kill_internal` removes the row under the registry mutex BEFORE signaling — `registry.rs:1294`→`:1350` — and `finish_pty_exit` has two independent false-guards at `:1423`/`:1427`; all 8 production kill paths, including idle reap and freshagent kills, route through `kill_internal`).
+
+Exit-code encoding (verified against portable-pty 0.8.1 source): signal deaths (SIGKILL/OOM) map to exit code **1** (`.code()==None → 1`) — non-zero, so crashes-by-signal correctly go loud, though signal identity is lost (all → 1, not 128+n; keep banner wording generic, "process exited (code 1)"). A `wait()` error maps to 0 (rare fake-clean; acceptable residual). Scope: this trigger model is verified for unix/WSL (the deployment target); native-Windows wrapper shells (`cmd /K`) survive CLI death, so the feature is simply inert there — not wrong.
 
 Post-reload edge: the ephemeral exit-code slice is empty, so a persisted `status:'exited'` agent pane briefly shows a codeless "process exited" bar with Relaunch until reconcile adjudicates it. This is acceptable (an actionable affordance, strictly better than the silent grey icon) and is pinned in a test.
 
@@ -64,8 +67,10 @@ The respawned terminal gets a NEW terminalId (`Uuid::new_v4()` per create, `crat
 - Schedule `AUTO_RESUME_DELAYS_MS = [2_000, 10_000]` (2 retries max), shaped after the repo's bounded-retry exemplar (`activity.rs:80-88` `lane_retry_delay_ms`: index = attempts-so-far, `None` = exhausted-and-loud). Env override `FRESHELL_AUTO_RESUME_DELAYS_MS="2000,10000"` (tests set `"50,100"`).
 - Attempts are counted per `createRequestId` in the orchestrator, **reset when the crashed generation lived ≥ 30s** (mirrors `DEFAULT_RESPAWN_LIVENESS_WINDOW_MS` — a healthy resume is not penalized; tomorrow's crash of an overnight pane starts at attempt 1).
 - The registry's respawn-generation cap (`respawn_exhausted`, cap 3/30s — mutated by every natural exit in `finish_pty_exit`) is consulted as an **outer guard**, composing with client-driven reconcile respawns: whoever exhausts generations first, the pane converges to `exited`.
-- Guards before each respawn: D7 live-session (`registry.live_terminal_for_session_ref` — never a second `--resume <sid>` writer), sessionRef lease (`claim_session_ref` — never race a concurrent client create).
+- Guards before each respawn (all post-sleep): D7 live-session (`registry.live_terminal_for_session_ref` — never a second `--resume <sid>` writer), sessionRef lease (`claim_session_ref` — never race a concurrent client create; VERIFIED: the lease is a registry-owned map keyed `provider\0sessionId`, connection-independent, and the identical object both the WS create ingress `terminal.rs:1149` and REST ingress contend on), and **binding-still-Bound** (re-check `pane_ledger.bound_session_ref_for_terminal` returns a live binding — a user who closed the pane during the backoff retires it via `retire_closed`, `terminal.rs:2716-2730`; if retired, settle `pane_closed`; this also bounds the crash-microseconds-before-kill race).
 - A pane with **no resumable identity** (no sessionRef in identity registry/ledger) or **no createRequestId** settles `exited` immediately.
+- **Per-provider identity provenance (VERIFIED — sets expectations for eligibility):** claude panes get a server-preallocated UUID passed as `--session-id` on the FIRST generation's argv, with identity + durable ledger binding written before create is answered (`terminal.rs:1280-1299`, `:1936-1964`) — resumable from a gen-1 crash. codex/opencode/amplifier session ids are discovered by locators only at the **first user prompt** — a crash before discovery has no identity and settles `no_resumable_identity` (loud banner + Relaunch: the correct degraded behavior, not a bug). E2E uses the claude fake, which matches the strongest (preallocated) provenance.
+- **Cap facts (VERIFIED):** the generation counter's sole write site (`registry.rs:1450-1458`) increments only when the dying generation lived < 30s and RESETS the counter on a long-lived exit — an overnight-healthy pane starts its crash at a fresh cap. The counter is in-memory (resets at server restart) and counts fast clean exits too; both are acceptable for a bounding guard.
 
 ## File Structure
 
@@ -392,7 +397,9 @@ git commit -m "feat(ws): auto-resume policy — bounded schedule + crash eligibi
 
 **Interfaces:**
 - Consumes: `CrashEvent` from Task 1; `registry.finish_pty_exit -> bool` (true = genuine natural exit); `registry.probe(terminal_id) -> Option<IdentityProbeRow>` (has `created_at`, `mode`); `registry.probe_create_request_id(terminal_id)` (`registry.rs:1755`).
-- Produces: `WsState.auto_resume_tx: tokio::sync::mpsc::UnboundedSender<CrashEvent>` — every genuine natural exit of ANY terminal sends one `CrashEvent` (filtering to agent modes happens in `decide()`, Task 5). Also: a shared exit-hook builder `pub(crate) fn build_pty_exit_hook(...) -> freshell_terminal::pty::ExitHook` that Task 4's respawn seam reuses, so respawned generations report their own crashes (this is load-bearing for retry #2).
+- Produces: `WsState.auto_resume_tx: tokio::sync::mpsc::UnboundedSender<CrashEvent>` — every genuine natural exit of any **WS-created** terminal sends one `CrashEvent` (filtering to agent modes happens in `decide()`, Task 5). Also: a shared exit-hook builder `pub(crate) fn build_pty_exit_hook(...) -> freshell_terminal::pty::ExitHook` that Task 4's respawn seam reuses, so respawned generations report their own crashes (this is load-bearing for retry #2).
+
+**Scope note (VERIFIED, checkpoint finding):** a SECOND production exit-hook construction site exists in `crates/freshell-freshagent/src/terminal_tabs.rs:1009-1043` (REST-created agent panes; that crate is FENCED for this lane and its closure is deliberately divergent). REST/freshagent-created panes are therefore **out of scope for auto-resume in this lane** — they keep today's behavior. Do NOT touch that site. (Both hooks funnel through `finish_pty_exit`, so a future registry-layer observation could cover all paths; record as future work, not this lane.) Update the Task 1 module doc comment accordingly if it implies universal coverage.
 
 - [ ] **Step 1: Write the failing integration test**
 
@@ -725,15 +732,34 @@ pub(crate) async fn respawn_agent_terminal(
 ) -> Result<String, RespawnError> {
     // 1. Resolve resume argv exactly like handle_create's CLI branch:
     //    CliLaunchInputs { mode, resume_session_id: Some(req.session_id),
-    //    launch_intent: LaunchIntent::Resume, ... } with model/sandbox/
-    //    permission_mode/effort loaded from the ledger's resume-invocation
-    //    record: state.pane_ledger.load_binding(&req.provider, &req.session_id)
-    //    (fields BindingRow::{model, sandbox, permission_mode, effort, cwd}).
+    //    launch_intent: LaunchIntent::Resume, ... }.
+    //    VERIFIED CORRECTION (do not use BindingRow launch fields): the pane
+    //    ledger's record_binding hardcodes model/sandbox/permission_mode/effort
+    //    to None for terminal-pane rows (pane_ledger.rs:405-408; only
+    //    fresh-agent writes populate them). Derive launch params from
+    //    state.settings EXACTLY as handle_create does (terminal.rs:1430-1445);
+    //    take cwd from the binding/identity record (BindingRow.cwd / identity
+    //    cwd — these ARE populated).
     //    Pass the SAME spec list + env + McpInjection handle_create passes to
     //    resolve_coding_cli_command (visible at the terminal.rs:1601-1633 call
     //    sites) — factor a small helper if those inputs are locals today.
+    //    Child env: mirror handle_create's env construction via the same
+    //    helper. Verification point: FRESHELL_TAB_ID / FRESHELL_PANE_ID come
+    //    from the create request's wire fields and are NOT derivable from
+    //    BindingRow — source them from the ledger binding if it carries
+    //    tab/pane ids, else OMIT them for auto-resumed generations and record
+    //    the deviation in task notes (do not invent values).
     // 2. Build the SpawnSpec via the same build_cli_spawn_spec /
     //    build_windows_cli_spawn_spec pair handle_create uses.
+    // 2b. Acquire the server-wide spawn gate BEFORE spawning (VERIFIED
+    //    in-path for all creates: SpawnGate 4-permit semaphore,
+    //    spawn_gate.rs:51, acquired at terminal.rs:1700-1722 — public API,
+    //    no fenced-internals modification). Mirror handle_create's acquire +
+    //    rejection handling; on gate rejection return
+    //    RespawnError::LaunchUnresolvable-style failure so the orchestrator
+    //    settles "respawn_failed" and releases the lease. (The per-connection
+    //    CreateRateLimiter is connection-loop-local and does not apply to
+    //    this headless path.)
     // 3. Mint ids and insert:
     let terminal_id = uuid::Uuid::new_v4().simple().to_string();
     let stream_id = uuid::Uuid::new_v4().simple().to_string();
@@ -958,8 +984,8 @@ pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver>(
 Production driver `WsAutoResumeDriver { state: WsState }` implements the trait by delegating:
 - `cap_exhausted` → `state.registry.respawn_exhausted(key)`
 - `resumable_session_ref` → `state.identity.session_ref_for(tid)` (retired-inclusive) with `state.pane_ledger.bound_session_ref_for_terminal(tid)` as fallback; map to `(provider, session_id, cwd)` (cwd from `BindingRow.cwd` / identity)
-- `session_owned_by_live_terminal` → `state.registry.live_terminal_for_session_ref(&locator).is_some()`
-- `claim_session`/`release_claim` → `claim_session_ref` / `complete_session_ref_claim` (mirror how the create ingress claims/releases — read the call sites and copy the exact release discipline, including the failure/`force_release_after_confirmed_kill` branches if the create path uses them)
+- `session_owned_by_live_terminal` → `state.registry.live_terminal_for_session_ref(&locator).is_some()`, AND additionally re-check the pane's ledger binding is still Bound (`bound_session_ref_for_terminal`) — a user who closed the pane during the backoff retires it (`retire_closed`, terminal.rs:2716-2730); if retired, settle `pane_closed` instead of respawning (this also bounds the crash-then-immediately-killed race — pin with a unit test scenario)
+- `claim_session`/`release_claim` → `claim_session_ref` / `complete_session_ref_claim` (VERIFIED shape: `claim_session_ref(locator, request_id_str, holder_conn: u64, now_ms)` at registry.rs:1812 takes plain values — callable headlessly). Two hard requirements from validation: (i) mint `holder_conn` via `registry.new_connection_id()` — NEVER a literal that could collide with a real WS connection id, or a client disconnect sweep (terminal.rs:446-458) could release the orchestrator's lease mid-respawn; a minted id is never swept, so (ii) the orchestrator OWNS the full release discipline on every path — success, respawn failure, and completion failure (mirror the create ingress's exact discipline at terminal.rs:1149ff, including complete==false → kill own child; no connection-death safety net exists for this holder)
 - `respawn` → `respawn_agent_terminal(&state, &AgentRespawnRequest { … })`
 - `emit_recovering` → build the existing `ServerMessage` for `terminal.status` (struct name at `server_messages.rs` — search `"terminal.status"`) with `status: "recovering"`, `reason: format!("{mode} crashed (exit {code}) — auto-resuming, attempt {n}/{max}")`, `attempt: Some(n)`; serialize with `serde_json::to_string` and send on `state.broadcast_tx` (same as `broadcast_terminals_changed`, `terminal.rs:2255`)
 - `emit_replaced` → same bus, `ServerMessage::TerminalReplaced(…)`
@@ -969,7 +995,7 @@ Public entry: `pub fn spawn_auto_resume_hub(state: WsState, rx: UnboundedReceive
 
 - [ ] **Step 4: Write + run the registry-integration test**
 
-Create `crates/freshell-ws/tests/auto_resume_e2e.rs`: harness with hub ON, `FRESHELL_AUTO_RESUME_DELAYS_MS="50,100"` (set via the harness env, not global `std::env::set_var` — if the harness can't inject env, pass delays through the spawn helper instead and note it), fake claude command = a shell script that exits 1 always. Create a claude terminal → within ~5s assert: (a) 3 spawns happened (1 + 2 retries — count via the recording shim), (b) a broadcast `terminal.status{recovering, attempt:1}` and `terminal.replaced{attempt:1}` were observed on a subscribed ws client, (c) final newest terminal for the createRequestId is `exited` (`registry.newest_by_create_request_id`, `registry.rs:1703`) and no further spawns occur for 500ms.
+Create `crates/freshell-ws/tests/auto_resume_e2e.rs`: harness with hub ON, `FRESHELL_AUTO_RESUME_DELAYS_MS="50,100"` (set via the harness env, not global `std::env::set_var` — if the harness can't inject env, pass delays through the spawn helper instead and note it), fake claude command = a shell script that exits 1 always. Create a claude terminal → within ~5s assert: (a) 3 spawns happened (1 + 2 retries — count via the recording shim), (b) a broadcast `terminal.status{recovering, attempt:1}` and `terminal.replaced{attempt:1}` were observed on a subscribed ws client, (c) final newest terminal for the createRequestId is `exited` (`registry.newest_by_create_request_id`, `registry.rs:1703`) and no further spawns occur for 500ms, and (d) **MANDATORY reconcile-after-replacement pin (per D-2's verified-but-novel-input finding):** with a crash-once fake (first invocation exits 1, replacement survives), after `terminal.replaced` is observed, a SECOND ws client sends `pane.reconcile` presenting the OLD terminalId + the pane's sessionRef + createRequestId and receives an attach verdict whose `terminal_id` is the NEW live terminal (assert `corrected` is None/absent — same-session replacement does not set it, `reconcile.rs:85-94`).
 
 ```bash
 cargo test -p freshell-ws auto_resume
@@ -1000,6 +1026,8 @@ git commit -m "feat(ws): auto-resume orchestrator — bounded retries, guards, r
 - Consumes: `TerminalReplacedMessage` + `terminal.status` message types from `shared/ws-protocol.ts`; `applyReconcileAttach` + `selectTabPaneByTerminalId` (`src/store/panesSlice.ts:1886`, selector used by `turnCompletionThunks.ts:25`).
 - Produces (used by Tasks 7–9):
 
+**Keying (per the VERIFIED constraint in D-2): the slice is keyed by `paneId`, with a `lastTerminalId` mapping recorded at exit time** — because TerminalView clears `paneContent.terminalId` on `terminal.exit` (`TerminalView.tsx:4141-4148`), old-terminalId frames can only be matched via this recorded mapping, and banner selectors can only be keyed by paneId.
+
 ```ts
 export const AUTO_RESUME_NOTICE_TTL_MS = 30_000
 
@@ -1011,14 +1039,22 @@ export interface AutoResumeNotice {
   exitCode: number
   at: number
 }
+export interface PaneLifecycleEntry {
+  lastTerminalId?: string   // the id the pane owned when it last exited (frame-matching key)
+  exit?: TerminalExitRecord
+  notice?: AutoResumeNotice
+}
+// state: { byPaneId: Record<string, PaneLifecycleEntry> }
 // actions:
-recordTerminalExit({ terminalId, exitCode, at })
-recordAutoResumeRecovering({ terminalId, attempt, maxAttempts, exitCode, at })
-foldTerminalReplacement({ oldTerminalId, newTerminalId, exitCode, attempt, maxAttempts, at })
-clearTerminalLifecycle({ terminalId })
+recordTerminalExit({ paneId, terminalId, exitCode, at })          // sets exit + lastTerminalId
+recordAutoResumeRecovering({ paneId, attempt, maxAttempts, exitCode, at })
+foldTerminalReplacement({ paneId, newTerminalId, exitCode, attempt, maxAttempts, at })
+  // clears exit, sets a 'resumed' notice, advances lastTerminalId = newTerminalId
+clearTerminalLifecycle({ paneId })
 // selectors:
-selectExitRecord(state, terminalId): TerminalExitRecord | undefined
-selectActiveNotice(state, terminalId, now): AutoResumeNotice | undefined  // TTL-filtered
+selectExitRecord(state, paneId): TerminalExitRecord | undefined
+selectActiveNotice(state, paneId, now): AutoResumeNotice | undefined  // TTL-filtered
+selectLastTerminalIdFrom(sliceState, paneId): string | undefined     // frame matching
 ```
 
 - [ ] **Step 1: Write the failing slice tests**
@@ -1030,41 +1066,42 @@ import { describe, it, expect } from 'vitest'
 import reducer, {
   recordTerminalExit, recordAutoResumeRecovering, foldTerminalReplacement,
   clearTerminalLifecycle, selectExitRecordFrom, selectActiveNoticeFrom,
-  AUTO_RESUME_NOTICE_TTL_MS,
+  selectLastTerminalIdFrom, AUTO_RESUME_NOTICE_TTL_MS,
 } from './terminalLifecycleSlice'
 
 const empty = reducer(undefined, { type: '@@init' })
 
 describe('terminalLifecycleSlice', () => {
-  it('records an exit code per terminalId', () => {
-    const s = reducer(empty, recordTerminalExit({ terminalId: 't1', exitCode: 1, at: 1000 }))
-    expect(selectExitRecordFrom(s, 't1')).toEqual({ exitCode: 1, at: 1000 })
+  it('records an exit code + lastTerminalId per paneId', () => {
+    const s = reducer(empty, recordTerminalExit({ paneId: 'p1', terminalId: 't1', exitCode: 1, at: 1000 }))
+    expect(selectExitRecordFrom(s, 'p1')).toEqual({ exitCode: 1, at: 1000 })
+    expect(selectLastTerminalIdFrom(s, 'p1')).toBe('t1') // frame-matching key survives TerminalView clearing its own terminalId
   })
 
   it('records a recovering notice and expires it after the TTL', () => {
-    const s = reducer(empty, recordAutoResumeRecovering({ terminalId: 't1', attempt: 1, maxAttempts: 2, exitCode: 1, at: 1000 }))
-    expect(selectActiveNoticeFrom(s, 't1', 1000 + AUTO_RESUME_NOTICE_TTL_MS - 1)?.kind).toBe('recovering')
-    expect(selectActiveNoticeFrom(s, 't1', 1000 + AUTO_RESUME_NOTICE_TTL_MS + 1)).toBeUndefined()
+    const s = reducer(empty, recordAutoResumeRecovering({ paneId: 'p1', attempt: 1, maxAttempts: 2, exitCode: 1, at: 1000 }))
+    expect(selectActiveNoticeFrom(s, 'p1', 1000 + AUTO_RESUME_NOTICE_TTL_MS - 1)?.kind).toBe('recovering')
+    expect(selectActiveNoticeFrom(s, 'p1', 1000 + AUTO_RESUME_NOTICE_TTL_MS + 1)).toBeUndefined()
   })
 
-  it('fold moves state from old to new terminalId as a resumed notice', () => {
-    let s = reducer(empty, recordTerminalExit({ terminalId: 't1', exitCode: 1, at: 1000 }))
-    s = reducer(s, recordAutoResumeRecovering({ terminalId: 't1', attempt: 1, maxAttempts: 2, exitCode: 1, at: 1000 }))
-    s = reducer(s, foldTerminalReplacement({ oldTerminalId: 't1', newTerminalId: 't2', exitCode: 1, attempt: 1, maxAttempts: 2, at: 2000 }))
-    expect(selectExitRecordFrom(s, 't1')).toBeUndefined()
-    expect(selectActiveNoticeFrom(s, 't1', 2000)).toBeUndefined()
-    expect(selectActiveNoticeFrom(s, 't2', 2000)).toEqual({ kind: 'resumed', attempt: 1, maxAttempts: 2, exitCode: 1, at: 2000 })
-    expect(selectExitRecordFrom(s, 't2')).toBeUndefined() // new terminal is alive
+  it('fold clears the exit record, sets a resumed notice, and advances lastTerminalId', () => {
+    let s = reducer(empty, recordTerminalExit({ paneId: 'p1', terminalId: 't1', exitCode: 1, at: 1000 }))
+    s = reducer(s, recordAutoResumeRecovering({ paneId: 'p1', attempt: 1, maxAttempts: 2, exitCode: 1, at: 1000 }))
+    s = reducer(s, foldTerminalReplacement({ paneId: 'p1', newTerminalId: 't2', exitCode: 1, attempt: 1, maxAttempts: 2, at: 2000 }))
+    expect(selectExitRecordFrom(s, 'p1')).toBeUndefined() // pane is alive again — no error bar
+    expect(selectActiveNoticeFrom(s, 'p1', 2000)).toEqual({ kind: 'resumed', attempt: 1, maxAttempts: 2, exitCode: 1, at: 2000 })
+    expect(selectLastTerminalIdFrom(s, 'p1')).toBe('t2')
   })
 
-  it('clearTerminalLifecycle wipes both maps for the id', () => {
-    let s = reducer(empty, recordTerminalExit({ terminalId: 't1', exitCode: 7, at: 1 }))
-    s = reducer(s, clearTerminalLifecycle({ terminalId: 't1' }))
-    expect(selectExitRecordFrom(s, 't1')).toBeUndefined()
+  it('clearTerminalLifecycle wipes the pane entry', () => {
+    let s = reducer(empty, recordTerminalExit({ paneId: 'p1', terminalId: 't1', exitCode: 7, at: 1 }))
+    s = reducer(s, clearTerminalLifecycle({ paneId: 'p1' }))
+    expect(selectExitRecordFrom(s, 'p1')).toBeUndefined()
+    expect(selectLastTerminalIdFrom(s, 'p1')).toBeUndefined()
   })
 })
 ```
-(`selectExitRecordFrom(sliceState, id)` / `selectActiveNoticeFrom(sliceState, id, now)` operate on the slice state directly; also export root-state wrappers `selectExitRecord`/`selectActiveNotice` for components.)
+(`selectExitRecordFrom(sliceState, paneId)` / `selectActiveNoticeFrom(sliceState, paneId, now)` / `selectLastTerminalIdFrom(sliceState, paneId)` operate on the slice state directly; also export root-state wrappers `selectExitRecord`/`selectActiveNotice` for components.)
 
 - [ ] **Step 2: Run to verify red**
 
@@ -1094,33 +1131,46 @@ export interface AutoResumeNotice {
   at: number
 }
 
-interface TerminalLifecycleState {
-  exitByTerminalId: Record<string, TerminalExitRecord>
-  noticeByTerminalId: Record<string, AutoResumeNotice>
+export interface PaneLifecycleEntry {
+  lastTerminalId?: string
+  exit?: TerminalExitRecord
+  notice?: AutoResumeNotice
 }
 
-const initialState: TerminalLifecycleState = { exitByTerminalId: {}, noticeByTerminalId: {} }
+interface TerminalLifecycleState {
+  byPaneId: Record<string, PaneLifecycleEntry>
+}
+
+const initialState: TerminalLifecycleState = { byPaneId: {} }
+
+const entry = (state: TerminalLifecycleState, paneId: string) =>
+  (state.byPaneId[paneId] ??= {})
 
 const slice = createSlice({
   name: 'terminalLifecycle',
   initialState,
   reducers: {
-    recordTerminalExit(state, a: PayloadAction<{ terminalId: string; exitCode: number; at: number }>) {
-      state.exitByTerminalId[a.payload.terminalId] = { exitCode: a.payload.exitCode, at: a.payload.at }
+    // Dispatched by the pane's own terminal.exit handler BEFORE it clears
+    // paneContent.terminalId (TerminalView.tsx:4141-4148) — this is the only
+    // moment both paneId and the dying terminalId are simultaneously known.
+    recordTerminalExit(state, a: PayloadAction<{ paneId: string; terminalId: string; exitCode: number; at: number }>) {
+      const e = entry(state, a.payload.paneId)
+      e.lastTerminalId = a.payload.terminalId
+      e.exit = { exitCode: a.payload.exitCode, at: a.payload.at }
     },
-    recordAutoResumeRecovering(state, a: PayloadAction<{ terminalId: string; attempt: number; maxAttempts: number; exitCode: number; at: number }>) {
-      const { terminalId, ...n } = a.payload
-      state.noticeByTerminalId[terminalId] = { kind: 'recovering', ...n }
+    recordAutoResumeRecovering(state, a: PayloadAction<{ paneId: string; attempt: number; maxAttempts: number; exitCode: number; at: number }>) {
+      const { paneId, ...n } = a.payload
+      entry(state, paneId).notice = { kind: 'recovering', ...n }
     },
-    foldTerminalReplacement(state, a: PayloadAction<{ oldTerminalId: string; newTerminalId: string; exitCode: number; attempt: number; maxAttempts: number; at: number }>) {
-      const { oldTerminalId, newTerminalId, exitCode, attempt, maxAttempts, at } = a.payload
-      delete state.exitByTerminalId[oldTerminalId]
-      delete state.noticeByTerminalId[oldTerminalId]
-      state.noticeByTerminalId[newTerminalId] = { kind: 'resumed', attempt, maxAttempts, exitCode, at }
+    foldTerminalReplacement(state, a: PayloadAction<{ paneId: string; newTerminalId: string; exitCode: number; attempt: number; maxAttempts: number; at: number }>) {
+      const { paneId, newTerminalId, exitCode, attempt, maxAttempts, at } = a.payload
+      const e = entry(state, paneId)
+      delete e.exit // pane is alive again — no error bar
+      e.notice = { kind: 'resumed', attempt, maxAttempts, exitCode, at }
+      e.lastTerminalId = newTerminalId
     },
-    clearTerminalLifecycle(state, a: PayloadAction<{ terminalId: string }>) {
-      delete state.exitByTerminalId[a.payload.terminalId]
-      delete state.noticeByTerminalId[a.payload.terminalId]
+    clearTerminalLifecycle(state, a: PayloadAction<{ paneId: string }>) {
+      delete state.byPaneId[a.payload.paneId]
     },
   },
 })
@@ -1128,32 +1178,36 @@ const slice = createSlice({
 export const { recordTerminalExit, recordAutoResumeRecovering, foldTerminalReplacement, clearTerminalLifecycle } = slice.actions
 export default slice.reducer
 
-export const selectExitRecordFrom = (s: TerminalLifecycleState, terminalId: string) => s.exitByTerminalId[terminalId]
-export const selectActiveNoticeFrom = (s: TerminalLifecycleState, terminalId: string, now: number) => {
-  const n = s.noticeByTerminalId[terminalId]
+export const selectExitRecordFrom = (s: TerminalLifecycleState, paneId: string) => s.byPaneId[paneId]?.exit
+export const selectLastTerminalIdFrom = (s: TerminalLifecycleState, paneId: string) => s.byPaneId[paneId]?.lastTerminalId
+export const selectActiveNoticeFrom = (s: TerminalLifecycleState, paneId: string, now: number) => {
+  const n = s.byPaneId[paneId]?.notice
   return n && now - n.at <= AUTO_RESUME_NOTICE_TTL_MS ? n : undefined
 }
 // Root-state wrappers — match the RootState typing convention of the sibling
 // selectors in this directory (see turnCompletionSlice.ts for the pattern):
-export const selectExitRecord = (root: { terminalLifecycle: TerminalLifecycleState }, terminalId: string) =>
-  selectExitRecordFrom(root.terminalLifecycle, terminalId)
-export const selectActiveNotice = (root: { terminalLifecycle: TerminalLifecycleState }, terminalId: string, now: number) =>
-  selectActiveNoticeFrom(root.terminalLifecycle, terminalId, now)
+export const selectExitRecord = (root: { terminalLifecycle: TerminalLifecycleState }, paneId: string) =>
+  selectExitRecordFrom(root.terminalLifecycle, paneId)
+export const selectActiveNotice = (root: { terminalLifecycle: TerminalLifecycleState }, paneId: string, now: number) =>
+  selectActiveNoticeFrom(root.terminalLifecycle, paneId, now)
 ```
-Register `terminalLifecycle: terminalLifecycleReducer` in the store-assembly file (found in Step 3's grep). Verify it is NOT added to any persist allowlist (persistence is a strip-denylist over `panes` state only — this slice is separate state, so it is not persisted; confirm by reading `persistMiddleware.ts:245-267`'s scope, do not modify it).
+Register `terminalLifecycle: terminalLifecycleReducer` in the store-assembly file (found in Step 3's grep). Verify it is NOT added to any persist allowlist (VERIFIED: persistence is an ALLOWLIST of four slices — tabs/panes, tabRecency, turnCompletion — `persistMiddleware.ts:589-621, :631-649, :652-659`; no path serializes unknown root slices, so this slice is unpersisted with zero middleware change; do not modify persistMiddleware).
 
 - [ ] **Step 4: Wire the three WS handlers in TerminalView**
 
-In `src/components/TerminalView.tsx`:
-- In the existing `terminal.exit` handler (~`:4101-4160`), after the current handling, add (for all modes — the render layer applies the agent/non-zero policy):
+In `src/components/TerminalView.tsx`. **Matching rule (VERIFIED constraint, D-2):** the `terminal.exit` handler clears `paneContent.terminalId`/`terminalIdRef` (`:4141-4148` — do NOT change that behavior), so the `recovering`/`replaced` handlers must match old-id frames against the pane's recorded `lastTerminalId` from the lifecycle slice, never against `paneContent.terminalId`:
+
+- In the existing `terminal.exit` handler (~`:4101-4160`), BEFORE the existing clearing of `terminalIdRef`/`terminalId` (this is the one moment paneId and the dying terminalId are both known), add (for all modes — the render layer applies the agent/non-zero policy):
   ```ts
-  dispatch(recordTerminalExit({ terminalId: msg.terminalId, exitCode: msg.exitCode, at: Date.now() }))
+  dispatch(recordTerminalExit({ paneId, terminalId: msg.terminalId, exitCode: msg.exitCode, at: Date.now() }))
   ```
-- In the existing `terminal.status` handler (~`:4087`), add:
+- In the existing `terminal.status` handler (~`:4087`), add (matching by live tid OR the recorded lastTerminalId, since the crash has usually already cleared tid by the time `recovering` arrives):
   ```ts
-  if (msg.status === 'recovering' && typeof msg.attempt === 'number') {
+  const mine = msg.terminalId === terminalIdRef.current ||
+    msg.terminalId === selectLastTerminalIdFrom(store.getState().terminalLifecycle, paneId)
+  if (mine && msg.status === 'recovering' && typeof msg.attempt === 'number') {
     dispatch(recordAutoResumeRecovering({
-      terminalId: msg.terminalId,
+      paneId,
       attempt: msg.attempt,
       // reason text carries "attempt n/max" — parse max defensively; default 2:
       maxAttempts: Number(msg.reason?.match(/attempt \d+\/(\d+)/)?.[1] ?? 2),
@@ -1162,17 +1216,26 @@ In `src/components/TerminalView.tsx`:
     }))
   }
   ```
-- New `terminal.replaced` case (beside the `terminal.status` case). This TerminalView instance handles it when `msg.oldTerminalId === content.terminalId`:
+  (Use whatever store-access idiom the surrounding handlers already use — a `useStore`/`getState` read or a selector snapshot; mirror the file's existing pattern.)
+- New `terminal.replaced` case (beside the `terminal.status` case). This TerminalView instance handles it when the old id matches its recorded `lastTerminalId` (or, defensively, a still-set live tid):
   ```ts
-  if (msg.oldTerminalId === paneContent.terminalId) {
-    dispatch(foldTerminalReplacement({ ...msg, at: Date.now() }))
+  const mine = msg.oldTerminalId === terminalIdRef.current ||
+    msg.oldTerminalId === selectLastTerminalIdFrom(store.getState().terminalLifecycle, paneId)
+  if (mine) {
+    dispatch(foldTerminalReplacement({
+      paneId, newTerminalId: msg.newTerminalId, exitCode: msg.exitCode,
+      attempt: msg.attempt, maxAttempts: msg.maxAttempts, at: Date.now(),
+    }))
     // Fold the new terminalId into this pane using the ONE reducer built for
     // server-supplied rebinds. Copy the exact payload shape from the existing
-    // dispatch site in src/lib/pane-reconcile.ts:289-297 (attach verdict fold):
-    dispatch(applyReconcileAttach({ tabId, paneId, terminalId: msg.newTerminalId /* + the other fields pane-reconcile.ts passes — mirror them exactly */ }))
+    // dispatch site in src/lib/pane-reconcile.ts:428-436 (attach verdict fold;
+    // NOTE corrected citation — not :289-297). Include EVERY field that site
+    // passes: applyReconcileAttach unconditionally overwrites serverInstanceId
+    // (panesSlice.ts:1904), so the fold must supply the current one too.
+    dispatch(applyReconcileAttach({ tabId, paneId, terminalId: msg.newTerminalId /* + the other fields pane-reconcile.ts:428-436 passes — mirror them exactly, incl. serverInstanceId */ }))
   }
   ```
-  The attach-gate rule: `applyReconcileAttach` must be dispatched BEFORE the attach effect runs (bind-before-attach, `TerminalView.tsx:2477-2484`) — dispatching from the message handler satisfies this because the create-or-attach effect re-fires on the epoch bump the reducer performs.
+  The attach-gate rule: `applyReconcileAttach` must be dispatched BEFORE the attach effect runs (bind-before-attach, `TerminalView.tsx:2477-2484`) — dispatching from the message handler satisfies this because the create-or-attach effect re-fires on the epoch bump the reducer performs (VERIFIED: reducer has no reconcile-flow preconditions, panesSlice.ts:1886-1923; epoch is in the effect deps at :4771; pinned further by Task 8).
 
 - [ ] **Step 5: Run green + lint + commit**
 
@@ -1321,10 +1384,10 @@ export function TerminalExitBanner({ mode, exitCode, notice, onRelaunch }: Termi
 Write all five out fully. Then wire in `TerminalView.tsx` near the JSX root (`:4838`ff), alongside the existing overlay/panel rendering:
 
 ```tsx
-const exitRecord = useSelector((s: RootState) =>
-  paneContent.terminalId ? selectExitRecord(s, paneContent.terminalId) : undefined)
-const activeNotice = useSelector((s: RootState) =>
-  paneContent.terminalId ? selectActiveNotice(s, paneContent.terminalId, Date.now()) : undefined)
+// Keyed by paneId (NOT terminalId — the exit handler clears paneContent.terminalId,
+// TerminalView.tsx:4141-4148, so an exited pane has no terminal id to key by):
+const exitRecord = useSelector((s: RootState) => selectExitRecord(s, paneId))
+const activeNotice = useSelector((s: RootState) => selectActiveNotice(s, paneId, Date.now()))
 
 const isAgentPane = paneContent.mode && paneContent.mode !== 'shell'
 const showExitBanner = Boolean(
@@ -1414,7 +1477,7 @@ Expected: tests 1–3 likely PASS immediately (they pin existing behavior — th
 
 - [ ] **Step 3: Fix anything red**
 
-If test 4 is red: add the fold action to the skip list in `src/store/terminalDetachMiddleware.ts` (`:14-28`), with a comment `// Lane D1: terminal.replaced fold rebinds the pane; the old terminal is already exited — never detach-storm it.` No other production change is expected; if 1–3 are red, the fold wiring from Task 6 is wrong — fix it there (payload shape vs `pane-reconcile.ts:289-297`), not by weakening the tests.
+If test 4 is red: add the fold action to the skip list in `src/store/terminalDetachMiddleware.ts` (`:14-28`), with a comment `// Lane D1: terminal.replaced fold rebinds the pane; the old terminal is already exited — never detach-storm it.` No other production change is expected; if 1–3 are red, the fold wiring from Task 6 is wrong — fix it there (payload shape vs `pane-reconcile.ts:428-436`), not by weakening the tests.
 
 - [ ] **Step 4: Run green**
 
@@ -1629,8 +1692,23 @@ Do NOT run `gh pr create`. Produce the lane report: branch name, base sha, per-t
 
 **1b. No silent deferrals.** Every user-facing requirement lands as production behavior proven by a non-mocked test: the auto-resume, banner, relaunch, and notices are all exercised end-to-end in Task 9 against a real server + real browser (the fake CLI substitutes only the third-party claude binary — the repo's established e2e convention for asserting provider argv, same as `recover-my-panes-rust.spec.ts`). Unit-level fakes (`FakeDriver`, headless terminals) are superseded by Task 5's registry-integration test and Task 9's e2e. No requirement was moved to known-limitations/future-work. Two explicitly-pinned known behaviors are *pre-existing and unchanged*, not deferrals: codex resume-busy seeding (D-4, shared with the existing client-driven respawn path) and the post-reload codeless banner (D-3, tested in Task 7 scenario 5).
 
-**2. Placeholder scan.** Remaining prose-shaped steps are mirror-existing-code instructions with exact source anchors (Task 2's `ExitHookDeps` field types ← `terminal.rs:1680-1690`; Task 4's pipeline ← `handle_create` blocks with line ranges; Task 6's `applyReconcileAttach` payload ← `pane-reconcile.ts:289-297`) — each names its authoritative source and a fidelity rule, so the implementer copies rather than invents. Test sketches marked "write fully" enumerate their exact scenario and assertions. No TBD/TODO/"handle edge cases" remain.
+**2. Placeholder scan.** Remaining prose-shaped steps are mirror-existing-code instructions with exact source anchors (Task 2's `ExitHookDeps` field types ← `terminal.rs:1680-1690`; Task 4's pipeline ← `handle_create` blocks with line ranges; Task 6's `applyReconcileAttach` payload ← `pane-reconcile.ts:428-436`) — each names its authoritative source and a fidelity rule, so the implementer copies rather than invents. Test sketches marked "write fully" enumerate their exact scenario and assertions. No TBD/TODO/"handle edge cases" remain.
 
 **3. Type consistency.** `CrashEvent`/`CrashContext`/`decide` names match across Tasks 1/2/5; `RespawnSpec` (driver-level) vs `AgentRespawnRequest` (seam-level) are distinct on purpose (the driver adapts one to the other in Task 5's production impl); `terminal.replaced` field names match TS (`oldTerminalId`…) ↔ Rust camelCase serde across Tasks 3/5/6; slice action/selector names match across Tasks 6/7/8; banner roles/labels match between component and tests; `FRESHELL_AUTO_RESUME_DELAYS_MS` spelled identically in Tasks 1, 5, 9.
 
 **Known verification points for reviewers (not gaps):** exact `WsState` field types in `ExitHookDeps`, the `terminal.status` Rust struct name, and the `resetPaneForReconcileCreate`/`applyReconcileAttach` payload shapes are mirrored from cited code at implementation time; the plan pins their behavior with tests rather than guessing their signatures.
+
+---
+
+## Stage-2 Load-Bearing Validation (addendum, 2026-07-27)
+
+24 load-bearing assumptions were surfaced and 22 validated against the actual repo (evidence ledger: `.worktrees/.the-usual-logs/agent-crash-resilience/load-bearing-ledger.md` + `reports/V1.md`–`V8.md`). 18 verified; 4 falsified and FIXED in this plan revision:
+
+1. **Exited panes do NOT retain `terminalId`** (TerminalView clears it at exit, `:4141-4148`) → the client lifecycle slice is keyed by **paneId** with a `lastTerminalId` mapping; `recovering`/`replaced` frames match via that mapping (D-2 note; Tasks 6/7 rewritten accordingly).
+2. **A second exit-hook construction site exists** in fenced `freshell-freshagent/terminal_tabs.rs:1009-1043` → REST-created panes documented out of auto-resume scope this lane (Task 2 scope note).
+3. **codex/opencode/amplifier session ids are discovered only at first prompt** (claude alone is preallocated at create) → per-provider provenance documented in D-5; pre-discovery crashes settle `no_resumable_identity` by design.
+4. **Terminal-pane `BindingRow` launch fields are hardcoded `None`** (`pane_ledger.rs:405-408`) → Task 4 derives launch params from `state.settings` as `handle_create` does.
+
+Verified-with-amendment items folded in: SpawnGate acquire added to the Task 4 seam (in-path for all creates); orchestrator lease discipline pinned (mint `holder_conn` via `new_connection_id()`, own every release path); binding-still-Bound pre-respawn guard added (bounds the crash-then-kill race); `corrected` flag semantics corrected in D-2 (None for same-session replacement) with a mandatory reconcile-after-replacement pin test in Task 5 step 4(d); `applyReconcileAttach` fold payload mirrors `pane-reconcile.ts:428-436` incl. `serverInstanceId`.
+
+Self-review re-run over the edited tasks (incl. 1b): every user-facing requirement still lands as production behavior proven by non-mocked tests — the paneId re-keying changes only the client data model, not what is proven (Task 9's e2e assertions are unchanged and remain the end-to-end proof); the REST-pane scope exclusion is a documented boundary of a fenced subsystem, not a silent deferral (WS-created agent panes — the product surface this feature targets — are fully covered); no new TBDs introduced; type/name consistency between Tasks 6/7/8 sketches re-checked after re-keying (`paneId` payloads, `selectExitRecord(root, paneId)`, `selectLastTerminalIdFrom`).
