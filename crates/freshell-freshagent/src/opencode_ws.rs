@@ -111,6 +111,12 @@ pub struct FreshOpencodeState {
     /// post-construction by `freshell-server` (precedent:
     /// `TerminalRegistry::set_activity_observer`).
     identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
+    /// The per-sessionRef create/resume lease (D8 for fresh agents, Task 13) —
+    /// ALWAYS ON. Opencode NEVER records a kill handle on it: no per-session process
+    /// exists, and the SHARED `opencode serve` sidecar must never be killed by the
+    /// lease (it hosts other sessions) — a hung resume resolves via the bounded
+    /// `get_session` (below) failing → `fail()` → the key reopens.
+    pub(crate) leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -165,6 +171,9 @@ enum ResumeOpencodeError {
     /// timeout, ...) -- NOT evidence the session is gone; safe to retry, never mapped to
     /// `INVALID_SESSION_ID`.
     Manager(freshell_opencode::ServeError),
+    /// Task 13 (D8): another create/attach holds this sessionRef's lease -- the caller
+    /// answers `freshAgent.error { code: "SESSION_RESERVED" }` (retryable, never lost).
+    Reserved,
 }
 
 impl OpencodeSession {
@@ -198,7 +207,17 @@ impl FreshOpencodeState {
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
             identity_sink: Arc::new(std::sync::OnceLock::new()),
+            leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
         }
+    }
+
+    /// Replace the default lease map with the ONE server-wide shared map (Task 13;
+    /// called by `main.rs` before this state is cloned into the router).
+    pub fn set_session_leases(
+        &mut self,
+        leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    ) {
+        self.leases = leases;
     }
 
     /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
@@ -406,6 +425,15 @@ impl FreshOpencodeState {
                 }
                 Err(ResumeOpencodeError::Manager(err)) => {
                     self.fail_create(&request_id, "FRESH_AGENT_CREATE_FAILED", &err.to_string());
+                    return;
+                }
+                Err(ResumeOpencodeError::Reserved) => {
+                    // Task 13 (D8): the create-resume loser answer -- retryable.
+                    self.fail_create(
+                        &request_id,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
                     return;
                 }
             },
@@ -742,6 +770,10 @@ impl FreshOpencodeState {
             if let Some(bridge) = s.serve_bridge.take() {
                 bridge.abort();
             }
+            // Task 13: a killed session must reopen its durable id's lease binding.
+            if let Some(real) = s.real_session_id.as_deref() {
+                self.leases.clear_binding(PROVIDER, real);
+            }
         }
 
         // Explicit kill evicts this session's requestId dedup cache entries (mirrors
@@ -856,6 +888,15 @@ impl FreshOpencodeState {
                     self.send_error(&None, "OPENCODE_ATTACH_RESUME_FAILED", &err.to_string());
                     return;
                 }
+                Err(ResumeOpencodeError::Reserved) => {
+                    // Task 13 (D8): loser answer -- retryable, never lost.
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
+                    return;
+                }
             },
         };
 
@@ -915,13 +956,75 @@ impl FreshOpencodeState {
         let manager = self.fresh_agent.ensure_manager().await;
         let route: freshell_opencode::Route = cwd.map(str::to_string);
 
-        let info = match manager.get_session(session_id, &route).await {
-            Ok(value) if value.is_object() => value,
-            Ok(_) => return Err(ResumeOpencodeError::NotFound),
-            Err(freshell_opencode::ServeError::Http { status: 404, .. }) => {
+        // Task 13 (D8): claim the per-sessionRef lease before the resume. Opencode
+        // never records a kill handle (the shared serve sidecar must never be killed
+        // by the lease), so a hung holder resolves via the BOUNDED `get_session`
+        // below failing -> the guard's `fail()` reopening the key -- never a tree-kill
+        // and never a permanent hold.
+        let resume_request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
+        let mut lease_guard = match self.leases.claim(
+            PROVIDER,
+            session_id,
+            &resume_request_id,
+            crate::session_lease::now_epoch_ms(),
+        ) {
+            crate::session_lease::FreshSessionClaim::Acquired => {
+                crate::FreshSessionLeaseGuard::armed(
+                    Arc::clone(&self.leases),
+                    PROVIDER,
+                    session_id,
+                    &resume_request_id,
+                )
+            }
+            crate::session_lease::FreshSessionClaim::BoundLive { live_session_key } => {
+                // The winner completed while we contended -- adopt its live session.
+                if let Some(existing) = self.sessions.lock().await.get(&live_session_key) {
+                    return Ok(existing.clone());
+                }
+                return Err(ResumeOpencodeError::Reserved);
+            }
+            crate::session_lease::FreshSessionClaim::Held { .. }
+            | crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { .. } => {
+                // Handle-less by design: expired holders are revoked + held closed by
+                // the primitive; both shapes answer RESERVED (retryable).
+                return Err(ResumeOpencodeError::Reserved);
+            }
+        };
+
+        // V5 caveat (b): `RequestOptions.timeout` defaults to `None`, so a
+        // wedged-but-accepting `opencode serve` would hang this await forever and hold
+        // the sessionRef reserved until restart. Bound it (env-tunable for tests).
+        let budget = std::env::var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000u64);
+        let get = tokio::time::timeout(
+            std::time::Duration::from_millis(budget),
+            manager.get_session(session_id, &route),
+        )
+        .await;
+        let info = match get {
+            Err(_elapsed) => {
+                lease_guard.fail();
+                return Err(ResumeOpencodeError::Manager(
+                    freshell_opencode::ServeError::Transport(format!(
+                        "GET /session/{session_id} did not answer within {budget}ms"
+                    )),
+                ));
+            }
+            Ok(Ok(value)) if value.is_object() => value,
+            Ok(Ok(_)) => {
+                lease_guard.fail();
                 return Err(ResumeOpencodeError::NotFound);
             }
-            Err(err) => return Err(ResumeOpencodeError::Manager(err)),
+            Ok(Err(freshell_opencode::ServeError::Http { status: 404, .. })) => {
+                lease_guard.fail();
+                return Err(ResumeOpencodeError::NotFound);
+            }
+            Ok(Err(err)) => {
+                lease_guard.fail();
+                return Err(ResumeOpencodeError::Manager(err));
+            }
         };
         // P1.13 (Task 8): recover this session's recorded settings snapshot, gated
         // per V7/A10 (same vocabulary + gating as codex.rs's Task 5 site).
@@ -978,6 +1081,14 @@ impl FreshOpencodeState {
             .lock()
             .await
             .insert(session_id.to_string(), session_arc.clone());
+
+        // Task 13: bind the durable id to this live session + release the lease. A
+        // revoked lease (expired handle-less holder held closed) means a contender may
+        // believe the key is poisoned -- we are still the only writer, so keep the
+        // registered session and reopen the key (has-live lookups adopt it from here).
+        if !lease_guard.complete(session_id) {
+            lease_guard.fail();
+        }
 
         // P1.13 (Task 8): refresh the binding row after a successful resume -- AWAITED
         // (durable-before-answer), and ONLY when a record was actually recovered: never
@@ -1431,6 +1542,73 @@ mod tests {
         let (manager, killed) = started_manager().await;
         fresh_agent.set_manager_for_test(manager).await;
         (FreshOpencodeState::new(fresh_agent), killed)
+    }
+
+    /// A `ServeHttp` fake that answers health probes but NEVER resolves anything else --
+    /// the wedged-but-accepting `opencode serve` shape (V5 caveat b).
+    struct WedgedHttp;
+    impl ServeHttp for WedgedHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            if req.url.contains("/global/health") {
+                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+            }
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// V5 caveat (b): `RequestOptions.timeout` defaults to `None`, so a wedged serve
+    /// would hang `get_session` forever and hold the sessionRef reserved until restart.
+    /// The bounded call must error within its budget, and the lease guard's `fail()`
+    /// must reopen the key (a fresh claim acquires).
+    #[tokio::test]
+    async fn resume_durable_session_get_session_is_bounded_and_reopens_the_lease() {
+        std::env::set_var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS", "200");
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(WedgedHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy (but wedged) fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let state = FreshOpencodeState::new(fresh_agent);
+
+        let started = std::time::Instant::now();
+        let out = state.resume_durable_session("ses_wedged_1", None).await;
+        std::env::remove_var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS");
+        assert!(
+            matches!(out, Err(ResumeOpencodeError::Manager(_))),
+            "a wedged get_session must resolve to a transient Manager error"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the get_session await must be BOUNDED (was: {:?})",
+            started.elapsed()
+        );
+        // The guard's fail() reopened the sessionRef -- a fresh claim acquires.
+        assert_eq!(
+            state.leases.claim(
+                "opencode",
+                "ses_wedged_1",
+                "req-next",
+                crate::session_lease::now_epoch_ms()
+            ),
+            crate::session_lease::FreshSessionClaim::Acquired,
+            "a bounded failure must reopen the lease"
+        );
     }
 
     fn create_msg(request_id: &str) -> FreshAgentCreate {

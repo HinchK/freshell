@@ -639,3 +639,271 @@ async fn expired_lease_kill_sweeps_the_sidecar_tree_before_release() {
     .await;
     assert!(created["sessionId"].is_string());
 }
+
+// ── Task 13: lease at the attach-resume seams ────────────────────────────────────────
+
+/// A loser ATTACH racing a winner's create-with-resume for the same durable id must get
+/// `freshAgent.error { code: "SESSION_RESERVED" }` (NOT the lost-session frame), and its
+/// re-attach after the winner binds must converge to the live session (the Task 10b
+/// rebind + ack) — sidecar spawn count still 1.
+#[tokio::test]
+async fn loser_attach_after_winner_binds_converges_to_the_live_session() {
+    let _guard = LEASE_ENV_LOCK.lock().await;
+    let env = FakeLeaseSidecarEnv::install();
+    std::env::set_var("FAKE_SIDECAR_CREATE_DELAY_MS", "3000");
+
+    let durable = "d5d5d5d5-d5d5-4d5d-8d5d-d5d5d5d5d5d5";
+    let url = spawn_server().await;
+    let mut ws_a = connect(&url, true).await;
+    let mut ws_b = connect(&url, true).await;
+
+    // Winner: create-with-resume, slow spawn (holds the lease mid-flight).
+    send_json(&mut ws_a, &claude_create_resume("req-att-a", durable)).await;
+    env.await_log_row(Duration::from_secs(10), |r| r["msg"]["type"] == "create")
+        .await;
+
+    // Loser: attach for the SAME durable id mid-spawn.
+    let attach = serde_json::json!({
+        "type": "freshAgent.attach",
+        "provider": "claude",
+        "sessionId": durable,
+        "sessionType": "freshclaude",
+        "resumeSessionId": durable,
+        "sessionRef": { "provider": "claude", "sessionId": durable },
+    });
+    send_json(&mut ws_b, &attach).await;
+    let err = await_frame(&mut ws_b, Duration::from_secs(10), |v| {
+        v["type"] == "freshAgent.event"
+            && v["sessionId"] == durable
+            && v["event"]["type"] == "freshAgent.error"
+    })
+    .await;
+    assert_eq!(
+        err["event"]["code"], "SESSION_RESERVED",
+        "the attach loser must be RESERVED, never lost (INVALID_SESSION_ID would kill the pane)"
+    );
+
+    // Winner binds.
+    await_frame(&mut ws_a, Duration::from_secs(15), |v| {
+        v["type"] == "freshAgent.created" && v["requestId"] == "req-att-a"
+    })
+    .await;
+
+    // Loser re-attaches: normal attach behavior against the live session (the Task 10b
+    // rebind + ack — an idle snapshot stamped with the durable id).
+    send_json(&mut ws_b, &attach).await;
+    await_frame(&mut ws_b, Duration::from_secs(10), |v| {
+        v["type"] == "freshAgent.event"
+            && v["sessionId"] == durable
+            && v["event"]["type"] == "freshAgent.session.snapshot"
+    })
+    .await;
+
+    let distinct_pids: std::collections::HashSet<i64> = env
+        .create_rows()
+        .iter()
+        .filter_map(|r| r["pid"].as_i64())
+        .collect();
+    assert_eq!(distinct_pids.len(), 1, "sidecar spawn count must stay 1");
+}
+
+// ── Task 13 Step 1a: the harness-owned fake `opencode serve` ────────────────────────
+//
+// No ws-level fake existed (V9): `OPENCODE_CMD` names a single executable that the
+// serve manager spawns as `<cmd> serve --hostname H --port P`, so the fake is a
+// shebang'd Node script implementing exactly the endpoints the attach-resume path
+// calls: `GET /global/health`, `GET /global/event` (SSE, held open), and
+// `GET /session/:id` (with an env-driven in-flight delay knob + a JSONL audit log).
+
+const FAKE_OPENCODE_SERVE_SOURCE: &str = r#"#!/usr/bin/env node
+const http = require('node:http')
+const fs = require('node:fs')
+function argValue(name) {
+  const i = process.argv.indexOf(name)
+  return i < 0 ? undefined : process.argv[i + 1]
+}
+const hostname = argValue('--hostname') || '127.0.0.1'
+const port = Number(argValue('--port'))
+const audit = process.env.FAKE_OPENCODE_SERVE_AUDIT_LOG || ''
+function log(row) {
+  if (!audit) return
+  try { fs.appendFileSync(audit, JSON.stringify({ pid: process.pid, t: Date.now(), ...row }) + '\n') } catch {}
+}
+const delayMs = Number(process.env.FAKE_OPENCODE_SERVE_SESSION_GET_DELAY_MS || 0)
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url || '/', `http://${hostname}:${port}`)
+  log({ method: req.method, path: url.pathname })
+  if (url.pathname === '/global/health') {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({ status: 'ok' }))
+    return
+  }
+  if (url.pathname === '/event' || url.pathname === '/global/event') {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+    res.write(':ok\n\n')
+    return // held open
+  }
+  const m = url.pathname.match(/^\/session\/([^/]+)$/)
+  if (m && req.method === 'GET') {
+    const id = decodeURIComponent(m[1])
+    const reply = () => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ id, directory: '/tmp', title: 'fake opencode session' }))
+    }
+    if (delayMs > 0) setTimeout(reply, delayMs)
+    else reply()
+    return
+  }
+  res.writeHead(404, { 'content-type': 'application/json' })
+  res.end(JSON.stringify({ error: 'not found' }))
+})
+server.listen(port, hostname, () => { log({ event: 'listen', hostname, port }) })
+"#;
+
+struct FakeOpencodeServeEnv {
+    dir: std::path::PathBuf,
+}
+
+impl FakeOpencodeServeEnv {
+    fn install() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-fake-opencode-serve-ws-{}",
+            uuid_like_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake serve temp dir");
+        let script = dir.join("fake-opencode-serve");
+        std::fs::write(&script, FAKE_OPENCODE_SERVE_SOURCE).expect("write fake serve");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake serve");
+        }
+        std::env::set_var("OPENCODE_CMD", &script);
+        std::env::set_var("FAKE_OPENCODE_SERVE_AUDIT_LOG", dir.join("audit.jsonl"));
+        Self { dir }
+    }
+
+    fn audit_rows(&self) -> Vec<Value> {
+        let Ok(raw) = std::fs::read_to_string(self.dir.join("audit.jsonl")) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("audit row parses"))
+            .collect()
+    }
+
+    async fn await_audit_row(&self, budget: Duration, pred: impl Fn(&Value) -> bool) -> Value {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            if let Some(row) = self.audit_rows().into_iter().find(&pred) {
+                return row;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "audit row did not appear within budget"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+impl Drop for FakeOpencodeServeEnv {
+    fn drop(&mut self) {
+        for var in [
+            "OPENCODE_CMD",
+            "FAKE_OPENCODE_SERVE_AUDIT_LOG",
+            "FAKE_OPENCODE_SERVE_SESSION_GET_DELAY_MS",
+        ] {
+            std::env::remove_var(var);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Two clients attach-resuming the same durable `ses_*` id concurrently: exactly one
+/// resume proceeds; the loser gets `freshAgent.error{SESSION_RESERVED}`; and the SHARED
+/// `opencode serve` sidecar is never killed by the lease (it hosts other sessions).
+#[tokio::test]
+async fn opencode_attach_resume_is_serialized_without_touching_the_shared_sidecar() {
+    let _guard = LEASE_ENV_LOCK.lock().await;
+    let env = FakeOpencodeServeEnv::install();
+    std::env::set_var("FAKE_OPENCODE_SERVE_SESSION_GET_DELAY_MS", "2500");
+
+    let ses = "ses_lease_serialized_1";
+    let url = spawn_server().await;
+    let mut ws_a = connect(&url, true).await;
+    let mut ws_b = connect(&url, true).await;
+
+    let attach = serde_json::json!({
+        "type": "freshAgent.attach",
+        "provider": "opencode",
+        "sessionId": ses,
+        "sessionType": "freshopencode",
+        "cwd": "/tmp",
+    });
+
+    // Client A: attach-resume; the fake holds its GET /session/:id in flight 2.5s.
+    send_json(&mut ws_a, &attach).await;
+    env.await_audit_row(Duration::from_secs(30), |r| {
+        r["path"] == format!("/session/{ses}")
+    })
+    .await;
+    let serve_pid = env
+        .await_audit_row(Duration::from_secs(5), |r| r["event"] == "listen")
+        .await["pid"]
+        .as_i64()
+        .expect("serve pid");
+
+    // Client B: same durable id mid-resume -> SESSION_RESERVED (never lost).
+    send_json(&mut ws_b, &attach).await;
+    let err = await_frame(&mut ws_b, Duration::from_secs(10), |v| {
+        v["type"] == "freshAgent.event"
+            && v["sessionId"] == ses
+            && v["event"]["type"] == "freshAgent.error"
+    })
+    .await;
+    assert_eq!(err["event"]["code"], "SESSION_RESERVED");
+
+    // The winner's resume completes (idle snapshot).
+    await_frame(&mut ws_a, Duration::from_secs(15), |v| {
+        v["type"] == "freshAgent.event"
+            && v["sessionId"] == ses
+            && v["event"]["type"] == "freshAgent.session.snapshot"
+    })
+    .await;
+
+    // Loser converges on re-attach (now tracked locally: snapshot, no error).
+    send_json(&mut ws_b, &attach).await;
+    await_frame(&mut ws_b, Duration::from_secs(10), |v| {
+        v["type"] == "freshAgent.event"
+            && v["sessionId"] == ses
+            && v["event"]["type"] == "freshAgent.session.snapshot"
+    })
+    .await;
+
+    // The shared serve sidecar was never killed: same pid, still running (not Z/X).
+    let stat = std::fs::read_to_string(format!("/proc/{serve_pid}/stat"))
+        .expect("shared opencode serve must still be alive");
+    let state = stat
+        .rsplit(')')
+        .next()
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or("?");
+    assert!(
+        state != "Z" && state != "X",
+        "the shared opencode serve must never be killed by the lease (state: {state})"
+    );
+
+    // Exactly ONE resume reached the serve for this session id.
+    let gets = env
+        .audit_rows()
+        .into_iter()
+        .filter(|r| r["path"] == format!("/session/{ses}"))
+        .count();
+    assert_eq!(
+        gets, 1,
+        "the loser must never issue a second in-flight resume"
+    );
+}

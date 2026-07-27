@@ -729,36 +729,15 @@ impl FreshClaudeState {
             self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
             return;
         };
-        if let Some(map_key) = self.cli_index.lock().await.get(&durable).cloned() {
+        if self
+            .try_rebind_to_live(&durable, session_type_str(msg.session_type))
+            .await
+        {
             // Task 10b: durable-in-cli_index on a LIVE session is a REBIND + ACK, not a
-            // silent no-op. Flip the live session's envelope stamp to the durable id
-            // (the pane keyed on the durable receives events) and answer the attaching
-            // client with the SAME idle snapshot the attach-resume path broadcasts,
-            // stamped with the durable. The sessions map is never re-keyed (alias,
-            // don't move -- in-flight consumers hold the placeholder key; sends and
-            // kills resolve through `cli_index`).
-            let session_type = session_type_str(msg.session_type).to_string();
-            let rebound = {
-                let guard = self.sessions.lock().await;
-                match guard.get(&map_key) {
-                    Some(session) => {
-                        *session.broadcast_id.lock().expect("broadcast id lock") = durable.clone();
-                        true
-                    }
-                    None => false,
-                }
-            };
-            if rebound {
-                self.broadcast(&status_snapshot_frame(
-                    &durable,
-                    &durable,
-                    "idle",
-                    &session_type,
-                ));
-                return;
-            }
-            // Stale index row (the aliased session died; consumer eviction in flight):
-            // fall through to the resume path below -- resuming converges the client.
+            // silent no-op. A stale index row (the aliased session died; consumer
+            // eviction in flight) falls through to the resume path below instead --
+            // resuming converges the client.
+            return;
         }
         {
             let mut resuming = self.resuming.lock().await;
@@ -766,8 +745,93 @@ impl FreshClaudeState {
                 return; // a concurrent attach is resuming this exact durable id
             }
         }
-        let outcome = self.resume_for_attach(&msg, &durable).await;
+        // Task 13: the attach-resume path SPAWNS, so it claims the D8 lease first (the
+        // in-process `resuming` single-flight above stays -- it is cheap and covers the
+        // attach-vs-attach window; the lease serializes against CREATE-path holders).
+        // Losers get `freshAgent.error { code: "SESSION_RESERVED" }` -- the established
+        // non-lost error channel (never INVALID_SESSION_ID, which would kill the pane).
+        let attach_request_id = format!("attach-{}", uuid::Uuid::new_v4());
+        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+        for round in 0..2u8 {
+            match self.leases.claim(
+                PROVIDER,
+                &durable,
+                &attach_request_id,
+                crate::session_lease::now_epoch_ms(),
+            ) {
+                crate::session_lease::FreshSessionClaim::Acquired => {
+                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
+                        Arc::clone(&self.leases),
+                        PROVIDER,
+                        &durable,
+                        &attach_request_id,
+                    ));
+                    break;
+                }
+                crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
+                    // The winner completed while we contended: converge via the same
+                    // rebind + ack the cli_index arm performs; if the binding is stale
+                    // (session just died), answer RESERVED -- the client re-drive
+                    // converges on the reopened key.
+                    self.resuming.lock().await.remove(&durable);
+                    if !self
+                        .try_rebind_to_live(&durable, session_type_str(msg.session_type))
+                        .await
+                    {
+                        self.emit_fresh_agent_error(
+                            &msg.session_id,
+                            session_type_str(msg.session_type),
+                            "SESSION_RESERVED",
+                            "Another resume for this session is in flight",
+                        );
+                    }
+                    return;
+                }
+                crate::session_lease::FreshSessionClaim::Held { .. } => {
+                    self.resuming.lock().await.remove(&durable);
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        session_type_str(msg.session_type),
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
+                    return;
+                }
+                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
+                    if round == 0
+                        && crate::session_lease::kill_and_confirm_tree_dead(
+                            pid,
+                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                            &ownership_id,
+                        )
+                        .await
+                    {
+                        self.leases
+                            .force_release_after_confirmed_kill(PROVIDER, &durable);
+                        continue;
+                    }
+                    tracing::error!(target: "invariant", pid, session_id = %durable,
+                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
+                    self.resuming.lock().await.remove(&durable);
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        session_type_str(msg.session_type),
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
+                    return;
+                }
+            }
+        }
+        let outcome = self
+            .resume_for_attach(&msg, &durable, &mut lease_guard)
+            .await;
         self.resuming.lock().await.remove(&durable);
+        // Any leftover armed guard means the resume ended WITHOUT registering a session
+        // (its own teardown already ran on every error path) -- release the key.
+        if let Some(mut g) = lease_guard.take() {
+            g.fail();
+        }
         match outcome {
             Ok(()) => {}
             Err(ResumeClaudeError::NotFound) => {
@@ -779,13 +843,48 @@ impl FreshClaudeState {
         }
     }
 
+    /// Task 10b's REBIND + ACK: if `durable` is in `cli_index` and its aliased session
+    /// is LIVE, flip the session's envelope stamp to the durable id and broadcast the
+    /// idle snapshot ack (stamped with the durable). Returns `false` when the index has
+    /// no row or the row is stale (aliased session gone). The sessions map is never
+    /// re-keyed (alias, don't move -- in-flight consumers hold the placeholder key;
+    /// sends and kills resolve through `cli_index`).
+    async fn try_rebind_to_live(&self, durable: &str, session_type: &str) -> bool {
+        let Some(map_key) = self.cli_index.lock().await.get(durable).cloned() else {
+            return false;
+        };
+        let rebound = {
+            let guard = self.sessions.lock().await;
+            match guard.get(&map_key) {
+                Some(session) => {
+                    *session.broadcast_id.lock().expect("broadcast id lock") = durable.to_string();
+                    true
+                }
+                None => false,
+            }
+        };
+        if rebound {
+            self.broadcast(&status_snapshot_frame(
+                durable,
+                durable,
+                "idle",
+                session_type,
+            ));
+        }
+        rebound
+    }
+
     /// The not-tracked resume (codex `ensure_session_resumable` analog, file-store
     /// flavored): transcript-present gate -> spawn sidecar with `resumeSessionId` ->
-    /// register under the CLIENT's id -> idle snapshot.
+    /// register under the CLIENT's id -> idle snapshot. `lease_guard` (Task 13): the
+    /// attach-path D8 lease -- the kill handle is armed after the spawn and the lease
+    /// completed (bound to the map key) at registration; error paths tear down their
+    /// own sidecar and leave the guard for the caller to `fail()`.
     async fn resume_for_attach(
         &self,
         msg: &FreshAgentAttach,
         durable: &str,
+        lease_guard: &mut Option<crate::FreshSessionLeaseGuard>,
     ) -> Result<(), ResumeClaudeError> {
         if crate::claude_snapshot::claude_home_candidates().is_empty() {
             // No store root resolvable at all: we cannot CHECK, so we must not DENY.
@@ -843,6 +942,12 @@ impl FreshClaudeState {
         let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar()
             .await
             .map_err(ResumeClaudeError::Transient)?;
+        // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
+        if let Some(g) = lease_guard.as_mut() {
+            if let Some(pid) = child.id() {
+                g.set_kill_handle(pid, &ownership_id);
+            }
+        }
         let request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
         let create_req = json!({
             "type": "create",
@@ -904,6 +1009,27 @@ impl FreshClaudeState {
             .lock()
             .await
             .insert(durable.to_string(), msg.session_id.clone());
+
+        // Task 13: bind the durable id to this live session + release the lease. A
+        // revoked lease means we must NOT keep the session -- tear down and fail.
+        if let Some(mut g) = lease_guard.take() {
+            if !g.complete(&msg.session_id) {
+                if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
+                    session.consumer.abort();
+                    let mut child = session.child;
+                    let _ = child.start_kill();
+                    reap_owned_claude_sidecars(&session.ownership_id);
+                }
+                self.cli_index
+                    .lock()
+                    .await
+                    .retain(|_, mapped| mapped != &msg.session_id);
+                g.fail(); // own tree torn down -- reopen the key
+                return Err(ResumeClaudeError::Transient(
+                    "session lease revoked during attach-resume; torn down".to_string(),
+                ));
+            }
+        }
 
         self.broadcast(&status_snapshot_frame(
             &msg.session_id,
