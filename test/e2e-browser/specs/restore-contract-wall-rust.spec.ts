@@ -1164,7 +1164,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // (client-side persistMiddleware work -- out of this branch's fence).
     test.fail(
       e2eServerKind === 'rust',
-      'P0.2 (§2.8): server legs landed (attach-resume + snapshot adapter; history + status green); client gap remains -- persistMiddleware strips content.sessionId so the post-reload identity leg fails',
+      'EXPECTED-FAIL WALL PIN (narrowed 2026-07-26 by reconcile-completion): pre-kill content.sessionId is the sidecar-minted placeholder, not the durable ref; the SIGKILL flow yields a respawn verdict which mints a new placeholder -- closing requires claude created/create to expose the durable id as the primary handle (not in C2 scope).',
     )
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshclaude-'))
@@ -2143,9 +2143,16 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // with EXACTLY ONE live PTY -- the one the pane is attached to. A
       // stray duplicate from the interrupted first recovery round would
       // show up here as a second running codex terminal.
-      const paneTerminalId = (await harness.getPaneLayout(tabId))?.content?.terminalId
+      // FLAKE HARDENING (2026-07-26, C2 6x proof): resolve the pane's CURRENT
+      // terminalId INSIDE the poll -- a pre-poll capture races the pane's own
+      // final convergence round (the pane can adopt a NEWER terminal a beat
+      // after the toPass block above, leaving the poll comparing against a
+      // stale id forever). Assertion strength unchanged: exactly one running
+      // codex PTY, and it IS the pane's.
       await expect
         .poll(async () => {
+          const paneTerminalId = (await harness.getPaneLayout(tabId))?.content?.terminalId
+          if (!paneTerminalId) return null
           const res = await fetch(`${info.baseUrl}/api/terminals`, {
             headers: restApiHeaders(info),
           })
