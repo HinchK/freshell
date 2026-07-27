@@ -330,7 +330,7 @@ In `test/e2e-browser/helpers/rust-server.ts`:
         // server that answered is OURS via a token-gated endpoint before
         // declaring success; a foreign server rejects our token.
         const identity = await fetch(`${info.baseUrl}/api/server-info`, {
-          headers: { authorization: `Bearer ${token}` },
+          headers: { 'x-auth-token': token },
         })
         if (!identity.ok) {
           throw new Error(
@@ -340,21 +340,34 @@ In `test/e2e-browser/helpers/rust-server.ts`:
         return info
       } catch (error) {
         lastError = error
-        await this.stopProcess(true)
+        // Between attempts: PROCESS-ONLY cleanup. Do NOT call
+        // stopProcess(true) here -- it deletes the owned home dir and nulls
+        // this.homeDir/this._info (rust-server.ts:575-588), so any retried
+        // boot would leave restart()/restartAbrupt() throwing "RustServer
+        // not started" and leak the home dir on stop(). killCurrentProcess()
+        // (rust-server.ts:504-541) kills only the child and touches neither.
+        await this.killCurrentProcess()
         // Retry ONLY the bind-race shape (kata f3wp): the child exited or
         // never became healthy because the probed port was stolen between
         // findFreePort's close and the server's bind -- or a foreign server
         // answered the health poll (identity check above). Everything else
-        // is a genuine boot failure -- rethrow immediately.
+        // is a genuine boot failure -- clean up fully and rethrow immediately
+        // (preserving the original single-attempt failure semantics).
         const message = error instanceof Error ? error.message : String(error)
         const bindRace = /EADDRINUSE|address (?:already )?in use|bind race/i.test(message)
-        if (!bindRace) throw error
+        if (!bindRace) {
+          await this.stopProcess(true)
+          throw error
+        }
       }
     }
+    // All attempts exhausted: full cleanup (home dir included), as the
+    // original pre-retry catch did.
+    await this.stopProcess(true)
     throw lastError
 ```
 
-VALIDATED (from the load-bearing stage, empirically): `freshell-server` spawned onto an occupied port exits with code 1 in ~0.13 s and prints `failed to bind 127.0.0.1:<port>: Address already in use (os error 98)` to stderr (single bind attempt, no internal retry) — so failed attempts are fast, NOT a 60 s health burn. `waitForHealth` already embeds the child's stderr in its child-exit error (rust-server.ts:594-598), so the predicate sees the bind text via the "address in use" alternation (the literal `EADDRINUSE` never appears in Rust's message — keep both alternates). No stderr-appending contingency is needed; do not widen the predicate to "retry any failure". For the identity check: confirm in Step 1's reading the exact auth header/query shape the server expects for token-gated endpoints (`/api/server-info` returns 401 for a missing/wrong token — verified; mirror however the existing helpers pass the token) and adjust the fetch above to match.
+VALIDATED (from the load-bearing stage, empirically): `freshell-server` spawned onto an occupied port exits with code 1 in ~0.13 s and prints `failed to bind 127.0.0.1:<port>: Address already in use (os error 98)` to stderr (single bind attempt, no internal retry) — so failed attempts are fast, NOT a 60 s health burn. `waitForHealth` already embeds the child's stderr in its child-exit error (rust-server.ts:594-598), so the predicate sees the bind text via the "address in use" alternation (the literal `EADDRINUSE` never appears in Rust's message — keep both alternates). No stderr-appending contingency is needed; do not widen the predicate to "retry any failure". For the identity check: the auth shape is VERIFIED against the crate — `is_authed` (`crates/freshell-server/src/boot.rs:686-708`, used by `server_info` in `crates/freshell-server/src/diag.rs:83-89`) accepts ONLY the `x-auth-token` header or the `freshell-auth` cookie (a present non-empty header wins; there is NO Bearer/authorization support anywhere in the crate). Existing test code passes the token the same way (e.g. `test/e2e-browser/specs/harness-02-matrix-bite.spec.ts:67-69` fetches `/api/server-info` with `headers: { 'x-auth-token': token }`). The fetch above uses exactly that shape — do not switch to an `authorization` header.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -708,11 +721,11 @@ Expected: PASS — all ~48 tests including the new regression test.
 
 - [ ] **Step 7: Affected-suite 10x proof**
 
-The affected suite is the file's real home, `npm run test:server` (coordinated — set the summary env; WAIT on the gate if held; each run is minutes):
+The affected suite is the file's real home, `npm run test:server -- --run` (the explicit broad `--run` is REQUIRED: per `scripts/testing/coordinator-command-matrix.ts:230-246` and AGENTS.md, a zero-arg `test:server` is classified delegated and stays watch-capable — it would hang in watch mode or bypass the coordination gate; only `-- --run` without narrowing selectors takes the coordinated broad path, which sets the summary env and WAITs on the gate if held; each run is minutes):
 ```bash
 cd /home/dan/code/freshell/.worktrees/deflake-load-flakes
 for i in 1 2 3 4 5 6 7 8 9 10; do
-  env -u FRESHELL_BIND_HOST FRESHELL_TEST_SUMMARY="f3wp flake3 proof $i/10" npm run test:server \
+  env -u FRESHELL_BIND_HOST FRESHELL_TEST_SUMMARY="f3wp flake3 proof $i/10" npm run test:server -- --run \
     2>&1 | tail -5 | tee -a /tmp/deflake-logs/flake3-10x.log
   test "${PIPESTATUS[0]}" -eq 0 || { echo "RUN $i FAILED" | tee -a /tmp/deflake-logs/flake3-10x.log; break; }
 done
