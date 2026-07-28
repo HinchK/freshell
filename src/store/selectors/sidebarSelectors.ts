@@ -641,14 +641,18 @@ export function sortSessionItems(
   const active = sorted.filter((i) => !i.archived)
   const archived = sorted.filter((i) => i.archived)
 
-  const compareByRecency = (a: SidebarSessionItem, b: SidebarSessionItem) => b.timestamp - a.timestamp
+  const compareBySessionKey = (a: SidebarSessionItem, b: SidebarSessionItem) =>
+    a.provider.localeCompare(b.provider) || a.sessionId.localeCompare(b.sessionId)
+
+  const compareByRecency = (a: SidebarSessionItem, b: SidebarSessionItem) =>
+    b.timestamp - a.timestamp || compareBySessionKey(a, b)
   const compareByActivity = (a: SidebarSessionItem, b: SidebarSessionItem) => {
     const aHasRatcheted = typeof a.ratchetedActivity === 'number'
     const bHasRatcheted = typeof b.ratchetedActivity === 'number'
     if (aHasRatcheted !== bHasRatcheted) return aHasRatcheted ? -1 : 1
     const aTime = a.ratchetedActivity ?? a.timestamp
     const bTime = b.ratchetedActivity ?? b.timestamp
-    return bTime - aTime
+    return bTime - aTime || compareBySessionKey(a, b)
   }
 
   const sortByMode = (list: SidebarSessionItem[]) => {
@@ -683,7 +687,7 @@ export function sortSessionItems(
       withTabs.sort((a, b) => {
         const aTime = a.ratchetedActivity ?? a.timestamp
         const bTime = b.ratchetedActivity ?? b.timestamp
-        return bTime - aTime
+        return bTime - aTime || compareBySessionKey(a, b)
       })
 
       withoutTabs.sort((a, b) => {
@@ -692,7 +696,7 @@ export function sortSessionItems(
         if (aHasRatcheted !== bHasRatcheted) return aHasRatcheted ? -1 : 1
         const aTime = a.ratchetedActivity ?? a.timestamp
         const bTime = b.ratchetedActivity ?? b.timestamp
-        return bTime - aTime
+        return bTime - aTime || compareBySessionKey(a, b)
       })
 
       return [...withTabs, ...withoutTabs]
@@ -703,7 +707,7 @@ export function sortSessionItems(
         const projA = a.projectPath || a.subtitle || ''
         const projB = b.projectPath || b.subtitle || ''
         if (projA !== projB) return projA.localeCompare(projB)
-        return b.timestamp - a.timestamp
+        return b.timestamp - a.timestamp || compareBySessionKey(a, b)
       })
     }
 
