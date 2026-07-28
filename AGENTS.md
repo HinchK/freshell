@@ -61,7 +61,31 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
   - **NEVER run `node dist/server/index.js` directly** — use `npm start` which sets `NODE_ENV=production`; without it the server prints the Vite port (5173) in the startup URL even though Vite isn't running
 - Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
 - Before stopping any process, verify it belongs to the worktree (`ps -fp <pid>` and confirm cwd/path includes `.worktrees/...`).
-- **The self-hosted Freshell server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation.
+- **The self-hosted Freshell server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation. As of July 2026 the live self-hosted server is the RUST server on port 3002 (see below), not the Node server.
+
+## Rust Server (Self-Hosted Production)
+
+The production self-hosted Freshell is the Rust server (`target/release/freshell-server`, workspace crate `freshell-server`), running on **port 3002** from the main checkout. The Node server (`npm start`) still exists but is not what the user runs day-to-day.
+
+**Canonical launcher: `scripts/launch-rust.sh`** — use this instead of hand-rolled build/launch commands:
+
+```bash
+scripts/launch-rust.sh                 # build client + Rust server, start on port 3002
+scripts/launch-rust.sh --port 3499     # any other port (e.g. testing from a worktree)
+scripts/launch-rust.sh --client-only   # rebuild dist/client ONLY (no restart needed)
+scripts/launch-rust.sh --skip-build    # start without rebuilding
+scripts/launch-rust.sh --restart       # stop the pid-file-verified instance, then start
+scripts/launch-rust.sh --stop          # stop the pid-file-verified instance
+```
+
+Key facts:
+
+- **Client is served from disk.** The Rust server serves `dist/client` from the filesystem (SPA + fallback routing), so `--client-only` + a browser hard-refresh deploys client-side changes **without a server restart** (and therefore without needing "APPROVED"). Server-side (Rust) changes DO require a restart.
+- **Restarting the live 3002 server still requires the user's explicit "APPROVED"** — `--restart`/`--stop` exist for approved deploys and for scratch instances on other ports, not as a license to bounce production.
+- The script is safe by construction: it only ever kills PIDs from its own pid file, after verifying the process is this repo's `freshell-server` binary (cwd + args match); if the port is held by anything else it refuses. Logs go to `~/.freshell/logs/rust-server-<port>.log`, pid to `~/.freshell/rust-server-<port>.pid`.
+- The server loads `.env` from its cwd (env vars win over the file) and refuses to start without `AUTH_TOKEN`. Note `.env`'s `PORT` may differ from the live port — the launcher passes `PORT` explicitly.
+- The startup log line includes the commit the binary was built from: `freshell-server listening on http://0.0.0.0:<port> (ws://...) [commit <sha>]`. Use it (or `~/.freshell/logs/rust-server-3002.log`) to check what the running server was built from when asking "are we running change X?".
+- Health check: `curl http://127.0.0.1:<port>/api/health` (unauthenticated, rate-limit exempt).
 
 ## Codex Agent in CMD Instructions (Codex agents only; only when running in CMD on windows; all other agents must ignore)
 - Prefer bash/WSL over PowerShell; Windows paths map like `D:\\...` -> `/mnt/d/...`.
