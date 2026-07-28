@@ -110,6 +110,7 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'attentionDismiss')
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'sessionOpenMode')
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'multirowTabs')
+  assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'repoIconsOnTabs')
   if (Object.keys(panes).length > 0) {
     patch.panes = panes
   }
