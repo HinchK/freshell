@@ -12,11 +12,6 @@
 //!
 //! No `git` subprocess is spawned (deliberate, matching the Node reference).
 
-// TEMPORARY (removed in Task 6 Step 7): until Task 6 wires `resolve_repo`
-// into the HTTP layer, the non-test build sees everything here as dead code
-// and the per-task `clippy -D warnings` gate would fail without this.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]

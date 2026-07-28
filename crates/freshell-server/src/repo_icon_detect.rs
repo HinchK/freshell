@@ -1,11 +1,6 @@
 //! Repo icon detection: bounded, tiered candidate scan with scoring.
 //! Part 1 (this section): byte probes, hashing, framework-defaults blacklist.
 
-// TEMPORARY (removed in Task 6 Step 7): until Task 6 wires `detect_icon`
-// into the HTTP layer, the non-test build sees everything here as dead code
-// and the per-task `clippy -D warnings` gates (Tasks 2-5) would fail without this.
-#![allow(dead_code)]
-
 use sha2::{Digest, Sha256};
 
 /// PNG: 8-byte signature, then IHDR with big-endian u32 width/height at 16/20.

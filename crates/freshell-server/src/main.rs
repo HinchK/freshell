@@ -29,6 +29,7 @@ mod network;
 mod proxy;
 mod rate_limit;
 mod recovery_inventory;
+mod repo_icon;
 mod repo_icon_detect;
 mod repo_icon_git;
 mod screenshots;
@@ -798,6 +799,15 @@ async fn main() -> ExitCode {
         registry: registry.clone(),
     };
 
+    // The repo-icon surface: same auth token and live settings tree as the
+    // files surface (the `allowed_file_paths` sandbox), plus an in-process
+    // per-repo-root icon cache.
+    let repo_icon_state = repo_icon::RepoIconState {
+        auth_token: Arc::clone(&auth_token),
+        settings: settings_store.clone(),
+        cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
+
     // The `/api/terminals` directory surface (GET list/page + PATCH/DELETE
     // overrides): reads the SAME registry the WS terminal path owns, patches
     // `config.terminalOverrides` through the live settings store, and broadcasts
@@ -959,6 +969,7 @@ async fn main() -> ExitCode {
             sessions_revision: Arc::clone(&sessions_revision),
         }))
         .merge(files::router(files_state))
+        .merge(repo_icon::router(repo_icon_state))
         .merge(terminals::router(terminals_state))
         .merge(proxy::router(proxy_state))
         .merge(screenshots::router(screenshots_state))

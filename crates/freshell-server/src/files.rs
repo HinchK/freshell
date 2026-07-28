@@ -433,7 +433,7 @@ fn add_unique_directory(
 /// POSIX host the oracle runs on \u2014 the `\\wsl$\u2026` Windows flavor is a later step,
 /// not exercised by the Linux-host e2e). Returns the path unchanged when it does
 /// not resolve.
-fn normalize_user_path(input: &str) -> String {
+pub(crate) fn normalize_user_path(input: &str) -> String {
     let expanded = expand_tilde(input);
     trim_trailing_separators(&expanded)
 }
@@ -489,7 +489,7 @@ fn mtime_iso(meta: &std::fs::Metadata) -> String {
 /// Port of `isPathAllowed` (`path-utils.ts`): a target is allowed iff there are no
 /// configured roots, or it equals / is nested under one (at a directory boundary).
 /// POSIX comparison (the oracle host); the Windows case-fold flavor is deferred.
-fn is_path_allowed(target: &str, allowed_roots: Option<&[String]>) -> bool {
+pub(crate) fn is_path_allowed(target: &str, allowed_roots: Option<&[String]>) -> bool {
     let roots = match allowed_roots {
         Some(roots) if !roots.is_empty() => roots,
         _ => return true,
@@ -540,12 +540,12 @@ fn unauthorized() -> Response {
 }
 
 /// `400 { "error": <msg> }`.
-fn bad_request(msg: &str) -> Response {
+pub(crate) fn bad_request(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
 /// `403 { "error": "Path not allowed" }` \u2014 the sandbox-deny shape (`files-router.ts:79`).
-fn forbidden() -> Response {
+pub(crate) fn forbidden() -> Response {
     (
         StatusCode::FORBIDDEN,
         Json(json!({ "error": "Path not allowed" })),
@@ -559,7 +559,7 @@ fn forbidden_msg(msg: &str) -> Response {
 }
 
 /// `404 { "error": <msg> }`.
-fn not_found(msg: &str) -> Response {
+pub(crate) fn not_found(msg: &str) -> Response {
     (StatusCode::NOT_FOUND, Json(json!({ "error": msg }))).into_response()
 }
 
