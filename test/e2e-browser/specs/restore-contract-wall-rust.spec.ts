@@ -340,7 +340,11 @@ process.exit(result.status ?? 1)
   return dest
 }
 
-async function createFreshcodexPane(page: Page, harness: TestHarness): Promise<void> {
+async function createFreshcodexPane(
+  page: Page,
+  harness: TestHarness,
+  cwd: string,
+): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
   // bootstrap + /api/platform fetch (App.tsx:572,609). Callers reach this
   // helper only after harness.waitForConnection(), which is what makes the
@@ -354,14 +358,21 @@ async function createFreshcodexPane(page: Page, harness: TestHarness): Promise<v
   })
   const picker = await openPanePicker(page)
   await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
-  // "First option" exists here only because selectShellIfPickerShowing
-  // already opened a shell whose live-terminal cwd becomes a candidate dir
-  // (/api/files/candidate-dirs returns [] on a truly clean boot -- no $HOME
-  // fallback, crates/freshell-server/src/files.rs:15-26). This mirrors the
-  // donor exactly (restore-double-restart.spec.ts:148-176); if no option
-  // renders, switch to the fill+Enter pattern used by
-  // createFreshopencodePane/createFreshclaudePane.
-  await page.getByRole('option').first().click()
+  // DEFLAKE/REBASE (f3wp refresh, 2026-07-28): main's #553 added the sidebar
+  // "Repo filter" -- a native <select> (Sidebar.tsx:713-727) whose <option>
+  // children are DOM-earlier than the DirectoryPicker candidates, so the old
+  // page-global `getByRole('option').first().click()` resolves to the
+  // ALWAYS-HIDDEN "All" option of the CLOSED select whenever the sidebar has
+  // repo-grouped sessions (true in THE RULER by this point) and waits on
+  // visibility forever -- observed as 4/4 deterministic RULER test-timeouts
+  // (trace pending on `role=option >> nth=0`, timeout 0). Use the fill+Enter
+  // pattern this helper's own contingency note prescribed (same as
+  // createFreshclaudePane/createFreshopencodePane) -- no role=option
+  // dependency at all.
+  const directoryInput = page.getByLabel(/^Starting directory for Freshcodex$/i)
+  await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+  await directoryInput.fill(cwd)
+  await directoryInput.press('Enter')
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
     timeout: 15_000,
   })
@@ -962,7 +973,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // the Freshcodex click is swallowed (donor ordering:
       // restore-double-restart.spec.ts:210-214; same guard as Contracts B/D).
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
-      await createFreshcodexPane(page, harness)
+      await createFreshcodexPane(page, harness, sharedRoot)
       await sendFreshAgentTurn(page, harness, tabId, 'wall freshcodex turn')
       await expect(
         page.locator('[data-context="fresh-agent"]').last().getByText('Fixture turn'),
@@ -1567,7 +1578,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // (boot-picker fade-out guard applies after every tab-add + shell pick).
       await expect(page.locator('.xterm').last()).toBeVisible({ timeout: 30_000 })
       await openSplitPickerOnVisibleTerminal()
-      await createFreshcodexPane(page, harness)
+      await createFreshcodexPane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, freshcodexTabId, 'ruler freshcodex turn')
       const freshcodexId = leafDurableIdentity(
         findFreshAgentLeaf(await harness.getPaneLayout(freshcodexTabId)),
