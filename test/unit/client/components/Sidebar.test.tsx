@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createHash } from 'crypto'
-import { render, screen, fireEvent, cleanup, act, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, cleanup, act, waitFor, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import Sidebar from '@/components/Sidebar'
@@ -101,6 +101,7 @@ function createTestStore(options?: {
   sortMode?: 'recency' | 'activity' | 'project'
   showProjectBadges?: boolean
   sessionOpenMode?: 'tab' | 'split'
+  sidebarSettings?: Partial<(typeof defaultSettings)['sidebar']>
   sessionActivity?: Record<string, number>
   codexActivity?: Partial<CodexActivityState>
   opencodeActivity?: Partial<OpencodeActivityState>
@@ -164,6 +165,7 @@ function createTestStore(options?: {
             sortMode: options?.sortMode ?? 'activity',
             showProjectBadges: options?.showProjectBadges ?? true,
             hideEmptySessions: false,
+            ...options?.sidebarSettings,
           },
           panes: {
             ...defaultSettings.panes,
@@ -1961,7 +1963,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       vi.advanceTimersByTime(100)
 
-      expect(screen.getByText('my-awesome-project')).toBeInTheDocument()
+      expect(within(screen.getByTestId('sidebar-session-list')).getByText('my-awesome-project')).toBeInTheDocument()
     })
 
     it('hides project name when showProjectBadges is false', async () => {
@@ -1985,7 +1987,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       vi.advanceTimersByTime(100)
 
-      expect(screen.queryByText('my-awesome-project')).not.toBeInTheDocument()
+      expect(within(screen.getByTestId('sidebar-session-list')).queryByText('my-awesome-project')).not.toBeInTheDocument()
     })
   })
 
@@ -2308,6 +2310,168 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       const select = getByRole('combobox', { name: /search tier/i })
       expect(select).toHaveValue('title')
+    })
+  })
+
+  describe('Repo filter dropdown', () => {
+    const repoProjects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/repo-alpha',
+        sessions: [
+          {
+            sessionId: sessionId('alpha-1'),
+            projectPath: '/home/user/repo-alpha',
+            lastActivityAt: Date.now() - 1000,
+            title: 'Alpha session one',
+            cwd: '/home/user/repo-alpha',
+          },
+          {
+            sessionId: sessionId('alpha-2'),
+            projectPath: '/home/user/repo-alpha',
+            lastActivityAt: Date.now() - 2000,
+            title: 'Alpha session two',
+            cwd: '/home/user/repo-alpha',
+          },
+        ],
+      },
+      {
+        projectPath: '/home/user/repo-beta',
+        sessions: [
+          {
+            sessionId: sessionId('beta-1'),
+            projectPath: '/home/user/repo-beta',
+            lastActivityAt: Date.now() - 3000,
+            title: 'Beta session one',
+            cwd: '/home/user/repo-beta',
+          },
+        ],
+      },
+    ]
+
+    it('renders the repo dropdown defaulting to All with one option per repo', async () => {
+      const store = createTestStore({ projects: repoProjects })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const select = getByRole('combobox', { name: /repo filter/i }) as HTMLSelectElement
+      expect(select).toHaveValue('all')
+      expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
+        'All',
+        'repo-alpha',
+        'repo-beta',
+      ])
+      expect(Array.from(select.options).map((o) => o.value)).toEqual([
+        'all',
+        '/home/user/repo-alpha',
+        '/home/user/repo-beta',
+      ])
+    })
+
+    it('shows all sessions by default and filters the list to the selected repo', async () => {
+      const store = createTestStore({ projects: repoProjects })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      expect(screen.getByText('Alpha session one')).toBeInTheDocument()
+      expect(screen.getByText('Beta session one')).toBeInTheDocument()
+
+      fireEvent.change(getByRole('combobox', { name: /repo filter/i }), {
+        target: { value: '/home/user/repo-beta' },
+      })
+
+      expect(screen.getByText('Beta session one')).toBeInTheDocument()
+      expect(screen.queryByText('Alpha session one')).not.toBeInTheDocument()
+      expect(screen.queryByText('Alpha session two')).not.toBeInTheDocument()
+    })
+
+    it('does not render the dropdown when no repos are loaded', async () => {
+      const store = createTestStore({ projects: [] })
+      const { queryByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      expect(queryByRole('combobox', { name: /repo filter/i })).not.toBeInTheDocument()
+    })
+
+    it('lists repo roots (not worktree checkout paths) in worktree grouping mode and still filters by repo', async () => {
+      const store = createTestStore({
+        sidebarSettings: { worktreeGrouping: 'worktree' },
+        projects: [
+          {
+            projectPath: '/home/user/repo-alpha',
+            sessions: [
+              {
+                sessionId: sessionId('wt-1'),
+                projectPath: '/home/user/repo-alpha',
+                checkoutPath: '/home/user/repo-alpha/.worktrees/feature-x',
+                lastActivityAt: Date.now() - 1000,
+                title: 'Worktree session',
+                cwd: '/home/user/repo-alpha/.worktrees/feature-x',
+              },
+            ],
+          },
+        ],
+      })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const select = getByRole('combobox', { name: /repo filter/i }) as HTMLSelectElement
+      expect(Array.from(select.options).map((o) => o.value)).toEqual([
+        'all',
+        '/home/user/repo-alpha',
+      ])
+
+      fireEvent.change(select, { target: { value: '/home/user/repo-alpha' } })
+      expect(screen.getByText('Worktree session')).toBeInTheDocument()
+    })
+
+    it('excludes server-fabricated live-terminal rows from the repo options (both variants)', async () => {
+      const store = createTestStore({
+        projects: [
+          ...repoProjects,
+          {
+            projectPath: 'terminal:t-123',
+            sessions: [
+              {
+                sessionId: sessionId('live-1'),
+                projectPath: 'terminal:t-123',
+                lastActivityAt: Date.now() - 500,
+                title: 'Live terminal row',
+                liveTerminalOnly: true,
+              },
+            ],
+          },
+          {
+            // sessionId-bearing but not-yet-indexed live terminal in a worktree:
+            // liveTerminalOnly is false, but checkoutPath === projectPath (an
+            // equality the indexer never emits) marks it server-fabricated.
+            projectPath: '/home/user/repo-alpha/.worktrees/live-wt',
+            sessions: [
+              {
+                sessionId: sessionId('live-2'),
+                projectPath: '/home/user/repo-alpha/.worktrees/live-wt',
+                checkoutPath: '/home/user/repo-alpha/.worktrees/live-wt',
+                lastActivityAt: Date.now() - 600,
+                title: 'Unindexed live session',
+                liveTerminalOnly: false,
+                isRunning: true,
+              },
+            ],
+          },
+        ],
+      })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const select = getByRole('combobox', { name: /repo filter/i }) as HTMLSelectElement
+      expect(Array.from(select.options).map((o) => o.value)).toEqual([
+        'all',
+        '/home/user/repo-alpha',
+        '/home/user/repo-beta',
+      ])
+
+      fireEvent.change(select, { target: { value: '/home/user/repo-alpha' } })
+      expect(screen.queryByText('Live terminal row')).not.toBeInTheDocument()
+      expect(screen.queryByText('Unindexed live session')).not.toBeInTheDocument()
     })
   })
 
