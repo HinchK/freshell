@@ -19,7 +19,7 @@
 - Setting `panes.repoIconsOnTabs`, default **ON**, browser-local — follow the exact `panes.iconsOnTabs`/`multirowTabs` pattern. No per-repo user override mechanism.
 - Server side is **Rust only** (`crates/freshell-server`). Do NOT implement in the Node `server/`. Client must degrade gracefully when the endpoint is absent (Node dev server): fall back to the letter avatar.
 - Detection scope v1: the tiered detector below only. Skip README-image parsing, .desktop/hicolor, .icns extraction, name-matching icon CDNs.
-- Security: canonicalize (realpath) both the supplied path and the winning candidate; candidate MUST be inside the repo root after symlink resolution. SVG served with `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`, `Content-Disposition: inline`; SVGs containing `<!DOCTYPE` or `<!ENTITY` are rejected. Client renders icons ONLY via `<img src>` (never inline SVG into the DOM).
+- Security: canonicalize (realpath) both the supplied path and the winning candidate; candidate MUST be inside the repo root after symlink resolution. The `allowed_file_paths` sandbox is enforced THREE times: on the raw normalized cwd (files.rs parity), re-checked on the CANONICAL cwd (symlink-escape defense — parity with Node's realpath-before-allowlist in `server/path-utils.ts:291-313`), and on the CANONICAL resolved repo root (the `.git` walk goes upward and must never serve bytes from an ancestor outside the sandbox). SVG served with `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`, `Content-Disposition: inline`; SVGs containing `<!DOCTYPE` or `<!ENTITY` are rejected. Client renders icons ONLY via `<img src>` (never inline SVG into the DOM).
 - Auth for the icon `<img>`: the existing `freshell-auth` cookie (accepted by `boot::is_authed`). Do NOT invent a `?token=` query pattern.
 - No protocol changes: no new `TerminalMeta`/WS fields, so no `crates/freshell-protocol` or `port/contract/*.schema.json` changes.
 - `npm run lint` (jsx-a11y) is a CI gate; new client code must be lint-clean. Rust CI gate: `cargo fmt --all --check` + `cargo clippy --workspace --all-targets -- -D warnings` (pinned toolchain 1.96.0).
@@ -285,20 +285,34 @@ git commit -m "feat(rust): repo-root resolver for repo icons (pure .git walk, wo
 - Consumes: `sha2` (existing dep).
 - Produces (all `pub(crate)`, consumed by Tasks 3–6): `png_dimensions(&[u8]) -> Option<(u32,u32)>`, `ico_largest_dimensions(&[u8]) -> Option<(u32,u32)>`, `svg_dimensions(&str) -> Option<(f64,f64)>`, `svg_is_dangerous(&str) -> bool`, `sha256_hex(&[u8]) -> String`, `framework_default_name(&[u8]) -> Option<&'static str>`.
 
-- [ ] **Step 1: Fetch the blacklist seed content**
+- [ ] **Step 1: Create the blacklist test fixture (offline — seed digests are pre-verified)**
 
-The blacklist is an easily-extended `sha256 -> name` table seeded with well-known scaffold defaults. Fetch them now:
+The blacklist is an easily-extended `sha256 -> name` table seeded with well-known scaffold defaults. The six seed digests in Step 4 were **pre-verified on 2026-07-28** against upstream pinned refs AND real scaffolded repos on this machine (see `.worktrees/.the-usual-logs/repo-icons-on-tabs/reports/validator-A1-A2.md`) — do NOT re-derive them from `main`-branch fetches: the classic `vite.svg` was rebranded and then renamed to `favicon.svg` upstream in Jan 2026, so the plan's original `main` URL now 404s.
+
+The test fixture comes from inside this repo (an unmodified create-vite scaffold copy):
 
 ```bash
 mkdir -p crates/freshell-server/testdata
-curl -fsSL https://raw.githubusercontent.com/vitejs/vite/main/packages/create-vite/template-react/public/vite.svg \
-  -o crates/freshell-server/testdata/vite.svg
+cp examples/demo-projects/synth/public/vite.svg crates/freshell-server/testdata/vite.svg
 sha256sum crates/freshell-server/testdata/vite.svg
-curl -fsSL https://raw.githubusercontent.com/facebook/create-react-app/main/packages/cra-template/template/public/logo192.png | sha256sum
-curl -fsSL https://raw.githubusercontent.com/facebook/create-react-app/main/packages/cra-template/template/public/logo512.png | sha256sum
 ```
 
-Expected: three 64-hex-char digests printed. Record them — they go into `FRAMEWORK_DEFAULTS` in Step 4. If a URL 404s (upstream moved), find the same file's raw URL on the project's default branch via the GitHub UI and re-run; if the network is entirely unavailable, seed only the entries you can hash locally and leave the others as commented rows containing the exact curl command (the table mechanism is still fully tested via the fixture).
+Expected: exactly `4a748afd443918bb16591c834c401dae33e87861ab5dbad0811c3a3b4a9214fb` — this MUST match the `vite-default-logo` row in Step 4's table (the fixture and the table row are the same bytes; the test depends on it). If you want to independently re-verify any seed, use these pinned-ref URLs (all verified working; never use unpinned `main` for vite):
+
+```bash
+# classic vite.svg (all create-vite templates, Jun 2022 - Jan 2026), expect 4a748afd…
+curl -fsSL https://raw.githubusercontent.com/vitejs/vite/v5.4.0/packages/create-vite/template-react/public/vite.svg | sha256sum
+# new Vite logo (post-Jan-2026 scaffolds ship it as public/favicon.svg), expect 61bc9a16…
+curl -fsSL https://raw.githubusercontent.com/vitejs/vite/main/packages/create-vite/template-react/public/favicon.svg | sha256sum
+# CRA >= 3.3 (cra-template, frozen since 2019 — repo archived), expect c386396e… / 9ea4f4da…
+curl -fsSL https://raw.githubusercontent.com/facebook/create-react-app/main/packages/cra-template/template/public/logo192.png | sha256sum
+curl -fsSL https://raw.githubusercontent.com/facebook/create-react-app/main/packages/cra-template/template/public/logo512.png | sha256sum
+# CRA 3.0-3.2 (react-scripts template era), expect 15d08b02… / 6c9a8886…
+curl -fsSL https://raw.githubusercontent.com/facebook/create-react-app/v3.2.0/packages/react-scripts/template/public/logo192.png | sha256sum
+curl -fsSL https://raw.githubusercontent.com/facebook/create-react-app/v3.2.0/packages/react-scripts/template/public/logo512.png | sha256sum
+```
+
+(Always keep `-f`/`--fail` on these curls: without it a 404 body gets hashed — `d5558cd4…` — and silently poisons the table.)
 
 - [ ] **Step 2: Declare the module and write the failing tests**
 
@@ -491,13 +505,27 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 /// Known framework scaffold defaults, by content sha256. Rejected so every
 /// Vite/CRA project doesn't show the same framework logo on tabs.
 /// EXTEND FREELY: one `("<sha256>", "<name>")` row per known default.
-/// Seeds are the create-vite public/vite.svg and CRA logo192/logo512 —
-/// their content is stable upstream; the hashes below were computed from
-/// the files fetched in this task's Step 1.
+/// All six digests below were verified 2026-07-28 against upstream pinned
+/// refs AND real scaffolded repos (see the pinned-ref curl commands in this
+/// task's Step 1). Content-hash (not filename) matching is deliberate: real
+/// users customize `logo192.png`/`favicon.svg` in place, and a name-based
+/// rejection would suppress those genuine custom icons.
 const FRAMEWORK_DEFAULTS: &[(&str, &str)] = &[
-    ("<PASTE sha256 of testdata/vite.svg from Step 1>", "vite-default-logo"),
-    ("<PASTE sha256 of CRA logo192.png from Step 1>", "cra-logo192"),
-    ("<PASTE sha256 of CRA logo512.png from Step 1>", "cra-logo512"),
+    // create-vite public/vite.svg, ALL templates (react/vue/vanilla/svelte), Jun 2022 - Jan 2026
+    ("4a748afd443918bb16591c834c401dae33e87861ab5dbad0811c3a3b4a9214fb", "vite-default-logo"),
+    // new Vite logo after the Jan 2026 rebrand; scaffolds ship it as public/favicon.svg
+    ("61bc9a161de58248288e6905425d7180f0624c2865007b97d763fdac12043a66", "vite-default-logo-2026"),
+    // CRA >= 3.3 (cra-template era, frozen upstream since 2019; repo archived)
+    ("c386396ec70db3608075b5fbfaac4ab1ccaa86ba05a68ab393ec551eb66c3e00", "cra-logo192"),
+    ("9ea4f4da7050c0cc408926f6a39c253624e9babb1d43c7977cd821445a60b461", "cra-logo512"),
+    // CRA 3.0-3.2 (react-scripts template era) shipped different bytes
+    ("15d08b02d78823c12616b72d1b5adb0520940016b89bae1f758e6f1a105597ff", "cra-logo192-legacy"),
+    ("6c9a88867fefa2489b91fb85dab7cbec88f1022193ede7320da0ac3c45429519", "cra-logo512-legacy"),
+    // Worthwhile extension (hash it yourself before adding — do NOT guess):
+    // create-next-app ships a Vercel-logo `app/favicon.ico` that tier-2 fixed
+    // paths WILL pick up on fresh Next.js repos. Scaffold one (`npx
+    // create-next-app`) or fetch the template file at a pinned ref, sha256 it,
+    // and add a ("<hex>", "nextjs-default-favicon") row.
 ];
 
 pub(crate) fn framework_default_name(bytes: &[u8]) -> Option<&'static str> {
@@ -509,7 +537,7 @@ pub(crate) fn framework_default_name(bytes: &[u8]) -> Option<&'static str> {
 }
 ```
 
-Replace the three `<PASTE …>` placeholders with the actual 64-hex digests printed in Step 1 (this is the one place values come from Step 1's command output — they MUST be real hex before commit; `git grep 'PASTE sha256' crates` must return nothing).
+All digests above are complete, pre-verified values — nothing to paste. Sanity gate before commit: Step 1's `sha256sum crates/freshell-server/testdata/vite.svg` must print `4a748afd…214fb` (the `vite-default-logo` row), or the fixture test below cannot pass.
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -1682,6 +1710,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repo_root_outside_allowlist_is_forbidden() {
+        // cwd is inside an allowed root, but the `.git` walk resolves the repo
+        // root to an ANCESTOR outside every allowed root -> Forbidden. The
+        // upward walk must never serve bytes from outside the sandbox.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = mkrepo_with_icon(&tmp); // tmp/proj: has .git + icon
+        let inner = repo.join("workdir");
+        fs::create_dir_all(&inner).unwrap();
+        let state = test_state();
+        let outcome = resolve_repo_and_icon(
+            &state,
+            &inner.to_string_lossy(),
+            Some(&[inner.to_string_lossy().into_owned()]), // only workdir allowed
+        );
+        assert!(matches!(outcome, Err(ResolveFailure::Forbidden)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlinked_cwd_escaping_allowlist_is_forbidden() {
+        // A symlink INSIDE an allowed root pointing OUTSIDE it: the raw path
+        // passes the string-prefix check, so the canonical path must be
+        // re-checked (Node realpath parity).
+        let tmp = tempfile::tempdir().unwrap();
+        let outside_repo = mkrepo_with_icon(&tmp); // tmp/proj, outside allowed
+        let allowed = tmp.path().join("allowed");
+        fs::create_dir_all(&allowed).unwrap();
+        std::os::unix::fs::symlink(&outside_repo, allowed.join("link")).unwrap();
+        let state = test_state();
+        let outcome = resolve_repo_and_icon(
+            &state,
+            &allowed.join("link").to_string_lossy(),
+            Some(&[allowed.to_string_lossy().into_owned()]),
+        );
+        assert!(matches!(outcome, Err(ResolveFailure::Forbidden)));
+    }
+
+    #[tokio::test]
     async fn cache_invalidates_when_icon_deleted() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = mkrepo_with_icon(&tmp);
@@ -1794,10 +1860,20 @@ fn failure_response(failure: ResolveFailure) -> Response {
     }
 }
 
-/// Sandbox + resolve + detect (with cache). Both the cwd and the winning
-/// candidate are canonicalized; the candidate must stay inside the repo root
-/// after symlink resolution — this is the escape defense the Node side gets
-/// from `fs.realpathSync` in `isPathAllowed` (`server/path-utils.ts:292`).
+/// Sandbox + resolve + detect (with cache). The `allowed_file_paths` sandbox
+/// is a hard security boundary for file disclosure (see the "security-relevant"
+/// R3/FILE-05 notes in files.rs and the rest-parity report), and this surface
+/// walks UPWARD from the cwd — so the allowlist is enforced three times:
+/// 1. on the raw normalized cwd (parity with the files.rs surfaces),
+/// 2. re-checked on the CANONICAL cwd — a symlinked cwd inside an allowed root
+///    must not escape it (parity with Node's realpath-before-allowlist in
+///    `isPathAllowed`, `server/path-utils.ts:291-313`; the Rust
+///    `files::is_path_allowed` does NOT canonicalize),
+/// 3. on the CANONICAL resolved repo root — the `.git` walk can land on an
+///    ancestor outside every allowed root, and everything served comes from
+///    under it.
+/// Separately, the winning candidate is canonicalized and must stay inside the
+/// repo root after symlink resolution (repo-root containment, not allowlist).
 fn resolve_repo_and_icon(
     state: &RepoIconState,
     cwd_param: &str,
@@ -1807,14 +1883,25 @@ fn resolve_repo_and_icon(
     if !Path::new(&normalized).is_absolute() {
         return Err(ResolveFailure::BadRequest("cwd must be an absolute path"));
     }
+    // (1) raw-path check first: clearly-disallowed paths get Forbidden without
+    // an existence probe (matches files.rs ordering).
     if !crate::files::is_path_allowed(&normalized, allowed_roots) {
         return Err(ResolveFailure::Forbidden);
     }
     let canonical_cwd =
         std::fs::canonicalize(&normalized).map_err(|_| ResolveFailure::NotFound)?;
+    // (2) re-check the canonical cwd: symlink-escape defense.
+    if !crate::files::is_path_allowed(&canonical_cwd.to_string_lossy(), allowed_roots) {
+        return Err(ResolveFailure::Forbidden);
+    }
     let repo = resolve_repo(&canonical_cwd);
     let repo_root =
         std::fs::canonicalize(&repo.repo_root).map_err(|_| ResolveFailure::NotFound)?;
+    // (3) the upward `.git` walk must not leave the sandbox: bytes are served
+    // from under repo_root, so repo_root itself must be allowed.
+    if !crate::files::is_path_allowed(&repo_root.to_string_lossy(), allowed_roots) {
+        return Err(ResolveFailure::Forbidden);
+    }
     let repo = RepoInfo {
         checkout_root: repo.checkout_root,
         repo_root: repo_root.clone(),
@@ -3331,7 +3418,7 @@ git add -A && git commit -m "chore: verification fixes for repo icons on tabs"  
 - No per-repo override mechanism → none added anywhere.
 - Rust-only server implementation; Node untouched; graceful client degradation on Node (rejected probe → avatar) → Tasks 1–6 (Rust only), Task 9 rejected-case, Task 12 fallback test.
 - Detection heuristic v1 (tiers 1/2/3, all listed paths, score modifiers, rejections, blacklist table + seeds, PNG/ICO header probing, SVG best-effort dims, deterministic tiebreak, bounded scan) → Tasks 2–5. The "path contains" rejection is implemented as path-component equality (strictly safer; documented in Task 3).
-- Serving & security (auth, repo-root resolution reusing/paralleling server git logic — none existed in Rust, so Task 1 ports the Node reference; canonicalize both sides; candidate inside root; `is_path_allowed` sandbox; SVG headers + DOCTYPE/ENTITY rejection; `<img src>`-only rendering; Cache-Control + ETag/304; in-process HashMap cache with stat-based invalidation; cheap probe endpoint remembered in Redux) → Tasks 6, 8, 9.
+- Serving & security (auth, repo-root resolution reusing/paralleling server git logic — none existed in Rust, so Task 1 ports the Node reference; canonicalize both sides; candidate inside root; `is_path_allowed` sandbox enforced three times — raw cwd, canonical cwd (symlink escape), canonical repo root (upward-walk escape) — each with a dedicated Forbidden test in Task 6; SVG headers + DOCTYPE/ENTITY rejection; `<img src>`-only rendering; Cache-Control + ETag/304; in-process HashMap cache with stat-based invalidation; cheap probe endpoint remembered in Redux) → Tasks 6, 8, 9.
 - Client repo identity: promoted a shared pure resolver (`resolvePaneRepoCwd` in `src/lib/repo-icon.ts`) instead of moving `resolvePaneRuntimeMeta` wholesale — verified reality first: the Rust server emits identity-only terminalMeta (cwd, no repoRoot) and an empty inventory snapshot, so the resolver prefers terminalMeta when present (Node) and falls back to pane/tab `initialCwd` (works on Rust); the endpoint accepts a cwd and resolves the root server-side, exactly as the spec's contingency prescribes. `PaneContainer.resolvePaneRuntimeMeta` is left untouched (it serves a different, richer purpose; duplicating its ladder for icons would violate YAGNI).
 - Dedupe per repo on a tab; overflow respected → Task 10 (grouping algorithm + tests; `MAX_TAB_ICONS` behavior unchanged and covered by existing overflow tests).
 - PaneHeader parity (nice-to-have) → Task 11.
@@ -3340,8 +3427,10 @@ git add -A && git commit -m "chore: verification fixes for repo icons on tabs"  
 - Protocol/port: no TerminalMeta/WS changes anywhere → no `freshell-protocol` / `port/contract` updates needed (explicitly verified: the design is pure HTTP keyed by cwd).
 - Repo rules: TDD everywhere; unit + e2e (jsdom flow suite under `test/e2e/` runs in `npm test`; Rust HTTP integration via oneshot; live scratch-server smoke in Task 13 — Playwright browser e2e is not in CI and is intentionally not added); worktree usage; lint gate; no 3002 restart; no deploy; `docs/index.html` judged not required (stated in Global Constraints).
 
-**1b. No silent deferrals:** No stubs/mocks stand in for production behavior. HTTP mocking appears only in client unit/flow tests, with the real Rust endpoint proven by `cargo test` integration tests (Task 6) AND a real-server smoke against a scratch port (Task 13 Step 3). The blacklist-hash fetch has an explicit degraded path (commented rows with exact commands) that keeps the mechanism tested via a committed fixture — not a deferral of behavior, a smaller seed set, which the spec explicitly permits ("add others as practical"). No known-limitations section exists and no requirement was moved to future work.
+**1b. No silent deferrals:** No stubs/mocks stand in for production behavior. HTTP mocking appears only in client unit/flow tests, with the real Rust endpoint proven by `cargo test` integration tests (Task 6) AND a real-server smoke against a scratch port (Task 13 Step 3). The blacklist seed digests are pre-verified constants (validated 2026-07-28 against pinned upstream refs and real scaffolded repos) and the test fixture is sourced offline from an in-repo scaffold copy — no network dependency and no degraded path needed. The commented Next.js blacklist row is an explicit optional extension (spec permits "add others as practical"), with exact instructions, not a deferral of required behavior. No known-limitations section exists and no requirement was moved to future work.
 
-**2. Placeholder scan:** The only intentional fill-ins are (a) Task 2's three sha256 hex digests — produced by exact commands in the same task, with a hard gate (`git grep 'PASTE sha256'` must be empty) before commit; (b) Task 6 Step 5's two state-field initializers — copied verbatim from the adjacent `files_state` literal, named precisely; (c) small "reuse the file's existing helper verbatim" notes where the helper already exists in the test file being edited. All code steps carry complete code.
+**2. Placeholder scan:** No digest placeholders remain — Task 2's six sha256 rows are complete pre-verified hex values, gated by Step 1's fixture-hash check (`sha256sum testdata/vite.svg` must print the `vite-default-logo` digest). The only intentional fill-ins are (a) Task 6 Step 5's two state-field initializers — copied verbatim from the adjacent `files_state` literal, named precisely; (b) small "reuse the file's existing helper verbatim" notes where the helper already exists in the test file being edited. All code steps carry complete code.
+
+**3. Load-bearing validation (Stage 2, 2026-07-28):** 8 load-bearing assumptions surfaced and validated (ledger: `.worktrees/.the-usual-logs/repo-icons-on-tabs/load-bearing-ledger.md`). Verified: cwd-hint availability across all create/restore/resume paths (A3), detector real-repo safety — 0/82 wrong picks (A4), existing TabItem/TabBar suites tolerate the grouped markup (A5), Task 12's minimal store is viable with a passing smaller-store precedent (A6), the default-ON probe is harmless to the existing test corpus (A8). Falsified and fixed in this plan: stale blacklist seed URLs/digests (A1/A2 → Task 2 rewritten with pre-verified digests + offline fixture), and the allowlist sandbox gap on the upward-walking endpoint (A7 → Task 6 triple allowlist enforcement + two new Forbidden tests).
 
 **3. Type consistency:** `RepoIconInfo { repoKey, repoName, iconUrl? }` defined in Task 8, consumed with those exact fields in Tasks 10–12. `RepoIconEntry { status, repoRoot?, checkoutRoot?, repoName?, hasIcon? }` defined in Task 9, consumed in Tasks 10–11. Rust: `RepoInfo { checkout_root, repo_root }` (Task 1) consumed in Task 6; `Candidate { path, tier_base, order, extra }` (Task 3) consumed in Tasks 4–5; `detect_icon(&Path) -> Option<PathBuf>` (Task 5) consumed in Task 6. Endpoint JSON is camelCase (`repoRoot`, `checkoutRoot`, `repoName`, `hasIcon`) in both the Rust `json!` literal and the TS `RepoIconMetaResponse`. `panes.repoIconsOnTabs` is spelled identically across all 8 registration points and every selector.
