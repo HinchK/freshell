@@ -593,6 +593,124 @@ pub(crate) fn tier1(sink: &mut CandidateSink) {
     // 6. index.html <link rel=icon>.
     index_html_candidates(sink);
 }
+
+fn tier2(sink: &mut CandidateSink) {
+    let root = sink.repo_root.clone();
+    const FIXED: &[&str] = &[
+        "app/icon.svg",
+        "app/icon.png",
+        "app/icon.ico",
+        "src/app/icon.svg",
+        "src/app/icon.png",
+        "src/app/icon.ico",
+        "app/favicon.ico",
+        "src/app/favicon.ico",
+        "app/apple-icon.png",
+        "public/favicon.svg",
+        "public/favicon.ico",
+        "public/favicon.png",
+        "static/favicon.svg",
+        "static/favicon.ico",
+        "static/favicon.png",
+        "public/apple-touch-icon.png",
+        "public/icon-192.png",
+        "public/logo192.png",
+        "favicon.ico",
+        "src-tauri/icons/128x128.png",
+        "src-tauri/icons/icon.png",
+        "build/icon.png",
+        "build/icon.ico",
+        "build/appicon.png",
+    ];
+    for rel in FIXED {
+        sink.push(root.join(rel), TIER2);
+    }
+    // build/icons/*.png -> largest by probed PNG width (electron-builder default dir).
+    if let Ok(entries) = std::fs::read_dir(root.join("build/icons")) {
+        let mut pngs: Vec<(u32, PathBuf)> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+            })
+            .filter_map(|p| {
+                let bytes = std::fs::read(&p).ok()?;
+                Some((png_dimensions(&bytes).map(|(w, _)| w).unwrap_or(0), p))
+            })
+            .collect();
+        pngs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        if let Some((_, p)) = pngs.into_iter().next() {
+            sink.push(p, TIER2);
+        }
+    }
+}
+
+/// Shallow scan of `dir` for files whose lowercase basename starts with one of
+/// `prefixes` and has an icon-ish extension. Lexicographic order for determinism.
+fn push_dir_prefix_matches(sink: &mut CandidateSink, dir: &Path, prefixes: &[&str], tier: i64) {
+    const EXTS: &[&str] = &["svg", "png", "ico", "webp", "jpg"];
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let lower = name.to_lowercase();
+        let ext_ok = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| EXTS.contains(&e.to_lowercase().as_str()));
+        if ext_ok && prefixes.iter().any(|p| lower.starts_with(p)) {
+            sink.push(path.clone(), tier);
+        }
+    }
+}
+
+fn tier3(sink: &mut CandidateSink) {
+    let root = sink.repo_root.clone();
+    // Root icon.* gets +5 over logo.* (spec).
+    sink.push_extra(root.join("icon.svg"), TIER3, 5);
+    sink.push_extra(root.join("icon.png"), TIER3, 5);
+    for ext in ["png", "jpg", "jpeg", "gif", "svg", "webp"] {
+        sink.push(root.join(format!("logo.{ext}")), TIER3); // GitLab parity
+    }
+    sink.push(root.join("app-icon.png"), TIER3);
+    for name in ["logo", "icon"] {
+        for ext in ["png", "svg"] {
+            sink.push(root.join(".github").join(format!("{name}.{ext}")), TIER3);
+        }
+    }
+    push_dir_prefix_matches(sink, &root.join(".github/assets"), &["logo"], TIER3);
+    for dir in [
+        "assets",
+        "static",
+        "public",
+        "resources",
+        "media",
+        "images",
+        "img",
+        "branding",
+        "docs",
+        "doc",
+    ] {
+        push_dir_prefix_matches(sink, &root.join(dir), &["icon", "logo"], TIER3);
+    }
+}
+
+/// The v1 detector entry point: bounded tiered scan, scored, deterministic.
+pub(crate) fn detect_icon(repo_root: &Path) -> Option<PathBuf> {
+    let mut sink = CandidateSink::new(repo_root.to_path_buf());
+    tier1(&mut sink);
+    tier2(&mut sink);
+    tier3(&mut sink);
+    let root = sink.repo_root.clone();
+    pick_best(&root, sink.out)
+}
 #[cfg(test)]
 mod probe_tests {
     use super::*;
@@ -948,5 +1066,98 @@ mod tier1_tests {
         let cands = candidates_for(root);
         assert!(has(&cands, root, "fav.svg"));
         assert!(!has(&cands, root, "fav48.png"));
+    }
+}
+
+#[cfg(test)]
+mod detect_tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn write_png_at(path: &Path, w: u32, h: u32) {
+        let mut b = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        b.extend_from_slice(&13u32.to_be_bytes());
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&w.to_be_bytes());
+        b.extend_from_slice(&h.to_be_bytes());
+        b.extend_from_slice(&[8, 6, 0, 0, 0]);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn tier2_favicon_beats_tier3_logo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("public")).unwrap();
+        fs::write(
+            root.join("public/favicon.svg"),
+            "<svg viewBox=\"0 0 16 16\"/>",
+        )
+        .unwrap();
+        write_png_at(&root.join("logo.png"), 100, 100);
+        assert_eq!(detect_icon(root), Some(root.join("public/favicon.svg")));
+    }
+
+    #[test]
+    fn tier1_web_manifest_beats_tier2_favicon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_png_at(&root.join("public/pwa-192.png"), 192, 192);
+        fs::write(
+            root.join("public/manifest.json"),
+            r#"{ "icons": [{ "src": "/pwa-192.png", "sizes": "192x192" }] }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("public/favicon.svg"),
+            "<svg viewBox=\"0 0 16 16\"/>",
+        )
+        .unwrap();
+        assert_eq!(detect_icon(root), Some(root.join("public/pwa-192.png")));
+    }
+
+    #[test]
+    fn blacklisted_default_falls_through_to_next_candidate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("public")).unwrap();
+        // Vite scaffold default at a tier-2 path...
+        fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/vite.svg"),
+            root.join("public/favicon.svg"),
+        )
+        .unwrap();
+        // ...and a real logo at tier 3.
+        write_png_at(&root.join("logo.png"), 100, 100);
+        assert_eq!(detect_icon(root), Some(root.join("logo.png")));
+    }
+
+    #[test]
+    fn no_candidates_yields_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(detect_icon(tmp.path()), None);
+    }
+
+    #[test]
+    fn tier3_prefix_scan_finds_assets_logo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_png_at(&root.join("assets/logo-dark.png"), 200, 200);
+        assert_eq!(detect_icon(root), Some(root.join("assets/logo-dark.png")));
+    }
+
+    #[test]
+    fn detection_is_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_png_at(&root.join("assets/icon-a.png"), 128, 128);
+        write_png_at(&root.join("assets/icon-b.png"), 128, 128);
+        let first = detect_icon(root);
+        for _ in 0..5 {
+            assert_eq!(detect_icon(root), first);
+        }
+        assert_eq!(first, Some(root.join("assets/icon-a.png"))); // lexicographic dir order
     }
 }
