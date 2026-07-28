@@ -280,14 +280,14 @@ impl CodexLocator {
                 continue;
             }
             let new_paths: Vec<PathBuf> = current.difference(&armed.known_files).cloned().collect();
-            let mut matches: Vec<(PathBuf, RolloutMeta)> = Vec::new();
+            let mut matches: Vec<(PathBuf, String)> = Vec::new();
             let mut pending_blocking = false;
             for path in new_paths {
                 match probe_rollout(&path) {
-                    Probe::Candidate(meta) => {
+                    Probe::Candidate { thread_id, cwd, .. } => {
                         armed.pending_first_line.remove(&path);
-                        if normalize_cwd(&meta.cwd) == armed.cwd_normalized {
-                            matches.push((path, meta));
+                        if normalize_cwd(&cwd) == armed.cwd_normalized {
+                            matches.push((path, thread_id));
                         }
                     }
                     Probe::NotYet => {
@@ -329,12 +329,12 @@ impl CodexLocator {
                             "codex_locator_contested_cwd: >=2 armed terminals share this cwd; refusing to bind"
                         );
                     } else {
-                        let (path, meta) = matches.remove(0);
+                        let (path, thread_id) = matches.remove(0);
                         claims.push((
                             terminal_id.clone(),
                             Located {
                                 terminal_id: terminal_id.clone(),
-                                thread_id: meta.thread_id,
+                                thread_id,
                                 rollout_path: path,
                                 cwd: armed.cwd_normalized.clone(),
                             },
@@ -407,24 +407,37 @@ impl CodexLocator {
     }
 }
 
-struct RolloutMeta {
-    thread_id: String,
-    /// REQUIRED — `SessionMeta.cwd` is non-optional at codex 0.145.0
-    /// (3,858/3,858 real rollouts carry it); a no-cwd first line is a
-    /// foreign shape, never a candidate (A4 hardening).
-    cwd: String,
-}
-
 /// Tri-state probe result. The distinction between `NotYet` and `Never` is
 /// load-bearing: codex writes the whole session_meta line + '\n' in one
 /// write-then-flush, so a COMPLETE (newline-terminated) line that fails the
 /// candidate shape will never become one, while an empty file or a line
 /// without its trailing newline is codex's create→meta gap (or a raced
 /// write) — "not yet", not "never" (A3, validated).
+#[derive(Debug)]
 enum Probe {
     /// Parseable `session_meta` with a bare-UUID `payload.id` AND a
     /// `payload.cwd` — a real candidate shape.
-    Candidate(RolloutMeta),
+    Candidate {
+        thread_id: String,
+        /// REQUIRED — `SessionMeta.cwd` is non-optional at codex 0.145.0
+        /// (3,858/3,858 real rollouts carry it); a no-cwd first line is a
+        /// foreign shape, never a candidate (A4 hardening).
+        cwd: String,
+        /// Fork lineage (`payload.forked_from_id`) — present on rollouts
+        /// created by codex's in-TUI `/resume` fork AND on subagent spawns;
+        /// lineage alone is not proof of a user fork (validated A4).
+        /// (dead_code allow: consumed by Task 4's ForkWatch lane.)
+        #[allow(dead_code)]
+        forked_from_id: Option<String>,
+        /// `payload.thread_source` — `"user"` on user forks, `"subagent"`
+        /// on subagent spawns; absent on pre-0.143 CLIs. NOTE: the sibling
+        /// `source` key is POLYMORPHIC on disk (string for user sessions,
+        /// object for subagents) — never read it with an assumed-string
+        /// shape; `thread_source` is a plain string on the whole substrate.
+        /// (dead_code allow: consumed by Task 4's ForkWatch lane.)
+        #[allow(dead_code)]
+        thread_source: Option<String>,
+    },
     /// Empty file, transient open/read failure, or first line still missing
     /// its trailing newline — re-probe within the pending grace.
     NotYet,
@@ -467,10 +480,29 @@ fn probe_rollout(path: &Path) -> Probe {
     let Some(cwd) = record.pointer("/payload/cwd").and_then(|v| v.as_str()) else {
         return Probe::Never; // cwd REQUIRED (A4 hardening)
     };
-    Probe::Candidate(RolloutMeta {
+    // Fork lineage (trim-nonempty semantics, matching parse/codex.rs). Do
+    // NOT read the sibling `source` key here — it is polymorphic on disk
+    // (string for user sessions, object {"subagent":{…}} for subagents);
+    // any assumed-string parse of it would fail on real subagent metas.
+    let payload = record.pointer("/payload");
+    let forked_from_id = payload
+        .and_then(|p| p.get("forked_from_id"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let thread_source = payload
+        .and_then(|p| p.get("thread_source"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Probe::Candidate {
         thread_id: thread_id.to_string(),
         cwd: cwd.to_string(),
-    })
+        forked_from_id,
+        thread_source,
+    }
 }
 
 /// Bare hyphenated 36-char UUID shape gate (deliberate small duplicate of
@@ -516,16 +548,53 @@ mod tests {
     /// record, exactly the shape the real codex CLI writes
     /// (payload.id = identity; payload.cwd = the session's working dir).
     fn write_rollout(root: &Path, rel_dir: &str, thread_id: &str, cwd: Option<&str>) -> PathBuf {
+        write_rollout_full(root, rel_dir, thread_id, cwd, None, None)
+    }
+
+    /// Extended writer: same session_meta shape, with optional fork lineage.
+    /// Modeled on the verified 019fa613 USER-fork child (forked_from_id +
+    /// thread_source:"user" + originator:"codex-tui") AND its ~100x-more-
+    /// common evil twin, the SUBAGENT child (thread_source:"subagent" +
+    /// OBJECT-shaped source {"subagent":{"thread_spawn":…}}). `source` is
+    /// polymorphic on disk -- string for user sessions, object for
+    /// subagents -- never parse it with an assumed-string shape.
+    fn write_rollout_full(
+        root: &Path,
+        rel_dir: &str,
+        thread_id: &str,
+        cwd: Option<&str>,
+        forked_from: Option<&str>,
+        thread_source: Option<&str>,
+    ) -> PathBuf {
         let dir = root.join(rel_dir);
         std::fs::create_dir_all(&dir).expect("create rollout dir");
         let file = dir.join(format!("rollout-2026-07-26T08-00-00-{thread_id}.jsonl"));
-        let payload = match cwd {
-            Some(c) => format!(r#"{{"id":"{thread_id}","cwd":"{c}"}}"#),
-            None => format!(r#"{{"id":"{thread_id}"}}"#),
-        };
-        let line = format!(
-            r#"{{"timestamp":"2026-07-26T08:00:00.000Z","type":"session_meta","payload":{payload}}}"#
-        );
+        let mut payload = serde_json::json!({ "id": thread_id, "session_id": thread_id });
+        if let Some(c) = cwd {
+            payload["cwd"] = serde_json::json!(c);
+        }
+        if let Some(f) = forked_from {
+            payload["forked_from_id"] = serde_json::json!(f);
+            payload["originator"] = serde_json::json!("codex-tui");
+        }
+        match thread_source {
+            Some("subagent") => {
+                payload["thread_source"] = serde_json::json!("subagent");
+                payload["source"] = serde_json::json!({
+                    "subagent": { "thread_spawn": { "parent_thread_id": forked_from, "depth": 1 } }
+                });
+            }
+            Some(ts) => {
+                payload["thread_source"] = serde_json::json!(ts);
+                payload["source"] = serde_json::json!("cli");
+            }
+            None => {} // older-CLI shape: no thread_source key at all
+        }
+        let line = serde_json::json!({
+            "timestamp": "2026-07-26T08:00:00.000Z",
+            "type": "session_meta",
+            "payload": payload,
+        });
         std::fs::write(&file, format!("{line}\n")).expect("write rollout");
         file
     }
@@ -966,6 +1035,66 @@ mod tests {
         write_rollout(&root, ".", TID, Some("/tmp"));
         let located = locator.tick(CODEX_WINDOW_MS);
         assert_eq!(located.len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn probe_surfaces_forked_from_id_and_thread_source() {
+        let root = unique_temp_dir("probe-fork");
+        let path = write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID,
+            Some("/tmp/x"),
+            Some("aaaa-parent"),
+            Some("user"),
+        );
+        match probe_rollout(&path) {
+            Probe::Candidate {
+                forked_from_id,
+                thread_source,
+                ..
+            } => {
+                assert_eq!(forked_from_id.as_deref(), Some("aaaa-parent"));
+                assert_eq!(thread_source.as_deref(), Some("user"));
+            }
+            other => panic!("expected Candidate, got {other:?}"),
+        }
+        // Subagent child: the OBJECT-shaped `source` must not break the
+        // probe (polymorphic source, validated A4).
+        const SUB: &str = "22222222-2222-3333-4444-555555555555";
+        let sub = write_rollout_full(
+            &root,
+            "2026/07/27",
+            SUB,
+            Some("/tmp/x"),
+            Some("aaaa-parent"),
+            Some("subagent"),
+        );
+        match probe_rollout(&sub) {
+            Probe::Candidate {
+                forked_from_id,
+                thread_source,
+                ..
+            } => {
+                assert_eq!(forked_from_id.as_deref(), Some("aaaa-parent"));
+                assert_eq!(thread_source.as_deref(), Some("subagent"));
+            }
+            other => panic!("expected Candidate, got {other:?}"),
+        }
+        const PLAIN: &str = "33333333-2222-3333-4444-555555555555";
+        let plain = write_rollout_full(&root, "2026/07/27", PLAIN, Some("/tmp/x"), None, None);
+        match probe_rollout(&plain) {
+            Probe::Candidate {
+                forked_from_id,
+                thread_source,
+                ..
+            } => {
+                assert_eq!(forked_from_id, None);
+                assert_eq!(thread_source, None);
+            }
+            other => panic!("expected Candidate, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 }
