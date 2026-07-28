@@ -1,6 +1,6 @@
 import { createSelector } from '@reduxjs/toolkit'
 import type { RootState } from '../store'
-import type { BackgroundTerminal, CodingCliProviderName, WorktreeGrouping } from '../types'
+import type { BackgroundTerminal, CodingCliProviderName, WorktreeGrouping, ProjectGroup } from '../types'
 import { collectSessionRefsFromTabs } from '@/lib/session-utils'
 import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
@@ -147,7 +147,7 @@ type RunningSessionInfo = {
 // fabricated rows. 'unknown' is the literal group path of cwd-less indexed
 // sessions. See the "repoPath semantics" design note in the plan.
 function resolveRepoPath(
-  session: { liveTerminalOnly?: boolean; sessionId: string; checkoutPath?: string; projectPath?: string },
+  session: ProjectGroup['sessions'][number],
   groupProjectPath: string,
 ): string | undefined {
   if (session.liveTerminalOnly) return undefined
