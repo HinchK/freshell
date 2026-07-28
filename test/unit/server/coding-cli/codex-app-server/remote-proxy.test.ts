@@ -1,9 +1,11 @@
 import { execFile } from 'node:child_process'
+import http from 'node:http'
 import { promisify } from 'node:util'
 
 import WebSocket, { WebSocketServer } from 'ws'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { CodexRemoteProxy } from '../../../../../server/coding-cli/codex-app-server/remote-proxy.js'
+import { allocateLocalhostPort, type LoopbackServerEndpoint } from '../../../../../server/local-port.js'
 import {
   MAX_FULL_PARSE_BYTES,
   MAX_RAW_FORWARD_BYTES,
@@ -103,16 +105,52 @@ async function startUpstream(handler?: (socket: WebSocket, message: any) => void
   return handle
 }
 
+async function occupyLoopbackPort(): Promise<{
+  blocker: http.Server
+  endpoint: LoopbackServerEndpoint
+}> {
+  const blocker = http.createServer((_req, res) => {
+    res.statusCode = 404
+    res.end()
+  })
+  await new Promise<void>((resolve, reject) => {
+    blocker.once('error', reject)
+    blocker.listen(0, '127.0.0.1', () => resolve())
+  })
+  const address = blocker.address()
+  if (!address || typeof address === 'string') {
+    throw new Error('Failed to occupy loopback port for test')
+  }
+  return { blocker, endpoint: { hostname: '127.0.0.1', port: address.port } }
+}
+
 async function startProxy(upstreamWsUrl: string, options: {
   requestHoldTimeoutMs?: number
   candidateCaptureTimeoutMs?: number
   requireCandidatePersistence?: boolean
   maxRawForwardBytes?: number
+  portAllocator?: () => Promise<LoopbackServerEndpoint>
 } = {}): Promise<CodexRemoteProxy> {
-  const proxy = new CodexRemoteProxy({ upstreamWsUrl, ...options })
-  await proxy.start()
-  proxies.add(proxy)
-  return proxy
+  // DEFLAKE (f3wp): allocateLocalhostPort documents that callers must retry
+  // startup if the probe port is lost before the rebind (local-port.ts:10-12).
+  // CodexRemoteProxy.start() itself does not retry (unlike runtime.ts:1498's
+  // startupAttemptLimit) -- recorded as a production finding; this harness
+  // honors the contract on the test side. 47 concurrent startProxy calls in
+  // a threads-pool run made the 1-in-N race a recurring suite failure.
+  let lastError: unknown
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const proxy = new CodexRemoteProxy({ upstreamWsUrl, ...options })
+    try {
+      await proxy.start()
+      proxies.add(proxy)
+      return proxy
+    } catch (error) {
+      lastError = error
+      await proxy.close().catch(() => {})
+      if ((error as NodeJS.ErrnoException)?.code !== 'EADDRINUSE') throw error
+    }
+  }
+  throw lastError
 }
 
 async function connect(wsUrl: string): Promise<WebSocket> {
@@ -315,6 +353,31 @@ describeFullBoundaryStress('CodexRemoteProxy constrained heap full-boundary larg
 })
 
 describe('CodexRemoteProxy', () => {
+  it('startProxy retries when the preallocated loopback port is lost before the proxy binds', async () => {
+    // allocateLocalhostPort's contract (server/local-port.ts:10-12): callers
+    // must be prepared to retry startup. Force the race deterministically,
+    // exactly like runtime.test.ts:2290 does for CodexAppServerRuntime.
+    const upstream = await startUpstream()
+    const { blocker, endpoint } = await occupyLoopbackPort()
+    try {
+      let first = true
+      const proxy = await startProxy(upstream.wsUrl, {
+        portAllocator: async () => {
+          if (first) {
+            first = false
+            return endpoint
+          }
+          return allocateLocalhostPort()
+        },
+      })
+      const { wsUrl } = await proxy.start() // idempotent: returns the bound wsUrl
+      expect(wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/)
+      expect(wsUrl).not.toBe(`ws://${endpoint.hostname}:${endpoint.port}`)
+    } finally {
+      await new Promise<void>((resolve) => blocker.close(() => resolve()))
+    }
+  })
+
   it('preserves text and binary frames across client and upstream forwarding', async () => {
     const upstream = await startUpstream((socket, message) => {
       if (message.method === 'initialize') {
