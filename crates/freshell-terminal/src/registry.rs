@@ -1385,6 +1385,19 @@ impl TerminalRegistry {
             .count()
     }
 
+    /// Read-only liveness probe: is a terminal with this id currently in the
+    /// registry? Used by `freshell-ws`'s `terminal.create` requestId-dedupe
+    /// guard for lazy eviction of settled entries whose terminal is gone
+    /// (killed/exited). Registry-lock + `contains_key` — no tokio, no
+    /// side effects.
+    pub fn exists(&self, terminal_id: &str) -> bool {
+        self.inner
+            .lock()
+            .expect("registry lock")
+            .terminals
+            .contains_key(terminal_id)
+    }
+
     /// `finishTerminalPtyExit` (`terminal-registry.ts:1479-1510`), non-codex core —
     /// the NATURAL-exit path (the kill path stays in [`kill`](Self::kill), which
     /// removes the record first so this lookup misses, mirroring the original's
@@ -2216,6 +2229,23 @@ impl TerminalRegistry {
             .expect("registry lock")
             .terminals
             .contains_key(terminal_id)
+    }
+
+    /// True only while the terminal's PTY is still running. Unlike the
+    /// presence-only `exists()`/`is_running`, this goes false when the
+    /// terminal exits naturally, even though the record is retained for
+    /// restore/replay. Drives create-dedupe eviction: legacy parity with
+    /// the Node server's delete-at-exit requestId pruning.
+    pub fn is_pty_running(&self, terminal_id: &str) -> bool {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            match inner.terminals.get(terminal_id) {
+                Some(handle) => Arc::clone(&handle.shared),
+                None => return false,
+            }
+        };
+        let s = shared.lock().expect("terminal lock");
+        s.status == TerminalRunStatus::Running
     }
 }
 
@@ -3116,6 +3146,70 @@ mod tests {
             "kill_all must NOT attempt a group-kill signal against a terminal \
              that already exited naturally -- its cached pid may have been \
              recycled to an unrelated process group"
+        );
+    }
+
+    /// `is_pty_running` must report run-status, not record presence: a
+    /// naturally-exited terminal is RETAINED in the registry (for restore),
+    /// so `exists()` stays true while `is_pty_running()` goes false. This is
+    /// the distinction create-dedupe eviction anchors to (legacy parity with
+    /// the Node server's delete-at-exit requestId pruning).
+    #[test]
+    fn is_pty_running_false_for_exited_retained_terminal() {
+        let reg = TerminalRegistry::new();
+        let reg_for_exit = reg.clone();
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "exit 0".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: None,
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        let terminal_id = "T-pty-running-natural-exit".to_string();
+        let on_exit_id = terminal_id.clone();
+        reg.create(
+            &spec,
+            &env,
+            terminal_id.clone(),
+            "S".to_string(),
+            "shell",
+            None,
+            None,
+            None,
+            Some(Box::new(move |code| {
+                // Mirrors the production wiring (`freshell-ws`'s on_exit hook):
+                // the reader thread calls `finish_pty_exit` on natural exit.
+                reg_for_exit.finish_pty_exit(&on_exit_id, code);
+            })),
+        )
+        .expect("spawn /bin/sh -c 'exit 0'");
+
+        // Wait for the natural exit to be observed (bounded poll; the child
+        // exits near-instantly, so this deadline is generous headroom, not a
+        // real-time dependency).
+        let exited = |reg: &TerminalRegistry| {
+            reg.inventory()
+                .iter()
+                .any(|t| t.terminal_id == terminal_id && t.status == TerminalRunStatus::Exited)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !exited(&reg) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            exited(&reg),
+            "the spawned child must exit naturally within the deadline"
+        );
+
+        assert!(
+            reg.exists(&terminal_id),
+            "exited terminal record is retained for restore"
+        );
+        assert!(
+            !reg.is_pty_running(&terminal_id),
+            "is_pty_running must go false at natural exit even though the record is retained"
         );
     }
 

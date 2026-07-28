@@ -286,6 +286,8 @@ mod tests {
             term09: crate::backpressure::Term09Config::default(),
             create_protect: crate::create_limit::CreateProtectConfig::default(),
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: Some(StdArc::new(OpencodeLocator::new(data_home))),
