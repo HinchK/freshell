@@ -11,6 +11,7 @@ import tabRecencyReducer from './tabRecencySlice'
 
 import turnCompletionReducer from './turnCompletionSlice'
 import terminalMetaReducer from './terminalMetaSlice'
+import repoIconsReducer from './repoIconsSlice'
 import codexActivityReducer from './codexActivitySlice'
 import claudeActivityReducer from './claudeActivitySlice'
 import amplifierActivityReducer from './amplifierActivitySlice'
@@ -51,6 +52,7 @@ export const store = configureStore({
 
     turnCompletion: turnCompletionReducer,
     terminalMeta: terminalMetaReducer,
+    repoIcons: repoIconsReducer,
     codexActivity: codexActivityReducer,
     claudeActivity: claudeActivityReducer,
     amplifierActivity: amplifierActivityReducer,

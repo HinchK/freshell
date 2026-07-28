@@ -227,4 +227,30 @@ describe('SettingsView Panes section', () => {
 
     expect(api.patch).not.toHaveBeenCalled()
   })
+
+  it('toggles repo icons on tabs locally without calling /api/settings', async () => {
+    const store = createTestStore('ask', { panes: { repoIconsOnTabs: true } })
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+    switchSettingsTab('Panes')
+
+    // Do NOT copy the iconsOnTabs test's `closest('div')` pattern here: this
+    // row has a `description`, so SettingsRow nests the label inside an inner
+    // text-only div and `closest('div')` would return that div (no button in
+    // it). Select the switch by its accessible name instead — the Toggle
+    // sets aria-label="Toggle repo icons on tabs".
+    const toggle = screen.getByRole('switch', { name: 'Toggle repo icons on tabs' })
+    fireEvent.click(toggle)
+
+    expect(store.getState().settings.settings.panes.repoIconsOnTabs).toBe(false)
+
+    await act(async () => {
+      vi.advanceTimersByTime(600)
+    })
+
+    expect(api.patch).not.toHaveBeenCalled()
+  })
 })

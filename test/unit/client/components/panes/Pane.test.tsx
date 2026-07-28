@@ -1,7 +1,25 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { render as renderWithoutStore, screen, fireEvent, cleanup } from '@testing-library/react'
+import type { ReactElement } from 'react'
+import { Provider } from 'react-redux'
+import { configureStore } from '@reduxjs/toolkit'
 import Pane from '@/components/panes/Pane'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
+import repoIconsReducer from '@/store/repoIconsSlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
+import settingsReducer from '@/store/settingsSlice'
+
+function makeStore() {
+  return configureStore({
+    reducer: { repoIcons: repoIconsReducer, terminalMeta: terminalMetaReducer, settings: settingsReducer },
+  })
+}
+
+// Pane renders PaneHeader, which reads the store (repo icons); in the app it
+// always renders under the Redux Provider, so mirror that by default.
+function render(ui: ReactElement) {
+  return renderWithoutStore(<Provider store={makeStore()}>{ui}</Provider>)
+}
 
 // Mock lucide-react icons
 vi.mock('lucide-react', () => ({
