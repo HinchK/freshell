@@ -37,13 +37,28 @@ const __dirname = path.dirname(__filename)
 
 const FAKE_CLAUDE_SIDECAR_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-sidecar.mjs')
 
-const DURABLE_CLI_SESSION_ID = '44444444-4444-4444-8444-444444444444'
+// Canonical claude session id shape (copy of shared/session-contract.ts's
+// CLAUDE_SESSION_ID_RE -- per-spec-ownership convention). The fake sidecar
+// mints a RANDOM canonical UUID per process (council follow-up, PR #562/#563
+// close-out: the old static 44444444-... default made every resume-less
+// create in every sidecar process collide onto one constant id --
+// collision-blind to identity loss), so this spec CAPTURES the id the run
+// actually minted instead of asserting a constant.
+const CANONICAL_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
-// The contract-correct identity reader: sessionRef IS the durable identity;
-// content.sessionId is a live handle (precedent:
-// freshclaude-restart-parity-rust.spec.ts:140-148).
+// The contract-correct identity reader -- UNIFIED order with the wall's
+// leafDurableIdentity (council follow-up, PR #562/#563 close-out: the P0.2
+// bug WAS a reader-ordering bug, so this suite keeps ONE ordering):
+// sessionRef IS the durable identity per the 2026-04-19 durable-session
+// contract; resumeSessionId is the durable-intent fallback;
+// content.sessionId is a LIVE handle (for claude, the create-time fc-e2e-*
+// placeholder forever) and may only be read LAST.
 const durableIdentity = (leaf: any): string =>
-  leaf?.content?.sessionRef?.sessionId ?? leaf?.content?.resumeSessionId ?? ''
+  leaf?.content?.sessionRef?.sessionId ??
+  leaf?.content?.resumeSessionId ??
+  leaf?.content?.sessionId ??
+  ''
 
 // ---------------------------------------------------------------------------
 // Shared helpers (per-spec copies -- donor: restore-contract-wall-rust.spec.ts)
@@ -241,10 +256,12 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       // the durable ref. Captured (not
       // hardcoded) so the round-trip checks below assert against what this
       // RUN actually minted -- same discipline as freshclaude-restart-parity
-      // -rust.spec.ts's `originalDurable` capture (:236-243).
+      // -rust.spec.ts's `originalDurable` capture (:236-243). The fixture id
+      // is random per sidecar process now, so the gate is the canonical-UUID
+      // SHAPE (which the fc-e2e-* live placeholder can never match).
       await expect
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!))), { timeout: 15_000 })
-        .toBe(DURABLE_CLI_SESSION_ID)
+        .toMatch(CANONICAL_UUID_RE)
       const originalDurable: string = durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!)))
 
       // Council fix round (B2): clearSentWsMessages() moved to BEFORE the
@@ -321,6 +338,156 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     }
   })
 
+  test('real-user reload: identity survives with NO manual persist flush (natural persistence path only)', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    // COUNCIL FOLLOW-UP (PR #562/#563 close-out, user-advocate's held
+    // finding): every other journey in this suite (and the wall's leg G)
+    // hand-cranks `persist/flushNow` before reloading -- a lever no real
+    // user has. INVESTIGATION (what the natural path actually is):
+    // persistMiddleware rides TWO mechanisms -- a 500 ms debounce timer on
+    // every persisted-slice change (PERSIST_DEBOUNCE_MS,
+    // persistMiddleware.ts:35,673-675) AND unload-time flush listeners on
+    // visibilitychange(hidden)/pagehide/beforeunload
+    // (persistMiddleware.ts:54-66) that call flushNow(). Playwright's
+    // Chromium page.reload() fires pagehide/beforeunload on the outgoing
+    // document, so the natural path CAN fire under Playwright -- no honest
+    // approximation needed. This leg therefore reloads with NO manual
+    // flush: whichever natural mechanism ran (debounce or unload flush),
+    // the identity must be on disk by navigation time, exactly as for a
+    // real user hitting F5.
+    // RED-FIRST verified: with both natural mechanisms sabotaged in a local
+    // client build (unload listeners no-op'd + debounce inflated), the
+    // identity poll below goes red; unsabotaged it is green.
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-noflush-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const { server, info, harness } = await bootWall(page, {
+      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
+      setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
+    })
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
+      expect(tabId).toBeTruthy()
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      await createFreshclaudePane(page, harness, projectDir)
+      await sendFreshAgentTurn(page, harness, tabId!, 'no-flush first turn')
+      await expect
+        .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!))), { timeout: 15_000 })
+        .toMatch(CANONICAL_UUID_RE)
+      const originalDurable: string = durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!)))
+
+      // Audit the reload window like test 1 does (any create fired must
+      // carry the original id -- never a bare identity-losing create).
+      await harness.clearSentWsMessages()
+
+      // THE POINT: no flushPersistence(page) here.
+      await reloadAndReconnect(page, harness)
+
+      const tabIdAfterReload = await harness.getActiveTabId()
+      await expect
+        .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfterReload!))), { timeout: 30_000 })
+        .toBe(originalDurable)
+
+      // Liveness on the naturally-persisted identity: the conversation
+      // continues (disk transcript is the fixture's ground truth).
+      await sendFreshAgentTurn(page, harness, tabIdAfterReload!, 'no-flush second turn')
+      const transcriptFile = path.join(info.homeDir, '.claude', 'projects', '-fixture', `${originalDurable}.jsonl`)
+      const transcriptLines = (await fs.readFile(transcriptFile, 'utf-8'))
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+      const userTexts = transcriptLines
+        .filter((l: any) => l.type === 'user')
+        .map((l: any) => l.message?.content?.[0]?.text)
+      expect(userTexts).toEqual(expect.arrayContaining(['no-flush first turn', 'no-flush second turn']))
+
+      // No identity-losing re-create anywhere in the reload window.
+      const sent = await harness.getSentWsMessages()
+      const creates = sent.filter((m: any) => m?.type === 'freshAgent.create') as any[]
+      for (const create of creates) {
+        expect(create.resumeSessionId ?? create.sessionRef?.sessionId, JSON.stringify(create)).toBe(originalDurable)
+      }
+    } finally {
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
+  test('cold-open: persisted localStorage ALONE drives resume in a fresh browser context', async ({ page, browser, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    // COUNCIL FOLLOW-UP (PR #562/#563 close-out, brian's cell): test 1
+    // proves persistence in COMPOSITION (same page object reloads, so any
+    // in-memory residue could in principle assist). This cell proves the
+    // persisted localStorage is SUFFICIENT on its own: a brand-new browser
+    // context -- fresh page, no in-memory state, seeded ONLY with the
+    // localStorage the first client persisted -- must resume the same
+    // conversation. The original page is CLOSED before the cold context
+    // opens, so no live client can assist the resume.
+    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-coldopen-'))
+    const projectDir = path.join(sharedRoot, 'project')
+    await fs.mkdir(projectDir, { recursive: true })
+    const { server, info, harness } = await bootWall(page, {
+      env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
+      setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
+    })
+    let coldContext: Awaited<ReturnType<typeof browser.newContext>> | null = null
+    try {
+      await selectShellIfPickerShowing(page)
+      const tabId = (await harness.getActiveTabId())!
+      expect(tabId).toBeTruthy()
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      await createFreshclaudePane(page, harness, projectDir)
+      await sendFreshAgentTurn(page, harness, tabId!, 'cold-open first turn')
+      await expect
+        .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!))), { timeout: 15_000 })
+        .toMatch(CANONICAL_UUID_RE)
+      const originalDurable: string = durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!)))
+
+      // Capture EXACTLY what the first client persisted, then close it.
+      await flushPersistence(page)
+      const persistedEntries: Array<[string, string]> = await page.evaluate(() =>
+        Object.entries(localStorage),
+      )
+      expect(persistedEntries.length).toBeGreaterThan(0)
+      await page.close()
+
+      // Cold open: fresh context, seeded ONLY with the persisted entries.
+      coldContext = await browser.newContext()
+      const coldPage = await coldContext.newPage()
+      await coldPage.addInitScript((entries: Array<[string, string]>) => {
+        for (const [k, v] of entries) localStorage.setItem(k, v)
+      }, persistedEntries)
+      await coldPage.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
+      const coldHarness = new TestHarness(coldPage)
+      await coldHarness.waitForHarness()
+      await coldHarness.waitForConnection()
+
+      const coldTabId = await coldHarness.getActiveTabId()
+      await expect
+        .poll(async () => durableIdentity(findFreshAgentLeaf(await coldHarness.getPaneLayout(coldTabId!))), { timeout: 30_000 })
+        .toBe(originalDurable)
+
+      // Liveness in the cold context: the SAME conversation continues.
+      await sendFreshAgentTurn(coldPage, coldHarness, coldTabId!, 'cold-open second turn')
+      const transcriptFile = path.join(info.homeDir, '.claude', 'projects', '-fixture', `${originalDurable}.jsonl`)
+      const transcriptLines = (await fs.readFile(transcriptFile, 'utf-8'))
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+      const userTexts = transcriptLines
+        .filter((l: any) => l.type === 'user')
+        .map((l: any) => l.message?.content?.[0]?.text)
+      expect(userTexts).toEqual(expect.arrayContaining(['cold-open first turn', 'cold-open second turn']))
+    } finally {
+      await coldContext?.close().catch(() => {})
+      await server.stop()
+      await fs.rm(sharedRoot, { recursive: true, force: true })
+    }
+  })
+
   test('HAZARD GUARD: stale persisted sessionRef yields loud dead_session, never silent wrong-session attach or silent fresh', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-stale-'))
@@ -343,13 +510,14 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       await sendFreshAgentTurn(page, harness, tabId!, 'turn that will become stale')
       await expect
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!))), { timeout: 15_000 })
-        .toBe(DURABLE_CLI_SESSION_ID)
+        .toMatch(CANONICAL_UUID_RE)
+      const staleDurable: string = durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!)))
       await flushPersistence(page)
 
       // Make the persisted identity STALE: delete every server-side artifact
       // naming the durable session (transcripts under the isolated HOME).
-      const deleted = await deleteFilesNamed(info.homeDir, `${DURABLE_CLI_SESSION_ID}.jsonl`)
-      expect(deleted.length, `expected transcript artifacts for ${DURABLE_CLI_SESSION_ID} under ${info.homeDir}`).toBeGreaterThan(0)
+      const deleted = await deleteFilesNamed(info.homeDir, `${staleDurable}.jsonl`)
+      expect(deleted.length, `expected transcript artifacts for ${staleDurable} under ${info.homeDir}`).toBeGreaterThan(0)
 
       // SIGKILL, then reload IMMEDIATELY -- the OLD page must never
       // reconnect and fire a recovery create-with-resume: the fake sidecar
@@ -367,7 +535,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
         .poll(async () => {
           const state = await harness.getState()
           const entries = state?.panes?.deadSessionAdjudication ?? []
-          return entries.some((e: any) => e?.kind === 'fresh-agent' && e?.sessionRef?.sessionId === DURABLE_CLI_SESSION_ID)
+          return entries.some((e: any) => e?.kind === 'fresh-agent' && e?.sessionRef?.sessionId === staleDurable)
         }, { timeout: 30_000 })
         .toBe(true)
       const leaf = findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfter!))
@@ -396,8 +564,13 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       // here would not actually prove "never silent" (follow-up from the PR
       // #562 council review).
       const leafAfterSettle = findFreshAgentLeaf(await harness.getPaneLayout(tabIdAfter!))
-      // NEVER silent: identity not swapped, no create fired for this pane.
-      expect(leafAfterSettle?.content?.sessionRef?.sessionId).toBe(DURABLE_CLI_SESSION_ID)
+      // NEVER silent: identity not swapped, the loud restoreError still
+      // standing (post-settle re-check -- council follow-up, PR #562/#563
+      // close-out: the pre-settle restoreError read alone could not prove
+      // the error survived whatever landed during the settle window), and
+      // no create fired for this pane.
+      expect(leafAfterSettle?.content?.sessionRef?.sessionId).toBe(staleDurable)
+      expect(leafAfterSettle?.content?.restoreError?.reason).toBe('durable_artifact_missing')
       const sent = await harness.getSentWsMessages()
       expect(sent.filter((m: any) => m?.type === 'freshAgent.create')).toEqual([])
     } finally {
