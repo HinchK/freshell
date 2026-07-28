@@ -113,10 +113,19 @@ pub(crate) fn parse_delays_env(raw: &str) -> Option<Vec<u64>> {
 }
 
 pub(crate) fn auto_resume_delays() -> Vec<u64> {
-    std::env::var("FRESHELL_AUTO_RESUME_DELAYS_MS")
-        .ok()
-        .and_then(|raw| parse_delays_env(&raw))
-        .unwrap_or_else(|| AUTO_RESUME_DEFAULT_DELAYS_MS.to_vec())
+    match std::env::var("FRESHELL_AUTO_RESUME_DELAYS_MS") {
+        Ok(raw) => parse_delays_env(&raw).unwrap_or_else(|| {
+            // Misconfiguration (e.g. trailing comma, non-numeric, zero) must
+            // be observable — the override silently reverting to defaults is
+            // otherwise indistinguishable from the env var not being set.
+            tracing::warn!(
+                raw,
+                "FRESHELL_AUTO_RESUME_DELAYS_MS is set but unparseable — falling back to default delays"
+            );
+            AUTO_RESUME_DEFAULT_DELAYS_MS.to_vec()
+        }),
+        Err(_) => AUTO_RESUME_DEFAULT_DELAYS_MS.to_vec(),
+    }
 }
 
 /// The auto-resume orchestrator: consumes [`CrashEvent`]s, applies
@@ -129,6 +138,9 @@ pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver>(
     delays: Vec<u64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Retaining exhausted / pane-closed entries is DELIBERATE (not a
+        // leak): evicting on exhaustion would refill the retry budget for an
+        // immediate manual-Relaunch re-crash.
         let mut attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         let max_attempts = delays.len() as u32;
         // Design note (serialization): handling events sequentially in ONE
@@ -534,8 +546,13 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                 "{mode} crashed (exit {exit_code}) — auto-resuming, attempt {attempt}/{max_attempts}"
             )),
         });
-        if let Ok(json) = serde_json::to_string(&msg) {
-            let _ = self.state.broadcast_tx.send(json);
+        match serde_json::to_string(&msg) {
+            Ok(json) => {
+                let _ = self.state.broadcast_tx.send(json);
+            }
+            Err(err) => {
+                tracing::error!(terminal_id, error = %err, "terminal.auto_resume.recovering_frame_serialize_failed");
+            }
         }
     }
 
@@ -549,8 +566,13 @@ impl AutoResumeDriver for WsAutoResumeDriver {
                 max_attempts,
             },
         );
-        if let Ok(json) = serde_json::to_string(&msg) {
-            let _ = self.state.broadcast_tx.send(json);
+        match serde_json::to_string(&msg) {
+            Ok(json) => {
+                let _ = self.state.broadcast_tx.send(json);
+            }
+            Err(err) => {
+                tracing::error!(old_terminal_id = old, new_terminal_id = new, error = %err, "terminal.auto_resume.replaced_frame_serialize_failed");
+            }
         }
     }
 

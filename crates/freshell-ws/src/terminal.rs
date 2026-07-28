@@ -1218,6 +1218,9 @@ pub(crate) fn build_pty_exit_hook(
         }
         // Lane D1: genuine natural exits only (kill removed the row → false).
         if finished {
+            // Missing probe: i64::MAX is a deliberate "treat as healthy /
+            // fresh attempt budget" sentinel (the healthy-lifetime check
+            // reads it as a long-lived process), NOT "unknown".
             let lifetime_ms = probe
                 .as_ref()
                 .map(|p| now_ms() - p.created_at)

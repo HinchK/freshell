@@ -1,7 +1,9 @@
 // Ephemeral crash/auto-resume presentation state (Lane D1). Deliberately a
 // separate slice: pane persistence shapes are owned by Lane D4 and the
 // persistMiddleware strip is a denylist — a new pane field would persist by
-// default. This slice is never persisted.
+// default. (Two layers, both true: store.ts allowlists which SLICES persist;
+// within an allowlisted slice, the strip deny-removes pane FIELDS.) This
+// slice is never added to that allowlist, so it is never persisted.
 import { createSlice, type PayloadAction } from '@reduxjs/toolkit'
 
 export const AUTO_RESUME_NOTICE_TTL_MS = 30_000

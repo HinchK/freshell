@@ -25,8 +25,12 @@ type PanesStateSlice = { panes: { layouts: Record<string, PaneNode | undefined> 
 const skipDetachActionTypes = new Set<string>([
   clearDeadTerminals.type,
   clearTerminalLiveHandles.type,
-  // Lane D1: terminal.replaced fold rebinds the pane; the old terminal is
-  // already exited — never detach-storm it.
+  // Two dispatch sites, both safe to skip:
+  // 1. Lane D1 crash fold (TerminalView terminal.replaced handler): the old
+  //    terminal already exited server-side — never detach-storm it.
+  // 2. Reconnect reconcile (pane-reconcile.ts:428): runs on a fresh
+  //    connection BEFORE any attach, so no live subscription exists for the
+  //    terminalId being swapped out.
   applyReconcileAttach.type,
 ])
 
