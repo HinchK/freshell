@@ -5,9 +5,9 @@
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
 > for tracking.
 
-**Goal:** Deterministic mid-session rebind for terminal-mode opencode panes: when the user switches sessions inside the opencode TUI (`session_new` / `session_list` / `session_child_cycle`), freshell rebinds the pane's identity to the new session id so a later restart resumes the NEW session instead of the stale one.
+**Goal:** Deterministic mid-session rebind for terminal-mode opencode panes: when the user switches sessions inside the opencode TUI (`session_new` / `session_list` / `session_child_cycle`), freshell rebinds the pane's identity to the new session id so a later restart resumes the NEW session instead of the stale one. Deterministic BECAUSE unacted signals are retained on disk and the consumer arbitrates first-bind and retired-pane cases (Task 5, D1); the one residual loss window is a pane dying before the plugin writes the signal file at all.
 
-**Architecture:** Ship a small static opencode TUI plugin (TypeScript) with freshell, injected per-pane via the `OPENCODE_CONFIG_CONTENT` env var (spike-proven to MERGE with user config and APPEND to the plugin list on opencode 1.18.8). The plugin reads `FRESHELL_TERMINAL_ID` from its env and writes atomic signal files in the exact shape the claude SessionStart lane already uses (`~/.freshell/session-signals/<provider>/<terminalId>__<nonce>.json`). A Rust sweep drains the files and feeds the existing guarded rebind lane (same guard ladder and pinned fan-out as claude/codex, ending in `terminal.session.associated` with `previousSessionId`).
+**Architecture:** Ship a small static opencode TUI plugin (TypeScript) with freshell. At launch, freshell idempotently installs TWO freshell-owned files: `~/.freshell/opencode/freshell-rebind-plugin.ts` (the embedded plugin source) and a plugin-only `~/.freshell/opencode/tui.json` (exactly `{"plugin":["file:///<abs home>/.freshell/opencode/freshell-rebind-plugin.ts"]}`), and injects `OPENCODE_TUI_CONFIG=<abs path to that tui.json>` per-pane. Why this vector (validated on opencode 1.18.8/1.18.9, source-traced + runtime-probed): plugins listed in MAIN config (opencode.json / `OPENCODE_CONFIG_CONTENT`) load only as SERVER plugins and never reach the TUI plugin host — `TuiConfig.get()` returns config without `plugin_origins`, so `plugin/tui/runtime.ts:1088` always falls back to `TuiConfig.pluginOrigins()`, which reads only TUI config sources. TUI config sources MERGE additively and plugin arrays UNION, so the env-pointed file never suppresses the user's own TUI config. The plugin reads `FRESHELL_TERMINAL_ID` from its env and writes atomic signal files in the exact shape the claude SessionStart lane already uses (`~/.freshell/session-signals/<provider>/<terminalId>__<nonce>.json`). A Rust sweep drains the files and feeds the existing guarded rebind lane (same guard ladder and pinned fan-out as claude/codex, ending in `terminal.session.associated` with `previousSessionId`).
 
 **Tech Stack:** TypeScript (opencode TUI plugin, vitest), Rust (freshell-platform launch injection, freshell-ws signal consumer, cargo/clippy), existing WS contract (no changes).
 
@@ -18,8 +18,8 @@
 - **No PR:** stop after pushing the branch. Do not run `gh pr create`.
 - **Never set `--pure` / `OPENCODE_PURE`** anywhere. If the user runs pure mode, plugins are disabled → no signal → today's behavior. That degradation is correct.
 - **NEVER fall back to the activity/row-update correlation heuristic** (banned as hijack-capable by `docs/plans/2026-07-28-stale-resume-identity-p3-audit.md`). When unsure, do nothing.
-- **Injection is env-only, per-pane.** Never write or modify the user's opencode config (`~/.config/opencode/*`, project `.opencode/opencode.json`). If the server env already carries `OPENCODE_CONFIG_CONTENT`, merge our plugin into that JSON; if it doesn't parse as a JSON object, skip injection entirely (preserve the user's value untouched).
-- **Signal validation:** consumer acts only when the filename yields a non-empty terminal id AND the body's `session_id` matches `^ses_[A-Za-z0-9]+$`.
+- **Injection is per-pane env + freshell-owned files only.** Freshell installs two freshell-owned files idempotently at launch (`~/.freshell/opencode/freshell-rebind-plugin.ts` and a plugin-only `~/.freshell/opencode/tui.json` — the `plugin` key ONLY, never any other key, pinned by a unit test) and injects `OPENCODE_TUI_CONFIG=<abs path to that tui.json>` into `command_env`. `OPENCODE_CONFIG_CONTENT` is NOT injected at all (main-config plugins never reach the TUI plugin host). Never write or modify the user's opencode config (`~/.config/opencode/*`, project `.opencode/opencode.json`, any `tui.json` outside `~/.freshell/opencode/`); never place our tui.json in an ancestor directory of pane cwds (project tui.json discovery walks up to `/` — `~/.freshell/opencode/` is safe). If the merged env already carries `OPENCODE_TUI_CONFIG`, skip injection entirely (a path var cannot be merged; preserving the user's value wins; degradation = today's no-rebind behavior). Kill switch: skip injection when `FRESHELL_OPENCODE_REBIND` in the merged env is `0`/`false` (inverted `merged_env_truthy`-style semantics) — opencode self-updates in place, so one env var + a pane restart must be able to disable the feature without a freshell release.
+- **Signal validation:** consumer acts only when the filename yields a non-empty terminal id AND the body's `session_id` matches `^ses_[A-Za-z0-9]+$`. Rejects are warn-logged (`opencode_signal_rejected`) before the file is consumed — a silently-never-firing lane is the failure mode to avoid (the producer stays silent).
 - **Version tolerance:** the plugin must silently no-op if any opencode API surface (`slots`, `route`, `lifecycle`) is absent or shaped differently. Plugin init failure is non-fatal in opencode (logged only); freshell must degrade to no-rebind.
 - **Frozen WS contract:** no new frames, no schema changes. `previousSessionId` on `terminal.session.associated` already exists (`shared/ws-protocol.ts:841`, `crates/freshell-protocol/src/server_messages.rs:1074`). The contract-freeze gate (`npm run test:port && npm run contract:generate && git diff --exit-code -- port/contract`) must show no diff.
 - **Do not regress base-branch guarantees:** one-writer invariant, A13 (never two live owners of one session id), A8 retired-inclusive ledger guard, D7 live-session guards, D8 leases, pinned fan-out order (identity.upsert → registry.set_meta → awaited `ledger_resolve_identity` → `associated` THEN `meta.updated`), G3 retire-never-defend (new bound ledger row FIRST, then retire+link old).
@@ -31,10 +31,10 @@
 ## Scope Decisions (locked)
 
 1. **The consumer is Rust-only**, exactly like the claude SessionStart lane on the base branch (`grep -rn "session-signals" server/ src/ shared/` returns zero hits — the Node server has no signal lane, by design). Injection lives in `crates/freshell-platform/src/cli_launch.rs`, which only Rust callers use, so the Node server keeps today's behavior and no unconsumed signal files are ever produced. Node parity for the fan-out already exists on the base branch (`server/session-binding-authority.ts:52-72 swapTerminalSession`: `from_session_mismatch` ≙ D7, `target_session_already_owned` ≙ A13) and is untouched.
-2. **No D7 old-owner guard needed beyond the claude ladder:** like claude's hook, the producer is per-terminal by construction (the plugin reads `FRESHELL_TERMINAL_ID` from its own PTY env), so the live-pane + provider-match check substitutes for codex's old-owner predicate (see `claude_signal.rs:127-223` note).
-3. **No sqlite `parent_id` cross-check:** the plugin reads the session id from the TUI's own route/slots (the session the user is LOOKING at), which is user-facing by construction. The server event bus is not consulted, so the subagent filter reduces to id-shape validation. (Documented in the audit-doc update, Task 6.)
-4. **Activity/status tracking needs no repoint:** the Node terminal-opencode activity tracker keys on `terminalId` + the pane's own loopback SSE port (`server/opencode-activity-tracker.ts:207-211`), session-agnostic; the Rust server has no opencode activity tracker; `fresh_opencode` is a separate lane that never binds terminal panes (and the fresh-agent ledger guard refuses cross-kind claims). The Rust `opencode_locator` is single-bind adoption (arm consumed at first bind) and cannot fight a later rebind. No code change; the crown test's post-rebind assertions prove stability.
-5. **MCP-injection coexistence:** freshell's opencode MCP tool is injected by mutating the project-local `.opencode/opencode.json` (`mcp_inject.rs:393`). `OPENCODE_CONFIG_CONTENT` MERGES with file config (spike-proven on opencode 1.18.8: user providers and plugins preserved, injected plugin appended). Our injected JSON contains ONLY the `plugin` key (Task 2 pins this with a unit test), so it cannot shadow `mcp`/provider config. Final task includes a manual real-opencode smoke check.
+2. **No D7 old-owner guard needed beyond the claude ladder:** like claude's hook, the producer is per-terminal by construction (the plugin reads `FRESHELL_TERMINAL_ID` from its own PTY env), so the live-pane + provider-match check substitutes for codex's old-owner predicate (see `claude_signal.rs:127-223` note). Locator × signal arbitration (validated, V6): the signal is user-facing route truth and OUTRANKS the opencode locator's DB heuristic — when a never-bound live opencode pane receives a signal, the sweep performs the FIRST BIND (Task 5, D1.2), and the bind itself disarms the locator: its existing `resume_session_id.is_some()` reject (`opencode_association.rs:127`) turns any later Located event into a no-op. The reverse order (locator binds first, signal later) is just the ordinary rebind path. No locator code change.
+3. **No sqlite `parent_id` cross-check:** the plugin reads the session id from the TUI's own route/slots (the session the user is LOOKING at), which is user-facing by construction. The server event bus is not consulted, so the subagent filter reduces to id-shape validation. Note (validated, V2): after a deliberate drill-in the viewed session can be a subagent CHILD session — that is still the session the user is viewing, and the id-shape-only policy deliberately rebinds to it. (Documented in the audit-doc update, Task 6.)
+4. **Activity/status tracking needs no repoint:** the Node terminal-opencode activity tracker keys on `terminalId` + the pane's own loopback SSE port (`server/coding-cli/opencode-activity-tracker.ts:207-211`), session-agnostic; the Rust server has no opencode activity tracker; `fresh_opencode` is a separate lane that never binds terminal panes (and the fresh-agent ledger guard refuses cross-kind claims). The Rust `opencode_locator` is single-bind adoption: once a pane is bound — by the locator OR by a signal first-bind (Task 5, D1.2) — its existing `resume_session_id.is_some()` reject (`opencode_association.rs:127`) makes later Located events no-ops, so it cannot fight a later rebind; and when locator and signal race on a never-bound pane, the SIGNAL wins (Scope Decision 2 arbitration: the signal is user-facing route truth, the locator is a DB heuristic). No locator code change; the crown test's post-rebind assertions (incl. Phase 8) prove stability.
+5. **MCP-injection coexistence:** freshell's opencode MCP tool is injected by mutating the project-local `.opencode/opencode.json` (`mcp_inject.rs:393`). Coexistence is trivially safe with the `OPENCODE_TUI_CONFIG` vector: `mcp` lives in opencode.json — a different namespace from tui.json — and our injected tui.json contains ONLY the `plugin` key (Task 2 pins this with a unit test). TUI config sources (global `<config-dir>/opencode/tui.json|jsonc`, the `OPENCODE_TUI_CONFIG`-pointed file, project `tui.json|jsonc` walk-up, `.opencode`-dir tui.json) all MERGE; plugin arrays UNION (dedup by file URL); the env-pointed file does NOT suppress the user's own TUI config (validated on opencode 1.18.8/1.18.9: runtime probe showed both user and env plugins fired, user theme/settings preserved). Main-config plugins never reach the TUI host at all (`TuiConfig.get()` drops `plugin_origins`; `plugin/tui/runtime.ts:1088` falls back to `TuiConfig.pluginOrigins()`) — which is WHY `OPENCODE_CONFIG_CONTENT` is not the vector. Final task includes a manual real-opencode smoke check.
 
 ## File Structure
 
@@ -42,15 +42,15 @@
 |---|---|
 | `extensions/opencode/freshell-rebind-plugin.ts` (create) | The opencode TUI plugin: dedup-emit `(terminalId, sessionID)` signal files on every session switch. Pure-testable helpers exported. |
 | `test/unit/server/opencode-rebind-plugin.test.ts` (create) | Vitest unit tests for the plugin (mocked TuiPluginApi, injected fs writer). |
-| `crates/freshell-platform/src/opencode_plugin.rs` (create) | Embed plugin source (`include_str!`), idempotent install to `~/.freshell/opencode/`, `OPENCODE_CONFIG_CONTENT` build/merge (pure). Inline unit tests. |
-| `crates/freshell-platform/src/cli_launch.rs` (modify, opencode block `:416-422` area) | Per-pane env injection of `OPENCODE_CONFIG_CONTENT` into `command_env`; `merged_env_value` helper beside `merged_env_truthy` (`:246-257`). |
+| `crates/freshell-platform/src/opencode_plugin.rs` (create) | Embed plugin source (`include_str!`), idempotent install of the plugin AND the plugin-only `tui.json` to `~/.freshell/opencode/`; pure `tui_config_path` / `tui_config_content` / `plugin_file_spec` helpers. Inline unit tests. |
+| `crates/freshell-platform/src/cli_launch.rs` (modify, opencode block `:416-422` area) | Per-pane env injection of `OPENCODE_TUI_CONFIG` into `command_env` (skip when user-set; `FRESHELL_OPENCODE_REBIND=0/false` kill switch); `merged_env_value` helper beside `merged_env_truthy` (`:246-257`). |
 | `crates/freshell-platform/src/cli_launch_goldens.rs` (modify) | Golden pins for the new opencode env injection. |
 | `crates/freshell-platform/src/lib.rs` (modify) | `pub mod opencode_plugin;` |
-| `crates/freshell-ws/src/opencode_signal.rs` (create) | `OpencodeSignalWatcher` (sorted drain, `ses_` validation), `drain_and_rebind_opencode` (guard ladder + pinned fan-out), `spawn_opencode_signal_sweep`. Inline unit tests. |
+| `crates/freshell-ws/src/opencode_signal.rs` (create) | `OpencodeSignalWatcher` (sorted non-destructive drain, `ses_` validation + `opencode_signal_rejected` logging, ~10-min staleness cap), `drain_and_rebind_opencode` (guard ladder + first-bind arbitration + retired-pane rebind, act-then-delete, pinned fan-out), `spawn_opencode_signal_sweep`. Inline unit tests. |
 | `crates/freshell-ws/src/lib.rs` (modify) | `pub mod opencode_signal;` |
 | `crates/freshell-ws/src/codex_identity.rs` (modify, `:268`) | Fix hardcoded `provider: Some("codex")` in the `meta.updated` upsert of `broadcast_terminal_session_associated` — use the `provider` parameter. |
 | `crates/freshell-server/src/main.rs` (modify, after `:803`) | Boot the opencode signal sweep next to the claude one. |
-| `crates/freshell-ws/tests/opencode_switch_rebind.rs` (create) | Crown integration test: switch → rebind → restart → resumes NEW id; A→B→A; invalid id; A13 hijack; no-signal regression. |
+| `crates/freshell-ws/tests/opencode_switch_rebind.rs` (create) | Crown integration test: switch → rebind → restart → resumes NEW id; A→B→A; invalid id; A13 hijack; no-signal regression; dead-pane retired rebind + retention; first-bind arbitration vs the locator. |
 | `docs/plans/2026-07-28-stale-resume-identity-p3-audit.md` (modify) | opencode section → shipped mechanism; amplifier section → strengthened "no rebind needed, by construction". |
 
 ---
@@ -68,16 +68,21 @@
   - **Signal-file contract** (consumed by Task 4): directory `<home>/.freshell/session-signals/opencode/`; filename `<FRESHELL_TERMINAL_ID>__<nonce>.json` (terminal id recovered by splitting the stem on the LAST `__`; nonce contains digits/`-` only, never `__`); staging file written as `<name>.tmp` then renamed to `<name>.json` (consumer ignores non-`.json`); body `{"session_id":"ses_...","source":"opencode-tui-plugin"}`.
   - Exports for tests: `extractSessionId(value: unknown): string | null`, `createEmitter(deps: EmitterDeps): (candidate: unknown) => void`, `interface EmitterDeps { env: Record<string, string | undefined>; writeFile?: (dir: string, name: string, body: string) => void; now?: () => number }`, default export `{ id: 'freshell-rebind', tui(api: unknown): void }`.
 
-- [ ] **Step 1: Verify the plugin API surface against the installed opencode**
+- [ ] **Step 1: Verified API surface (record — do NOT re-derive)**
 
-Read the installed opencode 1.18.8 types (informational — the plugin is defensive either way):
+The npm install of opencode is binary-only: there is NO `@opencode-ai/plugin/dist/tui.d.ts` on disk to read — do not go looking for one. The surface below was verified against the sst/opencode source at tags v1.18.8 and v1.18.9 (byte-identical in every inspected path) plus live runtime probes on the installed binary (validation reports V2/V3/V7, 2026-07-28):
+
+- The accepted TUI module shape is default export `{ id, tui(api) }` — and `id` is REQUIRED and non-empty for file plugins (`plugin/shared.ts:306-316`; a missing/empty id silently skips the plugin).
+- `api.route.current` is a live getter over the single global route store, shape `{ name: "session", params: { sessionID } }`; EVERY in-TUI switch path (session_new, session_list select, child cycle, quick-switch, fork, server-pushed select) writes it.
+- Slots `session_prompt` / `sidebar_title` exist via `api.slots.register(name, renderer)`, remount keyed per sessionID with `session_id = route.sessionID` in the renderer context, and a renderer returning `undefined` leaves the host's default UI fully intact (renderer errors contained). CAVEAT: `session_prompt` renders only while the prompt is visible and `sidebar_title` only while the sidebar is shown — slots have visibility gaps, so the `route.current` POLL is the PRIMARY edge and the slots are latency accelerators only (Step 4 is written accordingly).
+- A bare `file:///abs/path.ts` plugin file loads fine (Bun imports TS; no package.json needed), but Bun caches failed imports for the process lifetime: the file must exist and be syntactically valid BEFORE the TUI starts (Task 3 installs it before launch).
+
+Keep the version-tolerance posture regardless: every API touch is wrapped and the plugin silently no-ops if any surface is absent or changed. Optional re-verification against a future opencode version:
 
 ```bash
-sed -n '1,200p' ~/.nvm/versions/node/v22.21.1/lib/node_modules/opencode-ai/node_modules/@opencode-ai/plugin/dist/tui.d.ts 2>/dev/null \
-  || find ~/.nvm/versions/node/v22.21.1/lib/node_modules/opencode-ai -name 'tui.d.ts' -path '*plugin*' -exec sed -n '1,200p' {} \;
+git clone --depth 1 --branch "v$(opencode --version)" https://github.com/sst/opencode /tmp/opencode-src \
+  && sed -n '300,320p' /tmp/opencode-src/packages/opencode/src/plugin/shared.ts
 ```
-
-Confirm: `TuiPluginApi` exposes `route.current` (→ `{ name: "session", params: { sessionID } }`), `slots.register(name, renderer)`, `lifecycle` (AbortSignal and/or `onDispose`). Confirm what a slot renderer receives (context carrying the current `session_id`/`sessionID`) and that returning `undefined` leaves the host's default rendering in place. If slot registration would REPLACE visible host content unconditionally, drop the two `slots.register` calls in Step 4's code and lower the poll interval from 2000 to 1000 ms — route polling then carries the feature alone. Record which variant you shipped in the plugin's header comment.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -232,7 +237,9 @@ Create `extensions/opencode/freshell-rebind-plugin.ts`:
 ```ts
 // Freshell opencode TUI plugin — deterministic mid-session rebind signal.
 //
-// Injected per-pane by the freshell Rust server via OPENCODE_CONFIG_CONTENT
+// Injected per-pane by the freshell Rust server via OPENCODE_TUI_CONFIG,
+// which points at the freshell-owned plugin-only tui.json installed next to
+// this file in ~/.freshell/opencode/
 // (crates/freshell-platform/src/opencode_plugin.rs). On every session switch
 // it writes an atomic signal file in the claude-SessionStart shape:
 //   <home>/.freshell/session-signals/opencode/<FRESHELL_TERMINAL_ID>__<nonce>.json
@@ -243,15 +250,17 @@ Create `extensions/opencode/freshell-rebind-plugin.ts`:
 // HARD RULES (version tolerance): this file must NEVER break the TUI. Every
 // interaction with the opencode plugin API is wrapped; if any surface is
 // absent or changed, the plugin silently no-ops and freshell degrades to
-// today's no-rebind behavior. Primary edge: slot re-render (session_prompt /
-// sidebar_title receive the current session id on every switch). Belt and
-// suspenders: a low-frequency api.route.current poll.
+// today's no-rebind behavior. PRIMARY edge: the api.route.current poll (1s)
+// — the route store is written by every switch path. Latency accelerators:
+// slot re-renders (session_prompt / sidebar_title), which have visibility
+// gaps (session_prompt only while the prompt is visible, sidebar_title only
+// while the sidebar is shown) and therefore must never be the only edge.
 
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 const SESSION_ID_RE = /^ses_[A-Za-z0-9]+$/
-const POLL_INTERVAL_MS = 2000
+const POLL_INTERVAL_MS = 1000
 
 export interface EmitterDeps {
   env: Record<string, string | undefined>
@@ -323,9 +332,11 @@ export default {
           onDispose?: (fn: () => void) => unknown
         }
       } | undefined
-      // Primary edge: host slots re-render with the current session id on
-      // every switch. The renderer returns undefined so the host's own
-      // content is never replaced.
+      // Latency accelerators: host slots re-render with the current session
+      // id on every switch, but only while visible (session_prompt: prompt
+      // shown; sidebar_title: sidebar shown) — never the only edge. The
+      // renderer returns undefined so the host's own content is never
+      // replaced.
       for (const slot of ['session_prompt', 'sidebar_title']) {
         try {
           a?.slots?.register?.(slot, (ctx: unknown) => {
@@ -336,7 +347,7 @@ export default {
           /* slot API absent/changed -> polling still covers us */
         }
       }
-      // Belt and suspenders: low-frequency route poll.
+      // PRIMARY edge: 1s route poll — covers the slots' visibility gaps.
       const tick = (): void => {
         try {
           emit(a?.route?.current)
@@ -382,7 +393,7 @@ git commit -m "feat(opencode): freshell TUI rebind plugin emitting session-switc
 
 ---
 
-### Task 2: Rust plugin embed, install, and OPENCODE_CONFIG_CONTENT merge
+### Task 2: Rust plugin embed and install of the plugin + freshell-owned tui.json
 
 **Files:**
 - Create: `crates/freshell-platform/src/opencode_plugin.rs`
@@ -394,18 +405,22 @@ git commit -m "feat(opencode): freshell TUI rebind plugin emitting session-switc
 - Produces (used by Task 3):
   - `pub const REBIND_PLUGIN_SOURCE: &str`
   - `pub fn rebind_plugin_path(home: &Path) -> PathBuf` → `<home>/.freshell/opencode/freshell-rebind-plugin.ts`
-  - `pub fn ensure_rebind_plugin_installed(home: &Path) -> std::io::Result<PathBuf>` (idempotent, atomic tmp+rename, rewrites only when content differs)
+  - `pub fn tui_config_path(home: &Path) -> PathBuf` → `<home>/.freshell/opencode/tui.json`
   - `pub fn plugin_file_spec(plugin_path: &Path) -> String` (portable `file://` spec)
-  - `pub fn build_opencode_config_content(existing: Option<&str>, plugin_path: &Path) -> Option<String>` (None ⇒ SKIP injection, preserve the user's value untouched)
+  - `pub fn tui_config_content(plugin_path: &Path) -> String` → exactly `{"plugin":["file:///…"]}` — the `plugin` key ONLY, never any other key (pinned by a unit test; TUI config sources merge and plugin arrays union, so a plugin-only file preserves the no-shadowing property)
+  - `pub fn ensure_rebind_plugin_installed(home: &Path) -> std::io::Result<PathBuf>` (idempotent, atomic tmp+rename, rewrites only when content differs; installs BOTH freshell-owned files and returns the tui.json path — the value Task 3 injects as `OPENCODE_TUI_CONFIG`)
 
 - [ ] **Step 1: Write the failing tests**
 
 Create `crates/freshell-platform/src/opencode_plugin.rs` with ONLY the test module first:
 
 ```rust
-//! Freshell's opencode TUI rebind plugin: embedded source, idempotent
-//! install into the freshell data dir, and OPENCODE_CONFIG_CONTENT
-//! composition (merge-with-user-value, never clobber).
+//! Freshell's opencode TUI rebind plugin: embedded source and idempotent
+//! install of TWO freshell-owned files into ~/.freshell/opencode/ — the
+//! plugin itself and a plugin-only tui.json pointing at it. The tui.json
+//! is injected per-pane via OPENCODE_TUI_CONFIG (cli_launch.rs); TUI config
+//! sources merge and plugin arrays union, so a plugin-only file can never
+//! shadow the user's own TUI config.
 
 #[cfg(test)]
 mod tests {
@@ -419,64 +434,43 @@ mod tests {
     }
 
     #[test]
-    fn install_is_idempotent_and_heals_content_drift() {
+    fn install_writes_both_files_idempotently_and_heals_content_drift() {
         let home = tempfile::tempdir().unwrap();
-        let path = ensure_rebind_plugin_installed(home.path()).unwrap();
-        assert_eq!(path, rebind_plugin_path(home.path()));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), REBIND_PLUGIN_SOURCE);
+        let tui_json = ensure_rebind_plugin_installed(home.path()).unwrap();
+        assert_eq!(tui_json, tui_config_path(home.path()));
+        let plugin = rebind_plugin_path(home.path());
+        assert_eq!(std::fs::read_to_string(&plugin).unwrap(), REBIND_PLUGIN_SOURCE);
+        assert_eq!(
+            std::fs::read_to_string(&tui_json).unwrap(),
+            tui_config_content(&plugin)
+        );
         // Second call: no error, same content.
         ensure_rebind_plugin_installed(home.path()).unwrap();
-        // Drifted content is healed.
-        std::fs::write(&path, "tampered").unwrap();
+        // Drifted content is healed (both files).
+        std::fs::write(&plugin, "tampered").unwrap();
+        std::fs::write(&tui_json, "tampered").unwrap();
         ensure_rebind_plugin_installed(home.path()).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), REBIND_PLUGIN_SOURCE);
-    }
-
-    #[test]
-    fn config_content_with_no_user_value_is_exactly_the_plugin_stanza() {
-        let out =
-            build_opencode_config_content(None, Path::new("/h/.freshell/opencode/p.ts")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        // ONLY the plugin key — must never shadow user mcp/provider config
-        // (OPENCODE_CONFIG_CONTENT merges with file config; see plan Scope
-        // Decision 5 / mcp_inject.rs coexistence).
+        assert_eq!(std::fs::read_to_string(&plugin).unwrap(), REBIND_PLUGIN_SOURCE);
         assert_eq!(
-            v,
-            serde_json::json!({ "plugin": ["file:///h/.freshell/opencode/p.ts"] })
+            std::fs::read_to_string(&tui_json).unwrap(),
+            tui_config_content(&plugin)
         );
-        // Empty string behaves like no value.
-        assert!(build_opencode_config_content(Some(""), Path::new("/p.ts")).is_some());
     }
 
     #[test]
-    fn config_content_merges_into_a_user_value_preserving_their_keys() {
-        let user = r#"{"username":"me","plugin":["./their-plugin.ts"]}"#;
-        let out = build_opencode_config_content(Some(user), Path::new("/x/p.ts")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["username"], "me");
+    fn tui_config_content_is_exactly_the_plugin_key_and_nothing_else() {
+        let content = tui_config_content(Path::new("/h/.freshell/opencode/p.ts"));
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // ONLY the plugin key — TUI config sources MERGE (scalar keys:
+        // later-order source wins) and plugin arrays UNION, so a plugin-only
+        // file can never shadow the user's own tui.json (plan Scope
+        // Decision 5 / validation report V7). This pin is load-bearing:
+        // never add another key.
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
         assert_eq!(
             v["plugin"],
-            serde_json::json!(["./their-plugin.ts", "file:///x/p.ts"])
-        );
-    }
-
-    #[test]
-    fn config_content_does_not_duplicate_an_already_present_spec() {
-        let user = r#"{"plugin":["file:///x/p.ts"]}"#;
-        let out = build_opencode_config_content(Some(user), Path::new("/x/p.ts")).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["plugin"], serde_json::json!(["file:///x/p.ts"]));
-    }
-
-    #[test]
-    fn unparseable_or_non_object_user_value_skips_injection() {
-        // None ⇒ caller must NOT set the env var, preserving the user's raw value.
-        assert!(build_opencode_config_content(Some("{oops"), Path::new("/p.ts")).is_none());
-        assert!(build_opencode_config_content(Some("[1,2]"), Path::new("/p.ts")).is_none());
-        // A user `plugin` key of the wrong type also skips (never destroy it).
-        assert!(
-            build_opencode_config_content(Some(r#"{"plugin":"one"}"#), Path::new("/p.ts"))
-                .is_none()
+            serde_json::json!(["file:///h/.freshell/opencode/p.ts"])
         );
     }
 
@@ -517,30 +511,14 @@ pub fn rebind_plugin_path(home: &Path) -> PathBuf {
         .join("freshell-rebind-plugin.ts")
 }
 
-/// Idempotently materialize the plugin into the freshell data dir.
-/// Atomic (tmp + rename); rewrites only when content differs, so a running
-/// opencode never observes a torn file.
-pub fn ensure_rebind_plugin_installed(home: &Path) -> std::io::Result<PathBuf> {
-    let path = rebind_plugin_path(home);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        if existing == REBIND_PLUGIN_SOURCE {
-            return Ok(path);
-        }
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("ts.tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(REBIND_PLUGIN_SOURCE.as_bytes())?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    Ok(path)
+/// The freshell-owned TUI config injected per-pane via OPENCODE_TUI_CONFIG.
+/// Lives under ~/.freshell/opencode/ — deliberately NOT an ancestor of any
+/// pane cwd (opencode's project tui.json discovery walks up to `/`).
+pub fn tui_config_path(home: &Path) -> PathBuf {
+    home.join(".freshell").join("opencode").join("tui.json")
 }
 
-/// `file://` spec for the opencode config `plugin` array. Unix: `file:///abs`.
+/// `file://` spec for the tui.json `plugin` array. Unix: `file:///abs`.
 /// Windows drive paths get forward slashes and a third slash.
 pub fn plugin_file_spec(plugin_path: &Path) -> String {
     let s = plugin_path.display().to_string().replace('\\', "/");
@@ -551,33 +529,46 @@ pub fn plugin_file_spec(plugin_path: &Path) -> String {
     }
 }
 
-/// Compose the OPENCODE_CONFIG_CONTENT value for a freshell-spawned pane.
-///
-/// - No/empty user value: exactly `{"plugin":[<spec>]}` — the single-key
-///   stanza can never shadow user mcp/provider/file config (opencode MERGES
-///   env config with file config; spike-verified on 1.18.8).
-/// - User value present: parse and append our spec to their `plugin` array,
-///   preserving every other key.
-/// - Unparseable / non-object / wrong-typed `plugin`: return `None` — the
-///   caller must skip injection so the user's raw value passes through
-///   untouched (rebind degrades to no-op; NEVER destroy user config).
-pub fn build_opencode_config_content(existing: Option<&str>, plugin_path: &Path) -> Option<String> {
-    let spec = plugin_file_spec(plugin_path);
-    match existing {
-        None | Some("") => Some(serde_json::json!({ "plugin": [spec] }).to_string()),
-        Some(raw) => {
-            let mut value: serde_json::Value = serde_json::from_str(raw).ok()?;
-            let obj = value.as_object_mut()?;
-            let plugins = obj
-                .entry("plugin")
-                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
-            let arr = plugins.as_array_mut()?;
-            if !arr.iter().any(|p| p.as_str() == Some(spec.as_str())) {
-                arr.push(serde_json::Value::String(spec));
-            }
-            Some(value.to_string())
+/// Exactly `{"plugin":[<spec>]}` — the plugin key and NOTHING else. TUI
+/// config sources MERGE and plugin arrays UNION (dedup by file URL), so
+/// this single-key file can never shadow the user's global/project
+/// tui.json (validated on opencode 1.18.8/1.18.9, report V7). Load-bearing:
+/// never add another key (pinned by unit test).
+pub fn tui_config_content(plugin_path: &Path) -> String {
+    serde_json::json!({ "plugin": [plugin_file_spec(plugin_path)] }).to_string()
+}
+
+fn write_atomic_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == content {
+            return Ok(());
         }
     }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Idempotently materialize BOTH freshell-owned files into
+/// `~/.freshell/opencode/`: the plugin source and the plugin-only tui.json
+/// pointing at it. Atomic (tmp + rename); rewrites only when content
+/// differs, so a running opencode never observes a torn file. Returns the
+/// tui.json path — the value cli_launch.rs injects as OPENCODE_TUI_CONFIG.
+/// Bun caches failed imports for the process lifetime, so this MUST run
+/// (and succeed) before the TUI launches.
+pub fn ensure_rebind_plugin_installed(home: &Path) -> std::io::Result<PathBuf> {
+    let plugin = rebind_plugin_path(home);
+    write_atomic_if_changed(&plugin, REBIND_PLUGIN_SOURCE)?;
+    let tui_json = tui_config_path(home);
+    write_atomic_if_changed(&tui_json, &tui_config_content(&plugin))?;
+    Ok(tui_json)
 }
 ```
 
@@ -587,27 +578,27 @@ pub fn build_opencode_config_content(existing: Option<&str>, plugin_path: &Path)
 cargo test -p freshell-platform opencode_plugin
 ```
 
-Expected: PASS (7 tests).
+Expected: PASS (4 tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cargo fmt --all
 git add crates/freshell-platform/src/opencode_plugin.rs crates/freshell-platform/src/lib.rs crates/freshell-platform/Cargo.toml
-git commit -m "feat(platform): embed + install opencode rebind plugin; OPENCODE_CONFIG_CONTENT merge"
+git commit -m "feat(platform): embed + install opencode rebind plugin and plugin-only tui.json"
 ```
 
 ---
 
-### Task 3: Inject OPENCODE_CONFIG_CONTENT in the launch resolver (golden-first)
+### Task 3: Inject OPENCODE_TUI_CONFIG in the launch resolver (golden-first)
 
 **Files:**
 - Modify: `crates/freshell-platform/src/cli_launch.rs` (opencode block at `:416-422`; helper beside `merged_env_truthy` at `:246-257`)
 - Modify: `crates/freshell-platform/src/cli_launch_goldens.rs`
 
 **Interfaces:**
-- Consumes: Task 2's `opencode_plugin::{ensure_rebind_plugin_installed, rebind_plugin_path, build_opencode_config_content}`; the resolver's env abstraction (the `env` parameter `resolve_coding_cli_command(&cli_commands, &inputs, env)` already used by `get_opencode_env_overrides(env, &command_env)` and `merged_env_truthy`).
-- Produces: every freshell-spawned opencode pane (WS create `freshell-ws/src/terminal.rs:1635`, REST create `freshell-freshagent/src/terminal_tabs.rs:954`, and restore relaunches — `command_env` is rebuilt identically on restore) carries `OPENCODE_CONFIG_CONTENT` in `command_env`. New helper: `fn merged_env_value(env: &impl <the resolver's env trait>, command_env: &BTreeMap<String, String>, key: &str) -> Option<String>` with the same JS-spread shadowing semantics as `merged_env_truthy` (a present-but-empty `command_env` value shadows the process env).
+- Consumes: Task 2's `opencode_plugin::{ensure_rebind_plugin_installed, tui_config_path, rebind_plugin_path}`; the resolver's env abstraction (the `env` parameter `resolve_coding_cli_command(&cli_commands, &inputs, env)` already used by `get_opencode_env_overrides(env, &command_env)` and `merged_env_truthy`).
+- Produces: every freshell-spawned opencode pane (WS create `freshell-ws/src/terminal.rs:1635`, REST create `freshell-freshagent/src/terminal_tabs.rs:954`, and restore relaunches — `command_env` is rebuilt identically on restore) carries `OPENCODE_TUI_CONFIG=<abs path to ~/.freshell/opencode/tui.json>` in `command_env`. `OPENCODE_CONFIG_CONTENT` is NOT injected at all. Skip rules (each degrades to today's no-rebind behavior): (a) the merged env already carries `OPENCODE_TUI_CONFIG` — a path var cannot be merged; preserving the user's value wins, skip injection entirely; (b) kill switch — `FRESHELL_OPENCODE_REBIND` set to `0`/`false` in the merged env skips injection (opencode self-updates in place; one env var + a pane restart disables the feature without a freshell release); (c) unresolvable home; (d) install failure (warn, launch anyway). New helper: `fn merged_env_value(env: &impl <the resolver's env trait>, command_env: &BTreeMap<String, String>, key: &str) -> Option<String>` with the same JS-spread shadowing semantics as `merged_env_truthy` (a present-but-empty `command_env` value shadows the process env).
 
 **Home-dir resolution rule (locked):** resolve `home` through the resolver's env abstraction — `merged_env_value(env, &command_env, "HOME")` falling back to `"USERPROFILE"` — NOT `dirs::home_dir()` or `std::env`. This keeps the goldens hermetic (they pass a fake env with a temp HOME) and matches `claude_signal.rs`'s `$HOME`-then-`%USERPROFILE%` convention. No home ⇒ skip injection (degrade, mirroring `ClaudeSignalWatcher::default_root() -> None` skipping the sweep).
 
@@ -617,28 +608,28 @@ Read `crates/freshell-platform/src/cli_launch.rs:240-300` (the env-lookup helper
 
 - [ ] **Step 2: Update the goldens FIRST (verify RED)**
 
-In `cli_launch_goldens.rs`, for every opencode golden case, extend the expected `command_env` with the new key. Use the real composition functions against the golden's fake HOME so the assertion is host-independent, e.g.:
+In `cli_launch_goldens.rs`, for every opencode golden case, extend the expected `command_env` with the new key (the goldens now pin the `OPENCODE_TUI_CONFIG` injection). Use the real composition functions against the golden's fake HOME so the assertion is host-independent, e.g.:
 
 ```rust
 let home = tempfile::tempdir().unwrap();
 // (set HOME=<home> in the golden's fake env, alongside its existing vars)
 let expected_plugin_path = crate::opencode_plugin::rebind_plugin_path(home.path());
-let expected_config = crate::opencode_plugin::build_opencode_config_content(
-    None,
-    &expected_plugin_path,
-)
-.unwrap();
-// assert command_env["OPENCODE_CONFIG_CONTENT"] == expected_config
-// assert the plugin file now exists on disk with the embedded content:
+let expected_tui_config = crate::opencode_plugin::tui_config_path(home.path());
+// assert command_env["OPENCODE_TUI_CONFIG"] == expected_tui_config.display().to_string()
+// assert BOTH freshell-owned files now exist on disk with the expected content:
 assert_eq!(
     std::fs::read_to_string(&expected_plugin_path).unwrap(),
     crate::opencode_plugin::REBIND_PLUGIN_SOURCE
 );
+assert_eq!(
+    std::fs::read_to_string(&expected_tui_config).unwrap(),
+    crate::opencode_plugin::tui_config_content(&expected_plugin_path)
+);
 ```
 
 Add two NEW golden cases:
-1. **User value present:** fake env contains `OPENCODE_CONFIG_CONTENT={"username":"me","plugin":["./their.ts"]}` → resolved `command_env` value preserves `username` and appends our `file://` spec after `./their.ts`.
-2. **Unparseable user value:** fake env contains `OPENCODE_CONFIG_CONTENT={oops` → resolved `command_env` does NOT contain the key at all (the user's raw process-env value passes through to the PTY untouched).
+1. **User value present (skip):** fake env contains `OPENCODE_TUI_CONFIG=/their/tui.json` → resolved `command_env` does NOT contain the key at all (a path var cannot be merged; the user's raw process-env value passes through to the PTY untouched; no freshell files are forced on the pane).
+2. **Kill switch (skip):** fake env contains `FRESHELL_OPENCODE_REBIND=0` → resolved `command_env` does NOT contain `OPENCODE_TUI_CONFIG`; repeat with `false` (inverted `merged_env_truthy`-style semantics).
 
 Also assert in an existing opencode golden that **argv is byte-identical to before** (the injection is env-only; `--hostname/--port/--session` args unchanged).
 
@@ -672,27 +663,38 @@ In the `mode == "opencode"` block (after the existing `get_opencode_env_override
 
 ```rust
 // Freshell TUI rebind plugin (docs/plans/2026-07-28-opencode-tui-rebind.md):
-// install the plugin file into ~/.freshell/opencode/ and inject it per-pane
-// via OPENCODE_CONFIG_CONTENT. Merges with any user value; skips entirely
-// (preserving the user's raw value) when the user value is unparseable or
-// home is unresolvable. Failure here must never block the launch.
-let home = merged_env_value(env, &command_env, "HOME")
-    .filter(|s| !s.is_empty())
-    .or_else(|| merged_env_value(env, &command_env, "USERPROFILE").filter(|s| !s.is_empty()));
-if let Some(home) = home {
-    let home = std::path::PathBuf::from(home);
-    match crate::opencode_plugin::ensure_rebind_plugin_installed(&home) {
-        Ok(plugin_path) => {
-            let existing = merged_env_value(env, &command_env, "OPENCODE_CONFIG_CONTENT");
-            if let Some(content) = crate::opencode_plugin::build_opencode_config_content(
-                existing.as_deref(),
-                &plugin_path,
-            ) {
-                command_env.insert("OPENCODE_CONFIG_CONTENT".to_string(), content);
+// install the plugin + plugin-only tui.json into ~/.freshell/opencode/ and
+// point this pane's TUI at it via OPENCODE_TUI_CONFIG. Main-config plugins
+// (opencode.json / OPENCODE_CONFIG_CONTENT) load as SERVER plugins only and
+// never reach the TUI plugin host; TUI config sources MERGE and plugin
+// arrays UNION, so the injected plugin-only file can never shadow user
+// config (validated on opencode 1.18.8/1.18.9). Skips (each degrades to
+// today's no-rebind behavior): user-set OPENCODE_TUI_CONFIG (a path var
+// cannot be merged — preserve the user's value), the
+// FRESHELL_OPENCODE_REBIND=0/false kill switch (opencode self-updates in
+// place), unresolvable home, install failure. Failure here must never
+// block the launch.
+let rebind_disabled = matches!(
+    merged_env_value(env, &command_env, "FRESHELL_OPENCODE_REBIND").as_deref(),
+    Some("0") | Some("false")
+);
+let user_tui_config = merged_env_value(env, &command_env, "OPENCODE_TUI_CONFIG");
+if !rebind_disabled && user_tui_config.is_none() {
+    let home = merged_env_value(env, &command_env, "HOME")
+        .filter(|s| !s.is_empty())
+        .or_else(|| merged_env_value(env, &command_env, "USERPROFILE").filter(|s| !s.is_empty()));
+    if let Some(home) = home {
+        let home = std::path::PathBuf::from(home);
+        match crate::opencode_plugin::ensure_rebind_plugin_installed(&home) {
+            Ok(tui_config) => {
+                command_env.insert(
+                    "OPENCODE_TUI_CONFIG".to_string(),
+                    tui_config.display().to_string(),
+                );
             }
-        }
-        Err(error) => {
-            tracing::warn!(%error, "opencode_rebind_plugin_install_failed: launching without rebind signal");
+            Err(error) => {
+                tracing::warn!(%error, "opencode_rebind_plugin_install_failed: launching without rebind signal");
+            }
         }
     }
 }
@@ -713,7 +715,7 @@ Expected: PASS, including all pre-existing goldens (claude/codex untouched).
 ```bash
 cargo fmt --all --check && cargo clippy -p freshell-platform --all-targets -- -D warnings
 git add crates/freshell-platform/src/cli_launch.rs crates/freshell-platform/src/cli_launch_goldens.rs
-git commit -m "feat(platform): inject freshell rebind plugin into opencode panes via OPENCODE_CONFIG_CONTENT"
+git commit -m "feat(platform): inject freshell rebind plugin into opencode panes via OPENCODE_TUI_CONFIG"
 ```
 
 ---
@@ -728,11 +730,12 @@ git commit -m "feat(platform): inject freshell rebind plugin into opencode panes
 **Interfaces:**
 - Consumes: the signal-file contract from Task 1.
 - Produces (used by Task 5 and the crown test):
-  - `pub struct OpencodeSignalWatcher` with `pub fn new(root: PathBuf) -> Self`, `pub fn default_root() -> Option<PathBuf>` (`$HOME`/`%USERPROFILE%` + `.freshell/session-signals/opencode`, `None` when home unresolvable — mirror `claude_signal.rs:52-66`), `pub fn drain(&self) -> Vec<OpencodeSignal>`
-  - `pub struct OpencodeSignal { pub terminal_id: String, pub session_id: String, pub source: Option<String> }` (derive `Debug, Clone, PartialEq, Eq`)
+  - `pub struct OpencodeSignalWatcher` with `pub fn new(root: PathBuf) -> Self`, `pub fn default_root() -> Option<PathBuf>` (`$HOME`/`%USERPROFILE%` + `.freshell/session-signals/opencode`, `None` when home unresolvable — mirror `claude_signal.rs:52-66`), `pub fn drain(&self) -> Vec<OpencodeSignal>` — NON-DESTRUCTIVE for valid signals: they are returned WITH their file paths and left on disk (the Task 5 consumer deletes each file only after ACTING on it — D1.1); rejected files (bad id shape, empty terminal id, malformed json) are warn-logged (`opencode_signal_rejected`) and deleted; files older than `STALE_SIGNAL_MAX_AGE` (~10 min) are reaped without emitting; `*.tmp` ignored
+  - `pub struct OpencodeSignal { pub path: PathBuf, pub terminal_id: String, pub session_id: String, pub source: Option<String> }` (derive `Debug, Clone, PartialEq, Eq`)
+  - `pub(crate) const STALE_SIGNAL_MAX_AGE: std::time::Duration` (~10 minutes — the retention cap)
   - `pub(crate) fn is_valid_opencode_session_id(id: &str) -> bool`
 
-This module deliberately mirrors `claude_signal.rs`'s shape rather than extracting a provider-generic watcher. The spec prefers "the server-side consumer is reused, not duplicated" — what is REUSED is the signal-file contract, the sweep architecture, the entire guard/fan-out surface (`identity`, `registry`, `pane_ledger`, `broadcast_terminal_session_associated`), and the pinned tail; only the ~80-line watcher/ladder shell is mirrored, because (a) the codebase's stated preference is shape duplication over premature provider-generic controllers (`codex_association.rs:4-6`), (b) parameterizing `claude_signal.rs` would touch the base branch's shipped claude lane (Global Constraint: don't regress it), and (c) opencode needs two behavioral deltas claude must not inherit. Two deltas from claude: (1) `drain()` **sorts** entries by filename before processing, so one pane's timestamp-first nonces process in emission order and rapid A→B→A resolves last-write-wins deterministically; (2) `parse_signal_file` **rejects** any `session_id` not matching `^ses_[A-Za-z0-9]+$` (the spec's hard shape requirement — opencode ids are `ses_*`; claude skips shape checks because claude ids are validated elsewhere).
+This module deliberately mirrors `claude_signal.rs`'s shape rather than extracting a provider-generic watcher. The spec prefers "the server-side consumer is reused, not duplicated" — what is REUSED is the signal-file contract, the sweep architecture, the entire guard/fan-out surface (`identity`, `registry`, `pane_ledger`, `broadcast_terminal_session_associated`), and the pinned tail; only the ~80-line watcher/ladder shell is mirrored, because (a) the codebase's stated preference is shape duplication over premature provider-generic controllers (`codex_association.rs:4-6`), (b) parameterizing `claude_signal.rs` would touch the base branch's shipped claude lane (Global Constraint: don't regress it), and (c) opencode needs two behavioral deltas claude must not inherit. Three deltas from claude: (1) `drain()` **sorts** entries by filename before processing, so one pane's timestamp-first nonces process in emission order and rapid A→B→A resolves last-write-wins deterministically; (2) `parse_signal_file` **rejects** any `session_id` not matching `^ses_[A-Za-z0-9]+$` (the spec's hard shape requirement — opencode ids are `ses_*`; a census of 2151 real sessions showed zero violations, but opencode's own acceptance is weaker, so rejects are also **warn-logged** as `opencode_signal_rejected` before being consumed — a silently-never-firing lane is the failure mode to avoid; the producer stays silent); (3) drain is **non-destructive for valid signals** — each is returned WITH its file path and left on disk; the Task 5 consumer deletes a file only after ACTING on it (act-then-delete, D1.1), so signals for panes that are momentarily absent are retained for later sweeps, with a `STALE_SIGNAL_MAX_AGE` (~10 min) reap. Rationale (V6, falsified A14): a fire-and-forget drain permanently lost signals whenever a pane died within ~1-3s of a switch — every later restore then resumed the OLD id.
 
 - [ ] **Step 1: Read the reference implementation**
 
@@ -760,15 +763,25 @@ mod tests {
         assert!(!is_valid_opencode_session_id(""));
     }
 
+    fn remaining(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
-    fn drain_parses_sorts_deletes_and_rejects_bad_shapes() {
+    fn drain_parses_sorts_retains_valid_files_and_consumes_rejects() {
         let dir = tempfile::tempdir().unwrap();
         // Timestamp-first nonces: lexicographic order == emission order.
         write_signal(dir.path(), "term-1__00000000000002-000002-9.json",
             r#"{"session_id":"ses_bbb","source":"opencode-tui-plugin"}"#);
         write_signal(dir.path(), "term-1__00000000000001-000001-9.json",
             r#"{"session_id":"ses_aaa","source":"opencode-tui-plugin"}"#);
-        // Rejected: bad id shape (claude-style uuid), malformed json, missing __.
+        // Rejected (warn-logged as opencode_signal_rejected + deleted):
+        // bad id shape (claude-style uuid), malformed json, missing __.
         write_signal(dir.path(), "term-1__00000000000003-000003-9.json",
             r#"{"session_id":"22222222-3333-4444-8555-666677778888"}"#);
         write_signal(dir.path(), "junk__1.json", "{not json");
@@ -779,28 +792,45 @@ mod tests {
 
         let watcher = OpencodeSignalWatcher::new(dir.path().to_path_buf());
         let signals = watcher.drain();
+        let ids: Vec<(&str, &str)> = signals
+            .iter()
+            .map(|s| (s.terminal_id.as_str(), s.session_id.as_str()))
+            .collect();
+        assert_eq!(ids, vec![("term-1", "ses_aaa"), ("term-1", "ses_bbb")]);
+        assert_eq!(signals[0].source.as_deref(), Some("opencode-tui-plugin"));
+        // Valid signals carry their file paths and are RETAINED on disk —
+        // the Task 5 consumer deletes each file only after ACTING on it
+        // (act-then-delete, D1.1).
+        assert!(signals.iter().all(|s| s.path.exists()));
+        // Rejected .json files are consumed (single-shot — junk must not
+        // re-fail every sweep); the .tmp staging file is untouched.
         assert_eq!(
-            signals,
+            remaining(dir.path()),
             vec![
-                OpencodeSignal {
-                    terminal_id: "term-1".into(),
-                    session_id: "ses_aaa".into(),
-                    source: Some("opencode-tui-plugin".into()),
-                },
-                OpencodeSignal {
-                    terminal_id: "term-1".into(),
-                    session_id: "ses_bbb".into(),
-                    source: Some("opencode-tui-plugin".into()),
-                },
+                "term-1__00000000000001-000001-9.json".to_string(),
+                "term-1__00000000000002-000002-9.json".to_string(),
+                "term-1__00000000000004-000004-9.tmp".to_string(),
             ]
         );
-        // Every .json is consumed (even rejected ones — single-shot semantics);
-        // the .tmp staging file is untouched.
-        let remaining: Vec<_> = std::fs::read_dir(dir.path())
+    }
+
+    #[test]
+    fn drain_reaps_stale_files_without_emitting() {
+        let dir = tempfile::tempdir().unwrap();
+        write_signal(dir.path(), "term-1__00000000000001-000001-9.json",
+            r#"{"session_id":"ses_old"}"#);
+        let path = dir.path().join("term-1__00000000000001-000001-9.json");
+        // Backdate past the retention cap (D1.1 staleness reap).
+        let stale = std::time::SystemTime::now() - STALE_SIGNAL_MAX_AGE - std::time::Duration::from_secs(60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
             .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(remaining, vec!["term-1__00000000000004-000004-9.tmp".to_string()]);
+            .set_modified(stale)
+            .unwrap();
+        let watcher = OpencodeSignalWatcher::new(dir.path().to_path_buf());
+        assert!(watcher.drain().is_empty());
+        assert!(!path.exists());
     }
 
     #[test]
@@ -829,16 +859,20 @@ Above the tests in `opencode_signal.rs` (mirroring `claude_signal.rs:24-118` wit
 //! Opencode mid-session rebind: signal-file watcher.
 //!
 //! The freshell TUI plugin (extensions/opencode/freshell-rebind-plugin.ts,
-//! injected per-pane via OPENCODE_CONFIG_CONTENT) writes
+//! injected per-pane via OPENCODE_TUI_CONFIG pointing at the freshell-owned
+//! plugin-only tui.json) writes
 //! `$HOME/.freshell/session-signals/opencode/<terminal_id>__<nonce>.json`
 //! on every in-TUI session switch. This module drains those files.
 //!
 //! Shape-mirrors claude_signal.rs (the codebase prefers duplication over a
 //! premature provider-generic controller — see codex_association.rs:4-6),
-//! with two deltas: drain() sorts by filename (timestamp-first nonces ⇒
-//! deterministic last-write-wins under rapid A→B→A switching), and
-//! session ids must match `ses_[A-Za-z0-9]+` (opencode's id shape; reject
-//! everything else before any guard runs).
+//! with three deltas: drain() sorts by filename (timestamp-first nonces ⇒
+//! deterministic last-write-wins under rapid A→B→A switching); session ids
+//! must match `ses_[A-Za-z0-9]+` (opencode's id shape; reject everything
+//! else before any guard runs, warn-logging rejects for detectability);
+//! and drain is NON-DESTRUCTIVE for valid signals — the consumer deletes a
+//! file only after acting on it (act-then-delete, D1.1), with a ~10-minute
+//! staleness reap for signals nobody ever acts on.
 //!
 //! Deliberately NOT a WsState field: the sweep task owns the watcher
 //! (claude_signal.rs:12-14 — WsState is an exhaustive struct literal in
@@ -847,6 +881,9 @@ Above the tests in `opencode_signal.rs` (mirroring `claude_signal.rs:24-118` wit
 use std::path::{Path, PathBuf};
 
 const OPENCODE_SIGNAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Retention cap for unacted signal files (D1.1): a signal whose pane never
+/// (re)appears is reaped after this age instead of living forever.
+pub(crate) const STALE_SIGNAL_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[derive(Clone)]
 pub struct OpencodeSignalWatcher {
@@ -855,6 +892,9 @@ pub struct OpencodeSignalWatcher {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpencodeSignal {
+    /// The signal file itself. The consumer deletes it only after ACTING on
+    /// the signal (act-then-delete, D1.1) — never delete-on-read.
+    pub path: PathBuf,
     pub terminal_id: String,
     pub session_id: String,
     /// The plugin's `source` field ("opencode-tui-plugin"); logged only.
@@ -889,9 +929,14 @@ impl OpencodeSignalWatcher {
         )
     }
 
-    /// Read + parse + DELETE every `*.json`, sorted by filename. Malformed and
-    /// invalid-shape files are deleted AND skipped (single-shot semantics —
-    /// junk must not re-fail every sweep). `*.tmp` staging files are ignored.
+    /// Read + parse every `*.json`, sorted by filename. Valid signals are
+    /// returned WITH their file paths and RETAINED on disk — act-then-delete
+    /// is the consumer's job (D1.1: a fire-and-forget drain permanently lost
+    /// signals when a pane died within seconds of a switch, V6). Malformed
+    /// and invalid-shape files are warn-logged (`opencode_signal_rejected`)
+    /// and deleted (single-shot semantics — junk must not re-fail every
+    /// sweep). Files older than STALE_SIGNAL_MAX_AGE are reaped without
+    /// emitting. `*.tmp` staging files are ignored.
     pub fn drain(&self) -> Vec<OpencodeSignal> {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return Vec::new(); // no dir yet: no opencode pane has ever signaled
@@ -904,10 +949,25 @@ impl OpencodeSignalWatcher {
         paths.sort();
         let mut signals = Vec::new();
         for path in paths {
-            if let Some(sig) = parse_signal_file(&path) {
-                signals.push(sig);
+            let stale = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STALE_SIGNAL_MAX_AGE);
+            if stale {
+                let _ = std::fs::remove_file(&path); // retention cap (D1.1)
+                continue;
             }
-            let _ = std::fs::remove_file(&path);
+            match parse_signal_file(&path) {
+                Some(sig) => signals.push(sig), // retained: consumer act-then-deletes
+                None => {
+                    // A silently-never-firing lane is the failure mode to
+                    // avoid (A8 detectability): log rejects before consuming.
+                    tracing::warn!(path = %path.display(),
+                        "opencode_signal_rejected: bad terminal id or session_id shape, consuming file");
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
         }
         signals
     }
@@ -926,6 +986,7 @@ fn parse_signal_file(path: &Path) -> Option<OpencodeSignal> {
         return None;
     }
     Some(OpencodeSignal {
+        path: path.to_path_buf(),
         terminal_id: terminal_id.to_string(),
         session_id: session_id.to_string(),
         source: body.get("source").and_then(|v| v.as_str()).map(str::to_string),
@@ -941,7 +1002,7 @@ While here, verify against the actual `claude_signal.rs:52-66` `default_root` bo
 cargo test -p freshell-ws opencode_signal
 cargo fmt --all --check && cargo clippy -p freshell-ws --all-targets -- -D warnings
 git add crates/freshell-ws/src/opencode_signal.rs crates/freshell-ws/src/lib.rs
-git commit -m "feat(ws): opencode signal-file watcher (sorted drain, ses_ shape validation)"
+git commit -m "feat(ws): opencode signal-file watcher (sorted retained drain, ses_ shape validation)"
 ```
 
 ---
@@ -955,8 +1016,8 @@ git commit -m "feat(ws): opencode signal-file watcher (sorted drain, ses_ shape 
 - Test: Create `crates/freshell-ws/tests/opencode_switch_rebind.rs`
 
 **Interfaces:**
-- Consumes: Task 4's `OpencodeSignalWatcher`/`OpencodeSignal`; the base branch's guard/fan-out surface — `state.identity.get / upsert / find_by_session_including_retired` (`identity.rs`), `state.registry.live_session_owner(Some(&state.identity), "opencode", id)` (`registry.rs:2180`), `state.registry.set_meta`, `state.pane_ledger.lookup_by_session`, `crate::pane_ledger::ledger_resolve_identity(state, tid, "opencode", sid, cwd).await`, `crate::codex_identity::broadcast_terminal_session_associated(state, "opencode", tid, sid, cwd, previous)`.
-- Produces: `pub async fn drain_and_rebind_opencode(state: &WsState, watcher: &OpencodeSignalWatcher)` (`pub` so the integration test drives drains deterministically instead of racing the timer — same rationale as `drain_and_rebind_claude`), `pub fn spawn_opencode_signal_sweep(state: WsState, watcher: OpencodeSignalWatcher)`.
+- Consumes: Task 4's `OpencodeSignalWatcher`/`OpencodeSignal` (each signal carries its file `path`); the base branch's guard/fan-out surface — `state.identity.get / upsert / retire / find_by_session_including_retired` (`identity.rs`), `state.registry.live_session_owner(Some(&state.identity), "opencode", id)` (`registry.rs:2180`), the registry's per-terminal entry accessor (mode / Running / `resume_session_id` / cwd — needed for D1.2 first-bind arbitration; match the real accessor names), `state.registry.set_meta`, `state.pane_ledger.lookup_by_session`, `crate::pane_ledger::ledger_resolve_identity(state, tid, "opencode", sid, cwd).await`, `crate::codex_identity::broadcast_terminal_session_associated(state, "opencode", tid, sid, cwd, previous)`.
+- Produces: `pub async fn drain_and_rebind_opencode(state: &WsState, watcher: &OpencodeSignalWatcher)` (`pub` so the integration test drives drains deterministically instead of racing the timer — same rationale as `drain_and_rebind_claude`), `pub fn spawn_opencode_signal_sweep(state: WsState, watcher: OpencodeSignalWatcher)`. ACT-THEN-DELETE semantics (D1.1): a signal file is deleted only after the signal was ACTED ON — rebound (live, first-bind, or retired-pane), same-id no-op, or a deliberate guard refusal (A13 / ledger A8 / fresh-agent); signals with no actionable pane (no identity row and no live never-bound opencode pane, or a foreign-provider row) are RETAINED on disk for later sweeps, and the watcher's ~10-minute staleness cap reaps abandoned ones.
 
 - [ ] **Step 1: Read the two reference files**
 
@@ -986,9 +1047,11 @@ fn write_opencode_signal(root: &std::path::Path, terminal_id: &str, seq: u64, se
    - **Phase 1 (rebind):** create an opencode terminal bound to A (`terminal.create` with `restore:true` + `sessionRef {provider:"opencode", sessionId:A}` — exactly how the claude test binds its initial session). Write a signal for B, call `freshell_ws::opencode_signal::drain_and_rebind_opencode(&state, &watcher).await`, then assert: `terminal.session.associated` frame with `sessionRef {opencode, B}` AND `previousSessionId == A`; the following `terminal.meta.updated` frame carries **provider `"opencode"`** (this pins the `:268` fix — it currently says `"codex"`); registry meta `resume_session_id == B`; pane-ledger: A's row retired with reason Superseded and `superseded_by` → B's bound row (assert via the same ledger accessors the claude test uses).
    - **Phase 2 (restart resumes NEW id):** kill the terminal, re-create with `restore:true` + `sessionRef {opencode, B}`; assert captured argv contains `--session ses_bbb…` and does NOT contain `ses_aaa…`.
    - **Phase 3 (rapid A→B→A):** starting from the pane bound to A (use a fresh pane bound to A, or continue from phase 2's B-bound pane with B→A→B — keep the same three-signals-one-drain shape), write three signals in one sweep window with ascending seq (`A`, then `B`, then `A`), one `drain_and_rebind_opencode` call; assert the final identity/meta equals the LAST signal's id and the intermediate frames arrive in sorted order (last-write-wins, idempotent, no flapping error).
-   - **Phase 4 (invalid shape ignored):** write a signal whose body is `{"session_id":"not-a-session"}`; drain; assert no `associated` frame and meta unchanged, but the file IS consumed (`std::fs::read_dir(&root).unwrap().count() == 0`).
+   - **Phase 4 (invalid shape ignored):** write a signal whose body is `{"session_id":"not-a-session"}`; drain; assert no `associated` frame and meta unchanged, but the file IS consumed (`std::fs::read_dir(&root).unwrap().count() == 0`) — the watcher warn-logs it as `opencode_signal_rejected` (F7 detectability; the log itself is not asserted).
    - **Phase 5 (A13 hijack refusal):** second live opencode pane owns C; forge a signal naming pane 1's terminal id claiming C; drain; assert no `associated` frame, both panes' meta unchanged, file consumed. (Mirror the claude test's phase 3 assertions verbatim.)
-   - **Phase 6 (no-signal regression — the `--pure`/plugin-missing story):** with no signal files present, drain; assert zero frames and unchanged meta — freshell without a signal behaves exactly like today, which is precisely what `--pure`, `disableAllHooks`-style plugin loss, or plugin init failure produce.
+   - **Phase 6 (no-signal regression — the `--pure`/plugin-missing story):** with no signal files present, drain; assert zero frames and unchanged meta — freshell without a signal behaves exactly like today, which is precisely what `--pure`, `disableAllHooks`-style plugin loss, plugin init failure, a user-set `OPENCODE_TUI_CONFIG`, or the kill switch produce.
+   - **Phase 7 (dead-pane retired rebind + retention — pins D1.3):** bind a fresh pane to A; write a signal for B; KILL the pane BEFORE draining (the identity row is now retired — the exact window that permanently lost the signal under fire-and-forget drain, V6); call `drain_and_rebind_opencode`; assert an `associated` frame with `sessionRef {opencode, B}` and `previousSessionId == A`, the identity row STILL retired but now carrying B, and the signal file consumed (acted on). Then re-create the pane through the ref/restore flow the association produced (the frozen client moves the persisted pane ref on `associated` by layout presence — `src/lib/terminal-session-association.ts:84-105` — so restore now carries B) and assert the captured relaunch argv contains `--session ses_bbb…` and NOT `ses_aaa…`.
+   - **Phase 8 (first-bind arbitration vs the locator — pins D1.2):** create a live opencode pane WITHOUT any session binding (never-bound: `resume_session_id` unset, opencode locator still armed); write a signal for C; drain; assert an `associated` frame binding C with `previousSessionId == null` and registry meta `resume_session_id == C` (file consumed). Then drive a locator Located event for a DIFFERENT session row (mirror `opencode_association.rs`'s own test idiom for feeding Located events) and assert it is REJECTED — the existing `resume_session_id.is_some()` reject at `opencode_association.rs:127` shows the signal bind consumed the arm.
 5. Keep the claude test's `ENV_LOCK`/env-serialization discipline if it mutates process env for the fake CLI.
 
 - [ ] **Step 3: Run to verify RED**
@@ -1001,20 +1064,44 @@ Expected: compile FAIL — `drain_and_rebind_opencode` does not exist yet.
 
 - [ ] **Step 4: Implement the consumer + sweep**
 
-Append to `crates/freshell-ws/src/opencode_signal.rs` (this is `drain_and_rebind_claude` — `claude_signal.rs:127-223` — with `"claude"` → `"opencode"` and the A7-compaction comment replaced by the plugin-dedupe note; copy the real file's exact `use` items and `now_ms` idiom):
+Append to `crates/freshell-ws/src/opencode_signal.rs` (this is `drain_and_rebind_claude` — `claude_signal.rs:127-223` — with `"claude"` → `"opencode"`, the A7-compaction comment replaced by the plugin-dedupe note, and the D1 extensions: act-then-delete on `sig.path`, first-bind arbitration, retired-pane rebind; copy the real file's exact `use` items and `now_ms` idiom):
 
 ```rust
-/// Drain opencode switch signals and rebind live panes through the guarded
-/// lane. `pub` so integration tests drive drains deterministically.
+/// Drain opencode switch signals and rebind panes through the guarded lane.
+/// `pub` so integration tests drive drains deterministically.
 ///
-/// Guard ladder (identical to drain_and_rebind_claude; the producer is
-/// per-terminal by construction — the plugin reads FRESHELL_TERMINAL_ID from
-/// its own PTY env — so codex's D7 old-owner predicate is subsumed by the
-/// live-pane + provider-match check, exactly as in the claude lane):
-///   (0) live opencode pane, (1) same-id no-op (the plugin dedupes, but the
-///   initial route poll re-reports the bound id at startup), (2) A13 no live
-///   owner of the target, (3) ledger A8 retired-inclusive, (4) fresh-agent
-///   sessions never bind terminal panes.
+/// Guard ladder (drain_and_rebind_claude's ladder + the D1 extensions from
+/// the 2026-07-28 validation pass; the producer is per-terminal by
+/// construction — the plugin reads FRESHELL_TERMINAL_ID from its own PTY
+/// env — so codex's D7 old-owner predicate is subsumed by the live-pane +
+/// provider-match check, exactly as in the claude lane):
+///   (0)  identity row present with provider opencode, PLUS two extensions:
+///   (0a) FIRST-BIND ARBITRATION (D1.2, also resolves the locator race):
+///        no identity row, but the registry shows a LIVE never-bound
+///        opencode pane (mode=="opencode", Running,
+///        resume_session_id.is_none()) ⇒ first bind through guards (2)-(4),
+///        cwd from the registry entry, previousSessionId None. The signal
+///        is user-facing route truth and outranks the locator's DB
+///        heuristic; the bind itself disarms the locator
+///        (opencode_association.rs:127 rejects once
+///        resume_session_id.is_some()). No pane at all ⇒ RETAIN the file.
+///   (0b) RETIRED-PANE REBIND (D1.3): identity row RETIRED with provider
+///        opencode and a different session id ⇒ run guards (2)-(4), then
+///        identity.upsert + immediate re-retire (upsert clears the retired
+///        flag; retire preserves fields), SKIP registry.set_meta (no live
+///        row), await ledger_resolve_identity (G3 supersede), broadcast
+///        `associated` with previousSessionId — the frozen client applies
+///        association by layout presence, not liveness
+///        (src/lib/terminal-session-association.ts:84-105), so the
+///        persisted pane ref moves and a future restore resumes the NEW id.
+///   (1) same-id no-op (the plugin dedupes, but the initial route poll
+///   re-reports the bound id at startup), (2) A13 no live owner of the
+///   target, (3) ledger A8 retired-inclusive, (4) fresh-agent sessions
+///   never bind terminal panes.
+/// ACT-THEN-DELETE (D1.1): sig.path is removed only after the signal was
+/// acted on (rebound, same-id no-op, or a deliberate guard refusal); files
+/// with no actionable pane are RETAINED for later sweeps (the watcher's
+/// staleness cap reaps abandoned ones).
 /// NEVER any activity/row-correlation fallback: no signal ⇒ no rebind.
 pub async fn drain_and_rebind_opencode(state: &WsState, watcher: &OpencodeSignalWatcher) {
     // drain() is sync fs I/O -> blocking pool (claude_signal.rs pattern, a9583449)
@@ -1028,44 +1115,120 @@ pub async fn drain_and_rebind_opencode(state: &WsState, watcher: &OpencodeSignal
         }
     };
     for sig in signals {
-        let Some(current) = state.identity.get(&sig.terminal_id) else { continue };
-        if current.retired || current.provider.as_deref() != Some("opencode") {
-            continue;
+        let acted = apply_opencode_signal(state, &sig).await;
+        if acted {
+            let _ = std::fs::remove_file(&sig.path); // act-then-delete (D1.1)
         }
-        if current.session_id.as_deref() == Some(sig.session_id.as_str()) {
-            continue; // same-id no-op
-        }
-        if let Some(owner) = state
-            .registry
-            .live_session_owner(Some(&state.identity), "opencode", &sig.session_id)
-        {
-            tracing::warn!(terminal_id = %sig.terminal_id, owner = %owner,
-                "opencode_rebind_refused: target session already live-owned (A13)");
-            continue;
-        }
-        if let Some(existing) = state
-            .identity
-            .find_by_session_including_retired("opencode", &sig.session_id)
-        {
-            if existing != sig.terminal_id {
-                tracing::warn!(terminal_id = %sig.terminal_id,
-                    "opencode_rebind_refused: session_bound_elsewhere");
-                continue;
-            }
-        }
-        if state
-            .pane_ledger
-            .lookup_by_session("opencode", &sig.session_id)
-            .is_some_and(|r| r.row.pane_kind.as_deref() == Some("fresh-agent"))
-        {
-            continue;
-        }
+        // Not acted ⇒ the file stays for a later sweep (retention).
+    }
+}
 
-        let previous = current.session_id.clone();
+/// Guards (2)-(4): A13 live-owner, ledger A8 retired-inclusive, fresh-agent.
+/// `false` (warn-logged where meaningful) = the target session must NOT be
+/// bound to this terminal — a deliberate refusal, which still counts as
+/// ACTED ON for act-then-delete purposes.
+fn target_session_guards_pass(state: &WsState, sig: &OpencodeSignal) -> bool {
+    if let Some(owner) = state
+        .registry
+        .live_session_owner(Some(&state.identity), "opencode", &sig.session_id)
+    {
+        tracing::warn!(terminal_id = %sig.terminal_id, owner = %owner,
+            "opencode_rebind_refused: target session already live-owned (A13)");
+        return false;
+    }
+    if let Some(existing) = state
+        .identity
+        .find_by_session_including_retired("opencode", &sig.session_id)
+    {
+        if existing != sig.terminal_id {
+            tracing::warn!(terminal_id = %sig.terminal_id,
+                "opencode_rebind_refused: session_bound_elsewhere");
+            return false;
+        }
+    }
+    if state
+        .pane_ledger
+        .lookup_by_session("opencode", &sig.session_id)
+        .is_some_and(|r| r.row.pane_kind.as_deref() == Some("fresh-agent"))
+    {
+        return false;
+    }
+    true
+}
+
+/// PINNED fan-out for live panes: identity -> meta -> ledger(await) ->
+/// associated THEN meta.updated.
+async fn rebind_fanout(
+    state: &WsState,
+    sig: &OpencodeSignal,
+    cwd: Option<&str>,
+    previous: Option<String>,
+) {
+    state
+        .identity
+        .upsert(&sig.terminal_id, Some("opencode"), Some(&sig.session_id), cwd, now_ms());
+    state.registry.set_meta(
+        &sig.terminal_id,
+        None,
+        None,
+        Some("opencode".to_string()),
+        Some(sig.session_id.clone()),
+    );
+    crate::pane_ledger::ledger_resolve_identity(state, &sig.terminal_id, "opencode", &sig.session_id, cwd)
+        .await;
+    crate::codex_identity::broadcast_terminal_session_associated(
+        state,
+        "opencode",
+        &sig.terminal_id,
+        &sig.session_id,
+        cwd.map(str::to_string),
+        previous,
+    );
+}
+
+/// One signal through the ladder. Returns whether the signal was ACTED ON
+/// (delete the file) vs skipped (retain it for a later sweep).
+async fn apply_opencode_signal(state: &WsState, sig: &OpencodeSignal) -> bool {
+    let Some(current) = state.identity.get(&sig.terminal_id) else {
+        // (0a) D1.2 first-bind arbitration. Match the registry's real
+        // per-terminal accessor names for mode/liveness/resume_session_id
+        // and cwd when implementing.
+        let Some(entry) = state.registry.get(&sig.terminal_id) else {
+            return false; // no pane (yet): RETAIN for a later sweep
+        };
+        if entry.mode.as_deref() != Some("opencode")
+            || !entry.is_running()
+            || entry.resume_session_id.is_some()
+        {
+            return false; // not a live never-bound opencode pane: RETAIN
+        }
+        if !target_session_guards_pass(state, sig) {
+            return true; // deliberate refusal — acted
+        }
         tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
-            source = ?sig.source, "opencode_rebind: TUI plugin reported a new session id");
+            source = ?sig.source,
+            "opencode_rebind: first bind via TUI signal (signal outranks locator)");
+        rebind_fanout(state, sig, entry.cwd.as_deref(), None).await;
+        return true;
+    };
 
-        // PINNED order: identity -> meta -> ledger(await) -> associated THEN meta.updated.
+    if current.provider.as_deref() != Some("opencode") {
+        return false; // foreign-provider row: never touch; RETAIN until stale
+    }
+    if current.session_id.as_deref() == Some(sig.session_id.as_str()) {
+        return true; // same-id no-op — acted
+    }
+    if !target_session_guards_pass(state, sig) {
+        return true; // A13 / ledger A8 / fresh-agent refusal — acted
+    }
+
+    let previous = current.session_id.clone();
+    if current.retired {
+        // (0b) D1.3 retired-pane rebind: the pane died after the switch but
+        // the signal survived (retention). Move the persisted ref so a
+        // future restore resumes the NEW id.
+        tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
+            source = ?sig.source, "opencode_rebind: retired pane ref moved to new session");
         state.identity.upsert(
             &sig.terminal_id,
             Some("opencode"),
@@ -1073,13 +1236,9 @@ pub async fn drain_and_rebind_opencode(state: &WsState, watcher: &OpencodeSignal
             current.cwd.as_deref(),
             now_ms(),
         );
-        state.registry.set_meta(
-            &sig.terminal_id,
-            None,
-            None,
-            Some("opencode".to_string()),
-            Some(sig.session_id.clone()),
-        );
+        // upsert cleared the retired flag; re-retire preserves fields.
+        state.identity.retire(&sig.terminal_id);
+        // SKIP registry.set_meta: no live row.
         crate::pane_ledger::ledger_resolve_identity(
             state,
             &sig.terminal_id,
@@ -1096,7 +1255,14 @@ pub async fn drain_and_rebind_opencode(state: &WsState, watcher: &OpencodeSignal
             current.cwd.clone(),
             previous,
         );
+        return true;
     }
+
+    // (0) live pane — the ordinary rebind path.
+    tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
+        source = ?sig.source, "opencode_rebind: TUI plugin reported a new session id");
+    rebind_fanout(state, sig, current.cwd.as_deref(), previous).await;
+    true
 }
 
 pub fn spawn_opencode_signal_sweep(state: WsState, watcher: OpencodeSignalWatcher) {
@@ -1114,7 +1280,7 @@ pub fn spawn_opencode_signal_sweep(state: WsState, watcher: OpencodeSignalWatche
 
 Match the REAL signatures while implementing: `drain_and_rebind_claude` takes `&WsState` (possibly `&Arc<WsState>`) — mirror it exactly, along with its `now_ms()` import and `WsState` field access patterns.
 
-**Fix `codex_identity.rs:268`:** in `broadcast_terminal_session_associated`, the `meta.updated` upsert hardcodes `provider: Some("codex".to_string())` although the function takes `provider: &str` (the `associated` frame at `:249` already uses it). Change to `provider: Some(provider.to_string())`. This corrects claude rebinds too (they currently emit a `meta.updated` claiming provider codex) and is asserted by crown Phase 1.
+**Fix `codex_identity.rs:268`:** in `broadcast_terminal_session_associated`, the `meta.updated` upsert hardcodes `provider: Some("codex".to_string())` although the function takes `provider: &str` (the `associated` frame at `:249` already uses it). Change to `provider: Some(provider.to_string())`. This corrects claude rebinds too (they currently emit a `meta.updated` claiming provider codex) and is asserted by crown Phase 1. Validated safe (V5): NO consumer depends on the buggy value, and the fix REPAIRS two live client consumers currently broken by it for claude rebinds — `src/store/sessionsSlice.ts:198-223` (running-session keys) and `src/components/PaneContainer.tsx:100-124` (provider-matched meta). Mention that repair in the commit message.
 
 **Boot the sweep** — in `crates/freshell-server/src/main.rs`, immediately after the claude sweep block (`:792-803`):
 
@@ -1154,7 +1320,8 @@ Expected: PASS (the `:268` fix must not break codex/claude suites; if any test p
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 git add crates/freshell-ws/src/opencode_signal.rs crates/freshell-ws/src/codex_identity.rs \
         crates/freshell-server/src/main.rs crates/freshell-ws/tests/opencode_switch_rebind.rs
-git commit -m "feat(ws): opencode mid-session rebind via TUI-plugin signal files (P5)"
+git commit -m "feat(ws): opencode mid-session rebind via TUI-plugin signal files (P5)" \
+  -m "Includes the codex_identity.rs:268 provider fix, which also repairs the claude-rebind meta.updated consumers (src/store/sessionsSlice.ts:198-223, src/components/PaneContainer.tsx:100-124)."
 ```
 
 ---
@@ -1187,28 +1354,43 @@ Keep each section's existing "Why rebind was descoped" + "Findings:" bullet stru
 - `session.parent_id` is populated only for subagent children (verified against
   `~/.local/share/opencode/opencode.db`) — no user-fork lineage substrate.
 
-**Shipped mechanism (active signal, opencode 1.18.8):**
-- opencode loads TUI plugins from the config `plugin` array
-  (`TuiPluginModule { id?, tui }`, `@opencode-ai/plugin`); `OPENCODE_CONFIG_CONTENT`
-  MERGES with user config and APPENDS to the plugin list (empirically verified:
-  user providers/plugins preserved, injected plugin appended; `~/.config/opencode`
-  untouched; env is per-PTY so only freshell-spawned panes are affected).
-- Freshell ships `extensions/opencode/freshell-rebind-plugin.ts` (installed to
-  `~/.freshell/opencode/`, injected per-pane by
-  `crates/freshell-platform/src/cli_launch.rs` + `opencode_plugin.rs`). The
-  plugin reads `FRESHELL_TERMINAL_ID` and emits claude-shaped signal files
-  (`~/.freshell/session-signals/opencode/<tid>__<nonce>.json`) on every switch;
-  primary edge = slot re-render (`session_prompt`/`sidebar_title`), belt-and-
-  suspenders = low-frequency `api.route.current` poll; dedupe on repeat ids.
+**Shipped mechanism (active signal, opencode 1.18.8/1.18.9 — validated on
+both; opencode SELF-UPDATES in place, observed live during validation):**
+- The TUI plugin host loads plugins ONLY from TUI config sources (global
+  `<config-dir>/opencode/tui.json|jsonc`, an `OPENCODE_TUI_CONFIG`-pointed
+  file, project `tui.json|jsonc` walk-up, `.opencode`-dir tui.json);
+  main-config plugins (opencode.json / `OPENCODE_CONFIG_CONTENT`) load as
+  SERVER plugins only and never reach the TUI host. TUI config sources MERGE
+  and plugin arrays UNION (dedup by file URL), so the injected file never
+  suppresses the user's own TUI config (`~/.config/opencode` untouched; env
+  is per-PTY so only freshell-spawned panes are affected).
+- Freshell ships `extensions/opencode/freshell-rebind-plugin.ts`, installs it
+  plus a plugin-only `tui.json` to `~/.freshell/opencode/`
+  (`opencode_plugin.rs`), and injects `OPENCODE_TUI_CONFIG=<that tui.json>`
+  per-pane (`crates/freshell-platform/src/cli_launch.rs`). Kill switch:
+  `FRESHELL_OPENCODE_REBIND=0/false` skips injection (future-version drift
+  mitigation); a user-set `OPENCODE_TUI_CONFIG` also skips (their value
+  wins). The plugin reads `FRESHELL_TERMINAL_ID` and emits claude-shaped
+  signal files (`~/.freshell/session-signals/opencode/<tid>__<nonce>.json`)
+  on every switch; PRIMARY edge = 1s `api.route.current` poll, latency
+  accelerators = slot re-renders (`session_prompt`/`sidebar_title` — both
+  have visibility gaps, so never the only edge); dedupe on repeat ids.
 - Consumer: `crates/freshell-ws/src/opencode_signal.rs` — sorted drain,
-  `ses_[A-Za-z0-9]+` shape validation, then the claude guard ladder (live pane +
+  `ses_[A-Za-z0-9]+` shape validation (rejects warn-logged as
+  `opencode_signal_rejected`), then the claude guard ladder (live pane +
   provider match, same-id no-op, A13, ledger A8, fresh-agent guard) and the
   pinned fan-out ending in `terminal.session.associated` + `previousSessionId`.
-  The route-derived id is user-facing by construction (no bus consultation ⇒ no
-  `parent_id` cross-check needed).
-- Degradation: `--pure`/`OPENCODE_PURE` disables plugins; plugin init failure is
-  non-fatal in opencode; unparseable user `OPENCODE_CONFIG_CONTENT` skips
-  injection — all three yield exactly today's no-rebind behavior. Crown test:
+  D1 drain semantics: act-then-delete with on-disk RETENTION for signals
+  whose pane is momentarily absent (~10-min staleness cap); FIRST-BIND
+  arbitration for never-bound live panes (the signal outranks the opencode
+  locator and the bind disarms it); RETIRED-PANE rebind (moves the persisted
+  ref so a later restore resumes the new id). The route-derived id is
+  user-facing by construction (no bus consultation ⇒ no `parent_id`
+  cross-check needed).
+- Degradation: `--pure`/`OPENCODE_PURE` disables plugins; plugin init failure
+  is non-fatal in opencode (1.18.8/1.18.9, source-verified across every
+  loader path); a user-set `OPENCODE_TUI_CONFIG` or the kill switch skips
+  injection — all yield exactly today's no-rebind behavior. Crown test:
   `crates/freshell-ws/tests/opencode_switch_rebind.rs`.
 ```
 
@@ -1283,14 +1465,17 @@ scripts/launch-rust.sh --port 3499
 ```
 
 Then, in a browser at `http://localhost:3499/?token=<AUTH_TOKEN from .env>`:
+
+(Binary note: the pane's opencode command resolves via `cli_launch.rs:380-385` — `env[OPENCODE_CMD]` else plain `opencode` PATH resolution — an override lane exists, currently unset, if you need to pin a specific binary for this smoke. The installed opencode is 1.18.8/1.18.9-class and SELF-UPDATES in place — observed live during validation — so note the version you actually smoked against.)
+
 1. Open a terminal pane in opencode mode. In the pane run nothing — just confirm opencode starts (plugin init failure is non-fatal, but a hard TUI crash means the injected config is malformed: STOP and fix before pushing).
-2. From another shell: `OPENCODE_CONFIG_CONTENT=$(tr -d '\n' < /dev/null); ls ~/.freshell/opencode/freshell-rebind-plugin.ts && ls ~/.freshell/session-signals/opencode/ 2>/dev/null` — the plugin file exists; after the pane is up, at most transient signal files (the sweep consumes them within ~1s).
+2. From another shell: `ls ~/.freshell/opencode/freshell-rebind-plugin.ts ~/.freshell/opencode/tui.json && cat ~/.freshell/opencode/tui.json` — BOTH freshell-owned files exist next to each other and tui.json contains ONLY the `plugin` key. From INSIDE the pane: `echo $OPENCODE_TUI_CONFIG` prints that tui.json path. Then `ls ~/.freshell/session-signals/opencode/ 2>/dev/null` — after the pane is up, at most transient signal files (the sweep consumes acted-on files within ~1s).
 3. In the TUI, create/switch sessions (session list keybind). Within ~3s the pane's session association should update; check the server log (`~/.freshell/logs/rust-server-3499.log`) for `opencode_rebind: TUI plugin reported a new session id`.
 4. Kill the pane process and restore the pane: the relaunch argv (visible in the log or via `ps`) must carry `--session <NEW id>`.
 5. Verify the freshell MCP tool still appears inside opencode (Scope Decision 5 coexistence check).
 6. Stop the scratch server: `scripts/launch-rust.sh --port 3499 --stop`.
 
-If step 3 shows NO signal on switch: check `~/.freshell/session-signals/opencode/` for accumulating files (consumer problem) vs none at all (producer problem — re-verify the plugin API surface per Task 1 Step 1 and adjust the extraction, then rerun Tasks 1/5 tests). Do not push until the live smoke passes or the failure is understood and documented in the commit message.
+If step 3 shows NO signal on switch: check `~/.freshell/session-signals/opencode/` for accumulating files (consumer problem) vs none at all (producer problem). For a producer problem, verify the TUI actually LOADED the plugin — check the opencode TUI log (or run opencode with `--print-logs` in a pane-equivalent env) for the `freshell-rebind` plugin / its `file://` URL; confirm `OPENCODE_TUI_CONFIG` is set inside the pane; and remember Bun caches failed imports for the process lifetime, so a plugin file that was missing/invalid at TUI start stays dead until pane restart. (There are no d.ts files to re-read — the install is binary-only; if the API surface drifted, re-verify against the matching sst/opencode source tag per Task 1 Step 1 and rerun Tasks 1/5 tests.) Do not push until the live smoke passes or the failure is understood and documented in the commit message.
 
 - [ ] **Step 5: Push the branch (stop — no PR)**
 
@@ -1304,7 +1489,23 @@ Do NOT create a PR. The workflow's later stages handle review.
 
 ## Self-Review Record
 
-- **Spec coverage:** injected TUI plugin (Task 1), OPENCODE_CONFIG_CONTENT per-pane injection with user-value merge + skip-on-unparseable (Tasks 2–3), signal-file shape reuse of the claude lane (Tasks 1, 4), Rust-first guarded rebind with full fan-out incl. ledger supersede + `previousSessionId` + restart-resumes-new-id (Task 5), activity-tracking repoint audited as no-op with citations (Scope Decision 4), Node parity resolved as Rust-only consumer matching the claude precedent with Node fan-out untouched (Scope Decision 1), safety/degradation (`--pure`, plugin failure, version tolerance, no heuristic fallback — Global Constraints + crown Phases 4/6 + plugin tolerance tests), rapid A→B→A last-write-wins (sorted drain + crown Phase 3), subagent filter via id shape + no bus consultation (Scope Decision 3), doc updates for both audit sections (Task 6), tests mirroring the codex/claude crown pattern with simulated signal files + plugin unit tests with mocked TuiPluginApi + merge-behavior fixtures + no-signal regression (Tasks 1–5), contract freeze + clippy + coordinated suite + no-PR + production-3002 safety (Task 7, Global Constraints). No unresolved coverage gaps.
-- **Silent deferrals:** none. The one environment-dependent surface (real opencode 1.18.8 plugin API behavior) is covered by a mandatory manual smoke against a real opencode in Task 7 Step 4 with an explicit do-not-push-on-failure rule, in the same spirit as the repo's opt-in real-provider contract tests.
-- **Placeholder scan:** no TBD/TODO/"add error handling" steps; the two "copy the reference file and apply deltas" steps (crown test, sweep spawner) name the exact source file, line ranges, and every delta.
-- **Type consistency:** `OpencodeSignalWatcher::{new, default_root, drain}`, `OpencodeSignal{terminal_id, session_id, source}`, `drain_and_rebind_opencode(&WsState, &OpencodeSignalWatcher)`, `opencode_plugin::{REBIND_PLUGIN_SOURCE, rebind_plugin_path, ensure_rebind_plugin_installed, plugin_file_spec, build_opencode_config_content}`, plugin exports `extractSessionId`/`createEmitter`/`EmitterDeps`/default `{id, tui}` — consistent across Tasks 1–5 and the goldens.
+- **Spec coverage:** injected TUI plugin with poll-primary (1s) / slot-accelerator edges (Task 1), freshell-owned plugin + plugin-only tui.json install and per-pane `OPENCODE_TUI_CONFIG` injection with skip-if-user-set + `FRESHELL_OPENCODE_REBIND` kill switch (Tasks 2–3), signal-file shape reuse of the claude lane (Tasks 1, 4), Rust-first guarded rebind with full fan-out incl. ledger supersede + `previousSessionId` + restart-resumes-new-id (Task 5), D1 drain semantics — act-then-delete retention, first-bind arbitration vs the locator, retired-pane rebind (Tasks 4–5, crown Phases 7–8), rejected-signal detectability via the `opencode_signal_rejected` warn (Task 4, crown Phase 4), activity-tracking repoint audited as no-op with the corrected `server/coding-cli/` citation (Scope Decision 4), Node parity resolved as Rust-only consumer matching the claude precedent with Node fan-out untouched (Scope Decision 1), safety/degradation (`--pure`, plugin failure, version tolerance, kill switch, no heuristic fallback — Global Constraints + crown Phases 4/6 + plugin tolerance tests), rapid A→B→A last-write-wins (sorted drain + crown Phase 3), subagent filter via id shape + no bus consultation incl. the deliberate drilled-in-child case (Scope Decision 3), doc updates for both audit sections (Task 6), tests mirroring the codex/claude crown pattern with simulated signal files + plugin unit tests with mocked TuiPluginApi + the tui.json plugin-key-only pin + no-signal regression (Tasks 1–5), contract freeze + clippy + coordinated suite + no-PR + production-3002 safety (Task 7, Global Constraints). Every falsified finding from the 2026-07-28 validation pass is reflected — F1 injection vector (`OPENCODE_TUI_CONFIG`, not `OPENCODE_CONFIG_CONTENT`), F2 dead d.ts step replaced with the verified-surface record, F3 poll-primary at 1000 ms, F4 drain retention/arbitration (D1), F5 locator × signal arbitration, F6 version/citation/consumer-repair text, F7 reject logging, F8 audit-doc, F9 smoke — and no step contradicts the validated facts. No unresolved coverage gaps.
+- **Silent deferrals:** none. The environment-dependent surface (real opencode plugin API behavior on a self-updating binary) is covered by a mandatory manual smoke against a real opencode in Task 7 Step 4 with an explicit do-not-push-on-failure rule, plus the kill switch for post-ship drift, in the same spirit as the repo's opt-in real-provider contract tests.
+- **Placeholder scan:** no TBD/TODO/"add error handling" steps; no dead commands (the binary-only install has no d.ts to read — Task 1 Step 1 records the verified surface and offers a source-clone re-verification instead); the "copy the reference file and apply deltas" steps (crown test, sweep spawner) name the exact source file, line ranges, and every delta, including the D1 deltas.
+- **Type consistency:** `OpencodeSignalWatcher::{new, default_root, drain}`, `OpencodeSignal{path, terminal_id, session_id, source}`, `STALE_SIGNAL_MAX_AGE`, `drain_and_rebind_opencode(&WsState, &OpencodeSignalWatcher)` with act-then-delete on `sig.path` (helpers `apply_opencode_signal`, `target_session_guards_pass`, `rebind_fanout`), `opencode_plugin::{REBIND_PLUGIN_SOURCE, rebind_plugin_path, tui_config_path, tui_config_content, plugin_file_spec, ensure_rebind_plugin_installed}` (install returns the tui.json path Task 3 injects as `OPENCODE_TUI_CONFIG`), plugin exports `extractSessionId`/`createEmitter`/`EmitterDeps`/default `{id, tui}` with `POLL_INTERVAL_MS = 1000` — consistent across Tasks 1–5 and the goldens. The crown-test phase list (Phases 1–8) matches Task 5's step text, incl. Phase 7 (retired-pane rebind + retention) and Phase 8 (first-bind arbitration).
+
+## Validation Record (2026-07-28)
+
+Load-bearing-assumption validation ledger:
+`/home/dan/code/freshell/.worktrees/.the-usual-logs/opencode-tui-rebind/load-bearing-ledger.md`
+(detail reports V1–V7 alongside). Outcome: **11 verified, 5 falsified — all
+planned around** (injection vector → `OPENCODE_TUI_CONFIG` + plugin-only
+tui.json; dead d.ts verification step → recorded verified API surface; slot
+visibility gaps → route poll as the primary edge; fire-and-forget drain signal
+loss → D1 act-then-delete/retention/arbitration; locator × signal interleaving
+→ D1.2 first-bind arbitration), and **2 accepted residuals**: the stacked-base
+branch (A11) and future opencode version drift (A5/A12 — opencode self-updates
+in place, observed live; mitigated by the `FRESHELL_OPENCODE_REBIND` kill
+switch, the plugin's version tolerance, and the Task 7 real-opencode smoke).
+All findings were validated on opencode 1.18.8/1.18.9 (byte-identical in every
+inspected source path).
