@@ -140,12 +140,43 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       // this spec shares the host with ~14 parallel workers each spawning
       // rust servers (and cargo build-lock contention), and the
       // post-restart recreate/reattach round-trip was observed to
-      // legitimately exceed 20s under that load while passing comfortably
-      // in isolation (both observed on 2026-07-26). The spec-level
-      // test.setTimeout(180_000) already anticipated slow full-suite runs.
+      // legitimately exceed 20s under that load (2026-07-26).
+      // CORRECTED (f3wp council fix round): the earlier claim that this leg
+      // was "passing comfortably in isolation" did not make it reliably
+      // green under full-project load -- it still timed out at 60s in this
+      // branch's own acceptance run (/tmp/deflake-logs/e2eb-10x-run10.log:1089,
+      // "TimeoutError: page.waitForFunction: Timeout 60000ms exceeded"). A
+      // bare timeout there is not diagnosable: it cannot distinguish a
+      // wedged reattach (WS/redux never reached ready) from a dead PTY
+      // (server-side child gone) from a swallowed echo (everything alive,
+      // buffer just missing the marker). The catch below dumps exactly
+      // that state before rethrowing. The spec-level test.setTimeout(180_000)
+      // already anticipated slow full-suite runs.
       const marker2 = `HARNESS01-POST-RESTART-${randomUUID()}`
       await terminal.executeCommand(`echo ${marker2}`)
-      await terminal.waitForOutput(marker2, { timeout: 60_000 })
+      try {
+        await terminal.waitForOutput(marker2, { timeout: 60_000 })
+      } catch (error) {
+        const wsReadyState = await page
+          .evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getWsReadyState() ?? '<harness missing>')
+          .catch((evalError) => `<eval failed: ${evalError}>`)
+        const connectionStatus = await harness.getConnectionStatus().catch((evalError) => `<eval failed: ${evalError}>`)
+        const bufferTail = await terminal
+          .getVisibleText()
+          .then((text) => text.slice(-500))
+          .catch((evalError) => `<eval failed: ${evalError}>`)
+        const childPidsNow = server.ownedChildPids()
+        const childLiveness = childPidsNow.length
+          ? childPidsNow.map((pid) => `${pid}:${isProcessAlive(pid) ? 'alive' : 'dead'}`).join(', ')
+          : '<none captured>'
+        const serverPidAlive = isProcessAlive(server.info.pid)
+        throw new Error(
+          `post-restart marker2 wait failed -- diagnostics: ` +
+            `wsReadyState=${JSON.stringify(wsReadyState)} connectionStatus=${JSON.stringify(connectionStatus)} ` +
+            `serverPidAlive=${serverPidAlive} childPids=[${childLiveness}] ` +
+            `bufferTail=${JSON.stringify(bufferTail)}. Original error: ${error}`,
+        )
+      }
 
       const xtermText = await page.locator('.xterm').first().textContent()
       expect(xtermText).not.toContain('[Error]')
