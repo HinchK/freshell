@@ -13,12 +13,16 @@ import { shallowEqual } from 'react-redux'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import {
+  clearPaneReconcileNotice,
+  clearReconcilePendingPane,
   consumePaneRefreshRequest,
   repairCodexIdentityMismatch,
   splitPane,
   updatePaneContent,
   updatePaneTitle,
 } from '@/store/panesSlice'
+import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
+import type { PaneReconcileRequest } from '@shared/ws-protocol'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
@@ -28,7 +32,8 @@ import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
-import { getWsClient } from '@/lib/ws-client'
+import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
+import { sendTerminalKill } from '@/lib/terminal-kill'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import {
   buildCodexIdentityMismatchRepairContent,
@@ -65,7 +70,7 @@ import {
   type DeferredAttachReason,
   type TerminalAttachPriority,
 } from '@/lib/terminal-attach-policy'
-import { paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { collectAllTerminalIds, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { getInstalledPerfAuditBridge } from '@/lib/perf-audit-bridge'
 import {
   beginAttach,
@@ -155,6 +160,15 @@ const QUARANTINE_REPAIR_TIMEOUT_MS = 2000
 export const RATE_LIMIT_RETRY_MAX_ATTEMPTS = 5
 export const RATE_LIMIT_RETRY_BASE_MS = 2000
 export const RATE_LIMIT_RETRY_MAX_MS = 12000
+// Bounded re-drive (Task 12): SESSION_RESERVED honors the server hint inside
+// a 30s window (> the 20s sessionRef lease TTL + margin — a wall-clock
+// backstop, NOT a spawn budget; keep it > TTL + margin if the TTL env knob
+// changes defaults); launch-time INVALID_TERMINAL_ID gets 5 x 500ms.
+// On exhaustion: single-pane reconcile -> fold (auto-resolve, council rule 8).
+export const RESERVE_RETRY_WINDOW_MS = 30_000
+export const RESERVE_RETRY_FLOOR_MS = 250
+export const INVALID_TERMINAL_LAUNCH_RETRY_MAX_ATTEMPTS = 5
+export const INVALID_TERMINAL_LAUNCH_RETRY_DELAY_MS = 500
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
 const MOBILE_KEY_REPEAT_INTERVAL_MS = 70
@@ -525,6 +539,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const activePaneId = useAppSelector((s) => s.panes.activePane[tabId])
   const paneLastInputAt = useAppSelector((s) => s.tabRecency?.paneLastInputAt?.[paneId])
   const refreshRequest = useAppSelector((s) => s.panes.refreshRequestsByPane?.[tabId]?.[paneId] ?? null)
+  // Pre-verdict create wait (Task 8): while this pane is named in an outgoing
+  // pane.reconcile request (map entry = startedAt), defer the mount-time
+  // create until its verdict folds -- bounded by RECONCILE_VERDICT_WAIT_MS,
+  // then fall back to the legacy eager create. Defense-in-depth on top of the
+  // authoritative ws-client sender-level hold; this layer also owns the
+  // per-pane timeout that releases the Redux pending flag.
+  const reconcilePendingSince = useAppSelector(
+    (s) => s.panes.reconcilePendingPanes?.[`${tabId}:${paneId}`],
+  )
+  const reconcilePendingSinceRef = useRef<number | undefined>(reconcilePendingSince)
+  reconcilePendingSinceRef.current = reconcilePendingSince
+  const verdictWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
 
@@ -566,6 +592,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const lastSessionActivityAtRef = useRef(0)
   const paneLastInputAtRef = useRef<number | undefined>(paneLastInputAt)
   const rateLimitRetryRef = useRef<{ count: number; timer: ReturnType<typeof setTimeout> | null }>({ count: 0, timer: null })
+  // Task 12 bounded re-drive state. reserveWindowStart is wall-clock so an
+  // effect re-fire mid-standoff (deps change on the still-mounted pane)
+  // cannot refund the SESSION_RESERVED window. A full unmount/remount DOES
+  // reset it — the ref dies with the component — so the window is bounded
+  // per component instance, not per pane lifetime.
+  const reconcileRedriveRef = useRef<{
+    reserveWindowStart: number | null
+    invalidAttempts: number
+    timer: ReturnType<typeof setTimeout> | null
+  }>({ reserveWindowStart: null, invalidAttempts: 0, timer: null })
+  // Fold-ownership rule (see pane-reconcile.ts): this pane folds ONLY the
+  // pane.reconcile.result whose reconcileId it minted at exhaustion.
+  const exhaustionReconcileRef = useRef<PaneReconcileRequest | null>(null)
   const freshRecoveryRequestIdRef = useRef<string | null>(null)
   const freshRecoveryIntentRef = useRef<TerminalFreshRecoveryIntent | undefined>(undefined)
   const turnCompleteSignalStateRef = useRef(createTurnCompleteSignalParserState())
@@ -2433,6 +2472,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     opts?: AttachTerminalOptions,
   ) => {
     if (suppressNetworkEffects) return
+    // Never attach a terminal the layouts no longer reference: the layout-diff
+    // middleware can only release subscriptions it saw acquired. Covers the
+    // close-during-create race and stale deferred re-attach timers.
+    const layouts = appStore.getState().panes.layouts
+    if (!collectAllTerminalIds(layouts).has(tid)) {
+      log.debug('attach gate declined: terminal not referenced by any layout', {
+        terminalId: tid,
+        paneId: paneIdRef.current,
+        intent,
+      })
+      return
+    }
     const term = termRef.current
     if (!term) return
     const runtime = runtimeRef.current
@@ -2580,6 +2631,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   }, [
     suppressNetworkEffects,
     ws,
+    appStore,
     applySeqState,
     buildCheckpointReplayInput,
     clearQuarantineRepair,
@@ -2615,6 +2667,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         pendingReason: 'explicit_refresh',
       }
       setIsAttaching(false)
+      // F8: the detach was already sent above -- re-arm the attach via the
+      // background hydration queue so a hidden refresh cannot strand the
+      // pane detached until reveal. Same three-step sequence as the
+      // terminal.created site (see its comment for why each line exists).
+      getHydrationQueue().onHydrationComplete(paneIdRef.current)
+      hydrationRegisteredRef.current = false
+      registerForBackgroundHydration({ queueIfStarted: true })
     } else {
       attachTerminal(tid, 'viewport_hydrate', {
         clearViewportFirst: true,
@@ -2624,7 +2683,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
     return true
-  }, [attachTerminal, dispatch, paneId, suppressNetworkEffects, tabId, ws])
+  }, [attachTerminal, dispatch, paneId, registerForBackgroundHydration, suppressNetworkEffects, tabId, ws])
 
   // Apply settings changes
   useEffect(() => {
@@ -2739,6 +2798,40 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       retryState.count = 0
     }
 
+    // Task 12 bounded re-drive (SESSION_RESERVED / launch INVALID_TERMINAL_ID).
+    // Timer cancellation is separate from a full reset: an effect re-fire must
+    // drop the stale closure's timer WITHOUT refunding the reserve window or
+    // the invalid-terminal attempt budget.
+    const clearReconcileRedriveTimer = () => {
+      const redriveState = reconcileRedriveRef.current
+      if (redriveState.timer) {
+        clearTimeout(redriveState.timer)
+        redriveState.timer = null
+      }
+    }
+
+    const resetReconcileRedrive = () => {
+      clearReconcileRedriveTimer()
+      const redriveState = reconcileRedriveRef.current
+      redriveState.reserveWindowStart = null
+      redriveState.invalidAttempts = 0
+    }
+
+    // Cancels a pending create-retry resend WITHOUT refunding the attempt
+    // count. Used when terminal.created arrives: the ack makes a pending
+    // resend moot, but it is NOT launch success — a launch-time
+    // INVALID_TERMINAL_ID can still follow, and the budget must bound TOTAL
+    // create attempts per launch round (a full reset here would make the
+    // anchored-then-lost create cycle unbounded, and restore:true exempts
+    // those creates from the server-side rate limit).
+    const cancelCreateRetryTimer = () => {
+      const retryState = rateLimitRetryRef.current
+      if (retryState.timer) {
+        clearTimeout(retryState.timer)
+        retryState.timer = null
+      }
+    }
+
     // consumeTerminalRestoreRequestId is a non-destructive peek (see
     // terminal-restore.ts) -- it's safe, and required for correctness, to
     // call it fresh on every sendCreate for the same requestId. An
@@ -2757,9 +2850,37 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     }
 
     const sendCreate = (requestId: string) => {
-      const recoveryIntent = getFreshRecoveryIntent(requestId)
-      const restore = recoveryIntent ? false : getRestoreFlag(requestId)
-      const createSessionState = getCreateSessionStateFromRef(contentRef)
+      // Reconcile verdict precedence (Task 12): a folded respawn verdict's
+      // server-named sessionRef WINS over any other inference (restore flag,
+      // fresh-recovery intent); a folded fresh verdict omits resume identity
+      // entirely. pendingReconcile is cleared by the reducer once
+      // terminal.created folds a terminalId into this pane.
+      const pendingReconcile = contentRef.current?.pendingReconcile
+      const recoveryIntent = pendingReconcile ? undefined : getFreshRecoveryIntent(requestId)
+      if (pendingReconcile === 'respawn') {
+        const respawnSessionRef = contentRef.current?.sessionRef
+        if (!respawnSessionRef || respawnSessionRef.provider !== mode) {
+          // Invariant (shared with resetPaneForReconcileCreate): a respawn
+          // create must carry a mode-matching sessionRef — the server create
+          // path filters on it, and a mismatch spawns identity-less. The
+          // reducer degrades mismatches to fresh, so reaching here means
+          // unexpected state. Guard loudly rather than silently.
+          log.error('sendCreate: respawn create without a mode-matching sessionRef', {
+            paneId: paneIdRef.current,
+            requestId,
+            mode,
+            sessionRefProvider: respawnSessionRef?.provider,
+          })
+        }
+      }
+      const restore = pendingReconcile
+        ? pendingReconcile === 'respawn'
+        : recoveryIntent
+          ? false
+          : getRestoreFlag(requestId)
+      const createSessionState: ReturnType<typeof getCreateSessionStateFromRef> = pendingReconcile === 'fresh'
+        ? {}
+        : getCreateSessionStateFromRef(contentRef)
       launchAttemptRef.current = {
         requestId,
         restore,
@@ -2795,7 +2916,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       })
     }
 
-    const scheduleRateLimitRetry = (requestId: string) => {
+    const scheduleCreateRetry = (requestId: string, kind: 'rate-limit' | 'launch') => {
       const retryState = rateLimitRetryRef.current
       if (retryState.count >= RATE_LIMIT_RETRY_MAX_ATTEMPTS) return false
       retryState.count += 1
@@ -2809,7 +2930,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         if (requestIdRef.current !== requestId) return
         sendCreate(requestId)
       }, delayMs)
-      writeLocalXtermNotice(term, `\r\n[Rate limited - retrying in ${(delayMs / 1000).toFixed(0)}s]\r\n`)
+      const notice = kind === 'rate-limit'
+        ? `[Rate limited - retrying in ${(delayMs / 1000).toFixed(0)}s]`
+        : `[Terminal launch interrupted - retrying in ${(delayMs / 1000).toFixed(0)}s]`
+      writeLocalXtermNotice(term, `\r\n${notice}\r\n`)
       return true
     }
 
@@ -2889,7 +3013,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       lastSentViewportRef.current = null
       applySeqState(createAttachSeqState())
       writeLocalXtermNotice(term, '\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
-      ws.send({ type: 'terminal.kill', terminalId })
+      sendTerminalKill(terminalId)
       return true
     }
 
@@ -2959,9 +3083,165 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         writeLocalXtermNotice(term, `\r\n[Restored terminal exited cleanly${message ? `: ${message}` : ''}]\r\n`)
       }
 
+      // GAP F9/G5: a launch-time INVALID_TERMINAL_ID without a numeric
+      // terminalExitCode means the server no longer knows the terminal we just
+      // created — the restart / half-initialized-server signature. Instead of
+      // the permanent failLaunch dead-end, take a bounded backoff retry that
+      // re-sends terminal.create with the SAME createRequestId. The restore
+      // flag is re-armed first: terminal.created already consumed it (see the
+      // handler below), and restore:true also exempts the retry from the
+      // server's terminal.create rate limit. Exhaustion falls back to
+      // failLaunch. Server population (validated): only the legacy TS server
+      // emits this error at launch time (ws-handler.ts:2832); the rust server
+      // surfaces the same loss as a silent attach no-op healed by inventory
+      // census + reconnect re-drive, and never populates terminalExitCode.
+      // This closure is "the named retryer" future error codes
+      // (e.g. SESSION_RESERVED) will reuse — keep it generic.
+      const retryLaunchAfterInvalidTerminal = (
+        restore: boolean,
+        deadTerminalId: string | undefined,
+      ): boolean => {
+        const reqId = requestIdRef.current
+        if (!reqId) return false
+        if (restore) addTerminalRestoreRequestId(reqId)
+        if (!scheduleCreateRetry(reqId, 'launch')) return false
+        // Drop the dead terminal's identity so the retried create starts
+        // clean, but keep the pane in 'creating' (NOT 'error') while the
+        // retry timer runs. Mirrors failLaunch's cleanup minus the terminal
+        // error state.
+        clearQuarantineRepair()
+        setIsAttaching(false)
+        currentAttachRef.current = null
+        launchAttemptRef.current = null
+        deferredAttachStateRef.current = {
+          mode: 'none',
+          pendingIntent: null,
+          pendingSinceSeq: 0,
+          pendingReason: 'initial_hydrate',
+        }
+        if (deadTerminalId) {
+          clearTerminalCursor(deadTerminalId)
+          resetParserAppliedSurface()
+          forgetSentViewport(deadTerminalId)
+        }
+        lastSentViewportRef.current = null
+        terminalIdRef.current = undefined
+        applySeqState(createAttachSeqState())
+        updateContent({ terminalId: undefined, streamId: undefined, status: 'creating' })
+        return true
+      }
+
+      // Bounded re-drive (Task 12): SESSION_RESERVED honors the server hint
+      // inside a 30s window (> lease TTL + margin); launch-time
+      // INVALID_TERMINAL_ID gets 5 x 500ms. On exhaustion: single-pane
+      // reconcile -> fold (auto-resolve, council rule 8) — never a permanent
+      // error card for a standoff, never a silent wedge, never a duplicate
+      // (the reconcile verdict is folded, not blindly re-created).
+      const resolveReserveExhaustionViaReconcile = () => {
+        resetReconcileRedrive()
+        const request = buildReconcileRequestForPanes(appStore.getState(), [
+          { tabId, paneId: paneIdRef.current },
+        ])
+        if (!request) {
+          // The pane lost its reconcilable state (no createRequestId) —
+          // degrade loudly instead of wedging silently.
+          failLaunch('The session stayed reserved and this pane could not be reconciled.', true)
+          return
+        }
+        exhaustionReconcileRef.current = request
+        ws.send(request)
+      }
+
+      const redriveAfterSessionReserved = (requestId: string, retryAfterMs?: number) => {
+        const redriveState = reconcileRedriveRef.current
+        const now = Date.now()
+        if (redriveState.reserveWindowStart === null) {
+          redriveState.reserveWindowStart = now
+        }
+        if (now - redriveState.reserveWindowStart >= RESERVE_RETRY_WINDOW_MS) {
+          resolveReserveExhaustionViaReconcile()
+          return
+        }
+        const delay = Math.max(
+          typeof retryAfterMs === 'number' ? retryAfterMs : RESERVE_RETRY_FLOOR_MS,
+          RESERVE_RETRY_FLOOR_MS,
+        )
+        clearReconcileRedriveTimer()
+        redriveState.timer = setTimeout(() => {
+          redriveState.timer = null
+          if (requestIdRef.current !== requestId) return
+          if (terminalIdRef.current) return // anchored meanwhile
+          // Re-send the SAME terminal.create — createRequestId is NEVER
+          // re-minted (council rule 2).
+          sendCreate(requestId)
+        }, delay)
+      }
+
+      // F9: the server no longer knows the terminal this still-launching pane
+      // points at. Pump bounded same-requestId re-creates instead of minting a
+      // fresh recovery identity for a pane that never finished launching.
+      const redriveAfterLaunchInvalidTerminal = (deadTerminalId: string | undefined): boolean => {
+        const requestId = requestIdRef.current
+        if (!requestId) return false
+        const redriveState = reconcileRedriveRef.current
+        if (redriveState.invalidAttempts >= INVALID_TERMINAL_LAUNCH_RETRY_MAX_ATTEMPTS) return false
+        // The terminal existed before the server lost it — keep restore
+        // semantics and the server-side rate-limit exemption on every resend.
+        addTerminalRestoreRequestId(requestId)
+        // Drop the dead terminal's identity so the retried create starts
+        // clean, but keep the pane in 'creating' (NOT 'error') while the
+        // pump runs. Mirrors retryLaunchAfterInvalidTerminal's cleanup.
+        clearQuarantineRepair()
+        setIsAttaching(false)
+        currentAttachRef.current = null
+        launchAttemptRef.current = null
+        deferredAttachStateRef.current = {
+          mode: 'none',
+          pendingIntent: null,
+          pendingSinceSeq: 0,
+          pendingReason: 'initial_hydrate',
+        }
+        if (deadTerminalId) {
+          clearTerminalCursor(deadTerminalId)
+          resetParserAppliedSurface()
+          forgetSentViewport(deadTerminalId)
+        }
+        lastSentViewportRef.current = null
+        terminalIdRef.current = undefined
+        applySeqState(createAttachSeqState())
+        updateContent({ terminalId: undefined, streamId: undefined, status: 'creating' })
+        const attempt = () => {
+          if (requestIdRef.current !== requestId) return
+          if (terminalIdRef.current) return // anchored — stop the pump
+          if (redriveState.invalidAttempts >= INVALID_TERMINAL_LAUNCH_RETRY_MAX_ATTEMPTS) {
+            failLaunch('The server no longer knows this terminal and recreating it kept failing.', true)
+            return
+          }
+          redriveState.invalidAttempts += 1
+          // SAME createRequestId — never re-minted (council rule 2).
+          sendCreate(requestId)
+          clearReconcileRedriveTimer()
+          redriveState.timer = setTimeout(attempt, INVALID_TERMINAL_LAUNCH_RETRY_DELAY_MS)
+        }
+        attempt()
+        return true
+      }
+
       unsub = ws.onMessage((msg) => {
         const tid = terminalIdRef.current
         const reqId = requestIdRef.current
+
+        if (msg.type === 'pane.reconcile.result') {
+          // Fold-ownership rule (pane-reconcile.ts): fold ONLY the result
+          // whose reconcileId this pane minted at exhaustion; foreign
+          // reconciles (App boot, other panes) are silently skipped.
+          const pendingReconcileRequest = exhaustionReconcileRef.current
+          if (pendingReconcileRequest && msg.reconcileId === pendingReconcileRequest.reconcileId) {
+            exhaustionReconcileRef.current = null
+            foldVerdicts(dispatch, pendingReconcileRequest, msg)
+          }
+          return
+        }
 
         const markFirstOutputIfNeeded = (raw: string) => {
           if (
@@ -3686,7 +3966,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
-          clearRateLimitRetry()
+          cancelCreateRetryTimer()
+          // The create round succeeded — the SESSION_RESERVED window and the
+          // launch INVALID_TERMINAL_ID attempt budget both reset.
+          resetReconcileRedrive()
           // This requestId has anchored -- it now has a real terminalId, so
           // any pending restore flag for it is resolved. Clear it explicitly
           // so it can't be resurrected (it's a non-destructive peek until
@@ -3772,8 +4055,32 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               pendingReason: 'terminal_created',
             }
             setIsAttaching(false)
+            // F8: a hidden pane still owes the server an attach. Drive it
+            // through the background hydration queue (one-at-a-time stagger)
+            // instead of waiting for reveal -- otherwise the terminal sits
+            // detached server-side and is idle-reaped after 15 minutes.
+            // Order matters (verified queue semantics):
+            // 1) clear this pane's stale active slot -- a background
+            //    hydration that died with the old connection otherwise
+            //    wedges the whole queue (no-op when not the active pane);
+            // 2) reset the registration guard -- it is only cleared on
+            //    reveal/unmount, so a previously-hydrated pane could never
+            //    re-register;
+            // 3) queueIfStarted -- the queue has NO reconnect pump and
+            //    onActiveTabReady is one-shot, so this is the only
+            //    post-startup path that enqueues AND pumps.
+            getHydrationQueue().onHydrationComplete(paneIdRef.current)
+            hydrationRegisteredRef.current = false
+            registerForBackgroundHydration({ queueIfStarted: true })
           } else {
             attachTerminal(newId, 'viewport_hydrate', { clearViewportFirst: true })
+          }
+          // One-shot reconcile notice (respawn/fresh verdicts): render it now
+          // that the pane anchored, then clear it from the store.
+          const createdReconcileNotice = contentRef.current?.reconcileNotice
+          if (createdReconcileNotice) {
+            writeLocalXtermNotice(term, `\r\n${createdReconcileNotice}\r\n`)
+            dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
           }
         }
 
@@ -3992,9 +4299,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           return
         }
 
+        if (msg.type === 'error' && msg.code === 'SESSION_RESERVED' && reqId && msg.requestId === reqId) {
+          // Another create holds this sessionRef's lease. Re-drive the SAME
+          // terminal.create after the server's hint (floored), bounded by a
+          // wall-clock window; on exhaustion, auto-resolve via a single-pane
+          // reconcile instead of surfacing a dead-end error.
+          redriveAfterSessionReserved(reqId, msg.retryAfterMs)
+          return
+        }
+
         if (msg.type === 'error' && msg.requestId === reqId) {
           if (msg.code === 'RATE_LIMITED') {
-            const scheduled = scheduleRateLimitRetry(reqId)
+            const scheduled = scheduleCreateRetry(reqId, 'rate-limit')
             if (scheduled) {
               return
             }
@@ -4083,7 +4399,28 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               settleCleanRestoreStartupExit(currentTerminalId, msg.message)
               return
             }
+            // Only the "server lost the terminal" shape retries; a numeric
+            // nonzero terminalExitCode means the CLI spawned and died — do
+            // not respawn-storm it.
+            if (
+              typeof msg.terminalExitCode !== 'number'
+              && retryLaunchAfterInvalidTerminal(launchAttempt!.restore, currentTerminalId)
+            ) {
+              return
+            }
             failLaunch(msg.message || 'The terminal failed before it finished starting.', launchAttempt!.restore, currentTerminalId)
+            return
+          }
+          // F9: launch-time INVALID_TERMINAL_ID for a pane that is still
+          // 'creating' but has no matching launch attempt (e.g. a remount or
+          // reconcile fold mid-launch). A numeric terminalExitCode means the
+          // CLI spawned and died — that shape must not be respawn-stormed.
+          if (
+            currentTerminalId
+            && current?.status === 'creating'
+            && typeof msg.terminalExitCode !== 'number'
+            && redriveAfterLaunchInvalidTerminal(currentTerminalId)
+          ) {
             return
           }
           // Only auto-reconnect if terminal hasn't already exited.
@@ -4254,6 +4591,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             && !current.terminalId
             && current.status === 'creating'
           ) {
+            // Pre-verdict create wait (Task 8, V3 caveat): a mid-window WS
+            // flap must not fire this re-drive while the pane is
+            // reconcile-pending and young -- the post-flap reconcile
+            // round-trip (or the bounded timeout) drives the pane instead.
+            if (
+              reconcilePendingSinceRef.current !== undefined
+              && Date.now() - reconcilePendingSinceRef.current < RECONCILE_VERDICT_WAIT_MS
+            ) {
+              return
+            }
             sendCreate(current.createRequestId)
           }
           return
@@ -4330,8 +4677,39 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           attachTerminal(currentTerminalId, intent, intent === 'viewport_hydrate'
             ? viewportHydrateReplayOptions(contentRef.current)
             : undefined)
+          // One-shot reconcile notice (attach/corrected/duplicate verdicts):
+          // render it on the attach that the verdict fold re-fired, then
+          // clear it from the store.
+          const attachReconcileNotice = contentRef.current?.reconcileNotice
+          if (attachReconcileNotice) {
+            writeLocalXtermNotice(term, `\r\n${attachReconcileNotice}\r\n`)
+            dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
+          }
         }
       } else {
+        // Pre-verdict create wait (Task 8): a reconcile-pending pane defers
+        // its mount-time create until the verdict folds (the fold's
+        // clearReconcilePendingPane re-fires this effect), bounded by
+        // RECONCILE_VERDICT_WAIT_MS wall-clock -- on timeout the pending flag
+        // is released and the legacy eager create proceeds (never a silent
+        // wedge, same createRequestId, never re-minted). The attach branch
+        // above is NEVER gated.
+        if (reconcilePendingSinceRef.current !== undefined) {
+          const elapsed = Date.now() - reconcilePendingSinceRef.current
+          if (elapsed < RECONCILE_VERDICT_WAIT_MS) {
+            if (verdictWaitTimerRef.current === null) {
+              const paneKey = `${tabId}:${paneIdRef.current}`
+              verdictWaitTimerRef.current = setTimeout(() => {
+                verdictWaitTimerRef.current = null
+                // Timeout: verdict never folded -- release the gate; the
+                // effect re-fires (reconcilePendingSince is a dep) and the
+                // legacy drive proceeds.
+                dispatch(clearReconcilePendingPane({ paneKey }))
+              }, RECONCILE_VERDICT_WAIT_MS - elapsed)
+            }
+            return
+          }
+        }
         deferredAttachStateRef.current = {
           mode: 'none',
           pendingIntent: null,
@@ -4346,6 +4724,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     return () => {
       clearRateLimitRetry()
+      // Cancel only the timer: the reserve window and the invalid-terminal
+      // attempt budget must survive effect re-fires (no refunds).
+      clearReconcileRedriveTimer()
+      // Pre-verdict wait timer: never leak across re-runs/unmounts. ensure()
+      // reschedules with the REMAINING window (elapsed from startedAt), so
+      // the wait stays bounded wall-clock across effect re-fires.
+      if (verdictWaitTimerRef.current !== null) {
+        clearTimeout(verdictWaitTimerRef.current)
+        verdictWaitTimerRef.current = null
+      }
       unsub()
       unsubReconnect()
       if (hydrationRegisteredRef.current) {
@@ -4357,6 +4745,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // - isTerminal: skip effect for non-terminal panes
   // - paneId: unique identifier for this pane instance
   // - terminalContent?.createRequestId: re-run when createRequestId changes (reconnect after INVALID_TERMINAL_ID)
+  // - terminalContent?.reconcileEpoch: re-run when a pane.reconcile verdict folds
+  //   into an already-mounted pane. Verdict folds PRESERVE createRequestId
+  //   (council rule 2 — never re-minted), so the epoch bump is the ONLY signal
+  //   that a fold needs a fresh create/attach round (A1 fix).
   // - updateContent: stable callback (uses refs internally)
   // - ws: WebSocket client instance
   //
@@ -4376,6 +4768,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     suppressNetworkEffects,
     shouldWaitForProviderBehavior,
     terminalContent?.createRequestId,
+    terminalContent?.reconcileEpoch,
+    // reconcilePendingSince: re-run when the pane's pre-verdict wait state
+    // changes -- the verdict fold (or the bounded timeout) clears the entry
+    // and the deferred mount-create must then proceed (Task 8).
+    reconcilePendingSince,
     updateContent,
     ws,
     dispatch,

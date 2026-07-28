@@ -2,23 +2,25 @@
 //! sliding-window rate limiter (legacy parity: `server/ws-handler.ts:240-241,
 //! 2376-2389`).
 //!
-//! Legacy limiter semantics reproduced EXACTLY:
+//! Legacy semantics reproduced EXACTLY:
 //! - default 10 creates per 10_000 ms sliding window, per WS connection
 //! - env `TERMINAL_CREATE_RATE_LIMIT` / `TERMINAL_CREATE_RATE_WINDOW_MS`
+//!   (same names; parsing deliberately DIVERGES — see below)
 //! - prune predicate is strict: a timestamp survives while `now - t < window`
 //! - a REJECTED create consumes no budget (timestamps push on accept only)
 //! - `restore:true` creates bypass the limiter entirely (the CALLER enforces
-//!   the bypass; this type is bypass-agnostic) — they are bounded by the
-//!   [`crate::spawn_gate::RestoreSpawnGate`] instead.
+//!   the bypass; this type is bypass-agnostic)
 //!
 //! Deliberate env-parsing divergence from legacy: legacy is
 //! `Number(env || default)`, which silently DISABLES the limiter on an
-//! unparseable value and blocks ALL creates on `'0'`. We sanitize instead:
-//! unset, unparseable, zero, or negative -> default.
+//! unparseable value (`NaN` comparisons are false) and blocks ALL creates on
+//! `'0'`/negatives (truthy strings). We sanitize instead: unset, unparseable,
+//! zero, or negative -> default. Parity holds for unset and valid positive
+//! values — the cases that matter.
 //!
-//! The restore-spawn-gate knobs (WSL-outage RCA §6.3 hardening, no legacy
-//! analogue on this branch — see [`crate::spawn_gate`]) live in the same
-//! config struct to keep the `WsState` surface change to two fields.
+//! The spawn-gate knobs (new Rust-side work, no legacy analogue — see
+//! [`crate::spawn_gate`]) live in the same config struct to keep the
+//! `WsState` surface change to two fields.
 
 use std::collections::VecDeque;
 
@@ -28,13 +30,13 @@ pub struct CreateProtectConfig {
     pub rate_limit: usize,
     /// Sliding-window length, ms.
     pub rate_window_ms: u64,
-    /// Server-wide max concurrent restore-flagged creates (gate permits).
-    pub restore_spawn_concurrency: usize,
-    /// Max restore creates queued waiting on the gate before failing loud.
-    pub restore_spawn_queue_cap: usize,
-    /// Max wait for a gate permit before failing loud, ms. Must stay far
-    /// below the frozen client's ~38s RATE_LIMITED retry-ladder patience.
-    pub restore_spawn_timeout_ms: u64,
+    /// Server-wide max concurrent PTY spawns (spawn-gate permits).
+    pub spawn_concurrency: usize,
+    /// Max creates queued waiting on the gate before failing loud.
+    pub spawn_queue_cap: usize,
+    /// Max wait for a spawn-gate permit before failing loud, ms. Must stay
+    /// far below the frozen client's ~38s RATE_LIMITED ladder patience.
+    pub spawn_timeout_ms: u64,
 }
 
 impl Default for CreateProtectConfig {
@@ -42,15 +44,16 @@ impl Default for CreateProtectConfig {
         Self {
             rate_limit: 10,
             rate_window_ms: 10_000,
-            restore_spawn_concurrency: 4,
-            restore_spawn_queue_cap: 64,
-            restore_spawn_timeout_ms: 10_000,
+            spawn_concurrency: 4,
+            spawn_queue_cap: 64,
+            spawn_timeout_ms: 10_000,
         }
     }
 }
 
 /// Sanitizing env parse (same shape as the private helpers in
 /// `crate::backpressure`): unset, unparseable, zero, or negative -> default.
+/// Deliberately saner than legacy `Number(env || default)` — see module doc.
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -69,25 +72,15 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 impl CreateProtectConfig {
     /// Resolve from process env. Rate-limit names mirror legacy
-    /// (`server/ws-handler.ts:240-241`); the restore-spawn names are the
-    /// spec's `TERMINAL_RESTORE_SPAWN_*` family.
+    /// (`server/ws-handler.ts:240-241`); gate names are new Rust-side knobs.
     pub fn from_env() -> Self {
         let d = Self::default();
         Self {
             rate_limit: env_usize("TERMINAL_CREATE_RATE_LIMIT", d.rate_limit),
             rate_window_ms: env_u64("TERMINAL_CREATE_RATE_WINDOW_MS", d.rate_window_ms),
-            restore_spawn_concurrency: env_usize(
-                "TERMINAL_RESTORE_SPAWN_CONCURRENCY",
-                d.restore_spawn_concurrency,
-            ),
-            restore_spawn_queue_cap: env_usize(
-                "TERMINAL_RESTORE_SPAWN_QUEUE_CAP",
-                d.restore_spawn_queue_cap,
-            ),
-            restore_spawn_timeout_ms: env_u64(
-                "TERMINAL_RESTORE_SPAWN_TIMEOUT_MS",
-                d.restore_spawn_timeout_ms,
-            ),
+            spawn_concurrency: env_usize("FRESHELL_SPAWN_GATE_CONCURRENCY", d.spawn_concurrency),
+            spawn_queue_cap: env_usize("FRESHELL_SPAWN_GATE_QUEUE_CAP", d.spawn_queue_cap),
+            spawn_timeout_ms: env_u64("FRESHELL_SPAWN_GATE_TIMEOUT_MS", d.spawn_timeout_ms),
         }
     }
 }
@@ -159,8 +152,8 @@ mod tests {
         assert!(l.try_acquire(0));
         assert!(!l.try_acquire(1_000));
         assert!(!l.try_acquire(2_000));
-        // At t=10_000 both accepted stamps (t=0) expire (strict `<`). If the
-        // two REJECTIONS had been recorded, capacity would still be 0.
+        // At t=10_000 both accepted stamps (t=0) expire (strict `<`).
+        // If the two REJECTIONS had been recorded, capacity would still be 0.
         assert!(l.try_acquire(10_000));
         assert!(l.try_acquire(10_000));
     }
@@ -189,68 +182,85 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults() {
+    fn config_defaults_match_legacy() {
         let c = CreateProtectConfig::default();
         assert_eq!(c.rate_limit, 10);
         assert_eq!(c.rate_window_ms, 10_000);
-        assert_eq!(c.restore_spawn_concurrency, 4);
-        assert_eq!(c.restore_spawn_queue_cap, 64);
-        assert_eq!(c.restore_spawn_timeout_ms, 10_000);
+        assert_eq!(c.spawn_concurrency, 4);
+        assert_eq!(c.spawn_queue_cap, 64);
+        assert_eq!(c.spawn_timeout_ms, 10_000);
     }
 
     #[test]
     fn config_from_env_overrides_and_zero_falls_back() {
-        // `std::env::set_var` mutates whole-process state; this is the ONLY
-        // test in this binary touching these five names, and it restores them.
-        let names = [
-            "TERMINAL_CREATE_RATE_LIMIT",
-            "TERMINAL_CREATE_RATE_WINDOW_MS",
-            "TERMINAL_RESTORE_SPAWN_CONCURRENCY",
-            "TERMINAL_RESTORE_SPAWN_QUEUE_CAP",
-            "TERMINAL_RESTORE_SPAWN_TIMEOUT_MS",
-        ];
-        for n in names {
-            std::env::remove_var(n);
-        }
-        let d = CreateProtectConfig::default();
+        // Clean slate: remove all env vars to test fallback defaults.
+        std::env::remove_var("TERMINAL_CREATE_RATE_LIMIT");
+        std::env::remove_var("TERMINAL_CREATE_RATE_WINDOW_MS");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_CONCURRENCY");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_QUEUE_CAP");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_TIMEOUT_MS");
 
-        // unset -> defaults
+        // Test: unset -> defaults
         let c = CreateProtectConfig::from_env();
+        let d = CreateProtectConfig::default();
         assert_eq!(c.rate_limit, d.rate_limit);
-        assert_eq!(c.restore_spawn_concurrency, d.restore_spawn_concurrency);
+        assert_eq!(c.rate_window_ms, d.rate_window_ms);
+        assert_eq!(c.spawn_concurrency, d.spawn_concurrency);
+        assert_eq!(c.spawn_queue_cap, d.spawn_queue_cap);
+        assert_eq!(c.spawn_timeout_ms, d.spawn_timeout_ms);
 
-        // valid positive override takes effect
+        // Test: valid positive override takes effect
         std::env::set_var("TERMINAL_CREATE_RATE_LIMIT", "20");
         std::env::set_var("TERMINAL_CREATE_RATE_WINDOW_MS", "20000");
-        std::env::set_var("TERMINAL_RESTORE_SPAWN_CONCURRENCY", "8");
-        std::env::set_var("TERMINAL_RESTORE_SPAWN_QUEUE_CAP", "128");
-        std::env::set_var("TERMINAL_RESTORE_SPAWN_TIMEOUT_MS", "20000");
+        std::env::set_var("FRESHELL_SPAWN_GATE_CONCURRENCY", "8");
+        std::env::set_var("FRESHELL_SPAWN_GATE_QUEUE_CAP", "128");
+        std::env::set_var("FRESHELL_SPAWN_GATE_TIMEOUT_MS", "20000");
         let c = CreateProtectConfig::from_env();
         assert_eq!(c.rate_limit, 20);
-        assert_eq!(c.rate_window_ms, 20_000);
-        assert_eq!(c.restore_spawn_concurrency, 8);
-        assert_eq!(c.restore_spawn_queue_cap, 128);
-        assert_eq!(c.restore_spawn_timeout_ms, 20_000);
+        assert_eq!(c.rate_window_ms, 20000);
+        assert_eq!(c.spawn_concurrency, 8);
+        assert_eq!(c.spawn_queue_cap, 128);
+        assert_eq!(c.spawn_timeout_ms, 20000);
 
-        // '0' and garbage -> fallback to default
-        for n in names {
-            std::env::set_var(n, "0");
-        }
+        // Test: '0' -> fallback to default
+        std::env::set_var("TERMINAL_CREATE_RATE_LIMIT", "0");
+        std::env::set_var("TERMINAL_CREATE_RATE_WINDOW_MS", "0");
+        std::env::set_var("FRESHELL_SPAWN_GATE_CONCURRENCY", "0");
+        std::env::set_var("FRESHELL_SPAWN_GATE_QUEUE_CAP", "0");
+        std::env::set_var("FRESHELL_SPAWN_GATE_TIMEOUT_MS", "0");
         let c = CreateProtectConfig::from_env();
-        assert_eq!(c.restore_spawn_concurrency, d.restore_spawn_concurrency);
-        for n in names {
-            std::env::set_var(n, "not-a-number");
-        }
-        let c = CreateProtectConfig::from_env();
+        let d = CreateProtectConfig::default();
         assert_eq!(c.rate_limit, d.rate_limit);
+        assert_eq!(c.rate_window_ms, d.rate_window_ms);
+        assert_eq!(c.spawn_concurrency, d.spawn_concurrency);
+        assert_eq!(c.spawn_queue_cap, d.spawn_queue_cap);
+        assert_eq!(c.spawn_timeout_ms, d.spawn_timeout_ms);
 
-        for n in names {
-            std::env::remove_var(n);
-        }
+        // Test: unparseable -> fallback to default
+        std::env::set_var("TERMINAL_CREATE_RATE_LIMIT", "not-a-number");
+        std::env::set_var("TERMINAL_CREATE_RATE_WINDOW_MS", "not-a-number");
+        std::env::set_var("FRESHELL_SPAWN_GATE_CONCURRENCY", "not-a-number");
+        std::env::set_var("FRESHELL_SPAWN_GATE_QUEUE_CAP", "not-a-number");
+        std::env::set_var("FRESHELL_SPAWN_GATE_TIMEOUT_MS", "not-a-number");
+        let c = CreateProtectConfig::from_env();
+        let d = CreateProtectConfig::default();
+        assert_eq!(c.rate_limit, d.rate_limit);
+        assert_eq!(c.rate_window_ms, d.rate_window_ms);
+        assert_eq!(c.spawn_concurrency, d.spawn_concurrency);
+        assert_eq!(c.spawn_queue_cap, d.spawn_queue_cap);
+        assert_eq!(c.spawn_timeout_ms, d.spawn_timeout_ms);
+
+        // Cleanup
+        std::env::remove_var("TERMINAL_CREATE_RATE_LIMIT");
+        std::env::remove_var("TERMINAL_CREATE_RATE_WINDOW_MS");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_CONCURRENCY");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_QUEUE_CAP");
+        std::env::remove_var("FRESHELL_SPAWN_GATE_TIMEOUT_MS");
     }
 
     #[test]
     fn epoch_ms_returns_nonzero() {
-        assert!(epoch_ms() > 0);
+        let ms = epoch_ms();
+        assert!(ms > 0, "epoch_ms should return a nonzero value");
     }
 }

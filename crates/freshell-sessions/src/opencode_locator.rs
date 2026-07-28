@@ -366,7 +366,7 @@ impl OpencodeLocator {
 /// Lexical cwd normalization (mirrors `amplifier_locator::normalize_cwd`):
 /// trailing-slash / separator only — no realpath; `std::fs::canonicalize` is
 /// used opportunistically where the path exists.
-fn normalize_cwd(input: &str) -> String {
+pub(crate) fn normalize_cwd(input: &str) -> String {
     if let Ok(real) = std::fs::canonicalize(input) {
         return real.to_string_lossy().into_owned();
     }

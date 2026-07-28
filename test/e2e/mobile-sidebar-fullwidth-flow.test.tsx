@@ -32,6 +32,7 @@ vi.mock('@/lib/ws-client', () => ({
 }))
 
 vi.mock('@/lib/api', () => ({
+  getRecoveryInventory: async () => ({ recoverable: false, contentId: 'test', device: null, otherDevices: [], ledgerOnly: [] }),
   api: {
     get: (url: string) => mockApiGet(url),
     patch: vi.fn().mockResolvedValue({}),
@@ -72,6 +73,7 @@ vi.mock('@/hooks/useTheme', () => ({
 
 vi.mock('@/store/tabRegistrySync', () => ({
   startTabRegistrySync: () => () => {},
+  getCurrentTabRegistryClientInstanceId: () => 'test-client-instance',
 }))
 
 vi.mock('@/components/SetupWizard', () => ({

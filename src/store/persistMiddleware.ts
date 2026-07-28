@@ -251,6 +251,10 @@ function stripTransientSessionFields(content: any): any {
     resumeSessionId: _resumeSessionId,
     sessionRef: _legacySessionRef,
     sessionId: _sessionId,
+    // A19: reconcile fold state is volatile — never persisted.
+    pendingReconcile: _pendingReconcile,
+    reconcileNotice: _reconcileNotice,
+    reconcileEpoch: _reconcileEpoch,
     ...rest
   } = content
 
@@ -593,6 +597,9 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
             zoomedPane: _zp,
             refreshRequestsByPane: _rrbp,
             restoreFallbackAttemptsByPane: _rfabp,
+            deadSessionAdjudication: _dsa,
+            reconcileWarming: _rw,
+            reconcilePendingPanes: _rpp,
             ...persistablePanes
           } = state.panes
           persistablePanesSection = {
@@ -647,7 +654,6 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
           version: 1,
           attentionByTab: state.turnCompletion?.attentionByTab ?? {},
           attentionByPane: state.turnCompletion?.attentionByPane ?? {},
-          lastAppliedCompletionSeqByTerminalId: state.turnCompletion?.lastAppliedCompletionSeqByTerminalId ?? {},
         })
         localStorage.setItem(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
         broadcastPersistedRaw(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
@@ -699,7 +705,6 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       const turnCompletionChanged = (
         state.turnCompletion?.attentionByTab !== previousState.turnCompletion?.attentionByTab
         || state.turnCompletion?.attentionByPane !== previousState.turnCompletion?.attentionByPane
-        || state.turnCompletion?.lastAppliedCompletionSeqByTerminalId !== previousState.turnCompletion?.lastAppliedCompletionSeqByTerminalId
       )
 
       if (a.type.startsWith('tabs/') && tabsChanged) {

@@ -60,6 +60,18 @@ enum Entry {
     Settled {
         terminal_id: String,
         created: ServerMessage,
+        /// The `restore` flag the SETTLED create carried. A later reuse of
+        /// this `requestId` only replays when its OWN `restore` flag
+        /// matches -- a genuine blind resend of the identical frame
+        /// (legacy `inFlightCreates` parity: same requestId, same
+        /// `restore`). A mismatched reuse (e.g. a plain create's id later
+        /// reused by a `restore:true` attempt while that same terminal is
+        /// still live) is a DIFFERENT request wearing the same id -- it
+        /// must fall through to its own normal path (which may legitimately
+        /// reject it, e.g. `RESTORE_UNAVAILABLE` while the lineage is still
+        /// running) rather than silently being answered with the original
+        /// terminal.
+        restore: Option<bool>,
     },
 }
 
@@ -91,6 +103,7 @@ fn waiter_error(request_id: &str) -> ServerMessage {
         actual_session_ref: None,
         expected_session_ref: None,
         request_id: Some(request_id.to_string()),
+        retry_after_ms: None,
         terminal_exit_code: None,
         terminal_id: None,
     })
@@ -110,6 +123,7 @@ impl CreateDedupe {
         &self,
         request_id: &str,
         sink: &FrameSink,
+        restore: Option<bool>,
         is_running: impl Fn(&str) -> bool,
     ) -> DedupeDecision {
         let mut map = self.entries.lock().expect("create_dedupe lock");
@@ -125,9 +139,20 @@ impl CreateDedupe {
             Some(Entry::Settled {
                 terminal_id,
                 created,
+                restore: settled_restore,
             }) => {
-                if is_running(terminal_id) {
+                // Same id, same `restore` flag, terminal still live: a
+                // genuine blind resend of the identical frame -- replay.
+                // Same id, DIFFERENT `restore` flag: this is a different
+                // request wearing the same id (e.g. a plain create's id
+                // later reused by a `restore:true` attempt while that
+                // terminal is still running) -- let it proceed to its own
+                // normal path instead of silently answering with the
+                // original terminal.
+                if is_running(terminal_id) && *settled_restore == restore {
                     DedupeDecision::DuplicateSettled(created.clone())
+                } else if is_running(terminal_id) {
+                    DedupeDecision::Proceed
                 } else {
                     // Terminal exited or killed: evict and treat as fresh
                     // (legacy delete-at-exit parity).
@@ -166,6 +191,7 @@ impl CreateDedupe {
         request_id: &str,
         terminal_id: &str,
         created: &ServerMessage,
+        restore: Option<bool>,
         is_running: impl Fn(&str) -> bool,
     ) {
         let waiters = {
@@ -175,6 +201,7 @@ impl CreateDedupe {
                 Entry::Settled {
                     terminal_id: terminal_id.to_string(),
                     created: created.clone(),
+                    restore,
                 },
             );
             // Prune-on-access (house pattern; no background task): a settled
@@ -250,13 +277,13 @@ mod tests {
     fn settle_prunes_entries_for_non_running_terminals() {
         let d = CreateDedupe::default();
         let (s, _f) = recording_sink();
-        let _ = d.begin("r1", &s, |_| true);
-        d.settle("r1", "t1", &created_frame(), |_| true);
+        let _ = d.begin("r1", &s, None, |_| true);
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
         // t1's terminal has since exited: the next successful create's
         // settle sweeps its entry out (prune-on-access; legacy parity with
         // ws-handler's eager delete-at-exit).
-        let _ = d.begin("r2", &s, |_| true);
-        d.settle("r2", "t2", &created_frame(), |tid| tid != "t1");
+        let _ = d.begin("r2", &s, None, |_| true);
+        d.settle("r2", "t2", &created_frame(), None, |tid| tid != "t1");
         let map = d.entries.lock().expect("lock");
         assert_eq!(
             map.len(),
@@ -270,11 +297,11 @@ mod tests {
     fn prune_keeps_running_and_in_flight_entries() {
         let d = CreateDedupe::default();
         let (s, _f) = recording_sink();
-        let _ = d.begin("r1", &s, |_| true);
-        d.settle("r1", "t1", &created_frame(), |_| true);
-        let _ = d.begin("r2", &s, |_| true); // still in flight
-        let _ = d.begin("r3", &s, |_| true);
-        d.settle("r3", "t3", &created_frame(), |_| true); // prune runs; all running
+        let _ = d.begin("r1", &s, None, |_| true);
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
+        let _ = d.begin("r2", &s, None, |_| true); // still in flight
+        let _ = d.begin("r3", &s, None, |_| true);
+        d.settle("r3", "t3", &created_frame(), None, |_| true); // prune runs; all running
         {
             let map = d.entries.lock().expect("lock");
             assert_eq!(
@@ -285,7 +312,7 @@ mod tests {
         }
         // r1 still replays after the prune.
         assert!(matches!(
-            d.begin("r1", &s, |_| true),
+            d.begin("r1", &s, None, |_| true),
             DedupeDecision::DuplicateSettled(_)
         ));
     }
@@ -295,11 +322,11 @@ mod tests {
         let d = CreateDedupe::default();
         let (s1, _f1) = recording_sink();
         assert!(matches!(
-            d.begin("r1", &s1, |_| true),
+            d.begin("r1", &s1, None, |_| true),
             DedupeDecision::Proceed
         ));
         assert!(matches!(
-            d.begin("r1", &s1, |_| true),
+            d.begin("r1", &s1, None, |_| true),
             DedupeDecision::DuplicateInFlight
         ));
     }
@@ -308,10 +335,10 @@ mod tests {
     fn settled_entry_replays_frame_while_live() {
         let d = CreateDedupe::default();
         let (s1, _f1) = recording_sink();
-        let _ = d.begin("r1", &s1, |_| true);
-        d.settle("r1", "t1", &created_frame(), |_| true);
+        let _ = d.begin("r1", &s1, None, |_| true);
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
         assert!(matches!(
-            d.begin("r1", &s1, |_| true),
+            d.begin("r1", &s1, None, |_| true),
             DedupeDecision::DuplicateSettled(_)
         ));
     }
@@ -320,10 +347,10 @@ mod tests {
     fn dead_terminal_evicts_settled_entry() {
         let d = CreateDedupe::default();
         let (s1, _f1) = recording_sink();
-        let _ = d.begin("r1", &s1, |_| true);
-        d.settle("r1", "t1", &created_frame(), |_| true);
+        let _ = d.begin("r1", &s1, None, |_| true);
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
         assert!(matches!(
-            d.begin("r1", &s1, |_| false),
+            d.begin("r1", &s1, None, |_| false),
             DedupeDecision::Proceed
         ));
     }
@@ -332,16 +359,16 @@ mod tests {
     fn clear_if_in_flight_removes_sentinel_but_not_settled() {
         let d = CreateDedupe::default();
         let (s1, _f1) = recording_sink();
-        let _ = d.begin("r1", &s1, |_| true);
+        let _ = d.begin("r1", &s1, None, |_| true);
         d.clear_if_in_flight("r1");
         assert!(matches!(
-            d.begin("r1", &s1, |_| true),
+            d.begin("r1", &s1, None, |_| true),
             DedupeDecision::Proceed
         ));
-        d.settle("r1", "t1", &created_frame(), |_| true);
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
         d.clear_if_in_flight("r1");
         assert!(matches!(
-            d.begin("r1", &s1, |_| true),
+            d.begin("r1", &s1, None, |_| true),
             DedupeDecision::DuplicateSettled(_)
         ));
     }
@@ -351,12 +378,12 @@ mod tests {
         let d = CreateDedupe::default();
         let (origin, origin_frames) = recording_sink();
         let (other, other_frames) = recording_sink();
-        let _ = d.begin("r1", &origin, |_| true);
+        let _ = d.begin("r1", &origin, None, |_| true);
         assert!(matches!(
-            d.begin("r1", &other, |_| true),
+            d.begin("r1", &other, None, |_| true),
             DedupeDecision::DuplicateInFlight
         ));
-        d.settle("r1", "t1", &created_frame(), |_| true);
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
         assert_eq!(
             other_frames.lock().expect("frames").len(),
             1,
@@ -372,9 +399,9 @@ mod tests {
     fn same_connection_duplicate_is_not_a_waiter() {
         let d = CreateDedupe::default();
         let (origin, origin_frames) = recording_sink();
-        let _ = d.begin("r1", &origin, |_| true);
-        let _ = d.begin("r1", &origin, |_| true);
-        d.settle("r1", "t1", &created_frame(), |_| true);
+        let _ = d.begin("r1", &origin, None, |_| true);
+        let _ = d.begin("r1", &origin, None, |_| true);
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
         assert!(
             origin_frames.lock().expect("frames").is_empty(),
             "same-sink duplicates must not be double-answered"
@@ -386,8 +413,8 @@ mod tests {
         let d = CreateDedupe::default();
         let (origin, _f1) = recording_sink();
         let (other, other_frames) = recording_sink();
-        let _ = d.begin("r1", &origin, |_| true);
-        let _ = d.begin("r1", &other, |_| true);
+        let _ = d.begin("r1", &origin, None, |_| true);
+        let _ = d.begin("r1", &other, None, |_| true);
         d.clear_if_in_flight("r1");
         {
             let frames = other_frames.lock().expect("frames");
@@ -399,7 +426,7 @@ mod tests {
         }
         // Sentinel is gone: the client's retry proceeds fresh.
         assert!(matches!(
-            d.begin("r1", &other, |_| true),
+            d.begin("r1", &other, None, |_| true),
             DedupeDecision::Proceed
         ));
     }

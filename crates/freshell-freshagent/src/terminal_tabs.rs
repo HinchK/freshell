@@ -49,9 +49,11 @@ use freshell_platform::{
     RealFileProbe, ShellType, SpawnSpec,
 };
 use freshell_protocol::{ServerMessage, SessionLocator, UiCommand};
+use freshell_terminal::registry::SessionRefClaim;
 
 use crate::{
-    authorized, fail_json, ok_json, text_plain, FreshAgentState, TabRecord, TerminalPaneEntry,
+    authorized, fail_json, fail_json_code, ok_json, text_plain, FreshAgentState, TabRecord,
+    TerminalPaneEntry,
 };
 
 /// The exact legacy rejection text for a raw (non-`sessionRef`) `resumeSessionId`
@@ -468,6 +470,13 @@ fn arm_locators_for_fresh_pane(
     if let Some(locator) = &state.opencode_locator {
         locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
     }
+    // P1.14 / Incident-4: same shape as the WS-path codex arming call
+    // (`crates/freshell-ws/src/codex_association.rs:46`) -- `CodexLocator::arm`
+    // takes no timestamp (windows are Enter-anchored; arming schedules no
+    // deadline, see `codex_locator.rs:166`).
+    if let Some(locator) = &state.codex_locator {
+        locator.arm(terminal_id, mode, true, resume_session_id, cwd);
+    }
 }
 
 /// `sanitizeSessionRef` (`shared/session-contract.ts:55-62`) + `acceptedSessionRefForMode` /
@@ -547,10 +556,67 @@ fn codex_effective_resume_session_id(
     requested: Option<&str>,
     plan_session_id: Option<&str>,
 ) -> Option<String> {
-    match requested.filter(|s| !s.is_empty()) {
-        Some(requested) => Some(plan_session_id.unwrap_or(requested).to_string()),
-        None => None,
+    requested
+        .filter(|s| !s.is_empty())
+        .map(|requested| plan_session_id.unwrap_or(requested).to_string())
+}
+
+/// RAII release of a D8 sessionRef lease claim on the REST rung (port of the
+/// WS path's `SessionRefLeaseGuard`, `crates/freshell-ws/src/terminal.rs`):
+/// on EVERY non-complete exit of [`spawn_terminal_pane`] between claim and
+/// completion -- pre-spawn error, `registry.create` failure, codex adopt
+/// failure, or axum cancelling the request future -- drop releases the lease
+/// via `fail_session_ref_claim` (a no-op once `complete_session_ref_claim`
+/// removed it). The winner path disarms and completes explicitly.
+struct RestSessionRefLease {
+    registry: freshell_terminal::TerminalRegistry,
+    locator: SessionLocator,
+    holder_create_request_id: String,
+    armed: bool,
+}
+
+impl RestSessionRefLease {
+    fn new(
+        registry: freshell_terminal::TerminalRegistry,
+        locator: SessionLocator,
+        holder_create_request_id: String,
+    ) -> Self {
+        Self {
+            registry,
+            locator,
+            holder_create_request_id,
+            armed: true,
+        }
     }
+
+    /// Hand ownership of the release decision back to the caller (winner
+    /// bind or the revoked-lease kill path).
+    fn disarm(mut self) -> SessionLocator {
+        self.armed = false;
+        self.locator.clone()
+    }
+}
+
+impl Drop for RestSessionRefLease {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .fail_session_ref_claim(&self.locator, &self.holder_create_request_id);
+        }
+    }
+}
+
+/// Poll `kill(pid, 0)` for ESRCH for up to 500ms (the PTY's dedicated waiter
+/// thread reaps promptly -- `pty.rs` reader/waiter; same 20x25ms cadence as
+/// the WS path's `confirm_pid_dead_within_500ms`). `true` = death CONFIRMED.
+async fn confirm_pid_dead_within_500ms(pid: u32) -> bool {
+    for _ in 0..20u8 {
+        if !freshell_terminal::registry::pid_alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    !freshell_terminal::registry::pid_alive(pid)
 }
 
 /// The terminal-mode spawn pipeline (`router.ts:724-793` for create,
@@ -610,6 +676,18 @@ pub(crate) async fn spawn_terminal_pane(
         .map(str::to_string);
     let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
 
+    // Stable pane identity key (reconciliation-handshake design §5.5,
+    // precondition 2): honor a caller-supplied key (snapshot restore passes
+    // the captured one through `pane_to_create_body`), else mint one so every
+    // REST-created terminal pane is keyed. Same Uuid::simple idiom as the
+    // fresh-agent path (lib.rs `create_tab`).
+    let create_request_id = body
+        .get("createRequestId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+
     // Validate `cwd` up front: a nonexistent directory would otherwise fail
     // INSIDE the spawned child (post-fork), which a synchronous `registry.create`
     // call cannot observe -- checking here keeps the atomic-rollback contract
@@ -624,6 +702,95 @@ pub(crate) async fn spawn_terminal_pane(
     }
 
     let (mut resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
+
+    // D7 live-session guard, REST rung -- mirrors the WS terminal.create guard
+    // (freshell-ws/src/terminal.rs D7 block) via the shared
+    // TerminalRegistry::live_session_owner predicate: a resume derived from a
+    // wire `sessionRef` whose (provider, sessionId) is already owned by a
+    // RUNNING terminal is refused. Never spawn a second `<cli> --resume <sid>`
+    // while the original live PTY owns <sid> (one-JSONL-writer doctrine).
+    // Placement: before any side effect (no PTY, no MCP write, no port alloc,
+    // no codex plan), so refusal needs zero rollback. This is the single choke
+    // point for POST /api/tabs, /api/panes/:id/split, and /api/panes/:id/respawn
+    // (every spawn_terminal_pane caller). Scoped to the sessionRef rung exactly
+    // like WS (`accepted_session_ref` already implies provider == mode); the
+    // legacy bare-resumeSessionId rung keeps its existing behavior. No
+    // self-exemption for respawn: the old terminal is deliberately never
+    // killed ("detach, don't kill"), so resuming its live session in a second
+    // PTY would be exactly the two-writers corruption this guard forbids.
+    let mut session_ref_lease: Option<RestSessionRefLease> = None;
+    if let Some(live_sid) = accepted_session_ref
+        .as_ref()
+        .map(|r| r.session_id.as_str())
+        .filter(|sid| !sid.is_empty() && resume_session_id.as_deref() == Some(*sid))
+    {
+        if registry
+            .live_session_owner(state.session_identity.as_deref(), &mode, live_sid)
+            .is_some()
+        {
+            tracing::warn!(
+                target: "freshell_freshagent::terminal_tabs",
+                mode = %mode,
+                session_id = %live_sid,
+                pane_id = %pane_id,
+                "spawn_refused: a Running terminal already owns this session (D7 live-guard, REST rung)"
+            );
+            return Err(fail_json_code(
+                StatusCode::CONFLICT,
+                "RESTORE_UNAVAILABLE",
+                format!("Session {live_sid} is still running on the server."),
+            ));
+        }
+
+        // D8 session-ref lease, REST rung (Design Decision 6) -- D7 above is
+        // check-then-spawn: two concurrent REST resumes (or REST x WS) could
+        // both pass it and spawn two JSONL writers for one session. Claim the
+        // registry's per-sessionRef lease (the same primitive the WS create
+        // path holds) BEFORE spawning; the RAII guard releases it on every
+        // error path between here and the post-create completion. Holder id
+        // is the already-minted create_request_id; holder_conn is a fresh
+        // registry connection id (collision-free with WS conn cleanup -- REST
+        // leases rely on RAII drop + the lease TTL, not conn-death cleanup).
+        let locator = SessionLocator {
+            provider: mode.clone(),
+            session_id: live_sid.to_string(),
+        };
+        match registry.claim_session_ref(
+            &locator,
+            &create_request_id,
+            registry.new_connection_id(),
+            now_ms().max(0) as u64,
+        ) {
+            SessionRefClaim::Acquired => {
+                session_ref_lease = Some(RestSessionRefLease::new(
+                    registry.clone(),
+                    locator,
+                    create_request_id.clone(),
+                ));
+            }
+            // Conservative v1 (Design Decision 6): every non-Acquired arm
+            // answers the same 409 envelope. Held = a claim is in flight;
+            // BoundElsewhere = a live winner exists (D7's own answer);
+            // ExpiredNeedsKill = crashed holder -- no kill-and-adopt logic on
+            // REST, the lease TTL is the backstop.
+            SessionRefClaim::Held { .. }
+            | SessionRefClaim::BoundElsewhere { .. }
+            | SessionRefClaim::ExpiredNeedsKill { .. } => {
+                tracing::warn!(
+                    target: "freshell_freshagent::terminal_tabs",
+                    mode = %mode,
+                    session_id = %live_sid,
+                    pane_id = %pane_id,
+                    "spawn_refused: sessionRef lease unavailable (D8, REST rung)"
+                );
+                return Err(fail_json_code(
+                    StatusCode::CONFLICT,
+                    "RESTORE_UNAVAILABLE",
+                    format!("Session {live_sid} is still running on the server."),
+                ));
+            }
+        }
+    }
 
     let terminal_id = Uuid::new_v4().to_string();
     let stream_id = Uuid::new_v4().to_string();
@@ -871,7 +1038,8 @@ pub(crate) async fn spawn_terminal_pane(
         stream_id,
         &mode,
         resume_session_id.as_deref(),
-        None,
+        Some(create_request_id.as_str()), // create_request_id: REST accept-or-mint key (this task)
+        None,                             // ring_max_bytes: registry default
         on_exit,
     ) {
         // Nothing was recorded yet (no tab, no pane, no map entry) -> rollback
@@ -903,6 +1071,19 @@ pub(crate) async fn spawn_terminal_pane(
             resume_session_id.is_some(),
         );
         return Err(fail_json(StatusCode::BAD_REQUEST, message));
+    }
+
+    // D8: arm the lease's TTL kill path -- record the just-spawned child's pid
+    // on the winner's lease immediately (its presence decides ExpiredNeedsKill
+    // vs revoke-and-hold-closed on expiry). Mirrors the WS create path.
+    if let Some(guard) = &session_ref_lease {
+        if let Some(pid) = registry.pid_of(&terminal_id) {
+            registry.set_session_ref_lease_pid(
+                &guard.locator,
+                &guard.holder_create_request_id,
+                pid,
+            );
+        }
     }
 
     // DEV-0006 S4: adopt the managed codex launch for this terminal
@@ -942,9 +1123,57 @@ pub(crate) async fn spawn_terminal_pane(
         resume_session_id.as_deref(),
     );
 
+    // D8 winner bind (REST rung): record sessionRef->terminalId in the
+    // REGISTRY binding map (inside `complete_session_ref_claim` -- atomic with
+    // the lease release, then the duplicate alarm). A completed binding makes
+    // later WS claims answer BoundElsewhere (adopt) instead of double-spawning.
+    if let Some(guard) = session_ref_lease.take() {
+        let locator = guard.disarm();
+        if registry.complete_session_ref_claim(&locator, &create_request_id, &terminal_id) {
+            tracing::info!(
+                target: "freshell_freshagent::terminal_tabs",
+                terminal_id = %terminal_id,
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                "session_ref.winner_bound (REST rung)"
+            );
+        } else {
+            // Revoked while spawning (TTL expired on the then-pid-less lease):
+            // kill OUR OWN just-spawned child via the registry handle
+            // (group-kill discipline), confirm, and fail the create loudly --
+            // never leave an orphan running.
+            let pid = registry.pid_of(&terminal_id);
+            registry.kill(&terminal_id);
+            let confirmed = match pid {
+                Some(pid) => confirm_pid_dead_within_500ms(pid).await,
+                // No pid handle to probe: the registry kill removed the row;
+                // nothing is left to signal, so treat as confirmed.
+                None => true,
+            };
+            if confirmed {
+                registry.force_release_after_confirmed_kill(&locator);
+            } else {
+                tracing::error!(target: "invariant",
+                    terminal_id = %terminal_id,
+                    provider = %locator.provider,
+                    session_id = %locator.session_id,
+                    "session_ref_lease_revoked_child_kill_unconfirmed: holding lease closed (REST rung)");
+            }
+            return Err(fail_json_code(
+                StatusCode::CONFLICT,
+                "RESTORE_UNAVAILABLE",
+                format!(
+                    "Session {} is still running on the server.",
+                    locator.session_id
+                ),
+            ));
+        }
+    }
+
     let mut pane_content = json!({
         "kind": "terminal",
         "terminalId": terminal_id,
+        "createRequestId": create_request_id,
         "status": "running",
         "mode": mode,
         "shell": shell_str.clone().unwrap_or_else(|| "system".to_string()),
@@ -1258,6 +1487,21 @@ pub(crate) fn maybe_send_keys(
             StatusCode::NOT_FOUND,
             "terminal not found".to_string(),
         ));
+    }
+    // P1.14 / Incident-4: feed the codex locator BEFORE the PTY write.
+    // Contract (`codex_association.rs:49-56`): the first `note_submit`'s
+    // `known_files` re-snapshot must COMPLETE before the Enter byte reaches
+    // the PTY -- a re-snapshot racing after the write can capture
+    // (permanently exclude) the pane's own rollout file. `maybe_send_keys`
+    // is synchronous, so a plain call placed before `registry.input`
+    // satisfies the ordering. First submit does a bounded sessions-tree
+    // walk; later submits are a cheap mutex hop. No mode check needed:
+    // `note_submit` no-ops for terminals the locator never armed, and only
+    // codex panes are armed.
+    if is_submit_input(text) {
+        if let Some(locator) = &state.codex_locator {
+            locator.note_submit(&terminal_id, now_ms());
+        }
     }
     registry.input(&terminal_id, text.as_bytes());
     // Feed the amplifier/opencode locator's Enter<->session correlation
@@ -1658,6 +1902,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rest_create_terminal_tab_mints_and_stamps_create_request_id() {
+        let state = state_with_registry();
+        let mut rx = state.broadcast_tx.subscribe();
+        let router = app(state.clone());
+
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({ "mode": "shell", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create failed: {body}");
+
+        // Drain the broadcast bus for the ui.command{tab.create} frame.
+        let mut pane_content = None;
+        while let Ok(frame) = rx.try_recv() {
+            let msg: Value = serde_json::from_str(&frame).unwrap();
+            if msg["command"] == json!("tab.create") {
+                pane_content = msg
+                    .get("payload")
+                    .and_then(|p| p.get("paneContent"))
+                    .cloned();
+            }
+        }
+        let pane_content = pane_content.expect("no tab.create broadcast");
+        let crid = pane_content
+            .get("createRequestId")
+            .and_then(Value::as_str)
+            .expect("paneContent.createRequestId missing");
+        assert_eq!(crid.len(), 32, "expected Uuid::simple format, got {crid:?}");
+        assert!(crid.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // The registry row was stamped with the SAME key (atomic insert).
+        let terminal_id = pane_content
+            .get("terminalId")
+            .and_then(Value::as_str)
+            .expect("paneContent.terminalId missing");
+        let registry = state.terminal_registry.clone().expect("registry wired");
+        assert_eq!(
+            registry.probe_create_request_id(terminal_id).as_deref(),
+            Some(crid),
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_create_honors_caller_supplied_create_request_id() {
+        let state = state_with_registry();
+        let mut rx = state.broadcast_tx.subscribe();
+        let router = app(state.clone());
+
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "shell",
+                "cwd": tmp.to_string_lossy(),
+                "createRequestId": "crid-fixed-key",
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "create failed: {body}");
+
+        let mut pane_content = None;
+        while let Ok(frame) = rx.try_recv() {
+            let msg: Value = serde_json::from_str(&frame).unwrap();
+            if msg["command"] == json!("tab.create") {
+                pane_content = msg
+                    .get("payload")
+                    .and_then(|p| p.get("paneContent"))
+                    .cloned();
+            }
+        }
+        let pane_content = pane_content.expect("no tab.create broadcast");
+        assert_eq!(
+            pane_content.get("createRequestId").and_then(Value::as_str),
+            Some("crid-fixed-key"),
+        );
+        let terminal_id = pane_content
+            .get("terminalId")
+            .and_then(Value::as_str)
+            .expect("paneContent.terminalId missing");
+        let registry = state.terminal_registry.clone().expect("registry wired");
+        assert_eq!(
+            registry.probe_create_request_id(terminal_id).as_deref(),
+            Some("crid-fixed-key"),
+        );
+    }
+
+    #[tokio::test]
     async fn create_tab_passes_codex_durability_through_and_records_restore_key() {
         // Continuity trio (`tabs_snapshots.rs:245`/`:632`): a restore-driven
         // create carries the captured `codexDurability` into the broadcast
@@ -1987,9 +2324,7 @@ mod tests {
         if !is_wsl_env_live() {
             return;
         }
-        let _env_guard = crate::codex::tests::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _env_guard = crate::codex::tests::ENV_LOCK.blocking_lock();
         let prior = std::env::var_os("POWERSHELL_EXE");
         struct RestoreEnv(Option<std::ffi::OsString>);
         impl Drop for RestoreEnv {
@@ -2230,6 +2565,29 @@ mod tests {
         state_with_registry().with_opencode_locator(Some(std::sync::Arc::new(
             freshell_sessions::opencode_locator::OpencodeLocator::new(home),
         )))
+    }
+
+    /// P1.14 / Incident-4 hardening: the REST create path must arm the codex
+    /// locator exactly like amplifier/opencode, or a REST-created codex pane's
+    /// provisional identity can never be superseded by B2 adoption.
+    #[test]
+    fn arm_locators_for_fresh_pane_arms_the_codex_locator() {
+        let root = std::env::temp_dir().join(format!("codex-arm-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let locator =
+            std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(root));
+        let state = state_with_registry().with_codex_locator(Some(locator.clone()));
+        // Some(...) matches the sibling test-helper convention: the existing
+        // locator tests pass Some(std::sync::Arc::new(...)) (terminal_tabs.rs:2327-2337)
+        // because the builders take Option (with_amplifier_locator, lib.rs:362-368).
+
+        arm_locators_for_fresh_pane(&state, "term-codex-1", "codex", Some("/tmp/proj"), None);
+
+        assert_eq!(
+            locator.armed_count(),
+            1,
+            "codex mode must arm the codex locator"
+        );
     }
 
     #[tokio::test]
@@ -2564,6 +2922,416 @@ mod tests {
         let _ = std::fs::remove_file(&argv_file);
     }
 
+    // ── D7 live-session guard, REST rung (ks38) ──────────────────────────────
+
+    #[derive(Debug)]
+    struct StubSessionIdentity {
+        provider: &'static str,
+        session_id: &'static str,
+        terminal_id: &'static str,
+    }
+
+    impl freshell_terminal::registry::SessionIdentityLookup for StubSessionIdentity {
+        fn terminal_for_session(&self, provider: &str, session_id: &str) -> Option<String> {
+            (provider == self.provider && session_id == self.session_id)
+                .then(|| self.terminal_id.to_string())
+        }
+    }
+
+    const LIVE_SESSION: &str = "22222222-3333-4444-8555-666666666666";
+
+    /// Forge what a REST-spawned live resume leaves behind: a Running registry
+    /// row carrying (mode, resume_session_id). Headless: no real PTY.
+    fn forge_live_owner(registry: &freshell_terminal::TerminalRegistry, terminal_id: &str) {
+        registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: terminal_id.to_string(),
+            stream_id: format!("s-{terminal_id}"),
+            mode: "claude".to_string(),
+            resume_session_id: Some(LIVE_SESSION.to_string()),
+            create_request_id: None,
+            created_at: None,
+        });
+    }
+
+    async fn create_shell_tab(router: Router) -> (String, String, String) {
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({ "mode": "shell", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        (
+            body["data"]["tabId"].as_str().unwrap().to_string(),
+            body["data"]["paneId"].as_str().unwrap().to_string(),
+            body["data"]["terminalId"].as_str().unwrap().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_onto_live_session_is_refused_409_restore_unavailable() {
+        let argv_file = unique_argv_file("d7-rest-live-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        forge_live_owner(&registry, "t-live-owner");
+        let rows_before = registry.identity_probe_rows().len();
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["status"], json!("error"), "{body}");
+        assert_eq!(
+            body["code"],
+            json!("RESTORE_UNAVAILABLE"),
+            "exact wire code: {body}"
+        );
+        let msg = body["message"].as_str().expect("message");
+        assert!(
+            msg.contains(LIVE_SESSION),
+            "message must name the live session: {msg}"
+        );
+        // No duplicate spawn: only the forged owner exists.
+        assert_eq!(
+            registry.identity_probe_rows().len(),
+            rows_before,
+            "no new terminal"
+        );
+
+        registry.kill("t-live-owner");
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_onto_exited_session_still_works() {
+        let argv_file = unique_argv_file("d7-rest-exited-ok");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        forge_live_owner(&registry, "t-old-owner");
+        assert!(registry.finish_pty_exit("t-old-owner", 0));
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let new_tid = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        assert!(
+            registry.is_running(&new_tid),
+            "resume onto an exited session spawns"
+        );
+
+        registry.kill(&new_tid);
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_refused_when_identity_registry_owns_live_session() {
+        // Locator-adopted shape (d9b71f50): Running row with NO resume id; the
+        // binding lives only in the injected identity store.
+        let argv_file = unique_argv_file("d7-rest-identity-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]))
+            .with_session_identity(Arc::new(StubSessionIdentity {
+                provider: "claude",
+                session_id: LIVE_SESSION,
+                terminal_id: "t-adopted",
+            }));
+        let registry = state.terminal_registry.clone().unwrap();
+        registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "t-adopted".to_string(),
+            stream_id: "s-t-adopted".to_string(),
+            mode: "claude".to_string(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: None,
+        });
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+
+        registry.kill("t-adopted");
+    }
+
+    #[tokio::test]
+    async fn rest_respawn_resume_onto_live_session_is_refused_409() {
+        let argv_file = unique_argv_file("d7-respawn-live-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+        let (_tab_id, pane_id, shell_tid) = create_shell_tab(router.clone()).await;
+        forge_live_owner(&registry, "t-live-owner-respawn");
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/respawn"),
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+
+        registry.kill("t-live-owner-respawn");
+        registry.kill(&shell_tid);
+    }
+
+    #[tokio::test]
+    async fn rest_respawn_resume_after_owner_exits_succeeds() {
+        let argv_file = unique_argv_file("d7-respawn-after-exit");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+        let (_tab_id, pane_id, shell_tid) = create_shell_tab(router.clone()).await;
+        forge_live_owner(&registry, "t-exited-owner-respawn");
+        assert!(registry.finish_pty_exit("t-exited-owner-respawn", 0));
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/respawn"),
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let new_tid = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        assert!(registry.is_running(&new_tid));
+
+        registry.kill(&new_tid);
+        registry.kill(&shell_tid);
+    }
+
+    /// No self-exemption: the pane's OWN still-running terminal counts as the
+    /// live owner. Respawning pane P (which detaches -- never kills -- its old
+    /// terminal) with the same sessionRef would make two live writers for S.
+    #[tokio::test]
+    async fn rest_respawn_same_pane_own_live_session_is_refused_409() {
+        let argv_file = unique_argv_file("d7-respawn-self-collision");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        // First create resumes S with no live owner -> 200; leaves a Running
+        // claude terminal whose row is stamped resume_session_id = S.
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pane_id = body["data"]["paneId"].as_str().expect("paneId").to_string();
+        let first_tid = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+        assert!(registry.is_running(&first_tid));
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/respawn"),
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+        assert!(
+            registry.is_running(&first_tid),
+            "old terminal untouched by refusal"
+        );
+
+        registry.kill(&first_tid);
+    }
+
+    #[tokio::test]
+    async fn rest_split_resume_onto_live_session_is_refused_409() {
+        let argv_file = unique_argv_file("d7-split-live-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+        let (_tab_id, pane_id, shell_tid) = create_shell_tab(router.clone()).await;
+        forge_live_owner(&registry, "t-live-owner-split");
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/split"),
+            json!({
+                "direction": "vertical",
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+
+        registry.kill("t-live-owner-split");
+        registry.kill(&shell_tid);
+    }
+
+    // ── D8 session-ref lease, REST rung (ks38) ──────────────────────────────
+
+    /// `claim_session_ref` takes a u64 wall-clock ms; reuse the module's
+    /// `now_ms()` (i64 `Date.now()` semantics) clamped exactly like the WS
+    /// claim site (`freshell-ws/src/terminal.rs`: `now_ms().max(0) as u64`).
+    fn test_now_ms() -> u64 {
+        now_ms().max(0) as u64
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_while_lease_held_is_refused_409() {
+        let argv_file = unique_argv_file("d8-lease-held-refusal");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        // A foreign holder (e.g. an in-flight WS create) holds the lease.
+        let locator = SessionLocator {
+            provider: "claude".into(),
+            session_id: LIVE_SESSION.into(),
+        };
+        assert!(matches!(
+            registry.claim_session_ref(
+                &locator,
+                "foreign-holder",
+                registry.new_connection_id(),
+                test_now_ms()
+            ),
+            SessionRefClaim::Acquired
+        ));
+
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("RESTORE_UNAVAILABLE"), "{body}");
+
+        registry.fail_session_ref_claim(&locator, "foreign-holder");
+    }
+
+    #[tokio::test]
+    async fn rest_create_resume_completes_claim_into_binding() {
+        let argv_file = unique_argv_file("d8-lease-completion");
+        let state = state_with_registry()
+            .with_cli_commands(Arc::new(vec![recording_cli_spec("claude", &argv_file)]));
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state);
+
+        let locator = SessionLocator {
+            provider: "claude".into(),
+            session_id: LIVE_SESSION.into(),
+        };
+        // Precondition: nothing is bound before the spawn.
+        assert_eq!(registry.bound_terminal_for_session_ref(&locator), None);
+
+        let (status, body) = post(
+            router,
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": LIVE_SESSION },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let tid = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+
+        // The REST spawn must have completed its claim into a sessionRef->terminalId
+        // binding. Observe the bindings map DIRECTLY via the pub test probe
+        // `bound_terminal_for_session_ref` (registry.rs:2007-2013; only
+        // complete_session_ref_claim writes that map). Do NOT probe this with a
+        // late claim_session_ref call: its row-join arm (registry.rs:1771-1773)
+        // answers BoundElsewhere from the Running row's resume_session_id stamp
+        // alone, so that probe passes even when no binding was ever recorded --
+        // it cannot distinguish completion from the D7 row-join.
+        assert_eq!(
+            registry.bound_terminal_for_session_ref(&locator),
+            Some(tid.clone()),
+            "REST resume spawn must complete its lease into a sessionRef binding"
+        );
+
+        registry.kill(&tid);
+    }
+
     #[tokio::test]
     async fn create_claude_tab_with_non_canonical_resume_id_does_not_synthesize() {
         let argv_file = unique_argv_file("claude-implausible");
@@ -2803,6 +3571,85 @@ mod tests {
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
         let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// P1.14 / Incident-4 hardening, Step 5: a REST `send-keys` Enter must
+    /// feed the codex locator's `note_submit` (the codex window is
+    /// Enter-anchored -- without this, a REST-driven codex pane's window
+    /// never opens). Observable via the locator's own seams, mirroring the
+    /// WS-path test (`codex_association.rs:311-321`): the first submit
+    /// re-snapshots `known_files` (`fs_scan_count` 1 -> 2), and a direct
+    /// `note_submit` afterwards returns false (a still-pending window never
+    /// re-opens); non-submit text must not touch either.
+    #[tokio::test]
+    async fn send_keys_enter_feeds_codex_locator() {
+        let root = unique_temp_home("codex-submit");
+        let argv_file = unique_argv_file("codex-submit");
+        let locator = std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(
+            root.clone(),
+        ));
+        let state = state_with_registry()
+            .with_codex_locator(Some(locator.clone()))
+            .with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "codex", &argv_file,
+            )]));
+        let router = app(state.clone());
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({ "mode": "codex", "cwd": tmp.to_string_lossy() }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+        assert_eq!(
+            locator.armed_count(),
+            1,
+            "REST codex create must arm the codex locator"
+        );
+        assert_eq!(locator.fs_scan_count(), 1); // the arm snapshot
+
+        // Non-submit text (the `is_submit_input` gate): no window, no rescan.
+        let (send_status, _) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/send-keys"),
+            json!({ "data": "hello" }),
+            true,
+        )
+        .await;
+        assert_eq!(send_status, StatusCode::OK);
+        assert_eq!(
+            locator.fs_scan_count(),
+            1,
+            "non-submit input must not open the codex window"
+        );
+
+        // A lone Enter: the FIRST submit re-snapshots known_files.
+        let (send_status, _) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/send-keys"),
+            json!({ "data": "\r" }),
+            true,
+        )
+        .await;
+        assert_eq!(send_status, StatusCode::OK);
+        assert_eq!(
+            locator.fs_scan_count(),
+            2,
+            "the REST Enter must feed note_submit (first-submit re-snapshot)"
+        );
+        assert!(
+            !locator.note_submit(&terminal_id, now_ms()),
+            "the REST Enter already opened a still-pending window -- a direct \
+             note_submit must not re-open it"
+        );
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_file(&argv_file);
     }
 

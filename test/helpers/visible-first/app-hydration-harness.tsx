@@ -307,6 +307,8 @@ export async function createAppHydrationHarness(options: AppHydrationHarnessOpti
     getWsClient: () => wsState.ws,
   }))
   vi.doMock('@/lib/api', () => ({
+    getRecoveryInventory: async () => ({ recoverable: false, contentId: 'test', device: null, otherDevices: [], ledgerOnly: [] }),
+    isTransientRequestFailure: () => false,
     api: {
       get: (path: string) => resolveResponse(path),
       post: (path: string) => resolveResponse(path),

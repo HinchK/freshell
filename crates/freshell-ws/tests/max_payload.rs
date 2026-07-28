@@ -55,6 +55,7 @@ async fn spawn_server(ws_max_payload_bytes: usize) -> String {
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
 
     let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
@@ -86,12 +87,17 @@ async fn spawn_server(ws_max_payload_bytes: usize) -> String {
         ws_max_payload_bytes,
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::RestoreSpawnGate::new(4, 64)),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
     };
 
     let router = freshell_ws::router(state);

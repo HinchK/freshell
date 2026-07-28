@@ -91,6 +91,8 @@ describe('WsClient.connect', () => {
     expect(hello.capabilities).toEqual({
       uiScreenshotV1: true,
       terminalOutputBatchV1: true,
+      paneReconcileV1: true,
+      paneReconcileFreshAgentV1: true,
     })
 
     MockWebSocket.instances[0]._message({ type: 'ready' })

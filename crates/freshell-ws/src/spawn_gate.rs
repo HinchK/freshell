@@ -1,29 +1,31 @@
-//! Server-wide bounded-concurrency restore-spawn gate (restart-storm
-//! protection; prior art: docs/plans/2026-07-06-wsl-outage-rca.md — a
-//! ~20-tab fleet respawning 50-70 processes in the same instant, and branch
-//! feat/rust-create-protection commit da5d9b5c).
+//! Server-wide bounded-concurrency PTY spawn gate (restart-storm protection;
+//! prior art: docs/plans/2026-07-06-wsl-outage-rca.md — a ~20-tab fleet
+//! respawning 50-70 processes in the same instant).
 //!
 //! Semantics:
-//! - `concurrency` permits bound simultaneous restore-flagged creates
-//!   server-wide, from before the PTY spawn through the terminal being
-//!   settled (`terminal.created` + broadcasts queued) — the caller
+//! - `concurrency` permits bound simultaneous PTY spawns server-wide, from
+//!   before the PTY spawn through the terminal being settled
+//!   (`terminal.created` + broadcasts queued) — the caller
 //!   (`crate::create_gate`) owns that scope via the RAII permit.
 //! - FIFO-fair: tokio's Semaphore hands released permits to the oldest
 //!   queued waiter, so restore storms drain in arrival order (the
 //!   `try_acquire_owned` fast path fails while waiters queue — no barging).
-//! - Bounded queue: more than `queue_cap` waiters fails LOUD (`QueueFull`).
-//! - Bounded wait: no permit within the timeout fails LOUD (`Timeout`).
+//! - Bounded queue: more than `queue_cap` waiters fails LOUD (`QueueFull`)
+//!   instead of queueing unboundedly.
+//! - Bounded wait: a waiter that cannot get a permit within the timeout
+//!   fails LOUD (`Timeout`). Both bounds must resolve far below the frozen
+//!   client's ~38s RATE_LIMITED ladder patience.
 //! - CANCELLABLE: a queued waiter whose per-connection cancel watch fires
 //!   (or whose sender drops — the connection loop exited) unblocks with
 //!   `Cancelled` immediately. This is what lets a disconnecting client or a
-//!   shutting-down server abandon queued restore creates without ever
-//!   spawning a PTY.
+//!   shutting-down server abandon queued creates without ever spawning a PTY.
 //! - RAII: the returned `OwnedSemaphorePermit` releases on drop — every
 //!   completion/failure/panic path frees the permit. Never call
 //!   `permit.forget()` (it permanently shrinks capacity).
 //!
-//! `restore:true` creates bypass the per-connection RATE limiter but go
-//! through THIS gate; non-restore creates do the opposite.
+//! `restore:true` creates bypass the RATE limiter but NOT this gate — the
+//! gate is exactly what protects restore storms, and non-restore creates go
+//! through this same gate inline.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -44,6 +46,13 @@ pub enum SpawnGateError {
 /// Cancel-safe accounting for the `waiting` queue-depth counter: the
 /// decrement lives in `Drop` so success, timeout, cancellation, and the
 /// future being dropped mid-wait all reclaim the slot.
+///
+/// The caller's future can be DROPPED while suspended in the queued wait
+/// (e.g. a WS connection task aborted on disconnect). A straight-line
+/// `fetch_sub` after the await would never run on that path, leaking a queue
+/// slot per cancellation until the gate wedges into permanent `QueueFull`.
+/// Putting the decrement in `Drop` covers every exit: success, timeout, and
+/// cancellation.
 struct WaitingGuard<'a>(&'a AtomicUsize);
 
 impl Drop for WaitingGuard<'_> {
@@ -53,7 +62,7 @@ impl Drop for WaitingGuard<'_> {
 }
 
 #[derive(Debug)]
-pub struct RestoreSpawnGate {
+pub struct SpawnGate {
     semaphore: Arc<Semaphore>,
     queue_cap: usize,
     waiting: AtomicUsize,
@@ -63,7 +72,7 @@ pub struct RestoreSpawnGate {
     cancellations: AtomicU64,
 }
 
-impl RestoreSpawnGate {
+impl SpawnGate {
     pub fn new(concurrency: usize, queue_cap: usize) -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(concurrency)),
@@ -77,10 +86,10 @@ impl RestoreSpawnGate {
     }
 
     pub fn from_config(cfg: &crate::create_limit::CreateProtectConfig) -> Self {
-        Self::new(cfg.restore_spawn_concurrency, cfg.restore_spawn_queue_cap)
+        Self::new(cfg.spawn_concurrency, cfg.spawn_queue_cap)
     }
 
-    /// Acquire a restore-spawn permit, queueing FIFO behind other waiters.
+    /// Acquire a spawn permit, queueing FIFO behind other waiters.
     /// Cancellable: resolves `Err(Cancelled)` the moment `cancel` observes
     /// `true` or its sender drops.
     pub async fn acquire(
@@ -186,7 +195,7 @@ mod tests {
     #[tokio::test]
     async fn bounds_concurrency_to_n_and_all_complete() {
         // Spawn N+K creates, assert max in-flight == N, all complete.
-        let gate = Arc::new(RestoreSpawnGate::new(2, 64));
+        let gate = Arc::new(SpawnGate::new(2, 64));
         let in_flight = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let mut handles = Vec::new();
@@ -219,7 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn drains_fifo_in_arrival_order() {
-        let gate = Arc::new(RestoreSpawnGate::new(1, 64));
+        let gate = Arc::new(SpawnGate::new(1, 64));
         let (_htx, mut hrx) = cancel_pair();
         let holder = gate
             .acquire(Duration::from_secs(1), &mut hrx)
@@ -249,19 +258,24 @@ mod tests {
         assert_eq!(
             *order.lock().await,
             vec![0, 1, 2, 3],
-            "restore storms drain in order"
+            "storms drain in order"
         );
-        assert_eq!(gate.queued_total(), 4);
+        assert_eq!(
+            gate.queued_total(),
+            4,
+            "every queued waiter counts toward queued_total"
+        );
     }
 
     #[tokio::test]
     async fn queue_cap_fails_loud() {
-        let gate = Arc::new(RestoreSpawnGate::new(1, 2));
+        let gate = Arc::new(SpawnGate::new(1, 2));
         let (_htx, mut hrx) = cancel_pair();
         let _holder = gate
             .acquire(Duration::from_secs(1), &mut hrx)
             .await
             .expect("holder");
+        // Two waiters occupy the queue.
         let w1 = {
             let g = Arc::clone(&gate);
             tokio::spawn(async move {
@@ -277,6 +291,7 @@ mod tests {
             })
         };
         tokio::time::sleep(Duration::from_millis(50)).await; // let them enqueue
+                                                             // Third waiter overflows the cap: immediate loud failure.
         let (_tx3, mut rx3) = cancel_pair();
         let res = gate.acquire(Duration::from_secs(5), &mut rx3).await;
         assert_eq!(res.unwrap_err(), SpawnGateError::QueueFull);
@@ -288,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_fails_loud_and_leaks_no_permit() {
-        let gate = RestoreSpawnGate::new(1, 64);
+        let gate = SpawnGate::new(1, 64);
         let (_htx, mut hrx) = cancel_pair();
         let holder = gate
             .acquire(Duration::from_secs(1), &mut hrx)
@@ -299,6 +314,7 @@ mod tests {
         assert_eq!(res.unwrap_err(), SpawnGateError::Timeout);
         assert_eq!(gate.timeouts(), 1);
         drop(holder);
+        // The timed-out wait must not have consumed the permit.
         let (_tx2, mut rx2) = cancel_pair();
         let again = gate.acquire(Duration::from_millis(500), &mut rx2).await;
         assert!(again.is_ok(), "no leaked permits after a timeout");
@@ -306,7 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn already_cancelled_never_queues() {
-        let gate = RestoreSpawnGate::new(1, 64);
+        let gate = SpawnGate::new(1, 64);
         let (tx, mut rx) = cancel_pair();
         tx.send(true).expect("send");
         let res = gate.acquire(Duration::from_secs(5), &mut rx).await;
@@ -321,7 +337,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_signal_unblocks_queued_waiter_and_reclaims_slot() {
-        let gate = Arc::new(RestoreSpawnGate::new(1, 1));
+        // A WS connection task's cancel watch can fire while suspended in
+        // the queued wait. The `waiting` slot must be reclaimed on
+        // cancellation, or drift eventually wedges the gate into permanent
+        // QueueFull.
+        let gate = Arc::new(SpawnGate::new(1, 1));
         let (_htx, mut hrx) = cancel_pair();
         let holder = gate
             .acquire(Duration::from_secs(1), &mut hrx)
@@ -362,6 +382,7 @@ mod tests {
             "cancelled queued wait must release its queue slot"
         );
 
+        // And once the permit frees up, the gate fully recovers.
         drop(holder);
         let (_tx3, mut rx3) = cancel_pair();
         let again = gate.acquire(Duration::from_millis(500), &mut rx3).await;
@@ -372,7 +393,7 @@ mod tests {
     async fn sender_drop_cancels_queued_waiter() {
         // The connection loop exiting (disconnect OR server shutdown) drops
         // the watch sender; a queued create must unblock as Cancelled.
-        let gate = Arc::new(RestoreSpawnGate::new(1, 64));
+        let gate = Arc::new(SpawnGate::new(1, 64));
         let (_htx, mut hrx) = cancel_pair();
         let _holder = gate
             .acquire(Duration::from_secs(1), &mut hrx)
@@ -399,7 +420,7 @@ mod tests {
 
     #[tokio::test]
     async fn raii_drop_releases_permit() {
-        let gate = RestoreSpawnGate::new(1, 64);
+        let gate = SpawnGate::new(1, 64);
         let (_tx, mut rx) = cancel_pair();
         let p = gate
             .acquire(Duration::from_millis(100), &mut rx)

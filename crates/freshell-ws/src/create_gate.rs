@@ -31,30 +31,10 @@ impl CreateOutput<'_> {
 }
 
 use freshell_protocol::client_messages::TerminalCreate;
-use freshell_protocol::ErrorCode;
 
 use crate::spawn_gate::SpawnGateError;
+use crate::terminal::spawn_gate_error_parts;
 use crate::WsState;
-
-/// Map a gate rejection to the client-facing error frame parts.
-/// QueueFull -> RATE_LIMITED so the frozen client's retry ladder converts
-/// overload into backoff-and-retry (by the retry, the queue has drained).
-/// Timeout -> PTY_SPAWN_FAILED: fail loud; the pane shows a launch error.
-pub(crate) fn spawn_gate_error_parts(err: SpawnGateError) -> (ErrorCode, &'static str) {
-    match err {
-        SpawnGateError::QueueFull => (ErrorCode::RateLimited, "Too many terminal.create requests"),
-        SpawnGateError::Timeout => (
-            ErrorCode::PtySpawnFailed,
-            "Timed out waiting for a restore spawn slot",
-        ),
-        // Cancelled never reaches the client: the connection is gone (or the
-        // server is closing it with 4009). Mapped defensively anyway.
-        SpawnGateError::Cancelled => (
-            ErrorCode::PtySpawnFailed,
-            "Terminal create cancelled during shutdown",
-        ),
-    }
-}
 
 /// Run `work` (the whole settled-create section: handle_create through the
 /// shutdown post-check) while holding `permit`, releasing it only after
@@ -84,12 +64,13 @@ pub(crate) fn spawn_gated_restore_create(
     state: &WsState,
     conn_sink: &freshell_terminal::FrameSink,
     mut cancel_rx: tokio::sync::watch::Receiver<bool>,
+    conn_id: u64,
+    pane_reconcile_v1: bool,
 ) {
     let state = state.clone();
     let sink = std::sync::Arc::clone(conn_sink);
     tokio::spawn(async move {
-        let timeout =
-            std::time::Duration::from_millis(state.create_protect.restore_spawn_timeout_ms);
+        let timeout = std::time::Duration::from_millis(state.create_protect.spawn_timeout_ms);
         let permit = match state.spawn_gate.acquire(timeout, &mut cancel_rx).await {
             Ok(permit) => permit,
             Err(SpawnGateError::Cancelled) => {
@@ -157,7 +138,24 @@ pub(crate) fn spawn_gated_restore_create(
         let request_id = create.request_id.clone();
         hold_permit_across(permit, async {
             let mut out = CreateOutput::Channel(&sink);
-            let _ = crate::terminal::handle_create(create, &mut out, &state).await;
+            // Fresh limiter, never consulted: `handle_create`'s rate-limit
+            // check is gated on `create.restore != Some(true)`, and this
+            // path is restore:true by construction (the `if create.restore
+            // == Some(true)` branch in `handle_client_text`) — so this is a
+            // throwaway to satisfy the shared signature, not a live budget.
+            let mut create_limiter = crate::create_limit::CreateRateLimiter::new(
+                state.create_protect.rate_limit,
+                state.create_protect.rate_window_ms,
+            );
+            let _ = crate::terminal::handle_create(
+                create,
+                &mut out,
+                &state,
+                conn_id,
+                pane_reconcile_v1,
+                &mut create_limiter,
+            )
+            .await;
             // Covers create failure: no-op when handle_create settled the entry,
             // drops the InFlight sentinel (failing waiters loud) when it did not.
             state.create_dedupe.clear_if_in_flight(&request_id);

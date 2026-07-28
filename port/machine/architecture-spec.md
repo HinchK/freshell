@@ -284,7 +284,7 @@ disagree (`platform-glue.md §0`):
 
 - **`ws-protocol.schema.json`** = the inbound (client→server) **Zod runtime authority**
   → generate serde structs the server validates against.
-- **`ws-server-messages.schema.json`** = the outbound (server→client, all 52) **shape
+- **`ws-server-messages.schema.json`** = the outbound (server→client, all 56) **shape
   contract** → generate serde structs the server emits.
 - **`ws-message-inventory.json`** = the T0 conformance surface (every `type`
   discriminant) → the checklist every implementation must speak.

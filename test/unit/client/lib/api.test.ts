@@ -50,6 +50,17 @@ function mockJsonResponse(status: number, value: unknown) {
   }
 }
 
+function mockResponseWithHeaders(status: number, value: unknown, headers: Record<string, string>) {
+  const headerMap = new Map(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]))
+  mockFetch.mockResolvedValueOnce({
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: 'Too Many Requests',
+    text: async () => JSON.stringify(value),
+    headers: { get: (name: string) => headerMap.get(name.toLowerCase()) ?? null },
+  })
+}
+
 function successCapabilityResponse(
   sessionType: string,
   runtimeProvider: 'claude' | 'codex' | 'opencode',
@@ -272,6 +283,17 @@ describe('visible-first read-model helpers', () => {
       3,
       '/api/fresh-agent/threads/freshcodex/codex/thread-1/turns/turn-1?revision=7&cwd=%2Frepo%2Fworktree',
       expect.objectContaining({ signal, headers: expect.any(Headers) }),
+    )
+  })
+
+  it('appends the snapshot trigger to the fresh-agent snapshot query when provided', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson(codexContractSnapshot))
+
+    await getFreshAgentThreadSnapshot('freshcodex', 'codex', 'thread-1', { revision: 7, trigger: 'poll' })
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/fresh-agent/threads/freshcodex/codex/thread-1?revision=7&trigger=poll',
+      expect.objectContaining({ headers: expect.any(Headers) }),
     )
   })
 
@@ -865,5 +887,27 @@ describe('api error mapping', () => {
       status: 400,
       message: 'name required',
     })
+  })
+
+  it('carries retryAfterMs from a 429 Retry-After seconds header', async () => {
+    mockResponseWithHeaders(429, { error: 'Too many requests' }, { 'retry-after': '17' })
+    await expect(api.get('/api/fresh-agent/threads/freshopencode/opencode/ses_1')).rejects.toMatchObject({
+      status: 429,
+      retryAfterMs: 17_000,
+    })
+  })
+
+  it('leaves retryAfterMs undefined when the header is absent', async () => {
+    mockResponseWithHeaders(429, { error: 'Too many requests' }, {})
+    await expect(api.get('/api/x')).rejects.toMatchObject({ status: 429, retryAfterMs: undefined })
+  })
+
+  it('parses an HTTP-date Retry-After into a forward delta', async () => {
+    const future = new Date(Date.now() + 30_000).toUTCString()
+    mockResponseWithHeaders(429, { error: 'Too many requests' }, { 'retry-after': future })
+    const err = await api.get('/api/x').catch((e) => e)
+    expect(err.status).toBe(429)
+    expect(err.retryAfterMs).toBeGreaterThan(20_000)
+    expect(err.retryAfterMs).toBeLessThanOrEqual(31_000)
   })
 })

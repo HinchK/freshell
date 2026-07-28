@@ -21,7 +21,7 @@ import { cn } from '@/lib/utils'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
 import { getWsClient } from '@/lib/ws-client'
 import { api } from '@/lib/api'
-import { resolvePaneActivity } from '@/lib/pane-activity'
+import { isTrulyIdleCliMode, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
 import { getPaneDisplayTitle } from '@/lib/pane-title'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
 import {
@@ -335,13 +335,8 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   }, [])
 
   const handleClose = useCallback((paneId: string, content: PaneContent) => {
-    // Clean up terminal process if this pane has one
-    if (content.kind === 'terminal' && content.terminalId) {
-      ws.send({
-        type: 'terminal.detach',
-        terminalId: content.terminalId,
-      })
-    }
+    // Terminal detach is handled by terminalDetachMiddleware, which reconciles
+    // dropped terminal references on the resulting layout change.
     if (content.kind === 'fresh-agent') {
       clearDraft(paneId)
       const pendingCreate = freshAgentPendingCreates[content.createRequestId]
@@ -515,7 +510,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       paneRuntimeMeta
         ? formatPaneRuntimeTooltip(paneRuntimeMeta)
         : undefined
-    const paneBusy = resolvePaneActivity({
+    const paneActivityInput = {
       paneId: node.id,
       content: node.content,
       tabMode: tab?.mode,
@@ -526,9 +521,18 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       opencodeActivityByTerminalId,
       paneRuntimeActivityByPaneId,
       freshAgentSessions,
-    }).isBusy
+    }
+    const paneBusy = resolvePaneActivity(paneActivityInput).isBusy
 
-    const needsAttention = tabAttentionStyle !== 'none' && !!attentionByPane[node.id]
+    // Terminal CLI panes (claude/codex/opencode/amplifier): green is a PERSISTENT
+    // idle state (session known and not busy), independent of tab shading and its
+    // click-clearing. Everything else keeps the one-shot needs-attention green.
+    const effectiveTerminalMode = node.content.kind === 'terminal'
+      ? (node.content.mode !== 'shell' ? node.content.mode : tab?.mode)
+      : undefined
+    const needsAttention = node.content.kind === 'terminal' && isTrulyIdleCliMode(effectiveTerminalMode)
+      ? resolvePaneIdleGreen(paneActivityInput)
+      : tabAttentionStyle !== 'none' && !!attentionByPane[node.id]
 
     const refreshTarget = buildPaneRefreshTarget(node.content)
     const handleRefresh = refreshTarget

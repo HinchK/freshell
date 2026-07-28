@@ -11,7 +11,7 @@ oracle — is measured against these files.
 | File | What it is |
 |------|------------|
 | `ws-protocol.schema.json` | JSON Schema bundle (draft 2020-12) covering **every exported Zod schema** in `shared/ws-protocol.ts`, keyed by export name, plus `wsProtocolVersion`. This is the **inbound (client→server) runtime authority**. |
-| `ws-server-messages.schema.json` | JSON Schema for **every server→client message shape** (all 52), keyed by `type` discriminant, plus `wsProtocolVersion`. Synthesized from the `ServerMessage` union via the TypeScript type checker — the **outbound shape contract** for the oracle. |
+| `ws-server-messages.schema.json` | JSON Schema for **every server→client message shape** (all 56), keyed by `type` discriminant, plus `wsProtocolVersion`. Synthesized from the `ServerMessage` union via the TypeScript type checker — the **outbound shape contract** for the oracle. |
 | `ws-message-inventory.json` | The **T0 conformance surface**: the `type` discriminants of every client→server and server→client message. |
 | `generate-ws-contract.ts` | The generator. Reads `shared/ws-protocol.ts` and emits the three JSON files deterministically. |
 | `nondeterministic-fields.md` | Enumeration of runtime-nondeterministic fields (ids, timestamps, ports, paths, blobs) — the input to the oracle's normalization layer. |
@@ -56,11 +56,12 @@ The server→client shapes carry two extra guards:
 - **Full outbound coverage** — every `serverToClient` discriminant in the
   inventory must have a schema entry in `ws-server-messages.schema.json` (and no
   extra). No outbound message may go unschematized.
-- **Zod cross-check** — for the 8 server→client messages that *also* have a
-  runtime Zod schema (`terminal.meta.updated`, the `*.activity.*` pair, the
-  `*.activity.list.response` trio, `terminal.turn.complete`), the TS-derived and
-  Zod-derived schemas must agree on **required field names**. Any mismatch is
-  reported, never silently reconciled.
+- **Zod cross-check** — for the 12 server→client messages that *also* have a
+  runtime Zod schema (the `*.activity.updated` / `*.activity.list.response`
+  pairs for amplifier/claude/codex/opencode, plus `pane.reconcile.result`,
+  `terminal.idle`, `terminal.meta.updated`, `terminal.turn.complete`), the
+  TS-derived and Zod-derived schemas must agree on **required field names**.
+  Any mismatch is reported, never silently reconciled.
 
 The guards have been validated by mutation — tampering with any committed file
 (a shape value, or an inventory entry that leaves an outbound message
@@ -75,11 +76,13 @@ The contract regenerates only when the **authoring** source
 npm run contract:generate      # tsx port/contract/generate-ws-contract.ts
 ```
 
-Run the drift guard:
-
-```bash
-npx vitest run --config config/vitest/vitest.port.config.ts
-```
+Run the drift guard with `npm run test:port`. CI runs it on every PR via
+`.github/workflows/port-contract.yml`, which also regenerates the contract
+(`npm run contract:generate`) and fails on any resulting diff, and runs
+`cargo test -p freshell-protocol` so the Rust T0 surface moves in lockstep.
+When you change `shared/ws-protocol.ts`: run `npm run contract:generate`,
+update `crates/freshell-protocol` (arrays + inventory-test counts), and
+commit the regenerated `port/contract/*.json` in the same PR.
 
 ## How it is generated
 
@@ -88,7 +91,7 @@ npx vitest run --config config/vitest/vitest.port.config.ts
   `zod-to-json-schema` only if native conversion ever throws. Schemas are detected
   *structurally* (every exported `ZodType`), not by a `*Schema` name pattern, so
   first-class wire enums that break the convention — notably `ErrorCode` — are not
-  dropped. As of this writing all 55 exported schemas convert natively.
+  dropped. As of this writing all 66 exported schemas convert natively.
 - **Message inventory:** discriminants are resolved from the two canonical union
   types, `ClientMessage` and `ServerMessage`, via the **TypeScript type checker**.
   This is authoritative for both the Zod-validated client surface and the

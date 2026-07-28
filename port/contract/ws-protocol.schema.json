@@ -2,8 +2,195 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 55,
+  "schemaCount": 66,
   "schemas": {
+    "AmplifierActivityListResponseSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "latestTurnCompletions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "completionSeq": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "type": "integer"
+              },
+              "terminalId": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "terminalId",
+              "at",
+              "completionSeq"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "terminals": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "idle",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "updatedAt": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "terminalId",
+              "phase",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "amplifier.activity.list.response",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId",
+        "terminals"
+      ],
+      "type": "object"
+    },
+    "AmplifierActivityListSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "amplifier.activity.list",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "requestId"
+      ],
+      "type": "object"
+    },
+    "AmplifierActivityRecordSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "phase": {
+          "enum": [
+            "idle",
+            "busy"
+          ],
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "terminalId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "updatedAt": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "terminalId",
+        "phase",
+        "updatedAt"
+      ],
+      "type": "object"
+    },
+    "AmplifierActivityUpdatedSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "remove": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "amplifier.activity.updated",
+          "type": "string"
+        },
+        "upsert": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "idle",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "updatedAt": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "terminalId",
+              "phase",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "upsert",
+        "remove"
+      ],
+      "type": "object"
+    },
     "ClaudeActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -246,9 +433,103 @@
         {
           "additionalProperties": false,
           "properties": {
+            "panes": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "createRequestId": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "kind": {
+                    "enum": [
+                      "terminal",
+                      "fresh-agent"
+                    ],
+                    "type": "string"
+                  },
+                  "mode": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "paneKey": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "resumeSessionId": {
+                    "type": "string"
+                  },
+                  "serverInstanceId": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "sessionRef": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "provider": {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "sessionId": {
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "provider",
+                      "sessionId"
+                    ],
+                    "type": "object"
+                  },
+                  "status": {
+                    "type": "string"
+                  },
+                  "terminalId": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "paneKey",
+                  "kind",
+                  "mode",
+                  "createRequestId"
+                ],
+                "type": "object"
+              },
+              "maxItems": 200,
+              "type": "array"
+            },
+            "reconcileId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "pane.reconcile.request",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "reconcileId",
+            "panes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "capabilities": {
               "additionalProperties": false,
               "properties": {
+                "paneReconcileFreshAgentV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
+                "paneReconcileV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "terminalOutputBatchV1": {
                   "type": "boolean"
                 },
@@ -875,6 +1156,24 @@
             },
             "type": {
               "const": "claude.activity.list",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "requestId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "requestId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "amplifier.activity.list",
               "type": "string"
             }
           },
@@ -2145,7 +2444,9 @@
         "INTERNAL_ERROR",
         "RATE_LIMITED",
         "UNAUTHORIZED",
-        "PROTOCOL_MISMATCH"
+        "PROTOCOL_MISMATCH",
+        "SESSION_RESERVED",
+        "FRESH_AGENT_LOST_SESSION"
       ],
       "type": "string"
     },
@@ -3340,6 +3641,14 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "paneReconcileFreshAgentV1": {
+              "const": true,
+              "type": "boolean"
+            },
+            "paneReconcileV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "terminalOutputBatchV1": {
               "type": "boolean"
             },
@@ -3596,6 +3905,241 @@
       ],
       "type": "object"
     },
+    "PaneReconcileRequestSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "panes": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "createRequestId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "terminal",
+                  "fresh-agent"
+                ],
+                "type": "string"
+              },
+              "mode": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "paneKey": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "resumeSessionId": {
+                "type": "string"
+              },
+              "serverInstanceId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "sessionRef": {
+                "additionalProperties": false,
+                "properties": {
+                  "provider": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "sessionId": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "provider",
+                  "sessionId"
+                ],
+                "type": "object"
+              },
+              "status": {
+                "type": "string"
+              },
+              "terminalId": {
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "paneKey",
+              "kind",
+              "mode",
+              "createRequestId"
+            ],
+            "type": "object"
+          },
+          "maxItems": 200,
+          "type": "array"
+        },
+        "reconcileId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "pane.reconcile.request",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "reconcileId",
+        "panes"
+      ],
+      "type": "object"
+    },
+    "PaneReconcileResultSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "bootId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reconcileId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "serverInstanceId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "pane.reconcile.result",
+          "type": "string"
+        },
+        "verdicts": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "corrected": {
+                "const": true,
+                "type": "boolean"
+              },
+              "duplicate": {
+                "type": "string"
+              },
+              "paneKey": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "sessionRef": {
+                "additionalProperties": false,
+                "properties": {
+                  "provider": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "sessionId": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "provider",
+                  "sessionId"
+                ],
+                "type": "object"
+              },
+              "terminalId": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "verdict": {
+                "enum": [
+                  "attach",
+                  "respawn",
+                  "fresh",
+                  "dead_session",
+                  "invalid",
+                  "error"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "paneKey",
+              "verdict"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "type",
+        "reconcileId",
+        "bootId",
+        "serverInstanceId",
+        "verdicts"
+      ],
+      "type": "object"
+    },
+    "PaneVerdictSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "corrected": {
+          "const": true,
+          "type": "boolean"
+        },
+        "duplicate": {
+          "type": "string"
+        },
+        "paneKey": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "terminalId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "verdict": {
+          "enum": [
+            "attach",
+            "respawn",
+            "fresh",
+            "dead_session",
+            "invalid",
+            "error"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "paneKey",
+        "verdict"
+      ],
+      "type": "object"
+    },
     "PingSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -3607,6 +4151,104 @@
       },
       "required": [
         "type"
+      ],
+      "type": "object"
+    },
+    "ReadyCapabilitiesSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "paneReconcileFreshAgentV1": {
+          "const": true,
+          "type": "boolean"
+        },
+        "paneReconcileV1": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "ReconcilePaneSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "createRequestId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "terminal",
+            "fresh-agent"
+          ],
+          "type": "string"
+        },
+        "mode": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "paneKey": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "resumeSessionId": {
+          "type": "string"
+        },
+        "serverInstanceId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionRef": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "sessionId": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "sessionId"
+          ],
+          "type": "object"
+        },
+        "status": {
+          "type": "string"
+        },
+        "terminalId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "paneKey",
+        "kind",
+        "mode",
+        "createRequestId"
+      ],
+      "type": "object"
+    },
+    "ReconcileSessionRefSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "provider": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "sessionId"
       ],
       "type": "object"
     },
@@ -3996,6 +4638,39 @@
       ],
       "type": "object"
     },
+    "TerminalIdleSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reason": {
+          "enum": [
+            "grace",
+            "queue-empty"
+          ],
+          "type": "string"
+        },
+        "terminalId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.idle",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "terminalId",
+        "at",
+        "reason"
+      ],
+      "type": "object"
+    },
     "TerminalInputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -4342,7 +5017,8 @@
           "enum": [
             "opencode",
             "claude",
-            "codex"
+            "codex",
+            "amplifier"
           ],
           "type": "string"
         },

@@ -19,7 +19,7 @@
 //! { "version": 1, "sessions": { "<provider>": { "<sessionId>": { "sessionType": "...", "sessionTypeSource": "explicit" } } } }
 //! ```
 //!
-//! `get_all()`/`get()` are provided for future read-surfaces (the sidebar directory listing
+//! `get_all()`/`get()` are provided for future read-surfaces (test-only until the session-indexer read path is ported) (the sidebar directory listing
 //! embeds `sessionType` inline via `codingCliIndexer` server-side in the reference; this
 //! port's `crates/freshell-sessions` directory index is a SEPARATE crate this module does
 //! not reach into — wiring metadata into the directory listing is out of THIS module's
@@ -27,6 +27,7 @@
 //! `GET /api/session-metadata` route either (confirmed by exhaustive grep of
 //! `server/sessions-router.ts` and `server/index.ts` — only the `POST` exists).
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -112,6 +113,12 @@ impl SessionMetadataStore {
     }
 
     /// `get(provider, sessionId)` (`session-metadata-store.ts:102-106`).
+    ///
+    /// Test-only today: the port's production surface is the write path
+    /// (`POST /api/session-metadata` -> `set`). The reference's read callers
+    /// (`session-indexer.ts:1370`'s `getAll()` join) are not ported yet; when
+    /// that lands, the compiler will force this gate off.
+    #[cfg(test)]
     pub async fn get(&self, provider: &str, session_id: &str) -> Option<Value> {
         let mut guard = self.inner.lock().await;
         let data = Self::load_locked(&mut guard, &self.path).await;
@@ -125,6 +132,9 @@ impl SessionMetadataStore {
 
     /// `getAll()` (`session-metadata-store.ts:113-122`): flattened `provider:sessionId` →
     /// entry map.
+    ///
+    /// Test-only today — see `get` above.
+    #[cfg(test)]
     pub async fn get_all(&self) -> HashMap<String, Value> {
         let mut guard = self.inner.lock().await;
         let data = Self::load_locked(&mut guard, &self.path).await;

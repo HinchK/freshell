@@ -3,6 +3,7 @@
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 
 if (process.argv[2] === 'fake-native-child') {
@@ -33,7 +34,13 @@ function loadBehavior() {
 }
 
 function getCodexHome() {
-  return process.env.CODEX_HOME || '/tmp/fake-codex-home'
+  // Mirror the REAL codex CLI's resolution: CODEX_HOME env else ~/.codex.
+  // The old '/tmp/fake-codex-home' fallback wrote durable artifacts OUTSIDE
+  // the server's isolated HOME, so the Rust session-existence probe (which
+  // scans <home>/.codex/sessions and now gates reconcile verdicts) reported
+  // every fixture thread as artifact-missing -> dead_session, wiping the
+  // pane's durable identity across restart.
+  return process.env.CODEX_HOME || path.join(os.homedir(), '.codex')
 }
 
 function getRolloutSessionDir() {
@@ -58,9 +65,13 @@ function ensureDurableArtifact(threadId) {
   const now = new Date()
   const sessionDir = path.dirname(thread.path)
   fs.mkdirSync(sessionDir, { recursive: true })
+  // session_meta first line, the shape the real codex rollout writer produces
+  // and the Rust indexer parses (parse_codex_session_content requires an id +
+  // cwd -- the R10b cwd-less exclusion gate skips files without one).
   fs.writeFileSync(thread.path, JSON.stringify({
-    threadId,
-    createdAt: now.toISOString(),
+    timestamp: now.toISOString(),
+    type: 'session_meta',
+    payload: { id: threadId, cwd: process.cwd(), createdAt: now.toISOString() },
   }) + '\n', 'utf8')
   return {
     codexHome,
@@ -474,6 +485,22 @@ wss.on('connection', (socket) => {
         },
       }))
       return
+    }
+
+    // behavior.crashOnPromptMarker + behavior.crashOnPromptMarkerOnceMarkerPath:
+    // if the inbound turn input contains the marker AND this process wins the
+    // cross-process once-claim (claimCrossProcessOnce's 'wx' marker file),
+    // hard-exit(1) BEFORE responding to simulate a mid-turn sidecar crash.
+    // The respawned process finds the marker file on disk and proceeds
+    // normally. Cross-process (unlike exitProcessAfterMethodsOnce's
+    // per-process "once" set, which would make the respawn exit again).
+    if (
+      method === 'turn/start' &&
+      behavior.crashOnPromptMarker &&
+      JSON.stringify(message.params?.input ?? '').includes(behavior.crashOnPromptMarker) &&
+      claimCrossProcessOnce(behavior.crashOnPromptMarkerOnceMarkerPath, 'crashOnPromptMarker')
+    ) {
+      process.exit(1)
     }
 
     const override = behavior.overrides?.[method]

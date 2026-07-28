@@ -51,7 +51,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use freshell_platform::SpawnSpec;
 use freshell_protocol::{
     GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator,
-    TerminalAttachReady, TerminalExit, TerminalOutput, TerminalRunStatus,
+    TerminalAttachIntent, TerminalAttachReady, TerminalExit, TerminalOutput, TerminalRunStatus,
 };
 
 use crate::barrier_scanner::{BarrierReason, BarrierScanner, ScannerState};
@@ -60,6 +60,7 @@ use crate::batch::{
     BatchInputFrame,
 };
 use crate::fragment::terminal_stream_batch_max_bytes;
+use crate::idle_noise::NoiseScanner;
 use crate::pty::{MessageSink, PtyTerminal};
 
 /// Deliver one server→client message to a single attached connection's socket.
@@ -197,6 +198,10 @@ struct TerminalShared {
     /// The per-terminal stateful VT [`BarrierScanner`] (`replay-ring.ts:48`). Classifies
     /// each ingested frame in order; its mode/CSI/string state persists across frames.
     scanner: BarrierScanner,
+    /// Per-terminal repaint-noise fingerprinter feeding
+    /// `last_meaningful_activity_at` (DEV-0009). Independent of the barrier
+    /// scanner: separate state, separate concern (reaping, not batching).
+    noise: NoiseScanner,
     /// Highest `seqEnd` produced (drives `attach.ready.headSeq`).
     head_seq: i64,
     status: TerminalRunStatus,
@@ -208,10 +213,23 @@ struct TerminalShared {
     exit_code: Option<i64>,
     created_at: i64,
     last_activity_at: i64,
-    /// Current PTY geometry + epoch (`§5.3`): epoch starts 1, +1 only on real change.
+    /// The idle-kill reap clock (DEV-0009): last MEANINGFUL activity — user
+    /// input, or PTY output carrying genuinely new content per
+    /// [`NoiseScanner`]. Unlike `last_activity_at` (wire-visible via
+    /// `inventory()`/`DirectoryEntry` and spec-pinned to bump on EVERY
+    /// output frame, terminal-core.md §1.3), repaint noise (spinner frames,
+    /// ticking counters, status-bar redraws) does not refresh this.
+    /// Read ONLY by `enforce_idle_kills`.
+    last_meaningful_activity_at: i64,
+    /// Current PTY geometry + epoch (`§5.3`): epoch starts 1, +1 only on a real change after the first client geometry record.
     cols: u16,
     rows: u16,
     geometry_epoch: i64,
+    /// TERM-07 parity with Node's `hasPreviousGeometry` (`broker.ts:666-686`):
+    /// false until the first client-supplied geometry is recorded. The first
+    /// record applies dims WITHOUT bumping `geometry_epoch` (spawn defaults
+    /// never count as a prior record); later real changes bump.
+    has_client_geometry: bool,
     cwd: Option<String>,
     /// Directory metadata (`terminal-registry.ts:1614` stores `getModeLabel(opts.mode)`
     /// as the title at create; `getModeLabel('shell') === 'Shell'`). Defaults preserve
@@ -223,6 +241,12 @@ struct TerminalShared {
     mode: String,
     /// The session id a CLI pane resumed from (feeds the directory `sessionRef`).
     resume_session_id: Option<String>,
+    /// The pane's stable creation key (`terminal.create.requestId`), stamped
+    /// ATOMICALLY with the registry insert — it is a field of the inserted row,
+    /// so no observer can ever see a row without its key (reconciliation
+    /// handshake design §5.1). `None` for creates that carried no key (e.g.
+    /// REST ingress, which mints none — design §5.5 precondition 2).
+    create_request_id: Option<String>,
     /// Attached connections, keyed by connection id (multi-client fan-out, `§7.3`).
     subscribers: HashMap<u64, Subscriber>,
 }
@@ -276,6 +300,9 @@ pub struct IdentityProbeRow {
     /// (e.g. REST-created resumes, whose creates can't reach the WS-owned
     /// identity registry across the crate boundary).
     pub resume_session_id: Option<String>,
+    /// The terminal's working directory — carried so the §5.4 adopt branch can
+    /// echo the EXISTING terminal's cwd on its `terminal.created` frame.
+    pub cwd: Option<String>,
 }
 
 /// One terminal's row for the REST terminal directory (`registry.list()` as consumed
@@ -309,11 +336,39 @@ struct TerminalHandle {
     pty: Option<PtyTerminal>,
 }
 
+/// Registration options for a terminal record with NO backing PTY.
+///
+/// This is the registry's headless seam (reconciliation-handshake design §9.1:
+/// "the registry supports headless terminals for exactly this"): crate tests —
+/// including `freshell-ws`'s wire-level reconcile tests, which sit across the
+/// crate boundary and cannot reach the private [`TerminalShared`] — seed
+/// live/exited terminal generations deterministically without spawning real
+/// children. Never called on a production path (production terminals are only
+/// ever registered by [`TerminalRegistry::create`], which spawns the PTY).
+#[derive(Debug, Clone, Default)]
+pub struct HeadlessTerminal {
+    pub terminal_id: String,
+    pub stream_id: String,
+    /// `TerminalMode` string; empty is normalized to `"shell"`.
+    pub mode: String,
+    pub resume_session_id: Option<String>,
+    /// The pane's stable creation key (see [`TerminalRegistry::create`]).
+    pub create_request_id: Option<String>,
+    /// Explicit creation timestamp (epoch ms); `None` = now.
+    pub created_at: Option<i64>,
+}
+
 struct RegistryInner {
     terminals: HashMap<String, TerminalHandle>,
     /// Run-monotonic inventory revision (`terminals.changed.revision`, `§7.5`). Only
     /// its monotonic increase is asserted by the oracle, not the value.
     revision: i64,
+    /// Respawn-generation counters per `createRequestId` (reconciliation design
+    /// §7.5): consecutive generations that exited WITHIN the liveness window.
+    /// Reset to 0 whenever a generation survives the window. Read by
+    /// [`TerminalRegistry::respawn_exhausted`], which turns an infinite
+    /// respawn ↔ instant-exit loop into a terminal `dead_session` verdict.
+    respawn_generations: HashMap<String, u32>,
 }
 
 /// Shared, cheaply-cloneable owner of all live terminals, keyed by `terminalId`.
@@ -324,6 +379,143 @@ struct RegistryInner {
 /// a [`TerminalRegistry`] is constructed but `set_auto_kill_idle_minutes`
 /// hasn't been called yet (e.g. before the boot-time settings load completes).
 const DEFAULT_AUTO_KILL_IDLE_MINUTES: i64 = 15;
+
+/// TERM-15/TERM-16 activity tap: the registry-level lifecycle events the
+/// activity hub (`freshell-ws`) subscribes to. `Created`/`Exit` fire for
+/// every mode; `Input`/`Output` fire only for CLI modes (`mode != "shell"`)
+/// so plain shells pay zero per-chunk tap cost. The observer runs on the
+/// caller's thread (`Created`/`Input`/kill-`Exit`) or the PTY reader thread
+/// (`Output`/natural-exit `Exit`) — it must be cheap and non-blocking.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivityEvent {
+    Created {
+        terminal_id: String,
+        mode: String,
+        resume_session_id: Option<String>,
+        at: i64,
+    },
+    Input {
+        terminal_id: String,
+        data: String,
+        at: i64,
+    },
+    Output {
+        terminal_id: String,
+        data: String,
+        at: i64,
+    },
+    Exit {
+        terminal_id: String,
+        at: i64,
+    },
+}
+
+/// The activity tap callback (see [`ActivityEvent`]).
+pub type ActivityObserver = Arc<dyn Fn(ActivityEvent) + Send + Sync>;
+
+/// Reconciliation §7.5 defaults: a resumed CLI that exits within 30s of
+/// spawn, 3 generations in a row, is a respawn ↔ instant-exit loop.
+const DEFAULT_RESPAWN_LIVENESS_WINDOW_MS: i64 = 30_000;
+const DEFAULT_RESPAWN_GENERATION_CAP: i64 = 3;
+
+/// Explicit wall-clock backstop for a hung holder. NOT derived from any
+/// "spawn budget" — the 10s constant at create_limit.rs:49 (spawn_timeout_ms,
+/// env FRESHELL_SPAWN_GATE_TIMEOUT_MS) bounds the spawn-GATE PERMIT wait,
+/// not spawn duration; spawns run unbounded in spawn_blocking. Task 6 makes
+/// this env-tunable and adds spawn-duration instrumentation to tune it on
+/// evidence.
+pub const SESSION_REF_LEASE_TTL_MS: u64 = 20_000;
+pub const SESSION_RESERVED_RETRY_AFTER_MS: u64 = 1_000;
+
+/// The effective lease TTL: `FRESHELL_SESSION_REF_LEASE_TTL_MS` when set to a
+/// positive integer, else [`SESSION_REF_LEASE_TTL_MS`]. Same sanitizing-parse
+/// shape as the spawn-gate timeout's `FRESHELL_SPAWN_GATE_TIMEOUT_MS`
+/// (`freshell-ws/src/create_limit.rs`) — unset/unparseable/zero → default.
+/// Kept next to the const so the client's re-drive window derivation
+/// (Task 12: window > TTL + margin) stays visible in one place.
+pub fn session_ref_lease_ttl_ms() -> u64 {
+    std::env::var("FRESHELL_SESSION_REF_LEASE_TTL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(SESSION_REF_LEASE_TTL_MS)
+}
+
+/// Whether `pid` is still alive (`kill(pid, 0)`): the ESRCH death-confirm
+/// probe of the kill-before-release discipline (council rule 8). Only ESRCH
+/// confirms death — EPERM (or any other errno) reports ALIVE, so an
+/// uncertain probe can never release a lease it shouldn't. Non-unix: PTY
+/// pids are never recorded there ([`crate::pty::PtyTerminal::pid`] is
+/// `None`), so no pid-carrying lease can exist and this is unreachable.
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 performs existence/permission checking only; no
+        // signal is delivered.
+        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Outcome of [`TerminalRegistry::claim_session_ref`] (council rule 7, D8:
+/// one in-flight create per sessionRef, liveness-bound).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRefClaim {
+    Acquired,
+    Held {
+        retry_after_ms: u64,
+    },
+    /// TTL expired on a holder with a recorded child: caller must kill the
+    /// holder's spawn via the REGISTRY handle (group-kill discipline,
+    /// pty.rs:352-386 — never a raw single-pid SIGKILL), CONFIRM death, then
+    /// call force_release_after_confirmed_kill and re-claim. The pid is for
+    /// ESRCH-confirmation, not for raw kill().
+    ExpiredNeedsKill {
+        pid: u32,
+    },
+    BoundElsewhere {
+        terminal_id: String,
+    },
+}
+
+/// One in-flight sessionRef create reservation (value side of
+/// `TerminalRegistry::session_ref_leases`, keyed `"provider\u{0}sessionId"`).
+/// Released on spawn complete (bind), spawn fail (error), or holder
+/// connection death; [`SESSION_REF_LEASE_TTL_MS`] is the wall-clock backstop
+/// for a hung holder — expiry is KILL-BEFORE-RELEASE (a pid-carrying lease
+/// stays held until the caller confirms the kill; a pid-less one is revoked
+/// and held closed, never released except via holder conn death or spawn
+/// failure, both of which prove no orphan child exists).
+#[derive(Debug, Clone)]
+struct SessionRefLease {
+    /// Stored alongside the string key so conn-death cleanup can hand
+    /// callers real [`SessionLocator`]s without parsing NUL-joined keys.
+    locator: SessionLocator,
+    holder_create_request_id: String,
+    holder_conn: u64,
+    acquired_at_ms: u64,
+    /// The spawned child's pid once the holder records it
+    /// ([`TerminalRegistry::set_session_ref_lease_pid`]) — presence decides
+    /// TTL expiry's shape (`ExpiredNeedsKill` vs revoke-and-hold-closed).
+    pid: Option<u32>,
+    /// Set when TTL expired on a pid-less holder: there is nothing to kill,
+    /// so the lease is held closed and the holder's late
+    /// [`TerminalRegistry::complete_session_ref_claim`] is rejected.
+    revoked: bool,
+}
+
+/// A sessionRef lease's map key: `"provider\u{0}sessionId"` (NUL joint —
+/// neither side can contain it, so the key is collision-free).
+fn session_ref_key(locator: &SessionLocator) -> String {
+    format!("{}\u{0}{}", locator.provider, locator.session_id)
+}
 
 #[derive(Clone)]
 pub struct TerminalRegistry {
@@ -351,6 +543,38 @@ pub struct TerminalRegistry {
     /// Captured into each new terminal's `max_replay_chars` at [`Self::create`]
     /// time (TERM-13) -- see [`compute_scrollback_max_bytes`].
     scrollback_max_bytes: Arc<AtomicI64>,
+    /// TERM-15/TERM-16 activity tap (see [`ActivityEvent`]). Set once at boot
+    /// by the activity hub; `None` (the default) keeps every fire point a
+    /// cheap no-op. RwLock: read per event, written once.
+    activity_observer: Arc<std::sync::RwLock<Option<ActivityObserver>>>,
+    /// Reconciliation §7.5: a generation that exits within this window of its
+    /// creation counts toward the respawn cap; one that survives it resets the
+    /// counter. Atomic (mirrors `auto_kill_idle_minutes`) so tests can shrink
+    /// it without sleeping.
+    respawn_liveness_window_ms: Arc<AtomicI64>,
+    /// Reconciliation §7.5: consecutive short-lived generations after which
+    /// [`Self::respawn_exhausted`] fires.
+    respawn_generation_cap: Arc<AtomicI64>,
+    /// §5.4 single-flight: `createRequestId`s with a keyed create currently
+    /// in flight (claimed before the spawn, released after the insert). The
+    /// spawn takes milliseconds and the row only becomes observable at
+    /// insert, so without this reservation two truly concurrent creates for
+    /// one key could BOTH pass the `newest_live_by_create_request_id` check
+    /// and both spawn — the exact duplicate-writer shape the dedupe closes.
+    keyed_create_inflight: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Council rule 7 (D8): one in-flight create per sessionRef. Keyed
+    /// `"provider\u{0}sessionId"` ([`session_ref_key`]); see
+    /// [`SessionRefLease`] for the release/TTL/kill-before-release rules.
+    /// Mirrors the `keyed_create_inflight` shape (claim before spawn,
+    /// release after bind/fail/conn-death).
+    session_ref_leases: Arc<Mutex<HashMap<String, SessionRefLease>>>,
+    /// locator key ([`session_ref_key`]) → the terminalId a completed claim
+    /// bound the sessionRef to. Consulted by
+    /// [`Self::claim_session_ref`] alongside
+    /// [`Self::live_terminal_for_session_ref`]; a binding whose terminal is
+    /// KNOWN dead (registered but not Running) is pruned instead of
+    /// answering `BoundElsewhere`, so a dead winner never strands losers.
+    session_ref_bindings: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Default for TerminalRegistry {
@@ -367,17 +591,52 @@ pub struct AttachOutcome {
     pub found: bool,
 }
 
+/// Outcome of the attach-time geometry application (TERM-07;
+/// `broker.ts:358-397` `shouldResize` + `resizeIfSessionMatches` parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachResizeStatus {
+    /// Geometry changed: cols/rows updated, epoch bumped, PTY resized.
+    Resized,
+    /// Geometry already matched: no epoch bump, no PTY syscall (Node `unchanged`).
+    Unchanged,
+    /// The intent/subscriber condition said not to resize (Node `shouldResize` false).
+    Skipped,
+    /// Terminal is not running (Node `not_running`): no mutation.
+    NotRunning,
+    /// Unknown terminal id (Node `missing`).
+    Missing,
+}
+
+/// Read-only lookup into a session-identity store (in production: the WS-side
+/// `TerminalIdentityRegistry` in `freshell-ws`). Injected across the crate
+/// boundary so the D7 live-session guard can join BOTH stores from crates that
+/// cannot depend on `freshell-ws` (`freshell-freshagent` -- would be circular).
+/// Implementations must NOT return retired/dead bindings.
+pub trait SessionIdentityLookup: Send + Sync + std::fmt::Debug {
+    /// The terminal_id currently bound to `(provider, session_id)`, if any.
+    fn terminal_for_session(&self, provider: &str, session_id: &str) -> Option<String>;
+}
+
 impl TerminalRegistry {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(RegistryInner {
                 terminals: HashMap::new(),
                 revision: 0,
+                respawn_generations: HashMap::new(),
             })),
             conn_seq: Arc::new(AtomicU64::new(1)),
             active_connections: Arc::new(AtomicI64::new(0)),
             auto_kill_idle_minutes: Arc::new(AtomicI64::new(DEFAULT_AUTO_KILL_IDLE_MINUTES)),
             scrollback_max_bytes: Arc::new(AtomicI64::new(DEFAULT_MAX_SCROLLBACK_CHARS)),
+            activity_observer: Arc::new(std::sync::RwLock::new(None)),
+            respawn_liveness_window_ms: Arc::new(AtomicI64::new(
+                DEFAULT_RESPAWN_LIVENESS_WINDOW_MS,
+            )),
+            respawn_generation_cap: Arc::new(AtomicI64::new(DEFAULT_RESPAWN_GENERATION_CAP)),
+            keyed_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            session_ref_leases: Arc::new(Mutex::new(HashMap::new())),
+            session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -401,6 +660,26 @@ impl TerminalRegistry {
     /// NEXT sweep reads. Callers (the boot-time settings load, and any future
     /// live `PATCH /api/settings` wiring) push `settings.safety.autoKillIdleMinutes`
     /// here; `<= 0` disables the sweep (legacy: `!killMinutes || killMinutes <= 0`).
+    /// Install the TERM-15/TERM-16 activity tap (see [`ActivityEvent`]).
+    /// Set once at boot by the activity hub; later calls replace it.
+    pub fn set_activity_observer(&self, observer: ActivityObserver) {
+        *self
+            .activity_observer
+            .write()
+            .expect("activity observer lock") = Some(observer);
+    }
+
+    /// Fire the activity tap, if installed. Cheap no-op otherwise.
+    fn notify_activity(&self, event: ActivityEvent) {
+        let guard = self
+            .activity_observer
+            .read()
+            .expect("activity observer lock");
+        if let Some(observer) = guard.as_ref() {
+            observer(event);
+        }
+    }
+
     pub fn set_auto_kill_idle_minutes(&self, minutes: i64) {
         self.auto_kill_idle_minutes
             .store(minutes, Ordering::Relaxed);
@@ -435,9 +714,36 @@ impl TerminalRegistry {
         self.scrollback_max_bytes.load(Ordering::Relaxed)
     }
 
+    /// Reconciliation §7.5: shrink/grow the liveness window a generation must
+    /// survive to reset the respawn counter (tests use small values).
+    pub fn set_respawn_liveness_window_ms(&self, ms: i64) {
+        self.respawn_liveness_window_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Reconciliation §7.5: how many consecutive short-lived generations
+    /// exhaust a key.
+    pub fn set_respawn_generation_cap(&self, cap: i64) {
+        self.respawn_generation_cap.store(cap, Ordering::Relaxed);
+    }
+
+    /// Reconciliation §7.5: whether this `createRequestId` has hit the
+    /// respawn-generation cap — the verdict derivation returns
+    /// `dead_session(reason='respawn_exhausted')` instead of another
+    /// `respawn`, restoring §7's "at most one respawn" bound as a guarantee.
+    pub fn respawn_exhausted(&self, create_request_id: &str) -> bool {
+        let cap = self.respawn_generation_cap.load(Ordering::Relaxed).max(1) as u32;
+        let inner = self.inner.lock().expect("registry lock");
+        inner
+            .respawn_generations
+            .get(create_request_id)
+            .is_some_and(|count| *count >= cap)
+    }
+
     /// `enforceIdleKills()` (`terminal-registry.ts:1406-1425`): auto-kill every
     /// DETACHED **running** terminal idle beyond the configured threshold.
     /// `auto_kill_idle_minutes() <= 0` is legacy's disabled state -- a no-op.
+    /// Idleness is measured against `last_meaningful_activity_at` (DEV-0009):
+    /// self-generated repaint noise does not keep a detached terminal alive.
     /// "Detached" mirrors `term.clients.size > 0` continue-guard: any attached
     /// subscriber exempts the terminal regardless of idle time. Returns the
     /// killed terminal ids (empty when nothing was eligible), for callers that
@@ -467,7 +773,11 @@ impl TerminalRegistry {
                     if !s.subscribers.is_empty() {
                         return None; // only detached
                     }
-                    if now.saturating_sub(s.last_activity_at) < idle_threshold_ms {
+                    // DEV-0009: idleness is measured against the MEANINGFUL
+                    // activity clock, not the every-frame last_activity_at —
+                    // otherwise a detached animated TUI (spinner / ticking
+                    // counter) is exempt from this sweep forever.
+                    if now.saturating_sub(s.last_meaningful_activity_at) < idle_threshold_ms {
                         return None; // not idle long enough yet
                     }
                     Some(id.clone())
@@ -517,6 +827,7 @@ impl TerminalRegistry {
         stream_id: String,
         mode: &str,
         resume_session_id: Option<&str>,
+        create_request_id: Option<&str>,
         ring_max_bytes: Option<i64>,
         on_exit: Option<crate::pty::ExitHook>,
     ) -> io::Result<()> {
@@ -532,19 +843,23 @@ impl TerminalRegistry {
             // from `settings.terminal.scrollback` at boot).
             max_replay_chars: self.scrollback_max_bytes().max(0) as usize,
             scanner: BarrierScanner::new(),
+            noise: NoiseScanner::new(),
             head_seq: 0,
             status: TerminalRunStatus::Running,
             exit_code: None,
             created_at: now,
             last_activity_at: now,
+            last_meaningful_activity_at: now,
             cols: spec.cols,
             rows: spec.rows,
             geometry_epoch: 1,
+            has_client_geometry: false,
             cwd: spec.cwd.clone(),
             title: "Shell".to_string(),
             description: None,
             mode: mode.to_string(),
             resume_session_id: resume_session_id.map(str::to_string),
+            create_request_id: create_request_id.map(str::to_string),
             subscribers: HashMap::new(),
         }));
 
@@ -552,7 +867,28 @@ impl TerminalRegistry {
         // the replay log + fan out (stamped) to subscribers. Captures the shared
         // state, NOT the PTY (which does not exist yet).
         let sink_shared = Arc::clone(&shared);
-        let sink: MessageSink = Box::new(move |msg| ingest(&sink_shared, msg));
+        // TERM-15/TERM-16 output tap: CLI modes forward each framed output
+        // chunk to the activity observer (BEL turn-complete detection +
+        // liveness). Shell terminals skip the tap entirely (`tapped` false):
+        // zero per-chunk overhead beyond one bool test.
+        let tapped = mode != "shell";
+        let tap_observer = Arc::clone(&self.activity_observer);
+        let tap_terminal_id = terminal_id.clone();
+        let sink: MessageSink = Box::new(move |msg| {
+            if tapped {
+                if let ServerMessage::TerminalOutput(frame) = &msg {
+                    let guard = tap_observer.read().expect("activity observer lock");
+                    if let Some(observer) = guard.as_ref() {
+                        observer(ActivityEvent::Output {
+                            terminal_id: tap_terminal_id.clone(),
+                            data: frame.data.clone(),
+                            at: now_ms(),
+                        });
+                    }
+                }
+            }
+            ingest(&sink_shared, msg)
+        });
 
         let pty = PtyTerminal::spawn_with_sink(
             spec,
@@ -593,6 +929,18 @@ impl TerminalRegistry {
             pid = pid.unwrap_or(0),
             "terminal.created"
         );
+        // §5.4 backstop: two live PTYs on one createRequestId is the
+        // duplicate-writer data-loss shape — make it loud.
+        if let Some(key) = create_request_id {
+            self.warn_on_duplicate_live_ptys(key);
+        }
+        // TERM-15/TERM-16 tap: Created fires for every mode (the hub filters).
+        self.notify_activity(ActivityEvent::Created {
+            terminal_id,
+            mode: mode.to_string(),
+            resume_session_id: resume_session_id.map(str::to_string),
+            at: now,
+        });
         Ok(())
     }
 
@@ -737,11 +1085,16 @@ impl TerminalRegistry {
                 .map(|h| Arc::clone(&h.shared))
         };
         if let Some(shared) = shared {
-            shared
-                .lock()
-                .expect("terminal lock")
-                .subscribers
-                .remove(&conn_id);
+            let mut s = shared.lock().expect("terminal lock");
+            if s.subscribers.remove(&conn_id).is_some()
+                && s.subscribers.is_empty()
+                && s.status == TerminalRunStatus::Running
+            {
+                // DEV-0009: a freshly-detached terminal gets a full idle
+                // threshold of grace — its meaningful clock may have expired
+                // while a watcher was attached (attached => reaper-exempt).
+                s.last_meaningful_activity_at = s.last_meaningful_activity_at.max(now_ms());
+            }
         }
     }
 
@@ -758,49 +1111,169 @@ impl TerminalRegistry {
                 .collect()
         };
         for shared in shareds {
-            shared
-                .lock()
-                .expect("terminal lock")
-                .subscribers
-                .remove(&conn_id);
+            let mut s = shared.lock().expect("terminal lock");
+            if s.subscribers.remove(&conn_id).is_some()
+                && s.subscribers.is_empty()
+                && s.status == TerminalRunStatus::Running
+            {
+                // DEV-0009: a freshly-detached terminal gets a full idle
+                // threshold of grace — its meaningful clock may have expired
+                // while a watcher was attached (attached => reaper-exempt).
+                // The `.is_some()` gate is essential here: this sweep visits
+                // EVERY terminal, and an unconditional bump would reset the
+                // countdown of unrelated, already-detached terminals on
+                // every socket close.
+                s.last_meaningful_activity_at = s.last_meaningful_activity_at.max(now_ms());
+            }
         }
     }
 
     /// `terminal.input` write path (`terminal-registry.ts:3867-3894`): write bytes to
-    /// the PTY; bump `lastActivityAt`. No wire reply.
+    /// the PTY; bump `lastActivityAt` and the DEV-0009 meaningful-activity reap clock. No wire reply.
     pub fn input(&self, terminal_id: &str, data: &[u8]) {
-        let mut inner = self.inner.lock().expect("registry lock");
-        if let Some(handle) = inner.terminals.get_mut(terminal_id) {
-            if let Some(pty) = handle.pty.as_mut() {
-                let _ = pty.write_input(data);
+        let tapped_mode = {
+            let mut inner = self.inner.lock().expect("registry lock");
+            match inner.terminals.get_mut(terminal_id) {
+                Some(handle) => {
+                    if let Some(pty) = handle.pty.as_mut() {
+                        let _ = pty.write_input(data);
+                    }
+                    let mut s = handle.shared.lock().expect("terminal lock");
+                    let now = now_ms();
+                    s.last_activity_at = now;
+                    // User keystrokes are always meaningful (DEV-0009).
+                    s.last_meaningful_activity_at = now;
+                    s.mode != "shell"
+                }
+                None => false,
             }
-            handle
-                .shared
-                .lock()
-                .expect("terminal lock")
-                .last_activity_at = now_ms();
+        };
+        // TERM-15/TERM-16 tap (outside the registry lock): CLI-mode input
+        // feeds submit detection. Shell terminals skip it entirely.
+        if tapped_mode {
+            self.notify_activity(ActivityEvent::Input {
+                terminal_id: terminal_id.to_string(),
+                data: String::from_utf8_lossy(data).into_owned(),
+                at: now_ms(),
+            });
         }
     }
 
+    /// Node-parity geometry floor (`broker.ts:672-673`):
+    /// `Math.max(2, Math.floor(Number.isFinite(cols) ? cols : 80))`. For
+    /// `u16` input — always finite, always integral — the formula reduces
+    /// exactly to `.max(2)`; the `floor` and non-finite-fallback arms are
+    /// unrepresentable in the Rust type.
+    pub(crate) const MIN_GEOMETRY_DIM: u16 = 2;
+
     /// `terminal.resize` (`terminal-registry.ts:3975-3995`): `unchanged` when cols/rows
-    /// already match; else set them, `+1` the geometry epoch (`§5.3`), and resize the
-    /// PTY (errors swallowed, as node-pty's are).
+    /// already match; else set them, `+1` the geometry epoch (`§5.3`) unless this is the
+    /// first client geometry record (see `has_client_geometry`), and resize the PTY
+    /// (errors swallowed, as node-pty's are).
     pub fn resize(&self, terminal_id: &str, cols: u16, rows: u16) {
+        let cols = cols.max(Self::MIN_GEOMETRY_DIM);
+        let rows = rows.max(Self::MIN_GEOMETRY_DIM);
         let mut inner = self.inner.lock().expect("registry lock");
         if let Some(handle) = inner.terminals.get_mut(terminal_id) {
             {
                 let mut s = handle.shared.lock().expect("terminal lock");
+                let first_record = !s.has_client_geometry;
+                s.has_client_geometry = true;
                 if s.cols == cols && s.rows == rows {
                     return;
                 }
                 s.cols = cols;
                 s.rows = rows;
-                s.geometry_epoch += 1;
+                if !first_record {
+                    s.geometry_epoch += 1;
+                }
             }
             if let Some(pty) = handle.pty.as_ref() {
                 pty.resize(cols, rows);
             }
         }
+    }
+
+    /// TERM-07: apply the `terminal.attach`-supplied viewport geometry BEFORE
+    /// the broker attach/replay, replicating Node's `shouldResize`
+    /// (`broker.ts:358-362`): `viewport_hydrate` always resizes;
+    /// `transport_reconnect` resizes only when no OTHER socket is attached or
+    /// this same connection is re-attaching; `keepalive_delta` never resizes.
+    /// Node samples the client set PRE-attach, so call this before `attach`
+    /// inserts the subscriber (the insert would also destroy the
+    /// "existing attachment" evidence for the same `conn_id`).
+    /// Epoch semantics match `resize` (Task 2): the first-ever client
+    /// geometry record never bumps; later real changes bump. A record also
+    /// happens on unchanged dims when the resize is allowed, but never when
+    /// the intent condition skips it (Node `broker.ts:373, 387-392`).
+    pub fn resize_for_attach(
+        &self,
+        terminal_id: &str,
+        conn_id: u64,
+        intent: TerminalAttachIntent,
+        cols: u16,
+        rows: u16,
+    ) -> AttachResizeStatus {
+        let cols = cols.max(Self::MIN_GEOMETRY_DIM);
+        let rows = rows.max(Self::MIN_GEOMETRY_DIM);
+        let inner = self.inner.lock().expect("registry lock");
+        let Some(handle) = inner.terminals.get(terminal_id) else {
+            return AttachResizeStatus::Missing;
+        };
+        {
+            let mut s = handle.shared.lock().expect("terminal lock");
+            let has_other_attached = s.subscribers.keys().any(|k| *k != conn_id);
+            let existing_attachment = s.subscribers.contains_key(&conn_id);
+            let should_resize = match intent {
+                TerminalAttachIntent::ViewportHydrate => true,
+                TerminalAttachIntent::TransportReconnect => {
+                    !has_other_attached || existing_attachment
+                }
+                TerminalAttachIntent::KeepaliveDelta => false,
+            };
+            if !should_resize {
+                return AttachResizeStatus::Skipped;
+            }
+            if s.status != TerminalRunStatus::Running {
+                return AttachResizeStatus::NotRunning;
+            }
+            // Node records geometry for BOTH 'resized' and 'unchanged' results
+            // when shouldResize is true (broker.ts:387-392); a skipped attach
+            // never records (broker.ts:373). The first-ever record applies
+            // dims WITHOUT bumping the epoch (recordTerminalGeometry,
+            // broker.ts:666-686) -- the same rule `resize` follows since Task 2.
+            let first_record = !s.has_client_geometry;
+            s.has_client_geometry = true;
+            if s.cols == cols && s.rows == rows {
+                return AttachResizeStatus::Unchanged;
+            }
+            s.cols = cols;
+            s.rows = rows;
+            if !first_record {
+                s.geometry_epoch += 1;
+            }
+        }
+        if let Some(pty) = handle.pty.as_ref() {
+            pty.resize(cols, rows);
+        }
+        AttachResizeStatus::Resized
+    }
+
+    /// Current geometry bookkeeping as `(cols, rows, geometry_epoch)`; `None`
+    /// for an unknown terminal id. Test/diagnostic seam for the TERM-07
+    /// attach-time resize (the values `attach.ready` stamps come from here).
+    pub fn geometry(&self, terminal_id: &str) -> Option<(u16, u16, i64)> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.map(|shared| {
+            let s = shared.lock().expect("terminal lock");
+            (s.cols, s.rows, s.geometry_epoch)
+        })
     }
 
     /// `registry.kill()` (`terminal-registry.ts:3997-4033`): remove the terminal, send
@@ -832,6 +1305,18 @@ impl TerminalRegistry {
         let Some(mut handle) = handle else {
             return false;
         };
+        // sessionRef lease fix (finding 1): the kill path REMOVES the row
+        // entirely, so `claim_session_ref`'s "known dead" probe (which needs
+        // a registered-but-not-Running row) can never fire for a killed
+        // winner — an UNKNOWN id would be honored as `BoundElsewhere{dead-id}`
+        // forever. Prune any sessionRef binding pointing at this terminal at
+        // row-removal time instead. This is the ONLY row-removal site
+        // (natural exit RETAINS the row via `finish_pty_exit`). The `inner`
+        // lock is already released here, so no ordering hazard.
+        self.session_ref_bindings
+            .lock()
+            .expect("session-ref bindings lock")
+            .retain(|_, bound_id| bound_id != terminal_id);
         let was_running = {
             let mut s = handle.shared.lock().expect("terminal lock");
             let was_running = s.status == TerminalRunStatus::Running;
@@ -868,6 +1353,11 @@ impl TerminalRegistry {
             }
         }
         tracing::info!(terminal_id = %terminal_id, by = by, "terminal.killed");
+        // TERM-15/TERM-16 tap: a kill clears activity too — no stale blue.
+        self.notify_activity(ActivityEvent::Exit {
+            terminal_id: terminal_id.to_string(),
+            at: now_ms(),
+        });
         true
     }
 
@@ -950,9 +1440,13 @@ impl TerminalRegistry {
         if s.status == TerminalRunStatus::Exited {
             return false;
         }
+        let now = now_ms();
         s.status = TerminalRunStatus::Exited;
         s.exit_code = Some(exit_code);
-        s.last_activity_at = now_ms();
+        s.last_activity_at = now;
+        s.last_meaningful_activity_at = now;
+        let respawn_key = s.create_request_id.clone();
+        let lifetime_ms = now.saturating_sub(s.created_at);
         let exit = ServerMessage::TerminalExit(TerminalExit {
             exit_code,
             terminal_id: terminal_id.to_string(),
@@ -962,7 +1456,26 @@ impl TerminalRegistry {
         }
         s.subscribers.clear();
         drop(s);
+        // Reconciliation §7.5: a generation that died inside the liveness
+        // window counts toward the respawn cap; one that survived it resets
+        // the counter (a healthy resume is not penalized). Natural exits only
+        // — a user-initiated `kill` removes the record without passing here.
+        if let Some(key) = respawn_key {
+            let window = self.respawn_liveness_window_ms.load(Ordering::Relaxed);
+            let mut inner = self.inner.lock().expect("registry lock");
+            if lifetime_ms < window {
+                *inner.respawn_generations.entry(key).or_insert(0) += 1;
+            } else {
+                inner.respawn_generations.remove(&key);
+            }
+        }
         tracing::info!(terminal_id = %terminal_id, exit_code = exit_code, "terminal.exited");
+        // TERM-15/TERM-16 tap: natural exit clears activity (the hub removes
+        // the record — no stale blue after exit, TERM-18 semantics).
+        self.notify_activity(ActivityEvent::Exit {
+            terminal_id: terminal_id.to_string(),
+            at: now_ms(),
+        });
         true
     }
 
@@ -1013,6 +1526,7 @@ impl TerminalRegistry {
                     status: s.status,
                     created_at: s.created_at,
                     resume_session_id: s.resume_session_id.clone(),
+                    cwd: s.cwd.clone(),
                 }
             })
             .collect()
@@ -1103,6 +1617,606 @@ impl TerminalRegistry {
             .collect()
     }
 
+    /// Register a terminal record with NO backing PTY — see [`HeadlessTerminal`]
+    /// for exactly who this seam exists for. The row (including its
+    /// `create_request_id` stamp) is inserted atomically under the registry
+    /// lock, same as [`Self::create`].
+    pub fn register_headless(&self, opts: HeadlessTerminal) {
+        let created_at = opts.created_at.unwrap_or_else(now_ms);
+        let mode = if opts.mode.is_empty() {
+            "shell".to_string()
+        } else {
+            opts.mode
+        };
+        let create_request_id = opts.create_request_id.clone();
+        let shared = Arc::new(Mutex::new(TerminalShared {
+            terminal_id: opts.terminal_id.clone(),
+            stream_id: opts.stream_id,
+            replay: VecDeque::new(),
+            replay_chars: 0,
+            max_replay_chars: self.scrollback_max_bytes().max(0) as usize,
+            scanner: BarrierScanner::new(),
+            noise: NoiseScanner::new(),
+            head_seq: 0,
+            status: TerminalRunStatus::Running,
+            exit_code: None,
+            created_at,
+            last_activity_at: created_at,
+            last_meaningful_activity_at: created_at,
+            cols: 120,
+            rows: 30,
+            geometry_epoch: 1,
+            has_client_geometry: false,
+            cwd: None,
+            title: "Shell".to_string(),
+            description: None,
+            mode,
+            resume_session_id: opts.resume_session_id,
+            create_request_id,
+            subscribers: HashMap::new(),
+        }));
+        {
+            let mut inner = self.inner.lock().expect("registry lock");
+            inner.terminals.insert(
+                opts.terminal_id.clone(),
+                TerminalHandle { shared, pty: None },
+            );
+            inner.revision += 1;
+        }
+        if let Some(key) = opts
+            .create_request_id
+            .or_else(|| self.probe_create_request_id(&opts.terminal_id))
+        {
+            self.warn_on_duplicate_live_ptys(&key);
+        }
+    }
+
+    /// Terminals (of any status) matching a `createRequestId`, NEWEST
+    /// generation first (`created_at` desc, `terminal_id` desc tie-break).
+    fn terminals_by_create_request_id(&self, key: &str) -> Vec<(String, TerminalRunStatus)> {
+        let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .values()
+                .map(|h| Arc::clone(&h.shared))
+                .collect()
+        };
+        let mut rows: Vec<(i64, String, TerminalRunStatus)> = shareds
+            .iter()
+            .filter_map(|shared| {
+                let s = shared.lock().expect("terminal lock");
+                if s.create_request_id.as_deref() == Some(key) {
+                    Some((s.created_at, s.terminal_id.clone(), s.status))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        rows.into_iter()
+            .map(|(_, id, status)| (id, status))
+            .collect()
+    }
+
+    /// The newest **live** terminal for a `createRequestId` — the idempotency
+    /// keystone (design §7) and the single-flight create-dedupe key (§5.4).
+    /// Exited generations are excluded; a key whose every generation has
+    /// exited returns `None`.
+    pub fn newest_live_by_create_request_id(&self, key: &str) -> Option<String> {
+        self.terminals_by_create_request_id(key)
+            .into_iter()
+            .find(|(_, status)| *status == TerminalRunStatus::Running)
+            .map(|(id, _)| id)
+    }
+
+    /// The newest terminal for a `createRequestId` INCLUDING exited
+    /// generations — used by the verdict derivation (§5.2 step 2) to recover a
+    /// retired terminal's identity before declaring `fresh`.
+    pub fn newest_by_create_request_id(&self, key: &str) -> Option<String> {
+        self.terminals_by_create_request_id(key)
+            .into_iter()
+            .next()
+            .map(|(id, _)| id)
+    }
+
+    /// Whether a terminal is registered AND currently running (an exited-but-
+    /// retained record is NOT live — contrast [`Self::is_running`], which only
+    /// checks registration).
+    pub fn is_live(&self, terminal_id: &str) -> bool {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        match shared {
+            Some(shared) => {
+                shared.lock().expect("terminal lock").status == TerminalRunStatus::Running
+            }
+            None => false,
+        }
+    }
+
+    /// One terminal's [`IdentityProbeRow`] (mode / status / registry-side
+    /// resume id) — the per-terminal getter the reconcile derivation uses to
+    /// resolve identity across the crate boundary for REST-created resumes
+    /// (design §2 assumption 1's acceptance check).
+    pub fn probe(&self, terminal_id: &str) -> Option<IdentityProbeRow> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.map(|shared| {
+            let s = shared.lock().expect("terminal lock");
+            IdentityProbeRow {
+                terminal_id: s.terminal_id.clone(),
+                mode: s.mode.clone(),
+                status: s.status,
+                created_at: s.created_at,
+                resume_session_id: s.resume_session_id.clone(),
+                cwd: s.cwd.clone(),
+            }
+        })
+    }
+
+    /// A terminal's stamped `createRequestId`, if any.
+    pub fn probe_create_request_id(&self, terminal_id: &str) -> Option<String> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.and_then(|shared| {
+            shared
+                .lock()
+                .expect("terminal lock")
+                .create_request_id
+                .clone()
+        })
+    }
+
+    /// §5.4 single-flight claim: reserve `key` for an in-flight keyed create.
+    /// `false` means another create currently holds the reservation — the
+    /// caller should re-check for a live terminal (adopt) instead of
+    /// spawning. Pair with [`Self::end_keyed_create`].
+    pub fn begin_keyed_create(&self, key: &str) -> bool {
+        self.keyed_create_inflight
+            .lock()
+            .expect("keyed-create inflight lock")
+            .insert(key.to_string())
+    }
+
+    /// Release a [`Self::begin_keyed_create`] reservation (success OR failure
+    /// — the spawn's outcome is discoverable via the registry itself).
+    pub fn end_keyed_create(&self, key: &str) {
+        self.keyed_create_inflight
+            .lock()
+            .expect("keyed-create inflight lock")
+            .remove(key);
+    }
+
+    /// Council rule 7 (D8): claim the one in-flight create slot for a
+    /// sessionRef. Checks, in order:
+    ///
+    /// 1. A live terminal already carrying the ref
+    ///    ([`Self::live_terminal_for_session_ref`]) or a recorded binding
+    ///    whose terminal is not KNOWN dead → `BoundElsewhere` (attach to the
+    ///    winner). A binding whose terminal is known dead (registered but
+    ///    not Running) is pruned instead — a dead winner must not strand
+    ///    losers.
+    /// 2. A held, unexpired lease → `Held` (retry after
+    ///    [`SESSION_RESERVED_RETRY_AFTER_MS`]).
+    /// 3. A held lease past `acquired_at_ms + `[`SESSION_REF_LEASE_TTL_MS`]:
+    ///    with a recorded pid → `ExpiredNeedsKill` (KILL-BEFORE-RELEASE: the
+    ///    lease stays held until [`Self::force_release_after_confirmed_kill`]);
+    ///    without one (holder hung pre-spawn, nothing to kill) → revoke the
+    ///    lease, ERROR-log, and answer `Held` — hold closed, never release
+    ///    what you can't kill.
+    /// 4. Otherwise the slot is free → record the lease, `Acquired`.
+    ///
+    /// `now_ms` is caller-supplied wall-clock so tests never sleep.
+    pub fn claim_session_ref(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+        holder_conn: u64,
+        now_ms: u64,
+    ) -> SessionRefClaim {
+        let key = session_ref_key(locator);
+
+        // 1a. Row-join liveness: a live terminal already carries this ref.
+        if let Some(terminal_id) = self.live_terminal_for_session_ref(locator) {
+            return SessionRefClaim::BoundElsewhere { terminal_id };
+        }
+
+        // 1b. Recorded binding — honored unless its terminal is KNOWN dead
+        // (a registered row that is no longer Running). Lock order: the
+        // bindings mutex is held across the liveness probes, which take only
+        // the registry `inner` + terminal locks; no path acquires bindings
+        // while holding those, so the order is acyclic.
+        {
+            let mut bindings = self
+                .session_ref_bindings
+                .lock()
+                .expect("session-ref bindings lock");
+            if let Some(terminal_id) = bindings.get(&key).cloned() {
+                let known_dead = self.is_running(&terminal_id) && !self.is_live(&terminal_id);
+                if known_dead {
+                    bindings.remove(&key);
+                } else {
+                    return SessionRefClaim::BoundElsewhere { terminal_id };
+                }
+            }
+        }
+
+        self.claim_session_ref_lease_phase(locator, holder_create_request_id, holder_conn, now_ms)
+    }
+
+    /// Lease phase of [`Self::claim_session_ref`] (steps 2-4: held /
+    /// expired / free). Split out so the claim-side TOCTOU re-check
+    /// (final review finding 1) can be pinned by a test that stages
+    /// "loser passed checks 1a/1b before the winner registered" without
+    /// threads: a full `claim_session_ref` call is always caught by step
+    /// 1b while a binding exists, so only a direct entry here can
+    /// exercise the under-lock re-check.
+    fn claim_session_ref_lease_phase(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+        holder_conn: u64,
+        now_ms: u64,
+    ) -> SessionRefClaim {
+        let key = session_ref_key(locator);
+        let mut leases = self
+            .session_ref_leases
+            .lock()
+            .expect("session-ref lease lock");
+        match leases.get_mut(&key) {
+            None => {
+                // Claim-side TOCTOU (final review finding 1): checks 1a/1b
+                // ran BEFORE this lock was taken. A loser preempted across
+                // the winner's register -> `complete_session_ref_claim`
+                // window arrives here after complete removed the winner's
+                // lease -- seeing no lease -- while only the bindings map
+                // records the winner. Re-check bindings WHILE HOLDING the
+                // leases lock: a recorded binding means a winner already
+                // completed, so answer `BoundElsewhere` instead of
+                // double-acquiring (a second spawn on one sessionRef is the
+                // duplicate-writer shape D8 exists to close). Lock order
+                // leases -> bindings matches `complete_session_ref_claim`
+                // and is acyclic: step 1b's bindings block ends before the
+                // leases lock is taken, and no path acquires the leases
+                // lock while holding bindings. A binding observed here is
+                // either freshly completed (live winner) or, if its winner
+                // has since died, handled on the loser's retry claim, whose
+                // step 1b prunes known-dead winners.
+                let bound = self
+                    .session_ref_bindings
+                    .lock()
+                    .expect("session-ref bindings lock")
+                    .get(&key)
+                    .cloned();
+                if let Some(terminal_id) = bound {
+                    return SessionRefClaim::BoundElsewhere { terminal_id };
+                }
+                leases.insert(
+                    key,
+                    SessionRefLease {
+                        locator: locator.clone(),
+                        holder_create_request_id: holder_create_request_id.to_string(),
+                        holder_conn,
+                        acquired_at_ms: now_ms,
+                        pid: None,
+                        revoked: false,
+                    },
+                );
+                SessionRefClaim::Acquired
+            }
+            Some(lease) => {
+                let expired = now_ms > lease.acquired_at_ms + session_ref_lease_ttl_ms();
+                if !expired {
+                    return SessionRefClaim::Held {
+                        retry_after_ms: SESSION_RESERVED_RETRY_AFTER_MS,
+                    };
+                }
+                match lease.pid {
+                    Some(pid) => SessionRefClaim::ExpiredNeedsKill { pid },
+                    None => {
+                        if !lease.revoked {
+                            lease.revoked = true;
+                            tracing::error!(target: "invariant",
+                                provider = %locator.provider,
+                                session_id = %locator.session_id,
+                                holder_create_request_id = %lease.holder_create_request_id,
+                                acquired_at_ms = lease.acquired_at_ms,
+                                now_ms,
+                                "session_ref_lease_revoked: TTL expired on a pid-less holder; held closed");
+                        }
+                        SessionRefClaim::Held {
+                            retry_after_ms: SESSION_RESERVED_RETRY_AFTER_MS,
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Record the holder's spawned child pid on its lease, arming the TTL
+    /// expiry's `ExpiredNeedsKill` path. No-op if the lease is gone or held
+    /// by a different `createRequestId`.
+    pub fn set_session_ref_lease_pid(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+        pid: u32,
+    ) {
+        let key = session_ref_key(locator);
+        let mut leases = self
+            .session_ref_leases
+            .lock()
+            .expect("session-ref lease lock");
+        if let Some(lease) = leases.get_mut(&key) {
+            if lease.holder_create_request_id == holder_create_request_id {
+                lease.pid = Some(pid);
+            }
+        }
+    }
+
+    /// Spawn succeeded: record binding, release lease, run the duplicate alarm.
+    /// Returns false if the lease was revoked while spawning (caller must kill
+    /// its own child and fail the create loudly). A revoked lease is NOT
+    /// released here — kill-before-release: the caller confirms its child's
+    /// death, then calls [`Self::force_release_after_confirmed_kill`].
+    pub fn complete_session_ref_claim(
+        &self,
+        locator: &SessionLocator,
+        holder_create_request_id: &str,
+        terminal_id: &str,
+    ) -> bool {
+        let key = session_ref_key(locator);
+        {
+            let mut leases = self
+                .session_ref_leases
+                .lock()
+                .expect("session-ref lease lock");
+            match leases.get(&key) {
+                Some(lease)
+                    if lease.holder_create_request_id == holder_create_request_id
+                        && !lease.revoked =>
+                {
+                    leases.remove(&key);
+                    // ATOMICITY (fix round 1, finding 2): the binding MUST be
+                    // inserted while the leases lock is still held. Releasing
+                    // the lease first and binding under a separate lock opens
+                    // a window where a racing `claim_session_ref` sees no live
+                    // row, no binding, and no lease -> `Acquired` -> a second
+                    // spawn: the exact duplicate-writer race this primitive
+                    // exists to close. Lock order leases -> bindings is
+                    // acyclic: `claim_session_ref`'s bindings block ends
+                    // before it takes the leases lock, and no other path
+                    // acquires the leases lock while holding bindings.
+                    self.session_ref_bindings
+                        .lock()
+                        .expect("session-ref bindings lock")
+                        .insert(key, terminal_id.to_string());
+                }
+                _ => return false,
+            }
+        }
+        self.alarm_if_duplicate_session_ref(locator);
+        true
+    }
+
+    /// Spawn failed: release the holder's lease (no child exists — the spawn
+    /// itself errored — so release is safe even for a revoked lease). No-op
+    /// if the lease is gone or held by a different `createRequestId`.
+    pub fn fail_session_ref_claim(&self, locator: &SessionLocator, holder_create_request_id: &str) {
+        let key = session_ref_key(locator);
+        let mut leases = self
+            .session_ref_leases
+            .lock()
+            .expect("session-ref lease lock");
+        if leases
+            .get(&key)
+            .is_some_and(|l| l.holder_create_request_id == holder_create_request_id)
+        {
+            leases.remove(&key);
+        }
+    }
+
+    /// Connection death: release this conn's leases. Returns (locator_key, pid)
+    /// pairs whose in-flight children the caller must kill (kill-before-release
+    /// applies: entries WITH a pid are returned still-held; caller kills,
+    /// confirms, then calls force_release_after_confirmed_kill).
+    pub fn release_session_ref_leases_for_conn(
+        &self,
+        conn: u64,
+    ) -> Vec<(SessionLocator, Option<u32>)> {
+        let mut leases = self
+            .session_ref_leases
+            .lock()
+            .expect("session-ref lease lock");
+        let mut out = Vec::new();
+        leases.retain(|_, lease| {
+            if lease.holder_conn != conn {
+                return true;
+            }
+            out.push((lease.locator.clone(), lease.pid));
+            // pid-less: nothing spawned, release now. pid-carrying: keep held
+            // until the caller confirms the kill (kill-before-release).
+            lease.pid.is_some()
+        });
+        out
+    }
+
+    /// The caller killed the holder's child via the registry PTY handle and
+    /// CONFIRMED death (ESRCH): release the lease so the next claim wins.
+    pub fn force_release_after_confirmed_kill(&self, locator: &SessionLocator) {
+        self.session_ref_leases
+            .lock()
+            .expect("session-ref lease lock")
+            .remove(&session_ref_key(locator));
+    }
+
+    /// The terminalId a completed claim bound this sessionRef to
+    /// ([`Self::complete_session_ref_claim`]), if any — the read side of the
+    /// registry binding map (Task 6 winner bind; also a test probe).
+    pub fn bound_terminal_for_session_ref(&self, locator: &SessionLocator) -> Option<String> {
+        self.session_ref_bindings
+            .lock()
+            .expect("session-ref bindings lock")
+            .get(&session_ref_key(locator))
+            .cloned()
+    }
+
+    /// The live child pid behind `terminal_id`'s PTY handle (unix only;
+    /// `None` for headless/exited terminals). Task 6: the winner records this
+    /// on its sessionRef lease ([`Self::set_session_ref_lease_pid`]).
+    pub fn pid_of(&self, terminal_id: &str) -> Option<u32> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner
+            .terminals
+            .get(terminal_id)
+            .and_then(|h| h.pty.as_ref())
+            .and_then(|p| p.pid())
+    }
+
+    /// The terminal whose PTY handle carries `pid`. The kill-before-release
+    /// paths (lease TTL expiry, holder conn death) must kill through the
+    /// REGISTRY handle ([`Self::kill`] → group-kill discipline, `pty.rs`) —
+    /// NEVER a raw single-pid SIGKILL — so they resolve the recorded pid back
+    /// to its owning terminal first.
+    pub fn live_terminal_for_pid(&self, pid: u32) -> Option<String> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner.terminals.iter().find_map(|(id, h)| {
+            (h.pty.as_ref().and_then(|p| p.pid()) == Some(pid)).then(|| id.clone())
+        })
+    }
+
+    /// §5.4 backstop detector (always-on, capability-independent): if a key
+    /// now has two or more LIVE terminals, make it loud — two live PTYs on one
+    /// `createRequestId` means two JSONL writers on one session file.
+    fn warn_on_duplicate_live_ptys(&self, key: &str) {
+        let live: Vec<String> = self
+            .terminals_by_create_request_id(key)
+            .into_iter()
+            .filter(|(_, status)| *status == TerminalRunStatus::Running)
+            .map(|(id, _)| id)
+            .collect();
+        if live.len() >= 2 {
+            tracing::warn!(
+                create_request_id = %key,
+                terminal_ids = ?live,
+                "ws.reconcile.duplicate_pty"
+            );
+        }
+    }
+
+    /// Live terminal ids currently carrying this sessionRef via the
+    /// registry-row join: `mode == locator.provider &&
+    /// resume_session_id == Some(locator.session_id) && status Running`,
+    /// newest generation first (`created_at` desc, `terminal_id` desc
+    /// tie-break, mirroring [`Self::terminals_by_create_request_id`]).
+    ///
+    /// LOOKUP DESIGN (validator-corrected): registry rows have NO dedicated
+    /// `session_ref` field ([`TerminalShared::inventory`] hardcodes
+    /// `session_ref: None`), so row identity IS this join. Rows are one of
+    /// the TWO identity stores — the other is `freshell-ws`'s identity
+    /// registry, which this crate cannot see (dep direction) — so ws-side
+    /// callers consult both.
+    fn live_terminal_ids_for_session_ref(&self, locator: &SessionLocator) -> Vec<String> {
+        let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .values()
+                .map(|h| Arc::clone(&h.shared))
+                .collect()
+        };
+        let mut rows: Vec<(i64, String)> = shareds
+            .iter()
+            .filter_map(|shared| {
+                let s = shared.lock().expect("terminal lock");
+                if s.status == TerminalRunStatus::Running
+                    && s.mode == locator.provider
+                    && s.resume_session_id.as_deref() == Some(locator.session_id.as_str())
+                {
+                    Some((s.created_at, s.terminal_id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+        rows.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Council rule 6: the live terminal (newest first) currently carrying
+    /// this sessionRef, if any — the reconcile derivation and the create-path
+    /// lease (Tasks 5/6) attach every other client's claim for the same ref
+    /// to this winner, regardless of `createRequestId`.
+    pub fn live_terminal_for_session_ref(&self, locator: &SessionLocator) -> Option<String> {
+        self.live_terminal_ids_for_session_ref(locator)
+            .into_iter()
+            .next()
+    }
+
+    /// D7 live-session guard predicate, shared by the WS `terminal.create`
+    /// path (`freshell-ws/src/terminal.rs`) and the REST spawn pipeline
+    /// (`freshell-freshagent/src/terminal_tabs.rs`): returns the terminal_id
+    /// of a currently-RUNNING terminal that already owns `(mode, session_id)`,
+    /// if any. Two arms, exactly the WS guard's join (see commit d9b71f50):
+    /// 1. identity arm: the injected identity store's owner, probed Running;
+    /// 2. row arm: any directory row with this mode + resume_session_id, Running.
+    ///
+    /// `identity: None` (e.g. the seam is unwired) narrows to the row arm.
+    pub fn live_session_owner(
+        &self,
+        identity: Option<&dyn SessionIdentityLookup>,
+        mode: &str,
+        session_id: &str,
+    ) -> Option<String> {
+        if let Some(owner_tid) = identity
+            .and_then(|ident| ident.terminal_for_session(mode, session_id))
+            .filter(|tid| {
+                self.probe(tid)
+                    .is_some_and(|r| r.status == TerminalRunStatus::Running)
+            })
+        {
+            return Some(owner_tid);
+        }
+        self.directory().into_iter().find_map(|entry| {
+            (entry.mode == mode
+                && entry.resume_session_id.as_deref() == Some(session_id)
+                && entry.status == TerminalRunStatus::Running)
+                .then_some(entry.terminal_id)
+        })
+    }
+
+    /// Council rule 9, D8 backstop: >=2 live PTYs carrying one sessionRef is
+    /// the two-writers corruption shape. Alarm loudly (ERROR-level invariant
+    /// log); never kill silently. Returns whether the invariant is violated.
+    pub fn alarm_if_duplicate_session_ref(&self, locator: &SessionLocator) -> bool {
+        let live = self.live_terminal_ids_for_session_ref(locator);
+        if live.len() >= 2 {
+            tracing::error!(target: "invariant",
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                live = live.len(),
+                terminal_ids = ?live,
+                "duplicate_pty_for_session_ref: >=2 live PTYs share one sessionRef");
+            return true;
+        }
+        false
+    }
+
     /// The current `terminals.changed.revision` (run-monotonic, `§7.5`).
     pub fn revision(&self) -> i64 {
         self.inner.lock().expect("registry lock").revision
@@ -1147,6 +2261,14 @@ fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     let mut s = shared.lock().expect("terminal lock");
     s.head_seq = s.head_seq.max(frame.seq_end);
     s.last_activity_at = now_ms();
+    // DEV-0009: only genuinely-new content refreshes the idle-kill reap
+    // clock. Spinner repaints / ticking counters / status-bar redraws still
+    // bump the wire-visible last_activity_at above (terminal-core.md §1.3
+    // holds for every consumer except the reaper) but must not exempt a
+    // detached terminal from enforce_idle_kills forever.
+    if s.noise.observe(&frame.data) {
+        s.last_meaningful_activity_at = s.last_activity_at;
+    }
 
     // Classify with the persistent per-terminal scanner (state persists across frames,
     // `replay-ring.ts:62-79`). Non-truncated frames (every graded chunk) classify by
@@ -1375,6 +2497,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("spawn /bin/sh -c 'sleep 30'");
 
@@ -1428,6 +2551,7 @@ mod tests {
             "S-diag-created-codex".to_string(),
             "codex",
             Some("sess-codex-resume-1"),
+            None,
             None,
             None,
         )
@@ -1581,42 +2705,25 @@ mod tests {
         /// `inventory()`'s tie-break) without racing real `now_ms()` resolution
         /// under load -- see `inventory_lists_running_terminals_sorted_and_reflects_revision`.
         fn insert_headless_at(&self, terminal_id: &str, stream_id: &str, created_at: i64) {
-            let shared = Arc::new(Mutex::new(TerminalShared {
+            self.register_headless(HeadlessTerminal {
                 terminal_id: terminal_id.to_string(),
                 stream_id: stream_id.to_string(),
-                replay: VecDeque::new(),
-                replay_chars: 0,
-                max_replay_chars: self.scrollback_max_bytes().max(0) as usize,
-                scanner: BarrierScanner::new(),
-                head_seq: 0,
-                status: TerminalRunStatus::Running,
-                exit_code: None,
-                created_at,
-                last_activity_at: created_at,
-                cols: 120,
-                rows: 30,
-                geometry_epoch: 1,
-                cwd: None,
-                title: "Shell".to_string(),
-                description: None,
                 mode: "shell".to_string(),
                 resume_session_id: None,
-                subscribers: HashMap::new(),
-            }));
-            let mut inner = self.inner.lock().unwrap();
-            inner.terminals.insert(
-                terminal_id.to_string(),
-                TerminalHandle { shared, pty: None },
-            );
-            inner.revision += 1;
+                create_request_id: None,
+                created_at: Some(created_at),
+            });
         }
 
-        /// Test-only: force a terminal's `lastActivityAt` to an arbitrary value so
-        /// idle-kill sweep tests don't need to sleep for real minutes.
+        /// Test-only: force a terminal's `lastActivityAt` AND its DEV-0009
+        /// meaningful-activity reap clock to an arbitrary value so idle-kill
+        /// sweep tests don't need to sleep for real minutes.
         fn backdate_last_activity(&self, terminal_id: &str, last_activity_at: i64) {
             let inner = self.inner.lock().unwrap();
             let handle = inner.terminals.get(terminal_id).unwrap();
-            handle.shared.lock().unwrap().last_activity_at = last_activity_at;
+            let mut s = handle.shared.lock().unwrap();
+            s.last_activity_at = last_activity_at;
+            s.last_meaningful_activity_at = last_activity_at;
         }
 
         /// Simulate the reader thread producing one frame (append + fan-out).
@@ -1999,6 +3106,7 @@ mod tests {
             "shell",
             None,
             None,
+            None,
             Some(Box::new(move |code| {
                 // Mirrors the production wiring (`freshell-ws`'s on_exit hook):
                 // the reader thread calls `finish_pty_exit` on natural exit.
@@ -2069,6 +3177,7 @@ mod tests {
             "shell",
             None,
             None,
+            None,
             Some(Box::new(move |code| {
                 // Mirrors the production wiring (`freshell-ws`'s on_exit hook):
                 // the reader thread calls `finish_pty_exit` on natural exit.
@@ -2126,6 +3235,7 @@ mod tests {
             terminal_id.clone(),
             "S".to_string(),
             "shell",
+            None,
             None,
             None,
             None,
@@ -2237,17 +3347,188 @@ mod tests {
     fn resize_updates_geometry_epoch_only_on_change() {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
-        let (sink, seen) = collector();
-        // default 120x30, epoch 1.
-        reg.resize("T", 120, 30); // unchanged -> no epoch bump
-        reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
-        assert_eq!(attach_ready(&seen).unwrap().geometry_epoch, Some(1));
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+        reg.resize("T", 100, 40); // first record: applied, no bump
+        assert_eq!(reg.geometry("T"), Some((100, 40, 1)));
+        reg.resize("T", 100, 40); // identical dims: no bump
+        assert_eq!(reg.geometry("T"), Some((100, 40, 1)));
+        reg.resize("T", 90, 35); // subsequent real change: bump
+        assert_eq!(reg.geometry("T"), Some((90, 35, 2)));
+    }
 
-        // A real change bumps the epoch (observed on the next attach.ready).
+    #[test]
+    fn resize_floors_dimensions_at_two_node_broker_parity() {
+        // Node: recordTerminalGeometry floors both dims at 2 (broker.ts:672-673).
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.resize("T", 0, 0); // first record: floored to (2,2), no epoch bump
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1)));
+        reg.resize("T", 1, 1); // floors to (2,2): unchanged, no bump
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1)));
+        reg.resize("T", 1, 40); // floors to (2,40): real change, bump
+        assert_eq!(reg.geometry("T"), Some((2, 40, 2)));
+        reg.resize("T", 2, 2); // exact minimum passes through unaltered
+        assert_eq!(reg.geometry("T"), Some((2, 2, 3)));
+        reg.resize("T", 95, 41); // normal values pass through unaltered
+        assert_eq!(reg.geometry("T"), Some((95, 41, 4)));
+    }
+
+    #[test]
+    fn resize_for_attach_floors_dimensions_at_two_node_broker_parity() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let status = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 0, 1);
+        assert!(matches!(status, AttachResizeStatus::Resized));
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1))); // first record: no bump
+        let status = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 1, 2);
+        assert!(matches!(status, AttachResizeStatus::Unchanged)); // floored dup
+        assert_eq!(reg.geometry("T"), Some((2, 2, 1)));
+        let status = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert!(matches!(status, AttachResizeStatus::Resized));
+        assert_eq!(reg.geometry("T"), Some((95, 41, 2)));
+    }
+
+    #[test]
+    fn first_client_geometry_records_without_epoch_bump() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S"); // 120x30, epoch 1, no client geometry yet
+                                       // First client-supplied geometry: applied + recorded, NO epoch bump
+                                       // (Node recordTerminalGeometry: hasPreviousGeometry=false => no bump,
+                                       // broker.ts:666-686; spawn dims never count, broker.ts:692-697).
         reg.resize("T", 100, 40);
-        let (sink2, seen2) = collector();
+        assert_eq!(reg.geometry("T"), Some((100, 40, 1)));
+        // Second real change: bumps.
+        reg.resize("T", 90, 35);
+        assert_eq!(reg.geometry("T"), Some((90, 35, 2)));
+    }
+
+    #[test]
+    fn unchanged_first_geometry_still_counts_as_recorded() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // Node records geometry on 'unchanged' results too (ws-handler.ts:2995
+        // records for both 'resized' and 'unchanged'), so the NEXT change bumps.
+        reg.resize("T", 120, 30); // dims equal the spawn default: records, no change
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+        reg.resize("T", 95, 41);
+        assert_eq!(reg.geometry("T"), Some((95, 41, 2)));
+    }
+
+    #[test]
+    fn geometry_reports_cols_rows_epoch() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S"); // headless default: 120x30, epoch 1
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+
+        assert_eq!(reg.geometry("nope"), None);
+    }
+
+    #[test]
+    fn resize_for_attach_viewport_hydrate_applies_first_geometry_without_bump() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S"); // 120x30, epoch 1
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        // First-ever client geometry: applied, epoch NOT bumped (Node
+        // first-record-no-bump, broker.ts:666-686).
+        assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_second_change_bumps_epoch() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 100, 50);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        assert_eq!(reg.geometry("T"), Some((100, 50, 2)));
+    }
+
+    #[test]
+    fn resize_for_attach_unchanged_geometry_records_but_does_not_bump() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 120, 30);
+        assert_eq!(out, AttachResizeStatus::Unchanged);
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+        // Node records geometry on 'unchanged' results too (broker.ts:387-392),
+        // so the next real change must bump.
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        assert_eq!(reg.geometry("T"), Some((95, 41, 2)));
+    }
+
+    #[test]
+    fn resize_for_attach_keepalive_delta_never_resizes_or_records() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::KeepaliveDelta, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Skipped);
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+        // A skipped attach must NOT count as a geometry record (Node's forced
+        // 'unchanged' at broker.ts:373 never records): the next applied
+        // geometry is still the FIRST record, so no bump.
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_transport_reconnect_applies_when_alone() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // No subscribers at all -> no other attached sockets -> resize.
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::TransportReconnect, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_transport_reconnect_skips_when_other_socket_attached() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        reg.attach("T", 1, sink, Some("a".into()), 0, false, None); // conn 1 is attached
+                                                                    // conn 2 reconnects with another socket attached and no prior attachment of its own.
+        let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Skipped);
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_transport_reconnect_applies_when_same_conn_reattaches() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink1, _seen1) = collector();
+        let (sink2, _seen2) = collector();
+        reg.attach("T", 1, sink1, Some("a".into()), 0, false, None);
         reg.attach("T", 2, sink2, Some("b".into()), 0, false, None);
-        assert_eq!(attach_ready(&seen2).unwrap().geometry_epoch, Some(2));
+        // conn 2 already has an attachment -> resize even though conn 1 is also attached
+        // (Node: existingAttachment wins over hasOtherAttachedSockets).
+        let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Resized);
+        // First-ever geometry record: no epoch bump.
+        assert_eq!(reg.geometry("T"), Some((95, 41, 1)));
+    }
+
+    #[test]
+    fn resize_for_attach_missing_terminal() {
+        let reg = TerminalRegistry::new();
+        let out = reg.resize_for_attach("nope", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert_eq!(out, AttachResizeStatus::Missing);
+    }
+
+    #[test]
+    fn resize_for_attach_exited_terminal_not_running() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // finish_pty_exit flips a headless terminal to Exited while RETAINING
+        // the record (registry.rs:1112) -- the same seam the existing test
+        // attach_to_already_exited_terminal_delivers_synthetic_exit uses.
+        assert!(reg.finish_pty_exit("T", 7));
+        let out = reg.resize_for_attach("T", 1, TerminalAttachIntent::ViewportHydrate, 95, 41);
+        assert_eq!(out, AttachResizeStatus::NotRunning);
+        assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
     }
 
     #[test]
@@ -2356,6 +3637,133 @@ mod tests {
         let killed = reg.enforce_idle_kills();
 
         assert!(killed.is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn enforce_idle_kills_reaps_detached_terminal_with_only_repaint_noise() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        // Warm-up: the FIRST paint of a status line is genuinely new content
+        // and legitimately counts as activity.
+        reg.feed("T", frame(1, "\r\x1b[2K⠋ (1s • esc to interrupt)", "S"));
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        // Codex-style repaint noise after the backdate: same status line,
+        // only the braille glyph and the digits tick. Each frame still bumps
+        // the wire-visible last_activity_at (unchanged legacy semantics) but
+        // must NOT refresh the reap clock.
+        for (i, paint) in [
+            "\r\x1b[2K⠙ (2s • esc to interrupt)",
+            "\r\x1b[2K⠹ (3s • esc to interrupt)",
+            "\r\x1b[2K⠸ (14s • esc to interrupt)",
+            "\r\x1b[2K⠼ (65s • esc to interrupt)",
+        ]
+        .iter()
+        .enumerate()
+        {
+            reg.feed("T", frame(i as i64 + 2, paint, "S"));
+        }
+
+        let killed = reg.enforce_idle_kills();
+
+        assert_eq!(killed, vec!["T".to_string()]);
+        assert!(reg.inventory().is_empty());
+    }
+
+    #[test]
+    fn enforce_idle_kills_spares_detached_terminal_streaming_genuine_output() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        // A long build streaming REAL new log lines: genuine work, must
+        // survive the sweep even while detached.
+        reg.feed(
+            "T",
+            frame(1, "   Compiling freshell-terminal v0.1.0\n", "S"),
+        );
+        reg.feed(
+            "T",
+            frame(2, "warning: unused variable `x` in registry.rs\n", "S"),
+        );
+
+        let killed = reg.enforce_idle_kills();
+
+        assert!(killed.is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn input_write_resets_the_idle_reap_clock() {
+        // User keystrokes are always activity (headless => the PTY write is
+        // skipped but the activity bump still happens, matching input()).
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        reg.input("T", b"ls\n");
+
+        let killed = reg.enforce_idle_kills();
+
+        assert!(killed.is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+    }
+
+    #[test]
+    fn detach_grants_full_idle_threshold_of_grace() {
+        // A user may WATCH a spinner-only terminal attached for hours: the
+        // attached exemption forbids reaping, but nothing refreshes the
+        // meaningful clock, so it pre-expires underneath them. Detaching
+        // must therefore grant one full threshold of grace (DEV-0009) —
+        // otherwise the very next 30s sweep kills a terminal the user
+        // deliberately backgrounded seconds earlier (legacy never reaped it;
+        // terminal-core.md A13: "terminal stays running").
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        assert!(outcome.found);
+        reg.set_auto_kill_idle_minutes(1);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        reg.detach("T", 1);
+
+        // Freshly detached: the transition bump spares it a full threshold.
+        assert!(reg.enforce_idle_kills().is_empty());
+        assert_eq!(reg.inventory().len(), 1);
+
+        // Once it goes stale again AFTER the detach, it is reaped normally.
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        assert_eq!(reg.enforce_idle_kills(), vec!["T".to_string()]);
+    }
+
+    #[test]
+    fn disconnect_grants_full_idle_threshold_of_grace() {
+        // Socket-close cleanup (remove_connection) is the other live
+        // transition-to-detached path and must grant the same grace as an
+        // explicit detach. The bump is gated on "this connection actually
+        // subscribed here AND the set became empty AND status is Running" —
+        // remove_connection iterates EVERY terminal, and an unconditional
+        // bump would reset unrelated detached terminals' countdowns on
+        // every socket close.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        assert!(outcome.found);
+        // A second, already-detached terminal whose countdown must NOT be
+        // disturbed by conn 1's disconnect.
+        reg.insert_headless("U", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        reg.backdate_last_activity("U", now_ms() - 10 * 60_000);
+        reg.remove_connection(1);
+
+        let killed = reg.enforce_idle_kills();
+
+        // T was freshly detached by the disconnect => spared one threshold.
+        // U never had a subscriber => its stale countdown stands => reaped.
+        assert_eq!(killed, vec!["U".to_string()]);
         assert_eq!(reg.inventory().len(), 1);
     }
 
@@ -2527,6 +3935,192 @@ mod tests {
         );
     }
 
+    // ── TERM-15/TERM-16 activity observer ───────────────────────────────────
+    //
+    // The registry-level tap the activity hub (freshell-ws) subscribes to:
+    // Created (all modes), Input/Output (CLI modes only — shell terminals
+    // never pay the tap cost), Exit (all removal paths). The observer runs on
+    // the caller's thread (Input/Created) or the PTY reader thread (Output/
+    // natural Exit), so it must be cheap and non-blocking — the hub forwards
+    // into an unbounded channel.
+
+    fn wait_for<F: Fn() -> bool>(deadline_ms: u64, f: F) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < std::time::Duration::from_millis(deadline_ms) {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        f()
+    }
+
+    #[test]
+    fn activity_observer_sees_created_output_input_and_exit_for_cli_modes() {
+        let reg = TerminalRegistry::new();
+        let seen: Arc<Mutex<Vec<ActivityEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        reg.set_activity_observer(Arc::new(move |event| {
+            sink_seen.lock().unwrap().push(event);
+        }));
+
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf ready-marker; sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        reg.create(
+            &spec,
+            &env,
+            "T-act".to_string(),
+            "S-act".to_string(),
+            "claude",
+            Some("sess-act-1"),
+            None,
+            None,
+            None,
+        )
+        .expect("spawn");
+
+        // Created fires synchronously with the REAL mode + resume identity.
+        {
+            let events = seen.lock().unwrap();
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    ActivityEvent::Created { terminal_id, mode, resume_session_id, .. }
+                        if terminal_id == "T-act"
+                            && mode == "claude"
+                            && resume_session_id.as_deref() == Some("sess-act-1")
+                )),
+                "expected a Created event, got {events:?}"
+            );
+        }
+
+        // Output arrives from the PTY reader thread.
+        assert!(
+            wait_for(5_000, || {
+                seen.lock().unwrap().iter().any(|e| {
+                    matches!(
+                        e,
+                        ActivityEvent::Output { terminal_id, data, .. }
+                            if terminal_id == "T-act" && data.contains("ready-marker")
+                    )
+                })
+            }),
+            "expected an Output event carrying the PTY output"
+        );
+
+        // Input fires synchronously on write.
+        reg.input("T-act", b"\r");
+        assert!(
+            seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                ActivityEvent::Input { terminal_id, data, .. }
+                    if terminal_id == "T-act" && data == "\r"
+            )),
+            "expected an Input event for the Enter write"
+        );
+
+        // Kill fires Exit.
+        reg.kill("T-act");
+        assert!(
+            wait_for(5_000, || {
+                seen.lock().unwrap().iter().any(|e| {
+                    matches!(
+                        e,
+                        ActivityEvent::Exit { terminal_id, .. } if terminal_id == "T-act"
+                    )
+                })
+            }),
+            "expected an Exit event after kill"
+        );
+    }
+
+    #[test]
+    fn activity_observer_skips_input_and_output_for_shell_terminals() {
+        let reg = TerminalRegistry::new();
+        let seen: Arc<Mutex<Vec<ActivityEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        reg.set_activity_observer(Arc::new(move |event| {
+            sink_seen.lock().unwrap().push(event);
+        }));
+
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "printf shell-out; sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        reg.create(
+            &spec,
+            &env,
+            "T-shell".to_string(),
+            "S-shell".to_string(),
+            "shell",
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("spawn");
+
+        // Give the PTY time to produce output; the tap must stay silent for
+        // Input/Output on a plain shell (zero per-chunk overhead).
+        reg.input("T-shell", b"\r");
+        assert!(
+            wait_for(2_000, || {
+                // Wait until the PTY produced SOMETHING (visible via replay),
+                // then check the tap saw none of it.
+                reg.is_running("T-shell")
+            }),
+            "shell must be running"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let events = seen.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, ActivityEvent::Created { mode, .. } if mode == "shell")),
+            "Created fires for every mode"
+        );
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                ActivityEvent::Input { .. } | ActivityEvent::Output { .. }
+            )),
+            "no Input/Output tap for shell terminals, got {events:?}"
+        );
+        drop(events);
+        reg.kill("T-shell");
+    }
+
+    #[test]
+    fn activity_observer_sees_exit_on_natural_pty_exit() {
+        let reg = TerminalRegistry::new();
+        let seen: Arc<Mutex<Vec<ActivityEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        reg.set_activity_observer(Arc::new(move |event| {
+            sink_seen.lock().unwrap().push(event);
+        }));
+        reg.insert_headless("T-nat", "S-nat");
+        assert!(reg.finish_pty_exit("T-nat", 0));
+        assert!(
+            seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                ActivityEvent::Exit { terminal_id, .. } if terminal_id == "T-nat"
+            )),
+            "natural exit must fire the Exit tap"
+        );
+    }
+
     #[test]
     fn eviction_on_box_drawing_content_never_panics_and_stays_within_char_cap() {
         // Many small multi-byte frames driving continuous eviction: proves the
@@ -2548,6 +4142,633 @@ mod tests {
         assert!(
             retained_chars as i64 <= cap,
             "retained {retained_chars} chars must not exceed the {cap}-char cap"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Reconciliation handshake (design §5.1): createRequestId stamped
+    // atomically with the registry insert + the two newest-generation
+    // accessors + the ≥2-live-PTYs-per-key backstop detector.
+    // ------------------------------------------------------------------
+
+    fn headless(reg: &TerminalRegistry, id: &str, key: Option<&str>, created_at: i64) {
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: id.to_string(),
+            stream_id: format!("S-{id}"),
+            mode: "claude".to_string(),
+            resume_session_id: None,
+            create_request_id: key.map(str::to_string),
+            created_at: Some(created_at),
+        });
+    }
+
+    #[test]
+    fn create_stamps_create_request_id_visible_via_newest_live_accessor() {
+        let reg = TerminalRegistry::new();
+        let spec = SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        reg.create(
+            &spec,
+            &env,
+            "T-crid".to_string(),
+            "S-crid".to_string(),
+            "shell",
+            None,
+            Some("cr-stamp-1"),
+            None,
+            None,
+        )
+        .expect("spawn /bin/sh");
+
+        assert_eq!(
+            reg.newest_live_by_create_request_id("cr-stamp-1"),
+            Some("T-crid".to_string())
+        );
+        reg.kill("T-crid");
+    }
+
+    #[test]
+    fn newest_live_by_key_prefers_newest_generation_and_excludes_exited() {
+        let reg = TerminalRegistry::new();
+        headless(&reg, "gen1", Some("cr-k"), 1_000);
+        headless(&reg, "gen2", Some("cr-k"), 2_000);
+        // Exit the OLD generation: newest live is gen2.
+        reg.finish_pty_exit("gen1", 0);
+        assert_eq!(
+            reg.newest_live_by_create_request_id("cr-k"),
+            Some("gen2".to_string())
+        );
+        // Exit the newest too: no live generation left.
+        reg.finish_pty_exit("gen2", 0);
+        assert_eq!(reg.newest_live_by_create_request_id("cr-k"), None);
+        // ... but the exited-inclusive accessor still finds the NEWEST one.
+        assert_eq!(
+            reg.newest_by_create_request_id("cr-k"),
+            Some("gen2".to_string())
+        );
+        assert_eq!(reg.newest_by_create_request_id("cr-unknown"), None);
+    }
+
+    #[test]
+    fn is_live_distinguishes_running_exited_and_unknown() {
+        let reg = TerminalRegistry::new();
+        headless(&reg, "T-live", None, 1_000);
+        headless(&reg, "T-dead", None, 1_000);
+        reg.finish_pty_exit("T-dead", 1);
+        assert!(reg.is_live("T-live"));
+        assert!(!reg.is_live("T-dead"));
+        assert!(!reg.is_live("T-ghost"));
+    }
+
+    #[test]
+    fn probe_returns_identity_row_with_mode_and_resume_id() {
+        let reg = TerminalRegistry::new();
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-probe".to_string(),
+            stream_id: "S-probe".to_string(),
+            mode: "codex".to_string(),
+            resume_session_id: Some("sess-9".to_string()),
+            create_request_id: Some("cr-probe".to_string()),
+            created_at: None,
+        });
+        let row = reg.probe("T-probe").expect("registered");
+        assert_eq!(row.mode, "codex");
+        assert_eq!(row.resume_session_id.as_deref(), Some("sess-9"));
+        assert_eq!(row.status, TerminalRunStatus::Running);
+        assert!(reg.probe("T-ghost").is_none());
+    }
+
+    /// §5.4 backstop detector: whenever a create completes and the key now has
+    /// two or more LIVE terminals, a `ws.reconcile.duplicate_pty` warn event
+    /// makes the violation loud instead of a silent second JSONL writer.
+    #[test]
+    fn second_live_terminal_on_one_key_emits_duplicate_pty_warning() {
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        headless(&reg, "dup1", Some("cr-dup"), 1_000);
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                !captured
+                    .iter()
+                    .any(|e| e.message == "ws.reconcile.duplicate_pty"),
+                "one live terminal must not trip the detector"
+            );
+        }
+        headless(&reg, "dup2", Some("cr-dup"), 2_000);
+        let captured = events.lock().unwrap();
+        let warn = captured
+            .iter()
+            .find(|e| e.message == "ws.reconcile.duplicate_pty")
+            .expect("two live PTYs on one createRequestId must emit the detector event");
+        assert_eq!(
+            warn.fields.get("create_request_id").map(String::as_str),
+            Some("cr-dup")
+        );
+    }
+
+    /// Council rule 6 support: the registry-row join (mode +
+    /// resume_session_id + Running) finds the live terminal carrying a
+    /// sessionRef — exited generations and other providers/sessions never
+    /// match.
+    #[test]
+    fn live_terminal_for_session_ref_joins_rows_on_mode_and_resume_id() {
+        let reg = TerminalRegistry::new();
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-ref".to_string(),
+            stream_id: "S-ref".to_string(),
+            mode: "codex".to_string(),
+            resume_session_id: Some("sess-r".to_string()),
+            create_request_id: Some("cr-a".to_string()),
+            created_at: Some(1_000),
+        });
+        let locator = SessionLocator {
+            provider: "codex".to_string(),
+            session_id: "sess-r".to_string(),
+        };
+        assert_eq!(
+            reg.live_terminal_for_session_ref(&locator),
+            Some("T-ref".to_string())
+        );
+        // Wrong provider / wrong session never match.
+        assert!(reg
+            .live_terminal_for_session_ref(&SessionLocator {
+                provider: "claude".to_string(),
+                session_id: "sess-r".to_string(),
+            })
+            .is_none());
+        assert!(reg
+            .live_terminal_for_session_ref(&SessionLocator {
+                provider: "codex".to_string(),
+                session_id: "other".to_string(),
+            })
+            .is_none());
+        // An exited terminal is not a live carrier.
+        reg.finish_pty_exit("T-ref", 0);
+        assert!(reg.live_terminal_for_session_ref(&locator).is_none());
+    }
+
+    /// Council rule 9 (D8 backstop): >=2 live PTYs stamped with ONE
+    /// sessionRef is the two-writers corruption shape — the alarm returns
+    /// true and ERROR-logs `duplicate_pty_for_session_ref`; one live carrier
+    /// returns false and stays silent.
+    #[test]
+    fn alarm_if_duplicate_session_ref_fires_only_on_two_live_carriers() {
+        let (events, _guard) = tracing_capture::capture();
+        let reg = TerminalRegistry::new();
+        let stamped = |id: &str, created_at: i64| HeadlessTerminal {
+            terminal_id: id.to_string(),
+            stream_id: format!("S-{id}"),
+            mode: "claude".to_string(),
+            resume_session_id: Some("sess-dup".to_string()),
+            create_request_id: None,
+            created_at: Some(created_at),
+        };
+        let locator = SessionLocator {
+            provider: "claude".to_string(),
+            session_id: "sess-dup".to_string(),
+        };
+
+        reg.register_headless(stamped("dupA", 1_000));
+        assert!(
+            !reg.alarm_if_duplicate_session_ref(&locator),
+            "one live carrier must not trip the alarm"
+        );
+
+        reg.register_headless(stamped("dupB", 2_000));
+        assert!(reg.alarm_if_duplicate_session_ref(&locator));
+        let captured = events.lock().unwrap();
+        let alarm = captured
+            .iter()
+            .find(|e| e.message.contains("duplicate_pty_for_session_ref"))
+            .expect(">=2 live PTYs on one sessionRef must emit the invariant alarm");
+        assert_eq!(
+            alarm.fields.get("session_id").map(String::as_str),
+            Some("sess-dup")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Council rule 7 (D8): sessionRef liveness-bound lease — claim /
+    // complete / fail / conn-death release / TTL kill-before-release.
+    // ------------------------------------------------------------------
+
+    fn test_registry() -> TerminalRegistry {
+        TerminalRegistry::new()
+    }
+
+    fn locator(provider: &str, session_id: &str) -> SessionLocator {
+        SessionLocator {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn second_claim_while_held_is_reserved() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-A", 1, 1000),
+            SessionRefClaim::Acquired
+        ));
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 1500),
+            SessionRefClaim::Held { .. }
+        ));
+    }
+
+    #[test]
+    fn completed_claim_yields_bound_elsewhere() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        reg.claim_session_ref(&s, "cr-A", 1, 1000);
+        assert!(reg.complete_session_ref_claim(&s, "cr-A", "term-1"));
+        match reg.claim_session_ref(&s, "cr-B", 2, 2000) {
+            SessionRefClaim::BoundElsewhere { terminal_id } => assert_eq!(terminal_id, "term-1"),
+            other => panic!("expected BoundElsewhere, got {other:?}"),
+        }
+    }
+
+    /// winner-dies-mid-claim (council red test): holder conn death releases the
+    /// pid-less lease; the loser's next claim wins.
+    #[test]
+    fn winner_dies_mid_claim_releases_lease() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        reg.claim_session_ref(&s, "cr-A", 1, 1000);
+        let to_kill = reg.release_session_ref_leases_for_conn(1);
+        assert!(to_kill.iter().all(|(_, pid)| pid.is_none()));
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 1500),
+            SessionRefClaim::Acquired
+        ));
+    }
+
+    /// winner-hangs-mid-claim (council red test): TTL expiry with a recorded
+    /// child pid demands kill-before-release; confirmed kill releases; a pid-less
+    /// hung holder is revoked and HELD CLOSED, never released.
+    #[test]
+    fn winner_hangs_mid_claim_ttl_is_kill_before_release() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        reg.claim_session_ref(&s, "cr-A", 1, 1000);
+        reg.set_session_ref_lease_pid(&s, "cr-A", 4242);
+        let late = 1000 + SESSION_REF_LEASE_TTL_MS + 1;
+        match reg.claim_session_ref(&s, "cr-B", 2, late) {
+            SessionRefClaim::ExpiredNeedsKill { pid } => assert_eq!(pid, 4242),
+            other => panic!("expected ExpiredNeedsKill, got {other:?}"),
+        }
+        reg.force_release_after_confirmed_kill(&s);
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, late + 1),
+            SessionRefClaim::Acquired
+        ));
+    }
+
+    #[test]
+    fn hung_holder_without_pid_is_revoked_and_held_closed() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        reg.claim_session_ref(&s, "cr-A", 1, 1000);
+        let late = 1000 + SESSION_REF_LEASE_TTL_MS + 1;
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, late),
+            SessionRefClaim::Held { .. }
+        ));
+        // The revoked holder's late completion is rejected.
+        assert!(!reg.complete_session_ref_claim(&s, "cr-A", "term-late"));
+    }
+
+    /// Fix round 1, finding 1: a KILLED winner must not strand the
+    /// sessionRef. The kill path REMOVES the terminal row entirely
+    /// ([`TerminalRegistry::kill_internal`]), so the binding's terminal id
+    /// becomes UNKNOWN to the registry — the claim-time "known dead" probe
+    /// can never fire. The binding must instead be pruned at row-removal
+    /// time so the next claim wins, rather than answering
+    /// `BoundElsewhere{dead-id}` forever.
+    #[test]
+    fn killed_winner_binding_is_pruned_so_next_claim_acquires() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-A", 1, 1000),
+            SessionRefClaim::Acquired
+        ));
+        // The winner's spawn registers a real row carrying the ref, then binds.
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-win".to_string(),
+            stream_id: "S-win".to_string(),
+            mode: "claude".to_string(),
+            resume_session_id: Some("s1".to_string()),
+            create_request_id: Some("cr-A".to_string()),
+            created_at: Some(1_000),
+        });
+        assert!(reg.complete_session_ref_claim(&s, "cr-A", "T-win"));
+        // User kills the winner: the real kill path removes the row entirely.
+        assert!(reg.kill("T-win"));
+        // The dead winner must not strand losers.
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 2000),
+            SessionRefClaim::Acquired
+        ));
+    }
+
+    /// Final-review finding 1 (claim-side TOCTOU): loser B passes checks
+    /// 1a/1b while both maps are still empty, is preempted across the
+    /// winner's register -> `complete_session_ref_claim` window, then takes
+    /// the leases lock AFTER complete removed the lease. Pre-fix the lease
+    /// phase saw "no lease" and answered `Acquired` -> a second spawn for
+    /// the same sessionRef (the duplicate-writer shape D8 exists to close).
+    ///
+    /// Staged sequentially, no threads: the winner claims, registers its
+    /// row, and completes (binding recorded, lease gone); B then enters the
+    /// lease phase DIRECTLY -- exactly the state B is in after its early
+    /// (empty) 1a/1b pass. A full `claim_session_ref` call from B cannot
+    /// pin the fix: while the binding exists, step 1b always intercepts it,
+    /// so only direct entry exercises the under-lock bindings re-check.
+    #[test]
+    fn lease_phase_rechecks_bindings_under_leases_lock() {
+        let reg = test_registry();
+        let s = locator("claude", "s1");
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-A", 1, 1000),
+            SessionRefClaim::Acquired
+        ));
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-win".to_string(),
+            stream_id: "S-win".to_string(),
+            mode: "claude".to_string(),
+            resume_session_id: Some("s1".to_string()),
+            create_request_id: Some("cr-A".to_string()),
+            created_at: Some(1_000),
+        });
+        assert!(reg.complete_session_ref_claim(&s, "cr-A", "T-win"));
+        // B resumes at the lease phase; its 1a/1b ran before the winner
+        // existed, so neither check fired. It must NOT acquire.
+        match reg.claim_session_ref_lease_phase(&s, "cr-B", 2, 2000) {
+            SessionRefClaim::BoundElsewhere { terminal_id } => {
+                assert_eq!(terminal_id, "T-win")
+            }
+            other => panic!("expected BoundElsewhere, got {other:?}"),
+        }
+        // The full claim path agrees (step 1a/1b catch it sequentially).
+        assert!(matches!(
+            reg.claim_session_ref(&s, "cr-B", 2, 2000),
+            SessionRefClaim::BoundElsewhere { .. }
+        ));
+    }
+
+    /// §5.1 atomic-stamp insert-edge interleave (§9.1 test 5): the key is part
+    /// of the row inserted under the registry lock, so an observer's
+    /// `newest_live_by_create_request_id` sees either no row or the
+    /// row-with-key — never a row that later gains its key.
+    #[test]
+    fn concurrent_inserts_never_expose_a_row_without_its_key() {
+        let reg = TerminalRegistry::new();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader = {
+            let reg = reg.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut observed = Vec::new();
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some(id) = reg.newest_live_by_create_request_id("cr-race") {
+                        assert!(
+                            id == "race1" || id == "race2",
+                            "by-key lookup must only ever see fully-stamped rows, got {id}"
+                        );
+                        observed.push(id);
+                    }
+                }
+                observed
+            })
+        };
+
+        let w1 = {
+            let reg = reg.clone();
+            std::thread::spawn(move || headless(&reg, "race1", Some("cr-race"), 1_000))
+        };
+        let w2 = {
+            let reg = reg.clone();
+            std::thread::spawn(move || headless(&reg, "race2", Some("cr-race"), 2_000))
+        };
+        w1.join().unwrap();
+        w2.join().unwrap();
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        // After both inserts, the newest generation (by created_at) wins.
+        assert_eq!(
+            reg.newest_live_by_create_request_id("cr-race"),
+            Some("race2".to_string())
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Respawn-generation cap (design §7.5): a respawn ↔ instant-exit loop
+    // must converge to a terminal dead_session verdict instead of thrashing.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn respawn_cap_exhausts_after_n_short_lived_generations() {
+        let reg = TerminalRegistry::new();
+        reg.set_respawn_liveness_window_ms(10_000);
+        reg.set_respawn_generation_cap(3);
+
+        for gen in 1..=3 {
+            let id = format!("cap-gen{gen}");
+            // created_at = now → the exit below is inside the liveness window.
+            headless(&reg, &id, Some("cr-cap"), now_ms());
+            assert!(
+                !reg.respawn_exhausted("cr-cap"),
+                "cap must not fire before generation {gen} exits"
+            );
+            reg.finish_pty_exit(&id, 1);
+        }
+        assert!(
+            reg.respawn_exhausted("cr-cap"),
+            "3 short-lived generations must exhaust the cap"
+        );
+        // An unrelated key is unaffected.
+        assert!(!reg.respawn_exhausted("cr-other"));
+    }
+
+    #[test]
+    fn healthy_generation_resets_the_respawn_counter() {
+        let reg = TerminalRegistry::new();
+        reg.set_respawn_liveness_window_ms(10_000);
+        reg.set_respawn_generation_cap(3);
+
+        for gen in 1..=2 {
+            let id = format!("reset-gen{gen}");
+            headless(&reg, &id, Some("cr-reset"), now_ms());
+            reg.finish_pty_exit(&id, 1);
+        }
+        // A generation that SURVIVED the liveness window (created long ago)
+        // exits: the counter resets — a healthy resume is not penalized.
+        headless(&reg, "reset-healthy", Some("cr-reset"), now_ms() - 60_000);
+        reg.finish_pty_exit("reset-healthy", 0);
+        assert!(!reg.respawn_exhausted("cr-reset"));
+
+        // The next two short-lived exits count from zero again.
+        for gen in 3..=4 {
+            let id = format!("reset-gen{gen}");
+            headless(&reg, &id, Some("cr-reset"), now_ms());
+            reg.finish_pty_exit(&id, 1);
+        }
+        assert!(
+            !reg.respawn_exhausted("cr-reset"),
+            "only 2 short-lived generations since the healthy reset"
+        );
+    }
+
+    /// §5.4 single-flight claim: the in-flight keyed-create reservation that
+    /// closes the check-then-spawn window between two truly concurrent
+    /// creates for one key (the spawn itself takes milliseconds; the row only
+    /// becomes observable at insert).
+    #[test]
+    fn keyed_create_claim_is_exclusive_until_released() {
+        let reg = TerminalRegistry::new();
+        assert!(reg.begin_keyed_create("cr-claim"), "first claim wins");
+        assert!(
+            !reg.begin_keyed_create("cr-claim"),
+            "a second concurrent create must NOT also claim the key"
+        );
+        assert!(
+            reg.begin_keyed_create("cr-other"),
+            "unrelated keys are free"
+        );
+        reg.end_keyed_create("cr-claim");
+        assert!(
+            reg.begin_keyed_create("cr-claim"),
+            "a released key is claimable again"
+        );
+    }
+
+    #[test]
+    fn exits_without_a_create_request_id_never_count() {
+        let reg = TerminalRegistry::new();
+        reg.set_respawn_liveness_window_ms(10_000);
+        reg.set_respawn_generation_cap(1);
+        headless(&reg, "keyless", None, now_ms());
+        reg.finish_pty_exit("keyless", 1);
+        assert!(!reg.respawn_exhausted(""));
+    }
+
+    #[derive(Debug)]
+    struct StubIdentity {
+        provider: &'static str,
+        session_id: &'static str,
+        terminal_id: &'static str,
+    }
+
+    impl SessionIdentityLookup for StubIdentity {
+        fn terminal_for_session(&self, provider: &str, session_id: &str) -> Option<String> {
+            (provider == self.provider && session_id == self.session_id)
+                .then(|| self.terminal_id.to_string())
+        }
+    }
+
+    #[test]
+    fn live_session_owner_finds_running_row_by_resume_session_id() {
+        let registry = TerminalRegistry::new();
+        registry.register_headless(HeadlessTerminal {
+            terminal_id: "t-row-owner".into(),
+            stream_id: "s-row-owner".into(),
+            mode: "claude".into(),
+            resume_session_id: Some("sess-live".into()),
+            create_request_id: None,
+            created_at: None,
+        });
+
+        assert_eq!(
+            registry.live_session_owner(None, "claude", "sess-live"),
+            Some("t-row-owner".to_string()),
+            "row arm: Running row with matching mode+resume_session_id is a live owner"
+        );
+        // Wrong mode / unknown session: no owner.
+        assert_eq!(
+            registry.live_session_owner(None, "codex", "sess-live"),
+            None
+        );
+        assert_eq!(
+            registry.live_session_owner(None, "claude", "sess-other"),
+            None
+        );
+
+        registry.kill("t-row-owner");
+    }
+
+    #[test]
+    fn live_session_owner_ignores_exited_rows() {
+        let registry = TerminalRegistry::new();
+        registry.register_headless(HeadlessTerminal {
+            terminal_id: "t-exited".into(),
+            stream_id: "s-exited".into(),
+            mode: "claude".into(),
+            resume_session_id: Some("sess-done".into()),
+            create_request_id: None,
+            created_at: None,
+        });
+        assert!(registry.finish_pty_exit("t-exited", 0));
+
+        assert_eq!(
+            registry.live_session_owner(None, "claude", "sess-done"),
+            None,
+            "an Exited owner must not block resume"
+        );
+    }
+
+    #[test]
+    fn live_session_owner_finds_identity_bound_running_terminal() {
+        // Locator-adopted shape (d9b71f50's case): Running row with NO
+        // resume_session_id; the session binding exists only in the identity store.
+        let registry = TerminalRegistry::new();
+        registry.register_headless(HeadlessTerminal {
+            terminal_id: "t-adopted".into(),
+            stream_id: "s-adopted".into(),
+            mode: "codex".into(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: None,
+        });
+        let identity = StubIdentity {
+            provider: "codex",
+            session_id: "sess-adopted",
+            terminal_id: "t-adopted",
+        };
+
+        assert_eq!(
+            registry.live_session_owner(Some(&identity), "codex", "sess-adopted"),
+            Some("t-adopted".to_string()),
+            "identity arm: identity-bound session of a Running terminal is live"
+        );
+
+        registry.kill("t-adopted");
+    }
+
+    #[test]
+    fn live_session_owner_identity_binding_to_dead_terminal_is_not_live() {
+        let registry = TerminalRegistry::new();
+        // No registry row at all for "t-gone" -- identity binding alone must not count.
+        let identity = StubIdentity {
+            provider: "codex",
+            session_id: "sess-gone",
+            terminal_id: "t-gone",
+        };
+        assert_eq!(
+            registry.live_session_owner(Some(&identity), "codex", "sess-gone"),
+            None,
+            "identity arm requires the owner terminal to probe Running"
         );
     }
 }

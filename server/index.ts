@@ -8,7 +8,7 @@ import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import cookieParser from 'cookie-parser'
-import rateLimit from 'express-rate-limit'
+import { createApiRateLimiter } from './rate-limit.js'
 import chokidar from 'chokidar'
 import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
@@ -24,6 +24,7 @@ import { CodingCliSessionManager } from './coding-cli/session-manager.js'
 import { wireCodexActivityTracker } from './coding-cli/codex-activity-wiring.js'
 import { wireClaudeActivityTracker } from './coding-cli/claude-activity-wiring.js'
 import { wireAmplifierActivityTracker } from './coding-cli/amplifier-activity-wiring.js'
+import { TrulyIdleEmitter, wireTrulyIdleEmitter } from './coding-cli/truly-idle-emitter.js'
 import { createAmplifierActivityIntegration } from './coding-cli/amplifier-activity-integration.js'
 import { AmplifierSessionLocator } from './coding-cli/amplifier-session-locator.js'
 import { AmplifierSessionController } from './coding-cli/amplifier-session-controller.js'
@@ -71,6 +72,7 @@ import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
 import { createAiRouter } from './ai-router.js'
 import { createDebugRouter } from './debug-router.js'
+import { createFreshAgentIncidentRouter } from './fresh-agent/incident-router.js'
 import { LayoutStore } from './agent-api/layout-store.js'
 import { createAgentApiRouter } from './agent-api/router.js'
 import { ExtensionManager } from './extension-manager.js'
@@ -200,15 +202,7 @@ async function main() {
   app.use('/api/fresh-agent/threads', createFreshAgentSnapshotRateLimitMiddleware())
 
   // Basic rate limiting for /api
-  app.use(
-    '/api',
-    rateLimit({
-      windowMs: 60_000,
-      max: 300,
-      standardHeaders: true,
-      legacyHeaders: false,
-    }),
-  )
+  app.use('/api', createApiRateLimiter())
 
   app.use(cookieParser())
   app.use('/api', httpAuthMiddleware)
@@ -539,6 +533,18 @@ async function main() {
   const sessionsSync = new SessionsSyncService(wsHandler)
   const associationCoordinator = new SessionAssociationCoordinator(registry, ASSOCIATION_MAX_AGE_MS)
 
+  // Truly-idle alerting (terminal.idle): one emitter per provider tracker,
+  // fed by the tracker's 'changed' + 'turn.complete' streams. One-shot grace
+  // timers only — no polling, no per-pane intervals.
+  const trulyIdleWirings = [codexActivity.tracker, claudeActivity.tracker, amplifierActivity.tracker, opencodeActivity.tracker]
+    .map((tracker) => {
+      const emitter = new TrulyIdleEmitter()
+      emitter.on('idle', (event) => {
+        wsHandler.broadcastTerminalIdle(event)
+      })
+      return wireTrulyIdleEmitter({ tracker, emitter })
+    })
+
   codexActivity.tracker.on('changed', (payload) => {
     wsHandler.broadcastCodexActivityUpdated(payload)
   })
@@ -779,6 +785,19 @@ async function main() {
     codingCliIndexer,
     tabsRegistryStore,
     registry,
+  }))
+
+  // --- API: fresh-agent incident inspection (kata zrrj) ---
+  // Read-only, content-free (hashed identity only). Mounted after httpAuthMiddleware
+  // so it stays token-protected, and it shares the global /api rate limit
+  // (createApiRateLimiter, 300/60s) like every other API route — acceptable because
+  // this endpoint is polled manually by a human during incidents.
+  app.use('/api/debug/fresh-agent', createFreshAgentIncidentRouter({
+    runtimeManager: freshAgentRuntimeManager,
+    opencode: {
+      inspectSessions: () => opencodeFreshAgentAdapter.inspectSessions(),
+      describeSidecar: () => opencodeServeManager.describeSidecar(),
+    },
   }))
 
   // --- API: server-info ---
@@ -1227,6 +1246,7 @@ async function main() {
     await extWatcher?.close()
 
     // 9b. Stop Codex activity tracker listeners and sweep timer
+    for (const wiring of trulyIdleWirings) wiring.dispose()
     codexActivity.dispose()
     claudeActivity.dispose()
     amplifierActivity.dispose()

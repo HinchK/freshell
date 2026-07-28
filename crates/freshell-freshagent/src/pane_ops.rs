@@ -1137,6 +1137,10 @@ mod tests {
             msg["payload"]["newContent"]["terminalId"],
             json!(new_terminal_id)
         );
+        let crid = msg["payload"]["newContent"]["createRequestId"]
+            .as_str()
+            .expect("split newContent.createRequestId missing");
+        assert_eq!(crid.len(), 32);
 
         state
             .terminal_registry
@@ -1763,6 +1767,16 @@ mod tests {
             msg["payload"]["content"]["terminalId"],
             json!(new_terminal_id)
         );
+        // Task 3: respawn ROTATES the pane key — the broadcast content carries
+        // a fresh server-minted 32-hex createRequestId. Intentional legacy
+        // parity (router.ts:1602 mints per respawn) and required so
+        // reconcile's newest_live_by_create_request_id resolves the pane to
+        // the REPLACEMENT terminal, not the detached old one.
+        let crid = msg["payload"]["content"]["createRequestId"]
+            .as_str()
+            .expect("respawn content.createRequestId missing");
+        assert_eq!(crid.len(), 32, "expected Uuid::simple format, got {crid:?}");
+        assert!(crid.chars().all(|c| c.is_ascii_hexdigit()));
 
         // Bookkeeping now points the SAME pane id at the NEW terminal --
         // "replace in place", not a second pane.
@@ -1783,6 +1797,15 @@ mod tests {
         let registry = state.terminal_registry.clone().unwrap();
         assert!(registry.is_running(&old_terminal_id));
         assert!(registry.is_running(&new_terminal_id));
+
+        // The NEW terminal's registry row was stamped with the SAME key
+        // (atomic insert) — the old terminal keeps its own lineage.
+        assert_eq!(
+            registry
+                .probe_create_request_id(&new_terminal_id)
+                .as_deref(),
+            Some(crid),
+        );
 
         registry.kill(&old_terminal_id);
         registry.kill(&new_terminal_id);

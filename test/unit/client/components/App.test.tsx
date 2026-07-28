@@ -74,6 +74,7 @@ vi.mock('@/store/crossTabSync', () => ({
 const mockApiGet = vi.fn().mockResolvedValue({})
 const fetchSidebarSessionsSnapshot = vi.fn()
 vi.mock('@/lib/api', () => ({
+  getRecoveryInventory: async () => ({ recoverable: false, contentId: 'test', device: null, otherDevices: [], ledgerOnly: [] }),
   api: {
     get: (url: string) => mockApiGet(url),
     patch: vi.fn().mockResolvedValue({}),

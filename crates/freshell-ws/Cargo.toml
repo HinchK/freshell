@@ -31,12 +31,22 @@ freshell-platform = { path = "../freshell-platform" }
 # across server restart, docs/plans/2026-07-18-amplifier-restore-spec.md) --
 # a pure/poll-based crate this crate arms/drains but doesn't own the fs logic of.
 freshell-sessions = { path = "../freshell-sessions" }
+# TERM-15/TERM-16: the terminal-mode CLI activity engine (claude/codex/amplifier
+# trackers, the amplifier events tailer/reducer, the truly-idle grace gate).
+# The hub in src/activity.rs drives these pure state machines.
+freshell-activity = { path = "../freshell-activity" }
+# TERM-15 amplifier events lane: inotify-based watcher on the associated
+# session's events.jsonl (same crate freshell-sessions' indexer uses; ADR
+# Decision 1.1). ZERO polling — reads happen only on change events or the
+# tracker's force-read failsafe.
+notify = "6"
 # The freshcodex WS fresh-agent slice (freshAgent.create/send → codex app-server). The
 # post-handshake loop dispatches the codex client→server messages to this shared state,
 # which spawns the app-server sidecar and broadcasts freshAgent.created/send.accepted/event.
 freshell-freshagent = { path = "../freshell-freshagent" }
 # Transport: axum's WebSocket upgrade is tokio-tungstenite-backed (ADR Decision 3).
 axum = { version = "0.8", features = ["ws"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 # ISO-8601 timestamp for `ready.timestamp` (matches Date#toISOString()).
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -70,6 +80,10 @@ tracing = "0.1"
 # canonical `records` serialization, truncated to 128 bits. Same version the
 # workspace already resolves via crates/freshell-terminal/Cargo.toml:36.
 sha2 = "0.10"
+
+[target.'cfg(unix)'.dependencies]
+# `flock(2)` for pane_ledger's single-writer store lock (ConfigLock pattern).
+libc = "0.2"
 
 [dev-dependencies]
 # tabs_persist tests write snapshot generations into throwaway dirs. Same

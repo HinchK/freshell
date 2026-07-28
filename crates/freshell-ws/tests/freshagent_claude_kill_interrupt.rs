@@ -32,7 +32,7 @@
 //! unknown session.
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -47,7 +47,7 @@ const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 /// Serializes every test in this file, all of which mutate the process-global
 /// `FRESHELL_CLAUDE_SIDECAR`/`FRESHELL_CLAUDE_NODE` env vars (mirrors `claude.rs`'s
 /// own `CLAUDE_ENV_LOCK` convention for the identical hazard).
-static CLAUDE_ENV_LOCK: Mutex<()> = Mutex::new(());
+static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 // ── fake claude sidecar (production wire protocol only: create/interrupt/shutdown) ──
 
@@ -169,6 +169,7 @@ async fn spawn_server() -> String {
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
 
     let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
         identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
@@ -200,12 +201,17 @@ async fn spawn_server() -> String {
         ws_max_payload_bytes: 16 * 1024 * 1024,
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::RestoreSpawnGate::new(4, 64)),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
     };
 
     let router = freshell_ws::router(state);
@@ -311,7 +317,7 @@ fn create_frame(request_id: &str) -> Value {
 ///     wrong even though no timeout occurs).
 #[tokio::test]
 async fn claude_kill_frame_reaches_handle_kill_and_evicts_the_create_dedup_cache() {
-    let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
     let _sidecar = FakeClaudeSidecarEnv::install();
 
     let url = spawn_server().await;
@@ -367,7 +373,7 @@ async fn claude_kill_frame_reaches_handle_kill_and_evicts_the_create_dedup_cache
 /// broadcast to assert on (matching legacy's silence on success).
 #[tokio::test]
 async fn claude_interrupt_frame_reaches_the_sidecar_for_a_known_session() {
-    let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
     let sidecar = FakeClaudeSidecarEnv::install();
 
     let url = spawn_server().await;
@@ -418,7 +424,7 @@ async fn claude_interrupt_frame_reaches_the_sidecar_for_a_known_session() {
 /// created must produce an `error` frame, not silently vanish.
 #[tokio::test]
 async fn claude_interrupt_frame_errors_for_an_unknown_session() {
-    let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = CLAUDE_ENV_LOCK.lock().await;
     let _sidecar = FakeClaudeSidecarEnv::install();
 
     let url = spawn_server().await;

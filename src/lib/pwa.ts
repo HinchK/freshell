@@ -21,8 +21,21 @@ export function registerServiceWorker(options?: RegisterServiceWorkerOptions): v
     // Ignore sessionStorage access failures.
   }
 
+  // First-boot guard (wave-B B3 fast-follow): when the page was NOT already
+  // controlled, the first controllerchange is the service worker's initial
+  // claim (install -> skipWaiting -> clients.claim in sw.js), not an update
+  // swap. Reloading there races the first-boot recovery offer: by the time
+  // the reload lands, the auto shell tab has persisted a layout, so
+  // hadPersistedLayoutAtBoot flips true on the reloaded boot and the offer
+  // is permanently lost. Only a genuine update (controller already existed)
+  // reloads stale clients.
+  let hadController = !!navigator.serviceWorker.controller
   let reloading = false
   const onControllerChange = () => {
+    if (!hadController) {
+      hadController = true
+      return
+    }
     if (reloading) return
     reloading = true
     try {

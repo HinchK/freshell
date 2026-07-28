@@ -81,6 +81,13 @@ pub struct PushAck {
     pub accepted: bool,
     pub open_records: i64,
     pub closed_records: i64,
+    /// `Some(false)` when a persistence attempt did not durably write
+    /// (oversize, invalid ids, io failure, cap unenforceable). `None` when
+    /// persisted normally or when persistence was not attempted by design
+    /// (empty push, persistence disabled — kata h9vt owns those semantics).
+    pub persisted: Option<bool>,
+    /// Machine-readable reason accompanying `persisted: Some(false)`.
+    pub persist_reason: Option<String>,
 }
 
 /// Shared, cheaply-cloneable in-memory tabs registry. Lives in
@@ -172,6 +179,8 @@ impl TabsRegistry {
                     accepted: true,
                     open_records: open_records.len() as i64,
                     closed_records: closed_records.len() as i64,
+                    persisted: None,
+                    persist_reason: None,
                 });
             }
         } else if let Some(wm) = watermark_rev {
@@ -231,8 +240,10 @@ impl TabsRegistry {
         );
 
         drop(state); // release the registry mutex before filesystem I/O
+        let mut persisted = None;
+        let mut persist_reason = None;
         if let Some((dir, records)) = persist_input {
-            crate::tabs_persist::persist_generation(
+            match crate::tabs_persist::persist_generation(
                 &dir,
                 server_instance_id,
                 device_id,
@@ -241,13 +252,25 @@ impl TabsRegistry {
                 snapshot_revision,
                 &records,
                 now,
-            );
+            ) {
+                crate::tabs_persist::PersistOutcome::Persisted => {}
+                crate::tabs_persist::PersistOutcome::Skipped { reason } => {
+                    persisted = Some(false);
+                    persist_reason = Some(reason.to_string());
+                }
+                crate::tabs_persist::PersistOutcome::Failed { reason } => {
+                    persisted = Some(false);
+                    persist_reason = Some(reason);
+                }
+            }
         }
 
         Ok(PushAck {
             accepted: true,
             open_records: open_count,
             closed_records: closed_count,
+            persisted,
+            persist_reason,
         })
     }
 

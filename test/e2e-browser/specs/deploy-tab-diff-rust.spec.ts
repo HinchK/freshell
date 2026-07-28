@@ -16,14 +16,13 @@ import { TestHarness } from '../helpers/test-harness.js'
  *
  *   (1) LIVE: capture -> restart -> verify passes when identity survives;
  *       then a provably-removed codex pane makes verify FAIL LOUDLY
- *       (non-zero exit, named tab, MISSING verdict, remediation line), and
- *       EXECUTING the printed `--components` bundle remediation brings the
- *       session back -- proven by the fake-CLI argv `resume <sessionId>` log.
+ *       (non-zero exit, named tab, MISSING verdict, and a remediation note
+ *       pointing the operator at the UI recovery flow -- recover-my-panes,
+ *       whose end-to-end acceptance lives in recover-my-panes-rust.spec.ts).
  *   (2) OFFLINE: a deterministic diff-engine run (`verify --before F --after F`)
- *       over synthetic fixtures exercises ALL FOUR verdicts, the
- *       partial-coverage set-difference guard, and the multi-client bundle
- *       remediation -- with a fake `curl` proving verify makes ZERO network
- *       calls in --after mode.
+ *       over synthetic fixtures exercises ALL FIVE verdicts and the
+ *       partial-coverage set-difference guard -- with a fake `curl` proving
+ *       verify makes ZERO network calls in --after mode.
  *
  * Rust-only: legacy has no persisted snapshot generations. Registered ONLY
  * under `rust-chromium`; testIgnore'd via RUST_ONLY_SPECS everywhere else.
@@ -48,16 +47,6 @@ async function installFakeCodexCli(binDir: string): Promise<string> {
   await fs.copyFile(FAKE_CODEX_CLI_SOURCE, target)
   await fs.chmod(target, 0o755)
   return target
-}
-
-// Fake-CLI argv resume proof (copied from codex-terminal-bounce-rust.spec.ts:75-85).
-async function readArgvLog(logPath: string): Promise<Array<{ argv: string[] }>> {
-  const raw = await fs.readFile(logPath, 'utf8').catch(() => '')
-  return raw.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l) as { argv: string[] })
-}
-function hasResumePair(argv: string[], sessionId: string): boolean {
-  const idx = argv.indexOf('resume')
-  return idx >= 0 && argv[idx + 1] === sessionId
 }
 
 async function connect(page: import('@playwright/test').Page, info: any): Promise<TestHarness> {
@@ -96,18 +85,17 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
     test.setTimeout(240_000)
     // EPHEMERAL-ONLY: new RustServer(...) directly (never createE2eServerHandle).
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'fakecodex-'))
-    const argLogPath = path.join(sharedRoot, 'argv.jsonl')
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
     const fakeCodexPath = await installFakeCodexCli(path.join(sharedRoot, 'bin'))
     const server = new RustServer({
-      // CODEX_CMD + FAKE_CODEX_ARGV_LOG wiring copied from codex-terminal-bounce-rust.spec.ts.
-      env: { CODEX_CMD: fakeCodexPath, FAKE_CODEX_ARGV_LOG: argLogPath },
+      // CODEX_CMD wiring copied from codex-terminal-bounce-rust.spec.ts.
+      env: { CODEX_CMD: fakeCodexPath },
       setupHome: async (homeDir) => {
-        // Config seeding copied from codex-terminal-bounce-rust.spec.ts /
-        // snapshot-restore-rust.spec.ts: enabled providers + a real-reader
-        // codex session seed (`session_meta` + message records) so
-        // `codex resume <SESSION_ID>` targets an existing session.
+        // Config seeding copied from codex-terminal-bounce-rust.spec.ts:
+        // enabled providers + a real-reader codex session seed
+        // (`session_meta` + message records) so `codex resume <SESSION_ID>`
+        // targets an existing session.
         const freshellDir = path.join(homeDir, '.freshell')
         await fs.mkdir(freshellDir, { recursive: true })
         await fs.writeFile(path.join(freshellDir, 'config.json'), JSON.stringify({
@@ -207,72 +195,19 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
         expect(r.devices.some((d: any) => d.generations[0]?.capturedAt > before2Cap)).toBe(true)
       }).toPass({ timeout: 30_000 })
 
-      const tabCountBeforeRemediation = await harness.getTabCount() // codex closed; shell survives
       const bad = await tabDiff(['verify', '--url', info.baseUrl, '--token', info.token, '--before', before2])
       expect(bad.code).not.toBe(0)                         // exits non-zero
       expect(bad.out).toContain('TAB-DIFF DIVERGENCE')     // loud
       expect(bad.out).toMatch(/MISSING/)                   // names the category (closed codex pane)
       expect(bad.out).toContain('tab=work')                // names the diverged tab
-      expect(bad.out).toContain('scripts/restore-tabs.sh') // prints the remediation
-      // Remediation references the immutable multi-client BUNDLE (--components,
-      // stable digests), NEVER a single-client --generation-id (:2621), and is
-      // TARGETED (:175): one --pane per diverged pane, so still-healthy panes
-      // are never re-restored.
-      expect(bad.out).toMatch(/--components [0-9a-f,]+/)
-      expect(bad.out).toMatch(/--pane \S+/)
-      expect(bad.out).toMatch(/--force/)
-      expect(bad.out).not.toMatch(/--generation-id/)
-      expect(bad.out).not.toMatch(/--generation \d/)
-
-      // -- EXECUTE the printed remediation (substituting the real token) and prove
-      //    the missing codex session comes back. Only 1 browser connected -> the
-      //    restore exactly-one-client gate allows it. --
-      const comps = bad.out.match(/--components ([0-9a-f,]+)/)![1]
-      const dev = bad.out.match(/--device (\S+)/)![1]
-      // The printed pane keys are %q-quoted for the shell; strip backslash
-      // escapes when passing them as direct argv entries.
-      const paneArgs = [...bad.out.matchAll(/--pane (\S+)/g)]
-        .flatMap((m) => ['--pane', m[1].replace(/\\/g, '')])
-      expect(paneArgs.length).toBeGreaterThan(0)
-      const argvBefore = (await readArgvLog(argLogPath)).length
-      const rem = await run('scripts/restore-tabs.sh',
-        ['--url', info.baseUrl, '--token', info.token, '--device', dev, '--components', comps, '--force', ...paneArgs],
-        { cwd: process.cwd() })
-      expect(rem.stdout).toContain('failed=0')
-      await expect(async () => {
-        expect(await codexPaneSession(harness)).toBe(SESSION_ID) // the session identity returned
-      }).toPass({ timeout: 20_000 })
-      // RESUME PROOF: the remediation re-spawned codex with `resume <sessionId>`
-      // (argv-log delta), not plain `codex` -- identity echo alone is insufficient.
-      await expect(async () => {
-        const entries = (await readArgvLog(argLogPath)).slice(argvBefore)
-        expect(entries.some((e) => hasResumePair(e.argv, SESSION_ID)),
-          'remediation must exec `codex resume <sessionId>`').toBe(true)
-      }).toPass({ timeout: 20_000 })
-      // TARGETED (:175): ONLY the missing codex pane was restored -- the
-      // surviving shell pane is NOT duplicated and the total tab count is
-      // exactly the pre-failure count (codex back, shell untouched).
-      await expect(async () => {
-        const st = await harness.getState()
-        const shellTabs = st.tabs.tabs.filter((t: any) => t.title === 'sh' || t.name === 'sh')
-        expect(shellTabs.length, 'surviving shell tab must not be duplicated').toBeLessThanOrEqual(1)
-        expect(await harness.getTabCount()).toBe(tabCountBeforeRemediation + 1) // codex back, nothing else
-      }).toPass({ timeout: 20_000 })
-
-      // Repeat recovery: remove the pane AFTER its marker says restored, then
-      // execute the same forced remediation again in the same server process.
-      // This is the path that used to return only `already-restored`/a fence.
-      const tabCountBeforeRepeat = await harness.getTabCount()
-      await closeCodexTab(page, harness)
-      const repeat = await run('scripts/restore-tabs.sh',
-        ['--url', info.baseUrl, '--token', info.token, '--device', dev, '--components', comps, '--force', ...paneArgs],
-        { cwd: process.cwd() })
-      expect(repeat.stdout).toContain('restored=1')
-      expect(repeat.stdout).toContain('failed=0')
-      await expect(async () => {
-        expect(await codexPaneSession(harness)).toBe(SESSION_ID)
-        expect(await harness.getTabCount()).toBe(tabCountBeforeRepeat)
-      }).toPass({ timeout: 20_000 })
+      // Remediation points the operator at the UI recovery flow (the operator
+      // server-push restore machinery was deleted in the kata h9vt cleanup;
+      // the UI flow's end-to-end acceptance lives in
+      // recover-my-panes-rust.spec.ts).
+      expect(bad.out).toContain('REMEDIATION (UI recovery flow)')
+      expect(bad.out).toMatch(/recover-my-panes offer/)
+      expect(bad.out).toMatch(/affected device: \S+/)
+      expect(bad.out).not.toContain('restore-tabs.sh')
     } finally {
       await server.stop()
       await fs.rm(tmpDir, { recursive: true, force: true })
@@ -281,11 +216,11 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
   })
 
   // (2) DETERMINISTIC OFFLINE diff-engine coverage: drive `verify --before F
-  // --after F` over synthetic fixtures so ALL FOUR verdicts, the full-set-difference
-  // coverage guard, and the multi-client bundle remediation are exercised (the live
-  // path can only produce MISSING). With --after supplied verify does ZERO network
-  // ops (:2619) -- proven by prepending a fake `curl` that ABORTS if invoked.
-  test('verify classifies verdicts, guards partial coverage, remediates via bundle -- fully offline', async () => {
+  // --after F` over synthetic fixtures so ALL FIVE verdicts and the
+  // full-set-difference coverage guard are exercised (the live path can only
+  // produce MISSING). With --after supplied verify does ZERO network ops
+  // (:2619) -- proven by prepending a fake `curl` that ABORTS if invoked.
+  test('verify classifies verdicts, guards partial coverage, points at the UI recovery flow -- fully offline', async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-unit-'))
     // A fake `curl` that aborts (exit 99) on ANY invocation -- the offline guard.
     const binDir = path.join(tmp, 'bin'); await fs.mkdir(binDir)
@@ -316,13 +251,20 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
       rec('dev-1:codexRepoint', [pane('terminal', { mode: 'codex', sessionRef: { provider: 'codex', sessionId: 'S-old' } })]),
       rec('dev-1:codexFresh', [pane('terminal', { mode: 'codex', sessionRef: { provider: 'codex', sessionId: 'S-fresh' } })]),
       rec('dev-1:sh', [pane('terminal', { mode: 'shell', liveTerminal: { terminalId: 'T-live' } })]),
-    ], [term('T-live', 'running'), term('T-exited', 'exited')],
+      // Live coding-CLI pane whose session identity was NEVER captured (no
+      // sessionRef in any snapshot -- the amplifier-locator gap). Restore can
+      // only ever produce a blank session for it, so verify must FAIL LOUDLY
+      // even though the pane respawns a running terminal.
+      rec('dev-1:cliNoId', [pane('terminal', { mode: 'amplifier', liveTerminal: { terminalId: 'T-cli' } })]),
+    ], [term('T-live', 'running'), term('T-exited', 'exited'), term('T-cli', 'running')],
     { 'dev-1': { components: ['aaaa1111', 'bbbb2222'], capturedAt: 1000 } })) // TWO-client bundle
     const after = await write('after.json', doc(2000, [
       rec('dev-1:codexRepoint', [pane('terminal', { mode: 'codex', sessionRef: { provider: 'codex', sessionId: 'S-new' } })]),
       rec('dev-1:codexFresh', [pane('terminal', { mode: 'codex' })]),
       rec('dev-1:sh', [pane('terminal', { mode: 'shell', liveTerminal: { terminalId: 'T-gone' } })]),
-    ], []))
+      // ...respawned and running, yet unverifiable: still no identity.
+      rec('dev-1:cliNoId', [pane('terminal', { mode: 'amplifier', liveTerminal: { terminalId: 'T-cli2' } })]),
+    ], [term('T-cli2', 'running')]))
     const d = await runOffline(['verify', '--url', 'http://unused.invalid', '--token', 't', '--before', before, '--after', after])
     expect(d.code).not.toBe(0)
     expect(d.code).not.toBe(99)                       // curl was NEVER called (:2619)
@@ -331,21 +273,22 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
     expect(d.out).toContain('RE-POINTED')
     expect(d.out).toContain('FRESH (identity lost)')
     expect(d.out).toContain('NOT RESPAWNED')
-    // Remediation uses the immutable MULTI-CLIENT bundle (BOTH component ids), not
-    // a single-client --generation-id (:2621).
-    expect(d.out).toMatch(/--components aaaa1111,bbbb2222/)
-    expect(d.out).toMatch(/--force/)
-    expect(d.out).not.toMatch(/--generation-id/)
-    // ...and is TARGETED (:175): one --pane per diverged paneKey, so a restore
-    // of the whole union (which would duplicate healthy panes) is never printed.
-    for (const key of [
-      'dev-1:codexMiss#p-terminal',
-      'dev-1:codexRepoint#p-terminal',
-      'dev-1:codexFresh#p-terminal',
-      'dev-1:sh#p-terminal',
-    ]) {
-      expect(d.out).toContain(`--pane ${key}`)
-    }
+    // The fifth verdict: a live coding-CLI pane whose identity was never
+    // captured is UNVERIFIABLE -- verify must name it, not silently pass it
+    // (the 2026-07-25 blank-restore incident). Exactly ONE pane qualifies:
+    // the shell pane is stateless by design and must NOT be flagged.
+    expect(d.out).toContain('NO CAPTURED IDENTITY')
+    expect(d.out).toContain('dev-1:cliNoId')
+    expect((d.out.match(/NO CAPTURED IDENTITY/g) ?? []).length).toBe(1)
+    // Snapshots carry no identity for it, so no snapshot-driven recovery can
+    // rebuild it -- it must be called out for manual provider-store recovery.
+    expect(d.out).toMatch(/identity was never captured/i)
+    // Remediation points the operator at the UI recovery flow (recover-my-panes)
+    // and names the affected device.
+    expect(d.out).toContain('REMEDIATION (UI recovery flow)')
+    expect(d.out).toMatch(/recover-my-panes offer/)
+    expect(d.out).toContain('affected device: dev-1')
+    expect(d.out).not.toContain('restore-tabs.sh')
 
     // PARTIAL-coverage guard (:2559): TWO running terminals, only ONE covered by a
     // snapshot pane -> still FAILS, LISTING the uncovered one (not a silent OK).
@@ -360,100 +303,6 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
     expect(g.out).toContain('T-uncovered')            // names the uncovered terminal
     expect(g.out).not.toContain('T-covered')          // the covered one is NOT flagged
     await fs.rm(tmp, { recursive: true, force: true })
-  })
-
-  test('targeted restore fails on an all-skipped response and passes force through to the API', async () => {
-    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'restore-tabs-contract-'))
-    try {
-      const binDir = path.join(tmp, 'bin')
-      const requestBody = path.join(tmp, 'request.json')
-      await fs.mkdir(binDir)
-      await fs.writeFile(path.join(binDir, 'curl'), `#!/usr/bin/env bash
-set -euo pipefail
-body=""
-while [[ $# -gt 0 ]]; do
-  if [[ "$1" == "-d" ]]; then
-    body="$2"
-    shift 2
-  else
-    shift
-  fi
-done
-printf '%s' "$body" > "$FAKE_CURL_BODY"
-printf '%s' "$FAKE_CURL_RESPONSE"
-`, { mode: 0o755 })
-      const invoke = async (response: unknown, force = false) => {
-        const args = [
-          '--url', 'http://unused.invalid',
-          '--token', 't',
-          '--device', 'dev-1',
-          '--pane', 'dev-1:work#pane-1',
-          ...(force ? ['--force'] : []),
-        ]
-        try {
-          const { stdout, stderr } = await run('scripts/restore-tabs.sh', args, {
-            cwd: process.cwd(),
-            env: {
-              ...process.env,
-              PATH: `${binDir}:${process.env.PATH}`,
-              FAKE_CURL_BODY: requestBody,
-              FAKE_CURL_RESPONSE: JSON.stringify(response),
-            },
-          })
-          return { code: 0, out: `${stdout}${stderr}` }
-        } catch (err: any) {
-          return { code: err.code ?? 1, out: `${err.stdout ?? ''}${err.stderr ?? ''}` }
-        }
-      }
-
-      const skipped = await invoke({
-        deliveryConfirmed: true,
-        restored: [],
-        skipped: [{
-          tabKey: 'dev-1:work',
-          paneId: 'pane-1',
-          kind: 'terminal',
-          reason: 'already-restored',
-        }],
-        failed: [],
-      })
-      expect(skipped.code).not.toBe(0)
-      expect(skipped.out).toContain('targeted restore created no panes')
-      expect(JSON.parse(await fs.readFile(requestBody, 'utf8')).force).toBe(false)
-
-      const unconfirmed = await invoke({
-        deliveryConfirmed: false,
-        restored: [{
-          tabKey: 'dev-1:work',
-          paneId: 'pane-1',
-          kind: 'terminal',
-          tabId: 'undelivered-tab',
-          terminalId: 'existing-terminal',
-        }],
-        skipped: [],
-        failed: [],
-      }, true)
-      expect(unconfirmed.code).not.toBe(0)
-      expect(unconfirmed.out).toContain('forced restore was not confirmed')
-
-      const forced = await invoke({
-        deliveryConfirmed: true,
-        restored: [{
-          tabKey: 'dev-1:work',
-          paneId: 'pane-1',
-          kind: 'terminal',
-          tabId: 'replacement-tab',
-          terminalId: 'existing-terminal',
-        }],
-        skipped: [],
-        failed: [],
-      }, true)
-      expect(forced.code).toBe(0)
-      expect(forced.out).toContain('restored=1')
-      expect(JSON.parse(await fs.readFile(requestBody, 'utf8')).force).toBe(true)
-    } finally {
-      await fs.rm(tmp, { recursive: true, force: true })
-    }
   })
 
   test('capture rejects same-digest generation churn and preserves the prior artifact', async () => {

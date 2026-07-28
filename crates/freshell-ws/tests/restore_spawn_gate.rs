@@ -1,7 +1,11 @@
 //! WSL-outage RCA §6.3 acceptance tests: the per-connection create rate
-//! limit (legacy parity) and the cancellable restore-spawn gate. REAL axum
-//! server + REAL tokio-tungstenite client, the session_identity_frames.rs
-//! harness convention.
+//! limit (legacy parity) and the cancellable, server-wide spawn gate. Landing
+//! sync (integration/land-rust-tauri-port): the gate now covers EVERY
+//! `terminal.create` -- restore and non-restore alike -- not just
+//! restore-flagged creates (the prior restore-only design let a plain
+//! creation storm bypass the gate entirely). REAL axum server + REAL
+//! tokio-tungstenite client, the session_identity_frames.rs harness
+//! convention.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +15,7 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_ws::create_limit::CreateProtectConfig;
-use freshell_ws::spawn_gate::RestoreSpawnGate;
+use freshell_ws::spawn_gate::SpawnGate;
 use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
@@ -74,12 +78,12 @@ fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
 /// knobs. Returns (ws_url, registry, shutdown_notify, gate, shutdown_started).
 async fn spawn_server(
     create_protect: CreateProtectConfig,
-    gate: RestoreSpawnGate,
+    gate: SpawnGate,
 ) -> (
     String,
     freshell_terminal::TerminalRegistry,
     std::sync::Arc<tokio::sync::Notify>,
-    std::sync::Arc<RestoreSpawnGate>,
+    std::sync::Arc<SpawnGate>,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let gate = std::sync::Arc::new(gate);
@@ -132,6 +136,12 @@ async fn spawn_server(
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
     };
 
     let router = freshell_ws::router(state);
@@ -280,7 +290,7 @@ async fn third_non_restore_create_in_window_is_rate_limited() {
         ..CreateProtectConfig::default()
     };
     let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(4, 64)).await;
+        spawn_server(cfg, SpawnGate::new(4, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
 
     // Creates 1 and 2: accepted -> terminal.created replies.
@@ -303,38 +313,48 @@ async fn third_non_restore_create_in_window_is_rate_limited() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn restore_creates_are_gated_and_non_restore_bypass() {
-    // Zero-permit gate: any create that actually consults the gate can never
-    // proceed. This is the wiring proof — if the gate were inert (the Node
-    // attempt's failure mode), the restore create would succeed.
+async fn creates_of_both_kinds_are_gated() {
+    // Zero-permit gate: ANY create -- restore or non-restore -- must consult
+    // the SAME server-wide spawn gate and fail loud when it has no permits.
+    // This is the all-gated-semantics wiring proof: the prior restore-only
+    // design let a non-restore create bypass the gate entirely (the Node
+    // attempt's failure mode was the mirror image -- an inert gate letting
+    // restore creates through); landing sync closed that gap by routing both
+    // paths through one `SpawnGate`.
     let cfg = CreateProtectConfig {
-        restore_spawn_timeout_ms: 300,
+        spawn_timeout_ms: 300,
         ..CreateProtectConfig::default()
     };
     let (ws_url, registry, _shutdown, gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+        spawn_server(cfg, SpawnGate::new(0, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
 
-    // Non-restore create BYPASSES the zero-permit gate and succeeds.
+    // Non-restore create now ALSO consults the zero-permit gate: times out,
+    // fails loud, never spawns.
     send_text(&mut client, &create_frame("plain", false)).await;
-    let reply = next_json_of_type(&mut client, "terminal.created").await;
-    assert_eq!(reply["requestId"], "plain");
-
-    // Restore create consults the gate, times out, fails loud.
-    send_text(&mut client, &create_frame("restore-1", true)).await;
-    let err = next_json_of_type(&mut client, "error").await;
-    assert_eq!(err["code"], "PTY_SPAWN_FAILED");
-    assert_eq!(err["requestId"], "restore-1");
-    assert!(err["message"]
+    let err1 = next_json_of_type(&mut client, "error").await;
+    assert_eq!(err1["code"], "PTY_SPAWN_FAILED");
+    assert_eq!(err1["requestId"], "plain");
+    assert!(err1["message"]
         .as_str()
         .expect("message")
-        .contains("restore spawn slot"));
-    assert_eq!(gate.timeouts(), 1);
+        .contains("terminal spawn slot"));
 
+    // Restore create consults the SAME gate, times out, fails loud too.
+    send_text(&mut client, &create_frame("restore-1", true)).await;
+    let err2 = next_json_of_type(&mut client, "error").await;
+    assert_eq!(err2["code"], "PTY_SPAWN_FAILED");
+    assert_eq!(err2["requestId"], "restore-1");
+    assert!(err2["message"]
+        .as_str()
+        .expect("message")
+        .contains("terminal spawn slot"));
+
+    assert_eq!(gate.timeouts(), 2, "both kinds of create hit the gate");
     assert_eq!(
         registry.kill_all(),
-        1,
-        "only the non-restore create spawned"
+        0,
+        "neither create ever got a permit, so neither spawned"
     );
 }
 
@@ -352,7 +372,7 @@ async fn restore_creates_queue_behind_held_permit_and_both_settle() {
     // permit_released_only_after_work_completes.
     let cfg = CreateProtectConfig::default();
     let (ws_url, registry, _shutdown, gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(1, 64)).await;
+        spawn_server(cfg, SpawnGate::new(1, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
 
     // Hold the only permit so both creates MUST queue.
@@ -417,7 +437,7 @@ async fn gated_create_racing_shutdown_leaves_no_live_pty() {
     // re-check the shutdown latch around handle_create.
     let cfg = CreateProtectConfig::default();
     let (ws_url, registry, _shutdown, _gate, shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(1, 64)).await;
+        spawn_server(cfg, SpawnGate::new(1, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
 
     // Shutdown has begun (exactly what main.rs latches before the WS
@@ -438,11 +458,11 @@ async fn gated_create_racing_shutdown_leaves_no_live_pty() {
 async fn queued_restore_create_is_abandoned_on_disconnect_without_spawning() {
     // Zero-permit gate + long timeout: the restore create parks in the queue.
     let cfg = CreateProtectConfig {
-        restore_spawn_timeout_ms: 30_000,
+        spawn_timeout_ms: 30_000,
         ..CreateProtectConfig::default()
     };
     let (ws_url, registry, _shutdown, gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+        spawn_server(cfg, SpawnGate::new(0, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
     send_text(&mut client, &create_frame("doomed", true)).await;
 
@@ -477,11 +497,11 @@ async fn queued_restore_create_is_abandoned_on_disconnect_without_spawning() {
 #[tokio::test(flavor = "multi_thread")]
 async fn queued_restore_creates_drain_without_spawning_on_shutdown() {
     let cfg = CreateProtectConfig {
-        restore_spawn_timeout_ms: 30_000,
+        spawn_timeout_ms: 30_000,
         ..CreateProtectConfig::default()
     };
     let (ws_url, registry, shutdown, gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+        spawn_server(cfg, SpawnGate::new(0, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
     send_text(&mut client, &create_frame("draining-1", true)).await;
     send_text(&mut client, &create_frame("draining-2", true)).await;
@@ -524,7 +544,7 @@ async fn restore_storm_drains_bounded_with_per_terminal_ordering() {
     // create never auto-attaches, registry.rs:548).
     let cfg = CreateProtectConfig::default();
     let (ws_url, registry, _shutdown, gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(2, 64)).await;
+        spawn_server(cfg, SpawnGate::new(2, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
 
     const N: usize = 12; // > gate limit 2: forces real FIFO queueing
@@ -601,7 +621,7 @@ async fn same_requestid_resend_returns_existing_terminal() {
     // not spawn a duplicate.
     let cfg = CreateProtectConfig::default();
     let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(4, 64)).await;
+        spawn_server(cfg, SpawnGate::new(4, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
     send_text(&mut client, &create_frame("dup", true)).await;
     let first = next_json_of_type(&mut client, "terminal.created").await;
@@ -628,11 +648,11 @@ async fn duplicate_while_queued_does_not_double_spawn() {
     // InFlight sentinel (the queued original will answer), never enqueued
     // as a second spawn.
     let cfg = CreateProtectConfig {
-        restore_spawn_timeout_ms: 30_000,
+        spawn_timeout_ms: 30_000,
         ..CreateProtectConfig::default()
     };
     let (ws_url, registry, _shutdown, gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+        spawn_server(cfg, SpawnGate::new(0, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
     send_text(&mut client, &create_frame("dup-q", true)).await;
     for _ in 0..200 {
@@ -667,7 +687,7 @@ async fn rate_limited_retry_same_requestid_proceeds() {
         ..CreateProtectConfig::default()
     };
     let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(4, 64)).await;
+        spawn_server(cfg, SpawnGate::new(4, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
     // First non-restore create consumes the whole 1-token budget.
     send_text(&mut client, &create_frame("rl-1", false)).await;
@@ -701,7 +721,7 @@ async fn resend_on_new_connection_returns_same_terminal() {
     // exactly one PTY exists.
     let cfg = CreateProtectConfig::default();
     let (ws_url, registry, _shutdown, _gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(1, 64)).await;
+        spawn_server(cfg, SpawnGate::new(1, 64)).await;
     let mut client1 = connect_and_hello(&ws_url).await;
     let mut client2 = connect_and_hello(&ws_url).await;
     send_text(&mut client1, &create_frame("xconn", true)).await;
@@ -729,11 +749,11 @@ async fn resend_on_new_connection_never_swallowed_while_inflight() {
     // it exits non-settled, the waiter must receive the fail-loud error
     // (which re-drives the frozen client's retry ladder).
     let cfg = CreateProtectConfig {
-        restore_spawn_timeout_ms: 500,
+        spawn_timeout_ms: 500,
         ..CreateProtectConfig::default()
     };
     let (ws_url, registry, _shutdown, gate, _shutdown_started) =
-        spawn_server(cfg, RestoreSpawnGate::new(0, 64)).await;
+        spawn_server(cfg, SpawnGate::new(0, 64)).await;
     let mut client1 = connect_and_hello(&ws_url).await;
     let mut client2 = connect_and_hello(&ws_url).await;
     send_text(&mut client1, &create_frame("xq", true)).await;

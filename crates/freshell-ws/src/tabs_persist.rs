@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::{LazyLock, Mutex};
 
 use serde_json::{json, Value};
@@ -290,10 +291,12 @@ fn all_generations_parsed(
     Ok(order_generations_newest_first(files))
 }
 
-/// The RAW device ids that have at least one persisted generation (read from
-/// each device's stored `deviceId`, so the API never leaks the encoded folder
-/// name). Sorted + deduped. FAIL-LOUD: a missing root is absence (`Ok(empty)`);
-/// an unreadable dir or a corrupt device file is an ERROR (`Err`).
+/// The RAW device ids that have at least one persisted generation. Every
+/// generation in a device dir must agree on `deviceId` (verify-all-agree):
+/// a half-migrated or hand-edited dir is an ERROR, never a nondeterministic
+/// first-file-wins identity. Sorted + deduped. FAIL-LOUD: a missing root is
+/// absence (`Ok(empty)`); an unreadable dir, a corrupt device file, or an
+/// identity conflict is an ERROR (`Err`).
 pub fn list_snapshot_devices(dir: &Path) -> std::io::Result<Vec<String>> {
     with_persist_lock(|| list_snapshot_devices_locked(dir))
 }
@@ -309,19 +312,36 @@ fn list_snapshot_devices_locked(dir: &Path) -> std::io::Result<Vec<String>> {
         if !dpath.is_dir() {
             continue;
         }
-        // First readable *.json in the device dir carries the raw deviceId.
-        let first_json = std::fs::read_dir(&dpath)?
-            .flatten()
-            .map(|f| f.path())
-            .find(|p| p.extension().is_some_and(|x| x == "json"));
-        if let Some(p) = first_json {
+        let mut dir_id: Option<String> = None;
+        for p in std::fs::read_dir(&dpath)?.flatten().map(|f| f.path()) {
+            if p.extension().is_none_or(|x| x != "json") {
+                continue;
+            }
             let v = read_generation_file(&p)?;
-            ids.push(
-                v.get("deviceId")
-                    .and_then(Value::as_str)
-                    .expect("validated deviceId")
-                    .to_string(),
-            );
+            let id = v
+                .get("deviceId")
+                .and_then(Value::as_str)
+                .expect("validated deviceId")
+                .to_string();
+            match &dir_id {
+                None => dir_id = Some(id),
+                Some(existing) if *existing == id => {}
+                Some(existing) => {
+                    tracing::error!(target: "freshell_ws::invariants",
+                        dir = %dpath.display(), first = %existing, conflicting = %id,
+                        "tabs_snapshot_device_identity_conflict: generations in one device dir disagree on deviceId; refusing to guess an identity");
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "tabs_snapshot_device_identity_conflict: {} holds generations with conflicting deviceIds ({existing} vs {id})",
+                            dpath.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some(id) = dir_id {
+            ids.push(id);
         }
     }
     ids.sort();
@@ -608,9 +628,8 @@ fn read_device_overview_locked(
 /// this module. Held across the ENTIRE read-plan-mutate cycle, so concurrent
 /// pushes to the SAME or DIFFERENT devices can never race directory
 /// enumeration, eviction, or removal — the critical data-loss defect (`:678`)
-/// — and so each reader cannot observe a half-pruned directory. A restore's
-/// eviction lease bridges its separately locked selection, marker, create,
-/// and acknowledgement operations. `Mutex::new(())` needs no lazy init.
+/// — and so each reader cannot observe a half-pruned directory.
+/// `Mutex::new(())` needs no lazy init.
 /// Restores/pushes are low-frequency and this lock guards only the filesystem
 /// cycle (in-memory registry work already dropped its own lock), so contention
 /// is negligible.
@@ -620,11 +639,6 @@ fn read_device_overview_locked(
 /// that acquires it (the pub readers self-lock and only call lock-free private
 /// helpers), so there is no nested acquisition to deadlock on.
 static PERSIST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Device directories protected by a restore that spans multiple individually
-/// locked filesystem operations and async process/delivery work.
-static ACTIVE_RESTORE_DIRS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(test)]
 static INJECTED_DELETE_FAILURES: LazyLock<Mutex<std::collections::HashSet<PathBuf>>> =
@@ -644,44 +658,6 @@ fn injected_delete_failure(_path: &Path) -> Option<std::io::Error> {
         ));
     }
     None
-}
-
-/// Restore-scoped eviction lease. It holds no mutex across await points; the
-/// eviction planner consults the counted directory set while holding its own
-/// short persistence lock.
-#[must_use]
-pub struct SnapshotRestoreLease {
-    device_dir: PathBuf,
-}
-
-pub fn protect_snapshot_device(root: &Path, device_id: &str) -> Option<SnapshotRestoreLease> {
-    let device_dir = device_dir_for(root, device_id)?;
-    let mut active = ACTIVE_RESTORE_DIRS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *active.entry(device_dir.clone()).or_default() += 1;
-    Some(SnapshotRestoreLease { device_dir })
-}
-
-impl Drop for SnapshotRestoreLease {
-    fn drop(&mut self) {
-        let mut active = ACTIVE_RESTORE_DIRS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(count) = active.get_mut(&self.device_dir) {
-            *count -= 1;
-            if *count == 0 {
-                active.remove(&self.device_dir);
-            }
-        }
-    }
-}
-
-fn restore_protects(device_dir: &Path) -> bool {
-    ACTIVE_RESTORE_DIRS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains_key(device_dir)
 }
 
 /// Run `f` under the process-wide snapshot-persistence lock. This is THE ONE
@@ -762,10 +738,11 @@ fn sweep_orphan_tmp(device_dir: &Path) {
 /// atomically (tmp + rename), then enforce every retention cap: oversize skip,
 /// per-(device,client) generation cap, global-per-device file cap, device count
 /// cap. The ENTIRE read-plan-mutate cycle runs under `PERSIST_LOCK` so it is
-/// atomic w.r.t. any other push (`:678`). Best-effort: any failure is a WARN
-/// with the full path + error, never an Err (a failed snapshot must never fail a
-/// tabs push), and a partial-write failure leaves the last-good generations
-/// intact (nothing is deleted before the new file is durably renamed into place).
+/// atomic w.r.t. any other push (`:678`). Best-effort w.r.t. the push (a failed
+/// snapshot never fails a tabs push) but HONEST: every non-write returns a
+/// non-`Persisted` outcome that the ack surfaces. A partial-write failure leaves
+/// the last-good generations intact (nothing is deleted before the new file is
+/// durably renamed into place).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn persist_generation(
     dir: &Path,
@@ -776,14 +753,19 @@ pub(crate) fn persist_generation(
     snapshot_revision: i64,
     open_records: &[Value],
     captured_at: i64,
-) {
+) -> PersistOutcome {
     // Serialize the whole filesystem cycle (see `with_persist_lock`).
-    let write = || -> std::io::Result<()> {
+    let write = || -> std::io::Result<PersistOutcome> {
         let Some(device_dir) = device_dir_for(dir, device_id) else {
-            return Ok(()); // empty/uncontainable device id -> never persist
+            // empty/uncontainable device id -> never persist
+            return Ok(PersistOutcome::Skipped {
+                reason: "invalid-device-id",
+            });
         };
         let Some(client_enc) = encode_device_id(client_instance_id) else {
-            return Ok(());
+            return Ok(PersistOutcome::Skipped {
+                reason: "invalid-client-instance-id",
+            });
         };
         let snapshot = json!({
             "deviceId": device_id,
@@ -796,9 +778,10 @@ pub(crate) fn persist_generation(
         });
         let bytes = serde_json::to_vec_pretty(&snapshot)?;
         if bytes.len() > MAX_SNAPSHOT_BYTES {
-            tracing::warn!(target: "freshell_ws::tabs", device_id = %device_id,
-                bytes = bytes.len(), "tabs_snapshot_skipped_oversize");
-            return Ok(());
+            tracing::error!(target: "freshell_ws::invariants",
+                device_id = %device_id, bytes = bytes.len(), max = MAX_SNAPSHOT_BYTES,
+                "tabs_snapshot_dropped_oversize: generation exceeds MAX_SNAPSHOT_BYTES; nothing was persisted and the ack will carry persisted:false");
+            return Ok(PersistOutcome::Skipped { reason: "oversize" });
         }
         // Device cap: if this is a NEW device dir and we're at the cap, evict
         // the least-recently-written device (oldest max-capturedAt) first.
@@ -844,11 +827,17 @@ pub(crate) fn persist_generation(
                 ))),
             };
         }
-        Ok(())
+        Ok(PersistOutcome::Persisted)
     };
-    if let Err(err) = with_persist_lock(write) {
-        tracing::warn!(target: "freshell_ws::tabs", device_id = %device_id, dir = %dir.display(),
-            error = %err, "tabs_snapshot_persist_failed: generation not written");
+    match with_persist_lock(write) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::warn!(target: "freshell_ws::tabs", device_id = %device_id, dir = %dir.display(),
+                error = %err, "tabs_snapshot_persist_failed: generation not written");
+            PersistOutcome::Failed {
+                reason: err.to_string(),
+            }
+        }
     }
 }
 
@@ -939,60 +928,10 @@ fn enforce_device_file_cap(device_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Enforce MAX_SNAPSHOT_DEVICES before a write. New targets reserve one slot;
-/// existing targets also repair a previously over-cap root. Lease-protected
-/// restores and the write target are never candidates. If no eligible victim
-/// remains, fail with `WouldBlock` rather than creating another directory.
-fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Result<()> {
-    let target_exists = target_dir.exists();
-    let entries = match std::fs::read_dir(root) {
-        Ok(e) => e,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    let mut dirs: Vec<(i64, PathBuf)> = entries
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .map(|p| {
-            let newest = std::fs::read_dir(&p)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .map(|f| f.path())
-                .filter(|f| f.extension().is_some_and(|x| x == "json"))
-                .filter_map(|f| {
-                    serde_json::from_str::<Value>(&std::fs::read_to_string(&f).ok()?)
-                        .ok()?
-                        .get("capturedAt")
-                        .and_then(Value::as_i64)
-                })
-                .max()
-                .unwrap_or(0);
-            (newest, p)
-        })
-        .collect();
-    let mut device_count = dirs.len();
-    let allowed_before_write = if target_exists {
-        MAX_SNAPSHOT_DEVICES
-    } else {
-        MAX_SNAPSHOT_DEVICES.saturating_sub(1)
-    };
-    dirs.retain(|(_, path)| path != target_dir && !restore_protects(path));
-    while device_count > allowed_before_write {
-        if dirs.is_empty() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "snapshot device cap is exhausted: all eviction candidates are protected by active restores; retry the tabs-sync push",
-            ));
-        }
-        dirs.sort_by_key(|(c, _)| *c);
-        let (_, victim) = dirs.remove(0);
-        remove_dir_all_logged(&victim)?;
-        device_count -= 1;
-    }
-    Ok(())
-}
+#[path = "tabs_persist_retention.rs"]
+mod retention;
+use retention::enforce_device_cap;
+pub(crate) use retention::PersistOutcome;
 
 #[cfg(test)]
 #[path = "tabs_persist_tests.rs"]

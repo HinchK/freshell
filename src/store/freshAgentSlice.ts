@@ -442,6 +442,9 @@ const freshAgentSlice = createSlice({
       const session = resolveOrEnsureSession(state, action.payload)
       if (!session) return
       session.lastError = action.payload.message
+      // Task 14: the view filters SESSION_RESERVED out of the pane-level
+      // error banner (a transient reservation is re-driven, never surfaced).
+      session.lastErrorCode = action.payload.code
       if (action.payload.code?.startsWith('RESTORE_')) {
         session.awaitingDurableHistory = false
         session.historyLoaded = true
@@ -461,7 +464,20 @@ const freshAgentSlice = createSlice({
     markSessionLost(state, action: PayloadAction<SessionMutationPayload>) {
       const key = resolveSessionKey(state, action.payload)
       if (!key) return
-      state.sessions[key].lost = true
+      const session = state.sessions[key]
+      if (!session) return
+      session.lost = true
+    },
+
+    /** markSessionLost's counterpart: a reconcile fold produced a working outcome --
+     *  neutralize the lost flag WITHOUT destroying the session record
+     *  (removeSession below deletes transcript/status state -- never use it here). */
+    clearSessionLost(state, action: PayloadAction<SessionMutationPayload>) {
+      const key = resolveSessionKey(state, action.payload)
+      if (!key) return
+      const session = state.sessions[key]
+      if (!session) return
+      session.lost = false
     },
 
     removeSession(state, action: PayloadAction<SessionMutationPayload>) {
@@ -615,6 +631,7 @@ export const {
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,
+  clearSessionLost,
   clearStreaming,
   createFailed,
   freshAgentSnapshotReceived,

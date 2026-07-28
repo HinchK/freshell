@@ -83,6 +83,45 @@ describe('terminal-restore', () => {
     expect(consumeTerminalFreshRecoveryRequest('fresh-id-1')).toBeUndefined()
   })
 
+  it('reports not-armed while pane reconcile is active', async () => {
+    const {
+      setPaneReconcileActive,
+      addTerminalRestoreRequestId,
+      consumeTerminalRestoreRequestId,
+      addTerminalFreshRecoveryRequestId,
+      consumeTerminalFreshRecoveryRequest,
+    } = await import('@/lib/terminal-restore')
+
+    setPaneReconcileActive(true)
+    addTerminalRestoreRequestId('cr-x')
+    expect(consumeTerminalRestoreRequestId('cr-x')).toBeFalsy()
+
+    addTerminalFreshRecoveryRequestId('cr-y', 'fresh_after_restore_unavailable')
+    expect(consumeTerminalFreshRecoveryRequest('cr-y')).toBeUndefined()
+  })
+
+  it('restores latch behavior after pane reconcile is deactivated', async () => {
+    const {
+      setPaneReconcileActive,
+      addTerminalRestoreRequestId,
+      consumeTerminalRestoreRequestId,
+      addTerminalFreshRecoveryRequestId,
+      consumeTerminalFreshRecoveryRequest,
+    } = await import('@/lib/terminal-restore')
+
+    setPaneReconcileActive(true)
+    addTerminalRestoreRequestId('cr-x')
+    addTerminalFreshRecoveryRequestId('cr-y', 'fresh_after_restore_unavailable')
+    expect(consumeTerminalRestoreRequestId('cr-x')).toBeFalsy()
+    expect(consumeTerminalFreshRecoveryRequest('cr-y')).toBeUndefined()
+
+    // Deactivate: the bypass is a first-line early return, so the armed
+    // latches were never consumed and behave exactly as before.
+    setPaneReconcileActive(false)
+    expect(consumeTerminalRestoreRequestId('cr-x')).toBe(true)
+    expect(consumeTerminalFreshRecoveryRequest('cr-y')).toBe('fresh_after_restore_unavailable')
+  })
+
   it('prefers explicit fresh recovery when a request id is mistakenly registered for both paths', async () => {
     const {
       addTerminalFreshRecoveryRequestId,

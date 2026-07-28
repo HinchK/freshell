@@ -146,6 +146,19 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             Some("opencode".to_string()),
             Some(located.session_id.clone()),
         );
+        // P1.8 (trigger c) + P1.10: locator resolution is an identity event —
+        // durable binding row first, then the spawn-time pending marker is
+        // deleted. Registry-truth cwd, same as the in-memory binds above.
+        // Awaited (drain_and_associate is async; the helper spawn_blockings
+        // the fsync off this sweep task — V1.md).
+        crate::pane_ledger::ledger_resolve_identity(
+            state,
+            &located.terminal_id,
+            "opencode",
+            &located.session_id,
+            entry.cwd.as_deref(),
+        )
+        .await;
         broadcast_terminal_session_associated(
             state,
             &located.terminal_id,
@@ -224,6 +237,7 @@ mod tests {
         let broadcast_tx = StdArc::new(tokio::sync::broadcast::channel::<String>(16).0);
         let rx = broadcast_tx.subscribe();
         let state = WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
             identity: crate::identity::TerminalIdentityRegistry::new(),
             auth_token: StdArc::clone(&auth_token),
             server_instance_id: StdArc::new("srv-1111".to_string()),
@@ -271,13 +285,32 @@ mod tests {
             ws_max_payload_bytes: 16 * 1024 * 1024,
             term09: crate::backpressure::Term09Config::default(),
             create_protect: crate::create_limit::CreateProtectConfig::default(),
-            spawn_gate: std::sync::Arc::new(crate::spawn_gate::RestoreSpawnGate::new(4, 64)),
+            spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: Some(StdArc::new(OpencodeLocator::new(data_home))),
+            codex_locator: None,
+            activity: None,
+            session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
         };
+        (state, rx)
+    }
+
+    /// Sibling of `state_with_locator` with a REAL (enabled) pane ledger
+    /// rooted at `ledger_dir` — added rather than churning every existing
+    /// caller of the disabled-ledger fixture.
+    fn state_with_locator_and_ledger(
+        data_home: std::path::PathBuf,
+        ledger_dir: &std::path::Path,
+    ) -> (WsState, tokio::sync::broadcast::Receiver<String>) {
+        let (mut state, rx) = state_with_locator(data_home);
+        state.pane_ledger = std::sync::Arc::new(crate::pane_ledger::PaneLedger::new(Some(
+            ledger_dir.to_path_buf(),
+        )));
         (state, rx)
     }
 
@@ -433,6 +466,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("spawn a real shell for the test PTY");
         state
@@ -490,5 +524,97 @@ mod tests {
 
         state.registry.kill("t1");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// P1.10: a RESTORE-created opencode pane that lacks identity must
+    /// still arm (restore:true suppresses arming ONLY via an implied
+    /// resume_session_id — `OpencodeLocator::arm` checks the resume id,
+    /// never a restore flag), and its identity-in-flight window must be
+    /// covered by a durable pending marker until resolution deletes it.
+    #[tokio::test]
+    async fn restore_created_pane_without_identity_arms_and_resolves_into_the_ledger() {
+        let home = unique_temp_dir("p110-restore-rearm");
+        let ledger_dir = unique_temp_dir("p110-ledger");
+        let (state, _rx) = state_with_locator_and_ledger(home.clone(), &ledger_dir);
+        let db = open_seed_db(&home);
+
+        // A real PTY registry row, exactly as the sibling resolve-path test
+        // spawns it (the controller's reject checks read mode/status/resume
+        // from `state.registry`).
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "opencode",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("opencode".to_string()), None);
+
+        // The restore-shaped arm: identity absent, so resume is None — the
+        // exact argument shape terminal.rs's handle_create produces for a
+        // restore:true create that carried no sessionRef.
+        maybe_arm(&state, "t1", "opencode", Some("/tmp"), None);
+        assert_eq!(state.opencode_locator.as_ref().unwrap().armed_count(), 1);
+
+        // The spawn-time pending marker (written by handle_create in
+        // production — Task 6; written directly here because this test
+        // drives the module, not the WS handler).
+        state
+            .pane_ledger
+            .record_pending("t1", "opencode", Some("/tmp"), crate::terminal::now_ms())
+            .unwrap();
+
+        note_possible_submit(&state, "t1", "\r");
+
+        insert_session(&db, "ses_restore", "/tmp", crate::terminal::now_ms());
+
+        // Drain repeatedly until the locator's correlation window has
+        // definitely closed relative to wall-clock `now_ms()`.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if state
+                .identity
+                .get("t1")
+                .and_then(|i| i.session_id)
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+
+        // Resolution wrote the binding and deleted the marker (pinned order).
+        let hit = state
+            .pane_ledger
+            .lookup_by_session("opencode", "ses_restore")
+            .expect("binding row written at resolution");
+        assert_eq!(hit.row.live_terminal_id.as_deref(), Some("t1"));
+        assert!(state.pane_ledger.pending_for_terminal("t1").is_none());
+        assert!(state.pane_ledger.list_pending_raw().is_empty());
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ledger_dir);
     }
 }

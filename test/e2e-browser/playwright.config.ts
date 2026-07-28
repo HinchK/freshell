@@ -64,6 +64,10 @@ const MATRIX_SPECS = [
   /safe01-auth-matrix\.spec\.ts$/,
   /safe03-origin-matrix\.spec\.ts$/,
   /cfg03-backup-restore\.spec\.ts$/,
+  // Truly-idle alerting (terminal.idle): end-to-end blue -> green + one alert
+  // edge + tab shade -> activate clears. Both legs live: the rust
+  // terminal.idle emitter shipped with feat/rust-terminal-activity-idle.
+  /truly-idle-alerting\.spec\.ts$/,
   // AGENT-14 -- checkpoint create/list/metadata/restore driven through the
   // real "Rewind code to here" UI gesture (hover, click, confirm dialog,
   // POST restore, verify file bytes). Legacy is a true parity control: the
@@ -75,9 +79,71 @@ const MATRIX_SPECS = [
 // CONTINUITY TRIO: rust-only specs kept out of every match-all project
 // (their e2eServerKind:'rust' guard FAILS under the fixture-default 'legacy').
 const RUST_ONLY_SPECS = [
-  /snapshot-restore-rust\.spec\.ts$/,
   /continuity-smoke\.spec\.ts$/,
   /deploy-tab-diff-rust\.spec\.ts$/,
+  // COMPOUND-RESTART: drives RustServer.restartAbrupt() (SIGKILL + reboot),
+  // an owned-fixture capability the default/legacy seam does not implement.
+  /compound-restart-rust\.spec\.ts$/,
+  // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
+  // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
+  /restore-contract-wall-rust\.spec\.ts$/,
+  // TERM-15/TERM-16 terminal-mode CLI activity: hard `expect(e2eServerKind
+  // ).toBe('rust')` guard (predates this list's convention; fails under the
+  // fixture-default 'legacy' when the match-all chromium project picks it up).
+  /terminal-activity-rust\.spec\.ts$/,
+  // Lane A: busy-aware idle gate + queue-empty reason (imports RustServer
+  // directly for restartAbrupt() and two concurrent servers).
+  /idle-gate-semantics-rust\.spec\.ts$/,
+  // AMPLIFIER EVENTS-LANE RESILIENCE (Lane B): imports RustServer directly
+  // for restartAbrupt(); drives the Rust activity hub's events lane.
+  /amplifier-lane-resilience-rust\.spec\.ts$/,
+  /codex-status-completeness-rust\.spec\.ts$/,
+  // LANE E create protection: restore-storm contract; imports RustServer
+  // directly for restartAbrupt(). See docs/plans/2026-07-25-rust-create-protection.md
+  /create-protection-restore-storm-rust\.spec\.ts$/,
+  // LANE E create protection: frozen-client RATE_LIMITED ladder vs the Rust
+  // limiter. See docs/plans/2026-07-25-rust-create-protection.md
+  /create-rate-limit-ladder-rust\.spec\.ts$/,
+  // LANE E create protection: two concurrent RustServers, storm-isolation
+  // proof. See docs/plans/2026-07-25-rust-create-protection.md
+  /create-protection-isolation-rust\.spec\.ts$/,
+  /launch-retry-restart-rust\.spec\.ts$/,
+  /double-restart-terminal-restore-rust\.spec\.ts$/,
+  /turn-complete-restart-resume-rust\.spec\.ts$/,
+  // Lane A1 (P1.6): createRequestId stabilization — asserts the Rust REST
+  // ingress mints the key (Uuid::simple format), so it must run against the
+  // rust server only.
+  /createrequestid-stabilization-rust\.spec\.ts$/,
+  // P1.8 pane-identity ledger SIGKILL durability walls: imports RustServer
+  // directly for restartAbrupt(). See docs/plans/2026-07-25-pane-identity-ledger.md
+  /pane-ledger-restart-rust\.spec\.ts$/,
+  // Freshclaude restart parity (P0.2 §2.8 items 2-4) -- imports RustServer for restartAbrupt()
+  /freshclaude-restart-parity-rust\.spec\.ts$/,
+  // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
+  // restartAbrupt(); hidden panes must rebind without being revealed.
+  /hidden-pane-rebind-rust\.spec\.ts$/,
+  // Wave-A integration preflight: cross-lane interaction proofs (A1xA3
+  // ledger-join coherence, A2xA3 dual claude identity stores). Imports
+  // RustServer directly for restartAbrupt().
+  /wavea-interactions-rust\.spec\.ts$/,
+  // Reconcile client adoption (Task 14): verdict-driven recovery with the
+  // real SPA. Imports RustServer directly (restart()/restartAbrupt()).
+  /reconcile-client-adoption-rust\.spec\.ts$/,
+  // Lane C2 reconcile completion: fresh-agent verdict folding + D8 lease +
+  // pre-verdict create hold. Imports RustServer directly (restartAbrupt()).
+  /reconcile-completion-rust\.spec\.ts$/,
+  // Lane B2 codex rollout locator: rust-only (legacy has no codex terminal
+  // locator); imports the RustServer-backed harness for same-port restart.
+  /codex-terminal-restore-rust\.spec\.ts$/,
+  // B3/P1.9 recover-my-panes browser-loss recovery: drives the Rust-only
+  // GET /api/recovery/inventory + RecoveryOfferPanel; imports RustServer
+  // directly for restart(). See docs/plans/2026-07-26-recover-my-panes.md
+  /recover-my-panes-rust\.spec\.ts$/,
+  // P1.13 (Lane B4 Task 14): per-provider settings survive restart + codex
+  // crash memory-loss banner. Imports RustServer directly for restartAbrupt().
+  /freshagent-settings-resume-rust\.spec\.ts$/,
+  // imports RustServer directly; restart()/ledger semantics are rust-only (P1.14)
+  /sidebar-registry-sync-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -88,7 +154,11 @@ export default defineConfig({
   workers: process.env.CI ? 2 : undefined,
   reporter: process.env.CI
     ? [['html', { open: 'never' }], ['github']]
-    : [['html', { open: 'on-failure' }]],
+    : // 'never' locally too: many concurrent agents run this suite, and
+      // 'on-failure' auto-opens a report browser page (localhost:9323) at the
+      // user on every failing run. View reports on demand with
+      // `npx playwright show-report`.
+      [['html', { open: 'never' }]],
   timeout: 60_000,
   expect: {
     timeout: 10_000,
@@ -132,6 +202,14 @@ export default defineConfig({
         /harness-01-rust-server\.spec\.ts$/,
         /amplifier-restore-rust\.spec\.ts$/,
         /opencode-terminal-restore-rust\.spec\.ts$/,
+        // TERM-15/TERM-16 — terminal-mode CLI activity (blue/busy), the
+        // server-authoritative terminal.turn.complete, and the NEW
+        // terminal.idle edge, all on the Rust activity engine
+        // (`crates/freshell-activity` + `crates/freshell-ws/src/activity.rs`).
+        // Rust-only: this is the Rust port's implementation of the legacy
+        // activity engine (and the amplifier scenario has the same absent-
+        // legacy-provider KNOWN DIVERGENCE as amplifier-restore-rust above).
+        /terminal-activity-rust\.spec\.ts$/,
         // CODEX-BOUNCE (2026-07-22 incident regression): a sidebar-resumed
         // codex pane must re-resume (`codex resume <id>` argv) across a
         // server restart WITHOUT a page reload. Rust-only: the bug was the
@@ -148,6 +226,8 @@ export default defineConfig({
         // through the same unmodified legacy MCP stdio binary. See
         // mcp-qa-smoke-rust.spec.ts's own doc comment.
         /mcp-qa-smoke-rust\.spec\.ts$/,
+        // Lane C2 reconcile completion (see RUST_ONLY_SPECS entry above).
+        /reconcile-completion-rust\.spec\.ts$/,
         // TERM-28 (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`):
         // proves the Rust `freshell-terminal`/`freshell-platform` PATH-only
         // bare-command resolution fix. Rust-only -- the bug is in the Rust
@@ -172,13 +252,72 @@ export default defineConfig({
         // frozen legacy server/ tree has no equivalent. See
         // diag03-rotation-redaction-rust.spec.ts.
         /diag03-rotation-redaction-rust\.spec\.ts$/,
-        // CONTINUITY TRIO deliverable 1 (docs/plans/2026-07-22-continuity-safety-trio.md):
-        // snapshot generations + one-command restore round-trip. Rust-only:
-        // legacy has no persisted snapshot generations or restore endpoint.
-        /snapshot-restore-rust\.spec\.ts$/,
         // CONTINUITY TRIO deliverable 3: deploy tab-diff ritual acceptance
         // (capture -> restart -> verify OK; identity loss fails loudly + remediates).
         /deploy-tab-diff-rust\.spec\.ts$/,
+        // COMPOUND-RESTART (state-sync resilience assessment §7's two
+        // never-tested modes): abrupt SIGKILL death + revival, and server +
+        // browser restarting together. Rust-only: requires the owned
+        // RustServer.restartAbrupt() fixture capability.
+        /compound-restart-rust\.spec\.ts$/,
+        // Restore-resilience contract wall (P0.1 "the ruler") -- imports RustServer
+        // directly for restartAbrupt(); see docs/plans/2026-07-24-restore-contract-wall.md
+        /restore-contract-wall-rust\.spec\.ts$/,
+        /idle-gate-semantics-rust\.spec\.ts$/,
+        // AMPLIFIER EVENTS-LANE RESILIENCE (Lane B): rust-only, owns its
+        // servers, exercises events.jsonl rotation + abrupt restart.
+        /amplifier-lane-resilience-rust\.spec\.ts$/,
+        // Rust-only: drives RustServer directly (restartAbrupt + raw WS frames).
+        /codex-status-completeness-rust\.spec\.ts$/,
+        // LANE E create protection: restore-storm contract; imports RustServer
+        // directly for restartAbrupt(). See docs/plans/2026-07-25-rust-create-protection.md
+        /create-protection-restore-storm-rust\.spec\.ts$/,
+        // LANE E create protection: frozen-client RATE_LIMITED ladder vs the Rust
+        // limiter. See docs/plans/2026-07-25-rust-create-protection.md
+        /create-rate-limit-ladder-rust\.spec\.ts$/,
+        // LANE E create protection: two concurrent RustServers, storm-isolation
+        // proof. See docs/plans/2026-07-25-rust-create-protection.md
+        /create-protection-isolation-rust\.spec\.ts$/,
+        /launch-retry-restart-rust\.spec\.ts$/,
+        /double-restart-terminal-restore-rust\.spec\.ts$/,
+        /turn-complete-restart-resume-rust\.spec\.ts$/,
+        // Lane A1 (P1.6): createRequestId stabilization — asserts the Rust REST
+        // ingress mints the key (Uuid::simple format), so it must run against the
+        // rust server only.
+        /createrequestid-stabilization-rust\.spec\.ts$/,
+        // P1.8 pane-identity ledger SIGKILL durability walls (spec §4.2):
+        // identity rows/pending markers are durable within seconds of pane
+        // creation and survive an abrupt SIGKILL + boot scan. Rust-only:
+        // imports RustServer directly for restartAbrupt().
+        /pane-ledger-restart-rust\.spec\.ts$/,
+        // Freshclaude restart parity (P0.2 §2.8 items 2-4) -- imports RustServer for restartAbrupt()
+        /freshclaude-restart-parity-rust\.spec\.ts$/,
+        // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
+        // restartAbrupt(); hidden panes must rebind without being revealed.
+        /hidden-pane-rebind-rust\.spec\.ts$/,
+        // Wave-A integration preflight: cross-lane interaction proofs (A1xA3
+        // ledger-join coherence, A2xA3 dual claude identity stores). Imports
+        // RustServer directly for restartAbrupt().
+        /wavea-interactions-rust\.spec\.ts$/,
+        // Reconcile client adoption (Task 14): mixed-pane restart recovery,
+        // batched dead-session adjudication, double-restart convergence --
+        // all driven by pane.reconcile verdicts in the real SPA. Rust-only:
+        // imports RustServer directly (restart()/restartAbrupt()).
+        /reconcile-client-adoption-rust\.spec\.ts$/,
+        // Lane B2 codex rollout locator: rust-only (legacy has no codex terminal
+        // locator); imports the RustServer-backed harness for same-port restart.
+        /codex-terminal-restore-rust\.spec\.ts$/,
+        // B3/P1.9 recover-my-panes browser-loss recovery (offer, accept-resume,
+        // mixed-kind, reload guard, decline, live no-restart). Rust-only:
+        // drives GET /api/recovery/inventory; imports RustServer for restart().
+        /recover-my-panes-rust\.spec\.ts$/,
+        // P1.13 (Lane B4 Task 14): per-provider settings survive restart +
+        // codex crash memory-loss banner. Imports RustServer directly for
+        // restartAbrupt().
+        /freshagent-settings-resume-rust\.spec\.ts$/,
+        // P1.14 (Lane C1): sidebar/tab-registry sync pinning suite -- imports
+        // RustServer directly; restart()/ledger semantics are rust-only.
+        /sidebar-registry-sync-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

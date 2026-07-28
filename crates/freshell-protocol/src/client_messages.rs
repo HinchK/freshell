@@ -42,6 +42,11 @@ pub enum ClientMessage {
     OpencodeActivityList(ActivityList),
     #[serde(rename = "claude.activity.list")]
     ClaudeActivityList(ActivityList),
+    // Extension surface (not in the frozen T0 inventory — see
+    // `EXTENSION_CLIENT_MESSAGE_TYPES`): the frozen client already sends this
+    // on connect (`src/App.tsx:696-701`), mirroring the legacy zod schema.
+    #[serde(rename = "amplifier.activity.list")]
+    AmplifierActivityList(ActivityList),
     #[serde(rename = "ui.layout.sync")]
     UiLayoutSync(UiLayoutSync),
     #[serde(rename = "ui.screenshot.result")]
@@ -70,11 +75,14 @@ pub enum ClientMessage {
     FreshAgentKill(FreshAgentKill),
     #[serde(rename = "freshAgent.fork")]
     FreshAgentFork(FreshAgentFork),
+    #[serde(rename = "pane.reconcile.request")]
+    PaneReconcileRequest(PaneReconcileRequest),
 }
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 27] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 29] = [
+    "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
     "codex.activity.list",
@@ -92,6 +100,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 27] = [
     "freshAgent.send",
     "hello",
     "opencode.activity.list",
+    "pane.reconcile.request",
     "ping",
     "terminal.attach",
     "terminal.codex.candidate.persisted",
@@ -104,6 +113,12 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 27] = [
     "ui.screenshot.result",
 ];
 
+/// Extension client→server discriminants declared beyond the generated
+/// inventory. Empty since the 2026-07-26 contract reconciliation folded
+/// `amplifier.activity.list` into the frozen surface (it has been a
+/// first-class `shared/ws-protocol.ts` union member since PR #498).
+pub const EXTENSION_CLIENT_MESSAGE_TYPES: [&str; 0] = [];
+
 // --- hello ------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +128,11 @@ pub struct HelloCapabilities {
     pub terminal_output_batch_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_screenshot_v1: Option<bool>,
+    /// Reconciliation handshake opt-in (design §4.1). A client that sets this
+    /// MAY send `pane.reconcile.request` once the `ready` it receives
+    /// advertises the capability back (§4.2). Absent for the frozen client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,15 +200,27 @@ pub struct TerminalCreate {
     pub request_id: String,
     pub mode: String,
     pub shell: Shell,
+    /// Legacy client repair hint (Codex durability state). Consumed by the
+    /// legacy TS server (`server/ws-handler.ts:351-354`); deliberately ignored
+    /// by the Rust server, superseded by `pane.reconcile` verdicts. Retained
+    /// for frozen-wire compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub codex_durability: Option<CodexDurability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Legacy client repair hint (same-instance live-terminal reattach ref).
+    /// Consumed by the legacy TS server; deliberately ignored by the Rust
+    /// server, superseded by `pane.reconcile` verdicts. Retained for
+    /// frozen-wire compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_terminal: Option<LiveTerminalRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
-    /// const `"fresh_after_restore_unavailable"`.
+    /// const `"fresh_after_restore_unavailable"`. Legacy client repair hint;
+    /// consumed by the legacy TS server; deliberately ignored by the Rust
+    /// server, superseded by `pane.reconcile` verdicts (intent documented at
+    /// `freshell-ws/src/terminal.rs:506-513`). Retained for frozen-wire
+    /// compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_intent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -325,6 +357,59 @@ pub struct UiScreenshotResult {
     pub restored_focus: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub width: Option<i64>,
+}
+
+// --- pane.reconcile.request ---------------------------------------------------
+
+/// One pane's identity claims, as presented by a reconciling client
+/// (reconciliation-handshake design §4.3). Every field is a HINT to be
+/// validated, never trusted. All fields are parse-tolerant: a malformed entry
+/// must still deserialize so the server can answer it with an `invalid`
+/// verdict (total cardinality, §8) instead of failing the whole frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcilePane {
+    /// OPAQUE to the server; echoed verbatim on the verdict. `""` when the
+    /// client omitted it (the entry is then `invalid`).
+    #[serde(default)]
+    pub pane_key: String,
+    /// v1: `"terminal"`; `"fresh-agent"` is answered on connections that
+    /// negotiated `paneReconcileFreshAgentV1` (campaign §4.3) — otherwise it
+    /// keeps the frozen-client `invalid{unsupported_kind}` contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// `TerminalMode` string as persisted (`"shell"`, `"claude"`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The pane's stable creation key — required by contract (§5.5); an entry
+    /// without one is `invalid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_id: Option<String>,
+    /// Last known live handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// Locality hint, informational only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_instance_id: Option<String>,
+    /// Optional identity claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<SessionLocator>,
+    /// Optional legacy single-key claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session_id: Option<String>,
+    /// Informational only — never trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneReconcileRequest {
+    /// Client-minted, echoed verbatim; correlation only.
+    pub reconcile_id: String,
+    /// Flat list — no tree, no tab structure. Cap: 200 entries (an over-cap
+    /// request is answered with `error{RECONCILE_TOO_LARGE}`).
+    pub panes: Vec<ReconcilePane>,
 }
 
 // --- codingcli.* ------------------------------------------------------------

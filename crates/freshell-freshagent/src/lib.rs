@@ -37,16 +37,30 @@
 //! backstop, by the harness sentinel sweep — no orphans.
 
 pub mod claude;
+pub(crate) mod claude_snapshot;
 pub mod codex;
+pub mod identity_sink;
 pub mod opencode_ws;
 pub mod pane_ops;
+pub mod session_lease;
 pub mod snapshot;
 pub mod terminal_tabs;
 
 pub use claude::FreshClaudeState;
 pub use codex::FreshCodexState;
+pub use identity_sink::{
+    FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink,
+    SinkWrite,
+};
 pub use opencode_ws::FreshOpencodeState;
 pub use snapshot::SnapshotState;
+
+/// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
+/// true when a live terminal PTY currently owns that session. Constructed by
+/// `freshell-server`'s `main.rs` over the SAME probes the terminal D7 create-rung guard
+/// uses (identity owner + registry row), so this crate never imports `freshell-ws`.
+/// Defaults to "always false" (behavior-preserving for constructors that don't wire it).
+pub type TerminalLivenessProbe = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -71,7 +85,8 @@ use freshell_opencode::{
     ServeDeps, ServeError,
 };
 use freshell_protocol::{
-    FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged, UiCommand,
+    FreshAgentEvent, FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged,
+    UiCommand,
 };
 
 /// The opencode fresh-agent `sessionType` (`AGENT_SESSION_TYPES.opencode`, `router.ts:541`).
@@ -109,6 +124,13 @@ pub struct FreshAgentState {
     /// unchanged (terminal-mode routes 503 instead of touching a registry
     /// that was never given to them).
     pub(crate) terminal_registry: Option<freshell_terminal::TerminalRegistry>,
+    /// Read-only session-identity lookup (in production: the WS-side
+    /// TerminalIdentityRegistry behind the freshell-terminal
+    /// SessionIdentityLookup seam, wired by freshell-server). Powers the
+    /// identity arm of the REST D7 live-session guard. `None` (unwired)
+    /// narrows the guard to the registry-row arm.
+    pub(crate) session_identity:
+        Option<Arc<dyn freshell_terminal::registry::SessionIdentityLookup>>,
     /// paneId -> terminal pane record (Slice 1 `mode:'shell'` terminals
     /// created via `POST /api/tabs`). Disjoint from `panes` (fresh-agent-only)
     /// and `content_panes` (browser/editor) -- a pane id appears in exactly
@@ -170,6 +192,16 @@ pub struct FreshAgentState {
     /// restore fix -- the SAME shared instance
     /// `freshell_ws::opencode_association::maybe_arm` arms.
     pub(crate) opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
+    /// Sibling to [`Self::amplifier_locator`] for the P1.14 / Incident-4
+    /// codex hardening -- the SAME shared instance the WS
+    /// `codex_association` entry points arm and the B2 sweep polls.
+    pub(crate) codex_locator:
+        Option<std::sync::Arc<freshell_sessions::codex_locator::CodexLocator>>,
+    /// P1.13 identity-event sink (the pane-ledger bridge, [`identity_sink`]).
+    /// Clone-shared + set-once: the state is cloned into consumer tasks, so
+    /// the `OnceLock` sits behind an `Arc`. Wired post-construction by
+    /// `freshell-server` (precedent: `TerminalRegistry::set_activity_observer`).
+    identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
 }
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
@@ -226,6 +258,7 @@ impl FreshAgentState {
             opencode: Arc::new(tokio::sync::Mutex::new(None)),
             sessions_revision: Arc::new(AtomicI64::new(0)),
             terminal_registry: None,
+            session_identity: None,
             terminal_panes: Arc::new(Mutex::new(HashMap::new())),
             content_panes: Arc::new(Mutex::new(HashMap::new())),
             tabs: Arc::new(Mutex::new(HashMap::new())),
@@ -234,7 +267,20 @@ impl FreshAgentState {
             cli_commands: Arc::new(Vec::new()),
             amplifier_locator: None,
             opencode_locator: None,
+            codex_locator: None,
+            identity_sink: Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
+    pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
+        let _ = self.identity_sink.set(sink);
+    }
+
+    /// The wired identity sink, if any. Used by the REST send-keys
+    /// materialization site ([`send_keys`]'s cold-start block).
+    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+        self.identity_sink.get().cloned()
     }
 
     /// Record what a `restoreKey`-tagged create produced (continuity trio,
@@ -353,6 +399,16 @@ impl FreshAgentState {
         self
     }
 
+    /// Sibling to [`Self::with_amplifier_locator`] for the P1.14 /
+    /// Incident-4 codex hardening's [`freshell_sessions::codex_locator::CodexLocator`].
+    pub fn with_codex_locator(
+        mut self,
+        locator: Option<std::sync::Arc<freshell_sessions::codex_locator::CodexLocator>>,
+    ) -> Self {
+        self.codex_locator = locator;
+        self
+    }
+
     /// Slice 1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md` \u00a79 Risk 1):
     /// wire in the SAME [`freshell_terminal::TerminalRegistry`] the WS
     /// `terminal.create` path uses, so Agent-API-created terminals live in ONE
@@ -361,6 +417,20 @@ impl FreshAgentState {
     /// builder pattern.
     pub fn with_terminal_registry(mut self, registry: freshell_terminal::TerminalRegistry) -> Self {
         self.terminal_registry = Some(registry);
+        self
+    }
+
+    /// D7 live-session guard (REST rung): wire in the read-only
+    /// session-identity lookup (in production the WS-side
+    /// `TerminalIdentityRegistry`, injected by `freshell-server`'s `main.rs`)
+    /// so `spawn_terminal_pane` can probe the identity arm of
+    /// [`freshell_terminal::TerminalRegistry::live_session_owner`]. Unwired
+    /// (`None`), the guard degrades to the registry-row arm only.
+    pub fn with_session_identity(
+        mut self,
+        identity: Arc<dyn freshell_terminal::registry::SessionIdentityLookup>,
+    ) -> Self {
+        self.session_identity = Some(identity);
         self
     }
 
@@ -1233,6 +1303,17 @@ fn fail_json(status: StatusCode, message: String) -> Response {
         .into_response()
 }
 
+/// `fail_json` + a machine-readable code, matching how the WS side keys
+/// errors (`error["code"] == "RESTORE_UNAVAILABLE"`). Envelope is additive:
+/// `{status:"error", code, message}`.
+pub(crate) fn fail_json_code(status: StatusCode, code: &str, message: String) -> Response {
+    (
+        status,
+        Json(json!({ "status": "error", "code": code, "message": message })),
+    )
+        .into_response()
+}
+
 /// The error status the original maps serve failures to (`agentRouteErrorStatus`): a
 /// bounded cold-start failure / transport error is a 5xx; everything else 500 here.
 fn serve_error_status(err: &ServeError) -> StatusCode {
@@ -1493,6 +1574,58 @@ async fn send_keys(
         // `send-keys` on this pane can reuse it instead of re-materializing).
         if let Some(entry) = state.panes.lock().expect("panes mutex").get_mut(&pane_id) {
             entry.durable_id = Some(durable_id.clone());
+        }
+
+        // P1.13: binding row at REST materialization (AWAITED BEFORE the materialized
+        // broadcast -- durable-before-answer), resolving the pane's placeholder id.
+        // Without this site, REST-created sessions (the e2e seeding surface) never get
+        // a resume record (V10 A13-N1). Opencode has no sandbox/permission concepts.
+        // No-laundering guard (V7/A10, parity with `record_codex_binding` and
+        // claude's consumer arm): never persist an all-blank settings snapshot --
+        // it would make `was_recorded` true while `load_settings` returns None,
+        // arming a FALSE SETTINGS_RESET for a legitimately-default create.
+        let has_recordable_settings =
+            pane.model.is_some() || pane.effort.is_some() || pane.cwd.is_some();
+        if !has_recordable_settings {
+            tracing::debug!(
+                session = %durable_id,
+                "freshagent.opencode.rest_binding_skipped: all-blank settings snapshot"
+            );
+        }
+        if let (Some(sink), true) = (state.identity_sink(), has_recordable_settings) {
+            if let Err(e) = sink
+                .record_binding(identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: durable_id.clone(),
+                    mode: SESSION_TYPE.into(),
+                    create_request_id: None,
+                    resolves_pending: Some(pane.placeholder_id.clone()),
+                    supersedes: None,
+                    settings: identity_sink::FreshAgentSettings {
+                        model: pane.model.clone(),
+                        sandbox: None,
+                        permission_mode: None,
+                        effort: pane.effort.clone(),
+                        cwd: pane.cwd.clone(),
+                    },
+                })
+                .await
+            {
+                tracing::warn!(error = %e, session = %durable_id, "freshagent.opencode.rest_binding_write_failed");
+                // Same LEDGER_WRITE_FAILED frame shape the WS sites emit (top-level
+                // sessionType/provider + user-facing message), via state.broadcast.
+                state.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                    event: json!({
+                        "type": "freshAgent.error",
+                        "sessionId": durable_id,
+                        "code": "LEDGER_WRITE_FAILED",
+                        "message": "Failed to persist this session's resume record - settings may not survive a server restart.",
+                    }),
+                    provider: PROVIDER.to_string(),
+                    session_id: durable_id.clone(),
+                    session_type: SESSION_TYPE.to_string(),
+                }));
+            }
         }
 
         let session_ref = SessionLocator {
@@ -1779,6 +1912,94 @@ pub enum FreshAgentCreateOutcome<T> {
 /// the lock so a queued duplicate (or a fresh retry) can proceed.
 pub struct FreshAgentCreateGuard {
     _permit: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// RAII holder for a claimed fresh-agent session lease (Task 12, mirror of
+/// `SessionRefLeaseGuard` in `freshell-ws/src/terminal.rs`). `Drop` calls `fail()` ONLY
+/// while armed AND no kill handle was recorded: once a live child exists (kill handle
+/// set), a panic between `set_kill_handle` and `complete` must never release un-killed —
+/// the lease stays held (TTL + tree-kill is the recovery path).
+pub struct FreshSessionLeaseGuard {
+    leases: Arc<session_lease::FreshAgentSessionLeases>,
+    provider: &'static str,
+    session_id: String,
+    request_id: String,
+    armed: bool,
+    kill_handle_set: bool,
+}
+
+impl FreshSessionLeaseGuard {
+    /// Wrap a just-acquired claim ([`session_lease::FreshSessionClaim::Acquired`]).
+    pub fn armed(
+        leases: Arc<session_lease::FreshAgentSessionLeases>,
+        provider: &'static str,
+        session_id: &str,
+        request_id: &str,
+    ) -> Self {
+        Self {
+            leases,
+            provider,
+            session_id: session_id.to_string(),
+            request_id: request_id.to_string(),
+            armed: true,
+            kill_handle_set: false,
+        }
+    }
+
+    /// Record the spawned sidecar's pid + ownership tag on the lease (arms the
+    /// TTL tree-kill path).
+    pub fn set_kill_handle(&mut self, pid: u32, ownership_id: &str) {
+        self.leases.set_kill_handle(
+            self.provider,
+            &self.session_id,
+            &self.request_id,
+            pid,
+            ownership_id,
+        );
+        self.kill_handle_set = true;
+    }
+
+    /// Winner registered its session: bind + release in one lock scope. Returns `false`
+    /// when the lease was revoked/foreign — the caller must tear down its own child and
+    /// then call [`Self::fail`] (the guard stays armed).
+    pub fn complete(&mut self, live_session_key: &str) -> bool {
+        let ok = self.leases.complete(
+            self.provider,
+            &self.session_id,
+            &self.request_id,
+            live_session_key,
+        );
+        if ok {
+            self.armed = false;
+        }
+        ok
+    }
+
+    /// Spawn/resume failed AND the caller's own tree is (being) torn down: release.
+    pub fn fail(&mut self) {
+        if self.armed {
+            self.leases
+                .fail(self.provider, &self.session_id, &self.request_id);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for FreshSessionLeaseGuard {
+    fn drop(&mut self) {
+        if self.armed && !self.kill_handle_set {
+            self.leases
+                .fail(self.provider, &self.session_id, &self.request_id);
+        } else if self.armed {
+            // A live child may exist (kill handle set) — never blanket-release; the
+            // TTL + tree-kill path recovers this lease.
+            tracing::warn!(
+                provider = self.provider,
+                session_id = %self.session_id,
+                "fresh_agent_lease_guard_dropped_armed_with_kill_handle: holding for TTL recovery"
+            );
+        }
+    }
 }
 
 impl<T: Clone + Send + 'static> Default for FreshAgentCreateDedup<T> {
@@ -2362,6 +2583,143 @@ mod tests {
             .await
             .expect_err("unknown session");
         assert!(matches!(err, OpencodeSnapshotError::NotFound));
+    }
+
+    // -- P1.13 Task 7: REST send-keys materialization writes a binding row --
+
+    /// Like `opencode_ws::tests::FakeHttp`: `POST /session` mints `ses_1`; everything
+    /// else (health, prompt, status) answers a benign `{}`.
+    struct CreateCapableHttp;
+    impl ServeHttp for CreateCapableHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<ServeHttpResponse, String>> + Send + 'a>,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let body = if is_create {
+                serde_json::to_vec(&json!({ "id": "ses_1", "directory": null })).unwrap()
+            } else {
+                b"{}".to_vec()
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+        }
+    }
+
+    /// The REST half of the Task 7 identity-event coverage (V10 A13-N1): a REST-created
+    /// pane (POST /api/tabs seeds model/effort) whose first `send-keys` cold-start
+    /// materializes the durable `ses_*` id must record a binding through the pane
+    /// ledger sink -- without this site, REST-created sessions never get a resume record.
+    #[tokio::test]
+    async fn rest_send_keys_materialization_records_binding() {
+        let st = state();
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(CreateCapableHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+
+        let fake = Arc::new(identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // A REST-created pane carrying model/effort (what POST /api/tabs records).
+        st.panes.lock().expect("panes mutex").insert(
+            "pane-1".to_string(),
+            PaneEntry {
+                placeholder_id: "freshopencode-r1".to_string(),
+                cwd: Some("/w".to_string()),
+                model: Some("big-model".to_string()),
+                effort: Some("high".to_string()),
+                durable_id: None,
+            },
+        );
+
+        // Drive the REST send-keys cold-start materialization. `timeout: 0` bounds the
+        // inline `run_turn` idle-wait (the fake never reports activity); the
+        // materialization + binding write happen BEFORE the turn is driven.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let _resp = send_keys(
+            State(st.clone()),
+            Path("pane-1".to_string()),
+            headers,
+            Json(json!({ "text": "hello", "timeout": 0 })),
+        )
+        .await;
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings
+            .iter()
+            .find(|b| b.session_id == "ses_1")
+            .expect("binding recorded at REST send-keys materialization");
+        assert_eq!(b.provider, "opencode");
+        assert_eq!(b.mode, "freshopencode");
+        assert_eq!(b.resolves_pending.as_deref(), Some("freshopencode-r1"));
+        assert_eq!(b.settings.model.as_deref(), Some("big-model"));
+        assert_eq!(b.settings.effort.as_deref(), Some("high"));
+        assert_eq!(b.settings.cwd.as_deref(), Some("/w"));
+    }
+
+    /// WAVE-B fast-follow (B4 lane review): the REST send-keys materialization
+    /// site gets the SAME no-laundering guard as `record_codex_binding` /
+    /// claude's consumer arm (V7/A10): never persist an all-blank settings
+    /// snapshot -- it would make `was_recorded` true while `load_settings`
+    /// returns None, arming a FALSE SETTINGS_RESET for a
+    /// legitimately-default create on a later resume.
+    #[tokio::test]
+    async fn rest_send_keys_materialization_skips_all_blank_settings() {
+        let st = state();
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(CreateCapableHttp),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+
+        let fake = Arc::new(identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // A REST-created pane with NO model/effort/cwd -- the all-blank shape.
+        st.panes.lock().expect("panes mutex").insert(
+            "pane-blank".to_string(),
+            PaneEntry {
+                placeholder_id: "freshopencode-b1".to_string(),
+                cwd: None,
+                model: None,
+                effort: None,
+                durable_id: None,
+            },
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let _resp = send_keys(
+            State(st.clone()),
+            Path("pane-blank".to_string()),
+            headers,
+            Json(json!({ "text": "hello", "timeout": 0 })),
+        )
+        .await;
+
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "an all-blank settings snapshot must never be persisted (V7/A10 no-laundering guard)"
+        );
     }
 
     // -- Batch D PR-6: rich transcript items for the opencode snapshot endpoint --

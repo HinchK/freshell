@@ -561,3 +561,7 @@ pub(super) fn validate_generation(path: &Path, value: &Value) -> std::io::Result
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tabs_persist_validation_tests.rs"]
+mod validation_tests;

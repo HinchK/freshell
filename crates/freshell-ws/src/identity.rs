@@ -48,7 +48,7 @@ pub struct TerminalIdentity {
 /// constructed in `freshell-server::main`, cloned into `WsState` (the writer --
 /// terminal create/kill/exit) and into the `freshell-server` REST states that read
 /// it (`TerminalsState`, `SessionsState`, `SessionDirectoryState`).
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TerminalIdentityRegistry {
     inner: Arc<RwLock<HashMap<String, TerminalIdentity>>>,
 }
@@ -163,6 +163,43 @@ impl TerminalIdentityRegistry {
                 && entry.session_id.as_deref() == Some(session_id)
         })
     }
+
+    /// Guard 3b's retired-INCLUSIVE session lookup (P0.3, ledger A8): the
+    /// terminal id -- live OR retired -- bound to this exact
+    /// `provider:sessionId`. Unlike [`Self::find_by_session`] (live-only,
+    /// serving the rename cascade), this serves the hijack guard: a session
+    /// identity, once bound, may never be claimed by a DIFFERENT terminal,
+    /// even after its owner exits (dead-pane candidate replay). Breaks no
+    /// legitimate flow: every legit resume binds at create time, so a
+    /// re-announce short-circuits at guard 3a's same-terminal check before
+    /// this cross-terminal check runs.
+    pub(crate) fn find_by_session_including_retired(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> Option<String> {
+        self.inner
+            .read()
+            .expect("identity registry lock poisoned")
+            .values()
+            .find(|entry| {
+                entry.provider.as_deref() == Some(provider)
+                    && entry.session_id.as_deref() == Some(session_id)
+            })
+            .map(|entry| entry.terminal_id.clone())
+    }
+}
+
+/// D7 guard seam: expose this registry to `TerminalRegistry::live_session_owner`
+/// (and, via `freshell-server` wiring, to the REST spawn guard in
+/// `freshell-freshagent`, which cannot depend on this crate directly).
+/// Exactly reproduces the WS guard's identity arm: `find_by_session` -> owner
+/// terminal_id (liveness is probed by the shared predicate, not here).
+impl freshell_terminal::registry::SessionIdentityLookup for TerminalIdentityRegistry {
+    fn terminal_for_session(&self, provider: &str, session_id: &str) -> Option<String> {
+        self.find_by_session(provider, session_id)
+            .map(|owner| owner.terminal_id)
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +266,21 @@ mod tests {
     }
 
     #[test]
+    fn find_by_session_including_retired_matches_retired_terminal() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("exited", Some("codex"), Some("s2"), None, 2);
+        reg.retire("exited");
+
+        // Live-only lookup misses it (rename-cascade semantics)...
+        assert!(reg.find_by_session("codex", "s2").is_none());
+        // ...but the guard-3b lookup still finds the binding.
+        assert_eq!(
+            reg.find_by_session_including_retired("codex", "s2"),
+            Some("exited".to_string())
+        );
+    }
+
+    #[test]
     fn find_by_session_no_match_is_none() {
         let reg = TerminalIdentityRegistry::new();
         reg.upsert("t1", Some("claude"), Some("s1"), None, 1);
@@ -276,5 +328,36 @@ mod tests {
 
         reg.upsert("t1", Some("claude"), Some("s1"), None, 2);
         assert_eq!(reg.list().len(), 1);
+    }
+
+    #[test]
+    fn identity_registry_feeds_live_session_owner_join() {
+        let registry = freshell_terminal::TerminalRegistry::new();
+        registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "t-live".into(),
+            stream_id: "s-live".into(),
+            mode: "codex".into(),
+            resume_session_id: None, // fresh pane: row carries no resume id
+            create_request_id: None,
+            created_at: None,
+        });
+        let identity = TerminalIdentityRegistry::new();
+        identity.upsert("t-live", Some("codex"), Some("sess-live-1"), None, 0);
+
+        assert_eq!(
+            registry.live_session_owner(Some(&identity), "codex", "sess-live-1"),
+            Some("t-live".to_string()),
+            "identity-registry-bound session of a Running terminal must be live"
+        );
+
+        // Retired bindings must not count (mirrors d9b71f50's negative pin).
+        assert!(identity.retire("t-live"));
+        assert_eq!(
+            registry.live_session_owner(Some(&identity), "codex", "sess-live-1"),
+            None,
+            "a retired identity binding must not block resume"
+        );
+
+        registry.kill("t-live");
     }
 }

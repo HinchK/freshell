@@ -36,6 +36,17 @@ use crate::identity::TerminalIdentityRegistry;
 /// (2s) after a submit; five windows of slack keeps the alarm quiet through
 /// any normal association latency while still firing within seconds of a
 /// genuinely-lost identity.
+///
+/// This same grace also covers the codex locator
+/// ([`freshell_sessions::codex_locator::CODEX_WINDOW_MS`] = 2s,
+/// Enter-anchored, plus
+/// [`freshell_sessions::codex_locator::PENDING_FIRST_LINE_GRACE_MS`] = 10s
+/// that applies ONLY in the anomalous empty-first-line gap): fresh codex
+/// panes are expected to resolve via `codex_association` within this grace
+/// of their first Enter. A maximally slow codex git-info gap (rollout header
+/// held back until codex finishes probing repo state) can legitimately
+/// outlast the alarm grace -- in that case the alarm is advisory, not a
+/// lost identity.
 pub(crate) const IDENTITY_RESOLUTION_GRACE_MS: i64 =
     5 * freshell_sessions::amplifier_locator::AMPLIFIER_DIR_APPEAR_WINDOW_MS;
 
@@ -78,8 +89,122 @@ pub(crate) fn warn_unresolved_terminal_identities(
     }
 }
 
+/// P0.4 fail-loud (campaign plan §2.2): a `restore:true` claude create carried
+/// no client id AND no server-side identity source could resolve one -- an
+/// invariant-violation ("never happens") state. The create is rejected with
+/// `error{RESTORE_UNAVAILABLE}` instead of silently spawning claude with
+/// neither `--session-id` nor `--resume` (an unidentifiable, permanently
+/// un-resumable session). ERROR, not WARN: unlike the sweep alarms above,
+/// this is a per-request hard failure the user sees. Grep target:
+/// `claude_restore_identity_unresolved`.
+pub(crate) fn error_claude_restore_unresolved(request_id: &str) {
+    tracing::error!(
+        target: "freshell_ws::invariants",
+        request_id = %request_id,
+        "claude_restore_identity_unresolved: restore:true claude create had no \
+         sessionRef/resumeSessionId and no server-resolvable identity; rejected with \
+         RESTORE_UNAVAILABLE instead of spawning an unidentifiable claude session"
+    );
+}
+
+/// P1.8 (spec §4.2 write-failure policy): a ledger write failed. The event
+/// itself proceeded (fail loud, degrade to status quo) — but this pane may
+/// not survive a restart, and the live `durability.degraded` frame was
+/// pushed at failure time.
+pub(crate) fn error_pane_ledger_write_failed(terminal_id: &str, err: &std::io::Error) {
+    tracing::error!(
+        target: "freshell_ws::invariants",
+        terminal_id = %terminal_id,
+        error = %err,
+        "pane_ledger_write_failed: identity event could not be durably recorded; \
+         durability.degraded broadcast live to all connected clients"
+    );
+}
+
+#[cfg(test)]
+pub(crate) mod capture {
+    //! Thread-local capturing subscriber recording TARGET + message +
+    //! fields (the `freshell-freshagent` DIAG-01 convention, extended
+    //! with `metadata().target()` since these alarms are target-scoped).
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Subscriber};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::Layer;
+
+    #[derive(Debug, Clone, Default)]
+    pub struct CapturedEvent {
+        pub target: String,
+        pub message: String,
+        pub fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        message: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.message = rendered;
+            } else {
+                self.fields.insert(field.name().to_string(), rendered);
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields
+                    .insert(field.name().to_string(), value.to_string());
+            }
+        }
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    struct CaptureLayer {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for CaptureLayer {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("capture lock")
+                .push(CapturedEvent {
+                    target: event.metadata().target().to_string(),
+                    message: visitor.message,
+                    fields: visitor.fields,
+                });
+        }
+    }
+
+    pub fn capture() -> (
+        Arc<Mutex<Vec<CapturedEvent>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (events, guard)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::capture;
     use super::*;
 
     fn row(
@@ -95,86 +220,7 @@ mod tests {
             status,
             created_at,
             resume_session_id: resume_session_id.map(str::to_string),
-        }
-    }
-
-    mod capture {
-        //! Thread-local capturing subscriber recording TARGET + message +
-        //! fields (the `freshell-freshagent` DIAG-01 convention, extended
-        //! with `metadata().target()` since these alarms are target-scoped).
-        use std::collections::BTreeMap;
-        use std::sync::{Arc, Mutex};
-        use tracing::field::{Field, Visit};
-        use tracing::{Event, Subscriber};
-        use tracing_subscriber::layer::{Context, SubscriberExt};
-        use tracing_subscriber::Layer;
-
-        #[derive(Debug, Clone, Default)]
-        pub struct CapturedEvent {
-            pub target: String,
-            pub message: String,
-            pub fields: BTreeMap<String, String>,
-        }
-
-        #[derive(Default)]
-        struct FieldVisitor {
-            message: String,
-            fields: BTreeMap<String, String>,
-        }
-
-        impl Visit for FieldVisitor {
-            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-                let rendered = format!("{value:?}");
-                if field.name() == "message" {
-                    self.message = rendered;
-                } else {
-                    self.fields.insert(field.name().to_string(), rendered);
-                }
-            }
-            fn record_str(&mut self, field: &Field, value: &str) {
-                if field.name() == "message" {
-                    self.message = value.to_string();
-                } else {
-                    self.fields
-                        .insert(field.name().to_string(), value.to_string());
-                }
-            }
-            fn record_i64(&mut self, field: &Field, value: i64) {
-                self.fields
-                    .insert(field.name().to_string(), value.to_string());
-            }
-        }
-
-        struct CaptureLayer {
-            events: Arc<Mutex<Vec<CapturedEvent>>>,
-        }
-
-        impl<S: Subscriber> Layer<S> for CaptureLayer {
-            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-                let mut visitor = FieldVisitor::default();
-                event.record(&mut visitor);
-                self.events
-                    .lock()
-                    .expect("capture lock")
-                    .push(CapturedEvent {
-                        target: event.metadata().target().to_string(),
-                        message: visitor.message,
-                        fields: visitor.fields,
-                    });
-            }
-        }
-
-        pub fn capture() -> (
-            Arc<Mutex<Vec<CapturedEvent>>>,
-            tracing::subscriber::DefaultGuard,
-        ) {
-            let events = Arc::new(Mutex::new(Vec::new()));
-            let layer = CaptureLayer {
-                events: Arc::clone(&events),
-            };
-            let subscriber = tracing_subscriber::registry().with(layer);
-            let guard = tracing::subscriber::set_default(subscriber);
-            (events, guard)
+            cwd: None,
         }
     }
 
@@ -255,6 +301,35 @@ mod tests {
         warn_unresolved_terminal_identities(&rows, &identity, &mut warned, i64::MAX);
 
         assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn error_claude_restore_unresolved_emits_on_invariants_target() {
+        let (events, _guard) = capture::capture();
+
+        super::error_claude_restore_unresolved("req-lost-42");
+
+        let captured: Vec<capture::CapturedEvent> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.target == "freshell_ws::invariants")
+            .cloned()
+            .collect();
+        assert_eq!(captured.len(), 1, "exactly one emission: {captured:?}");
+        assert!(
+            captured[0]
+                .message
+                .starts_with("claude_restore_identity_unresolved:"),
+            "message must lead with the grep-target invariant name: {}",
+            captured[0].message
+        );
+        assert_eq!(
+            captured[0].fields.get("request_id").map(String::as_str),
+            Some("req-lost-42"),
+            "request_id must be a structured field: {:?}",
+            captured[0]
+        );
     }
 
     #[test]

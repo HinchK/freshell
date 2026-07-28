@@ -153,6 +153,65 @@ describe('fresh-agent-ws', () => {
     })
   })
 
+  it('create.failed SESSION_RESERVED (retryable) is not projected into pendingCreateFailures and keeps the create route alive', () => {
+    // Task 14: a transient reservation must never mint an error-card entry
+    // (no Retry button racing the same-requestId re-drive) AND must not
+    // consume the create route -- the re-driven create's eventual
+    // created/failed still has to route to this pane.
+    const store = createFreshAgentStore()
+    const ws = { send: vi.fn() }
+
+    registerFreshAgentCreate(store.dispatch, 'req-reserved-1', {
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      cwd: '/repo/reserved-route',
+    })
+
+    const handled = handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.create.failed',
+      requestId: 'req-reserved-1',
+      code: 'SESSION_RESERVED',
+      message: 'Another resume for this session is in flight',
+      retryable: true,
+    })
+    expect(handled).toBe(true)
+    expect(store.getState().freshAgent.pendingCreateFailures['req-reserved-1']).toBeUndefined()
+
+    // Route NOT consumed: a later cancelled created still routes its cleanup
+    // kill through the ORIGINAL cwd (the observable the route carries).
+    cancelCreate('req-reserved-1')
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-reserved-1',
+      sessionId: 'ses_reserved_late',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+    }, ws)
+    expect(ws.send).toHaveBeenCalledWith({
+      type: 'freshAgent.kill',
+      sessionId: 'ses_reserved_late',
+      sessionType: 'freshclaude',
+      provider: 'claude',
+      cwd: '/repo/reserved-route',
+    })
+  })
+
+  it('non-reserved create.failed still projects into pendingCreateFailures (regression)', () => {
+    const store = createFreshAgentStore()
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.create.failed',
+      requestId: 'req-hard-1',
+      code: 'SPAWN_FAILED',
+      message: 'x',
+      retryable: false,
+    })
+    expect(store.getState().freshAgent.pendingCreateFailures['req-hard-1']).toEqual({
+      code: 'SPAWN_FAILED',
+      message: 'x',
+      retryable: false,
+    })
+  })
+
   it('materializes FreshOpenCode pane and live session state from the global websocket handler', () => {
     const actionTypes: string[] = []
     const store = createFreshAgentPaneStore(actionTypes)

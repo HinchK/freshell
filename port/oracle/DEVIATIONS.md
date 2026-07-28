@@ -652,6 +652,68 @@ path itself is intact).
 - status: accepted (terminals.changed parity CLOSED; terminal.meta.updated open gap, tracked for
   closure with DEV-0006)
 
+### DEV-0009 — idle auto-kill reap clock ignores self-generated repaint noise (original never reaps an animated detached TUI)
+
+- objective_defect: *resource leak* — `server/terminal-registry.ts:1705-1708` (the `onData`
+  handler) bumps `lastActivityAt` on **every** PTY output frame, and `enforceIdleKills`
+  (`terminal-registry.ts:1416-1435`) keys idleness on that stamp. Any detached terminal whose program merely repaints (codex's braille
+  spinner + ticking `(Ns • esc to interrupt)` counter, claude's ticking `✻ Crunched for Ns` line,
+  any status-bar clock) refreshes the stamp continuously, so `settings.safety.autoKillIdleMinutes`
+  can never reap it: the PTY, its child process tree, and its replay buffer are retained
+  indefinitely — precisely the leak the setting exists to prevent. Observed in production
+  2026-07-25: 10 detached CLIs alive 10-22h against a 3h threshold (the client-side half of that
+  incident was PR #534; this entry is the server-side half).
+- original_behavior: idleness = `now - lastActivityAt`, where `lastActivityAt` is refreshed by
+  every PTY output frame regardless of content; a detached animated TUI is exempt from the idle
+  sweep forever.
+- port_behavior: the port keeps `lastActivityAt`'s wire semantics identical (still bumped on
+  every output frame and every input write — terminal-core.md §1.3 holds for `inventory`, the
+  directory projection, and sorting) but gives `enforce_idle_kills` its own reap clock,
+  `last_meaningful_activity_at` (`crates/freshell-terminal/src/registry.rs`), refreshed by input
+  writes, by transition-to-detached (a freshly detached or socket-orphaned terminal gets one full
+  threshold of grace — its clock may have gone stale while a watcher was attached, since attached
+  terminals are reaper-exempt), and by output frames carrying genuinely new content per the
+  stateful per-terminal `NoiseScanner` (`crates/freshell-terminal/src/idle_noise.rs`): a frame
+  whose escape-stripped text — minus whitespace, ASCII digits, Braille spinner glyphs
+  (U+2800-U+28FF), and a small spinner-glyph set (`✻`-family incl. `✶`, `|/-\`, bullets
+  `·`/`•`/`◦`, geometric spinners) — is empty or fingerprint-identical to one of the 32 most
+  recent distinct frames counts as repaint noise and does not refresh the reap clock (ring sized
+  for codex's shimmer animation, which cycles ~13-16 letter-subset fingerprints; measured on
+  codex 0.145.0). Detection fails open (anything not provably a repeat counts as activity);
+  attached terminals stay exempt and `autoKillIdleMinutes <= 0` stays disabled, both unchanged.
+  Known accepted limitation (deliberate, and a genuine regression vs legacy): the original
+  would NEVER reap a detached workload whose only output novelty is numeric (curl/dd-style
+  single-transfer meters, bare numeric step logs); the port WILL reap it after the threshold
+  despite it being genuine work — at fingerprint level such output is indistinguishable from
+  the ticking counters this deviation exists to defeat. Bar-style and prose-emitting workloads
+  are unaffected; unit rollovers (kB→MB→GB) reset the clock; the threshold is user-tunable and
+  `<= 0` disables the sweep entirely. Product-owner approval: explicitly accepted by the user
+  (AD-1) on 2026-07-27, reaffirming the 2026-07-26 plan-phase decision
+  (`docs/plans/2026-07-26-idle-repaint-noise.md`).
+- fingerprint: behavior/timing-only — no wire message, field, or schema change; the only
+  observable divergence is that the port's idle sweep reaps a detached repaint-only terminal after
+  the threshold where the original never would (surfaces as a `terminal.killed by=idle` /
+  `terminal.exit` for such a terminal, and its absence from subsequent inventories).
+- pinning_test: `crates/freshell-terminal/src/registry.rs` tests
+  `enforce_idle_kills_reaps_detached_terminal_with_only_repaint_noise`,
+  `enforce_idle_kills_spares_detached_terminal_streaming_genuine_output`,
+  `detach_grants_full_idle_threshold_of_grace`, and
+  `disconnect_grants_full_idle_threshold_of_grace`, plus the `NoiseScanner`
+  unit suite in `crates/freshell-terminal/src/idle_noise.rs` (split-escape statefulness, ring
+  membership, digits-only ticks, codex shimmer letter-subset cycle, first-paint-counts semantics).
+- adjudicated_by: antagonist-reviewer session
+  `0000000000000000-577b1039e2984df1_foundation-zen-architect`, 2026-07-27 — **ACCEPT** with
+  three conditions (fix stale line refs to `:1705-1708`/`:1416-1435`; record the AD-1
+  product-owner approval in the entry body; state the numeric-only limitation as a legacy
+  regression explicitly), all incorporated above. Key finding: "a lifetime-bounding safety
+  control that cannot fire for the product's primary workload class, confirmed by a production
+  incident, is an objective defect — not scope creep." Reviewer independently re-verified the
+  legacy defect mechanism, the port's fail-open/exemption/grace semantics (including the
+  socket-close-must-not-reset-unrelated-terminals hole, pinned at `registry.rs:3646`), and ran
+  the pinning suites (157 passed, 0 failed). Implementer: the-usual recipe run
+  b7a1a8f0a0104fb3-20260726-232357 (distinct from adjudicating reviewer).
+- status: accepted.
+
 ## E2E-discovered intentional divergences (EDEV-xx)
 
 **Scope — READ THIS FIRST.** This section is DELIBERATELY SEPARATE from the DEV-NNNN
@@ -851,6 +913,53 @@ proves the pre-existing gap, and the rust leg proves the improvement.
   amplifier/opencode/gemini/kimi now shows as OPEN in the sidebar, dedupes on sidebar
   click instead of opening a duplicate, and survives a server restart + browser refresh
   with its session identity intact.
+
+### EDEV-08 — REST pane create MINTS a stable `createRequestId` into the broadcast pane content (pane-identity stabilization)
+- what_differs: `POST /api/tabs` (terminal path) and `POST /api/panes/:id/split` (which
+  shares `spawn_terminal_pane`) now accept-or-mint a `createRequestId`
+  (`Uuid::new_v4().simple()`, 32 lowercase hex; a caller-supplied key — the snapshot-restore
+  path via `pane_to_create_body` — is honored verbatim) and emit it in the broadcast pane
+  content: `ui.command{tab.create}` `payload.paneContent.createRequestId` and
+  `ui.command{pane.split}` `payload.newContent.createRequestId`
+  (`crates/freshell-freshagent/src/terminal_tabs.rs`, `spawn_terminal_pane`), with the same
+  key stamped atomically into the terminal registry (`TerminalRegistry::create`'s existing
+  `create_request_id` parameter). Legacy emits NO `createRequestId` in either payload
+  (`server/agent-api/router.ts:762-789` tab.create terminal paneContent, `:1360-1380`
+  pane.split newContent) — the frozen client then mints its own substitute nanoid on receipt
+  (`src/store/panesSlice.ts:78-79`). Parity nuance, `ui.command{pane.attach}`: `POST
+  /api/panes/:id/respawn` delegates to the same shared pipeline (`pane_ops.rs`), so its
+  `pane.attach` `content` now carries the key too — there legacy ALREADY mints one
+  (`router.ts:1602` respawn, `:1646` terminal-attach, `createRequestId: nanoid()`), so
+  pane.attach moves TOWARD parity (both sides keyed; value format differs, uuid-simple vs
+  nanoid — both opaque ids the oracle normalizer masks,
+  `port/oracle/harness/normalize.ts:77` `createRequestId: ID('RID')`). The fresh-agent
+  tab.create path already carried the key on BOTH sides (`router.ts:558/:578`; the rust
+  fresh-agent create) — unchanged. Wire-contract safe: the frozen `ui.command` payload is
+  free-form (`port/contract/ws-server-messages.schema.json:2856-2874`, `"payload": true`);
+  absence of the field stays legal on read everywhere (backward compat).
+- why_intentional: Rust is the better side — the legacy keyless broadcast is the root cause
+  of pane-identity correlation loss (restart-resilience campaign P1.6 /
+  reconciliation-handshake design §5.5 precondition 2): a REST-created pane never receives a
+  server-known identity key, the client's substitute nanoid is re-minted on hydrate, so
+  panes cannot be re-identified across reload/restore and server state keyed on
+  `create_request_id` (terminal registry) can never match a client pane. Minting
+  server-side — and honoring the captured key on snapshot restore — makes the key stable
+  end-to-end with ZERO legacy-server changes and no client schema change.
+- evidence: RED-first unit coverage in `crates/freshell-freshagent/src/terminal_tabs.rs`
+  (`rest_create_terminal_tab_mints_and_stamps_create_request_id`,
+  `rest_create_honors_caller_supplied_create_request_id`) and the extended split assertion
+  in `crates/freshell-freshagent/src/pane_ops.rs`
+  (`split_terminal_pane_spawns_real_pty_and_broadcasts_pane_split`) plus the extended
+  respawn rotation test (`respawn_pane_replaces_terminal_in_place_and_broadcasts_pane_attach`,
+  also `pane_ops.rs`); e2e pin:
+  `test/e2e-browser/specs/createrequestid-stabilization-rust.spec.ts` (the 32-hex
+  server-mint discriminator + reload-preserves-key). Legacy shape:
+  `server/agent-api/router.ts:762-789` / `:1360-1380` (no key), `:1602` / `:1646`
+  (pane.attach, keyed).
+- user_impact: A REST-created terminal pane keeps ONE stable identity key from creation
+  through reload/restore — the precondition for reconciliation-phase dedupe/adoption —
+  instead of a fresh client-minted key per hydrate; snapshot-restored panes are re-created
+  under their captured key.
 
 <!--
 Template:

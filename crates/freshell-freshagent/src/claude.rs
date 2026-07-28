@@ -5,8 +5,8 @@
 //! `original≡rust` at T2. A faithful port of the claude path of `server/ws-handler.ts`
 //! (`freshAgent.create` / `freshAgent.send`) + `server/fresh-agent/adapters/claude/adapter.ts`
 //! + `server/sdk-bridge.ts` — but the SDK itself (`@anthropic-ai/claude-agent-sdk`, which
-//! has NO Rust equivalent) runs in the ONE sanctioned Node sidecar
-//! (`crates/freshell-claude-sidecar`, ADR Decision 2), spoken over newline-JSON stdio.
+//!   has NO Rust equivalent) runs in the ONE sanctioned Node sidecar
+//!   (`crates/freshell-claude-sidecar`, ADR Decision 2), spoken over newline-JSON stdio.
 //!
 //! ## Drive path (WS, not REST) — mirrors the codex slice
 //!
@@ -55,12 +55,12 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as TokioMutex;
 
 use freshell_protocol::{
-    ErrorCode, ErrorMsg, FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated,
-    FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled, FreshAgentSend,
-    FreshAgentSendAccepted, ServerMessage, SessionType,
+    ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCreate, FreshAgentCreateFailed,
+    FreshAgentCreated, FreshAgentEvent, FreshAgentInterrupt, FreshAgentKill, FreshAgentKilled,
+    FreshAgentSend, FreshAgentSendAccepted, ServerMessage, SessionType,
 };
 
-use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome};
+use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySink};
 
 /// The runtime provider (`AGENT_SESSION_TYPES.claude.provider`).
 const PROVIDER: &str = "claude";
@@ -79,14 +79,39 @@ pub struct FreshClaudeState {
     broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
     /// placeholder-nanoid → live claude session (sidecar stdin + owned child + consumer).
     sessions: Arc<TokioMutex<HashMap<String, ClaudeSession>>>,
+    /// durable Claude UUID (`cliSessionId` from `sdk.session.init`) -> sessions-map key.
+    /// THE restart-parity index (plan §2.8 item 2): lets attach/snapshot find a live
+    /// session by its durable identity instead of the process-ephemeral placeholder.
+    /// pub(crate) so in-crate tests (and snapshot wiring) can inspect it.
+    pub(crate) cli_index: Arc<TokioMutex<HashMap<String, String>>>,
     /// `freshAgent.create` requestId dedup (parity gap fix -- see the module doc on
     /// [`crate::FreshAgentCreateDedup`]): single-flight + replay cache so a client
     /// resending the SAME `requestId` on every reconnect while a pane is
     /// `status==creating` reattaches to the ONE session it already created instead of
     /// spawning a fresh claude sidecar per resend. Cleared for a session's entries only
     /// on an explicit `freshAgent.kill` ([`Self::handle_kill`]); an unrequested sidecar
-    /// exit does NOT evict (mirrors legacy, see the type doc).
+    /// exit does NOT evict from THIS dedup cache (mirrors legacy, see the type doc) --
+    /// it DOES evict the dead entry from the `sessions` map (consumer-exit eviction).
     create_dedup: Arc<FreshAgentCreateDedup<ClaudeCreateRecord>>,
+    /// Single-flight guard for resume-on-attach, keyed by DURABLE id (codex's
+    /// `resuming` analog, simplified: contenders return immediately instead of
+    /// waiting -- the winner's frames broadcast to every client anyway).
+    resuming: Arc<TokioMutex<std::collections::HashSet<String>>>,
+    /// P1.13 identity-event sink (the pane-ledger bridge,
+    /// [`crate::identity_sink`]). Clone-shared + set-once: the state is cloned
+    /// into consumer tasks, so the `OnceLock` sits behind an `Arc`. Wired
+    /// post-construction by `freshell-server` (precedent:
+    /// `TerminalRegistry::set_activity_observer`).
+    identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
+    /// The per-sessionRef create/resume lease (D8 for fresh agents, Task 12) —
+    /// ALWAYS ON at this runtime seam (never capability-gated: the two-writers JSONL
+    /// corruption it prevents is real regardless of client generation). `main.rs`
+    /// replaces the default with the ONE server-wide shared map via
+    /// [`Self::set_session_leases`]; keys are provider-namespaced either way.
+    leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    /// Task 13b: cross-kind liveness -- true when a live terminal PTY owns
+    /// `(provider, session_id)`. Wired by `main.rs`; defaults to always-false.
+    terminal_liveness: crate::TerminalLivenessProbe,
 }
 
 /// The cached result of a completed claude/kilroy `freshAgent.create`, keyed by
@@ -109,6 +134,23 @@ struct ClaudeSession {
     ownership_id: String,
     /// The stdout-consumer task (aborted on shutdown).
     consumer: tokio::task::JoinHandle<()>,
+    /// The id the SIDECAR keys this session by (`created.sessionId`). Equal to the
+    /// sessions-map key for created sessions; DIFFERENT for resumed-on-attach sessions
+    /// (Task 6), where the map key is the CLIENT's original id. `handle_send`/
+    /// `handle_interrupt` MUST address the sidecar with this id, never the map key.
+    sidecar_session_id: String,
+    /// Best-effort copy of the durable Claude UUID, recorded from `sdk.session.init`
+    /// by the stdout consumer. Nothing in production reads it: attach/eviction resolve
+    /// durable ids through [`FreshClaudeState::cli_index`], and the snapshot adapter
+    /// is disk-only. Currently read only by in-crate tests; kept as a diagnostic/
+    /// forward slot.
+    #[allow(dead_code)]
+    cli_session_id: Option<String>,
+    /// The envelope-stamp id the stdout consumer reads PER EVENT (Task 10b). Starts as
+    /// the sessions-map key; an attach-by-durable REBIND flips it to the durable id so
+    /// the pane keyed on the durable receives events. A shared mutable handle because
+    /// the consumer task runs detached from this record.
+    broadcast_id: Arc<std::sync::Mutex<String>>,
 }
 
 impl FreshClaudeState {
@@ -117,8 +159,66 @@ impl FreshClaudeState {
         Self {
             broadcast_tx,
             sessions: Arc::new(TokioMutex::new(HashMap::new())),
+            cli_index: Arc::new(TokioMutex::new(HashMap::new())),
             create_dedup: Arc::new(FreshAgentCreateDedup::new()),
+            resuming: Arc::new(TokioMutex::new(std::collections::HashSet::new())),
+            identity_sink: Arc::new(std::sync::OnceLock::new()),
+            leases: Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+            terminal_liveness: Arc::new(|_, _| false),
         }
+    }
+
+    /// Wire the cross-kind terminal-liveness probe (Task 13b; called by `main.rs`
+    /// before this state is cloned into the router).
+    pub fn set_terminal_liveness(&mut self, probe: crate::TerminalLivenessProbe) {
+        self.terminal_liveness = probe;
+    }
+
+    /// Replace the default lease map with the ONE server-wide shared map (Task 12;
+    /// called by `main.rs` before this state is cloned into the router). Keys are
+    /// provider-namespaced, so a default per-runtime map is semantically identical —
+    /// the shared map exists for observability and Task 13b's cross-kind wiring.
+    pub fn set_session_leases(
+        &mut self,
+        leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    ) {
+        self.leases = leases;
+    }
+
+    /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
+    pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
+        let _ = self.identity_sink.set(sink);
+    }
+
+    /// The wired identity sink, if any.
+    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+        self.identity_sink.get().cloned()
+    }
+
+    /// Broadcast a `freshAgent.error` alarm/degradation frame (P1.13; Task 10
+    /// consumes this too). Same envelope contract as codex's helper (`codex.rs`):
+    /// top-level `sessionType`/`provider` are REQUIRED (locator resolution) and
+    /// `message` is user-facing (the banner shows the message, never the code) —
+    /// but unlike codex this one cannot hardcode the session type: provider
+    /// `claude` covers BOTH `freshclaude` and `kilroy`, so the flavour is a param.
+    fn emit_fresh_agent_error(
+        &self,
+        session_id: &str,
+        session_type: &str,
+        code: &str,
+        message: &str,
+    ) {
+        self.broadcast(&ServerMessage::FreshAgentEvent(FreshAgentEvent {
+            event: json!({
+                "type": "freshAgent.error",
+                "sessionId": session_id,
+                "code": code,
+                "message": message,
+            }),
+            provider: PROVIDER.to_string(),
+            session_id: session_id.to_string(),
+            session_type: session_type.to_string(),
+        }));
     }
 
     /// Reap every owned claude sidecar: SIGTERM the Node process (so it cleanly kills its
@@ -143,6 +243,7 @@ impl FreshClaudeState {
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&session.ownership_id);
         }
+        self.cli_index.lock().await.clear();
     }
 
     fn broadcast(&self, msg: &ServerMessage) {
@@ -180,12 +281,105 @@ impl FreshClaudeState {
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
 
+        // Task 12 (D8 for fresh agents): a create-with-resume claims the per-sessionRef
+        // lease BEFORE any spawn -- exactly one in-flight resume (and one live writer)
+        // per durable transcript. ALWAYS ON (never capability-gated).
+        let resume_sid = msg.resume_session_id.clone().filter(|s| !s.is_empty());
+        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+        if let Some(sid) = resume_sid.as_deref() {
+            // Task 13b (cross-kind liveness): a live terminal PTY owning `(claude, sid)`
+            // is the one writer on that JSONL -- refuse the resume with the retryable
+            // loser answer (the terminal may be closing); NO lease claim, NO spawn.
+            if (self.terminal_liveness)(PROVIDER, sid) {
+                tracing::warn!(target: "freshell_freshagent::claude", session_id = sid,
+                    request_id = %request_id,
+                    "fresh_agent_create_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+                self.fail_create_session_reserved(&request_id);
+                return;
+            }
+            // Fast-path ADOPT (V1: new server behavior): the durable id already has a
+            // live session -- answer created against it, spawn nothing.
+            if self.has_live_session(sid).await {
+                self.adopt_live_create(&request_id, sid, session_type).await;
+                return;
+            }
+            for round in 0..2u8 {
+                match self.leases.claim(
+                    PROVIDER,
+                    sid,
+                    &request_id,
+                    crate::session_lease::now_epoch_ms(),
+                ) {
+                    crate::session_lease::FreshSessionClaim::Acquired => {
+                        lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
+                            Arc::clone(&self.leases),
+                            PROVIDER,
+                            sid,
+                            &request_id,
+                        ));
+                        break;
+                    }
+                    crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
+                        // Under-lock ADOPT: the winner completed between our pre-check
+                        // and the claim (the V5 TOCTOU window).
+                        self.adopt_live_create(&request_id, sid, session_type).await;
+                        return;
+                    }
+                    crate::session_lease::FreshSessionClaim::Held { .. } => {
+                        self.fail_create_session_reserved(&request_id);
+                        return;
+                    }
+                    crate::session_lease::FreshSessionClaim::ExpiredNeedsKill {
+                        pid,
+                        ownership_id,
+                    } => {
+                        if round == 0
+                            && crate::session_lease::kill_and_confirm_tree_dead(
+                                pid,
+                                CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                                &ownership_id,
+                            )
+                            .await
+                        {
+                            self.leases
+                                .force_release_after_confirmed_kill(PROVIDER, sid);
+                            continue;
+                        }
+                        tracing::error!(target: "invariant", pid, session_id = sid,
+                            "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
+                        self.fail_create_session_reserved(&request_id);
+                        return;
+                    }
+                }
+            }
+        }
+
         let (mut child, mut stdin, stdout, ownership_id) = match spawn_sidecar().await {
             Ok(parts) => parts,
             Err(err) => {
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
                 self.fail_create(&request_id, "CLAUDE_SIDECAR_START_FAILED", &err);
                 return;
             }
+        };
+        // Arm the TTL tree-kill path now that the child + its ownership tag exist.
+        if let Some(g) = lease_guard.as_mut() {
+            if let Some(pid) = child.id() {
+                g.set_kill_handle(pid, &ownership_id);
+            }
+        }
+
+        // P1.13: FULL settings snapshot for the binding row the consumer writes at
+        // `sdk.session.init` (claude has no sandbox concept — always `None`). Built
+        // from the SAME values the create request below actually sends.
+        let settings = crate::identity_sink::FreshAgentSettings {
+            model: msg.model.clone(),
+            sandbox: None,
+            permission_mode: msg.permission_mode.clone(),
+            effort: msg.effort.clone(),
+            cwd: msg.cwd.clone(),
         };
 
         // Send the create request (faithful to createClaudeSdkOptions inputs).
@@ -201,6 +395,10 @@ impl FreshClaudeState {
         if let Err(err) = write_line(&mut stdin, &create_req).await {
             let _ = child.start_kill();
             reap_owned_claude_sidecars(&ownership_id);
+            // Own tree torn down above -- releasing the lease is safe (no orphan writer).
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
             self.fail_create(&request_id, "CLAUDE_SIDECAR_WRITE_FAILED", &err);
             return;
         }
@@ -213,23 +411,78 @@ impl FreshClaudeState {
             Err(err) => {
                 let _ = child.start_kill();
                 reap_owned_claude_sidecars(&ownership_id);
+                // Own tree torn down above -- release so the loser can acquire.
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
                 self.fail_create(&request_id, "CLAUDE_CREATE_FAILED", &err);
                 return;
             }
         };
 
         // Start the stdout consumer (the completion edge normalization lives here).
-        let consumer = self.spawn_consumer(reader, created.clone(), session_type.to_string());
+        // `Some(settings)` => the consumer records a binding row at `sdk.session.init`.
+        let broadcast_id = Arc::new(std::sync::Mutex::new(created.clone()));
+        let consumer = self.spawn_consumer(
+            reader,
+            created.clone(),
+            session_type.to_string(),
+            created.clone(),
+            Some(settings),
+            Arc::clone(&broadcast_id),
+        );
 
+        // V5 interleaving 2 (Task 12): on the create-resume path, insert
+        // `cli_index[durable] = map_key` SYNCHRONOUSLY at session registration
+        // (mirroring the attach path) -- NOT lazily at `sdk.session.init`, which lands
+        // hundreds of ms later and leaves `has_live_session` blind exactly when the 1s
+        // loser retry arrives. The `sdk.session.init` write stays as a corrector.
+        if let Some(sid) = resume_sid.as_deref() {
+            self.cli_index
+                .lock()
+                .await
+                .insert(sid.to_string(), created.clone());
+        }
         self.sessions.lock().await.insert(
             created.clone(),
             ClaudeSession {
                 stdin,
                 child,
-                ownership_id,
+                ownership_id: ownership_id.clone(),
                 consumer,
+                sidecar_session_id: created.clone(),
+                cli_session_id: resume_sid.clone(),
+                broadcast_id,
             },
         );
+
+        // Task 12: bind the durable id to this live session + release the lease in ONE
+        // lock scope. A revoked lease (expired handle-less holder) means we must NOT
+        // keep the session -- tear down our own tree and answer failed.
+        if let Some(mut g) = lease_guard.take() {
+            if !g.complete(&created) {
+                if let Some(session) = self.sessions.lock().await.remove(&created) {
+                    session.consumer.abort();
+                    let mut child = session.child;
+                    let _ = child.start_kill();
+                    reap_owned_claude_sidecars(&session.ownership_id);
+                }
+                if let Some(sid) = resume_sid.as_deref() {
+                    self.cli_index
+                        .lock()
+                        .await
+                        .retain(|_, mapped| mapped != &created);
+                    let _ = sid;
+                }
+                g.fail(); // own tree torn down -- reopen the key
+                self.fail_create(
+                    &request_id,
+                    "FRESH_AGENT_CREATE_FAILED",
+                    "session lease revoked during create; torn down",
+                );
+                return;
+            }
+        }
 
         // Cache the completed create for requestId dedup BEFORE responding (mirrors
         // codex/opencode: a duplicate `create` arriving right after this point must see
@@ -267,6 +520,46 @@ impl FreshClaudeState {
         ));
     }
 
+    /// The D8 loser answer (Task 12): reuses the existing create-failed frame with the
+    /// fixed reservation code — NO new protocol fields (deliberate: avoids a C3 wire
+    /// change; the client re-drive uses a fixed floor).
+    fn fail_create_session_reserved(&self, request_id: &str) {
+        self.broadcast(&ServerMessage::FreshAgentCreateFailed(
+            FreshAgentCreateFailed {
+                code: "SESSION_RESERVED".to_string(),
+                message: "Another resume for this session is in flight".to_string(),
+                request_id: request_id.to_string(),
+                retryable: Some(true),
+            },
+        ));
+    }
+
+    /// The HAS-LIVE→ADOPT arm (Task 12, V1: new server behavior): answer a loser's
+    /// create-with-resume with `freshAgent.created` naming the adopted DURABLE session
+    /// (send/attach route to it via Task 10b's `cli_index` resolution) under the
+    /// loser's own `requestId` — no spawn, no second writer.
+    async fn adopt_live_create(&self, request_id: &str, durable: &str, session_type: &str) {
+        self.create_dedup
+            .record_success(
+                request_id,
+                ClaudeCreateRecord {
+                    session_id: durable.to_string(),
+                },
+            )
+            .await;
+        self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
+            provider: PROVIDER.to_string(),
+            request_id: request_id.to_string(),
+            runtime_provider: PROVIDER.to_string(),
+            session_id: durable.to_string(),
+            session_type: session_type.to_string(),
+            session_ref: Some(freshell_protocol::SessionLocator {
+                provider: PROVIDER.to_string(),
+                session_id: durable.to_string(),
+            }),
+        }));
+    }
+
     // ── freshAgent.kill (WS) ─────────────────────────────────────────────────
 
     /// Handle a `freshAgent.kill` for claude/kilroy: remove the session and tear down
@@ -280,7 +573,14 @@ impl FreshClaudeState {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
-        let removed = self.sessions.lock().await.remove(&session_id);
+        // Task 10b: durable ids resolve through `cli_index` (alias, don't move) --
+        // a kill addressed by the durable id must tear down the live aliased session.
+        // Unresolvable ids keep today's idempotent success path.
+        let map_key = self
+            .resolve_session_key(&session_id)
+            .await
+            .unwrap_or_else(|| session_id.clone());
+        let removed = self.sessions.lock().await.remove(&map_key);
         if let Some(session) = removed {
             session.consumer.abort();
             let mut stdin = session.stdin;
@@ -299,8 +599,15 @@ impl FreshClaudeState {
         // same requestId must genuinely mint a fresh session, not replay the one just
         // killed.
         self.create_dedup
-            .clear_for_session(|record| record.session_id == session_id)
+            .clear_for_session(|record| record.session_id == map_key)
             .await;
+
+        // Evict the killed session's durable-id index entries (retain covers the case
+        // where `sdk.session.init` raced in before the session-map insert).
+        self.cli_index
+            .lock()
+            .await
+            .retain(|_, mapped| mapped != &map_key);
 
         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
             provider: PROVIDER.to_string(),
@@ -326,13 +633,20 @@ impl FreshClaudeState {
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_id = msg.session_id.clone();
 
-        let interrupt_req = json!({ "type": "interrupt", "sessionId": session_id });
+        // Task 10b: durable ids resolve through `cli_index` (same aliasing as send).
+        let Some(map_key) = self.resolve_session_key(&session_id).await else {
+            self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
+            return;
+        };
         let mut guard = self.sessions.lock().await;
-        let Some(session) = guard.get_mut(&session_id) else {
+        let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
             self.send_error(&None, "SESSION_NOT_FOUND", "claude session not found");
             return;
         };
+        // Address the sidecar by ITS id for this session (== the map key for created
+        // sessions; differs for resumed-on-attach sessions, Task 6).
+        let interrupt_req = json!({ "type": "interrupt", "sessionId": session.sidecar_session_id });
         if let Err(err) = write_line(&mut session.stdin, &interrupt_req).await {
             drop(guard);
             self.send_error(&None, "CLAUDE_INTERRUPT_FAILED", &err);
@@ -351,13 +665,22 @@ impl FreshClaudeState {
         let session_id = msg.session_id.clone();
         let session_type = session_type_str(msg.session_type);
 
-        let send_req = json!({ "type": "send", "sessionId": session_id, "text": msg.text });
+        // Task 10b: a durable claude UUID resolves through `cli_index` to the live
+        // session -- no more SESSION_NOT_FOUND for a durable id the index maps.
+        let Some(map_key) = self.resolve_session_key(&session_id).await else {
+            self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
+            return;
+        };
         let mut guard = self.sessions.lock().await;
-        let Some(session) = guard.get_mut(&session_id) else {
+        let Some(session) = guard.get_mut(&map_key) else {
             drop(guard);
             self.send_error(&request_id, "SESSION_NOT_FOUND", "claude session not found");
             return;
         };
+        // Address the sidecar by ITS id for this session (== the map key for created
+        // sessions; differs for resumed-on-attach sessions, Task 6).
+        let send_req =
+            json!({ "type": "send", "sessionId": session.sidecar_session_id, "text": msg.text });
         if let Err(err) = write_line(&mut session.stdin, &send_req).await {
             drop(guard);
             self.send_error(&request_id, "CLAUDE_SEND_FAILED", &err);
@@ -377,6 +700,381 @@ impl FreshClaudeState {
         ));
     }
 
+    /// Reconcile liveness probe (campaign §4.3, Task 13): resolve the DURABLE
+    /// claude UUID through [`Self::cli_index`] to its sessions-map key, then
+    /// check the map. The sessions map is read UNFILTERED — no session_type
+    /// filter, so kilroy sessions count for free (V2 N-A17-1).
+    pub async fn has_live_session(&self, session_id: &str) -> bool {
+        let Some(key) = self.cli_index.lock().await.get(session_id).cloned() else {
+            return false;
+        };
+        self.sessions.lock().await.contains_key(&key)
+    }
+
+    /// Resolve a client-addressed session id to the sessions-map key (Task 10b): the id
+    /// itself when tracked, else through [`Self::cli_index`] (durable UUID -> map key).
+    /// The map is never re-keyed (in-flight consumers hold the placeholder key);
+    /// `cli_index` IS the alias table, so every map consumer works under BOTH keys.
+    async fn resolve_session_key(&self, session_id: &str) -> Option<String> {
+        if self.sessions.lock().await.contains_key(session_id) {
+            return Some(session_id.to_string());
+        }
+        let mapped = self.cli_index.lock().await.get(session_id).cloned()?;
+        self.sessions
+            .lock()
+            .await
+            .contains_key(&mapped)
+            .then_some(mapped)
+    }
+
+    // ── freshAgent.attach (restart parity: resume untracked sessions in place) ──────────
+
+    /// Handle a `freshAgent.attach` for claude/kilroy. Decision table (restart parity):
+    ///
+    /// | State | Action |
+    /// |---|---|
+    /// | tracked under `msg.session_id` | no-op -- NO frame (wire-shape parity, unchanged). Safe against dead sidecars ONLY because the consumer-exit eviction removes dead entries (ledger A9) |
+    /// | untracked, no canonical durable id on the message | `lost_session_frame` (`INVALID_SESSION_ID`) -- unchanged fallback (also covers the verified A2 edge: a pane that never learned its UUID pre-kill attaches bare; lost -> client re-create is the designed, non-destructive outcome) |
+    /// | untracked, durable id already in `cli_index`, aliased session LIVE | REBIND + ACK (Task 10b): flip the live session's envelope stamp to the durable id and answer with the idle `freshAgent.session.snapshot` stamped with the durable -- the attaching client must observe success, never silence. The map is never re-keyed (alias, don't move) |
+    /// | untracked, durable id in `cli_index` but aliased session GONE (stale row, eviction in flight) | fall through to the resume path below (the session is dead; resuming converges the client) |
+    /// | untracked, transcript EXISTS (in ANY candidate root) | spawn sidecar and resume with the session's ORIGINAL cwd from `transcript_cwd` (ledger A15: the CLI's resume lookup is cwd-slug-scoped); if that cwd no longer exists, resume by the transcript's `.jsonl` PATH (verified cli.js escape hatch that bypasses slug scoping) with the attach cwd. Register under the CLIENT's `msg.session_id`, emit idle `freshAgent.session.snapshot` whose `timelineSessionId` is the durable UUID -- NEVER a nanoid (the frozen client persists it unvalidated, ledger A14/N3) |
+    /// | untracked, transcript ABSENT in EVERY candidate root | `lost_session_frame` -- positive denial: the store is the authority (honest even under the 30-day GC, ledger A4) |
+    /// | untracked, spawn/pipe/created failure (incl. no store root resolvable) | top-level `error` `CLAUDE_ATTACH_RESUME_FAILED` -- NEVER the lost frame |
+    pub async fn handle_attach(&self, msg: FreshAgentAttach) {
+        if self.sessions.lock().await.contains_key(&msg.session_id) {
+            return; // tracked-and-alive: no frame (wire-shape parity with codex)
+        }
+        let Some(durable) = attach_durable_id(&msg) else {
+            // No durable identity to resume from: the pre-parity fallback (PR #529).
+            self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
+            return;
+        };
+        if self
+            .try_rebind_to_live(&durable, session_type_str(msg.session_type))
+            .await
+        {
+            // Task 10b: durable-in-cli_index on a LIVE session is a REBIND + ACK, not a
+            // silent no-op. A stale index row (the aliased session died; consumer
+            // eviction in flight) falls through to the resume path below instead --
+            // resuming converges the client.
+            return;
+        }
+        {
+            let mut resuming = self.resuming.lock().await;
+            if !resuming.insert(durable.clone()) {
+                return; // a concurrent attach is resuming this exact durable id
+            }
+        }
+        // Task 13: the attach-resume path SPAWNS, so it claims the D8 lease first (the
+        // in-process `resuming` single-flight above stays -- it is cheap and covers the
+        // attach-vs-attach window; the lease serializes against CREATE-path holders).
+        // Losers get `freshAgent.error { code: "SESSION_RESERVED" }` -- the established
+        // non-lost error channel (never INVALID_SESSION_ID, which would kill the pane).
+        //
+        // Task 13b (cross-kind liveness): a live terminal PTY owning `(claude, durable)`
+        // is the one writer on that JSONL -- refuse the attach-resume the same way.
+        if (self.terminal_liveness)(PROVIDER, &durable) {
+            tracing::warn!(target: "freshell_freshagent::claude", session_id = %durable,
+                "fresh_agent_attach_refused: a live terminal PTY owns this session (Task 13b cross-kind live-guard)");
+            self.resuming.lock().await.remove(&durable);
+            self.emit_fresh_agent_error(
+                &msg.session_id,
+                session_type_str(msg.session_type),
+                "SESSION_RESERVED",
+                "Another resume for this session is in flight",
+            );
+            return;
+        }
+        let attach_request_id = format!("attach-{}", uuid::Uuid::new_v4());
+        let mut lease_guard: Option<crate::FreshSessionLeaseGuard> = None;
+        for round in 0..2u8 {
+            match self.leases.claim(
+                PROVIDER,
+                &durable,
+                &attach_request_id,
+                crate::session_lease::now_epoch_ms(),
+            ) {
+                crate::session_lease::FreshSessionClaim::Acquired => {
+                    lease_guard = Some(crate::FreshSessionLeaseGuard::armed(
+                        Arc::clone(&self.leases),
+                        PROVIDER,
+                        &durable,
+                        &attach_request_id,
+                    ));
+                    break;
+                }
+                crate::session_lease::FreshSessionClaim::BoundLive { .. } => {
+                    // The winner completed while we contended: converge via the same
+                    // rebind + ack the cli_index arm performs; if the binding is stale
+                    // (session just died), answer RESERVED -- the client re-drive
+                    // converges on the reopened key.
+                    self.resuming.lock().await.remove(&durable);
+                    if !self
+                        .try_rebind_to_live(&durable, session_type_str(msg.session_type))
+                        .await
+                    {
+                        self.emit_fresh_agent_error(
+                            &msg.session_id,
+                            session_type_str(msg.session_type),
+                            "SESSION_RESERVED",
+                            "Another resume for this session is in flight",
+                        );
+                    }
+                    return;
+                }
+                crate::session_lease::FreshSessionClaim::Held { .. } => {
+                    self.resuming.lock().await.remove(&durable);
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        session_type_str(msg.session_type),
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
+                    return;
+                }
+                crate::session_lease::FreshSessionClaim::ExpiredNeedsKill { pid, ownership_id } => {
+                    if round == 0
+                        && crate::session_lease::kill_and_confirm_tree_dead(
+                            pid,
+                            CLAUDE_SIDECAR_OWNERSHIP_ENV,
+                            &ownership_id,
+                        )
+                        .await
+                    {
+                        self.leases
+                            .force_release_after_confirmed_kill(PROVIDER, &durable);
+                        continue;
+                    }
+                    tracing::error!(target: "invariant", pid, session_id = %durable,
+                        "fresh_agent_lease_expired_kill_unconfirmed: holding closed");
+                    self.resuming.lock().await.remove(&durable);
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        session_type_str(msg.session_type),
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
+                    return;
+                }
+            }
+        }
+        let outcome = self
+            .resume_for_attach(&msg, &durable, &mut lease_guard)
+            .await;
+        self.resuming.lock().await.remove(&durable);
+        // Any leftover armed guard means the resume ended WITHOUT registering a session
+        // (its own teardown already ran on every error path) -- release the key.
+        if let Some(mut g) = lease_guard.take() {
+            g.fail();
+        }
+        match outcome {
+            Ok(()) => {}
+            Err(ResumeClaudeError::NotFound) => {
+                self.broadcast(&lost_session_frame(&msg.session_id, msg.session_type));
+            }
+            Err(ResumeClaudeError::Transient(err)) => {
+                self.send_error(&None, "CLAUDE_ATTACH_RESUME_FAILED", &err);
+            }
+        }
+    }
+
+    /// Task 10b's REBIND + ACK: if `durable` is in `cli_index` and its aliased session
+    /// is LIVE, flip the session's envelope stamp to the durable id and broadcast the
+    /// idle snapshot ack (stamped with the durable). Returns `false` when the index has
+    /// no row or the row is stale (aliased session gone). The sessions map is never
+    /// re-keyed (alias, don't move -- in-flight consumers hold the placeholder key;
+    /// sends and kills resolve through `cli_index`).
+    async fn try_rebind_to_live(&self, durable: &str, session_type: &str) -> bool {
+        let Some(map_key) = self.cli_index.lock().await.get(durable).cloned() else {
+            return false;
+        };
+        let rebound = {
+            let guard = self.sessions.lock().await;
+            match guard.get(&map_key) {
+                Some(session) => {
+                    *session.broadcast_id.lock().expect("broadcast id lock") = durable.to_string();
+                    true
+                }
+                None => false,
+            }
+        };
+        if rebound {
+            self.broadcast(&status_snapshot_frame(
+                durable,
+                durable,
+                "idle",
+                session_type,
+            ));
+        }
+        rebound
+    }
+
+    /// The not-tracked resume (codex `ensure_session_resumable` analog, file-store
+    /// flavored): transcript-present gate -> spawn sidecar with `resumeSessionId` ->
+    /// register under the CLIENT's id -> idle snapshot. `lease_guard` (Task 13): the
+    /// attach-path D8 lease -- the kill handle is armed after the spawn and the lease
+    /// completed (bound to the map key) at registration; error paths tear down their
+    /// own sidecar and leave the guard for the caller to `fail()`.
+    async fn resume_for_attach(
+        &self,
+        msg: &FreshAgentAttach,
+        durable: &str,
+        lease_guard: &mut Option<crate::FreshSessionLeaseGuard>,
+    ) -> Result<(), ResumeClaudeError> {
+        if crate::claude_snapshot::claude_home_candidates().is_empty() {
+            // No store root resolvable at all: we cannot CHECK, so we must not DENY.
+            return Err(ResumeClaudeError::Transient(
+                "no claude store root resolvable (CLAUDE_CONFIG_DIR/CLAUDE_HOME/HOME unset)"
+                    .to_string(),
+            ));
+        }
+        // Positive denial only when the transcript is absent in EVERY candidate
+        // root (CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude -- ledger A3).
+        let Some(transcript) = crate::claude_snapshot::locate_transcript(durable) else {
+            return Err(ResumeClaudeError::NotFound);
+        };
+        // P1.13 (Task 10): recover the pane's recorded settings from the ledger so a
+        // resume-in-place does not silently revert model/permissionMode/effort. V7/A10
+        // alarm gate: alarm ONLY when the ledger PROVES prior recording yet no snapshot
+        // is recoverable. Never-recorded transcripts (the entire pre-existing
+        // ~/.claude/projects population — resume_for_attach exists FOR them) stay silent.
+        let sink = self.identity_sink();
+        let recovered = sink
+            .as_ref()
+            .and_then(|s| s.load_settings("claude", durable));
+        if recovered.is_none()
+            && sink
+                .as_ref()
+                .is_some_and(|s| s.was_recorded("claude", durable))
+        {
+            // Recorded before, unrecoverable now — the genuine anomaly.
+            tracing::warn!(session = %durable, "freshagent.claude.settings_record_unrecoverable");
+            self.emit_fresh_agent_error(
+                durable,
+                session_type_str(msg.session_type), // preserves freshclaude vs kilroy in the frame
+                "SETTINGS_RESET",
+                "Session settings could not be recovered after restart - the agent is running with default model and permissions. Reconfirm your settings.",
+            );
+        }
+        let rec = recovered.clone().unwrap_or_default();
+        // The CLI's resume lookup is scoped to the ORIGINAL cwd's project slug
+        // (ledger A15) -- resume with the cwd recorded in the transcript itself.
+        // If that directory is gone, fall back to path-based resume
+        // (`--resume <path>.jsonl` bypasses slug scoping -- verified cli.js 2.1.220),
+        // keeping the attach cwd for the process itself.
+        let original_cwd = crate::claude_snapshot::transcript_cwd(&transcript)
+            .filter(|c| std::path::Path::new(c).is_dir());
+        let (resume_value, resume_cwd) = match original_cwd {
+            Some(cwd) => (json!(durable), json!(cwd)),
+            // Attach cwd stays primary; the ledger record's cwd is a FINAL
+            // fallback only when both existing sources are absent (Task 10).
+            None => (
+                json!(transcript.to_string_lossy()),
+                json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
+            ),
+        };
+
+        let (mut child, mut stdin, stdout, ownership_id) = spawn_sidecar()
+            .await
+            .map_err(ResumeClaudeError::Transient)?;
+        // Task 13: arm the lease's TTL tree-kill path now that the child + tag exist.
+        if let Some(g) = lease_guard.as_mut() {
+            if let Some(pid) = child.id() {
+                g.set_kill_handle(pid, &ownership_id);
+            }
+        }
+        let request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
+        let create_req = json!({
+            "type": "create",
+            "requestId": request_id,
+            "cwd": resume_cwd,
+            // Recovered from the ledger record (Task 10); `json!` serializes `None`
+            // as `null`, preserving today's fallback wire shape exactly on a miss.
+            "model": rec.model,
+            "permissionMode": rec.permission_mode,
+            "effort": rec.effort,
+            "resumeSessionId": resume_value,
+        });
+        if let Err(err) = write_line(&mut stdin, &create_req).await {
+            let _ = child.start_kill();
+            reap_owned_claude_sidecars(&ownership_id);
+            return Err(ResumeClaudeError::Transient(err));
+        }
+        let mut reader = BufReader::new(stdout).lines();
+        let sidecar_session_id = match read_created(&mut reader, SIDECAR_CREATE_BUDGET).await {
+            Ok(id) => id,
+            Err(err) => {
+                let _ = child.start_kill();
+                reap_owned_claude_sidecars(&ownership_id);
+                return Err(ResumeClaudeError::Transient(err));
+            }
+        };
+
+        let session_type = session_type_str(msg.session_type).to_string();
+        // Register under the CLIENT's id: the consumer stamps the map key on every
+        // envelope and the frozen client routes by envelope sessionId
+        // (fresh-agent-ws.ts:180-183) -- a fresh key would strand the pane.
+        // The sidecar's created id is the eviction identity guard for this consumer.
+        // `settings` (P1.13, Task 10): `Some(rec)` re-records the row under any new
+        // cliSessionId (the old durable's row keeps serving `load_settings`, so later
+        // attaches with the old id still resolve — no repeat-fire, V7 §4); `None`
+        // records nothing (no laundered blank row under the new id, V7/A10).
+        let broadcast_id = Arc::new(std::sync::Mutex::new(msg.session_id.clone()));
+        let consumer = self.spawn_consumer(
+            reader,
+            msg.session_id.clone(),
+            session_type.clone(),
+            sidecar_session_id.clone(),
+            recovered,
+            Arc::clone(&broadcast_id),
+        );
+        self.sessions.lock().await.insert(
+            msg.session_id.clone(),
+            ClaudeSession {
+                stdin,
+                child,
+                ownership_id,
+                consumer,
+                sidecar_session_id,
+                cli_session_id: Some(durable.to_string()),
+                broadcast_id,
+            },
+        );
+        self.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), msg.session_id.clone());
+
+        // Task 13: bind the durable id to this live session + release the lease. A
+        // revoked lease means we must NOT keep the session -- tear down and fail.
+        if let Some(mut g) = lease_guard.take() {
+            if !g.complete(&msg.session_id) {
+                if let Some(session) = self.sessions.lock().await.remove(&msg.session_id) {
+                    session.consumer.abort();
+                    let mut child = session.child;
+                    let _ = child.start_kill();
+                    reap_owned_claude_sidecars(&session.ownership_id);
+                }
+                self.cli_index
+                    .lock()
+                    .await
+                    .retain(|_, mapped| mapped != &msg.session_id);
+                g.fail(); // own tree torn down -- reopen the key
+                return Err(ResumeClaudeError::Transient(
+                    "session lease revoked during attach-resume; torn down".to_string(),
+                ));
+            }
+        }
+
+        self.broadcast(&status_snapshot_frame(
+            &msg.session_id,
+            durable,
+            "idle",
+            &session_type,
+        ));
+        Ok(())
+    }
+
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
             code: ErrorCode::InternalError,
@@ -385,6 +1083,7 @@ impl FreshClaudeState {
             actual_session_ref: None,
             expected_session_ref: None,
             request_id: request_id.clone(),
+            retry_after_ms: None,
             terminal_exit_code: None,
             terminal_id: None,
         }));
@@ -394,14 +1093,33 @@ impl FreshClaudeState {
 
     /// Consume the sidecar's stdout event stream (one `sdk.*` JSON per line), normalize
     /// each `sdk.* → freshAgent.*` and broadcast it wrapped in a `freshAgent.event`. On EOF
-    /// (a clean end OR a mid-turn death) the loop just stops — never a false completion.
+    /// (a clean end OR a mid-turn death) the loop stops — never a false completion — and
+    /// the dead session is evicted from both maps (identity-guarded, ledger A9).
+    /// `sidecar_session_id` is the id THIS consumer's sidecar is keyed by; it guards the
+    /// eviction so a stale consumer can never evict a newer session re-registered under
+    /// the same map key (attach-resume, Task 6).
+    ///
+    /// `settings` (P1.13): `Some` = record a fresh-agent binding row at
+    /// `sdk.session.init` (create path / resume-with-record); `None` = do NOT record
+    /// (resume of a never-recorded session — writing would launder a blank row under
+    /// the new cliSessionId, V7/A10). The row's `mode` is the `session_type` param
+    /// (the `"freshclaude"` vs `"kilroy"` flavour; provider is always [`PROVIDER`]).
+    /// `broadcast_id` (Task 10b): the shared envelope-stamp handle read PER EVENT --
+    /// starts as the map key; an attach-by-durable rebind flips it to the durable id.
     fn spawn_consumer(
         &self,
         mut reader: tokio::io::Lines<BufReader<ChildStdout>>,
         session_id: String,
         session_type: String,
+        sidecar_session_id: String,
+        settings: Option<crate::identity_sink::FreshAgentSettings>,
+        broadcast_id: Arc<std::sync::Mutex<String>>,
     ) -> tokio::task::JoinHandle<()> {
         let broadcast_tx = self.broadcast_tx.clone();
+        let sessions = self.sessions.clone();
+        let cli_index = self.cli_index.clone();
+        let identity_sink = self.identity_sink();
+        let state = self.clone();
         tokio::spawn(async move {
             while let Ok(Some(line)) = reader.next_line().await {
                 let trimmed = line.trim();
@@ -411,8 +1129,93 @@ impl FreshClaudeState {
                 let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
                     continue;
                 };
-                if let Some(frame) = sdk_line_to_frame(&value, &session_id, &session_type) {
+                // Restart-parity (plan §2.8 item 2): record the durable Claude UUID.
+                // The index insert is load-bearing; the session-field copy is
+                // best-effort (the map entry may not exist yet during create).
+                if value.get("type").and_then(Value::as_str) == Some("sdk.session.init") {
+                    if let Some(cli_id) = value.get("cliSessionId").and_then(Value::as_str) {
+                        cli_index
+                            .lock()
+                            .await
+                            .insert(cli_id.to_string(), session_id.clone());
+                        if let Some(session) = sessions.lock().await.get_mut(&session_id) {
+                            session.cli_session_id = Some(cli_id.to_string());
+                        }
+                        // P1.13: binding row keyed by the DURABLE cliSessionId, with
+                        // the FULL create-settings snapshot — AWAITED here (this arm
+                        // runs on the async consumer task) so the row is durable
+                        // BEFORE the init-driven broadcast below proceeds (V8/A11).
+                        // A failed write is surfaced user-visibly, never
+                        // warn-and-drop, then the identity event proceeds.
+                        // No-laundering guard (V7/A10, parity with codex's
+                        // `record_codex_binding`): never persist an all-blank
+                        // snapshot — it would make `was_recorded` true while
+                        // `load_settings` returns None (the server sink's
+                        // blank-snapshot guard), arming a FALSE SETTINGS_RESET
+                        // for a legitimately-default create on a later resume.
+                        let recordable = settings
+                            .as_ref()
+                            .filter(|s| **s != crate::identity_sink::FreshAgentSettings::default());
+                        if let (Some(sink), Some(settings)) = (identity_sink.clone(), recordable) {
+                            if let Err(e) = sink
+                                .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                                    provider: PROVIDER.into(),
+                                    session_id: cli_id.to_string(),
+                                    mode: session_type.clone(),
+                                    create_request_id: None,
+                                    resolves_pending: None,
+                                    supersedes: None,
+                                    settings: settings.clone(),
+                                })
+                                .await
+                            {
+                                tracing::warn!(error = %e, session = %cli_id, "freshagent.claude.binding_write_failed");
+                                state.emit_fresh_agent_error(
+                                    cli_id,
+                                    &session_type,
+                                    "LEDGER_WRITE_FAILED",
+                                    "Failed to persist this session's resume record - settings may not survive a server restart.",
+                                );
+                            }
+                        }
+                    }
+                }
+                // Task 10b: stamp the envelope from the SHARED handle (not the captured
+                // map key) so an attach-by-durable rebind flips live event routing.
+                let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
+                if let Some(frame) = sdk_line_to_frame(&value, &stamp, &session_type) {
                     let _ = broadcast_tx.send(frame);
+                }
+            }
+            // Consumer exit == this sidecar's stdout closed == sidecar death
+            // (ledger A9). Evict the dead session and its cli_index entries,
+            // identity-guarded: a newer session re-registered under the same
+            // map key (attach-resume, Task 6) has a DIFFERENT
+            // sidecar_session_id and must not be evicted by this stale consumer.
+            let evicted = {
+                let mut map = sessions.lock().await;
+                match map.get(&session_id) {
+                    Some(s) if s.sidecar_session_id == sidecar_session_id => {
+                        map.remove(&session_id);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if evicted {
+                let mut removed_durables = Vec::new();
+                cli_index.lock().await.retain(|durable, mapped| {
+                    if mapped == &session_id {
+                        removed_durables.push(durable.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                // Task 12: a dead BOUND session must reopen its durable id, or the
+                // sessionRef stays adopt-only forever.
+                for durable in &removed_durables {
+                    state.leases.clear_binding(PROVIDER, durable);
                 }
             }
         })
@@ -476,6 +1279,81 @@ fn session_type_str(session_type: SessionType) -> &'static str {
         SessionType::Kilroy => "kilroy",
         _ => "freshclaude",
     }
+}
+
+/// The `freshAgent.error{code:'INVALID_SESSION_ID'}` shape (`sdk-events.ts:37`) the client
+/// folds into `markSessionLost` (`fresh-agent-ws.ts:326-328`) instead of hanging on a stale
+/// `freshAgent.attach` for a session this server has never heard of. Third copy after
+/// `codex.rs`/`opencode_ws.rs` (both document the duplication) -- but unlike those two this
+/// one cannot hardcode the session type: provider `claude` covers BOTH `freshclaude` and
+/// `kilroy`, so the envelope's sessionType comes from the attach message.
+/// The durable claude id an attach carries: `resumeSessionId` first, then
+/// `sessionRef.sessionId` -- both written by the FROZEN client
+/// (`FreshAgentView.tsx:303-313`). Only canonical UUIDs qualify
+/// (`shared/session-contract.ts:34`) -- a nanoid here would just miss the store.
+fn attach_durable_id(msg: &FreshAgentAttach) -> Option<String> {
+    let candidate = msg
+        .resume_session_id
+        .clone()
+        .or_else(|| msg.session_ref.as_ref().map(|r| r.session_id.clone()))?;
+    is_canonical_claude_uuid(&candidate).then_some(candidate)
+}
+
+fn is_canonical_claude_uuid(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
+}
+
+/// The codex-shape idle status snapshot (`freshAgent.session.snapshot`) claude emits
+/// after a resume-on-attach: provider-agnostic client-side (`fresh-agent-ws.ts:196-206`),
+/// it un-wedges a BUSY pane and hands the durable UUID over via `timelineSessionId`.
+fn status_snapshot_frame(
+    session_id: &str,
+    timeline_session_id: &str,
+    status: &str,
+    session_type: &str,
+) -> ServerMessage {
+    ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: json!({
+            "type": "freshAgent.session.snapshot",
+            "sessionId": session_id,
+            "latestTurnId": Value::Null,
+            "status": status,
+            "timelineSessionId": timeline_session_id,
+        }),
+        provider: PROVIDER.to_string(),
+        session_id: session_id.to_string(),
+        session_type: session_type.to_string(),
+    })
+}
+
+/// Why a resume-on-attach could not produce a live session (codex's
+/// `ResumeSessionError` analog).
+#[derive(Debug)]
+enum ResumeClaudeError {
+    /// The transcript store positively has no file for this durable id.
+    NotFound,
+    /// Spawn/pipe/`created` failure -- the session may be perfectly resumable;
+    /// NEVER declared lost (opencode_ws.rs discipline).
+    Transient(String),
+}
+
+fn lost_session_frame(session_id: &str, session_type: SessionType) -> ServerMessage {
+    ServerMessage::FreshAgentEvent(FreshAgentEvent {
+        event: json!({
+            "type": "freshAgent.error",
+            "sessionId": session_id,
+            "code": "INVALID_SESSION_ID",
+            "message": format!("claude session {session_id} not found"),
+        }),
+        provider: PROVIDER.to_string(),
+        session_id: session_id.to_string(),
+        session_type: session_type_str(session_type).to_string(),
+    })
 }
 
 // ── Node sidecar spawn ──────────────────────────────────────────────────────────────────
@@ -692,12 +1570,325 @@ fn now_iso() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn state() -> FreshClaudeState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         FreshClaudeState::new(Arc::new(tx))
+    }
+
+    fn state_with_bus() -> (FreshClaudeState, tokio::sync::broadcast::Receiver<String>) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        (FreshClaudeState::new(Arc::new(tx)), rx)
+    }
+
+    fn attach_msg(session_id: &str) -> FreshAgentAttach {
+        FreshAgentAttach {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+            resume_session_id: None,
+            session_ref: None,
+        }
+    }
+
+    /// Insert a fake tracked session directly into the map, bypassing the sidecar spawn
+    /// (the claude analog of codex.rs's `spawn_sleeper` + `insert_fake_session`). The
+    /// `sleep 30` child stands in for the Node sidecar; `kill_on_drop` reaps it at test end.
+    async fn insert_fake_claude_session(st: &FreshClaudeState, session_id: &str) {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sleeper");
+        let stdin = child.stdin.take().expect("piped stdin");
+        let consumer = tokio::spawn(async {});
+        st.sessions.lock().await.insert(
+            session_id.to_string(),
+            ClaudeSession {
+                stdin,
+                child,
+                ownership_id: format!("test-{session_id}"),
+                consumer,
+                sidecar_session_id: session_id.to_string(),
+                cli_session_id: None,
+                broadcast_id: Arc::new(std::sync::Mutex::new(session_id.to_string())),
+            },
+        );
+    }
+
+    /// P0.2 slice 1 (restart-resilience §2.8): an attach for a session this process does
+    /// not track (the always-true case after a server restart) must emit the
+    /// `freshAgent.error{code:'INVALID_SESSION_ID'}` lost-session shape -- NOT be
+    /// swallowed -- so the client marks the pane `.lost` and `triggerRecovery`
+    /// re-creates with `resumeSessionId` (`fresh-agent-ws.ts:325-327`).
+    #[tokio::test]
+    async fn handle_attach_untracked_session_emits_lost_session_frame() {
+        let (st, mut rx) = state_with_bus();
+
+        st.handle_attach(attach_msg("does-not-exist")).await;
+
+        let raw = rx.try_recv().expect("a lost-session frame was broadcast");
+        let frame: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["sessionId"], "does-not-exist");
+        assert_eq!(frame["provider"], "claude");
+        assert_eq!(frame["sessionType"], "freshclaude");
+        assert_eq!(frame["event"]["type"], "freshAgent.error");
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    /// Kilroy panes send `provider: "claude"` with `sessionType: "kilroy"` -- the envelope
+    /// must echo the message's session type or the client builds the wrong locator and the
+    /// pane never goes `.lost`.
+    #[tokio::test]
+    async fn handle_attach_untracked_kilroy_session_keeps_kilroy_session_type() {
+        let (st, mut rx) = state_with_bus();
+        let mut msg = attach_msg("kilroy-gone");
+        msg.session_type = SessionType::Kilroy;
+
+        st.handle_attach(msg).await;
+
+        let frame: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["sessionType"], "kilroy");
+        assert_eq!(frame["provider"], "claude");
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    /// Wire-shape parity with codex's tracked-and-alive row (codex.rs decision table /
+    /// `handle_attach_known_alive_session_emits_no_frame_regardless_of_turn_state`):
+    /// attaching to a session this process DOES track must broadcast nothing -- above all
+    /// it must never declare a live session lost (which would make the client kill and
+    /// re-create a healthy pane).
+    #[tokio::test]
+    async fn handle_attach_tracked_session_broadcasts_nothing() {
+        let (st, mut rx) = state_with_bus();
+        insert_fake_claude_session(&st, "still-alive").await;
+
+        st.handle_attach(attach_msg("still-alive")).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "tracked attach must not broadcast any frame (wire-shape parity)"
+        );
+    }
+
+    // ── freshAgent.attach: resume-on-attach (restart parity, Task 6) ──────────────
+
+    fn attach_msg_with_resume(session_id: &str, durable: &str) -> FreshAgentAttach {
+        let mut msg = attach_msg(session_id);
+        msg.resume_session_id = Some(durable.to_string());
+        msg
+    }
+
+    fn write_fake_transcript(home: &std::path::Path, durable: &str) {
+        let dir = home.join("projects").join("-t");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{durable}.jsonl")),
+            // `cwd` present + existing (ledger A15): the resume request must carry
+            // the transcript's ORIGINAL cwd, and resume by UUID (primary path).
+            r#"{"type":"user","cwd":"/tmp","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        )
+        .unwrap();
+    }
+
+    /// Bounded drain of the broadcast receiver until a `freshAgent.event` envelope with
+    /// the given INNER type arrives (mirrors [`await_claude_created`]'s 15s shape).
+    async fn await_frame_of_inner_type(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        inner_type: &str,
+    ) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.event" && frame["event"]["type"] == inner_type {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("freshAgent.event with inner type {inner_type} within budget"))
+    }
+
+    /// Bounded drain until a TOP-LEVEL `error` ServerMessage arrives; returns its message.
+    async fn await_top_level_error(rx: &mut tokio::sync::broadcast::Receiver<String>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "error" {
+                    return frame["message"].as_str().unwrap_or_default().to_string();
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("top-level error frame within budget"))
+    }
+
+    #[tokio::test]
+    async fn attach_untracked_with_transcript_resumes_and_emits_idle_snapshot() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        let durable = "77777777-7777-4777-8777-777777777777";
+        write_fake_transcript(home.path(), durable);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (st, mut rx) = state_with_bus();
+        st.handle_attach(attach_msg_with_resume("client-nanoid-1", durable))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        // Registered under the CLIENT's id (envelope tagging + send routing depend on it).
+        assert!(st.sessions.lock().await.contains_key("client-nanoid-1"));
+        assert_eq!(
+            st.cli_index.lock().await.get(durable),
+            Some(&"client-nanoid-1".to_string())
+        );
+        // The fake received resumeSessionId (spawn log now records the create request).
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        assert!(
+            log.contains(durable),
+            "sidecar create must carry resumeSessionId"
+        );
+        // Idle snapshot frame, tagged with the client's id + the durable timeline id.
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(frame["sessionId"], "client-nanoid-1");
+        assert_eq!(frame["event"]["status"], "idle");
+        assert_eq!(frame["event"]["timelineSessionId"], durable);
+        drop(env);
+    }
+
+    #[tokio::test]
+    async fn attach_untracked_with_missing_transcript_emits_lost_frame() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("projects")).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let (st, mut rx) = state_with_bus();
+        st.handle_attach(attach_msg_with_resume(
+            "client-nanoid-2",
+            "88888888-8888-4888-8888-888888888888",
+        ))
+        .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    #[tokio::test]
+    async fn attach_transient_spawn_failure_is_not_a_lost_frame() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let durable = "99999999-9999-4999-8999-999999999999";
+        write_fake_transcript(home.path(), durable);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "/nonexistent-node-binary");
+        let (st, mut rx) = state_with_bus();
+        st.handle_attach(attach_msg_with_resume("client-nanoid-3", durable))
+            .await;
+        std::env::remove_var("FRESHELL_CLAUDE_NODE");
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        // Mirrors codex: transient => top-level error with the provider code,
+        // explicitly NOT INVALID_SESSION_ID.
+        let err = await_top_level_error(&mut rx).await;
+        assert!(err.contains("CLAUDE_ATTACH_RESUME_FAILED"));
+        assert!(st.sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn attach_untracked_without_any_durable_id_still_emits_lost_frame() {
+        // The pre-parity fallback (PR #529) is preserved verbatim.
+        let (st, mut rx) = state_with_bus();
+        st.handle_attach(attach_msg("no-resume-anywhere")).await;
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.error").await;
+        assert_eq!(frame["event"]["code"], "INVALID_SESSION_ID");
+    }
+
+    #[tokio::test]
+    async fn concurrent_attaches_for_the_same_durable_id_spawn_at_most_one_sidecar() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        let durable = "12121212-1212-4121-8121-121212121212";
+        write_fake_transcript(home.path(), durable);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let (st, _rx) = state_with_bus();
+        let a = st.clone();
+        let b = st.clone();
+        let m1 = attach_msg_with_resume("nano-a", durable);
+        let m2 = attach_msg_with_resume("nano-b", durable);
+        tokio::join!(a.handle_attach(m1), b.handle_attach(m2));
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(env.spawn_count(), 1, "single-flight per durable id");
+        drop(env);
+    }
+
+    /// Decision-table row 3 (Task 10b pins the NEW contract): a durable id already in
+    /// `cli_index` whose aliased session is LIVE is REBOUND -- the envelope stamp flips
+    /// to the durable id and the idle snapshot ack (stamped with the durable) answers
+    /// the attach. The sessions map is never re-keyed (alias, don't move).
+    #[tokio::test]
+    async fn attach_with_durable_id_already_indexed_rebinds_and_acks() {
+        let (st, mut rx) = state_with_bus();
+        let durable = "56565656-5656-4656-8656-565656565656";
+        insert_fake_claude_session(&st, "earlier-winner").await;
+        st.cli_index
+            .lock()
+            .await
+            .insert(durable.to_string(), "earlier-winner".to_string());
+        st.handle_attach(attach_msg_with_resume("late-attacher", durable))
+            .await;
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(frame["sessionId"], durable);
+        assert_eq!(frame["event"]["status"], "idle");
+        assert_eq!(frame["event"]["timelineSessionId"], durable);
+        // Alias, don't move: the map still holds the placeholder key...
+        let sessions = st.sessions.lock().await;
+        let session = sessions
+            .get("earlier-winner")
+            .expect("map key never re-keyed");
+        // ...and the live record's envelope stamp now reads the durable id.
+        assert_eq!(
+            session.broadcast_id.lock().unwrap().as_str(),
+            durable,
+            "rebind must flip the envelope stamp to the durable id"
+        );
+    }
+
+    /// Ledger A15's failure case: the transcript's recorded cwd no longer exists on
+    /// disk, so the resume request must carry the transcript's `.jsonl` PATH (the
+    /// verified cli.js escape hatch bypassing slug scoping) instead of the bare UUID.
+    #[tokio::test]
+    async fn attach_resume_falls_back_to_transcript_path_when_original_cwd_is_gone() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        let durable = "34343434-3434-4343-8343-343434343434";
+        let dir = home.path().join("projects").join("-t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join(format!("{durable}.jsonl"));
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","cwd":"/nonexistent-original-cwd-freshell-task6","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        )
+        .unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let (st, mut rx) = state_with_bus();
+        st.handle_attach(attach_msg_with_resume("client-nanoid-4", durable))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        assert!(
+            log.contains(transcript.to_string_lossy().as_ref()),
+            "cwd-gone resume must carry the transcript PATH, got: {log}"
+        );
+        let frame = await_frame_of_inner_type(&mut rx, "freshAgent.session.snapshot").await;
+        assert_eq!(frame["event"]["timelineSessionId"], durable);
+        drop(env);
     }
 
     #[test]
@@ -835,7 +2026,7 @@ mod tests {
     fn sidecar_entry_resolves_to_the_vendored_package() {
         // Guard against the dedup tests' concurrent FRESHELL_CLAUDE_SIDECAR mutation
         // (see CLAUDE_ENV_LOCK below) -- this test reads the SAME process-global env var.
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.blocking_lock();
         std::env::remove_var("FRESHELL_CLAUDE_SIDECAR");
         // The compile-time path points at the vendored Node package beside this crate.
         let entry = sidecar_entry_path();
@@ -856,7 +2047,10 @@ mod tests {
     /// Serializes every test in this file that mutates process-global env vars
     /// (`FRESHELL_CLAUDE_SIDECAR` / `FRESHELL_CLAUDE_NODE`), mirroring codex's
     /// `ENV_LOCK` (`codex.rs`).
-    static CLAUDE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `pub(crate)` so snapshot.rs's claude-store tests share this ONE lock (mirroring
+    // how snapshot.rs reuses `crate::codex::tests::ENV_LOCK`) -- two independent
+    // per-file locks would NOT serialize against each other.
+    pub(crate) static CLAUDE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A minimal scripted fake claude sidecar (no real `@anthropic-ai/claude-agent-sdk`,
     /// no network, no cost): on `{"type":"create",...}` it appends a marker line to
@@ -872,9 +2066,6 @@ import fs from 'node:fs'
 import readline from 'node:readline'
 
 const spawnLog = process.env.FRESHELL_TEST_CLAUDE_SPAWN_LOG
-if (spawnLog) {
-  fs.appendFileSync(spawnLog, `${process.pid}\n`)
-}
 
 let counter = 0
 const rl = readline.createInterface({ input: process.stdin, terminal: false })
@@ -888,9 +2079,23 @@ rl.on('line', (line) => {
     return
   }
   if (msg.type === 'create') {
+    // Log the WHOLE create request (one line per create) so tests can both count
+    // spawns AND assert what the sidecar received (e.g. resumeSessionId).
+    if (spawnLog) {
+      fs.appendFileSync(spawnLog, `${JSON.stringify(msg)}\n`)
+    }
     counter += 1
     const sessionId = `fake-claude-session-${process.pid}-${counter}`
     process.stdout.write(JSON.stringify({ type: 'created', sessionId }) + '\n')
+    // Mirror the real sidecar's post-create init: echo resumeSessionId as the durable
+    // id when present (resume continuity), else a fixed fake uuid.
+    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    console.log(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }))
+    console.log(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }))
+  } else if (msg.type === 'send') {
+    // Test hook: lets tests kill the sidecar THROUGH the public API to exercise
+    // the consumer-exit eviction path (ledger A9).
+    if (msg.text === '__exit__') process.exit(0)
   } else if (msg.type === 'interrupt') {
     const interruptLog = process.env.FRESHELL_TEST_CLAUDE_INTERRUPT_LOG
     if (interruptLog) fs.appendFileSync(interruptLog, `${msg.sessionId}\n`)
@@ -933,6 +2138,12 @@ rl.on('line', (line) => {
             }
         }
 
+        /// Path of the spawn log (one full JSON create-request line per spawn) so tests
+        /// can assert what the sidecar received (e.g. `resumeSessionId`).
+        fn spawn_log_path(&self) -> &std::path::Path {
+            &self.spawn_log
+        }
+
         /// Number of times the fake sidecar has been spawned so far (one marker line per
         /// process start).
         fn spawn_count(&self) -> usize {
@@ -953,6 +2164,19 @@ rl.on('line', (line) => {
             std::env::remove_var("FRESHELL_CLAUDE_NODE");
             std::env::remove_var("FRESHELL_TEST_CLAUDE_SPAWN_LOG");
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn send_msg(session_id: &str, text: &str) -> FreshAgentSend {
+        FreshAgentSend {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: session_id.to_string(),
+            session_type: SessionType::Freshclaude,
+            text: text.to_string(),
+            cwd: None,
+            images: None,
+            request_id: None,
+            settings: None,
         }
     }
 
@@ -1001,7 +2225,7 @@ rl.on('line', (line) => {
     /// SAME session id on the second response.
     #[tokio::test]
     async fn handle_create_duplicate_request_id_reuses_the_session_and_spawns_once() {
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
@@ -1032,7 +2256,7 @@ rl.on('line', (line) => {
     /// must still spawn at most one sidecar and both resolve to the SAME session.
     #[tokio::test]
     async fn handle_create_concurrent_duplicate_request_id_spawns_at_most_once() {
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
@@ -1062,7 +2286,7 @@ rl.on('line', (line) => {
     /// Control: DISTINCT requestIds must never dedup against each other.
     #[tokio::test]
     async fn handle_create_distinct_request_ids_create_distinct_sessions() {
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
@@ -1099,7 +2323,7 @@ rl.on('line', (line) => {
     /// it is dropped rather than mirrored redundantly -- 4 tests, not 5.
     #[tokio::test]
     async fn handle_create_duplicate_after_explicit_kill_creates_a_fresh_session() {
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
@@ -1155,6 +2379,326 @@ rl.on('line', (line) => {
         assert_eq!(frame["sessionId"], "unknown-session");
     }
 
+    // ── cliSessionId recording (restart-parity plan §2.8 item 2) ──────────────────
+
+    /// The stdout consumer must record `sdk.session.init`'s durable `cliSessionId` in
+    /// [`FreshClaudeState::cli_index`] (durable id → sessions-map key), and an explicit
+    /// kill must evict the index entry along with the session.
+    #[tokio::test]
+    async fn session_init_records_cli_session_id_in_the_index() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-cli-idx-1")).await;
+        let created_frame = await_claude_created(&mut rx, "req-cli-idx-1").await;
+        let created = created_frame["sessionId"].as_str().unwrap().to_string();
+
+        // The fake emits sdk.session.init with the durable uuid; poll until the
+        // consumer has recorded it (bounded).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            {
+                let idx = st.cli_index.lock().await;
+                if idx.get("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa") == Some(&created) {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "cli_index never recorded the durable id"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // The session carries the best-effort copy of the durable id.
+        assert_eq!(
+            st.sessions
+                .lock()
+                .await
+                .get(&created)
+                .unwrap()
+                .cli_session_id
+                .as_deref(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
+        // Kill evicts the index entry.
+        st.handle_kill(FreshAgentKill {
+            provider: freshell_protocol::AgentProvider::Claude,
+            session_id: created.clone(),
+            session_type: SessionType::Freshclaude,
+            cwd: None,
+        })
+        .await;
+        assert!(st.cli_index.lock().await.is_empty());
+        drop(env);
+    }
+
+    /// P1.13 (Task 9): the `sdk.session.init` arm must record ONE fresh-agent binding
+    /// row through the identity sink — keyed by the DURABLE cliSessionId, carrying the
+    /// FULL create-settings snapshot and the sessionType flavour — AWAITED before the
+    /// init-driven broadcast proceeds (durable-before-answer, V8/A11).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_init_records_binding_with_create_settings() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // Drive freshAgent.create with sessionType kilroy + explicit settings.
+        let mut msg = dedup_create_msg("req-binding-init");
+        msg.session_type = SessionType::Kilroy;
+        msg.model = Some("opus-x".to_string());
+        msg.permission_mode = Some("plan".to_string());
+        msg.effort = Some("high".to_string());
+        msg.cwd = Some(env.dir.to_string_lossy().to_string());
+        state.handle_create(msg).await;
+        await_claude_created(&mut rx, "req-binding-init").await;
+
+        // Wait for sdk.session.init to be consumed: the binding write is AWAITED
+        // before the init frame broadcasts, so seeing the freshAgent.session.init
+        // envelope proves the row already landed.
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.session.init" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("freshAgent.session.init consumed within budget");
+
+        let bindings = fake.bindings.lock().unwrap();
+        let b = bindings.last().expect("binding at sdk.session.init");
+        assert_eq!(b.provider, "claude");
+        assert_eq!(b.mode, "kilroy", "sessionType flavour preserved in the row");
+        assert_eq!(
+            b.session_id, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "keyed by cliSessionId"
+        );
+        assert_eq!(b.settings.model.as_deref(), Some("opus-x"));
+        assert_eq!(b.settings.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(b.settings.effort.as_deref(), Some("high"));
+        assert!(b.settings.cwd.is_some());
+    }
+
+    /// No-laundering guard (V7/A10, parity with codex's `record_codex_binding`):
+    /// a create carrying NO optional settings (model/permissionMode/effort/cwd all
+    /// None) must NOT persist an all-blank binding row at `sdk.session.init`. A blank
+    /// row makes `was_recorded` true while `load_settings` returns None (the server
+    /// sink's blank-snapshot guard) — the exact SETTINGS_RESET alarm condition — so a
+    /// legitimately-default session would false-alarm on a later resume. The init
+    /// frame itself still broadcasts; only the ledger write is skipped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_init_with_all_blank_settings_records_no_binding() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        // dedup_create_msg carries no model/permissionMode/effort/cwd — the
+        // all-blank snapshot shape.
+        state
+            .handle_create(dedup_create_msg("req-binding-blank"))
+            .await;
+        await_claude_created(&mut rx, "req-binding-blank").await;
+
+        // The init frame still broadcasts (the skip affects ONLY the ledger write).
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["event"]["type"] == "freshAgent.session.init" {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("freshAgent.session.init consumed within budget");
+
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "an all-blank settings snapshot must not be persisted \
+             (it would arm a false SETTINGS_RESET on resume)"
+        );
+        drop(env);
+    }
+
+    // ── resume settings-from-ledger (P1.13, Task 10) ─────────────────────────────
+
+    /// P1.13 (Task 10): resume-in-place must reapply the pane's recorded
+    /// model/permissionMode/effort from the ledger record instead of sending Nulls —
+    /// the known defect where a restarted freshclaude/kilroy pane silently reverted
+    /// its settings. The fake sidecar logs the WHOLE create-request JSON per spawn,
+    /// so the wire itself is the assertion surface.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_for_attach_reapplies_settings_from_ledger() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (state, _rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.seed(
+            "claude",
+            DURABLE,
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("opus-x".into()),
+                sandbox: None,
+                permission_mode: Some("plan".into()),
+                effort: Some("high".into()),
+                cwd: None,
+            },
+        );
+        state.set_identity_sink(fake);
+
+        // Drive the donor resume flow (attach to DURABLE with a transcript on disk).
+        state
+            .handle_attach(attach_msg_with_resume("client-nanoid-settings", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        let create_req: serde_json::Value =
+            serde_json::from_str(log.lines().next().expect("one spawn-logged create request"))
+                .unwrap();
+        assert_eq!(create_req["model"], "opus-x");
+        assert_eq!(create_req["permissionMode"], "plan");
+        assert_eq!(create_req["effort"], "high");
+        drop(env);
+    }
+
+    /// V7/A10: record misses are ROUTINE — `resume_for_attach` exists precisely to
+    /// serve never-tracked transcripts (every claude-CLI-created and pre-ship session
+    /// in the shared `~/.claude/projects` store). They resume silently with nulls
+    /// exactly as today (the preserved fallback), and record NOTHING under the new
+    /// cliSessionId (settings: None ⇒ no laundered blank row — Task 9).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_without_record_is_silent_and_sends_nulls() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (state, mut rx) = state_with_bus();
+        // Deliberately empty: no record, no snapshot.
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        state.set_identity_sink(fake.clone());
+
+        state
+            .handle_attach(attach_msg_with_resume("client-nanoid-norec", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        // Today's behavior preserved as the silent fallback: nulls on the wire.
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        let create_req: serde_json::Value =
+            serde_json::from_str(log.lines().next().expect("one spawn-logged create request"))
+                .unwrap();
+        assert_eq!(create_req["model"], Value::Null);
+        assert_eq!(create_req["permissionMode"], Value::Null);
+        assert_eq!(create_req["effort"], Value::Null);
+
+        // Bounded bus drain (pattern from Task 5): NO SETTINGS_RESET frame may appear.
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            assert!(
+                !text.contains("SETTINGS_RESET"),
+                "never-recorded resume must stay silent"
+            );
+        }
+        // No defaults laundering: no binding row was written under the new cliSessionId.
+        assert!(
+            fake.bindings.lock().unwrap().is_empty(),
+            "a load_settings miss must not write a blank row"
+        );
+        drop(env);
+    }
+
+    /// The genuine anomaly (V7/A10): the ledger PROVES prior fresh-agent recording,
+    /// yet no snapshot is recoverable — the only resume case that alarms.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_with_prior_record_but_unrecoverable_settings_alarms() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+        write_fake_transcript(home.path(), DURABLE);
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (state, mut rx) = state_with_bus();
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        // was_recorded=true, load_settings=None — the SETTINGS_RESET-positive fixture.
+        fake.seed_recorded_only("claude", DURABLE);
+        state.set_identity_sink(fake);
+
+        state
+            .handle_attach(attach_msg_with_resume("client-nanoid-alarm", DURABLE))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let mut found = false;
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await
+        {
+            let Ok(text) = frame else { break };
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["event"]["code"] == "SETTINGS_RESET" {
+                // Top-level sessionType/provider (locator resolution) + a
+                // user-facing message (the banner shows the message, never the code).
+                assert_eq!(frame["event"]["type"], "freshAgent.error");
+                assert_eq!(frame["sessionType"], "freshclaude");
+                assert_eq!(frame["provider"], "claude");
+                assert!(frame["event"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Reconfirm your settings"));
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "recorded-but-unrecoverable resume must broadcast SETTINGS_RESET"
+        );
+        drop(env);
+    }
+
+    /// Ledger A9: consumer exit (== sidecar death) must evict the dead session AND its
+    /// `cli_index` entries — kill/shutdown are NOT the only eviction paths. Without this,
+    /// a dead-but-tracked session makes the tracked⇒no-op attach row strand panes forever.
+    #[tokio::test]
+    async fn consumer_exit_evicts_dead_session_and_index() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+        st.handle_create(dedup_create_msg("req-evict-1")).await;
+        let created_frame = await_claude_created(&mut rx, "req-evict-1").await;
+        let created = created_frame["sessionId"].as_str().unwrap().to_string();
+        // Kill the sidecar through the public API (fake exits on text "__exit__"),
+        // then poll (bounded) until the consumer-exit eviction clears BOTH maps.
+        st.handle_send(send_msg(&created, "__exit__")).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if st.sessions.lock().await.is_empty() && st.cli_index.lock().await.is_empty() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "consumer exit must evict the dead session and its cli_index entries"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        drop(env);
+    }
+
     // ── freshAgent.interrupt (parity gap fix -- see terminal.rs's dispatch arm) ────
 
     /// A missing session mirrors the `SESSION_NOT_FOUND` convention already
@@ -1192,7 +2736,7 @@ rl.on('line', (line) => {
     /// assert on instead).
     #[tokio::test]
     async fn handle_interrupt_forwards_the_request_to_the_sidecar_for_a_known_session() {
-        let _guard = CLAUDE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let st = FreshClaudeState::new(Arc::new(tx));
@@ -1225,10 +2769,20 @@ rl.on('line', (line) => {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        // Success is silent -- no `error`/other frame was broadcast for this interrupt.
-        assert!(
-            rx.try_recv().is_err(),
-            "a successful interrupt must not broadcast"
-        );
+        // Success is silent -- no `error` frame was broadcast for this interrupt. The
+        // fake sidecar also emits `sdk.session.init`/`sdk.status` after `created`
+        // (Task 1); those unrelated `freshAgent.event` frames are skipped rather than
+        // miscounted as an interrupt response.
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                frame["type"], "freshAgent.event",
+                "a successful interrupt must not broadcast: {frame}"
+            );
+            assert_ne!(
+                frame["event"]["type"], "freshAgent.error",
+                "a successful interrupt must not broadcast an error: {frame}"
+            );
+        }
     }
 }

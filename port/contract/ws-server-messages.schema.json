@@ -3,8 +3,132 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 52,
+  "messageCount": 56,
   "messages": {
+    "amplifier.activity.list.response": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "latestTurnCompletions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "type": "number"
+              },
+              "completionSeq": {
+                "type": "number"
+              },
+              "terminalId": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "at",
+              "completionSeq",
+              "terminalId"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "requestId": {
+          "type": "string"
+        },
+        "terminals": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "idle",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "phase",
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "amplifier.activity.list.response",
+          "type": "string"
+        }
+      },
+      "required": [
+        "requestId",
+        "terminals",
+        "type"
+      ],
+      "type": "object"
+    },
+    "amplifier.activity.updated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "remove": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "amplifier.activity.updated",
+          "type": "string"
+        },
+        "upsert": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "phase": {
+                "enum": [
+                  "idle",
+                  "busy"
+                ],
+                "type": "string"
+              },
+              "sessionId": {
+                "type": "string"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "updatedAt": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "phase",
+              "terminalId",
+              "updatedAt"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "remove",
+        "type",
+        "upsert"
+      ],
+      "type": "object"
+    },
     "claude.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -444,7 +568,9 @@
             "INTERNAL_ERROR",
             "RATE_LIMITED",
             "UNAUTHORIZED",
-            "PROTOCOL_MISMATCH"
+            "PROTOCOL_MISMATCH",
+            "SESSION_RESERVED",
+            "FRESH_AGENT_LOST_SESSION"
           ],
           "type": "string"
         },
@@ -469,6 +595,9 @@
         },
         "requestId": {
           "type": "string"
+        },
+        "retryAfterMs": {
+          "type": "number"
         },
         "terminalExitCode": {
           "type": "number"
@@ -1123,6 +1252,88 @@
       ],
       "type": "object"
     },
+    "pane.reconcile.result": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "bootId": {
+          "type": "string"
+        },
+        "reconcileId": {
+          "type": "string"
+        },
+        "serverInstanceId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "pane.reconcile.result",
+          "type": "string"
+        },
+        "verdicts": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "corrected": {
+                "type": "boolean"
+              },
+              "duplicate": {
+                "type": "string"
+              },
+              "paneKey": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "sessionRef": {
+                "additionalProperties": false,
+                "properties": {
+                  "provider": {
+                    "type": "string"
+                  },
+                  "sessionId": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "provider",
+                  "sessionId"
+                ],
+                "type": "object"
+              },
+              "terminalId": {
+                "type": "string"
+              },
+              "verdict": {
+                "enum": [
+                  "error",
+                  "attach",
+                  "respawn",
+                  "fresh",
+                  "dead_session",
+                  "invalid"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "paneKey",
+              "verdict"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "bootId",
+        "reconcileId",
+        "serverInstanceId",
+        "type",
+        "verdicts"
+      ],
+      "type": "object"
+    },
     "perf.logging": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -1165,6 +1376,18 @@
       "properties": {
         "bootId": {
           "type": "string"
+        },
+        "capabilities": {
+          "additionalProperties": false,
+          "properties": {
+            "paneReconcileFreshAgentV1": {
+              "type": "boolean"
+            },
+            "paneReconcileV1": {
+              "type": "boolean"
+            }
+          },
+          "type": "object"
         },
         "serverInstanceId": {
           "type": "string"
@@ -1616,6 +1839,12 @@
         },
         "openRecords": {
           "type": "number"
+        },
+        "persistReason": {
+          "type": "string"
+        },
+        "persisted": {
+          "type": "boolean"
         },
         "type": {
           "const": "tabs.sync.ack",
@@ -2079,6 +2308,36 @@
       },
       "required": [
         "exitCode",
+        "terminalId",
+        "type"
+      ],
+      "type": "object"
+    },
+    "terminal.idle": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "type": "number"
+        },
+        "reason": {
+          "enum": [
+            "grace",
+            "queue-empty"
+          ],
+          "type": "string"
+        },
+        "terminalId": {
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.idle",
+          "type": "string"
+        }
+      },
+      "required": [
+        "at",
+        "reason",
         "terminalId",
         "type"
       ],
@@ -2805,7 +3064,8 @@
           "enum": [
             "codex",
             "claude",
-            "opencode"
+            "opencode",
+            "amplifier"
           ],
           "type": "string"
         },

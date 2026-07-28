@@ -17,21 +17,22 @@
 //! * `server/session-history-loader.ts` (`getClaudeHome`) — `<home>/.claude/projects`.
 //!   The per-file parse reuses `freshell_sessions::parse_session_content`.
 //!
-//! ## Scope (honest, faithful subset — documented deviations)
+//! ## Scope (what this module actually covers today)
 //!
-//! * **claude only.** codex (`<home>/.codex/sessions`) + opencode (`opencode.db`)
-//!   listing are faithful extension points, deferred. `freshell_sessions` already
-//!   ships their parsers, so this is additive wiring, not new logic.
+//! * **claude + codex + opencode.** The `SessionIndex` enumerates all three
+//!   providers (`ClaudeSource` / `CodexSource` / `OpencodeSource`,
+//!   `freshell_sessions::directory_index`); the original "claude only" Batch-B
+//!   fence is long gone.
 //! * **`projectPath = meta.cwd` (or `"unknown"`).** The original resolves the git
 //!   repo root of `cwd` (`resolveProjectPath` → `resolveGitRepoRoot`, a LIVE `git`
 //!   call); that resolution is deferred (documented). `cwd` is faithful data.
-//! * **title-tier search only.** The `userMessages`/`fullText` file-content tiers
-//!   (`applyFileSearch`) are deferred; a search query matches title/summary/
-//!   firstUserMessage metadata (the `title` tier), never wrong results.
-//! * **no live terminal join / metadata-store flavor.** `isRunning` is always
-//!   `false` here (the terminal registry join + session-flavor overrides are the
-//!   original's live wiring); `sessionType` is omitted. Faithful for a browse of
-//!   persisted transcripts.
+//! * **all three search tiers.** The `title` metadata tier plus the SESSION-07
+//!   `userMessages`/`fullText` file-content tiers (`apply_file_search`, porting
+//!   `server/session-directory/file-search.ts`).
+//! * **live terminal join.** The sidebar join below (`join_live_terminals`)
+//!   fuses the live `TerminalIdentityRegistry` set into the parsed items:
+//!   a matched item gains `isRunning`/`runningTerminalId`, and each unmatched
+//!   live identity gets exactly one synthesized entry (with `sessionType`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -682,12 +683,17 @@ fn apply_session_overrides(
 // Deliberately NOT built here (fenced by the fix spec): no filesystem watcher,
 // no cwd-fuzzy join (the join key is `provider:sessionId` ONLY, matching the
 // original), no server-side pane-layout store, no client edits. A freshly
-// created `codex` terminal with no session id yet (identity established only at
-// create time; the real session id arrives later via `terminal.session.bound`,
-// which this port doesn't associate — see `crate::identity`'s module doc)
-// surfaces as a `liveTerminalOnly` item that a subsequent index refresh may
-// duplicate once the session file appears — an EXPECTED, documented residual
-// (pinned by a test below), not a regression.
+// created `codex` terminal with no session id yet surfaces as a
+// `liveTerminalOnly` item that an index refresh may briefly duplicate once its
+// session file appears — a TRANSIENT pre-adoption window (pinned by a test
+// below), not a permanent residual: the B2 codex locator
+// (`freshell_ws::codex_identity`) adopts the real session id into the identity
+// registry, after which the rung-1 registry consultation here
+// (`join_running_state`, dedupe in `join_live_terminals`) collapses the pair
+// to one entry. A rung-2 `PaneLedger` fallback for this join was evaluated
+// during P1.14 planning and deliberately REJECTED: no production window exists
+// where a live identity lacks a `session_id` while a Bound ledger row covers
+// its current terminal id, so the fallback would be dormant machinery.
 
 /// `providerDisplayName` (`service.ts:97-108`).
 fn provider_display_name(provider: &str) -> String {
@@ -946,20 +952,22 @@ mod join_tests {
         assert_eq!(joined.len(), 1, "no duplicate for a matched terminal");
     }
 
-    /// An EXPECTED, documented residual (Fix Spec, SYMPTOM 1 caveat): a fresh
-    /// codex terminal identity (no session id, hence keyed `terminal:<id>`) and
-    /// an ALREADY-INDEXED codex session file with its own real session id are
+    /// A TRANSIENT pre-adoption window (P1.14): a fresh codex terminal
+    /// identity (no session id, hence keyed `terminal:<id>`) and an
+    /// ALREADY-INDEXED codex session file with its own real session id are
     /// DIFFERENT join keys -- codex assigns its own session id independently,
-    /// and this port doesn't associate the two after the fact (no
-    /// `terminal.session.bound` wiring, see `crate::identity`'s module doc).
-    /// This produces two sidebar entries until the identity's provisional key
-    /// is superseded by association. Pinned here as CURRENT, ACCEPTED behavior
-    /// -- not a regression to fix in this task.
+    /// so BOTH surface until the B2 codex locator
+    /// (`freshell_ws::codex_identity`) adopts the real session id into the
+    /// identity registry. After adoption, the EXISTING rung-1 registry
+    /// consultation here (`join_running_state`, dedupe in
+    /// `join_live_terminals`) collapses the pair to one entry, and the
+    /// identity-aware sweep (`main.rs`, Task 3) pushes the refresh. Pinned
+    /// here: the NO-IDENTITY input still yields two entries -- the duplicate
+    /// is transient pending locator adoption, no longer a permanent residual.
     #[test]
-    fn codex_fresh_terminal_and_its_eventual_session_file_are_a_documented_residual_duplicate() {
+    fn codex_fresh_terminal_pre_adoption_duplicate_is_transient_pending_locator_adoption() {
         let reg = TerminalIdentityRegistry::new();
-        // The live terminal, no session id yet (identity established at create
-        // time only).
+        // The live terminal, no session id yet (pre-adoption).
         reg.upsert("term-codex", Some("codex"), None, None, 5000);
         // The session file the codex CLI eventually writes, under ITS OWN real
         // session id -- a different join key than `terminal:term-codex`.
@@ -969,7 +977,7 @@ mod join_tests {
         assert_eq!(
             joined.len(),
             2,
-            "documented residual: unassociated codex terminal + its session file don't merge"
+            "pre-adoption: unassociated codex terminal + its session file don't merge yet"
         );
     }
 }

@@ -96,11 +96,13 @@ const wsMocks = vi.hoisted(() => ({
 const terminalRestoreMocks = vi.hoisted(() => ({
   addTerminalRestoreRequestId: vi.fn(),
   addTerminalFreshRecoveryRequestId: vi.fn(),
+  setPaneReconcileActive: vi.fn(),
 }))
 
 vi.mock('@/lib/terminal-restore', () => ({
   addTerminalRestoreRequestId: terminalRestoreMocks.addTerminalRestoreRequestId,
   addTerminalFreshRecoveryRequestId: terminalRestoreMocks.addTerminalFreshRecoveryRequestId,
+  setPaneReconcileActive: terminalRestoreMocks.setPaneReconcileActive,
 }))
 
 let messageHandler: ((msg: any) => void) | null = null
@@ -114,6 +116,9 @@ vi.mock('@/lib/ws-client', () => ({
     onReconnect: wsMocks.onReconnect,
     onDisconnect: wsMocks.onDisconnect,
     setHelloExtensionProvider: wsMocks.setHelloExtensionProvider,
+    cancelCreate: vi.fn(),
+    setReconcilePendingCreates: vi.fn(),
+    clearReconcileCreateHold: vi.fn(),
     get isReady() {
       return wsMocks.isReady
     },
@@ -128,6 +133,7 @@ const fetchSidebarSessionsSnapshot = vi.hoisted(() => vi.fn())
 const getTerminalDirectoryPage = vi.hoisted(() => vi.fn())
 const searchTerminalView = vi.hoisted(() => vi.fn())
 vi.mock('@/lib/api', () => ({
+  getRecoveryInventory: async () => ({ recoverable: false, contentId: 'test', device: null, otherDevices: [], ledgerOnly: [] }),
   api: {
     get: (url: string) => apiGet(url),
     patch: vi.fn().mockResolvedValue({}),
@@ -247,7 +253,7 @@ function createStore(options?: {
       turnCompletion: {
         seq: 0,
         lastAtByTerminalId: {},
-        lastAppliedCompletionSeqByTerminalId: {},
+        lastIdleAtByTerminalId: {},
         pendingEvents: [],
         attentionByTab: {},
         attentionByPane: {},
@@ -597,6 +603,35 @@ describe('App WS bootstrap recovery', () => {
     expect(sidebarCalls).toBe(2)
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex.activity.list' }))
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
+  })
+
+  it('tears down the session and surfaces an auth failure when the sidebar window load returns 401', async () => {
+    const store = createStore()
+    // Bootstrap auth succeeds (beforeEach default apiGet), but the follow-up sidebar
+    // snapshot is unauthorized -> ensureSidebarSessionsWindow must perform the auth
+    // teardown even though fetchSessionWindow no longer throws.
+    fetchSidebarSessionsSnapshot.mockRejectedValue(Object.assign(new Error('Unauthorized'), { status: 401 }))
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      // Proves the thunk path actually ran and recorded the failure...
+      expect(store.getState().sessions.windows.sidebar?.error).toBe('Unauthorized')
+      // ...and that the 401 drove the full auth teardown.
+      expect(store.getState().connection.lastError).toBe('Authentication failed')
+      expect(store.getState().connection.status).toBe('disconnected')
+    })
+
+    // Residue-proof discriminator: the teardown makes ensureSidebarSessionsWindow
+    // return false, so bootstrap exits before the pre-connect clears and never
+    // connects the websocket. (Without the teardown, bootstrap proceeds and
+    // connect IS called — so this assertion alone keeps the test RED even if
+    // transient 'Authentication failed' residue were ever observable.)
+    expect(wsMocks.connect).not.toHaveBeenCalled()
   })
 
   it('repairs missing bootstrap platform capabilities from /api/platform after websocket readiness', async () => {
@@ -1335,7 +1370,7 @@ describe('App WS bootstrap recovery', () => {
     })
   })
 
-  it('records OpenCode turn completion from the production WebSocket message path', async () => {
+  it('records the terminal.idle edge from the production WebSocket message path', async () => {
     const store = createStore({
       tabs: [{
         id: 'tab-opencode',
@@ -1381,6 +1416,7 @@ describe('App WS bootstrap recovery', () => {
       expect(store.getState().connection.status).toBe('ready')
     })
 
+    // terminal.turn.complete is informational for terminal CLI panes: no bell/shade.
     act(() => {
       messageHandler?.({
         type: 'terminal.turn.complete',
@@ -1391,17 +1427,28 @@ describe('App WS bootstrap recovery', () => {
         completionSeq: 5,
       })
     })
+    expect(store.getState().turnCompletion.pendingEvents).toEqual([])
+    expect(store.getState().turnCompletion.seq).toBe(0)
+
+    // The truly-idle edge is the ONLY bell/shade trigger.
+    act(() => {
+      messageHandler?.({
+        type: 'terminal.idle',
+        terminalId: 'term-opencode',
+        at: 2345,
+        reason: 'grace',
+      })
+    })
 
     await waitFor(() => {
       expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBe(true)
     })
     expect(store.getState().turnCompletion.attentionByTab['tab-opencode']).toBe(true)
-    expect(store.getState().turnCompletion.lastAtByTerminalId['term-opencode']).toBe(1234)
-    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(5)
+    expect(store.getState().turnCompletion.lastIdleAtByTerminalId['term-opencode']).toBe(2345)
     expect(store.getState().turnCompletion.seq).toBe(1)
   })
 
-  it('applies latest turn completions from activity list responses once across reconnect refreshes', async () => {
+  it('ignores latestTurnCompletions in activity list responses (turn completions no longer ring or shade)', async () => {
     const store = createStore({
       tabs: [{
         id: 'tab-opencode',
@@ -1466,50 +1513,15 @@ describe('App WS bootstrap recovery', () => {
       })
     })
 
-    await waitFor(() => {
-      expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBe(true)
-    })
-    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(7)
-    expect(store.getState().turnCompletion.seq).toBe(1)
-
-    act(() => {
-      messageHandler?.({
-        type: 'ready',
-        timestamp: new Date().toISOString(),
-        serverInstanceId: 'srv-preconnected-opencode-latest-completion',
-      })
-    })
-
-    await waitFor(() => {
-      const opencodeRequests = wsMocks.send.mock.calls
-        .map(([payload]) => payload)
-        .filter((payload) => payload?.type === 'opencode.activity.list')
-      expect(opencodeRequests.length).toBeGreaterThanOrEqual(2)
-    })
-    const secondRequestId = wsMocks.send.mock.calls
-      .map(([payload]) => payload)
-      .filter((payload) => payload?.type === 'opencode.activity.list')
-      .at(-1)?.requestId as string
-
-    act(() => {
-      messageHandler?.({
-        type: 'opencode.activity.list.response',
-        requestId: secondRequestId,
-        terminals: [],
-        latestTurnCompletions: [{
-          terminalId: 'term-opencode',
-          at: 2_000,
-          completionSeq: 7,
-        }],
-      })
-    })
-
-    expect(store.getState().turnCompletion.seq).toBe(1)
-    expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBe(true)
-    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(7)
+    // Turn completions are informational: no bell, no shade, no pending events —
+    // the truly-idle terminal.idle edge is the only alerting trigger.
+    expect(store.getState().turnCompletion.pendingEvents).toEqual([])
+    expect(store.getState().turnCompletion.seq).toBe(0)
+    expect(store.getState().turnCompletion.attentionByPane['pane-opencode']).toBeUndefined()
+    expect(store.getState().turnCompletion.attentionByTab['tab-opencode']).toBeUndefined()
   })
 
-  it('records OpenCode turn completion against the active tab when a terminal is duplicated', async () => {
+  it('records the terminal.idle edge against the active tab when a terminal is duplicated', async () => {
     const store = createStore({
       activeTabId: 'tab-active',
       tabs: [
@@ -1584,12 +1596,10 @@ describe('App WS bootstrap recovery', () => {
 
     act(() => {
       messageHandler?.({
-        type: 'terminal.turn.complete',
+        type: 'terminal.idle',
         terminalId: 'term-opencode',
-        provider: 'opencode',
-        sessionId: 'session-opencode',
         at: 5678,
-        completionSeq: 6,
+        reason: 'queue-empty',
       })
     })
 
@@ -1597,8 +1607,7 @@ describe('App WS bootstrap recovery', () => {
       expect(store.getState().turnCompletion.attentionByPane['pane-active']).toBe(true)
     })
     expect(store.getState().turnCompletion.attentionByTab['tab-active']).toBe(true)
-    expect(store.getState().turnCompletion.lastAtByTerminalId['term-opencode']).toBe(5678)
-    expect(store.getState().turnCompletion.lastAppliedCompletionSeqByTerminalId?.['term-opencode']).toBe(6)
+    expect(store.getState().turnCompletion.lastIdleAtByTerminalId['term-opencode']).toBe(5678)
     expect(store.getState().turnCompletion.seq).toBe(1)
   })
 
@@ -1962,17 +1971,17 @@ describe('App WS bootstrap recovery', () => {
   })
 
   it('contains a failing queued session-window refresh from a sessions.changed broadcast instead of leaking an unhandled rejection', async () => {
-    // Regression: the sessions.changed handler dispatched queueActiveSessionWindowRefresh()
-    // fire-and-forget with no .catch(). That thunk re-throws when it falls through to
-    // fetchSessionWindow() without committed window data (e.g. a sessions.changed before the
-    // sidebar window commits, or after a failed direct fetch retry), so a transient refresh
-    // failure leaked an unhandled rejection that fails the whole test run even though every
-    // test "passed" — the same failure class the terminal.inventory site already contains.
+    // Regression: the sessions.changed handler dispatches queueActiveSessionWindowRefresh()
+    // fire-and-forget with no .catch(). fetchSessionWindow used to re-throw on API failure,
+    // so a transient refresh failure leaked an unhandled rejection that failed the whole
+    // test run even though every test "passed". fetchSessionWindow now resolves a result
+    // instead of rejecting, so containment is provided at the source — this test proves the
+    // fire-and-forget dispatch can never leak, with no inline .catch present.
     const store = createStore()
 
     // Reject every snapshot fetch. The bootstrap sidebar load fails but is contained by
     // ensureSidebarSessionsWindow (so no window ever commits -> hasCommittedWindow stays
-    // false), and the queued refresh then takes the re-throwing fetchSessionWindow branch.
+    // false), and the queued refresh then exercises the failing fetchSessionWindow branch.
     fetchSidebarSessionsSnapshot.mockRejectedValue(new Error('window snapshot unavailable'))
 
     const unhandled: unknown[] = []

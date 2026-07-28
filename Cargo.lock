@@ -1258,6 +1258,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "freshell-activity"
+version = "0.1.0"
+dependencies = [
+ "freshell-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "freshell-api"
 version = "0.1.0"
 dependencies = [
@@ -1291,6 +1302,7 @@ dependencies = [
  "freshell-terminal",
  "libc",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tracing",
@@ -1350,6 +1362,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.24.0",
@@ -1411,6 +1424,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "freshell-activity",
  "freshell-codex",
  "freshell-freshagent",
  "freshell-opencode",
@@ -1419,7 +1433,10 @@ dependencies = [
  "freshell-sessions",
  "freshell-terminal",
  "futures-util",
+ "libc",
+ "notify",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "socket2",

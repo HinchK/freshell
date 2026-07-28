@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn default_network_is_unconfigured_loopback() {
         let s = default_server_settings();
-        assert_eq!(s.network.configured, false);
+        assert!(!s.network.configured);
         assert_eq!(s.network.host, NetworkHost::Loopback);
     }
 }

@@ -14,9 +14,12 @@ import {
   fetchSessionWindow,
   loadInitialSessionsWindow,
   queueActiveSessionWindowRefresh,
+  type FetchSessionWindowResult,
 } from '@/store/sessionsThunks'
 import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
+import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
+import { PaneReconcileResultSchema, type PaneReconcileRequest } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -50,7 +53,10 @@ import OverviewView from '@/components/OverviewView'
 import TabsView from '@/components/TabsView'
 import PaneDivider from '@/components/panes/PaneDivider'
 import { AuthRequiredModal } from '@/components/AuthRequiredModal'
+import { DeadSessionPanel } from '@/components/DeadSessionPanel'
+import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
 import { SetupWizard } from '@/components/SetupWizard'
+import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { fetchNetworkStatus } from '@/store/networkSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
@@ -60,14 +66,14 @@ import { X, Copy, Check, PanelLeft, AlertTriangle } from 'lucide-react'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 
 import { setTerminalMetaSnapshot, upsertTerminalMeta, removeTerminalMeta } from '@/store/terminalMetaSlice'
-import { clearDeadTerminals, clearTerminalLiveHandles } from '@/store/panesSlice'
-import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId } from '@/lib/terminal-restore'
+import { clearAllReconcilePendingPanes, clearDeadSessionAdjudication, clearDeadTerminals, clearReconcileWarming, clearTerminalLiveHandles, setReconcilePendingPanes } from '@/store/panesSlice'
+import { addTerminalFreshRecoveryRequestId, addTerminalRestoreRequestId, setPaneReconcileActive } from '@/lib/terminal-restore'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { setCodexActivitySnapshot, upsertCodexActivity, removeCodexActivity, resetCodexActivity } from '@/store/codexActivitySlice'
 import { setClaudeActivitySnapshot, upsertClaudeActivity, removeClaudeActivity, resetClaudeActivity } from '@/store/claudeActivitySlice'
 import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierActivity, resetAmplifierActivity } from '@/store/amplifierActivitySlice'
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
-import { applyServerCompletion } from '@/store/turnCompletionThunks'
+import { applyServerIdle } from '@/store/turnCompletionThunks'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { createLogger } from '@/lib/client-logger'
@@ -151,6 +157,10 @@ const ReadyMessageSchema = z.object({
   timestamp: z.string(),
   serverInstanceId: z.string().min(1),
   bootId: z.string().min(1).optional(),
+  // Server capability ack (present iff our hello opted in). Deliberately a
+  // loose record: an unexpected capabilities shape must never fail the WHOLE
+  // ready frame and silently disable restart detection.
+  capabilities: z.record(z.string(), z.unknown()).optional(),
 })
 
 export default function App() {
@@ -244,6 +254,13 @@ export default function App() {
   const amplifierActivityOrderRef = useRef(0)
   const opencodeActivityOrderRef = useRef(0)
   const copiedResetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // pane.reconcile adoption: capability of the CURRENT connection (re-captured
+  // on every ready) and the reconcile request App itself minted. Fold-ownership
+  // rule: App folds ONLY results whose reconcileId it minted, skipping foreign
+  // ones (TerminalView exhaustion auto-resolve and the warming-banner Retry
+  // mint their own).
+  const paneReconcileActiveRef = useRef(false)
+  const pendingReconcileRef = useRef<PaneReconcileRequest | null>(null)
   const fullscreenTouchStartYRef = useRef<number | null>(null)
   const isLandscapeTerminalView = isMobile && isLandscape && view === 'terminal'
   const shareAccessUrl = networkStatus?.accessUrl
@@ -490,8 +507,7 @@ export default function App() {
     const versionInfoLoadedRef = { current: false }
 
     async function bootstrap() {
-      const handleBootstrapAuthFailure = (err: unknown): boolean => {
-        if (!isApiUnauthorizedError(err)) return false
+      const performAuthFailureTeardown = () => {
         if (!cancelled) {
           resetCodexActivityOverlay()
           resetClaudeActivityOverlay()
@@ -504,6 +520,11 @@ export default function App() {
         // fetches (cleanup + stopTabRegistrySync are already assigned by now).
         cleanup?.()
         stopTabRegistrySync?.()
+      }
+
+      const handleBootstrapAuthFailure = (err: unknown): boolean => {
+        if (!isApiUnauthorizedError(err)) return false
+        performAuthFailureTeardown()
         return true
       }
 
@@ -763,18 +784,19 @@ export default function App() {
         sidebarWindowLoading = true
         try {
           const activeSurface = appStore.getState().sessions.activeSurface
-          if (activeSurface && activeSurface !== 'sidebar') {
-            await dispatch(fetchSessionWindow({
-              surface: 'sidebar',
-              priority: 'visible',
-            }) as any)
-          } else {
-            await dispatch(loadInitialSessionsWindow() as any)
+          const result = (activeSurface && activeSurface !== 'sidebar'
+            ? await dispatch(fetchSessionWindow({
+                surface: 'sidebar',
+                priority: 'visible',
+              }) as any)
+            : await dispatch(loadInitialSessionsWindow() as any)) as FetchSessionWindowResult | undefined
+          if (result?.unauthorized) {
+            performAuthFailureTeardown()
+            return false
           }
-          return true
-        } catch (err: unknown) {
-          if (handleBootstrapAuthFailure(err)) return false
-          log.warn('Failed to load initial sidebar session window', err)
+          if (!result?.ok) {
+            log.warn('Failed to load initial sidebar session window')
+          }
           return true
         } finally {
           sidebarWindowLoading = false
@@ -806,31 +828,6 @@ export default function App() {
             void recoverMissingStartupState()
           }
         }
-      }
-
-      const collectTerminalPaneTargets = (terminalIds: string[]) => {
-        const terminalIdSet = new Set(terminalIds)
-        const layouts = appStore.getState().panes.layouts
-        const targets: Array<{ tabId: string; paneId: string }> = []
-        for (const [tabId, layout] of Object.entries(layouts)) {
-          ;(function walk(node: any) {
-            if (!node) return
-            if (node.type === 'leaf') {
-              if (
-                node.content?.kind === 'terminal' &&
-                node.content.terminalId &&
-                terminalIdSet.has(node.content.terminalId)
-              ) {
-                targets.push({ tabId, paneId: node.id })
-              }
-              return
-            }
-            if (node.type === 'split' && Array.isArray(node.children)) {
-              for (const child of node.children) walk(child)
-            }
-          })(layout)
-        }
-        return targets
       }
 
       const findPaneById = (layout: any, paneId: string): any | undefined => {
@@ -867,6 +864,62 @@ export default function App() {
         }
       }
 
+      // The destructive half of the legacy inventory census: wipe pane handles
+      // whose terminals are not in liveIds, then re-arm the explicit recovery
+      // latches for the regenerated createRequestIds. Shared by the
+      // capability-absent inventory path and the reconcile fallback path.
+      const runDestructiveTerminalCensus = (liveIds: string[]) => {
+        dispatch(clearDeadTerminals({ liveTerminalIds: liveIds }))
+        // Register regenerated createRequestIds with the correct explicit
+        // recovery path after stale terminal handles are cleared.
+        const layouts = appStore.getState().panes.layouts
+        const fallbackAttempts = appStore.getState().panes.restoreFallbackAttemptsByPane || {}
+        for (const [tabId, layout] of Object.entries(layouts)) {
+          ;(function walk(node: any) {
+            if (!node) return
+            if (node.type === 'leaf') {
+              if (node.content?.kind === 'terminal' && node.content.status === 'creating' && node.content.createRequestId) {
+                const fallbackAttempt = fallbackAttempts[tabId]?.[node.id]
+                if (
+                  fallbackAttempt?.requestId === node.content.createRequestId
+                  && !node.content.sessionRef
+                ) {
+                  addTerminalFreshRecoveryRequestId(
+                    node.content.createRequestId,
+                    'fresh_after_restore_unavailable',
+                  )
+                } else if (node.content.sessionRef) {
+                  addTerminalRestoreRequestId(node.content.createRequestId)
+                }
+              }
+              return
+            }
+            if (node.type === 'split' && Array.isArray(node.children)) {
+              for (const child of node.children) walk(child)
+            }
+          })(layout)
+        }
+      }
+
+      // Terminal failure of a reconcile App minted (cardinality violation or a
+      // correlated server error frame like RECONCILE_TOO_LARGE /
+      // RECONCILE_UNAVAILABLE): deactivate reconcile for THIS inventory cycle
+      // (re-set true on the next ready) and run the legacy census once from
+      // the CACHED liveTerminalIds — on the real wire terminal.inventory
+      // ALWAYS precedes any reconcile result, so the cache is populated.
+      // Deliberately NO wall-clock timeout on the pending reconcile: it would
+      // false-trip on legitimate deferrals; the request is re-sent on every
+      // ready, so reconnect covers loss windows.
+      const fallBackToLegacyCensus = () => {
+        pendingReconcileRef.current = null
+        paneReconcileActiveRef.current = false
+        setPaneReconcileActive(false)
+        const cachedLiveIds = appStore.getState().connection.liveTerminalIds
+        if (cachedLiveIds) {
+          runDestructiveTerminalCensus(cachedLiveIds)
+        }
+      }
+
       const terminalInvalidationHandler = createTerminalInvalidationHandler({
         dispatch: (action) => appStore.dispatch(action as any),
         upsertTerminalMeta,
@@ -875,7 +928,7 @@ export default function App() {
         queueActiveSessionWindowRefresh: () => queueActiveSessionWindowRefresh() as any,
         fetchTerminalDirectoryWindow: (payload) => fetchTerminalDirectoryWindow(payload) as any,
         handleRecoverableTerminalIds: (terminalIds) => {
-          const targets = collectTerminalPaneTargets(terminalIds)
+          const targets = collectTerminalPaneTargets(appStore.getState().panes.layouts, terminalIds)
           if (targets.length === 0) return
           const removedSet = new Set(terminalIds)
           const currentLiveIds = appStore.getState().connection.liveTerminalIds
@@ -919,18 +972,85 @@ export default function App() {
           resetOpencodeActivityOverlay()
           dispatch(setError(undefined))
           dispatch(setStatus('ready'))
-          dispatch(setServerInstanceId(nextServerInstanceId))
-          const newBootId = ready.success ? ready.data.bootId : undefined
+          // Restart detection (gaps F2/G10 + F10/G11). `bootId` stays OPTIONAL
+          // in ReadyMessageSchema on purpose: both live servers always emit it
+          // (legacy server/ws-handler.ts:1910-1915, rust freshell-ws/lib.rs:356),
+          // but the shared wire type and the frozen port-oracle contract mark
+          // it optional — hard-requiring it would fail the WHOLE ready frame
+          // against an older server and silently disable all ready handling.
+          // Instead: log loudly when absent and fall back to a
+          // serverInstanceId change as the restart signal. The fallback is
+          // DEFENSE-IN-DEPTH for unknown servers/forks: git archaeology shows
+          // no shipped server ever both omitted bootId and rotated
+          // serverInstanceId on restart (legacy's bootId-less window had a
+          // persistent instanceId; rust emits bootId unconditionally, even
+          // when its instanceId is ephemeral in no-home mode).
           const previousBootId = appStore.getState().connection.bootId
-          const serverRestarted = !!previousBootId && previousBootId !== newBootId
-          dispatch(setBootId(newBootId))
-          dispatch(setServerRestarted(serverRestarted))
-          if (serverRestarted) {
-            dispatch(setLiveTerminalIds([]))
-            // The fresh process replays nothing and may stamp a lower wall-clock `at` than
-            // a clamp-inflated pre-restart value; drop the per-terminal `at` baselines so a
-            // resumed durable session's next real completion is not swallowed as a replay.
-            dispatch(resetCompletionDedupeBaselines())
+          const previousServerInstanceId = appStore.getState().connection.serverInstanceId
+          if (!ready.success) {
+            // A malformed ready frame must not wipe identity or fake a
+            // restart: keep the stored bootId/serverInstanceId and skip
+            // restart detection for this frame.
+            log.error('ready frame failed schema validation; skipping restart detection', ready.error.issues)
+          } else {
+            dispatch(setServerInstanceId(nextServerInstanceId))
+            const newBootId = ready.data.bootId
+            if (!newBootId) {
+              log.warn('ready frame carried no bootId; falling back to serverInstanceId for restart detection')
+            }
+            const bootIdRestart = !!previousBootId && previousBootId !== newBootId
+            const instanceChanged = !!previousServerInstanceId
+              && !!nextServerInstanceId
+              && previousServerInstanceId !== nextServerInstanceId
+            const serverRestarted = bootIdRestart || (!newBootId && instanceChanged)
+            dispatch(setBootId(newBootId))
+            dispatch(setServerRestarted(serverRestarted))
+            if (serverRestarted) {
+              dispatch(setLiveTerminalIds([]))
+            }
+            // The fresh process replays nothing and may stamp a lower
+            // wall-clock `at` than a clamp-inflated pre-restart value; drop
+            // the per-terminal `at` baselines so a resumed durable session's
+            // next real completion is not swallowed. Fires on EITHER restart
+            // signal, and idempotently on the first parsed ready of the page
+            // lifetime (no-op while baselines are unpersisted; future-proofs
+            // against rehydrated baselines). Never on a plain reconnect with
+            // unchanged identity.
+            const firstReadyBaseline = !previousBootId && !previousServerInstanceId
+            if (serverRestarted || instanceChanged || firstReadyBaseline) {
+              dispatch(resetCompletionDedupeBaselines())
+            }
+            // pane.reconcile adoption: capability re-captured per connection,
+            // and the request re-sent on EVERY ready — a result is not
+            // guaranteed (deferral, drop, error frame), so reconnect covers
+            // loss windows. While active, the destructive inventory census is
+            // gated off and the terminal-restore latches report not-armed.
+            const paneReconcile = ready.data.capabilities?.paneReconcileV1 === true
+            const freshAgentReconcile = ready.data.capabilities?.paneReconcileFreshAgentV1 === true
+            paneReconcileActiveRef.current = paneReconcile
+            setPaneReconcileActive(paneReconcile)
+            setFreshAgentReconcileActive(freshAgentReconcile)
+            pendingReconcileRef.current = null
+            dispatch(clearAllReconcilePendingPanes())
+            if (paneReconcile) {
+              // ONE request covering terminal panes plus (iff the server
+              // advertised paneReconcileFreshAgentV1) fresh-agent panes.
+              // Frozen-client invariant: without the capability, fresh-agent
+              // panes stay on the legacy recovery path.
+              const req = buildReconcileRequest(appStore.getState(), { includeFreshAgent: freshAgentReconcile })
+              if (req) {
+                pendingReconcileRef.current = req
+                // Exactly the requested paneKeys wait for verdicts (Redux),
+                // and the sender hold narrows to exactly their creates.
+                dispatch(setReconcilePendingPanes({ paneKeys: req.panes.map((p) => p.paneKey), startedAt: Date.now() }))
+                ws.setReconcilePendingCreates(req.panes.map((p) => p.createRequestId))
+                ws.send(req)
+              } else {
+                ws.clearReconcileCreateHold() // nothing to reconcile — release any held creates immediately
+              }
+            } else {
+              ws.clearReconcileCreateHold()
+            }
           }
           dispatch(resetWsSnapshotReceived())
           // If App registered late and missed a prior invalidation, a fresh HTTP baseline
@@ -943,13 +1063,83 @@ export default function App() {
           lastSessionsRevision = -1
           void recoverMissingStartupState()
         }
+        if (msg.type === 'pane.reconcile.result') {
+          const pending = pendingReconcileRef.current
+          // Fold-ownership rule: App folds ONLY results whose reconcileId it
+          // minted; foreign ones belong to another requester (TerminalView
+          // exhaustion auto-resolve, warming-banner Retry) — skip silently.
+          if (!pending || (msg as { reconcileId?: unknown }).reconcileId !== pending.reconcileId) {
+            return
+          }
+          pendingReconcileRef.current = null
+          const parsed = PaneReconcileResultSchema.safeParse(msg)
+          if (!parsed.success) {
+            console.error('[reconcile] malformed result — falling back to legacy census', parsed.error.issues)
+            // A malformed result is terminal for this reconcile: no verdicts
+            // will fold, so release the pending panes and the sender hold
+            // (never a silent wedge).
+            dispatch(clearAllReconcilePendingPanes())
+            ws.clearReconcileCreateHold()
+            fallBackToLegacyCensus()
+            return
+          }
+          // Every folded pane's stale held create is retracted at the sender
+          // BEFORE the hold clears below (the fold-corrected create is re-sent
+          // by the view with the same requestId).
+          const outcome = foldVerdicts(dispatch, pending, parsed.data, {
+            onVerdictFolded: (createRequestId) => ws.cancelCreate(createRequestId),
+          })
+          // Fold reducers self-clear per-pane pending flags; these two catch
+          // what they can't — skipped verdicts and cardinality-violation
+          // outcomes where nothing folded.
+          dispatch(clearAllReconcilePendingPanes())
+          ws.clearReconcileCreateHold()
+          if (outcome.cardinalityViolation) {
+            console.error('[reconcile] cardinality violation — falling back to legacy census')
+            fallBackToLegacyCensus()
+            return
+          }
+          // Final-review finding 2: foldVerdicts only SETS the batched
+          // warming/dead-adjudication state (counts > 0) — it never clears
+          // it, so a later clean round (e.g. after a WS reconnect) would
+          // leave the warming banner or dead-sessions dialog up forever.
+          // App's request covers EVERY terminal pane, so its outcome is
+          // authoritative — clear whichever batched state this round
+          // reported none of. Deliberately NOT inside foldVerdicts:
+          // single-pane requesters (TerminalView exhaustion auto-resolve,
+          // warming-banner Retry) must not clear state about other panes.
+          if (outcome.warming === 0) {
+            dispatch(clearReconcileWarming())
+          }
+          if (outcome.dead === 0) {
+            dispatch(clearDeadSessionAdjudication())
+          }
+          return
+        }
+        if (msg.type === 'error') {
+          const pending = pendingReconcileRef.current
+          if (pending && (msg as { requestId?: unknown }).requestId === pending.reconcileId) {
+            // A RESULT IS NOT GUARANTEED: the server has live-socket
+            // error-instead-of-result paths (RECONCILE_TOO_LARGE,
+            // RECONCILE_UNAVAILABLE) carrying requestId = reconcileId. Such an
+            // error is TERMINAL for this reconcile — fall back to the legacy
+            // census from the cached inventory (which always precedes the
+            // result on the real wire).
+            console.error('[reconcile] server error — falling back to legacy census', (msg as { code?: unknown }).code)
+            // Terminal for this reconcile: no verdicts are coming — release
+            // the pending panes and the sender hold before the census.
+            dispatch(clearAllReconcilePendingPanes())
+            ws.clearReconcileCreateHold()
+            fallBackToLegacyCensus()
+          }
+        }
         if (msg.type === 'sessions.changed') {
           const rev = typeof msg.revision === 'number' ? msg.revision : -1
           if (rev > lastSessionsRevision) {
             lastSessionsRevision = rev
-            // Fire-and-forget refresh: the thunk re-throws on failure, so contain the
-            // rejection rather than leak an unhandled rejection (matches the inventory site).
-            void appStore.dispatch(queueActiveSessionWindowRefresh() as any).catch((error: unknown) => log.debug('active session window refresh failed', error))
+            // Fire-and-forget refresh. queueActiveSessionWindowRefresh resolves even on
+            // failure (fetchSessionWindow records the error in Redux), so it cannot leak.
+            void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
           }
         }
         if (msg.type === 'settings.updated') {
@@ -1010,48 +1200,26 @@ export default function App() {
             .map((t: any) => t.terminalId as string)
           dispatch(setLiveTerminalIds(liveIds))
           dispatch(setServerRestarted(false))
-          dispatch(clearDeadTerminals({ liveTerminalIds: liveIds }))
-          // Register regenerated createRequestIds with the correct explicit
-          // recovery path after stale terminal handles are cleared.
-          const layouts = appStore.getState().panes.layouts
-          const fallbackAttempts = appStore.getState().panes.restoreFallbackAttemptsByPane || {}
-          for (const [tabId, layout] of Object.entries(layouts)) {
-            ;(function walk(node: any) {
-              if (!node) return
-              if (node.type === 'leaf') {
-                if (node.content?.kind === 'terminal' && node.content.status === 'creating' && node.content.createRequestId) {
-                  const fallbackAttempt = fallbackAttempts[tabId]?.[node.id]
-                  if (
-                    fallbackAttempt?.requestId === node.content.createRequestId
-                    && !node.content.sessionRef
-                  ) {
-                    addTerminalFreshRecoveryRequestId(
-                      node.content.createRequestId,
-                      'fresh_after_restore_unavailable',
-                    )
-                  } else if (node.content.sessionRef) {
-                    addTerminalRestoreRequestId(node.content.createRequestId)
-                  }
-                }
-                return
-              }
-              if (node.type === 'split' && Array.isArray(node.children)) {
-                for (const child of node.children) walk(child)
-              }
-            })(layout)
+          // Capability-gated census (council rule 11): while pane.reconcile is
+          // active on this connection the reconcile verdicts own pane adoption,
+          // so ONLY the destructive part is skipped — the cached liveTerminalIds
+          // and restart-flag reset above stay unconditional (and feed the
+          // fallback census if the reconcile later fails).
+          if (!paneReconcileActiveRef.current) {
+            runDestructiveTerminalCensus(liveIds)
           }
           dispatch(setTerminalMetaSnapshot({ terminals: terminalMeta, requestedAt: terminalMetaRequestedAt }))
           dispatch(patchSessionRunningStateFromTerminalMeta({
             upsert: terminalMeta,
             remove: removedTerminalMetaIds,
           }))
-          // Fire-and-forget refreshes: the thunks re-throw on failure, so
-          // contain the rejection rather than leak an unhandled rejection.
+          // fetchTerminalDirectoryWindow still re-throws on failure, so contain its
+          // rejection. queueActiveSessionWindowRefresh resolves even on failure.
           void appStore.dispatch(fetchTerminalDirectoryWindow({
             surface: 'sidebar',
             priority: 'visible',
           }) as any).catch((error: unknown) => log.debug('terminal directory background refresh failed', error))
-          void appStore.dispatch(queueActiveSessionWindowRefresh() as any).catch((error: unknown) => log.debug('active session window refresh failed', error))
+          void appStore.dispatch(queueActiveSessionWindowRefresh() as any)
         }
         if (msg.type === 'codex.activity.list.response') {
           const requestId = typeof msg.requestId === 'string' ? msg.requestId : ''
@@ -1063,14 +1231,6 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
-          for (const completion of msg.latestTurnCompletions || []) {
-            dispatch(applyServerCompletion({
-              provider: 'codex',
-              terminalId: completion.terminalId,
-              at: completion.at,
-              completionSeq: completion.completionSeq,
-            }) as any)
-          }
         }
         if (msg.type === 'codex.activity.updated') {
           const mutationSeq = ++codexActivityOrderRef.current
@@ -1100,14 +1260,6 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
-          for (const completion of msg.latestTurnCompletions || []) {
-            dispatch(applyServerCompletion({
-              provider: 'claude',
-              terminalId: completion.terminalId,
-              at: completion.at,
-              completionSeq: completion.completionSeq,
-            }) as any)
-          }
         }
         if (msg.type === 'claude.activity.updated') {
           const mutationSeq = ++claudeActivityOrderRef.current
@@ -1137,14 +1289,6 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
-          for (const completion of msg.latestTurnCompletions || []) {
-            dispatch(applyServerCompletion({
-              provider: 'amplifier',
-              terminalId: completion.terminalId,
-              at: completion.at,
-              completionSeq: completion.completionSeq,
-            }) as any)
-          }
         }
         if (msg.type === 'amplifier.activity.updated') {
           const mutationSeq = ++amplifierActivityOrderRef.current
@@ -1174,14 +1318,6 @@ export default function App() {
             terminals: msg.terminals || [],
             requestSeq,
           }))
-          for (const completion of msg.latestTurnCompletions || []) {
-            dispatch(applyServerCompletion({
-              provider: 'opencode',
-              terminalId: completion.terminalId,
-              at: completion.at,
-              completionSeq: completion.completionSeq,
-            }) as any)
-          }
         }
         if (msg.type === 'opencode.activity.updated') {
           const mutationSeq = ++opencodeActivityOrderRef.current
@@ -1201,17 +1337,15 @@ export default function App() {
             }))
           }
         }
-        if (msg.type === 'terminal.turn.complete') {
+        // 'terminal.turn.complete' stays informational for terminal CLI panes:
+        // the client no longer rings/shades on it. The truly-idle edge below is
+        // the ONLY bell/shade trigger for claude/codex/opencode/amplifier panes.
+        if (msg.type === 'terminal.idle') {
           const terminalId = typeof msg.terminalId === 'string' ? msg.terminalId : ''
           const at = typeof msg.at === 'number' ? msg.at : Date.now()
-          const completionSeq = typeof msg.completionSeq === 'number' ? msg.completionSeq : undefined
-          if (terminalId && completionSeq !== undefined) {
-            dispatch(applyServerCompletion({
-              provider: msg.provider,
-              terminalId,
-              at,
-              completionSeq,
-            }) as any)
+          const reason = msg.reason === 'queue-empty' ? 'queue-empty' : 'grace'
+          if (terminalId) {
+            dispatch(applyServerIdle({ terminalId, at, reason }) as any)
           }
         }
         if (msg.type === 'terminal.exit') {
@@ -1752,6 +1886,8 @@ npm run serve`}</pre>
         </div>
       )}
       <AuthRequiredModal />
+      <DeadSessionPanel />
+      <ReconcileWarmingBanner />
       {showSetupWizard && (
         <SetupWizard
           initialStep={wizardInitialStep}
@@ -1765,6 +1901,8 @@ npm run serve`}</pre>
           }}
         />
       )}
+      {/* LANE B3 (recover-my-panes): self-gating recovery offer — see docs/plans/2026-07-26-recover-my-panes.md */}
+      <RecoveryOfferPanel />
       </div>
     </ContextMenuProvider>
   )

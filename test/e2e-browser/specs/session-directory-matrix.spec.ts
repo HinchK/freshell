@@ -286,6 +286,19 @@ const test = base.extend({
               JSON.stringify({ role: 'assistant', content: 'harness-02 matrix epsilon reply 1' }),
             ].join('\n') + '\n',
           )
+          // FIXTURE REALISM: the amplifier recency formula folds the
+          // activity-sidecar mtimes into lastActivityAt --
+          // `max(metadata timestamps, mtime(transcript.jsonl), mtime(events.jsonl))`
+          // (`crates/freshell-sessions/src/amplifier.rs`'s
+          // `getActivityMtimeMs` port). Seed-time mtimes are "now", which
+          // silently dominated the seeded 2026-07-19 metadata timestamp the
+          // moment the real-world clock passed it (a time bomb, detonated
+          // 2026-07-19T08:00:02Z). A session genuinely last active at the
+          // seeded instant would carry file mtimes from that instant -- set
+          // them explicitly so the fixture matches what it claims.
+          const amplifierSeededActivity = new Date(AMPLIFIER_LAST_ACTIVITY_AT_ISO)
+          await fs.utimes(path.join(amplifierSessionDir, 'metadata.json'), amplifierSeededActivity, amplifierSeededActivity)
+          await fs.utimes(path.join(amplifierSessionDir, 'transcript.jsonl'), amplifierSeededActivity, amplifierSeededActivity)
         },
       },
     })

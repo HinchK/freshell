@@ -32,6 +32,8 @@ export const ErrorCode = z.enum([
   'RATE_LIMITED',
   'UNAUTHORIZED',
   'PROTOCOL_MISMATCH',
+  'SESSION_RESERVED',
+  'FRESH_AGENT_LOST_SESSION',
 ])
 
 export type ErrorCode = z.infer<typeof ErrorCode>
@@ -194,6 +196,24 @@ export const TerminalTurnCompleteSchema = z.object({
   completionSeq: z.number().int().positive(),
 })
 
+/**
+ * Truly-idle edge for terminal-mode CLI panes (claude/codex/opencode/amplifier).
+ * Emitted once per busy -> truly-idle transition, after a grace window with no
+ * new session-file activity AND no detectable queued user prompt. Never emitted
+ * after crash/interrupt/exit; subagent completions inside a running turn never
+ * produce it. This is the ONLY edge the client rings/shades on for terminal CLI
+ * panes ('terminal.turn.complete' stays informational for them).
+ *
+ * Pinned wire contract shared with the Rust server port - do not change
+ * unilaterally: { terminalId, at (server epoch ms), reason: 'grace' | 'queue-empty' }.
+ */
+export const TerminalIdleSchema = z.object({
+  type: z.literal('terminal.idle'),
+  terminalId: z.string().min(1),
+  at: z.number().int().nonnegative(),
+  reason: z.enum(['grace', 'queue-empty']),
+})
+
 // ──────────────────────────────────────────────────────────────
 // SDK content block schemas (from Claude Code NDJSON)
 // ──────────────────────────────────────────────────────────────
@@ -253,6 +273,10 @@ export const HelloSchema = z.object({
   capabilities: z.object({
     uiScreenshotV1: z.boolean().optional(),
     terminalOutputBatchV1: z.boolean().optional(),
+    // REQUIRED here (not just in the sent object): Zod non-strict objects silently
+    // STRIP unknown keys, so without this the capability would silently no-op.
+    paneReconcileV1: z.literal(true).optional(),
+    paneReconcileFreshAgentV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -546,9 +570,89 @@ export const FreshAgentClientMessageSchema = z.discriminatedUnion('type', [
 
 export type FreshAgentClientMessage = z.infer<typeof FreshAgentClientMessageSchema>
 
+// ── pane.reconcile (reconciliation handshake) ──
+
+export const ReconcileSessionRefSchema = SessionLocatorSchema
+
+export const ReconcilePaneSchema = z.object({
+  /** Opaque to the server; echoed verbatim on the verdict. */
+  paneKey: z.string().min(1),
+  /** v1: 'terminal' or 'fresh-agent'. */
+  kind: z.enum(['terminal', 'fresh-agent']),
+  /** TerminalMode string as persisted ('shell', 'claude', …). */
+  mode: z.string().min(1),
+  /** The pane's stable creation key — required by contract. */
+  createRequestId: z.string().min(1),
+  /** Last known live handle. */
+  terminalId: z.string().min(1).optional(),
+  /** Locality hint, informational only. */
+  serverInstanceId: z.string().min(1).optional(),
+  /** Optional identity claim. */
+  sessionRef: ReconcileSessionRefSchema.optional(),
+  /** Optional legacy single-key claim. */
+  resumeSessionId: z.string().optional(),
+  /** Informational only — never trusted. */
+  status: z.string().optional(),
+})
+
+export const PaneReconcileRequestSchema = z.object({
+  type: z.literal('pane.reconcile.request'),
+  /** Client-minted, echoed verbatim; correlation only. */
+  reconcileId: z.string().min(1),
+  /** Flat list — no tree, no tab structure. Cap: 200 entries. */
+  panes: z.array(ReconcilePaneSchema).max(200),
+})
+
+export type ReconcilePane = z.infer<typeof ReconcilePaneSchema>
+export type PaneReconcileRequest = z.infer<typeof PaneReconcileRequestSchema>
+
+export const PaneVerdictSchema = z.object({
+  /** Echoed verbatim, 1:1 with request order. */
+  paneKey: z.string().min(1),
+  verdict: z.enum(['attach', 'respawn', 'fresh', 'dead_session', 'invalid', 'error']),
+  /** attach only: the live terminal to attach to. */
+  terminalId: z.string().min(1).optional(),
+  /**
+   * attach: authoritative identity; respawn: THE identity to resume with;
+   * dead_session: the claimed-but-missing identity, for the error UI.
+   */
+  sessionRef: ReconcileSessionRefSchema.optional(),
+  /** Present iff the server overrode a differing client claim. */
+  corrected: z.literal(true).optional(),
+  /** fresh / dead_session / error / invalid: machine-readable code. */
+  reason: z.string().optional(),
+  /** A newer duplicate generation exists for the same createRequestId; flags the duplicate terminalId. */
+  duplicate: z.string().optional(),
+})
+
+export const PaneReconcileResultSchema = z.object({
+  type: z.literal('pane.reconcile.result'),
+  /** Echoed from the request. */
+  reconcileId: z.string().min(1),
+  /** This server process's boot. */
+  bootId: z.string().min(1),
+  serverInstanceId: z.string().min(1),
+  /** Cardinality invariant: verdicts.length === panes.length, matched 1:1 by paneKey. */
+  verdicts: z.array(PaneVerdictSchema),
+})
+
+export type PaneVerdict = z.infer<typeof PaneVerdictSchema>
+export type PaneReconcileResultMessage = z.infer<typeof PaneReconcileResultSchema>
+
+/** Server capability advertisement on `ready`: present iff the client's hello opted in via capabilities.paneReconcileV1. */
+export const ReadyCapabilitiesSchema = z
+  .object({
+    paneReconcileV1: z.literal(true).optional(),
+    paneReconcileFreshAgentV1: z.literal(true).optional(),
+  })
+  .optional()
+
+export type ReadyCapabilities = z.infer<typeof ReadyCapabilitiesSchema>
+
 // ── Client message discriminated union ──
 
 export const ClientMessageSchema = z.discriminatedUnion('type', [
+  PaneReconcileRequestSchema,
   HelloSchema,
   PingSchema,
   ClientDiagnosticSchema,
@@ -592,6 +696,8 @@ export type ReadyMessage = {
   timestamp: string
   serverInstanceId?: string
   bootId?: string
+  /** Present iff the client's hello opted in via capabilities.paneReconcileV1. */
+  capabilities?: ReadyCapabilities
 }
 
 export type PongMessage = {
@@ -608,6 +714,8 @@ export type ErrorMessage = {
   terminalExitCode?: number
   expectedSessionRef?: SessionLocator
   actualSessionRef?: SessionLocator
+  /** SESSION_RESERVED only: how long the loser should wait before re-sending its create. Additive; omitted everywhere else. */
+  retryAfterMs?: number
   timestamp: string
 }
 
@@ -759,6 +867,7 @@ export type AmplifierActivityListResponseMessage = z.infer<typeof AmplifierActiv
 export type AmplifierActivityUpdatedMessage = z.infer<typeof AmplifierActivityUpdatedSchema>
 
 export type TerminalTurnCompleteMessage = z.infer<typeof TerminalTurnCompleteSchema>
+export type TerminalIdleMessage = z.infer<typeof TerminalIdleSchema>
 
 // -- Sessions --
 
@@ -802,6 +911,10 @@ export type TabsSyncAckMessage = {
   accepted: boolean
   openRecords: number
   closedRecords: number
+  /** false when the accepted push was NOT durably persisted (fail-loud honesty). Omitted on success. */
+  persisted?: boolean
+  /** machine-readable reason accompanying persisted:false (e.g. "oversize") */
+  persistReason?: string
 }
 
 export type TabsSyncSnapshotOpenRecord = Record<string, unknown> & {
@@ -981,6 +1094,7 @@ export type ServerMessage =
   | TerminalsChangedMessage
   | TerminalMetaUpdatedMessage
   | TerminalInventoryMessage
+  | PaneReconcileResultMessage
   | CodexActivityListResponseMessage
   | CodexActivityUpdatedMessage
   | OpencodeActivityListResponseMessage
@@ -990,6 +1104,7 @@ export type ServerMessage =
   | AmplifierActivityListResponseMessage
   | AmplifierActivityUpdatedMessage
   | TerminalTurnCompleteMessage
+  | TerminalIdleMessage
   | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage

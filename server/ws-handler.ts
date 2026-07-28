@@ -27,6 +27,7 @@ import type {
   OpencodeActivityRecord,
   TerminalTurnCompletionSnapshot,
   TerminalTurnCompleteMessage,
+  TerminalIdleMessage,
 } from '../shared/ws-protocol.js'
 import type { ExtensionManager } from './extension-manager.js'
 import { allocateLocalhostPort } from './local-port.js'
@@ -71,6 +72,7 @@ import {
   OpencodeActivityListSchema,
   OpencodeActivityUpdatedSchema,
   TerminalTurnCompleteSchema,
+  TerminalIdleSchema,
   HelloSchema,
   PingSchema,
   ClientDiagnosticSchema,
@@ -116,6 +118,8 @@ import {
   makeFreshAgentProviderErrorEvent,
   normalizeFreshAgentProviderEvent,
 } from './fresh-agent/sdk-events.js'
+import { FreshAgentLostSessionError } from './fresh-agent/runtime-manager.js'
+import { hashForLogs, recordFreshAgentObservabilityEvent } from './fresh-agent/observability.js'
 
 type WsHandlerConfig = {
   maxConnections: number
@@ -136,6 +140,9 @@ type FreshAgentRuntimeManagerLike = {
   create: (input: any) => Promise<any>
   attach: (input: any) => any
   subscribe?: (locator: any, listener: (message: unknown) => void) => Promise<() => void> | (() => void)
+  /** Optional synchronous adapter-state generation lookup; when present, a changed
+   * generation means the state's emitter was recreated and subscriptions must rebind. */
+  sessionStateGeneration?: (locator: any) => number | undefined
   send?: (locator: any, input: any) => Promise<FreshAgentSendResult> | FreshAgentSendResult
   interrupt?: (locator: any) => Promise<void> | void
   compact?: (locator: any, input?: { instructions?: string }) => Promise<void> | void
@@ -174,6 +181,8 @@ type FreshAgentSubscriptionEntry = {
   locator: FreshAgentLocator
   off?: () => void
   pending?: Promise<void>
+  /** Adapter-state generation observed when the subscription bound (managers that expose it). */
+  stateGeneration?: number
 }
 
 type FreshAgentAuthorizationEntry = FreshAgentLocator
@@ -1301,6 +1310,27 @@ export class WsHandler {
     }
   }
 
+  // Identity convention for structured observability rows (zrrj): never log raw
+  // session ids or cwd paths — only provider + sessionIdHash + cwdHash.
+  private freshAgentIdentityFields(locator: FreshAgentLocator): {
+    sessionType: string
+    provider: string
+    sessionIdHash: string
+    cwdHash?: string
+  } {
+    return {
+      sessionType: locator.sessionType,
+      provider: locator.provider,
+      sessionIdHash: hashForLogs(locator.sessionId),
+      ...(locator.cwd ? { cwdHash: hashForLogs(locator.cwd) } : {}),
+    }
+  }
+
+  private freshAgentErrorCode(error: unknown): string {
+    const code = (error as { code?: unknown } | null | undefined)?.code
+    return typeof code === 'string' && code.length > 0 ? code : 'INTERNAL_ERROR'
+  }
+
   private freshAgentEventMessage(locator: FreshAgentLocator, event: unknown) {
     return {
       type: 'freshAgent.event',
@@ -1428,6 +1458,16 @@ export class WsHandler {
       next.sessionId,
       sessionRef,
     )
+    // Single choke point for materialization: every freshAgent.session.materialized
+    // frame the WS layer sends flows through here (zrrj).
+    recordFreshAgentObservabilityEvent({
+      kind: 'fresh_agent_materialized',
+      sessionType: locator.sessionType,
+      provider: locator.provider,
+      previousSessionIdHash: hashForLogs(next.previousSessionId ?? locator.sessionId),
+      sessionIdHash: hashForLogs(next.sessionId),
+      ...(locator.cwd ? { cwdHash: hashForLogs(locator.cwd) } : {}),
+    })
     return materializedLocator
   }
 
@@ -1505,7 +1545,16 @@ export class WsHandler {
       if (this.hasFreshAgentRoute(locator)) {
         existing.locator = { ...locator }
       }
-      return
+      // Generation-aware rebind (zrrj): when the manager exposes adapter-state
+      // generations and the current generation differs from the one we bound to,
+      // the adapter state (and its emitter) was recreated — our listener is
+      // orphaned on the dead emitter. Cancel the stale subscription and fall
+      // through to rebind. Managers without generations keep the no-op behavior.
+      const currentGeneration = manager.sessionStateGeneration?.(locator)
+      if (typeof currentGeneration !== 'number' || currentGeneration === existing.stateGeneration) {
+        return
+      }
+      this.cancelFreshAgentSubscription(state, existing.locator)
     }
 
     const entry: FreshAgentSubscriptionEntry = { active: true, locator: { ...locator } }
@@ -1539,16 +1588,24 @@ export class WsHandler {
               this.logFreshAgentSubscriptionOffError(locator, error)
             }
           }
-          state.freshAgentSubscriptions.delete(key)
+          // A rebind may have replaced this key with a fresh entry; only remove our own.
+          if (state.freshAgentSubscriptions.get(key) === entry) {
+            state.freshAgentSubscriptions.delete(key)
+          }
           return
         }
+        // Record the adapter-state generation the subscription actually bound to
+        // (read after subscribe so recovery-triggered state recreation is captured).
+        entry.stateGeneration = manager.sessionStateGeneration?.(locator)
         if (off) {
           entry.off = off
         }
       })
       .catch((error) => {
         entry.pending = undefined
-        state.freshAgentSubscriptions.delete(key)
+        if (state.freshAgentSubscriptions.get(key) === entry) {
+          state.freshAgentSubscriptions.delete(key)
+        }
         if (entry.active) {
           this.sendFreshAgentSubscriptionError(ws, locator, error)
         }
@@ -3491,7 +3548,18 @@ export class WsHandler {
         state.pendingFreshAgentAttachByKey.set(authorizationKey, pendingEntry)
         try {
           await attachPromise
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_attach',
+            ...this.freshAgentIdentityFields(locator),
+            outcome: 'ok',
+          })
         } catch (error) {
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_attach',
+            ...this.freshAgentIdentityFields(locator),
+            outcome: 'failed',
+            errorCode: this.freshAgentErrorCode(error),
+          })
           if (this.clientStates.get(ws) !== state) return
           log.warn({
             err: error instanceof Error ? error : new Error(String(error)),
@@ -3515,12 +3583,20 @@ export class WsHandler {
         }
         const locator = this.freshAgentLocatorFromMessage(m)
         if (!await this.waitForFreshAgentAuthorization(ws, state, locator, m.requestId)) return
+        const startedAt = Date.now()
         try {
           const result = await manager.send(locator, {
             requestId: m.requestId,
             text: m.text,
             images: m.images,
             settings: m.settings,
+          })
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_send',
+            ...this.freshAgentIdentityFields(locator),
+            ...(m.requestId ? { requestId: m.requestId } : {}),
+            outcome: 'accepted',
+            durationMs: Date.now() - startedAt,
           })
           let acceptedLocator = locator
           if (result?.sessionId && result.sessionId !== m.sessionId) {
@@ -3550,6 +3626,18 @@ export class WsHandler {
             })
           }
         } catch (error) {
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_send',
+            ...this.freshAgentIdentityFields(locator),
+            ...(m.requestId ? { requestId: m.requestId } : {}),
+            outcome: 'failed',
+            errorCode: this.freshAgentErrorCode(error),
+            durationMs: Date.now() - startedAt,
+          })
+          if (error instanceof FreshAgentLostSessionError) {
+            this.sendError(ws, { code: 'FRESH_AGENT_LOST_SESSION', message: errorMessage(error), requestId: m.requestId })
+            return
+          }
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error), requestId: m.requestId })
         }
         return
@@ -3565,7 +3653,18 @@ export class WsHandler {
         if (!this.requireFreshAgentAuthorization(ws, state, locator)) return
         try {
           await manager.interrupt(locator)
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_interrupt',
+            ...this.freshAgentIdentityFields(locator),
+            outcome: 'ok',
+          })
         } catch (error) {
+          recordFreshAgentObservabilityEvent({
+            kind: 'fresh_agent_interrupt',
+            ...this.freshAgentIdentityFields(locator),
+            outcome: 'failed',
+            errorCode: this.freshAgentErrorCode(error),
+          })
           this.sendError(ws, { code: 'INTERNAL_ERROR', message: errorMessage(error) })
         }
         return
@@ -3817,6 +3916,20 @@ export class WsHandler {
 
     if (!parsed.success) {
       log.warn({ issues: parsed.error.issues }, 'Invalid terminal.turn.complete payload')
+      return
+    }
+
+    this.broadcastAuthenticated(parsed.data)
+  }
+
+  broadcastTerminalIdle(msg: Omit<TerminalIdleMessage, 'type'>): void {
+    const parsed = TerminalIdleSchema.safeParse({
+      type: 'terminal.idle',
+      ...msg,
+    })
+
+    if (!parsed.success) {
+      log.warn({ issues: parsed.error.issues }, 'Invalid terminal.idle payload')
       return
     }
 

@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::common::{
-    AgentProvider, ClaudeActivityRecord, CodexActivityRecord, CodexDurability, ErrorCode,
-    OpencodeActivityRecord, SessionLocator, TerminalMetaRecord, TurnCompletionSnapshot,
+    AgentProvider, AmplifierActivityRecord, ClaudeActivityRecord, CodexActivityRecord,
+    CodexDurability, ErrorCode, OpencodeActivityRecord, SessionLocator, TerminalMetaRecord,
+    TurnCompletionSnapshot,
 };
 use crate::settings::ServerSettings;
 
@@ -16,6 +17,13 @@ use crate::settings::ServerSettings;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
+    // Extension surface (not in the frozen T0 inventory — see
+    // `EXTENSION_SERVER_MESSAGE_TYPES`): the amplifier activity family the
+    // frozen client already consumes, mirroring the legacy zod schemas.
+    #[serde(rename = "amplifier.activity.list.response")]
+    AmplifierActivityListResponse(AmplifierActivityListResponse),
+    #[serde(rename = "amplifier.activity.updated")]
+    AmplifierActivityUpdated(AmplifierActivityUpdated),
     #[serde(rename = "claude.activity.list.response")]
     ClaudeActivityListResponse(ClaudeActivityListResponse),
     #[serde(rename = "claude.activity.updated")]
@@ -36,6 +44,11 @@ pub enum ServerMessage {
     CodingCliStderr(CodingCliStderr),
     #[serde(rename = "config.fallback")]
     ConfigFallback(ConfigFallback),
+    // Extension surface (P1.8 pane-identity ledger, not in the frozen T0
+    // inventory): live per-pane durability warning. See
+    // `EXTENSION_SERVER_MESSAGE_TYPES`.
+    #[serde(rename = "durability.degraded")]
+    DurabilityDegraded(DurabilityDegraded),
     #[serde(rename = "error")]
     Error(ErrorMsg),
     #[serde(rename = "extension.server.error")]
@@ -66,6 +79,8 @@ pub enum ServerMessage {
     OpencodeActivityListResponse(OpencodeActivityListResponse),
     #[serde(rename = "opencode.activity.updated")]
     OpencodeActivityUpdated(OpencodeActivityUpdated),
+    #[serde(rename = "pane.reconcile.result")]
+    PaneReconcileResult(PaneReconcileResult),
     #[serde(rename = "perf.logging")]
     PerfLogging(PerfLogging),
     #[serde(rename = "pong")]
@@ -94,6 +109,11 @@ pub enum ServerMessage {
     TerminalDetached(TerminalIdOnly),
     #[serde(rename = "terminal.exit")]
     TerminalExit(TerminalExit),
+    // Extension surface (TERM-16 follow-on, not in the frozen T0 inventory):
+    // the NEW truly-idle edge — `{ terminalId, at, reason }`, emitted ONCE per
+    // busy→truly-idle transition. See `EXTENSION_SERVER_MESSAGE_TYPES`.
+    #[serde(rename = "terminal.idle")]
+    TerminalIdle(TerminalIdle),
     #[serde(rename = "terminal.input.blocked")]
     TerminalInputBlocked(TerminalInputBlocked),
     #[serde(rename = "terminal.inventory")]
@@ -124,7 +144,9 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 52] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 56] = [
+    "amplifier.activity.list.response",
+    "amplifier.activity.updated",
     "claude.activity.list.response",
     "claude.activity.updated",
     "codex.activity.list.response",
@@ -150,6 +172,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 52] = [
     "freshAgent.session.materialized",
     "opencode.activity.list.response",
     "opencode.activity.updated",
+    "pane.reconcile.result",
     "perf.logging",
     "pong",
     "ready",
@@ -164,6 +187,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 52] = [
     "terminal.created",
     "terminal.detached",
     "terminal.exit",
+    "terminal.idle",
     "terminal.input.blocked",
     "terminal.inventory",
     "terminal.meta.updated",
@@ -178,6 +202,20 @@ pub const SERVER_MESSAGE_TYPES: [&str; 52] = [
     "terminals.changed",
     "ui.command",
 ];
+
+/// Extension server→client discriminants declared BEYOND the generated
+/// inventory (`port/contract/ws-message-inventory.json`). Since the
+/// 2026-07-26 reconciliation the only entry is `durability.degraded` — a
+/// Rust-server-only frame (P1.8 pane-identity ledger, emitted by
+/// `crates/freshell-ws/src/pane_ledger.rs`) with no TypeScript
+/// counterpart: the inventory is generated from `shared/ws-protocol.ts`,
+/// so it cannot carry it. NOT the same family as the frozen
+/// `terminal.codex.durability.updated` (codex-sidecar durability); the
+/// name collision is nearest-neighbor only. If the client ever grows a
+/// consumer, add the Zod schema to `shared/ws-protocol.ts`, run
+/// `npm run contract:generate`, and promote this into
+/// [`SERVER_MESSAGE_TYPES`]. Shape pinned by `tests/activity_extension.rs`.
+pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 1] = ["durability.degraded"];
 
 // ---------------------------------------------------------------------------
 // Server-only enums.
@@ -315,6 +353,52 @@ pub struct ExtensionServerNamed {
 
 // --- activity families ------------------------------------------------------
 
+/// `AmplifierActivityListResponseSchema` (`shared/ws-protocol.ts:175-180`) —
+/// extension surface, see [`EXTENSION_SERVER_MESSAGE_TYPES`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmplifierActivityListResponse {
+    pub request_id: String,
+    pub terminals: Vec<AmplifierActivityRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_turn_completions: Option<Vec<TurnCompletionSnapshot>>,
+}
+
+/// `AmplifierActivityUpdatedSchema` (`shared/ws-protocol.ts:182-186`) —
+/// extension surface, see [`EXTENSION_SERVER_MESSAGE_TYPES`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmplifierActivityUpdated {
+    pub remove: Vec<String>,
+    pub upsert: Vec<AmplifierActivityRecord>,
+}
+
+/// `terminal.idle.reason` — why the server believes the terminal is truly
+/// idle: `grace` = a grace window passed with no new activity after the turn
+/// boundary; `queue-empty` = queued-prompt evidence was observed during the
+/// turn (a boundary while busy, or a codex busy→pending re-arm) and the
+/// queue has since drained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalIdleReason {
+    #[serde(rename = "grace")]
+    Grace,
+    #[serde(rename = "queue-empty")]
+    QueueEmpty,
+}
+
+/// `terminal.idle` — the NEW truly-idle edge (pinned wire contract:
+/// `{ terminalId, at (server epoch ms), reason: 'grace' | 'queue-empty' }`),
+/// emitted ONCE per busy→truly-idle transition. Subagent/tool completions
+/// inside a running turn never produce it. Extension surface, see
+/// [`EXTENSION_SERVER_MESSAGE_TYPES`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalIdle {
+    pub terminal_id: String,
+    pub at: i64,
+    pub reason: TerminalIdleReason,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeActivityListResponse {
@@ -426,6 +510,11 @@ pub struct ErrorMsg {
     pub expected_session_ref: Option<SessionLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// D8 (`SESSION_RESERVED` only): how long the loser should wait before
+    /// re-sending its create. Additive and omitted everywhere else, so every
+    /// other error frame stays byte-identical on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -592,6 +681,63 @@ pub struct FreshAgentSessionMaterialized {
     pub session_ref: Option<SessionLocator>,
 }
 
+// --- pane.reconcile.result ----------------------------------------------------
+
+/// Authoritative per-pane verdict (reconciliation-handshake design §4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconcileVerdict {
+    Attach,
+    Respawn,
+    Fresh,
+    DeadSession,
+    Invalid,
+    /// Terminal per-pane error state (replaces the deleted `retry`):
+    /// reason is one of "index_warming" | "provider_unavailable".
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneVerdict {
+    /// Echoed verbatim, 1:1 with request order.
+    pub pane_key: String,
+    pub verdict: ReconcileVerdict,
+    /// `attach` only: the live terminal to attach to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// attach: authoritative identity; respawn: THE identity to resume with;
+    /// dead_session: the claimed-but-missing identity, for the error UI.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<SessionLocator>,
+    /// Present iff the server overrode a differing client claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrected: Option<bool>,
+    /// fresh / dead_session / error / invalid: machine-readable code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Row 2b (invariant I6): a newer duplicate generation exists for the same
+    /// `createRequestId`; the client stays on its live attachment and this
+    /// merely flags the duplicate `terminalId`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duplicate: Option<String>,
+}
+
+/// Sent ONLY in response to `pane.reconcile.request` — the server never
+/// volunteers it (frozen-client inertness gate 3, design §3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneReconcileResult {
+    /// Echoed from the request.
+    pub reconcile_id: String,
+    /// This server process's boot.
+    pub boot_id: String,
+    pub server_instance_id: String,
+    /// Cardinality invariant: `verdicts.len() == panes.len()`, matched 1:1 by
+    /// `paneKey` — a malformed entry gets `invalid`, never omission.
+    pub verdicts: Vec<PaneVerdict>,
+}
+
 // --- lifecycle / misc -------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -604,6 +750,22 @@ pub struct Pong {
     pub timestamp: String,
 }
 
+/// Server capability advertisement on `ready` (reconciliation-handshake design
+/// §4.2). Populated **iff** the connection's `hello` carried the matching
+/// client capability — today's frozen client never opts in, so the emitted
+/// clean-boot handshake stays byte-for-byte unchanged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadyCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_v1: Option<bool>,
+    /// Fresh-agent restart resilience: `Some(true)` iff the connection's
+    /// `hello` opted in via `capabilities.paneReconcileFreshAgentV1` —
+    /// omitted from the wire entirely otherwise (frozen-client inertness).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pane_reconcile_fresh_agent_v1: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Ready {
@@ -612,6 +774,12 @@ pub struct Ready {
     pub boot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_instance_id: Option<String>,
+    /// Reconciliation-handshake advertisement (§4.2): `Some` only when the
+    /// client's `hello` opted in via `capabilities.paneReconcileV1`. A client
+    /// must not send `pane.reconcile.request` unless the `ready` it just
+    /// received advertised the capability.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ReadyCapabilities>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -658,6 +826,16 @@ pub struct TabsSyncAck {
     pub accepted: bool,
     pub closed_records: i64,
     pub open_records: i64,
+    /// `false` when the accepted push was NOT durably persisted (fail-loud
+    /// honesty, campaign P2.17). Omitted when persisted normally or when
+    /// persistence was skipped by design (empty push, persistence disabled),
+    /// keeping pre-change acks byte-identical on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted: Option<bool>,
+    /// Machine-readable reason accompanying `persisted:false`
+    /// (e.g. "oversize"). Serializes as `persistReason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persist_reason: Option<String>,
 }
 
 // --- tabs.sync.snapshot -----------------------------------------------------
@@ -740,6 +918,20 @@ pub struct TerminalAttachReady {
 pub struct TerminalCodexDurabilityUpdated {
     pub durability: CodexDurability,
     pub terminal_id: String,
+}
+
+/// P1.8 write-failure policy (spec §4.2): pushed LIVE at ledger-write
+/// failure time so the warning arrives BEFORE the restart it warns about —
+/// never a posthumous verdict flag. Frozen clients ignore unknown frame
+/// types; rendering lands with the Phase 3 client adoption lane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DurabilityDegraded {
+    pub terminal_id: String,
+    /// Machine-readable, e.g. "ledger_write_failed".
+    pub reason: String,
+    /// Human-readable pane warning.
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

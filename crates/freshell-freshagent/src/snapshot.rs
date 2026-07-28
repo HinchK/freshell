@@ -26,13 +26,14 @@
 //!
 //! ## Scope
 //!
-//! `sessionType`/`provider` combinations outside `{freshcodex/codex, freshopencode/opencode}`
-//! but within the shared locator's valid enum (`freshclaude/claude`, `kilroy/claude`) mirror
-//! the reference's `FreshAgentRuntimeUnavailableError` (`runtime-manager.ts:25-27,338-341`) —
-//! a 503 with `code:'FRESH_AGENT_RUNTIME_UNAVAILABLE'` — since this port has no adapter
-//! registered for them (`server/fresh-agent/provider-registry.ts` equivalent doesn't exist
-//! here yet). An outright invalid enum member (e.g. `sessionType=bogus`) is a 400, mirroring
-//! the reference's `ThreadParamsSchema.safeParse` failure (`router.ts:181-186`).
+//! All three providers are served: **freshcodex/codex** and **freshopencode/opencode** ask
+//! their live runtime slices, while **freshclaude/claude** and **kilroy/claude** are a
+//! disk+env adapter ([`crate::claude_snapshot::get_claude_snapshot`]) that reads the CLI's
+//! own transcript store directly (`<claude_home>/projects/*/<threadId>.jsonl`) — no sidecar
+//! required, so snapshots survive a server restart. A missing transcript is a positive
+//! denial: 404 with `code:'FRESH_AGENT_LOST_SESSION'` (the codex/opencode convention); a
+//! read failure is a 500. An outright invalid enum member (e.g. `sessionType=bogus`) is a
+//! 400, mirroring the reference's `ThreadParamsSchema.safeParse` failure (`router.ts:181-186`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -129,14 +130,28 @@ async fn get_snapshot(
                 }
             }
         }
+        ("freshclaude", "claude") | ("kilroy", "claude") => {
+            match crate::claude_snapshot::get_claude_snapshot(&session_type, &thread_id).await {
+                Ok(snapshot) => Json(snapshot).into_response(),
+                Err(crate::claude_snapshot::ClaudeSnapshotError::NotFound) => fail_with_code(
+                    StatusCode::NOT_FOUND,
+                    format!("claude session {thread_id} not found"),
+                    "FRESH_AGENT_LOST_SESSION",
+                ),
+                Err(crate::claude_snapshot::ClaudeSnapshotError::Io(err)) => {
+                    fail(StatusCode::INTERNAL_SERVER_ERROR, err)
+                }
+            }
+        }
         (session_type_value, provider_value) => {
             if !VALID_SESSION_TYPES.contains(&session_type_value)
                 || !VALID_PROVIDERS.contains(&provider_value)
             {
                 return fail(StatusCode::BAD_REQUEST, "Invalid request".to_string());
             }
-            // A structurally valid locator this port has no adapter registered for
-            // (freshclaude/claude, kilroy/claude) -- mirrors `FreshAgentRuntimeUnavailableError`.
+            // Every structurally valid locator now has an adapter registered above; this
+            // 503 arm is retained purely as a safety net for future enum growth --
+            // mirrors `FreshAgentRuntimeUnavailableError` (`runtime-manager.ts:25-27`).
             fail_with_code(
                 StatusCode::SERVICE_UNAVAILABLE,
                 format!("No fresh-agent snapshot adapter registered for {session_type_value}"),
@@ -250,25 +265,86 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    #[tokio::test]
-    async fn valid_but_unregistered_locator_is_503_with_code() {
+    // NOTE: `valid_but_unregistered_locator_is_503_with_code` used to live here. With
+    // the claude adapter registered, NO structurally-valid locator is unregistered
+    // anymore -- the handler's catch-all 503 arm is retained purely as a safety net for
+    // future enum growth. The two claude tests below plus the existing 400
+    // invalid-locator tests now cover the whole routing table.
+
+    // Env vars are process-global and cargo test is multi-threaded: EVERY test that
+    // mutates claude-store env (this file AND claude.rs) must take the SAME lock --
+    // two independent per-file locks would NOT serialize against each other. claude.rs's
+    // `CLAUDE_ENV_LOCK` is `pub(crate)` for exactly this (mirroring how this file
+    // already reuses `crate::codex::tests::ENV_LOCK`).
+    use crate::claude::tests::CLAUDE_ENV_LOCK;
+
+    /// The authorized-GET construction every test in this file uses, returning
+    /// `(status, parsed JSON body)`.
+    async fn get_json(
+        session_type: &str,
+        provider: &str,
+        thread_id: &str,
+    ) -> (StatusCode, serde_json::Value) {
         let resp = get_snapshot(
             State(snapshot_state()),
             Path((
-                "freshclaude".to_string(),
-                "claude".to_string(),
-                "thread-1".to_string(),
+                session_type.to_string(),
+                provider.to_string(),
+                thread_id.to_string(),
             )),
             Query(HashMap::new()),
             headers_with_token("tok"),
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let status = resp.status();
         let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["code"], json!("FRESH_AGENT_RUNTIME_UNAVAILABLE"));
+        (status, value)
+    }
+
+    #[tokio::test]
+    async fn claude_locator_serves_a_snapshot_from_the_transcript_store() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("projects").join("-e2e");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("55555555-5555-4555-8555-555555555555.jsonl"),
+            r#"{"type":"user","timestamp":"2026-07-25T10:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#,
+        )
+        .unwrap();
+        // CLAUDE_CONFIG_DIR is the FIRST candidate root (what the real CLI honors) --
+        // setting it makes the test immune to ambient CLAUDE_HOME/HOME.
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (status, body) = get_json(
+            "freshclaude",
+            "claude",
+            "55555555-5555-4555-8555-555555555555",
+        )
+        .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["sessionType"], "freshclaude");
+        assert_eq!(body["provider"], "claude");
+        assert_eq!(body["turns"][0]["role"], "user");
+        assert_eq!(body["turns"][0]["items"][0]["text"], "hello");
+        assert!(body["revision"].as_i64().unwrap() >= 0);
+    }
+
+    #[tokio::test]
+    async fn claude_locator_with_unknown_session_id_is_404_with_lost_session_code() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("projects")).unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        let (status, body) =
+            get_json("kilroy", "claude", "66666666-6666-4666-8666-666666666666").await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "FRESH_AGENT_LOST_SESSION");
     }
 
     #[tokio::test]
@@ -283,9 +359,7 @@ mod tests {
         // provide that, and sharing it across modules is out of scope for this test, assert
         // the REALISTIC outcome instead: with no real codex binary reachable, the request
         // fails, but never with a 200 (masking a nonexistent thread as found).
-        let _guard = crate::codex::tests::ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::codex::tests::ENV_LOCK.lock().await;
         std::env::set_var(
             "CODEX_CMD",
             "/definitely/not/a/real/codex/binary-xyz-does-not-exist",

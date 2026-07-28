@@ -89,3 +89,4 @@ tower = { version = "0.5", features = ["util"] }
 # to assert lifecycle events fire, without depending on the global subscriber
 # `freshell-server` owns.
 tracing-subscriber = "0.3"
+tempfile = "3"
