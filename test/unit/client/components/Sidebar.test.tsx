@@ -2815,6 +2815,38 @@ describe('Sidebar Component - Session-Centric Display', () => {
       // Empty state names the agent filter as a possible cause.
       expect(screen.getByText('No sessions for selected agent')).toBeInTheDocument()
     })
+
+    it('never persists the selection: localStorage untouched and a fresh mount resets to All agents', async () => {
+      const snapshotLocalStorage = () => {
+        const entries: Record<string, string | null> = {}
+        for (let i = 0; i < window.localStorage.length; i++) {
+          const key = window.localStorage.key(i) as string
+          entries[key] = window.localStorage.getItem(key)
+        }
+        return JSON.stringify(entries)
+      }
+
+      const store = createTestStore({ projects: agentProjects })
+      const first = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const before = snapshotLocalStorage()
+      fireEvent.change(first.getByRole('combobox', { name: /agent filter/i }), {
+        target: { value: 'codex' },
+      })
+      expect(screen.queryByText('Alpha claude session')).not.toBeInTheDocument()
+      expect(snapshotLocalStorage()).toBe(before)
+
+      // Remount against the SAME store: client-side "browser refresh".
+      // If the selection leaked into Redux or storage, it would survive this.
+      cleanup()
+      const second = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      expect(second.getByRole('combobox', { name: /agent filter/i })).toHaveValue('all')
+      expect(screen.getByText('Alpha claude session')).toBeInTheDocument()
+      expect(screen.getByText('Alpha codex session')).toBeInTheDocument()
+    })
   })
 
   describe('Search loading state', () => {
