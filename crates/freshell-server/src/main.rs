@@ -635,7 +635,11 @@ async fn main() -> ExitCode {
 
     // Lane D1 (Task 5): the auto-resume hub — consumes the crash events the
     // PTY exit hook sends and drives bounded respawns. A boot-time background
-    // task, same precedent as `spawn_idle_monitor` above.
+    // task, same precedent as `spawn_idle_monitor` above. The handle is
+    // deliberately discarded: the hub SELF-SUPERVISES (council 7w4h/xkhx,
+    // crusty) — a driver panic is caught inside the task, logged ERROR, and
+    // the loop restarted with bounded escalating backoff, so the task only
+    // ever ends when the crash-event channel closes at shutdown.
     freshell_ws::auto_resume::spawn_auto_resume_hub(ws_state.clone(), auto_resume_rx);
 
     // P1.8 boot hygiene: quarantine, stale-marker sweep, supersession

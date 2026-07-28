@@ -132,16 +132,83 @@ pub(crate) fn auto_resume_delays() -> Vec<u64> {
 /// [`decide`], and drives the retry pipeline (recovering frame → backoff →
 /// post-sleep guards → lease claim → respawn → lease completion → replaced
 /// frame) through an [`AutoResumeDriver`].
-pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver>(
+/// Backoff (ms) between hub-body restarts after a driver panic — escalating so
+/// a hot-panicking driver cannot spin a restart loop, capped at the last entry
+/// so auto-resume is NEVER permanently lost (council 7w4h/xkhx, crusty: an
+/// unsupervised panic silently ending auto-resume forever would reinstate the
+/// exact overnight-grey-pane incident this feature prevents). The counter
+/// resets after a body that ran healthy for [`AUTO_RESUME_HEALTHY_LIFETIME_MS`].
+const HUB_SUPERVISOR_BACKOFF_MS: &[u64] = &[1_000, 5_000, 30_000, 60_000];
+
+pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver + Sync>(
     driver: D,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<CrashEvent>,
     delays: Vec<u64>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // SUPERVISOR: `rx` and the attempts map are owned HERE, outside the
+        // catch_unwind boundary, so a driver panic mid-event drops only the
+        // in-flight body future — the crash-event channel (whose senders live
+        // in every PTY exit hook) and the retry bookkeeping both survive the
+        // restart. (Respawning with a fresh channel would NOT work: exit
+        // hooks clone the sender at hook-build time.)
+        let mut attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut consecutive_panics: u32 = 0;
+        loop {
+            let body_started = std::time::Instant::now();
+            let body = std::panic::AssertUnwindSafe(run_hub_body(
+                &driver,
+                &mut rx,
+                &delays,
+                &mut attempts,
+            ));
+            match futures_util::FutureExt::catch_unwind(body).await {
+                // Channel closed: every sender dropped (server shutdown).
+                Ok(()) => return,
+                Err(panic) => {
+                    if body_started.elapsed().as_millis() as i64 >= AUTO_RESUME_HEALTHY_LIFETIME_MS
+                    {
+                        consecutive_panics = 0;
+                    }
+                    let idx =
+                        (consecutive_panics as usize).min(HUB_SUPERVISOR_BACKOFF_MS.len() - 1);
+                    let backoff_ms = HUB_SUPERVISOR_BACKOFF_MS[idx];
+                    consecutive_panics = consecutive_panics.saturating_add(1);
+                    let message: String = panic
+                        .downcast_ref::<&'static str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                    // The payload box is `dyn Any + Send` (not Sync): drop it
+                    // BEFORE the backoff await so this future stays Send.
+                    drop(panic);
+                    tracing::error!(
+                        panic = %message,
+                        consecutive_panics,
+                        restart_in_ms = backoff_ms,
+                        "terminal.auto_resume.hub_panicked — restarting driver"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                }
+            }
+        }
+    })
+}
+
+/// One incarnation of the hub loop. Returns only when the crash-event channel
+/// closes; a driver panic unwinds out to the supervisor in
+/// [`spawn_hub_with_driver`], which restarts this body with the same `rx` and
+/// `attempts` after a bounded backoff.
+async fn run_hub_body<D: AutoResumeDriver + Sync>(
+    driver: &D,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<CrashEvent>,
+    delays: &[u64],
+    attempts: &mut std::collections::HashMap<String, u32>,
+) {
+    {
         // Retaining exhausted / pane-closed entries is DELIBERATE (not a
         // leak): evicting on exhaustion would refill the retry budget for an
         // immediate manual-Relaunch re-crash.
-        let mut attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         let max_attempts = delays.len() as u32;
         // Design note (serialization): handling events sequentially in ONE
         // task means a backoff sleep delays other panes' resumes by up to
@@ -167,7 +234,7 @@ pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver>(
                     .map(|k| driver.cap_exhausted(k))
                     .unwrap_or(true),
             };
-            match decide(&ctx, &delays) {
+            match decide(&ctx, delays) {
                 AutoResumeDecision::SettleExited { reason } => {
                     if ev.mode != "shell" {
                         driver.log_settled(&ev.terminal_id, reason);
@@ -237,7 +304,7 @@ pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver>(
                 }
             }
         }
-    })
+    }
 }
 
 /// Orchestrator-facing effects, faked in unit tests.
@@ -803,6 +870,7 @@ mod tests {
         guard: Option<&'static str>,
         claim_ok: bool,
         complete_ok: bool,
+        panic_next_recovering: bool,
         respawn_result: Result<String, String>,
         recovering: Vec<(String, u32, u32)>,
         replaced: Vec<(String, String, u32)>,
@@ -830,6 +898,7 @@ mod tests {
                     guard: None,
                     claim_ok: true,
                     complete_ok: true,
+                    panic_next_recovering: false,
                     respawn_result: Ok("t-new".into()),
                     recovering: Vec::new(),
                     replaced: Vec::new(),
@@ -863,6 +932,9 @@ mod tests {
         }
         fn set_respawn_result(&self, v: Result<String, String>) {
             self.lock().respawn_result = v;
+        }
+        fn set_panic_next_recovering(&self, v: bool) {
+            self.lock().panic_next_recovering = v;
         }
 
         /// (old_terminal_id, attempt, max_attempts)
@@ -957,9 +1029,23 @@ mod tests {
             attempt: u32,
             max_attempts: u32,
         ) {
-            self.lock()
-                .recovering
-                .push((terminal_id.to_string(), attempt, max_attempts));
+            // One-shot injected panic for the supervision test. The flag is
+            // consumed and the guard DROPPED before panicking so the mutex is
+            // never poisoned for subsequent events.
+            let should_panic = {
+                let mut s = self.lock();
+                if s.panic_next_recovering {
+                    s.panic_next_recovering = false;
+                    true
+                } else {
+                    s.recovering
+                        .push((terminal_id.to_string(), attempt, max_attempts));
+                    false
+                }
+            };
+            if should_panic {
+                panic!("test-injected driver panic");
+            }
         }
         fn emit_replaced(
             &self,
@@ -1232,5 +1318,45 @@ mod tests {
         assert!(fake.respawn_calls().is_empty());
         assert!(fake.recovering_calls().is_empty());
         assert!(fake.claim_calls().is_empty());
+    }
+
+    /// Council MEDIUM fix (crusty, 7w4h/xkhx review): a driver panic must not
+    /// silently end auto-resume forever — that would reinstate the exact
+    /// incident this feature exists to prevent (a crashed pane sitting grey
+    /// for hours). The hub is supervised: the panic is caught, logged ERROR,
+    /// and the loop restarted after a bounded backoff, with the crash-event
+    /// receiver surviving the restart.
+    ///
+    /// Real time (not start_paused): the supervision backoff is a real sleep.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hub_survives_driver_panic_and_processes_subsequent_crashes() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_panic_next_recovering(true);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![10]);
+
+        // Event 1: the driver panics mid-processing (inside emit_recovering).
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 5_000))
+            .unwrap();
+        // Event 2: must still be processed by the restarted hub body.
+        tx.send(crash("t2", 1, "claude", Some("cr-2"), 5_000))
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let respawned: Vec<String> = fake
+                .respawn_calls()
+                .iter()
+                .map(|r| r.create_request_id.clone())
+                .collect();
+            if respawned.contains(&"cr-2".to_string()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "hub never recovered from the driver panic: respawns={respawned:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
     }
 }
