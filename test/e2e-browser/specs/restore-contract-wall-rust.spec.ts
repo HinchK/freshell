@@ -1499,7 +1499,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // delete this pin when the last per-pane pin is retired.
     test.fail(
       e2eServerKind === 'rust',
-      'P0.1: composed all-pane ruler; red until remaining P1.x land -- current observed red: the claude terminal \u00a72.2 --resume argv leg under composition (the former P0.2 freshclaude identity gap closed in #562)',
+      'P0.1: composed all-pane ruler; red until remaining P1.x land -- current observed red: the claude terminal §2.2 --resume argv leg under composition (the former P0.2 freshclaude identity gap closed in #562)',
     )
 
     const CODEX_SESSION_ID = '99999999-8888-4777-8666-555555555555'
