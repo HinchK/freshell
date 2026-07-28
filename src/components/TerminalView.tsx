@@ -32,6 +32,7 @@ import { clearPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
 import { recordTurnComplete } from '@/store/turnCompletionSlice'
 import {
   AUTO_RESUME_NOTICE_TTL_MS,
+  clearTerminalLifecycle,
   foldTerminalReplacement,
   recordAutoResumeRecovering,
   recordTerminalExit,
@@ -5032,12 +5033,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             mode={terminalContent.mode ?? 'agent'}
             exitCode={exitRecord?.exitCode ?? null}
             notice={activeNotice ?? null}
-            onRelaunch={() => dispatch(resetPaneForReconcileCreate({
-              tabId,
-              paneId,
-              intent: 'respawn',
-              sessionRef: terminalContent.sessionRef,
-            }))}
+            onRelaunch={() => {
+              // Discard the OLD crash's lifecycle entry: if the relaunch
+              // create is rejected (pane settles 'error' with no new
+              // terminal.exit), a stale exit record would resurrect the
+              // previous "process exited (code N)" banner for what is
+              // actually a launch failure. A genuine crash-during-relaunch
+              // repopulates via recordTerminalExit.
+              dispatch(clearTerminalLifecycle({ paneId }))
+              dispatch(resetPaneForReconcileCreate({
+                tabId,
+                paneId,
+                intent: 'respawn',
+                sessionRef: terminalContent.sessionRef,
+              }))
+            }}
           />
         </div>
       )}

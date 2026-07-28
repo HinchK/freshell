@@ -6,7 +6,8 @@ import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import terminalLifecycleReducer, { AUTO_RESUME_NOTICE_TTL_MS } from '@/store/terminalLifecycleSlice'
+import terminalLifecycleReducer, { AUTO_RESUME_NOTICE_TTL_MS, selectExitRecordFrom } from '@/store/terminalLifecycleSlice'
+import { updatePaneContent } from '@/store/panesSlice'
 import { resetPersistedLayoutCacheForTests, resetPersistFlushListenersForTests } from '@/store/persistMiddleware'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { __resetTerminalCursorCacheForTests } from '@/lib/terminal-cursor'
@@ -249,6 +250,52 @@ describe('TerminalView exited-pane error banner', () => {
     expect(content.pendingReconcile).toBe('respawn')
     expect(content.sessionRef?.sessionId).toBe(SESSION_ID) // unchanged from seed
     expect(content.terminalId).toBeUndefined()
+  })
+
+  it('Relaunch clears the stale exit record so a failed relaunch does not resurrect the old crash banner', async () => {
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'exited',
+      lifecycle: { exit: { exitCode: 1, at: Date.now() } },
+    })
+    const { rerender } = render(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneContent} />
+      </Provider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(messageHandler).not.toBeNull()
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Relaunch claude session' }))
+    })
+
+    // The click must discard the PREVIOUS crash's record — a genuine
+    // crash-during-relaunch still repopulates via recordTerminalExit.
+    expect(selectExitRecordFrom(store.getState().terminalLifecycle, PANE)).toBeUndefined()
+
+    // Relaunch create rejected: the pane settles 'error' with NO new
+    // terminal.exit. The stale "process exited (code 1)" must not linger.
+    act(() => {
+      store.dispatch(updatePaneContent({
+        tabId: TAB,
+        paneId: PANE,
+        content: { ...paneState(store), terminalId: undefined, streamId: undefined, status: 'error' },
+      }))
+    })
+    rerender(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneState(store)} />
+      </Provider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 
   it('keeps shell panes quiet: no alert for an exited shell even with a non-zero exit record', async () => {
