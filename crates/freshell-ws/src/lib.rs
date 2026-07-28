@@ -991,6 +991,16 @@ mod tests {
         // differ in that one field (flipped twice under cargo-workspace
         // load: left/right identical except `.725Z` vs `.726Z`). Neutralize
         // ONLY the timestamp; every other field must still match exactly.
+        // Assert the timestamp is RFC3339-parseable BEFORE blanking it below --
+        // otherwise a malformed/missing timestamp would silently pass through
+        // the "<normalized>" substitution instead of failing the test.
+        if let Some(ServerMessage::Ready(r)) = first_connection
+            .iter()
+            .find(|m| matches!(m, ServerMessage::Ready(_)))
+        {
+            chrono::DateTime::parse_from_rfc3339(&r.timestamp)
+                .expect("ready.timestamp must be RFC3339-parseable");
+        }
         let normalize = |msgs: Vec<ServerMessage>| -> Vec<ServerMessage> {
             msgs.into_iter()
                 .map(|m| match m {
