@@ -154,6 +154,19 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
         expect(status).toBe('ready')
       }).toPass({ timeout: 30_000 })
 
+      // DEFLAKE (f3wp council round 2, optional-but-cheap): the isolation
+      // proof above was captured from the FIRST boot only, so a HOME leak
+      // introduced specifically by the restart cycle (e.g. a code path that
+      // re-resolves HOME on restart() and gets it wrong) would be invisible
+      // on a live host, where the "real ~/.freshell pre-exists" branch below
+      // only checks POSITIVE isolation, never NEGATIVE (that nothing new
+      // leaked into the real home during restart). Re-stat post-restart,
+      // while the isolated home still exists (stop() deletes it), so the
+      // fixture's own restart write is re-confirmed under the isolated home.
+      const isolatedBootLogExistedAfterRestart = fs.existsSync(
+        path.join(info.homeDir, '.freshell', 'logs', 'rust-server.jsonl'),
+      )
+
       // Prove the reconnected terminal is FUNCTIONALLY alive (not just
       // showing stale pre-restart DOM content): a brand-new command must
       // still execute correctly after the client recreates/reattaches.
@@ -187,7 +200,14 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       // window can be silently lost) -- recorded in the verification
       // report; this loop only de-flakes the harness contract.
       let roundTripped = false
-      let lastAttemptError: unknown = null
+      // DEFLAKE (f3wp council round 2, B4): the prior version kept only the
+      // LAST attempt's error, silently discarding earlier ones. When all 3
+      // attempts fail for genuinely different reasons (e.g. attempt 1
+      // head-truncated, attempt 2 wedged, attempt 3 timed out clean), the
+      // final thrown diagnostic must show every attempt's failure, not just
+      // the last -- otherwise the reported cause can be actively misleading
+      // about what actually happened on earlier attempts.
+      const attemptErrors: unknown[] = []
       for (let attempt = 1; attempt <= 3 && !roundTripped; attempt++) {
         const marker = `HARNESS01-POST-RESTART-${attempt}-${randomUUID()}`
         try {
@@ -195,11 +215,20 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
           await terminal.waitForOutput(marker, { timeout: 30_000 })
           roundTripped = true
         } catch (attemptError) {
-          lastAttemptError = attemptError
+          // eslint-disable-next-line no-console
+          console.log(`[harness-01] post-restart round-trip attempt ${attempt} failed: ${attemptError}`)
+          attemptErrors.push(attemptError)
         }
       }
       try {
-        if (!roundTripped) throw lastAttemptError ?? new Error('post-restart round-trip never attempted')
+        if (!roundTripped) {
+          throw new Error(
+            attemptErrors.length
+              ? `post-restart round-trip failed after ${attemptErrors.length} attempt(s) -- ` +
+                attemptErrors.map((err, i) => `[attempt ${i + 1}] ${err}`).join(' | ')
+              : 'post-restart round-trip never attempted',
+          )
+        }
       } catch (error) {
         const wsReadyState = await page
           .evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getWsReadyState() ?? '<harness missing>')
@@ -288,6 +317,10 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       // there), which a HOME-resolution regression would break.
       expect(realFreshellStatAfter).not.toBeNull()
       expect(isolatedBootLogExisted).toBe(true)
+      // Covers the restart cycle specifically (see capture-site comment
+      // above): without this, a restart-time HOME leak would be invisible
+      // on exactly the hosts where this branch runs.
+      expect(isolatedBootLogExistedAfterRestart).toBe(true)
       console.log(
         '[harness-01] real ~/.freshell pre-exists on this host (live freshell likely active) -- ' +
           'strict real-home mtime tripwire skipped as unattributable; isolated-home boot artifacts verified instead.',

@@ -326,6 +326,24 @@ export class RustServer implements E2eServerHandle {
           // endpoint would otherwise hang the whole boot-retry loop instead
           // of failing fast into the next attempt.
           signal: AbortSignal.timeout(2000),
+        }).catch((fetchError: unknown) => {
+          // DEFLAKE (f3wp council round 2, B6): AbortSignal.timeout()
+          // rejects with a TimeoutError/AbortError DOMException whose
+          // message never matches the bindRace classifier below, so left
+          // uncaught this silently skipped the "fail fast into the next
+          // attempt" path promised above and instead hard-failed with full
+          // teardown (home dir deleted, evidence destroyed) on a mere
+          // stall. Reshape it into the bind-race vocabulary the classifier
+          // already understands: a foreign server stalling on this
+          // identity check is the same "something else owns this port"
+          // retry case as one that answers outright wrong.
+          const name = fetchError instanceof Error ? fetchError.name : ''
+          if (name === 'TimeoutError' || name === 'AbortError') {
+            throw new Error(
+              `bind race: foreign server on port ${port} stalled responding to server-info identity check`,
+            )
+          }
+          throw fetchError
         })
         if (!identity.ok) {
           throw new Error(
