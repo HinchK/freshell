@@ -23,9 +23,13 @@
 //!   completion/failure/panic path frees the permit. Never call
 //!   `permit.forget()` (it permanently shrinks capacity).
 //!
-//! `restore:true` creates bypass the RATE limiter but NOT this gate — the
-//! gate is exactly what protects restore storms, and non-restore creates go
-//! through this same gate inline.
+//! RESTORE-ONLY scope (user decision, PR #552): `restore:true` creates
+//! bypass the RATE limiter but go through THIS gate (via
+//! `crate::create_gate::spawn_gated_restore_create`'s spawned, cancellable
+//! acquire) — the gate is exactly what protects restore storms. Interactive
+//! (non-restore) creates do the opposite: they are rate-limited but BYPASS
+//! this gate entirely, so a human clicking "new terminal" gets an instant
+//! create with zero queueing latency.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;

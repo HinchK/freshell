@@ -85,6 +85,12 @@ pub(crate) fn spawn_gated_restore_create(
                 return; // Client gone or server shutting down: no PTY, no reply.
             }
             Err(err) => {
+                // No side-effect cleanup needed here: the gate acquire runs
+                // BEFORE handle_create, so at rejection time nothing has
+                // been materialized yet — no codex launch plan to discard,
+                // no MCP injection to undo (both happen inside
+                // handle_create, and its own failed-spawn arm cleans them
+                // up on that path).
                 let (code, msg) = spawn_gate_error_parts(err);
                 let mut out = CreateOutput::Channel(&sink);
                 let _ = crate::terminal::send_create_error(

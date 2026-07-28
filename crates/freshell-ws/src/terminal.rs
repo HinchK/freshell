@@ -1761,54 +1761,23 @@ pub(crate) async fn handle_create(
     };
 
     // Server-wide spawn gate (restart-storm protection; WSL-outage RCA prior
-    // art). Every create is gated -- but restore:true creates are gated by
-    // the CALLER: `create_gate::spawn_gated_restore_create` acquires the
-    // permit BEFORE invoking this function and holds it across the whole
-    // spawn-to-settled scope (spawn-to-settled permit hold), so acquiring
-    // AGAIN here would self-deadlock against that outer permit (the outer
-    // permit can never free until this call returns, and this call can
-    // never return until it acquires a permit from the same
-    // already-exhausted gate). This INLINE path therefore only acquires for
-    // the non-restore case, against a never-cancelled receiver (this same
-    // task is the one that would signal cancel, so there is no per-
-    // connection cancel reason to observe mid-acquire). RAII permit:
-    // released on completion, failure, or unwind when `_spawn_permit` drops
-    // at scope end.
-    let (_never_cancel_tx, mut never_cancel_rx) = tokio::sync::watch::channel(false);
-    let _spawn_permit: Option<tokio::sync::OwnedSemaphorePermit> = if create.restore == Some(true)
-    {
-        None
-    } else {
-        match state
-            .spawn_gate
-            .acquire(
-                std::time::Duration::from_millis(state.create_protect.spawn_timeout_ms),
-                &mut never_cancel_rx,
-            )
-            .await
-        {
-            Ok(permit) => Some(permit),
-            Err(err) => {
-                // Gate rejection mirrors the failed-spawn cleanup below: discard a
-                // planned-but-unadopted codex launch (sidecar + proxy) and undo the
-                // MCP side effects already materialized by generate_mcp_injection
-                // (claude/gemini/kimi tmp config file; opencode sidecar refcount).
-                if let Some(launch) = codex_launch {
-                    freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-                        .discard(launch)
-                        .await;
-                }
-                cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
-                let (code, msg) = spawn_gate_error_parts(err);
-                return send_create_error(out, code, msg.to_string(), &create.request_id).await;
-            }
-        }
-    };
+    // art): RESTORE-ONLY scope, by design decision (PR #552). Interactive
+    // (non-restore) creates are a human clicking "new terminal" — one at a
+    // time, latency-visible — so they proceed INSTANTLY and never touch the
+    // gate; the storm the gate exists for is the ~20-tab restore fleet
+    // respawning 50-70 processes in the same instant, and exactly those
+    // (restore == Some(true)) creates are gated — by the CALLER:
+    // `create_gate::spawn_gated_restore_create` acquires the permit BEFORE
+    // invoking this function and holds it across the whole spawn-to-settled
+    // scope (spawn-to-settled permit hold, cancellable while queued). No
+    // acquire happens here: for restore it would self-deadlock against that
+    // outer permit; for non-restore it is bypassed on purpose.
 
     // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
-    // spawns occupy a permit + a blocking thread, never an async worker
-    // (on small hosts, N inline blocking spawns would wedge the whole
-    // runtime including the timer driver). Permit stays held throughout.
+    // spawns occupy a blocking thread (plus, on the gated restore path, the
+    // caller-held permit), never an async worker (on small hosts, N inline
+    // blocking spawns would wedge the whole runtime including the timer
+    // driver).
     let registry = state.registry.clone();
     let spawn_spec = spec.clone();
     let spawn_terminal_id = terminal_id.clone();

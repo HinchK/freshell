@@ -1,11 +1,10 @@
 //! WSL-outage RCA §6.3 acceptance tests: the per-connection create rate
-//! limit (legacy parity) and the cancellable, server-wide spawn gate. Landing
-//! sync (integration/land-rust-tauri-port): the gate now covers EVERY
-//! `terminal.create` -- restore and non-restore alike -- not just
-//! restore-flagged creates (the prior restore-only design let a plain
-//! creation storm bypass the gate entirely). REAL axum server + REAL
-//! tokio-tungstenite client, the session_identity_frames.rs harness
-//! convention.
+//! limit (legacy parity) and the cancellable, server-wide RESTORE-ONLY spawn
+//! gate (scope pinned by user decision, PR #552): interactive (non-restore)
+//! creates bypass the gate entirely for an instant create; only
+//! `restore == Some(true)` creates -- the restart-storm fleet the gate
+//! exists for -- are gated. REAL axum server + REAL tokio-tungstenite
+//! client, the session_identity_frames.rs harness convention.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -313,14 +312,15 @@ async fn third_non_restore_create_in_window_is_rate_limited() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn creates_of_both_kinds_are_gated() {
-    // Zero-permit gate: ANY create -- restore or non-restore -- must consult
-    // the SAME server-wide spawn gate and fail loud when it has no permits.
-    // This is the all-gated-semantics wiring proof: the prior restore-only
-    // design let a non-restore create bypass the gate entirely (the Node
-    // attempt's failure mode was the mirror image -- an inert gate letting
-    // restore creates through); landing sync closed that gap by routing both
-    // paths through one `SpawnGate`.
+async fn restore_creates_are_gated_and_non_restore_bypass() {
+    // RESTORE-ONLY gate scope (user decision, PR #552): interactive
+    // (non-restore) creates are latency-visible one-at-a-time human actions
+    // and BYPASS the gate entirely for an instant create; the restart-storm
+    // the gate exists for is restore fleets, and exactly those creates are
+    // gated. Zero-permit gate: any create that actually consults the gate
+    // can never proceed — the wiring proof in both directions (an inert
+    // gate would let the restore create through; an over-broad gate would
+    // block the plain create).
     let cfg = CreateProtectConfig {
         spawn_timeout_ms: 300,
         ..CreateProtectConfig::default()
@@ -329,32 +329,27 @@ async fn creates_of_both_kinds_are_gated() {
         spawn_server(cfg, SpawnGate::new(0, 64)).await;
     let mut client = connect_and_hello(&ws_url).await;
 
-    // Non-restore create now ALSO consults the zero-permit gate: times out,
-    // fails loud, never spawns.
+    // Non-restore create BYPASSES the zero-permit gate and succeeds.
     send_text(&mut client, &create_frame("plain", false)).await;
-    let err1 = next_json_of_type(&mut client, "error").await;
-    assert_eq!(err1["code"], "PTY_SPAWN_FAILED");
-    assert_eq!(err1["requestId"], "plain");
-    assert!(err1["message"]
-        .as_str()
-        .expect("message")
-        .contains("terminal spawn slot"));
+    let reply = next_json_of_type(&mut client, "terminal.created").await;
+    assert_eq!(reply["requestId"], "plain");
 
-    // Restore create consults the SAME gate, times out, fails loud too.
+    // Restore create consults the gate, times out, fails loud with theirs'
+    // pinned error string.
     send_text(&mut client, &create_frame("restore-1", true)).await;
-    let err2 = next_json_of_type(&mut client, "error").await;
-    assert_eq!(err2["code"], "PTY_SPAWN_FAILED");
-    assert_eq!(err2["requestId"], "restore-1");
-    assert!(err2["message"]
+    let err = next_json_of_type(&mut client, "error").await;
+    assert_eq!(err["code"], "PTY_SPAWN_FAILED");
+    assert_eq!(err["requestId"], "restore-1");
+    assert!(err["message"]
         .as_str()
         .expect("message")
         .contains("terminal spawn slot"));
+    assert_eq!(gate.timeouts(), 1, "only the restore create hit the gate");
 
-    assert_eq!(gate.timeouts(), 2, "both kinds of create hit the gate");
     assert_eq!(
         registry.kill_all(),
-        0,
-        "neither create ever got a permit, so neither spawned"
+        1,
+        "only the non-restore create spawned"
     );
 }
 
