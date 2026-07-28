@@ -13,8 +13,11 @@ import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import {
+  ALL_AGENTS,
   ALL_REPOS,
+  collectAgentFilterOptions,
   collectRepoFilterOptions,
+  filterSessionItemsByAgent,
   filterSessionItemsByRepo,
   makeSelectSortedSessionItems,
   type SidebarSessionItem,
@@ -235,6 +238,9 @@ export default function Sidebar({
   // Repo filter is deliberately component-local and never persisted:
   // a browser refresh must reset it to 'all' (spec requirement).
   const [repoFilter, setRepoFilter] = useState<string>(ALL_REPOS)
+  // Agent filter is deliberately component-local and never persisted:
+  // a browser refresh must reset it to 'all' (spec requirement).
+  const [agentFilter, setAgentFilter] = useState<string>(ALL_AGENTS)
   const localQuery = filter.trim()
   const localMatchesRequestedSearch = filter === requestedQueryValue && searchTier === requestedSearchTier
 
@@ -324,11 +330,25 @@ export default function Sidebar({
     () => collectRepoFilterOptions(localFilteredItems, repoFilter),
     [localFilteredItems, repoFilter],
   )
-  // ANDs with the selector pipeline (visibility + applied search + sort),
-  // which has already run inside selectSortedItems.
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries)
+  // Options come from the PRE-filter list so every agent kind stays listed
+  // while one is selected; the current selection is retained even if its
+  // rows are temporarily absent, keeping the controlled select valid.
+  const agentOptions = useMemo(
+    () => collectAgentFilterOptions(
+      localFilteredItems,
+      agentFilter,
+      (sessionType) => resolveSessionTypeConfig(sessionType, extensionEntries).label,
+    ),
+    [localFilteredItems, agentFilter, extensionEntries],
+  )
+  // ANDs: selector pipeline (visibility + applied search + sort) → repo → agent.
   const computedItems = useMemo(
-    () => filterSessionItemsByRepo(localFilteredItems, repoFilter),
-    [localFilteredItems, repoFilter],
+    () => filterSessionItemsByAgent(
+      filterSessionItemsByRepo(localFilteredItems, repoFilter),
+      agentFilter,
+    ),
+    [localFilteredItems, repoFilter, agentFilter],
   )
 
   // Stabilize the array reference so react-window doesn't rebuild all row
@@ -734,6 +754,23 @@ export default function Sidebar({
                 <X className="h-3.5 w-3.5" />
               </button>
             ) : null}
+          </div>
+        )}
+        {agentOptions.length > 0 && (
+          <div className="mt-2 flex items-center gap-1">
+            <select
+              aria-label="Agent filter"
+              value={agentFilter}
+              onChange={(e) => setAgentFilter(e.target.value || ALL_AGENTS)}
+              className="min-w-0 flex-1 h-7 px-2 text-xs bg-muted/50 border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+            >
+              <option value={ALL_AGENTS}>All agents</option>
+              {agentOptions.map((option) => (
+                <option key={option.value} value={option.value} title={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
           </div>
         )}
         {localQuery && (

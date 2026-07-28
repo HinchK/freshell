@@ -2668,6 +2668,105 @@ describe('Sidebar Component - Session-Centric Display', () => {
     })
   })
 
+  describe('Agent filter dropdown', () => {
+    const agentProjects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/repo-alpha',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionId: sessionId('agent-alpha-claude'),
+            projectPath: '/home/user/repo-alpha',
+            lastActivityAt: Date.now() - 1000,
+            title: 'Alpha claude session',
+            cwd: '/home/user/repo-alpha',
+          },
+          {
+            provider: 'codex',
+            sessionId: sessionId('agent-alpha-codex'),
+            projectPath: '/home/user/repo-alpha',
+            lastActivityAt: Date.now() - 2000,
+            title: 'Alpha codex session',
+            cwd: '/home/user/repo-alpha',
+          },
+        ],
+      },
+      {
+        projectPath: '/home/user/repo-beta',
+        sessions: [
+          {
+            provider: 'codex',
+            sessionId: sessionId('agent-beta-codex'),
+            projectPath: '/home/user/repo-beta',
+            lastActivityAt: Date.now() - 3000,
+            title: 'Beta codex session',
+            cwd: '/home/user/repo-beta',
+          },
+        ],
+      },
+    ]
+
+    it('renders the agent dropdown defaulting to All agents with one option per agent kind', async () => {
+      const store = createTestStore({ projects: agentProjects })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const select = getByRole('combobox', { name: /agent filter/i }) as HTMLSelectElement
+      expect(select).toHaveValue('all')
+      // Labels come from the extensions registry (createTestStore preloads
+      // 'Claude CLI' / 'Codex CLI'), sorted by label.
+      expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
+        'All agents',
+        'Claude CLI',
+        'Codex CLI',
+      ])
+      expect(Array.from(select.options).map((o) => o.value)).toEqual([
+        'all',
+        'claude',
+        'codex',
+      ])
+    })
+
+    it('filters the list to the selected agent', async () => {
+      const store = createTestStore({ projects: agentProjects })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByRole('combobox', { name: /agent filter/i }), {
+        target: { value: 'codex' },
+      })
+
+      expect(screen.getByText('Alpha codex session')).toBeInTheDocument()
+      expect(screen.getByText('Beta codex session')).toBeInTheDocument()
+      expect(screen.queryByText('Alpha claude session')).not.toBeInTheDocument()
+    })
+
+    it('ANDs with the repo filter', async () => {
+      const store = createTestStore({ projects: agentProjects })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByRole('combobox', { name: /repo filter/i }), {
+        target: { value: '/home/user/repo-alpha' },
+      })
+      fireEvent.change(getByRole('combobox', { name: /agent filter/i }), {
+        target: { value: 'codex' },
+      })
+
+      expect(screen.getByText('Alpha codex session')).toBeInTheDocument()
+      expect(screen.queryByText('Alpha claude session')).not.toBeInTheDocument()
+      expect(screen.queryByText('Beta codex session')).not.toBeInTheDocument()
+    })
+
+    it('does not render the dropdown when no sessions are loaded', async () => {
+      const store = createTestStore({ projects: [] })
+      const { queryByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      expect(queryByRole('combobox', { name: /agent filter/i })).not.toBeInTheDocument()
+    })
+  })
+
   describe('Search loading state', () => {
     it('shows loading indicator while searching', async () => {
       // Make the search take some time
