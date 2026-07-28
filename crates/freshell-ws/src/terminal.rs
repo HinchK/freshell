@@ -1702,13 +1702,8 @@ pub(crate) async fn handle_create(
         Err(message) => {
             // A thrown planCodexLaunch surfaces through the generic create catch
             // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
-            return send_create_error(
-                out,
-                ErrorCode::PtySpawnFailed,
-                message,
-                &create.request_id,
-            )
-            .await;
+            return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+                .await;
         }
     };
     let codex_remote_ws_url: Option<String> =
