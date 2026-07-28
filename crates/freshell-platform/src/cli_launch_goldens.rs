@@ -5,12 +5,14 @@ use super::*;
 use crate::detect::HostOs;
 use crate::spawn::{build_windows_cli_spawn_spec, quote_powershell_literal, ShellType};
 
-/// `CLAUDE_SETTINGS_UNIX` (§4 conventions) — exact compact-JSON bytes.
-const CLAUDE_SETTINGS_UNIX: &str = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"sh -lc \"printf '\\a' > /dev/tty 2>/dev/null || true\""}]}]}}"#;
+/// `CLAUDE_SETTINGS_UNIX` (§4 conventions) — exact compact-JSON bytes:
+/// `SessionStart` (session-id signal file hook, P4) then `Stop` (bell).
+const CLAUDE_SETTINGS_UNIX: &str = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sh -lc 'd=\"$HOME/.freshell/session-signals/claude\"; f=\"$d/${FRESHELL_TERMINAL_ID:-unknown}__$$-$(date +%s%N)\"; mkdir -p \"$d\" && cat > \"$f.tmp\" && mv \"$f.tmp\" \"$f.json\"' 2>/dev/null || true"}]}],"Stop":[{"hooks":[{"type":"command","command":"sh -lc \"printf '\\a' > /dev/tty 2>/dev/null || true\""}]}]}}"#;
 
-/// `CLAUDE_SETTINGS_WIN` — compact JSON of the windows bell string
-/// (`'\\.\CONOUT$'` appears in JSON as `'\\\\.\\CONOUT$'`).
-const CLAUDE_SETTINGS_WIN: &str = r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$bell=[char]7; $ok=$false; try {[System.IO.File]::AppendAllText('\\\\.\\CONOUT$', [string]$bell); $ok=$true} catch {}; if (-not $ok) { try {[Console]::Out.Write($bell); $ok=$true} catch {} }; if (-not $ok) { try {[Console]::Error.Write($bell)} catch {} }\""}]}]}}"#;
+/// `CLAUDE_SETTINGS_WIN` — compact JSON: `SessionStart` (signal file hook,
+/// `\` appears in JSON as `\\`) then `Stop` (the windows bell string;
+/// `'\\.\CONOUT$'` appears in JSON as `'\\\\.\\CONOUT$'`).
+const CLAUDE_SETTINGS_WIN: &str = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"try { $tid = if ($env:FRESHELL_TERMINAL_ID) { $env:FRESHELL_TERMINAL_ID } else { 'unknown' }; $d = Join-Path $env:USERPROFILE '.freshell\\session-signals\\claude'; New-Item -ItemType Directory -Force -Path $d | Out-Null; $f = Join-Path $d ($tid + '__' + [DateTime]::UtcNow.Ticks); [System.IO.File]::WriteAllText($f + '.tmp', [Console]::In.ReadToEnd()); Move-Item -Force ($f + '.tmp') ($f + '.json') } catch {}\""}]}],"Stop":[{"hooks":[{"type":"command","command":"powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$bell=[char]7; $ok=$false; try {[System.IO.File]::AppendAllText('\\\\.\\CONOUT$', [string]$bell); $ok=$true} catch {}; if (-not $ok) { try {[Console]::Out.Write($bell); $ok=$true} catch {} }; if (-not $ok) { try {[Console]::Error.Write($bell)} catch {} }\""}]}]}}"#;
 
 /// Dev-mode MCP server args (`MCP_UNIX`, §4 conventions).
 const MCP_UNIX: &[&str] = &[
