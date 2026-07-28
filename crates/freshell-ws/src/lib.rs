@@ -986,7 +986,34 @@ mod tests {
         // handshake on a second, independent call.
         let late_connection = build_handshake(&s);
 
-        assert_eq!(first_connection, late_connection);
+        // DEFLAKE (f3wp): `ready.timestamp` is wall-clock at build time, so
+        // two handshakes built across a millisecond boundary legitimately
+        // differ in that one field (flipped twice under cargo-workspace
+        // load: left/right identical except `.725Z` vs `.726Z`). Neutralize
+        // ONLY the timestamp; every other field must still match exactly.
+        // Assert the timestamp is RFC3339-parseable BEFORE blanking it below --
+        // otherwise a malformed/missing timestamp would silently pass through
+        // the "<normalized>" substitution instead of failing the test.
+        if let Some(ServerMessage::Ready(r)) = first_connection
+            .iter()
+            .find(|m| matches!(m, ServerMessage::Ready(_)))
+        {
+            chrono::DateTime::parse_from_rfc3339(&r.timestamp)
+                .expect("ready.timestamp must be RFC3339-parseable");
+        }
+        let normalize = |msgs: Vec<ServerMessage>| -> Vec<ServerMessage> {
+            msgs.into_iter()
+                .map(|m| match m {
+                    ServerMessage::Ready(mut r) => {
+                        r.timestamp = String::from("<normalized>");
+                        ServerMessage::Ready(r)
+                    }
+                    other => other,
+                })
+                .collect()
+        };
+        let late_connection = normalize(late_connection);
+        assert_eq!(normalize(first_connection), late_connection);
         assert!(
             late_connection
                 .iter()
