@@ -305,12 +305,15 @@ test.describe('hidden-pane rebind (F8 / P1.11)', () => {
       // FreshAgentView.tsx mergePaneContent) -- the post-restart attach must
       // deterministically carry it so the server's restart-parity resume arm
       // (claude.rs handle_attach decision table) can engage.
+      // The fake sidecar mints a RANDOM canonical UUID per process (council
+      // follow-up: the old static default was collision-blind), so gate on
+      // the canonical-UUID SHAPE and capture what this run minted below.
       await expect
         .poll(async () => {
           const c = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))?.content
           return c?.sessionRef?.sessionId ?? c?.resumeSessionId ?? ''
         }, { timeout: 30_000 })
-        .toBe('44444444-4444-4444-8444-444444444444')
+        .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
       const contentBefore = findFreshAgentLeaf(await harness.getPaneLayout(freshTabId))!.content!
       const originalDurable = (contentBefore.sessionRef?.sessionId ?? contentBefore.resumeSessionId) as string
       // COMBINED-TREE CONTRACT (F8 rebind x freshclaude restart parity): with

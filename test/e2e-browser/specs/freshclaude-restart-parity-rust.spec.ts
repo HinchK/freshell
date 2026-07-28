@@ -239,6 +239,10 @@ test.describe('freshclaude restart parity (rust)', () => {
 
       // Durable identity = the fixture's canonical UUID (via liveDurableIdentity;
       // content.sessionId stays the create-time nanoid on a live claude pane).
+      // The fake sidecar mints a RANDOM canonical UUID per process (council
+      // follow-up: the old static default was collision-blind), so gate on
+      // the canonical-UUID SHAPE (which the fc-e2e-* nanoid never matches)
+      // and CAPTURE what this run minted.
       let originalDurable = ''
       await expect
         .poll(async () => {
@@ -246,7 +250,7 @@ test.describe('freshclaude restart parity (rust)', () => {
           originalDurable = liveDurableIdentity(findFreshAgentLeaf(layout))
           return originalDurable
         })
-        .toBe('44444444-4444-4444-8444-444444444444')
+        .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
 
       await flushPersistence(page)
       await harness.clearSentWsMessages()
@@ -383,7 +387,7 @@ test.describe('freshclaude restart parity (rust)', () => {
         .split('\n')
         .filter(Boolean)
         .map((l) => JSON.parse(l))
-        .some((e) => e.msg?.type === 'create' && e.msg?.resumeSessionId === '44444444-4444-4444-8444-444444444444')
+        .some((e) => e.msg?.type === 'create' && e.msg?.resumeSessionId === originalDurable)
       expect(resumed).toBe(true)
     } finally {
       await server.stop().catch(() => {})

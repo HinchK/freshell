@@ -26,11 +26,20 @@ import readline from 'node:readline'
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
+import { randomUUID } from 'node:crypto'
 
 const HOLD_TURN = process.env.FAKE_CLAUDE_SIDECAR_HOLD_TURN === '1'
 const HOLD_ONCE_MARKER = process.env.FAKE_CLAUDE_SIDECAR_HOLD_TURN_ONCE_MARKER
-const CLI_SESSION_ID =
-  process.env.FAKE_CLAUDE_SIDECAR_CLI_SESSION_ID ?? '44444444-4444-4444-8444-444444444444'
+// RANDOM canonical UUID per sidecar PROCESS (council follow-up, PR #562/#563
+// close-out): the old static 44444444-... default made every resume-less
+// create in every sidecar process mint the SAME id, so a regression that
+// silently lost the durable identity across a restart would be re-stamped
+// with the identical constant and collide onto the same transcript file --
+// structurally collision-blind. With a per-process random default, any
+// identity-losing bare create after a restart (new sidecar process) mints a
+// DIFFERENT id and the identity assertions in the specs go red. The env
+// override remains for specs that need a caller-chosen id.
+const CLI_SESSION_ID = process.env.FAKE_CLAUDE_SIDECAR_CLI_SESSION_ID ?? randomUUID()
 const REQUEST_LOG = process.env.FAKE_CLAUDE_SIDECAR_LOG
 
 // sessionId (bridge nanoid) -> { cliSessionId (durable uuid), cwd }
