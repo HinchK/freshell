@@ -85,6 +85,10 @@ describe('repo icon tab flow', () => {
     apiGet.mockReset()
   })
 
+  afterEach(() => {
+    cleanup()
+  })
+
   it('probes the meta endpoint and renders the server icon image on the tab', async () => {
     apiGet.mockResolvedValue({
       repoRoot: '/home/u/myrepo',
