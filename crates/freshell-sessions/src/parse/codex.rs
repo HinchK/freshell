@@ -352,9 +352,16 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
                     is_dirty = Some(d);
                 }
             }
+            // A forked_from_id with thread_source == "user" is an in-TUI
+            // /resume continuation -- the user's REAL session -- not a
+            // subagent (verified fork pair 019fa60f -> 019fa613; the child
+            // carries thread_source:"user"). thread_source ABSENT falls back
+            // to the old classification (fail toward hiding).
+            let forked_user_thread = has_codex_forked_from_session(payload)
+                && payload.get("thread_source").and_then(Value::as_str) == Some("user");
             if is_subagent.is_none()
                 && (is_codex_subagent_source(payload.get("source"))
-                    || has_codex_forked_from_session(payload))
+                    || (has_codex_forked_from_session(payload) && !forked_user_thread))
             {
                 is_subagent = Some(true);
             }
@@ -487,5 +494,38 @@ pub fn parse_codex_session_content(content: &str) -> ParsedSessionMeta {
         is_dirty,
         token_usage,
         codex_task_events,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_fork_with_thread_source_user_is_not_a_subagent() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/coding-cli/codex/fork-child-meta.sanitized.jsonl");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let meta = parse_codex_session_content(&content);
+        assert_ne!(meta.is_subagent, Some(true),
+            "an in-TUI /resume continuation (forked_from_id + thread_source=user) must stay sidebar-visible");
+    }
+
+    #[test]
+    fn fork_without_thread_source_stays_classified_subagent() {
+        let content = r#"{"timestamp":"t","type":"session_meta","payload":{"id":"a","forked_from_id":"b","cwd":"/tmp/x"}}"#;
+        let meta = parse_codex_session_content(content);
+        assert_eq!(
+            meta.is_subagent,
+            Some(true),
+            "fail toward hiding when thread_source is absent"
+        );
+    }
+
+    #[test]
+    fn explicit_subagent_source_always_wins() {
+        let content = r#"{"timestamp":"t","type":"session_meta","payload":{"id":"a","forked_from_id":"b","thread_source":"user","source":{"subagent":{"thread_spawn":true}},"cwd":"/tmp/x"}}"#;
+        let meta = parse_codex_session_content(content);
+        assert_eq!(meta.is_subagent, Some(true));
     }
 }
