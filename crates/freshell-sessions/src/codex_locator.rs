@@ -55,8 +55,9 @@
 //!   must not win while the pane's own file sits in its git-info gap).
 //!   Enter→creation latency beyond the 2 s window is mitigated by this grace
 //!   plus window re-open on a later Enter.
-//! - Contested-cwd refusal is CROSS-TICK: while ≥2 armed terminals share a
-//!   normalized cwd, no candidate with that cwd binds for any of them.
+//! - Contested-cwd refusal is CROSS-TICK: while ≥2 contenders (armed
+//!   terminals with in-flight evaluation windows) share a normalized cwd, no
+//!   candidate with that cwd binds for any of them.
 //! - Ownership is proven ONLY by `payload.id` on line 1 — NEVER the filename
 //!   (prefilter-grade at best), NEVER `payload.session_id` (fork/resume
 //!   LINEAGE: matches a FOREIGN session in 54/144 sampled real rollouts) —
@@ -307,9 +308,10 @@ impl CodexLocator {
     ///   excluded);
     /// - 0 candidates → keep watching (stays armed, `resolved = true`);
     /// - 2+ candidates for one terminal → WARN + refuse (never guess);
-    /// - exactly one candidate but ≥2 ARMED terminals share this cwd → WARN +
-    ///   refuse (contested cwd — cross-tick, so staggered deadlines can't
-    ///   grab a sibling's rollout uncontested);
+    /// - exactly one candidate but ≥2 CONTENDERS (armed terminals with
+    ///   in-flight evaluation windows) share this cwd → WARN + refuse
+    ///   (contested cwd — cross-tick, so staggered deadlines can't grab a
+    ///   sibling's rollout uncontested);
     /// - one candidate claimed by ≥2 terminals in the same tick → WARN +
     ///   refuse ALL claimants (defense-in-depth behind the cwd census);
     /// - exactly one clean match → emit `Located` and disarm. `tick()` drains.
@@ -406,7 +408,7 @@ impl CodexLocator {
                     if cwd_counts.get(&armed.cwd_normalized).copied().unwrap_or(0) >= 2 {
                         tracing::warn!(
                             terminal_id = %terminal_id,
-                            "codex_locator_contested_cwd: >=2 armed terminals share this cwd; refusing to bind"
+                            "codex_locator_contested_cwd: >=2 contenders (in-flight evaluation windows) share this cwd; refusing to bind"
                         );
                     } else {
                         let (path, thread_id) = matches.remove(0);
@@ -1373,6 +1375,66 @@ mod tests {
         );
         // One-shot per fork: drained.
         assert!(locator.tick_forks(2_200).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn refused_rebind_recovery_rewatch_still_detects_a_later_genuine_fork() {
+        // `tick_forks` eagerly advances the watch to the child id BEFORE the
+        // ws-layer rebind guards run. When the rebind is REFUSED, the fork
+        // drain recovers by re-registering the watch with the OLD id
+        // (`watch_fork(t, old)`). This pins that recovery's semantics:
+        // (a) a later GENUINE fork of the ORIGINAL session is still
+        // detected, and (b) the refused child's rollout (re-snapshotted
+        // into known_files) can never re-fire.
+        let root = unique_temp_dir("fork-refused-recovery");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        assert!(locator.note_fork_submit("t1", 1_000));
+        // A fork child of aaaa-old appears whose rebind the ws layer will
+        // refuse (e.g. the A13 hijack guard). The locator can't know that:
+        // it emits the hit and eagerly advances the watch to the child id.
+        const REFUSED: &str = "55555555-2222-3333-4444-555555555555";
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            REFUSED,
+            Some("/tmp/x"),
+            Some("aaaa-old"),
+            Some("user"),
+        );
+        let located = locator.tick_forks(1_100);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].new_session_id, REFUSED);
+        // The refusal recovery: re-register with the OLD id (this also
+        // re-snapshots known_files, capturing the refused child's file).
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        // A later GENUINE user fork of the ORIGINAL session must still be
+        // detected -- without the recovery the watch would be tracking the
+        // refused child id and this fork would be silently missed.
+        assert!(locator.note_fork_submit("t1", 2_000));
+        const GENUINE: &str = "66666666-2222-3333-4444-555555555555";
+        let genuine_path = write_rollout_full(
+            &root,
+            "2026/07/27",
+            GENUINE,
+            Some("/tmp/x"),
+            Some("aaaa-old"),
+            Some("user"),
+        );
+        let located = locator.tick_forks(2_100);
+        assert_eq!(
+            located,
+            vec![ForkLocated {
+                terminal_id: "t1".into(),
+                old_session_id: "aaaa-old".into(),
+                new_session_id: GENUINE.into(),
+                rollout_path: genuine_path,
+                cwd: Some("/tmp/x".into()),
+            }],
+            "the genuine fork of the ORIGINAL session must be the sole hit \
+             (the refused child is in known_files and cannot re-fire)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

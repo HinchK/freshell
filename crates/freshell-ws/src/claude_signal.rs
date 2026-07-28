@@ -24,7 +24,9 @@ use crate::WsState;
 const CLAUDE_SIGNAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Drains `*.json` signal files from one directory. Owned by the sweep task
-/// (or a test) -- deliberately not stored in `WsState`.
+/// (or a test) -- deliberately not stored in `WsState`. `Clone` (a bare
+/// `PathBuf`) so the sweep can hand a copy to `spawn_blocking`.
+#[derive(Clone)]
 pub struct ClaudeSignalWatcher {
     root: PathBuf,
 }
@@ -123,7 +125,22 @@ fn parse_signal_file(path: &Path) -> Option<ClaudeSignal> {
 /// (`tests/claude_session_rebind.rs`) drives drains directly for determinism
 /// instead of racing a spawned sweep timer.
 pub async fn drain_and_rebind_claude(state: &WsState, watcher: &ClaudeSignalWatcher) {
-    for sig in watcher.drain() {
+    // `drain()` is synchronous fs I/O (read_dir + read + remove per signal
+    // file); run it on the blocking pool like the codex locator lanes
+    // (30a34360) instead of on the async runtime inside the 1s sweep.
+    // `drain()` itself stays synchronous -- only the call site moves.
+    let drain_watcher = watcher.clone();
+    let signals = match tokio::task::spawn_blocking(move || drain_watcher.drain()).await {
+        Ok(signals) => signals,
+        Err(join_error) => {
+            tracing::warn!(
+                error = %join_error,
+                "claude_signal_drain_panicked: blocking drain task panicked, skipping this cycle"
+            );
+            return;
+        }
+    };
+    for sig in signals {
         // Registry row: must be a live claude pane.
         let Some(current) = state.identity.get(&sig.terminal_id) else {
             continue;

@@ -780,6 +780,39 @@ async fn fork_targeting_a_live_owned_session_is_refused() {
         "pane2 must still own C"
     );
 
+    // ── Recovery: the refused rebind must have re-registered pane1's fork
+    // watch with its REAL session (A) -- tick_forks had eagerly advanced the
+    // watch to C before the guard refused. A subsequent GENUINE user fork of
+    // A (child id D, unowned) must still be detected and rebind pane1;
+    // without the recovery the watch would silently track C forever.
+    const D: &str = "019fa620-eeee-4fff-8aaa-00000000000d";
+    common::send_input(&mut ws, &pane1, "\r").await;
+    let genuine = sessions_day.join(format!("rollout-2026-07-27T12-15-00-{D}.jsonl"));
+    std::fs::write(
+        &genuine,
+        format!("{}\n", session_meta_line(D, &cwd1, Some(A))),
+    )
+    .unwrap();
+    let rebound = next_associated_frame(&mut ws, &pane1, "hijack/recovery-rebind").await;
+    assert_eq!(
+        rebound["sessionRef"]["sessionId"], D,
+        "after the refused hijack, a genuine fork of pane1's real session must still rebind"
+    );
+    assert_eq!(
+        rebound["previousSessionId"], A,
+        "the recovery rebind must supersede A (the id the restored watch tracked)"
+    );
+    assert_eq!(
+        registry_resume_id(&registry, &pane1).as_deref(),
+        Some(D),
+        "pane1 must follow the genuine fork to D"
+    );
+    assert_eq!(
+        registry_resume_id(&registry, &pane2).as_deref(),
+        Some(C),
+        "pane2 must still own C after pane1's recovery rebind"
+    );
+
     registry.kill(&pane1);
     registry.kill(&pane2);
     std::env::remove_var("CODEX_HOME");
