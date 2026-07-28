@@ -2441,6 +2441,7 @@ async fn handle_pane_reconcile(
             registry: &state.registry,
             identity: &state.identity,
             existence: state.session_existence.as_ref(),
+            pane_ledger: &state.pane_ledger,
             fresh_agent: fresh_agent_snapshot.as_ref(),
         };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
