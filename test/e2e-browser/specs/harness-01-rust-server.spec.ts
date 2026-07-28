@@ -86,30 +86,34 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
     const realFreshellStatBefore = fs.existsSync(realFreshellDir)
       ? fs.statSync(realFreshellDir)
       : null
-    // DEFLAKE (f3wp refresh, evidence /tmp/f3wp-refresh/e2e-rundiag{2,3}.log):
-    // on a host running a LIVE freshell (the self-hosted server, other
-    // agents), the real ~/.freshell dir mtime moves for reasons entirely
-    // outside this test (config.json atomic rewrites, checkpoint dirs), so a
-    // bare mtime-equality tripwire is unattributable there. Witness files:
-    // a live server writes the REAL ~/.freshell/logs continuously, while
-    // THIS fixture's server has its log dir env-pinned (FRESHELL_LOG_DIR ->
-    // isolated home) -- so a leak by OUR server would bump the dir but never
-    // the real logs. Movement of the real logs during the test window
-    // therefore proves a foreign writer and makes the dir-mtime tripwire
-    // inconclusive (skipped with a note) instead of falsely red.
-    const foreignWitnessPaths = [
-      path.join(realFreshellDir, 'logs'),
-      path.join(realFreshellDir, 'logs', 'rust-server.jsonl'),
-    ]
-    const witnessMtimes = () =>
-      foreignWitnessPaths.map((p) => (fs.existsSync(p) ? fs.statSync(p).mtimeMs : null))
-    const foreignWitnessBefore = witnessMtimes()
+    // DEFLAKE (f3wp refresh, evidence /tmp/f3wp-refresh/e2e-rundiag{2,3}.log
+    // and e2e-run8.log): on a host running a LIVE freshell (the self-hosted
+    // server, other agents), the real ~/.freshell dir mtime moves for
+    // reasons entirely outside this test -- config.json atomic rewrites
+    // (~60s cadence observed) bump it even while the live server's logs
+    // stay quiet, so NO temporal witness makes an mtime-equality assertion
+    // attributable there (a logs-mtime witness was tried and still false-
+    // positived in run8). The tripwire is therefore structural now:
+    // - real ~/.freshell ABSENT before the test (CI / fresh host): strict --
+    //   it must still be absent after; a HOME-resolution leak would have
+    //   created it, and creation is fully attributable.
+    // - real ~/.freshell PRE-EXISTING (shared live host): the mtime check is
+    //   unattributable noise; assert POSITIVE isolation instead (the
+    //   fixture's server demonstrably wrote its boot artifacts under the
+    //   isolated home) and skip the real-home check with a note.
 
     const server = new RustServer({ verbose: false })
     const info = await server.start()
 
     // The fixture must never bind the user's real port.
     expect(info.port).not.toBe(3001)
+
+    // Positive-isolation proof, captured while the isolated HOME still
+    // exists (stop() deletes it before step 5 runs): the server resolved the
+    // isolated home for its env-pinned log dir and wrote its boot log there.
+    const isolatedBootLogExisted = fs.existsSync(
+      path.join(info.homeDir, '.freshell', 'logs', 'rust-server.jsonl'),
+    )
 
     let sentinel: ChildProcess | null = null
 
@@ -273,26 +277,21 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       : null
 
     if (realFreshellStatBefore === null) {
+      // Fresh host / CI: creation of the real ~/.freshell IS the leak, and
+      // nothing else on the host could have created it -- fully attributable.
       expect(realFreshellStatAfter).toBeNull()
     } else {
+      // Shared live host: see the rationale where realFreshellStatBefore is
+      // captured -- mtime equality is unattributable here. Positive
+      // isolation proof instead: the fixture's server resolved the ISOLATED
+      // home for its state and the env-pinned log dir (its boot log exists
+      // there), which a HOME-resolution regression would break.
       expect(realFreshellStatAfter).not.toBeNull()
-      const foreignWitnessAfter = witnessMtimes()
-      const foreignWriterActive = foreignWitnessAfter.some(
-        (mtime, i) => mtime !== foreignWitnessBefore[i],
+      expect(isolatedBootLogExisted).toBe(true)
+      console.log(
+        '[harness-01] real ~/.freshell pre-exists on this host (live freshell likely active) -- ' +
+          'strict real-home mtime tripwire skipped as unattributable; isolated-home boot artifacts verified instead.',
       )
-      if (realFreshellStatAfter!.mtimeMs !== realFreshellStatBefore.mtimeMs && foreignWriterActive) {
-        // See the witness rationale where foreignWitnessBefore is captured:
-        // a foreign live freshell was demonstrably writing the real
-        // ~/.freshell during this test's window, so the dir-mtime move is
-        // not attributable to the fixture's isolated server.
-        console.log(
-          '[harness-01] real ~/.freshell mtime moved during the test window, but a foreign ' +
-            'live freshell was actively writing (real logs witness moved) -- tripwire inconclusive, skipping. ' +
-            `dir mtime ${realFreshellStatBefore.mtimeMs} -> ${realFreshellStatAfter!.mtimeMs}`,
-        )
-      } else {
-        expect(realFreshellStatAfter!.mtimeMs).toBe(realFreshellStatBefore.mtimeMs)
-      }
     }
   })
 })
