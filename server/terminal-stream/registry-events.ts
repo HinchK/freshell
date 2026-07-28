@@ -20,6 +20,12 @@ export type TerminalSessionBoundEvent = {
   provider: CodingCliProviderName
   sessionId: string
   reason: SessionBindingReason
+  /**
+   * Present ONLY on a server-authoritative mid-session rebind (e.g. codex fork
+   * handoff). Names the session id this binding supersedes so the
+   * terminal.session.associated fanout can carry it as previousSessionId.
+   */
+  previousSessionId?: string
 }
 
 export type TerminalSessionUnboundEvent = {

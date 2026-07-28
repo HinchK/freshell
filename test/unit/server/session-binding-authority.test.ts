@@ -33,4 +33,67 @@ describe('SessionBindingAuthority', () => {
     if (second.ok) throw new Error('Expected failed bind')
     expect(second.reason).toBe('terminal_already_bound')
   })
+
+  describe('swapTerminalSession', () => {
+    it('moves the session key for a bound terminal', () => {
+      const authority = new SessionBindingAuthority()
+      authority.bind({ provider: 'codex', sessionId: 'a', terminalId: 't1' })
+      const result = authority.swapTerminalSession({
+        provider: 'codex',
+        terminalId: 't1',
+        fromSessionId: 'a',
+        toSessionId: 'b',
+      })
+      expect(result.ok).toBe(true)
+      expect(authority.ownerForSession('codex', 'b')).toBe('t1')
+      expect(authority.ownerForSession('codex', 'a')).toBeUndefined()
+    })
+
+    it('refuses when the terminal is not bound', () => {
+      const authority = new SessionBindingAuthority()
+      expect(authority.swapTerminalSession({
+        provider: 'codex',
+        terminalId: 't1',
+        fromSessionId: 'a',
+        toSessionId: 'b',
+      }).ok).toBe(false)
+    })
+
+    it('refuses on from-session mismatch (optimistic concurrency)', () => {
+      const authority = new SessionBindingAuthority()
+      authority.bind({ provider: 'codex', sessionId: 'a', terminalId: 't1' })
+      const result = authority.swapTerminalSession({
+        provider: 'codex',
+        terminalId: 't1',
+        fromSessionId: 'zzz',
+        toSessionId: 'b',
+      })
+      expect(result.ok).toBe(false)
+      expect(authority.ownerForSession('codex', 'a')).toBe('t1')
+    })
+
+    it('refuses when the target session is owned by another terminal', () => {
+      const authority = new SessionBindingAuthority()
+      authority.bind({ provider: 'codex', sessionId: 'a', terminalId: 't1' })
+      authority.bind({ provider: 'codex', sessionId: 'b', terminalId: 't2' })
+      expect(authority.swapTerminalSession({
+        provider: 'codex',
+        terminalId: 't1',
+        fromSessionId: 'a',
+        toSessionId: 'b',
+      }).ok).toBe(false)
+    })
+
+    it('self-swap is an ok no-op', () => {
+      const authority = new SessionBindingAuthority()
+      authority.bind({ provider: 'codex', sessionId: 'a', terminalId: 't1' })
+      expect(authority.swapTerminalSession({
+        provider: 'codex',
+        terminalId: 't1',
+        fromSessionId: 'a',
+        toSessionId: 'a',
+      }).ok).toBe(true)
+      expect(authority.ownerForSession('codex', 'a')).toBe('t1')
+    })
+  })
 })

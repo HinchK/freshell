@@ -2815,6 +2815,7 @@ export class TerminalRegistry extends EventEmitter {
       provider: 'codex',
       sessionId: durableThreadId,
       reason: 'association',
+      previousSessionId: handoff.oldResumeSessionId,
     } satisfies TerminalSessionBoundEvent)
     recordSessionLifecycleEvent({
       kind: 'terminal_session_bound',
@@ -2823,7 +2824,7 @@ export class TerminalRegistry extends EventEmitter {
       sessionId: durableThreadId,
       reason: 'association',
     })
-    this.broadcastCodexSessionAssociated(record, durableThreadId)
+    this.broadcastCodexSessionAssociated(record, durableThreadId, handoff.oldResumeSessionId)
     recordSessionLifecycleEvent({
       kind: 'codex_durable_session_observed',
       provider: 'codex',
@@ -3055,7 +3056,7 @@ export class TerminalRegistry extends EventEmitter {
     })
   }
 
-  private broadcastCodexSessionAssociated(record: TerminalRecord, sessionId: string): void {
+  private broadcastCodexSessionAssociated(record: TerminalRecord, sessionId: string, previousSessionId?: string): void {
     for (const client of record.clients) {
       this.safeSend(client, {
         type: 'terminal.session.associated',
@@ -3064,6 +3065,7 @@ export class TerminalRegistry extends EventEmitter {
           provider: 'codex',
           sessionId,
         },
+        ...(previousSessionId ? { previousSessionId } : {}),
       }, { terminalId: record.terminalId, perf: record.perf })
     }
   }
