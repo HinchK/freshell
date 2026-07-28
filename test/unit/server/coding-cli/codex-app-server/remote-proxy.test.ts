@@ -360,9 +360,16 @@ describe('CodexRemoteProxy', () => {
     const upstream = await startUpstream()
     const { blocker, endpoint } = await occupyLoopbackPort()
     try {
+      // Anti-vacuity call count (load-bearing per the rust-server.ts sibling
+      // regression test, test/e2e-browser/helpers/rust-server.test.ts): without
+      // this assertion, an unconsumed/ignored `portAllocator` option would
+      // silently fall back to the real `allocateLocalhostPort` and still pass
+      // the port assertions below vacuously.
+      let allocatorCalls = 0
       let first = true
       const proxy = await startProxy(upstream.wsUrl, {
         portAllocator: async () => {
+          allocatorCalls++
           if (first) {
             first = false
             return endpoint
@@ -371,6 +378,7 @@ describe('CodexRemoteProxy', () => {
         },
       })
       const { wsUrl } = await proxy.start() // idempotent: returns the bound wsUrl
+      expect(allocatorCalls).toBeGreaterThanOrEqual(2) // seam consumed AND retried
       expect(wsUrl).toMatch(/^ws:\/\/127\.0\.0\.1:\d+$/)
       expect(wsUrl).not.toBe(`ws://${endpoint.hostname}:${endpoint.port}`)
     } finally {
