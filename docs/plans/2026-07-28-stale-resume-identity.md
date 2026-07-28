@@ -6,38 +6,53 @@
 > for tracking.
 
 **Goal:** Make pane↔CLI-session identity *rebindable* mid-session — when the user switches
-sessions inside a CLI (codex/claude in-TUI `/resume` both FORK to a new session id), freshell
-rebinds the pane's identity everywhere (identity registry, registry meta, durable pane ledger,
-rollout tailer, client `sessionRef`) so a server restart resumes the CORRECT session — and fix
-the contested-cwd census that permanently starves codex association when ≥2 panes share a cwd.
+sessions inside a CLI (codex in-TUI `/resume` MAY fork to a new session id — intermittent,
+upstream openai/codex#34972; claude signals the pane's current session id via a `SessionStart`
+hook), freshell rebinds the pane's identity everywhere (identity registry, registry meta,
+durable pane ledger, rollout tailer, client `sessionRef`) so a server restart resumes the
+CORRECT session — and fix the contested-cwd census that permanently starves codex association
+when ≥2 panes share a cwd. Rebind ships for codex + claude; amplifier and opencode were audited
+and DESCOPED (no safe deterministic signal exists — see Tasks 13-14).
 
 **Architecture:** Detection uses deterministic lineage signals, never mtime/cwd heuristics:
-codex writes `forked_from_id` into the new rollout's `session_meta` (verified on disk:
-`019fa613…` child → `forked_from_id: 019fa60f…` parent); claude gets a `SessionStart` hook
-(injected via the already-existing `--settings` channel) that writes the current `session_id`
-to a per-terminal signal file; amplifier's `events.jsonl` carries `parent_id`/`session:fork`
-lineage; opencode uses submit-window row-update correlation on its SQLite substrate (audited
-first). The rebind write path reuses the existing adoption tail primitives — `identity.upsert`
+when the intermittent in-TUI fork occurs, codex writes `forked_from_id` +
+`thread_source:"user"` into the new rollout's `session_meta` (verified on disk: `019fa613…`
+child → `forked_from_id: 019fa60f…` parent; the `thread_source == "user"` filter is
+load-bearing — subagent forks dominate ~100:1 on the real substrate, see Task 4); claude gets a
+`SessionStart` hook (injected via the already-existing `--settings` channel) that writes the
+current `session_id` to a per-terminal signal file; amplifier and opencode were audit-FALSIFIED
+(amplifier has no in-TUI switch and no `session:start` lineage; opencode's row-update
+correlation has real non-switch writers) and ship as audit documentation only (Tasks 13-14).
+The rebind write path reuses the existing adoption tail primitives — `identity.upsert`
 is already an unconditional overwrite, `registry.set_meta` overwrites `resume_session_id`, and
 `pane_ledger::record_binding_locked` already supersedes+tombstones the old row (`Retired`/
 `Superseded`/`supersededBy`). The client accepts a server-authoritative rebind via a new
 OPTIONAL `previousSessionId` field on `terminal.session.associated` — the client rebinds only
 when the pane's current `sessionRef.sessionId` equals `previousSessionId` (a deterministic
-supersession handshake), then `flushPersistedLayoutNow()`.
+supersession handshake), then `flushPersistedLayoutNow()`. Clients ABSENT at fork time are
+corrected server-side by a ledger-chain reconcile rung (Task 7b) that resolves superseded
+claims to their supersession-chain terminus.
 
 **Tech Stack:** Rust (crates/freshell-ws, freshell-sessions, freshell-platform,
 freshell-protocol), TypeScript client (src/), Node server parity (server/), vitest + cargo test.
 
 ## Verified incident facts this plan is built on (do not re-litigate)
 
-- codex in-TUI `/resume` FORKS: new rollout file, new `payload.id`, `forked_from_id` = parent id,
-  `thread_source: "user"`, `originator: "codex-tui"`. Launch-time `codex resume <id>` appends to
-  the ORIGINAL file. The locator module doc at `crates/freshell-sessions/src/codex_locator.rs:64-67`
-  documents the opposite and is FALSE for in-TUI resume.
-- claude's in-CLI `/resume` also forks: NEW file, NEW `sessionId`, full parent history COPIED with
-  every record's `sessionId` rewritten to the child's; **no lineage field exists on disk** (verified
-  by exhaustive key-walk of `~/.claude/projects/`). The only deterministic signal available is a
-  `SessionStart` hook (fires on startup/resume/clear with the current `session_id` on stdin).
+- codex in-TUI `/resume` MAY fork — INTERMITTENTLY (upstream bug openai/codex#34972: "Not every
+  /resume produces a new ID"; upstream considers the fork itself bug behavior, so it may be fixed
+  away). When it forks: new rollout file, new `payload.id`, `forked_from_id` = parent id,
+  `thread_source: "user"`, `originator: "codex-tui"` (verified on-disk pair 019fa60f → 019fa613;
+  shape stable 0.142.5–0.145.0). Launch-time `codex resume <id>` appends to the ORIGINAL file
+  (statistically supported across thousands of freshell-launched sessions; no live test). The
+  locator module doc at `crates/freshell-sessions/src/codex_locator.rs:64-67` documents the
+  opposite and is FALSE for in-TUI resume.
+- claude: on the installed CLI (2.1.220) plain in-TUI `/resume` does NOT fork — `--fork-session`
+  is the opt-in, and the hooks docs reserve the `fork` SessionStart source for it (a fork MAY
+  occur on other/older versions: pre-2.1.214 forked sessions reported source `"resume"`). Either
+  way **no lineage field exists on disk** (verified by exhaustive key-walk of
+  `~/.claude/projects/`), and either way the deterministic signal is the same: a `SessionStart`
+  hook (fires on startup/resume/clear with the CURRENT — i.e. selected — `session_id` on stdin);
+  Task 12's rebind predicate is lineage-free (signal id != bound id).
 - Write-once identity is FIVE gates: `codex_locator.rs:174` arm gate, `:375-377` one-shot removal,
   `codex_association.rs:122-128` `terminal_already_bound`, the false doc premise, and the
   `CodexLane` tailer having no re-attach discipline (`activity.rs:163` map entry).
@@ -77,8 +92,10 @@ freshell-protocol), TypeScript client (src/), Node server parity (server/), vite
   Rationale (documented here deliberately; reviewers should treat this as the plan's explicit
   call): the field is additive, optional, server→client only, not Zod-validated by the client
   (old clients ignore it safely, degrading to today's conflict-veto behavior), and a bump
-  hard-disconnects every live client ("Please reload the page"). Encode this rationale in the
-  Task 1 commit message.
+  hard-disconnects every live client ("Please reload the page"). Precedent (validated A1):
+  commit `a18dd4c6` (2026-07-26, post-freeze) added optional server→client fields
+  (`persisted`/`persistReason` on `tabs.sync.ack`) at v7 with no bump; the only historical bump
+  (6→7, `37c9097c`) was a breaking removal. Encode this rationale in the Task 1 commit message.
 - Do not regress: D7 live-session guards, D8 leases (`SESSION_RESERVED` single-flight), the
   restore spawn gate, create-dedupe, the P0.4 claude restore ladder
   (`terminal.rs:2152-2226`), pane ledger GC/boot_scan, one-writer invariant, and **A13: never two
@@ -89,12 +106,23 @@ freshell-protocol), TypeScript client (src/), Node server parity (server/), vite
   THEN `terminal.meta.updated` → activity hub); ledger supersession order (new bound row FIRST,
   then retire old).
 - Prefer deterministic signals (lineage fields, hooks) over mtime/cwd heuristics, everywhere.
+- Stale `expectedSessionRef` traffic during rebind propagation is BENIGN and must stay that way
+  (validated A12): attach/input/resize carrying a superseded ref has exactly ONE server
+  consumer — the attach-time viewport-geometry gate (`terminal.rs:2679-2688`); a mismatch skips
+  only the pre-attach resize, the attach proceeds, and `attach.ready` carries the NEW canonical
+  ref (input/resize never read the field). Therefore the Rust server must NOT start emitting
+  `SESSION_IDENTITY_MISMATCH` (zero Rust constructors exist today; emitting it would activate
+  the client's dormant `repairCodexIdentityMismatch` recreate loop mid-rebind,
+  `TerminalView.tsx:4246-4300`). Any future emission must be supersession-chain-aware.
 - `README.md` remains the only end-user markdown doc; files under `docs/plans/` are working docs.
 - Real fixture shapes: model codex fork fixtures on the verified `019fa60f`/`019fa613` pair
   (payload keys: `session_id`, `id`, `forked_from_id`, `timestamp`, `cwd`, `originator:"codex-tui"`,
   `cli_version`, `source:"cli"` (string), `thread_source:"user"`, `model_provider`,
   `base_instructions:{text}`, `history_mode`, `multi_agent_version` (child only),
   `context_window:{window_id}`, `git:{commit_hash,branch,repository_url}` — no `dirty` key).
+  CAVEAT (validated A4): `source` is POLYMORPHIC on disk — a string (`"cli"`/`"vscode"`) on
+  user sessions but an OBJECT (`{"subagent":{"thread_spawn":…}}`) on subagent sessions. Never
+  parse it with an assumed-string shape; fixtures must be able to express both (Tasks 3-4, 10).
 
 ## File Structure (what changes where)
 
@@ -109,23 +137,27 @@ freshell-protocol), TypeScript client (src/), Node server parity (server/), vite
 | Rust identity | `crates/freshell-ws/src/codex_identity.rs` | shared guards; `rebind_codex_identity`; broadcast gains `previous_session_id` |
 | Rust assoc | `crates/freshell-ws/src/codex_association.rs` | drain fork candidates → rebind; register fork-watch after adopt; fork-submit wiring |
 | Rust activity | `crates/freshell-ws/src/activity.rs` | `attach_codex_rollout` re-attach REPLACES the existing `CodexLane` |
-| Rust ws | `crates/freshell-ws/src/terminal.rs` | fork-watch arming for resume-launched codex panes; `FRESHELL_TERMINAL_ID` env |
+| Rust ws | `crates/freshell-ws/src/terminal.rs` | fork-watch arming for resume-launched codex panes; `FRESHELL_TERMINAL_ID` env; ReconcileDeps ledger threading (`:2427`) |
+| Rust reconcile | `crates/freshell-ws/src/reconcile.rs` | Task 7b: ledger-chain correction rung for stale terminal-pane claims |
 | Rust ledger | `crates/freshell-ws/src/pane_ledger_scan.rs` | orphaned pending-marker GC rule |
 | Rust parse | `crates/freshell-sessions/src/parse/codex.rs` | `thread_source == "user"` veto on `forked_from_id`-derived `is_subagent` |
 | Rust launch | `crates/freshell-platform/src/cli_launch.rs` (+`cli_launch_goldens.rs`) | claude `SessionStart` hook in `--settings` |
 | Rust claude | `crates/freshell-ws/src/claude_signal.rs` (NEW) | signal-file watcher + `rebind_claude_identity` |
-| Rust amplifier | `crates/freshell-sessions/src/amplifier_locator.rs`, `crates/freshell-ws/src/amplifier_association.rs` | fork-lineage watch + rebind |
-| Rust opencode | `crates/freshell-sessions/src/opencode_locator.rs`, `crates/freshell-ws/src/opencode_association.rs` | audited switch detection + rebind |
 | Rust tests | `crates/freshell-ws/tests/codex_fork_rebind.rs` (NEW), `crates/freshell-ws/tests/claude_session_rebind.rs` (NEW) | end-to-end user-story tests |
 | Fixtures | `test/fixtures/coding-cli/codex/fork-child-meta.sanitized.jsonl` (NEW) | sanitized real fork-child session_meta |
 | Node | `server/index.ts`, `server/terminal-registry.ts` | emit `previousSessionId` on fork-handoff fanout |
 | Node tests | `test/unit/server/session-binding-authority.test.ts` | swapTerminalSession coverage (currently zero) |
 | Node parse | `server/coding-cli/providers/codex.ts` | mirror the `thread_source` veto (parser parity source) |
-| Audit doc | `docs/plans/2026-07-28-stale-resume-identity-p3-audit.md` (NEW) | opencode/amplifier in-TUI switch on-disk findings |
+| Audit doc | `docs/plans/2026-07-28-stale-resume-identity-p3-audit.md` (NEW) | opencode/amplifier audit findings — rebind DESCOPED (validated A8/A10); no amplifier/opencode locator or association files are modified |
 
 Tasks 1–2 (contract+client) come first so every later server task can assert the full frame.
-Tasks 3–7 are the codex P1 spine. Task 8–9 are P2. Task 10 is P5. Tasks 11–12 are P4.
-Tasks 13–14 are P3. Task 15 is P6. Task 16 is the final verification gate.
+Tasks 3–7 are the codex P1 spine; Task 7b (numbered to avoid renumbering) extends terminal-pane
+reconcile with a ledger-chain correction rung — it closes the absent-client/restart hole and
+depends on Task 5's superseded ledger rows, so it lands right after Task 7's crown test.
+Tasks 8–9 are P2. Task 10 is P5. Tasks 11–12 are P4. Tasks 13–14 are P3, DESCOPED to audit
+documentation only (validated findings A8/A10: amplifier has no legitimate rebind trigger and
+the planned predicate matches only subagents; opencode's correlation rebind is hijack-capable —
+no amplifier/opencode rebind code ships). Task 15 is P6. Task 16 is the final verification gate.
 
 ---
 
@@ -337,11 +369,21 @@ describe('server-authoritative rebind (previousSessionId)', () => {
 If the existing file has no `makeStateWithTerminalPane`-style helper, extract one from the
 existing write-once test at `:25-43` (do not duplicate state literals three times).
 
+Additionally (lightweight cross-tab pin, validated A2): in the hydrate-merge test home
+(`test/unit/client/store/crossTabSync.test.ts` or the `panesSlice` `hydratePanes` tests —
+wherever `preserveLocalCanonicalTerminalIdentity` merge coverage already lives), add ONE test:
+a pane whose local `sessionRef` was rebound to `{provider:'codex', sessionId:'new-id'}` receives
+a `hydratePanes` broadcast whose incoming layout still carries `sessionId:'old-id'` for the same
+pane — assert the merged pane keeps `new-id` (the local-wins merge, `panesSlice.ts:698-715`,
+protects a rebound tab from a stale tab's flush; this test pins that protection).
+
 - [ ] **Step 2: Run to verify failure**
 
 Run: `npm run test:vitest -- run test/unit/client/lib/terminal-session-association.test.ts --config config/vitest/vitest.config.ts`
 Expected: the first new test FAILS with `'conflict'` returned instead of `'reconciled'`; the
-other two PASS (they codify current behavior).
+other two PASS (they codify current behavior). The cross-tab local-wins pin from Step 1 lives in
+a different file and passes immediately (it pins EXISTING merge behavior — run it once now to
+prove it green before touching production code).
 
 - [ ] **Step 3: Implement**
 
@@ -386,8 +428,16 @@ and replace the conflict predicate inside the tab loop (currently `:98-101`):
 
 (Nothing else in the body changes: an authorized-rebind pane now flows into the
 `terminalPaneNeedsDurableIdentityUpdate` check at `:102`, which is true for a differing ref, so
-`shouldFlush` is set and `flushPersistedLayoutNow()` fires — this is what defeats the cross-tab
-local-wins resurrection hazard: the flush broadcasts the rebound layout to other tabs.)
+`shouldFlush` is set and `flushPersistedLayoutNow()` fires. NOTE — corrected rationale,
+validated A2: the flush is required for PERSISTENCE (restart correctness: the rebound ref must
+reach localStorage before a reload), but it can NOT rebind another tab — the cross-tab merge
+`preserveLocalCanonicalTerminalIdentity` (`src/store/panesSlice.ts:698-715`) is local-wins, so
+a stale tab receiving the broadcast keeps its own sessionRef. Connected tabs actually converge
+because each tab holds its OWN WS connection and receives the `terminal.session.associated`
+frame itself, and reconnecting tabs are corrected by the per-connect pane.reconcile
+corrected-Attach lane (`crates/freshell-ws/src/reconcile.rs:229-241`, `:161-166`; applied
+client-side at `src/lib/pane-reconcile.ts:428-436` and `panesSlice.ts:2004-2021`). A client
+ABSENT at fork time + server restart is closed server-side by Task 7b's ledger-chain rung.)
 
 Thread the field at frame-handling call sites, e.g. in `TerminalView.tsx` / `App.tsx` where the
 handler receives the `terminal.session.associated` message `msg`:
@@ -413,7 +463,7 @@ must still pass as-is).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/lib/terminal-session-association.ts src/App.tsx src/components/TerminalView.tsx test/unit/client/lib/terminal-session-association.test.ts
+git add src/lib/terminal-session-association.ts src/App.tsx src/components/TerminalView.tsx test/unit/client/lib/terminal-session-association.test.ts test/unit/client/store/
 git commit -m "feat(client): accept server-authoritative sessionRef rebind via previousSessionId"
 ```
 
@@ -428,22 +478,32 @@ git commit -m "feat(client): accept server-authoritative sessionRef rebind via p
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces: `Probe::Candidate` gains `forked_from_id: Option<String>`; a new test helper
-  `write_rollout_full(root, rel_dir, thread_id, cwd: Option<&str>, forked_from: Option<&str>) -> PathBuf`
-  that Task 4/8 tests reuse (existing `write_rollout` delegates to it with `forked_from: None`).
+- Produces: `Probe::Candidate` gains `forked_from_id: Option<String>` AND
+  `thread_source: Option<String>` (Task 4's fork predicate needs BOTH — lineage alone is not
+  proof of a user fork, validated A4); a new test helper
+  `write_rollout_full(root, rel_dir, thread_id, cwd: Option<&str>, forked_from: Option<&str>, thread_source: Option<&str>) -> PathBuf`
+  that Task 4/8 tests reuse (existing `write_rollout` delegates to it with
+  `forked_from: None, thread_source: None`). The helper must be able to express a SUBAGENT
+  child (`thread_source:"subagent"` + OBJECT-shaped `source`) — auto-writing `"user"` whenever
+  `forked_from` is set would make the A4 collision case inexpressible in tests.
 
 - [ ] **Step 1: Write the failing test**
 
 ```rust
-    /// Extended writer: same session_meta shape, with optional fork lineage
-    /// (modeled on the verified 019fa613 fork child: forked_from_id +
-    /// thread_source:"user" + originator:"codex-tui").
+    /// Extended writer: same session_meta shape, with optional fork lineage.
+    /// Modeled on the verified 019fa613 USER-fork child (forked_from_id +
+    /// thread_source:"user" + originator:"codex-tui") AND its ~100x-more-
+    /// common evil twin, the SUBAGENT child (thread_source:"subagent" +
+    /// OBJECT-shaped source {"subagent":{"thread_spawn":…}}). `source` is
+    /// polymorphic on disk -- string for user sessions, object for
+    /// subagents -- never parse it with an assumed-string shape.
     fn write_rollout_full(
         root: &Path,
         rel_dir: &str,
         thread_id: &str,
         cwd: Option<&str>,
         forked_from: Option<&str>,
+        thread_source: Option<&str>,
     ) -> PathBuf {
         let dir = root.join(rel_dir);
         std::fs::create_dir_all(&dir).expect("create rollout dir");
@@ -452,8 +512,20 @@ git commit -m "feat(client): accept server-authoritative sessionRef rebind via p
         if let Some(c) = cwd { payload["cwd"] = serde_json::json!(c); }
         if let Some(f) = forked_from {
             payload["forked_from_id"] = serde_json::json!(f);
-            payload["thread_source"] = serde_json::json!("user");
             payload["originator"] = serde_json::json!("codex-tui");
+        }
+        match thread_source {
+            Some("subagent") => {
+                payload["thread_source"] = serde_json::json!("subagent");
+                payload["source"] = serde_json::json!({
+                    "subagent": { "thread_spawn": { "parent_thread_id": forked_from, "depth": 1 } }
+                });
+            }
+            Some(ts) => {
+                payload["thread_source"] = serde_json::json!(ts);
+                payload["source"] = serde_json::json!("cli");
+            }
+            None => {} // older-CLI shape: no thread_source key at all
         }
         let line = serde_json::json!({
             "timestamp": "2026-07-26T08:00:00.000Z",
@@ -465,18 +537,34 @@ git commit -m "feat(client): accept server-authoritative sessionRef rebind via p
     }
 
     #[test]
-    fn probe_surfaces_forked_from_id() {
+    fn probe_surfaces_forked_from_id_and_thread_source() {
         let root = unique_temp_dir("probe-fork");
-        let path = write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-parent"));
+        let path = write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-parent"), Some("user"));
         match probe_rollout(&path) {
-            Probe::Candidate { forked_from_id, .. } => {
+            Probe::Candidate { forked_from_id, thread_source, .. } => {
                 assert_eq!(forked_from_id.as_deref(), Some("aaaa-parent"));
+                assert_eq!(thread_source.as_deref(), Some("user"));
             }
             other => panic!("expected Candidate, got {other:?}"),
         }
-        let plain = write_rollout_full(&root, "2026/07/27", "22222222-2222-3333-4444-555555555555", Some("/tmp/x"), None);
+        // Subagent child: the OBJECT-shaped `source` must not break the
+        // probe (polymorphic source, validated A4).
+        const SUB: &str = "22222222-2222-3333-4444-555555555555";
+        let sub = write_rollout_full(&root, "2026/07/27", SUB, Some("/tmp/x"), Some("aaaa-parent"), Some("subagent"));
+        match probe_rollout(&sub) {
+            Probe::Candidate { forked_from_id, thread_source, .. } => {
+                assert_eq!(forked_from_id.as_deref(), Some("aaaa-parent"));
+                assert_eq!(thread_source.as_deref(), Some("subagent"));
+            }
+            other => panic!("expected Candidate, got {other:?}"),
+        }
+        const PLAIN: &str = "33333333-2222-3333-4444-555555555555";
+        let plain = write_rollout_full(&root, "2026/07/27", PLAIN, Some("/tmp/x"), None, None);
         match probe_rollout(&plain) {
-            Probe::Candidate { forked_from_id, .. } => assert_eq!(forked_from_id, None),
+            Probe::Candidate { forked_from_id, thread_source, .. } => {
+                assert_eq!(forked_from_id, None);
+                assert_eq!(thread_source, None);
+            }
             other => panic!("expected Candidate, got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -487,7 +575,7 @@ Also rewrite the existing `write_rollout` as a delegating wrapper:
 
 ```rust
     fn write_rollout(root: &Path, rel_dir: &str, thread_id: &str, cwd: Option<&str>) -> PathBuf {
-        write_rollout_full(root, rel_dir, thread_id, cwd, None)
+        write_rollout_full(root, rel_dir, thread_id, cwd, None, None)
     }
 ```
 
@@ -508,10 +596,20 @@ In `probe_rollout` (`:439`), where the first line's `payload` is already parsed 
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let thread_source = payload
+        .get("thread_source")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 ```
 
-and carry it on `Probe::Candidate { thread_id, cwd, forked_from_id }`. Update every existing
-`match`/constructor of `Probe::Candidate` in the file (compiler-driven).
+and carry both on `Probe::Candidate { thread_id, cwd, forked_from_id, thread_source }`. Update
+every existing `match`/constructor of `Probe::Candidate` in the file (compiler-driven).
+PARSER NOTE (validated A4): do NOT read the sibling `source` key here — it is polymorphic on
+disk (string for user sessions, object `{"subagent":{…}}` for subagents); any assumed-string
+parse of it would fail on real subagent metas. `thread_source` is a plain string on 100% of the
+substrate (4,021/4,028 real metas carry it; the misses are pre-0.143 + test pollution).
 
 - [ ] **Step 4: Run the whole locator suite**
 
@@ -534,7 +632,8 @@ git commit -m "feat(freshell-sessions): codex probe_rollout surfaces forked_from
 - Test: inline `#[cfg(test)]` in the same file
 
 **Interfaces:**
-- Consumes: Task 3's `Probe::Candidate.forked_from_id`, `write_rollout_full`.
+- Consumes: Task 3's `Probe::Candidate.forked_from_id` + `.thread_source`, `write_rollout_full`
+  (including its subagent-child mode).
 - Produces (all `pub`, used by Tasks 5–7):
 
 ```rust
@@ -558,11 +657,28 @@ impl CodexLocator {
     /// Enter presses; scanning is gated on this window to bound fs cost).
     pub fn note_fork_submit(&self, terminal_id: &str, at_ms: i64) -> bool;
     /// Scan (at most once per call, only when >=1 window is open) for NEW
-    /// rollout files whose session_meta forked_from_id == a watched pane's
-    /// bound session id. Positive lineage proof -- no cwd census applies.
+    /// rollout files whose session_meta carries forked_from_id == a watched
+    /// pane's bound session id AND thread_source == "user". Lineage ALONE is
+    /// not proof of a user fork (validated A4: subagent forks dominate
+    /// ~100:1 on the real substrate -- 1,148 of 1,160 forked rollouts -- and
+    /// 86/340 codex-tui subagent children were born <=30s after the parent's
+    /// user input, i.e. inside this window); WITH the user filter it is
+    /// positive proof of ownership -- no cwd census applies.
     pub fn tick_forks(&self, now_ms: i64) -> Vec<ForkLocated>;
 }
 ```
+
+**Lane-discipline notes (validated A4/A13/A5 — encode these in the module doc alongside the
+Task 6 premise fix):**
+- The fork lane is OPPORTUNISTIC / best-effort: upstream codex bug openai/codex#34972 documents
+  that /resume forking is INTERMITTENT ("Not every /resume produces a new ID") and may be fixed
+  away upstream; when no fork happens the lane is simply idle — no correctness dependency.
+- Known limitation (out of the watch's scope BY DESIGN): an in-TUI /resume to a DIFFERENT
+  session yields `forked_from_id` = the SELECTED session's id, not the bound id — undetectable
+  by this watch (rare: 12 user forks total on this machine's substrate).
+- Accepted residuals (A5, one line each): a user-rebindable picker accept key (confirm without a
+  pure-CR chunk) and kitty CSI-u Enter encoding (`CSI 13 u` instead of `\r`) would each silently
+  defeat the Enter anchor — degradation = today's behavior, no corruption.
 
 `disarm(terminal_id)` (`:198`) additionally clears the fork watch (the PTY exit hook already
 calls `disarm` — `terminal.rs:1743`).
@@ -576,7 +692,7 @@ calls `disarm` — `terminal.rs:1743`).
         let locator = CodexLocator::new(root.clone());
         assert!(locator.watch_fork("t1", "aaaa-old"));
         // No window open: a fork file appearing is NOT scanned/claimed yet.
-        let path = write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"));
+        let path = write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"), Some("user"));
         assert!(locator.tick_forks(1_000).is_empty());
         // Enter opens the window; the same file is now claimed.
         assert!(locator.note_fork_submit("t1", 2_000));
@@ -599,8 +715,42 @@ calls `disarm` — `terminal.rs:1743`).
         let locator = CodexLocator::new(root.clone());
         assert!(locator.watch_fork("t1", "aaaa-old"));
         assert!(locator.note_fork_submit("t1", 1_000));
-        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("zzzz-not-ours"));
+        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("zzzz-not-ours"), Some("user"));
         assert!(locator.tick_forks(1_100).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn in_window_subagent_child_is_never_a_fork_candidate() {
+        // A4 (validated 2026-07-28): subagent forks outnumber user forks
+        // ~100:1 on the real substrate (1,148 of 1,160 forked rollouts), and
+        // 86/340 codex-tui subagent children were born <=30s after the
+        // parent's user input (min 7.0s) -- squarely inside this window.
+        // Lineage alone is NOT proof: without the thread_source filter the
+        // pane would be rebound onto a subagent thread.
+        let root = unique_temp_dir("fork-subagent");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        assert!(locator.note_fork_submit("t1", 1_000));
+        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"), Some("subagent"));
+        assert!(locator.tick_forks(1_100).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn subagent_sibling_does_not_make_a_real_user_fork_ambiguous() {
+        // Subagent children are excluded BEFORE the n>=2 ambiguity count: a
+        // same-window subagent must not veto the genuine user fork.
+        let root = unique_temp_dir("fork-subagent-sibling");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        assert!(locator.note_fork_submit("t1", 1_000));
+        const SUB: &str = "44444444-2222-3333-4444-555555555555";
+        write_rollout_full(&root, "2026/07/27", SUB, Some("/tmp/x"), Some("aaaa-old"), Some("subagent"));
+        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"), Some("user"));
+        let located = locator.tick_forks(1_100);
+        assert_eq!(located.len(), 1, "the user fork must be emitted despite the subagent sibling");
+        assert_eq!(located[0].new_session_id, TID);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -610,7 +760,7 @@ calls `disarm` — `terminal.rs:1743`).
         let locator = CodexLocator::new(root.clone());
         assert!(locator.watch_fork("t1", "aaaa-old"));
         assert!(locator.note_fork_submit("t1", 1_000));
-        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), None);
+        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), None, None);
         assert!(locator.tick_forks(1_100).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -621,7 +771,7 @@ calls `disarm` — `terminal.rs:1743`).
         let locator = CodexLocator::new(root.clone());
         assert!(locator.watch_fork("t1", "aaaa-old"));
         assert!(locator.note_fork_submit("t1", 1_000));
-        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"));
+        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"), Some("user"));
         let scans_before = locator.fs_scan_count();
         assert!(locator.tick_forks(1_000 + CODEX_FORK_WINDOW_MS + 1).is_empty());
         assert_eq!(locator.fs_scan_count(), scans_before, "expired window must not walk the fs");
@@ -634,14 +784,14 @@ calls `disarm` — `terminal.rs:1743`).
         let locator = CodexLocator::new(root.clone());
         assert!(locator.watch_fork("t1", "aaaa-old"));
         assert!(locator.note_fork_submit("t1", 1_000));
-        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"));
+        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"), Some("user"));
         let first = locator.tick_forks(1_100);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].new_session_id, TID);
         // Watch auto-advanced to TID: a second fork off TID is claimed next.
         const TID2: &str = "33333333-2222-3333-4444-555555555555";
         assert!(locator.note_fork_submit("t1", 2_000));
-        write_rollout_full(&root, "2026/07/27", TID2, Some("/tmp/x"), Some(TID));
+        write_rollout_full(&root, "2026/07/27", TID2, Some("/tmp/x"), Some(TID), Some("user"));
         let second = locator.tick_forks(2_100);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].old_session_id, TID);
@@ -660,8 +810,8 @@ calls `disarm` — `terminal.rs:1743`).
         assert!(locator.note_fork_submit("t1", 1_000));
         assert!(locator.note_fork_submit("t2", 1_000));
         const TID2: &str = "33333333-2222-3333-4444-555555555555";
-        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"));
-        write_rollout_full(&root, "2026/07/27", TID2, Some("/tmp/x"), Some("bbbb-old"));
+        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"), Some("user"));
+        write_rollout_full(&root, "2026/07/27", TID2, Some("/tmp/x"), Some("bbbb-old"), Some("user"));
         let mut located = locator.tick_forks(1_100);
         located.sort_by(|a, b| a.terminal_id.cmp(&b.terminal_id));
         assert_eq!(located.len(), 2);
@@ -677,7 +827,7 @@ calls `disarm` — `terminal.rs:1743`).
         assert!(locator.watch_fork("t1", "aaaa-old"));
         locator.disarm("t1");
         assert!(locator.note_fork_submit("t1", 1_000) == false);
-        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"));
+        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), Some("aaaa-old"), Some("user"));
         assert!(locator.tick_forks(1_100).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -745,8 +895,14 @@ Implementation (add below `tick`):
             let mut hits: Vec<(PathBuf, String, Option<String>)> = Vec::new();
             for path in current.difference(&watch.known_files) {
                 match probe_rollout(path) {
-                    Probe::Candidate { thread_id, cwd, forked_from_id }
+                    // A4 predicate: lineage AND thread_source == "user".
+                    // Subagent children (thread_source:"subagent") fail the
+                    // guard, fall to the `_` arm, and are merged into
+                    // known_files -- permanently excluded AND never counted
+                    // toward the n>=2 ambiguity refusal below.
+                    Probe::Candidate { thread_id, cwd, forked_from_id, thread_source }
                         if forked_from_id.as_deref() == Some(watch.session_id.as_str())
+                            && thread_source.as_deref() == Some("user")
                             && thread_id != watch.session_id
                             && is_uuid_shaped(&thread_id) =>
                     {
@@ -1048,6 +1204,14 @@ fork lane's precondition):
         locator.note_fork_submit(terminal_id, at_ms);
 ```
 
+EXPLICIT WIRING REQUIREMENT (validated A5, load-bearing): `note_possible_submit` runs for EVERY
+`terminal.input` frame (`terminal.rs:622-634`), and the `note_fork_submit` call must NOT be
+gated on the arm state or on `note_submit`'s outcome — Enters from already-BOUND (watched, not
+armed) codex panes MUST reach it. Fork-then-idle children are real (2/12 real user forks: the
+child's `session_meta` is fully written ~0.1s after fork-confirm and the file is never touched
+again), so the confirm Enter itself must open the fork window — there is no later Enter to
+catch. `note_fork_submit` no-ops when no watch exists, so the unconditional call is cheap.
+
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test -p freshell-ws --test codex_fork_rebind && cargo test -p freshell-ws --test codex_locator_activity && cargo test -p freshell-ws --test codex_session_ref_resume && cargo test -p freshell-ws pane_ledger`
@@ -1110,8 +1274,9 @@ In `terminal.rs`, immediately after the `codex_association::maybe_arm(...)` call
 ```rust
         // Resume-launched codex panes are (correctly) refused by arm() --
         // their session already exists. They DO need fork detection: an
-        // in-TUI /resume forks to a NEW rollout and the pane would otherwise
-        // go permanently stale (incident 2026-07-27).
+        // in-TUI /resume MAY fork to a NEW rollout (intermittent, upstream
+        // openai/codex#34972) and the pane would otherwise go permanently
+        // stale (incident 2026-07-27).
         if mode == "codex" {
             if let (Some(locator), Some(rsid)) =
                 (state.codex_locator.as_ref(), resume_session_id.as_deref())
@@ -1130,11 +1295,16 @@ Replace `codex_locator.rs:64-67`'s bullet with:
 
 ```rust
 //! - CLI-launch `codex resume <id>` appends to the EXISTING rollout file (no
-//!   new file) -- consistent with the arm gate refusing resume panes. In-TUI
-//!   `/resume` is DIFFERENT: it FORKS -- a NEW rollout file with a NEW
-//!   session id and `forked_from_id` lineage (verified on disk 2026-07-27,
-//!   019fa60f -> 019fa613). The ForkWatch lane exists for exactly that case.
-//!   Compressed artifacts (`.jsonl.zst`) fail the `.jsonl` suffix filter.
+//!   new file; statistically supported across thousands of freshell-launched
+//!   sessions -- no live test) -- consistent with the arm gate refusing
+//!   resume panes. In-TUI `/resume` is DIFFERENT: it MAY fork --
+//!   INTERMITTENTLY (upstream bug openai/codex#34972; may be fixed away
+//!   upstream): a NEW rollout file with a NEW session id, `forked_from_id`
+//!   lineage and `thread_source:"user"` (verified on disk 2026-07-27,
+//!   019fa60f -> 019fa613). The ForkWatch lane exists for exactly that case
+//!   and is OPPORTUNISTIC/best-effort: when no fork happens it is simply
+//!   idle. Compressed artifacts (`.jsonl.zst`) fail the `.jsonl` suffix
+//!   filter.
 ```
 
 - [ ] **Step 4: Run tests**
@@ -1231,6 +1401,141 @@ git commit -m "test(freshell-ws): fork->rebind->restart-resume, hijack guard, an
 
 ---
 
+### Task 7b: Server — ledger-chain correction rung for terminal-pane reconcile (the restart hole)
+
+**Files:**
+- Modify: `crates/freshell-ws/src/reconcile.rs` (`resolve_authoritative_ref` `:101-136`;
+  `ReconcileDeps` `:29-38`; the inline `#[cfg(test)] mod tests` at `:326` — this module's
+  harness, `FakeProbe` + the `deps()` builder at `:395`, is the test home)
+- Modify: `crates/freshell-ws/src/terminal.rs:2427` (the production `ReconcileDeps` literal —
+  thread the ledger handle)
+- Test: `reconcile.rs` inline test module
+
+**Interfaces:**
+- Consumes: `pane_ledger.lookup_by_session` — the existing supersededBy chain-walk API
+  (`pane_ledger.rs:591-611`; returns `Resolution { corrected, row }`, `corrected` true only
+  when ≥1 supersession hop was followed); Task 5's rebind ledger writes (superseded rows are
+  fsynced BEFORE the announce, so they survive a restart).
+- Produces: `ReconcileDeps` gains `pane_ledger: &'a crate::pane_ledger::PaneLedger`; a new
+  resolution rung between rung 2 (registry by createRequestId, `:113-129`) and the echo-claim
+  fallback (rung 3, `:130-133`).
+
+WHY (validated A3, falsified — this task closes the hole): without it, a client ABSENT at fork
+time (browser closed) + a server restart reproduces the incident verbatim. The identity
+registry is memory-only and empty after restart, so `resolve_authoritative_ref` rung 3 echoes
+the client's stale OLD claim; the fork PARENT rollout still exists on disk (codex fork = NEW
+file, old file remains) → `SessionExistence::Present` → verdict Respawn with the OLD ref → the
+pane resumes the superseded session. `pane_ledger.lookup_by_session` has exactly ONE production
+consumer today — the fresh-agent G3 reader rule (`reconcile_freshagent.rs:82-90`) — terminal
+panes never consult the durable chain. This rung is the same pattern applied to terminal panes;
+it also closes Task 2's disconnected-tab residue (a stale tab that flushed OLD to localStorage,
+then reloaded after a restart), and it is `previousSessionId`-independent.
+
+- [ ] **Step 1: Write the failing tests**
+
+In `reconcile.rs`'s inline test module: extend the harness struct with a real `PaneLedger`
+rooted at a unique temp dir (construct it exactly the way `pane_ledger_tests.rs`'s
+`test_ledger()` helper does) and pass `&self.ledger` in the `deps()` builder (`:395`). Then:
+
+```rust
+    #[test]
+    fn superseded_claim_resolves_to_chain_terminus_with_corrected_flag() {
+        // The A3 restart hole: ledger has A retired Superseded-by B (exactly
+        // what Task 5's rebind writes and fsyncs); client claims A; no live
+        // terminal; B's rollout exists on disk. The verdict must carry B
+        // with corrected: Some(true) -- NOT echo A (the incident: restart +
+        // absent client resumed the superseded parent).
+        // harness: bind t1 -> codex/"aaaa-old" then rebind t1 -> codex/
+        // "bbbb-new" via the same resolve_pending calls Task 5's ledger test
+        // uses; existence probe: ("codex","bbbb-new") -> Present.
+        // pane: sessionRef {codex, "aaaa-old"}, no live terminal.
+        // assert: verdict == Respawn, session_ref == codex/"bbbb-new",
+        //         corrected == Some(true).
+    }
+
+    #[test]
+    fn chained_supersession_resolves_to_the_terminus() {
+        // A -> B -> C in the ledger (two rebinds); claim A; probe: C Present.
+        // assert: session_ref == codex/"cccc-new2", corrected == Some(true).
+    }
+
+    #[test]
+    fn unretired_claim_passes_through_unchanged() {
+        // Claim D has a live (non-retired) ledger row -- or no row at all
+        // (test both via two panes in one request). assert: verdicts are
+        // identical to today's rung-3 echo (session_ref == D, corrected ==
+        // None). Pins that the rung fires ONLY on Superseded chains.
+    }
+```
+
+Write them fully against the harness's existing helpers (`pane(...)`, `sref(...)`, `one(...)`,
+`FakeProbe::set`); the comments above are the pinned assertions.
+
+Run: `cargo test -p freshell-ws reconcile::tests::superseded_claim`
+Expected: FAIL to compile — `ReconcileDeps` has no `pane_ledger` field.
+
+- [ ] **Step 2: Implement**
+
+(a) Add `pub pane_ledger: &'a crate::pane_ledger::PaneLedger` to `ReconcileDeps` (`:29-38`);
+thread it at the production construction site (`terminal.rs:2427` — the deps literal inside the
+per-derivation `derive` closure; pass `pane_ledger: &state.pane_ledger`, which deref-coerces
+from the `Arc<PaneLedger>` on `WsState` at `lib.rs:299`) and at the test builder (`:395`).
+Compiler-driven: `cargo check -p freshell-ws` lists every other construction site
+(integration-test harnesses included).
+
+(b) Insert the rung in `resolve_authoritative_ref`, between rung 2 (`:113-129`) and the
+echo-claim fallback (`:130-133`):
+
+```rust
+    // 2b. Durable ledger chain (A3): the claimed ref may name a session this
+    // server retired as Superseded BEFORE it restarted (mid-session rebind,
+    // Task 5 -- fsynced before announce). Follow the supersededBy chain to
+    // its terminus and answer with the terminus -- exactly the fresh-agent
+    // G3 reader rule (reconcile_freshagent.rs:82-90). Without this rung an
+    // absent-at-fork client + restart resumes the superseded parent (the
+    // 2026-07-27 incident; the parent rollout still exists on disk).
+    if let Some(claim) = pane.session_ref.as_ref() {
+        if let Some(resolved) = deps
+            .pane_ledger
+            .lookup_by_session(&claim.provider, &claim.session_id)
+            .filter(|r| r.corrected)
+        {
+            return Some(SessionLocator {
+                provider: claim.provider.clone(),
+                session_id: resolved.row.session_id,
+            });
+        }
+    }
+```
+
+Guard notes (pinned): `lookup_by_session` sets `corrected` only when ≥1 supersession hop was
+followed, so unretired/no-row claims fall through to rung 3 untouched. The terminus IS
+existence-checked exactly like the surrounding code checks every resolved ref — the caller
+(`verdict_for_pane`) probes whatever ref this function returns, so an Absent terminus yields
+the normal dead-session row, never a silent fallback to the stale parent. `corrected_flag`
+(`:89`) yields `Some(true)` automatically because the claim and the returned ref differ. Do
+NOT touch the fresh-agent lane (`reconcile_freshagent.rs` keeps its own G3 read).
+
+- [ ] **Step 3: Run the reconcile suites**
+
+Run: `cargo test -p freshell-ws reconcile && cargo test -p freshell-ws --test pane_reconcile && cargo test -p freshell-ws --test pane_reconcile_freshagent`
+Expected: PASS — the three new tests green; every pre-existing verdict-table test unchanged
+(their harness now supplies an empty ledger, so every `lookup_by_session` misses and rung 2b
+is inert).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/freshell-ws/
+git commit -m "feat(freshell-ws): terminal-pane reconcile resolves superseded claims through the pane-ledger chain
+
+Closes the absent-client + restart hole (A3): rung between registry
+resolution and the echo-claim fallback follows supersededBy to the
+terminus with corrected:true, mirroring the fresh-agent G3 reader rule."
+```
+
+---
+
 ### Task 8: P2 — contested-cwd census: contenders are in-flight windows, not all armed panes
 
 **Files:**
@@ -1292,6 +1597,40 @@ Replace `staggered_same_cwd_armed_terminals_never_bind_uncontested` (`:743-771`)
         assert_eq!(located[0].terminal_id, "t1");
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn windowless_same_cwd_rollout_is_claimed_by_a_later_solo_window() {
+        // PINNED ACCEPTED RESIDUAL (A6.1/A6.3) -- not desired behavior, but
+        // deliberately visible: t2's submission was coalesced into a
+        // text+CR chunk freshell never classified as submit-shaped (e.g. the
+        // REST maybe_send_keys "prompt\r" path with codex's paste-burst
+        // disabled), so its rollout lands WINDOWLESS. Candidates are a
+        // SNAPSHOT DIFFERENCE, not time-bounded (codex_locator.rs:282), so
+        // t1's later SOLO window claims t2's file -- a misbind whose sole
+        // guard is codex-tui's own submit discipline (see Step 2's census
+        // comment). This test keeps the residual from regressing silently
+        // into an unpinned assumption.
+        let root = unique_temp_dir("census-windowless");
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_s = cwd.to_string_lossy().to_string();
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some(&cwd_s)));
+        assert!(locator.arm("t2", "codex", true, None, Some(&cwd_s)));
+        // t1's first Enter snapshots known_files; its window resolves empty.
+        assert!(locator.note_submit("t1", 10_000));
+        assert!(locator.tick(10_000 + CODEX_WINDOW_MS).is_empty());
+        // t2's windowless rollout appears (owner never opened a window).
+        let path = write_rollout(&root, "2026/07/26", TID, Some(&cwd_s));
+        // t1 re-enters SOLO: t2 has no in-flight window, so it is not a
+        // contender under the new census -- t1 claims t2's file.
+        assert!(locator.note_submit("t1", 60_000));
+        let located = locator.tick(60_000 + CODEX_WINDOW_MS);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].terminal_id, "t1");
+        assert_eq!(located[0].rollout_path, path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 ```
 
 Keep `same_rollout_claimed_by_two_armed_terminals_refuses_both` (`:726`) and
@@ -1316,6 +1655,17 @@ Replace the census construction (`:267-273`) with:
         // never-promoted pending markers). Genuine ambiguity -- >=2
         // overlapping windows in one cwd -- still refuses, and refusal still
         // never disarms (a later solo Enter re-evaluates).
+        //
+        // SAFETY DEPENDENCY (validated A6, 2026-07-28): "every real codex
+        // submission opens a window" holds only because codex-tui ITSELF
+        // converts coalesced/pasted Enters into composer newlines
+        // (EnableBracketedPaste + paste_burst.rs) -- a foreign,
+        // config-escapable guard (`disable_paste_burst` turns it off).
+        // Candidates are a SNAPSHOT DIFFERENCE (`current.difference(
+        // &known_files)`, :282), NOT time-bounded: a windowless rollout
+        // stays claimable by any later solo window, so this census is the
+        // ONLY protection against that misbind. Pinned by
+        // windowless_same_cwd_rollout_is_claimed_by_a_later_solo_window.
         let mut cwd_counts: HashMap<String, usize> = HashMap::new();
         for a in inner.armed.values() {
             if a.enter_ms.is_some() && !a.resolved {
@@ -1354,23 +1704,37 @@ changes needed in those locators."
 - Test: the scan test module used by `pane_ledger_scan.rs`'s existing tests
 
 **Interfaces:**
-- Consumes: the live terminal-id set from the periodic GC caller (it has `state.registry`;
-  a terminal is live iff it appears in the registry — use the same probe the caller already uses
-  for the covered-by-binding rule, or `registry.identity_probe_rows()` ids).
+- Consumes: the live terminal-id set from the PERIODIC GC caller only (the 6h ticker,
+  `main.rs:632-664`, has `state.registry`; a terminal is live iff it appears in the registry —
+  use the same probe the caller already uses for the covered-by-binding rule, or
+  `registry.identity_probe_rows()` ids). The pre-serve `boot_scan` path (`main.rs:603-630`)
+  passes `None`: at boot the registry is necessarily EMPTY (PTYs die with the process; restore
+  is client-driven and post-serve), so running the orphan rule there would sweep EVERY old
+  marker at EVERY boot.
 - Produces: new rule + constant:
 
 ```rust
 /// A pending marker whose terminal is not live and which is older than this
-/// is orphaned (server death before resolution -- exit hook never ran).
-/// Deliberately >> the boot window: boot_scan's fresh-by-race vs
-/// fresh-by-intent job (P1.8) reads markers minutes old; this rule only
-/// clears the multi-day residue (live evidence: DirectorDeck markers from
-/// 2026-07-28 still present).
-pub const PENDING_MARKER_ORPHAN_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+/// is orphaned (server death before resolution -- the exit hook never ran).
+/// HONEST RATIONALE (validated A11, 2026-07-28): this rule is safe because
+/// NO production reader of pending markers exists at ANY age -- the only
+/// semantic read APIs (`pending_for_terminal`, pane_ledger.rs:779-791, and
+/// `list_pending_raw`, :794) have ZERO non-test callers (grep-verified); the
+/// often-cited boot_scan "fresh-by-race vs fresh-by-intent" reader is
+/// comments only, not implemented. The live-set guard does real work only in
+/// the PERIODIC sweep (protecting a live-but-unresolved pane, e.g. one
+/// starved by the Task 8 census shape). TTL is 7 DAYS for FORENSICS: the
+/// starvation diagnosis this plan is built on relied on multi-day-old
+/// on-disk markers (DirectorDeck, 2026-07-28); after the TTL, loud sweep
+/// logs are the remaining trail. If a real marker reader is ever
+/// implemented, this wall-clock TTL must be revisited (server-down time is
+/// indistinguishable from server-up time).
+pub const PENDING_MARKER_ORPHAN_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 ```
 
-`gc_marker_locked` gains a `live_terminal_ids: &HashSet<String>` parameter (threaded from the
-GC entry point; `boot_scan` passes the post-restore live set).
+`gc_marker_locked` gains a `live_terminal_ids: Option<&HashSet<String>>` parameter: the
+periodic GC threads `Some(live set)`; `boot_scan` threads `None` (orphan rule disabled on the
+boot path — never sweep at boot).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1379,15 +1743,25 @@ In the existing scan test module (mirror its marker-construction helpers):
 ```rust
 #[test]
 fn orphaned_pending_marker_is_gced_after_orphan_ttl() {
+    // PERIODIC sweep semantics (live_terminal_ids = Some({"live-t"})):
     // marker: terminal "dead-t", spawned_at = now - (ORPHAN_TTL + 1h), no
     // binding row, terminal NOT in the live set -> deleted.
     // marker: terminal "live-t", same age, IS in the live set -> kept.
     // marker: terminal "young-t", spawned_at = now - 60_000, not live ->
-    // kept (younger than the orphan TTL; boot_scan semantics preserved).
+    // kept (younger than the orphan TTL).
+}
+
+#[test]
+fn boot_path_never_runs_the_orphan_rule() {
+    // BOOT sweep semantics (live_terminal_ids = None -- pre-serve, the
+    // registry is empty, main.rs:603-630): a "dead-t"-shaped marker older
+    // than ORPHAN_TTL with no binding row -> KEPT (otherwise every old
+    // marker would be swept at every boot; only the pre-existing
+    // PENDING_MARKER_TTL_MS 30-day rule applies at boot).
 }
 ```
 
-Write it fully with the module's existing ledger/marker fixtures and a `HashSet` live set of
+Write them fully with the module's existing ledger/marker fixtures and a `HashSet` live set of
 `{"live-t"}`; assert via the module's marker-listing helper.
 
 Run: `cargo test -p freshell-ws orphaned_pending_marker`
@@ -1398,19 +1772,28 @@ Expected: FAIL to compile (new param/constant) or FAIL on the kept/deleted asser
 In `gc_marker_locked`, after the existing age/covered rules, add:
 
 ```rust
-        // Orphan rule (P2): the exit hook deletes markers on PTY exit, but a
-        // SERVER death orphans them (terminal.rs:1738 never runs). A marker
-        // older than the orphan TTL whose terminal is not live has no
-        // remaining job.
-        if !live_terminal_ids.contains(marker_terminal_id)
-            && now_ms - marker.spawned_at_ms > PENDING_MARKER_ORPHAN_TTL_MS
-        {
-            /* delete via the same deletion path the TTL rule uses */
+        // Orphan rule (P2, PERIODIC sweep only): the exit hook deletes
+        // markers on PTY exit, but a SERVER death orphans them
+        // (terminal.rs:1738 never runs). Safe because NO production reader
+        // of pending markers exists (pane_ledger.rs:779-794 read APIs have
+        // zero non-test callers -- A11); the live-set guard does real work
+        // only here, protecting a live-but-unresolved pane (e.g. census
+        // starvation, Task 8). live_terminal_ids is None on the pre-serve
+        // boot path (registry empty, main.rs:603-630) -- boot never sweeps
+        // by this rule.
+        if let Some(live) = live_terminal_ids {
+            if !live.contains(marker_terminal_id)
+                && now_ms - marker.spawned_at > PENDING_MARKER_ORPHAN_TTL_MS
+            {
+                /* delete via the same deletion path the TTL rule uses */
+            }
         }
 ```
 
-(Adapt field/variable names to the function's actuals; reuse the existing deletion call.)
-Thread `live_terminal_ids` from both callers (periodic GC and `boot_scan`).
+(Adapt field/variable names to the function's actuals — note the marker field is `spawned_at`,
+not `spawned_at_ms`; reuse the existing deletion call.) Thread `live_terminal_ids` from both
+callers: the periodic GC ticker (`main.rs:632-664`) passes `Some(registry ids)`; `boot_scan`
+passes `None`.
 
 - [ ] **Step 3: Run the scan + ledger suites**
 
@@ -1421,7 +1804,13 @@ Expected: PASS (including all pre-existing boot_scan/gc tests).
 
 ```bash
 git add crates/freshell-ws/src/pane_ledger_scan.rs crates/freshell-ws/src/
-git commit -m "fix(freshell-ws): GC orphaned pending markers (dead terminal + 24h TTL) without touching boot_scan semantics"
+git commit -m "fix(freshell-ws): GC orphaned pending markers (dead terminal + 7-day TTL, periodic sweep only)
+
+Safe vacuously: no production reader of pending markers exists at any
+age (pending_for_terminal/list_pending_raw have zero non-test callers).
+Boot path passes None -- its live set is empty pre-serve, so running the
+rule there would sweep every old marker at every boot. 7-day TTL
+preserves the multi-day forensic window this plan's own diagnosis used."
 ```
 
 ---
@@ -1556,11 +1945,20 @@ Unix hook command constant:
 
 ```rust
 /// SessionStart fires with the CURRENT session id on startup/resume/clear --
-/// the deterministic signal for claude's fork-on-resume (claude writes NO
-/// lineage field on disk; verified 2026-07-27). Atomic tmp+rename; never
-/// blocks or fails the CLI (trailing `|| true`).
+/// the deterministic signal for claude's in-TUI session switches. On claude
+/// 2.1.220 plain /resume does NOT fork (`--fork-session` is the opt-in; the
+/// docs reserve the `fork` source for it) -- the hook delivers the SELECTED
+/// session's id, which is exactly what the rebind needs whether or not a
+/// fork occurred (claude writes NO lineage field on disk either way;
+/// verified 2026-07-27/28). Atomic tmp+rename; never blocks or fails the
+/// CLI (trailing `|| true`).
 pub const CLAUDE_SESSION_START_COMMAND_UNIX: &str = "sh -lc 'd=\"$HOME/.freshell/session-signals/claude\"; f=\"$d/${FRESHELL_TERMINAL_ID:-unknown}__$$-$(date +%s%N)\"; mkdir -p \"$d\" && cat > \"$f.tmp\" && mv \"$f.tmp\" \"$f.json\"' 2>/dev/null || true";
 ```
+
+Degradation notes (validated A7 — record them in this constant's module doc): `disableAllHooks:
+true` in user settings, an enterprise `allowManagedHooksOnly` policy, or a `--bare` launch
+silently disable the injected hook — graceful degradation to today's stale-resume behavior (no
+rebind), never corruption; freshell cannot detect it.
 
 Windows: a PowerShell one-liner reading `[Console]::In.ReadToEnd()` and writing it to
 `$env:USERPROFILE\.freshell\session-signals\claude\${env:FRESHELL_TERMINAL_ID}__<ticks>.json`
@@ -1693,7 +2091,11 @@ pub(crate) async fn drain_and_rebind_claude(state: &WsState, watcher: &ClaudeSig
             continue;
         }
         if current.session_id.as_deref() == Some(sig.session_id.as_str()) {
-            continue; // startup echo of the id we launched with -- idempotent
+            // Load-bearing no-op (A7): SessionStart also fires on `startup`
+            // and on EVERY compaction (`compact`) with session_id == bound
+            // id -- one signal file per compaction. Same-id signals must
+            // stay silent no-ops; keep this guard.
+            continue;
         }
         // A13: the claimed id must have no live owner.
         if let Some(owner) = state
@@ -1794,167 +2196,106 @@ git commit -m "feat(freshell-ws): claude mid-session rebind via SessionStart sig
 
 ---
 
-### Task 13: P3 — amplifier fork-lineage rebind
+### Task 13: P3 — amplifier: record the audit; rebind DESCOPED (no code)
 
 **Files:**
-- Modify: `crates/freshell-sessions/src/amplifier_locator.rs` (fork-watch analog; its probe
-  already parses `events.jsonl` `session:start` and REJECTS `parent_id`/`session:fork` — those
-  rejection sites define the lineage format to match)
-- Modify: `crates/freshell-ws/src/amplifier_association.rs` (`:128-134` gate untouched for the
-  adoption lane; new fork drain + rebind tail; adoption is currently INLINE at `:136-181` —
-  extract it into `apply_amplifier_identity(state, terminal_id, session_id, session_dir, cwd,
-  previous_session_id)` so adopt and rebind share one write path, mirroring Task 5's shape)
-- Test: locator inline tests + `crates/freshell-ws/tests/amplifier_fork_rebind.rs` (NEW, frames +
-  meta assertions only — modeled on `codex_fork_rebind.rs` but without the argv phase)
+- Create: `docs/plans/2026-07-28-stale-resume-identity-p3-audit.md` (amplifier section)
 
 **Interfaces:**
-- Consumes: Task 1 frame field; Task 5's provider-parameterized broadcaster.
-- Produces: `AmplifierLocator::{watch_fork, note_fork_submit, tick_forks} -> Vec<AmplifierForkLocated>`
-  with the same shape and window discipline as Task 4 (constant
-  `AMPLIFIER_FORK_WINDOW_MS: i64 = 30_000`), where a fork candidate is a NEW
-  `projects/<slug>/sessions/<id>/` dir whose `events.jsonl` `session:start` carries
-  `parent_id == watched id` (or a `session:fork` event referencing it).
+- Consumes: nothing.
+- Produces: the committed audit record. NO amplifier locator/association/rebind code ships in
+  this plan — `amplifier_locator.rs` and `amplifier_association.rs` are NOT modified.
 
-- [ ] **Step 1: Audit-first gate (P3 requirement — do not assume codex semantics)**
+WHY the descope (validated A8, FALSIFIED — critical): the originally-planned fork-lineage lane
+was audit-falsified on the live substrate (8,535 session dirs / 8,083 `events.jsonl`, plus the
+installed `amplifier_app_cli 0.1.1` source). Shipping it would have corrupted the durable pane
+ledger; recording WHY is the P3 deliverable.
 
-Before writing code, read `amplifier_locator.rs`'s probe to extract the EXACT field names it
-parses for `session:start`/`session:config` and the exact rejection predicates for
-`parent_id`/`session:fork`. Then check the live substrate if present:
-`ls ~/.amplifier 2>/dev/null || true` and locate the projects/sessions dir the locator's
-`default root` uses; if any real session dir contains a `session:start` with `parent_id`,
-record 1-2 sanitized lines in `docs/plans/2026-07-28-stale-resume-identity-p3-audit.md`
-(create it in this step) under an "amplifier" heading. If no real fork evidence exists on this
-machine, record that and proceed with the locator-parser-defined synthetic format — the parser's
-own rejection code is the repo's authoritative format knowledge.
+- [ ] **Step 1: Write the amplifier audit section**
 
-- [ ] **Step 2: Write the failing locator tests**
+Create `docs/plans/2026-07-28-stale-resume-identity-p3-audit.md` with an "amplifier" heading
+recording exactly these validated findings (full evidence:
+`.worktrees/.the-usual-logs/stale-resume-identity/reports/validator-A8.md`):
 
-Mirror Task 4's six test shapes (happy lineage, foreign lineage, plain new session, expired
-window, chained, disarm-clears) using the amplifier locator test module's existing synthetic
-`events.jsonl` fixture helpers (it has them — its probe tests construct session dirs; reuse and
-extend with a `parent_id` writer). Same assertions, amplifier types.
+- amplifier's TUI has `/fork` but NO `/resume`/session picker (`amplifier_app_cli/main.py:398-412`).
+- `/fork` does NOT rebind the running pane's session: `_fork_session` (`main.py:1113-1226`)
+  creates the fork dir and prints "Resume with: `amplifier session resume <id>`" while the live
+  session remains the old one — there is NO legitimate rebind trigger; rebinding on `/fork`
+  would be actively wrong (the user keeps talking in the OLD session).
+- 0 of 2,509 real `session:start` records carry `parent_id` (top-level key absent everywhere;
+  `data.parent_id` non-null in 0) — fork lineage lives in `metadata.json`
+  (`parent_id` + `forked_from_turn`, `fork.py:158-171`).
+- The originally-planned predicate ("new session dir whose `session:start` carries
+  `parent_id == watched id`, or a `session:fork` event referencing it") would match exactly the
+  5,553 subagent dirs (69% of the substrate) whose FIRST event is `session:fork` with
+  `data.parent_id` = the parent session's id — spawned immediately after the pane's Enter, i.e.
+  inside any Enter-anchored window → the pane would be rebound onto a subagent dir and the true
+  binding durably retired `Superseded` (the A4 corruption shape).
+- Future work (short note): a deterministic amplifier signal would need upstream lineage in
+  `session:start` (or a hook analogous to claude's SessionStart). Until then amplifier keeps
+  today's behavior — no mid-session rebind, no added corruption risk.
 
-Run: `cargo test -p freshell-sessions amplifier_locator::tests::fork_`
-Expected: FAIL to compile.
-
-- [ ] **Step 3: Implement locator + association**
-
-Locator: same `ForkWatch` structure as Task 4, with `scan` = the locator's existing session-dir
-enumeration and `probe` = its existing `session:start` parse, but ACCEPTING (as fork candidates)
-exactly what the adoption probe rejects: `parent_id == watch.session_id`. Association: fork
-drain in the amplifier sweep calling a new `rebind_amplifier_identity` that (1) applies the same
-three guards as Task 5 (live-owner of old, A13 on new via
-`live_session_owner(.., "amplifier", ..)`, retired-inclusive bound-elsewhere), (2) calls the
-extracted `apply_amplifier_identity` with `previous_session_id: Some(old)`, (3) re-attaches the
-amplifier events tailer to the NEW session dir (the attach call currently made inline at
-`:175-181` — same replace-the-lane requirement as Task 5 Step 4; verify the amplifier lane map
-insert semantics in `activity.rs:1512+` and fix to `insert` if needed). Register `watch_fork`
-after successful adoption and for resume-launched amplifier panes (same `terminal.rs` site
-pattern as Task 6, keyed `mode == "amplifier"`). Wire `note_fork_submit` in amplifier's
-`note_possible_submit` equivalent.
-
-- [ ] **Step 4: Write + pass the integration test**
-
-`crates/freshell-ws/tests/amplifier_fork_rebind.rs`: bind (existing amplifier adoption flow —
-copy from the amplifier association integration test if one exists, else drive the locator via
-the harness's amplifier locator seam), fork (write new session dir with `parent_id` = old id),
-assert `terminal.session.associated` with new id + `previousSessionId` = old id + registry meta.
-
-Run: `cargo test -p freshell-sessions amplifier_locator && cargo test -p freshell-ws --test amplifier_fork_rebind`
-Expected: PASS.
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 2: Commit**
 
 ```bash
-git add crates/freshell-sessions/src/amplifier_locator.rs crates/freshell-ws/ docs/plans/2026-07-28-stale-resume-identity-p3-audit.md
-git commit -m "feat(amplifier): lineage-proven mid-session rebind (parent_id/session:fork) mirroring the codex fork lane (P3)"
+git add docs/plans/2026-07-28-stale-resume-identity-p3-audit.md
+git commit -m "docs(plans): P3 amplifier audit -- rebind descoped (no in-TUI switch; no session:start lineage; predicate matches only subagents)"
 ```
 
 ---
 
-### Task 14: P3 — opencode in-TUI switch: audit + correlation rebind
+### Task 14: P3 — opencode: record the audit; correlation rebind DESCOPED (no code)
 
 **Files:**
 - Modify: `docs/plans/2026-07-28-stale-resume-identity-p3-audit.md` (opencode section)
-- Modify: `crates/freshell-sessions/src/opencode_locator.rs`
-- Modify: `crates/freshell-ws/src/opencode_association.rs` (adoption inline at `:135-167` —
-  extract shared write path as in Task 13)
-- Test: locator inline tests (synthetic SQLite fixtures — the locator's existing tests already
-  build a fake `opencode.db`; reuse those helpers)
 
 **Interfaces:**
-- Consumes: Task 1 field; shared broadcaster.
-- Produces: `OpencodeLocator::{watch_switch(terminal_id, session_id, directory),
-  note_switch_submit(terminal_id, at_ms), tick_switches(now_ms) -> Vec<OpencodeSwitchLocated>}`
-  with `OpencodeSwitchLocated { terminal_id, old_session_id, new_session_id, directory }`.
+- Consumes: nothing (Task 13 created the audit doc).
+- Produces: the committed audit record. NO opencode watch/switch/rebind code ships in this
+  plan — `opencode_locator.rs` and `opencode_association.rs` are NOT modified (no
+  `watch_switch`/`tick_switches`/`rebind_opencode_identity`).
 
-- [ ] **Step 1: The audit (mandatory first; this defines the trigger predicate)**
+WHY the descope (validated A9 confirmed-with-corrections + A10 FALSIFIED): the audit that
+Task 14 originally mandated was performed against the real 4.6 GB `opencode.db` (copied
+read-only) and the `sst/opencode` v1.18.8 source (the exact installed version). It proved the
+planned two-window correlation rebind is a heuristic with real false-positive drivers → a
+hijack-capable rebind that would durably retire the true binding `Superseded`. Recording WHY is
+the P3 deliverable.
 
-opencode's substrate is a SQLite `session` row per session (the locator diffs rows via its
-bounded `list_sessions_since`). Audit procedure — run it and record results in the audit doc:
+- [ ] **Step 1: Write the opencode audit section**
 
-1. `sqlite3 <opencode data_home>/opencode.db "SELECT id, directory, json_extract(data,'$.time.updated') FROM session ORDER BY 3 DESC LIMIT 10;"`
-   (adapt table/column names to what `opencode_locator.rs`'s queries actually use — copy its SQL).
-2. In a scratch terminal (NOT via the 3002 server): run `opencode` in a temp dir, create a
-   session, exit; run `opencode` again, use the session list (leader+l) to switch to the first
-   session, send one message, exit.
-3. Re-run the query. Record: did switching create a NEW row (fork semantics) or UPDATE the
-   existing row's `time.updated` (append semantics)? Does any lineage column/field exist?
+Add an "opencode" heading to `docs/plans/2026-07-28-stale-resume-identity-p3-audit.md`
+recording exactly these validated findings (full evidence:
+`.worktrees/.the-usual-logs/stale-resume-identity/reports/validator-A9-A10.md`):
 
-Expected finding (design assumption to verify): opencode switching APPENDS to the chosen
-existing session — the deterministic signal is "after this pane's Enter, a DIFFERENT session row
-in the same directory advanced while the bound session did not".
+- Switching sessions in the v1.18.8 TUI is PURE CLIENT NAVIGATION with zero DB write
+  (`packages/tui/src/component/dialog-session-list.tsx:283` — `route.navigate(...)`); the
+  chosen row's `time_updated` advances only on the NEXT prompt Enter
+  (`packages/opencode/src/session/prompt.ts:1058` `sessions.touch`).
+- `time_updated` is a real NOT NULL integer COLUMN on `session` (not JSON `$.time.updated`).
+- Freshell's `list_sessions_since` floors on `time_created`
+  (`crates/freshell-sessions/src/parse/opencode.rs:185`) and cannot express
+  "updated-in-range" — a pre-existing switch target is filtered out; a new SQL variant would
+  have been required.
+- User forks (`session.fork`) set NO `parentID` (lineage = title-suffix convention only;
+  `parent_id` is used solely for subagent child sessions) — a lineage-variant detector has no
+  substrate field to key on.
+- The correlation rebind is UNSAFE: non-switch writers of `session.time_updated` at the
+  installed v1.18.8 include external prompts (a second TUI, ACP/IDE, `opencode run` loops —
+  `opencode-ralph-loop` is installed on this machine), auto-compaction `setSummary`,
+  `setAgentModel`, `setPermission`, revert stage/clear, `setShare`, `setWorkspace`, and API
+  `setMetadata`. An externally-advanced session passes every planned guard (no live owner, A13
+  vacuous) → false-positive hijack of the pane + durable `Superseded` retirement of the true
+  binding.
+- Future work (short note): a deterministic path would be an opencode plugin/event signal
+  (follow-up research) — never row-update correlation. Until then opencode keeps today's
+  behavior (stale resume remains unfixed for opencode: status quo, no corruption added).
 
-If the audit contradicts this (e.g. opencode also forks with a lineage field), implement the
-LINEAGE variant instead (Task 13's shape) — the interfaces above stay identical; only the
-predicate inside `tick_switches` changes. Record whichever variant shipped in the audit doc.
-
-- [ ] **Step 2: Write the failing locator tests (correlation variant)**
-
-```rust
-    #[test]
-    fn switch_to_another_session_in_directory_is_detected_after_two_windows() {
-        // Bound pane on session A in dir D. Enter at t1: session B (same D)
-        // advances in-window, A does not -> candidate (1st confirmation, no
-        // emit -- hijack guard requires TWO consecutive confirming windows).
-        // Enter at t2: B advances again, A does not -> SwitchLocated{A->B}.
-    }
-    #[test]
-    fn bound_session_advancing_suppresses_the_candidate() { /* A advances too -> no candidate, streak reset */ }
-    #[test]
-    fn two_foreign_sessions_advancing_is_ambiguous_and_never_emits() { /* B and C advance -> refuse, streak reset */ }
-    #[test]
-    fn foreign_directory_updates_never_match() { /* B in dir E -> ignored */ }
-```
-
-Write them fully against the locator's fake-db helpers (rows with injectable
-`time.updated`; injected clocks like the codex tests). Two-window confirmation constant:
-`OPENCODE_SWITCH_CONFIRMATIONS: u32 = 2`.
-
-Run: `cargo test -p freshell-sessions opencode_locator::tests::switch_`
-Expected: FAIL to compile.
-
-- [ ] **Step 3: Implement locator + association wiring**
-
-`tick_switches` per open window: query sessions updated in `[enter_ms, now]` for the watched
-directory (reuse `list_sessions_since`); classify: bound advanced → reset streak; exactly one
-foreign advanced → increment streak (emit on reaching 2, then advance the watch to the new id
-and reset); zero or ≥2 foreign → reset. Association: drain in the opencode sweep →
-`rebind_opencode_identity` with the same three guards (live-owner of old, A13 on new,
-retired-inclusive bound-elsewhere) → shared write path with `previous_session_id: Some(old)`.
-Register `watch_switch` after adoption and for resume-launched opencode panes (`terminal.rs`,
-`mode == "opencode"`); wire `note_switch_submit` from opencode's submit seam.
-
-- [ ] **Step 4: Run tests**
-
-Run: `cargo test -p freshell-sessions opencode_locator && cargo test -p freshell-ws opencode`
-Expected: PASS (all pre-existing opencode association tests green).
-
-- [ ] **Step 5: Commit**
+- [ ] **Step 2: Commit**
 
 ```bash
-git add crates/ docs/plans/2026-07-28-stale-resume-identity-p3-audit.md
-git commit -m "feat(opencode): audited in-TUI switch detection (two-window row-update correlation) + guarded rebind (P3)"
+git add docs/plans/2026-07-28-stale-resume-identity-p3-audit.md
+git commit -m "docs(plans): P3 opencode audit -- correlation rebind descoped (switch writes nothing; time_updated has non-switch writers; no fork lineage)"
 ```
 
 ---
@@ -2102,11 +2443,17 @@ Do NOT open a PR (explicit user approval required; the workflow stops here).
 **1. Spec coverage:**
 - P1 mid-session codex rebind end-to-end (identity registry, meta, ledger tombstone/supersede,
   tailer re-attach, client-accepted authoritative frame, restart resumes NEW id, hijack guard):
-  Tasks 1–7.
+  Tasks 1–7, plus Task 7b (ledger-chain reconcile rung) closing the absent-client/restart hole
+  the load-bearing validation surfaced (A3).
 - P2 contested-cwd starvation + audit of opencode/amplifier census + orphaned pending markers:
   Task 8 (audit recorded in commit message; findings in the "Verified incident facts" section),
   Task 9.
-- P3 opencode/amplifier rebind with audit-first discipline: Tasks 13–14 (+ committed audit doc).
+- P3 opencode/amplifier with audit-first discipline: the audits were PERFORMED during
+  load-bearing validation and FALSIFIED both rebind designs (A8: amplifier has no in-TUI switch,
+  no session:start lineage, and the planned predicate matches only subagent dirs; A10: opencode
+  row-update correlation has real non-switch writers → hijack-capable). Tasks 13–14 are
+  deliberately audit-doc-only — the descope IS the validated P3 outcome, with rationale
+  committed, not a deferral.
 - P4 claude deterministic mechanism (SessionStart hook — chosen over the JSONL-watcher fallback
   because claude writes no lineage on disk; fully implemented, not a design doc): Tasks 11–12.
 - P5 sidebar fork visibility: Task 10.
@@ -2116,22 +2463,29 @@ Do NOT open a PR (explicit user approval required; the workflow stops here).
   deterministic signals, real fixture shapes): Global Constraints + guard steps throughout +
   Task 16 audit.
 
-**1b. No silent deferrals:** every requirement lands as production behavior with a
+**1b. No silent deferrals:** every in-scope requirement lands as production behavior with a
 production-path test: the codex story is proven by `codex_fork_rebind.rs` (real server, real
-frames, real argv of the respawned CLI); claude by `claude_session_rebind.rs` (same); amplifier
-by `amplifier_fork_rebind.rs`; opencode by locator-level tests against its real SQLite substrate
-shape plus the shared guarded write path (the audit doc records the verified trigger semantics).
-Fake CLIs (`sh` scripts) are the repo's established argv-capture idiom for launch verification,
-not behavior stubs — the behavior under test (identity movement + resume argv) is fully real.
-No requirement was moved to "known limitations"/"future work". No unresolved coverage gaps.
+frames, real argv of the respawned CLI); claude by `claude_session_rebind.rs` (same); the
+restart hole by Task 7b's reconcile tests against a real temp-dir pane ledger. Fake CLIs
+(`sh` scripts) are the repo's established argv-capture idiom for launch verification, not
+behavior stubs — the behavior under test (identity movement + resume argv) is fully real.
+Deliberately scoped OUT with recorded rationale (not silent): amplifier/opencode rebind
+(Tasks 13–14 — validated as corruption-capable; audit doc commits the why + the future-work
+signal path); the codex fork lane's intermittency (upstream #34972 — the lane is opportunistic
+by design and idle when upstream doesn't fork); the A5/A6 residuals (rebindable accept key,
+kitty CSI-u, `disable_paste_burst`) — each named in-plan at the mechanism it degrades, each
+degrading to today's behavior, never to corruption. No unresolved coverage gaps.
 
 **2. Placeholder scan:** the remaining "adapt names to the file's actuals" instructions are
 anchored to exact files/lines with the contract pinned by the surrounding test code — none are
-TBDs. Steps that intentionally summarize a test's phases (Tasks 7, 12, 14) still specify every
+TBDs. Steps that intentionally summarize a test's phases (Tasks 7, 7b, 12) still specify every
 assertion and the exact fixtures/helpers to copy from named precedents.
 
 **3. Type consistency:** `previousSessionId` (wire, camelCase) / `previous_session_id` (Rust)
-used consistently across Tasks 1, 2, 5, 12, 13, 15. `ForkLocated`/`watch_fork`/
+used consistently across Tasks 1, 2, 5, 12, 15. `ForkLocated`/`watch_fork`/
 `note_fork_submit`/`tick_forks` names match between Task 4 (definition) and Tasks 5–7
-(consumption); amplifier/opencode analogs are namespaced per-locator. The shared broadcaster's
-provider parameterization is reconciled in Task 12's note against Task 5's definition.
+(consumption); `Probe::Candidate`'s `forked_from_id`/`thread_source` fields match between
+Task 3 (definition) and Task 4 (consumption); Task 7b consumes the existing
+`pane_ledger.lookup_by_session` `Resolution { corrected, row }` shape that Task 5's ledger test
+also pins. The shared broadcaster's provider parameterization is reconciled in Task 12's note
+against Task 5's definition.
