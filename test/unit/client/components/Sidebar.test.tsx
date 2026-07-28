@@ -10,6 +10,7 @@ import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer, {
   commitSessionWindowReplacement,
+  commitSessionWindowVisibleRefresh,
   setSessionWindowLoading,
 } from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
@@ -2348,7 +2349,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       },
     ]
 
-    it('renders the repo dropdown defaulting to All with one option per repo', async () => {
+    it('renders the repo dropdown defaulting to All repos with one option per repo', async () => {
       const store = createTestStore({ projects: repoProjects })
       const { getByRole } = renderSidebar(store, [])
       await act(() => vi.advanceTimersByTime(100))
@@ -2356,7 +2357,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const select = getByRole('combobox', { name: /repo filter/i }) as HTMLSelectElement
       expect(select).toHaveValue('all')
       expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
-        'All',
+        'All repos',
         'repo-alpha',
         'repo-beta',
       ])
@@ -2624,6 +2625,227 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(second.getByRole('combobox', { name: /repo filter/i })).toHaveValue('all')
       expect(screen.getByText('Beta session one')).toBeInTheDocument()
       expect(screen.getByText('Alpha session one')).toBeInTheDocument()
+    })
+
+    it('keeps the scroll container mounted when a refresh transiently empties the filtered list', async () => {
+      const store = createTestStore({ projects: repoProjects })
+      const { getByRole, getByTestId } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByRole('combobox', { name: /repo filter/i }), {
+        target: { value: '/home/user/repo-beta' },
+      })
+      expect(screen.getByText('Beta session one')).toBeInTheDocument()
+      const containerBefore = getByTestId('sidebar-session-list')
+
+      // A live refresh commits a page-1 window with no repo-beta sessions:
+      // the filtered list is transiently empty.
+      await act(async () => {
+        store.dispatch(commitSessionWindowVisibleRefresh({
+          surface: 'sidebar',
+          projects: [repoProjects[0]],
+          totalSessions: 2,
+          hasMore: false,
+        }))
+      })
+
+      // Empty state renders INSIDE the still-mounted scroll container.
+      expect(screen.getByText('No sessions in selected repo')).toBeInTheDocument()
+      expect(getByTestId('sidebar-session-list')).toBe(containerBefore)
+
+      // The next refresh restores repo-beta rows into the SAME container
+      // instance (scroll position survives in a real browser).
+      await act(async () => {
+        store.dispatch(commitSessionWindowVisibleRefresh({
+          surface: 'sidebar',
+          projects: repoProjects,
+          totalSessions: 3,
+          hasMore: false,
+        }))
+      })
+      expect(screen.getByText('Beta session one')).toBeInTheDocument()
+      expect(getByTestId('sidebar-session-list')).toBe(containerBefore)
+    })
+  })
+
+  describe('Agent filter dropdown', () => {
+    const agentProjects: ProjectGroup[] = [
+      {
+        projectPath: '/home/user/repo-alpha',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionId: sessionId('agent-alpha-claude'),
+            projectPath: '/home/user/repo-alpha',
+            lastActivityAt: Date.now() - 1000,
+            title: 'Alpha claude session',
+            cwd: '/home/user/repo-alpha',
+          },
+          {
+            provider: 'codex',
+            sessionId: sessionId('agent-alpha-codex'),
+            projectPath: '/home/user/repo-alpha',
+            lastActivityAt: Date.now() - 2000,
+            title: 'Alpha codex session',
+            cwd: '/home/user/repo-alpha',
+          },
+        ],
+      },
+      {
+        projectPath: '/home/user/repo-beta',
+        sessions: [
+          {
+            provider: 'codex',
+            sessionId: sessionId('agent-beta-codex'),
+            projectPath: '/home/user/repo-beta',
+            lastActivityAt: Date.now() - 3000,
+            title: 'Beta codex session',
+            cwd: '/home/user/repo-beta',
+          },
+        ],
+      },
+    ]
+
+    it('renders the agent dropdown defaulting to All agents with one option per agent kind', async () => {
+      const store = createTestStore({ projects: agentProjects })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const select = getByRole('combobox', { name: /agent filter/i }) as HTMLSelectElement
+      expect(select).toHaveValue('all')
+      // Labels come from the extensions registry (createTestStore preloads
+      // 'Claude CLI' / 'Codex CLI'), sorted by label.
+      expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
+        'All agents',
+        'Claude CLI',
+        'Codex CLI',
+      ])
+      expect(Array.from(select.options).map((o) => o.value)).toEqual([
+        'all',
+        'claude',
+        'codex',
+      ])
+    })
+
+    it('filters the list to the selected agent', async () => {
+      const store = createTestStore({ projects: agentProjects })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByRole('combobox', { name: /agent filter/i }), {
+        target: { value: 'codex' },
+      })
+
+      expect(screen.getByText('Alpha codex session')).toBeInTheDocument()
+      expect(screen.getByText('Beta codex session')).toBeInTheDocument()
+      expect(screen.queryByText('Alpha claude session')).not.toBeInTheDocument()
+    })
+
+    it('ANDs with the repo filter', async () => {
+      const store = createTestStore({ projects: agentProjects })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByRole('combobox', { name: /repo filter/i }), {
+        target: { value: '/home/user/repo-alpha' },
+      })
+      fireEvent.change(getByRole('combobox', { name: /agent filter/i }), {
+        target: { value: 'codex' },
+      })
+
+      expect(screen.getByText('Alpha codex session')).toBeInTheDocument()
+      expect(screen.queryByText('Alpha claude session')).not.toBeInTheDocument()
+      expect(screen.queryByText('Beta codex session')).not.toBeInTheDocument()
+    })
+
+    it('does not render the dropdown when no sessions are loaded', async () => {
+      const store = createTestStore({ projects: [] })
+      const { queryByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      expect(queryByRole('combobox', { name: /agent filter/i })).not.toBeInTheDocument()
+    })
+
+    it('shows a clear (x) button only while an agent is selected and it resets to All agents', async () => {
+      const store = createTestStore({ projects: agentProjects })
+      const { getByRole, queryByLabelText, getByLabelText } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      expect(queryByLabelText('Clear agent filter')).not.toBeInTheDocument()
+
+      fireEvent.change(getByRole('combobox', { name: /agent filter/i }), {
+        target: { value: 'codex' },
+      })
+      expect(screen.queryByText('Alpha claude session')).not.toBeInTheDocument()
+
+      fireEvent.click(getByLabelText('Clear agent filter'))
+
+      expect(getByRole('combobox', { name: /agent filter/i })).toHaveValue('all')
+      expect(screen.getByText('Alpha claude session')).toBeInTheDocument()
+      expect(queryByLabelText('Clear agent filter')).not.toBeInTheDocument()
+    })
+
+    it('keeps the selected agent option and shows an agent-aware empty state when a search empties the window', async () => {
+      const searchRequest = createDeferred<any>()
+      vi.mocked(mockSearchSessions).mockReturnValueOnce(searchRequest.promise)
+
+      const store = createTestStore({ projects: agentProjects })
+      const { getByRole, getByPlaceholderText } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByRole('combobox', { name: /agent filter/i }), {
+        target: { value: 'codex' },
+      })
+
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'zeta' } })
+      await act(async () => {
+        vi.advanceTimersByTime(300)
+        await Promise.resolve()
+      })
+      await act(async () => {
+        searchRequest.resolve({ results: [], tier: 'title', query: 'zeta', totalScanned: 0 })
+        await Promise.resolve()
+      })
+
+      // Selection survives the (empty) search commit and remains a valid option.
+      const select = getByRole('combobox', { name: /agent filter/i }) as HTMLSelectElement
+      expect(select).toHaveValue('codex')
+      expect(Array.from(select.options).map((o) => o.value)).toContain('codex')
+
+      // Empty state names the agent filter as a possible cause.
+      expect(screen.getByText('No sessions for selected agent')).toBeInTheDocument()
+    })
+
+    it('never persists the selection: localStorage untouched and a fresh mount resets to All agents', async () => {
+      const snapshotLocalStorage = () => {
+        const entries: Record<string, string | null> = {}
+        for (let i = 0; i < window.localStorage.length; i++) {
+          const key = window.localStorage.key(i) as string
+          entries[key] = window.localStorage.getItem(key)
+        }
+        return JSON.stringify(entries)
+      }
+
+      const store = createTestStore({ projects: agentProjects })
+      const first = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const before = snapshotLocalStorage()
+      fireEvent.change(first.getByRole('combobox', { name: /agent filter/i }), {
+        target: { value: 'codex' },
+      })
+      expect(screen.queryByText('Alpha claude session')).not.toBeInTheDocument()
+      expect(snapshotLocalStorage()).toBe(before)
+
+      // Remount against the SAME store: client-side "browser refresh".
+      // If the selection leaked into Redux or storage, it would survive this.
+      cleanup()
+      const second = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      expect(second.getByRole('combobox', { name: /agent filter/i })).toHaveValue('all')
+      expect(screen.getByText('Alpha claude session')).toBeInTheDocument()
+      expect(screen.getByText('Alpha codex session')).toBeInTheDocument()
     })
   })
 
@@ -3018,7 +3240,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       expect(screen.getByText('Loading sessions...')).toBeInTheDocument()
       expect(screen.queryByText('Fallback Session')).not.toBeInTheDocument()
-      expect(screen.queryByTestId('sidebar-session-list')).not.toBeInTheDocument()
+      // Container stays mounted with the loading state rendered inside it.
+      expect(within(screen.getByTestId('sidebar-session-list')).getByText('Loading sessions...')).toBeInTheDocument()
     })
 
     it('keeps first-load search blocking even when fallback tab sessions exist', async () => {
@@ -3076,7 +3299,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       expect(screen.getByTestId('search-loading')).toBeInTheDocument()
       expect(screen.queryByText('Fallback Search Session')).not.toBeInTheDocument()
-      expect(screen.queryByTestId('sidebar-session-list')).not.toBeInTheDocument()
+      // Container stays mounted with the search-loading state rendered inside it.
+      expect(within(screen.getByTestId('sidebar-session-list')).getByTestId('search-loading')).toBeInTheDocument()
     })
 
     it('starts append pagination when the loaded sidebar is scrolled near the bottom', async () => {

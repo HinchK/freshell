@@ -13,8 +13,11 @@ import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
 import {
+  ALL_AGENTS,
   ALL_REPOS,
+  collectAgentFilterOptions,
   collectRepoFilterOptions,
+  filterSessionItemsByAgent,
   filterSessionItemsByRepo,
   makeSelectSortedSessionItems,
   type SidebarSessionItem,
@@ -235,6 +238,9 @@ export default function Sidebar({
   // Repo filter is deliberately component-local and never persisted:
   // a browser refresh must reset it to 'all' (spec requirement).
   const [repoFilter, setRepoFilter] = useState<string>(ALL_REPOS)
+  // Agent filter is deliberately component-local and never persisted:
+  // a browser refresh must reset it to 'all' (spec requirement).
+  const [agentFilter, setAgentFilter] = useState<string>(ALL_AGENTS)
   const localQuery = filter.trim()
   const localMatchesRequestedSearch = filter === requestedQueryValue && searchTier === requestedSearchTier
 
@@ -324,11 +330,25 @@ export default function Sidebar({
     () => collectRepoFilterOptions(localFilteredItems, repoFilter),
     [localFilteredItems, repoFilter],
   )
-  // ANDs with the selector pipeline (visibility + applied search + sort),
-  // which has already run inside selectSortedItems.
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries)
+  // Options come from the PRE-filter list so every agent kind stays listed
+  // while one is selected; the current selection is retained even if its
+  // rows are temporarily absent, keeping the controlled select valid.
+  const agentOptions = useMemo(
+    () => collectAgentFilterOptions(
+      localFilteredItems,
+      agentFilter,
+      (sessionType) => resolveSessionTypeConfig(sessionType, extensionEntries).label,
+    ),
+    [localFilteredItems, agentFilter, extensionEntries],
+  )
+  // ANDs: selector pipeline (visibility + applied search + sort) → repo → agent.
   const computedItems = useMemo(
-    () => filterSessionItemsByRepo(localFilteredItems, repoFilter),
-    [localFilteredItems, repoFilter],
+    () => filterSessionItemsByAgent(
+      filterSessionItemsByRepo(localFilteredItems, repoFilter),
+      agentFilter,
+    ),
+    [localFilteredItems, repoFilter, agentFilter],
   )
 
   // Stabilize the array reference so react-window doesn't rebuild all row
@@ -718,7 +738,7 @@ export default function Sidebar({
               onChange={(e) => setRepoFilter(e.target.value || ALL_REPOS)}
               className="min-w-0 flex-1 h-7 px-2 text-xs bg-muted/50 border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
             >
-              <option value={ALL_REPOS}>All</option>
+              <option value={ALL_REPOS}>All repos</option>
               {repoOptions.map((option) => (
                 <option key={option.value} value={option.value} title={option.value}>
                   {option.label}
@@ -729,6 +749,32 @@ export default function Sidebar({
               <button
                 aria-label="Clear repo filter"
                 onClick={() => setRepoFilter(ALL_REPOS)}
+                className="p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
+          </div>
+        )}
+        {agentOptions.length > 0 && (
+          <div className="mt-2 flex items-center gap-1">
+            <select
+              aria-label="Agent filter"
+              value={agentFilter}
+              onChange={(e) => setAgentFilter(e.target.value || ALL_AGENTS)}
+              className="min-w-0 flex-1 h-7 px-2 text-xs bg-muted/50 border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+            >
+              <option value={ALL_AGENTS}>All agents</option>
+              {agentOptions.map((option) => (
+                <option key={option.value} value={option.value} title={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            {agentFilter !== ALL_AGENTS ? (
+              <button
+                aria-label="Clear agent filter"
+                onClick={() => setAgentFilter(ALL_AGENTS)}
                 className="p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
               >
                 <X className="h-3.5 w-3.5" />
@@ -786,40 +832,42 @@ export default function Sidebar({
       {/* Session List */}
       <div className="flex flex-1 min-h-0 flex-col">
         <div className="flex-1 min-h-0 px-2">
-          {showBlockingLoad ? (
-            <div
-              className="flex items-center justify-center py-8"
-              data-testid={hasRequestedQuery ? 'search-loading' : undefined}
-            >
-              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-              <span className="ml-2 text-sm text-muted-foreground">
-                {hasRequestedQuery ? 'Searching...' : 'Loading sessions...'}
-              </span>
-            </div>
-          ) : sortedItems.length === 0 ? (
-          showDeepSearchPending ? (
-            <div className="flex items-center justify-center py-8" role="status" aria-live="polite">
-              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-hidden="true" />
-              <span className="ml-2 text-sm text-muted-foreground">Scanning files...</span>
-            </div>
-          ) : (
-          <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-            {repoFilter !== ALL_REPOS
-              ? 'No sessions in selected repo'
-              : visibleQuery && visibleSearchTier !== 'title'
-              ? 'No results found'
-              : visibleQuery
-              ? 'No matching sessions'
-              : 'No sessions yet'}
-          </div>
-          )
-          ) : (
-            <div
-              ref={listRef}
-              data-testid="sidebar-session-list"
-              className="h-full overflow-y-auto"
-              onScroll={handleListScroll}
-            >
+          <div
+            ref={listRef}
+            data-testid="sidebar-session-list"
+            className="h-full overflow-y-auto"
+            onScroll={handleListScroll}
+          >
+            {showBlockingLoad ? (
+              <div
+                className="flex items-center justify-center py-8"
+                data-testid={hasRequestedQuery ? 'search-loading' : undefined}
+              >
+                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                <span className="ml-2 text-sm text-muted-foreground">
+                  {hasRequestedQuery ? 'Searching...' : 'Loading sessions...'}
+                </span>
+              </div>
+            ) : sortedItems.length === 0 ? (
+              showDeepSearchPending ? (
+                <div className="flex items-center justify-center py-8" role="status" aria-live="polite">
+                  <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-hidden="true" />
+                  <span className="ml-2 text-sm text-muted-foreground">Scanning files...</span>
+                </div>
+              ) : (
+                <div className="px-2 py-8 text-center text-sm text-muted-foreground">
+                  {repoFilter !== ALL_REPOS
+                    ? 'No sessions in selected repo'
+                    : agentFilter !== ALL_AGENTS
+                    ? 'No sessions for selected agent'
+                    : visibleQuery && visibleSearchTier !== 'title'
+                    ? 'No results found'
+                    : visibleQuery
+                    ? 'No matching sessions'
+                    : 'No sessions yet'}
+                </div>
+              )
+            ) : (
               <div ref={listContentRef}>
                 {sortedItems.map((item) => {
                   const sessionKey = `${item.provider}:${item.sessionId}`
@@ -845,8 +893,8 @@ export default function Sidebar({
                   )
                 })}
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       </div>
 
