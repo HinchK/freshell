@@ -29,6 +29,7 @@ mod network;
 mod proxy;
 mod rate_limit;
 mod recovery_inventory;
+mod repo_icon_detect;
 mod repo_icon_git;
 mod screenshots;
 mod serve_client;
