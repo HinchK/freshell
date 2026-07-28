@@ -992,9 +992,11 @@ naming convention, the full CI-parity run, and the final coordinated `npm test` 
 artifact names (`final-npm-test.log`, `final-cargo.log`, a `CI-PARITY-GREEN` marker) as of
 this writing — do not read the per-flake proof above as an implicit attestation that the
 full suite is green. This note is superseded by the "Certifying run (council round 2)"
-section appended below Task 8, which supplies the actual `final-npm-test.log` /
-`final-cargo.log` artifacts, a fresh 10x `rust-chromium` loop, and the exact commit SHA
-they were run against.
+section at the end of this report, which supplies the actual `final-npm-test.log` /
+`final-cargo.log` artifacts, the exact commit SHA they were run against, and the honest
+classification of the one red they produced. (The fresh full-suite 10x `rust-chromium`
+loop is a separate in-flight effort — `/tmp/deflake-logs/round2-10x*.log` — recorded by
+the lane running it, not claimed by this certification.)
 
 ### Per-flake summary
 
@@ -1245,6 +1247,20 @@ landed, not a re-litigation of already-verified fixes.
 4. **`client.test.ts` blast-radius rule (c)** ("Timed out waiting for fake Codex app-server"):
    grepped across all flake3/flake3b 10x logs this round — **zero occurrences**. Rule (c)
    never fired; no additional hardening needed there.
+5. **Post-restart pane reattach can head-truncate the first typed command** (possible product
+   bug, discovered deflaking HARNESS-01's post-restart round-trip: under full-parallel-suite
+   load the first command typed after a pane reattaches arrived at the PTY with its leading
+   bytes dropped — the buffer showed the marker UUID's tail plus "command not found";
+   evidence `/tmp/f3wp-refresh/e2e-rundiag1.log`). The test retries with a distinct marker
+   per attempt, which de-flakes the harness contract but does not fix or bound the product
+   behavior. Out of scope for this test-only lane. Filed as kata `dtfn`.
+6. **codex rollout status lane can fail to deliver `terminal.turn.complete` for 30+ seconds
+   under host load** (product-adjacent; inotify lane, no poll fallback). Evidence and full
+   classification in the "Certifying run (council round 2)" section below: the certifying
+   `cargo test --workspace` red burned the already-widened 30s frame-wait budget
+   (`/tmp/deflake-logs/final-cargo.log`, 35.42s), rerun green, 10/10 solo repeats green on
+   the `origin/main` baseline — pre-existing, load-only, not introduced by this branch.
+   Filed as kata `namg`.
 
 ### Kata framing correction
 
@@ -1255,3 +1271,63 @@ suspected real product race is escalated, not masked** (B3/kata `s52d`). None of
 originally-scoped flakes (wall-restart, sidebar case-a, remote-proxy EADDRINUSE in its
 retry-covered call site) are product bugs — the correction applies specifically to the
 pane_ledger addition and the two out-of-scope findings surfaced along the way.
+
+### Certifying run (council round 2)
+
+The Task 8 Step 3 coordinated + cargo gate, run to completion with the prescribed artifact
+names. Code tree under test: **`a32be570`** (HEAD at run time was a docs-only commit
+directly atop it — originally `335bebe6`, later rewritten in place to `0627f2cb` when a
+harness-01 block-scoping fix was folded in; the rewrite post-dates these runs, so the
+tested code tree is exactly `a32be570`'s).
+
+- **`npm test` (coordinated, `env -u FRESHELL_BIND_HOST`, summary "f3wp deflake final"):
+  GREEN.** `/tmp/deflake-logs/final-npm-test.log`, completed 2026-07-28 04:36:32,
+  `npm_status=0`. Suite totals: server 397 files passed / 3 skipped (4273 tests passed /
+  8 skipped), client 301 files passed / 3 skipped (4640 passed / 16 skipped), electron 34
+  files passed (350 passed). Zero failures.
+- **`cargo test --workspace` (first attempt): RED.** `/tmp/deflake-logs/final-cargo.log`,
+  completed 2026-07-28 04:38:12, `cargo_status=101`. Exactly one failure:
+  `fresh_pane_locator_identity_reaches_activity_and_turn_complete`
+  (`crates/freshell-ws/tests/codex_locator_activity.rs:249`), panic message "expected
+  terminal.turn.complete with provider=codex and sessionId stamped by the locator
+  adoption", test wall time **35.42s**. Every other suite block in the run is green.
+- **`cargo test --workspace` (immediate rerun): GREEN.**
+  `/tmp/deflake-logs/final-cargo-run2.log`, completed 2026-07-28 04:41:07, 0 failures
+  across all suite blocks. Both attempts are recorded here — the red is not superseded by
+  the green retry, it is classified below.
+
+**Classification of the red (honest, with baseline):**
+
+1. **It is the same assertion, but NOT the same failure the branch already fixed.** This
+   branch's `f2c505e9` widened `wait_for_frame` 10s→30s after a 15.43s instance of this
+   assertion (`/tmp/f3wp-refresh/cargo-runverify1.log`). The certifying red ran WITH that
+   30s budget — 35.42s total means the final wait burned its entire 30s. The
+   `terminal.turn.complete` frame was not delivered within 30 seconds of the
+   `task_complete` rollout append. `f2c505e9` therefore does **not** address this
+   instance: this is not a "late frame" that a budget can absorb, it is a frame that
+   plausibly never arrived.
+2. **Pre-existing on origin/main, not introduced by this branch.** The branch's only diff
+   to this test file is the wait budget; the production delivery path (inotify rollout
+   watcher → status watcher → WS broadcast) is identical on `origin/main`. Baseline
+   attempt on `origin/main` (`6537d65c`): **10/10 solo repeats green** (~5.4s each) — the
+   failure did not reproduce solo, consistent with its load-only profile. On this branch
+   the test was green in all 10 acceptance-round `cargo test -p freshell-ws` runs (under
+   concurrent Playwright + vitest load) and in the certifying rerun; it has failed twice
+   ever, both under heavy concurrent load (once at 10s, once at 30s).
+3. **Product-adjacent, escalated.** The same inotify lane drives turn-complete stamping in
+   production; an appended rollout event going unprocessed for 30+ seconds under host load
+   (with no poll fallback) would silently stall turn tracking for that pane. Filed as
+   **kata `namg`** ("codex rollout status lane can fail to deliver terminal.turn.complete
+   for 30+s under host load") with the full evidence chain; also added to the findings
+   ledger above.
+
+**Scope note:** this certification covers the coordinated `npm test` + `cargo test
+--workspace` gate (Task 8 Step 3). The fresh full-suite 10x `rust-chromium` loop
+(Task 8 Step 1's shape) is a separate in-flight effort (`/tmp/deflake-logs/round2-10x*.log`,
+started 04:41 by the concurrent lane) — its results are NOT claimed by this section and
+will be recorded by the lane running it. For the record, the earlier `/tmp/f3wp-refresh`
+"10 rounds green" table was a targeted affected-suite loop (the deflaked specs — wall +
+sidebar serial suites + harness-01 — at Playwright's default worker parallelism, run
+concurrently with `remote-proxy.test.ts` and `cargo test -p freshell-ws`), not a full
+`rust-chromium` project run; it proves the deflaked specs' stability under load, not
+full-suite green.

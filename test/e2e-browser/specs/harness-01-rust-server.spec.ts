@@ -204,8 +204,10 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       // marker per attempt (a stale partial echo of attempt N can never
       // satisfy attempt N+1). NOTE: the head-truncation itself is a
       // possible product-level issue (typed input during the recreate
-      // window can be silently lost) -- recorded in the verification
-      // report; this loop only de-flakes the harness contract.
+      // window can be silently lost) -- tracked as kata `dtfn` and listed
+      // in the plan doc's findings ledger
+      // (docs/plans/2026-07-27-deflake-load-flakes.md); this loop only
+      // de-flakes the harness contract.
       let roundTripped = false
       // DEFLAKE (f3wp council round 2, B4): the prior version kept only the
       // LAST attempt's error, silently discarding earlier ones. When all 3
