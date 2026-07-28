@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use freshell_protocol::{ErrorCode, ErrorMsg, ServerMessage};
 use freshell_terminal::FrameSink;
@@ -55,6 +56,11 @@ enum Entry {
         /// OTHER connections that re-sent this requestId and are owed a
         /// reply when the create settles or exits non-settled.
         waiters: Vec<FrameSink>,
+        /// When this sentinel was installed — the age stamp for the
+        /// `terminal_create_duplicate_in_flight` warn line (council
+        /// observability follow-up, PR #552): a duplicate arriving against
+        /// a MINUTES-old sentinel is a wedged create, not a race.
+        started: Instant,
     },
     /// The create settled: replay this exact `terminal.created` frame.
     Settled {
@@ -115,10 +121,53 @@ pub struct CreateDedupe {
 }
 
 impl CreateDedupe {
+    /// Register `sink` as a waiter on an in-flight entry (unless it is the
+    /// origin or already registered — compared by `Arc::ptr_eq`, the
+    /// per-connection sink is one Arc) and emit the duplicate-in-flight
+    /// warn line with the sentinel's age (council observability follow-up).
+    fn note_duplicate_in_flight(
+        request_id: &str,
+        sink: &FrameSink,
+        origin: &FrameSink,
+        waiters: &mut Vec<FrameSink>,
+        started: &Instant,
+    ) {
+        let already_known =
+            Arc::ptr_eq(origin, sink) || waiters.iter().any(|w| Arc::ptr_eq(w, sink));
+        if !already_known {
+            waiters.push(Arc::clone(sink));
+        }
+        tracing::warn!(
+            target: "freshell_ws::create_dedupe",
+            request_id = %request_id,
+            in_flight_age_ms = started.elapsed().as_millis() as u64,
+            "terminal_create_duplicate_in_flight"
+        );
+    }
+
+    fn fresh_sentinel(sink: &FrameSink) -> Entry {
+        Entry::InFlight {
+            origin: Arc::clone(sink),
+            waiters: Vec::new(),
+            started: Instant::now(),
+        }
+    }
+
     /// Look up `request_id`. Registers an InFlight sentinel (with `sink`
     /// as origin) on `Proceed`; registers `sink` as a waiter on
     /// `DuplicateInFlight` when it belongs to a different connection
     /// (compared by `Arc::ptr_eq` — the per-connection sink is one Arc).
+    ///
+    /// LOCK DISCIPLINE (council follow-up 2c, PR #552): the `is_running`
+    /// liveness probe is NEVER evaluated while the dedupe mutex is held.
+    /// The probe takes two `.expect()`ed registry locks
+    /// (registry.rs `is_pty_running`); probing under our lock would let ONE
+    /// poisoned registry lock cascade into a permanent process-wide create
+    /// outage through every "create_dedupe lock" expect. Scheme: read the
+    /// settled candidate under the lock, DROP the lock, probe, re-acquire
+    /// and RE-VALIDATE the entry is unchanged before acting; if it changed
+    /// while unlocked, decide from the fresh entry instead of the stale
+    /// snapshot.
     pub fn begin(
         &self,
         request_id: &str,
@@ -126,55 +175,109 @@ impl CreateDedupe {
         restore: Option<bool>,
         is_running: impl Fn(&str) -> bool,
     ) -> DedupeDecision {
-        let mut map = self.entries.lock().expect("create_dedupe lock");
-        match map.get_mut(request_id) {
-            Some(Entry::InFlight { origin, waiters }) => {
-                let already_known =
-                    Arc::ptr_eq(origin, sink) || waiters.iter().any(|w| Arc::ptr_eq(w, sink));
-                if !already_known {
-                    waiters.push(Arc::clone(sink));
+        // Phase 1: classify under the lock. Everything except the settled
+        // liveness question resolves here in one critical section.
+        let (settled_tid, settled_restore) = {
+            let mut map = self.entries.lock().expect("create_dedupe lock");
+            match map.get_mut(request_id) {
+                Some(Entry::InFlight {
+                    origin,
+                    waiters,
+                    started,
+                }) => {
+                    Self::note_duplicate_in_flight(request_id, sink, origin, waiters, started);
+                    return DedupeDecision::DuplicateInFlight;
                 }
-                DedupeDecision::DuplicateInFlight
+                Some(Entry::Settled {
+                    terminal_id,
+                    restore: settled_restore,
+                    ..
+                }) => (terminal_id.clone(), *settled_restore),
+                None => {
+                    map.insert(request_id.to_string(), Self::fresh_sentinel(sink));
+                    return DedupeDecision::Proceed;
+                }
+            }
+        };
+
+        // Phase 2: probe liveness with the lock RELEASED.
+        let running = is_running(&settled_tid);
+
+        // Phase 3: re-acquire and re-validate — the entry may have changed
+        // while we probed (another begin replaced it with a sentinel; a
+        // concurrent create re-settled it; a prune removed it).
+        let mut map = self.entries.lock().expect("create_dedupe lock");
+        #[allow(clippy::large_enum_variant)] // transient, once-per-begin; see `Entry`
+        enum Act {
+            Replay(ServerMessage),
+            InsertSentinel,
+        }
+        let act = match map.get_mut(request_id) {
+            Some(Entry::InFlight {
+                origin,
+                waiters,
+                started,
+            }) => {
+                // Raced: another same-id create won the window while we
+                // probed. Fold in as a duplicate of THAT create.
+                Self::note_duplicate_in_flight(request_id, sink, origin, waiters, started);
+                return DedupeDecision::DuplicateInFlight;
             }
             Some(Entry::Settled {
                 terminal_id,
                 created,
-                restore: settled_restore,
+                restore: now_restore,
             }) => {
-                // Same id, same `restore` flag, terminal still live: a
-                // genuine blind resend of the identical frame -- replay.
-                // Same id, DIFFERENT `restore` flag: this is a different
-                // request wearing the same id (e.g. a plain create's id
-                // later reused by a `restore:true` attempt while that
-                // terminal is still running) -- let it proceed to its own
-                // normal path instead of silently answering with the
-                // original terminal.
-                if is_running(terminal_id) && *settled_restore == restore {
-                    DedupeDecision::DuplicateSettled(created.clone())
-                } else if is_running(terminal_id) {
-                    DedupeDecision::Proceed
+                let unchanged = *terminal_id == settled_tid && *now_restore == settled_restore;
+                if unchanged {
+                    // Same id, same `restore` flag, terminal still live: a
+                    // genuine blind resend of the identical frame — replay.
+                    // Same id, DIFFERENT `restore` flag: a different request
+                    // wearing the same id (restore-latch flip,
+                    // redriveAfterLaunchInvalidTerminal) — proceed to its
+                    // own normal path. Dead terminal: evict and treat as
+                    // fresh (legacy delete-at-exit parity). BOTH Proceed
+                    // cases replace the stale settled entry with an
+                    // InFlight sentinel (council finding: a Proceed without
+                    // a sentinel leaves the in-flight window unguarded and
+                    // a second duplicate inside it would also Proceed →
+                    // duplicate PTY).
+                    if running && settled_restore == restore {
+                        Act::Replay(created.clone())
+                    } else {
+                        Act::InsertSentinel
+                    }
                 } else {
-                    // Terminal exited or killed: evict and treat as fresh
-                    // (legacy delete-at-exit parity).
-                    let origin = Arc::clone(sink);
-                    map.insert(
-                        request_id.to_string(),
-                        Entry::InFlight {
-                            origin,
-                            waiters: Vec::new(),
-                        },
-                    );
-                    DedupeDecision::Proceed
+                    // Re-settled while we probed: our probe answered a
+                    // stale question. The fresh entry settled microseconds
+                    // ago — treat it as live (evicting it on the strength
+                    // of a probe against the OLD terminal would clobber the
+                    // just-settled create and re-spawn a duplicate).
+                    if *now_restore == restore {
+                        Act::Replay(created.clone())
+                    } else {
+                        Act::InsertSentinel
+                    }
                 }
             }
-            None => {
-                map.insert(
-                    request_id.to_string(),
-                    Entry::InFlight {
-                        origin: Arc::clone(sink),
-                        waiters: Vec::new(),
-                    },
+            None => Act::InsertSentinel, // pruned/cleared while unlocked: fresh
+        };
+        match act {
+            Act::Replay(created) => {
+                let terminal_id = match map.get(request_id) {
+                    Some(Entry::Settled { terminal_id, .. }) => terminal_id.clone(),
+                    _ => String::new(), // unreachable: Replay only chosen from a Settled arm
+                };
+                tracing::debug!(
+                    target: "freshell_ws::create_dedupe",
+                    request_id = %request_id,
+                    terminal_id = %terminal_id,
+                    "terminal_create_duplicate_settled_replay"
                 );
+                DedupeDecision::DuplicateSettled(created)
+            }
+            Act::InsertSentinel => {
+                map.insert(request_id.to_string(), Self::fresh_sentinel(sink));
                 DedupeDecision::Proceed
             }
         }
@@ -194,7 +297,11 @@ impl CreateDedupe {
         restore: Option<bool>,
         is_running: impl Fn(&str) -> bool,
     ) {
-        let waiters = {
+        // Phase 1: install the settled entry, take the waiters, and SNAPSHOT
+        // the prune candidates — every OTHER settled entry's (id, terminal).
+        // The just-settled entry is excluded by construction: it was created
+        // microseconds ago and never needs a liveness probe to be trusted.
+        let (waiters, candidates) = {
             let mut map = self.entries.lock().expect("create_dedupe lock");
             let prev = map.insert(
                 request_id.to_string(),
@@ -204,19 +311,46 @@ impl CreateDedupe {
                     restore,
                 },
             );
-            // Prune-on-access (house pattern; no background task): a settled
-            // entry lives exactly as long as its terminal is running -- the
-            // legacy liveness-anchored model. Entries for exited or killed
-            // terminals are swept on every successful create's settle.
-            map.retain(|_, e| match e {
-                Entry::InFlight { .. } => true,
-                Entry::Settled { terminal_id, .. } => is_running(terminal_id),
-            });
-            match prev {
+            let candidates: Vec<(String, String)> = map
+                .iter()
+                .filter_map(|(id, e)| match e {
+                    Entry::Settled { terminal_id, .. } if id != request_id => {
+                        Some((id.clone(), terminal_id.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let waiters = match prev {
                 Some(Entry::InFlight { waiters, .. }) => waiters,
                 _ => Vec::new(),
-            }
+            };
+            (waiters, candidates)
         };
+
+        // Phase 2: probe liveness with the lock RELEASED (same lock
+        // discipline as `begin` — see its doc comment).
+        let dead: Vec<(String, String)> = candidates
+            .into_iter()
+            .filter(|(_, tid)| !is_running(tid))
+            .collect();
+
+        // Phase 3: prune-on-access (house pattern; no background task): a
+        // settled entry lives exactly as long as its terminal is running --
+        // the legacy liveness-anchored model. Re-validate under the lock:
+        // remove only entries STILL settled on the same terminal (an entry
+        // replaced while we probed is left alone).
+        if !dead.is_empty() {
+            let mut map = self.entries.lock().expect("create_dedupe lock");
+            for (id, tid) in dead {
+                if matches!(
+                    map.get(&id),
+                    Some(Entry::Settled { terminal_id, .. }) if *terminal_id == tid
+                ) {
+                    map.remove(&id);
+                }
+            }
+        }
+
         for w in waiters {
             w(created.clone());
         }
@@ -406,6 +540,157 @@ mod tests {
             origin_frames.lock().expect("frames").is_empty(),
             "same-sink duplicates must not be double-answered"
         );
+    }
+
+    /// Council finding (unanimous, PR #552 follow-up): the flag-mismatch
+    /// arm — settled entry exists, terminal live, but the incoming create's
+    /// `restore` flag differs — returned `Proceed` WITHOUT inserting an
+    /// InFlight sentinel. While that second create is in flight, another
+    /// same-requestId duplicate also got `Proceed` → duplicate PTY. Two
+    /// real client paths reach this: a persisted restore latch flipping a
+    /// lost fresh create into a same-requestId restore:true resend across
+    /// reload, and redriveAfterLaunchInvalidTerminal.
+    #[test]
+    fn flag_mismatch_proceed_registers_sentinel_blocking_further_duplicates() {
+        let d = CreateDedupe::default();
+        let (s1, _f1) = recording_sink();
+        // Settle R as a plain (restore=false) create; terminal stays live.
+        let _ = d.begin("r1", &s1, Some(false), |_| true);
+        d.settle("r1", "t1", &created_frame(), Some(false), |_| true);
+
+        // Same id, DIFFERENT flag: proceeds to its own create path...
+        assert!(matches!(
+            d.begin("r1", &s1, Some(true), |_| true),
+            DedupeDecision::Proceed
+        ));
+        // ...but MUST have registered an InFlight sentinel: a second
+        // duplicate while the first is unsettled must NOT also proceed.
+        assert!(
+            matches!(
+                d.begin("r1", &s1, Some(true), |_| true),
+                DedupeDecision::DuplicateInFlight
+            ),
+            "second same-requestId duplicate during the in-flight window must \
+             be deduped, not spawn a second PTY"
+        );
+    }
+
+    /// The sentinel installed by the flag-mismatch arm must behave exactly
+    /// like any other InFlight entry: clear_if_in_flight drops it (waiters
+    /// get the fail-loud error; a retry proceeds fresh) and settle replaces
+    /// it (waiters get the settled frame).
+    #[test]
+    fn flag_mismatch_sentinel_supports_clear_and_settle() {
+        // clear_if_in_flight path: waiter notified, retry proceeds fresh.
+        let d = CreateDedupe::default();
+        let (origin, _f1) = recording_sink();
+        let (other, other_frames) = recording_sink();
+        let _ = d.begin("r1", &origin, Some(false), |_| true);
+        d.settle("r1", "t1", &created_frame(), Some(false), |_| true);
+        let _ = d.begin("r1", &origin, Some(true), |_| true); // replaces Settled with InFlight
+        let _ = d.begin("r1", &other, Some(true), |_| true); // cross-conn waiter
+        d.clear_if_in_flight("r1");
+        {
+            let frames = other_frames.lock().expect("frames");
+            assert_eq!(frames.len(), 1, "waiter gets the fail-loud error");
+            assert!(matches!(
+                &frames[0],
+                ServerMessage::Error(err) if err.request_id.as_deref() == Some("r1")
+            ));
+        }
+        assert!(matches!(
+            d.begin("r1", &other, Some(true), |_| true),
+            DedupeDecision::Proceed
+        ));
+
+        // settle path: the replaced entry settles normally, waiter gets the
+        // frame, and the NEW settled flag governs later replays.
+        let d = CreateDedupe::default();
+        let (origin, _f2) = recording_sink();
+        let (other, other_frames) = recording_sink();
+        let _ = d.begin("r2", &origin, Some(false), |_| true);
+        d.settle("r2", "t1", &created_frame(), Some(false), |_| true);
+        let _ = d.begin("r2", &origin, Some(true), |_| true); // replaces Settled with InFlight
+        let _ = d.begin("r2", &other, Some(true), |_| true); // waiter
+        d.settle("r2", "t2", &created_frame(), Some(true), |_| true);
+        assert_eq!(
+            other_frames.lock().expect("frames").len(),
+            1,
+            "waiter receives the new settled frame"
+        );
+        // Replay now keys on the NEW restore flag.
+        assert!(matches!(
+            d.begin("r2", &other, Some(true), |_| true),
+            DedupeDecision::DuplicateSettled(_)
+        ));
+    }
+
+    /// Council follow-up (2c, lock decoupling): the liveness probe must
+    /// NEVER run while the dedupe mutex is held — `is_running` takes two
+    /// `.expect()`ed registry locks, so probing under our lock lets one
+    /// poisoned registry lock cascade into a permanent process-wide create
+    /// outage through the "create_dedupe lock" expects. Proof of the
+    /// decoupling: a probe that RE-ENTERS the dedupe (here:
+    /// clear_if_in_flight on another id) must complete instead of
+    /// self-deadlocking. Under the old probe-under-lock code this test
+    /// hangs forever (std::sync::Mutex is not reentrant).
+    #[test]
+    fn liveness_probe_can_reenter_dedupe_without_deadlock() {
+        let d = Arc::new(CreateDedupe::default());
+        let (s, _f) = recording_sink();
+        // A settled entry so begin() must consult the probe at all.
+        let _ = d.begin("r1", &s, None, |_| true);
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
+        // An unrelated in-flight sentinel the probe will clear.
+        let _ = d.begin("r-other", &s, None, |_| true);
+
+        let d2 = Arc::clone(&d);
+        let decision = d.begin("r1", &s, None, move |_| {
+            // Re-entrant dedupe call from inside the probe: only possible
+            // if the dedupe lock is NOT held around the probe.
+            d2.clear_if_in_flight("r-other");
+            true
+        });
+        assert!(matches!(decision, DedupeDecision::DuplicateSettled(_)));
+        // The re-entrant clear really happened.
+        assert!(matches!(
+            d.begin("r-other", &s, None, |_| true),
+            DedupeDecision::Proceed
+        ));
+    }
+
+    /// The race window the unlock-probe-relock scheme must close: the
+    /// entry can CHANGE while the probe runs outside the lock. If a
+    /// concurrent create re-settles the same requestId onto a NEW terminal
+    /// during the probe, begin() must act on the FRESH entry (replay the
+    /// new frame), never on its stale pre-probe snapshot (which would
+    /// evict the just-settled entry and spawn a duplicate).
+    #[test]
+    fn entry_resettled_during_probe_replays_fresh_frame_not_stale_eviction() {
+        let d = Arc::new(CreateDedupe::default());
+        let (s, _f) = recording_sink();
+        let _ = d.begin("r1", &s, None, |_| true);
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
+
+        let d2 = Arc::clone(&d);
+        let s2 = Arc::clone(&s);
+        // Probe says t1 is DEAD, and meanwhile (simulated concurrent
+        // create) the id is re-settled onto live t2 with a matching flag.
+        let decision = d.begin("r1", &s, None, move |_| {
+            d2.settle("r1", "t2", &created_frame(), None, |_| true);
+            let _ = &s2;
+            false // stale snapshot's terminal (t1) is dead
+        });
+        assert!(
+            matches!(decision, DedupeDecision::DuplicateSettled(_)),
+            "the freshly re-settled entry must be replayed; acting on the \
+             stale snapshot would evict it and spawn a duplicate"
+        );
+        // The fresh entry survives.
+        assert!(matches!(
+            d.begin("r1", &s, None, |_| true),
+            DedupeDecision::DuplicateSettled(_)
+        ));
     }
 
     #[test]
