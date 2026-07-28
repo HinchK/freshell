@@ -117,7 +117,12 @@ async function seedCodexRollout(homeDir: string, threadId: string, cwd: string):
 // semantics themselves are case-d territory (Task 8) -- here we just decline.
 async function declineRecoveryOfferIfShowing(page: import('@playwright/test').Page): Promise<void> {
   const panel = page.getByTestId('recovery-offer-panel')
-  const appeared = await panel.waitFor({ state: 'visible', timeout: 10_000 }).then(
+  // DEFLAKE (f3wp): under load the recovery overlay can render >10 s after
+  // reload; a swallowed miss leaves an inset-0 z-[60] overlay intercepting
+  // every later click, failing case-a far from the cause. 30 s bounds the
+  // worst case; tests where no offer appears pay the wait inside a 240 s
+  // per-test budget.
+  const appeared = await panel.waitFor({ state: 'visible', timeout: 30_000 }).then(
     () => true,
     () => false, // standalone run: no panes in server memory, no offer
   )
@@ -465,7 +470,7 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     ] as const) {
       const row = page.locator(`[data-session-id="${sessionId}"][data-provider="${mode}"]`)
       await expect(row).toHaveAttribute('data-has-tab', 'true', { timeout: 45_000 })
-      await expect(row).toHaveCount(1)
+      await expect(row).toHaveCount(1, { timeout: 45_000 })
     }
     // No provisional ghosts left over from respawned terminals.
     await expect(page.locator('[data-provider="codex"][data-session-id^="terminal:"]')).toHaveCount(0, { timeout: 45_000 })
@@ -474,8 +479,17 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     // restart -- assert the count INCREASED relative to the pre-restart
     // snapshot (an absolute >=N threshold would already be met pre-restart and
     // prove nothing about the respawn).
-    const resumesAfter = countResumes(await readArgvLog(path.join(sharedRoot, 'claude-argv.jsonl')))
-    expect(resumesAfter).toBeGreaterThan(resumesBefore)
+    // DEFLAKE (f3wp): sidebar rows go green from the ledger/registry join
+    // BEFORE the respawned `claude --resume` has necessarily exec'd and
+    // flushed its argv line -- a one-shot read raced that flush under load.
+    // Same assertion strength (before/after delta), now polled.
+    await expect
+      .poll(
+        async () =>
+          countResumes(await readArgvLog(path.join(sharedRoot, 'claude-argv.jsonl'))),
+        { timeout: 30_000 },
+      )
+      .toBeGreaterThan(resumesBefore)
   })
 
   // KEEP THIS SCENARIO LAST in the serial suite: it destroys the local
