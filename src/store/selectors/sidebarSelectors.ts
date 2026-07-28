@@ -563,6 +563,37 @@ export function collectRepoFilterOptions(
     .sort((a, b) => a.label.localeCompare(b.label) || a.value.localeCompare(b.value))
 }
 
+// 'all' cannot collide with a real sessionType in practice; mirrors ALL_REPOS.
+export const ALL_AGENTS = 'all'
+
+export interface AgentFilterOption {
+  value: string
+  label: string
+}
+
+export function filterSessionItemsByAgent(
+  items: SidebarSessionItem[],
+  agentFilter: string,
+): SidebarSessionItem[] {
+  if (agentFilter === ALL_AGENTS) return items
+  return items.filter((item) => item.sessionType === agentFilter)
+}
+
+export function collectAgentFilterOptions(
+  items: SidebarSessionItem[],
+  selected: string,
+  getLabel: (sessionType: string) => string,
+): AgentFilterOption[] {
+  const types = new Set<string>()
+  for (const item of items) {
+    if (item.sessionType) types.add(item.sessionType)
+  }
+  if (selected !== ALL_AGENTS) types.add(selected)
+  return [...types]
+    .map((value) => ({ value, label: getLabel(value) }))
+    .sort((a, b) => a.label.localeCompare(b.label) || a.value.localeCompare(b.value))
+}
+
 function filterSessionItemsForAppliedSearch(
   items: SidebarSessionItem[],
   appliedQuery: string,
