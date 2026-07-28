@@ -95,6 +95,11 @@ Create `crates/freshell-server/src/repo_icon_git.rs` containing ONLY the tests f
 //! - no `.git` anywhere      -> both roots = the starting path
 //! No `git` subprocess is spawned (deliberate, matching the Node reference).
 
+// TEMPORARY (removed in Task 6 Step 7): until Task 6 wires `resolve_repo`
+// into the HTTP layer, the non-test build sees everything here as dead code
+// and the per-task `clippy -D warnings` gate would fail without this.
+#![allow(dead_code)]
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +333,11 @@ Create `crates/freshell-server/src/repo_icon_detect.rs` with the module doc and 
 //! Repo icon detection: bounded, tiered candidate scan with scoring.
 //! Part 1 (this section): byte probes, hashing, framework-defaults blacklist.
 
+// TEMPORARY (removed in Task 6 Step 7): until Task 6 wires `detect_icon`
+// into the HTTP layer, the non-test build sees everything here as dead code
+// and the per-task `clippy -D warnings` gates (Tasks 2-5) would fail without this.
+#![allow(dead_code)]
+
 #[cfg(test)]
 mod probe_tests {
     use super::*;
@@ -451,7 +461,8 @@ pub(crate) fn ico_largest_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         }
         let w = if bytes[off] == 0 { 256 } else { bytes[off] as u32 };
         let h = if bytes[off + 1] == 0 { 256 } else { bytes[off + 1] as u32 };
-        if best.map_or(true, |(bw, _)| w > bw) {
+        // `is_none_or` (not `map_or(true, …)`) — clippy::unnecessary_map_or fires under -D warnings.
+        if best.is_none_or(|(bw, _)| w > bw) {
             best = Some((w, h));
         }
     }
@@ -1160,7 +1171,8 @@ fn web_manifest_candidates(sink: &mut CandidateSink) {
                     .unwrap_or(0);
                 // Rank: prefer the smallest size >= 64; else the largest below 64.
                 let rank = if size >= 64 { 1_000_000 - size } else { size };
-                if best.as_ref().map_or(true, |(r, _)| rank > *r) {
+                // `is_none_or` (not `map_or(true, …)`) — clippy::unnecessary_map_or fires under -D warnings.
+                if best.as_ref().is_none_or(|(r, _)| rank > *r) {
                     best = Some((rank, src.to_string()));
                 }
             }
@@ -2099,13 +2111,15 @@ Then add to the router chain, after `.merge(files::router(files_state))`:
 Run: `cargo test -p freshell-server repo_icon`
 Expected: PASS (git + detect + HTTP tests, ~35 total across the three modules).
 
-- [ ] **Step 7: Full Rust gate and commit**
+- [ ] **Step 7: Remove the temporary dead-code allows, run the full Rust gate, and commit**
+
+Now that the router wires `resolve_repo` and `detect_icon` into the non-test build, delete the `#![allow(dead_code)]` line (and its `// TEMPORARY …` comment) from BOTH `crates/freshell-server/src/repo_icon_git.rs` and `crates/freshell-server/src/repo_icon_detect.rs` (added in Tasks 1–2). The clippy gate below then verifies nothing is actually dead.
 
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p freshell-server
-git add crates/freshell-server/src/repo_icon.rs crates/freshell-server/src/files.rs crates/freshell-server/src/main.rs
+git add crates/freshell-server/src/repo_icon.rs crates/freshell-server/src/files.rs crates/freshell-server/src/main.rs crates/freshell-server/src/repo_icon_git.rs crates/freshell-server/src/repo_icon_detect.rs
 git commit -m "feat(rust): /api/repo-icon + /api/repo-icon/meta endpoints with sandboxing, ETag, SVG hardening"
 ```
 
@@ -2210,8 +2224,12 @@ In `test/unit/client/components/SettingsView.panes.test.tsx`, next to the existi
     )
     switchSettingsTab('Panes')
 
-    const row = screen.getByText('Repo icons on tabs').closest('div')!
-    const toggle = row.querySelector('button')!
+    // Do NOT copy the iconsOnTabs test's `closest('div')` pattern here: this
+    // row has a `description`, so SettingsRow nests the label inside an inner
+    // text-only div and `closest('div')` would return that div (no button in
+    // it). Select the switch by its accessible name instead — Step 7's Toggle
+    // sets aria-label="Toggle repo icons on tabs".
+    const toggle = screen.getByRole('switch', { name: 'Toggle repo icons on tabs' })
     fireEvent.click(toggle)
 
     expect(store.getState().settings.settings.panes.repoIconsOnTabs).toBe(false)
@@ -2225,7 +2243,7 @@ In `test/unit/client/components/SettingsView.panes.test.tsx`, next to the existi
 ```
 
 Run: `npm run test:vitest -- run test/unit/client/components/SettingsView.panes.test.tsx --config config/vitest/vitest.config.ts`
-Expected: FAIL — `Unable to find an element with the text: Repo icons on tabs`.
+Expected: FAIL — `Unable to find an accessible element with the role "switch" and name "Toggle repo icons on tabs"` (the row and its Toggle are added in Step 7).
 
 - [ ] **Step 7: Add the toggle UI**
 
