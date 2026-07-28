@@ -292,6 +292,307 @@ pub(crate) fn pick_best(repo_root: &Path, candidates: Vec<Candidate>) -> Option<
     scored.into_iter().next().map(|(_, _, _, _, path)| path)
 }
 
+pub(crate) struct CandidateSink {
+    pub repo_root: PathBuf,
+    pub out: Vec<Candidate>,
+    next_order: u32,
+}
+
+impl CandidateSink {
+    pub(crate) fn new(repo_root: PathBuf) -> Self {
+        Self {
+            repo_root,
+            out: Vec::new(),
+            next_order: 0,
+        }
+    }
+
+    pub(crate) fn push(&mut self, path: PathBuf, tier_base: i64) {
+        self.push_extra(path, tier_base, 0);
+    }
+
+    /// Only existing regular files become candidates; the order counter always
+    /// advances so enumeration order is stable regardless of what exists.
+    pub(crate) fn push_extra(&mut self, path: PathBuf, tier_base: i64, extra: i64) {
+        let order = self.next_order;
+        self.next_order += 1;
+        if path.is_file() {
+            self.out.push(Candidate {
+                path,
+                tier_base,
+                order,
+                extra,
+            });
+        }
+    }
+}
+
+fn read_json(path: &Path) -> Option<serde_json::Value> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > 1_048_576 {
+        return None;
+    }
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// Resolve a web-style src: relative to its document dir; absolute `/x`
+/// probed against public/, static/, then the repo root. Remote/data URLs skipped.
+fn resolve_web_src(root: &Path, doc_dir: &Path, src: &str) -> Vec<PathBuf> {
+    if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("data:") {
+        return Vec::new();
+    }
+    if let Some(rest) = src.strip_prefix('/') {
+        return vec![
+            root.join("public").join(rest),
+            root.join("static").join(rest),
+            root.join(rest),
+        ];
+    }
+    vec![doc_dir.join(src)]
+}
+
+/// First contiguous digit run in the basename ("128x128.png" -> 128).
+fn filename_size_hint(name: &str) -> Option<i64> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let digits: String = base
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+/// Best-effort JSON5 -> JSON: strip `//` line comments (outside strings,
+/// approximated by "no quote earlier on the line") and trailing commas.
+fn strip_json5(raw: &str) -> String {
+    let no_comments: String = raw
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(idx) if !line[..idx].contains('"') => &line[..idx],
+            _ => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    match regex::Regex::new(r",\s*([}\]])") {
+        Ok(re) => re.replace_all(&no_comments, "$1").into_owned(),
+        Err(_) => no_comments,
+    }
+}
+
+fn tauri_candidates(sink: &mut CandidateSink) {
+    let dir = sink.repo_root.join("src-tauri");
+    let mut icon_lists: Vec<Vec<String>> = Vec::new();
+    for name in ["tauri.conf.json", "tauri.conf.json5"] {
+        let path = dir.join(name);
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let cleaned = if name.ends_with(".json5") {
+            strip_json5(&raw)
+        } else {
+            raw
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&cleaned) else {
+            continue;
+        };
+        let arr = v
+            .pointer("/bundle/icon") // Tauri v2
+            .or_else(|| v.pointer("/tauri/bundle/icon")); // Tauri v1
+        if let Some(items) = arr.and_then(|a| a.as_array()) {
+            icon_lists.push(
+                items
+                    .iter()
+                    .filter_map(|i| i.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+    }
+    // Tauri.toml best-effort: regex the `icon = [ ... ]` array.
+    if let Ok(raw) = std::fs::read_to_string(dir.join("Tauri.toml")) {
+        if let Ok(re) = regex::Regex::new(r#"icon\s*=\s*\[([^\]]*)\]"#) {
+            if let Some(cap) = re.captures(&raw) {
+                let items: Vec<String> = cap[1]
+                    .split(',')
+                    .map(|s| s.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !items.is_empty() {
+                    icon_lists.push(items);
+                }
+            }
+        }
+    }
+    for items in icon_lists {
+        // Pick the .png closest to 128px by filename size hint.
+        let best = items
+            .iter()
+            .filter(|i| i.to_lowercase().ends_with(".png"))
+            .min_by_key(|i| filename_size_hint(i).map_or(i64::MAX, |s| (s - 128).abs()));
+        if let Some(rel) = best {
+            sink.push(dir.join(rel), TIER1);
+        }
+    }
+}
+
+fn web_manifest_candidates(sink: &mut CandidateSink) {
+    let root = sink.repo_root.clone();
+    for base in ["public", "static", "app", ""] {
+        let dir = if base.is_empty() {
+            root.clone()
+        } else {
+            root.join(base)
+        };
+        for name in ["manifest.json", "site.webmanifest", "manifest.webmanifest"] {
+            let Some(v) = read_json(&dir.join(name)) else {
+                continue;
+            };
+            // Icons must be an ARRAY (distinguishes web manifests from
+            // browser-extension manifests, whose icons is an object).
+            let Some(icons) = v.get("icons").and_then(|i| i.as_array()) else {
+                continue;
+            };
+            let mut best: Option<(i64, String)> = None; // (rank, src)
+            for icon in icons {
+                let Some(src) = icon.get("src").and_then(|s| s.as_str()) else {
+                    continue;
+                };
+                let purpose = icon
+                    .get("purpose")
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("any");
+                if !purpose.split_whitespace().any(|p| p == "any") {
+                    continue;
+                }
+                let size = icon
+                    .get("sizes")
+                    .and_then(|s| s.as_str())
+                    .and_then(|s| s.split(['x', 'X']).next())
+                    .and_then(|w| w.trim().parse::<i64>().ok())
+                    .unwrap_or(0);
+                // Rank: prefer the smallest size >= 64; else the largest below 64.
+                let rank = if size >= 64 { 1_000_000 - size } else { size };
+                // `is_none_or` (not `map_or(true, …)`) — clippy::unnecessary_map_or fires under -D warnings.
+                if best.as_ref().is_none_or(|(r, _)| rank > *r) {
+                    best = Some((rank, src.to_string()));
+                }
+            }
+            if let Some((_, src)) = best {
+                for resolved in resolve_web_src(&root, &dir, &src) {
+                    sink.push(resolved, TIER1);
+                }
+            }
+        }
+    }
+}
+
+fn index_html_candidates(sink: &mut CandidateSink) {
+    let root = sink.repo_root.clone();
+    let Ok(link_re) = regex::Regex::new(r"(?is)<link\b[^>]*>") else {
+        return;
+    };
+    let Ok(rel_re) = regex::Regex::new(r#"(?i)\brel\s*=\s*[\"']([^\"']+)[\"']"#) else {
+        return;
+    };
+    let Ok(href_re) = regex::Regex::new(r#"(?i)\bhref\s*=\s*[\"']([^\"']+)[\"']"#) else {
+        return;
+    };
+    let Ok(sizes_re) = regex::Regex::new(r#"(?i)\bsizes\s*=\s*[\"'](\d+)"#) else {
+        return;
+    };
+    for base in ["", "public", "src"] {
+        let dir = if base.is_empty() {
+            root.clone()
+        } else {
+            root.join(base)
+        };
+        let Ok(raw) = std::fs::read_to_string(dir.join("index.html")) else {
+            continue;
+        };
+        let head = raw.get(..raw.len().min(64 * 1024)).unwrap_or(&raw);
+        let mut found: Vec<(i64, String)> = Vec::new(); // (rank, href)
+        for tag in link_re.find_iter(head) {
+            let tag = tag.as_str();
+            let Some(rel) = rel_re.captures(tag).map(|c| c[1].to_lowercase()) else {
+                continue;
+            };
+            if !["icon", "shortcut icon", "apple-touch-icon"].contains(&rel.as_str()) {
+                continue;
+            }
+            let Some(href) = href_re.captures(tag).map(|c| c[1].to_string()) else {
+                continue;
+            };
+            let lower = href.to_lowercase();
+            let size = sizes_re
+                .captures(tag)
+                .and_then(|c| c[1].parse::<i64>().ok())
+                .unwrap_or(0);
+            // svg > largest png > ico > anything else.
+            let rank = if lower.ends_with(".svg") {
+                3_000_000
+            } else if lower.ends_with(".png") {
+                2_000_000 + size
+            } else if lower.ends_with(".ico") {
+                1_000_000
+            } else {
+                0
+            };
+            found.push((rank, href));
+        }
+        found.sort_by_key(|b| std::cmp::Reverse(b.0));
+        if let Some((_, href)) = found.into_iter().next() {
+            for resolved in resolve_web_src(&root, &dir, &href) {
+                sink.push(resolved, TIER1);
+            }
+        }
+    }
+}
+
+pub(crate) fn tier1(sink: &mut CandidateSink) {
+    let root = sink.repo_root.clone();
+    let pkg = read_json(&root.join("package.json"));
+    // 1. VS Code extension: icon field, only with engines.vscode present.
+    if let Some(pkg) = &pkg {
+        if pkg.pointer("/engines/vscode").is_some() {
+            if let Some(icon) = pkg.get("icon").and_then(|v| v.as_str()) {
+                sink.push(root.join(icon.trim_start_matches('/')), TIER1);
+            }
+        }
+    }
+    // 2. Browser extension manifest.json (icons is an OBJECT keyed by size).
+    if let Some(manifest) = read_json(&root.join("manifest.json")) {
+        if manifest.get("manifest_version").is_some() {
+            if let Some(icons) = manifest.get("icons").and_then(|v| v.as_object()) {
+                let pick = icons
+                    .get("128")
+                    .or_else(|| icons.get("48"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        icons
+                            .iter()
+                            .filter_map(|(k, v)| Some((k.parse::<u32>().ok()?, v.as_str()?)))
+                            .max_by_key(|(size, _)| *size)
+                            .map(|(_, src)| src.to_string())
+                    });
+                if let Some(src) = pick {
+                    sink.push(root.join(src.trim_start_matches('/')), TIER1);
+                }
+            }
+        }
+    }
+    // 3. Tauri.
+    tauri_candidates(sink);
+    // 4. electron-builder: package.json build.icon (its default paths are Tier 2).
+    if let Some(pkg) = &pkg {
+        if let Some(icon) = pkg.pointer("/build/icon").and_then(|v| v.as_str()) {
+            sink.push(root.join(icon.trim_start_matches('/')), TIER1);
+        }
+    }
+    // 5. Web app manifest.
+    web_manifest_candidates(sink);
+    // 6. index.html <link rel=icon>.
+    index_html_candidates(sink);
+}
 #[cfg(test)]
 mod probe_tests {
     use super::*;
@@ -503,5 +804,149 @@ mod scoring_tests {
             ],
         );
         assert_eq!(best, Some(root.join("b/icon.png")));
+    }
+}
+
+#[cfg(test)]
+mod tier1_tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn write_png_at(path: &Path, w: u32, h: u32) {
+        let mut b = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        b.extend_from_slice(&13u32.to_be_bytes());
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&w.to_be_bytes());
+        b.extend_from_slice(&h.to_be_bytes());
+        b.extend_from_slice(&[8, 6, 0, 0, 0]);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b).unwrap();
+    }
+
+    fn candidates_for(root: &Path) -> Vec<Candidate> {
+        let mut sink = CandidateSink::new(root.to_path_buf());
+        tier1(&mut sink);
+        sink.out
+    }
+
+    fn has(cands: &[Candidate], root: &Path, rel: &str) -> bool {
+        cands.iter().any(|c| c.path == root.join(rel))
+    }
+
+    #[test]
+    fn vscode_extension_icon_requires_engines_vscode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_png_at(&root.join("images/ext.png"), 128, 128);
+        fs::write(
+            root.join("package.json"),
+            r#"{ "icon": "images/ext.png", "engines": { "vscode": "^1.80.0" } }"#,
+        )
+        .unwrap();
+        assert!(has(&candidates_for(root), root, "images/ext.png"));
+        // Without engines.vscode the icon field is ignored.
+        fs::write(root.join("package.json"), r#"{ "icon": "images/ext.png" }"#).unwrap();
+        assert!(!has(&candidates_for(root), root, "images/ext.png"));
+    }
+
+    #[test]
+    fn browser_extension_manifest_prefers_128() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_png_at(&root.join("i48.png"), 48, 48);
+        write_png_at(&root.join("i128.png"), 128, 128);
+        fs::write(
+            root.join("manifest.json"),
+            r#"{ "manifest_version": 3, "icons": { "48": "i48.png", "128": "i128.png" } }"#,
+        )
+        .unwrap();
+        let cands = candidates_for(root);
+        assert!(has(&cands, root, "i128.png"));
+        assert!(!has(&cands, root, "i48.png"));
+    }
+
+    #[test]
+    fn tauri_v2_picks_png_closest_to_128() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_png_at(&root.join("src-tauri/icons/32x32.png"), 32, 32);
+        write_png_at(&root.join("src-tauri/icons/128x128.png"), 128, 128);
+        fs::write(
+            root.join("src-tauri/tauri.conf.json"),
+            r#"{ "bundle": { "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.icns"] } }"#,
+        )
+        .unwrap();
+        let cands = candidates_for(root);
+        assert!(has(&cands, root, "src-tauri/icons/128x128.png"));
+        assert!(!has(&cands, root, "src-tauri/icons/32x32.png"));
+    }
+
+    #[test]
+    fn electron_builder_icon_from_package_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_png_at(&root.join("build/app.png"), 256, 256);
+        fs::write(
+            root.join("package.json"),
+            r#"{ "build": { "icon": "build/app.png" } }"#,
+        )
+        .unwrap();
+        assert!(has(&candidates_for(root), root, "build/app.png"));
+    }
+
+    #[test]
+    fn web_manifest_picks_size_closest_to_64_and_maps_absolute_src() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_png_at(&root.join("public/i32.png"), 32, 32);
+        write_png_at(&root.join("public/i96.png"), 96, 96);
+        write_png_at(&root.join("public/i512.png"), 512, 512);
+        fs::write(
+            root.join("public/manifest.json"),
+            r#"{ "icons": [
+                { "src": "/i32.png", "sizes": "32x32" },
+                { "src": "/i96.png", "sizes": "96x96" },
+                { "src": "/i512.png", "sizes": "512x512", "purpose": "maskable" }
+            ] }"#,
+        )
+        .unwrap();
+        let cands = candidates_for(root);
+        assert!(has(&cands, root, "public/i96.png")); // smallest >= 64, purpose ok
+        assert!(!has(&cands, root, "public/i512.png")); // maskable filtered out
+    }
+
+    #[test]
+    fn web_manifest_requires_icons_array() {
+        // A browser-extension manifest (icons OBJECT) must not be treated as a web manifest.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_png_at(&root.join("public/i128.png"), 128, 128);
+        fs::write(
+            root.join("public/manifest.json"),
+            r#"{ "icons": { "128": "i128.png" } }"#,
+        )
+        .unwrap();
+        // No manifest_version either -> neither rule fires; no candidates.
+        assert!(candidates_for(root).is_empty());
+    }
+
+    #[test]
+    fn index_html_link_prefers_svg_then_largest_png_then_ico() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("fav.svg"), "<svg viewBox=\"0 0 16 16\"/>").unwrap();
+        write_png_at(&root.join("fav48.png"), 48, 48);
+        fs::write(
+            root.join("index.html"),
+            r#"<html><head>
+                <link rel="icon" sizes="48x48" href="/fav48.png">
+                <link rel="icon" href="/fav.svg">
+            </head></html>"#,
+        )
+        .unwrap();
+        let cands = candidates_for(root);
+        assert!(has(&cands, root, "fav.svg"));
+        assert!(!has(&cands, root, "fav48.png"));
     }
 }
