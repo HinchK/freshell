@@ -975,3 +975,215 @@ The plan's assumptions were validated post-write (ledger: `.the-usual-logs/defla
 2. **No silent deferrals introduced** — the client.test.ts hardening is conditional-on-evidence with an explicit trigger (blast-radius rule c), and the `/api/server-info` auth-shape check is a read-first instruction with a concrete verified fallback (401-on-wrong-token behavior), not a TBD.
 3. **Placeholder scan** — all new code blocks are complete; the only conditional instruction (TMPDIR vs PID/mtime fossil attribution) carries both concrete branches.
 4. **Type consistency of new code** — `pickerCalls` assertion uses the same `portPicker` seam; the identity fetch reuses `info.baseUrl` + the loop's `token`; the widened retry predicate adds only the synthetic `bind race` prefix thrown two lines above it.
+
+## Verification report
+
+Written during a post-review "council fix round" (7-lens review voted MERGE AFTER FIXES,
+blocking items B1-B4 below) rather than at original authoring time, so it also closes
+the four blocking gaps the council found: a missing origin/main baseline, a missing
+committed verification report, a missing STOP-gate record, and a non-diagnosing
+harness-01 timeout.
+
+### Per-flake summary
+
+**Flake 1 — wall-rust double-restart (`restore-contract-wall-rust.spec.ts:2063`, "double-restart
+mid-recovery: a second SIGKILL during recovery must not duplicate or wedge")**
+
+- Root cause: worst-case serial gate budget (20+45+60+30+60+30 s = 245 s) plus 3 serialized
+  boot/health budgets structurally exceeded the describe-level 180 s timeout under full
+  parallel-suite load; no WS-ready gate existed after the first SIGKILL, so the 45 s
+  argv-growth poll could burn its whole budget waiting on a spawn that couldn't start
+  until the client had reconnected.
+- Fix (test-only): `test.setTimeout(600_000)` override with worst-case arithmetic in a
+  comment; explicit 30 s click timeout; `waitForWsReady(page)` gate inserted before the
+  post-first-SIGKILL argv poll.
+- Proof: this specific test shows **zero failures** across all 10 of this branch's own
+  e2e-browser 10x acceptance runs (`/tmp/deflake-logs/e2eb-10x-run{1..10}.log`) and **zero
+  failures** across all 10 of the fresh origin/main baseline runs captured for this fix
+  round (`/tmp/deflake-baseline/baseline-10x-run{1..10}.log`, see B1 below). A *different*
+  test in the same file ("THE RULER: all pane types live, one SIGKILL, every §2 contract
+  holds", line 1359, NOT touched by this branch) fails on **both** origin/main (10/10 baseline
+  runs) and this branch (present in the same run's failure list) — confirming it is an
+  unrelated, pre-existing flake outside this task's scope.
+
+**Flake 2 — sidebar case-a (`sidebar-registry-sync-rust.spec.ts`, "case-a: sidebar joins survive
+a graceful server restart")**
+
+- Root cause: the respawn proof was a one-shot, unpolled read of the claude-argv log —
+  sidebar rows go green from the registry join before the respawned `claude --resume` has
+  necessarily exec'd and flushed its argv line. Secondary contributors: the recovery-decline
+  overlay's `waitFor` used the ambient 10 s default while its sibling gate got 45 s, and
+  `toHaveCount` had no explicit timeout.
+- Fix (test-only): `declineRecoveryOfferIfShowing` timeout raised 10 s → 30 s; explicit
+  45 s `toHaveCount` timeout; the argv-resume-count assertion changed from a one-shot read
+  to a 30 s `expect.poll`, keeping the same before/after-delta assertion strength.
+- Proof: this test shows **zero failures** in this branch's final acceptance run
+  (`/tmp/deflake-logs/e2eb-10x-run10.log`, all 4 sidebar-registry-sync cases green). On the
+  fresh origin/main baseline (unfixed code, B1 below), case-a **failed in 4 of 10 runs**
+  (baseline runs 7, 8, 9, 10) — direct evidence this is a real, pre-existing, load-sensitive
+  flake that the poll-based fix addresses (n=1 post-fix pass is not as strong as flakes 3/4's
+  dedicated 10x isolation, since this flake was only proven inside the shared full-project
+  loop, not a standalone repro loop — recorded here rather than overstated).
+
+**Flake 3 — remote-proxy EADDRINUSE (`test/unit/server/coding-cli/codex-app-server/remote-proxy.test.ts`)**
+
+- Root cause: `allocateLocalhostPort`'s close-then-rebind TOCTOU is production code
+  (`server/local-port.ts`) whose own doc comment says callers must retry; `CodexRemoteProxy.start()`
+  does not retry (unlike its sibling `CodexAppServerRuntime.start()`, which has a
+  `startupAttemptLimit` loop at `runtime.ts:1498`). Under `pool: 'threads'` /
+  `maxConcurrency: 10` / shuffle, the test harness's own `startProxy()` helper hit this
+  47 times per pass.
+- Fix (test-only): new regression test proving `startProxy` retries when the harness injects
+  a retrying `portAllocator`, now with an anti-vacuity call-count assertion added this round
+  (see Cheap fixes below) so an unconsumed seam can't pass vacuously.
+- Proof / residual risk: the dedicated Task 6 acceptance loops (`/tmp/deflake-logs/flake3-10x.log`
+  9/10 red, `flake3b-10x.log` 9/10 red) look alarming in isolation, but **none of the reds are
+  in the new retry test itself** — every failure is a *different*, pre-existing test in the
+  same file or an unrelated file (`ws-sidebar-snapshot-refresh.test.ts`, `network-manager.test.ts`,
+  `session-repair-service.test.ts`, `opencode-serve-manager.test.ts`) failing under full
+  `test:server` parallel load. This matches the authoring-time A/B baseline already on disk
+  (`/tmp/deflake-logs/rp-ab.log`): origin/main's own (unmodified) remote-proxy files run
+  standalone 10x are **10/10 green**, but the same origin/main files run inside the full
+  `test:server` suite 3x are **3/3 red** — proving the full-suite-level flakiness in this
+  area is pre-existing/environmental, not introduced by this branch. One genuine EADDRINUSE
+  did land in-scope: `flake3b-10x-run10.log` (lines 243, 803) shows
+  `listen EADDRINUSE: address already in use 127.0.0.1:42935` failing
+  `CodexRemoteProxy > fails closed for large thread/start root-array upstream batches before
+  forwarding` — a *different* test that does not use a retrying `portAllocator`, i.e. it hit
+  the raw, unretried production path. This is exactly finding (1) below, not a new regression.
+
+**Flake 4 — pane_ledger lock test (`crates/freshell-ws/src/pane_ledger_tests.rs`,
+`new_locked_degrades_to_disabled_when_another_holder_exists`)**
+
+- Root cause: the kata's "cross-lane flock contention" framing does not hold — the lock
+  path is PID-scoped. Four on-disk fossils proved the real failure was the third
+  `new_locked` coming up blind (index either genuinely absent post-lock-failure or silently
+  emptied), with the diagnosing errno dropped because the lib test binary installs no
+  tracing subscriber.
+- Fix (test-only): rewritten to probe the on-disk truth (`s1.json` exists) and re-acquire
+  the lock through the same private `acquire_store_lock` path production uses, so any Err
+  surfaces its errno/kind instead of being swallowed.
+- Proof: `/tmp/deflake-logs/flake4b-10x.log` — **9 of 10** TMPDIR-isolated runs green;
+  **run 10 hit the new diagnostic** (see STOP-gate below) rather than reproducing the old,
+  silent failure. Per the plan's own decision gate ("any run fails WITH the new diagnostics
+  firing → STOP on this item, do not add retries"), this is the correct, intended outcome —
+  the diagnostics did their job. Focused re-run this fix round: `cargo test -p freshell-ws --lib
+  pane_ledger::tests::new_locked_degrades_to_disabled_when_another_holder_exists` → PASS.
+
+### B1 — Origin/main baseline attribution (this fix round)
+
+The kata's acceptance bar (line ~8, "10x consecutive green runs") was never met by this
+branch's own authoring-time e2e loop (`e2eb-10x.log`: 10/10 red). No origin/main baseline
+existed to attribute those reds against, so this round ran the **identical** full
+`--project=rust-chromium` loop, 10x sequentially, against a fresh `git worktree add --detach`
+checkout of `origin/main` (`6537d65c`) in an isolated worktree/build (so as not to disturb the
+live self-hosted server on the main checkout), full logs at `/tmp/deflake-baseline/baseline-10x*.log`:
+
+| Run | Branch (e2eb, post-fix) | Baseline (origin/main, fresh) |
+|---|---|---|
+| 1 | 13 failed / 150 passed (4.0m) | 14 failed / 149 passed (6.0m) |
+| 2 | 13 failed / 150 passed (3.7m) | 17 failed / 146 passed (6.0m) |
+| 3 | 15 failed / 148 passed (3.9m) | 15 failed / 148 passed (6.0m) |
+| 4 | 14 failed / 149 passed (3.9m) | 13 failed / 150 passed (6.0m) |
+| 5 | 15 failed / 148 passed (3.8m) | 14 failed / 149 passed (6.0m) |
+| 6 | 14 failed / 149 passed (4.2m) | 16 failed / 147 passed (6.0m) |
+| 7 | 16 failed / 147 passed (3.6m) | 17 failed / 145 passed (6.1m) |
+| 8 | 14 failed / 149 passed (3.6m) | 17 failed / 145 passed (6.3m) |
+| 9 | 13 failed / 150 passed (3.8m) | 15 failed / 147 passed (6.4m) |
+| 10 | 14 failed / 149 passed (3.7m) | 15 failed / 147 passed (6.3m) |
+
+**Both origin/main and this branch are 10/10 red under current host load**, with comparable
+failure counts (13-17 both sides) — the baseline is if anything a harsher run (6.0-6.4 min/run
+vs. the branch's 3.6-4.2 min/run, reflecting heavier concurrent host load during the baseline
+window: dozens of other agent worktrees building/testing concurrently, confirmed via `ps`/`uptime`
+at the time). The failing spec set is near-identical on both sides: `codex-status-completeness-rust.spec.ts`
+(sessionId on turn-complete), `multi-client.spec.ts`, `settings-live-reload.spec.ts`,
+`term13-scrollback-boundary.spec.ts`, ~8-10 sub-tests of `terminal-lifecycle.spec.ts`,
+`hidden-pane-rebind-rust.spec.ts`, and `restore-contract-wall-rust.spec.ts`'s unrelated "THE
+RULER" test — all present on **both** origin/main and this branch, all **outside** the four
+flakes this branch touches. This confirms the tester-breaker's earlier grep finding (zero
+bind-race/EADDRINUSE/server-info boot failures across all ten reds; reds dominated by
+reattach/recovery timeouts) and extends it: those reattach/recovery timeouts are not new —
+they reproduce identically on unmodified origin/main under the same load.
+
+**`harness-01-rust-server.spec.ts:84` explicit attribution** (mandatory per council review,
+since this branch modified this spec's marker2 budget and, this round, added timeout
+diagnostics): counting genuine failures (via each run's `test-failed-*.png` artifact, not
+just string occurrences of the test name, which also appear in normal progress output):
+
+| | Runs failed | Rate |
+|---|---|---|
+| Origin/main baseline (unmodified, still on the original 20 s marker2 budget) | 3 of 10 (runs 3, 7, 8) | 30% |
+| This branch, e2eb-10x (60 s marker2 budget, pre-this-round evidence) | 3 of 10 (runs 7, 8, 10) | 30% |
+
+Identical 30% failure rate on both sides. The branch's 20 s→60 s budget increase neither
+regressed nor (in this snapshot) measurably improved the rate — it is a **pre-existing,
+load-proportional flake**, not something this branch introduced. What the branch's marker2
+budget change *did* do incorrectly was claim (in a comment) that the leg passed "comfortably
+in isolation" as if the wider budget were sufficient; the run 10 red
+(`/tmp/deflake-logs/e2eb-10x-run10.log:1089`, bare `TimeoutError: page.waitForFunction: Timeout
+60000ms exceeded`) proves it is not always sufficient under full-project load, and gave no way
+to tell *why*. This fix round's B4 change (below) corrects the comment and makes the failure
+mode diagnosable going forward.
+
+**Why the 10x bar was not met, and what changes as a result:** the kata's literal acceptance
+bar ("full e2e suite 10x consecutive green at local unbounded parallelism") cannot be met by
+*any* version of this codebase right now, including unmodified origin/main, under the current
+level of concurrent host load (confirmed above: origin/main is also 10/10 red). The bar was
+written assuming a host running only this suite; the actual environment during both the
+original authoring run and this fix round's baseline had dozens of other agent worktrees
+building and testing concurrently. This branch's four targeted fixes are verified correct
+(each flake's *specific* failure mode is fixed or, for flake 4, correctly escalated rather
+than masked) via the dedicated per-flake 10x/A-B evidence above; the *aggregate* full-suite
+10x green bar is a separate, environmental precondition this branch cannot control and does
+not regress. Recommendation: treat the four flakes as closed on their own dedicated evidence:
+kata f3wp's "none product bugs" framing is corrected (see findings below), and the aggregate
+10x bar should be re-attempted on a quiescent host, or restated as a per-flake bar, in a
+follow-up.
+
+### B3 — STOP-gate record (suspected real product race)
+
+`flake4b-10x-run10.log` (lines 265-266) — the new diagnostic probe added in Task 7 fired for
+real, rather than reproducing the old silent failure:
+
+```
+thread 'pane_ledger::tests::new_locked_degrades_to_disabled_when_another_holder_exists' (2952647) panicked at crates/freshell-ws/src/pane_ledger_tests.rs:190:21:
+acquire_store_lock failed after holder drop: errno=Some(11) kind=WouldBlock (EWOULDBLOCK => flock genuinely still held after drop; ENOSPC/EMFILE/EACCES => resource pressure, H1)
+```
+
+Per the plan's own decision gate (§ Task 7 Step 4), a diagnostics-firing failure is NOT
+retry-masked. This is recorded here as a **suspected real product race**: errno 11
+(`EWOULDBLOCK`) on Linux `flock(LOCK_EX|LOCK_NB)` specifically means the lock was still held
+at acquisition time — which should be impossible immediately after the holding `PaneLedger`'s
+`Drop` released the flock, unless (a) a genuine race exists between `Drop`'s release and the
+next acquirer under host contention, or (b) a different concurrently-running holder (test or
+process) still had the lock. This is escalated, not fixed, per the test-only lane fence.
+Filed as kata `s52d` ("pane_ledger flock still held after drop (EWOULDBLOCK) — suspected
+product race caught by deflake probe").
+
+### Findings ledger
+
+1. **`CodexRemoteProxy.start()` does not honor `allocateLocalhostPort`'s retry contract**
+   (production gap, `server/coding-cli/codex-app-server/remote-proxy.ts:152-176`, contrast
+   `CodexAppServerRuntime`'s `startupAttemptLimit` at `runtime.ts:1498`). Evidence:
+   `/tmp/deflake-logs/flake3b-10x-run10.log` lines 243/803. Out of scope for this test-only
+   lane. Filed as kata `des0`.
+2. **`pane_ledger::load_index()` silently swallows I/O errors** (`pane_ledger.rs` ~299-321),
+   which combined with `new_locked()`'s Err→DISABLED mapping (~236-256) means a restarted
+   server can come up blind/disabled with no loud signal. Relates to kata `9s8p` (pane-ledger
+   lineage). Out of scope for this test-only lane. Filed as kata `qzka`.
+3. **STOPPED items:** flake 4's diagnostic probe (see B3 above) — filed as kata `s52d`, not
+   masked with a retry.
+4. **`client.test.ts` blast-radius rule (c)** ("Timed out waiting for fake Codex app-server"):
+   grepped across all flake3/flake3b 10x logs this round — **zero occurrences**. Rule (c)
+   never fired; no additional hardening needed there.
+
+### Kata framing correction
+
+Kata f3wp's original framing enumerated three flakes and asserted "none product bugs"; the
+pane_ledger lock test (a fourth, noted by C1's report) and this round's B1/B3/findings work
+correct that: **two production gaps are now on record** (findings 1-2 above) and **one
+suspected real product race is escalated, not masked** (B3/kata `s52d`). None of the three
+originally-scoped flakes (wall-restart, sidebar case-a, remote-proxy EADDRINUSE in its
+retry-covered call site) are product bugs — the correction applies specifically to the
+pane_ledger addition and the two out-of-scope findings surfaced along the way.
