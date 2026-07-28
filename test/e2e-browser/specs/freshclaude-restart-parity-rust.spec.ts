@@ -350,6 +350,17 @@ test.describe('freshclaude restart parity (rust)', () => {
       await fsp.mkdir(projectDir, { recursive: true })
       await createFreshclaudePane(page, harness, projectDir)
 
+      // Capture the run's durable id (fixture id is random per process now;
+      // the sdk.session.init fold lands at create, before any send).
+      let busyDurable = ''
+      await expect
+        .poll(async () => {
+          const layout = await harness.getPaneLayout(tabId)
+          busyDurable = liveDurableIdentity(findFreshAgentLeaf(layout))
+          return busyDurable
+        })
+        .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+
       // First send wedges (fixture holds the first turn forever): status stuck busy.
       // Wait for idle BEFORE filling (donor sendFreshAgentTurn's pre-send poll,
       // :371-391) -- but do NOT wait for idle after: this turn never completes.
@@ -387,7 +398,7 @@ test.describe('freshclaude restart parity (rust)', () => {
         .split('\n')
         .filter(Boolean)
         .map((l) => JSON.parse(l))
-        .some((e) => e.msg?.type === 'create' && e.msg?.resumeSessionId === originalDurable)
+        .some((e) => e.msg?.type === 'create' && e.msg?.resumeSessionId === busyDurable)
       expect(resumed).toBe(true)
     } finally {
       await server.stop().catch(() => {})
