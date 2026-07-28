@@ -30,6 +30,13 @@
 //! (non-restore) creates do the opposite: they are rate-limited but BYPASS
 //! this gate entirely, so a human clicking "new terminal" gets an instant
 //! create with zero queueing latency.
+//!
+//! Accepted scope: non-restore (interactive) creates intentionally bypass
+//! this gate and therefore have NO server-wide concurrency bound. freshell
+//! is a single-user, token-authenticated deployment, so the per-connection
+//! rate limiter — rate-shaping, not a hard bound — is accepted as
+//! sufficient protection for that path. Decision recorded on PR #552 after
+//! council review (post-c3268185).
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;

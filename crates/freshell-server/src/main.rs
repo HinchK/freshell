@@ -484,6 +484,20 @@ async fn main() -> ExitCode {
     // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
     // are guaranteed to come from the same env snapshot.
     let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();
+    // Boot visibility (council observability follow-up, PR #552): the ONE
+    // authoritative line stating the resolved create-protection posture —
+    // env-overridable knobs plus the fact that requestId dedupe is active —
+    // so a support bundle answers "what protection was this boot running?"
+    // without source-diving.
+    tracing::info!(
+        spawn_gate_concurrency = create_protect.spawn_concurrency,
+        spawn_gate_queue_cap = create_protect.spawn_queue_cap,
+        spawn_gate_timeout_ms = create_protect.spawn_timeout_ms,
+        rate_limit = create_protect.rate_limit,
+        rate_window_ms = create_protect.rate_window_ms,
+        request_id_dedupe = "active",
+        "create_protection_config"
+    );
     // Shutdown latch shared with shutdown_signal (Task 7 wires the setter).
     let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // P1.8: the pane-identity ledger (spec §4.2). Root resolved ONCE here;
