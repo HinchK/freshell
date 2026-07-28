@@ -487,6 +487,30 @@ async fn main() -> ExitCode {
     // Resolved ONCE so the rate-limit knobs and the gate the handlers consult
     // are guaranteed to come from the same env snapshot.
     let create_protect = freshell_ws::create_limit::CreateProtectConfig::from_env();
+    // Kata enn3: ONE server-wide spawn gate shared by BOTH create doors —
+    // WS terminal.create (restore path, via create_gate) AND the freshagent
+    // REST pipeline (/api/tabs, /api/panes/{id}/split,
+    // /api/panes/{id}/respawn). A single concurrency budget, never two
+    // parallel budgets; pinned by
+    // crates/freshell-ws/tests/rest_ws_shared_gate.rs. Post-construction
+    // setter (ledger precedent): create_protect resolves here, after the
+    // last fresh_agent_state builder rebinding. SpawnGate::new passes the
+    // (already env-sanitized) values straight through.
+    let spawn_gate = std::sync::Arc::new(freshell_freshagent::spawn_gate::SpawnGate::new(
+        create_protect.spawn_concurrency,
+        create_protect.spawn_queue_cap,
+    ));
+    fresh_agent_state.set_spawn_gate(
+        std::sync::Arc::clone(&spawn_gate),
+        std::time::Duration::from_millis(create_protect.spawn_timeout_ms),
+    );
+    // Boot assertion (council enn3 follow-up): the OnceLock is a fail-OPEN
+    // seam — unwired means every REST create runs ungated. Fail LOUD at boot
+    // if the wiring above ever regresses.
+    assert!(
+        fresh_agent_state.spawn_gate_wired(),
+        "spawn-gate OnceLock must be wired at startup (REST creates would run ungated)"
+    );
     // Boot visibility (council observability follow-up, PR #552): the ONE
     // authoritative line stating the resolved create-protection posture —
     // env-overridable knobs plus the fact that requestId dedupe is active —
@@ -595,9 +619,9 @@ async fn main() -> ExitCode {
         ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
         term09: freshell_ws::backpressure::Term09Config::from_env(),
         create_protect,
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::from_config(
-            &create_protect,
-        )),
+        // THE kata-enn3 pin: the WS door holds the SAME gate Arc as the
+        // REST door (never a second budget minted here).
+        spawn_gate: std::sync::Arc::clone(&spawn_gate),
         shutdown_started: std::sync::Arc::clone(&shutdown_started),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         pane_ledger: std::sync::Arc::clone(&pane_ledger),
