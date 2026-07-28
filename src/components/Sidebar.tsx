@@ -12,7 +12,13 @@ import { resolveSessionTypeConfig, buildResumeContent } from '@/lib/session-type
 import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import type { BackgroundTerminal, CodingCliProviderName } from '@/store/types'
-import { makeSelectSortedSessionItems, type SidebarSessionItem } from '@/store/selectors/sidebarSelectors'
+import {
+  ALL_REPOS,
+  collectRepoFilterOptions,
+  filterSessionItemsByRepo,
+  makeSelectSortedSessionItems,
+  type SidebarSessionItem,
+} from '@/store/selectors/sidebarSelectors'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { getActiveSessionRefForTab } from '@/lib/session-utils'
 import { useStableArray } from '@/hooks/useStableArray'
@@ -226,6 +232,9 @@ export default function Sidebar({
   const appliedSearchTier = sidebarWindow?.appliedSearchTier ?? 'title'
   const [filter, setFilter] = useState(requestedQueryValue)
   const [searchTier, setSearchTier] = useState<typeof requestedSearchTier>(requestedSearchTier)
+  // Repo filter is deliberately component-local and never persisted:
+  // a browser refresh must reset it to 'all' (spec requirement).
+  const [repoFilter, setRepoFilter] = useState<string>(ALL_REPOS)
   const localQuery = filter.trim()
   const localMatchesRequestedSearch = filter === requestedQueryValue && searchTier === requestedSearchTier
 
@@ -308,7 +317,19 @@ export default function Sidebar({
   ])
 
   const localFilteredItems = useAppSelector((state) => selectSortedItems(state, terminals, ''))
-  const computedItems = useMemo(() => localFilteredItems, [localFilteredItems])
+  // Options come from the PRE-repo-filter list so every repo stays listed while
+  // one is selected; the current selection is retained even if its rows are
+  // temporarily absent (e.g. mid-search), keeping the controlled select valid.
+  const repoOptions = useMemo(
+    () => collectRepoFilterOptions(localFilteredItems, repoFilter),
+    [localFilteredItems, repoFilter],
+  )
+  // ANDs with the selector pipeline (visibility + applied search + sort),
+  // which has already run inside selectSortedItems.
+  const computedItems = useMemo(
+    () => filterSessionItemsByRepo(localFilteredItems, repoFilter),
+    [localFilteredItems, repoFilter],
+  )
 
   // Stabilize the array reference so react-window doesn't rebuild all row
   // elements when the selector produces new objects with identical field
@@ -689,6 +710,32 @@ export default function Sidebar({
             ) : null}
           </div>
         </div>
+        {repoOptions.length > 0 && (
+          <div className="mt-2 flex items-center gap-1">
+            <select
+              aria-label="Repo filter"
+              value={repoFilter}
+              onChange={(e) => setRepoFilter(e.target.value || ALL_REPOS)}
+              className="min-w-0 flex-1 h-7 px-2 text-xs bg-muted/50 border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+            >
+              <option value={ALL_REPOS}>All</option>
+              {repoOptions.map((option) => (
+                <option key={option.value} value={option.value} title={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            {repoFilter !== ALL_REPOS ? (
+              <button
+                aria-label="Clear repo filter"
+                onClick={() => setRepoFilter(ALL_REPOS)}
+                className="p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
+          </div>
+        )}
         {localQuery && (
           <div className="mt-2">
             <select
@@ -757,7 +804,9 @@ export default function Sidebar({
             </div>
           ) : (
           <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-            {visibleQuery && visibleSearchTier !== 'title'
+            {repoFilter !== ALL_REPOS
+              ? 'No sessions in selected repo'
+              : visibleQuery && visibleSearchTier !== 'title'
               ? 'No results found'
               : visibleQuery
               ? 'No matching sessions'
