@@ -3670,9 +3670,7 @@ mod tests {
 
             let r = router.clone();
             let req =
-                tokio::spawn(
-                    async move { post(r, "/api/tabs", shell_create_body(), true).await },
-                );
+                tokio::spawn(async move { post(r, "/api/tabs", shell_create_body(), true).await });
             // Wait until the request is a queued waiter (held permit => the
             // fast path fails and the waiter counts toward queued_total).
             let mut waited = 0u32;
