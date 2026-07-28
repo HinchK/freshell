@@ -1234,6 +1234,144 @@ describe('sessionsThunks', () => {
     expect(windowState.resultVersion).toBe(12)
   })
 
+  it('preserves deeper loaded pages when a live refresh returns only page 1 (no truncation)', async () => {
+    const pageOneProject = {
+      projectPath: '/tmp/project-a',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-new',
+        projectPath: '/tmp/project-a',
+        lastActivityAt: 5_000,
+        title: 'Newest session',
+      }],
+    }
+    const deepProject = {
+      projectPath: '/tmp/project-b',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-old',
+        projectPath: '/tmp/project-b',
+        lastActivityAt: 1_000,
+        title: 'Old paginated session',
+      }],
+    }
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: [pageOneProject, deepProject],
+      lastLoadedAt: 5_000,
+      windows: {
+        sidebar: {
+          projects: [pageOneProject, deepProject],
+          lastLoadedAt: 5_000,
+          query: '',
+          searchTier: 'title',
+          appliedQuery: '',
+          appliedSearchTier: 'title',
+          loading: false,
+          // The user (or viewport backfill) paginated past page 1:
+          hasMore: false,
+          oldestLoadedTimestamp: 1_000,
+          oldestLoadedSessionId: 'claude:session-old',
+        },
+      },
+    })
+
+    // The live refresh only ever fetches page 1 (limit 50) — it does not
+    // contain the deeper session, and its cursor points at the fresh page.
+    fetchSidebarSessionsSnapshot.mockResolvedValue({
+      projects: [{
+        ...pageOneProject,
+        sessions: [{
+          ...pageOneProject.sessions[0],
+          title: 'Newest session (refreshed)',
+          lastActivityAt: 6_000,
+        }],
+      }],
+      totalSessions: 1,
+      oldestIncludedTimestamp: 6_000,
+      oldestIncludedSessionId: 'claude:session-new',
+      hasMore: true,
+    })
+
+    await store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    const windowState = store.getState().sessions.windows.sidebar
+    const allSessions = windowState.projects.flatMap((p: any) => p.sessions)
+    // Fresh page-1 data wins for overlapping sessions...
+    expect(allSessions.find((s: any) => s.sessionId === 'session-new')?.title)
+      .toBe('Newest session (refreshed)')
+    // ...and previously paginated deeper sessions are NOT dropped.
+    expect(allSessions.some((s: any) => s.sessionId === 'session-old')).toBe(true)
+    // The cursor + hasMore still describe the deepest loaded point, so the
+    // viewport backfill does not re-walk pages after every refresh.
+    expect(windowState.oldestLoadedTimestamp).toBe(1_000)
+    expect(windowState.oldestLoadedSessionId).toBe('claude:session-old')
+    expect(windowState.hasMore).toBe(false)
+    expect(windowState.totalSessions).toBe(2)
+  })
+
+  it('replaces the window on refresh when no deeper pages were loaded', async () => {
+    const staleProject = {
+      projectPath: '/tmp/project-a',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-stale',
+        projectPath: '/tmp/project-a',
+        lastActivityAt: 5_000,
+        title: 'Stale session',
+      }],
+    }
+    const store = createStoreWithSessions({
+      activeSurface: 'sidebar',
+      projects: [staleProject],
+      lastLoadedAt: 5_000,
+      windows: {
+        sidebar: {
+          projects: [staleProject],
+          lastLoadedAt: 5_000,
+          query: '',
+          searchTier: 'title',
+          appliedQuery: '',
+          appliedSearchTier: 'title',
+          loading: false,
+          hasMore: true,
+          // Only page 1 was ever loaded — cursor sits at the newest page.
+          oldestLoadedTimestamp: 5_000,
+          oldestLoadedSessionId: 'claude:session-stale',
+        },
+      },
+    })
+
+    const freshProjects = [{
+      projectPath: '/tmp/project-c',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-fresh',
+        projectPath: '/tmp/project-c',
+        lastActivityAt: 3_000,
+        title: 'Fresh session',
+      }],
+    }]
+    fetchSidebarSessionsSnapshot.mockResolvedValue({
+      projects: freshProjects,
+      totalSessions: 1,
+      oldestIncludedTimestamp: 3_000,
+      oldestIncludedSessionId: 'claude:session-fresh',
+      hasMore: false,
+    })
+
+    await store.dispatch(queueActiveSessionWindowRefresh() as any)
+
+    const windowState = store.getState().sessions.windows.sidebar
+    const allSessions = windowState.projects.flatMap((p: any) => p.sessions)
+    // Plain replace: deletions/archival propagate when nothing deeper is at stake.
+    expect(allSessions.map((s: any) => s.sessionId)).toEqual(['session-fresh'])
+    expect(windowState.oldestLoadedTimestamp).toBe(3_000)
+    expect(windowState.oldestLoadedSessionId).toBe('claude:session-fresh')
+    expect(windowState.hasMore).toBe(false)
+    expect(windowState.totalSessions).toBe(1)
+  })
+
   it('drops a stale visible refresh once a newer committed resultVersion replaces the visible set', async () => {
     const staleRefresh = createDeferred<any>()
     searchSessions.mockReturnValueOnce(staleRefresh.promise)

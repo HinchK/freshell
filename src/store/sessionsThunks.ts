@@ -434,13 +434,37 @@ async function refreshVisibleSessionWindowSilently(args: {
       ...visibilityOpts,
     })
     const nextProjects = Array.isArray(response) ? response : (response?.projects ?? [])
+    // A silent refresh must never shrink the loaded window. The sidebar may
+    // have paginated past page 1 (infinite scroll / viewport backfill);
+    // replacing N loaded pages with page 1 makes the visible row count
+    // sawtooth every few seconds, clamps scrollTop to 0 and re-sorts under
+    // the user, then forces the backfill to re-walk the same pages. When the
+    // existing window is deeper than the fresh page, merge the fresh page
+    // over it (fresh session objects win for overlaps; deeper sessions are
+    // retained) and keep the deeper cursor + hasMore so backfill stays idle.
+    const prevWindow = getState().sessions.windows?.[surface]
+    const prevOldestTimestamp = prevWindow?.oldestLoadedTimestamp
+    const freshOldestTimestamp = response?.oldestIncludedTimestamp
+    const hasDeeperWindow =
+      typeof prevOldestTimestamp === 'number' &&
+      prevOldestTimestamp > 0 &&
+      typeof freshOldestTimestamp === 'number' &&
+      freshOldestTimestamp > 0 &&
+      prevOldestTimestamp < freshOldestTimestamp
+    const projects = hasDeeperWindow
+      ? mergeProjects(nextProjects, prevWindow?.projects ?? [])
+      : nextProjects
     commitData({
       surface,
-      projects: nextProjects,
-      totalSessions: response?.totalSessions,
-      oldestLoadedTimestamp: response?.oldestIncludedTimestamp,
-      oldestLoadedSessionId: response?.oldestIncludedSessionId,
-      hasMore: response?.hasMore,
+      projects,
+      totalSessions: hasDeeperWindow ? countSessions(projects) : response?.totalSessions,
+      oldestLoadedTimestamp: hasDeeperWindow
+        ? prevOldestTimestamp
+        : response?.oldestIncludedTimestamp,
+      oldestLoadedSessionId: hasDeeperWindow
+        ? prevWindow?.oldestLoadedSessionId
+        : response?.oldestIncludedSessionId,
+      hasMore: hasDeeperWindow ? prevWindow?.hasMore : response?.hasMore,
       query: identity.query,
       searchTier: identity.searchTier,
     })

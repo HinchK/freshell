@@ -6,6 +6,7 @@ import sessionsReducer, {
   clearProjects,
   mergeProjects,
   applySessionsPatch,
+  removeSessionFromProjects,
   toggleProjectExpanded,
   setProjectExpanded,
   SessionsState,
@@ -506,6 +507,47 @@ describe('sessionsSlice', () => {
 
       expect(next.projects[0]?.projectPath).toBe('/p1')
       expect(next.projects[1]?.projectPath).toBe('/p2')
+    })
+  })
+
+  describe('removeSessionFromProjects', () => {
+    it('removes the session from top-level projects and every window and prunes empty project groups', () => {
+      const projects = [
+        {
+          projectPath: '/p1',
+          sessions: [
+            { provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 2 },
+            { provider: 'codex', sessionId: 's2', projectPath: '/p1', lastActivityAt: 1 },
+          ],
+        },
+        {
+          projectPath: '/p2',
+          sessions: [{ provider: 'claude', sessionId: 's3', projectPath: '/p2', lastActivityAt: 3 }],
+        },
+      ]
+      let state = sessionsReducer(undefined, setProjects(projects as any))
+      state = sessionsReducer(state, commitSessionWindowVisibleRefresh({
+        surface: 'sidebar',
+        projects,
+        totalSessions: 3,
+        hasMore: true,
+        oldestLoadedTimestamp: 1,
+        oldestLoadedSessionId: 'codex:s2',
+      } as any))
+
+      // Removing one session leaves its project — and the window's pagination
+      // cursor — intact, in both top-level projects and the sidebar window.
+      let next = sessionsReducer(state, removeSessionFromProjects({ provider: 'claude', sessionId: 's1' }))
+      const windowSessions = next.windows.sidebar.projects.flatMap((p: any) => p.sessions)
+      expect(windowSessions.map((s: any) => `${s.provider}:${s.sessionId}`)).toEqual(['codex:s2', 'claude:s3'])
+      expect(next.projects.flatMap((p: any) => p.sessions).some((s: any) => s.sessionId === 's1')).toBe(false)
+      expect(next.windows.sidebar.oldestLoadedTimestamp).toBe(1)
+      expect(next.windows.sidebar.hasMore).toBe(true)
+
+      // Removing a project's last session prunes the empty group everywhere.
+      next = sessionsReducer(next, removeSessionFromProjects({ provider: 'claude', sessionId: 's3' }))
+      expect(next.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
+      expect(next.windows.sidebar.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
     })
   })
 

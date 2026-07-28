@@ -797,7 +797,10 @@ describe('open tab session sidebar visibility (e2e)', () => {
       expect(screen.getAllByText('Older Open Session').length).toBeGreaterThan(0)
     })
 
-    expect(screen.queryByText('Recent Session')).not.toBeInTheDocument()
+    // Depth-preserving refresh contract (see refreshVisibleSessionWindowSilently):
+    // a silent refresh never shrinks a deeper-than-fresh-page window, so the
+    // previously loaded session is retained alongside the fresh page.
+    expect(screen.getAllByText('Recent Session').length).toBeGreaterThan(0)
     expect(fetchSidebarSessionsSnapshot.mock.calls.length).toBeLessThanOrEqual(2)
   })
 

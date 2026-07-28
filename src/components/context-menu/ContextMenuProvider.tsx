@@ -14,7 +14,7 @@ import {
   swapSplit,
   updatePaneContent,
 } from '@/store/panesSlice'
-import { setProjectExpanded } from '@/store/sessionsSlice'
+import { removeSessionFromProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { sendTerminalKill } from '@/lib/terminal-kill'
 import { api, setSessionMetadata } from '@/lib/api'
@@ -531,6 +531,10 @@ export function ContextMenuProvider({
         try {
           const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
           await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
+          // The depth-preserving silent refresh (see refreshVisibleSessionWindowSilently)
+          // no longer removes vanished sessions — propagate the delete
+          // explicitly and immediately.
+          dispatch(removeSessionFromProjects({ provider: provider || info.session.provider, sessionId }))
           await dispatch(refreshActiveSessionWindow() as any)
         } catch {
           // ignore

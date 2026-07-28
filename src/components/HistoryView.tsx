@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
-import { toggleProjectExpanded } from '@/store/sessionsSlice'
+import { removeSessionFromProjects, toggleProjectExpanded } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
 import { activateSessionSurface, fetchSessionWindow } from '@/store/sessionsThunks'
 import { openSessionTab } from '@/store/tabsSlice'
@@ -112,6 +112,9 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     // Use composite key format: provider:sessionId
     const compositeKey = `${provider || 'claude'}:${sessionId}`
     await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
+    // The depth-preserving silent refresh no longer removes vanished sessions —
+    // propagate the delete explicitly and immediately.
+    dispatch(removeSessionFromProjects({ provider, sessionId }))
     await refresh()
   }
 
