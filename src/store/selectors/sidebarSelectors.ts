@@ -19,6 +19,13 @@ export interface SidebarSessionItem {
   title: string
   subtitle?: string
   projectPath?: string
+  // Repo root (ProjectGroup.projectPath) — independent of the worktreeGrouping
+  // display setting. Undefined for fallback rows, for server-fabricated
+  // live-terminal rows (both variants: liveTerminalOnly / 'terminal:<id>'
+  // sessionIds, and sessionId-bearing-but-unindexed rows identified by
+  // checkoutPath === projectPath), and for the literal 'unknown' group path —
+  // none of which carry a repo root.
+  repoPath?: string
   projectColor?: string
   archived?: boolean
   timestamp: number
@@ -128,6 +135,28 @@ type RunningSessionInfo = {
   codexDurabilityReason?: string
 }
 
+// Rows whose group path is NOT a repo root get repoPath: undefined.
+// Server-fabricated live-terminal rows (buildLiveTerminalSessionItem in
+// server/session-directory/service.ts) use checkoutRoot || cwd || 'terminal:<id>'
+// — never repo-root-collapsed — in two variants: sessionId-less rows
+// (liveTerminalOnly: true, sessionId 'terminal:<id>') and
+// sessionId-bearing-but-unindexed rows (liveTerminalOnly: false), which are
+// identified by checkoutPath === projectPath: the indexer suppresses
+// checkoutPath whenever it would equal projectPath
+// (server/coding-cli/session-indexer.ts), so that equality holds only for
+// fabricated rows. 'unknown' is the literal group path of cwd-less indexed
+// sessions. See the "repoPath semantics" design note in the plan.
+function resolveRepoPath(
+  session: { liveTerminalOnly?: boolean; sessionId: string; checkoutPath?: string; projectPath?: string },
+  groupProjectPath: string,
+): string | undefined {
+  if (session.liveTerminalOnly) return undefined
+  if (session.sessionId.startsWith('terminal:')) return undefined
+  if (session.checkoutPath && session.checkoutPath === session.projectPath) return undefined
+  if (groupProjectPath === 'unknown') return undefined
+  return groupProjectPath
+}
+
 export function buildSessionItems(
   projects: RootState['sessions']['projects'],
   tabs: RootState['tabs']['tabs'],
@@ -225,6 +254,7 @@ export function buildSessionItems(
         hasTitle,
         subtitle: getProjectName(effectivePath),
         projectPath: effectivePath,
+        repoPath: resolveRepoPath(session, project.projectPath),
         projectColor: project.color,
         archived: session.archived,
         timestamp: session.lastActivityAt,
@@ -502,6 +532,35 @@ function filterSessionItems(items: SidebarSessionItem[], filter: string): Sideba
       item.projectPath?.toLowerCase().includes(q) ||
       item.provider.toLowerCase().includes(q)
   )
+}
+
+export const ALL_REPOS = 'all'
+
+export interface RepoFilterOption {
+  value: string
+  label: string
+}
+
+export function filterSessionItemsByRepo(
+  items: SidebarSessionItem[],
+  repoFilter: string,
+): SidebarSessionItem[] {
+  if (repoFilter === ALL_REPOS) return items
+  return items.filter((item) => item.repoPath === repoFilter)
+}
+
+export function collectRepoFilterOptions(
+  items: SidebarSessionItem[],
+  selected: string,
+): RepoFilterOption[] {
+  const paths = new Set<string>()
+  for (const item of items) {
+    if (item.repoPath) paths.add(item.repoPath)
+  }
+  if (selected !== ALL_REPOS) paths.add(selected)
+  return [...paths]
+    .map((value) => ({ value, label: getProjectName(value) }))
+    .sort((a, b) => a.label.localeCompare(b.label) || a.value.localeCompare(b.value))
 }
 
 function filterSessionItemsForAppliedSearch(
