@@ -20,13 +20,16 @@ The literal string "restore location" appears nowhere in this codebase. The spec
 - It has the app's only `x`-clear idiom (the "Clear search" button at `Sidebar.tsx:679-686`).
 - Every result carries a repo path (`projectPath` / `ProjectGroup.projectPath`).
 
+Validated by code inspection (load-bearing check): the Sidebar is the only surface matching all four clues jointly — TabsView clicks pull tab-registry records (no repo field, no session resume), HistoryView has zero dropdowns and no x-clear idiom. Caveat verified: not literally *every* result carries a repo path — fallback/live-terminal rows can lack one; the design below handles them explicitly.
+
 ## Global Constraints
 
 - The repo selection must **NOT** be persisted: no `localStorage`, no persisted Redux state, no `settings.sidebar.*` (everything under `settings.sidebar` is persisted to `~/.freshell/config.json`), no `sessions.windows.sidebar` mirroring. Component-local `useState` only. Browser refresh must reset it to "All".
 - Dropdown default value and default option label: exactly `All` (sentinel value `'all'`, matching the `FilterMode`/`ScopeMode` precedent in `TabsView.tsx:45-46`).
 - Clearing via the `x` button resets the dropdown to "All".
 - The repo filter **ANDs** with all other search settings (visibility settings, applied server-side search, tier) — it composes with them, never replaces them.
-- Dropdown options = all repos that have loaded restorable session locations (repo **roots**, even when the sidebar's worktree-grouping display setting is `'worktree'`).
+- Dropdown options = all repos that have **loaded** restorable session locations (repo **roots**, even when the sidebar's worktree-grouping display setting is `'worktree'`). This windowed-options semantics is a deliberate, recorded decision — see the "Windowed options" design note below.
+- Coverage per AGENTS.md: **unit AND e2e** — the repo's e2e tier for UI controls is a Vitest flow test under `test/e2e/` (Task 5). `npm run test:unit` does NOT execute `test/e2e/` files; the final gate therefore runs the default client config workload (`npm run test:client`).
 - A11y (CI gate via `npm run lint` + eslint-plugin-jsx-a11y): `aria-label` on the new select ("Repo filter") and on the icon-only clear button ("Clear repo filter").
 - TDD per AGENTS.md: Red-Green-Refactor for every task; run the failing test before implementing.
 - Commits: focused and atomic; use the repository's configured commit identity per AGENTS.md (`Dan Shapiro <3732858+danshapiro@users.noreply.github.com>`). Never run `gh pr create` (the workflow handles integration).
@@ -42,13 +45,15 @@ The literal string "restore location" appears nowhere in this codebase. The spec
 | `test/unit/client/store/sidebar-repo-filter.test.ts` | Create | Unit tests for the two pure functions |
 | `test/unit/client/components/Sidebar.test.tsx` | Modify | New `describe('Repo filter dropdown')` component tests; small `createTestStore` extension (`sidebarSettings` override) |
 | `docs/index.html` | Modify | Add the new dropdown to the nonfunctional UI mock (AGENTS.md convention for user-visible UI changes) |
+| `test/e2e/sidebar-repo-filter-flow.test.tsx` | Create | Vitest e2e flow test (AGENTS.md requires unit AND e2e coverage; this is the repo's e2e tier for UI controls) |
 
 Design notes locked in here:
 
-- **`repoPath` semantics:** For session rows built from `ProjectGroup`s, `repoPath = project.projectPath` (the repo root) regardless of the `worktreeGrouping` display setting (which rewrites `item.projectPath` to the worktree checkout path). Fallback rows (`pushFallbackItem`) and live-terminal-only rows only know a `cwd`, not a repo root — their `repoPath` stays `undefined`, they never contribute dropdown options, and they are hidden when a specific repo is selected. This is the honest reading of "all the repos that we have restore locations for".
+- **`repoPath` semantics:** For session rows built from `ProjectGroup`s, `repoPath = project.projectPath` (the repo root) regardless of the `worktreeGrouping` display setting (which rewrites `item.projectPath` to the worktree checkout path) — EXCEPT for `liveTerminalOnly` sessions. Verified by code inspection: the server session directory injects live-terminal-only sessions into `ProjectGroup`s (`server/session-directory/service.ts:110-130`) with `projectPath = checkoutRoot || repoRoot || cwd || 'terminal:<id>'` — which can be a worktree checkout path, a bare cwd, or a literal `terminal:<id>`, not a repo root. So Task 1 gates them out: `repoPath: session.liveTerminalOnly ? undefined : project.projectPath`. Fallback rows (`pushFallbackItem`), client-built live-terminal rows, and server-injected `liveTerminalOnly` rows therefore all have `repoPath === undefined`: they never contribute dropdown options and are hidden when a specific repo is selected. This is the honest reading of "all the repos that we have restore locations for".
 - **Filter seam:** in-component, between the selector output (`localFilteredItems`) and `useStableArray`. The selector pipeline (`visibility → appliedSearch → filter → sort`) runs first, so the repo filter ANDs with everything by construction. `repoPath` is not rendered by `SidebarItem`, and membership is recomputed from fresh selector output each render, so `areSessionItemsEqual`/`isSessionItemEqual` need no change.
 - **Options list:** derived from the *pre-repo-filter* items so all repos stay listed while one is selected; the currently selected repo is retained as an option even if a live search temporarily empties its rows (otherwise the controlled `<select>` would render blank).
-- **Known interaction (no task, by design):** the infinite-scroll backfill (`handleListScroll`/append logic) keys off `sortedItems.length`; a shrunken filtered list may fetch more pages, which is bounded by the existing `hasMore` guard and only loads more candidate sessions. jsdom reports zero scroll metrics so this is not unit-testable; no behavior change is made to it.
+- **Windowed options (decision, verified):** the session window is paginated at *session* granularity — the server flattens all sessions, sorts by recency, and slices the top N (`server/session-directory/service.ts:240,281`; client page cap 50, `src/lib/api.ts:670`). So the dropdown lists repos present in the **loaded** window: repos whose sessions are all outside it appear only as more pages load (scroll) or via search (which scans the full index). During an active search, a committed search *replaces* the window's projects (`sessionsSlice.ts:143`), so options narrow to repos in the search results plus the retained selection; clearing the search refetches page 1 (not the pre-search window). This is deliberate: every option always corresponds to rows the user can see (no dead options that filter to an unexplained empty list), and no server change is needed. Alternatives considered and rejected for this iteration: a full-index repo aggregate in the session-directory response (`codingCliIndexer.getProjects()` is in memory server-side — the additive upgrade path if complete option coverage is later required) would create options whose selection strands the user on an empty list, because an empty filtered list unmounts the list container and suppresses backfill (see next note); full server-side repo filtering would touch the search and pagination surfaces shared with other views.
+- **Known interaction (no task, by design — verified by code trace):** the viewport backfill has three triggers (scroll handler, a mount/update effect keyed on `sortedItems.length`/cursors/`hasMore`/`loading`, and a ResizeObserver — `Sidebar.tsx:~544-578`), all keyed off the *rendered* list. A repo-filter-shrunken-but-nonempty list makes the effect fetch subsequent pages sequentially until `hasMore` is false — bounded (worst case `ceil(remaining/50)` fetches; guards: `loading` flag, in-flight ref + 15s failsafe, strictly advancing server cursor — no livelock). An **empty** filtered list unmounts the list container, so backfill goes fully inert (older matches are then unreachable until the filter is cleared — accepted UX asymmetry, no behavior change made). Under jsdom, quiet mounts are inert because `maybeBackfillViewport` returns when `clientHeight <= 0` and the setup ResizeObserver is a no-op stub — the existing suite proves zero append calls on quiet mounts. Backfill IS unit-testable via the existing geometry-mocking idiom (`Object.defineProperty` on `clientHeight`/`scrollHeight` + `fireEvent.scroll`); no new backfill test is added because the behavior is verified bounded and unchanged. Test-author caveat: `handleListScroll` has no `clientHeight` guard — the new tests must not fire scroll events on stores seeded with `hasMore` + cursors.
 
 ---
 
@@ -60,7 +65,7 @@ Design notes locked in here:
 
 **Interfaces:**
 - Consumes: existing `SidebarSessionItem` interface, private `getProjectName(projectPath: string): string` helper (line 69), `ProjectGroup.projectPath`.
-- Produces (relied on by Tasks 2-5):
+- Produces (relied on by Tasks 2-6):
   - `SidebarSessionItem.repoPath?: string` — repo root; `undefined` on fallback/live-terminal rows.
   - `export const ALL_REPOS = 'all'`
   - `export interface RepoFilterOption { value: string; label: string }`
@@ -171,15 +176,19 @@ In `src/store/selectors/sidebarSelectors.ts`:
 
 ```typescript
   // Repo root (ProjectGroup.projectPath) — independent of the worktreeGrouping
-  // display setting. Undefined for fallback/live-terminal rows, which only know a cwd.
+  // display setting. Undefined for fallback/live-terminal rows (which only know
+  // a cwd) and for liveTerminalOnly sessions, whose server-fabricated group path
+  // may be a checkout path, bare cwd, or literal 'terminal:<id>', not a repo root.
   repoPath?: string
 ```
 
-3b. In `buildSessionItems`, in the session-item construction (the `const item: SidebarSessionItem = {` block at ~line 218, inside the `for (const project of projects || [])` loop), directly after the line `projectPath: effectivePath,`, add:
+3b. In `buildSessionItems`, in the session-item construction (the `const item: SidebarSessionItem = {` block at ~line 219, inside the `for (const session of project.sessions || [])` loop), directly after the line `projectPath: effectivePath,`, add:
 
 ```typescript
-        repoPath: project.projectPath,
+        repoPath: session.liveTerminalOnly ? undefined : project.projectPath,
 ```
+
+The `liveTerminalOnly` gate is required: the server injects live-terminal-only sessions into `ProjectGroup`s whose `projectPath` can be a checkout path, bare cwd, or literal `terminal:<id>` (see the `repoPath` semantics design note). The gate's observable behavior is locked by a component test in Task 2 Step 2 (a selector-level unit test would need the full memoized-selector fixture for no extra coverage).
 
 Leave `pushFallbackItem` (~line 253) and the live-terminal item construction (~line 468) untouched — their `repoPath` remains `undefined` by design.
 
@@ -248,7 +257,7 @@ git commit -m "feat(sidebar): add repoPath to session items and pure repo-filter
 
 **Interfaces:**
 - Consumes (from Task 1): `ALL_REPOS`, `filterSessionItemsByRepo(items, repoFilter)`, `collectRepoFilterOptions(items, selected)`, `SidebarSessionItem.repoPath`.
-- Produces (relied on by Tasks 3-5):
+- Produces (relied on by Tasks 3-6):
   - Local state `const [repoFilter, setRepoFilter] = useState<string>(ALL_REPOS)` in the `Sidebar` component.
   - Memo `repoOptions: RepoFilterOption[]` derived from the pre-filter item list.
   - A native `<select aria-label="Repo filter">` rendered whenever `repoOptions.length > 0`, first option `<option value={ALL_REPOS}>All</option>`.
@@ -402,6 +411,38 @@ In `test/unit/client/components/Sidebar.test.tsx`, immediately after the closing
       fireEvent.change(select, { target: { value: '/home/user/repo-alpha' } })
       expect(screen.getByText('Worktree session')).toBeInTheDocument()
     })
+
+    it('excludes live-terminal-only rows from the repo options (their group path is not a repo root)', async () => {
+      const store = createTestStore({
+        projects: [
+          ...repoProjects,
+          {
+            projectPath: 'terminal:t-123',
+            sessions: [
+              {
+                sessionId: sessionId('live-1'),
+                projectPath: 'terminal:t-123',
+                lastActivityAt: Date.now() - 500,
+                title: 'Live terminal row',
+                liveTerminalOnly: true,
+              },
+            ],
+          },
+        ],
+      })
+      const { getByRole } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      const select = getByRole('combobox', { name: /repo filter/i }) as HTMLSelectElement
+      expect(Array.from(select.options).map((o) => o.value)).toEqual([
+        'all',
+        '/home/user/repo-alpha',
+        '/home/user/repo-beta',
+      ])
+
+      fireEvent.change(select, { target: { value: '/home/user/repo-alpha' } })
+      expect(screen.queryByText('Live terminal row')).not.toBeInTheDocument()
+    })
   })
 ```
 
@@ -413,7 +454,7 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx --config config/vitest/vitest.config.ts -t "Repo filter"
 ```
-Expected: FAIL — `Unable to find an accessible element with the role "combobox" and name /repo filter/i` (4 failing tests).
+Expected: FAIL — `Unable to find an accessible element with the role "combobox" and name /repo filter/i` (5 failing tests).
 
 - [ ] **Step 4: Implement the dropdown in `Sidebar.tsx`**
 
@@ -485,15 +526,25 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx --config config/vitest/vitest.config.ts -t "Repo filter"
 ```
-Expected: PASS (4 tests).
+Expected: PASS (5 tests).
 
-- [ ] **Step 6: Run the whole Sidebar suite to catch regressions**
+- [ ] **Step 6: Fix the two known badge-test collisions, then run the whole Sidebar suite**
 
-Run:
+Verified by a scan of all Sidebar test suites (unit + jsdom-e2e siblings): every existing combobox query is name-qualified, there are no snapshots or DOM-shape/count assertions the new select can break — EXCEPT two project-badge tests (at ~lines 1964 and 1988 of `test/unit/client/components/Sidebar.test.tsx`) that assert on the bare text `my-awesome-project`, which now ALSO renders as the repo dropdown's option label (leaf-dir of the seeded `/home/user/my-awesome-project`). The markup is correct; those two queries are under-scoped. Fix them by scoping to the session list (the `within` idiom already used at ~lines 282-283; import `within` from `@testing-library/react` if not already imported):
+
+```tsx
+// was: expect(screen.getByText('my-awesome-project')).toBeInTheDocument()
+expect(within(screen.getByTestId('sidebar-session-list')).getByText('my-awesome-project')).toBeInTheDocument()
+
+// was: expect(screen.queryByText('my-awesome-project')).not.toBeInTheDocument()
+expect(within(screen.getByTestId('sidebar-session-list')).queryByText('my-awesome-project')).not.toBeInTheDocument()
+```
+
+Then run:
 ```bash
 npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx --config config/vitest/vitest.config.ts
 ```
-Expected: PASS — no existing test regressions. (Existing tests seed `projects`, so the new dropdown appears in them; none of them assert on an exhaustive combobox list, but if any unexpected failure names the repo select, fix the markup, not the test.)
+Expected: PASS — no other regressions. (All other existing tests seed `projects`, so the new dropdown appears in them; none assert on an exhaustive combobox list. If any OTHER unexpected failure names the repo select: when the failing query is an under-scoped text/role query colliding with an option label, scope the query as above; otherwise fix the markup, not the test.)
 
 - [ ] **Step 7: Typecheck**
 
@@ -581,7 +632,7 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx --config config/vitest/vitest.config.ts -t "Repo filter"
 ```
-Expected: PASS (6 tests in the describe).
+Expected: PASS (7 tests in the describe).
 
 - [ ] **Step 5: Commit**
 
@@ -744,7 +795,7 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx --config config/vitest/vitest.config.ts -t "Repo filter"
 ```
-Expected: PASS (9 tests in the describe).
+Expected: PASS (10 tests in the describe).
 
 - [ ] **Step 5: Run the whole Sidebar suite**
 
@@ -763,14 +814,185 @@ git commit -m "feat(sidebar): repo filter composes with search settings and gets
 
 ---
 
-### Task 5: Non-persistence proof, UI mock update, full verification
+### Task 5: E2E flow test (`test/e2e/`, the AGENTS.md e2e gate)
+
+AGENTS.md requires "both unit test & e2e coverage of everything"; the repo's e2e tier for UI controls is a Vitest flow test under `test/e2e/` (jsdom, real store/thunks/reducers, mocked `@/lib/api` + `@/lib/ws-client`) — modeled on `test/e2e/sidebar-search-flow.test.tsx`. Note: `test/e2e/` files run under the default client config (`config/vitest/vitest.config.ts` excludes only `test/e2e-browser/**` and `test/e2e-electron/**`), NOT under `npm run test:unit` — so this file is exercised by the individual coordinated-runner command below and by the `npm run test:client` gate in Task 6. The default config uses `sequence.shuffle: true`; each test must be fully self-contained.
+
+**Files:**
+- Create: `test/e2e/sidebar-repo-filter-flow.test.tsx`
+
+**Interfaces:**
+- Consumes: the complete feature from Tasks 1-4 (dropdown, filtering, clear button, AND-composition). No new production code.
+
+- [ ] **Step 1: Write the flow test**
+
+Create `test/e2e/sidebar-repo-filter-flow.test.tsx`. Copy the header block (imports, `vi.mock('@/lib/ws-client')`, `vi.mock('@/lib/api')`, `createStore`, `renderSidebar`, and the `beforeEach`/`afterEach` bodies) from `test/e2e/sidebar-search-flow.test.tsx` lines 1-173 verbatim (omit `createDeferred` and `getSidebarSessionOrder`, which this file does not use), renaming the describe to `'sidebar repo filter flow (e2e)'`, then add these two tests inside the describe:
+
+```tsx
+  const browseProjects: ProjectGroup[] = [
+    {
+      projectPath: '/home/user/repo-alpha',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-alpha-1',
+        projectPath: '/home/user/repo-alpha',
+        lastActivityAt: 2_000,
+        title: 'Alpha session',
+      }],
+    },
+    {
+      projectPath: '/home/user/repo-beta',
+      sessions: [{
+        provider: 'claude',
+        sessionId: 'session-beta-1',
+        projectPath: '/home/user/repo-beta',
+        lastActivityAt: 1_000,
+        title: 'Beta session',
+      }],
+    },
+  ]
+
+  function createBrowseStore() {
+    vi.mocked(mockFetchSnapshot).mockResolvedValue({
+      projects: browseProjects,
+      totalSessions: 2,
+      oldestIncludedTimestamp: 1_000,
+      oldestIncludedSessionId: 'claude:session-beta-1',
+      hasMore: false,
+    })
+    return createStore({
+      projects: browseProjects,
+      sessions: {
+        activeSurface: 'sidebar',
+        projects: browseProjects,
+        lastLoadedAt: 1_000,
+        windows: {
+          sidebar: {
+            projects: browseProjects,
+            lastLoadedAt: 1_000,
+            query: '',
+            searchTier: 'title',
+            appliedQuery: '',
+            appliedSearchTier: 'title',
+            loading: false,
+            hasMore: false,
+            oldestLoadedTimestamp: 1_000,
+            oldestLoadedSessionId: 'claude:session-beta-1',
+          },
+        },
+      },
+    })
+  }
+
+  it('repo dropdown filters browse results and the clear-x restores them', async () => {
+    const store = createBrowseStore()
+    renderSidebar(store)
+    await act(() => vi.advanceTimersByTime(100))
+
+    expect(screen.getByText('Alpha session')).toBeInTheDocument()
+    expect(screen.getByText('Beta session')).toBeInTheDocument()
+
+    const select = screen.getByRole('combobox', { name: /repo filter/i }) as HTMLSelectElement
+    expect(select).toHaveValue('all')
+    expect(Array.from(select.options).map((o) => o.value)).toEqual([
+      'all',
+      '/home/user/repo-alpha',
+      '/home/user/repo-beta',
+    ])
+
+    fireEvent.change(select, { target: { value: '/home/user/repo-beta' } })
+    expect(screen.getByText('Beta session')).toBeInTheDocument()
+    expect(screen.queryByText('Alpha session')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByLabelText('Clear repo filter'))
+    expect(select).toHaveValue('all')
+    expect(screen.getByText('Alpha session')).toBeInTheDocument()
+    expect(screen.getByText('Beta session')).toBeInTheDocument()
+  })
+
+  it('repo filter ANDs with a committed server search and the selection survives the commit', async () => {
+    vi.mocked(mockSearchSessions).mockResolvedValue({
+      results: [
+        {
+          sessionId: 'session-alpha-hit',
+          provider: 'claude',
+          projectPath: '/home/user/repo-alpha',
+          title: 'Alpha deploy notes',
+          matchedIn: 'title',
+          lastActivityAt: 3_000,
+          archived: false,
+        },
+        {
+          sessionId: 'session-beta-hit',
+          provider: 'claude',
+          projectPath: '/home/user/repo-beta',
+          title: 'Beta deploy notes',
+          matchedIn: 'title',
+          lastActivityAt: 2_500,
+          archived: false,
+        },
+      ],
+      tier: 'title',
+      query: 'deploy',
+      totalScanned: 5,
+    })
+
+    const store = createBrowseStore()
+    renderSidebar(store)
+    await act(() => vi.advanceTimersByTime(100))
+
+    const select = screen.getByRole('combobox', { name: /repo filter/i }) as HTMLSelectElement
+    fireEvent.change(select, { target: { value: '/home/user/repo-alpha' } })
+    expect(screen.queryByText('Beta session')).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByPlaceholderText('Search...'), { target: { value: 'deploy' } })
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+      await Promise.resolve()
+    })
+
+    expect(mockSearchSessions).toHaveBeenCalledWith(expect.objectContaining({
+      query: 'deploy',
+      tier: 'title',
+    }))
+
+    // Search results committed (window replaced); repo filter still ANDs on top.
+    expect(screen.getByText('Alpha deploy notes')).toBeInTheDocument()
+    expect(screen.queryByText('Beta deploy notes')).not.toBeInTheDocument()
+
+    // Selection survived the window replacement and remains a valid option.
+    expect(select).toHaveValue('/home/user/repo-alpha')
+    expect(Array.from(select.options).map((o) => o.value)).toContain('/home/user/repo-alpha')
+  })
+```
+
+(If the commit needs an extra microtask to render, follow the sibling file's idiom and add a second `await Promise.resolve()` inside the same `act` block — do not lengthen timers.)
+
+- [ ] **Step 2: Run it**
+
+Run:
+```bash
+npm run test:vitest -- run test/e2e/sidebar-repo-filter-flow.test.tsx --config config/vitest/vitest.config.ts
+```
+Expected: PASS (2 tests) immediately — the feature is complete after Tasks 1-4; this file is the e2e regression lock AGENTS.md requires. If it FAILS, fix the production code or the store seeding (compare against `sidebar-search-flow.test.tsx`), not the assertions.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add test/e2e/sidebar-repo-filter-flow.test.tsx
+git commit -m "test(e2e): sidebar repo filter flow coverage (filter, clear, AND with server search)"
+```
+
+---
+
+### Task 6: Non-persistence proof, UI mock update, full verification
 
 **Files:**
 - Test: `test/unit/client/components/Sidebar.test.tsx` (extend `describe('Repo filter dropdown')`)
 - Modify: `docs/index.html` (sidebar mock, `.sb-search` block at ~lines 602-607)
 
 **Interfaces:**
-- Consumes: everything from Tasks 1-4. No new production code exports — this task proves the non-persistence requirement and finishes conventions.
+- Consumes: everything from Tasks 1-5. No new production code exports — this task proves the non-persistence requirement and finishes conventions.
 
 - [ ] **Step 1: Write the failing/locking non-persistence test**
 
@@ -859,15 +1081,16 @@ Run each; all must succeed:
 ```bash
 npm run test:vitest -- run test/unit/client/store/sidebar-repo-filter.test.ts --config config/vitest/vitest.config.ts
 npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx --config config/vitest/vitest.config.ts
+npm run test:vitest -- run test/e2e/sidebar-repo-filter-flow.test.tsx --config config/vitest/vitest.config.ts
 npm run typecheck:client
 npm run lint
 ```
 Expected: all PASS / exit 0 (lint includes the jsx-a11y gate — the `aria-label`s on the select and icon-only button satisfy it).
 
-Then the coordinated unit workload (may wait on the shared test gate):
+Then the coordinated client workload (may wait on the shared test gate). This is `test:client`, not `test:unit`, because `test:unit` runs only `test/unit/` and would never execute the Task 5 e2e flow test:
 
 ```bash
-FRESHELL_TEST_SUMMARY="repo filter dropdown in sidebar search" npm run test:unit
+FRESHELL_TEST_SUMMARY="repo filter dropdown in sidebar search" npm run test:client
 ```
 Expected: PASS with no regressions.
 
@@ -880,17 +1103,21 @@ git commit -m "test(sidebar): lock repo filter non-persistence; add repo dropdow
 
 ---
 
+## Load-Bearing Validation Record (post-planning hardening)
+
+Ten load-bearing assumptions were surfaced and validated (ledger: `.worktrees/.the-usual-logs/restore-locations-repo-filter/load-bearing-ledger.md`). Verified: backfill boundedness (A5), jsdom test inertness (A6), `projectPath` byte-identity across snapshot/search/append (A7). Falsified and fixed in this plan: window-derived options are NOT full-repo coverage (A2 — recorded as the deliberate "Windowed options" decision with documented rationale and upgrade path); server-injected `liveTerminalOnly` rows would have produced bogus repo options (A3 — Task 1 gate + Task 2 test); two existing badge tests collide with the new option label (A8 — Task 2 Step 6 scoping fix); zero e2e coverage violated AGENTS.md (A10 — new Task 5 + `test:client` gate). Accepted decisions: Sidebar as the target surface (A1 — verified only joint clue match), hiding cwd-only rows under a specific repo (A4 — `terminalMeta.repoRoot` plumbing rejected as async-optional coupling), search-narrowed options (A9 — consistent with the windowed-options decision).
+
 ## Self-Review Record
 
-Checked the plan against the spec from a fresh read:
+Checked the plan against the spec from a fresh read (re-run after the load-bearing fixes):
 
 1. **Spec coverage:**
    - "second dropdown … defaults to 'All'" → Task 2 (Steps 2/4; test asserts `toHaveValue('all')` and first option label `All`).
-   - "populated with all the repos that we have restore locations for" → Task 1 (`repoPath` = repo root; `collectRepoFilterOptions`) + Task 2 option-list tests, including the worktree-grouping-mode test proving options are repo roots, and the "no repos → no dropdown" boundary.
+   - "populated with all the repos that we have restore locations for" → Task 1 (`repoPath` = repo root, gated for `liveTerminalOnly`; `collectRepoFilterOptions`) + Task 2 option-list tests, including the worktree-grouping-mode test proving options are repo roots, the live-terminal-exclusion test, and the "no repos → no dropdown" boundary. Scope is the loaded window per the recorded "Windowed options" decision.
    - "Selecting a repo filters the results to only locations from that repo" → Task 2 filtering test; Task 1 pure-function tests.
    - "ANDs with the other search settings (compose, not replace)" → filter applied *after* the full selector pipeline (visibility + applied search + tier + sort); Task 4 tests: AND-with-visibility-settings, coexistence with the tier dropdown during an active query, and AND-with-live-server-search (search commit while repo selected).
    - "'x' (clear) on the dropdown resets it to 'All'" → Task 3 (conditional button, reset behavior, hidden while on All).
-   - "must NOT be persisted … refresh resets to 'All'" → component-local `useState` only (Global Constraints forbid `settings.sidebar.*`, `localStorage`, and window-state mirroring); Task 5 regression lock (localStorage snapshot + same-store remount resets to All).
+   - "must NOT be persisted … refresh resets to 'All'" → component-local `useState` only (Global Constraints forbid `settings.sidebar.*`, `localStorage`, and window-state mirroring); Task 6 regression lock (localStorage snapshot + same-store remount resets to All).
 2. **1b — no silent deferrals:** No stubs, mocks-as-behavior, or deferred requirements. Every user-facing behavior has a production implementation task and an observable test. The only mocked pieces in tests are the pre-existing suite-level WS/API mocks, and Task 4's live-search test exercises the real thunk/reducer path through them. No UNRESOLVED COVERAGE GAPS.
 3. **Placeholder scan:** No TBD/TODO/"handle edge cases"/"similar to Task N" items; every code step shows the code; every run step names the command and expected outcome.
-4. **Type consistency:** `ALL_REPOS`/`RepoFilterOption`/`filterSessionItemsByRepo(items, repoFilter)`/`collectRepoFilterOptions(items, selected)` defined in Task 1 are used with identical names/signatures in Tasks 2-5; `repoFilter: string` state matches the functions' `string` params; `sidebarSettings` helper option defined in Task 2 Step 1 before its uses in Tasks 2 and 4.
+4. **Type consistency:** `ALL_REPOS`/`RepoFilterOption`/`filterSessionItemsByRepo(items, repoFilter)`/`collectRepoFilterOptions(items, selected)` defined in Task 1 are used with identical names/signatures in Tasks 2-6; `repoFilter: string` state matches the functions' `string` params; `sidebarSettings` helper option defined in Task 2 Step 1 before its uses in Tasks 2 and 4.
