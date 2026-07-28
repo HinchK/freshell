@@ -149,6 +149,9 @@ const RUST_ONLY_SPECS = [
   // Kata enn3: REST spawn-gate burst; owns its RustServer.
   // See docs/plans/2026-07-27-rest-spawn-gate.md
   /rest-spawn-gate-rust\.spec\.ts$/,
+  // P0.2 lane D4: freshclaude durable identity across reload + SIGKILL +
+  // stale-sessionRef dead_session guard. Imports RustServer for restartAbrupt().
+  /freshclaude-identity-persistence-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -328,6 +331,9 @@ export default defineConfig({
         // Kata enn3: REST spawn-gate burst; owns its RustServer.
         // See docs/plans/2026-07-27-rest-spawn-gate.md
         /rest-spawn-gate-rust\.spec\.ts$/,
+        // P0.2 lane D4: freshclaude durable identity across reload + SIGKILL +
+        // stale-sessionRef dead_session guard. Imports RustServer for restartAbrupt().
+        /freshclaude-identity-persistence-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

@@ -242,10 +242,15 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
+// Durable identity reader: sessionRef IS the durable identity per the
+// 2026-04-19 durable-session contract; content.sessionId is a live handle
+// (for claude, the create-time fc-e2e-* placeholder forever -- see
+// freshclaude-restart-parity-rust.spec.ts:140-148). sessionRef-first keeps
+// this reader reload-symmetric for every fresh-agent provider.
 function leafDurableIdentity(leaf: any): string | undefined {
   return (
-    leaf?.content?.sessionId ??
     leaf?.content?.sessionRef?.sessionId ??
+    leaf?.content?.sessionId ??
     leaf?.content?.resumeSessionId
   )
 }
@@ -469,12 +474,17 @@ async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: stri
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
     timeout: 15_000,
   })
-  // NOTE: once the canonical-UUID cliSessionId lands, the client fetches the
-  // thread snapshot and the Rust router has NO claude adapter -> 503
-  // FRESH_AGENT_RUNTIME_UNAVAILABLE (crates/freshell-freshagent/src/
-  // snapshot.rs:133-146), which can surface a history-load-error banner on a
-  // perfectly healthy fresh pane. Assert pane state via the harness (Redux),
-  // tolerate the banner -- never assert error-free UI chrome for freshclaude.
+  // NOTE (corrected, council fix round -- the Rust router HAS shipped a
+  // claude snapshot adapter since this comment was written: crates/
+  // freshell-freshagent/src/snapshot.rs:133-146 routes freshclaude/kilroy +
+  // claude through get_claude_snapshot(), a disk+env adapter over the CLI's
+  // own transcript store; FRESH_AGENT_RUNTIME_UNAVAILABLE now only fires for
+  // session types with NO adapter registered at all). A transient
+  // history-load-error banner may still appear on a freshly-created pane
+  // (snapshot fetch racing pane creation), so this suite still asserts pane
+  // state via the harness (Redux) rather than error-free UI chrome for
+  // freshclaude -- but the reason is a fetch-timing race, not a missing
+  // adapter.
 }
 
 // --- browser pane helper (donor: browser-pane.spec.ts:8) -- consumed
@@ -1157,26 +1167,20 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // EXPECTED-FAIL WALL PIN -- P0.2 (§2.8), PARTIALLY LANDED by
-    // feat/freshclaude-restart-parity: the attach-resume arm + claude snapshot
-    // adapter shipped, so post-reload the HISTORY leg passes ('Fixture claude
-    // turn' renders from the REST snapshot) and the STATUS leg passes (not
-    // 'error'/'creating') -- probed 2026-07-25 with the identity leg
-    // neutralized: green in one run. The IDENTITY leg still fails, and the
-    // blocker is the CLIENT persistence gap this pin has always named:
-    // persistMiddleware strips content.sessionId (src/store/
-    // persistMiddleware.ts:245-266), so after reload the pane re-CREATEs
-    // (resumeSessionId carries the durable UUID -- the conversation itself
-    // resumes) and receives a NEW create-time sidecar id; observed
-    // pre-kill fc-e2e-84069-1785038517244 vs post-reload
-    // fc-e2e-88780-1785038519518, so leafDurableIdentity's first arm
-    // (content.sessionId) can never match across reload until the client
-    // persists it. FLIP when claude pane identity survives reload
-    // (client-side persistMiddleware work -- out of this branch's fence).
-    test.fail(
-      e2eServerKind === 'rust',
-      'EXPECTED-FAIL WALL PIN (narrowed 2026-07-26 by reconcile-completion): pre-kill content.sessionId is the sidecar-minted placeholder, not the durable ref; the SIGKILL flow yields a respawn verdict which mints a new placeholder -- closing requires claude created/create to expose the durable id as the primary handle (not in C2 scope).',
-    )
+    // HISTORY: the P0.2 pin was FLIPPED 2026-07-27 by lane D4
+    // (freshclaude-identity-persistence). Investigation showed the durable
+    // identity ALREADY survives reload: FreshAgentView's merge effect folds
+    // the canonical claude cliSessionId into content.sessionRef +
+    // resumeSessionId (FreshAgentView.tsx mergePaneContent effect), and
+    // persistMiddleware round-trips sessionRef -- the 2026-04-19
+    // durable-session contract's designated durable identity -- while the
+    // live placeholder in content.sessionId stays unpersisted. This leg was
+    // red only because leafDurableIdentity read content.sessionId (the
+    // fc-e2e-* live handle, legitimately different across reloads) FIRST;
+    // the reader is sessionRef-first accordingly. The stale-claim hazard
+    // that motivated the original strip is pinned by
+    // specs/freshclaude-identity-persistence-rust.spec.ts (dead_session,
+    // never silent).
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshclaude-'))
     const projectDir = path.join(sharedRoot, 'project')
@@ -1197,14 +1201,19 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await createFreshclaudePane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, tabId, 'wall freshclaude turn')
-      // Pre-kill turn proof via the HARNESS (Redux), not UI chrome: the
-      // fresh-agent transcript renders exclusively from the REST thread
-      // snapshot (FreshAgentView.tsx:1302,1782 -- getFreshAgentThreadSnapshot
-      // -> snapshot?.turns), and the Rust router has NO claude snapshot
-      // adapter (503 FRESH_AGENT_RUNTIME_UNAVAILABLE, crates/
-      // freshell-freshagent/src/snapshot.rs:133-146), so the assistant reply
-      // NEVER renders in the DOM today even though the turn completed. The
-      // sidecar protocol itself is verified end-to-end: freshAgent.event/
+      // Pre-kill turn proof via the HARNESS (Redux), not UI chrome (corrected,
+      // council fix round): the fresh-agent transcript renders exclusively
+      // from the REST thread snapshot (FreshAgentView.tsx:1302,1782 --
+      // getFreshAgentThreadSnapshot -> snapshot?.turns). The claim that "the
+      // Rust router has NO claude snapshot adapter -> 503" is FALSE at HEAD --
+      // crates/freshell-freshagent/src/snapshot.rs:133-146 routes
+      // freshclaude/kilroy + claude through get_claude_snapshot(), a
+      // disk+env adapter over the CLI's own transcript store;
+      // FRESH_AGENT_RUNTIME_UNAVAILABLE now only fires for session types
+      // with no adapter registered at all. This assertion still reads via
+      // the harness (not DOM) because the snapshot fetch can race pane
+      // creation, not because the adapter is missing. The sidecar protocol
+      // itself is verified end-to-end regardless: freshAgent.event/
       // freshAgent.assistant arrives on the wire and folds into the
       // freshAgent slice (turns[]) -- assert THAT (createFreshclaudePane's
       // note: assert pane state via the harness, never error-free UI chrome
@@ -1234,6 +1243,16 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
       await flushPersistence(page)
 
+      // Council fix round (freshclaude-identity-persistence, B2): audit the
+      // FULL restart+reload window for identity-losing re-creates. The fake
+      // sidecar mints the SAME static id for every resume-less create, so a
+      // regressed persistMiddleware that silently drops sessionRef would
+      // still leave leafDurableIdentity() reading the identical constant
+      // (colliding onto the SAME transcript file) -- collision-blind on this
+      // exact axis, same discrimination applied in
+      // specs/freshclaude-identity-persistence-rust.spec.ts.
+      await harness.clearSentWsMessages()
+
       // --- SIGKILL + revive, then reload. ---
       await server.restartAbrupt()
       await waitForWsReady(page)
@@ -1252,6 +1271,16 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       const finalLeaf = findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))
       expect(finalLeaf?.content?.status).not.toBe('error')
       expect(finalLeaf?.content?.status).not.toBe('creating')
+
+      // Any freshAgent.create fired across the restart+reload window must
+      // carry the ORIGINAL durable id -- never a bare (resume-less) create,
+      // which the fixture would otherwise re-stamp with the same static
+      // default and mask a lost identity.
+      const sentAfterRestartReload = await harness.getSentWsMessages()
+      const restartCreates = sentAfterRestartReload.filter((m: any) => m?.type === 'freshAgent.create') as any[]
+      for (const create of restartCreates) {
+        expect(create.resumeSessionId ?? create.sessionRef?.sessionId, JSON.stringify(create)).toBe(originalSessionId)
+      }
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
