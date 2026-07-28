@@ -149,6 +149,149 @@ pub(crate) fn framework_default_name(bytes: &[u8]) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
+use std::path::{Path, PathBuf};
+
+pub(crate) const TIER1: i64 = 100;
+pub(crate) const TIER2: i64 = 80;
+pub(crate) const TIER3: i64 = 60;
+
+const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_SVG_BYTES: u64 = 256 * 1024;
+const REJECTED_PATH_COMPONENTS: &[&str] = &[
+    "node_modules",
+    "vendor",
+    "third_party",
+    "test",
+    "tests",
+    "fixtures",
+    "example",
+    "template",
+    "dist",
+    "out",
+    "coverage",
+];
+const REJECTED_EXTENSIONS: &[&str] = &["icns", "xml", "icon"];
+
+#[derive(Debug, Clone)]
+pub(crate) struct Candidate {
+    /// Absolute path (under the repo root; out-of-root candidates are rejected).
+    pub path: PathBuf,
+    pub tier_base: i64,
+    /// Stable enumeration sequence — encodes "first match in listed order within a tier".
+    pub order: u32,
+    /// Spec-mandated extra (e.g. +5 for root `icon.*` over `logo.*`).
+    pub extra: i64,
+}
+
+/// Score a candidate; `None` = hard rejection.
+pub(crate) fn score_candidate(repo_root: &Path, cand: &Candidate) -> Option<i64> {
+    let rel = cand.path.strip_prefix(repo_root).ok()?;
+    for comp in rel.components() {
+        let c = comp.as_os_str().to_string_lossy().to_lowercase();
+        if REJECTED_PATH_COMPONENTS.contains(&c.as_str()) {
+            return None;
+        }
+    }
+    let ext = cand
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if REJECTED_EXTENSIONS.contains(&ext.as_str()) {
+        return None;
+    }
+    let meta = std::fs::metadata(&cand.path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    if ext == "svg" && meta.len() > MAX_SVG_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(&cand.path).ok()?;
+    if framework_default_name(&bytes).is_some() {
+        return None;
+    }
+
+    let mut score = cand.tier_base + cand.extra;
+    let is_raster = matches!(
+        ext.as_str(),
+        "png" | "ico" | "jpg" | "jpeg" | "gif" | "webp"
+    );
+    let dims: Option<(f64, f64)> = match ext.as_str() {
+        "png" => png_dimensions(&bytes).map(|(w, h)| (f64::from(w), f64::from(h))),
+        "ico" => ico_largest_dimensions(&bytes).map(|(w, h)| (f64::from(w), f64::from(h))),
+        "svg" => {
+            let text = String::from_utf8_lossy(&bytes);
+            if svg_is_dangerous(&text) {
+                return None;
+            }
+            svg_dimensions(&text)
+        }
+        _ => None,
+    };
+    if let Some((w, h)) = dims {
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let aspect = (w / h).max(h / w);
+        if aspect > 2.5 {
+            return None;
+        }
+        if is_raster && w < 16.0 {
+            return None;
+        }
+        if aspect > 1.6 {
+            score -= 20;
+        }
+        if (w / h - 1.0).abs() < 0.05 {
+            score += 15;
+        }
+        let max_dim = w.max(h);
+        if (32.0..=512.0).contains(&max_dim) {
+            score += 10;
+        }
+    }
+    let stem = cand
+        .path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if stem == "icon" {
+        score += 5;
+    }
+    if matches!(ext.as_str(), "png" | "ico" | "svg") {
+        score += 5;
+    }
+    Some(score)
+}
+
+/// Deterministic winner: highest score, then earliest enumeration order,
+/// then shortest relative path, then lexicographic.
+pub(crate) fn pick_best(repo_root: &Path, candidates: Vec<Candidate>) -> Option<PathBuf> {
+    let mut scored: Vec<(i64, u32, usize, String, PathBuf)> = candidates
+        .into_iter()
+        .filter_map(|cand| {
+            let score = score_candidate(repo_root, &cand)?;
+            let rel = cand
+                .path
+                .strip_prefix(repo_root)
+                .ok()?
+                .to_string_lossy()
+                .into_owned();
+            Some((score, cand.order, rel.len(), rel, cand.path))
+        })
+        .collect();
+    scored.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+    });
+    scored.into_iter().next().map(|(_, _, _, _, path)| path)
+}
+
 #[cfg(test)]
 mod probe_tests {
     use super::*;
@@ -229,5 +372,136 @@ mod probe_tests {
     #[test]
     fn arbitrary_content_is_not_blacklisted() {
         assert_eq!(framework_default_name(b"<svg>my real logo</svg>"), None);
+    }
+}
+
+#[cfg(test)]
+mod scoring_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn write_png(path: &PathBuf, w: u32, h: u32) {
+        let mut b = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        b.extend_from_slice(&13u32.to_be_bytes());
+        b.extend_from_slice(b"IHDR");
+        b.extend_from_slice(&w.to_be_bytes());
+        b.extend_from_slice(&h.to_be_bytes());
+        b.extend_from_slice(&[8, 6, 0, 0, 0]);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b).unwrap();
+    }
+
+    fn cand(root: &std::path::Path, rel: &str, tier: i64, order: u32) -> Candidate {
+        Candidate {
+            path: root.join(rel),
+            tier_base: tier,
+            order,
+            extra: 0,
+        }
+    }
+
+    #[test]
+    fn square_icon_in_range_scores_bonuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_png(&root.join("icon.png"), 128, 128);
+        let score = score_candidate(&root, &cand(&root, "icon.png", TIER3, 0)).unwrap();
+        // 60 base + 15 square + 10 size + 5 basename 'icon' + 5 png format = 95
+        assert_eq!(score, 95);
+    }
+
+    #[test]
+    fn wide_wordmark_is_rejected_and_medium_wide_penalized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_png(&root.join("logo.png"), 600, 200); // aspect 3.0 -> reject
+        assert_eq!(
+            score_candidate(&root, &cand(&root, "logo.png", TIER3, 0)),
+            None
+        );
+        write_png(&root.join("banner.png"), 200, 100); // aspect 2.0 -> -20
+        let score = score_candidate(&root, &cand(&root, "banner.png", TIER3, 0)).unwrap();
+        // 60 - 20 + 10 (size in range) + 5 (png) = 55
+        assert_eq!(score, 55);
+    }
+
+    #[test]
+    fn tiny_and_huge_and_bad_paths_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_png(&root.join("small.png"), 8, 8); // raster width < 16
+        assert_eq!(
+            score_candidate(&root, &cand(&root, "small.png", TIER3, 0)),
+            None
+        );
+        write_png(&root.join("node_modules/pkg/icon.png"), 128, 128);
+        assert_eq!(
+            score_candidate(&root, &cand(&root, "node_modules/pkg/icon.png", TIER3, 0)),
+            None
+        );
+        fs::write(root.join("icon.icns"), b"whatever").unwrap();
+        assert_eq!(
+            score_candidate(&root, &cand(&root, "icon.icns", TIER3, 0)),
+            None
+        );
+        // outside the repo root -> rejected
+        let outside = tmp.path().join("elsewhere.png");
+        write_png(&outside, 128, 128);
+        let c = Candidate {
+            path: outside,
+            tier_base: TIER3,
+            order: 0,
+            extra: 0,
+        };
+        assert_eq!(score_candidate(&root.join("sub"), &c), None);
+    }
+
+    #[test]
+    fn oversized_files_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("big.svg"), vec![b'a'; 300 * 1024]).unwrap(); // svg > 256KB
+        assert_eq!(
+            score_candidate(&root, &cand(&root, "big.svg", TIER3, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn dangerous_svg_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        fs::write(root.join("evil.svg"), "<!DOCTYPE svg><svg/>").unwrap();
+        assert_eq!(
+            score_candidate(&root, &cand(&root, "evil.svg", TIER3, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn pick_best_prefers_score_then_order_then_shortest_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write_png(&root.join("a/icon.png"), 128, 128); // tier1
+        write_png(&root.join("logo.png"), 128, 128); // tier3
+        let best = pick_best(
+            &root,
+            vec![
+                cand(&root, "logo.png", TIER3, 5),
+                cand(&root, "a/icon.png", TIER1, 0),
+            ],
+        );
+        assert_eq!(best, Some(root.join("a/icon.png")));
+        // Equal score -> earlier enumeration order wins.
+        write_png(&root.join("b/icon.png"), 128, 128);
+        let best = pick_best(
+            &root,
+            vec![
+                cand(&root, "b/icon.png", TIER1, 1),
+                cand(&root, "a/icon.png", TIER1, 2),
+            ],
+        );
+        assert_eq!(best, Some(root.join("b/icon.png")));
     }
 }
