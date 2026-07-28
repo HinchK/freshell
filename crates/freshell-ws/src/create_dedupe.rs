@@ -151,11 +151,20 @@ impl CreateDedupe {
                 // original terminal.
                 if is_running(terminal_id) && *settled_restore == restore {
                     DedupeDecision::DuplicateSettled(created.clone())
-                } else if is_running(terminal_id) {
-                    DedupeDecision::Proceed
                 } else {
-                    // Terminal exited or killed: evict and treat as fresh
-                    // (legacy delete-at-exit parity).
+                    // Two Proceed cases, ONE sentinel discipline (council
+                    // finding, PR #552 follow-up):
+                    // - flag mismatch on a live terminal: a different
+                    //   request wearing the same id (restore-latch flip,
+                    //   redriveAfterLaunchInvalidTerminal) proceeds to its
+                    //   own path;
+                    // - terminal exited or killed: evict and treat as
+                    //   fresh (legacy delete-at-exit parity).
+                    // BOTH must replace the stale settled entry with an
+                    // InFlight sentinel — a Proceed without a sentinel
+                    // leaves the in-flight window unguarded, and a second
+                    // same-requestId duplicate arriving inside it would
+                    // also Proceed and spawn a duplicate PTY.
                     let origin = Arc::clone(sink);
                     map.insert(
                         request_id.to_string(),
@@ -406,6 +415,89 @@ mod tests {
             origin_frames.lock().expect("frames").is_empty(),
             "same-sink duplicates must not be double-answered"
         );
+    }
+
+    /// Council finding (unanimous, PR #552 follow-up): the flag-mismatch
+    /// arm — settled entry exists, terminal live, but the incoming create's
+    /// `restore` flag differs — returned `Proceed` WITHOUT inserting an
+    /// InFlight sentinel. While that second create is in flight, another
+    /// same-requestId duplicate also got `Proceed` → duplicate PTY. Two
+    /// real client paths reach this: a persisted restore latch flipping a
+    /// lost fresh create into a same-requestId restore:true resend across
+    /// reload, and redriveAfterLaunchInvalidTerminal.
+    #[test]
+    fn flag_mismatch_proceed_registers_sentinel_blocking_further_duplicates() {
+        let d = CreateDedupe::default();
+        let (s1, _f1) = recording_sink();
+        // Settle R as a plain (restore=false) create; terminal stays live.
+        let _ = d.begin("r1", &s1, Some(false), |_| true);
+        d.settle("r1", "t1", &created_frame(), Some(false), |_| true);
+
+        // Same id, DIFFERENT flag: proceeds to its own create path...
+        assert!(matches!(
+            d.begin("r1", &s1, Some(true), |_| true),
+            DedupeDecision::Proceed
+        ));
+        // ...but MUST have registered an InFlight sentinel: a second
+        // duplicate while the first is unsettled must NOT also proceed.
+        assert!(
+            matches!(
+                d.begin("r1", &s1, Some(true), |_| true),
+                DedupeDecision::DuplicateInFlight
+            ),
+            "second same-requestId duplicate during the in-flight window must \
+             be deduped, not spawn a second PTY"
+        );
+    }
+
+    /// The sentinel installed by the flag-mismatch arm must behave exactly
+    /// like any other InFlight entry: clear_if_in_flight drops it (waiters
+    /// get the fail-loud error; a retry proceeds fresh) and settle replaces
+    /// it (waiters get the settled frame).
+    #[test]
+    fn flag_mismatch_sentinel_supports_clear_and_settle() {
+        // clear_if_in_flight path: waiter notified, retry proceeds fresh.
+        let d = CreateDedupe::default();
+        let (origin, _f1) = recording_sink();
+        let (other, other_frames) = recording_sink();
+        let _ = d.begin("r1", &origin, Some(false), |_| true);
+        d.settle("r1", "t1", &created_frame(), Some(false), |_| true);
+        let _ = d.begin("r1", &origin, Some(true), |_| true); // replaces Settled with InFlight
+        let _ = d.begin("r1", &other, Some(true), |_| true); // cross-conn waiter
+        d.clear_if_in_flight("r1");
+        {
+            let frames = other_frames.lock().expect("frames");
+            assert_eq!(frames.len(), 1, "waiter gets the fail-loud error");
+            assert!(matches!(
+                &frames[0],
+                ServerMessage::Error(err) if err.request_id.as_deref() == Some("r1")
+            ));
+        }
+        assert!(matches!(
+            d.begin("r1", &other, Some(true), |_| true),
+            DedupeDecision::Proceed
+        ));
+
+        // settle path: the replaced entry settles normally, waiter gets the
+        // frame, and the NEW settled flag governs later replays.
+        let d = CreateDedupe::default();
+        let (origin, _f2) = recording_sink();
+        let (other, other_frames) = recording_sink();
+        let _ = d.begin("r2", &origin, Some(false), |_| true);
+        d.settle("r2", "t1", &created_frame(), Some(false), |_| true);
+        let _ = d.begin("r2", &origin, Some(true), |_| true); // replaces Settled with InFlight
+        let _ = d.begin("r2", &other, Some(true), |_| true); // waiter
+        d.settle("r2", "t2", &created_frame(), Some(true), |_| true);
+        assert_eq!(
+            other_frames.lock().expect("frames").len(),
+            1,
+            "waiter receives the new settled frame"
+        );
+        // Replay now keys on the NEW restore flag.
+        assert!(matches!(
+            d.begin("r2", &other, Some(true), |_| true),
+            DedupeDecision::DuplicateSettled(_)
+        ));
     }
 
     #[test]
