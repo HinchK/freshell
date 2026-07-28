@@ -771,6 +771,15 @@ export default function Sidebar({
                 </option>
               ))}
             </select>
+            {agentFilter !== ALL_AGENTS ? (
+              <button
+                aria-label="Clear agent filter"
+                onClick={() => setAgentFilter(ALL_AGENTS)}
+                className="p-0.5 min-h-11 min-w-11 md:min-h-0 md:min-w-0 flex items-center justify-center rounded hover:bg-muted text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            ) : null}
           </div>
         )}
         {localQuery && (
@@ -849,6 +858,8 @@ export default function Sidebar({
                 <div className="px-2 py-8 text-center text-sm text-muted-foreground">
                   {repoFilter !== ALL_REPOS
                     ? 'No sessions in selected repo'
+                    : agentFilter !== ALL_AGENTS
+                    ? 'No sessions for selected agent'
                     : visibleQuery && visibleSearchTier !== 'title'
                     ? 'No results found'
                     : visibleQuery

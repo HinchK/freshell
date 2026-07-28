@@ -2765,6 +2765,56 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       expect(queryByRole('combobox', { name: /agent filter/i })).not.toBeInTheDocument()
     })
+
+    it('shows a clear (x) button only while an agent is selected and it resets to All agents', async () => {
+      const store = createTestStore({ projects: agentProjects })
+      const { getByRole, queryByLabelText, getByLabelText } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      expect(queryByLabelText('Clear agent filter')).not.toBeInTheDocument()
+
+      fireEvent.change(getByRole('combobox', { name: /agent filter/i }), {
+        target: { value: 'codex' },
+      })
+      expect(screen.queryByText('Alpha claude session')).not.toBeInTheDocument()
+
+      fireEvent.click(getByLabelText('Clear agent filter'))
+
+      expect(getByRole('combobox', { name: /agent filter/i })).toHaveValue('all')
+      expect(screen.getByText('Alpha claude session')).toBeInTheDocument()
+      expect(queryByLabelText('Clear agent filter')).not.toBeInTheDocument()
+    })
+
+    it('keeps the selected agent option and shows an agent-aware empty state when a search empties the window', async () => {
+      const searchRequest = createDeferred<any>()
+      vi.mocked(mockSearchSessions).mockReturnValueOnce(searchRequest.promise)
+
+      const store = createTestStore({ projects: agentProjects })
+      const { getByRole, getByPlaceholderText } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByRole('combobox', { name: /agent filter/i }), {
+        target: { value: 'codex' },
+      })
+
+      fireEvent.change(getByPlaceholderText('Search...'), { target: { value: 'zeta' } })
+      await act(async () => {
+        vi.advanceTimersByTime(300)
+        await Promise.resolve()
+      })
+      await act(async () => {
+        searchRequest.resolve({ results: [], tier: 'title', query: 'zeta', totalScanned: 0 })
+        await Promise.resolve()
+      })
+
+      // Selection survives the (empty) search commit and remains a valid option.
+      const select = getByRole('combobox', { name: /agent filter/i }) as HTMLSelectElement
+      expect(select).toHaveValue('codex')
+      expect(Array.from(select.options).map((o) => o.value)).toContain('codex')
+
+      // Empty state names the agent filter as a possible cause.
+      expect(screen.getByText('No sessions for selected agent')).toBeInTheDocument()
+    })
   })
 
   describe('Search loading state', () => {
