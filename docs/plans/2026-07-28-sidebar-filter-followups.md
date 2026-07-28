@@ -19,7 +19,7 @@
 - Agent filter ANDs with BOTH the repo filter and the text search.
 - Jumpiness fix must be root-cause (preserve scroll position structurally, stable ordering, no window truncation) — do NOT implement the throttle fallback.
 - TDD Red-Green-Refactor for every task; never skip the failing-test run.
-- Focused test runs use `npm run test:vitest -- <file>` (never raw `npx vitest`); broad runs use `npm run check` (shared coordinator gate).
+- Focused test runs use `npm run test:vitest -- --run <file>` (never raw `npx vitest`). The `--run` flag is MANDATORY: the coordinator passes default-config invocations straight to vitest, which enters watch mode when stdin is a TTY and `CI` is unset — the command then hangs forever, indistinguishable from a broken test (verified live). Broad runs use `npm run check` (shared coordinator gate).
 - Commits must use git identity `Dan Shapiro <3732858+danshapiro@users.noreply.github.com>`.
 - Icon-only buttons must carry `aria-label` (eslint-plugin-jsx-a11y is a CI gate).
 - Update `docs/index.html` static UI mock for user-facing sidebar changes.
@@ -45,7 +45,7 @@
 
 Background facts every task relies on (verified against `main` @ `6537d65c`):
 
-- `SidebarSessionItem` (`sidebarSelectors.ts:14-48`) has `provider: CodingCliProviderName` (open string) and `sessionType: string` which **defaults to `provider`** (`sessionType: session.sessionType || provider`, `sidebarSelectors.ts:251`). Every item has a non-empty `sessionType` — there is no `undefined` bucket (unlike `repoPath`). The agent filter keys on `sessionType` because it is the field that already drives each row's icon/label via `resolveSessionTypeConfig` and distinguishes `freshclaude` from `claude`.
+- `SidebarSessionItem` (`sidebarSelectors.ts:14-48`) has `provider: CodingCliProviderName` (open string) and `sessionType: string` which **defaults to `provider`** (`sessionType: session.sessionType || provider`, `sidebarSelectors.ts:252`). Every item has a non-empty `sessionType` — there is no `undefined` bucket (unlike `repoPath`). The agent filter keys on `sessionType` because it is the field that already drives each row's icon/label via `resolveSessionTypeConfig` and distinguishes `freshclaude` from `claude`.
 - The repo filter pipeline: `localFilteredItems` (memoized selector output) → `repoOptions = collectRepoFilterOptions(localFilteredItems, repoFilter)` → `computedItems = filterSessionItemsByRepo(...)` → `sortedItems = useStableArray(computedItems, isSessionItemEqual)` (`Sidebar.tsx:319-340`). The agent filter slots into the same chain.
 - List rows are keyed `` `${item.provider}:${item.sessionId}` `` and rendered inside `<div ref={listRef} data-testid="sidebar-session-list">` (`Sidebar.tsx:817-848`).
 - "E2E" for sidebar filters means Vitest+jsdom flow tests in `test/e2e/` (run by default vitest config / `npm test`), NOT Playwright (`test/e2e-browser/` has no filter coverage — do not add any there).
@@ -92,7 +92,7 @@ In `test/unit/client/components/Sidebar.test.tsx`, inside `describe('Repo filter
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm run test:vitest -- test/unit/client/components/Sidebar.test.tsx -t "renders the repo dropdown defaulting to All repos"`
+Run: `npm run test:vitest -- --run test/unit/client/components/Sidebar.test.tsx -t "renders the repo dropdown defaulting to All repos"`
 Expected: FAIL — received `'All'`, expected `'All repos'`.
 
 - [ ] **Step 3: Change the option label**
@@ -111,7 +111,7 @@ to:
 
 - [ ] **Step 4: Run tests to verify pass**
 
-Run: `npm run test:vitest -- test/unit/client/components/Sidebar.test.tsx test/e2e/sidebar-repo-filter-flow.test.tsx test/unit/client/store/sidebar-repo-filter.test.ts`
+Run: `npm run test:vitest -- --run test/unit/client/components/Sidebar.test.tsx test/e2e/sidebar-repo-filter-flow.test.tsx test/unit/client/store/sidebar-repo-filter.test.ts`
 Expected: PASS (all — the e2e/helper suites assert option *values*, not the label).
 
 - [ ] **Step 5: Update the static UI mock**
@@ -197,7 +197,7 @@ Then add this test at the end of `describe('Repo filter dropdown')` (after the n
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm run test:vitest -- test/unit/client/components/Sidebar.test.tsx -t "keeps the scroll container mounted when a refresh transiently empties"`
+Run: `npm run test:vitest -- --run test/unit/client/components/Sidebar.test.tsx -t "keeps the scroll container mounted when a refresh transiently empties"`
 Expected: FAIL — `getByTestId('sidebar-session-list')` throws while the empty state is showing (today the container is unmounted when `sortedItems.length === 0`).
 
 - [ ] **Step 3: Hoist the scroll container**
@@ -273,11 +273,11 @@ In `src/components/Sidebar.tsx`, replace the entire `{/* Session List */}` inner
       </div>
 ```
 
-Bonus effect (intentional): `listRef.current` is now non-null in the empty state, so the viewport backfill (`getListMetrics`/`maybeBackfillViewport`, `Sidebar.tsx:532-599`) can recover from a transient-empty filtered list instead of going inert.
+Bonus effect (intentional): `listRef.current` is now non-null in the empty state, so the viewport backfill (`getListMetrics`/`maybeBackfillViewport`, `Sidebar.tsx:532-599`) can recover from a transient-empty filtered list instead of going inert. This cannot fetch-storm: the backfill walk is a bounded sequential page walk (monotonic cursor, terminated by server `hasMore`), and a truly-empty window is inert via the cursor-null guard. Known PRE-EXISTING edge, deliberately out of scope for this plan: a persistently FAILING append retries with no backoff (`window.error` is never consulted by the backfill effect) — this task merely extends that pathology's reachability to the empty state; do not attempt to fix it here.
 
 - [ ] **Step 4: Run the sidebar suites to verify pass and catch structural-contract fallout**
 
-Run: `npm run test:vitest -- test/unit/client/components/Sidebar.test.tsx test/unit/client/components/Sidebar.dom-stability.test.tsx test/unit/client/components/Sidebar.render-stability.test.tsx test/e2e/sidebar-repo-filter-flow.test.tsx test/e2e/sidebar-refresh-dom-stability.test.tsx test/e2e/sidebar-search-flow.test.tsx`
+Run: `npm run test:vitest -- --run test/unit/client/components/Sidebar.test.tsx test/unit/client/components/Sidebar.dom-stability.test.tsx test/unit/client/components/Sidebar.render-stability.test.tsx test/e2e/sidebar-repo-filter-flow.test.tsx test/e2e/sidebar-refresh-dom-stability.test.tsx test/e2e/sidebar-search-flow.test.tsx`
 Expected: the new test PASSES. If any pre-existing test fails, it can only be because it asserted the OLD structure (e.g. `queryByTestId('sidebar-session-list')` absent during loading/empty, or `search-loading` as a sibling of the container). Update ONLY such assertions to the new contract (container always mounted; loading/empty content inside it) — do not weaken any other assertion. The mount-stability tests ("keeps ... mounted") assert presence and should pass unchanged.
 
 - [ ] **Step 5: Commit**
@@ -295,12 +295,20 @@ Root cause of "updates every few seconds, jumps to top, re-sorts": every WS `ses
 
 Fix: merge the fresh page 1 OVER the existing window (fresh wins for overlapping sessions; previously loaded deeper sessions retained) and keep the deeper pagination cursor + `hasMore`, so backfill has nothing to re-walk.
 
+Companion change (same task, steps 4-6): because the merge deliberately stops the silent refresh from removing vanished sessions, and refresh-replace is today the ONLY mechanism that removes a deleted session from sidebar state (verified: no targeted removal action is ever dispatched in production), a client-initiated delete would otherwise leave the deleted row visibly in place — it sorts by recency, not "below page 1". Fix: a small `removeSessionFromProjects` reducer dispatched from both delete flows, so deletes propagate immediately and don't depend on refresh semantics at all. Sessions deleted EXTERNALLY (another client/server-side) that sit in a deeper-than-page-1 window still linger until a window rebuild — an accepted, documented residual (rare case; the alternative full replace reintroduces the exact churn this task removes).
+
 **Files:**
 - Modify: `src/store/sessionsThunks.ts:431-446` (browse path of `refreshVisibleSessionWindowSilently`)
+- Modify: `src/store/sessionsSlice.ts` (new `removeSessionFromProjects` reducer + export)
+- Modify: `src/components/context-menu/ContextMenuProvider.tsx:506-542` (delete flow dispatch)
+- Modify: `src/components/HistoryView.tsx:111-116` (delete flow dispatch)
 - Test: `test/unit/client/store/sessionsThunks.test.ts` (two new tests inside `describe('sessionsThunks')`)
+- Test: `test/unit/client/store/sessionsSlice.test.ts` (new `describe('removeSessionFromProjects')`)
+- Test: `test/unit/client/components/ContextMenuProvider.test.tsx` (delete-flow wiring test)
+- Test: `test/e2e/open-tab-session-sidebar-visibility.test.tsx` (one assertion updated to the new refresh contract — see Step 7)
 
 **Interfaces:**
-- Consumes: module-private `mergeProjects(existing, incoming)` (`sessionsThunks.ts:142-179` — keeps `existing`'s session objects, appends `incoming` sessions not already present, keyed by provider:sessionId) and `countSessions(projects)` (same file, already used at line 553). Both are in scope at line 431. NOTE: `sessionsSlice.ts` also exports an unrelated Redux action named `mergeProjects` — do not touch it.
+- Consumes: module-private `mergeProjects(existing, incoming)` (`sessionsThunks.ts:142-179` — keeps `existing`'s session objects, appends `incoming` sessions not already present, keyed by provider:sessionId) and `countSessions(projects)` (same file, already used at line 542). Both are in scope at line 431. NOTE: `sessionsSlice.ts` also exports an unrelated Redux action named `mergeProjects` — do not touch it.
 - Produces: refresh commit payload semantics relied on by the sidebar backfill effect (`Sidebar.tsx:581-591`): after a silent browse refresh, `windows.sidebar.projects` is a superset of what was loaded, and `oldestLoadedTimestamp`/`oldestLoadedSessionId`/`hasMore` still describe the deepest loaded point.
 
 - [ ] **Step 1: Write the failing truncation test**
@@ -449,10 +457,10 @@ Add to `test/unit/client/store/sessionsThunks.test.ts`, inside `describe('sessio
 
 - [ ] **Step 2: Run tests to verify the first fails**
 
-Run: `npm run test:vitest -- test/unit/client/store/sessionsThunks.test.ts -t "preserves deeper loaded pages"`
+Run: `npm run test:vitest -- --run test/unit/client/store/sessionsThunks.test.ts -t "preserves deeper loaded pages"`
 Expected: FAIL — `session-old` is dropped (window replaced by page 1) and `oldestLoadedTimestamp` becomes `6_000`.
 
-Run: `npm run test:vitest -- test/unit/client/store/sessionsThunks.test.ts -t "replaces the window on refresh when no deeper pages"`
+Run: `npm run test:vitest -- --run test/unit/client/store/sessionsThunks.test.ts -t "replaces the window on refresh when no deeper pages"`
 Expected: PASS already (documents the unchanged replace path — keep it as a pin).
 
 - [ ] **Step 3: Implement the depth-preserving merge**
@@ -504,20 +512,136 @@ In `src/store/sessionsThunks.ts`, replace the browse-path block of `refreshVisib
 
 Notes for the implementer:
 - `mergeProjects(existing, incoming)` keeps `existing`'s session objects and appends `incoming` sessions not already present — passing the FRESH page as `existing` is deliberate: fresh data wins for overlapping sessions, deeper (old-window-only) sessions are appended.
-- `countSessions` already exists in this file (used at line 553 for the search-append merge).
-- Sessions deleted server-side can linger in the merged deep pages until the window is rebuilt (initial load, search, replace path) — an accepted trade-off; deletions are rare and staleness below page 1 is invisible compared to the churn this removes.
+- `countSessions` already exists in this file (used at line 542 for the search-append merge). Committing the merged count is safe: `windows.*.totalSessions` has no functional readers in `src/` (pagination gates on `hasMore` + cursor), and the search-append path already commits `countSessions(...)`.
+- Staleness contract (be precise — the merge NEVER removes anything): a session that vanished from the server keeps its place in the merged window — at whatever position its recency sorts it, including the top — until a window rebuild (initial load, search apply→clear, or a replace-path refresh). Client-initiated deletes are therefore propagated explicitly by Steps 4-6 below; only EXTERNAL deletions can linger, which is the accepted residual. Archive flags on deeper-than-page-1 sessions may likewise lag until rebuild (minor: fresh page 1 covers recent archives).
+- Boundary tie: when `prevOldestTimestamp === freshOldestTimestamp`, `hasDeeperWindow` is false and the window is replaced. Accepted: ms-epoch equality at the exact boundary is improbable, and the worst case is a single truncate/backfill cycle (one-time churn, self-healing).
 - Do not touch the search paths (lines 388-429) — search refreshes already rebuild the full result set.
+- Do NOT reuse `syncAllWindowsFromTopLevel`/`applySessionsPatch` for anything in this task: `syncWindowProjectsFromTopLevel` REPLACES a window's projects with the (possibly shallower) top-level array — the exact truncation this task eliminates. That machinery is dormant in production (never dispatched from `src/`).
 
-- [ ] **Step 4: Run tests to verify pass**
+- [ ] **Step 4: Write the failing deletion-propagation tests (Red)**
 
-Run: `npm run test:vitest -- test/unit/client/store/sessionsThunks.test.ts test/unit/client/store/sessionsSlice.test.ts test/unit/client/store/sidebar-staleness.test.ts test/e2e/sidebar-refresh-dom-stability.test.tsx`
-Expected: PASS (both new tests plus all existing refresh/coalescing tests — the change only affects the browse commit payload, not identity gating, coalescing, or loading-state handling).
+(a) In `test/unit/client/store/sessionsSlice.test.ts`, add `removeSessionFromProjects` to the sessionsSlice import list (lines 4-16; `setProjects` and `commitSessionWindowVisibleRefresh` are already imported — add any that are missing), then insert this new describe after the `applySessionsPatch` describe closes (line 510, immediately before `describe('toggleProjectExpanded'` at line 512):
 
-- [ ] **Step 5: Commit**
+```ts
+  describe('removeSessionFromProjects', () => {
+    it('removes the session from top-level projects and every window and prunes empty project groups', () => {
+      const projects = [
+        {
+          projectPath: '/p1',
+          sessions: [
+            { provider: 'claude', sessionId: 's1', projectPath: '/p1', lastActivityAt: 2 },
+            { provider: 'codex', sessionId: 's2', projectPath: '/p1', lastActivityAt: 1 },
+          ],
+        },
+        {
+          projectPath: '/p2',
+          sessions: [{ provider: 'claude', sessionId: 's3', projectPath: '/p2', lastActivityAt: 3 }],
+        },
+      ]
+      let state = sessionsReducer(undefined, setProjects(projects as any))
+      state = sessionsReducer(state, commitSessionWindowVisibleRefresh({
+        surface: 'sidebar',
+        projects,
+        totalSessions: 3,
+        hasMore: true,
+        oldestLoadedTimestamp: 1,
+        oldestLoadedSessionId: 'codex:s2',
+      } as any))
+
+      // Removing one session leaves its project — and the window's pagination
+      // cursor — intact, in both top-level projects and the sidebar window.
+      let next = sessionsReducer(state, removeSessionFromProjects({ provider: 'claude', sessionId: 's1' }))
+      const windowSessions = next.windows.sidebar.projects.flatMap((p: any) => p.sessions)
+      expect(windowSessions.map((s: any) => `${s.provider}:${s.sessionId}`)).toEqual(['codex:s2', 'claude:s3'])
+      expect(next.projects.flatMap((p: any) => p.sessions).some((s: any) => s.sessionId === 's1')).toBe(false)
+      expect(next.windows.sidebar.oldestLoadedTimestamp).toBe(1)
+      expect(next.windows.sidebar.hasMore).toBe(true)
+
+      // Removing a project's last session prunes the empty group everywhere.
+      next = sessionsReducer(next, removeSessionFromProjects({ provider: 'claude', sessionId: 's3' }))
+      expect(next.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
+      expect(next.windows.sidebar.projects.map((p: any) => p.projectPath)).toEqual(['/p1'])
+    })
+  })
+```
+
+(b) In `test/unit/client/components/ContextMenuProvider.test.tsx` (describe `'ContextMenuProvider'`, line 616; `api.delete` is already mocked to resolve at lines 57/71), add one wiring test for the sidebar-session delete flow. No existing test exercises delete, so mirror the harness idioms of the existing rename-session test in the same file (menu invocation on a sidebar-session target, modal interaction): trigger `Delete session`, confirm the modal, then assert (1) `api.delete` was called with `/api/sessions/<encoded provider:sessionId>` and (2) the session is gone from BOTH `store.getState().sessions.projects` and `store.getState().sessions.windows.sidebar.projects` without waiting for any refresh to resolve. Bounded judgment: reuse the file's existing store/render/menu helpers exactly as the neighboring tests do — only the action under test and the two store assertions are new.
+
+- [ ] **Step 5: Run tests to verify they fail**
+
+Run: `npm run test:vitest -- --run test/unit/client/store/sessionsSlice.test.ts -t "removeSessionFromProjects"`
+Expected: FAIL — `removeSessionFromProjects` is not exported from `@/store/sessionsSlice`.
+
+Run: `npm run test:vitest -- --run test/unit/client/components/ContextMenuProvider.test.tsx -t "delete"`
+Expected: FAIL — the deleted session is still present in store state (nothing removes it today).
+
+- [ ] **Step 6: Implement the reducer and wire the delete flows**
+
+(a) In `src/store/sessionsSlice.ts`, add the reducer after `setProjectExpanded` (after line 498, before the `},` that closes `reducers` at line 499) — it deliberately mirrors `patchSessionRunningStateFromTerminalMeta`'s iterate-top-level-AND-every-window model (lines 401-414), applying to search windows too, and leaves cursors/`hasMore`/`totalSessions` untouched (removal does not change window depth):
+
+```ts
+    removeSessionFromProjects: (state, action: PayloadAction<{ provider?: string; sessionId: string }>) => {
+      const key = sessionKey(action.payload)
+      const removeFrom = (projects: ProjectGroup[]) =>
+        projects
+          .map((project) => ({
+            ...project,
+            sessions: (project.sessions || []).filter((s) => sessionKey(s) !== key),
+          }))
+          .filter((project) => project.sessions.length > 0)
+      state.projects = removeFrom(state.projects || [])
+      if (state.windows) {
+        for (const window of Object.values(state.windows)) {
+          if (!window) continue
+          window.projects = removeFrom(window.projects || [])
+        }
+      }
+    },
+```
+
+Then add `removeSessionFromProjects` to the action re-export list (after `setProjectExpanded,` at line 520). `sessionKey` (lines 29-31) and `PayloadAction` are already in scope.
+
+(b) In `src/components/context-menu/ContextMenuProvider.tsx`: extend the line 17 import to `import { removeSessionFromProjects, setProjectExpanded } from '@/store/sessionsSlice'`, and in `deleteSession`'s `onConfirm` (lines 532-534) dispatch the removal between the API call and the refresh:
+
+```tsx
+          const compositeKey = `${provider || info.session.provider || 'claude'}:${sessionId}`
+          await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
+          // The depth-preserving silent refresh (this task) no longer removes
+          // vanished sessions — propagate the delete explicitly and immediately.
+          dispatch(removeSessionFromProjects({ provider: provider || info.session.provider, sessionId }))
+          await dispatch(refreshActiveSessionWindow() as any)
+```
+
+(c) In `src/components/HistoryView.tsx`: extend the line 4 import to `import { removeSessionFromProjects, toggleProjectExpanded } from '@/store/sessionsSlice'`, and in `deleteSession` (lines 111-116) dispatch the removal after `api.delete`, before `refresh()`:
+
+```ts
+    await api.delete(`/api/sessions/${encodeURIComponent(compositeKey)}`)
+    dispatch(removeSessionFromProjects({ provider, sessionId }))
+    await refresh()
+```
+
+- [ ] **Step 7: Update the one pinned-contract e2e assertion, then run the suites**
+
+`test/e2e/open-tab-session-sidebar-visibility.test.tsx` line 800, inside the test `'keeps the loaded sidebar visible during an invalidation burst and queues at most one follow-up refresh'` (lines 688-802), currently pins the OLD replace semantics: its fixture preloads a sidebar window with `oldestLoadedTimestamp: 10` and resolves a fresh snapshot with `oldestIncludedTimestamp: 11` — exactly the `hasDeeperWindow` configuration this task turns into a merge — and asserts `expect(screen.queryByText('Recent Session')).not.toBeInTheDocument()`. Under the new, deliberate contract a silent refresh never shrinks a deeper-than-fresh-page window, so `Recent Session` is now retained (until a window rebuild). Update ONLY line 800 to:
+
+```tsx
+    // Depth-preserving refresh contract (see refreshVisibleSessionWindowSilently):
+    // a silent refresh never shrinks a deeper-than-fresh-page window, so the
+    // previously loaded session is retained alongside the fresh page.
+    expect(screen.getAllByText('Recent Session').length).toBeGreaterThan(0)
+```
+
+Every other assertion in that test (burst coalescing at lines 773/801, `Older Open Session` appearing, `Recent Session` staying visible mid-refresh) is the test's actual purpose and MUST remain unchanged. Do not touch the sibling test at lines 559-686 (its fresh cursor `1` < prev `10` is not deeper → replace path → passes unchanged).
+
+Then run:
+`npm run test:vitest -- --run test/unit/client/store/sessionsThunks.test.ts test/unit/client/store/sessionsSlice.test.ts test/unit/client/store/sidebar-staleness.test.ts test/unit/client/components/ContextMenuProvider.test.tsx test/e2e/sidebar-refresh-dom-stability.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx`
+Expected: PASS (all new tests, the updated e2e pin, and all existing refresh/coalescing tests — the thunk change only affects the browse commit payload, not identity gating, coalescing, or loading-state handling; `sidebar-staleness.test.ts` still passes because its fixture has no pagination cursor → replace path).
+
+- [ ] **Step 8: Commit**
 
 ```bash
-git add src/store/sessionsThunks.ts test/unit/client/store/sessionsThunks.test.ts
-git commit -m "fix(sidebar): preserve paginated session window across live refreshes (no truncation)"
+git add src/store/sessionsThunks.ts src/store/sessionsSlice.ts src/components/context-menu/ContextMenuProvider.tsx src/components/HistoryView.tsx test/unit/client/store/sessionsThunks.test.ts test/unit/client/store/sessionsSlice.test.ts test/unit/client/components/ContextMenuProvider.test.tsx test/e2e/open-tab-session-sidebar-visibility.test.tsx
+git commit -m "fix(sidebar): depth-preserving live refresh with immediate delete propagation"
 ```
 
 ---
@@ -561,7 +685,7 @@ Add inside `describe('sortSessionItems', ...)` in `test/unit/client/store/select
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `npm run test:vitest -- test/unit/client/store/selectors/sidebarSelectors.test.ts -t "breaks equal-timestamp ties"`
+Run: `npm run test:vitest -- --run test/unit/client/store/selectors/sidebarSelectors.test.ts -t "breaks equal-timestamp ties"`
 Expected: FAIL — with equal timestamps, V8's stable sort preserves input order, so the reversed input yields `['ccc', 'bbb', 'aaa']` (or similar input-order-dependent result).
 
 - [ ] **Step 3: Add the tie-break comparator**
@@ -602,7 +726,7 @@ Apply the same `|| compareBySessionKey(a, b)` suffix to the `withoutTabs` inline
 
 - [ ] **Step 4: Run tests to verify pass**
 
-Run: `npm run test:vitest -- test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/sidebar-staleness.test.ts test/unit/client/components/Sidebar.test.tsx`
+Run: `npm run test:vitest -- --run test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/sidebar-staleness.test.ts test/unit/client/components/Sidebar.test.tsx`
 Expected: PASS. If an existing sort test pinned an equal-timestamp order that relied on input order, update that expectation to the deterministic provider+sessionId order (this is the intended behavior change; nothing else may change).
 
 - [ ] **Step 5: Commit**
@@ -714,7 +838,7 @@ describe('collectAgentFilterOptions', () => {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- test/unit/client/store/sidebar-agent-filter.test.ts`
+Run: `npm run test:vitest -- --run test/unit/client/store/sidebar-agent-filter.test.ts`
 Expected: FAIL — module has no export `ALL_AGENTS` / `collectAgentFilterOptions` / `filterSessionItemsByAgent`.
 
 - [ ] **Step 3: Implement the helpers**
@@ -758,7 +882,7 @@ export function collectAgentFilterOptions(
 
 - [ ] **Step 4: Run tests to verify pass**
 
-Run: `npm run test:vitest -- test/unit/client/store/sidebar-agent-filter.test.ts test/unit/client/store/sidebar-repo-filter.test.ts`
+Run: `npm run test:vitest -- --run test/unit/client/store/sidebar-agent-filter.test.ts test/unit/client/store/sidebar-repo-filter.test.ts`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -887,7 +1011,7 @@ In `test/unit/client/components/Sidebar.test.tsx`, add a new describe block imme
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- test/unit/client/components/Sidebar.test.tsx -t "Agent filter dropdown"`
+Run: `npm run test:vitest -- --run test/unit/client/components/Sidebar.test.tsx -t "Agent filter dropdown"`
 Expected: FAIL — no combobox named "Agent filter" exists.
 
 - [ ] **Step 3: Wire the agent filter into Sidebar**
@@ -970,7 +1094,7 @@ import {
 
 - [ ] **Step 4: Run tests to verify pass**
 
-Run: `npm run test:vitest -- test/unit/client/components/Sidebar.test.tsx`
+Run: `npm run test:vitest -- --run test/unit/client/components/Sidebar.test.tsx`
 Expected: PASS — all new agent tests plus the full existing Sidebar suite (repo-filter tests use `{ name: /repo filter/i }` queries, so the second combobox does not collide).
 
 - [ ] **Step 5: Commit**
@@ -1050,7 +1174,7 @@ Add to `describe('Agent filter dropdown')`:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `npm run test:vitest -- test/unit/client/components/Sidebar.test.tsx -t "Agent filter dropdown"`
+Run: `npm run test:vitest -- --run test/unit/client/components/Sidebar.test.tsx -t "Agent filter dropdown"`
 Expected: the two new tests FAIL (no `Clear agent filter` button; empty state says `No matching sessions` instead of the agent-aware string).
 
 - [ ] **Step 3: Implement clear-x and empty state**
@@ -1087,7 +1211,7 @@ Expected: the two new tests FAIL (no `Clear agent filter` button; empty state sa
 
 - [ ] **Step 4: Run tests to verify pass**
 
-Run: `npm run test:vitest -- test/unit/client/components/Sidebar.test.tsx`
+Run: `npm run test:vitest -- --run test/unit/client/components/Sidebar.test.tsx`
 Expected: PASS (full file).
 
 - [ ] **Step 5: Commit**
@@ -1149,7 +1273,7 @@ Add as the last test of `describe('Agent filter dropdown')`:
 
 - [ ] **Step 2: Run test — expect PASS (lock, not bug-fix)**
 
-Run: `npm run test:vitest -- test/unit/client/components/Sidebar.test.tsx -t "never persists the selection: localStorage untouched and a fresh mount resets to All agents"`
+Run: `npm run test:vitest -- --run test/unit/client/components/Sidebar.test.tsx -t "never persists the selection: localStorage untouched and a fresh mount resets to All agents"`
 Expected: PASS immediately (the Task 6 implementation is already component-local `useState`). This test is a regression lock, mirroring `ddedf75a`. If it FAILS, the Task 6 implementation leaked state — fix that, do not weaken the test.
 
 - [ ] **Step 3: Add the static mock**
@@ -1161,7 +1285,7 @@ In `docs/index.html`, immediately after the repo-filter mock `</select>` (line ~
             <option>All agents</option>
             <option>Claude</option>
             <option>Codex</option>
-            <option>OpenCode</option>
+            <option>Opencode</option>
           </select>
 ```
 
@@ -1351,8 +1475,8 @@ Create `test/e2e/sidebar-agent-filter-flow.test.tsx`. Copy the ENTIRE harness fr
 
 - [ ] **Step 2: Run to verify (should pass; failures indicate wiring bugs)**
 
-Run: `npm run test:vitest -- test/e2e/sidebar-agent-filter-flow.test.tsx`
-Expected: PASS. If a test fails, the Task 6/7 wiring has a real bug (e.g. filter not composing with the applied search) — fix `Sidebar.tsx`, not the test. Also run the sibling: `npm run test:vitest -- test/e2e/sidebar-repo-filter-flow.test.tsx` — Expected: PASS.
+Run: `npm run test:vitest -- --run test/e2e/sidebar-agent-filter-flow.test.tsx`
+Expected: PASS. If a test fails, the Task 6/7 wiring has a real bug (e.g. filter not composing with the applied search) — fix `Sidebar.tsx`, not the test. Also run the sibling: `npm run test:vitest -- --run test/e2e/sidebar-repo-filter-flow.test.tsx` — Expected: PASS.
 
 - [ ] **Step 3: Commit**
 
@@ -1374,7 +1498,7 @@ Expected: lint (including jsx-a11y), typecheck, and the full Vitest suite all gr
 
 - [ ] **Step 2: Fix anything red, atomically**
 
-If failures surface, fix them and commit each fix separately with a focused message (e.g. `fix(sidebar): <specific issue>`). Do not weaken tests to get to green — the only acceptable assertion updates are the ones explicitly called out in Tasks 2 and 4 (structural contract / deterministic tie order).
+If failures surface, fix them and commit each fix separately with a focused message (e.g. `fix(sidebar): <specific issue>`). Do not weaken tests to get to green — the only acceptable assertion updates are the ones explicitly called out in Tasks 2, 3 and 4 (structural contract / depth-preserving refresh contract at open-tab-session-sidebar-visibility line 800 / deterministic tie order).
 
 - [ ] **Step 3: Confirm clean tree**
 
@@ -1386,12 +1510,12 @@ Run: `git status --short` → empty. `git log --oneline origin/main..HEAD` → o
 
 **1. Spec coverage:**
 - Rename 'All' → 'All repos' (visible text only) → Task 1. ✓
-- Live-update jumpiness, PREFERRED root-cause fix, "emulate the main page": HistoryView's calm is structural — unconditional scroll container (Task 2 mirrors `HistoryView.tsx:181`), no self-inflicted window truncation (Task 3 makes the sidebar's refresh depth-preserving, matching the main page's "nothing to lose" property), stable ordering (Task 4). "Investigate why selecting a repo makes it worse" — answered and encoded in Tasks 2/3: the client-side filter draws its visible rows from deeper pages, so truncation deletes what's on screen and transient-empty unmounts the scroller. Fallback (scroll-freeze + 30-60s throttle) intentionally NOT implemented per spec ("only if a clean root-cause fix is not feasible" — it is feasible). ✓
+- Live-update jumpiness, PREFERRED root-cause fix, "emulate the main page": HistoryView's calm is structural — unconditional scroll container (Task 2 mirrors `HistoryView.tsx:181`), no self-inflicted window truncation (Task 3 makes the sidebar's refresh depth-preserving, matching the main page's "nothing to lose" property, and pairs the merge with immediate delete propagation so it never masks a user's delete), stable ordering (Task 4). "Investigate why selecting a repo makes it worse" — answered and encoded in Tasks 2/3: the client-side filter draws its visible rows from deeper pages, so truncation deletes what's on screen and transient-empty unmounts the scroller. Fallback (scroll-freeze + 30-60s throttle) intentionally NOT implemented per spec ("only if a clean root-cause fix is not feasible" — it is feasible). ✓
 - Agent dropdown: defaults to 'All agents' (Task 6), populated from loaded sessions' agent kinds (`sessionType`, which defaults to `provider` — covers claude/codex/opencode/freshclaude/etc., i.e. "whatever kinds the session data exposes"; there is no `'terminal'` sessionType on sidebar rows — shell terminals surface as fallback rows whose `sessionType` is still a provider name, so they filter consistently), filters the list (Task 6), ANDs with repo + text search (Tasks 6, 9), clear-x (Task 7), NOT persisted + locked by test (Task 8), same UX conventions (identical classes/aria patterns). ✓
 - "Existing patterns" conventions: pure helpers + unit tests (Task 5), sidebar component tests (Tasks 6-8), e2e coverage where the repo filter has it (Task 9 — `test/e2e/*.test.tsx` jsdom flow, the repo filter's actual e2e surface; it has no Playwright coverage, so none is added), non-persistence locked by test (Task 8), `docs/index.html` mock (Tasks 1, 8). ✓
 
-**1b. No silent deferrals:** No stubs, mocks-as-product, or deferred behavior. All test mocks (`@/lib/api`, `@/lib/ws-client`) are the repo's established component/flow test seams, not stand-ins for unimplemented behavior; production behavior is exercised through the real component + real Redux store + real thunks/reducers. Task 3's "deleted sessions may linger below page 1 until a window rebuild" is a documented trade-off of the fix, not a deferred requirement — no spec requirement demands immediate deletion propagation. No UNRESOLVED COVERAGE GAPS.
+**1b. No silent deferrals:** No stubs, mocks-as-product, or deferred behavior. All test mocks (`@/lib/api`, `@/lib/ws-client`) are the repo's established component/flow test seams, not stand-ins for unimplemented behavior; production behavior is exercised through the real component + real Redux store + real thunks/reducers. Task 3 pairs the depth-preserving merge with an explicit `removeSessionFromProjects` dispatch in both delete flows (Steps 4-6), so client-initiated deletions propagate immediately and do not depend on refresh semantics; the accepted, documented residual (surfaced by load-bearing validation) is that EXTERNALLY-deleted sessions in a deeper-than-page-1 window linger — at their sorted position — until a window rebuild. One existing e2e assertion pinned the old replace-refresh semantics; it is updated with explicit justification in Task 3 Step 7 (a deliberate contract change, not a weakened test). No UNRESOLVED COVERAGE GAPS.
 
-**2. Placeholder scan:** No TBD/TODO/"handle edge cases"/"similar to Task N" placeholders. Two bounded judgment instructions exist by design: Task 2 Step 4 and Task 4 Step 4 tell the implementer exactly which kind of pre-existing assertion may be updated and to what contract; Task 4 Step 3 gives an exact mechanical transformation rule for the two unquoted comparators. Task 9 copies a named existing harness verbatim with an exact list of what to copy and the one allowed change.
+**2. Placeholder scan:** No TBD/TODO/"handle edge cases"/"similar to Task N" placeholders. Bounded judgment instructions exist by design: Task 2 Step 4 and Task 4 Step 4 tell the implementer exactly which kind of pre-existing assertion may be updated and to what contract; Task 3 Step 4(b) fixes the wiring test's assertion contract while allowing reuse of the named file's existing harness idioms, and Task 3 Step 7 names the single e2e assertion (file, line, exact replacement) that changes with the refresh contract; Task 4 Step 3 gives an exact mechanical transformation rule for the two unquoted comparators. Task 9 copies a named existing harness verbatim with an exact list of what to copy and the one allowed change.
 
-**3. Type consistency:** `ALL_AGENTS`/`AgentFilterOption`/`filterSessionItemsByAgent(items, agentFilter)`/`collectAgentFilterOptions(items, selected, getLabel)` are defined once (Task 5) and consumed with identical signatures in Tasks 6-9. `compareBySessionKey` exists only within Task 4's `sortSessionItems`. `commitSessionWindowVisibleRefresh` payload fields used in tests match `SessionWindowCommitPayload` (`sessionsSlice.ts:124-137`). `getByRole('combobox', { name: /agent filter/i })` matches `aria-label="Agent filter"`; labels differ intentionally between component tests (`Claude CLI`, from `createTestStore`'s extensions entries) and e2e tests (`Claude`, capitalization fallback — that store has no extensions reducer), both flowing through `resolveSessionTypeConfig` → `getProviderLabel`.
+**3. Type consistency:** `ALL_AGENTS`/`AgentFilterOption`/`filterSessionItemsByAgent(items, agentFilter)`/`collectAgentFilterOptions(items, selected, getLabel)` are defined once (Task 5) and consumed with identical signatures in Tasks 6-9. `compareBySessionKey` exists only within Task 4's `sortSessionItems`. `commitSessionWindowVisibleRefresh` payload fields used in tests match `SessionWindowCommitPayload` (`sessionsSlice.ts:124-137`). `removeSessionFromProjects({ provider?, sessionId })` is defined once (Task 3 Step 6) and dispatched with the same payload shape from `ContextMenuProvider.tsx` and `HistoryView.tsx`; it reuses the in-file `sessionKey` helper so its `provider || 'claude'` fallback matches both delete flows' composite-key construction. `getByRole('combobox', { name: /agent filter/i })` matches `aria-label="Agent filter"`; labels differ intentionally between component tests (`Claude CLI`, from `createTestStore`'s extensions entries) and e2e tests (`Claude`, capitalization fallback — that store has no extensions reducer), both flowing through `resolveSessionTypeConfig` → `getProviderLabel`.
