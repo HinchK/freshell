@@ -984,6 +984,18 @@ the four blocking gaps the council found: a missing origin/main baseline, a miss
 committed verification report, a missing STOP-gate record, and a non-diagnosing
 harness-01 timeout.
 
+**Status note (council round 2, B7):** the per-flake evidence below is real and
+artifact-backed (each cited `/tmp/deflake-logs/*` and `/tmp/deflake-baseline/*` log exists).
+However, Task 8's own Steps 1-3 (the affected-suite 10x `rust-chromium` loop at this task's
+naming convention, the full CI-parity run, and the final coordinated `npm test` +
+`cargo test --workspace` green) had **not** been run to completion with their prescribed
+artifact names (`final-npm-test.log`, `final-cargo.log`, a `CI-PARITY-GREEN` marker) as of
+this writing — do not read the per-flake proof above as an implicit attestation that the
+full suite is green. This note is superseded by the "Certifying run (council round 2)"
+section appended below Task 8, which supplies the actual `final-npm-test.log` /
+`final-cargo.log` artifacts, a fresh 10x `rust-chromium` loop, and the exact commit SHA
+they were run against.
+
 ### Per-flake summary
 
 **Flake 1 — wall-rust double-restart (`restore-contract-wall-rust.spec.ts:2063`, "double-restart
@@ -1000,11 +1012,24 @@ mid-recovery: a second SIGKILL during recovery must not duplicate or wedge")**
 - Proof: this specific test shows **zero failures** across all 10 of this branch's own
   e2e-browser 10x acceptance runs (`/tmp/deflake-logs/e2eb-10x-run{1..10}.log`) and **zero
   failures** across all 10 of the fresh origin/main baseline runs captured for this fix
-  round (`/tmp/deflake-baseline/baseline-10x-run{1..10}.log`, see B1 below). A *different*
-  test in the same file ("THE RULER: all pane types live, one SIGKILL, every §2 contract
-  holds", line 1359, NOT touched by this branch) fails on **both** origin/main (10/10 baseline
-  runs) and this branch (present in the same run's failure list) — confirming it is an
-  unrelated, pre-existing flake outside this task's scope.
+  round (`/tmp/deflake-baseline/baseline-10x-run{1..10}.log`, see B1 below).
+
+  **Correction (council round 2, B8):** an earlier draft of this paragraph claimed a
+  *different* test in the same file ("THE RULER: all pane types live, one SIGKILL, every §2
+  contract holds", line 1359) was "NOT touched by this branch" — that was false. Two
+  concurrent commits on this branch *did* touch it: `4494c783` ("deflake THE RULER -- 600s
+  worst-case budget matching double-restart sibling") and `7726247d` ("fix THE RULER wedge on
+  rebased main -- repo-filter `<select>` poisons page-global option locator"). The true
+  attribution story is stronger than the false one: despite both a locator-wedge fix and a
+  600s worst-case budget (up from the prior, tighter one), THE RULER still fails at the same
+  rate on **both** origin/main (10/10 baseline runs) and this branch (present in the same
+  run's failure list). A generous timeout is a ceiling, not a cure — it cannot mask a genuine
+  failure by making the test wait longer for something that was never going to resolve. That
+  this test still fails identically after the budget was widened is *positive* evidence the
+  remaining failure is a real, pre-existing flake independent of budget sizing — not
+  something a wider ceiling quietly hid. It remains outside this task's four-flake scope; see
+  the disclosure paragraph below for the full accounting of commits this report did not
+  originally cover.
 
 **Flake 2 — sidebar case-a (`sidebar-registry-sync-rust.spec.ts`, "case-a: sidebar joins survive
 a graceful server restart")**
@@ -1160,6 +1185,49 @@ next acquirer under host contention, or (b) a different concurrently-running hol
 process) still had the lock. This is escalated, not fixed, per the test-only lane fence.
 Filed as kata `s52d` ("pane_ledger flock still held after drop (EWOULDBLOCK) — suspected
 product race caught by deflake probe").
+
+### Disclosure — commits absent from the original report (council round 2, B8)
+
+A concurrent agent (commit trailer "f3wp refresh") landed additional deflake commits on this
+branch, both before and after the original verification report commit (`fc86ca88`). None of
+these were within the four-flake-plus-pane_ledger scope this report otherwise covers, and the
+original report did not mention them. Full disclosure, in commit order:
+
+- **`1839b11e`** ("deflake `cross_kind_liveness` sleeper script -- unique per-call path") — a
+  **genuine root-cause fix**, not a budget/retry workaround: `terminal_create_is_refused_while_a_live_sidecar_owns_the_session`
+  panicked with `ETXTBSY` ("Text file busy") because `sleeper_cli_spec` built its script path
+  from `{name}-{pid}` only, so both tests in the binary shared ONE on-disk path and the second
+  test's write raced the first test's still-executing sleeper script. Fixed by making the path
+  unique per call. Carries its own RED-verified anti-regression test (reverting the fix
+  reproduces the original `ETXTBSY` failure); council-verified clean -- the fix matches the
+  diagnosed race exactly, with no unrelated changes bundled in.
+- **`4494c783`** / **`7726247d`** — THE RULER budget widening and the repo-filter `<select>`
+  locator-wedge fix (see the corrected Flake-1 paragraph above for full attribution).
+- **`f2c505e9`** ("deflake `codex_locator_activity` -- 30s frame-wait budget") — under
+  concurrent `cargo test` + parallel Playwright load, the inotify-driven rollout read plus WS
+  frame delivery exceeded the prior 10s `wait_for_frame` budget once; assertions unchanged,
+  only the wait budget grew. Council-verified clean drive-by.
+- **`f451871d`** ("deflake amplifier events-lane attach-read assertion") — the bind upsert can
+  broadcast before the attach's initial drain increments `tail_reads`; the prior one-shot
+  counter read raced that increment under workspace load. Council-verified clean drive-by.
+- **`f6573466`** ("make harness-01 real-home tripwire structural, not temporal") — landed
+  *after* the original report commit. Replaces the mtime/logs-witness real-home tripwire
+  (which still false-positived under live-host load: config.json's ~60s atomic-rewrite cadence
+  bumps the real `~/.freshell` dir even while the live server's logs stay quiet, so no temporal
+  witness is attributable there) with a structural check: if the real `~/.freshell` was ABSENT
+  before the test, it must still be absent after (fully attributable on CI/fresh hosts); if it
+  PRE-EXISTS (shared live host), the strict mtime/logs-witness check is skipped as
+  unattributable noise and a positive-isolation proof substitutes (the fixture's server
+  demonstrably wrote its own boot log under the *isolated* home). **Disclosed behavior change:**
+  on a shared live host, this test no longer attempts to detect a real-home write during the
+  test window at all — it only proves the isolated-home path was used, which is weaker than a
+  true negative-isolation proof but is the only assertion actually attributable given the
+  witness's demonstrated false-positive rate. Council round 2 additionally re-stats the
+  isolated boot log post-restart (see the mechanical fix above) to cover the restart cycle,
+  which this commit's isolation proof did not.
+
+None of these five commits are split or reverted here — this is disclosure of what already
+landed, not a re-litigation of already-verified fixes.
 
 ### Findings ledger
 

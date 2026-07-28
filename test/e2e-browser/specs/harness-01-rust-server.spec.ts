@@ -114,6 +114,13 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
     const isolatedBootLogExisted = fs.existsSync(
       path.join(info.homeDir, '.freshell', 'logs', 'rust-server.jsonl'),
     )
+    // DEFLAKE (f3wp council round 2, B-fix): declared here (function scope),
+    // not inside the try{} block below where it's assigned -- a `const`
+    // declared inside try{} is not visible in the final assertion block
+    // after the try/finally (that block-scoping bug produced a hard
+    // ReferenceError on every run where the "real ~/.freshell pre-exists"
+    // branch was taken, i.e. every run on this shared live host).
+    let isolatedBootLogExistedAfterRestart: boolean | null = null
 
     let sentinel: ChildProcess | null = null
 
@@ -163,7 +170,7 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       // leaked into the real home during restart). Re-stat post-restart,
       // while the isolated home still exists (stop() deletes it), so the
       // fixture's own restart write is re-confirmed under the isolated home.
-      const isolatedBootLogExistedAfterRestart = fs.existsSync(
+      isolatedBootLogExistedAfterRestart = fs.existsSync(
         path.join(info.homeDir, '.freshell', 'logs', 'rust-server.jsonl'),
       )
 
