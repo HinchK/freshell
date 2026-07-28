@@ -631,6 +631,7 @@ async fn main() -> ExitCode {
     {
         let ledger = std::sync::Arc::clone(&pane_ledger);
         let gc_home = home.clone(); // same Option<PathBuf> as above
+        let gc_registry = registry.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 60 * 60));
             ticker.tick().await; // the immediate first tick — boot_scan already ran
@@ -638,18 +639,32 @@ async fn main() -> ExitCode {
                 ticker.tick().await;
                 let ledger = std::sync::Arc::clone(&ledger);
                 let home = gc_home.clone();
+                let registry = gc_registry.clone();
                 let joined = tokio::task::spawn_blocking(move || {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis() as i64)
                         .unwrap_or(0);
+                    // Orphan-rule live set (P2): a terminal is live iff it
+                    // appears in the registry. PERIODIC sweep only — the
+                    // boot_scan path above never runs the orphan rule (its
+                    // registry is necessarily empty pre-serve).
+                    let live: std::collections::HashSet<String> = registry
+                        .identity_probe_rows()
+                        .into_iter()
+                        .map(|r| r.terminal_id)
+                        .collect();
                     // Same Option handling as the boot-scan closure above:
                     // no home => defer (false) — never the destructive branch.
-                    ledger.gc(now, &|provider, session_id| {
-                        home.as_deref().is_some_and(|h| {
-                            transcript_definitively_absent(h, provider, session_id)
-                        })
-                    });
+                    ledger.gc(
+                        now,
+                        &|provider, session_id| {
+                            home.as_deref().is_some_and(|h| {
+                                transcript_definitively_absent(h, provider, session_id)
+                            })
+                        },
+                        Some(&live),
+                    );
                 })
                 .await;
                 if let Err(e) = joined {

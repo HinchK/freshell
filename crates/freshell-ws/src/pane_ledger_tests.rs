@@ -3,6 +3,7 @@
 //! file limit as the ledger's test surface grows.
 
 use super::*;
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 fn temp_root(label: &str) -> PathBuf {
@@ -510,13 +511,82 @@ fn periodic_gc_sweeps_aged_markers_without_a_restart() {
         .record_pending("t1", "codex", Some("/tmp/p"), 1_000)
         .unwrap();
     // A fresh marker survives a GC pass (never swept merely for age < TTL)...
-    let report = ledger.gc(2_000, &never_absent);
+    let report = ledger.gc(2_000, &never_absent, None);
     assert!(report.stale_markers_removed.is_empty());
     assert!(ledger.pending_for_terminal("t1").is_some());
     // ...but an aged-out one is swept by gc() alone — no boot_scan involved.
-    let report = ledger.gc(1_000 + PENDING_MARKER_TTL_MS + 1, &never_absent);
+    let report = ledger.gc(1_000 + PENDING_MARKER_TTL_MS + 1, &never_absent, None);
     assert_eq!(report.stale_markers_removed, vec!["t1".to_string()]);
     assert!(ledger.list_pending_raw().is_empty());
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn orphaned_pending_marker_is_gced_after_orphan_ttl() {
+    // PERIODIC sweep semantics (live_terminal_ids = Some({"live-t"})):
+    // marker: terminal "dead-t", spawned_at = now - (ORPHAN_TTL + 1h), no
+    // binding row, terminal NOT in the live set -> deleted.
+    // marker: terminal "live-t", same age, IS in the live set -> kept.
+    // marker: terminal "young-t", spawned_at = now - 60_000, not live ->
+    // kept (younger than the orphan TTL).
+    let root = temp_root("orphan-gc");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let now = 2 * PENDING_MARKER_ORPHAN_TTL_MS;
+    let orphan_age = now - (PENDING_MARKER_ORPHAN_TTL_MS + 60 * 60 * 1000);
+    ledger
+        .record_pending("dead-t", "codex", Some("/tmp/p"), orphan_age)
+        .unwrap();
+    ledger
+        .record_pending("live-t", "codex", Some("/tmp/p"), orphan_age)
+        .unwrap();
+    ledger
+        .record_pending("young-t", "codex", Some("/tmp/p"), now - 60_000)
+        .unwrap();
+    let live: HashSet<String> = HashSet::from(["live-t".to_string()]);
+
+    let report = ledger.gc(now, &never_absent, Some(&live));
+    assert_eq!(report.stale_markers_removed, vec!["dead-t".to_string()]);
+    let mut remaining: Vec<String> = ledger
+        .list_pending_raw()
+        .into_iter()
+        .map(|m| m.terminal_id)
+        .collect();
+    remaining.sort();
+    assert_eq!(
+        remaining,
+        vec!["live-t".to_string(), "young-t".to_string()],
+        "live marker and young marker are kept; only the dead+old orphan is swept"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn boot_path_never_runs_the_orphan_rule() {
+    // BOOT sweep semantics (live_terminal_ids = None -- pre-serve, the
+    // registry is empty, main.rs:603-630): a "dead-t"-shaped marker older
+    // than ORPHAN_TTL with no binding row -> KEPT (otherwise every old
+    // marker would be swept at every boot; only the pre-existing
+    // PENDING_MARKER_TTL_MS 30-day rule applies at boot).
+    let root = temp_root("orphan-boot");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    let now = 2 * PENDING_MARKER_ORPHAN_TTL_MS;
+    let orphan_age = now - (PENDING_MARKER_ORPHAN_TTL_MS + 60 * 60 * 1000);
+    ledger
+        .record_pending("dead-t", "codex", Some("/tmp/p"), orphan_age)
+        .unwrap();
+
+    let report = ledger.boot_scan(now, &never_absent);
+    assert!(report.stale_markers_removed.is_empty());
+    let remaining: Vec<String> = ledger
+        .list_pending_raw()
+        .into_iter()
+        .map(|m| m.terminal_id)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec!["dead-t".to_string()],
+        "boot never sweeps by the orphan rule"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 
@@ -582,7 +652,7 @@ fn gc_expires_unobserved_bound_rows_to_tombstones_never_deletion() {
         .record_binding(&write("claude", "sess-old", "t1", 1_000))
         .unwrap();
     let now = 1_000 + BOUND_GC_TTL_MS + 1;
-    let report = ledger.gc(now, &never_absent);
+    let report = ledger.gc(now, &never_absent, None);
     assert_eq!(report.gc_tombstoned.len(), 1);
     let row = ledger.load_binding("claude", "sess-old").unwrap();
     assert_eq!(row.state, RowState::Retired);
@@ -600,16 +670,16 @@ fn tombstone_deletion_is_conditioned_on_transcript_absence() {
         .record_binding(&write("claude", "sess-x", "t1", 1_000))
         .unwrap();
     let expire_at = 1_000 + BOUND_GC_TTL_MS + 1;
-    ledger.gc(expire_at, &never_absent);
+    ledger.gc(expire_at, &never_absent, None);
     let delete_at = expire_at + TOMBSTONE_GC_TTL_MS + 1;
 
     // Transcript still on disk (or unknown) -> tombstone survives forever.
-    let report = ledger.gc(delete_at, &never_absent);
+    let report = ledger.gc(delete_at, &never_absent, None);
     assert!(report.tombstones_deleted.is_empty());
     assert!(ledger.ever_bound("claude", "sess-x"));
 
     // Definitively absent -> deletion is finally allowed.
-    let report = ledger.gc(delete_at, &|_p, _s| true);
+    let report = ledger.gc(delete_at, &|_p, _s| true, None);
     assert_eq!(report.tombstones_deleted.len(), 1);
     assert!(!ledger.ever_bound("claude", "sess-x"));
     std::fs::remove_dir_all(&root).ok();
@@ -624,7 +694,7 @@ fn gc_expired_tombstone_rebinds_on_a_live_identity_event() {
     ledger
         .record_binding(&write("claude", "sess-x", "t1", 1_000))
         .unwrap();
-    ledger.gc(1_000 + BOUND_GC_TTL_MS + 1, &never_absent);
+    ledger.gc(1_000 + BOUND_GC_TTL_MS + 1, &never_absent, None);
     assert_eq!(
         ledger
             .load_binding("claude", "sess-x")
