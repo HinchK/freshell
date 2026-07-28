@@ -10,6 +10,7 @@ import panesReducer from '@/store/panesSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer, {
   commitSessionWindowReplacement,
+  commitSessionWindowVisibleRefresh,
   setSessionWindowLoading,
 } from '@/store/sessionsSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
@@ -2625,6 +2626,46 @@ describe('Sidebar Component - Session-Centric Display', () => {
       expect(screen.getByText('Beta session one')).toBeInTheDocument()
       expect(screen.getByText('Alpha session one')).toBeInTheDocument()
     })
+
+    it('keeps the scroll container mounted when a refresh transiently empties the filtered list', async () => {
+      const store = createTestStore({ projects: repoProjects })
+      const { getByRole, getByTestId } = renderSidebar(store, [])
+      await act(() => vi.advanceTimersByTime(100))
+
+      fireEvent.change(getByRole('combobox', { name: /repo filter/i }), {
+        target: { value: '/home/user/repo-beta' },
+      })
+      expect(screen.getByText('Beta session one')).toBeInTheDocument()
+      const containerBefore = getByTestId('sidebar-session-list')
+
+      // A live refresh commits a page-1 window with no repo-beta sessions:
+      // the filtered list is transiently empty.
+      await act(async () => {
+        store.dispatch(commitSessionWindowVisibleRefresh({
+          surface: 'sidebar',
+          projects: [repoProjects[0]],
+          totalSessions: 2,
+          hasMore: false,
+        }))
+      })
+
+      // Empty state renders INSIDE the still-mounted scroll container.
+      expect(screen.getByText('No sessions in selected repo')).toBeInTheDocument()
+      expect(getByTestId('sidebar-session-list')).toBe(containerBefore)
+
+      // The next refresh restores repo-beta rows into the SAME container
+      // instance (scroll position survives in a real browser).
+      await act(async () => {
+        store.dispatch(commitSessionWindowVisibleRefresh({
+          surface: 'sidebar',
+          projects: repoProjects,
+          totalSessions: 3,
+          hasMore: false,
+        }))
+      })
+      expect(screen.getByText('Beta session one')).toBeInTheDocument()
+      expect(getByTestId('sidebar-session-list')).toBe(containerBefore)
+    })
   })
 
   describe('Search loading state', () => {
@@ -3018,7 +3059,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       expect(screen.getByText('Loading sessions...')).toBeInTheDocument()
       expect(screen.queryByText('Fallback Session')).not.toBeInTheDocument()
-      expect(screen.queryByTestId('sidebar-session-list')).not.toBeInTheDocument()
+      // Container stays mounted with the loading state rendered inside it.
+      expect(within(screen.getByTestId('sidebar-session-list')).getByText('Loading sessions...')).toBeInTheDocument()
     })
 
     it('keeps first-load search blocking even when fallback tab sessions exist', async () => {
@@ -3076,7 +3118,8 @@ describe('Sidebar Component - Session-Centric Display', () => {
 
       expect(screen.getByTestId('search-loading')).toBeInTheDocument()
       expect(screen.queryByText('Fallback Search Session')).not.toBeInTheDocument()
-      expect(screen.queryByTestId('sidebar-session-list')).not.toBeInTheDocument()
+      // Container stays mounted with the search-loading state rendered inside it.
+      expect(within(screen.getByTestId('sidebar-session-list')).getByTestId('search-loading')).toBeInTheDocument()
     })
 
     it('starts append pagination when the loaded sidebar is scrolled near the bottom', async () => {

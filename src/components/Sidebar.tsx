@@ -786,40 +786,40 @@ export default function Sidebar({
       {/* Session List */}
       <div className="flex flex-1 min-h-0 flex-col">
         <div className="flex-1 min-h-0 px-2">
-          {showBlockingLoad ? (
-            <div
-              className="flex items-center justify-center py-8"
-              data-testid={hasRequestedQuery ? 'search-loading' : undefined}
-            >
-              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
-              <span className="ml-2 text-sm text-muted-foreground">
-                {hasRequestedQuery ? 'Searching...' : 'Loading sessions...'}
-              </span>
-            </div>
-          ) : sortedItems.length === 0 ? (
-          showDeepSearchPending ? (
-            <div className="flex items-center justify-center py-8" role="status" aria-live="polite">
-              <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-hidden="true" />
-              <span className="ml-2 text-sm text-muted-foreground">Scanning files...</span>
-            </div>
-          ) : (
-          <div className="px-2 py-8 text-center text-sm text-muted-foreground">
-            {repoFilter !== ALL_REPOS
-              ? 'No sessions in selected repo'
-              : visibleQuery && visibleSearchTier !== 'title'
-              ? 'No results found'
-              : visibleQuery
-              ? 'No matching sessions'
-              : 'No sessions yet'}
-          </div>
-          )
-          ) : (
-            <div
-              ref={listRef}
-              data-testid="sidebar-session-list"
-              className="h-full overflow-y-auto"
-              onScroll={handleListScroll}
-            >
+          <div
+            ref={listRef}
+            data-testid="sidebar-session-list"
+            className="h-full overflow-y-auto"
+            onScroll={handleListScroll}
+          >
+            {showBlockingLoad ? (
+              <div
+                className="flex items-center justify-center py-8"
+                data-testid={hasRequestedQuery ? 'search-loading' : undefined}
+              >
+                <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
+                <span className="ml-2 text-sm text-muted-foreground">
+                  {hasRequestedQuery ? 'Searching...' : 'Loading sessions...'}
+                </span>
+              </div>
+            ) : sortedItems.length === 0 ? (
+              showDeepSearchPending ? (
+                <div className="flex items-center justify-center py-8" role="status" aria-live="polite">
+                  <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" aria-hidden="true" />
+                  <span className="ml-2 text-sm text-muted-foreground">Scanning files...</span>
+                </div>
+              ) : (
+                <div className="px-2 py-8 text-center text-sm text-muted-foreground">
+                  {repoFilter !== ALL_REPOS
+                    ? 'No sessions in selected repo'
+                    : visibleQuery && visibleSearchTier !== 'title'
+                    ? 'No results found'
+                    : visibleQuery
+                    ? 'No matching sessions'
+                    : 'No sessions yet'}
+                </div>
+              )
+            ) : (
               <div ref={listContentRef}>
                 {sortedItems.map((item) => {
                   const sessionKey = `${item.provider}:${item.sessionId}`
@@ -845,8 +845,8 @@ export default function Sidebar({
                   )
                 })}
               </div>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       </div>
 

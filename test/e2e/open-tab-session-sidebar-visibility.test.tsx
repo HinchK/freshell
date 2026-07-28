@@ -1149,7 +1149,8 @@ describe('open tab session sidebar visibility (e2e)', () => {
     )
 
     await screen.findByText('No sessions yet')
-    expect(screen.queryByTestId('sidebar-session-list')).not.toBeInTheDocument()
+    // Container stays mounted with the empty state rendered inside it.
+    expect(within(screen.getByTestId('sidebar-session-list')).getByText('No sessions yet')).toBeInTheDocument()
   })
 
   it('keeps an open Codex session visible when the indexed sidebar row is titleless', async () => {
