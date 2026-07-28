@@ -28,7 +28,7 @@ Validated by code inspection (load-bearing check): the Sidebar is the only surfa
 - Dropdown default value and default option label: exactly `All` (sentinel value `'all'`, matching the `FilterMode`/`ScopeMode` precedent in `TabsView.tsx:45-46`).
 - Clearing via the `x` button resets the dropdown to "All".
 - The repo filter **ANDs** with all other search settings (visibility settings, applied server-side search, tier) — it composes with them, never replaces them.
-- Dropdown options = all repos that have **loaded** restorable session locations (repo **roots**, even when the sidebar's worktree-grouping display setting is `'worktree'`). This windowed-options semantics is a deliberate, recorded decision — see the "Windowed options" design note below.
+- Dropdown options = all repos that have **loaded** restorable session locations (repo **roots**, even when the sidebar's worktree-grouping display setting is `'worktree'`). This windowed-options semantics is a deliberate, recorded decision — see the "Windowed options" design note below. Repo-root fidelity is enforced by the Task 1 composite gate and carries two recorded upstream residuals (search-mode `checkoutPath` omission; opencode cwd-derived project paths) — see the "`repoPath` semantics" design note.
 - Coverage per AGENTS.md: **unit AND e2e** — the repo's e2e tier for UI controls is a Vitest flow test under `test/e2e/` (Task 5). `npm run test:unit` does NOT execute `test/e2e/` files; the final gate therefore runs the default client config workload (`npm run test:client`).
 - A11y (CI gate via `npm run lint` + eslint-plugin-jsx-a11y): `aria-label` on the new select ("Repo filter") and on the icon-only clear button ("Clear repo filter").
 - TDD per AGENTS.md: Red-Green-Refactor for every task; run the failing test before implementing.
@@ -49,7 +49,7 @@ Validated by code inspection (load-bearing check): the Sidebar is the only surfa
 
 Design notes locked in here:
 
-- **`repoPath` semantics:** For session rows built from `ProjectGroup`s, `repoPath = project.projectPath` (the repo root) regardless of the `worktreeGrouping` display setting (which rewrites `item.projectPath` to the worktree checkout path) — EXCEPT for `liveTerminalOnly` sessions. Verified by code inspection: the server session directory injects live-terminal-only sessions into `ProjectGroup`s (`server/session-directory/service.ts:110-130`) with `projectPath = checkoutRoot || repoRoot || cwd || 'terminal:<id>'` — which can be a worktree checkout path, a bare cwd, or a literal `terminal:<id>`, not a repo root. So Task 1 gates them out: `repoPath: session.liveTerminalOnly ? undefined : project.projectPath`. Fallback rows (`pushFallbackItem`), client-built live-terminal rows, and server-injected `liveTerminalOnly` rows therefore all have `repoPath === undefined`: they never contribute dropdown options and are hidden when a specific repo is selected. This is the honest reading of "all the repos that we have restore locations for".
+- **`repoPath` semantics:** For session rows built from `ProjectGroup`s, `repoPath = project.projectPath` regardless of the `worktreeGrouping` display setting (which rewrites `item.projectPath` to the worktree checkout path) — EXCEPT for server-fabricated live-terminal rows and the literal `'unknown'` group path, which Task 1 gates out. Verified by code inspection: the server session directory injects one item per non-shell live terminal not deduped against the index (`server/session-directory/service.ts:141-148`) with `projectPath = checkoutRoot || repoRoot || cwd || 'terminal:<id>'` (`service.ts:114`) — a worktree checkout path, a bare cwd, or a literal `terminal:<id>`, never a repo-root-collapsed path. These injected rows come in TWO variants (`service.ts:128` sets `liveTerminalOnly: !meta.sessionId`): **(A)** sessionId-less terminals get `liveTerminalOnly: true` and `sessionId = 'terminal:<id>'`; **(B)** terminals that already carry a real `sessionId` but are not yet in the CLI index (the normal race for a freshly started coding session — recurring in worktree-based workflows) get `liveTerminalOnly: false`, so a `liveTerminalOnly`-only gate would miss them. Variant B is identified by `checkoutPath === projectPath`: `buildLiveTerminalSessionItem` sets both fields from `meta.checkoutRoot` (`service.ts:114,120`), while the indexer structurally suppresses `checkoutPath` whenever it would equal `projectPath` (`server/coding-cli/session-indexer.ts:992-999`), so the equality is guaranteed for injected rows with a cwd and impossible for indexed rows. Task 1 therefore gates with a composite predicate: `liveTerminalOnly === true`, OR `sessionId.startsWith('terminal:')` (belt-and-braces equivalent of variant A that also covers client-built live rows), OR `checkoutPath === projectPath` (variant B), OR group path `'unknown'` (the literal emitted for cwd-less indexed claude/codex/amplifier sessions). Fallback rows (`pushFallbackItem`), client-built live-terminal rows, and both server-injected variants therefore all have `repoPath === undefined`: they never contribute dropdown options and are hidden when a specific repo is selected. Recorded residual limitations (accepted; the additive upgrade path — a server-side `repoPath` field on the session-directory DTO — would eliminate both): (i) during an applied search the `checkoutPath`-equality term is inert because the search-result mapping omits `checkoutPath` (`src/lib/api.ts:709-728`, a pre-existing omission that already degrades worktree-grouping display in search mode); the other gate terms still apply there. (ii) `project.projectPath` is repo-root-collapsed by the claude/codex/amplifier providers (`resolveGitRepoRoot`), but the opencode provider resolves it to the raw session cwd (`server/coding-cli/providers/opencode.ts:348-350`), so an opencode session started in a worktree or subdirectory contributes that path as its "repo" option — indistinguishable client-side, accepted as an upstream limitation. This is the honest reading of "all the repos that we have restore locations for".
 - **Filter seam:** in-component, between the selector output (`localFilteredItems`) and `useStableArray`. The selector pipeline (`visibility → appliedSearch → filter → sort`) runs first, so the repo filter ANDs with everything by construction. `repoPath` is not rendered by `SidebarItem`, and membership is recomputed from fresh selector output each render, so `areSessionItemsEqual`/`isSessionItemEqual` need no change.
 - **Options list:** derived from the *pre-repo-filter* items so all repos stay listed while one is selected; the currently selected repo is retained as an option even if a live search temporarily empties its rows (otherwise the controlled `<select>` would render blank).
 - **Windowed options (decision, verified):** the session window is paginated at *session* granularity — the server flattens all sessions, sorts by recency, and slices the top N (`server/session-directory/service.ts:240,281`; client page cap 50, `src/lib/api.ts:670`). So the dropdown lists repos present in the **loaded** window: repos whose sessions are all outside it appear only as more pages load (scroll) or via search (which scans the full index). During an active search, a committed search *replaces* the window's projects (`sessionsSlice.ts:143`), so options narrow to repos in the search results plus the retained selection; clearing the search refetches page 1 (not the pre-search window). This is deliberate: every option always corresponds to rows the user can see (no dead options that filter to an unexplained empty list), and no server change is needed. Alternatives considered and rejected for this iteration: a full-index repo aggregate in the session-directory response (`codingCliIndexer.getProjects()` is in memory server-side — the additive upgrade path if complete option coverage is later required) would create options whose selection strands the user on an empty list, because an empty filtered list unmounts the list container and suppresses backfill (see next note); full server-side repo filtering would touch the search and pagination surfaces shared with other views.
@@ -66,7 +66,7 @@ Design notes locked in here:
 **Interfaces:**
 - Consumes: existing `SidebarSessionItem` interface, private `getProjectName(projectPath: string): string` helper (line 69), `ProjectGroup.projectPath`.
 - Produces (relied on by Tasks 2-6):
-  - `SidebarSessionItem.repoPath?: string` — repo root; `undefined` on fallback/live-terminal rows.
+  - `SidebarSessionItem.repoPath?: string` — repo root; `undefined` on fallback rows, server-fabricated live-terminal rows (both variants — see the "`repoPath` semantics" design note), and `'unknown'` group paths.
   - `export const ALL_REPOS = 'all'`
   - `export interface RepoFilterOption { value: string; label: string }`
   - `export function filterSessionItemsByRepo(items: SidebarSessionItem[], repoFilter: string): SidebarSessionItem[]`
@@ -176,19 +176,47 @@ In `src/store/selectors/sidebarSelectors.ts`:
 
 ```typescript
   // Repo root (ProjectGroup.projectPath) — independent of the worktreeGrouping
-  // display setting. Undefined for fallback/live-terminal rows (which only know
-  // a cwd) and for liveTerminalOnly sessions, whose server-fabricated group path
-  // may be a checkout path, bare cwd, or literal 'terminal:<id>', not a repo root.
+  // display setting. Undefined for fallback rows, for server-fabricated
+  // live-terminal rows (both variants: liveTerminalOnly / 'terminal:<id>'
+  // sessionIds, and sessionId-bearing-but-unindexed rows identified by
+  // checkoutPath === projectPath), and for the literal 'unknown' group path —
+  // none of which carry a repo root.
   repoPath?: string
 ```
 
-3b. In `buildSessionItems`, in the session-item construction (the `const item: SidebarSessionItem = {` block at ~line 219, inside the `for (const session of project.sessions || [])` loop), directly after the line `projectPath: effectivePath,`, add:
+3b. Directly above the `buildSessionItems` function, add a private helper (`ProjectGroup` is already the type of the projects consumed in this file; import it from `@/store/types` only if it is not already in scope):
 
 ```typescript
-        repoPath: session.liveTerminalOnly ? undefined : project.projectPath,
+// Rows whose group path is NOT a repo root get repoPath: undefined.
+// Server-fabricated live-terminal rows (buildLiveTerminalSessionItem in
+// server/session-directory/service.ts) use checkoutRoot || cwd || 'terminal:<id>'
+// — never repo-root-collapsed — in two variants: sessionId-less rows
+// (liveTerminalOnly: true, sessionId 'terminal:<id>') and
+// sessionId-bearing-but-unindexed rows (liveTerminalOnly: false), which are
+// identified by checkoutPath === projectPath: the indexer suppresses
+// checkoutPath whenever it would equal projectPath
+// (server/coding-cli/session-indexer.ts), so that equality holds only for
+// fabricated rows. 'unknown' is the literal group path of cwd-less indexed
+// sessions. See the "repoPath semantics" design note in the plan.
+function resolveRepoPath(
+  session: ProjectGroup['sessions'][number],
+  groupProjectPath: string,
+): string | undefined {
+  if (session.liveTerminalOnly) return undefined
+  if (session.sessionId.startsWith('terminal:')) return undefined
+  if (session.checkoutPath && session.checkoutPath === session.projectPath) return undefined
+  if (groupProjectPath === 'unknown') return undefined
+  return groupProjectPath
+}
 ```
 
-The `liveTerminalOnly` gate is required: the server injects live-terminal-only sessions into `ProjectGroup`s whose `projectPath` can be a checkout path, bare cwd, or literal `terminal:<id>` (see the `repoPath` semantics design note). The gate's observable behavior is locked by a component test in Task 2 Step 2 (a selector-level unit test would need the full memoized-selector fixture for no extra coverage).
+Then, in `buildSessionItems`, in the session-item construction (the `const item: SidebarSessionItem = {` block at ~line 219, inside the `for (const session of project.sessions || [])` loop), directly after the line `projectPath: effectivePath,`, add:
+
+```typescript
+        repoPath: resolveRepoPath(session, project.projectPath),
+```
+
+The composite gate is required: a `liveTerminalOnly`-only gate misses server-injected rows whose terminal already carries a real `sessionId` but is not yet in the CLI index — `service.ts:128` sets `liveTerminalOnly: !meta.sessionId`, and `toItems` (`service.ts:141-148`) injects every non-shell live terminal not deduped against the index, so those rows arrive with `liveTerminalOnly: false` and a worktree-checkout/bare-cwd group path (see the `repoPath` semantics design note). The gate's observable behavior — including the sessionId-bearing variant — is locked by a component test in Task 2 Step 2 (a selector-level unit test would need the full memoized-selector fixture for no extra coverage).
 
 Leave `pushFallbackItem` (~line 253) and the live-terminal item construction (~line 468) untouched — their `repoPath` remains `undefined` by design.
 
@@ -412,7 +440,7 @@ In `test/unit/client/components/Sidebar.test.tsx`, immediately after the closing
       expect(screen.getByText('Worktree session')).toBeInTheDocument()
     })
 
-    it('excludes live-terminal-only rows from the repo options (their group path is not a repo root)', async () => {
+    it('excludes server-fabricated live-terminal rows from the repo options (both variants)', async () => {
       const store = createTestStore({
         projects: [
           ...repoProjects,
@@ -425,6 +453,23 @@ In `test/unit/client/components/Sidebar.test.tsx`, immediately after the closing
                 lastActivityAt: Date.now() - 500,
                 title: 'Live terminal row',
                 liveTerminalOnly: true,
+              },
+            ],
+          },
+          {
+            // sessionId-bearing but not-yet-indexed live terminal in a worktree:
+            // liveTerminalOnly is false, but checkoutPath === projectPath (an
+            // equality the indexer never emits) marks it server-fabricated.
+            projectPath: '/home/user/repo-alpha/.worktrees/live-wt',
+            sessions: [
+              {
+                sessionId: sessionId('live-2'),
+                projectPath: '/home/user/repo-alpha/.worktrees/live-wt',
+                checkoutPath: '/home/user/repo-alpha/.worktrees/live-wt',
+                lastActivityAt: Date.now() - 600,
+                title: 'Unindexed live session',
+                liveTerminalOnly: false,
+                isRunning: true,
               },
             ],
           },
@@ -442,6 +487,7 @@ In `test/unit/client/components/Sidebar.test.tsx`, immediately after the closing
 
       fireEvent.change(select, { target: { value: '/home/user/repo-alpha' } })
       expect(screen.queryByText('Live terminal row')).not.toBeInTheDocument()
+      expect(screen.queryByText('Unindexed live session')).not.toBeInTheDocument()
     })
   })
 ```
@@ -454,7 +500,7 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/client/components/Sidebar.test.tsx --config config/vitest/vitest.config.ts -t "Repo filter"
 ```
-Expected: FAIL — `Unable to find an accessible element with the role "combobox" and name /repo filter/i` (5 failing tests).
+Expected: 4 of the 5 new tests FAIL, each with `Unable to find an accessible element with the role "combobox" and name /repo filter/i`. The fifth — `'does not render the dropdown when no repos are loaded'` — passes vacuously before implementation (its `queryByRole(...).not.toBeInTheDocument()` assertion already holds while the dropdown does not exist); it is the negative boundary that only goes red if the dropdown later over-renders. Red gate: exactly 4 failures, all with the missing-combobox error.
 
 - [ ] **Step 4: Implement the dropdown in `Sidebar.tsx`**
 
@@ -1105,7 +1151,7 @@ git commit -m "test(sidebar): lock repo filter non-persistence; add repo dropdow
 
 ## Load-Bearing Validation Record (post-planning hardening)
 
-Ten load-bearing assumptions were surfaced and validated (ledger: `.worktrees/.the-usual-logs/restore-locations-repo-filter/load-bearing-ledger.md`). Verified: backfill boundedness (A5), jsdom test inertness (A6), `projectPath` byte-identity across snapshot/search/append (A7). Falsified and fixed in this plan: window-derived options are NOT full-repo coverage (A2 — recorded as the deliberate "Windowed options" decision with documented rationale and upgrade path); server-injected `liveTerminalOnly` rows would have produced bogus repo options (A3 — Task 1 gate + Task 2 test); two existing badge tests collide with the new option label (A8 — Task 2 Step 6 scoping fix); zero e2e coverage violated AGENTS.md (A10 — new Task 5 + `test:client` gate). Accepted decisions: Sidebar as the target surface (A1 — verified only joint clue match), hiding cwd-only rows under a specific repo (A4 — `terminalMeta.repoRoot` plumbing rejected as async-optional coupling), search-narrowed options (A9 — consistent with the windowed-options decision).
+Ten load-bearing assumptions were surfaced and validated (ledger: `.worktrees/.the-usual-logs/restore-locations-repo-filter/load-bearing-ledger.md`). Verified: backfill boundedness (A5), jsdom test inertness (A6), `projectPath` byte-identity across snapshot/search/append (A7). Falsified and fixed in this plan: window-derived options are NOT full-repo coverage (A2 — recorded as the deliberate "Windowed options" decision with documented rationale and upgrade path); server-fabricated live-terminal rows — both the `liveTerminalOnly` variant and the sessionId-bearing-but-unindexed variant surfaced by fresheyes review — would have produced bogus repo options (A3 — Task 1 composite gate + Task 2 test); two existing badge tests collide with the new option label (A8 — Task 2 Step 6 scoping fix); zero e2e coverage violated AGENTS.md (A10 — new Task 5 + `test:client` gate). Accepted decisions: Sidebar as the target surface (A1 — verified only joint clue match), hiding cwd-only rows under a specific repo (A4 — `terminalMeta.repoRoot` plumbing rejected as async-optional coupling), search-narrowed options (A9 — consistent with the windowed-options decision).
 
 ## Self-Review Record
 
@@ -1113,7 +1159,7 @@ Checked the plan against the spec from a fresh read (re-run after the load-beari
 
 1. **Spec coverage:**
    - "second dropdown … defaults to 'All'" → Task 2 (Steps 2/4; test asserts `toHaveValue('all')` and first option label `All`).
-   - "populated with all the repos that we have restore locations for" → Task 1 (`repoPath` = repo root, gated for `liveTerminalOnly`; `collectRepoFilterOptions`) + Task 2 option-list tests, including the worktree-grouping-mode test proving options are repo roots, the live-terminal-exclusion test, and the "no repos → no dropdown" boundary. Scope is the loaded window per the recorded "Windowed options" decision.
+   - "populated with all the repos that we have restore locations for" → Task 1 (`repoPath` = repo root, composite-gated against server-fabricated live-terminal rows — both variants — and `'unknown'` paths; `collectRepoFilterOptions`) + Task 2 option-list tests, including the worktree-grouping-mode test proving options are repo roots, the two-variant live-terminal-exclusion test, and the "no repos → no dropdown" boundary. Scope is the loaded window per the recorded "Windowed options" decision.
    - "Selecting a repo filters the results to only locations from that repo" → Task 2 filtering test; Task 1 pure-function tests.
    - "ANDs with the other search settings (compose, not replace)" → filter applied *after* the full selector pipeline (visibility + applied search + tier + sort); Task 4 tests: AND-with-visibility-settings, coexistence with the tier dropdown during an active query, and AND-with-live-server-search (search commit while repo selected).
    - "'x' (clear) on the dropdown resets it to 'All'" → Task 3 (conditional button, reset behavior, hidden while on All).
