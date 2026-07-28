@@ -733,7 +733,7 @@ pub(crate) async fn spawn_terminal_pane(
         }
     }
 
-    let (mut resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
+    let (resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
 
     // D7 live-session guard, REST rung -- mirrors the WS terminal.create guard
     // (freshell-ws/src/terminal.rs D7 block) via the shared
@@ -831,18 +831,17 @@ pub(crate) async fn spawn_terminal_pane(
     // generation, opencode port allocation, and the codex managed-launch
     // plan — so the permit also bounds the REST-reachable sidecar spawn and
     // rejection needs NO cleanup (the session-ref lease above releases via
-    // its own Drop). RAII:
-    // `_spawn_permit` drops on every early-return Err(...) below, on spawn
-    // failure, and at fn end — never call `.forget()`. `None` (unwired) =
-    // ungated: unit-test states without server wiring keep legacy behavior.
-    let _spawn_permit = match state.spawn_gate() {
+    // its own Drop). `None` (unwired) = ungated: unit-test states without
+    // server wiring keep legacy behavior.
+    let spawn_permit = match state.spawn_gate() {
         Some(rest_gate) => {
             // The gate's acquire is cancellable via a watch channel (the WS
             // door wires its per-connection cancel signal). REST has no such
             // signal: hold a live, never-fired sender for the whole acquire
             // (dropping it early would read as "connection gone" =>
-            // Cancelled). If the HTTP request itself is dropped, axum drops
-            // this future and the gate's queue-slot guard reclaims the slot.
+            // Cancelled). If the HTTP request itself is dropped while
+            // QUEUED, axum drops this future and the gate's queue-slot
+            // guard reclaims the slot — nothing has been spawned yet.
             let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
             match rest_gate
                 .gate
@@ -855,6 +854,94 @@ pub(crate) async fn spawn_terminal_pane(
         }
         None => None,
     };
+
+    // F1 (council enn3; prior art da5d9b5c, pinned by the WS door's
+    // `create_gate::hold_permit_across`): everything from here to the
+    // settled terminal runs on a DETACHED task that OWNS the permit, the
+    // session-ref lease, and (for codex) the launch plan. This handler
+    // future is droppable at every await — a client abort (`curl
+    // --max-time` does it) must NOT release the permit while the
+    // uncancellable `spawn_blocking` fork proceeds (that was the gate
+    // escape), nor skip the post-spawn bookkeeping (set_meta / lease bind /
+    // codex adopt / `terminal_panes`+`pane_tabs`). With the settle task
+    // detached, an aborted create is FULLY BOOKKEPT — never a
+    // half-initialized orphan. (The WS door solves the same hazard by
+    // spawning its settled restore create: `spawn_gated_restore_create`.)
+    let settle = tokio::spawn(settle_gated_create(GatedSettleInputs {
+        permit: spawn_permit,
+        state: state.clone(),
+        body: body.clone(),
+        tab_id: tab_id.to_string(),
+        pane_id: pane_id.to_string(),
+        mode,
+        shell_str,
+        cwd,
+        resume_session_id,
+        accepted_session_ref,
+        create_request_id,
+        session_ref_lease,
+        registry,
+    }));
+    match settle.await {
+        Ok(result) => result,
+        // JoinError = panic inside the settle task (the task's own
+        // spawn_blocking JoinError arm already maps fork panics into the
+        // 400 rollback path below). RAII (permit, lease) released on the
+        // task's unwind.
+        Err(join_err) => Err(fail_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("terminal create task panicked: {join_err}"),
+        )),
+    }
+}
+
+/// Owned inputs for [`settle_gated_create`]: the settle task must be
+/// `'static` (it outlives an aborted handler future by design), so every
+/// input moves in by value.
+struct GatedSettleInputs {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    state: FreshAgentState,
+    body: Value,
+    tab_id: String,
+    pane_id: String,
+    mode: String,
+    shell_str: Option<String>,
+    cwd: Option<String>,
+    resume_session_id: Option<String>,
+    accepted_session_ref: Option<SessionLocator>,
+    create_request_id: String,
+    session_ref_lease: Option<RestSessionRefLease>,
+    registry: freshell_terminal::TerminalRegistry,
+}
+
+/// The spawn-to-settled tail of [`spawn_terminal_pane`], run on a detached
+/// `tokio::spawn` so a dropped (client-aborted) handler future can neither
+/// release the spawn-gate permit early nor leave the created terminal
+/// half-bookkept — the F1 fix (see the call site's comment). The permit is
+/// held from before the PTY fork until every settle step (meta, lease bind,
+/// codex adopt, pane bookkeeping) completed — the same spawn-to-settled
+/// scope the WS door pins with `hold_permit_across`.
+async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnResult, Response> {
+    let mut inputs = inputs;
+    // Bound FIRST so it drops LAST (locals drop in reverse declaration
+    // order): the permit outlives every settle step below, on success and
+    // on every early-return Err(...) alike — never call `.forget()`.
+    let _spawn_permit = inputs.permit.take();
+    let GatedSettleInputs {
+        permit: _,
+        state,
+        body,
+        tab_id,
+        pane_id,
+        mode,
+        shell_str,
+        cwd,
+        mut resume_session_id,
+        accepted_session_ref,
+        create_request_id,
+        mut session_ref_lease,
+        registry,
+    } = inputs;
 
     let terminal_id = Uuid::new_v4().to_string();
     let stream_id = Uuid::new_v4().to_string();
@@ -876,7 +963,7 @@ pub(crate) async fn spawn_terminal_pane(
             .and_then(ShellType::parse)
             .unwrap_or(ShellType::System);
         let overrides =
-            build_terminal_base_env(&RealEnv, &terminal_id, Some(tab_id), Some(pane_id));
+            build_terminal_base_env(&RealEnv, &terminal_id, Some(&tab_id), Some(&pane_id));
         spec = build_spawn_spec(
             shell_type,
             host_os,
@@ -1023,7 +1110,7 @@ pub(crate) async fn spawn_terminal_pane(
         let effective_shell = resolve_shell(shell_type, host_os, is_wsl);
         let windows_like = is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
         let overrides =
-            build_terminal_base_env(&RealEnv, &terminal_id, Some(tab_id), Some(pane_id));
+            build_terminal_base_env(&RealEnv, &terminal_id, Some(&tab_id), Some(&pane_id));
 
         spec = match &launch {
             Some(l) if windows_like => build_windows_cli_spawn_spec(
@@ -1099,9 +1186,12 @@ pub(crate) async fn spawn_terminal_pane(
     // spawns occupy a permit + a blocking thread, never an async worker (WS
     // lane ledger A4: on hosts with nproc <= spawn_concurrency, N inline
     // blocking spawns would wedge the runtime incl. the timer driver, and
-    // gate timeouts could never fire). Permit stays held throughout. Mirrors
-    // the WS door (`crates/freshell-ws/src/terminal.rs`). Values consumed by
-    // the call and unused afterwards (`child_env`, `stream_id`, `on_exit`)
+    // gate timeouts could never fire). The permit stays held throughout
+    // BECAUSE this whole function runs on the detached settle task that owns
+    // it (F1): a client abort drops only the handler future, never this
+    // task, so the fork can no longer outlive its permit. Mirrors the WS
+    // door (`crates/freshell-ws/src/terminal.rs`). Values consumed by the
+    // call and unused afterwards (`child_env`, `stream_id`, `on_exit`)
     // move in without cloning.
     let spawn_registry = registry.clone();
     let spawn_spec = spec.clone();
@@ -1207,7 +1297,7 @@ pub(crate) async fn spawn_terminal_pane(
     // admission checks live inside `arm()` itself, see
     // `arm_locators_for_fresh_pane`'s doc comment).
     arm_locators_for_fresh_pane(
-        state,
+        &state,
         &terminal_id,
         &mode,
         cwd.as_deref(),
@@ -3518,6 +3608,135 @@ mod tests {
         let (status, body) = post(router, "/api/tabs", shell_create_body(), true).await;
         assert_eq!(status, StatusCode::OK, "permit leaked? {body}");
         registry.kill(body["data"]["terminalId"].as_str().unwrap());
+    }
+
+    /// F1 (council enn3): the RAII spawn-gate permit lived in the DROPPABLE
+    /// axum handler future while the uncancellable `spawn_blocking` fork did
+    /// not capture it. A client abort (`curl --max-time 2` does it) dropped
+    /// the future, releasing the permit while the detached fork proceeded —
+    /// gate escaped exactly under load (`max concurrent registry.create >
+    /// spawn_concurrency`) — AND skipped every post-spawn bookkeeping step
+    /// (`set_meta`, `terminal_panes`/`pane_tabs`) — a half-initialized
+    /// orphan. Same bug class as WS prior art da5d9b5c (permit released
+    /// before settle), pinned there by `create_gate::hold_permit_across`.
+    ///
+    /// Choreography per iteration (the council's named breaking input:
+    /// aborted HTTP creates in a loop): the test holds the ONLY permit, a
+    /// create queues behind it, the test releases, then aborts the request
+    /// task while the fork is in flight. Two assertions:
+    ///  1. Gate bound (`<= spawn_concurrency`): re-acquiring the single
+    ///     permit is only possible once the aborted create fully settled —
+    ///     so at the moment the test holds it, no half-settled terminal may
+    ///     exist.
+    ///  2. No orphan: every terminal the registry gained must be fully
+    ///     bookkept (a `terminal_panes` entry points at it and its meta
+    ///     mode was recorded).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abort_burst_rest_creates_stay_gated_and_leave_no_half_bookkept_terminal() {
+        let state = state_with_registry();
+        let registry = state.terminal_registry.clone().unwrap();
+        let gate = Arc::new(crate::spawn_gate::SpawnGate::new(1, 64));
+        state.set_spawn_gate(Arc::clone(&gate), std::time::Duration::from_secs(30));
+        let router = app(state.clone());
+
+        let inventory_ids = |registry: &freshell_terminal::TerminalRegistry| {
+            registry
+                .inventory()
+                .into_iter()
+                .map(|t| t.terminal_id)
+                .collect::<std::collections::HashSet<String>>()
+        };
+        let bookkept = |state: &FreshAgentState, tid: &str| {
+            state
+                .terminal_panes
+                .lock()
+                .expect("terminal_panes mutex")
+                .values()
+                .any(|e| e.terminal_id == tid)
+        };
+
+        let mut forked_iterations = 0u32;
+        let mut all_forked: Vec<String> = Vec::new();
+        for i in 0..20u64 {
+            let before = inventory_ids(&registry);
+
+            // Hold the only permit so the request deterministically QUEUES.
+            let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+            let held = gate
+                .acquire(std::time::Duration::from_secs(5), &mut cancel_rx)
+                .await
+                .expect("test acquires the only permit");
+            let queued_before = gate.queued_total();
+
+            let r = router.clone();
+            let req =
+                tokio::spawn(
+                    async move { post(r, "/api/tabs", shell_create_body(), true).await },
+                );
+            // Wait until the request is a queued waiter (held permit => the
+            // fast path fails and the waiter counts toward queued_total).
+            let mut waited = 0u32;
+            while gate.queued_total() == queued_before {
+                waited += 1;
+                assert!(waited < 2000, "request never queued on the gate");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            // Release the permit to the queued create, give it a sliver of
+            // runway (sweep the abort across the fork window), then ABORT
+            // the handler future — the simulated client disconnect.
+            drop(held);
+            tokio::time::sleep(std::time::Duration::from_micros(200 * i)).await;
+            req.abort();
+            let _ = req.await;
+
+            // Did this iteration actually fork? (An abort landing before the
+            // granted permit was ever polled forks nothing — inconclusive.)
+            let mut new_terminals: Vec<String> = Vec::new();
+            for _ in 0..200u32 {
+                new_terminals = inventory_ids(&registry)
+                    .difference(&before)
+                    .cloned()
+                    .collect();
+                if !new_terminals.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            if new_terminals.is_empty() {
+                continue;
+            }
+            forked_iterations += 1;
+            all_forked.extend(new_terminals.iter().cloned());
+
+            // Assertion 1 — gate bound: the single permit must be
+            // re-acquirable ONLY once the aborted create fully settled.
+            let (_cancel_tx2, mut cancel_rx2) = tokio::sync::watch::channel(false);
+            let reacquired = gate
+                .acquire(std::time::Duration::from_secs(10), &mut cancel_rx2)
+                .await
+                .expect("permit must return after the aborted create settles");
+
+            // Assertion 2 — no half-initialized orphan: while WE hold the
+            // only permit, every forked terminal is fully bookkept.
+            for tid in &new_terminals {
+                assert!(
+                    bookkept(&state, tid),
+                    "aborted create escaped the gate and left a half-initialized orphan: \
+                     terminal {tid} exists in the registry but has no terminal_panes entry \
+                     (iteration {i})"
+                );
+            }
+            drop(reacquired);
+        }
+
+        assert!(
+            forked_iterations >= 1,
+            "abort sweep never landed inside the fork window; widen the sweep"
+        );
+        for tid in &all_forked {
+            registry.kill(tid);
+        }
     }
 
     // ── D8 session-ref lease, REST rung (ks38) ──────────────────────────────
