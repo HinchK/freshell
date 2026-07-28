@@ -261,7 +261,7 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/client/store/sidebar-repo-filter.test.ts --config config/vitest/vitest.config.ts
 ```
-Expected: PASS (6 tests).
+Expected: PASS (7 tests: 3 in `describe('filterSessionItemsByRepo')` + 4 in `describe('collectRepoFilterOptions')`).
 
 - [ ] **Step 5: Typecheck**
 
