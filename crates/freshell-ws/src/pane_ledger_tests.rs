@@ -832,6 +832,32 @@ fn old_terminal_rows_without_settings_fields_still_deserialize() {
 }
 
 #[test]
+fn resolve_identity_without_pending_marker_supersedes_prior_binding() {
+    // The mid-session rebind path calls resolve_pending with NO pending
+    // marker on disk (the pane bound long ago). The binding row must still
+    // be written and the previous bound row retired as Superseded with
+    // supersededBy -- and the absent marker delete must be a no-op, not an
+    // error surfaced to the caller.
+    let root = temp_root("resolve-no-marker");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .resolve_pending(&write("codex", "old-id", "t1", 1_000))
+        .expect("first bind");
+    ledger
+        .resolve_pending(&write("codex", "new-id", "t1", 2_000))
+        .expect("rebind without marker must succeed");
+    let hit = ledger
+        .lookup_by_session("codex", "old-id")
+        .expect("old row remains, retired");
+    assert!(
+        hit.corrected,
+        "stale claim answered from the chain terminus"
+    );
+    assert_eq!(hit.row.session_id, "new-id");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn rebind_to_the_same_identity_is_not_a_supersession() {
     let root = temp_root("samebind");
     let ledger = PaneLedger::new(Some(root.clone()));

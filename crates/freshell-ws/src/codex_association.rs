@@ -64,8 +64,20 @@ pub(crate) async fn note_possible_submit(state: &WsState, terminal_id: &str, dat
     let locator = std::sync::Arc::clone(locator);
     let terminal_id = terminal_id.to_string();
     let at_ms = now_ms();
-    if let Err(join_error) =
-        tokio::task::spawn_blocking(move || locator.note_submit(&terminal_id, at_ms)).await
+    if let Err(join_error) = tokio::task::spawn_blocking(move || {
+        locator.note_submit(&terminal_id, at_ms);
+        // Fork lane (validated A5, load-bearing): EVERY Enter opens the
+        // fork-scan window -- NOT gated on the arm state or on
+        // `note_submit`'s outcome, because Enters from already-BOUND
+        // (watched, not armed) codex panes MUST reach it. Fork-then-idle
+        // children are real (2/12 real user forks: the child's session_meta
+        // is fully written ~0.1s after fork-confirm and the file is never
+        // touched again), so the confirm Enter itself must open the window
+        // -- there is no later Enter to catch. `note_fork_submit` no-ops
+        // when no watch exists, so the unconditional call is cheap.
+        locator.note_fork_submit(&terminal_id, at_ms);
+    })
+    .await
     {
         tracing::warn!(
             error = %join_error,
@@ -82,9 +94,9 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
     let Some(locator) = &state.codex_locator else {
         return;
     };
-    let locator = std::sync::Arc::clone(locator);
+    let tick_locator = std::sync::Arc::clone(locator);
     let now = now_ms();
-    let located = match tokio::task::spawn_blocking(move || locator.tick(now)).await {
+    let located = match tokio::task::spawn_blocking(move || tick_locator.tick(now)).await {
         Ok(located) => located,
         Err(join_error) => {
             tracing::warn!(
@@ -130,7 +142,7 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
         // homes, awaits the durable ledger row, broadcasts the pinned
         // associated/meta pair, and feeds the activity hub (including the
         // rollout attach for the reconcile lane).
-        crate::codex_identity::adopt_codex_identity(
+        let adopted = crate::codex_identity::adopt_codex_identity(
             state,
             crate::codex_identity::CodexAdoption {
                 terminal_id: &hit.terminal_id,
@@ -140,6 +152,30 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             },
         )
         .await;
+        if adopted {
+            locator.watch_fork(&hit.terminal_id, &hit.thread_id);
+        }
+    }
+
+    // Fork lane: lineage-proven mid-session rebinds. Runs on the same sweep.
+    // The adoption loop's `terminal_already_bound` gate does NOT apply here
+    // -- being bound is the fork lane's precondition.
+    let forks = locator.tick_forks(now);
+    for f in forks {
+        let ok = crate::codex_identity::rebind_codex_identity(
+            state,
+            crate::codex_identity::CodexRebind {
+                terminal_id: &f.terminal_id,
+                old_session_id: &f.old_session_id,
+                new_session_id: &f.new_session_id,
+                rollout_path: &f.rollout_path,
+                cwd: f.cwd.as_deref(),
+            },
+        )
+        .await;
+        if !ok {
+            tracing::warn!(terminal_id = %f.terminal_id, "codex_fork_rebind_refused");
+        }
     }
 }
 

@@ -359,6 +359,10 @@ impl ActivityHub {
             let mut inner = self.inner.lock().expect("activity hub lock");
             let bind = inner.codex.bind_session(terminal_id, session_id);
             let frames = codex_frames(&mut inner.idle, bind);
+            // Re-attach REPLACES the lane: a mid-session fork moves the pane to a
+            // NEW rollout file; keeping the old tailer would keep busy/turn
+            // signals keyed to the abandoned parent file (stale-tailer defect,
+            // plan 2026-07-28-stale-resume-identity.md).
             inner.codex_lanes.insert(
                 terminal_id.to_string(),
                 CodexLane {
