@@ -789,6 +789,18 @@ async fn main() -> ExitCode {
             AMPLIFIER_LOCATOR_SWEEP_INTERVAL,
         );
     }
+    // P4 (stale-resume-identity): claude SessionStart signal sweep — drains
+    // the signal files Task 11's launch hook writes
+    // (`$HOME/.freshell/session-signals/claude/<terminal_id>__<nonce>.json`)
+    // and rebinds a live claude pane whose CLI reported a NEW session id
+    // mid-session (in-TUI /resume, /clear). `None` root (unresolvable HOME)
+    // skips the sweep, mirroring the sibling locators' Option convention.
+    if let Some(signal_root) = freshell_ws::claude_signal::ClaudeSignalWatcher::default_root() {
+        freshell_ws::claude_signal::spawn_claude_signal_sweep(
+            ws_state.clone(),
+            freshell_ws::claude_signal::ClaudeSignalWatcher::new(signal_root),
+        );
+    }
     // DIAG-05: the diag router's `sessionsProjects` reads the SAME session
     // index (clone before the move below into `session_directory_state`).
     let diag_session_index = session_index.clone();

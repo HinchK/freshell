@@ -209,6 +209,7 @@ async fn apply_codex_identity(
     crate::pane_ledger::ledger_resolve_identity(state, terminal_id, "codex", thread_id, cwd).await;
     broadcast_terminal_session_associated(
         state,
+        "codex",
         terminal_id,
         thread_id,
         cwd.map(str::to_string),
@@ -227,13 +228,16 @@ async fn apply_codex_identity(
 
 /// Fan `terminal.session.associated` + a `terminal.meta.updated` upsert to
 /// every connection. Byte-for-byte the shape of
-/// `opencode_association.rs::broadcast_terminal_session_associated` with
-/// provider "codex". EMISSION ORDER IS PINNED: `associated` FIRST, then
-/// `meta.updated` (mirroring opencode_association.rs:163-198) -- the
-/// integration test awaits them in exactly this order, and
+/// `opencode_association.rs::broadcast_terminal_session_associated`,
+/// provider-parameterized: the codex adoption/rebind tail passes "codex",
+/// the claude signal rebind (`claude_signal.rs`) passes "claude" -- ONE
+/// shared broadcaster, no copy. EMISSION ORDER IS PINNED: `associated`
+/// FIRST, then `meta.updated` (mirroring opencode_association.rs:163-198)
+/// -- the integration test awaits them in exactly this order, and
 /// `next_frame_of_type` drops out-of-order frames. Do not reorder.
-fn broadcast_terminal_session_associated(
+pub(crate) fn broadcast_terminal_session_associated(
     state: &WsState,
+    provider: &str,
     terminal_id: &str,
     session_id: &str,
     cwd: Option<String>,
@@ -242,7 +246,7 @@ fn broadcast_terminal_session_associated(
     let associated = ServerMessage::TerminalSessionAssociated(TerminalSessionAssociated {
         terminal_id: terminal_id.to_string(),
         session_ref: SessionLocator {
-            provider: "codex".to_string(),
+            provider: provider.to_string(),
             session_id: session_id.to_string(),
         },
         previous_session_id,
