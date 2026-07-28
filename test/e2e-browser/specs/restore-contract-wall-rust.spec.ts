@@ -1361,7 +1361,20 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    test.setTimeout(300_000)
+    // DEFLAKE (f3wp refresh): 300 s timed out twice back-to-back under
+    // concurrent-suite load (2026-07-28, runs at 01:28 and 01:37; both
+    // failure screenshots show a healthy, still-progressing page -- slow,
+    // not wedged). The ruler's serial cost is structurally LARGER than the
+    // double-restart test's (~91 s bootWall + one ~65 s restartAbrupt +
+    // every per-pane creation/identity gate for ALL pane types across two
+    // tabs), and a 300 s budget recreates the same sum-of-gates > timeout
+    // defect the f3wp double-restart fix (:2068-2076) removed at 180 s.
+    // 600 s covers the worst case with margin, matching that sibling.
+    // NOTE the test.fail pin below: on a load-starved run the 300 s TEST
+    // timeout fired BEFORE the pin's expected in-test red was reached, and
+    // a test-level timeout does not satisfy the pin -- so the underfunded
+    // budget reds the whole run despite the expected-fail marking.
+    test.setTimeout(600_000)
     // EXPECTED-FAIL WALL PIN -- P0.1: this is the composed ruler; it flips
     // green only when every per-pane contract above is green un-pinned
     // (P0.2..P1.13). OBSERVED first red (run of 2026-07-24): the freshclaude
