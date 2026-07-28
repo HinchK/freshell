@@ -8,7 +8,7 @@ import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import cookieParser from 'cookie-parser'
-import rateLimit from 'express-rate-limit'
+import { createApiRateLimiter } from './rate-limit.js'
 import chokidar from 'chokidar'
 import { logger, resolveRuntimeLogLevel, setLogLevel } from './logger.js'
 import { requestLogger } from './request-logger.js'
@@ -72,6 +72,7 @@ import { createSettingsRouter } from './settings-router.js'
 import { createPerfRouter } from './perf-router.js'
 import { createAiRouter } from './ai-router.js'
 import { createDebugRouter } from './debug-router.js'
+import { createFreshAgentIncidentRouter } from './fresh-agent/incident-router.js'
 import { LayoutStore } from './agent-api/layout-store.js'
 import { createAgentApiRouter } from './agent-api/router.js'
 import { ExtensionManager } from './extension-manager.js'
@@ -201,15 +202,7 @@ async function main() {
   app.use('/api/fresh-agent/threads', createFreshAgentSnapshotRateLimitMiddleware())
 
   // Basic rate limiting for /api
-  app.use(
-    '/api',
-    rateLimit({
-      windowMs: 60_000,
-      max: 300,
-      standardHeaders: true,
-      legacyHeaders: false,
-    }),
-  )
+  app.use('/api', createApiRateLimiter())
 
   app.use(cookieParser())
   app.use('/api', httpAuthMiddleware)
@@ -792,6 +785,19 @@ async function main() {
     codingCliIndexer,
     tabsRegistryStore,
     registry,
+  }))
+
+  // --- API: fresh-agent incident inspection (kata zrrj) ---
+  // Read-only, content-free (hashed identity only). Mounted after httpAuthMiddleware
+  // so it stays token-protected, and it shares the global /api rate limit
+  // (createApiRateLimiter, 300/60s) like every other API route — acceptable because
+  // this endpoint is polled manually by a human during incidents.
+  app.use('/api/debug/fresh-agent', createFreshAgentIncidentRouter({
+    runtimeManager: freshAgentRuntimeManager,
+    opencode: {
+      inspectSessions: () => opencodeFreshAgentAdapter.inspectSessions(),
+      describeSidecar: () => opencodeServeManager.describeSidecar(),
+    },
   }))
 
   // --- API: server-info ---

@@ -6,12 +6,14 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import freshAgentReducer, { sessionInit, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
-import { FreshAgentView } from '@/components/fresh-agent/FreshAgentView'
+import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { initLayout, requestPaneRefresh, setActivePane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
+import { ApiError } from '@/lib/api'
+import { resetSnapshotSchedulerForTests } from '@/lib/fresh-agent-snapshot-scheduler'
 import type { PaneNode } from '@/store/paneTypes'
 
 const CLAUDE_THREAD_ID = '550e8400-e29b-41d4-a716-446655440000'
@@ -182,6 +184,7 @@ function freshopencodeSnapshot(text: string, revision: number) {
 }
 
 beforeEach(() => {
+  resetSnapshotSchedulerForTests()
   wsMock.send.mockReset()
   wsMock.onMessage.mockReset()
   wsMock.onReconnect.mockReset()
@@ -1653,6 +1656,173 @@ describe('FreshAgentView', () => {
     expect(screen.getByText('Do not disappear on reload')).toBeInTheDocument()
   })
 
+  it('re-attaches with the route cwd and resends once when a send fails with FRESH_AGENT_LOST_SESSION', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'empty',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-lost-session',
+        sessionId: 'ses_9',
+        status: 'idle',
+        initialCwd: '/w',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'hello again' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const sendFrame = sentFreshAgentMessages('freshAgent.send').at(-1)
+    expect(sendFrame).toBeTruthy()
+    expect(sendFrame?.text).toBe('hello again')
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ status: 'running' })
+    })
+    wsMock.send.mockClear()
+
+    // Act: server rejects with the lost-session code for that request
+    expect(onMessage).toBeTypeOf('function')
+    act(() => {
+      onMessage?.({
+        type: 'error',
+        code: 'FRESH_AGENT_LOST_SESSION',
+        requestId: sendFrame?.requestId,
+        message: 'not tracked',
+        timestamp: Date.now(),
+      })
+    })
+
+    // Assert: exactly one attach (with cwd) then one resend of the same text
+    await waitFor(() => {
+      const attaches = sentFreshAgentMessages('freshAgent.attach')
+      expect(attaches.some((m) => m.sessionId === 'ses_9' && m.cwd === '/w')).toBe(true)
+      expect(sentFreshAgentMessages('freshAgent.send').filter((m) => m.text === 'hello again')).toHaveLength(1)
+    })
+    // The echo stays visible while the retry is in flight
+    expect(screen.getByText('hello again')).toBeInTheDocument()
+
+    // Second failure for the retried request must NOT loop...
+    const retried = sentFreshAgentMessages('freshAgent.send').at(-1)
+    expect(retried?.requestId).toEqual(expect.any(String))
+    expect(retried?.requestId).not.toBe(sendFrame?.requestId)
+    wsMock.send.mockClear()
+    act(() => {
+      onMessage?.({
+        type: 'error',
+        code: 'FRESH_AGENT_LOST_SESSION',
+        requestId: retried?.requestId,
+        message: 'still not tracked',
+        timestamp: Date.now(),
+      })
+    })
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 100))
+    })
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+
+    // ...and the cleanup fall-through must fire for the final failure:
+    await waitFor(() => {
+      expect(screen.queryByText('hello again')).not.toBeInTheDocument() // stale local echo cleared
+    })
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined() // Redux copy cleared too (dual-write)
+    expect(getFreshAgentPaneContent(store).status).not.toBe('running') // optimistic busy released
+  })
+
+  it('keeps placeholder-session lost-session failures on the normal cleanup path without a retry', async () => {
+    const store = createStore()
+    let onMessage: ((message: Record<string, unknown>) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler: (message: Record<string, unknown>) => void) => {
+      onMessage = handler
+      return () => {}
+    })
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'empty',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-placeholder-lost',
+        sessionId: 'freshopencode-req-placeholder-lost',
+        status: 'idle',
+        initialCwd: '/w',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'hello placeholder' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const sendFrame = sentFreshAgentMessages('freshAgent.send').at(-1)
+    expect(sendFrame?.text).toBe('hello placeholder')
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store)).toMatchObject({ status: 'running' })
+    })
+    wsMock.send.mockClear()
+
+    expect(onMessage).toBeTypeOf('function')
+    act(() => {
+      onMessage?.({
+        type: 'error',
+        code: 'FRESH_AGENT_LOST_SESSION',
+        requestId: sendFrame?.requestId,
+        message: 'not tracked',
+        timestamp: Date.now(),
+      })
+    })
+
+    // No retry for a placeholder (non-ses_) session: cleanup path only.
+    await waitFor(() => {
+      expect(screen.queryByText('hello placeholder')).not.toBeInTheDocument()
+    })
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(0)
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
+    expect(getFreshAgentPaneContent(store).status).not.toBe('running')
+  })
+
   it('does not transmit stale Freshopencode permissionMode on create or send', async () => {
     const creatingStore = createStore()
     creatingStore.dispatch(initLayout({
@@ -2776,6 +2946,119 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentPaneContent(store).status).toBe('idle')
     })
     expect(store.getState().freshAgent.sessions[`freshcodex:codex:${sessionId}`]?.status).toBe('running')
+  })
+
+  it('clears stale opencode busy state from a live-reconciled idle HTTP snapshot', async () => {
+    const store = createStore()
+    const sessionId = 'ses_1'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: sessionId,
+      sessionId,
+      status: 'idle',
+      revision: 210,
+      latestTurnId: null,
+      capabilities: { send: true, interrupt: true, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+      turns: [],
+      pendingApprovals: [],
+      pendingQuestions: [],
+      extensions: { opencode: { statusFromLiveState: true } },
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId,
+        sessionRef: { provider: 'opencode', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-freshopencode-stale-running',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      status: 'running',
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${sessionId}`]?.status).toBe('idle')
+    })
+    expect(getFreshAgentPaneContent(store).status).toBe('idle')
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledWith(
+      'freshopencode',
+      'opencode',
+      sessionId,
+      expect.objectContaining({ cwd: '/home/dan/code/freshell' }),
+    )
+  })
+
+  it('does NOT clear opencode busy state from an idle snapshot that is not live-reconciled', async () => {
+    const store = createStore()
+    const sessionId = 'ses_1'
+    // Restore-window default idle: untracked (adapter liveState?.status ?? 'idle')
+    // or mid-reconcile -- the snapshot carries no statusFromLiveState marker.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: sessionId,
+      sessionId,
+      status: 'idle',
+      revision: 211,
+      latestTurnId: null,
+      capabilities: { send: true, interrupt: true, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+      turns: [],
+      pendingApprovals: [],
+      pendingQuestions: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId,
+        sessionRef: { provider: 'opencode', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-freshopencode-not-live-reconciled',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      status: 'running',
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // The pane content still adopts the snapshot status (pre-existing behavior);
+    // waiting on it proves the snapshot was fully applied before we assert.
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).status).toBe('idle')
+    })
+    expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${sessionId}`]?.status).toBe('running')
   })
 
   it('preserves loaded transcript history when a submit refresh returns only the in-flight turn', async () => {
@@ -4155,7 +4438,7 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('performs a follow-up freshopencode refresh when final send acceptance lands during an earlier invalidation debounce', async () => {
+  it('coalesces a final send acceptance landing during an earlier invalidation debounce into one shared refresh', async () => {
     const store = createStore()
     let wsHandler: ((message: any) => void) | undefined
     wsMock.onMessage.mockImplementation((handler) => {
@@ -4170,23 +4453,6 @@ describe('FreshAgentView', () => {
         status: 'idle',
         capabilities: { send: true, interrupt: true, fork: true },
         turns: [],
-      })
-      .mockResolvedValueOnce({
-        sessionType: 'freshopencode',
-        provider: 'opencode',
-        threadId: 'ses_final_race',
-        revision: 2,
-        status: 'idle',
-        capabilities: { send: true, interrupt: true, fork: true },
-        turns: [
-          {
-            id: 'turn-final-user',
-            turnId: 'turn-final-user',
-            role: 'user',
-            summary: 'Race final prompt',
-            items: [{ id: 'item-final-user', kind: 'text', text: 'Race final prompt' }],
-          },
-        ],
       })
       .mockResolvedValueOnce({
         sessionType: 'freshopencode',
@@ -4269,7 +4535,9 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(screen.getByText('Final answer after durable history catches up')).toBeInTheDocument()
     })
-    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+    // The invalidation debounce and the send acceptance coalesce into ONE
+    // shared scheduler run (initial fetch + one refresh), not a follow-up chain.
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
   })
 
   it('clears stale local echo after an idle recovered snapshot without the submitted turn', async () => {
@@ -4289,23 +4557,28 @@ describe('FreshAgentView', () => {
         capabilities: { send: true, interrupt: true, fork: true },
         turns: [],
       })
-      .mockResolvedValueOnce({
-        sessionType: 'freshopencode',
-        provider: 'opencode',
-        threadId: 'ses_stale_echo',
-        status: 'idle',
-        summary: 'recovered',
-        capabilities: { send: true, interrupt: true, fork: true },
-        turns: [
-          {
-            id: 'turn-existing-assistant',
-            turnId: 'turn-existing-assistant',
-            role: 'assistant',
-            summary: 'Recovered idle snapshot',
-            items: [{ id: 'item-existing-assistant', kind: 'text', text: 'Recovered idle snapshot' }],
-          },
-        ],
-      })
+    // Task 16: every subsequent fetch returns a FRESH recovered snapshot that
+    // still lacks the submitted turn — acceptance is by object identity, so a
+    // shared instance would skip the stale-echo path for the wrong reason.
+    let recoveredRevision = 2
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(async () => ({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: 'ses_stale_echo',
+      status: 'idle',
+      summary: 'recovered',
+      revision: recoveredRevision++,
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [
+        {
+          id: 'turn-existing-assistant',
+          turnId: 'turn-existing-assistant',
+          role: 'assistant',
+          summary: 'Recovered idle snapshot',
+          items: [{ id: 'item-existing-assistant', kind: 'text', text: 'Recovered idle snapshot' }],
+        },
+      ],
+    }))
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -4365,9 +4638,92 @@ describe('FreshAgentView', () => {
     await waitFor(() => {
       expect(screen.getByText('Recovered idle snapshot')).toBeInTheDocument()
     })
-    expect(screen.queryByText('Orphan prompt')).not.toBeInTheDocument()
+    // Task 16 contract change: the echo is the idle-incomplete re-poll loop's
+    // marker, so the FIRST incomplete idle snapshot must NOT clear it...
+    expect(screen.getByText('Orphan prompt')).toBeInTheDocument()
+    // ...but once the bounded retry budget is exhausted, the stale echo
+    // clears exactly as before (real timers: 5 retries x 1s + settle).
+    await waitFor(() => {
+      expect(screen.queryByText('Orphan prompt')).not.toBeInTheDocument()
+    }, { timeout: 15_000 })
     expect(getFreshAgentPaneContent(store).pendingLocalEcho).toBeUndefined()
-  })
+  }, 25_000)
+
+  it('keeps re-polling (bounded) when an idle snapshot is missing the just-sent turn', async () => {
+    const store = createStore()
+    let wsHandler: ((message: any) => void) | undefined
+    wsMock.onMessage.mockImplementation((handler) => {
+      wsHandler = handler
+      return () => {}
+    })
+    // HARNESS TRAP (fresh-eyes i3): return a FRESH snapshot object per fetch.
+    // Acceptance is by OBJECT IDENTITY (`snapshotAccepted = displaySnapshot
+    // !== previousSnapshot`; mergeSnapshotForDisplay does no content
+    // comparison). A shared mockResolvedValue(...) instance makes
+    // snapshotAccepted false, skips the stale-echo clear for the wrong
+    // reason, and lets a broken loop pass vacuously.
+    let rev = 1
+    apiMock.getFreshAgentThreadSnapshot.mockImplementation(
+      async () => freshopencodeSnapshot('unrelated earlier turn', rev++),
+    )
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-idle-incomplete',
+        sessionId: 'ses_late_change',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_late_change' },
+        resumeSessionId: 'ses_late_change',
+        status: 'idle',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('textbox', { name: 'Chat message input' })).not.toBeDisabled()
+    })
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), {
+      target: { value: 'question?' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    const send = sentFreshAgentMessages('freshAgent.send').at(-1)
+    const requestId = String(send?.requestId)
+    act(() => {
+      wsHandler?.({
+        type: 'freshAgent.send.accepted',
+        requestId,
+        sessionId: 'ses_late_change',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      })
+    })
+
+    const calls = () => apiMock.getFreshAgentThreadSnapshot.mock.calls.length
+    const before = calls()
+    // SUSTAINED loop — a single extra fetch must NOT satisfy this test:
+    await waitFor(() => expect(calls()).toBeGreaterThanOrEqual(before + 2), { timeout: 8_000 })
+    // ...and it runs to the cap...
+    await waitFor(
+      () => expect(calls()).toBeGreaterThanOrEqual(before + IDLE_INCOMPLETE_MAX_RETRIES),
+      { timeout: 10_000 },
+    )
+    // ...then the exhaustion pass clears the echo (the loop's marker)...
+    await waitFor(() => {
+      expect(screen.queryByText('question?')).not.toBeInTheDocument()
+    }, { timeout: 8_000 })
+    // ...and STOPS (bounded — no unbounded polling):
+    const atCap = calls()
+    await new Promise((r) => setTimeout(r, 1_500))
+    expect(calls()).toBe(atCap)
+  }, 25_000) // real timers (this suite uses none fake); 5 retries x 1s + settle needs a raised test timeout
 
   it('clears local echo as soon as a fresh snapshot contains the submitted text', async () => {
     const store = createStore()
@@ -5650,5 +6006,158 @@ describe('FreshAgentView transcript font size', () => {
       await waitFor(() => expect(document.activeElement).toBe(root))
       expect(focusSpy).not.toHaveBeenCalled()
     })
+  })
+})
+
+describe('snapshot scheduler integration (zrrj)', () => {
+  const SCHED_SESSION_ID = 'ses_late_change'
+
+  function schedulerPaneContent(createRequestId: string) {
+    return {
+      kind: 'fresh-agent',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      createRequestId,
+      sessionId: SCHED_SESSION_ID,
+      sessionRef: { provider: 'opencode', sessionId: SCHED_SESSION_ID },
+      resumeSessionId: SCHED_SESSION_ID,
+      status: 'idle',
+    } as const
+  }
+
+  /**
+   * Capture EVERY ws.onMessage subscription and broadcast to all of them,
+   * like the real ws client does. Last-handler capture (the older pattern)
+   * only reaches one pane, which would hide the N-pane fan-out this task
+   * collapses.
+   */
+  function captureWsBroadcast() {
+    const handlers: Array<(message: unknown) => void> = []
+    wsMock.onMessage.mockImplementation((handler) => {
+      handlers.push(handler)
+      return () => {}
+    })
+    return (message: unknown) => {
+      act(() => {
+        for (const handler of [...handlers]) handler(message)
+      })
+    }
+  }
+
+  function sessionChanged() {
+    return {
+      type: 'freshAgent.event',
+      sessionId: SCHED_SESSION_ID,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      event: {
+        type: 'freshAgent.session.changed',
+        sessionId: SCHED_SESSION_ID,
+        reason: 'opencode-message',
+      },
+    }
+  }
+
+  /** Real-timer sleep wrapped in act so late state updates never warn. */
+  const flushMs = (ms: number) => act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, ms))
+  })
+
+  it('coalesces a burst of freshopencode session.changed events across sibling panes into one snapshot GET', async () => {
+    const store = createStore()
+    const broadcast = captureWsBroadcast()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-a') }))
+    store.dispatch(initLayout({ tabId: 'tab-2', paneId: 'pane-2', content: schedulerPaneContent('req-sched-b') }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        <StoreBackedFreshAgentView tabId="tab-2" paneId="pane-2" />
+      </Provider>,
+    )
+    // Let the identity fetches (immediate + trailing coalesce for the sibling)
+    // fully settle before measuring the burst.
+    await waitFor(() => expect(screen.getAllByText('done').length).toBeGreaterThan(0))
+    await flushMs(400)
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+
+    for (let i = 0; i < 10; i += 1) {
+      broadcast(sessionChanged())
+    }
+
+    // Exactly one trailing GET shared by both panes, not one per event/pane.
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    await flushMs(400)
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps the last good snapshot visible and stops fetching during 429 backoff', async () => {
+    const store = createStore()
+    const broadcast = captureWsBroadcast()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce(freshopencodeSnapshot('hello world', 10))
+
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-429') }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await screen.findByText('hello world')
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(429, 'Too many requests', undefined, 60_000))
+
+    broadcast(sessionChanged())
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2))
+    await flushMs(50)
+    // Last good transcript stays visible; no load-error banner.
+    expect(screen.getByText('hello world')).toBeInTheDocument()
+    expect(screen.queryByText(/Too many requests/)).not.toBeInTheDocument()
+
+    // Further invalidations during backoff are suppressed without network.
+    broadcast(sessionChanged())
+    await flushMs(400)
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('hello world')).toBeInTheDocument()
+  })
+
+  it('does not refetch when another session sends (send.accepted for a foreign request)', async () => {
+    const store = createStore()
+    const broadcast = captureWsBroadcast()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-foreign') }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    apiMock.getFreshAgentThreadSnapshot.mockClear()
+
+    broadcast({
+      type: 'freshAgent.send.accepted',
+      requestId: 'someone-elses-request',
+      sessionId: SCHED_SESSION_ID,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+    })
+    await flushMs(400)
+    expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalled()
+  })
+
+  it('scheduler-path fetches carry no abort signal (shared runs must survive one pane unmounting)', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue(freshopencodeSnapshot('done', 10))
+
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: schedulerPaneContent('req-sched-signal') }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    // 4th positional arg is the query/options bag ({ revision?, cwd?, signal? }).
+    const options = apiMock.getFreshAgentThreadSnapshot.mock.calls[0][3]
+    expect(options?.signal).toBeUndefined()
   })
 })
