@@ -321,6 +321,11 @@ export class RustServer implements E2eServerHandle {
         // declaring success; a foreign server rejects our token.
         const identity = await fetch(`${info.baseUrl}/api/server-info`, {
           headers: { 'x-auth-token': token },
+          // Node 22's fetch has no default timeout (kata f3wp): a foreign
+          // process that answered /api/health but never responds on this
+          // endpoint would otherwise hang the whole boot-retry loop instead
+          // of failing fast into the next attempt.
+          signal: AbortSignal.timeout(2000),
         })
         if (!identity.ok) {
           throw new Error(
