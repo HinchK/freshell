@@ -21,6 +21,11 @@ use std::time::Duration;
 #[cfg(unix)]
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+/// Both tests mutate process-wide env (`CODEX_HOME`); serialize them (the
+/// repo's `ENV_LOCK` convention, e.g. `cross_kind_liveness.rs`).
+#[cfg(unix)]
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Fake codex: just parks the PTY (identity comes from the rollout files the
 /// test writes into the locator's sessions root, never from the binary).
 #[cfg(unix)]
@@ -74,6 +79,34 @@ async fn send_create(ws: &mut common::TestWs, mode: &str) -> String {
     ))
     .await
     .expect("send terminal.create");
+    let created = common::next_frame_of_type(ws, "terminal.created").await;
+    created["terminalId"]
+        .as_str()
+        .expect("terminal.created carries terminalId")
+        .to_string()
+}
+
+/// Send a `terminal.create` carrying the frozen client's resume shape --
+/// `sessionRef {provider:"codex", sessionId}` + `restore:true` (the Phase-1
+/// incident shape from `codex_session_ref_resume.rs`) -- and await its
+/// `terminal.created`, returning the terminalId. The server derives
+/// `resume_session_id` from the sessionRef and spawns `codex resume <id>`.
+#[cfg(unix)]
+async fn send_create_resume(ws: &mut common::TestWs, session_id: &str) -> String {
+    ws.send(WsMessage::Text(
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-codex-fork-rebind-resume-1",
+            "mode": "codex",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "restore": true,
+            "sessionRef": { "provider": "codex", "sessionId": session_id },
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create (resume)");
     let created = common::next_frame_of_type(ws, "terminal.created").await;
     created["terminalId"]
         .as_str()
@@ -136,7 +169,9 @@ async fn in_tui_fork_rebinds_the_pane_identity() {
     const OLD: &str = "019fa60f-aaaa-4bbb-8ccc-000000000001";
     const NEW: &str = "019fa613-dddd-4eee-8fff-000000000002";
 
-    // ---- env setup (single sequential test: this binary owns process env) ----
+    let _env = ENV_LOCK.lock().await;
+
+    // ---- env setup (serialized via ENV_LOCK: this binary owns process env) ----
     let codex_home = tempfile::tempdir().expect("codex home");
     let sessions_root = codex_home.path().join("sessions");
     let sessions_day = sessions_root.join("2026").join("07").join("27");
@@ -197,6 +232,94 @@ async fn in_tui_fork_rebinds_the_pane_identity() {
     assert_eq!(
         rebound["sessionRef"]["sessionId"], NEW,
         "rebind must move the pane to the fork child"
+    );
+    assert_eq!(
+        rebound["previousSessionId"], OLD,
+        "rebind must carry previousSessionId == the superseded id"
+    );
+
+    // 5. Registry meta followed the move.
+    let row = registry
+        .identity_probe_rows()
+        .into_iter()
+        .find(|r| r.terminal_id == terminal_id)
+        .expect("registry row for the pane");
+    assert_eq!(
+        row.resume_session_id.as_deref(),
+        Some(NEW),
+        "registry meta resume_session_id must be the NEW id"
+    );
+
+    registry.kill(&terminal_id);
+    std::env::remove_var("CODEX_HOME");
+}
+
+/// Resume-LAUNCHED panes (spawned `codex resume <id>` from a create carrying
+/// `sessionRef`) never pass through the adoption lane -- `arm()` refuses them
+/// (correctly: their session already exists) and must keep refusing. They DO
+/// need fork detection: an in-TUI /resume MAY fork to a NEW rollout
+/// (intermittent, upstream openai/codex#34972) and the pane would otherwise
+/// go permanently stale. The spawn-time `watch_fork` is the coverage under
+/// test.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_launched_pane_gets_fork_detection() {
+    const OLD: &str = "019fa60f-aaaa-4bbb-8ccc-000000000011";
+    const NEW: &str = "019fa613-dddd-4eee-8fff-000000000012";
+
+    let _env = ENV_LOCK.lock().await;
+
+    // ---- env setup (serialized via ENV_LOCK: this binary owns process env) ----
+    let codex_home = tempfile::tempdir().expect("codex home");
+    let sessions_root = codex_home.path().join("sessions");
+    let sessions_day = sessions_root.join("2026").join("07").join("27");
+    std::fs::create_dir_all(&sessions_day).expect("sessions tree");
+    std::env::set_var("CODEX_HOME", codex_home.path());
+    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+
+    // Rollout A (the resumed session's file) exists BEFORE the create -- a
+    // resume targets a session already on disk. The spawn-time watch
+    // snapshot must capture it as known (only NEW files are fork
+    // candidates).
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let rollout_a = sessions_day.join(format!("rollout-2026-07-27T12-00-00-{OLD}.jsonl"));
+    std::fs::write(
+        &rollout_a,
+        format!("{}\n", session_meta_line(OLD, &cwd, None)),
+    )
+    .unwrap();
+
+    // 1. Spawn server with codex locator rooted at the temp sessions dir.
+    let (url, registry) = common::spawn_server_with_specs_activity_and_codex_locator(
+        vec![codex_spec()],
+        &sessions_root,
+    )
+    .await;
+    let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;
+
+    // 2. Create a codex terminal WITH sessionRef {provider:"codex",
+    //    sessionId: OLD} -- the resume path. The create writes
+    //    identity.upsert + registry meta (resume_session_id == OLD), so this
+    //    pane is the live owner of OLD; the fork watch must be armed at
+    //    spawn.
+    let terminal_id = send_create_resume(&mut ws, OLD).await;
+
+    // 3. Drive Enter (opens the Enter-anchored fork-scan window), then write
+    //    rollout B with payload.id == NEW and payload.forked_from_id == OLD.
+    common::send_input(&mut ws, &terminal_id, "\r").await;
+    let rollout_b = sessions_day.join(format!("rollout-2026-07-27T12-05-00-{NEW}.jsonl"));
+    std::fs::write(
+        &rollout_b,
+        format!("{}\n", session_meta_line(NEW, &cwd, Some(OLD))),
+    )
+    .unwrap();
+
+    // 4. The rebind broadcast: sessionRef.sessionId == NEW, and the frame
+    //    names the identity it superseded.
+    let rebound = next_associated_frame(&mut ws, &terminal_id, "resume-fork-rebind").await;
+    assert_eq!(
+        rebound["sessionRef"]["sessionId"], NEW,
+        "rebind must move the resume-launched pane to the fork child"
     );
     assert_eq!(
         rebound["previousSessionId"], OLD,

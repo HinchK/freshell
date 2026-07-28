@@ -61,10 +61,17 @@
 //!   (prefilter-grade at best), NEVER `payload.session_id` (fork/resume
 //!   LINEAGE: matches a FOREIGN session in 54/144 sampled real rollouts) —
 //!   same predicate as `freshell-ws`'s `first_line_owns`.
-//! - Resumed codex sessions append to their EXISTING rollout file (no new
-//!   file) — consistent with the arm gate refusing resume panes. Compressed
-//!   artifacts (`.jsonl.zst`, present in 0.145.0 source) fail the `.jsonl`
-//!   suffix filter; fresh sessions always write plain `.jsonl`.
+//! - CLI-launch `codex resume <id>` appends to the EXISTING rollout file (no
+//!   new file; statistically supported across thousands of freshell-launched
+//!   sessions -- no live test) -- consistent with the arm gate refusing
+//!   resume panes. In-TUI `/resume` is DIFFERENT: it MAY fork --
+//!   INTERMITTENTLY (upstream bug openai/codex#34972; may be fixed away
+//!   upstream): a NEW rollout file with a NEW session id, `forked_from_id`
+//!   lineage and `thread_source:"user"` (verified on disk 2026-07-27,
+//!   019fa60f -> 019fa613). The ForkWatch lane exists for exactly that case
+//!   and is OPPORTUNISTIC/best-effort: when no fork happens it is simply
+//!   idle. Compressed artifacts (`.jsonl.zst`) fail the `.jsonl` suffix
+//!   filter.
 //!
 //! Zero cost when idle: scans happen only at arm, at the FIRST `note_submit`
 //! (the re-snapshot), and at due Enter-anchored
