@@ -326,12 +326,30 @@ impl CodexLocator {
         let current = self.scan_rollout_files();
         let mut inner = self.inner.lock().unwrap();
 
-        // Cross-tick contested-cwd census over ALL armed terminals (not just
-        // the due ones): two armed same-cwd panes are indistinguishable on
-        // this substrate, whatever their deadlines.
+        // Cross-tick contested-cwd census over CONTENDERS -- armed terminals
+        // with an in-flight Enter-anchored evaluation window -- not over all
+        // armed terminals. An armed pane that never submitted (or whose
+        // evaluation already resolved) cannot claim a file and must not
+        // starve its cwd-mates (P2, incident 2026-07-27: permanently
+        // never-promoted pending markers). Genuine ambiguity -- >=2
+        // overlapping windows in one cwd -- still refuses, and refusal still
+        // never disarms (a later solo Enter re-evaluates).
+        //
+        // SAFETY DEPENDENCY (validated A6, 2026-07-28): "every real codex
+        // submission opens a window" holds only because codex-tui ITSELF
+        // converts coalesced/pasted Enters into composer newlines
+        // (EnableBracketedPaste + paste_burst.rs) -- a foreign,
+        // config-escapable guard (`disable_paste_burst` turns it off).
+        // Candidates are a SNAPSHOT DIFFERENCE (`current.difference(
+        // &known_files)`, :282), NOT time-bounded: a windowless rollout
+        // stays claimable by any later solo window, so this census is the
+        // ONLY protection against that misbind. Pinned by
+        // windowless_same_cwd_rollout_is_claimed_by_a_later_solo_window.
         let mut cwd_counts: HashMap<String, usize> = HashMap::new();
         for a in inner.armed.values() {
-            *cwd_counts.entry(a.cwd_normalized.clone()).or_insert(0) += 1;
+            if a.enter_ms.is_some() && !a.resolved {
+                *cwd_counts.entry(a.cwd_normalized.clone()).or_insert(0) += 1;
+            }
         }
 
         // Pass 1: per-terminal candidate evaluation.
@@ -976,31 +994,91 @@ mod tests {
     }
 
     #[test]
-    fn staggered_same_cwd_armed_terminals_never_bind_uncontested() {
-        // Cross-tick contested guard (A4 hardening): ambiguity refusal must
-        // not be same-tick-only. While ≥2 ARMED terminals share a normalized
-        // cwd, NO candidate with that cwd binds for any of them — staggered
-        // deadlines must not let pane A grab pane B's rollout uncontested.
-        let root = unique_temp_dir("staggered");
+    fn idle_armed_cwd_mate_does_not_starve_a_submitting_pane() {
+        // Incident 2026-07-27 (DirectorDeck): three panes armed in one repo,
+        // ONE submitted and created its session -- the census refused
+        // forever because it counted ARMED panes, not contenders. Only panes
+        // with an in-flight Enter window can claim a file; idle armed mates
+        // are not contenders.
+        let root = unique_temp_dir("census-idle-mate");
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_s = cwd.to_string_lossy().to_string();
         let locator = CodexLocator::new(root.clone());
-        assert!(locator.arm("t1", "codex", true, None, Some("/tmp")));
-        assert!(locator.arm("t2", "codex", true, None, Some("/tmp")));
-        assert!(locator.note_submit("t1", 0));
-        assert!(locator.note_submit("t2", 5_000));
-        write_rollout(&root, "2026/07/26", TID, Some("/tmp"));
-        // t1's deadline fires alone: contested cwd → refuse.
-        assert!(locator.tick(CODEX_WINDOW_MS).is_empty());
-        // t2's deadline: still contested → refuse.
-        assert!(locator.tick(5_000 + CODEX_WINDOW_MS).is_empty());
-        assert_eq!(locator.armed_count(), 2);
-        // One pane exits (disarm); the survivor re-opens with a fresh Enter
-        // and may now bind — re-evaluation is legitimate once uncontested.
-        locator.disarm("t2");
-        assert!(locator.note_submit("t1", 10_000));
+        assert!(locator.arm("t1", "codex", true, None, Some(&cwd_s)));
+        assert!(locator.arm("t2", "codex", true, None, Some(&cwd_s)));
+        assert!(locator.note_submit("t1", 10_000)); // t2 never submits
+        let path = write_rollout(&root, "2026/07/26", TID, Some(&cwd_s));
         let located = locator.tick(10_000 + CODEX_WINDOW_MS);
+        assert_eq!(
+            located.len(),
+            1,
+            "solo submitter must bind despite an idle armed cwd-mate"
+        );
+        assert_eq!(located[0].terminal_id, "t1");
+        assert_eq!(located[0].rollout_path, path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn overlapping_windows_same_cwd_still_refuse_then_solo_reenter_binds() {
+        // Genuine ambiguity (two in-flight windows, one new file) still
+        // refuses -- but refusal is not forever: a later SOLO Enter binds.
+        let root = unique_temp_dir("census-overlap");
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_s = cwd.to_string_lossy().to_string();
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some(&cwd_s)));
+        assert!(locator.arm("t2", "codex", true, None, Some(&cwd_s)));
+        assert!(locator.note_submit("t1", 10_000));
+        assert!(locator.note_submit("t2", 10_500));
+        write_rollout(&root, "2026/07/26", TID, Some(&cwd_s));
+        assert!(
+            locator.tick(10_500 + CODEX_WINDOW_MS).is_empty(),
+            "contested: refuse"
+        );
+        assert_eq!(locator.armed_count(), 2, "refusal never disarms");
+        // t2's evaluation resolved; t1 re-enters SOLO -> binds (re-opens
+        // never re-snapshot, so the file is still a candidate for t1).
+        assert!(locator.note_submit("t1", 20_000));
+        let located = locator.tick(20_000 + CODEX_WINDOW_MS);
         assert_eq!(located.len(), 1);
         assert_eq!(located[0].terminal_id, "t1");
-        assert_eq!(located[0].thread_id, TID);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn windowless_same_cwd_rollout_is_claimed_by_a_later_solo_window() {
+        // PINNED ACCEPTED RESIDUAL (A6.1/A6.3) -- not desired behavior, but
+        // deliberately visible: t2's submission was coalesced into a
+        // text+CR chunk freshell never classified as submit-shaped (e.g. the
+        // REST maybe_send_keys "prompt\r" path with codex's paste-burst
+        // disabled), so its rollout lands WINDOWLESS. Candidates are a
+        // SNAPSHOT DIFFERENCE, not time-bounded (codex_locator.rs:282), so
+        // t1's later SOLO window claims t2's file -- a misbind whose sole
+        // guard is codex-tui's own submit discipline (see Step 2's census
+        // comment). This test keeps the residual from regressing silently
+        // into an unpinned assumption.
+        let root = unique_temp_dir("census-windowless");
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cwd_s = cwd.to_string_lossy().to_string();
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.arm("t1", "codex", true, None, Some(&cwd_s)));
+        assert!(locator.arm("t2", "codex", true, None, Some(&cwd_s)));
+        // t1's first Enter snapshots known_files; its window resolves empty.
+        assert!(locator.note_submit("t1", 10_000));
+        assert!(locator.tick(10_000 + CODEX_WINDOW_MS).is_empty());
+        // t2's windowless rollout appears (owner never opened a window).
+        let path = write_rollout(&root, "2026/07/26", TID, Some(&cwd_s));
+        // t1 re-enters SOLO: t2 has no in-flight window, so it is not a
+        // contender under the new census -- t1 claims t2's file.
+        assert!(locator.note_submit("t1", 60_000));
+        let located = locator.tick(60_000 + CODEX_WINDOW_MS);
+        assert_eq!(located.len(), 1);
+        assert_eq!(located[0].terminal_id, "t1");
+        assert_eq!(located[0].rollout_path, path);
         let _ = std::fs::remove_dir_all(&root);
     }
 
