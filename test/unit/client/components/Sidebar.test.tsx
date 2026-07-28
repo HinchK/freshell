@@ -2348,7 +2348,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       },
     ]
 
-    it('renders the repo dropdown defaulting to All with one option per repo', async () => {
+    it('renders the repo dropdown defaulting to All repos with one option per repo', async () => {
       const store = createTestStore({ projects: repoProjects })
       const { getByRole } = renderSidebar(store, [])
       await act(() => vi.advanceTimersByTime(100))
@@ -2356,7 +2356,7 @@ describe('Sidebar Component - Session-Centric Display', () => {
       const select = getByRole('combobox', { name: /repo filter/i }) as HTMLSelectElement
       expect(select).toHaveValue('all')
       expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
-        'All',
+        'All repos',
         'repo-alpha',
         'repo-beta',
       ])

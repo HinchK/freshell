@@ -718,7 +718,7 @@ export default function Sidebar({
               onChange={(e) => setRepoFilter(e.target.value || ALL_REPOS)}
               className="min-w-0 flex-1 h-7 px-2 text-xs bg-muted/50 border-0 rounded-md focus:outline-none focus:ring-1 focus:ring-border"
             >
-              <option value={ALL_REPOS}>All</option>
+              <option value={ALL_REPOS}>All repos</option>
               {repoOptions.map((option) => (
                 <option key={option.value} value={option.value} title={option.value}>
                   {option.label}
