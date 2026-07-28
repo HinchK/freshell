@@ -830,6 +830,15 @@ export type TerminalSessionAssociatedMessage = {
   type: 'terminal.session.associated'
   terminalId: string
   sessionRef: SessionLocator
+  /**
+   * Present ONLY on a server-authoritative mid-session rebind (the CLI under
+   * this pane switched/forked to a new session). Names the session id this
+   * association supersedes; the client accepts the overwrite only when its
+   * current sessionRef.sessionId equals this value. Optional + additive:
+   * WS_PROTOCOL_VERSION deliberately NOT bumped (server->client only, not
+   * client-validated; old clients ignore it and keep the conflict veto).
+   */
+  previousSessionId?: string
 }
 
 export type TerminalCodexDurabilityUpdatedMessage = {
