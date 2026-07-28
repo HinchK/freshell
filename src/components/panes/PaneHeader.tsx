@@ -7,6 +7,14 @@ import type { PaneContent } from '@/store/paneTypes'
 import PaneIcon from '@/components/icons/PaneIcon'
 import FreshAgentSettingsButton from '@/components/fresh-agent/FreshAgentSettingsButton'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
+import { useAppSelector } from '@/store/hooks'
+import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
+import { resolvePaneRepoCwd, pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
+import type { RepoIconEntry } from '@/store/repoIconsSlice'
+import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
+
+const EMPTY_REPO_ICONS: Record<string, RepoIconEntry> = {}
+const EMPTY_TERMINAL_META: Record<string, TerminalMetaRecord> = {}
 
 interface PaneHeaderProps {
   tabId?: string
@@ -58,6 +66,19 @@ export default function PaneHeader({
   onRefresh,
 }: PaneHeaderProps) {
   const inputRef = useRef<HTMLInputElement>(null)
+  const repoIconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.repoIconsOnTabs ?? true)
+  const repoIconsByCwd = useAppSelector((s) => s.repoIcons?.byCwd ?? EMPTY_REPO_ICONS)
+  const terminalMetaById = useAppSelector((s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META)
+  const repoCwd = repoIconsOnTabs ? resolvePaneRepoCwd(content, undefined, terminalMetaById) : undefined
+  const repoEntry = repoCwd ? repoIconsByCwd[repoCwd] : undefined
+  const repoIconInfo: RepoIconInfo | undefined =
+    repoCwd && repoEntry && repoEntry.status !== 'loading'
+      ? {
+          repoKey: repoEntry.repoRoot || repoCwd,
+          repoName: repoEntry.repoName || pathBasename(repoEntry.repoRoot || repoCwd),
+          iconUrl: repoEntry.hasIcon ? buildRepoIconUrl(repoCwd) : undefined,
+        }
+      : undefined
   const isFreshAgentPane = content.kind === 'fresh-agent'
   const freshAgentDerivedTitle = isFreshAgentPane ? derivePaneTitle(content) : undefined
   const freshAgentTitle = title.trim()
@@ -107,6 +128,10 @@ export default function PaneHeader({
       role="banner"
       aria-label={`Pane: ${title}`}
     >
+      {!isFreshAgentPane && repoIconInfo ? (
+        <RepoIcon info={repoIconInfo} className="h-3.5 w-3.5 shrink-0" />
+      ) : null}
+
       {!isFreshAgentPane ? (
         <PaneIcon
           content={content}
