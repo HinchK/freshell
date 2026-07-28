@@ -314,6 +314,14 @@ impl FreshAgentState {
         self.spawn_gate.get().cloned()
     }
 
+    /// Boot-assertion probe (council enn3 follow-up): the spawn-gate
+    /// OnceLock is a fail-OPEN seam — unwired means every REST create runs
+    /// ungated. `freshell-server` asserts this at startup so a wiring
+    /// regression fails LOUD at boot instead of silently ungating.
+    pub fn spawn_gate_wired(&self) -> bool {
+        self.spawn_gate.get().is_some()
+    }
+
     /// Record what a `restoreKey`-tagged create produced (continuity trio,
     /// `tabs_snapshots.rs:632`). Called by `terminal_tabs`'s create paths
     /// immediately after the tab/pane maps are populated, so a restore retry
@@ -2283,6 +2291,21 @@ mod spawn_gate_seam_tests {
     #[test]
     fn unwired_state_has_no_spawn_gate() {
         assert!(bare_state().spawn_gate().is_none());
+    }
+
+    /// Boot-assertion seam (council enn3 follow-up): the OnceLock is a
+    /// fail-OPEN seam — an unwired gate silently ungates every REST create.
+    /// `spawn_gate_wired` is the public probe `freshell-server` asserts at
+    /// startup so a wiring regression fails LOUD at boot.
+    #[test]
+    fn spawn_gate_wired_reflects_oncelock_state() {
+        let state = bare_state();
+        assert!(!state.spawn_gate_wired(), "bare state must report unwired");
+        state.set_spawn_gate(
+            Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            Duration::from_millis(100),
+        );
+        assert!(state.spawn_gate_wired(), "wired state must report wired");
     }
 
     #[test]

@@ -504,6 +504,13 @@ async fn main() -> ExitCode {
         std::sync::Arc::clone(&spawn_gate),
         std::time::Duration::from_millis(create_protect.spawn_timeout_ms),
     );
+    // Boot assertion (council enn3 follow-up): the OnceLock is a fail-OPEN
+    // seam — unwired means every REST create runs ungated. Fail LOUD at boot
+    // if the wiring above ever regresses.
+    assert!(
+        fresh_agent_state.spawn_gate_wired(),
+        "spawn-gate OnceLock must be wired at startup (REST creates would run ungated)"
+    );
     // Boot visibility (council observability follow-up, PR #552): the ONE
     // authoritative line stating the resolved create-protection posture —
     // env-overridable knobs plus the fact that requestId dedupe is active —
