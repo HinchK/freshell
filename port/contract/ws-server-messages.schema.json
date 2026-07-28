@@ -3002,6 +3002,12 @@
         "attempt": {
           "type": "number"
         },
+        "exitCode": {
+          "type": "number"
+        },
+        "maxAttempts": {
+          "type": "number"
+        },
         "reason": {
           "type": "string"
         },

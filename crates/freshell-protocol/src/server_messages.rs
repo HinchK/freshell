@@ -1088,6 +1088,14 @@ pub struct TerminalStatus {
     pub terminal_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt: Option<i64>,
+    /// Auto-resume `recovering` frames only: the bounded retry budget. The
+    /// client renders attempt/maxAttempts from these FIELDS — `reason` prose
+    /// is purely presentational and must never be parsed (council 7w4h/xkhx).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<i64>,
+    /// Auto-resume `recovering` frames only: the crashed generation's exit code.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

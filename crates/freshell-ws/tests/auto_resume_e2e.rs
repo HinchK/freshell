@@ -167,6 +167,10 @@ async fn crashing_agent_is_resumed_twice_then_settles_exited() {
     .await;
     assert_eq!(recovering["terminalId"], serde_json::json!(old_tid));
     assert_eq!(recovering["attempt"], serde_json::json!(1));
+    // Council 7w4h/xkhx: the client renders from these typed FIELDS — the
+    // reason prose below is purely presentational.
+    assert_eq!(recovering["maxAttempts"], serde_json::json!(2));
+    assert_eq!(recovering["exitCode"], serde_json::json!(1));
     let reason = recovering["reason"].as_str().expect("reason string");
     assert!(
         reason.contains("claude crashed") && reason.contains("attempt 1/2"),

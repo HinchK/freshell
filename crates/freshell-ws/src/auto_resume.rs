@@ -542,6 +542,11 @@ impl AutoResumeDriver for WsAutoResumeDriver {
             status: freshell_protocol::RuntimeStatus::Recovering,
             terminal_id: terminal_id.to_string(),
             attempt: Some(attempt as i64),
+            // The client renders attempt/max/exit from these typed FIELDS;
+            // `reason` below is purely presentational and safe to reword
+            // (council 7w4h/xkhx: prose must never be protocol).
+            max_attempts: Some(max_attempts as i64),
+            exit_code: Some(exit_code),
             reason: Some(format!(
                 "{mode} crashed (exit {exit_code}) — auto-resuming, attempt {attempt}/{max_attempts}"
             )),

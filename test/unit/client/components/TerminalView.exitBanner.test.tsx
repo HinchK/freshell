@@ -120,6 +120,7 @@ interface StoreOptions {
   status?: TerminalPaneContent['status']
   withSessionRef?: boolean
   lifecycle?: {
+    lastTerminalId?: string
     exit?: { exitCode: number; at: number }
     notice?: { kind: 'recovering' | 'resumed'; attempt: number; maxAttempts: number; exitCode: number; at: number }
   }
@@ -387,5 +388,39 @@ describe('TerminalView exited-pane error banner', () => {
 
     expect(screen.queryByText('claude crashed (exit 1) — auto-resuming, attempt 1/2')).toBeNull()
     expect(screen.getByRole('alert')).toHaveTextContent('process exited (code 1)')
+  })
+
+  it('renders the recovering notice from the frame FIELDS — prose is presentational, never parsed', async () => {
+    // Council MEDIUM fix (7w4h/xkhx review): the client must read
+    // attempt/maxAttempts/exitCode from the terminal.status frame's typed
+    // fields. The reason prose here is DELIBERATELY reworded so any regex
+    // parse of it ("attempt n/m", "exit N") finds nothing — if the banner
+    // still shows invented defaults (1/2, exit 1), prose is load-bearing.
+    const at = Date.now()
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'exited',
+      lifecycle: {
+        lastTerminalId: 'term-crashed',
+        exit: { exitCode: 137, at },
+      },
+    })
+    await renderPane(store, paneContent)
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-crashed',
+        status: 'recovering',
+        attempt: 1,
+        maxAttempts: 3,
+        exitCode: 137,
+        reason: 'claude quit unexpectedly and is being brought back',
+      })
+    })
+
+    expect(
+      screen.getByText('claude crashed (exit 137) — auto-resuming, attempt 1/3')
+    ).toBeInTheDocument()
   })
 })

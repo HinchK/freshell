@@ -4120,13 +4120,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // match against the recorded lastTerminalId from the lifecycle slice.
           const statusMine = msg.terminalId === tid
             || msg.terminalId === selectLastTerminalIdFrom(appStore.getState().terminalLifecycle, paneIdRef.current)
-          if (statusMine && msg.status === 'recovering' && typeof msg.attempt === 'number') {
+          // Attempt/max/exit come from the frame's typed FIELDS — never parsed
+          // out of the reason prose, which is purely presentational (council
+          // 7w4h/xkhx: rewording UI copy must not change client behavior).
+          if (
+            statusMine
+            && msg.status === 'recovering'
+            && typeof msg.attempt === 'number'
+            && typeof msg.maxAttempts === 'number'
+            && typeof msg.exitCode === 'number'
+          ) {
             dispatch(recordAutoResumeRecovering({
               paneId: paneIdRef.current,
               attempt: msg.attempt,
-              // reason text carries "attempt n/max" — parse max defensively; default 2:
-              maxAttempts: Number(msg.reason?.match(/attempt \d+\/(\d+)/)?.[1] ?? 2),
-              exitCode: Number(msg.reason?.match(/exit (-?\d+)/)?.[1] ?? 1),
+              maxAttempts: msg.maxAttempts,
+              exitCode: msg.exitCode,
               at: Date.now(),
             }))
           }
