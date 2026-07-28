@@ -605,6 +605,35 @@ describe('App WS bootstrap recovery', () => {
     expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'opencode.activity.list' }))
   })
 
+  it('tears down the session and surfaces an auth failure when the sidebar window load returns 401', async () => {
+    const store = createStore()
+    // Bootstrap auth succeeds (beforeEach default apiGet), but the follow-up sidebar
+    // snapshot is unauthorized -> ensureSidebarSessionsWindow must perform the auth
+    // teardown even though fetchSessionWindow no longer throws.
+    fetchSidebarSessionsSnapshot.mockRejectedValue(Object.assign(new Error('Unauthorized'), { status: 401 }))
+
+    render(
+      <Provider store={store}>
+        <App />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      // Proves the thunk path actually ran and recorded the failure...
+      expect(store.getState().sessions.windows.sidebar?.error).toBe('Unauthorized')
+      // ...and that the 401 drove the full auth teardown.
+      expect(store.getState().connection.lastError).toBe('Authentication failed')
+      expect(store.getState().connection.status).toBe('disconnected')
+    })
+
+    // Residue-proof discriminator: the teardown makes ensureSidebarSessionsWindow
+    // return false, so bootstrap exits before the pre-connect clears and never
+    // connects the websocket. (Without the teardown, bootstrap proceeds and
+    // connect IS called — so this assertion alone keeps the test RED even if
+    // transient 'Authentication failed' residue were ever observable.)
+    expect(wsMocks.connect).not.toHaveBeenCalled()
+  })
+
   it('repairs missing bootstrap platform capabilities from /api/platform after websocket readiness', async () => {
     const store = createStore()
     let platformCalls = 0
@@ -1942,17 +1971,17 @@ describe('App WS bootstrap recovery', () => {
   })
 
   it('contains a failing queued session-window refresh from a sessions.changed broadcast instead of leaking an unhandled rejection', async () => {
-    // Regression: the sessions.changed handler dispatched queueActiveSessionWindowRefresh()
-    // fire-and-forget with no .catch(). That thunk re-throws when it falls through to
-    // fetchSessionWindow() without committed window data (e.g. a sessions.changed before the
-    // sidebar window commits, or after a failed direct fetch retry), so a transient refresh
-    // failure leaked an unhandled rejection that fails the whole test run even though every
-    // test "passed" — the same failure class the terminal.inventory site already contains.
+    // Regression: the sessions.changed handler dispatches queueActiveSessionWindowRefresh()
+    // fire-and-forget with no .catch(). fetchSessionWindow used to re-throw on API failure,
+    // so a transient refresh failure leaked an unhandled rejection that failed the whole
+    // test run even though every test "passed". fetchSessionWindow now resolves a result
+    // instead of rejecting, so containment is provided at the source — this test proves the
+    // fire-and-forget dispatch can never leak, with no inline .catch present.
     const store = createStore()
 
     // Reject every snapshot fetch. The bootstrap sidebar load fails but is contained by
     // ensureSidebarSessionsWindow (so no window ever commits -> hasCommittedWindow stays
-    // false), and the queued refresh then takes the re-throwing fetchSessionWindow branch.
+    // false), and the queued refresh then exercises the failing fetchSessionWindow branch.
     fetchSidebarSessionsSnapshot.mockRejectedValue(new Error('window snapshot unavailable'))
 
     const unhandled: unknown[] = []

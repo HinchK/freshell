@@ -211,11 +211,15 @@ async fn gate_at_concurrency_one_never_breaks_a_restore_storm() {
 
 #[tokio::test]
 async fn zero_permit_gate_times_out_create_with_pinned_error_frame() {
-    // spawn_concurrency: 0 => SpawnGate::from_config builds a 0-permit
-    // semaphore (legal: only from_env treats 0 as "fall back to default";
-    // a literal config passes 0 straight through from_config -> new).
-    // acquire() can therefore never succeed: the create queues (under the
-    // 64-cap) and times out after spawn_timeout_ms.
+    // spawn_concurrency: 0 => the harness builds a 0-permit semaphore
+    // (legal: only from_env treats 0 as "fall back to default"; the test
+    // harness passes 0 straight through to SpawnGate::new).
+    // acquire() can therefore never succeed: a create that consults the
+    // gate queues (under the 64-cap) and times out after spawn_timeout_ms.
+    //
+    // RESTORE-ONLY gate scope (user decision, PR #552): only restore:true
+    // creates consult the gate; interactive (non-restore) creates bypass it
+    // entirely for an instant create.
     let cfg = CreateProtectConfig {
         spawn_concurrency: 0,
         spawn_queue_cap: 64,
@@ -225,7 +229,9 @@ async fn zero_permit_gate_times_out_create_with_pinned_error_frame() {
     let url = common::spawn_server_with_create_protect(cfg).await;
     let mut ws = connect_and_hello(&url).await;
 
-    let rejected = send_create_and_await_reply(&mut ws, "cr-gate-timeout", false).await;
+    // restore:true is exempt from the RATE limit but goes THROUGH the gate:
+    // the pinned error frame the frozen client ladder matches on.
+    let rejected = send_create_and_await_reply(&mut ws, "cr-gate-timeout", true).await;
     assert_eq!(rejected["type"], "error", "gate must reject: {rejected}");
     assert_eq!(rejected["code"], "PTY_SPAWN_FAILED");
     assert_eq!(
@@ -234,11 +240,12 @@ async fn zero_permit_gate_times_out_create_with_pinned_error_frame() {
     );
     assert_eq!(rejected["requestId"], "cr-gate-timeout");
 
-    // restore:true is exempt from the RATE limit but NOT the gate.
-    let restore_rejected = send_create_and_await_reply(&mut ws, "cr-gate-restore", true).await;
+    // Non-restore creates BYPASS the gate: instant create even with zero
+    // permits.
+    let plain = send_create_and_await_reply(&mut ws, "cr-gate-bypass", false).await;
     assert_eq!(
-        restore_rejected["code"], "PTY_SPAWN_FAILED",
-        "restore creates go THROUGH the gate: {restore_rejected}"
+        plain["type"], "terminal.created",
+        "non-restore creates bypass the gate for an instant create: {plain}"
     );
 }
 

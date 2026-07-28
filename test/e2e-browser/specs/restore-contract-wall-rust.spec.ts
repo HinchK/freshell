@@ -340,7 +340,11 @@ process.exit(result.status ?? 1)
   return dest
 }
 
-async function createFreshcodexPane(page: Page, harness: TestHarness): Promise<void> {
+async function createFreshcodexPane(
+  page: Page,
+  harness: TestHarness,
+  cwd: string,
+): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
   // bootstrap + /api/platform fetch (App.tsx:572,609). Callers reach this
   // helper only after harness.waitForConnection(), which is what makes the
@@ -354,14 +358,21 @@ async function createFreshcodexPane(page: Page, harness: TestHarness): Promise<v
   })
   const picker = await openPanePicker(page)
   await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
-  // "First option" exists here only because selectShellIfPickerShowing
-  // already opened a shell whose live-terminal cwd becomes a candidate dir
-  // (/api/files/candidate-dirs returns [] on a truly clean boot -- no $HOME
-  // fallback, crates/freshell-server/src/files.rs:15-26). This mirrors the
-  // donor exactly (restore-double-restart.spec.ts:148-176); if no option
-  // renders, switch to the fill+Enter pattern used by
-  // createFreshopencodePane/createFreshclaudePane.
-  await page.getByRole('option').first().click()
+  // DEFLAKE/REBASE (f3wp refresh, 2026-07-28): main's #553 added the sidebar
+  // "Repo filter" -- a native <select> (Sidebar.tsx:713-727) whose <option>
+  // children are DOM-earlier than the DirectoryPicker candidates, so the old
+  // page-global `getByRole('option').first().click()` resolves to the
+  // ALWAYS-HIDDEN "All" option of the CLOSED select whenever the sidebar has
+  // repo-grouped sessions (true in THE RULER by this point) and waits on
+  // visibility forever -- observed as 4/4 deterministic RULER test-timeouts
+  // (trace pending on `role=option >> nth=0`, timeout 0). Use the fill+Enter
+  // pattern this helper's own contingency note prescribed (same as
+  // createFreshclaudePane/createFreshopencodePane) -- no role=option
+  // dependency at all.
+  const directoryInput = page.getByLabel(/^Starting directory for Freshcodex$/i)
+  await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+  await directoryInput.fill(cwd)
+  await directoryInput.press('Enter')
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
     timeout: 15_000,
   })
@@ -962,7 +973,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // the Freshcodex click is swallowed (donor ordering:
       // restore-double-restart.spec.ts:210-214; same guard as Contracts B/D).
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
-      await createFreshcodexPane(page, harness)
+      await createFreshcodexPane(page, harness, sharedRoot)
       await sendFreshAgentTurn(page, harness, tabId, 'wall freshcodex turn')
       await expect(
         page.locator('[data-context="fresh-agent"]').last().getByText('Fixture turn'),
@@ -1361,7 +1372,20 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    test.setTimeout(300_000)
+    // DEFLAKE (f3wp refresh): 300 s timed out twice back-to-back under
+    // concurrent-suite load (2026-07-28, runs at 01:28 and 01:37; both
+    // failure screenshots show a healthy, still-progressing page -- slow,
+    // not wedged). The ruler's serial cost is structurally LARGER than the
+    // double-restart test's (~91 s bootWall + one ~65 s restartAbrupt +
+    // every per-pane creation/identity gate for ALL pane types across two
+    // tabs), and a 300 s budget recreates the same sum-of-gates > timeout
+    // defect the f3wp double-restart fix (:2068-2076) removed at 180 s.
+    // 600 s covers the worst case with margin, matching that sibling.
+    // NOTE the test.fail pin below: on a load-starved run the 300 s TEST
+    // timeout fired BEFORE the pin's expected in-test red was reached, and
+    // a test-level timeout does not satisfy the pin -- so the underfunded
+    // budget reds the whole run despite the expected-fail marking.
+    test.setTimeout(600_000)
     // EXPECTED-FAIL WALL PIN -- P0.1: this is the composed ruler; it flips
     // green only when every per-pane contract above is green un-pinned
     // (P0.2..P1.13). OBSERVED first red (run of 2026-07-24): the freshclaude
@@ -1554,7 +1578,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // (boot-picker fade-out guard applies after every tab-add + shell pick).
       await expect(page.locator('.xterm').last()).toBeVisible({ timeout: 30_000 })
       await openSplitPickerOnVisibleTerminal()
-      await createFreshcodexPane(page, harness)
+      await createFreshcodexPane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, freshcodexTabId, 'ruler freshcodex turn')
       const freshcodexId = leafDurableIdentity(
         findFreshAgentLeaf(await harness.getPaneLayout(freshcodexTabId)),
@@ -2065,6 +2089,15 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
+    // DEFLAKE (f3wp): this test's serial gate budget (20+45+60+30+60+30 s
+    // = 245 s) plus 3 serialized boot/health budgets (~91 s bootWall +
+    // 2 x 65 s restartAbrupt) structurally exceeds the describe-level 180 s
+    // under full parallel-suite load. Post-fix worst case (with the new
+    // 60 s WS gate and the 30 s explicit click) is ~556 s, so 300 s would
+    // recreate the same sum-of-gates > timeout defect at a higher threshold.
+    // 600 s covers the strict worst case with margin. Same per-test override
+    // pattern THE RULER uses (:1364).
+    test.setTimeout(600_000)
     // ADOPTED REALITY (reconcile-client-adoption lane): the client advertises
     // capabilities.paneReconcileV1 in hello and sends pane.reconcile.request
     // after EVERY ready, so a restart landing mid-recovery is answered by a
@@ -2088,7 +2121,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     })
     try {
       await selectShellIfPickerShowing(page)
-      await page.getByText(SESSION_TITLE, { exact: false }).first().click()
+      await page.getByText(SESSION_TITLE, { exact: false }).first().click({ timeout: 30_000 })
       const tabId = (await harness.getActiveTabId())!
       await expect
         .poll(async () => (await harness.getPaneLayout(tabId))?.content?.terminalId ?? null, {
@@ -2106,6 +2139,12 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // First SIGKILL; wait until recovery is IN FLIGHT (a new spawn hit the
       // argv log), then SIGKILL again mid-recovery.
       await server.restartAbrupt()
+      // DEFLAKE (f3wp): gate the reconnect BEFORE polling for the recovery
+      // spawn -- under load the client can still be mid-reconnect here, and
+      // the argv poll silently burns its 45 s budget waiting on a spawn that
+      // cannot start until the WS is ready. The second SIGKILL still lands
+      // mid-recovery: the argv-growth poll below remains the trigger.
+      await waitForWsReady(page)
       await expect
         .poll(async () => (await readArgvLog(argLogPath)).length, { timeout: 45_000 })
         .toBeGreaterThan(argvCountBeforeKill)

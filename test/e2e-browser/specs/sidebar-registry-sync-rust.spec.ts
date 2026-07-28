@@ -117,7 +117,12 @@ async function seedCodexRollout(homeDir: string, threadId: string, cwd: string):
 // semantics themselves are case-d territory (Task 8) -- here we just decline.
 async function declineRecoveryOfferIfShowing(page: import('@playwright/test').Page): Promise<void> {
   const panel = page.getByTestId('recovery-offer-panel')
-  const appeared = await panel.waitFor({ state: 'visible', timeout: 10_000 }).then(
+  // DEFLAKE (f3wp): under load the recovery overlay can render >10 s after
+  // reload; a swallowed miss leaves an inset-0 z-[60] overlay intercepting
+  // every later click, failing case-a far from the cause. 30 s bounds the
+  // worst case; tests where no offer appears pay the wait inside a 240 s
+  // per-test budget.
+  const appeared = await panel.waitFor({ state: 'visible', timeout: 30_000 }).then(
     () => true,
     () => false, // standalone run: no panes in server memory, no offer
   )
@@ -464,8 +469,111 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
       ['codex', SEEDED_CODEX_THREAD_ID],
     ] as const) {
       const row = page.locator(`[data-session-id="${sessionId}"][data-provider="${mode}"]`)
-      await expect(row).toHaveAttribute('data-has-tab', 'true', { timeout: 45_000 })
-      await expect(row).toHaveCount(1)
+      try {
+        await expect(row).toHaveAttribute('data-has-tab', 'true', { timeout: 45_000 })
+        await expect(row).toHaveCount(1, { timeout: 45_000 })
+      } catch (error) {
+        // DEFLAKE-DIAG (f3wp refresh): a bare "element not found" here is
+        // undiagnosable -- it cannot distinguish (a) the server's directory
+        // index not listing the seeded session, from (b) the respawned
+        // terminal's identity never being adopted (row stuck provisional),
+        // from (c) the client's one-shot sessions fetch having missed/lost
+        // the data with no sessions.changed repair. Dump all three layers
+        // before rethrowing so a recurrence pins the layer that lost it.
+        const dumpDirectory = async (label: string, params: string) =>
+          page.request
+            .get(`${info.baseUrl}/api/session-directory?${params}`, { headers: { 'x-auth-token': info.token } })
+            .then(async (r) => {
+              const body: any = await r.json().catch(() => null)
+              const items = Array.isArray(body?.items) ? body.items : []
+              return `${label}: status=${r.status()} items=${JSON.stringify(items.map((it: any) => ({
+                sessionId: it.sessionId, provider: it.provider, liveTerminalOnly: it.liveTerminalOnly,
+                isRunning: it.isRunning, runningTerminalId: it.runningTerminalId, title: it.title,
+              })))}`
+            })
+            .catch((e) => `${label}: <fetch failed: ${e}>`)
+        // Same query shape the client sends (sessionsThunks -> getSessionDirectoryPage).
+        const dirDump = await dumpDirectory('client-shaped', 'priority=visible&limit=50')
+        // Unfiltered variant: distinguishes "not indexed" from "indexed but filtered".
+        const dirDumpAll = await dumpDirectory(
+          'permissive',
+          'priority=visible&limit=50&includeEmpty=1&includeNonInteractive=1&includeSubagents=1',
+        )
+        // Disk truth: what transcript files exist in the isolated HOME right now.
+        const listDisk = async (root: string): Promise<string[]> => {
+          const out: string[] = []
+          const walk = async (dir: string): Promise<void> => {
+            const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => [])
+            for (const e of entries) {
+              const p = path.join(dir, e.name)
+              if (e.isDirectory()) await walk(p)
+              else out.push(p)
+            }
+          }
+          await walk(root)
+          return out
+        }
+        const diskDump = JSON.stringify({
+          codex: await listDisk(path.join(info.homeDir, '.codex', 'sessions')),
+          claude: await listDisk(path.join(info.homeDir, '.claude', 'projects')),
+        })
+        const termDump = await page.request
+          .get(`${info.baseUrl}/api/terminals`, { headers: { 'x-auth-token': info.token } })
+          .then(async (r) => {
+            const body: any = await r.json().catch(() => null)
+            const items = Array.isArray(body) ? body : []
+            return `status=${r.status()} terminals=${JSON.stringify(items.map((t: any) => ({
+              terminalId: t.terminalId, mode: t.mode, status: t.status, sessionRef: t.sessionRef,
+            })))}`
+          })
+          .catch((e) => `<fetch failed: ${e}>`)
+        const reduxDump = await page
+          .evaluate(() => {
+            const state = (window as any).__FRESHELL_TEST_HARNESS__?.getState()
+            const summarize = (projects: any[]) => (projects ?? []).map((p: any) => ({
+              projectPath: p.projectPath,
+              sessions: (p.sessions ?? []).map((s: any) => ({
+                sessionId: s.sessionId, provider: s.provider, liveTerminalOnly: s.liveTerminalOnly,
+              })),
+            }))
+            return JSON.stringify({
+              projects: summarize(state?.sessions?.projects),
+              sidebarWindow: summarize(state?.sessions?.windows?.sidebar?.projects),
+              sidebarWindowError: state?.sessions?.windows?.sidebar?.error ?? null,
+            })
+          })
+          .catch((e) => `<eval failed: ${e}>`)
+        const domDump = await page
+          .evaluate(() =>
+            JSON.stringify(Array.from(document.querySelectorAll('[data-session-id]')).map((el) => ({
+              sessionId: el.getAttribute('data-session-id'),
+              provider: el.getAttribute('data-provider'),
+              hasTab: el.getAttribute('data-has-tab'),
+              isRunning: el.getAttribute('data-is-running'),
+            }))))
+          .catch((e) => `<eval failed: ${e}>`)
+        // Server-side truth: the restarted process's own log (index warm
+        // count, request lines) -- read directly from the isolated HOME.
+        const serverLogDump = await fs
+          .readFile(path.join(info.homeDir, '.freshell', 'logs', 'rust-server.jsonl'), 'utf8')
+          .then((raw) => {
+            const lines = raw.trim().split('\n')
+            const warm = lines.filter((l) => l.includes('session_index_warm'))
+            return `warm=[${warm.join(', ')}] tail=[${lines.slice(-8).join(', ')}]`
+          })
+          .catch((e) => `<read failed: ${e}>`)
+        throw new Error(
+          `case-a post-restart ${mode} row assertion failed -- diagnostics:\n` +
+            `  server /api/session-directory (${dirDump})\n` +
+            `  server /api/session-directory (${dirDumpAll})\n` +
+            `  disk transcripts: ${diskDump}\n` +
+            `  server /api/terminals: ${termDump}\n` +
+            `  redux sessions: ${reduxDump}\n` +
+            `  DOM [data-session-id] rows: ${domDump}\n` +
+            `  server log: ${serverLogDump}\n` +
+            `Original error: ${error}`,
+        )
+      }
     }
     // No provisional ghosts left over from respawned terminals.
     await expect(page.locator('[data-provider="codex"][data-session-id^="terminal:"]')).toHaveCount(0, { timeout: 45_000 })
@@ -474,8 +582,17 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     // restart -- assert the count INCREASED relative to the pre-restart
     // snapshot (an absolute >=N threshold would already be met pre-restart and
     // prove nothing about the respawn).
-    const resumesAfter = countResumes(await readArgvLog(path.join(sharedRoot, 'claude-argv.jsonl')))
-    expect(resumesAfter).toBeGreaterThan(resumesBefore)
+    // DEFLAKE (f3wp): sidebar rows go green from the ledger/registry join
+    // BEFORE the respawned `claude --resume` has necessarily exec'd and
+    // flushed its argv line -- a one-shot read raced that flush under load.
+    // Same assertion strength (before/after delta), now polled.
+    await expect
+      .poll(
+        async () =>
+          countResumes(await readArgvLog(path.join(sharedRoot, 'claude-argv.jsonl'))),
+        { timeout: 30_000 },
+      )
+      .toBeGreaterThan(resumesBefore)
   })
 
   // KEEP THIS SCENARIO LAST in the serial suite: it destroys the local

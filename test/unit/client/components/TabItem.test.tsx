@@ -20,6 +20,12 @@ vi.mock('@/components/icons/PaneIcon', () => ({
   ),
 }))
 
+vi.mock('@/components/icons/RepoIcon', () => ({
+  default: ({ info, className }: { info: any; className?: string }) => (
+    <svg data-testid="repo-icon" data-repo-key={info?.repoKey} data-repo-name={info?.repoName} className={className} />
+  ),
+}))
+
 function createTab(overrides: Partial<Tab> = {}): Tab {
   return {
     id: 'tab-1',
@@ -379,6 +385,73 @@ describe('TabItem', () => {
       expect(container.querySelector('script')).toBeNull()
       expect(container.querySelector('img[onerror]')).toBeNull()
       expect(container.querySelector('svg[onload]')).toBeNull()
+    })
+  })
+
+  describe('repo icons', () => {
+    const codingContent = (initialCwd: string): PaneContent =>
+      ({ kind: 'terminal', mode: 'claude', createRequestId: 'r', status: 'running', initialCwd } as PaneContent)
+
+    const repoIcons = {
+      '/repo/a': { repoKey: '/repo/a', repoName: 'a', iconUrl: '/api/repo-icon?cwd=%2Frepo%2Fa' },
+      '/repo/b': { repoKey: '/repo/b', repoName: 'b' },
+    }
+
+    const entries = (cwds: Array<string | undefined>) =>
+      cwds.map((repoCwd, i) => ({
+        paneId: `pane-${i}`,
+        content: codingContent(repoCwd ?? '/none'),
+        repoCwd,
+      }))
+
+    it('renders one repo icon per distinct repo, left of that repo group', () => {
+      render(
+        <TabItem
+          {...defaultProps}
+          paneEntries={entries(['/repo/a', '/repo/a', '/repo/b'])}
+          repoIcons={repoIcons}
+        />,
+      )
+      const repoIconsRendered = screen.getAllByTestId('repo-icon')
+      expect(repoIconsRendered).toHaveLength(2)
+      expect(repoIconsRendered[0].getAttribute('data-repo-key')).toBe('/repo/a')
+      expect(repoIconsRendered[1].getAttribute('data-repo-key')).toBe('/repo/b')
+      expect(screen.getAllByTestId('pane-icon')).toHaveLength(3)
+      // The first repo icon precedes the first pane icon in DOM order.
+      const first = repoIconsRendered[0]
+      const firstPane = screen.getAllByTestId('pane-icon')[0]
+      expect(first.compareDocumentPosition(firstPane) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    })
+
+    it('sizes repo icons h-3 w-3 like agent icons', () => {
+      render(<TabItem {...defaultProps} paneEntries={entries(['/repo/a'])} repoIcons={repoIcons} />)
+      const icon = screen.getByTestId('repo-icon')
+      expect(icon.getAttribute('class') || '').toContain('h-3 w-3')
+    })
+
+    it('renders no repo icons when repoIconsOnTabs is false', () => {
+      render(
+        <TabItem
+          {...defaultProps}
+          paneEntries={entries(['/repo/a'])}
+          repoIcons={repoIcons}
+          repoIconsOnTabs={false}
+        />,
+      )
+      expect(screen.queryByTestId('repo-icon')).toBeNull()
+      expect(screen.getAllByTestId('pane-icon')).toHaveLength(1)
+    })
+
+    it('renders no repo icon for entries without repoCwd or without loaded info', () => {
+      render(
+        <TabItem
+          {...defaultProps}
+          paneEntries={entries([undefined, '/repo/unknown'])}
+          repoIcons={repoIcons}
+        />,
+      )
+      expect(screen.queryByTestId('repo-icon')).toBeNull()
+      expect(screen.getAllByTestId('pane-icon')).toHaveLength(2)
     })
   })
 })

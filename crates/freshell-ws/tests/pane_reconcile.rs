@@ -157,6 +157,8 @@ async fn spawn_server_with_probe(
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
@@ -617,11 +619,21 @@ async fn negotiated_create_for_existing_key_adopts_instead_of_spawning() {
     server.registry.kill(&first_id);
 }
 
-/// The other half of change #1's fence: a NON-negotiating (frozen-client)
-/// connection keeps the legacy spawn path byte-for-byte — same requestId,
-/// second spawn (today's behavior, untouched).
+/// Landing-sync update: change #1's fence originally kept a NON-negotiating
+/// (frozen-client) connection's blind same-requestId re-create spawning a
+/// SECOND terminal, unchanged by the (capability-gated) paneReconcileV1
+/// adopt path. The server-wide `create_dedupe` guard woven in during the
+/// rust-tauri-port landing sync is deliberately NOT capability-gated --
+/// its own motivating case (module doc, `crate::create_dedupe`) is
+/// precisely this frozen client's blind resend-with-same-requestId on
+/// reconnect, which previously spawned a duplicate PTY and orphaned the
+/// original as a detached background session. So the frozen client's
+/// legacy WIRE SHAPE stays byte-for-byte unchanged (no capability
+/// negotiated, no `pane.reconcile.*` traffic), but its blind re-create is
+/// now answered from the dedupe guard with the EXISTING terminal, same as
+/// every other connection kind.
 #[tokio::test]
-async fn frozen_client_create_path_is_unchanged_no_dedupe() {
+async fn frozen_client_create_path_is_deduped_same_as_negotiating_clients() {
     let server = spawn_server().await;
     let (mut ws, _ready) = connect(&server.url, false).await;
 
@@ -642,13 +654,17 @@ async fn frozen_client_create_path_is_unchanged_no_dedupe() {
 
     let id1 = created1["terminalId"].as_str().expect("id1").to_string();
     let id2 = created2["terminalId"].as_str().expect("id2").to_string();
-    assert_ne!(
+    assert_eq!(
         id1, id2,
-        "the frozen client's blind re-create behavior must be unchanged"
+        "the frozen client's blind re-create is deduped by create_dedupe just like any other connection"
+    );
+    assert_eq!(
+        server.registry.inventory().len(),
+        1,
+        "exactly one terminal exists after both creates"
     );
 
     server.registry.kill(&id1);
-    server.registry.kill(&id2);
 }
 
 // --- 9.1.6 index warming: error{index_warming} + bounded single deferral ----------

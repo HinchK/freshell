@@ -82,14 +82,22 @@ async fn send_create(ws: &mut common::TestWs, mode: &str) -> String {
         .to_string()
 }
 
-/// Scan WS text frames until `pred` matches or the 10s budget elapses.
+/// Scan WS text frames until `pred` matches or the 30s budget elapses.
 /// Non-matching frames are simply skipped (no drop-on-mismatch semantics).
+///
+/// DEFLAKE (f3wp refresh): was 10s. Under workspace-level load (full
+/// cargo-test parallelism alongside a parallel playwright e2e run) the
+/// inotify-driven rollout read plus frame delivery was observed to exceed
+/// 10s once (`/tmp/f3wp-refresh/cargo-runverify1.log`, "expected
+/// terminal.turn.complete ... stamped by the locator adoption",
+/// 15.43s total test time). The assertions are unchanged -- only the wait
+/// budget grew; a genuinely missing frame still fails, 20s later.
 #[cfg(unix)]
 async fn wait_for_frame(
     ws: &mut common::TestWs,
     pred: impl Fn(&serde_json::Value) -> bool,
 ) -> bool {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {

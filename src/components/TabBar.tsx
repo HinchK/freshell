@@ -7,6 +7,8 @@ import { getTabDisplayTitle } from '@/lib/tab-title'
 import { sendTerminalKill } from '@/lib/terminal-kill'
 import { collectPaneEntries, collectTerminalIds } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
+import { resolvePaneRepoCwd, pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
+import { fetchRepoIconMeta } from '@/store/repoIconsSlice'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTabBarScroll } from '@/hooks/useTabBarScroll'
 import TabItem from './TabItem'
@@ -38,6 +40,7 @@ import type { Tab, TabAttentionStyle } from '@/store/types'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import type { FreshAgentSessionState } from '@/store/freshAgentTypes'
 import type { PaneRuntimeActivityRecord } from '@/store/paneRuntimeActivitySlice'
+import type { RepoIconInfo } from '@/components/icons/RepoIcon'
 import { ContextIds } from '@/components/context-menu/context-menu-constants'
 import { applyTabRename } from '@/store/titleSync'
 
@@ -63,8 +66,10 @@ interface SortableTabProps {
   isDragging: boolean
   isRenaming: boolean
   renameValue: string
-  paneEntries?: Array<{ paneId: string; content: PaneContent }>
+  paneEntries?: Array<{ paneId: string; content: PaneContent; repoCwd?: string }>
   iconsOnTabs?: boolean
+  repoIconsOnTabs?: boolean
+  repoIcons?: Record<string, RepoIconInfo>
   tabAttentionStyle?: TabAttentionStyle
   onRenameChange: (value: string) => void
   onRenameBlur: () => void
@@ -86,6 +91,8 @@ function SortableTab({
   renameValue,
   paneEntries,
   iconsOnTabs,
+  repoIconsOnTabs,
+  repoIcons,
   tabAttentionStyle,
   onRenameChange,
   onRenameBlur,
@@ -126,6 +133,8 @@ function SortableTab({
         renameValue={renameValue}
         paneEntries={paneEntries}
         iconsOnTabs={iconsOnTabs}
+        repoIconsOnTabs={repoIconsOnTabs}
+        repoIcons={repoIcons}
         tabAttentionStyle={tabAttentionStyle}
         onRenameChange={onRenameChange}
         onRenameBlur={onRenameBlur}
@@ -148,6 +157,8 @@ const EMPTY_AMPLIFIER_ACTIVITY_BY_ID = {}
 const EMPTY_OPENCODE_ACTIVITY_BY_ID = {}
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
 const EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID: Record<string, PaneRuntimeActivityRecord> = {}
+const EMPTY_REPO_ICONS: Record<string, import('@/store/repoIconsSlice').RepoIconEntry> = {}
+const EMPTY_TERMINAL_META: Record<string, import('@/store/terminalMetaSlice').TerminalMetaRecord> = {}
 
 interface TabBarProps {
   sidebarCollapsed?: boolean
@@ -175,6 +186,9 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
   )
   const attentionDismiss = useAppSelector((s) => s.settings?.settings?.panes?.attentionDismiss ?? 'click')
   const iconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.iconsOnTabs ?? true)
+  const repoIconsOnTabs = useAppSelector((s) => s.settings?.settings?.panes?.repoIconsOnTabs ?? true)
+  const repoIconsByCwd = useAppSelector((s) => s.repoIcons?.byCwd ?? EMPTY_REPO_ICONS)
+  const terminalMetaById = useAppSelector((s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META)
   const tabAttentionStyle = useAppSelector((s) => s.settings?.settings?.panes?.tabAttentionStyle ?? 'highlight')
   const multirowTabs = useAppSelector((s) => s.settings?.settings?.panes?.multirowTabs ?? false)
   const extensions = useAppSelector((s) => s.extensions?.entries)
@@ -186,28 +200,60 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     [paneLayouts, paneTitles, extensions]
   )
 
-  const getPaneEntries = useCallback((tab: Tab): Array<{ paneId: string; content: PaneContent }> | undefined => {
+  const getPaneEntries = useCallback((tab: Tab): Array<{ paneId: string; content: PaneContent; repoCwd?: string }> | undefined => {
     const layout = paneLayouts[tab.id]
-    if (layout) {
-      return collectPaneEntries(layout)
-    }
     // Fallback: synthesize a single content from tab.mode
-    if (tab.mode) {
-      return [{
-        paneId: tab.id,
-        content: {
-          kind: 'terminal' as const,
-          mode: tab.mode,
-          shell: tab.shell,
-          createRequestId: tab.createRequestId,
-          status: tab.status,
-          sessionRef: tab.sessionRef,
-          initialCwd: tab.initialCwd,
-        },
-      }]
+    const base = layout
+      ? collectPaneEntries(layout)
+      : tab.mode
+        ? [{
+            paneId: tab.id,
+            content: {
+              kind: 'terminal' as const,
+              mode: tab.mode,
+              shell: tab.shell,
+              createRequestId: tab.createRequestId,
+              status: tab.status,
+              sessionRef: tab.sessionRef,
+              initialCwd: tab.initialCwd,
+            },
+          }]
+        : undefined
+    return base?.map((entry) => ({
+      ...entry,
+      repoCwd: resolvePaneRepoCwd(entry.content, tab, terminalMetaById),
+    }))
+  }, [paneLayouts, terminalMetaById])
+
+  // Probe repo-icon meta once per distinct repo cwd visible on any tab.
+  useEffect(() => {
+    if (!repoIconsOnTabs) return
+    const cwds = new Set<string>()
+    for (const tab of tabs) {
+      const entries = getPaneEntries(tab)
+      if (!entries) continue
+      for (const entry of entries) {
+        if (entry.repoCwd) cwds.add(entry.repoCwd)
+      }
     }
-    return undefined
-  }, [paneLayouts])
+    for (const cwd of cwds) {
+      if (!repoIconsByCwd[cwd]) void dispatch(fetchRepoIconMeta(cwd))
+    }
+  }, [tabs, getPaneEntries, repoIconsOnTabs, repoIconsByCwd, dispatch])
+
+  const repoIconInfoByCwd = useMemo(() => {
+    const out: Record<string, RepoIconInfo> = {}
+    for (const [cwd, entry] of Object.entries(repoIconsByCwd)) {
+      if (entry.status === 'loading') continue
+      const repoKey = entry.repoRoot || cwd
+      out[cwd] = {
+        repoKey,
+        repoName: entry.repoName || pathBasename(repoKey),
+        iconUrl: entry.hasIcon ? buildRepoIconUrl(cwd) : undefined,
+      }
+    }
+    return out
+  }, [repoIconsByCwd])
 
   const getTerminalIdsForTab = useCallback((tab: Tab): string[] => {
     const layout = paneLayouts[tab.id]
@@ -295,6 +341,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         renameValue={renameValue}
         paneEntries={getPaneEntries(tab)}
         iconsOnTabs={iconsOnTabs}
+        repoIconsOnTabs={repoIconsOnTabs}
+        repoIcons={repoIconInfoByCwd}
         tabAttentionStyle={tabAttentionStyle}
         onRenameChange={setRenameValue}
         onRenameBlur={() => {
@@ -341,6 +389,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
     getPaneEntries,
     getTerminalIdsForTab,
     iconsOnTabs,
+    repoIconsOnTabs,
+    repoIconInfoByCwd,
     renameValue,
     renamingId,
     tabAttentionStyle,
@@ -553,6 +603,8 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
                 renameValue=""
                 paneEntries={getPaneEntries(activeTab)}
                 iconsOnTabs={iconsOnTabs}
+                repoIconsOnTabs={repoIconsOnTabs}
+                repoIcons={repoIconInfoByCwd}
                 tabAttentionStyle={tabAttentionStyle}
                 onRenameChange={() => {}}
                 onRenameBlur={() => {}}

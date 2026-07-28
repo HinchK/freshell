@@ -68,11 +68,11 @@ use freshell_terminal::{build_child_env_from_process, FrameSink};
 use crate::WsState;
 
 /// The write half of a split axum WebSocket.
-type WsSink = SplitSink<WebSocket, Message>;
+pub(crate) type WsSink = SplitSink<WebSocket, Message>;
 
 /// Serialize + send one server→client message. Returns `false` if the socket is
 /// closed/errored (the caller then tears the connection down).
-async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
+pub(crate) async fn send(ws_tx: &mut WsSink, msg: &ServerMessage) -> bool {
     match serde_json::to_string(msg) {
         Ok(json) => ws_tx.send(Message::Text(json.into())).await.is_ok(),
         Err(_) => false,
@@ -172,6 +172,12 @@ pub async fn run(
             }
         })
     };
+    // Per-connection cancel signal for gated restore creates. The sender
+    // lives in this function's scope, so queued gated creates are cancelled
+    // when the loop exits for ANY reason — client disconnect, socket error,
+    // keepalive timeout, or server shutdown (4009): the explicit send below
+    // plus the sender drop at return both unblock waiters.
+    let (create_cancel_tx, create_cancel_rx) = tokio::sync::watch::channel(false);
     if ui_screenshot_v1 {
         let tx = conn_tx.clone();
         state
@@ -262,6 +268,7 @@ pub async fn run(
                             pane_reconcile_v1,
                             pane_reconcile_fresh_agent_v1,
                             &mut create_limiter,
+                            &create_cancel_rx,
                         )
                         .await
                         {
@@ -438,6 +445,10 @@ pub async fn run(
         state.screenshots.remove_capable_client(conn_id);
     }
     state.registry.remove_connection(conn_id);
+    // Abandon any restore creates still queued on the spawn gate for this
+    // connection (RCA hardening: never spawn a PTY for a client that is
+    // gone). Redundant with the sender drop at return; explicit for clarity.
+    let _ = create_cancel_tx.send(true);
 
     // D8 conn-death lease release (council rule 8): pid-less in-flight leases
     // are released inside the registry call; pid-carrying ones come back
@@ -460,7 +471,7 @@ pub async fn run(
 
 /// Parse + dispatch one inbound client text frame. Returns `false` to close the
 /// connection (only on an unrecoverable send failure).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // Connection-scoped plumbing, one call site.
 async fn handle_client_text(
     text: &str,
     ws_tx: &mut WsSink,
@@ -471,6 +482,7 @@ async fn handle_client_text(
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     create_limiter: &mut crate::create_limit::CreateRateLimiter,
+    create_cancel_rx: &tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -527,15 +539,65 @@ async fn handle_client_text(
         }
         ClientMessage::ClientDiagnostic(_) => true,
         ClientMessage::TerminalCreate(create) => {
-            handle_create(
-                create,
-                ws_tx,
-                state,
-                conn_id,
-                pane_reconcile_v1,
-                create_limiter,
-            )
-            .await
+            // Server-wide requestId -> terminal dedupe (legacy `createdByRequestId`
+            // parity): registered BEFORE the rate limiter and BEFORE the
+            // paneReconcileV1 adopt/sessionRef-lease branches inside `handle_create`,
+            // so a resend during any of those windows is answered from here instead
+            // of re-entering the create path.
+            match state
+                .create_dedupe
+                .begin(&create.request_id, conn_sink, create.restore, |tid| {
+                    state.registry.is_pty_running(tid)
+                }) {
+                crate::create_dedupe::DedupeDecision::DuplicateSettled(created) => {
+                    // Re-send the original terminal.created (same requestId,
+                    // same terminalId) — never spawn a duplicate.
+                    let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                    return out.send(&created).await;
+                }
+                crate::create_dedupe::DedupeDecision::DuplicateInFlight => {
+                    // Same connection: the in-flight create replies on this
+                    // very sink. Different connection: begin() registered
+                    // this connection's sink as a waiter — settle() or
+                    // clear_if_in_flight() forwards the reply. Either way a
+                    // live client always gets an answer; never silence.
+                    return true;
+                }
+                crate::create_dedupe::DedupeDecision::Proceed => {}
+            }
+            if create.restore == Some(true) {
+                // restore:true bypasses the per-connection rate limiter —
+                // neither checked nor recorded (legacy `if (!m.restore)`) —
+                // and goes through the server-wide spawn gate on a spawned
+                // task (spawn-to-settled permit, cancellable).
+                crate::create_gate::spawn_gated_restore_create(
+                    create,
+                    state,
+                    conn_sink,
+                    create_cancel_rx.clone(),
+                    conn_id,
+                    pane_reconcile_v1,
+                );
+                true
+            } else {
+                let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
+                let request_id = create.request_id.clone();
+                let sent = handle_create(
+                    create,
+                    &mut out,
+                    state,
+                    conn_id,
+                    pane_reconcile_v1,
+                    create_limiter,
+                )
+                .await;
+                // No-op on success (the entry is Settled by `handle_create`'s
+                // main spawn path); drops the InFlight sentinel on every
+                // other exit (adopt/session-reserved/sessionRef-attach/
+                // rate-limited/failed) so a retry proceeds fresh (A2).
+                state.create_dedupe.clear_if_in_flight(&request_id);
+                sent
+            }
         }
         // RETIRED (campaign §2.3.2, Lane B2): codex identity has exactly one
         // writer -- the server-side rollout locator (codex_association). The
@@ -1124,7 +1186,11 @@ pub(crate) async fn kill_session_ref_holder_and_confirm(
 
 /// The D8 loser reply: `error{SESSION_RESERVED, requestId, retryAfterMs}` —
 /// the only error frame that carries `retryAfterMs`.
-async fn send_session_reserved(ws_tx: &mut WsSink, request_id: &str, retry_after_ms: u64) -> bool {
+async fn send_session_reserved(
+    out: &mut crate::create_gate::CreateOutput<'_>,
+    request_id: &str,
+    retry_after_ms: u64,
+) -> bool {
     let msg = ServerMessage::Error(ErrorMsg {
         code: ErrorCode::SessionReserved,
         message: "Another terminal.create for this sessionRef is in flight".to_string(),
@@ -1136,7 +1202,7 @@ async fn send_session_reserved(ws_tx: &mut WsSink, request_id: &str, retry_after
         terminal_exit_code: None,
         terminal_id: None,
     });
-    send(ws_tx, &msg).await
+    out.send(&msg).await
 }
 
 /// Everything a PTY exit hook needs. Built once per spawned generation —
@@ -1239,9 +1305,9 @@ pub(crate) fn build_pty_exit_hook(
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next.
-async fn handle_create(
+pub(crate) async fn handle_create(
     create: TerminalCreate,
-    ws_tx: &mut WsSink,
+    out: &mut crate::create_gate::CreateOutput<'_>,
     state: &WsState,
     conn_id: u64,
     pane_reconcile_v1: bool,
@@ -1284,7 +1350,7 @@ async fn handle_create(
                     restore_error: None,
                     session_ref: state.identity.session_ref_for(&existing),
                 });
-                return send(ws_tx, &created).await;
+                return out.send(&created).await;
             }
             if state.registry.begin_keyed_create(&create.request_id) {
                 keyed_create_guard = Some(KeyedCreateGuard {
@@ -1351,10 +1417,10 @@ async fn handle_create(
                                 .session_ref_for(&terminal_id)
                                 .or(Some(locator)),
                         });
-                        return send(ws_tx, &created).await;
+                        return out.send(&created).await;
                     }
                     SessionRefClaim::Held { retry_after_ms } => {
-                        return send_session_reserved(ws_tx, &create.request_id, retry_after_ms)
+                        return send_session_reserved(out, &create.request_id, retry_after_ms)
                             .await;
                     }
                     SessionRefClaim::ExpiredNeedsKill { pid } => {
@@ -1372,7 +1438,7 @@ async fn handle_create(
                             pid,
                             "session_ref_lease_expired_kill_unconfirmed: holding lease closed");
                         return send_session_reserved(
-                            ws_tx,
+                            out,
                             &create.request_id,
                             freshell_terminal::registry::SESSION_RESERVED_RETRY_AFTER_MS,
                         )
@@ -1393,7 +1459,7 @@ async fn handle_create(
             "terminal_create_rate_limited"
         );
         return send_create_error(
-            ws_tx,
+            out,
             ErrorCode::RateLimited,
             "Too many terminal.create requests".to_string(),
             &create.request_id,
@@ -1424,7 +1490,7 @@ async fn handle_create(
             .collect::<Vec<_>>()
             .join(", ");
         return send_create_error(
-            ws_tx,
+            out,
             ErrorCode::PtySpawnFailed,
             format!("Invalid terminal mode: '{mode}'. Valid: {valid}"),
             &create.request_id,
@@ -1507,7 +1573,7 @@ async fn handle_create(
                 if resume_session_id.is_none() {
                     crate::invariants::error_claude_restore_unresolved(&create.request_id);
                     return send_create_error(
-                        ws_tx,
+                        out,
                         ErrorCode::RestoreUnavailable,
                         // Node parity (`server/ws-handler.ts:2130-2159`): the
                         // frozen client's create-error handler shows
@@ -1581,7 +1647,7 @@ async fn handle_create(
                 );
             }
             return send_create_error(
-                ws_tx,
+                out,
                 ErrorCode::RestoreUnavailable,
                 format!("Session {live_sid} is still running on the server."),
                 &create.request_id,
@@ -1606,7 +1672,7 @@ async fn handle_create(
         match freshell_opencode::transport::LoopbackPortAllocator.allocate() {
             Ok(ep) => Some(ep),
             Err(e) => {
-                return send_create_error(ws_tx, ErrorCode::PtySpawnFailed, e, &create.request_id)
+                return send_create_error(out, ErrorCode::PtySpawnFailed, e, &create.request_id)
                     .await
             }
         }
@@ -1637,7 +1703,7 @@ async fn handle_create(
             // A thrown planCodexLaunch surfaces through the generic create catch
             // (`ws:2606-2614`) as an `error{code:PTY_SPAWN_FAILED}` frame.
             return send_create_error(
-                ws_tx,
+                out,
                 ErrorCode::PtySpawnFailed,
                 message,
                 &create.request_id,
@@ -1671,7 +1737,7 @@ async fn handle_create(
             Ok(i) => i,
             Err(e) => {
                 return send_create_error(
-                    ws_tx,
+                    out,
                     ErrorCode::PtySpawnFailed,
                     e.message,
                     &create.request_id,
@@ -1701,7 +1767,7 @@ async fn handle_create(
         Ok(l) => l,
         Err(e) => {
             return send_create_error(
-                ws_tx,
+                out,
                 ErrorCode::PtySpawnFailed,
                 e.message(),
                 &create.request_id,
@@ -1783,36 +1849,23 @@ async fn handle_create(
     ));
 
     // Server-wide spawn gate (restart-storm protection; WSL-outage RCA prior
-    // art). restore creates go THROUGH the gate. RAII permit: released on
-    // completion, failure, or unwind when `_spawn_permit` drops at scope end.
-    let _spawn_permit = match state
-        .spawn_gate
-        .acquire(std::time::Duration::from_millis(
-            state.create_protect.spawn_timeout_ms,
-        ))
-        .await
-    {
-        Ok(permit) => permit,
-        Err(err) => {
-            // Gate rejection mirrors the failed-spawn cleanup below: discard a
-            // planned-but-unadopted codex launch (sidecar + proxy) and undo the
-            // MCP side effects already materialized by generate_mcp_injection
-            // (claude/gemini/kimi tmp config file; opencode sidecar refcount).
-            if let Some(launch) = codex_launch {
-                freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
-                    .discard(launch)
-                    .await;
-            }
-            cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
-            let (code, msg) = spawn_gate_error_parts(err);
-            return send_create_error(ws_tx, code, msg.to_string(), &create.request_id).await;
-        }
-    };
+    // art): RESTORE-ONLY scope, by design decision (PR #552). Interactive
+    // (non-restore) creates are a human clicking "new terminal" — one at a
+    // time, latency-visible — so they proceed INSTANTLY and never touch the
+    // gate; the storm the gate exists for is the ~20-tab restore fleet
+    // respawning 50-70 processes in the same instant, and exactly those
+    // (restore == Some(true)) creates are gated — by the CALLER:
+    // `create_gate::spawn_gated_restore_create` acquires the permit BEFORE
+    // invoking this function and holds it across the whole spawn-to-settled
+    // scope (spawn-to-settled permit hold, cancellable while queued). No
+    // acquire happens here: for restore it would self-deadlock against that
+    // outer permit; for non-restore it is bypassed on purpose.
 
     // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
-    // spawns occupy a permit + a blocking thread, never an async worker
-    // (on small hosts, N inline blocking spawns would wedge the whole
-    // runtime including the timer driver). Permit stays held throughout.
+    // spawns occupy a blocking thread (plus, on the gated restore path, the
+    // caller-held permit), never an async worker (on small hosts, N inline
+    // blocking spawns would wedge the whole runtime including the timer
+    // driver).
     let registry = state.registry.clone();
     let spawn_spec = spec.clone();
     let spawn_terminal_id = terminal_id.clone();
@@ -1867,13 +1920,8 @@ async fn handle_create(
             env_var.as_deref(),
             resume_session_id.is_some(),
         );
-        return send_create_error(
-            ws_tx,
-            ErrorCode::PtySpawnFailed,
-            message,
-            &create.request_id,
-        )
-        .await;
+        return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+            .await;
     }
 
     // D8: arm the lease's TTL kill path — record the just-spawned child's pid
@@ -1901,13 +1949,8 @@ async fn handle_create(
             .await
         {
             state.registry.kill(&terminal_id);
-            return send_create_error(
-                ws_tx,
-                ErrorCode::PtySpawnFailed,
-                message,
-                &create.request_id,
-            )
-            .await;
+            return send_create_error(out, ErrorCode::PtySpawnFailed, message, &create.request_id)
+                .await;
         }
     }
 
@@ -2108,7 +2151,7 @@ async fn handle_create(
                     "session_ref_lease_revoked_child_kill_unconfirmed: holding lease closed");
             }
             return send_create_error(
-                ws_tx,
+            out,
                 ErrorCode::InternalError,
                 "Terminal create lost its sessionRef lease during spawn; the spawned process was killed".to_string(),
                 &create.request_id,
@@ -2116,6 +2159,13 @@ async fn handle_create(
             .await;
         }
     }
+
+    // Dedupe settle needs both ids, but the `TerminalCreated` literal below
+    // MOVES `create.request_id` and `terminal_id` into the struct — clone
+    // into locals first.
+    let dedupe_request_id = create.request_id.clone();
+    let dedupe_terminal_id = terminal_id.clone();
+    let dedupe_restore = create.restore;
 
     let created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
@@ -2129,7 +2179,17 @@ async fn handle_create(
         // identity-stamped frame reads (shell creates have no entry -> `None`).
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
     });
-    let sent = send(ws_tx, &created).await;
+    // Record the settled create (server-wide requestId dedupe) and forward
+    // the frame to any cross-connection waiters BEFORE the origin reply —
+    // both are non-blocking sink pushes, so ordering here is cosmetic.
+    state.create_dedupe.settle(
+        &dedupe_request_id,
+        &dedupe_terminal_id,
+        &created,
+        dedupe_restore,
+        |tid| state.registry.is_pty_running(tid),
+    );
+    let sent = out.send(&created).await;
     // "Notify all clients that list changed" (`ws-handler.ts:2570`); the original's
     // failed-delivery arm (`ws:2553`) broadcasts too, so once the terminal record
     // exists this is unconditional. Live-pinned frame order (exit-orig.json):
@@ -2808,8 +2868,9 @@ async fn handle_pane_reconcile(
     pane_reconcile_fresh_agent_v1: bool,
 ) -> bool {
     if request.panes.len() > crate::reconcile::MAX_RECONCILE_PANES {
+        let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
         return send_create_error(
-            ws_tx,
+            &mut out,
             ErrorCode::ReconcileTooLarge,
             format!(
                 "pane.reconcile.request presented {} panes (cap {})",
@@ -2853,8 +2914,9 @@ async fn handle_pane_reconcile(
     let mut verdicts = match derive() {
         Ok(verdicts) => verdicts,
         Err(_) => {
+            let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
             return send_create_error(
-                ws_tx,
+                &mut out,
                 ErrorCode::ReconcileUnavailable,
                 "reconcile derivation failed; keep current state and re-send".to_string(),
                 &request.reconcile_id,
@@ -2887,8 +2949,9 @@ async fn handle_pane_reconcile(
         verdicts = match derive() {
             Ok(verdicts) => verdicts,
             Err(_) => {
+                let mut out = crate::create_gate::CreateOutput::Socket(ws_tx);
                 return send_create_error(
-                    ws_tx,
+                    &mut out,
                     ErrorCode::ReconcileUnavailable,
                     "reconcile derivation failed; keep current state and re-send".to_string(),
                     &request.reconcile_id,
@@ -2910,7 +2973,9 @@ async fn handle_pane_reconcile(
 /// QueueFull -> RATE_LIMITED so the frozen client's retry ladder converts
 /// overload into backoff-and-retry (by the retry, the queue has drained).
 /// Timeout -> PTY_SPAWN_FAILED: fail loud; the pane shows a launch error.
-fn spawn_gate_error_parts(err: crate::spawn_gate::SpawnGateError) -> (ErrorCode, &'static str) {
+pub(crate) fn spawn_gate_error_parts(
+    err: crate::spawn_gate::SpawnGateError,
+) -> (ErrorCode, &'static str) {
     match err {
         crate::spawn_gate::SpawnGateError::QueueFull => {
             (ErrorCode::RateLimited, "Too many terminal.create requests")
@@ -2919,11 +2984,17 @@ fn spawn_gate_error_parts(err: crate::spawn_gate::SpawnGateError) -> (ErrorCode,
             ErrorCode::PtySpawnFailed,
             "Timed out waiting for a terminal spawn slot",
         ),
+        // Cancelled never reaches the client: the connection is gone (or the
+        // server is closing it with 4009). Mapped defensively anyway.
+        crate::spawn_gate::SpawnGateError::Cancelled => (
+            ErrorCode::PtySpawnFailed,
+            "Terminal create cancelled during shutdown",
+        ),
     }
 }
 
-async fn send_create_error(
-    ws_tx: &mut WsSink,
+pub(crate) async fn send_create_error(
+    out: &mut crate::create_gate::CreateOutput<'_>,
     code: ErrorCode,
     message: String,
     request_id: &str,
@@ -2939,7 +3010,7 @@ async fn send_create_error(
         terminal_exit_code: None,
         terminal_id: None,
     });
-    send(ws_tx, &msg).await
+    out.send(&msg).await
 }
 
 /// `getModeLabel` (`terminal-registry.ts:439-443`): `'Shell'` for shell, the CLI
@@ -4144,6 +4215,8 @@ mod terminals_changed_tests {
             term09: crate::backpressure::Term09Config::default(),
             create_protect: crate::create_limit::CreateProtectConfig::default(),
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
@@ -4355,6 +4428,8 @@ mod terminal_meta_created_tests {
             term09: crate::backpressure::Term09Config::default(),
             create_protect: crate::create_limit::CreateProtectConfig::default(),
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,

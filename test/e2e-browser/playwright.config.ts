@@ -146,6 +146,9 @@ const RUST_ONLY_SPECS = [
   /sidebar-registry-sync-rust\.spec\.ts$/,
   // Lane D1: agent crash auto-resume — rust-server-only spec.
   /agent-crash-autoresume-rust\.spec\.ts$/,
+  // Kata enn3: REST spawn-gate burst; owns its RustServer.
+  // See docs/plans/2026-07-27-rest-spawn-gate.md
+  /rest-spawn-gate-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -322,6 +325,9 @@ export default defineConfig({
         /sidebar-registry-sync-rust\.spec\.ts$/,
         // Lane D1: agent crash auto-resume — rust-server-only spec.
         /agent-crash-autoresume-rust\.spec\.ts$/,
+        // Kata enn3: REST spawn-gate burst; owns its RustServer.
+        // See docs/plans/2026-07-27-rest-spawn-gate.md
+        /rest-spawn-gate-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
