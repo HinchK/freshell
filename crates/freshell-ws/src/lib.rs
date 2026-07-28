@@ -26,6 +26,8 @@ pub mod backpressure;
 pub mod codex_association;
 pub(crate) mod codex_identity;
 pub(crate) mod codex_reconcile;
+pub mod create_dedupe;
+pub(crate) mod create_gate;
 pub mod create_limit;
 pub mod existence;
 pub mod identity;
@@ -203,8 +205,20 @@ pub struct WsState {
     /// terminal.create protection knobs (rate limit + spawn gate). See
     /// [`crate::create_limit::CreateProtectConfig`].
     pub create_protect: crate::create_limit::CreateProtectConfig,
-    /// Server-wide PTY spawn gate. See [`crate::spawn_gate::SpawnGate`].
+    /// Server-wide requestId -> terminal dedupe for `terminal.create`
+    /// (legacy `createdByRequestId` parity — see
+    /// [`crate::create_dedupe::CreateDedupe`]).
+    pub create_dedupe: std::sync::Arc<crate::create_dedupe::CreateDedupe>,
+    /// Server-wide PTY spawn gate (restart-storm / WSL-outage RCA §6.3
+    /// protection). One per server process, shared across all WS
+    /// connections. See [`crate::spawn_gate::SpawnGate`].
     pub spawn_gate: std::sync::Arc<crate::spawn_gate::SpawnGate>,
+    /// Latched `true` the instant a shutdown signal is received (before the
+    /// WS notify). Gated creates re-check it around `registry.create` so a
+    /// create racing shutdown never leaves a live PTY that `kill_all`'s
+    /// one-shot id snapshot (`freshell-terminal/src/registry.rs:889-892`)
+    /// would miss (A10/V3).
+    pub shutdown_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// SAFE-06: inbound WS frame/message size bound (legacy parity:
     /// `ws-handler.ts:226` `wsMaxPayloadBytes: Number(process.env.WS_MAX_PAYLOAD_BYTES
     /// || 16 * 1024 * 1024)`, passed to the `ws` library's `maxPayload` at
@@ -783,6 +797,8 @@ mod tests {
             term09: crate::backpressure::Term09Config::default(),
             create_protect: crate::create_limit::CreateProtectConfig::default(),
             spawn_gate: std::sync::Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
             amplifier_locator: None,
             opencode_locator: None,
@@ -970,7 +986,34 @@ mod tests {
         // handshake on a second, independent call.
         let late_connection = build_handshake(&s);
 
-        assert_eq!(first_connection, late_connection);
+        // DEFLAKE (f3wp): `ready.timestamp` is wall-clock at build time, so
+        // two handshakes built across a millisecond boundary legitimately
+        // differ in that one field (flipped twice under cargo-workspace
+        // load: left/right identical except `.725Z` vs `.726Z`). Neutralize
+        // ONLY the timestamp; every other field must still match exactly.
+        // Assert the timestamp is RFC3339-parseable BEFORE blanking it below --
+        // otherwise a malformed/missing timestamp would silently pass through
+        // the "<normalized>" substitution instead of failing the test.
+        if let Some(ServerMessage::Ready(r)) = first_connection
+            .iter()
+            .find(|m| matches!(m, ServerMessage::Ready(_)))
+        {
+            chrono::DateTime::parse_from_rfc3339(&r.timestamp)
+                .expect("ready.timestamp must be RFC3339-parseable");
+        }
+        let normalize = |msgs: Vec<ServerMessage>| -> Vec<ServerMessage> {
+            msgs.into_iter()
+                .map(|m| match m {
+                    ServerMessage::Ready(mut r) => {
+                        r.timestamp = String::from("<normalized>");
+                        ServerMessage::Ready(r)
+                    }
+                    other => other,
+                })
+                .collect()
+        };
+        let late_connection = normalize(late_connection);
+        assert_eq!(normalize(first_connection), late_connection);
         assert!(
             late_connection
                 .iter()

@@ -62,12 +62,12 @@ fn scan_device_dir(path: PathBuf) -> DeviceDirHealth {
 }
 
 /// Enforce MAX_SNAPSHOT_DEVICES before a write. New targets reserve one slot;
-/// existing targets also repair a previously over-cap root. Lease-protected
-/// restores, the write target, and — fail-loud, campaign P2.17 defect 1 —
-/// any dir holding unreadable generation files are never candidates: corrupt
-/// dirs are forensic evidence, not the cheapest victim. If no cleanly
-/// parseable victim remains, fail the incoming write with `WouldBlock`
-/// rather than destroying evidence or creating another directory.
+/// existing targets also repair a previously over-cap root. The write target
+/// and — fail-loud, campaign P2.17 defect 1 — any dir holding unreadable
+/// generation files are never candidates: corrupt dirs are forensic evidence,
+/// not the cheapest victim. If no cleanly parseable victim remains, fail the
+/// incoming write with `WouldBlock` rather than destroying evidence or
+/// creating another directory.
 pub(super) fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Result<()> {
     let target_exists = target_dir.exists();
     let entries = match std::fs::read_dir(root) {
@@ -95,7 +95,7 @@ pub(super) fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Res
     let mut corrupt_exempt = 0usize;
     let mut candidates: Vec<(i64, PathBuf)> = Vec::new();
     for d in dirs {
-        if d.path == *target_dir || restore_protects(&d.path) {
+        if d.path == *target_dir {
             continue;
         }
         if d.unreadable > 0 {
@@ -116,7 +116,7 @@ pub(super) fn enforce_device_cap(root: &Path, target_dir: &Path) -> std::io::Res
                 "tabs_snapshot_device_cap_unenforceable: no cleanly-parseable eviction candidate remains; failing the incoming write instead of destroying evidence");
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                "snapshot device cap is exhausted: remaining candidates are protected by active restores or hold unreadable (corrupt) generations; refusing to evict",
+                "snapshot device cap is exhausted: remaining candidates hold unreadable (corrupt) generations; refusing to evict",
             ));
         };
         tracing::warn!(target: "freshell_ws::tabs", path = %victim.display(),

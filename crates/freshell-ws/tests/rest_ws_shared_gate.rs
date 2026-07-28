@@ -9,6 +9,11 @@
 //! pinned message), release the permit, prove BOTH doors recover. If anyone
 //! ever splits the budget into two gate instances, the starved-door
 //! assertions fail (each door would succeed on its own budget).
+//!
+//! RESTORE-ONLY scope on the WS side (user decision, PR #552): only
+//! `restore:true` WS creates consult the gate — interactive creates bypass
+//! it entirely. The WS creates in this test are therefore `restore:true`;
+//! the REST door gates EVERY create (agent/programmatic traffic can burst).
 
 mod common;
 
@@ -36,9 +41,12 @@ async fn ws_and_rest_creates_share_one_spawn_budget() {
     let (ws_url, base_url, auth_token, registry) =
         spawn_combined_server(cfg, Arc::clone(&gate)).await;
 
-    // 1) Saturate the ONLY permit from OUTSIDE both doors.
+    // 1) Saturate the ONLY permit from OUTSIDE both doors. (The acquire is
+    //    cancellable via a watch channel; the sender must stay alive across
+    //    the await — a dropped sender reads as Cancelled.)
+    let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
     let held = gate
-        .acquire(Duration::from_secs(1))
+        .acquire(Duration::from_secs(1), &mut cancel_rx)
         .await
         .expect("hold the permit");
 
@@ -48,7 +56,8 @@ async fn ws_and_rest_creates_share_one_spawn_budget() {
     assert_eq!(client.json["code"], serde_json::json!("SPAWN_TIMEOUT"));
 
     // 3) WS door is starved by the SAME budget -> PTY_SPAWN_FAILED frame
-    //    with the pinned message (unchanged WS wire shape).
+    //    with the pinned message (unchanged WS wire shape). restore:true is
+    //    the WS path that consults the gate (PR #552 restore-only scope).
     let ws_reply = ws_create_and_await_reply(&ws_url, &auth_token, "req-starved").await;
     assert_eq!(ws_reply["type"], serde_json::json!("error"));
     assert_eq!(ws_reply["code"], serde_json::json!("PTY_SPAWN_FAILED"));
@@ -134,6 +143,8 @@ async fn spawn_combined_server(
         create_protect: cfg,
         // THE pin under test: the WS door holds the SAME Arc as the REST door.
         spawn_gate: Arc::clone(&gate),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
@@ -267,12 +278,16 @@ async fn ws_create_and_await_reply(
         assert!(matches!(msg, WsMessage::Text(_)));
     }
 
+    // restore:true — the WS path that consults the spawn gate (PR #552
+    // restore-only scope; shell-mode restore plain-succeeds when a permit
+    // is free, see tests/create_protection.rs).
     ws.send(WsMessage::Text(
         serde_json::json!({
             "type": "terminal.create",
             "requestId": request_id,
             "mode": "shell",
             "shell": "system",
+            "restore": true,
         })
         .to_string(),
     ))

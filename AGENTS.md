@@ -15,7 +15,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - Before creating a new worktree, ensure the repo-supported test suite is green on the intended base. If the suite is not green, pause before creating the worktree and notify the user with the failing command and failure summary.
 - New behavior changes start on a worktree branch from `origin/main` and are submitted as PRs targeting `main`.
 - Do not create or open a PR until the user explicitly approves PR creation for that branch/change. Preparing a branch, committing locally, and pushing the branch is fine; stop before `gh pr create` or any equivalent PR creation step unless approval is explicit.
-- Use `dan@danshapiro.com` when using `gh`.
+- Use the `dan@danshapiro.com` account when selecting a `gh` CLI account. This is NOT a git identity: never use `dan@danshapiro.com` as a git author/committer email and never write it into `git config` — GitHub rejects pushes exposing it (GH007). Commits must use `Dan Shapiro <3732858+danshapiro@users.noreply.github.com>` (the repo/global config already provides this; do not override it).
 - Everything goes through a PR — never push behavior changes directly to `origin/main`.
 - Merge PRs once their required checks pass, then bring `origin/main` down to local `main`. Self-merging your own PRs is the norm. The only exception is a PR the user has said needs someone else to approve it first — leave those unmerged.
 - Many agents may be working in the worktree at the same time. If you see activity from other agents (for example test runs or file changes), respect it.
@@ -61,10 +61,34 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
   - **NEVER run `node dist/server/index.js` directly** — use `npm start` which sets `NODE_ENV=production`; without it the server prints the Vite port (5173) in the startup URL even though Vite isn't running
 - Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
 - Before stopping any process, verify it belongs to the worktree (`ps -fp <pid>` and confirm cwd/path includes `.worktrees/...`).
-- **The self-hosted Freshell server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation.
+- **The self-hosted Freshell server must never be restarted without explicit user approval (the word "APPROVED").** Building is fine; deploying (stop + start) is not. The user's current Freshell session depends on it, and an unapproved restart will disconnect them mid-operation. As of July 2026 the live self-hosted server is the RUST server on port 3002 (see below), not the Node server.
+
+## Rust Server (Self-Hosted Production)
+
+The production self-hosted Freshell is the Rust server (`target/release/freshell-server`, workspace crate `freshell-server`), running on **port 3002** from the main checkout. The Node server (`npm start`) still exists but is not what the user runs day-to-day.
+
+**Canonical launcher: `scripts/launch-rust.sh`** — use this instead of hand-rolled build/launch commands:
+
+```bash
+scripts/launch-rust.sh                 # build client + Rust server, start on port 3002
+scripts/launch-rust.sh --port 3499     # any other port (e.g. testing from a worktree)
+scripts/launch-rust.sh --client-only   # rebuild dist/client ONLY (no restart needed)
+scripts/launch-rust.sh --skip-build    # start without rebuilding
+scripts/launch-rust.sh --restart       # stop the pid-file-verified instance, then start
+scripts/launch-rust.sh --stop          # stop the pid-file-verified instance
+```
+
+Key facts:
+
+- **Client is served from disk.** The Rust server serves `dist/client` from the filesystem (SPA + fallback routing), so `--client-only` + a browser hard-refresh deploys client-side changes **without a server restart** (and therefore without needing "APPROVED"). Server-side (Rust) changes DO require a restart.
+- **Restarting the live 3002 server still requires the user's explicit "APPROVED"** — `--restart`/`--stop` exist for approved deploys and for scratch instances on other ports, not as a license to bounce production.
+- The script is safe by construction: it only ever kills PIDs from its own pid file, after verifying the process is this repo's `freshell-server` binary (cwd + args match); if the port is held by anything else it refuses. Logs go to `~/.freshell/logs/rust-server-<port>.log`, pid to `~/.freshell/rust-server-<port>.pid`.
+- The server loads `.env` from its cwd (env vars win over the file) and refuses to start without `AUTH_TOKEN`. Note `.env`'s `PORT` may differ from the live port — the launcher passes `PORT` explicitly.
+- The startup log line includes the commit the binary was built from: `freshell-server listening on http://0.0.0.0:<port> (ws://...) [commit <sha>]`. Use it (or `~/.freshell/logs/rust-server-3002.log`) to check what the running server was built from when asking "are we running change X?".
+- Health check: `curl http://127.0.0.1:<port>/api/health` (unauthenticated, rate-limit exempt).
 
 ## Codex Agent in CMD Instructions (Codex agents only; only when running in CMD on windows; all other agents must ignore)
-- Prefer bash/WSL over PowerShell; Windows paths map like `D:\...` -> `/mnt/d/...`.
+- Prefer bash/WSL over PowerShell; Windows paths map like `D:\\...` -> `/mnt/d/...`.
 - Use `bash -lc "<cmd>"` for non-interactive commands; avoid interactive shells so commands return control.
 - Apply_patch expects Windows-style paths.
 - If a bash command produces no visible output, rerun with `tty: true` to force output.
@@ -145,7 +169,7 @@ FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
 
 **Pane System:** Tabs contain pane layouts (tree structure of splits). Each pane owns its terminal lifecycle via `createRequestId` and `terminalId`. When splitting panes, each new pane gets its own `createRequestId`, ensuring independent backend terminals. Pane content types: `terminal` (with mode, shell, status) and `browser` (with URL, devtools state).
 
-**Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Turn-complete (green/sound) is server-authoritative everywhere: terminal CLIs via `terminal.turn.complete`, and fresh-agent panes (freshclaude/kilroy/freshcodex/freshopencode) via a discrete `freshAgent.turn.complete` edge emitted only on a positive completion — freshclaude/kilroy on the SDK `result` with `subtype === 'success'`, freshopencode on the success-only `emitStatus(idle)` path, and freshcodex on `turn/completed` only when `params.turn.status === 'completed'` (the notification also fires on interrupt). The client folds it in via `applyFreshAgentCompletion` using the `at`-monotonic dedupe regime (wall-clock `at`, no per-session counter, so a resumed durable session can't swallow completions across a server restart). The waiting-for-approval edge is ALSO server-authoritative: the Claude/kilroy `SdkBridge` emits a discrete `freshAgent.turn.waiting` edge on the 0→≥1 pending permission/question transition (only Claude/kilroy raise approvals/questions), and the client folds it in via `applyFreshAgentWaiting` under a distinct `${provider}:${sessionId}#waiting` dedupe namespace so it can never poison (or be poisoned by) the turn-complete bucket. The fragile client-side busy→idle derivation AND the client-side waiting-edge hook (`useAgentSessionTurnCompletion`) were both removed — all green/sound edges are now server-emitted. freshcodex additionally self-heals a crashed/disconnected codex sidecar by consuming the runtime `onExit` hook in `subscribe()`, emitting `sdk.status:'exited'` to clear BLUE (no chime — a crash is not a positive completion). `freshopencode` still runs on a shared long-lived `opencode serve` sidecar and uses server-pushed `session.idle`/`session.status` events to drive busy. Gemini and Kimi terminal modes are status-inert until their CLIs expose a reliable turn-complete signal.
+**Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Turn-complete (green/sound) is server-authoritative everywhere: terminal CLIs via `terminal.turn.complete`, and fresh-agent panes (freshclaude/kilroy/freshcodex/freshopencode) via a discrete `freshAgent.turn.complete` edge emitted only on a positive completion — freshclaude/kilroy on the SDK `result` with `subtype === 'success'`, freshopencode on the success-only `emitStatus(idle)` path, and freshcodex on `turn/completed` only when `params.turn.status === 'completed'` (the notification also fires on interrupt). The client folds it in via `applyFreshAgentCompletion` using the `at`-monotonic dedupe regime (wall-clock `at`, no per-session counter, so a resumed durable session can't swallow completions across a server restart). The waiting-for-approval edge is ALSO server-authoritative: the Claude/kilroy `SdkBridge` emits a discrete `freshAgent.turn.waiting` edge on the 0→≥1 pending permission/question transition (only Claude/kilroy raise approvals/questions), and the client folds it in via `applyFreshAgentWaiting` under a distinct `${provider}:${sessionId}#waiting` dedupe namespace so it can never poison (or be poisoned by) the turn-complete bucket. The fragile client-side busy→idle derivation AND the client-side waiting-edge hook (`useAgentSessionTurnCompletion`) were both removed — all green/sound edges are now server-emitted. freshcodex additionally self-heals a crashed/disconnected codex sidecar by consuming the runtime `onExit` hook in `subscribe()`, emitting `sdk.status:'exited'` to clear BLUE (no chime — a crash is not a positive completion). `freshopencode` still runs on a shared long-lived `opencode serve` sidecar and uses server-pushed `session.idle`/`session.status` events to drive busy. Gemini and Kimi terminal modes are status-in... [truncated]
 
 **Fresh-Agent Orchestration:** The REST agent API (`/api/tabs`, `/api/panes/:id/split`, `/api/panes/:id/send-keys`, `/api/panes/:id/capture`, `/api/panes/:id/wait-for`) and the MCP `freshell` tool accept `agent`/`model`/`effort` parameters to create and drive fresh-agent panes (e.g. `agent=opencode`). The orchestration layer dispatches to the registered `FreshAgentRuntimeManager`, so the same external surface works for any fresh-agent provider.
 

@@ -7,7 +7,9 @@ import tabsReducer, { TabsState } from '@/store/tabsSlice'
 import codexActivityReducer, { type CodexActivityState } from '@/store/codexActivitySlice'
 import opencodeActivityReducer, { type OpencodeActivityState } from '@/store/opencodeActivitySlice'
 import panesReducer from '@/store/panesSlice'
+import repoIconsReducer from '@/store/repoIconsSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import type { Tab } from '@/store/types'
@@ -24,6 +26,17 @@ vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
     send: mockSend,
   }),
+}))
+
+// Mock the api module so the repo-icon meta probe thunk never hits the network
+vi.mock('@/lib/api', () => ({
+  api: {
+    get: vi.fn().mockRejectedValue(new Error('no server in tests')),
+    post: vi.fn(),
+    patch: vi.fn(),
+    put: vi.fn(),
+    delete: vi.fn(),
+  },
 }))
 
 // Mock lucide-react icons
@@ -64,6 +77,13 @@ vi.mock('@/components/icons/PaneIcon', () => ({
       data-terminal-id={content?.terminalId}
       className={className}
     />
+  ),
+}))
+
+// Mock RepoIcon component
+vi.mock('@/components/icons/RepoIcon', () => ({
+  default: ({ info, className }: { info: any; className?: string }) => (
+    <svg data-testid="repo-icon" data-repo-key={info?.repoKey} data-repo-name={info?.repoName} className={className} />
   ),
 }))
 
@@ -147,7 +167,9 @@ function createStore(
       codexActivity: codexActivityReducer,
       opencodeActivity: opencodeActivityReducer,
       panes: panesReducer,
+      repoIcons: repoIconsReducer,
       settings: settingsReducer,
+      terminalMeta: terminalMetaReducer,
       turnCompletion: turnCompletionReducer,
     },
     middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(terminalDetachMiddleware),
@@ -1444,6 +1466,60 @@ describe('TabBar', () => {
       expect(icons).toHaveLength(1)
       expect(icons[0].getAttribute('data-content-kind')).toBe('terminal')
       expect(icons[0].getAttribute('data-content-mode')).toBe('claude')
+    })
+
+    it('renders a repo icon for a coding pane once meta is known', () => {
+      const tab = createTab({ id: 'tab-1', title: 'Tab 1', status: 'running' })
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: { kind: 'terminal', mode: 'claude', createRequestId: 'r', status: 'running', initialCwd: '/repo/a' },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
+      store.dispatch({
+        type: 'repoIcons/fetchMeta/fulfilled',
+        meta: { arg: '/repo/a' },
+        payload: { repoRoot: '/repo/a', checkoutRoot: '/repo/a', repoName: 'a', hasIcon: true },
+      })
+      renderWithStore(<TabBar />, store)
+      expect(screen.getAllByTestId('repo-icon').length).toBeGreaterThanOrEqual(1)
+    })
+
+    it('renders no repo icon when panes.repoIconsOnTabs is disabled', () => {
+      const tab = createTab({ id: 'tab-1', title: 'Tab 1', status: 'running' })
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: { kind: 'terminal', mode: 'claude', createRequestId: 'r', status: 'running', initialCwd: '/repo/a' },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
+      store.dispatch({
+        type: 'repoIcons/fetchMeta/fulfilled',
+        meta: { arg: '/repo/a' },
+        payload: { repoRoot: '/repo/a', checkoutRoot: '/repo/a', repoName: 'a', hasIcon: true },
+      })
+      store.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { repoIconsOnTabs: false } },
+      })
+      renderWithStore(<TabBar />, store)
+      expect(screen.queryByTestId('repo-icon')).toBeNull()
     })
   })
 })

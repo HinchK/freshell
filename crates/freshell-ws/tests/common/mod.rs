@@ -131,6 +131,8 @@ pub async fn spawn_server_with_specs(
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
@@ -214,6 +216,8 @@ pub async fn spawn_server_with_ledger(
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
@@ -293,6 +297,8 @@ pub async fn spawn_server_with_specs_and_activity(
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
@@ -371,6 +377,8 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,
@@ -449,10 +457,14 @@ pub async fn spawn_server_with_create_protect(
         create_protect: cfg,
         // NOTE: SpawnGate::new passes 0 through (no sanitizing) — the
         // zero-permit test in create_protection.rs depends on this.
+        // (`from_config` stayed behind when the gate moved to
+        // freshell-freshagent; it referenced this crate's CreateProtectConfig.)
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(
             cfg.spawn_concurrency,
             cfg.spawn_queue_cap,
         )),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,

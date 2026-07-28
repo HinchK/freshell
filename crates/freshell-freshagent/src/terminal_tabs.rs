@@ -568,6 +568,14 @@ fn spawn_gate_error_response(err: crate::spawn_gate::SpawnGateError) -> Response
             "SPAWN_TIMEOUT",
             "Timed out waiting for a terminal spawn slot".to_string(),
         ),
+        // Unreachable on the REST door: the handler holds its cancel
+        // sender (never fired, never dropped) across the whole acquire.
+        // Mapped like Timeout so an impossible arm still fails safe.
+        crate::spawn_gate::SpawnGateError::Cancelled => crate::fail_json_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SPAWN_TIMEOUT",
+            "Timed out waiting for a terminal spawn slot".to_string(),
+        ),
     }
 }
 
@@ -828,10 +836,23 @@ pub(crate) async fn spawn_terminal_pane(
     // failure, and at fn end — never call `.forget()`. `None` (unwired) =
     // ungated: unit-test states without server wiring keep legacy behavior.
     let _spawn_permit = match state.spawn_gate() {
-        Some(rest_gate) => match rest_gate.gate.acquire(rest_gate.timeout).await {
-            Ok(permit) => Some(permit),
-            Err(err) => return Err(spawn_gate_error_response(err)),
-        },
+        Some(rest_gate) => {
+            // The gate's acquire is cancellable via a watch channel (the WS
+            // door wires its per-connection cancel signal). REST has no such
+            // signal: hold a live, never-fired sender for the whole acquire
+            // (dropping it early would read as "connection gone" =>
+            // Cancelled). If the HTTP request itself is dropped, axum drops
+            // this future and the gate's queue-slot guard reclaims the slot.
+            let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+            match rest_gate
+                .gate
+                .acquire(rest_gate.timeout, &mut cancel_rx)
+                .await
+            {
+                Ok(permit) => Some(permit),
+                Err(err) => return Err(spawn_gate_error_response(err)),
+            }
+        }
         None => None,
     };
 
@@ -3444,8 +3465,9 @@ mod tests {
         state.set_spawn_gate(Arc::clone(&gate), std::time::Duration::from_millis(200));
         let router = app(state);
 
+        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let held = gate
-            .acquire(std::time::Duration::from_secs(1))
+            .acquire(std::time::Duration::from_secs(1), &mut cancel_rx)
             .await
             .expect("test holds the only permit");
         let (status, body) = post(router.clone(), "/api/tabs", shell_create_body(), true).await;

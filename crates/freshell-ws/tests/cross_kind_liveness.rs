@@ -122,9 +122,17 @@ fn uuid_like_suffix() -> String {
 /// Sleeper CLI spec (duplicated from `tests/common/mod.rs` -- this file needs its own
 /// server builder because the shared one disables `freshAgent.enabled`).
 fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
+    // DEFLAKE (f3wp refresh): the path must be unique PER CALL, not per
+    // process. Both tests in this binary build a `claude` spec, so a
+    // `{name}-{pid}`-only path is SHARED between them -- and test 2's
+    // `fs::write` then races test 1's still-running PTY spawn: Linux holds
+    // deny-write on a file while it is being `execve`d, so under load the
+    // write fails with ETXTBSY ("Text file busy"). A fresh per-call path
+    // (nanos + thread id) can never collide with an in-flight exec.
     let script_path = std::env::temp_dir().join(format!(
-        "freshell-cross-kind-sleeper-{name}-{}.sh",
-        std::process::id()
+        "freshell-cross-kind-sleeper-{name}-{}-{}.sh",
+        std::process::id(),
+        uuid_like_suffix()
     ));
     std::fs::write(&script_path, "#!/bin/sh\nexec sleep 30\n").expect("write sleeper script");
     #[cfg(unix)]
@@ -150,6 +158,22 @@ fn sleeper_cli_spec(name: &str) -> freshell_platform::CliCommandSpec {
         sandbox_args: None,
         permission_mode_args: None,
     }
+}
+
+/// DEFLAKE (f3wp refresh): two `sleeper_cli_spec` calls in one process must
+/// never share a script path. With a `{name}-{pid}`-only path, test 2's
+/// `fs::write` races test 1's still-in-flight `execve` of the SAME file --
+/// Linux denies writes to a file mid-exec, so under load the write fails with
+/// `ETXTBSY` ("Text file busy", observed 2026-07-28 under the f3wp 10x load).
+#[test]
+fn sleeper_cli_spec_paths_are_unique_per_call() {
+    let first = sleeper_cli_spec("claude");
+    let second = sleeper_cli_spec("claude");
+    assert_ne!(
+        first.default_cmd, second.default_cmd,
+        "same-name specs in one process must not share a script path -- \
+         a shared path lets a later write race an earlier spawn's execve (ETXTBSY)"
+    );
 }
 
 fn test_settings_value() -> serde_json::Value {
@@ -245,6 +269,8 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
         spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
         amplifier_locator: None,
         opencode_locator: None,

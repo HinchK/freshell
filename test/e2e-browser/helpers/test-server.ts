@@ -136,8 +136,33 @@ function validateTestServerOptions(options: TestServerOptions): void {
 /**
  * Find an available ephemeral port by briefly binding to port 0.
  * The OS assigns a free port, we read it, then close immediately.
+ *
+ * TOCTOU caveat (kata f3wp): the port is RELEASED before the caller binds it,
+ * so it can be stolen. Two mitigations:
+ *  - a recently-issued ring prevents THIS process from handing the same port
+ *    to two callers in quick succession;
+ *  - consumers that spawn a server against the port retry on a bind failure
+ *    (see RustServer.start()).
+ * The optional `probe` parameter exists for unit tests only.
  */
-export async function findFreePort(): Promise<number> {
+const recentlyIssuedPorts: number[] = []
+const RECENTLY_ISSUED_CAP = 64
+
+export async function findFreePort(
+  probe: () => Promise<number> = probeEphemeralPort,
+): Promise<number> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const port = await probe()
+    if (!recentlyIssuedPorts.includes(port)) {
+      recentlyIssuedPorts.push(port)
+      if (recentlyIssuedPorts.length > RECENTLY_ISSUED_CAP) recentlyIssuedPorts.shift()
+      return port
+    }
+  }
+  throw new Error('findFreePort: no not-recently-issued port after 20 probes')
+}
+
+function probeEphemeralPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const srv = net.createServer()
     srv.listen(0, '127.0.0.1', () => {
