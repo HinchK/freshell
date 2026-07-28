@@ -153,14 +153,40 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
         )
         .await;
         if adopted {
-            locator.watch_fork(&hit.terminal_id, &hit.thread_id);
+            // `watch_fork` snapshots the sessions tree (bounded fs walk), so
+            // it runs on the blocking pool like the adoption tick above.
+            let watch_locator = std::sync::Arc::clone(locator);
+            let terminal_id = hit.terminal_id.clone();
+            let thread_id = hit.thread_id.clone();
+            if let Err(join_error) = tokio::task::spawn_blocking(move || {
+                watch_locator.watch_fork(&terminal_id, &thread_id);
+            })
+            .await
+            {
+                tracing::warn!(
+                    error = %join_error,
+                    "codex_watch_fork_panicked: blocking watch_fork task panicked"
+                );
+            }
         }
     }
 
     // Fork lane: lineage-proven mid-session rebinds. Runs on the same sweep.
     // The adoption loop's `terminal_already_bound` gate does NOT apply here
     // -- being bound is the fork lane's precondition.
-    let forks = locator.tick_forks(now);
+    // `tick_forks` diffs the sessions tree (bounded fs walk), so it runs on
+    // the blocking pool like the adoption tick above.
+    let fork_locator = std::sync::Arc::clone(locator);
+    let forks = match tokio::task::spawn_blocking(move || fork_locator.tick_forks(now)).await {
+        Ok(forks) => forks,
+        Err(join_error) => {
+            tracing::warn!(
+                error = %join_error,
+                "codex_fork_tick_panicked: fork sweep tick task panicked, skipping this cycle"
+            );
+            return;
+        }
+    };
     for f in forks {
         let ok = crate::codex_identity::rebind_codex_identity(
             state,
