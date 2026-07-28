@@ -175,3 +175,81 @@ async fn respawn_spawns_resume_generation_with_same_create_request_id() {
         "resume argv missing: {argv:?}"
     );
 }
+
+/// Kata enn3 interaction pin: an auto-resume respawn is a SERVER-initiated
+/// create, and a crash-loop storm is exactly the shape the server-wide spawn
+/// gate exists to bound — so `respawn_agent_terminal` must queue behind the
+/// SAME gate as the WS-restore and REST doors and fail loud (no spawn) when
+/// the gate's queue is full.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn respawn_is_rejected_loud_when_spawn_gate_queue_is_full() {
+    let (_url, _registry, state) =
+        common::spawn_server_with_specs_and_state(vec![common::sleeper_cli_spec("claude")]).await;
+
+    // Saturate the gate: hold every concurrency permit (the shared test
+    // harness builds `SpawnGate::new(4, 64)`)...
+    let (_hold_tx, mut hold_rx) = tokio::sync::watch::channel(false);
+    let mut held_permits = Vec::new();
+    for _ in 0..4 {
+        held_permits.push(
+            state
+                .spawn_gate
+                .acquire(Duration::from_secs(30), &mut hold_rx)
+                .await
+                .expect("free permit while unsaturated"),
+        );
+    }
+    // ...then fill the 64-deep queue with waiters (each owns a never-fired
+    // cancel sender for its lifetime, the REST-door convention).
+    let mut waiters = Vec::new();
+    for _ in 0..64 {
+        let gate = std::sync::Arc::clone(&state.spawn_gate);
+        waiters.push(tokio::spawn(async move {
+            let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+            let _ = gate.acquire(Duration::from_secs(30), &mut cancel_rx).await;
+        }));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while state.spawn_gate.queued_total() < 64 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "gate queue never filled: queued_total={}",
+            state.spawn_gate.queued_total()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let err = freshell_ws::terminal::respawn_agent_terminal(
+        &state,
+        &freshell_ws::terminal::AgentRespawnRequest {
+            mode: "claude".into(),
+            provider: "claude".into(),
+            session_id: "sess-gate-pin".into(),
+            create_request_id: "req-gate-pin".into(),
+            cwd: None,
+        },
+    )
+    .await
+    .expect_err("a queue-full spawn gate must reject the respawn, not spawn a PTY");
+
+    match err {
+        freshell_ws::terminal::RespawnError::LaunchUnresolvable(msg) => {
+            // The queue-full mapping from `spawn_gate_error_parts` — proof the
+            // rejection came from the gate, not some other pre-spawn failure.
+            assert_eq!(msg, "Too many terminal.create requests");
+        }
+        other => panic!("expected the gate's queue-full rejection, got {other:?}"),
+    }
+    assert_eq!(
+        state.spawn_gate.queue_rejections(),
+        1,
+        "exactly the respawn's acquire was rejected by the gate"
+    );
+
+    // Unblock the queued waiters so the test exits promptly.
+    drop(held_permits);
+    for w in waiters {
+        let _ = w.await;
+    }
+}

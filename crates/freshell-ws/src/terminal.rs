@@ -2411,14 +2411,24 @@ pub async fn respawn_agent_terminal(
     ));
 
     // Server-wide spawn gate (restart-storm protection): acquired BEFORE
-    // spawning, RAII permit released at scope end — mirror of
-    // `handle_create`'s acquire + rejection cleanup. (The per-connection
-    // CreateRateLimiter is connection-loop-local and does not apply here.)
+    // spawning, RAII permit released at scope end. A crash-loop storm is
+    // exactly what the gate bounds, so the auto-resume respawn door must
+    // queue behind the same server-wide gate as the WS-restore and REST
+    // doors. (The per-connection CreateRateLimiter is connection-loop-local
+    // and does not apply here.)
+    //
+    // The gate's acquire is cancellable via a watch channel (the WS restore
+    // door wires its per-connection cancel signal; kata enn3). Auto-resume
+    // is server-initiated with no connection to die, so — like the REST
+    // door (`terminal_tabs.rs` rest gate) — hold a never-fired sender for
+    // the acquire's duration; the timeout still bounds the wait.
+    let (_respawn_cancel_tx, mut respawn_cancel_rx) = tokio::sync::watch::channel(false);
     let _spawn_permit = match state
         .spawn_gate
-        .acquire(std::time::Duration::from_millis(
-            state.create_protect.spawn_timeout_ms,
-        ))
+        .acquire(
+            std::time::Duration::from_millis(state.create_protect.spawn_timeout_ms),
+            &mut respawn_cancel_rx,
+        )
         .await
     {
         Ok(permit) => permit,
