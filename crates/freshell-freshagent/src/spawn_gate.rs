@@ -1,6 +1,6 @@
 //! Server-wide bounded-concurrency PTY spawn gate (restart-storm protection;
-//! prior art: docs/plans/2026-07-06-wsl-outage-rca.md — a ~20-tab fleet
-//! respawning 50-70 processes in the same instant).
+//! prior art: docs/plans/2026-07-25-rust-create-protection.md — a ~20-tab
+//! fleet respawning 50-70 processes in the same instant).
 //!
 //! Semantics:
 //! - `concurrency` permits bound simultaneous PTY spawns server-wide, from
@@ -23,20 +23,23 @@
 //!   completion/failure/panic path frees the permit. Never call
 //!   `permit.forget()` (it permanently shrinks capacity).
 //!
-//! RESTORE-ONLY scope (user decision, PR #552): `restore:true` creates
-//! bypass the RATE limiter but go through THIS gate (via
-//! `crate::create_gate::spawn_gated_restore_create`'s spawned, cancellable
-//! acquire) — the gate is exactly what protects restore storms. Interactive
-//! (non-restore) creates do the opposite: they are rate-limited but BYPASS
-//! this gate entirely, so a human clicking "new terminal" gets an instant
-//! create with zero queueing latency.
-//!
-//! Accepted scope: non-restore (interactive) creates intentionally bypass
-//! this gate and therefore have NO server-wide concurrency bound. freshell
-//! is a single-user, token-authenticated deployment, so the per-connection
-//! rate limiter — rate-shaping, not a hard bound — is accepted as
-//! sufficient protection for that path. Decision recorded on PR #552 after
-//! council review (post-c3268185).
+//! Consumer scope — the two doors consult this gate differently:
+//! - WS door (`freshell-ws`): `restore:true` creates bypass the RATE
+//!   limiter but go through THIS gate (via freshell-ws's
+//!   `create_gate::spawn_gated_restore_create`'s spawned, cancellable
+//!   acquire) — the gate is exactly what protects restore storms.
+//!   Interactive (non-restore) WS creates do the opposite: they are
+//!   rate-limited but bypass this gate, so a human clicking "new terminal"
+//!   gets an instant create with zero queueing latency (user decision,
+//!   PR #552, recorded after council review post-c3268185; freshell is a
+//!   single-user, token-authenticated deployment, so the per-connection
+//!   rate limiter — rate-shaping, not a hard bound — is accepted as
+//!   sufficient for that path).
+//! - REST/agent-API door (`crate::terminal_tabs::spawn_terminal_pane`,
+//!   serving POST /api/tabs, pane split, and respawn): ALL creates —
+//!   restore-driven or not — consult this gate (council ruling, kata enn3).
+//!   REST callers are programmatic (MCP bridge, orchestration loops), so
+//!   the interactive-latency exemption does not apply there.
 //!
 //! HOME NOTE: this module moved from `freshell-ws` so the freshagent REST
 //! create pipeline can share the ONE server-wide gate (freshell-freshagent
