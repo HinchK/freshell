@@ -72,6 +72,28 @@
 //! ride the same gate), proven by `fs_scan_count`. Callers run `arm()`,
 //! `note_submit()`, and `tick()` inside `tokio::task::spawn_blocking` (cold
 //! dentry cache is the one unmeasured tail — A6).
+//!
+//! FORK LANE (`watch_fork`/`note_fork_submit`/`tick_forks` — validated
+//! A4/A13/A5): a second, independent lane for a BOUND pane, detecting codex's
+//! in-TUI `/resume` fork (upstream openai/codex#34972: the child rollout
+//! carries `forked_from_id` = the parent id + `thread_source: "user"`).
+//! Ownership is proven by LINEAGE plus the user filter — lineage ALONE is not
+//! proof (subagent forks dominate ~100:1 on the real substrate: 1,148 of
+//! 1,160 forked rollouts; 86/340 codex-tui subagent children were born ≤30 s
+//! after the parent's user input, i.e. inside the fork window). With the
+//! `thread_source == "user"` filter the match is positive proof — NO cwd
+//! census applies to this lane. Lane discipline:
+//! - OPPORTUNISTIC / best-effort: /resume forking is INTERMITTENT ("Not
+//!   every /resume produces a new ID") and may be fixed away upstream; when
+//!   no fork happens the lane is simply idle — no correctness dependency.
+//! - Known limitation (out of scope BY DESIGN): an in-TUI /resume to a
+//!   DIFFERENT session yields `forked_from_id` = the SELECTED session's id,
+//!   not the bound id — undetectable by this watch (rare: 12 user forks
+//!   total on this machine's substrate).
+//! - Accepted residuals (A5): a user-rebindable picker accept key (confirm
+//!   without a pure-CR chunk) and kitty CSI-u Enter encoding (`CSI 13 u`
+//!   instead of `\r`) would each silently defeat the Enter anchor —
+//!   degradation = today's behavior, no corruption.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -85,6 +107,12 @@ use crate::opencode_locator::normalize_cwd;
 /// when the first user prompt is recorded, so before the pane's first Enter
 /// every new same-cwd rollout is by construction foreign.
 pub const CODEX_WINDOW_MS: i64 = 2_000;
+
+/// Fork-lane scan window after an Enter (in-TUI /resume is driven by Enter
+/// presses; scanning is gated on this window to bound fs cost). 30 s covers
+/// the picker-navigation + fork-materialization gap; the `thread_source ==
+/// "user"` filter keeps same-window subagent children out (see module doc).
+pub const CODEX_FORK_WINDOW_MS: i64 = 30_000;
 
 /// Bounded re-probe grace for a NEW file whose first line is not yet
 /// readable: codex creates the file, then awaits git-info collection
@@ -109,6 +137,17 @@ pub struct Located {
     pub cwd: String,
 }
 
+/// A detected in-TUI /resume fork of a BOUND pane's session (fork lane —
+/// see module doc). Task 5 consumes this to drive the rebind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkLocated {
+    pub terminal_id: String,
+    pub old_session_id: String,
+    pub new_session_id: String,
+    pub rollout_path: PathBuf,
+    pub cwd: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct Armed {
     cwd_normalized: String,
@@ -123,9 +162,23 @@ struct Armed {
     pending_first_line: HashMap<PathBuf, i64>,
 }
 
+/// Fork-lane watch for a BOUND pane (contrast `Armed`: the arm/census lane
+/// for an identity-less pane). Ownership here is lineage-proven, so no cwd
+/// is tracked and no census applies.
+#[derive(Debug, Clone)]
+struct ForkWatch {
+    session_id: String,
+    /// Files known at watch registration / last fork; only NEW files are probed.
+    known_files: HashSet<PathBuf>,
+    /// Enter-anchored scan window; scanning happens only while open.
+    window_until_ms: Option<i64>,
+}
+
 #[derive(Default)]
 struct Inner {
     armed: HashMap<String, Armed>,
+    /// terminal_id -> fork watch (fork lane; independent of `armed`).
+    fork_watch: HashMap<String, ForkWatch>,
 }
 
 pub struct CodexLocator {
@@ -196,7 +249,9 @@ impl CodexLocator {
     }
 
     pub fn disarm(&self, terminal_id: &str) {
-        self.inner.lock().unwrap().armed.remove(terminal_id);
+        let mut inner = self.inner.lock().unwrap();
+        inner.armed.remove(terminal_id);
+        inner.fork_watch.remove(terminal_id);
     }
 
     /// The FIRST submit is what opens a window at all (windows are
@@ -378,6 +433,113 @@ impl CodexLocator {
         located
     }
 
+    /// Register (or move) the fork watch for a BOUND pane. Snapshots the
+    /// current rollout file set; overwrites any existing watch (chained
+    /// forks re-register with the new id).
+    pub fn watch_fork(&self, terminal_id: &str, session_id: &str) -> bool {
+        if terminal_id.is_empty() || session_id.is_empty() {
+            return false;
+        }
+        let known_files = self.scan_rollout_files();
+        let mut inner = self.inner.lock().unwrap();
+        inner.fork_watch.insert(
+            terminal_id.to_string(),
+            ForkWatch {
+                session_id: session_id.to_string(),
+                known_files,
+                window_until_ms: None,
+            },
+        );
+        true
+    }
+
+    /// Open an Enter-anchored fork-scan window (in-TUI /resume is driven by
+    /// Enter presses; scanning is gated on this window to bound fs cost).
+    pub fn note_fork_submit(&self, terminal_id: &str, at_ms: i64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(watch) = inner.fork_watch.get_mut(terminal_id) else {
+            return false;
+        };
+        watch.window_until_ms = Some(at_ms + CODEX_FORK_WINDOW_MS);
+        true
+    }
+
+    /// Scan (at most once per call, only when >=1 window is open) for NEW
+    /// rollout files whose session_meta carries forked_from_id == a watched
+    /// pane's bound session id AND thread_source == "user". Lineage ALONE is
+    /// not proof of a user fork (validated A4: subagent forks dominate
+    /// ~100:1 on the real substrate -- 1,148 of 1,160 forked rollouts -- and
+    /// 86/340 codex-tui subagent children were born <=30s after the parent's
+    /// user input, i.e. inside this window); WITH the user filter it is
+    /// positive proof of ownership -- no cwd census applies.
+    pub fn tick_forks(&self, now_ms: i64) -> Vec<ForkLocated> {
+        {
+            let inner = self.inner.lock().unwrap();
+            if !inner
+                .fork_watch
+                .values()
+                .any(|w| w.window_until_ms.is_some_and(|u| now_ms <= u))
+            {
+                return Vec::new(); // no open window -> zero fs cost
+            }
+        }
+        let current = self.scan_rollout_files();
+        let mut located = Vec::new();
+        let mut inner = self.inner.lock().unwrap();
+        for (terminal_id, watch) in inner.fork_watch.iter_mut() {
+            if watch.window_until_ms.is_none_or(|u| now_ms > u) {
+                continue;
+            }
+            let mut hits: Vec<(PathBuf, String, Option<String>)> = Vec::new();
+            let new_paths: Vec<PathBuf> = current.difference(&watch.known_files).cloned().collect();
+            for path in new_paths {
+                match probe_rollout(&path) {
+                    // A4 predicate: lineage AND thread_source == "user".
+                    // Subagent children (thread_source:"subagent") fail the
+                    // guard, fall to the `_` arm, and are merged into
+                    // known_files -- permanently excluded AND never counted
+                    // toward the n>=2 ambiguity refusal below.
+                    Probe::Candidate {
+                        thread_id,
+                        cwd,
+                        forked_from_id,
+                        thread_source,
+                    } if forked_from_id.as_deref() == Some(watch.session_id.as_str())
+                        && thread_source.as_deref() == Some("user")
+                        && thread_id != watch.session_id
+                        && is_uuid_shaped(&thread_id) =>
+                    {
+                        hits.push((path.clone(), thread_id, Some(cwd)));
+                    }
+                    Probe::NotYet => { /* leave un-merged; retried next tick */ }
+                    _ => {
+                        watch.known_files.insert(path.clone());
+                    }
+                }
+            }
+            match hits.len() {
+                0 => {}
+                1 => {
+                    let (path, new_id, cwd) = hits.remove(0);
+                    located.push(ForkLocated {
+                        terminal_id: terminal_id.clone(),
+                        old_session_id: std::mem::replace(&mut watch.session_id, new_id.clone()),
+                        new_session_id: new_id,
+                        rollout_path: path.clone(),
+                        cwd,
+                    });
+                    watch.known_files.insert(path);
+                    watch.window_until_ms = None; // one-shot per fork
+                }
+                n => {
+                    tracing::warn!(terminal_id = %terminal_id, candidates = n,
+                        "codex_fork_ambiguous: multiple forks of one session in one window; refusing");
+                }
+            }
+        }
+        located
+    }
+
     fn scan_rollout_files(&self) -> HashSet<PathBuf> {
         self.fs_scan_count.fetch_add(1, Ordering::SeqCst);
         fn walk(dir: &Path, depth: u8, out: &mut HashSet<PathBuf>) {
@@ -426,16 +588,14 @@ enum Probe {
         /// Fork lineage (`payload.forked_from_id`) — present on rollouts
         /// created by codex's in-TUI `/resume` fork AND on subagent spawns;
         /// lineage alone is not proof of a user fork (validated A4).
-        /// (dead_code allow: consumed by Task 4's ForkWatch lane.)
-        #[allow(dead_code)]
+        /// Consumed by the ForkWatch lane (`tick_forks`).
         forked_from_id: Option<String>,
         /// `payload.thread_source` — `"user"` on user forks, `"subagent"`
         /// on subagent spawns; absent on pre-0.143 CLIs. NOTE: the sibling
         /// `source` key is POLYMORPHIC on disk (string for user sessions,
         /// object for subagents) — never read it with an assumed-string
         /// shape; `thread_source` is a plain string on the whole substrate.
-        /// (dead_code allow: consumed by Task 4's ForkWatch lane.)
-        #[allow(dead_code)]
+        /// Consumed by the ForkWatch lane (`tick_forks`).
         thread_source: Option<String>,
     },
     /// Empty file, transient open/read failure, or first line still missing
@@ -1095,6 +1255,254 @@ mod tests {
             }
             other => panic!("expected Candidate, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fork_rollout_with_lineage_rebinds_within_window() {
+        let root = unique_temp_dir("fork-happy");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        // No window open: a fork file appearing is NOT scanned/claimed yet.
+        let path = write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID,
+            Some("/tmp/x"),
+            Some("aaaa-old"),
+            Some("user"),
+        );
+        assert!(locator.tick_forks(1_000).is_empty());
+        // Enter opens the window; the same file is now claimed.
+        assert!(locator.note_fork_submit("t1", 2_000));
+        let located = locator.tick_forks(2_100);
+        assert_eq!(
+            located,
+            vec![ForkLocated {
+                terminal_id: "t1".into(),
+                old_session_id: "aaaa-old".into(),
+                new_session_id: TID.into(),
+                rollout_path: path,
+                cwd: Some("/tmp/x".into()),
+            }]
+        );
+        // One-shot per fork: drained.
+        assert!(locator.tick_forks(2_200).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fork_pointing_at_foreign_session_never_matches() {
+        let root = unique_temp_dir("fork-foreign");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        assert!(locator.note_fork_submit("t1", 1_000));
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID,
+            Some("/tmp/x"),
+            Some("zzzz-not-ours"),
+            Some("user"),
+        );
+        assert!(locator.tick_forks(1_100).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn in_window_subagent_child_is_never_a_fork_candidate() {
+        // A4 (validated 2026-07-28): subagent forks outnumber user forks
+        // ~100:1 on the real substrate (1,148 of 1,160 forked rollouts), and
+        // 86/340 codex-tui subagent children were born <=30s after the
+        // parent's user input (min 7.0s) -- squarely inside this window.
+        // Lineage alone is NOT proof: without the thread_source filter the
+        // pane would be rebound onto a subagent thread.
+        let root = unique_temp_dir("fork-subagent");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        assert!(locator.note_fork_submit("t1", 1_000));
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID,
+            Some("/tmp/x"),
+            Some("aaaa-old"),
+            Some("subagent"),
+        );
+        assert!(locator.tick_forks(1_100).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn subagent_sibling_does_not_make_a_real_user_fork_ambiguous() {
+        // Subagent children are excluded BEFORE the n>=2 ambiguity count: a
+        // same-window subagent must not veto the genuine user fork.
+        let root = unique_temp_dir("fork-subagent-sibling");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        assert!(locator.note_fork_submit("t1", 1_000));
+        const SUB: &str = "44444444-2222-3333-4444-555555555555";
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            SUB,
+            Some("/tmp/x"),
+            Some("aaaa-old"),
+            Some("subagent"),
+        );
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID,
+            Some("/tmp/x"),
+            Some("aaaa-old"),
+            Some("user"),
+        );
+        let located = locator.tick_forks(1_100);
+        assert_eq!(
+            located.len(),
+            1,
+            "the user fork must be emitted despite the subagent sibling"
+        );
+        assert_eq!(located[0].new_session_id, TID);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plain_new_rollout_is_not_a_fork_candidate() {
+        let root = unique_temp_dir("fork-plain");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        assert!(locator.note_fork_submit("t1", 1_000));
+        write_rollout_full(&root, "2026/07/27", TID, Some("/tmp/x"), None, None);
+        assert!(locator.tick_forks(1_100).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn expired_window_never_scans_or_claims() {
+        let root = unique_temp_dir("fork-expired");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        assert!(locator.note_fork_submit("t1", 1_000));
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID,
+            Some("/tmp/x"),
+            Some("aaaa-old"),
+            Some("user"),
+        );
+        let scans_before = locator.fs_scan_count();
+        assert!(locator
+            .tick_forks(1_000 + CODEX_FORK_WINDOW_MS + 1)
+            .is_empty());
+        assert_eq!(
+            locator.fs_scan_count(),
+            scans_before,
+            "expired window must not walk the fs"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chained_fork_rebinds_twice() {
+        let root = unique_temp_dir("fork-chain");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        assert!(locator.note_fork_submit("t1", 1_000));
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID,
+            Some("/tmp/x"),
+            Some("aaaa-old"),
+            Some("user"),
+        );
+        let first = locator.tick_forks(1_100);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].new_session_id, TID);
+        // Watch auto-advanced to TID: a second fork off TID is claimed next.
+        const TID2: &str = "33333333-2222-3333-4444-555555555555";
+        assert!(locator.note_fork_submit("t1", 2_000));
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID2,
+            Some("/tmp/x"),
+            Some(TID),
+            Some("user"),
+        );
+        let second = locator.tick_forks(2_100);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].old_session_id, TID);
+        assert_eq!(second[0].new_session_id, TID2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_watched_panes_same_cwd_each_claim_their_own_fork() {
+        // Lineage is positive proof of ownership -- NO cwd census applies to
+        // the fork lane (contrast: the arm/census lane, Task 8).
+        let root = unique_temp_dir("fork-two-panes");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        assert!(locator.watch_fork("t2", "bbbb-old"));
+        assert!(locator.note_fork_submit("t1", 1_000));
+        assert!(locator.note_fork_submit("t2", 1_000));
+        const TID2: &str = "33333333-2222-3333-4444-555555555555";
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID,
+            Some("/tmp/x"),
+            Some("aaaa-old"),
+            Some("user"),
+        );
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID2,
+            Some("/tmp/x"),
+            Some("bbbb-old"),
+            Some("user"),
+        );
+        let mut located = locator.tick_forks(1_100);
+        located.sort_by(|a, b| a.terminal_id.cmp(&b.terminal_id));
+        assert_eq!(located.len(), 2);
+        assert_eq!(
+            (
+                located[0].terminal_id.as_str(),
+                located[0].new_session_id.as_str()
+            ),
+            ("t1", TID)
+        );
+        assert_eq!(
+            (
+                located[1].terminal_id.as_str(),
+                located[1].new_session_id.as_str()
+            ),
+            ("t2", TID2)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn disarm_clears_the_fork_watch() {
+        let root = unique_temp_dir("fork-disarm");
+        let locator = CodexLocator::new(root.clone());
+        assert!(locator.watch_fork("t1", "aaaa-old"));
+        locator.disarm("t1");
+        assert!(!locator.note_fork_submit("t1", 1_000));
+        write_rollout_full(
+            &root,
+            "2026/07/27",
+            TID,
+            Some("/tmp/x"),
+            Some("aaaa-old"),
+            Some("user"),
+        );
+        assert!(locator.tick_forks(1_100).is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
