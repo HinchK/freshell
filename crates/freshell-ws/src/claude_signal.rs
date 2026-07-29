@@ -70,10 +70,7 @@ impl ClaudeSignalWatcher {
     /// splitting the stem on the LAST `__` (`rsplit_once`): the nonce
     /// (`<timestamp>-<pid>` digits and `-`) can never contain `__`, so a LAST-split
     /// always recovers the full terminal id even if an id ever contained
-    /// `__`. Malformed files are deleted and skipped (a signal is
-    /// single-shot; leaving junk behind would re-fail every sweep forever).
-    /// In-flight `*.tmp` files (the hook's atomic write staging) are left
-    /// alone.
+    /// `__`. Fresh `*.tmp` staging files are ignored; stale ones (orphaned by a dead hook) are reaped on `STALE_SIGNAL_MAX_AGE`, as are unconsumed `*.json` files older than the same TTL. Malformed files are warn-logged (`claude_signal_rejected`) and deleted.
     /// drain() sorts by filename (timestamp-first nonces => deterministic
     /// last-write-wins under rapid A->B->A switching on nanosecond-precision
     /// date; the second-granularity fallback degrades same-second order to pid
@@ -82,24 +79,54 @@ impl ClaudeSignalWatcher {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return Vec::new(); // no dir yet: no claude pane has ever signaled
         };
-        let mut paths: Vec<std::path::PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-            .collect();
-        // Deterministic last-write-wins (mirrors opencode_signal.rs): the
-        // producer nonce is timestamp-first and width-stable, so a filename
-        // sort is emission order on nanosecond-precision `date` (GNU; on the
-        // second-granularity fallback, same-second order degrades to pid
-        // order -- see the producer's doc comment); the consumer applies
-        // signals in sequence, so the newest signal per terminal wins.
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("json") => paths.push(path),
+                Some("tmp") => {
+                    // Orphaned atomic-write staging (hook died before the
+                    // rename): reap on the shared TTL so junk stays bounded
+                    // (mirrors opencode_signal.rs:146-157).
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > crate::opencode_signal::STALE_SIGNAL_MAX_AGE);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Deterministic last-write-wins (#575): timestamp-first, width-stable
+        // producer nonces make a filename sort emission order.
         paths.sort();
         let mut signals = Vec::new();
         for path in paths {
-            if let Some(sig) = parse_signal_file(&path) {
-                signals.push(sig);
+            let stale = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > crate::opencode_signal::STALE_SIGNAL_MAX_AGE);
+            if stale {
+                let _ = std::fs::remove_file(&path); // retention cap (D1.1)
+                continue;
             }
-            let _ = std::fs::remove_file(&path);
+            match parse_signal_file(&path) {
+                Some(sig) => {
+                    signals.push(sig);
+                    let _ = std::fs::remove_file(&path);
+                }
+                None => {
+                    // A silently-never-firing lane is the failure mode to
+                    // avoid (A8 detectability): log rejects before consuming.
+                    tracing::warn!(path = %path.display(),
+                        "claude_signal_rejected: bad terminal id or session_id, consuming file");
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
         }
         signals
     }
@@ -336,5 +363,96 @@ mod tests {
         // Existing delete-on-read semantics are unchanged.
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn write_file(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    /// Backdate a file's mtime past the retention cap (mirrors
+    /// opencode_signal.rs::drain_reaps_stale_files_without_emitting).
+    fn backdate_past_ttl(path: &std::path::Path) {
+        let stale = std::time::SystemTime::now()
+            - crate::opencode_signal::STALE_SIGNAL_MAX_AGE
+            - std::time::Duration::from_secs(60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+    }
+
+    #[test]
+    fn drain_reaps_stale_files_without_emitting() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "t1__0000000000000000001-1.json",
+            r#"{"session_id":"old-id","source":"resume"}"#,
+        );
+        let path = dir.path().join("t1__0000000000000000001-1.json");
+        backdate_past_ttl(&path);
+        let watcher = ClaudeSignalWatcher::new(dir.path().to_path_buf());
+        let signals = watcher.drain();
+        assert!(
+            signals.is_empty(),
+            "stale signals must be reaped, not emitted"
+        );
+        assert!(
+            !path.exists(),
+            "stale signal file must be deleted (retention cap)"
+        );
+    }
+
+    #[test]
+    fn drain_reaps_stale_tmp_staging_files_but_keeps_fresh_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "t1__0000000000000000001-1.tmp", "partial write");
+        write_file(dir.path(), "t2__0000000000000000002-1.tmp", "in flight");
+        backdate_past_ttl(&dir.path().join("t1__0000000000000000001-1.tmp"));
+        let watcher = ClaudeSignalWatcher::new(dir.path().to_path_buf());
+        let signals = watcher.drain();
+        assert!(signals.is_empty());
+        assert!(
+            !dir.path().join("t1__0000000000000000001-1.tmp").exists(),
+            "orphaned .tmp (writer died before rename) must be reaped on the TTL"
+        );
+        assert!(
+            dir.path().join("t2__0000000000000000002-1.tmp").exists(),
+            "fresh in-flight .tmp must be left alone"
+        );
+    }
+
+    #[test]
+    fn drain_on_missing_directory_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = ClaudeSignalWatcher::new(dir.path().join("never-created"));
+        assert!(
+            watcher.drain().is_empty(),
+            "missing root: empty drain, no panic"
+        );
+    }
+
+    #[test]
+    fn drain_warns_on_rejected_files() {
+        let (events, _guard) = crate::invariants::capture::capture();
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "junk__1.json", "not json");
+        let watcher = ClaudeSignalWatcher::new(dir.path().to_path_buf());
+        let signals = watcher.drain();
+        assert!(signals.is_empty());
+        assert!(
+            !dir.path().join("junk__1.json").exists(),
+            "malformed files stay single-shot (consumed)"
+        );
+        let events = events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains("claude_signal_rejected")),
+            "parse rejects must be warn-logged for detectability (A8)"
+        );
     }
 }
