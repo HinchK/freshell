@@ -61,12 +61,13 @@ function toAscii(text: string): string {
 }
 
 export function stripText(
-  model: { tabs: Array<{ title: string; active: boolean; busy: boolean; attention: boolean }> },
+  model: { tabs: Array<{ title: string; active: boolean; busy: boolean; attention: boolean; pendingApproval: boolean }> },
   page: number, pages: number,
 ): string {
   const active = model.tabs.find((t) => t.active)
   const busyCount = model.tabs.filter((t) => t.busy).length
-  const waitingCount = model.tabs.filter((t) => t.attention).length
+  // "waiting" = needs attention (turn complete) OR waiting for approval — each tab once.
+  const waitingCount = model.tabs.filter((t) => t.attention || t.pendingApproval).length
   return toAscii(`${active?.title ?? '-'}  |  page ${page}/${pages}  |  ${busyCount} busy  ${waitingCount} waiting`)
 }
 

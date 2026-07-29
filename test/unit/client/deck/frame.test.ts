@@ -7,7 +7,7 @@ import type { DeckModel, DeckTab } from '@/deck/deck-selectors'
 
 function makeDeckTab(over: Partial<DeckTab> & Pick<DeckTab, 'id' | 'title'>): DeckTab {
   return {
-    active: false, busy: false, attention: false, fill: 'none', dot: null,
+    active: false, busy: false, attention: false, pendingApproval: false, fill: 'none', dot: null,
     priority: 4, repoIcons: [], ...over,
   }
 }
@@ -128,5 +128,25 @@ describe('stripText', () => {
       ],
     }
     expect(stripText(model, 1, 1)).toContain('1 busy  1 waiting')
+  })
+
+  it('stripText counts a pending-approval tab as waiting', () => {
+    const m = model(3)
+    m.tabs[1].pendingApproval = true
+    expect(stripText(m, 1, 1)).toContain('1 waiting')
+  })
+
+  it('stripText counts waiting as the union of attention and pending approval', () => {
+    const m = model(3)
+    m.tabs[0].attention = true
+    m.tabs[1].pendingApproval = true
+    expect(stripText(m, 1, 1)).toContain('2 waiting')
+  })
+
+  it('a tab that both needs attention and awaits approval counts once', () => {
+    const m = model(2)
+    m.tabs[0].attention = true
+    m.tabs[0].pendingApproval = true
+    expect(stripText(m, 1, 1)).toContain('1 waiting')
   })
 })
