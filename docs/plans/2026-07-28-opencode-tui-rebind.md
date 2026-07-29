@@ -43,8 +43,10 @@
 | `extensions/opencode/freshell-rebind-plugin.ts` (create) | The opencode TUI plugin: dedup-emit `(terminalId, sessionID)` signal files on every session switch. Pure-testable helpers exported. |
 | `test/unit/server/opencode-rebind-plugin.test.ts` (create) | Vitest unit tests for the plugin (mocked TuiPluginApi, injected fs writer). |
 | `crates/freshell-platform/src/opencode_plugin.rs` (create) | Embed plugin source (`include_str!`), idempotent install of the plugin AND the plugin-only `tui.json` to `~/.freshell/opencode/`; pure `tui_config_path` / `tui_config_content` / `plugin_file_spec` helpers. Inline unit tests. |
-| `crates/freshell-platform/src/cli_launch.rs` (modify, opencode block `:416-422` area) | Per-pane env injection of `OPENCODE_TUI_CONFIG` into `command_env` (skip when user-set; `FRESHELL_OPENCODE_REBIND=0/false` kill switch); `merged_env_value` helper beside `merged_env_truthy` (`:246-257`). |
-| `crates/freshell-platform/src/cli_launch_goldens.rs` (modify) | Golden pins for the new opencode env injection. |
+| `crates/freshell-platform/src/cli_launch.rs` (modify, opencode block `:416-422` area) | Per-pane env injection of `OPENCODE_TUI_CONFIG` into `command_env` (skip when user-set; `FRESHELL_OPENCODE_REBIND=0/false` kill switch); `merged_env_value` helper beside `merged_env_truthy` (`:246-257`); new `CliLaunchInputs.opencode_rebind_tui_config` field — the resolver stays pure, consuming the IO-precomputed install result (the `mcp_injection` precedent). |
+| `crates/freshell-platform/src/cli_launch_goldens.rs` (modify) | Golden pins for the new opencode env injection (pure — inputs field set directly, no fs I/O). |
+| `crates/freshell-ws/src/terminal.rs` (modify, `:1596-1646` area) | WS create call site: precompute the rebind-plugin install (fs I/O, warn-on-failure) and pass the tui.json path via `CliLaunchInputs`. |
+| `crates/freshell-freshagent/src/terminal_tabs.rs` (modify, `:839-957` area) | REST create call site: same precompute-and-pass. |
 | `crates/freshell-platform/src/lib.rs` (modify) | `pub mod opencode_plugin;` |
 | `crates/freshell-ws/src/opencode_signal.rs` (create) | `OpencodeSignalWatcher` (sorted non-destructive drain, `ses_` validation + `opencode_signal_rejected` logging, ~10-min staleness cap), `drain_and_rebind_opencode` (guard ladder + first-bind arbitration + retired-pane rebind, act-then-delete, pinned fan-out), `spawn_opencode_signal_sweep`. Inline unit tests. |
 | `crates/freshell-ws/src/lib.rs` (modify) | `pub mod opencode_signal;` |
@@ -593,43 +595,40 @@ git commit -m "feat(platform): embed + install opencode rebind plugin and plugin
 ### Task 3: Inject OPENCODE_TUI_CONFIG in the launch resolver (golden-first)
 
 **Files:**
-- Modify: `crates/freshell-platform/src/cli_launch.rs` (opencode block at `:416-422`; helper beside `merged_env_truthy` at `:246-257`)
+- Modify: `crates/freshell-platform/src/cli_launch.rs` (opencode block at `:416-422`; helper beside `merged_env_truthy` at `:246-257`; new field on `CliLaunchInputs` at `:106-124`)
 - Modify: `crates/freshell-platform/src/cli_launch_goldens.rs`
+- Modify: `crates/freshell-ws/src/terminal.rs` (WS create call site, `:1596-1646` — precompute the plugin install beside the existing `generate_mcp_injection` precompute)
+- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs` (REST create call site, `:839-957` — same precompute)
 
 **Interfaces:**
-- Consumes: Task 2's `opencode_plugin::{ensure_rebind_plugin_installed, tui_config_path, rebind_plugin_path}`; the resolver's env abstraction (the `env` parameter `resolve_coding_cli_command(&cli_commands, &inputs, env)` already used by `get_opencode_env_overrides(env, &command_env)` and `merged_env_truthy`).
-- Produces: every freshell-spawned opencode pane (WS create `freshell-ws/src/terminal.rs:1635`, REST create `freshell-freshagent/src/terminal_tabs.rs:954`, and restore relaunches — `command_env` is rebuilt identically on restore) carries `OPENCODE_TUI_CONFIG=<abs path to ~/.freshell/opencode/tui.json>` in `command_env`. `OPENCODE_CONFIG_CONTENT` is NOT injected at all. Skip rules (each degrades to today's no-rebind behavior): (a) the merged env already carries `OPENCODE_TUI_CONFIG` — a path var cannot be merged; preserving the user's value wins, skip injection entirely; (b) kill switch — `FRESHELL_OPENCODE_REBIND` set to `0`/`false` in the merged env skips injection (opencode self-updates in place; one env var + a pane restart disables the feature without a freshell release); (c) unresolvable home; (d) install failure (warn, launch anyway). New helper: `fn merged_env_value(env: &impl <the resolver's env trait>, command_env: &BTreeMap<String, String>, key: &str) -> Option<String>` with the same JS-spread shadowing semantics as `merged_env_truthy` (a present-but-empty `command_env` value shadows the process env).
+- Consumes: Task 2's `opencode_plugin::{ensure_rebind_plugin_installed, tui_config_path, rebind_plugin_path}`; the resolver's env abstraction (`env: &dyn Env` with `.get(key) -> Option<String>`, already used by `get_opencode_env_overrides(env, &command_env)` and `merged_env_truthy`); the existing precomputed-IO seam — `CliLaunchInputs` (`cli_launch.rs:106-124`), whose `mcp_injection` field is THE precedent this task mirrors ("Pure: all IO … arrives through `CliLaunchInputs`", `cli_launch.rs:5-8` and `:366-368`).
+- Produces: every freshell-spawned opencode pane (WS create `freshell-ws/src/terminal.rs:1635`, REST create `freshell-freshagent/src/terminal_tabs.rs:954`, and restore relaunches — `command_env` is rebuilt identically on restore) carries `OPENCODE_TUI_CONFIG=<abs path to ~/.freshell/opencode/tui.json>` in `command_env`. `OPENCODE_CONFIG_CONTENT` is NOT injected at all. **Split of responsibilities (mirrors `mcp_injection` exactly):** the plugin INSTALL (fs I/O) runs at the two IO call sites BEFORE the resolver, and its result is passed in via a new `CliLaunchInputs.opencode_rebind_tui_config: Option<String>` field (`Some(tui.json path)` on success; `None` = do not inject). `resolve_coding_cli_command` stays pure — it never touches the filesystem (its doc comment pins this contract; performing the install inside it would violate `cli_launch.rs:5-8`/`:366-369` and force fs writes into the hermetic goldens; `freshell-platform` also deliberately has no logging dependency, so the install's warn-on-failure cannot live there). Skip rules (each degrades to today's no-rebind behavior): (a) PURE, in the resolver — the merged env already carries `OPENCODE_TUI_CONFIG` (a path var cannot be merged; preserving the user's value wins, skip injection entirely); (b) PURE, in the resolver — kill switch: `FRESHELL_OPENCODE_REBIND` set to `0`/`false` in the merged env skips injection (opencode self-updates in place; one env var + a pane restart disables the feature without a freshell release); (c) IO layer — unresolvable home ⇒ pass `None`; (d) IO layer — install failure ⇒ `tracing::warn!` (both call-site crates already depend on and use `tracing`) and pass `None`, never blocking the launch. New pure helper: `fn merged_env_value(parent: &dyn Env, command_env: &BTreeMap<String, String>, key: &str) -> Option<String>` (mirror `merged_env_truthy`'s exact parameter types at `:246-257`) with the same JS-spread shadowing semantics (a present-but-empty `command_env` value shadows the process env).
 
-**Home-dir resolution rule (locked):** resolve `home` through the resolver's env abstraction — `merged_env_value(env, &command_env, "HOME")` falling back to `"USERPROFILE"` — NOT `dirs::home_dir()` or `std::env`. This keeps the goldens hermetic (they pass a fake env with a temp HOME) and matches `claude_signal.rs`'s `$HOME`-then-`%USERPROFILE%` convention. No home ⇒ skip injection (degrade, mirroring `ClaudeSignalWatcher::default_root() -> None` skipping the sweep).
+**Home-dir resolution rule (locked):** home is resolved at the IO call sites (where the real process env is the correct source), matching `ClaudeSignalWatcher::default_root`'s exact home-resolution idiom — read `claude_signal.rs:52-66` and mirror whatever it does (`$HOME`-then-`%USERPROFILE%` convention). NOT in the resolver: the resolver receives only the precomputed `Option<String>`. No home ⇒ pass `None` ⇒ skip injection (degrade, mirroring `default_root() -> None` skipping the sweep). The goldens stay hermetic because they never call the installer — they set `opencode_rebind_tui_config` directly, building the expected path with the PURE `opencode_plugin::tui_config_path` helper. Note for integration tests: a test that creates a real opencode pane through these call sites installs the two freshell-owned files under the process `$HOME`; point `HOME` at a tempdir (under the suite's env lock) if isolation matters.
 
 - [ ] **Step 1: Read the exact current shape**
 
-Read `crates/freshell-platform/src/cli_launch.rs:240-300` (the env-lookup helpers and `get_opencode_env_overrides`) and `:405-480` (the opencode block, resume args). Read the opencode golden(s) in `cli_launch_goldens.rs` (argv pins near `:393,418,457,472`; note how the golden constructs its fake env and whether it asserts `command_env`). Keep `get_opencode_env_overrides` pure and untouched — the injection is a separate statement in the same `mode == "opencode"` block, because it performs fs I/O (plugin install) which does not belong in the pure overrides function.
+Read `crates/freshell-platform/src/cli_launch.rs:100-130` (`CliLaunchInputs` and the `mcp_injection` precedent field), `:240-300` (the env-lookup helpers and `get_opencode_env_overrides`), and `:405-480` (the opencode block, resume args). Read the two IO call sites you are extending — `freshell-ws/src/terminal.rs:1596-1646` and `freshell-freshagent/src/terminal_tabs.rs:839-957` — noting how each precomputes `generate_mcp_injection` and then builds the `CliLaunchInputs` literal (that precompute-then-pass shape is exactly what this task replicates). Read the goldens' input constructors in `cli_launch_goldens.rs` (`claude_inputs` `:78`, `codex_inputs` `:243`, `opencode_inputs` `:367`, `amplifier_inputs` `:677`; argv pins near `:393,418,457,472`; note how the golden constructs its fake env and whether it asserts `command_env`). Keep `get_opencode_env_overrides` pure and untouched — the injection is a separate statement in the same `mode == "opencode"` block, consuming only the precomputed input and the merged env.
 
 - [ ] **Step 2: Update the goldens FIRST (verify RED)**
 
-In `cli_launch_goldens.rs`, for every opencode golden case, extend the expected `command_env` with the new key (the goldens now pin the `OPENCODE_TUI_CONFIG` injection). Use the real composition functions against the golden's fake HOME so the assertion is host-independent, e.g.:
+In `cli_launch_goldens.rs`, for every opencode golden case, extend the expected `command_env` with the new key (the goldens now pin the `OPENCODE_TUI_CONFIG` injection). The goldens stay PURE — no tempdir, no fs I/O, no installer call (the file-install behavior is already pinned by Task 2's `opencode_plugin` unit tests). Build the expected value with the pure path helper and pass it through the new inputs field:
 
 ```rust
-let home = tempfile::tempdir().unwrap();
-// (set HOME=<home> in the golden's fake env, alongside its existing vars)
-let expected_plugin_path = crate::opencode_plugin::rebind_plugin_path(home.path());
-let expected_tui_config = crate::opencode_plugin::tui_config_path(home.path());
-// assert command_env["OPENCODE_TUI_CONFIG"] == expected_tui_config.display().to_string()
-// assert BOTH freshell-owned files now exist on disk with the expected content:
-assert_eq!(
-    std::fs::read_to_string(&expected_plugin_path).unwrap(),
-    crate::opencode_plugin::REBIND_PLUGIN_SOURCE
-);
-assert_eq!(
-    std::fs::read_to_string(&expected_tui_config).unwrap(),
-    crate::opencode_plugin::tui_config_content(&expected_plugin_path)
-);
+let fake_home = std::path::Path::new("/golden-home");
+let expected_tui_config = crate::opencode_plugin::tui_config_path(fake_home)
+    .display()
+    .to_string();
+let mut inputs = opencode_inputs();
+inputs.opencode_rebind_tui_config = Some(expected_tui_config.clone());
+// resolve, then:
+// assert command_env["OPENCODE_TUI_CONFIG"] == expected_tui_config
 ```
 
-Add two NEW golden cases:
-1. **User value present (skip):** fake env contains `OPENCODE_TUI_CONFIG=/their/tui.json` → resolved `command_env` does NOT contain the key at all (a path var cannot be merged; the user's raw process-env value passes through to the PTY untouched; no freshell files are forced on the pane).
-2. **Kill switch (skip):** fake env contains `FRESHELL_OPENCODE_REBIND=0` → resolved `command_env` does NOT contain `OPENCODE_TUI_CONFIG`; repeat with `false` (inverted `merged_env_truthy`-style semantics).
+Add three NEW golden cases:
+1. **User value present (skip):** fake env contains `OPENCODE_TUI_CONFIG=/their/tui.json` and inputs carry `Some(...)` → resolved `command_env` does NOT contain the key at all (a path var cannot be merged; the user's raw process-env value passes through to the PTY untouched; no freshell files are forced on the pane).
+2. **Kill switch (skip):** fake env contains `FRESHELL_OPENCODE_REBIND=0` and inputs carry `Some(...)` → resolved `command_env` does NOT contain `OPENCODE_TUI_CONFIG`; repeat with `false` (inverted `merged_env_truthy`-style semantics).
+3. **No precomputed install (skip):** inputs carry `opencode_rebind_tui_config: None` (the IO layer's unresolvable-home / install-failure outcome) → resolved `command_env` does NOT contain the key.
 
 Also assert in an existing opencode golden that **argv is byte-identical to before** (the injection is env-only; `--hostname/--port/--session` args unchanged).
 
@@ -637,85 +636,123 @@ Also assert in an existing opencode golden that **argv is byte-identical to befo
 cargo test -p freshell-platform cli_launch 2>&1 | tail -20
 ```
 
-Expected: FAIL (goldens demand the new env key that isn't produced yet).
+Expected: FAIL — initially as a COMPILE error (`opencode_rebind_tui_config` does not exist until Step 3 adds it; that compile failure is the RED state), and, once the field exists, as assertion failures because the injection isn't implemented yet.
 
-- [ ] **Step 3: Implement the helper and the injection**
+- [ ] **Step 3: Implement the field, the helper, the pure injection, and the IO-layer precompute**
 
-Beside `merged_env_truthy` (`cli_launch.rs:246-257`), add (adapting the trait/type names to exactly what `merged_env_truthy` uses):
+**(a) New input field** — in `CliLaunchInputs` (`cli_launch.rs:106-124`), beside `mcp_injection`:
+
+```rust
+/// Precomputed by the IO layer (like `mcp_injection` — this resolver never
+/// does fs I/O): `Some(<abs path to the freshell-owned tui.json>)` when the
+/// opencode rebind-plugin install succeeded at the call site, `None`
+/// otherwise (non-opencode pane, unresolvable home, or install failure —
+/// skip injection, degrading to today's no-rebind behavior).
+pub opencode_rebind_tui_config: Option<String>,
+```
+
+The struct is built as an exhaustive literal at both IO call sites and in the goldens' four constructor helpers (`claude_inputs`/`codex_inputs`/`opencode_inputs`/`amplifier_inputs`) — the compiler will point at every construction that needs the new field. Set `None` everywhere except the opencode paths below and the golden cases from Step 2.
+
+**(b) Pure merged-env helper** — beside `merged_env_truthy` (`cli_launch.rs:246-257`), mirroring its exact parameter types:
 
 ```rust
 /// Merged-view env lookup with JS spread semantics: a key present in
 /// command_env (even empty) shadows the process env. Companion to
 /// merged_env_truthy, returning the value instead of truthiness.
 fn merged_env_value(
-    env: &impl EnvSource, // ← use merged_env_truthy's exact env-parameter type
+    parent: &dyn Env, // ← merged_env_truthy's exact env-parameter type
     command_env: &std::collections::BTreeMap<String, String>,
     key: &str,
 ) -> Option<String> {
     if let Some(v) = command_env.get(key) {
         return Some(v.clone());
     }
-    env.var(key) // ← use the same accessor merged_env_truthy uses
+    parent.get(key) // ← the same accessor merged_env_truthy uses
 }
 ```
 
-In the `mode == "opencode"` block (after the existing `get_opencode_env_overrides` insertion at `:416-422`):
+**(c) Pure injection decision** — in the `mode == "opencode"` block (after the existing `get_opencode_env_overrides` insertion at `:416-422`). No fs I/O here — the install already happened (or didn't) at the IO layer:
 
 ```rust
 // Freshell TUI rebind plugin (docs/plans/2026-07-28-opencode-tui-rebind.md):
-// install the plugin + plugin-only tui.json into ~/.freshell/opencode/ and
-// point this pane's TUI at it via OPENCODE_TUI_CONFIG. Main-config plugins
-// (opencode.json / OPENCODE_CONFIG_CONTENT) load as SERVER plugins only and
-// never reach the TUI plugin host; TUI config sources MERGE and plugin
-// arrays UNION, so the injected plugin-only file can never shadow user
-// config (validated on opencode 1.18.8/1.18.9). Skips (each degrades to
-// today's no-rebind behavior): user-set OPENCODE_TUI_CONFIG (a path var
-// cannot be merged — preserve the user's value), the
-// FRESHELL_OPENCODE_REBIND=0/false kill switch (opencode self-updates in
-// place), unresolvable home, install failure. Failure here must never
-// block the launch.
+// the IO layer installed the plugin + plugin-only tui.json into
+// ~/.freshell/opencode/ and passed the tui.json path via
+// inputs.opencode_rebind_tui_config (the mcp_injection precedent — this
+// resolver stays pure). Point this pane's TUI at it via OPENCODE_TUI_CONFIG.
+// Main-config plugins (opencode.json / OPENCODE_CONFIG_CONTENT) load as
+// SERVER plugins only and never reach the TUI plugin host; TUI config
+// sources MERGE and plugin arrays UNION, so the injected plugin-only file
+// can never shadow user config (validated on opencode 1.18.8/1.18.9).
+// Skips (each degrades to today's no-rebind behavior): user-set
+// OPENCODE_TUI_CONFIG (a path var cannot be merged — preserve the user's
+// value), the FRESHELL_OPENCODE_REBIND=0/false kill switch (opencode
+// self-updates in place), and a None input (unresolvable home or install
+// failure at the IO layer, which warn-logs and never blocks the launch).
 let rebind_disabled = matches!(
     merged_env_value(env, &command_env, "FRESHELL_OPENCODE_REBIND").as_deref(),
     Some("0") | Some("false")
 );
 let user_tui_config = merged_env_value(env, &command_env, "OPENCODE_TUI_CONFIG");
 if !rebind_disabled && user_tui_config.is_none() {
-    let home = merged_env_value(env, &command_env, "HOME")
-        .filter(|s| !s.is_empty())
-        .or_else(|| merged_env_value(env, &command_env, "USERPROFILE").filter(|s| !s.is_empty()));
-    if let Some(home) = home {
-        let home = std::path::PathBuf::from(home);
-        match crate::opencode_plugin::ensure_rebind_plugin_installed(&home) {
-            Ok(tui_config) => {
-                command_env.insert(
-                    "OPENCODE_TUI_CONFIG".to_string(),
-                    tui_config.display().to_string(),
-                );
-            }
-            Err(error) => {
-                tracing::warn!(%error, "opencode_rebind_plugin_install_failed: launching without rebind signal");
-            }
-        }
+    if let Some(tui_config) = &inputs.opencode_rebind_tui_config {
+        command_env.insert("OPENCODE_TUI_CONFIG".to_string(), tui_config.clone());
     }
 }
 ```
 
-(If `tracing` is not already a freshell-platform dependency, use the crate's existing logging idiom in `cli_launch.rs` — check how other warnings in this file are emitted and match it.)
+**(d) IO-layer precompute** — at BOTH call sites (`freshell-ws/src/terminal.rs:1596-1646` and `freshell-freshagent/src/terminal_tabs.rs:839-957`), beside the existing `generate_mcp_injection` precompute, feeding the new field into the `CliLaunchInputs` literal. Both crates already depend on and use `tracing`; adapt the platform-crate path to how each file already imports the resolver, and adapt the `mode == "opencode"` condition to the call site's existing opencode branch/variable (`terminal.rs:1517` / `terminal_tabs.rs:852`):
+
+```rust
+// Freshell opencode TUI rebind plugin: the install (fs I/O) happens HERE at
+// the IO layer; the pure resolver only reads the result from
+// CliLaunchInputs (mcp_injection precedent). Failure must never block the
+// launch.
+let opencode_rebind_tui_config = if mode == "opencode" {
+    // Home from the real process env — verify against the actual
+    // ClaudeSignalWatcher::default_root body (claude_signal.rs:52-66) and
+    // mirror its exact home-resolution idiom; the chain below is
+    // illustrative, the real body wins.
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok().filter(|h| !h.is_empty()));
+    match home {
+        Some(home) => {
+            match freshell_platform::opencode_plugin::ensure_rebind_plugin_installed(
+                std::path::Path::new(&home),
+            ) {
+                Ok(tui_config) => Some(tui_config.display().to_string()),
+                Err(error) => {
+                    tracing::warn!(%error,
+                        "opencode_rebind_plugin_install_failed: launching without rebind signal");
+                    None
+                }
+            }
+        }
+        None => None,
+    }
+} else {
+    None
+};
+// … then in the CliLaunchInputs literal:
+//     opencode_rebind_tui_config,
+```
 
 - [ ] **Step 4: Run tests to verify GREEN**
 
 ```bash
 cargo test -p freshell-platform
+cargo check -p freshell-ws -p freshell-freshagent
 ```
 
-Expected: PASS, including all pre-existing goldens (claude/codex untouched).
+Expected: PASS, including all pre-existing goldens (claude/codex untouched), and clean compilation of both call-site crates (their runtime behavior is exercised by Task 5's crown test).
 
 - [ ] **Step 5: Quality gates and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy -p freshell-platform --all-targets -- -D warnings
-git add crates/freshell-platform/src/cli_launch.rs crates/freshell-platform/src/cli_launch_goldens.rs
-git commit -m "feat(platform): inject freshell rebind plugin into opencode panes via OPENCODE_TUI_CONFIG"
+cargo fmt --all --check && cargo clippy -p freshell-platform -p freshell-ws -p freshell-freshagent --all-targets -- -D warnings
+git add crates/freshell-platform/src/cli_launch.rs crates/freshell-platform/src/cli_launch_goldens.rs crates/freshell-ws/src/terminal.rs crates/freshell-freshagent/src/terminal_tabs.rs
+git commit -m "feat(platform,ws,freshagent): inject freshell rebind plugin into opencode panes via OPENCODE_TUI_CONFIG, install precomputed at the IO call sites"
 ```
 
 ---
@@ -880,7 +917,10 @@ Above the tests in `opencode_signal.rs` (mirroring `claude_signal.rs:24-118` wit
 
 use std::path::{Path, PathBuf};
 
-const OPENCODE_SIGNAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+// NOTE: the sweep-interval const (OPENCODE_SIGNAL_SWEEP_INTERVAL) is added in
+// Task 5 together with its only consumer, spawn_opencode_signal_sweep —
+// introducing it here would make this task's `clippy -D warnings` gate fail
+// as dead_code.
 /// Retention cap for unacted signal files (D1.1): a signal whose pane never
 /// (re)appears is reaped after this age instead of living forever.
 pub(crate) const STALE_SIGNAL_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
@@ -1267,6 +1307,10 @@ async fn apply_opencode_signal(state: &WsState, sig: &OpencodeSignal) -> bool {
     rebind_fanout(state, sig, current.cwd.as_deref(), previous).await;
     true
 }
+
+// Introduced here (not in Task 4) because this is its only consumer — an
+// unused private const would fail Task 4's `clippy -D warnings` gate.
+const OPENCODE_SIGNAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub fn spawn_opencode_signal_sweep(state: WsState, watcher: OpencodeSignalWatcher) {
     // Copy spawn_claude_signal_sweep (claude_signal.rs:228-236) verbatim,
