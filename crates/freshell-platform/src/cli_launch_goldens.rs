@@ -87,6 +87,7 @@ fn claude_inputs<'a>(injection: McpInjection) -> CliLaunchInputs<'a> {
         codex_remote_ws_url: None,
         opencode_server: None,
         mcp_injection: injection,
+        opencode_rebind_tui_config: None,
     }
 }
 
@@ -252,6 +253,7 @@ fn codex_inputs<'a>(injection: McpInjection) -> CliLaunchInputs<'a> {
         codex_remote_ws_url: None,
         opencode_server: None,
         mcp_injection: injection,
+        opencode_rebind_tui_config: None,
     }
 }
 
@@ -376,17 +378,33 @@ fn opencode_inputs<'a>() -> CliLaunchInputs<'a> {
         codex_remote_ws_url: None,
         opencode_server: Some(("127.0.0.1", 51234)),
         mcp_injection: McpInjection::default(),
+        opencode_rebind_tui_config: None,
     }
 }
 
-/// G-O1 — opencode, linux, fresh, explicit model.
+/// The expected `OPENCODE_TUI_CONFIG` value the goldens pin: built with the
+/// PURE `opencode_plugin::tui_config_path` helper (no fs I/O, no installer
+/// call — the file-install behavior is pinned by `opencode_plugin`'s own
+/// unit tests; the goldens stay hermetic).
+fn golden_rebind_tui_config() -> String {
+    crate::opencode_plugin::tui_config_path(std::path::Path::new("/golden-home"))
+        .display()
+        .to_string()
+}
+
+/// G-O1 — opencode, linux, fresh, explicit model. Also pins the rebind
+/// injection: `OPENCODE_TUI_CONFIG` lands in the env and argv stays
+/// byte-identical to the pre-rebind shape (the injection is env-ONLY).
 #[test]
 fn g_o1_opencode_fresh_explicit_model() {
+    let expected_tui_config = golden_rebind_tui_config();
     let mut inputs = opencode_inputs();
     inputs.model = Some("anthropic/claude-sonnet-4-5");
+    inputs.opencode_rebind_tui_config = Some(expected_tui_config.clone());
     let launch = resolve_coding_cli_command(&specs(), &inputs, &env_of(&[]))
         .unwrap()
         .unwrap();
+    // Byte-identical argv: `--hostname/--port/--model` only, no rebind args.
     assert_eq!(
         launch.args,
         vec![
@@ -398,20 +416,25 @@ fn g_o1_opencode_fresh_explicit_model() {
             "anthropic/claude-sonnet-4-5".to_string(),
         ]
     );
-    assert!(launch.env.is_empty());
+    // Env-only injection: exactly the one key.
+    assert_eq!(
+        launch.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+        Some(expected_tui_config.as_str())
+    );
+    assert_eq!(launch.env.len(), 1);
 }
 
 /// G-O2 — opencode, fresh, no model, `GEMINI_API_KEY=k1` (env-key default
 /// model + GOOGLE_GENERATIVE_AI_API_KEY override).
 #[test]
 fn g_o2_opencode_gemini_key_default_model_and_env_override() {
-    let launch = resolve_coding_cli_command(
-        &specs(),
-        &opencode_inputs(),
-        &env_of(&[("GEMINI_API_KEY", "k1")]),
-    )
-    .unwrap()
-    .unwrap();
+    let expected_tui_config = golden_rebind_tui_config();
+    let mut inputs = opencode_inputs();
+    inputs.opencode_rebind_tui_config = Some(expected_tui_config.clone());
+    let launch =
+        resolve_coding_cli_command(&specs(), &inputs, &env_of(&[("GEMINI_API_KEY", "k1")]))
+            .unwrap()
+            .unwrap();
     assert_eq!(
         launch.args,
         vec![
@@ -430,39 +453,66 @@ fn g_o2_opencode_gemini_key_default_model_and_env_override() {
             .map(String::as_str),
         Some("k1")
     );
+    // The rebind injection coexists with the opencode env overrides.
+    assert_eq!(
+        launch.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+        Some(expected_tui_config.as_str())
+    );
 }
 
-/// Opencode env-key default fallbacks: OPENAI, ANTHROPIC, none.
+/// Opencode env-key default fallbacks: OPENAI, ANTHROPIC, none. Every case
+/// also carries the rebind injection (the env-only key never affects argv).
 #[test]
 fn opencode_env_key_model_fallbacks() {
+    let expected_tui_config = golden_rebind_tui_config();
+    let inputs_with_rebind = || {
+        let mut inputs = opencode_inputs();
+        inputs.opencode_rebind_tui_config = Some(expected_tui_config.clone());
+        inputs
+    };
     let l1 = resolve_coding_cli_command(
         &specs(),
-        &opencode_inputs(),
+        &inputs_with_rebind(),
         &env_of(&[("OPENAI_API_KEY", "x")]),
     )
     .unwrap()
     .unwrap();
     assert!(l1.args.contains(&"openai/gpt-5".to_string()));
+    assert_eq!(
+        l1.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+        Some(expected_tui_config.as_str())
+    );
     let l2 = resolve_coding_cli_command(
         &specs(),
-        &opencode_inputs(),
+        &inputs_with_rebind(),
         &env_of(&[("ANTHROPIC_API_KEY", "x")]),
     )
     .unwrap()
     .unwrap();
     assert!(l2.args.contains(&"anthropic/claude-sonnet-4-5".to_string()));
-    let l3 = resolve_coding_cli_command(&specs(), &opencode_inputs(), &env_of(&[]))
+    assert_eq!(
+        l2.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+        Some(expected_tui_config.as_str())
+    );
+    let l3 = resolve_coding_cli_command(&specs(), &inputs_with_rebind(), &env_of(&[]))
         .unwrap()
         .unwrap();
     assert_eq!(l3.args, s(&["--hostname", "127.0.0.1", "--port", "51234"]));
+    assert_eq!(
+        l3.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+        Some(expected_tui_config.as_str())
+    );
 }
 
-/// G-O3 — opencode, resume: model suppressed even when configured.
+/// G-O3 — opencode, resume: model suppressed even when configured. Rebind
+/// injection applies to resumes/restores identically (env-only).
 #[test]
 fn g_o3_opencode_resume_suppresses_model() {
+    let expected_tui_config = golden_rebind_tui_config();
     let mut inputs = opencode_inputs();
     inputs.resume_session_id = Some("ses_abc");
     inputs.model = Some("openai/gpt-5");
+    inputs.opencode_rebind_tui_config = Some(expected_tui_config.clone());
     let launch = resolve_coding_cli_command(&specs(), &inputs, &env_of(&[("OPENAI_API_KEY", "x")]))
         .unwrap()
         .unwrap();
@@ -477,6 +527,62 @@ fn g_o3_opencode_resume_suppresses_model() {
             "ses_abc".to_string(),
         ]
     );
+    assert_eq!(
+        launch.env.get("OPENCODE_TUI_CONFIG").map(String::as_str),
+        Some(expected_tui_config.as_str())
+    );
+}
+
+/// Rebind skip (a) — the user already set `OPENCODE_TUI_CONFIG` in the
+/// process env: a path var cannot be merged, so the resolver must NOT
+/// inject at all (the user's raw process-env value passes through to the
+/// PTY untouched; no freshell files are forced on the pane).
+#[test]
+fn opencode_rebind_skips_when_user_tui_config_set() {
+    let mut inputs = opencode_inputs();
+    inputs.opencode_rebind_tui_config = Some(golden_rebind_tui_config());
+    let launch = resolve_coding_cli_command(
+        &specs(),
+        &inputs,
+        &env_of(&[("OPENCODE_TUI_CONFIG", "/their/tui.json")]),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!launch.env.contains_key("OPENCODE_TUI_CONFIG"));
+}
+
+/// Rebind skip (b) — the `FRESHELL_OPENCODE_REBIND` kill switch set to `0`
+/// or `false` in the merged env skips injection (inverted
+/// `merged_env_truthy`-style semantics; opencode self-updates in place, so
+/// one env var + a pane restart disables the feature without a release).
+#[test]
+fn opencode_rebind_kill_switch_skips_injection() {
+    for value in ["0", "false"] {
+        let mut inputs = opencode_inputs();
+        inputs.opencode_rebind_tui_config = Some(golden_rebind_tui_config());
+        let launch = resolve_coding_cli_command(
+            &specs(),
+            &inputs,
+            &env_of(&[("FRESHELL_OPENCODE_REBIND", value)]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !launch.env.contains_key("OPENCODE_TUI_CONFIG"),
+            "kill switch value: {value}"
+        );
+    }
+}
+
+/// Rebind skip (c) — no precomputed install: the IO layer passes `None`
+/// (unresolvable home or install failure) and the resolver injects nothing.
+#[test]
+fn opencode_rebind_none_input_skips_injection() {
+    let inputs = opencode_inputs(); // opencode_rebind_tui_config: None
+    let launch = resolve_coding_cli_command(&specs(), &inputs, &env_of(&[]))
+        .unwrap()
+        .unwrap();
+    assert!(!launch.env.contains_key("OPENCODE_TUI_CONFIG"));
 }
 
 /// G-O4 — opencode error goldens: missing/invalid endpoint.
@@ -686,6 +792,7 @@ fn amplifier_inputs<'a>(resume_session_id: Option<&'a str>) -> CliLaunchInputs<'
         codex_remote_ws_url: None,
         opencode_server: None,
         mcp_injection: McpInjection::default(),
+        opencode_rebind_tui_config: None,
     }
 }
 
