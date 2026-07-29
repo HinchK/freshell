@@ -701,6 +701,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
     registry.kill(&tid2);
     registry.kill(&tid3);
     registry.kill(&tid4);
+    registry.kill(&tid6);
     let _ = std::fs::remove_dir_all(&signal_root);
     std::env::remove_var("CLAUDE_ARGV_CAPTURE_PATH");
     std::env::remove_var("CLAUDE_CMD");
