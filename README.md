@@ -32,7 +32,7 @@
 - **AI-powered session titles** — Right-click any session and generate a Gemini-powered title based on conversation content
 - **Progressive sidebar search** — Two-phase search with instant local results followed by deep server-side content search
 - **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
-- **Stream Deck** — Drive freshell from an Elgato Stream Deck: tabs on keys with live previews and status rings, press to focus, long-press to approve or stop agents. See [Stream Deck](#stream-deck).
+- **Stream Deck** — Drive freshell from an Elgato Stream Deck: tabs on keys with repo icons and status backgrounds (or classic live previews and status rings), press to focus, long-press to approve or stop agents. See [Stream Deck](#stream-deck).
 
 ## Quick Start
 
@@ -67,7 +67,7 @@ npm run serve   # Production build and run
 
 ## Stream Deck
 
-Freshell can drive an Elgato Stream Deck straight from the browser. Each key shows a tab — title, live terminal preview, and a status ring (busy, needs attention, waiting for approval). Press a key to focus that tab; long-press (500 ms) to open an action layer with BACK / APPROVE / STOP keys (it closes itself after 10 s). When you have more tabs than keys, the last key pages through them (wrapping around). On a Stream Deck +, the dials cycle tabs and flip pages and the touch strip shows the active tab. The deck dims after a configurable idle timeout and wakes on activity.
+Freshell can drive an Elgato Stream Deck straight from the browser. Each key shows a tab — by default the **Status icons** style: title on top, centered repo icons, and a status background (green for tabs that want attention), with keys sorted so attention-seeking tabs come first. Press a key to focus that tab; long-press (500 ms) to open an action layer with BACK / APPROVE / STOP keys (it closes itself after 10 s). When you have more tabs than keys, the last key pages through them (wrapping around). On a Stream Deck +, the dials cycle tabs and flip pages and the touch strip shows the active tab plus busy/waiting counts (waiting = tabs that finished a turn or are waiting for approval). The deck dims after a configurable idle timeout and wakes on activity.
 
 **Requirements**
 
@@ -77,6 +77,8 @@ Freshell can drive an Elgato Stream Deck straight from the browser. Each key sho
 **Connecting:** Settings → Stream Deck → turn on **Enable Stream Deck**, click **Connect Stream Deck**, and pick the device in the browser prompt. After that first grant, freshell reconnects automatically — including after unplug/replug and page reloads. Deck settings are stored in the browser (localStorage), so they are per browser profile, not per freshell server.
 
 **Virtual deck:** Settings → Stream Deck → **Show virtual deck** opens an on-screen deck panel that mirrors the keys. It works without any hardware — and in browsers without WebHID.
+
+**Tile style:** Settings → Stream Deck → **Tile style** switches between **Status icons** (the default, described above) and **Terminal previews** — the classic look with a title banner, a live mini terminal preview on each key, and colored status rings (blue busy, green needs-attention, amber waiting for approval), with keys in plain tab-bar order. Switching takes effect immediately, on the hardware deck and the virtual deck alike.
 
 **Linux device permissions (udev):** hidraw device nodes default to root-only, so the browser cannot open the deck until you grant access to the Elgato vendor id (`0fd9`):
 

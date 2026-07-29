@@ -16,6 +16,8 @@ import amplifierActivityReducer from '@/store/amplifierActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import settingsReducer from '@/store/settingsSlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
+import repoIconsReducer from '@/store/repoIconsSlice'
 import deckReducer, { setVirtualDeckOpen } from '@/store/deckSlice'
 import VirtualDeckPanel from '@/components/VirtualDeckPanel'
 
@@ -24,7 +26,8 @@ const reducer = {
   freshAgent: freshAgentReducer, codexActivity: codexActivityReducer,
   claudeActivity: claudeActivityReducer, amplifierActivity: amplifierActivityReducer,
   opencodeActivity: opencodeActivityReducer, paneRuntimeActivity: paneRuntimeActivityReducer,
-  settings: settingsReducer, deck: deckReducer,
+  settings: settingsReducer, terminalMeta: terminalMetaReducer, repoIcons: repoIconsReducer,
+  deck: deckReducer,
 }
 
 // Mirrors the Task 3 fixture builder with two seeded tabs: tabs t1/t2, terminal

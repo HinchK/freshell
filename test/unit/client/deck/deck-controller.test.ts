@@ -4,7 +4,7 @@ const sendMock = vi.fn()
 vi.mock('@/lib/ws-client', () => ({ getWsClient: () => ({ send: sendMock }) }))
 
 import { configureStore } from '@reduxjs/toolkit'
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { closeTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import turnCompletionReducer, { markTabAttention } from '@/store/turnCompletionSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
@@ -13,11 +13,16 @@ import claudeActivityReducer from '@/store/claudeActivitySlice'
 import amplifierActivityReducer from '@/store/amplifierActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
+import terminalMetaReducer, { upsertTerminalMeta } from '@/store/terminalMetaSlice'
+import repoIconsReducer, { type RepoIconEntry } from '@/store/repoIconsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import type { DeckTileStyle } from '@shared/settings'
+import { registerTerminalTextReader, resetTerminalTextRegistryForTests } from '@/deck/terminal-text-registry'
 import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
-import { DeckController } from '@/deck/deck-controller'
+import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
+import { IconImageCache } from '@/deck/icon-image-cache'
 import type { KeySpec } from '@/deck/frame'
 
 const reducer = {
@@ -25,7 +30,7 @@ const reducer = {
   freshAgent: freshAgentReducer, codexActivity: codexActivityReducer,
   claudeActivity: claudeActivityReducer, amplifierActivity: amplifierActivityReducer,
   opencodeActivity: opencodeActivityReducer, paneRuntimeActivity: paneRuntimeActivityReducer,
-  settings: settingsReducer,
+  settings: settingsReducer, terminalMeta: terminalMetaReducer, repoIcons: repoIconsReducer,
 }
 
 const s1Key = makeFreshAgentSessionKey({ sessionType: 'freshclaude', provider: 'claude', sessionId: 's1' })
@@ -37,6 +42,19 @@ type StoreOpts = {
   freshAgentTab?: boolean // makes t2 a fresh-agent pane bound to session s1
   pendingPermissions?: Record<string, { requestId: string }>
   freshAgentRunning?: boolean
+  /** Seed state.terminalMeta.byTerminalId (terminalId/updatedAt filled in). */
+  terminalMeta?: Record<string, { cwd?: string; repoRoot?: string; checkoutRoot?: string }>
+  /** Seed state.repoIcons.byCwd. */
+  repoIcons?: Record<string, RepoIconEntry>
+  /** Dispatch updateSettingsLocal({ panes: { repoIconsOnTabs } }) BEFORE the controller starts. */
+  repoIconsOnTabs?: boolean
+  /**
+   * Tile style. Seeds BOTH the store settings (selectDeckModel reads
+   * state.settings.settings.streamDeck.tileStyle) and the controller's
+   * settings() thunk (tick gating) - production call sites pass the whole
+   * streamDeck settings object, so the two are always consistent there.
+   */
+  tileStyle?: DeckTileStyle
 }
 
 // Mirrors the Task 3 fixture builder, parameterized by tab count: tabs t1..tN,
@@ -59,9 +77,19 @@ function makeStore(opts: StoreOpts = {}) {
     }
     activePane[`t${i}`] = `p${i}`
   }
-  return configureStore({
+  const store = configureStore({
     reducer,
     preloadedState: {
+      ...(opts.terminalMeta
+        ? {
+            terminalMeta: {
+              byTerminalId: Object.fromEntries(Object.entries(opts.terminalMeta).map(
+                ([terminalId, meta]) => [terminalId, { terminalId, updatedAt: 0, ...meta }],
+              )),
+            },
+          }
+        : {}),
+      ...(opts.repoIcons ? { repoIcons: { byCwd: opts.repoIcons } } : {}),
       tabs: { tabs, activeTabId: 't1', renameRequestTabId: null, tombstones: [] },
       panes: {
         layouts, activePane,
@@ -87,6 +115,15 @@ function makeStore(opts: StoreOpts = {}) {
       },
     } as never,
   })
+  if (opts.repoIconsOnTabs !== undefined) {
+    // Precedent: deck-manager.test.ts:128 — the value must be in place BEFORE
+    // setup() constructs and starts the controller.
+    store.dispatch(updateSettingsLocal({ panes: { repoIconsOnTabs: opts.repoIconsOnTabs } }))
+  }
+  if (opts.tileStyle !== undefined) {
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: opts.tileStyle } }))
+  }
+  return store
 }
 
 // Spec-recording renderer: encodes the KeySpec JSON into the pixel buffer so
@@ -102,11 +139,19 @@ function decodeStrip(device: FakeDeckDevice): string | null {
   return device.stripImage ? new TextDecoder().decode(device.stripImage.rgba as unknown as Uint8Array) : null
 }
 
-const settings = () => ({ brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300 })
+// Deferred loader as in icon-image-cache.test.ts: resolve/reject each url by hand.
+function deferredLoader() {
+  const pending = new Map<string, { resolve: (b: CanvasImageSource) => void; reject: (e: Error) => void }>()
+  const loader = (url: string) =>
+    new Promise<CanvasImageSource>((resolve, reject) => pending.set(url, { resolve, reject }))
+  return { loader, pending }
+}
+
+const settings = () => ({ brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300, tileStyle: 'status-icons' as const })
 
 let activeController: DeckController | null = null
 
-function setup(opts: StoreOpts = {}, caps?: DeckCapabilities) {
+function setup(opts: StoreOpts = {}, caps?: DeckCapabilities, extra?: Partial<DeckControllerOptions>) {
   const store = makeStore(opts)
   const device = new FakeDeckDevice(caps)
   const controller = new DeckController({
@@ -114,7 +159,8 @@ function setup(opts: StoreOpts = {}, caps?: DeckCapabilities) {
     device,
     renderKey: (spec) => encodeSpec(spec),
     renderStrip: (text) => new TextEncoder().encode(text) as unknown as Uint8ClampedArray,
-    settings,
+    settings: opts.tileStyle !== undefined ? () => ({ ...settings(), tileStyle: opts.tileStyle! }) : settings,
+    ...extra,
   })
   controller.start()
   activeController = controller
@@ -141,6 +187,7 @@ beforeEach(() => {
 afterEach(() => {
   activeController?.stop()
   activeController = null
+  resetTerminalTextRegistryForTests()
   vi.useRealTimers()
 })
 
@@ -148,7 +195,7 @@ describe('DeckController', () => {
   it('paints tab tiles in tab order with active ring and asserts brightness on start', () => {
     const { device } = setup()
     expect(device.brightnessHistory[0]).toBe(100)
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', title: 'tab1', active: true, ring: null })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', title: 'tab1', active: true })
     expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', title: 'tab2', active: false })
     expect(decodeKey(device, 2)).toEqual({ kind: 'empty' })
     expect(decodeKey(device, 5)).toEqual({ kind: 'empty' })
@@ -156,19 +203,62 @@ describe('DeckController', () => {
 
   it('short press focuses the tab in the browser and dismisses green', () => {
     const { store, device } = setup({ attention: { t2: true } })
-    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', ring: 'green', active: false })
-    shortPress(device, 1)
+    // t2 has attention (priority 1) so it sorts ahead of green-icon t1 -> key 0
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't2', fill: 'green', active: false })
+    shortPress(device, 0)
     const state = store.getState()
     expect(state.tabs.activeTabId).toBe('t2')
     expect(state.turnCompletion.attentionByTab.t2).toBeFalsy()
-    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', active: true, ring: null })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', active: true, fill: 'none' })
+  })
+
+  it('acts on the tab displayed at press-down even if the sort changes mid-press', () => {
+    // t1 greenIcon (key 0), t2 greenIcon (key 1); active tab defaults to t1.
+    const { store, device } = setup({ tabCount: 2 })
+    device.emit({ type: 'keyDown', keyIndex: 1 }) // user is pressing "t2"
+    // Mid-press: t2 gains attention -> re-sort moves t2 to key 0; key 1 now shows t1.
+    store.dispatch(markTabAttention({ tabId: 't2' }))
+    // Sanity: the RED gate is armed - attention actually set, re-sort actually happened.
+    expect(store.getState().turnCompletion.attentionByTab.t2).toBe(true)
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't2' })
+    vi.advanceTimersByTime(100)
+    device.emit({ type: 'keyUp', keyIndex: 1 })
+    // Snapshot guard: the press focuses t2 (what the user saw), not t1 (what the slot shows now)
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+  })
+
+  it('press on a tab that was closed mid-press is a no-op', () => {
+    const { store, device } = setup({ tabCount: 2 })
+    device.emit({ type: 'keyDown', keyIndex: 1 })
+    store.dispatch(closeTab('t2'))
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1']) // t2 really gone mid-press
+    vi.advanceTimersByTime(100)
+    device.emit({ type: 'keyUp', keyIndex: 1 })
+    expect(store.getState().tabs.activeTabId).toBe('t1')
+  })
+
+  it('long-press opens the action layer for the press-down tab despite a mid-press re-sort', () => {
+    // t2 is a fresh-agent pane with pending permission r1 -> APPROVE is enabled only
+    // if the action layer targets t2; t1 is a plain terminal (approve target null).
+    const { store, device } = setup({ tabCount: 2, freshAgentTab: true, pendingPermissions: { r1: { requestId: 'r1' } } })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2' }) // pre-press: t2 on key 1
+    device.emit({ type: 'keyDown', keyIndex: 1 })
+    store.dispatch(markTabAttention({ tabId: 't2' }))
+    // Sanity: the RED gate is armed - attention set, mid-press re-sort moved t2 to key 0.
+    expect(store.getState().turnCompletion.attentionByTab.t2).toBe(true)
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't2' })
+    vi.advanceTimersByTime(600)
+    device.emit({ type: 'keyUp', keyIndex: 1 })
+    // Action layer opened, targeting the press-down tab t2 (approve enabled via r1)
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'action', action: 'back' })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'action', action: 'approve', enabled: true })
   })
 
   it('store changes repaint only changed keys', () => {
     const { store, device } = setup()
     device.keyImages.clear()
     store.dispatch(markTabAttention({ tabId: 't1' }))
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', ring: 'green' })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', fill: 'barTop' })
     expect(device.keyImages.has(1)).toBe(false)
     expect(device.keyImages.has(2)).toBe(false)
   })
@@ -229,13 +319,14 @@ describe('DeckController', () => {
 
   it('STOP on a busy terminal sends ESC, then Ctrl+C within 5s', () => {
     const { device } = setup({ claudeBusy: true })
-    longPress(device, 0)
+    // busy t1 (priority 3) sorts after green-icon t2 -> t1 lands on key 1
+    longPress(device, 1)
     expect(decodeKey(device, 2)).toEqual({ kind: 'action', action: 'stop', enabled: true })
     device.press(2)
     expect(sendMock.mock.calls[0][0]).toMatchObject({ type: 'terminal.input', terminalId: 'term-1', data: '\x1b' })
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab' })
     // second stop within the 5s escalation window -> Ctrl+C
-    longPress(device, 0)
+    longPress(device, 1)
     device.press(2)
     expect(sendMock.mock.calls[1][0]).toMatchObject({ type: 'terminal.input', terminalId: 'term-1', data: '\x03' })
   })
@@ -284,5 +375,85 @@ describe('DeckController', () => {
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1' })
     device.emit({ type: 'dialPress', dialIndex: 0 })
     expect(store.getState().tabs.activeTabId).toBe('t10') // re-focus current active tab
+  })
+
+  it('repaints keys when an icon bitmap finishes loading (cache subscription)', async () => {
+    // Deferred loader as in icon-image-cache.test.ts
+    const { loader, pending } = deferredLoader()
+    const cache = new IconImageCache(loader)
+    const { device } = setup({
+      tabCount: 1,
+      terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
+      repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
+    }, undefined, { iconCache: cache })
+    const before = decodeKey(device, 0)!
+    expect(before.kind === 'tab' && before.icons[0].ready).toBe(false)
+    pending.get(before.kind === 'tab' ? before.icons[0].url! : '')!.resolve({} as CanvasImageSource)
+    await vi.advanceTimersByTimeAsync(0) // flush the load microtask under fake timers
+    const after = decodeKey(device, 0)!
+    expect(after.kind === 'tab' && after.icons[0].ready).toBe(true)
+  })
+
+  it('status-icons style: 3s of ticks paints nothing even when terminal text changes', () => {
+    // A CHANGING reader is what makes this RED if polling leaks into the new style.
+    let n = 0
+    const unregister = registerTerminalTextReader('term-1', () => [`line ${n++}`])
+    const { device } = setup({ tabCount: 1 })
+    device.keyImages.clear()
+    vi.advanceTimersByTime(3_000)
+    expect(device.keyImages.size).toBe(0)
+    unregister()
+  })
+
+  it('terminal-previews style: changing terminal text repaints within PREVIEW_REFRESH_TICKS', () => {
+    let n = 0
+    const unregister = registerTerminalTextReader('term-1', () => [`line ${n++}`])
+    const { device } = setup({ tabCount: 1, tileStyle: 'terminal-previews' })
+    device.keyImages.clear()
+    vi.advanceTimersByTime(3_000)
+    expect(device.keyImages.size).toBeGreaterThan(0)
+    unregister()
+  })
+
+  it('terminal-previews style: static terminal text does not repaint on ticks', () => {
+    const unregister = registerTerminalTextReader('term-1', () => ['same line'])
+    const { device } = setup({ tabCount: 1, tileStyle: 'terminal-previews' })
+    device.keyImages.clear()
+    vi.advanceTimersByTime(3_000)
+    expect(device.keyImages.size).toBe(0) // spec JSON unchanged -> per-key diff skips
+    unregister()
+  })
+
+  it('dispatches fetchRepoIconMeta for tab cwds even when settings.panes.repoIconsOnTabs is false (deck owns the probe)', () => {
+    // No repoIcons seeded: the controller itself must probe /repos/alpha. TabBar cannot be
+    // relied on (its probe is gated on repoIconsOnTabs and TabBar is conditionally mounted).
+    const { store } = setup({
+      tabCount: 1,
+      terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
+      repoIconsOnTabs: false,
+    })
+    // The thunk's pending case records { status: 'loading' } synchronously on dispatch.
+    expect(store.getState().repoIcons.byCwd['/repos/alpha']).toMatchObject({ status: 'loading' })
+  })
+
+  it('does not re-probe a cwd already present in state.repoIcons.byCwd', () => {
+    const { store } = setup({
+      tabCount: 1,
+      terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
+      repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
+    })
+    expect(store.getState().repoIcons.byCwd['/repos/alpha'].status).toBe('ready') // untouched, no 'loading' overwrite
+  })
+
+  it('probes a cwd that only becomes resolvable AFTER start (late terminalMeta, model JSON unchanged)', () => {
+    // Fixture panes have no initialCwd, so nothing is resolvable at start(). A later
+    // upsertTerminalMeta makes term-1's cwd resolvable but does NOT change the deck
+    // model JSON (icons stay [] until meta AND repoIcons both exist), so this test
+    // proves the probe runs BEFORE onStoreChange's model-JSON bail-out - the exact
+    // TabBar-less leader scenario the deck-owned probe exists for.
+    const { store } = setup({ tabCount: 1 }) // no terminalMeta seeded
+    expect(store.getState().repoIcons.byCwd['/repos/alpha']).toBeUndefined()
+    store.dispatch(upsertTerminalMeta([{ terminalId: 'term-1', cwd: '/repos/alpha', updatedAt: Date.now() }]))
+    expect(store.getState().repoIcons.byCwd['/repos/alpha']).toMatchObject({ status: 'loading' })
   })
 })

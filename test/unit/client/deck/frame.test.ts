@@ -1,19 +1,25 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { MINI_CAPS, PLUS_CAPS } from '@/deck/fake-deck-device'
 import {
   ACTION_KEYS, buildFrame, clampPage, pageCount, planLayout, ringColor, stripText, visibleTabs,
 } from '@/deck/frame'
-import type { DeckModel } from '@/deck/deck-selectors'
+import type { DeckModel, DeckTab } from '@/deck/deck-selectors'
 
-const quiet = { busy: false, green: false, amber: false }
+function makeDeckTab(over: Partial<DeckTab> & Pick<DeckTab, 'id' | 'title'>): DeckTab {
+  return {
+    active: false, busy: false, attention: false, pendingApproval: false, fill: 'none', dot: null,
+    priority: 4, repoIcons: [], ...over,
+  }
+}
 function model(n: number, activeId = 'tab-0'): DeckModel {
   return {
     activeTabId: activeId,
-    tabs: Array.from({ length: n }, (_, i) => ({
-      id: `tab-${i}`, title: `Tab ${i}`, active: `tab-${i}` === activeId, status: { ...quiet },
-    })),
+    tileStyle: 'status-icons',
+    tabs: Array.from({ length: n }, (_, i) =>
+      makeDeckTab({ id: `tab-${i}`, title: `Tab ${i}`, active: `tab-${i}` === activeId })),
   }
 }
+const noIcon = () => false
 const noPreview = () => []
 
 describe('planLayout', () => {
@@ -47,6 +53,71 @@ describe('page math', () => {
   })
 })
 
+describe('buildFrame', () => {
+  it('tabs fit: all tab tiles, active flag set, rest empty', () => {
+    const frame = buildFrame({ model: model(3), caps: MINI_CAPS, page: 1, actionLayer: null, iconReady: noIcon, previewFor: noPreview })
+    expect(frame.keys).toHaveLength(6)
+    expect(frame.keys[0]).toMatchObject({ kind: 'tab', tabId: 'tab-0', title: 'Tab 0', active: true })
+    expect(frame.keys[2]).toMatchObject({ kind: 'tab', tabId: 'tab-2', active: false })
+    expect(frame.keys[3]).toEqual({ kind: 'empty' })
+    expect(frame.strip).toBeNull()
+  })
+  it('overflow: pager key at 5 with page/pageCount; page 2 shows the tail', () => {
+    const f1 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 1, actionLayer: null, iconReady: noIcon, previewFor: noPreview })
+    expect(f1.keys[5]).toEqual({ kind: 'pager', page: 1, pageCount: 2 })
+    expect((f1.keys[0] as { tabId: string }).tabId).toBe('tab-0')
+    const f2 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 2, actionLayer: null, iconReady: noIcon, previewFor: noPreview })
+    expect((f2.keys[0] as { tabId: string }).tabId).toBe('tab-5')
+    expect(f2.keys[3]).toEqual({ kind: 'empty' })
+    expect(f2.keys[5]).toEqual({ kind: 'pager', page: 2, pageCount: 2 })
+  })
+  it('action layer replaces the frame', () => {
+    const frame = buildFrame({
+      model: model(3), caps: MINI_CAPS, page: 1,
+      actionLayer: { tabId: 'tab-1', approveEnabled: false, stopEnabled: true }, iconReady: noIcon, previewFor: noPreview,
+    })
+    expect(frame.keys[ACTION_KEYS.back]).toEqual({ kind: 'action', action: 'back', enabled: true })
+    expect(frame.keys[ACTION_KEYS.approve]).toEqual({ kind: 'action', action: 'approve', enabled: false })
+    expect(frame.keys[ACTION_KEYS.stop]).toEqual({ kind: 'action', action: 'stop', enabled: true })
+    expect(frame.keys[3]).toEqual({ kind: 'empty' })
+  })
+  it('buildFrame carries fill/dot/icons onto tab keys, with iconReady resolving readiness', () => {
+    const model: DeckModel = {
+      activeTabId: 't1',
+      tileStyle: 'status-icons',
+      tabs: [makeDeckTab({
+        id: 't1', title: 'alpha', active: true, fill: 'barTop', dot: 'green',
+        repoIcons: [
+          { url: '/api/repo-icon?cwd=%2Fr%2Fa', letter: 'A', hue: 120 },
+          { url: null, letter: 'B', hue: 200 },
+        ],
+      })],
+    }
+    const frame = buildFrame({
+      model, caps: MINI_CAPS, page: 1, actionLayer: null,
+      iconReady: (url) => url === '/api/repo-icon?cwd=%2Fr%2Fa',
+      previewFor: noPreview,
+    })
+    expect(frame.keys[0]).toMatchObject({
+      kind: 'tab', tabId: 't1', fill: 'barTop', dot: 'green',
+      icons: [
+        { url: '/api/repo-icon?cwd=%2Fr%2Fa', letter: 'A', hue: 120, ready: true },
+        { url: null, letter: 'B', hue: 200, ready: false },
+      ],
+    })
+  })
+  it('full mode fills the strip and never emits a pager', () => {
+    const m = model(10)
+    m.tabs[1].busy = true
+    m.tabs[2].attention = true
+    const frame = buildFrame({ model: m, caps: PLUS_CAPS, page: 1, actionLayer: null, iconReady: noIcon, previewFor: noPreview })
+    expect(frame.keys.every((k) => k.kind !== 'pager')).toBe(true)
+    expect(frame.strip).toEqual({ text: 'Tab 0  |  page 1/2  |  1 busy  1 waiting' })
+  })
+})
+
+const quiet = { busy: false, green: false, amber: false }
+
 describe('ringColor priority', () => {
   it('amber > green > blue > none', () => {
     expect(ringColor({ busy: true, green: true, amber: true })).toBe('amber')
@@ -56,48 +127,65 @@ describe('ringColor priority', () => {
   })
 })
 
-describe('buildFrame', () => {
-  it('tabs fit: all tab tiles, active flag set, rest empty', () => {
-    const frame = buildFrame({ model: model(3), caps: MINI_CAPS, page: 1, actionLayer: null, previewFor: noPreview })
-    expect(frame.keys).toHaveLength(6)
-    expect(frame.keys[0]).toMatchObject({ kind: 'tab', tabId: 'tab-0', title: 'Tab 0', active: true })
-    expect(frame.keys[2]).toMatchObject({ kind: 'tab', tabId: 'tab-2', active: false })
-    expect(frame.keys[3]).toEqual({ kind: 'empty' })
-    expect(frame.strip).toBeNull()
+describe('buildFrame tile styles', () => {
+  it('status-icons model yields icons-style tab specs and never calls previewFor', () => {
+    const previewFor = vi.fn(() => ['nope'])
+    const frame = buildFrame({ model: model(2), caps: MINI_CAPS, page: 1, actionLayer: null, iconReady: noIcon, previewFor })
+    expect(frame.keys[0]).toMatchObject({ kind: 'tab', style: 'icons' })
+    expect(previewFor).not.toHaveBeenCalled()
   })
-  it('overflow: pager key at 5 with page/pageCount; page 2 shows the tail', () => {
-    const f1 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 1, actionLayer: null, previewFor: noPreview })
-    expect(f1.keys[5]).toEqual({ kind: 'pager', page: 1, pageCount: 2 })
-    expect((f1.keys[0] as { tabId: string }).tabId).toBe('tab-0')
-    const f2 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 2, actionLayer: null, previewFor: noPreview })
-    expect((f2.keys[0] as { tabId: string }).tabId).toBe('tab-5')
-    expect(f2.keys[3]).toEqual({ kind: 'empty' })
-    expect(f2.keys[5]).toEqual({ kind: 'pager', page: 2, pageCount: 2 })
-  })
-  it('action layer replaces the frame', () => {
+
+  it('terminal-previews model yields preview-style specs with lines and ring', () => {
+    const m = model(2)
+    m.tileStyle = 'terminal-previews'
+    m.tabs[0].busy = true
+    m.tabs[1].pendingApproval = true
     const frame = buildFrame({
-      model: model(3), caps: MINI_CAPS, page: 1,
-      actionLayer: { tabId: 'tab-1', approveEnabled: false, stopEnabled: true }, previewFor: noPreview,
+      model: m, caps: MINI_CAPS, page: 1, actionLayer: null, iconReady: noIcon,
+      previewFor: (tabId) => [`preview of ${tabId}`],
     })
-    expect(frame.keys[ACTION_KEYS.back]).toEqual({ kind: 'action', action: 'back', enabled: true })
-    expect(frame.keys[ACTION_KEYS.approve]).toEqual({ kind: 'action', action: 'approve', enabled: false })
-    expect(frame.keys[ACTION_KEYS.stop]).toEqual({ kind: 'action', action: 'stop', enabled: true })
-    expect(frame.keys[3]).toEqual({ kind: 'empty' })
-  })
-  it('full mode fills the strip and never emits a pager', () => {
-    const m = model(10)
-    m.tabs[1].status.busy = true
-    m.tabs[2].status.amber = true
-    const frame = buildFrame({ model: m, caps: PLUS_CAPS, page: 1, actionLayer: null, previewFor: noPreview })
-    expect(frame.keys.every((k) => k.kind !== 'pager')).toBe(true)
-    expect(frame.strip).toEqual({ text: 'Tab 0  |  page 1/2  |  1 busy  1 waiting' })
+    expect(frame.keys[0]).toMatchObject({
+      kind: 'tab', style: 'preview', previewLines: ['preview of tab-0'], ring: 'blue',
+    })
+    expect(frame.keys[1]).toMatchObject({ kind: 'tab', style: 'preview', ring: 'amber' })
   })
 })
 
 describe('stripText', () => {
   it('uses - for no active tab and forces ASCII', () => {
     expect(stripText({ tabs: [] }, 1, 1)).toBe('-  |  page 1/1  |  0 busy  0 waiting')
-    expect(stripText({ tabs: [{ title: 'café', active: true, status: { busy: false, amber: false } }] }, 1, 1))
+    expect(stripText({ tabs: [{ title: 'café', active: true, busy: false, attention: false }] }, 1, 1))
       .toBe('caf?  |  page 1/1  |  0 busy  0 waiting')
+  })
+  it('stripText counts busy and waiting from tab flags', () => {
+    const model = {
+      activeTabId: 't1',
+      tabs: [
+        makeDeckTab({ id: 't1', title: 'alpha', active: true, busy: true }),
+        makeDeckTab({ id: 't2', title: 'beta', attention: true }),
+        makeDeckTab({ id: 't3', title: 'gamma' }),
+      ],
+    }
+    expect(stripText(model, 1, 1)).toContain('1 busy  1 waiting')
+  })
+
+  it('stripText counts a pending-approval tab as waiting', () => {
+    const m = model(3)
+    m.tabs[1].pendingApproval = true
+    expect(stripText(m, 1, 1)).toContain('1 waiting')
+  })
+
+  it('stripText counts waiting as the union of attention and pending approval', () => {
+    const m = model(3)
+    m.tabs[0].attention = true
+    m.tabs[1].pendingApproval = true
+    expect(stripText(m, 1, 1)).toContain('2 waiting')
+  })
+
+  it('a tab that both needs attention and awaits approval counts once', () => {
+    const m = model(2)
+    m.tabs[0].attention = true
+    m.tabs[0].pendingApproval = true
+    expect(stripText(m, 1, 1)).toContain('1 waiting')
   })
 })

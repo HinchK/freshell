@@ -11,6 +11,8 @@ import claudeActivityReducer from '@/store/claudeActivitySlice'
 import amplifierActivityReducer from '@/store/amplifierActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
+import repoIconsReducer from '@/store/repoIconsSlice'
 import { FakeDeckDevice } from '@/deck/fake-deck-device'
 import { DeckOpenError } from '@/deck/webhid-transport'
 import {
@@ -92,6 +94,11 @@ function makeStore() {
       amplifierActivity: amplifierActivityReducer,
       opencodeActivity: opencodeActivityReducer,
       paneRuntimeActivity: paneRuntimeActivityReducer,
+      // The real controller's probeRepoIcons() dereferences these slices even
+      // with zero tabs; without the reducers every test that reaches start()
+      // would die in a swallowed TypeError and never report 'connected'.
+      terminalMeta: terminalMetaReducer,
+      repoIcons: repoIconsReducer,
     },
   })
 }
