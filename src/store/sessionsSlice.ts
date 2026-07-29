@@ -496,6 +496,23 @@ export const sessionsSlice = createSlice({
       if (expanded) state.expandedProjects.add(projectPath)
       else state.expandedProjects.delete(projectPath)
     },
+    removeSessionFromProjects: (state, action: PayloadAction<{ provider?: string; sessionId: string }>) => {
+      const key = sessionKey(action.payload)
+      const removeFrom = (projects: ProjectGroup[]) =>
+        projects
+          .map((project) => ({
+            ...project,
+            sessions: (project.sessions || []).filter((s) => sessionKey(s) !== key),
+          }))
+          .filter((project) => project.sessions.length > 0)
+      state.projects = removeFrom(state.projects || [])
+      if (state.windows) {
+        for (const window of Object.values(state.windows)) {
+          if (!window) continue
+          window.projects = removeFrom(window.projects || [])
+        }
+      }
+    },
   },
 })
 
@@ -518,6 +535,7 @@ export const {
   setLoadingMore,
   toggleProjectExpanded,
   setProjectExpanded,
+  removeSessionFromProjects,
 } =
   sessionsSlice.actions
 

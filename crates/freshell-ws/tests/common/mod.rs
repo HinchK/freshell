@@ -18,6 +18,27 @@ use freshell_ws::WsState;
 
 pub const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
+/// Launcher-assigned amplifier identity (F7/V9): tests that create
+/// amplifier terminals now WRITE stub dirs into the amplifier home.
+/// Isolate eagerly at this choke point so no test ever touches the real
+/// `~/.amplifier`. `set_var` is process-global: use ONE shared value per
+/// test process. Called by [`spawn_server_with_specs`] (the constructor
+/// every existing amplifier-creating ws test flows through — V7) AND
+/// directly by amplifier test files (defense in depth: 17 ws test files
+/// build `WsState` inline and would silently bypass the constructor).
+pub fn isolate_amplifier_home() -> std::path::PathBuf {
+    static AMP_HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    AMP_HOME
+        .get_or_init(|| {
+            let amp_home =
+                std::env::temp_dir().join(format!("freshell-ws-amp-home-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&amp_home);
+            std::env::set_var("FRESHELL_AMPLIFIER_HOME", &amp_home);
+            amp_home
+        })
+        .clone()
+}
+
 pub fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
         "ai": {},
@@ -91,6 +112,8 @@ pub async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
 pub async fn spawn_server_with_specs(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
 ) -> (String, freshell_terminal::TerminalRegistry) {
+    // F7/V9 choke point: BEFORE anything can reach an amplifier create.
+    let _ = isolate_amplifier_home();
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -105,6 +128,7 @@ pub async fn spawn_server_with_specs(
         boot_id: Arc::new("boot-test".to_string()),
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -134,7 +158,6 @@ pub async fn spawn_server_with_specs(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,
@@ -153,6 +176,239 @@ pub async fn spawn_server_with_specs(
     });
 
     (format!("ws://{addr}/ws", addr = addr), registry)
+}
+
+/// [`spawn_server_with_specs`], additionally handing back the receiver half
+/// of `WsState.auto_resume_tx` (Lane D1) so tests can drain the CrashEvents
+/// the PTY exit hook sends — the "take_auto_resume_rx" accessor of this
+/// free-function harness. Identical `WsState` otherwise.
+pub async fn spawn_server_with_specs_and_auto_resume_rx(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    tokio::sync::mpsc::UnboundedReceiver<freshell_ws::auto_resume::CrashEvent>,
+) {
+    let auth_token = Arc::new(AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings =
+        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let (auto_resume_tx, auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx,
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+            ),
+        ),
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(cli_commands),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    };
+
+    let router = freshell_ws::router(state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (
+        format!("ws://{addr}/ws", addr = addr),
+        registry,
+        auto_resume_rx,
+    )
+}
+
+/// [`spawn_server_with_specs`], with the auto-resume hub SPAWNED (Task 5) on
+/// an injected backoff schedule. Delays ride the spawn helper — NOT the
+/// `FRESHELL_AUTO_RESUME_DELAYS_MS` env — because the harness is in-process
+/// and a `std::env::set_var` would leak across parallel tests in the same
+/// binary. Task 2's event tests keep using
+/// [`spawn_server_with_specs_and_auto_resume_rx`] (hub OFF, rx taken by the
+/// test).
+pub async fn spawn_server_with_specs_and_auto_resume_hub(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    delays: Vec<u64>,
+) -> (String, freshell_terminal::TerminalRegistry) {
+    let auth_token = Arc::new(AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings =
+        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let (auto_resume_tx, auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx,
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+            ),
+        ),
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(cli_commands),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    };
+
+    freshell_ws::auto_resume::spawn_auto_resume_hub_with_delays(
+        state.clone(),
+        auto_resume_rx,
+        delays,
+    );
+
+    let router = freshell_ws::router(state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (format!("ws://{addr}/ws", addr = addr), registry)
+}
+
+/// [`spawn_server_with_specs`], additionally handing back a CLONE of the
+/// `WsState` so tests can drive connection-independent server-side seams
+/// directly (Task 4: `respawn_agent_terminal`). Identical `WsState`
+/// otherwise (the state is `Clone`; the router gets its own clone).
+pub async fn spawn_server_with_specs_and_state(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+) -> (String, freshell_terminal::TerminalRegistry, WsState) {
+    let auth_token = Arc::new(AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings =
+        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
+    let registry = freshell_terminal::TerminalRegistry::new();
+
+    let state = WsState {
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+            ),
+        ),
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(cli_commands),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    };
+
+    let router = freshell_ws::router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (format!("ws://{addr}/ws", addr = addr), registry, state)
 }
 
 /// [`spawn_server_with_specs`], with a REAL pane ledger rooted at
@@ -190,6 +446,7 @@ pub async fn spawn_server_with_ledger(
         boot_id: Arc::new("boot-test".to_string()),
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -219,7 +476,6 @@ pub async fn spawn_server_with_ledger(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,
@@ -271,6 +527,7 @@ pub async fn spawn_server_with_specs_and_activity(
         boot_id: Arc::new("boot-test".to_string()),
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -300,7 +557,6 @@ pub async fn spawn_server_with_specs_and_activity(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: Some(activity_hub.clone()),
@@ -351,6 +607,7 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         boot_id: Arc::new("boot-test".to_string()),
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -380,7 +637,6 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: Some(std::sync::Arc::new(
             freshell_sessions::codex_locator::CodexLocator::new(codex_sessions_root.to_path_buf()),
@@ -392,8 +648,7 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
     };
 
     // Mirrors main.rs's sweep wiring; 150 ms is re-declared here because
-    // main.rs's AMPLIFIER_LOCATOR_SWEEP_INTERVAL is private to the server
-    // binary.
+    // main.rs's LOCATOR_SWEEP_INTERVAL is private to the server binary.
     freshell_ws::codex_association::spawn_codex_locator_sweep(
         state.clone(),
         std::time::Duration::from_millis(150),
@@ -430,6 +685,7 @@ pub async fn spawn_server_with_create_protect(
         boot_id: Arc::new("boot-test".to_string()),
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -455,11 +711,17 @@ pub async fn spawn_server_with_create_protect(
         ws_max_payload_bytes: 16 * 1024 * 1024,
         term09: freshell_ws::backpressure::Term09Config::default(),
         create_protect: cfg,
-        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::from_config(&cfg)),
+        // NOTE: SpawnGate::new passes 0 through (no sanitizing) — the
+        // zero-permit test in create_protection.rs depends on this.
+        // (`from_config` stayed behind when the gate moved to
+        // freshell-freshagent; it referenced this crate's CreateProtectConfig.)
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(
+            cfg.spawn_concurrency,
+            cfg.spawn_queue_cap,
+        )),
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,

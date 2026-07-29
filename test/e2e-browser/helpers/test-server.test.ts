@@ -412,3 +412,25 @@ describe('TestServer', () => {
     await expect(fs.stat(defaultHomeDir)).rejects.toThrow()
   })
 })
+
+describe('findFreePort', () => {
+  it('does not reissue a port it recently handed out (injected probe)', async () => {
+    // Simulate the OS returning the same ephemeral port twice in a row --
+    // the intra-process half of the close-then-rebind TOCTOU (kata f3wp).
+    const { findFreePort } = await import('./test-server.js')
+    const sequence = [45001, 45001, 45002]
+    let i = 0
+    const probe = async () => sequence[Math.min(i++, sequence.length - 1)]
+    const first = await findFreePort(probe)
+    const second = await findFreePort(probe)
+    expect(first).toBe(45001)
+    expect(second).toBe(45002)
+  })
+
+  it('throws after exhausting attempts when the probe always repeats', async () => {
+    const { findFreePort } = await import('./test-server.js')
+    const probe = async () => 45100
+    await findFreePort(probe) // issues 45100 once
+    await expect(findFreePort(probe)).rejects.toThrow(/not-recently-issued/)
+  })
+})

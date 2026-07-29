@@ -797,7 +797,10 @@ describe('open tab session sidebar visibility (e2e)', () => {
       expect(screen.getAllByText('Older Open Session').length).toBeGreaterThan(0)
     })
 
-    expect(screen.queryByText('Recent Session')).not.toBeInTheDocument()
+    // Depth-preserving refresh contract (see refreshVisibleSessionWindowSilently):
+    // a silent refresh never shrinks a deeper-than-fresh-page window, so the
+    // previously loaded session is retained alongside the fresh page.
+    expect(screen.getAllByText('Recent Session').length).toBeGreaterThan(0)
     expect(fetchSidebarSessionsSnapshot.mock.calls.length).toBeLessThanOrEqual(2)
   })
 
@@ -1149,7 +1152,8 @@ describe('open tab session sidebar visibility (e2e)', () => {
     )
 
     await screen.findByText('No sessions yet')
-    expect(screen.queryByTestId('sidebar-session-list')).not.toBeInTheDocument()
+    // Container stays mounted with the empty state rendered inside it.
+    expect(within(screen.getByTestId('sidebar-session-list')).getByText('No sessions yet')).toBeInTheDocument()
   })
 
   it('keeps an open Codex session visible when the indexed sidebar row is titleless', async () => {

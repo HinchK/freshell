@@ -211,9 +211,9 @@ async fn gate_at_concurrency_one_never_breaks_a_restore_storm() {
 
 #[tokio::test]
 async fn zero_permit_gate_times_out_create_with_pinned_error_frame() {
-    // spawn_concurrency: 0 => SpawnGate::from_config builds a 0-permit
-    // semaphore (legal: only from_env treats 0 as "fall back to default";
-    // a literal config passes 0 straight through from_config -> new).
+    // spawn_concurrency: 0 => the harness builds a 0-permit semaphore
+    // (legal: only from_env treats 0 as "fall back to default"; the test
+    // harness passes 0 straight through to SpawnGate::new).
     // acquire() can therefore never succeed: a create that consults the
     // gate queues (under the 64-cap) and times out after spawn_timeout_ms.
     //

@@ -1176,5 +1176,24 @@ describe('sidebarSelectors', () => {
         expect(sorted.map((i) => i.id)).toEqual(['2', '1'])
       })
     })
+
+    describe('tie-breaking', () => {
+      it('breaks equal-timestamp ties deterministically by provider + sessionId', () => {
+        const items = [
+          createSessionItem({ id: 'b', sessionId: 'bbb', timestamp: 1000 }),
+          createSessionItem({ id: 'c', sessionId: 'ccc', timestamp: 1000 }),
+          createSessionItem({ id: 'a', sessionId: 'aaa', timestamp: 1000 }),
+        ]
+
+        const activityOrder = sortSessionItems(items, 'activity')
+        const activityReversed = sortSessionItems([...items].reverse(), 'activity')
+        const recencyReversed = sortSessionItems([...items].reverse(), 'recency')
+
+        // Same data in any input order yields the same output order.
+        expect(activityOrder.map((i) => i.sessionId)).toEqual(['aaa', 'bbb', 'ccc'])
+        expect(activityReversed.map((i) => i.sessionId)).toEqual(['aaa', 'bbb', 'ccc'])
+        expect(recencyReversed.map((i) => i.sessionId)).toEqual(['aaa', 'bbb', 'ccc'])
+      })
+    })
   })
 })

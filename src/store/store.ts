@@ -10,7 +10,9 @@ import terminalDirectoryReducer from './terminalDirectorySlice'
 import tabRecencyReducer from './tabRecencySlice'
 
 import turnCompletionReducer from './turnCompletionSlice'
+import terminalLifecycleReducer from './terminalLifecycleSlice'
 import terminalMetaReducer from './terminalMetaSlice'
+import repoIconsReducer from './repoIconsSlice'
 import codexActivityReducer from './codexActivitySlice'
 import claudeActivityReducer from './claudeActivitySlice'
 import amplifierActivityReducer from './amplifierActivitySlice'
@@ -50,7 +52,11 @@ export const store = configureStore({
     tabRecency: tabRecencyReducer,
 
     turnCompletion: turnCompletionReducer,
+    // Ephemeral crash/auto-resume presentation state — never persisted
+    // (persistence is an allowlist in persistMiddleware; do not add this).
+    terminalLifecycle: terminalLifecycleReducer,
     terminalMeta: terminalMetaReducer,
+    repoIcons: repoIconsReducer,
     codexActivity: codexActivityReducer,
     claudeActivity: claudeActivityReducer,
     amplifierActivity: amplifierActivityReducer,

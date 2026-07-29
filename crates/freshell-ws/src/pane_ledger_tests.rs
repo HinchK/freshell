@@ -149,6 +149,17 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // Single-writer guard (V2.md): never two writers on one store. The
     // second locked construction logs a loud ERROR and comes up DISABLED;
     // dropping the holder frees the flock (kernel-released on death too).
+    //
+    // DEFLAKE (f3wp): this test flaked >=4 times under `cargo test
+    // --workspace` load (fossils: /tmp/pane-ledger-test-lock-*-13; history:
+    // docs/plans/2026-07-26-sidebar-registry-sync.md:1192-1207). Every fossil
+    // held a complete durably-written s1.json, so the failure was the THIRD
+    // constructor coming up blind -- and the errno that would name the
+    // mechanism (EWOULDBLOCK: flock genuinely held, vs ENOSPC/EMFILE:
+    // resource pressure, vs a silently-empty load_index) was dropped because
+    // this binary installs no tracing subscriber. Per C1's reasoning we do
+    // NOT retry-mask; instead every assertion below carries the on-disk and
+    // errno evidence needed to diagnose the next occurrence on sight.
     let root = temp_root("lock");
     let holder = PaneLedger::new_locked(Some(root.clone()));
     holder
@@ -160,8 +171,40 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
         .expect("disabled no-op");
     assert!(!loser.ever_bound("claude", "s2"), "loser is disabled");
     drop(holder);
+
+    // Evidence probe 1: the on-disk truth the fossils always showed.
+    let s1_on_disk = root
+        .join("bindings")
+        .join("claude")
+        .join("s1.json")
+        .exists();
+    assert!(
+        s1_on_disk,
+        "holder's s1.json must be durably on disk before the re-acquire"
+    );
+
+    // Evidence probe 2: re-acquire through the SAME private code path
+    // production uses, so an Err surfaces its errno instead of being
+    // swallowed into a DISABLED ledger.
+    match PaneLedger::acquire_store_lock(&root) {
+        Ok(lock) => drop(lock), // release before constructing `next`
+        Err(err) => panic!(
+            "acquire_store_lock failed after holder drop: errno={:?} kind={:?} \
+             (EWOULDBLOCK => flock genuinely still held after drop; \
+             ENOSPC/EMFILE/EACCES => resource pressure, H1)",
+            err.raw_os_error(),
+            err.kind()
+        ),
+    }
+
     let next = PaneLedger::new_locked(Some(root.clone()));
-    assert!(next.ever_bound("claude", "s1"), "flock freed on drop");
+    assert!(
+        next.ever_bound("claude", "s1"),
+        "third new_locked came up blind despite the lock being acquirable and \
+         s1.json on disk ({s1_on_disk}): load_index silently returned empty \
+         (H2, pane_ledger.rs:299-321 swallows I/O errors) or a second \
+         acquire Err raced in after the probe"
+    );
     std::fs::remove_dir_all(&root).ok();
 }
 

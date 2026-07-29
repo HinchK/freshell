@@ -242,11 +242,20 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
+// Durable identity reader -- ONE ordering, UNIFIED with the lane specs'
+// readers (freshclaude-identity-persistence-rust.spec.ts durableIdentity,
+// freshclaude-restart-parity-rust.spec.ts liveDurableIdentity; council
+// follow-up, PR #562/#563 close-out: the P0.2 bug WAS a reader-ordering
+// bug, so this suite keeps a single order everywhere): sessionRef IS the
+// durable identity per the 2026-04-19 durable-session contract;
+// resumeSessionId is the durable-intent fallback; content.sessionId is a
+// LIVE handle (for claude, the create-time fc-e2e-* placeholder forever)
+// and may only be read LAST.
 function leafDurableIdentity(leaf: any): string | undefined {
   return (
-    leaf?.content?.sessionId ??
     leaf?.content?.sessionRef?.sessionId ??
-    leaf?.content?.resumeSessionId
+    leaf?.content?.resumeSessionId ??
+    leaf?.content?.sessionId
   )
 }
 
@@ -340,7 +349,11 @@ process.exit(result.status ?? 1)
   return dest
 }
 
-async function createFreshcodexPane(page: Page, harness: TestHarness): Promise<void> {
+async function createFreshcodexPane(
+  page: Page,
+  harness: TestHarness,
+  cwd: string,
+): Promise<void> {
   // setAvailableClis is client-only AND gets overwritten by the app
   // bootstrap + /api/platform fetch (App.tsx:572,609). Callers reach this
   // helper only after harness.waitForConnection(), which is what makes the
@@ -354,14 +367,21 @@ async function createFreshcodexPane(page: Page, harness: TestHarness): Promise<v
   })
   const picker = await openPanePicker(page)
   await picker.getByRole('button', { name: /^Freshcodex$/i }).click({ force: true })
-  // "First option" exists here only because selectShellIfPickerShowing
-  // already opened a shell whose live-terminal cwd becomes a candidate dir
-  // (/api/files/candidate-dirs returns [] on a truly clean boot -- no $HOME
-  // fallback, crates/freshell-server/src/files.rs:15-26). This mirrors the
-  // donor exactly (restore-double-restart.spec.ts:148-176); if no option
-  // renders, switch to the fill+Enter pattern used by
-  // createFreshopencodePane/createFreshclaudePane.
-  await page.getByRole('option').first().click()
+  // DEFLAKE/REBASE (f3wp refresh, 2026-07-28): main's #553 added the sidebar
+  // "Repo filter" -- a native <select> (Sidebar.tsx:713-727) whose <option>
+  // children are DOM-earlier than the DirectoryPicker candidates, so the old
+  // page-global `getByRole('option').first().click()` resolves to the
+  // ALWAYS-HIDDEN "All" option of the CLOSED select whenever the sidebar has
+  // repo-grouped sessions (true in THE RULER by this point) and waits on
+  // visibility forever -- observed as 4/4 deterministic RULER test-timeouts
+  // (trace pending on `role=option >> nth=0`, timeout 0). Use the fill+Enter
+  // pattern this helper's own contingency note prescribed (same as
+  // createFreshclaudePane/createFreshopencodePane) -- no role=option
+  // dependency at all.
+  const directoryInput = page.getByLabel(/^Starting directory for Freshcodex$/i)
+  await expect(directoryInput).toBeVisible({ timeout: 15_000 })
+  await directoryInput.fill(cwd)
+  await directoryInput.press('Enter')
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
     timeout: 15_000,
   })
@@ -458,12 +478,17 @@ async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: stri
   await expect(page.locator('[data-context="fresh-agent"]').last()).toBeVisible({
     timeout: 15_000,
   })
-  // NOTE: once the canonical-UUID cliSessionId lands, the client fetches the
-  // thread snapshot and the Rust router has NO claude adapter -> 503
-  // FRESH_AGENT_RUNTIME_UNAVAILABLE (crates/freshell-freshagent/src/
-  // snapshot.rs:133-146), which can surface a history-load-error banner on a
-  // perfectly healthy fresh pane. Assert pane state via the harness (Redux),
-  // tolerate the banner -- never assert error-free UI chrome for freshclaude.
+  // NOTE (corrected, council fix round -- the Rust router HAS shipped a
+  // claude snapshot adapter since this comment was written: crates/
+  // freshell-freshagent/src/snapshot.rs:133-146 routes freshclaude/kilroy +
+  // claude through get_claude_snapshot(), a disk+env adapter over the CLI's
+  // own transcript store; FRESH_AGENT_RUNTIME_UNAVAILABLE now only fires for
+  // session types with NO adapter registered at all). A transient
+  // history-load-error banner may still appear on a freshly-created pane
+  // (snapshot fetch racing pane creation), so this suite still asserts pane
+  // state via the harness (Redux) rather than error-free UI chrome for
+  // freshclaude -- but the reason is a fetch-timing race, not a missing
+  // adapter.
 }
 
 // --- browser pane helper (donor: browser-pane.spec.ts:8) -- consumed
@@ -962,7 +987,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // the Freshcodex click is swallowed (donor ordering:
       // restore-double-restart.spec.ts:210-214; same guard as Contracts B/D).
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
-      await createFreshcodexPane(page, harness)
+      await createFreshcodexPane(page, harness, sharedRoot)
       await sendFreshAgentTurn(page, harness, tabId, 'wall freshcodex turn')
       await expect(
         page.locator('[data-context="fresh-agent"]').last().getByText('Fixture turn'),
@@ -1146,32 +1171,26 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // EXPECTED-FAIL WALL PIN -- P0.2 (§2.8), PARTIALLY LANDED by
-    // feat/freshclaude-restart-parity: the attach-resume arm + claude snapshot
-    // adapter shipped, so post-reload the HISTORY leg passes ('Fixture claude
-    // turn' renders from the REST snapshot) and the STATUS leg passes (not
-    // 'error'/'creating') -- probed 2026-07-25 with the identity leg
-    // neutralized: green in one run. The IDENTITY leg still fails, and the
-    // blocker is the CLIENT persistence gap this pin has always named:
-    // persistMiddleware strips content.sessionId (src/store/
-    // persistMiddleware.ts:245-266), so after reload the pane re-CREATEs
-    // (resumeSessionId carries the durable UUID -- the conversation itself
-    // resumes) and receives a NEW create-time sidecar id; observed
-    // pre-kill fc-e2e-84069-1785038517244 vs post-reload
-    // fc-e2e-88780-1785038519518, so leafDurableIdentity's first arm
-    // (content.sessionId) can never match across reload until the client
-    // persists it. FLIP when claude pane identity survives reload
-    // (client-side persistMiddleware work -- out of this branch's fence).
-    test.fail(
-      e2eServerKind === 'rust',
-      'EXPECTED-FAIL WALL PIN (narrowed 2026-07-26 by reconcile-completion): pre-kill content.sessionId is the sidecar-minted placeholder, not the durable ref; the SIGKILL flow yields a respawn verdict which mints a new placeholder -- closing requires claude created/create to expose the durable id as the primary handle (not in C2 scope).',
-    )
+    // HISTORY: the P0.2 pin was FLIPPED 2026-07-27 by lane D4
+    // (freshclaude-identity-persistence). Investigation showed the durable
+    // identity ALREADY survives reload: FreshAgentView's merge effect folds
+    // the canonical claude cliSessionId into content.sessionRef +
+    // resumeSessionId (FreshAgentView.tsx mergePaneContent effect), and
+    // persistMiddleware round-trips sessionRef -- the 2026-04-19
+    // durable-session contract's designated durable identity -- while the
+    // live placeholder in content.sessionId stays unpersisted. This leg was
+    // red only because leafDurableIdentity read content.sessionId (the
+    // fc-e2e-* live handle, legitimately different across reloads) FIRST;
+    // the reader is sessionRef-first accordingly. The stale-claim hazard
+    // that motivated the original strip is pinned by
+    // specs/freshclaude-identity-persistence-rust.spec.ts (dead_session,
+    // never silent).
 
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-freshclaude-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
 
-    const { server, harness } = await bootWall(page, {
+    const { server, harness, info } = await bootWall(page, {
       env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
@@ -1186,14 +1205,19 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
       await createFreshclaudePane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, tabId, 'wall freshclaude turn')
-      // Pre-kill turn proof via the HARNESS (Redux), not UI chrome: the
-      // fresh-agent transcript renders exclusively from the REST thread
-      // snapshot (FreshAgentView.tsx:1302,1782 -- getFreshAgentThreadSnapshot
-      // -> snapshot?.turns), and the Rust router has NO claude snapshot
-      // adapter (503 FRESH_AGENT_RUNTIME_UNAVAILABLE, crates/
-      // freshell-freshagent/src/snapshot.rs:133-146), so the assistant reply
-      // NEVER renders in the DOM today even though the turn completed. The
-      // sidecar protocol itself is verified end-to-end: freshAgent.event/
+      // Pre-kill turn proof via the HARNESS (Redux), not UI chrome (corrected,
+      // council fix round): the fresh-agent transcript renders exclusively
+      // from the REST thread snapshot (FreshAgentView.tsx:1302,1782 --
+      // getFreshAgentThreadSnapshot -> snapshot?.turns). The claim that "the
+      // Rust router has NO claude snapshot adapter -> 503" is FALSE at HEAD --
+      // crates/freshell-freshagent/src/snapshot.rs:133-146 routes
+      // freshclaude/kilroy + claude through get_claude_snapshot(), a
+      // disk+env adapter over the CLI's own transcript store;
+      // FRESH_AGENT_RUNTIME_UNAVAILABLE now only fires for session types
+      // with no adapter registered at all. This assertion still reads via
+      // the harness (not DOM) because the snapshot fetch can race pane
+      // creation, not because the adapter is missing. The sidecar protocol
+      // itself is verified end-to-end regardless: freshAgent.event/
       // freshAgent.assistant arrives on the wire and folds into the
       // freshAgent slice (turns[]) -- assert THAT (createFreshclaudePane's
       // note: assert pane state via the harness, never error-free UI chrome
@@ -1223,6 +1247,16 @@ test.describe('Restore Contract Wall (P0.1)', () => {
 
       await flushPersistence(page)
 
+      // Council fix round (freshclaude-identity-persistence, B2): audit the
+      // FULL restart+reload window for identity-losing re-creates. The fake
+      // sidecar mints the SAME static id for every resume-less create, so a
+      // regressed persistMiddleware that silently drops sessionRef would
+      // still leave leafDurableIdentity() reading the identical constant
+      // (colliding onto the SAME transcript file) -- collision-blind on this
+      // exact axis, same discrimination applied in
+      // specs/freshclaude-identity-persistence-rust.spec.ts.
+      await harness.clearSentWsMessages()
+
       // --- SIGKILL + revive, then reload. ---
       await server.restartAbrupt()
       await waitForWsReady(page)
@@ -1241,6 +1275,72 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       const finalLeaf = findFreshAgentLeaf(await harness.getPaneLayout(rehydratedTabId))
       expect(finalLeaf?.content?.status).not.toBe('error')
       expect(finalLeaf?.content?.status).not.toBe('creating')
+
+      // Any freshAgent.create fired across the restart+reload window must
+      // carry the ORIGINAL durable id -- never a bare (resume-less) create,
+      // which the fixture would otherwise re-stamp with the same static
+      // default and mask a lost identity. Non-vacuity checked (follow-up
+      // from the PR #562 council review): unlike
+      // specs/freshclaude-identity-persistence-rust.spec.ts's test 1, which
+      // RELOADS BEFORE the SIGKILL restart and observes exactly one RESPAWN
+      // freshAgent.create, THIS leg's ordering -- SIGKILL restart THEN
+      // reload -- resolves via freshAgent.attach alone; verified empirically
+      // (message list: hello, terminal.attach x3, ..., freshAgent.attach --
+      // zero freshAgent.create). So no non-vacuity assertion is added here:
+      // one would assert a create that never happens on this ordering and
+      // permanently red this leg. The for-loop below stays as the safety
+      // net against any future regression that starts firing a bare
+      // (identity-losing) create on this path, without falsely claiming a
+      // create is expected today.
+      const sentAfterRestartReload = await harness.getSentWsMessages()
+      const restartCreates = sentAfterRestartReload.filter((m: any) => m?.type === 'freshAgent.create') as any[]
+      for (const create of restartCreates) {
+        expect(create.resumeSessionId ?? create.sessionRef?.sessionId, JSON.stringify(create)).toBe(originalSessionId)
+      }
+
+      // LIVENESS (council follow-up, PR #562/#563 close-out): everything
+      // above proves the durable IDENTITY survived, but a mutation where the
+      // attach arm sets pane status and never wires the event stream (the
+      // literal historical P0.2 bug shape) would leave every assertion above
+      // green over a dead socket. Mirror lane test 1's post-restart turn on
+      // THIS ordering (SIGKILL restart THEN reload, attach-resolved): send a
+      // second turn and require the assistant reply to ROUND-TRIP through
+      // the live event stream into the freshAgent slice (turns[] is fed by
+      // wire events -- freshAgent.assistant folds, fresh-agent-ws.ts -- so a
+      // dead socket can never grow it), plus the fixture transcript on disk
+      // gaining the second user line (the server->sidecar leg).
+      const countFoldedAssistantTurns = async (): Promise<number> => {
+        const sessions = (await harness.getState())?.freshAgent?.sessions ?? {}
+        return Object.values(sessions).reduce(
+          (n: number, s: any) =>
+            n + (s?.turns ?? []).filter((t: any) => t?.role === 'assistant').length,
+          0,
+        )
+      }
+      const assistantTurnsBefore = await countFoldedAssistantTurns()
+      await sendFreshAgentTurn(page, harness, rehydratedTabId, 'wall freshclaude liveness turn')
+      await expect
+        .poll(countFoldedAssistantTurns, { timeout: 30_000 })
+        .toBeGreaterThan(assistantTurnsBefore)
+      const transcriptFile = path.join(
+        info.homeDir,
+        '.claude',
+        'projects',
+        '-fixture',
+        `${originalSessionId}.jsonl`,
+      )
+      const transcriptLines = (await fs.readFile(transcriptFile, 'utf8'))
+        .trim()
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line))
+      const userTexts = transcriptLines
+        .filter((l: any) => l.type === 'user')
+        .map((l: any) => l.message?.content?.[0]?.text)
+      expect(userTexts).toEqual(
+        expect.arrayContaining(['wall freshclaude turn', 'wall freshclaude liveness turn']),
+      )
+      expect(transcriptLines.filter((l: any) => l.type === 'assistant').length).toBeGreaterThanOrEqual(2)
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
@@ -1361,25 +1461,45 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    test.setTimeout(300_000)
+    // DEFLAKE (f3wp refresh): 300 s timed out twice back-to-back under
+    // concurrent-suite load (2026-07-28, runs at 01:28 and 01:37; both
+    // failure screenshots show a healthy, still-progressing page -- slow,
+    // not wedged). The ruler's serial cost is structurally LARGER than the
+    // double-restart test's (~91 s bootWall + one ~65 s restartAbrupt +
+    // every per-pane creation/identity gate for ALL pane types across two
+    // tabs), and a 300 s budget recreates the same sum-of-gates > timeout
+    // defect the f3wp double-restart fix (:2068-2076) removed at 180 s.
+    // 600 s covers the worst case with margin, matching that sibling.
+    // NOTE the test.fail pin below: on a load-starved run the 300 s TEST
+    // timeout fired BEFORE the pin's expected in-test red was reached, and
+    // a test-level timeout does not satisfy the pin -- so the underfunded
+    // budget reds the whole run despite the expected-fail marking.
+    test.setTimeout(600_000)
     // EXPECTED-FAIL WALL PIN -- P0.1: this is the composed ruler; it flips
-    // green only when every per-pane contract above is green un-pinned
-    // (P0.2..P1.13). OBSERVED first red (run of 2026-07-24): the freshclaude
-    // identity poll -- post-reload the freshclaude pane carries the canonical
-    // cliSessionId (the fixture's 44444444-... UUID) instead of the pre-kill
-    // ephemeral fc-e2e-* created id, and no rebind is possible behind that
-    // (attach swallow + snapshot 503, P0.2 -- see Contract G's pin). The
-    // hidden-tab legs (F8/P1.11) PASSED in this composition: the
-    // dead-terminal census DID reach hidden tabs' layouts and the claude/
-    // codex/opencode resume argv polls all went green -- the plan flagged
+    // green only when every per-pane contract above is green un-pinned.
+    // HISTORY: the first observed red (run of 2026-07-24) was the freshclaude
+    // identity poll -- that P0.2 client identity-persistence gap has since
+    // CLOSED (#562: sessionRef persists + sessionRef-first reader; pinned by
+    // Contract G above and specs/freshclaude-identity-persistence-rust
+    // .spec.ts), so it is NO LONGER this pin's reason.
+    // CURRENT OBSERVED RED (verified pre-existing at the PR #562/#563
+    // council close-out): the composed ruler fails at the CLAUDE TERMINAL
+    // \u00a72.2 leg -- the post-restart `--resume <claudePreallocatedId>` argv
+    // poll below never goes green UNDER COMPOSITION, even though the same
+    // contract passes in its standalone per-pane test.
+    // The hidden-tab legs (F8/P1.11) PASSED in this composition: the
+    // dead-terminal census DID reach hidden tabs' layouts -- the plan flagged
     // this ordering as runtime-dependent and verdict-neutral (both candidates
     // are post-restart contract assertions). The freshcodex/freshopencode
     // identity polls pass VACUOUSLY from persisted state (they measure
-    // persistence, not restore). FLIP: delete this pin when the last
-    // per-pane pin is retired.
+    // persistence, not restore).
+    // FLIP DISCIPLINE (council, PR #562/#563 close-out): leg G's identity
+    // assertions alone are NOT liveness proof -- its post-attach turn-send is.
+    // Flip only when the composed ruler GENUINELY passes 3x consecutively;
+    // delete this pin when the last per-pane pin is retired.
     test.fail(
       e2eServerKind === 'rust',
-      'P0.1: composed all-pane ruler; red until remaining P1.x land + the P0.2 client identity-persistence gap closes (P0.2 server legs -- attach-resume + snapshot adapter -- landed on feat/freshclaude-restart-parity)',
+      'P0.1: composed all-pane ruler; red until remaining P1.x land -- current observed red: the claude terminal §2.2 --resume argv leg under composition (the former P0.2 freshclaude identity gap closed in #562)',
     )
 
     const CODEX_SESSION_ID = '99999999-8888-4777-8666-555555555555'
@@ -1554,7 +1674,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // (boot-picker fade-out guard applies after every tab-add + shell pick).
       await expect(page.locator('.xterm').last()).toBeVisible({ timeout: 30_000 })
       await openSplitPickerOnVisibleTerminal()
-      await createFreshcodexPane(page, harness)
+      await createFreshcodexPane(page, harness, projectDir)
       await sendFreshAgentTurn(page, harness, freshcodexTabId, 'ruler freshcodex turn')
       const freshcodexId = leafDurableIdentity(
         findFreshAgentLeaf(await harness.getPaneLayout(freshcodexTabId)),
@@ -1676,12 +1796,12 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       }
 
       // Quiet client: no alerts, no noisy error text (donor: restore-sync05).
-      // CAVEAT: freshclaude creates get a snapshot 503
-      // (FRESH_AGENT_RUNTIME_UNAVAILABLE, snapshot.rs:133-146) which can
-      // surface a history-load-error banner; if this count is nonzero ONLY
-      // because of that banner, scope the locator to exclude the freshclaude
-      // pane (or drop this line) rather than treating it as a new product
-      // red -- the pane-state assertions above are the real contract.
+      // (A prior CAVEAT here blamed a freshclaude snapshot 503; that was
+      // stale -- snapshot.rs:133-146 routes freshclaude through the disk+env
+      // claude adapter and the endpoint has not 503'd since wave A. The only
+      // known benign alert source is the transient history-load-error banner
+      // from the snapshot fetch racing pane creation -- see
+      // createFreshclaudePane's note above.)
       await expect(page.getByRole('alert')).toHaveCount(0)
     } finally {
       await server.stop()
@@ -2065,6 +2185,15 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
+    // DEFLAKE (f3wp): this test's serial gate budget (20+45+60+30+60+30 s
+    // = 245 s) plus 3 serialized boot/health budgets (~91 s bootWall +
+    // 2 x 65 s restartAbrupt) structurally exceeds the describe-level 180 s
+    // under full parallel-suite load. Post-fix worst case (with the new
+    // 60 s WS gate and the 30 s explicit click) is ~556 s, so 300 s would
+    // recreate the same sum-of-gates > timeout defect at a higher threshold.
+    // 600 s covers the strict worst case with margin. Same per-test override
+    // pattern THE RULER uses (:1364).
+    test.setTimeout(600_000)
     // ADOPTED REALITY (reconcile-client-adoption lane): the client advertises
     // capabilities.paneReconcileV1 in hello and sends pane.reconcile.request
     // after EVERY ready, so a restart landing mid-recovery is answered by a
@@ -2088,7 +2217,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     })
     try {
       await selectShellIfPickerShowing(page)
-      await page.getByText(SESSION_TITLE, { exact: false }).first().click()
+      await page.getByText(SESSION_TITLE, { exact: false }).first().click({ timeout: 30_000 })
       const tabId = (await harness.getActiveTabId())!
       await expect
         .poll(async () => (await harness.getPaneLayout(tabId))?.content?.terminalId ?? null, {
@@ -2106,6 +2235,12 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // First SIGKILL; wait until recovery is IN FLIGHT (a new spawn hit the
       // argv log), then SIGKILL again mid-recovery.
       await server.restartAbrupt()
+      // DEFLAKE (f3wp): gate the reconnect BEFORE polling for the recovery
+      // spawn -- under load the client can still be mid-reconnect here, and
+      // the argv poll silently burns its 45 s budget waiting on a spawn that
+      // cannot start until the WS is ready. The second SIGKILL still lands
+      // mid-recovery: the argv-growth poll below remains the trigger.
+      await waitForWsReady(page)
       await expect
         .poll(async () => (await readArgvLog(argLogPath)).length, { timeout: 45_000 })
         .toBeGreaterThan(argvCountBeforeKill)

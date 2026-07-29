@@ -286,7 +286,10 @@ test.describe('wave-A cross-lane interactions', () => {
   test('A2xA3: one restart restores BOTH claude identity stores with no cross-talk', async ({ page, e2eServerKind }) => {
     expect(e2eServerKind).toBe('rust')
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'wavea-a2a3-'))
-    const FRESH_DURABLE = '44444444-4444-4444-8444-444444444444' // fake sidecar default
+    // The fake sidecar mints a RANDOM canonical UUID per process (council
+    // follow-up: the old static 44444444-... default was collision-blind),
+    // so the fresh-agent durable id is CAPTURED from the run below.
+    let FRESH_DURABLE = ''
     let capturedHome = ''
     try {
       const fakeClaude = await installFakeCli(path.join(sharedRoot, 'bin'), 'claude', 'fake-claude-cli.mjs')
@@ -324,7 +327,6 @@ test.describe('wave-A cross-lane interactions', () => {
         )
         const terminalSession = (await readClaudeBindingRows(ledgerDir))[0].sessionId as string
         expect(terminalSession).toBeTruthy()
-        expect(terminalSession).not.toBe(FRESH_DURABLE)
         let terminalIdBefore = ''
         await expect
           .poll(async () => {
@@ -334,13 +336,19 @@ test.describe('wave-A cross-lane interactions', () => {
           .not.toBe('')
 
         // Identity store 2 (A2): freshclaude pane -> sidecar cliSessionId index.
+        // Gate on the canonical-UUID SHAPE, then capture what this run minted.
         await createFreshclaudePane(page, sharedRoot)
         await expect
           .poll(async () => {
             const c = freshAgentLeaf(await harness.getPaneLayout(tabId))?.content
             return c?.sessionRef?.sessionId ?? c?.resumeSessionId ?? ''
           }, { timeout: 30_000 })
-          .toBe(FRESH_DURABLE)
+          .toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i)
+        {
+          const c = freshAgentLeaf(await harness.getPaneLayout(tabId))?.content
+          FRESH_DURABLE = (c?.sessionRef?.sessionId ?? c?.resumeSessionId) as string
+        }
+        expect(terminalSession).not.toBe(FRESH_DURABLE)
 
         // FIXTURE REALISM (reconcile adoption): real claude writes
         // ~/.claude/projects/<proj>/<sessionId>.jsonl as soon as the session

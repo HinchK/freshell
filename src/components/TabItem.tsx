@@ -3,6 +3,7 @@ import { useRef, useEffect } from 'react'
 import { cn } from '@/lib/utils'
 import { getTerminalStatusDotClassName, getTerminalStatusIconClassName } from '@/lib/terminal-status-indicator'
 import PaneIcon from '@/components/icons/PaneIcon'
+import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import type { Tab, TabAttentionStyle, TerminalStatus } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
@@ -12,6 +13,8 @@ import { ContextIds } from '@/components/context-menu/context-menu-constants'
 type TabPaneEntry = {
   paneId: string
   content: PaneContent
+  /** cwd hint identifying this pane's repo (coding-agent panes only). */
+  repoCwd?: string
 }
 
 function StatusDot({ status, busy }: { status: TerminalStatus; busy?: boolean }) {
@@ -34,6 +37,8 @@ export interface TabItemProps {
   renameValue: string
   paneEntries?: TabPaneEntry[]
   iconsOnTabs?: boolean
+  repoIconsOnTabs?: boolean
+  repoIcons?: Record<string, RepoIconInfo>
   tabAttentionStyle?: TabAttentionStyle
   onRenameChange: (value: string) => void
   onRenameBlur: () => void
@@ -54,6 +59,8 @@ export default function TabItem({
   renameValue,
   paneEntries,
   iconsOnTabs = true,
+  repoIconsOnTabs = true,
+  repoIcons,
   tabAttentionStyle = 'highlight',
   onRenameChange,
   onRenameBlur,
@@ -81,22 +88,45 @@ export default function TabItem({
       .slice(MAX_TAB_ICONS)
       .some((entry) => busyPaneIds.includes(entry.paneId))
 
+    // Group visible entries by repo identity (first-appearance order) so each
+    // distinct repo icon renders once, immediately left of that repo's agent
+    // icons. Entries without repo info keep their position as singleton groups.
+    type Group = { key: string; info?: RepoIconInfo; entries: typeof visible }
+    const groups: Group[] = []
+    const groupIndex = new Map<string, number>()
+    for (const entry of visible) {
+      const info = repoIconsOnTabs && entry.repoCwd ? repoIcons?.[entry.repoCwd] : undefined
+      const key = info ? `repo:${info.repoKey}` : `pane:${entry.paneId}`
+      const existing = groupIndex.get(key)
+      if (existing !== undefined) {
+        groups[existing].entries.push(entry)
+        continue
+      }
+      groupIndex.set(key, groups.length)
+      groups.push({ key, info, entries: [entry] })
+    }
+
     return (
       <span className="flex items-center gap-0.5">
-        {visible.map(({ paneId, content }, i) => {
-          const status: TerminalStatus = content.kind === 'terminal' ? content.status : 'running'
-          const isBusy = busyPaneIds.includes(paneId)
-          return (
-            <PaneIcon
-              key={i}
-              content={content}
-              className={cn(
-                'h-3 w-3 shrink-0',
-                isBusy ? 'text-blue-500' : getTerminalStatusIconClassName(status),
-              )}
-            />
-          )
-        })}
+        {groups.map((group) => (
+          <span key={group.key} className="flex items-center gap-0.5">
+            {group.info && <RepoIcon info={group.info} className="h-3 w-3 shrink-0" />}
+            {group.entries.map(({ paneId, content }) => {
+              const status: TerminalStatus = content.kind === 'terminal' ? content.status : 'running'
+              const isBusy = busyPaneIds.includes(paneId)
+              return (
+                <PaneIcon
+                  key={paneId}
+                  content={content}
+                  className={cn(
+                    'h-3 w-3 shrink-0',
+                    isBusy ? 'text-blue-500' : getTerminalStatusIconClassName(status),
+                  )}
+                />
+              )
+            })}
+          </span>
+        ))}
         {overflow > 0 && (
           <span className={cn('text-[10px] leading-none', hiddenBusyPane ? 'text-blue-500' : 'text-muted-foreground')}>+{overflow}</span>
         )}

@@ -124,6 +124,7 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         boot_id: Arc::new("boot-e2e".to_string()),
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -153,7 +154,6 @@ async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,

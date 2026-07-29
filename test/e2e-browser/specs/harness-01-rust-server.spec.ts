@@ -86,12 +86,41 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
     const realFreshellStatBefore = fs.existsSync(realFreshellDir)
       ? fs.statSync(realFreshellDir)
       : null
+    // DEFLAKE (f3wp refresh, evidence /tmp/f3wp-refresh/e2e-rundiag{2,3}.log
+    // and e2e-run8.log): on a host running a LIVE freshell (the self-hosted
+    // server, other agents), the real ~/.freshell dir mtime moves for
+    // reasons entirely outside this test -- config.json atomic rewrites
+    // (~60s cadence observed) bump it even while the live server's logs
+    // stay quiet, so NO temporal witness makes an mtime-equality assertion
+    // attributable there (a logs-mtime witness was tried and still false-
+    // positived in run8). The tripwire is therefore structural now:
+    // - real ~/.freshell ABSENT before the test (CI / fresh host): strict --
+    //   it must still be absent after; a HOME-resolution leak would have
+    //   created it, and creation is fully attributable.
+    // - real ~/.freshell PRE-EXISTING (shared live host): the mtime check is
+    //   unattributable noise; assert POSITIVE isolation instead (the
+    //   fixture's server demonstrably wrote its boot artifacts under the
+    //   isolated home) and skip the real-home check with a note.
 
     const server = new RustServer({ verbose: false })
     const info = await server.start()
 
     // The fixture must never bind the user's real port.
     expect(info.port).not.toBe(3001)
+
+    // Positive-isolation proof, captured while the isolated HOME still
+    // exists (stop() deletes it before step 5 runs): the server resolved the
+    // isolated home for its env-pinned log dir and wrote its boot log there.
+    const isolatedBootLogExisted = fs.existsSync(
+      path.join(info.homeDir, '.freshell', 'logs', 'rust-server.jsonl'),
+    )
+    // DEFLAKE (f3wp council round 2, B-fix): declared here (function scope),
+    // not inside the try{} block below where it's assigned -- a `const`
+    // declared inside try{} is not visible in the final assertion block
+    // after the try/finally (that block-scoping bug produced a hard
+    // ReferenceError on every run where the "real ~/.freshell pre-exists"
+    // branch was taken, i.e. every run on this shared live host).
+    let isolatedBootLogExistedAfterRestart: boolean | null = null
 
     let sentinel: ChildProcess | null = null
 
@@ -132,6 +161,19 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
         expect(status).toBe('ready')
       }).toPass({ timeout: 30_000 })
 
+      // DEFLAKE (f3wp council round 2, optional-but-cheap): the isolation
+      // proof above was captured from the FIRST boot only, so a HOME leak
+      // introduced specifically by the restart cycle (e.g. a code path that
+      // re-resolves HOME on restart() and gets it wrong) would be invisible
+      // on a live host, where the "real ~/.freshell pre-exists" branch below
+      // only checks POSITIVE isolation, never NEGATIVE (that nothing new
+      // leaked into the real home during restart). Re-stat post-restart,
+      // while the isolated home still exists (stop() deletes it), so the
+      // fixture's own restart write is re-confirmed under the isolated home.
+      isolatedBootLogExistedAfterRestart = fs.existsSync(
+        path.join(info.homeDir, '.freshell', 'logs', 'rust-server.jsonl'),
+      )
+
       // Prove the reconnected terminal is FUNCTIONALLY alive (not just
       // showing stale pre-restart DOM content): a brand-new command must
       // still execute correctly after the client recreates/reattaches.
@@ -140,12 +182,83 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       // this spec shares the host with ~14 parallel workers each spawning
       // rust servers (and cargo build-lock contention), and the
       // post-restart recreate/reattach round-trip was observed to
-      // legitimately exceed 20s under that load while passing comfortably
-      // in isolation (both observed on 2026-07-26). The spec-level
-      // test.setTimeout(180_000) already anticipated slow full-suite runs.
-      const marker2 = `HARNESS01-POST-RESTART-${randomUUID()}`
-      await terminal.executeCommand(`echo ${marker2}`)
-      await terminal.waitForOutput(marker2, { timeout: 60_000 })
+      // legitimately exceed 20s under that load (2026-07-26).
+      // CORRECTED (f3wp council fix round): the earlier claim that this leg
+      // was "passing comfortably in isolation" did not make it reliably
+      // green under full-project load -- it still timed out at 60s in this
+      // branch's own acceptance run (/tmp/deflake-logs/e2eb-10x-run10.log:1089,
+      // "TimeoutError: page.waitForFunction: Timeout 60000ms exceeded"). A
+      // bare timeout there is not diagnosable: it cannot distinguish a
+      // wedged reattach (WS/redux never reached ready) from a dead PTY
+      // (server-side child gone) from a swallowed echo (everything alive,
+      // buffer just missing the marker). The catch below dumps exactly
+      // that state before rethrowing. The spec-level test.setTimeout(180_000)
+      // already anticipated slow full-suite runs.
+      // DEFLAKE (f3wp refresh, evidence /tmp/f3wp-refresh/e2e-rundiag1.log):
+      // under load the FIRST post-restart command can arrive at the PTY with
+      // its HEAD truncated (buffer showed the marker's uuid TAIL plus
+      // "command not found" -- the leading "echo HARNESS01-..." bytes were
+      // dropped while the pane was still recreating/reattaching). The
+      // contract is "the recreated pane round-trips a command", not "no
+      // input byte is ever dropped mid-reattach", so retry with a DISTINCT
+      // marker per attempt (a stale partial echo of attempt N can never
+      // satisfy attempt N+1). NOTE: the head-truncation itself is a
+      // possible product-level issue (typed input during the recreate
+      // window can be silently lost) -- tracked as kata `dtfn` and listed
+      // in the plan doc's findings ledger
+      // (docs/plans/2026-07-27-deflake-load-flakes.md); this loop only
+      // de-flakes the harness contract.
+      let roundTripped = false
+      // DEFLAKE (f3wp council round 2, B4): the prior version kept only the
+      // LAST attempt's error, silently discarding earlier ones. When all 3
+      // attempts fail for genuinely different reasons (e.g. attempt 1
+      // head-truncated, attempt 2 wedged, attempt 3 timed out clean), the
+      // final thrown diagnostic must show every attempt's failure, not just
+      // the last -- otherwise the reported cause can be actively misleading
+      // about what actually happened on earlier attempts.
+      const attemptErrors: unknown[] = []
+      for (let attempt = 1; attempt <= 3 && !roundTripped; attempt++) {
+        const marker = `HARNESS01-POST-RESTART-${attempt}-${randomUUID()}`
+        try {
+          await terminal.executeCommand(`echo ${marker}`)
+          await terminal.waitForOutput(marker, { timeout: 30_000 })
+          roundTripped = true
+        } catch (attemptError) {
+          // eslint-disable-next-line no-console
+          console.log(`[harness-01] post-restart round-trip attempt ${attempt} failed: ${attemptError}`)
+          attemptErrors.push(attemptError)
+        }
+      }
+      try {
+        if (!roundTripped) {
+          throw new Error(
+            attemptErrors.length
+              ? `post-restart round-trip failed after ${attemptErrors.length} attempt(s) -- ` +
+                attemptErrors.map((err, i) => `[attempt ${i + 1}] ${err}`).join(' | ')
+              : 'post-restart round-trip never attempted',
+          )
+        }
+      } catch (error) {
+        const wsReadyState = await page
+          .evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getWsReadyState() ?? '<harness missing>')
+          .catch((evalError) => `<eval failed: ${evalError}>`)
+        const connectionStatus = await harness.getConnectionStatus().catch((evalError) => `<eval failed: ${evalError}>`)
+        const bufferTail = await terminal
+          .getVisibleText()
+          .then((text) => text.slice(-500))
+          .catch((evalError) => `<eval failed: ${evalError}>`)
+        const childPidsNow = server.ownedChildPids()
+        const childLiveness = childPidsNow.length
+          ? childPidsNow.map((pid) => `${pid}:${isProcessAlive(pid) ? 'alive' : 'dead'}`).join(', ')
+          : '<none captured>'
+        const serverPidAlive = isProcessAlive(server.info.pid)
+        throw new Error(
+          `post-restart marker2 wait failed -- diagnostics: ` +
+            `wsReadyState=${JSON.stringify(wsReadyState)} connectionStatus=${JSON.stringify(connectionStatus)} ` +
+            `serverPidAlive=${serverPidAlive} childPids=[${childLiveness}] ` +
+            `bufferTail=${JSON.stringify(bufferTail)}. Original error: ${error}`,
+        )
+      }
 
       const xtermText = await page.locator('.xterm').first().textContent()
       expect(xtermText).not.toContain('[Error]')
@@ -202,10 +315,25 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       : null
 
     if (realFreshellStatBefore === null) {
+      // Fresh host / CI: creation of the real ~/.freshell IS the leak, and
+      // nothing else on the host could have created it -- fully attributable.
       expect(realFreshellStatAfter).toBeNull()
     } else {
+      // Shared live host: see the rationale where realFreshellStatBefore is
+      // captured -- mtime equality is unattributable here. Positive
+      // isolation proof instead: the fixture's server resolved the ISOLATED
+      // home for its state and the env-pinned log dir (its boot log exists
+      // there), which a HOME-resolution regression would break.
       expect(realFreshellStatAfter).not.toBeNull()
-      expect(realFreshellStatAfter!.mtimeMs).toBe(realFreshellStatBefore.mtimeMs)
+      expect(isolatedBootLogExisted).toBe(true)
+      // Covers the restart cycle specifically (see capture-site comment
+      // above): without this, a restart-time HOME leak would be invisible
+      // on exactly the hosts where this branch runs.
+      expect(isolatedBootLogExistedAfterRestart).toBe(true)
+      console.log(
+        '[harness-01] real ~/.freshell pre-exists on this host (live freshell likely active) -- ' +
+          'strict real-home mtime tripwire skipped as unattributable; isolated-home boot artifacts verified instead.',
+      )
     }
   })
 })

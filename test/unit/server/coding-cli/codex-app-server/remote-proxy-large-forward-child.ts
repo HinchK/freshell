@@ -210,15 +210,29 @@ async function runAboveCapMode(activeCap: number): Promise<void> {
 }
 
 async function startProxy(upstreamWsUrl: string, activeCap: number): Promise<CodexRemoteProxy> {
-  const proxy = new CodexRemoteProxy({
-    upstreamWsUrl,
-    maxRawForwardBytes: activeCap,
-    requireCandidatePersistence: false,
-    requestHoldTimeoutMs: 5_000,
-    candidateCaptureTimeoutMs: 5_000,
-  })
-  await proxy.start()
-  return proxy
+  // DEFLAKE (f3wp): allocateLocalhostPort documents that callers must retry
+  // startup if the probe port is lost before the rebind (local-port.ts:10-12).
+  // CodexRemoteProxy.start() itself does not retry -- honor the allocator's
+  // contract on the test side, same loop shape as remote-proxy.test.ts.
+  let lastError: unknown
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const proxy = new CodexRemoteProxy({
+      upstreamWsUrl,
+      maxRawForwardBytes: activeCap,
+      requireCandidatePersistence: false,
+      requestHoldTimeoutMs: 5_000,
+      candidateCaptureTimeoutMs: 5_000,
+    })
+    try {
+      await proxy.start()
+      return proxy
+    } catch (error) {
+      lastError = error
+      await proxy.close().catch(() => {})
+      if ((error as NodeJS.ErrnoException)?.code !== 'EADDRINUSE') throw error
+    }
+  }
+  throw lastError
 }
 
 async function startUpstream(

@@ -44,9 +44,14 @@ pub mod opencode_ws;
 pub mod pane_ops;
 pub mod session_lease;
 pub mod snapshot;
+pub mod spawn_gate;
 pub mod terminal_tabs;
 
 pub use claude::FreshClaudeState;
+// Kata 09v1: the ONE claude_snapshot item visible outside this crate — the
+// raw-file existence check freshell-server's IndexExistenceProbe shares with
+// the attach arm. Keep the rest of claude_snapshot crate-private.
+pub use claude_snapshot::locate_transcript;
 pub use codex::FreshCodexState;
 pub use identity_sink::{
     FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, SharedPaneIdentitySink,
@@ -54,6 +59,7 @@ pub use identity_sink::{
 };
 pub use opencode_ws::FreshOpencodeState;
 pub use snapshot::SnapshotState;
+pub use spawn_gate::{SpawnGate, SpawnGateError};
 
 /// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
 /// true when a live terminal PTY currently owns that session. Constructed by
@@ -61,6 +67,15 @@ pub use snapshot::SnapshotState;
 /// uses (identity owner + registry row), so this crate never imports `freshell-ws`.
 /// Defaults to "always false" (behavior-preserving for constructors that don't wire it).
 pub type TerminalLivenessProbe = std::sync::Arc<dyn Fn(&str, &str) -> bool + Send + Sync>;
+
+/// Handle pairing the shared gate with the permit-wait timeout
+/// (`CreateProtectConfig.spawn_timeout_ms`, resolved once in main.rs so both
+/// doors share one env snapshot).
+#[derive(Clone)]
+pub(crate) struct RestSpawnGate {
+    pub(crate) gate: Arc<spawn_gate::SpawnGate>,
+    pub(crate) timeout: std::time::Duration,
+}
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -174,25 +189,19 @@ pub struct FreshAgentState {
     /// route degrades honestly instead of touching data it was never given"
     /// convention.
     pub(crate) cli_commands: Arc<Vec<freshell_platform::CliCommandSpec>>,
-    /// The SAME amplifier session locator the WS `terminal.create` path arms
-    /// (`freshell_ws::amplifier_association::maybe_arm`), wired in from
-    /// `freshell-server`'s main.rs via [`Self::with_amplifier_locator`] so a
-    /// REST-created fresh amplifier pane arms the identical instance the
+    /// The SAME opencode session locator the WS `terminal.create` path arms
+    /// (`freshell_ws::opencode_association::maybe_arm`), wired in from
+    /// `freshell-server`'s main.rs via [`Self::with_opencode_locator`] so a
+    /// REST-created fresh opencode pane arms the identical instance the
     /// periodic sweep (spawned once, against `WsState`, at boot) already
     /// polls -- association/broadcast parity falls out of sharing the one
     /// locator rather than standing up a second sweep loop this crate would
     /// have no way to drive (the sweep's `identity.upsert` target,
     /// `freshell_ws::identity::TerminalIdentityRegistry`, is `freshell-ws`-
     /// owned and unreachable here without a circular crate dependency).
-    /// `None` when unwired (every pre-existing test) or when the provider
-    /// home can't be resolved (mirrors `main.rs`'s own `Option` convention).
-    pub(crate) amplifier_locator:
-        Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
-    /// Sibling to [`Self::amplifier_locator`] for the opencode terminal-pane
-    /// restore fix -- the SAME shared instance
-    /// `freshell_ws::opencode_association::maybe_arm` arms.
+    /// `None` when unwired (every pre-existing test).
     pub(crate) opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
-    /// Sibling to [`Self::amplifier_locator`] for the P1.14 / Incident-4
+    /// Sibling to [`Self::opencode_locator`] for the P1.14 / Incident-4
     /// codex hardening -- the SAME shared instance the WS
     /// `codex_association` entry points arm and the B2 sweep polls.
     pub(crate) codex_locator:
@@ -202,6 +211,13 @@ pub struct FreshAgentState {
     /// the `OnceLock` sits behind an `Arc`. Wired post-construction by
     /// `freshell-server` (precedent: `TerminalRegistry::set_activity_observer`).
     identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
+    /// Server-wide PTY spawn gate — the SAME instance the WS terminal.create
+    /// path uses (ONE global concurrency budget; see
+    /// docs/plans/2026-07-27-rest-spawn-gate.md). Clone-shared + set-once,
+    /// wired post-construction by freshell-server (same shape as
+    /// `identity_sink`). `None` = ungated (unwired unit tests keep legacy
+    /// behavior; production always wires it).
+    spawn_gate: Arc<std::sync::OnceLock<RestSpawnGate>>,
 }
 
 /// A fresh-agent pane (the `paneContent` subset the opencode T2 path needs).
@@ -265,10 +281,10 @@ impl FreshAgentState {
             pane_tabs: Arc::new(Mutex::new(HashMap::new())),
             restore_keys: Arc::new(Mutex::new(HashMap::new())),
             cli_commands: Arc::new(Vec::new()),
-            amplifier_locator: None,
             opencode_locator: None,
             codex_locator: None,
             identity_sink: Arc::new(std::sync::OnceLock::new()),
+            spawn_gate: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -281,6 +297,26 @@ impl FreshAgentState {
     /// materialization site ([`send_keys`]'s cold-start block).
     fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
         self.identity_sink.get().cloned()
+    }
+
+    /// Wire the server-wide spawn gate (set-once; later calls are no-ops).
+    /// `timeout` bounds PERMIT ACQUISITION only, not spawn duration —
+    /// identical semantics to the WS door.
+    pub fn set_spawn_gate(&self, gate: Arc<spawn_gate::SpawnGate>, timeout: std::time::Duration) {
+        let _ = self.spawn_gate.set(RestSpawnGate { gate, timeout });
+    }
+
+    /// The wired spawn gate, if any. `None` = ungated (unwired test states).
+    pub(crate) fn spawn_gate(&self) -> Option<RestSpawnGate> {
+        self.spawn_gate.get().cloned()
+    }
+
+    /// Boot-assertion probe (council enn3 follow-up): the spawn-gate
+    /// OnceLock is a fail-OPEN seam — unwired means every REST create runs
+    /// ungated. `freshell-server` asserts this at startup so a wiring
+    /// regression fails LOUD at boot instead of silently ungating.
+    pub fn spawn_gate_wired(&self) -> bool {
+        self.spawn_gate.get().is_some()
     }
 
     /// Record what a `restoreKey`-tagged create produced (continuity trio,
@@ -376,21 +412,11 @@ impl FreshAgentState {
     }
 
     /// Slice 3a (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`): wire
-    /// in the SAME [`freshell_sessions::amplifier_locator::AmplifierLocator`]
-    /// the WS `terminal.create` path arms, so a REST-created fresh amplifier
+    /// in the SAME [`freshell_sessions::opencode_locator::OpencodeLocator`]
+    /// the WS `terminal.create` path arms, so a REST-created fresh opencode
     /// pane is armed in the identical instance the already-running periodic
     /// sweep polls. `freshell-server`'s `main.rs` calls this once at boot
     /// with the same `Arc` (or `None`) `WsState` holds.
-    pub fn with_amplifier_locator(
-        mut self,
-        locator: Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
-    ) -> Self {
-        self.amplifier_locator = locator;
-        self
-    }
-
-    /// Sibling to [`Self::with_amplifier_locator`] for the opencode
-    /// terminal-pane restore fix's [`freshell_sessions::opencode_locator::OpencodeLocator`].
     pub fn with_opencode_locator(
         mut self,
         locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
@@ -399,7 +425,7 @@ impl FreshAgentState {
         self
     }
 
-    /// Sibling to [`Self::with_amplifier_locator`] for the P1.14 /
+    /// Sibling to [`Self::with_opencode_locator`] for the P1.14 /
     /// Incident-4 codex hardening's [`freshell_sessions::codex_locator::CodexLocator`].
     pub fn with_codex_locator(
         mut self,
@@ -2235,6 +2261,58 @@ mod fresh_agent_create_dedup_tests {
                 panic!("req-3 must still be cached (most recent, within cap)")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod spawn_gate_seam_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn bare_state() -> FreshAgentState {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+    }
+
+    #[test]
+    fn unwired_state_has_no_spawn_gate() {
+        assert!(bare_state().spawn_gate().is_none());
+    }
+
+    /// Boot-assertion seam (council enn3 follow-up): the OnceLock is a
+    /// fail-OPEN seam — an unwired gate silently ungates every REST create.
+    /// `spawn_gate_wired` is the public probe `freshell-server` asserts at
+    /// startup so a wiring regression fails LOUD at boot.
+    #[test]
+    fn spawn_gate_wired_reflects_oncelock_state() {
+        let state = bare_state();
+        assert!(!state.spawn_gate_wired(), "bare state must report unwired");
+        state.set_spawn_gate(
+            Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            Duration::from_millis(100),
+        );
+        assert!(state.spawn_gate_wired(), "wired state must report wired");
+    }
+
+    #[test]
+    fn set_spawn_gate_is_visible_to_every_clone_and_set_once() {
+        let state = bare_state();
+        let clone_taken_before_set = state.clone();
+        let gate = Arc::new(crate::spawn_gate::SpawnGate::new(4, 64));
+        state.set_spawn_gate(Arc::clone(&gate), Duration::from_millis(1234));
+
+        // Clones share the Arc<OnceLock>, so even a clone taken BEFORE the
+        // set observes the wiring (the ledger-injection property).
+        let wired = clone_taken_before_set.spawn_gate().expect("wired");
+        assert!(Arc::ptr_eq(&wired.gate, &gate), "same gate instance");
+        assert_eq!(wired.timeout, Duration::from_millis(1234));
+
+        // Second set is ignored (OnceLock).
+        let other = Arc::new(crate::spawn_gate::SpawnGate::new(1, 1));
+        state.set_spawn_gate(other, Duration::from_millis(1));
+        let still = state.spawn_gate().expect("still wired");
+        assert!(Arc::ptr_eq(&still.gate, &gate), "first wiring wins");
     }
 }
 
