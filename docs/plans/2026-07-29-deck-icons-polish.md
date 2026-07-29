@@ -917,7 +917,12 @@ export function providerIconSvg(provider: string, colorHex: string): string {
   const key = `${provider}\u0000${colorHex}`
   const hit = markupCache.get(key)
   if (hit) return hit
-  const Icon = resolveFreshAgentType(provider)?.icon ?? PROVIDER_ICONS[provider] ?? DefaultProviderIcon
+  const Icon =
+    resolveFreshAgentType(provider)?.icon ??
+    // `provider` is an open string; PROVIDER_ICONS is Record<CodingCliProviderName, ...>,
+    // so a plain string index is TS7053 under strict. Same cast as session-type-utils.ts.
+    PROVIDER_ICONS[provider as keyof typeof PROVIDER_ICONS] ??
+    DefaultProviderIcon
   const raw = renderToStaticMarkup(createElement(Icon))
   let svg = raw.replace('<svg', `<svg color="${colorHex}"`)
   // Standalone SVG (loaded via <img src="data:...">) requires xmlns; React
