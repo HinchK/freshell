@@ -186,6 +186,13 @@ impl SessionExistenceProbe for IndexExistenceProbe {
             .as_ref()
             .is_some_and(|ledger| ledger.ever_bound(provider, session_id))
     }
+
+    fn ever_observed_on_disk(&self, provider: &str, session_id: &str) -> bool {
+        self.observed
+            .lock()
+            .expect("observed set lock")
+            .contains(&format!("{provider}:{session_id}"))
+    }
 }
 
 #[cfg(test)]
@@ -419,6 +426,65 @@ mod tests {
         let bare = new_test_probe_with_ledger(None);
         assert!(!bare.ever_observed("claude", "11111111-2222-3333-4444-555555555555"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// PIN 1 (claude never-conversed carve-out): "seen on disk" is a strictly
+    /// stronger fact than "ever bound". A ledger binding proves the identity
+    /// was minted at create — NOT that a transcript ever existed. The
+    /// carve-out keys on disk observation, so ever_bound alone must not
+    /// count.
+    #[test]
+    fn ever_observed_on_disk_excludes_ledger_only_bindings() {
+        let dir = std::env::temp_dir().join(format!(
+            "ledger-everobs-disk-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ledger =
+            std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(dir.clone())));
+        // "Generation 1" bound this identity durably.
+        ledger
+            .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                provider: "claude",
+                session_id: "11111111-2222-3333-4444-555555555555",
+                terminal_id: "t1",
+                mode: "claude",
+                cwd: None,
+                create_request_id: None,
+                now_ms: 1_000,
+            })
+            .unwrap();
+
+        // "Generation 2": a brand-new probe with an EMPTY observed set —
+        // construct it exactly as main.rs does, over an index whose
+        // provider home is an empty temp dir (the transcript is gone).
+        let probe = new_test_probe_with_ledger(Some(std::sync::Arc::clone(&ledger)));
+        let session_id = "11111111-2222-3333-4444-555555555555";
+        assert!(probe.ever_observed("claude", session_id)); // via ledger — unchanged
+        assert!(!probe.ever_observed_on_disk("claude", session_id)); // NEW: ledger does not count
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A genuine on-disk observation (index snapshot or locator-fallback hit)
+    /// counts for BOTH ever_observed and ever_observed_on_disk.
+    #[tokio::test]
+    async fn ever_observed_on_disk_true_after_disk_observation() {
+        let home = temp_claude_home("disk-observed");
+        let session_id = "3c4d5e6f-7081-4a92-8b3c-4d5e6f708192";
+        write_zero_turn_session(&home, session_id);
+        let (probe, index) = probe_over(&home);
+        let probe = probe.with_claude_transcript_locator(direct_locator_over(&home));
+        index.warm().await;
+        assert_eq!(
+            probe.exists("claude", session_id),
+            SessionExistence::Present
+        );
+        assert!(probe.ever_observed_on_disk("claude", session_id));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
