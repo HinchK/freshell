@@ -10,10 +10,17 @@ import amplifierActivityReducer from '@/store/amplifierActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import settingsReducer from '@/store/settingsSlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
+import repoIconsReducer from '@/store/repoIconsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import type { Tab } from '@/store/types'
+import type { PaneNode } from '@/store/paneTypes'
+import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
+import type { RepoIconEntry } from '@/store/repoIconsSlice'
+import { buildRepoIconUrl } from '@/lib/repo-icon'
+import { hueFromString } from '@/components/icons/RepoIcon'
 import {
-  findApproveTarget, findStopTarget, getTabRingStatus, getTabStatusFlags, selectDeckModel,
+  findApproveTarget, findStopTarget, getTabRepoIcons, getTabRingStatus, getTabStatusFlags, selectDeckModel,
 } from '@/deck/deck-selectors'
 
 const reducer = {
@@ -21,7 +28,7 @@ const reducer = {
   freshAgent: freshAgentReducer, codexActivity: codexActivityReducer,
   claudeActivity: claudeActivityReducer, amplifierActivity: amplifierActivityReducer,
   opencodeActivity: opencodeActivityReducer, paneRuntimeActivity: paneRuntimeActivityReducer,
-  settings: settingsReducer,
+  settings: settingsReducer, terminalMeta: terminalMetaReducer, repoIcons: repoIconsReducer,
 }
 
 const s1Key = makeFreshAgentSessionKey({ sessionType: 'freshclaude', provider: 'claude', sessionId: 's1' })
@@ -32,6 +39,9 @@ function makeState(overrides: {
   pendingPermissions?: Record<string, { requestId: string }>
   freshAgentRunning?: boolean
   paneStatus?: Record<string, Tab['status']>
+  terminalMeta?: Record<string, TerminalMetaRecord>
+  repoIcons?: Record<string, RepoIconEntry>
+  t1Layout?: PaneNode
 } = {}) {
   const store = configureStore({
     reducer,
@@ -45,7 +55,7 @@ function makeState(overrides: {
       },
       panes: {
         layouts: {
-          t1: { type: 'leaf', id: 'p1', content: { kind: 'terminal', terminalId: 'term-1', createRequestId: 'c1', status: overrides.paneStatus?.p1 ?? 'running', mode: 'claude' } },
+          t1: overrides.t1Layout ?? { type: 'leaf', id: 'p1', content: { kind: 'terminal', terminalId: 'term-1', createRequestId: 'c1', status: overrides.paneStatus?.p1 ?? 'running', mode: 'claude' } },
           t2: { type: 'leaf', id: 'p2', content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', sessionId: 's1', createRequestId: 'c2', status: 'running' } },
         },
         activePane: { t1: 'p1', t2: 'p2' },
@@ -53,6 +63,8 @@ function makeState(overrides: {
         zoomedPane: {}, refreshRequestsByPane: {}, restoreFallbackAttemptsByPane: {},
       },
       claudeActivity: { byTerminalId: overrides.claudeBusy ? { 'term-1': { phase: 'busy' } } : {} },
+      terminalMeta: { byTerminalId: overrides.terminalMeta ?? {} },
+      repoIcons: { byCwd: overrides.repoIcons ?? {} },
       turnCompletion: {
         seq: 0, lastAtByTerminalId: {}, lastIdleAtByTerminalId: {}, pendingEvents: [],
         attentionByTab: overrides.attention ?? {}, attentionByPane: {},
@@ -216,5 +228,96 @@ describe('getTabStatusFlags', () => {
     const base = state as { panes: Record<string, unknown> }
     const noLayout = { ...(state as object), panes: { ...base.panes, layouts: {} } } as never
     expect(getTabStatusFlags(noLayout, tab)).toEqual({ busy: false, attention: false, greenIcon: true })
+  })
+})
+
+function meta(terminalId: string, cwd: string): TerminalMetaRecord {
+  return { terminalId, cwd, updatedAt: 1 }
+}
+
+function claudeLeaf(id: string, terminalId: string): PaneNode {
+  return { type: 'leaf', id, content: { kind: 'terminal', terminalId, createRequestId: 'c1', status: 'running', mode: 'claude' } }
+}
+
+function split(id: string, a: PaneNode, b: PaneNode): PaneNode {
+  return { type: 'split', id, direction: 'horizontal', children: [a, b], sizes: [50, 50] }
+}
+
+describe('getTabRepoIcons', () => {
+  it('maps a resolved repo cwd with an icon to a repo-icon URL + letter + hue', () => {
+    const state = makeState({
+      terminalMeta: { 'term-1': meta('term-1', '/repos/alpha') },
+      repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
+    })
+    expect(getTabRepoIcons(state, tabsOf(state)[0])).toEqual([
+      { url: buildRepoIconUrl('/repos/alpha'), letter: 'A', hue: hueFromString('alpha') },
+    ])
+  })
+
+  it('falls back to letter-only (url null) when the repo has no icon', () => {
+    const state = makeState({
+      terminalMeta: { 'term-1': meta('term-1', '/repos/beta') },
+      repoIcons: { '/repos/beta': { status: 'error', hasIcon: false, repoName: 'beta' } },
+    })
+    expect(getTabRepoIcons(state, tabsOf(state)[0])).toEqual([
+      { url: null, letter: 'B', hue: hueFromString('beta') },
+    ])
+  })
+
+  it('skips cwds still loading, dedupes by repoKey, caps at 3 distinct repos', () => {
+    // 6 panes in one tab across cwds: loading, r1, r1-worktree (same repoRoot), r2, r3, r4.
+    // Expect exactly r1, r2, r3 in first-appearance order (r4 truncated by the cap).
+    const state = makeState({
+      t1Layout: split('s1',
+        claudeLeaf('p1', 'term-loading'),
+        split('s2',
+          claudeLeaf('p2', 'term-r1a'),
+          split('s3',
+            claudeLeaf('p3', 'term-r1b'),
+            split('s4',
+              claudeLeaf('p4', 'term-r2'),
+              split('s5', claudeLeaf('p5', 'term-r3'), claudeLeaf('p6', 'term-r4')))))),
+      terminalMeta: {
+        'term-loading': meta('term-loading', '/repos/loading'),
+        'term-r1a': meta('term-r1a', '/repos/r1'),
+        'term-r1b': meta('term-r1b', '/repos/r1-wt'),
+        'term-r2': meta('term-r2', '/repos/r2'),
+        'term-r3': meta('term-r3', '/repos/r3'),
+        'term-r4': meta('term-r4', '/repos/r4'),
+      },
+      repoIcons: {
+        '/repos/loading': { status: 'loading' },
+        '/repos/r1': { status: 'ready', repoRoot: '/repos/r1', repoName: 'r1', hasIcon: true },
+        '/repos/r1-wt': { status: 'ready', repoRoot: '/repos/r1', repoName: 'r1', hasIcon: true },
+        '/repos/r2': { status: 'error', hasIcon: false, repoName: 'r2' },
+        '/repos/r3': { status: 'ready', repoRoot: '/repos/r3', repoName: 'r3', hasIcon: true },
+        '/repos/r4': { status: 'ready', repoRoot: '/repos/r4', repoName: 'r4', hasIcon: true },
+      },
+    })
+    expect(getTabRepoIcons(state, tabsOf(state)[0])).toEqual([
+      { url: buildRepoIconUrl('/repos/r1'), letter: 'R', hue: hueFromString('r1') },
+      { url: null, letter: 'R', hue: hueFromString('r2') },
+      { url: buildRepoIconUrl('/repos/r3'), letter: 'R', hue: hueFromString('r3') },
+    ])
+  })
+
+  it('returns [] for a tab with no repo-resolvable panes', () => {
+    const state = makeState() // no terminalMeta seeded, no initialCwd anywhere
+    expect(getTabRepoIcons(state, tabsOf(state)[0])).toEqual([])
+  })
+
+  it('tab with NO pane layout derives its icon from the synthesized pane (tab.initialCwd), matching the tab bar', () => {
+    const state = makeState({
+      repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
+    })
+    // Fixture tabs are mode: 'shell', and resolvePaneRepoCwd resolves terminal panes only
+    // when their mode is non-shell (isNonShellMode); the synthesized pane inherits tab.mode.
+    // Override mode alongside initialCwd or the icon can never appear.
+    const tab = { ...tabsOf(state)[0], mode: 'claude' as const, initialCwd: '/repos/alpha' }
+    const base = state as { panes: Record<string, unknown> }
+    const noLayout = { ...(state as object), panes: { ...base.panes, layouts: {} } } as never
+    expect(getTabRepoIcons(noLayout, tab)).toEqual([
+      { url: buildRepoIconUrl('/repos/alpha'), letter: 'A', hue: hueFromString('alpha') },
+    ])
   })
 })

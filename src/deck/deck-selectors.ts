@@ -5,6 +5,8 @@ import type { TabStatusFlags } from './tile-state'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab, hasWaitingPrompt, resolvePaneActivity } from '@/lib/pane-activity'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
+import { buildRepoIconUrl, pathBasename, resolvePaneRepoCwd } from '@/lib/repo-icon'
+import { hueFromString } from '@/components/icons/RepoIcon'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 
 export type TabRingStatus = { busy: boolean; green: boolean; amber: boolean }
@@ -74,6 +76,51 @@ export function panesForTab(state: RootState, tab: Tab): Array<{ paneId: string;
       initialCwd: tab.initialCwd,
     },
   }]
+}
+
+/** Mirrors MAX_REPO_ICONS in TabItem.tsx (locked decision: cap distinct repo icons at 3). */
+export const MAX_TILE_REPO_ICONS = 3
+
+export type TileRepoIcon = {
+  /** /api/repo-icon URL when the repo has a detected icon, else null (letter avatar). */
+  url: string | null
+  letter: string
+  hue: number
+}
+
+/**
+ * Repo icons for a tab, using the SAME resolution pipeline as the tab bar
+ * (TabBar.tsx getPaneEntries -> repoIconInfoByCwd): resolvePaneRepoCwd per pane
+ * (panesForTab supplies layout entries or the TabBar.tsx:203-221-style synthesized
+ * pane for layout-less tabs), meta from state.repoIcons.byCwd (probed by the
+ * DeckController itself in Task 8; TabBar also probes when mounted), distinct
+ * repos in first-appearance order, capped at 3, silently truncated.
+ * Deliberate divergences from TabItem: considers ALL panes (not just the first
+ * 3 pane icons) and ignores settings.panes.repoIconsOnTabs (deck tiles always
+ * show their center glyph).
+ */
+export function getTabRepoIcons(state: RootState, tab: Tab): TileRepoIcon[] {
+  const terminalMetaById = state.terminalMeta.byTerminalId
+  const byCwd = state.repoIcons.byCwd
+  const seen = new Set<string>()
+  const icons: TileRepoIcon[] = []
+  for (const entry of panesForTab(state, tab)) {
+    const cwd = resolvePaneRepoCwd(entry.content, tab, terminalMetaById)
+    if (!cwd) continue
+    const meta = byCwd[cwd]
+    if (!meta || meta.status === 'loading') continue
+    const repoKey = meta.repoRoot || cwd
+    if (seen.has(repoKey)) continue
+    seen.add(repoKey)
+    const repoName = meta.repoName || pathBasename(repoKey)
+    icons.push({
+      url: meta.hasIcon ? buildRepoIconUrl(cwd) : null,
+      letter: (repoName.trim()[0] || '?').toUpperCase(),
+      hue: hueFromString(repoName),
+    })
+    if (icons.length >= MAX_TILE_REPO_ICONS) break
+  }
+  return icons
 }
 
 /**
