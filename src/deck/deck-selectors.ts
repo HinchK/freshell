@@ -1,6 +1,7 @@
 import type { RootState } from '@/store/store'
 import type { Tab } from '@/store/types'
-import type { FreshAgentPaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import type { FreshAgentPaneContent, PaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
+import type { TabStatusFlags } from './tile-state'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab, hasWaitingPrompt, resolvePaneActivity } from '@/lib/pane-activity'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
@@ -45,6 +46,61 @@ export function getTabRingStatus(state: RootState, tab: Tab): TabRingStatus {
     busy,
     green: !!state.turnCompletion.attentionByTab[tab.id],
     amber: tabHasPendingApproval(state, tab.id),
+  }
+}
+
+/**
+ * Pane entries for a tab, tolerant of layout-less tabs. This transient is REAL:
+ * addTab (tabsSlice.ts:296) never seeds a layout — PaneLayout.tsx:30-35 initializes
+ * it in a post-paint useEffect, and persisted-state restore can omit layout entries —
+ * while the deck repaints synchronously per dispatch, so it WILL paint such tabs.
+ * Mirrors the tab bar's live synthesis fallback (TabBar.tsx:203-221): synthesize a
+ * single terminal pane from the tab's own fields. Do NOT touch TabBar; this is the
+ * deck-local twin of that fallback.
+ */
+export function panesForTab(state: RootState, tab: Tab): Array<{ paneId: string; content: PaneContent }> {
+  const layout = state.panes.layouts[tab.id]
+  if (layout) return collectPaneEntries(layout)
+  if (!tab.mode) return []
+  return [{
+    paneId: tab.id,
+    content: {
+      kind: 'terminal' as const,
+      mode: tab.mode,
+      shell: tab.shell,
+      createRequestId: tab.createRequestId,
+      status: tab.status,
+      sessionRef: tab.sessionRef,
+      initialCwd: tab.initialCwd,
+    },
+  }]
+}
+
+/**
+ * Per-tab status flags, derived from the SAME conditions the tab bar uses:
+ * - busy: any pane busy (getBusyPaneIdsForTab, TabBar.tsx:329-338)
+ * - attention: turnCompletion.attentionByTab gated on tabAttentionStyle !== 'none'
+ *   (TabItem.tsx:158-184 renders no bar/fill when the style is 'none')
+ * - greenIcon: any non-busy pane whose effective status is 'running'
+ *   (TabItem.tsx:135-147; non-terminal pane kinds count as 'running')
+ */
+export function getTabStatusFlags(state: RootState, tab: Tab): TabStatusFlags {
+  const busyIds = getBusyPaneIdsForTab({
+    tab,
+    paneLayouts: state.panes.layouts as Record<string, PaneNode | undefined>,
+    ...activityInputs(state),
+  })
+  const entries = panesForTab(state, tab) // layout entries, or the synthesized single pane
+  const greenIcon = entries.some(({ paneId, content }) => {
+    if (busyIds.includes(paneId)) return false
+    const status = content.kind === 'terminal' ? content.status : 'running'
+    return status === 'running'
+  })
+  const attentionStyle = state.settings.settings.panes.tabAttentionStyle
+  return {
+    busy: busyIds.length > 0,
+    attention: !!state.turnCompletion.attentionByTab[tab.id] && attentionStyle !== 'none',
+    greenIcon,
   }
 }
 

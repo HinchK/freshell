@@ -11,8 +11,9 @@ import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import settingsReducer from '@/store/settingsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import type { Tab } from '@/store/types'
 import {
-  findApproveTarget, findStopTarget, getTabRingStatus, selectDeckModel,
+  findApproveTarget, findStopTarget, getTabRingStatus, getTabStatusFlags, selectDeckModel,
 } from '@/deck/deck-selectors'
 
 const reducer = {
@@ -30,6 +31,7 @@ function makeState(overrides: {
   attention?: Record<string, boolean>
   pendingPermissions?: Record<string, { requestId: string }>
   freshAgentRunning?: boolean
+  paneStatus?: Record<string, Tab['status']>
 } = {}) {
   const store = configureStore({
     reducer,
@@ -43,7 +45,7 @@ function makeState(overrides: {
       },
       panes: {
         layouts: {
-          t1: { type: 'leaf', id: 'p1', content: { kind: 'terminal', terminalId: 'term-1', createRequestId: 'c1', status: 'running', mode: 'claude' } },
+          t1: { type: 'leaf', id: 'p1', content: { kind: 'terminal', terminalId: 'term-1', createRequestId: 'c1', status: overrides.paneStatus?.p1 ?? 'running', mode: 'claude' } },
           t2: { type: 'leaf', id: 'p2', content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', sessionId: 's1', createRequestId: 'c2', status: 'running' } },
         },
         activePane: { t1: 'p1', t2: 'p2' },
@@ -162,5 +164,57 @@ describe('freshopencode targets carry cwd (server auth keys embed it — A8)', (
     expect(findStopTarget(state, 't3')).toEqual({
       kind: 'fresh-agent', sessionId: 'ses_1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo/a',
     })
+  })
+})
+
+function tabsOf(state: never): Tab[] {
+  return (state as { tabs: { tabs: Tab[] } }).tabs.tabs
+}
+
+function withTabAttentionStyle(state: never, style: 'none' | 'highlight'): never {
+  const clone = structuredClone(state) as { settings: { settings: { panes: { tabAttentionStyle: string } } } }
+  clone.settings.settings.panes.tabAttentionStyle = style
+  return clone as never
+}
+
+describe('getTabStatusFlags', () => {
+  it('greenIcon: running non-busy pane sets greenIcon (tab bar green icon condition)', () => {
+    const state = makeState() // default fixture: t1 has a claude terminal pane, status running, not busy
+    const tab = tabsOf(state)[0]
+    expect(getTabStatusFlags(state, tab)).toEqual({ busy: false, attention: false, greenIcon: true })
+  })
+
+  it('busy pane sets busy and suppresses greenIcon when it is the only pane', () => {
+    const state = makeState({ claudeBusy: true }) // term-1 busy; p1 is t1's only pane
+    expect(getTabStatusFlags(state, tabsOf(state)[0])).toEqual({ busy: true, attention: false, greenIcon: false })
+  })
+
+  it('attention flag mirrors turnCompletion.attentionByTab', () => {
+    const state = makeState({ attention: { t1: true } })
+    expect(getTabStatusFlags(state, tabsOf(state)[0]).attention).toBe(true)
+  })
+
+  it("attention is gated off when tabAttentionStyle is 'none' (tab bar shows no bar/fill then)", () => {
+    const state = withTabAttentionStyle(makeState({ attention: { t1: true } }), 'none')
+    expect(getTabStatusFlags(state, tabsOf(state)[0]).attention).toBe(false)
+  })
+
+  it('exited terminal pane yields no greenIcon', () => {
+    const state = makeState({ paneStatus: { p1: 'exited' } })
+    expect(getTabStatusFlags(state, tabsOf(state)[0]).greenIcon).toBe(false)
+  })
+
+  it('tab with NO pane layout classifies from the synthesized pane (tab.mode/tab.status), matching the tab bar', () => {
+    // Real transient: addTab (tabsSlice.ts:296) never seeds a layout — PaneLayout.tsx:30-35
+    // initializes it in a post-paint useEffect, persisted-state restore can omit layout entries,
+    // and the deck repaints synchronously per dispatch, so it WILL paint layout-less tabs.
+    const state = makeState()
+    // Fixture tabs carry mode: 'shell' (only pane CONTENTS are mode 'claude'). The synthesized
+    // pane inherits tab.mode, and a shell-mode pane never yields greenIcon — so override the
+    // tab under test.
+    const tab = { ...tabsOf(state)[0], mode: 'claude' as const, status: 'running' as const }
+    const base = state as { panes: Record<string, unknown> }
+    const noLayout = { ...(state as object), panes: { ...base.panes, layouts: {} } } as never
+    expect(getTabStatusFlags(noLayout, tab)).toEqual({ busy: false, attention: false, greenIcon: true })
   })
 })
