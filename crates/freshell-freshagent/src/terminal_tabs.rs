@@ -4012,16 +4012,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn fifteen_plus_rest_create_burst_is_bounded_and_all_complete() {
-        // Concurrency-1 gate: at most ONE request may hold the spawn permit
-        // at a time, so a 16-burst must serialize through the gate — the
-        // queued_total counter proves the burst actually queued (bounded
-        // in-flight) instead of spawning in parallel, and every request
-        // still completes (FIFO drain, nothing dropped).
+        // Deterministic pin (kata bccd item 2, council enn3): pre-holding the
+        // single permit forces EVERY burst request through the queue —
+        // queued_total() reaches exactly 16 (the fast path cannot fire while
+        // the budget is held), and ZERO requests may complete while the
+        // budget is exhausted. That pins max-in-flight <= budget without the
+        // probabilistic `queued_total >= 8` lower bound (the fast path skips
+        // the counter). Mirrors the re-acquire precedent at
+        // `abort_burst_rest_creates_stay_gated...`.
         let state = state_with_registry();
         let registry = state.terminal_registry.clone().unwrap();
         let gate = Arc::new(crate::spawn_gate::SpawnGate::new(1, 64));
         state.set_spawn_gate(Arc::clone(&gate), std::time::Duration::from_secs(30));
         let router = app(state);
+
+        let held = gate
+            .acquire_uncancellable(std::time::Duration::from_secs(1))
+            .await
+            .expect("test pre-hold of the single permit");
 
         let mut handles = Vec::new();
         for _ in 0..16 {
@@ -4030,20 +4038,32 @@ mod tests {
                 post(r, "/api/tabs", shell_create_body(), true).await
             }));
         }
+
+        // Every request must queue behind the held permit — exact, not
+        // probabilistic.
+        for _ in 0..600 {
+            if gate.queued_total() == 16 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            gate.queued_total(),
+            16,
+            "all 16 burst requests must queue while the permit is held"
+        );
+        assert!(
+            handles.iter().all(|h| !h.is_finished()),
+            "no request may complete while the budget is fully held (max-in-flight <= budget)"
+        );
+
+        drop(held);
         let mut terminal_ids = Vec::new();
         for h in handles {
             let (status, body) = h.await.expect("request task");
             assert_eq!(status, StatusCode::OK, "{body}");
             terminal_ids.push(body["data"]["terminalId"].as_str().unwrap().to_string());
         }
-        // With 16 near-simultaneous arrivals and 1 permit, the overwhelming
-        // majority must have queued. (The fast path skips the counter when
-        // the queue is momentarily empty, hence >= 8, not == 15.)
-        assert!(
-            gate.queued_total() >= 8,
-            "burst did not queue through the gate: queued_total={}",
-            gate.queued_total()
-        );
         assert_eq!(gate.queue_rejections(), 0, "no loud rejections expected");
         assert_eq!(gate.timeouts(), 0, "no permit-wait timeouts expected");
 
