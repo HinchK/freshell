@@ -567,33 +567,45 @@ async fn main() -> ExitCode {
         // provider home resolves — mirrors `session_index`'s own `Option`
         // convention.
         session_existence: match &session_index {
-            Some(index) => std::sync::Arc::new(existence::IndexExistenceProbe::new(
-                std::sync::Arc::clone(index),
-                // P1.8 read 2: the durable ledger backs `ever_observed`, so a
-                // transcript deleted while the server was DOWN still derives
-                // loud dead_session (per-boot observed set is empty then).
-                Some(std::sync::Arc::clone(&pane_ledger)),
-                // Provider session roots resolved with the SAME helpers the
-                // `session_index` sources above use — a known provider whose
-                // root does not exist on this machine derives an immediate
-                // `error{provider_unavailable}`, never `index_warming`.
-                session_directory::provider_home()
-                    .map(|h| {
-                        std::collections::HashMap::from([
-                            ("claude".to_string(), session_directory::claude_home(&h)),
-                            ("codex".to_string(), session_directory::codex_home(&h)),
-                            (
-                                "opencode".to_string(),
-                                freshell_sessions::parse::default_opencode_data_home(),
-                            ),
-                            (
-                                "amplifier".to_string(),
-                                freshell_sessions::amplifier::amplifier_home(&h),
-                            ),
-                        ])
-                    })
-                    .unwrap_or_default(),
-            )),
+            Some(index) => std::sync::Arc::new(
+                existence::IndexExistenceProbe::new(
+                    std::sync::Arc::clone(index),
+                    // P1.8 read 2: the durable ledger backs `ever_observed`, so a
+                    // transcript deleted while the server was DOWN still derives
+                    // loud dead_session (per-boot observed set is empty then).
+                    Some(std::sync::Arc::clone(&pane_ledger)),
+                    // Provider session roots resolved with the SAME helpers the
+                    // `session_index` sources above use — a known provider whose
+                    // root does not exist on this machine derives an immediate
+                    // `error{provider_unavailable}`, never `index_warming`.
+                    session_directory::provider_home()
+                        .map(|h| {
+                            std::collections::HashMap::from([
+                                ("claude".to_string(), session_directory::claude_home(&h)),
+                                ("codex".to_string(), session_directory::codex_home(&h)),
+                                (
+                                    "opencode".to_string(),
+                                    freshell_sessions::parse::default_opencode_data_home(),
+                                ),
+                                (
+                                    "amplifier".to_string(),
+                                    freshell_sessions::amplifier::amplifier_home(&h),
+                                ),
+                            ])
+                        })
+                        .unwrap_or_default(),
+                )
+                // Kata 09v1 zero-turn claude fallback: the SAME raw-file check
+                // the attach arm trusts (claude_snapshot ordered candidate
+                // roots, CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude), so
+                // reconcile and attach can never disagree about whether a
+                // claude transcript exists. Degenerate no-roots case (HOME
+                // unset etc.): locate_transcript answers None and the probe
+                // keeps the pure index answer — identical to pre-fix behavior.
+                .with_claude_transcript_locator(std::sync::Arc::new(|session_id: &str| {
+                    freshell_freshagent::locate_transcript(session_id)
+                })),
+            ),
             None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         },
         // §5.3 row 5: the ONE bounded index-warming deferral's budget

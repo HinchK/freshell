@@ -83,7 +83,6 @@ impl IndexExistenceProbe {
 
     /// Builder-style: install the raw-file fallback for claude (see the field
     /// doc). Chained at the single production construction site in main.rs.
-    #[allow(dead_code)]
     pub fn with_claude_transcript_locator(mut self, locator: ClaudeTranscriptLocator) -> Self {
         self.claude_transcript_locator = Some(locator);
         self
