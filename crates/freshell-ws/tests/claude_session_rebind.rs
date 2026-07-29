@@ -12,6 +12,9 @@
 //! Phase 4 (cross-kind, D7): a LIVE freshclaude sidecar owns "D" (fake
 //!   sidecar, in-memory session map only -- no ledger row); a signal claiming
 //!   "D" for a terminal pane -> refused (live-sidecar session-map probe).
+//! Phase 5 (multi-instance, P4): a signal naming a terminal id unknown to
+//!   this instance is RETAINED across drain cycles, never emits a frame,
+//!   and is reaped only after the staleness TTL.
 //!
 //! Determinism: the test calls `drain_and_rebind_claude` directly on a state
 //! handle (the brief's preferred shape) instead of racing a spawned sweep
@@ -579,6 +582,61 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
     assert!(!signal_root
         .join(format!("{tid4}__1769000000000000009-1.json"))
         .exists());
+
+    // ── Phase 5 — multi-instance retention (P4): a signal naming a terminal
+    // id UNKNOWN to this instance (another freshell server sharing $HOME
+    // owns that pane) must be RETAINED across drain cycles, never emit a
+    // frame, and be reaped only after the staleness TTL.
+    let foreign_tid = "some-other-instances-pane";
+    let foreign_path = signal_root.join(format!("{foreign_tid}__9000000000000000000-1.json"));
+    std::fs::write(
+        &foreign_path,
+        r#"{"session_id":"11111111-2222-3333-4444-555555555555","source":"resume","hook_event_name":"SessionStart"}"#,
+    )
+    .expect("write foreign-instance signal");
+    freshell_ws::claude_signal::drain_and_rebind_claude(&state, &watcher).await;
+    tokio::task::yield_now().await;
+    assert!(
+        foreign_path.exists(),
+        "an unknown-terminal signal must be RETAINED on disk (act-then-delete), \
+         not destroyed -- a second freshell instance sharing $HOME owns it"
+    );
+    // Absence proof: no associated frame for the foreign terminal id within
+    // 1s (reuse this file's Phase 3 absence-proof helper/pattern verbatim,
+    // substituting foreign_tid).
+    let moved = frame_seen_within(&mut ws, Duration::from_secs(1), |v| {
+        v["type"] == "terminal.session.associated" && v["terminalId"] == foreign_tid
+    })
+    .await;
+    assert!(
+        !moved,
+        "an unknown-terminal signal must never produce an associated frame on this instance"
+    );
+    // Retention is stable across sweeps, not a one-drain artifact.
+    freshell_ws::claude_signal::drain_and_rebind_claude(&state, &watcher).await;
+    tokio::task::yield_now().await;
+    assert!(
+        foreign_path.exists(),
+        "the retained signal must survive a SECOND drain (stable retention)"
+    );
+    // Reaped ONLY after the staleness TTL: backdate the mtime past the cap
+    // (STALE_SIGNAL_MAX_AGE = 600s, opencode_signal.rs:40 -- pub(crate),
+    // not visible to this integration binary, hence the literal; the
+    // in-module unit test drain_reaps_stale_files_without_emitting pins the
+    // reap against the constant itself).
+    let stale = std::time::SystemTime::now() - std::time::Duration::from_secs(11 * 60);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&foreign_path)
+        .expect("open retained signal for backdating")
+        .set_modified(stale)
+        .expect("backdate retained signal");
+    freshell_ws::claude_signal::drain_and_rebind_claude(&state, &watcher).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !foreign_path.exists(),
+        "an orphaned unknown-terminal signal must be reaped after the staleness TTL"
+    );
 
     state.fresh_claude.shutdown().await; // reap the fake node child
 
