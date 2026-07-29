@@ -25,7 +25,8 @@
 - rusqlite 0.31 (bundled) is a runtime dependency of `freshell-sessions` and a dev-dependency of `freshell-server`. Do NOT add a runtime rusqlite dependency to `freshell-server` — the production query belongs in `freshell-sessions`.
 - Commits must use the git identity `Dan Shapiro <3732858+danshapiro@users.noreply.github.com>` (repo/global config already provides this; do not override it).
 - Busy timeout for the new by-id query: 250ms — deliberately NOT the listing's 5000ms (`exists()` is sync on the reconcile path; N panes × 5s is unacceptable).
-- LOAD-BEARING error semantics: missing DB file ⇒ `Absent` is fine (no opencode ever ran); ANY other failure to open/read the DB (lock contention, corruption, io error, missing `time_archived` column) ⇒ `Unknown`, NEVER `Absent`. `Unknown` makes reconcile defer (`Error{index_warming}` + the handler's single bounded deferral) and re-derive; Absent-on-error would recreate the bug under WAL lock contention.
+- LOAD-BEARING error semantics: missing DB file ⇒ `Absent` is fine (no opencode ever ran); ANY other failure to open/read the DB (lock contention, corruption, io error) ⇒ `Unknown`, NEVER `Absent`. `Unknown` makes reconcile defer (`Error{index_warming}` + the handler's single bounded deferral) and re-derive; Absent-on-error would recreate the bug under WAL lock contention. (Empirically validated with the workspace-pinned rusqlite 0.31.0: `busy_timeout(250)` bounds every lock scenario — max observed 251.53ms, all failures surface as `Err`, no hang, no false-empty result; see the load-bearing ledger.)
+- Load-bearing validation (2026-07-29, ledger: `.worktrees/.the-usual-logs/opencode-existence-fallback/load-bearing-ledger.md`): verified against real opencode v1.18.9 — the attach arm is by-id (`resumeArgs ["--session","{{sessionId}}"]`, `extensions/opencode/freshell.json:10`), and opencode's `Session.get` resolves children, directory-less roots, AND ARCHIVED sessions (no `time_archived` filter in `Session.get`; a live attach to an archived session succeeded). FALSIFIED-and-fixed: the by-id query carries NO `time_archived IS NULL` filter — archived rows answer "found" (attach parity). Accepted limitation (parity with the listing, not a regression): opencode uses `opencode-<channel>.db` on non-standard channels and honors an `OPENCODE_DB` env override; both the listing and this fallback probe `<data_home>/opencode.db`, so non-standard channels behave exactly as today.
 - Explicitly OUT of scope (rejected by adversarial review — do not implement): living-ancestor/chain-fallback in reconcile; signal-lane guards or child→root translation at rebind time; including children in the SessionIndex listing (the listing's root-only query MUST stay root-only); any ledger migration/repair; Node server or client code.
 - Deliberately skipped (allowed by spec): per-derive-pass memoization of fallback hits. The probe has no per-derivation-pass notion, so threading one through would complicate the `SessionExistenceProbe` contract for a micro-optimization; the chain case's double probe costs one extra 250ms-bounded read-only query. Spec pin 6 says "skip if it complicates anything" — it does.
 
@@ -56,7 +57,7 @@
 
 ### Task 1: `session_exists_by_id` in freshell-sessions
 
-The raw by-id sqlite lookup, living beside all other opencode SQL. Query: `SELECT 1 FROM session WHERE id = ?1 AND time_archived IS NULL` — deliberately NO `parent_id` filter (children are attachable via `opencode --session <id>`) and NO `directory` filter (directory-less roots are real rows the listing drops at mapping). Archived rows answer "not found" — this matches the listing, whose `WHERE s.time_archived IS NULL` is unconditional (verified: `parse/opencode.rs:204`; also pinned by the fixture comment "archived -> excluded" in `tests/opencode_sqlite.rs:105`); Task 1 pins it with its own test. Schema variance: the listing probes only `parent_id` (which this query never references) and treats `time_archived` as a schema invariant (a DB lacking it errors into the transient `OpencodeReadError` path) — this function does the same, so no column probing is needed; a missing `time_archived` column becomes `Err` (⇒ `Unknown` at the probe, pinned by test).
+The raw by-id sqlite lookup, living beside all other opencode SQL. Query: `SELECT 1 FROM session WHERE id = ?1` — deliberately NO `parent_id` filter (children are attachable via `opencode --session <id>`), NO `directory` filter (directory-less roots are real rows the listing drops at mapping), and NO `time_archived` filter. An archived filter was originally planned for listing parity, but load-bearing validation FALSIFIED its premise against real opencode v1.18.9: `Session.get` (session.ts:542-546) has no archived filter — archived filtering exists only in the list surface (`listGlobal`, session.ts:564) — and a live TUI attach to an archived session succeeded (see `reports/validator-V1.md` in the logs dir). Attach parity is this fix's governing principle: filtering archived rows would answer Absent for attachable sessions, the exact false-dead-session bug class this plan removes. So archived rows answer "found", pinned by test. Schema variance: the query references only `id`, so a legacy DB lacking `time_archived` answers normally (pinned by test) — strictly fewer `Err` paths than the listing, which treats `time_archived` as a schema invariant.
 
 **Files:**
 - Modify: `crates/freshell-sessions/src/parse/opencode.rs` (add one const + one pub fn near `default_opencode_data_home`, ~line 374)
@@ -65,7 +66,7 @@ The raw by-id sqlite lookup, living beside all other opencode SQL. Query: `SELEC
 
 **Interfaces:**
 - Consumes: `OpencodeReadError`, `Connection`, `OpenFlags` (already imported in `parse/opencode.rs`).
-- Produces: `pub fn session_exists_by_id(data_home: &Path, session_id: &str) -> Result<bool, OpencodeReadError>`, reachable as `freshell_sessions::parse::session_exists_by_id` (Task 2 calls it by that path). Semantics: `Ok(true)` = unarchived row exists; `Ok(false)` = no such row OR no DB file; `Err` = any read failure.
+- Produces: `pub fn session_exists_by_id(data_home: &Path, session_id: &str) -> Result<bool, OpencodeReadError>`, reachable as `freshell_sessions::parse::session_exists_by_id` (Task 2 calls it by that path). Semantics: `Ok(true)` = a row with this id exists (archived included — attach parity); `Ok(false)` = no such row OR no DB file; `Err` = any read failure.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -78,12 +79,16 @@ Create `crates/freshell-sessions/tests/opencode_exists_by_id.rs`:
 //! - CHILD rows (`parent_id` set) and directory-less ROOT rows are found
 //!   (the attach arm `opencode --session <id>` resolves both; the listing
 //!   hides both);
-//! - archived rows and unknown ids are not found (matches the listing's
-//!   unconditional `time_archived IS NULL`);
+//! - ARCHIVED rows are found too: opencode's `Session.get` has no
+//!   `time_archived` filter and a live attach to an archived session
+//!   succeeds (validated against opencode v1.18.9) — the query matches
+//!   the ATTACH arm, not the listing;
+//! - unknown ids are not found;
 //! - a missing DB file is a benign "not found" (no opencode ever ran);
-//! - an unreadable DB — or one whose schema lacks `time_archived`, the
-//!   same invariant the listing assumes — is a hard `Err` (the probe maps
-//!   it to Unknown, NEVER Absent).
+//! - an unreadable DB is a hard `Err` (the probe maps it to Unknown,
+//!   NEVER Absent);
+//! - a legacy schema lacking `time_archived` still answers by id (the
+//!   query references only `id`).
 
 use freshell_sessions::parse::session_exists_by_id;
 
@@ -173,13 +178,19 @@ fn directory_less_root_row_is_found() {
 }
 
 #[test]
-fn archived_row_is_not_found() {
+fn archived_row_is_found_attach_parity() {
+    // FALSIFIED-and-fixed premise: opencode's Session.get has NO archived
+    // filter (session.ts:542-546; archived filtering exists only in the
+    // list surface) and a live attach to an archived session succeeds.
+    // The probe must agree with the ATTACH arm — filtering archived rows
+    // would answer Absent for an attachable session (the bug class this
+    // fix removes).
     let home = temp_data_home("archived");
     let conn = seed_schema(&home);
     insert_row(&conn, "ses_arch0000000000000000000000", Some("/tmp/p"), None, Some(9999));
     assert!(
-        !session_exists_by_id(&home, "ses_arch0000000000000000000000").expect("query ok"),
-        "archived rows match the listing's unconditional `time_archived IS NULL`"
+        session_exists_by_id(&home, "ses_arch0000000000000000000000").expect("query ok"),
+        "archived rows ARE attachable (`opencode --session <id>` resumes them) — found"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -216,10 +227,11 @@ fn unreadable_db_is_an_error_never_not_found() {
 }
 
 #[test]
-fn schema_missing_time_archived_is_an_error() {
-    // The listing treats `time_archived` as a schema invariant (no column
-    // probe; a DB lacking it errors into the transient OpencodeReadError
-    // path). The by-id query matches: Err, so the probe answers Unknown.
+fn schema_missing_time_archived_still_answers_by_id() {
+    // The by-id query references only `id`, so — unlike the listing, which
+    // treats `time_archived` as a schema invariant and errors on a DB
+    // lacking it — a legacy schema still answers normally. Pins that the
+    // query has strictly fewer failure modes than the listing.
     let home = temp_data_home("old-schema");
     let conn =
         rusqlite::Connection::open(home.join("opencode.db")).expect("open fixture db");
@@ -239,8 +251,9 @@ fn schema_missing_time_archived_is_an_error() {
     )
     .expect("insert");
     assert!(
-        session_exists_by_id(&home, "ses_old00000000000000000000000").is_err(),
-        "missing time_archived column = read failure = Err (probe: Unknown)"
+        session_exists_by_id(&home, "ses_old00000000000000000000000").expect("query ok"),
+        "the query references only `id` — a legacy schema without \
+         time_archived answers normally"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -265,17 +278,21 @@ In `crates/freshell-sessions/src/parse/opencode.rs`, add near `default_opencode_
 /// reconcile's bounded deferral retries), not evidence of absence.
 const EXISTENCE_BY_ID_BUSY_TIMEOUT_MS: u64 = 250;
 
-/// Existence-probe by-id lookup: does `<data_home>/opencode.db` hold an
-/// unarchived `session` row with this id?
+/// Existence-probe by-id lookup: does `<data_home>/opencode.db` hold a
+/// `session` row with this id?
 ///
 /// Deliberately NO `parent_id` filter — the attach arm
 /// (`opencode --session <id>` -> session.get by id) resolves CHILD
-/// sessions the root-filtered listing hides — and NO `directory` filter
+/// sessions the root-filtered listing hides — NO `directory` filter
 /// (directory-less roots are real, attachable rows the listing drops at
-/// mapping). Archived rows answer `Ok(false)`, matching the listing's
-/// unconditional `time_archived IS NULL`. Schema note: like the listing,
-/// `time_archived` is treated as a schema invariant — a DB lacking it
-/// surfaces as `Err`, not a guessed answer.
+/// mapping) — and NO `time_archived` filter: opencode's `Session.get`
+/// has no archived filter and a live attach to an archived session
+/// succeeds (validated against v1.18.9), so archived rows answer
+/// `Ok(true)`. The query matches the ATTACH arm, not the listing: any
+/// filter the attach arm lacks would answer "absent" for an attachable
+/// session — the false-dead-session bug class this function removes.
+/// Schema note: only `id` is referenced, so legacy schemas lacking
+/// `time_archived` answer normally.
 ///
 /// - `Ok(false)` for a missing DB file (opencode never ran here) or no
 ///   matching row;
@@ -301,7 +318,7 @@ pub fn session_exists_by_id(
     ))
     .map_err(|e| OpencodeReadError(e.to_string()))?;
     match conn.query_row(
-        "SELECT 1 FROM session WHERE id = ?1 AND time_archived IS NULL",
+        "SELECT 1 FROM session WHERE id = ?1",
         rusqlite::params![session_id],
         |_| Ok(()),
     ) {
@@ -573,11 +590,16 @@ Then the tests (the quartet mirroring the claude fallback tests, plus the DB-sem
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// PINNED: an archived row (time_archived set) stays Absent — the
-    /// fallback matches the listing's unconditional `time_archived IS NULL`
-    /// (verified in parse/opencode.rs:204; the listing excludes archived).
+    /// PINNED: an archived row (time_archived set) is PRESENT via the
+    /// fallback — attach parity. The listing excludes archived rows
+    /// (parse/opencode.rs:204, `time_archived IS NULL`), but opencode's
+    /// attach arm resolves them: `Session.get` has NO archived filter and
+    /// a live `opencode --session <archived-id>` attach succeeds
+    /// (load-bearing validation against v1.18.9). Answering Absent here
+    /// would kill the bookmark of an attachable session — the exact bug
+    /// class this fix removes.
     #[tokio::test]
-    async fn archived_opencode_row_stays_absent_matching_the_listing() {
+    async fn archived_opencode_row_is_present_attach_parity() {
         let home = temp_opencode_data_home("archived");
         seed_opencode_db(
             &home,
@@ -588,7 +610,9 @@ Then the tests (the quartet mirroring the claude fallback tests, plus the DB-sem
         index.warm().await;
         assert_eq!(
             probe.exists("opencode", "ses_arch0000000000000000000000"),
-            SessionExistence::Absent
+            SessionExistence::Present,
+            "archived rows are index-invisible but attachable — the probe \
+             must agree with the attach arm"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -659,11 +683,12 @@ In `crates/freshell-server/src/existence.rs`:
 ```rust
 //! * warm snapshot `Absent` for provider `opencode` with a session locator
 //!   installed => re-checked BY ID against `opencode.db` (rebind
-//!   dead-session fix): child rows (`parent_id` set) and directory-less
-//!   roots are DB-present yet index-invisible — the listing is
-//!   root-filtered and drops cwd-less rows — while the attach arm
-//!   (`opencode --session <id>`, session.get by id) resolves them. Row
-//!   present => `Present`; unreadable DB => `Unknown`, never `Absent`.
+//!   dead-session fix): child rows (`parent_id` set), directory-less
+//!   roots, and archived rows are DB-present yet index-invisible — the
+//!   listing is root-filtered, drops cwd-less rows, and excludes archived
+//!   — while the attach arm (`opencode --session <id>`, session.get by
+//!   id, which has none of those filters) resolves them all. Row present
+//!   => `Present`; unreadable DB => `Unknown`, never `Absent`.
 ```
 
 **(b)** Types — after the `ClaudeTranscriptLocator` type alias (~line 42):
@@ -672,7 +697,8 @@ In `crates/freshell-server/src/existence.rs`:
 /// Answer from the injected opencode by-id DB check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpencodeDbAnswer {
-    /// An unarchived `session` row with the id exists in `opencode.db`.
+    /// A `session` row with the id exists in `opencode.db` (archived
+    /// included — the attach arm's session.get has no archived filter).
     Present,
     /// No such row — including "no DB file at all" (opencode never ran here).
     Absent,
@@ -698,8 +724,9 @@ pub type OpencodeSessionLocator = Arc<dyn Fn(&str) -> OpencodeDbAnswer + Send + 
 ```rust
     /// Opencode by-id fallback (rebind dead-session fix): a session row can
     /// be in opencode.db yet index-invisible — the listing filters
-    /// `parent_id IS NULL` (children hidden) and drops NULL/empty
-    /// `directory` rows (some roots hidden) — so the warm snapshot answers
+    /// `parent_id IS NULL` (children hidden), drops NULL/empty
+    /// `directory` rows (some roots hidden), and excludes archived rows
+    /// (which the attach arm still resolves) — so the warm snapshot answers
     /// a false Absent while the attach arm (`opencode --session <id>`)
     /// would resolve it. When set, a warm-index Absent for provider
     /// "opencode" is re-checked by id against the DB before being
@@ -729,9 +756,10 @@ pub type OpencodeSessionLocator = Arc<dyn Fn(&str) -> OpencodeDbAnswer + Send + 
 /// `<data_home>/opencode.db` via
 /// `freshell_sessions::parse::session_exists_by_id` — read-only open, 250ms
 /// busy timeout (NOT the listing's 5000ms; `exists()` is sync on the
-/// reconcile path), `time_archived IS NULL`, no parent/directory filters.
-/// Missing DB file => `Absent` (opencode never ran); any read error =>
-/// `Unreadable` (=> the probe answers `Unknown`).
+/// reconcile path), no archived/parent/directory filters (attach parity:
+/// opencode's session.get has none of them). Missing DB file => `Absent`
+/// (opencode never ran); any read error => `Unreadable` (=> the probe
+/// answers `Unknown`).
 pub fn opencode_db_locator(data_home: PathBuf) -> OpencodeSessionLocator {
     Arc::new(move |session_id: &str| {
         match freshell_sessions::parse::session_exists_by_id(&data_home, session_id) {
@@ -752,8 +780,9 @@ pub fn opencode_db_locator(data_home: PathBuf) -> OpencodeSessionLocator {
                 // rebound CHILD session id — or a cwd-less root — is
                 // DB-present yet index-invisible and the warm snapshot
                 // answers a false Absent, while the attach arm
-                // (`opencode --session <id>` -> session.get by id) resolves
-                // it. The two arms must agree: before finalizing Absent for
+                // (`opencode --session <id>` -> session.get by id, no
+                // parent/directory/archived filters) resolves it. The two
+                // arms must agree: before finalizing Absent for
                 // opencode, consult the SAME by-id DB truth. An unreadable
                 // DB (WAL lock contention, corruption) is honest Unknown —
                 // reconcile's bounded deferral retries — NEVER Absent. The
@@ -1288,12 +1317,12 @@ Expected: commit succeeds. (If Step 2's infeasibility branch was taken, the comm
 
 **1. Spec coverage.**
 - By-id fallback, warm-Absent + provider-gated, locator-injected, wired in main.rs at the same data home as OpencodeSource → Task 2 (spec pin 1). ✔
-- Query with no parent_id/directory filters, archived ⇒ Absent with listing semantics verified (`WHERE s.time_archived IS NULL` is unconditional in the listing) and pinned by tests at both layers; schema variance handled the way the listing does (parent_id irrelevant to this query; time_archived treated as invariant ⇒ Err ⇒ Unknown, pinned) → Tasks 1-2 (spec pin 2). ✔
+- Query with no parent_id/directory/archived filters. DEVIATION FROM THE ORIGINAL SPEC PIN, evidence-forced: the spec's archived ⇒ Absent pin assumed the attach arm refuses archived sessions; load-bearing validation FALSIFIED that against real opencode v1.18.9 (`Session.get` has no archived filter — session.ts:542-546 vs listGlobal :564 — and a live attach to an archived session succeeded; reports/validator-V1.md). The spec's overriding principle ("the SAME truth the attach arm trusts") therefore requires archived ⇒ Present, pinned by tests at both layers. Schema variance: the query references only `id`, so legacy schemas lacking `time_archived` answer normally (pinned) → Tasks 1-2 (spec pin 2, arm-agreement principle preserved). ✔
 - Error semantics: missing file ⇒ Absent; any read failure ⇒ Unknown never Absent; read-only open; 250ms busy timeout → Tasks 1-2 (spec pin 3). ✔
 - Fallback hit feeds monotone observed-set → Task 2 test `opencode_fallback_present_feeds_ever_observed` (spec pin 4). ✔
 - Provider gating with claude AND codex mirrors of `codex_absent_never_consults_the_claude_locator` → Task 2 (spec pin 5). ✔
 - Memoization → explicitly skipped with rationale in Global Constraints (spec pin 6 allows). ✔
-- Red tests 1-6 from the spec: promoted spike (Task 3), quartet (Task 2), directory-less root (Tasks 1+2), archived pinned (Tasks 1+2), unreadable ⇒ Unknown + missing file ⇒ Absent (Tasks 1+2), real-provider contract with halt rule (Task 4). ✔
+- Red tests 1-6 from the spec: promoted spike (Task 3), quartet (Task 2), directory-less root (Tasks 1+2), archived pinned as Present/attach-parity (Tasks 1+2, per the falsified-A5 deviation above), unreadable ⇒ Unknown + missing file ⇒ Absent (Tasks 1+2), real-provider contract with halt rule (Task 4). ✔
 - Out-of-scope exclusions restated in Global Constraints so no task drifts into them. ✔
 
 **1b. No silent deferrals.** The production outcome — a rebound child pane surviving a freshell restart as `Respawn` — is proven by Task 3's end-to-end test using the REAL index, listing, ledger, production locator, and verdict derivation over a real sqlite file (no fakes). Task 2's two closure doubles exist only in the provider-gating tests (`OpencodeDbAnswer::Present` for a foreign provider), where a double is the point: proving the locator is never consulted; every Present/Absent/Unknown path is tested through the production `opencode_db_locator`. The one requirement not always executable locally is Task 4's real-binary run (external CLI availability); it is spec-sanctioned as opt-in with an explicit halt-on-refusal rule and an honest-reporting step, not a silent deferral. No UNRESOLVED COVERAGE GAPS.
