@@ -174,7 +174,9 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
       fill: 'none', dot: 'green', icons: [],
     })
     expect(decodeKey(device, 2)).toEqual({
-      kind: 'tab', tabId: 't1', title: 'tab1', previewLines: ['$ npm test', 'PASS'], ring: 'blue', active: true,
+      // previewLines is always [] since Task 8 (field dies in Task 9); the
+      // registered term-1 reader above is deliberately ignored.
+      kind: 'tab', tabId: 't1', title: 'tab1', previewLines: [], ring: 'blue', active: true,
       fill: 'none', dot: 'blue', icons: [],
     })
   })

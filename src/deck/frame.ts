@@ -84,11 +84,10 @@ export type FrameInputs = {
   caps: DeckCapabilities
   page: number
   actionLayer: { tabId: string; approveEnabled: boolean; stopEnabled: boolean } | null
-  previewFor: (tabId: string) => string[]
   iconReady: (url: string) => boolean
 }
 
-export function buildFrame({ model, caps, page, actionLayer, previewFor, iconReady }: FrameInputs): FrameSpec {
+export function buildFrame({ model, caps, page, actionLayer, iconReady }: FrameInputs): FrameSpec {
   const plan = planLayout(caps, model.tabs.length)
   const pages = pageCount(model.tabs.length, plan.tabsPerPage)
   const keys: KeySpec[] = Array.from({ length: plan.keyCount }, () => ({ kind: 'empty' as const }))
@@ -110,7 +109,8 @@ export function buildFrame({ model, caps, page, actionLayer, previewFor, iconRea
     if (!tab) return
     keys[keyIndex] = {
       kind: 'tab', tabId: tab.id, title: tab.title,
-      previewLines: previewFor(tab.id), ring: ringColor(tab.status), active: tab.active,
+      previewLines: [], // field dies in Task 9
+      ring: ringColor(tab.status), active: tab.active,
       fill: tab.fill, dot: tab.dot,
       icons: tab.repoIcons.map((icon) => ({
         ...icon,

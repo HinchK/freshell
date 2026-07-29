@@ -17,11 +17,12 @@ import type { KeySpec } from './frame'
 import type { DeckModel } from './deck-selectors'
 import type { RootState } from '@/store/store'
 import { ACTION_KEYS, buildFrame, clampPage, pageCount, planLayout, visibleTabs } from './frame'
-import { findApproveTarget, findStopTarget, selectDeckModel } from './deck-selectors'
+import { findApproveTarget, findStopTarget, panesForTab, selectDeckModel } from './deck-selectors'
 import { executeDeckStop, focusTabFromDeck, sendDeckApproval } from './deck-actions'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
-import { findPaneContent } from '@/lib/pane-utils'
-import { getTerminalTextSnapshot } from './terminal-text-registry'
+import { fetchRepoIconMeta } from '@/store/repoIconsSlice'
+import { resolvePaneRepoCwd } from '@/lib/repo-icon'
+import { IconImageCache, getIconImageCache } from './icon-image-cache'
 import { defaultCtxFactory, renderKey as canvasRenderKey, renderStrip as canvasRenderStrip } from './tile-renderer'
 
 export type DeckControllerOptions = {
@@ -31,13 +32,13 @@ export type DeckControllerOptions = {
   renderStrip?: (text: string, width: number, height: number) => Uint8ClampedArray
   settings: () => { brightness: number; idleBrightness: number; idleTimeoutSeconds: number }
   now?: () => number
+  iconCache?: IconImageCache
 }
 
 export const LONG_PRESS_MS = 500
 export const ACTION_LAYER_TIMEOUT_MS = 10_000
 export const STOP_ESCALATE_MS = 5_000
 export const TICK_MS = 500
-export const PREVIEW_REFRESH_TICKS = 6 // previews re-checked every 3s
 
 export class DeckController {
   private readonly store: DeckControllerOptions['store']
@@ -46,6 +47,7 @@ export class DeckController {
   private readonly renderStripFn: (text: string, width: number, height: number) => Uint8ClampedArray
   private readonly settings: DeckControllerOptions['settings']
   private readonly now: () => number
+  private readonly iconCache: IconImageCache
 
   private page = 1
   private actionLayer: { tabId: string; openedAt: number } | null = null
@@ -55,19 +57,21 @@ export class DeckController {
   private dimmed = false
   private lastPaintedSpecs: string[] = []
   private lastStripText: string | null = null
-  private tickCount = 0
   private lastModelJson: string | null = null
   private lastTabsPerPage: number | null = null
 
   private unsubscribeStore: (() => void) | null = null
   private unsubscribeInput: (() => void) | null = null
+  private unsubscribeIcons: (() => void) | null = null
   private intervalId: ReturnType<typeof setInterval> | null = null
   private onVisibilityChange: (() => void) | null = null
 
   constructor(options: DeckControllerOptions) {
     this.store = options.store
     this.device = options.device
-    this.renderKeyFn = options.renderKey ?? ((spec, caps) => canvasRenderKey(spec, caps, defaultCtxFactory))
+    this.iconCache = options.iconCache ?? getIconImageCache()
+    this.renderKeyFn = options.renderKey ??
+      ((spec, caps) => canvasRenderKey(spec, caps, defaultCtxFactory, (url) => this.iconCache.bitmapFor(url)))
     this.renderStripFn = options.renderStrip ?? ((text, width, height) => canvasRenderStrip(text, width, height, defaultCtxFactory))
     this.settings = options.settings
     this.now = options.now ?? (() => Date.now())
@@ -77,6 +81,8 @@ export class DeckController {
     this.lastActivityAt = this.now()
     void this.device.setBrightness(this.settings().brightness)
     this.repaint()
+    this.probeRepoIcons()
+    this.unsubscribeIcons = this.iconCache.subscribe(() => this.repaint())
     this.unsubscribeStore = this.store.subscribe(() => this.onStoreChange())
     this.unsubscribeInput = this.device.onInput((event) => this.handleInput(event))
     this.intervalId = setInterval(() => this.tick(), TICK_MS)
@@ -92,6 +98,8 @@ export class DeckController {
     this.unsubscribeStore = null
     this.unsubscribeInput?.()
     this.unsubscribeInput = null
+    this.unsubscribeIcons?.()
+    this.unsubscribeIcons = null
     if (this.intervalId !== null) {
       clearInterval(this.intervalId)
       this.intervalId = null
@@ -119,8 +127,9 @@ export class DeckController {
       caps,
       page: this.page,
       actionLayer: this.actionLayerInputs(state),
-      previewFor: (tabId) => this.previewFor(state, tabId),
-      iconReady: () => false, // stub; Task 8 wires the real icon cache
+      // bitmapFor both reports readiness and requests the load - first paint
+      // of a tile with an unloaded icon starts the fetch.
+      iconReady: (url) => this.iconCache.bitmapFor(url) !== null,
     })
     let painted = false
     frame.keys.forEach((spec, keyIndex) => {
@@ -149,24 +158,39 @@ export class DeckController {
     }
   }
 
-  private previewFor(state: RootState, tabId: string): string[] {
-    const paneId = state.panes.activePane[tabId]
-    const layout = state.panes.layouts[tabId]
-    if (!paneId || !layout) return []
-    const content = findPaneContent(layout, paneId)
-    if (content && content.kind === 'terminal' && content.terminalId) {
-      return getTerminalTextSnapshot(content.terminalId) ?? []
+  /**
+   * Probe repo-icon meta for every distinct resolved cwd of the tabs we render.
+   * Deliberately UN-gated by settings.panes.repoIconsOnTabs (Design decision 7:
+   * deck tiles always show their center glyph). Double-probing alongside a
+   * mounted TabBar is harmless - the thunk self-dedupes (repoIconsSlice.ts:36-40).
+   */
+  private probeRepoIcons(): void {
+    const state = this.store.getState()
+    const terminalMetaById = state.terminalMeta.byTerminalId
+    const cwds = new Set<string>()
+    for (const tab of state.tabs.tabs) {
+      for (const entry of panesForTab(state, tab)) {
+        const cwd = resolvePaneRepoCwd(entry.content, tab, terminalMetaById)
+        if (cwd) cwds.add(cwd)
+      }
     }
-    return []
+    for (const cwd of cwds) {
+      if (!state.repoIcons.byCwd[cwd]) this.store.dispatch(fetchRepoIconMeta(cwd))
+    }
   }
 
   // --- store subscription ---
 
   private onStoreChange(): void {
     const state = this.store.getState()
-    // ORDERING (load-bearing): compare the model JSON BEFORE any xterm buffer
-    // reads - previewFor is only invoked by repaint, which we skip entirely
-    // when the model is unchanged.
+    // Probe BEFORE the model-JSON bail-out: the store events that first make a
+    // cwd resolvable (upsertTerminalMeta/setTerminalMetaSnapshot) do NOT change
+    // the model JSON (icons stay [] until meta AND repoIcons both exist), so a
+    // probe placed after the bail-out would never fire in the TabBar-less
+    // leader scenario this probe exists for. It cannot loop: the thunk's
+    // synchronous pending entry makes the byCwd guard skip that cwd on the
+    // re-entrant store change.
+    this.probeRepoIcons()
     const model = selectDeckModel(state)
     const modelJson = JSON.stringify(model)
     if (modelJson === this.lastModelJson) return
@@ -327,8 +351,6 @@ export class DeckController {
 
   private tick(): void {
     this.dutyChecks()
-    this.tickCount++
-    if (this.tickCount % PREVIEW_REFRESH_TICKS === 0) this.repaint() // picks up xterm buffer changes
   }
 
   private noteActivity(): void {

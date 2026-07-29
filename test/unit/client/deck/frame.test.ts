@@ -19,7 +19,6 @@ function model(n: number, activeId = 'tab-0'): DeckModel {
       makeDeckTab({ id: `tab-${i}`, title: `Tab ${i}`, active: `tab-${i}` === activeId })),
   }
 }
-const noPreview = () => []
 const noIcon = () => false
 
 describe('planLayout', () => {
@@ -64,7 +63,7 @@ describe('ringColor priority', () => {
 
 describe('buildFrame', () => {
   it('tabs fit: all tab tiles, active flag set, rest empty', () => {
-    const frame = buildFrame({ model: model(3), caps: MINI_CAPS, page: 1, actionLayer: null, previewFor: noPreview, iconReady: noIcon })
+    const frame = buildFrame({ model: model(3), caps: MINI_CAPS, page: 1, actionLayer: null, iconReady: noIcon })
     expect(frame.keys).toHaveLength(6)
     expect(frame.keys[0]).toMatchObject({ kind: 'tab', tabId: 'tab-0', title: 'Tab 0', active: true })
     expect(frame.keys[2]).toMatchObject({ kind: 'tab', tabId: 'tab-2', active: false })
@@ -72,10 +71,10 @@ describe('buildFrame', () => {
     expect(frame.strip).toBeNull()
   })
   it('overflow: pager key at 5 with page/pageCount; page 2 shows the tail', () => {
-    const f1 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 1, actionLayer: null, previewFor: noPreview, iconReady: noIcon })
+    const f1 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 1, actionLayer: null, iconReady: noIcon })
     expect(f1.keys[5]).toEqual({ kind: 'pager', page: 1, pageCount: 2 })
     expect((f1.keys[0] as { tabId: string }).tabId).toBe('tab-0')
-    const f2 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 2, actionLayer: null, previewFor: noPreview, iconReady: noIcon })
+    const f2 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 2, actionLayer: null, iconReady: noIcon })
     expect((f2.keys[0] as { tabId: string }).tabId).toBe('tab-5')
     expect(f2.keys[3]).toEqual({ kind: 'empty' })
     expect(f2.keys[5]).toEqual({ kind: 'pager', page: 2, pageCount: 2 })
@@ -83,7 +82,7 @@ describe('buildFrame', () => {
   it('action layer replaces the frame', () => {
     const frame = buildFrame({
       model: model(3), caps: MINI_CAPS, page: 1,
-      actionLayer: { tabId: 'tab-1', approveEnabled: false, stopEnabled: true }, previewFor: noPreview, iconReady: noIcon,
+      actionLayer: { tabId: 'tab-1', approveEnabled: false, stopEnabled: true }, iconReady: noIcon,
     })
     expect(frame.keys[ACTION_KEYS.back]).toEqual({ kind: 'action', action: 'back', enabled: true })
     expect(frame.keys[ACTION_KEYS.approve]).toEqual({ kind: 'action', action: 'approve', enabled: false })
@@ -103,7 +102,6 @@ describe('buildFrame', () => {
     }
     const frame = buildFrame({
       model, caps: MINI_CAPS, page: 1, actionLayer: null,
-      previewFor: () => [],
       iconReady: (url) => url === '/api/repo-icon?cwd=%2Fr%2Fa',
     })
     expect(frame.keys[0]).toMatchObject({
@@ -118,7 +116,7 @@ describe('buildFrame', () => {
     const m = model(10)
     m.tabs[1].status.busy = true
     m.tabs[2].status.amber = true
-    const frame = buildFrame({ model: m, caps: PLUS_CAPS, page: 1, actionLayer: null, previewFor: noPreview, iconReady: noIcon })
+    const frame = buildFrame({ model: m, caps: PLUS_CAPS, page: 1, actionLayer: null, iconReady: noIcon })
     expect(frame.keys.every((k) => k.kind !== 'pager')).toBe(true)
     expect(frame.strip).toEqual({ text: 'Tab 0  |  page 1/2  |  1 busy  1 waiting' })
   })

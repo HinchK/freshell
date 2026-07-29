@@ -13,13 +13,15 @@ import claudeActivityReducer from '@/store/claudeActivitySlice'
 import amplifierActivityReducer from '@/store/amplifierActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
-import settingsReducer from '@/store/settingsSlice'
-import terminalMetaReducer from '@/store/terminalMetaSlice'
-import repoIconsReducer from '@/store/repoIconsSlice'
+import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
+import terminalMetaReducer, { upsertTerminalMeta } from '@/store/terminalMetaSlice'
+import repoIconsReducer, { type RepoIconEntry } from '@/store/repoIconsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
-import { DeckController } from '@/deck/deck-controller'
+import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
+import { IconImageCache } from '@/deck/icon-image-cache'
+import { registerTerminalTextReader } from '@/deck/terminal-text-registry'
 import type { KeySpec } from '@/deck/frame'
 
 const reducer = {
@@ -39,6 +41,12 @@ type StoreOpts = {
   freshAgentTab?: boolean // makes t2 a fresh-agent pane bound to session s1
   pendingPermissions?: Record<string, { requestId: string }>
   freshAgentRunning?: boolean
+  /** Seed state.terminalMeta.byTerminalId (terminalId/updatedAt filled in). */
+  terminalMeta?: Record<string, { cwd?: string; repoRoot?: string; checkoutRoot?: string }>
+  /** Seed state.repoIcons.byCwd. */
+  repoIcons?: Record<string, RepoIconEntry>
+  /** Dispatch updateSettingsLocal({ panes: { repoIconsOnTabs } }) BEFORE the controller starts. */
+  repoIconsOnTabs?: boolean
 }
 
 // Mirrors the Task 3 fixture builder, parameterized by tab count: tabs t1..tN,
@@ -61,9 +69,19 @@ function makeStore(opts: StoreOpts = {}) {
     }
     activePane[`t${i}`] = `p${i}`
   }
-  return configureStore({
+  const store = configureStore({
     reducer,
     preloadedState: {
+      ...(opts.terminalMeta
+        ? {
+            terminalMeta: {
+              byTerminalId: Object.fromEntries(Object.entries(opts.terminalMeta).map(
+                ([terminalId, meta]) => [terminalId, { terminalId, updatedAt: 0, ...meta }],
+              )),
+            },
+          }
+        : {}),
+      ...(opts.repoIcons ? { repoIcons: { byCwd: opts.repoIcons } } : {}),
       tabs: { tabs, activeTabId: 't1', renameRequestTabId: null, tombstones: [] },
       panes: {
         layouts, activePane,
@@ -89,6 +107,12 @@ function makeStore(opts: StoreOpts = {}) {
       },
     } as never,
   })
+  if (opts.repoIconsOnTabs !== undefined) {
+    // Precedent: deck-manager.test.ts:128 — the value must be in place BEFORE
+    // setup() constructs and starts the controller.
+    store.dispatch(updateSettingsLocal({ panes: { repoIconsOnTabs: opts.repoIconsOnTabs } }))
+  }
+  return store
 }
 
 // Spec-recording renderer: encodes the KeySpec JSON into the pixel buffer so
@@ -104,11 +128,19 @@ function decodeStrip(device: FakeDeckDevice): string | null {
   return device.stripImage ? new TextDecoder().decode(device.stripImage.rgba as unknown as Uint8Array) : null
 }
 
+// Deferred loader as in icon-image-cache.test.ts: resolve/reject each url by hand.
+function deferredLoader() {
+  const pending = new Map<string, { resolve: (b: CanvasImageSource) => void; reject: (e: Error) => void }>()
+  const loader = (url: string) =>
+    new Promise<CanvasImageSource>((resolve, reject) => pending.set(url, { resolve, reject }))
+  return { loader, pending }
+}
+
 const settings = () => ({ brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300 })
 
 let activeController: DeckController | null = null
 
-function setup(opts: StoreOpts = {}, caps?: DeckCapabilities) {
+function setup(opts: StoreOpts = {}, caps?: DeckCapabilities, extra?: Partial<DeckControllerOptions>) {
   const store = makeStore(opts)
   const device = new FakeDeckDevice(caps)
   const controller = new DeckController({
@@ -117,6 +149,7 @@ function setup(opts: StoreOpts = {}, caps?: DeckCapabilities) {
     renderKey: (spec) => encodeSpec(spec),
     renderStrip: (text) => new TextEncoder().encode(text) as unknown as Uint8ClampedArray,
     settings,
+    ...extra,
   })
   controller.start()
   activeController = controller
@@ -288,5 +321,74 @@ describe('DeckController', () => {
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1' })
     device.emit({ type: 'dialPress', dialIndex: 0 })
     expect(store.getState().tabs.activeTabId).toBe('t10') // re-focus current active tab
+  })
+
+  it('repaints keys when an icon bitmap finishes loading (cache subscription)', async () => {
+    // Deferred loader as in icon-image-cache.test.ts
+    const { loader, pending } = deferredLoader()
+    const cache = new IconImageCache(loader)
+    const { device } = setup({
+      tabCount: 1,
+      terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
+      repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
+    }, undefined, { iconCache: cache })
+    const before = decodeKey(device, 0)!
+    expect(before.kind === 'tab' && before.icons[0].ready).toBe(false)
+    pending.get(before.kind === 'tab' ? before.icons[0].url! : '')!.resolve({} as CanvasImageSource)
+    await vi.advanceTimersByTimeAsync(0) // flush the load microtask under fake timers
+    const after = decodeKey(device, 0)!
+    expect(after.kind === 'tab' && after.icons[0].ready).toBe(true)
+  })
+
+  it('no periodic preview repaint: 3s of ticks paints nothing even when terminal text changes', () => {
+    // A reader with a CHANGING snapshot is what makes this test able to go RED: with
+    // no reader registered, previewFor already yields [] and the per-key spec-JSON
+    // diff suppresses every paint, so the assertion would pass against unmodified
+    // code (vacuous). With the reader, current code's PREVIEW_REFRESH_TICKS branch
+    // repaints key 0 at the ~3s tick (new previewLines -> spec differs) and the test
+    // fails; it goes green only when previewFor and the tick branch are deleted.
+    // (Task 9 deletes the registry module itself; when it does, rework this test to
+    // drop the reader registration - the no-repaint guarantee becomes structural via
+    // Task 9's grep gate on PREVIEW_REFRESH_TICKS/registerTerminalTextReader.)
+    let n = 0
+    const unregister = registerTerminalTextReader('term-1', () => [`line ${n++}`])
+    const { device } = setup({ tabCount: 1 })
+    device.keyImages.clear()
+    vi.advanceTimersByTime(3_000)
+    expect(device.keyImages.size).toBe(0)
+    unregister()
+  })
+
+  it('dispatches fetchRepoIconMeta for tab cwds even when settings.panes.repoIconsOnTabs is false (deck owns the probe)', () => {
+    // No repoIcons seeded: the controller itself must probe /repos/alpha. TabBar cannot be
+    // relied on (its probe is gated on repoIconsOnTabs and TabBar is conditionally mounted).
+    const { store } = setup({
+      tabCount: 1,
+      terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
+      repoIconsOnTabs: false,
+    })
+    // The thunk's pending case records { status: 'loading' } synchronously on dispatch.
+    expect(store.getState().repoIcons.byCwd['/repos/alpha']).toMatchObject({ status: 'loading' })
+  })
+
+  it('does not re-probe a cwd already present in state.repoIcons.byCwd', () => {
+    const { store } = setup({
+      tabCount: 1,
+      terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
+      repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
+    })
+    expect(store.getState().repoIcons.byCwd['/repos/alpha'].status).toBe('ready') // untouched, no 'loading' overwrite
+  })
+
+  it('probes a cwd that only becomes resolvable AFTER start (late terminalMeta, model JSON unchanged)', () => {
+    // Fixture panes have no initialCwd, so nothing is resolvable at start(). A later
+    // upsertTerminalMeta makes term-1's cwd resolvable but does NOT change the deck
+    // model JSON (icons stay [] until meta AND repoIcons both exist), so this test
+    // proves the probe runs BEFORE onStoreChange's model-JSON bail-out - the exact
+    // TabBar-less leader scenario the deck-owned probe exists for.
+    const { store } = setup({ tabCount: 1 }) // no terminalMeta seeded
+    expect(store.getState().repoIcons.byCwd['/repos/alpha']).toBeUndefined()
+    store.dispatch(upsertTerminalMeta([{ terminalId: 'term-1', cwd: '/repos/alpha', updatedAt: Date.now() }]))
+    expect(store.getState().repoIcons.byCwd['/repos/alpha']).toMatchObject({ status: 'loading' })
   })
 })
