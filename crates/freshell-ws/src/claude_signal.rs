@@ -68,13 +68,16 @@ impl ClaudeSignalWatcher {
     /// Read+parse+DELETE every `*.json` in the root. Filename:
     /// `<terminal_id>__<nonce>.json` -- the terminal id is recovered by
     /// splitting the stem on the LAST `__` (`rsplit_once`): the nonce
-    /// (`<pid>-<ns>` digits and `-`) can never contain `__`, so a LAST-split
+    /// (`<timestamp>-<pid>` digits and `-`) can never contain `__`, so a LAST-split
     /// always recovers the full terminal id even if an id ever contained
     /// `__`. Malformed files are deleted and skipped (a signal is
     /// single-shot; leaving junk behind would re-fail every sweep forever).
     /// In-flight `*.tmp` files (the hook's atomic write staging) are left
     /// alone.
-    /// drain() sorts by filename (timestamp-first nonces => deterministic last-write-wins under rapid A->B->A switching on nanosecond-precision date; the second-granularity fallback degrades same-second order to pid order).
+    /// drain() sorts by filename (timestamp-first nonces => deterministic
+    /// last-write-wins under rapid A->B->A switching on nanosecond-precision
+    /// date; the second-granularity fallback degrades same-second order to pid
+    /// order).
     pub fn drain(&self) -> Vec<ClaudeSignal> {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return Vec::new(); // no dir yet: no claude pane has ever signaled
