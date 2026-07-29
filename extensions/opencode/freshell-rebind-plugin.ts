@@ -51,18 +51,47 @@ function defaultWriteFile(dir: string, name: string, body: string): void {
   renameSync(tmp, join(dir, `${name}.json`))
 }
 
-export function createEmitter(deps: EmitterDeps): (candidate: unknown) => void {
+function resolveSignalTarget(
+  env: EmitterDeps['env'],
+): { dir: string; terminalId: string } | null {
   // Mirror the Rust consumer's home resolution (OpencodeSignalWatcher::
   // default_root is cfg-gated: USERPROFILE only on Windows, HOME otherwise)
   // — otherwise a Windows git-bash/MSYS shell with HOME set would emit
   // signals into a directory the server never sweeps.
   const home =
     process.platform === 'win32'
-      ? (deps.env.USERPROFILE ?? deps.env.HOME)
-      : (deps.env.HOME ?? deps.env.USERPROFILE)
-  const terminalId = deps.env.FRESHELL_TERMINAL_ID
-  if (!home || !terminalId) return () => {}
-  const dir = join(home, '.freshell', 'session-signals', 'opencode')
+      ? (env.USERPROFILE ?? env.HOME)
+      : (env.HOME ?? env.USERPROFILE)
+  const terminalId = env.FRESHELL_TERMINAL_ID
+  if (!home || !terminalId) return null
+  return { dir: join(home, '.freshell', 'session-signals', 'opencode'), terminalId }
+}
+
+/** Plugin-alive heartbeat: written ONCE at TUI startup, before any opencode
+ *  API surface is touched, so it proves the plugin LOADED (not that the
+ *  route API still exists). The server's sweeper consumes it silently as
+ *  liveness proof and warns when an opencode pane never says hello. */
+export function emitHello(deps: EmitterDeps): void {
+  try {
+    const target = resolveSignalTarget(deps.env)
+    if (!target) return
+    const write = deps.writeFile ?? defaultWriteFile
+    const now = deps.now ?? Date.now
+    const nonce = `${String(now()).padStart(14, '0')}-000000-${process.pid}`
+    write(
+      target.dir,
+      `${target.terminalId}__${nonce}`,
+      JSON.stringify({ hello: true, source: 'opencode-tui-plugin' }),
+    )
+  } catch {
+    // Losing the hello degrades to no-heartbeat. Never surface into the TUI.
+  }
+}
+
+export function createEmitter(deps: EmitterDeps): (candidate: unknown) => void {
+  const target = resolveSignalTarget(deps.env)
+  if (!target) return () => {}
+  const { dir, terminalId } = target
   const write = deps.writeFile ?? defaultWriteFile
   const now = deps.now ?? Date.now
   let lastEmitted: string | null = null
@@ -93,6 +122,7 @@ export default {
   id: 'freshell-rebind',
   tui(api: unknown): void {
     try {
+      emitHello({ env: process.env })
       const emit = createEmitter({ env: process.env })
       const a = api as {
         slots?: { register?: (name: string, fn: (ctx: unknown) => unknown) => unknown }

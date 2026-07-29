@@ -626,6 +626,28 @@ async fn handle_client_text(
             }
         }
         ClientMessage::TerminalInput(input) => {
+            // Node-parity frame (server/ws-handler.ts:2902-2925), scoped to
+            // the opencode lane (see input_session_identity_ok): a
+            // terminal.input frame whose opencode expectedSessionRef no
+            // longer matches the terminal's canonical opencode identity is
+            // bounced with SESSION_IDENTITY_MISMATCH (actualSessionRef
+            // populated) instead of being written to a PTY the client no
+            // longer means. Unresolved identity and non-opencode lanes fail
+            // open -- see input_session_identity_ok.
+            if let Some(expected) = input.expected_session_ref.as_ref() {
+                let canonical = state.identity.session_ref_for(&input.terminal_id);
+                if !input_session_identity_ok(Some(expected), canonical.as_ref()) {
+                    return send(
+                        ws_tx,
+                        &input_session_identity_mismatch_error(
+                            &input.terminal_id,
+                            expected.clone(),
+                            canonical,
+                        ),
+                    )
+                    .await;
+                }
+            }
             // Lane B2: MUST complete before the Enter reaches the PTY — the
             // codex locator's FIRST-submit re-snapshot has to finish before
             // codex can materialize the rollout this very Enter triggers
@@ -3611,6 +3633,62 @@ fn attach_geometry_identity_ok(
     }
 }
 
+/// Input-path identity guard (Node-parity FRAME, `server/ws-handler.ts:2902-2925`
+/// `inputIfSessionMatches`, but deliberately NARROWER in scope). Two
+/// deviations, both load-bearing:
+/// 1. SCOPE: the guard bounces only when BOTH refs are `provider ==
+///    "opencode"`. Claude (`claude_signal.rs:192`, every in-TUI
+///    /clear-resume) and codex (`codex_association.rs:207-220` fork rebind)
+///    have legitimate identity swap windows, and the client fold's
+///    conflict-veto can pin a pane on a stale ref indefinitely -- an
+///    all-provider guard would bounce keystrokes that are delivered
+///    correctly today. Only the opencode signal-rebind lane this plan
+///    hardens is guarded; everything else passes through.
+/// 2. Deliberately LAXER than `attach_geometry_identity_ok` in the
+///    `(Some, None)` case: canonical identity is None during the opencode
+///    locator correlation window AND permanently for REST/fresh-agent-created
+///    resume panes (they never reach the WS identity registry) -- attach's
+///    silent resize-skip is harmless there, a dropped keystroke is not, so
+///    unresolved identity FAILS OPEN and the input is delivered.
+fn input_session_identity_ok(
+    expected: Option<&SessionLocator>,
+    canonical: Option<&SessionLocator>,
+) -> bool {
+    match (expected, canonical) {
+        (None, _) => true,
+        (Some(_), None) => true,
+        (Some(e), Some(c)) => {
+            if e.provider != "opencode" || c.provider != "opencode" {
+                return true;
+            }
+            e == c
+        }
+    }
+}
+
+/// The bounce frame for a stale-expectation `terminal.input`: the FIRST
+/// `actual_session_ref: Some(..)` emitter in the Rust tree. The client's
+/// stale-window suppression (terminal-view-utils.ts
+/// isStaleSessionIdentityMismatch) keys on that echo, so it must carry the
+/// canonical ref whenever one exists (and the guard only fires when it does).
+fn input_session_identity_mismatch_error(
+    terminal_id: &str,
+    expected: SessionLocator,
+    actual: Option<SessionLocator>,
+) -> ServerMessage {
+    ServerMessage::Error(ErrorMsg {
+        code: ErrorCode::SessionIdentityMismatch,
+        message: "Terminal session does not match the expected session.".to_string(),
+        timestamp: crate::now_iso(),
+        actual_session_ref: actual,
+        expected_session_ref: Some(expected),
+        request_id: None,
+        retry_after_ms: None,
+        terminal_exit_code: None,
+        terminal_id: Some(terminal_id.to_string()),
+    })
+}
+
 /// Node-parity geometry bounds for `terminal.attach` / `terminal.resize`
 /// (`shared/ws-protocol.ts:344-345, 364-365`): `cols` must be an integer in
 /// `[2, 1000]` and `rows` in `[2, 500]`. Node enforces this at the Zod
@@ -4954,6 +5032,98 @@ mod attach_geometry_tests {
     fn expectation_against_no_identity_mismatch() {
         let expected = locator("codex", "s1");
         assert!(!attach_geometry_identity_ok(Some(&expected), None));
+    }
+}
+
+#[cfg(test)]
+mod input_identity_tests {
+    use super::{input_session_identity_mismatch_error, input_session_identity_ok};
+    use freshell_protocol::SessionLocator;
+
+    fn locator(provider: &str, session_id: &str) -> SessionLocator {
+        SessionLocator {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn no_expectation_always_ok() {
+        assert!(input_session_identity_ok(None, None));
+        assert!(input_session_identity_ok(
+            None,
+            Some(&locator("opencode", "ses_a"))
+        ));
+    }
+
+    #[test]
+    fn unresolved_identity_fails_open() {
+        // Deliberately laxer than attach_geometry_identity_ok: canonical
+        // identity is None not only during the opencode locator correlation
+        // window after spawn but PERMANENTLY for REST/fresh-agent-created
+        // resume panes (they never reach the WS identity registry) -- while
+        // the client already sends an expectation. Never drop their
+        // keystrokes: (Some, None) fails open, for life if need be.
+        assert!(input_session_identity_ok(
+            Some(&locator("opencode", "ses_a")),
+            None
+        ));
+    }
+
+    #[test]
+    fn non_opencode_divergence_passes_through() {
+        // Guard scope (LB3): claude (/clear-resume) and codex (fork rebind)
+        // have LEGITIMATE identity swap windows -- a divergent (Some, Some)
+        // pair outside the opencode lane must deliver, not bounce.
+        assert!(input_session_identity_ok(
+            Some(&locator("claude", "ses_a")),
+            Some(&locator("claude", "ses_b"))
+        ));
+        assert!(input_session_identity_ok(
+            Some(&locator("codex", "thread_a")),
+            Some(&locator("codex", "thread_b"))
+        ));
+        // Cross-provider disagreement (never produced by this plan's lanes)
+        // also fails open.
+        assert!(input_session_identity_ok(
+            Some(&locator("codex", "ses_a")),
+            Some(&locator("opencode", "ses_b"))
+        ));
+    }
+
+    #[test]
+    fn matching_expectation_ok() {
+        assert!(input_session_identity_ok(
+            Some(&locator("opencode", "ses_a")),
+            Some(&locator("opencode", "ses_a"))
+        ));
+    }
+
+    #[test]
+    fn differing_expectation_is_a_mismatch() {
+        assert!(!input_session_identity_ok(
+            Some(&locator("opencode", "ses_a")),
+            Some(&locator("opencode", "ses_b"))
+        ));
+    }
+
+    #[test]
+    fn mismatch_error_serializes_with_actual_session_ref() {
+        let msg = input_session_identity_mismatch_error(
+            "term-1",
+            locator("opencode", "ses_a"),
+            Some(locator("opencode", "ses_b")),
+        );
+        let value = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["code"], "SESSION_IDENTITY_MISMATCH");
+        assert_eq!(value["terminalId"], "term-1");
+        assert_eq!(value["expectedSessionRef"]["sessionId"], "ses_a");
+        assert_eq!(value["actualSessionRef"]["sessionId"], "ses_b");
+        assert_eq!(
+            value["message"],
+            "Terminal session does not match the expected session."
+        );
     }
 }
 

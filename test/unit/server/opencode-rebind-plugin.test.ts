@@ -1,6 +1,10 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
+import { mkdtempSync, readdirSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import plugin, {
   createEmitter,
+  emitHello,
   extractSessionId,
   type EmitterDeps,
 } from '../../../extensions/opencode/freshell-rebind-plugin'
@@ -26,6 +30,45 @@ describe('extractSessionId', () => {
     expect(extractSessionId(42)).toBeNull()
     expect(extractSessionId('ses_bare-string-ok')).toBeNull() // ses_ + non-alnum rejected
     expect(extractSessionId('ses_barestringok')).toBe('ses_barestringok')
+  })
+})
+
+describe('emitHello', () => {
+  const writes: Array<{ dir: string; name: string; body: string }> = []
+  const deps = (env: EmitterDeps['env']): EmitterDeps => ({
+    env,
+    writeFile: (dir, name, body) => writes.push({ dir, name, body }),
+    now: () => 1_700_000_000_000,
+  })
+  beforeEach(() => writes.splice(0))
+
+  it('writes a hello signal named <terminalId>__<nonce> into the opencode signal dir', () => {
+    emitHello(deps({ HOME: '/home/u', FRESHELL_TERMINAL_ID: 'term-1' }))
+    expect(writes).toHaveLength(1)
+    expect(writes[0].dir).toBe('/home/u/.freshell/session-signals/opencode')
+    expect(writes[0].name).toMatch(/^term-1__\d{14}-\d{6}-\d+$/)
+    expect(writes[0].name.split('__')).toHaveLength(2) // nonce never contains the __ delimiter
+    expect(JSON.parse(writes[0].body)).toEqual({
+      hello: true,
+      source: 'opencode-tui-plugin',
+    })
+  })
+
+  it('never writes without a home dir or FRESHELL_TERMINAL_ID', () => {
+    emitHello(deps({ FRESHELL_TERMINAL_ID: 'term-1' }))
+    emitHello(deps({ HOME: '/home/u' }))
+    expect(writes).toHaveLength(0)
+  })
+
+  it('swallows writer exceptions (never surfaces into the TUI)', () => {
+    expect(() =>
+      emitHello({
+        env: { HOME: '/home/u', FRESHELL_TERMINAL_ID: 'term-1' },
+        writeFile: () => {
+          throw new Error('disk full')
+        },
+      }),
+    ).not.toThrow()
   })
 })
 
@@ -148,5 +191,27 @@ describe('default export (TuiPluginModule)', () => {
       }),
     ).not.toThrow()
     vi.advanceTimersByTime(10_000)
+  })
+
+  it('writes a plugin-alive hello at tui() startup, even against a hostile api surface', () => {
+    const home = mkdtempSync(join(tmpdir(), 'freshell-hello-'))
+    vi.stubEnv('HOME', home)
+    vi.stubEnv('FRESHELL_TERMINAL_ID', 'term-hello')
+
+    const hostileApi = new Proxy({}, {
+      get() {
+        throw new Error('API drift')
+      },
+    })
+    expect(() => plugin.tui(hostileApi)).not.toThrow()
+
+    const dir = join(home, '.freshell', 'session-signals', 'opencode')
+    const files = readdirSync(dir).filter((name) => name.endsWith('.json'))
+    expect(files).toHaveLength(1)
+    expect(files[0]).toMatch(/^term-hello__\d{14}-\d{6}-\d+\.json$/)
+    expect(JSON.parse(readFileSync(join(dir, files[0]), 'utf-8'))).toEqual({
+      hello: true,
+      source: 'opencode-tui-plugin',
+    })
   })
 })

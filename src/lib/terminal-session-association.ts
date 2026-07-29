@@ -127,6 +127,7 @@ export function reconcileTerminalSessionAssociation({
       tabSessionRef: tab.sessionRef,
       paneResumeSessionId: content.resumeSessionId,
       tabResumeSessionId: tab.resumeSessionId,
+      tabSessionMetadataByKey: tab.sessionMetadataByKey,
     })
     const nextTabCodexDurability = sessionRef.provider === 'codex'
       && tab.codexDurability?.state === 'durable'

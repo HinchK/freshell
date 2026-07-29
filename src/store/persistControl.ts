@@ -17,6 +17,7 @@ export function buildTerminalDurableSessionRefUpdate({
   tabSessionRef,
   paneResumeSessionId,
   tabResumeSessionId,
+  tabSessionMetadataByKey,
 }: {
   provider?: CodingCliProviderName
   sessionId?: string
@@ -24,6 +25,7 @@ export function buildTerminalDurableSessionRefUpdate({
   tabSessionRef?: SessionRef
   paneResumeSessionId?: string
   tabResumeSessionId?: string
+  tabSessionMetadataByKey?: Record<string, SessionListMetadata>
 }): {
   paneUpdates?: { sessionRef?: SessionRef; resumeSessionId?: undefined }
   tabUpdates?: Partial<Tab>
@@ -46,12 +48,31 @@ export function buildTerminalDurableSessionRefUpdate({
       }
     : undefined
 
-  const tabUpdates = tabNeedsSessionRef || tabNeedsResumeClear
-    ? {
-        ...(tabNeedsSessionRef ? { sessionRef } : {}),
-        ...(tabNeedsResumeClear ? { resumeSessionId: undefined } : {}),
-      }
-    : undefined
+  const nextTabUpdates: Partial<Tab> = {
+    ...(tabNeedsSessionRef ? { sessionRef } : {}),
+    ...(tabNeedsResumeClear ? { resumeSessionId: undefined } : {}),
+  }
+
+  // Rebind metadata re-key (same idiom as buildFreshAgentPersistedIdentityUpdate
+  // below): merge whatever the tab knew under the superseded id(s) into the
+  // `${provider}:${sessionId}` key of the new canonical id, deleting the old
+  // keys. The merge helper ALWAYS returns a fresh object, so deep-compare
+  // before writing to avoid churn updates on every broadcast.
+  const nextSessionMetadataByKey = mergeSessionMetadataForPreferredResumeId({
+    localSessionMetadataByKey: tabSessionMetadataByKey,
+    remoteSessionMetadataByKey: tabSessionMetadataByKey,
+    existingSessionMetadataByKey: tabSessionMetadataByKey,
+    provider,
+    localResumeSessionId: tabSessionRef?.sessionId ?? tabResumeSessionId,
+    remoteResumeSessionId: paneSessionRef?.sessionId ?? paneResumeSessionId,
+    preferredResumeSessionId: sessionRef.sessionId,
+  })
+
+  if (JSON.stringify(nextSessionMetadataByKey ?? {}) !== JSON.stringify(tabSessionMetadataByKey ?? {})) {
+    nextTabUpdates.sessionMetadataByKey = nextSessionMetadataByKey
+  }
+
+  const tabUpdates = Object.keys(nextTabUpdates).length > 0 ? nextTabUpdates : undefined
 
   const shouldFlush = paneNeedsSessionRef || tabNeedsSessionRef || paneNeedsResumeClear || tabNeedsResumeClear
 

@@ -147,6 +147,42 @@ fn write_opencode_signal(root: &std::path::Path, terminal_id: &str, seq: u64, se
     .unwrap();
 }
 
+/// Send one raw client frame (the [`send_create`] transmit idiom, generalized
+/// to any payload).
+#[cfg(unix)]
+async fn send_json(ws: &mut common::TestWs, value: serde_json::Value) {
+    ws.send(WsMessage::Text(value.to_string()))
+        .await
+        .expect("send raw client frame");
+}
+
+/// Scan WS text frames until `pred` matches (10 s budget, the
+/// [`next_associated_frame`] deadline-poll loop generalized to an arbitrary
+/// predicate), returning the matching frame; panic with `label` on timeout.
+#[cfg(unix)]
+async fn wait_for_frame(
+    ws: &mut common::TestWs,
+    label: &str,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if pred(&value) {
+                        return value;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            other => panic!("[{label}] ws ended/errored/timed out awaiting frame: {other:?}"),
+        }
+    }
+    panic!("[{label}] no matching frame within 10s");
+}
+
 /// [`common::spawn_server_with_specs`], but ALSO returning the `WsState`
 /// handle so the test can drive `drain_and_rebind_opencode` directly
 /// (deterministic — no sweep-timer race), and with an ENABLED pane ledger
@@ -474,6 +510,60 @@ async fn tui_switch_signal_rebinds_and_restart_resumes_the_new_id() {
         std::fs::read_dir(&signal_root).unwrap().count(),
         0,
         "the acted-on signal file must be deleted (act-then-delete)"
+    );
+
+    // ────── Phase 1b — stale-expectation input bounce (Node-parity frame,
+    // server/ws-handler.ts:2902-2925; guard SCOPED to the opencode lane,
+    // which this rebind is): an in-flight terminal.input still
+    // carrying the OLD ref A after the A→B rebind is bounced with
+    // SESSION_IDENTITY_MISMATCH echoing actualSessionRef=B and is NOT
+    // delivered; a frame carrying the NEW ref B is delivered with no error.
+    // (Non-opencode divergence never bounces — pinned by the in-module
+    // test non_opencode_divergence_passes_through.)
+    send_json(
+        &mut ws,
+        json!({
+            "type": "terminal.input",
+            "terminalId": tid1,
+            "data": "stale-ref-keystroke",
+            "expectedSessionRef": { "provider": "opencode", "sessionId": A },
+        }),
+    )
+    .await;
+    let bounce = wait_for_frame(&mut ws, "phase1b/mismatch", |v| {
+        v["type"] == "error"
+            && v["code"] == "SESSION_IDENTITY_MISMATCH"
+            && v["terminalId"] == json!(tid1)
+    })
+    .await;
+    assert_eq!(
+        bounce["actualSessionRef"],
+        json!({ "provider": "opencode", "sessionId": B }),
+        "bounce must echo the canonical (post-rebind) ref: {bounce}"
+    );
+    assert_eq!(
+        bounce["expectedSessionRef"],
+        json!({ "provider": "opencode", "sessionId": A }),
+        "bounce must echo the stale expectation: {bounce}"
+    );
+
+    send_json(
+        &mut ws,
+        json!({
+            "type": "terminal.input",
+            "terminalId": tid1,
+            "data": "fresh-ref-keystroke\r",
+            "expectedSessionRef": { "provider": "opencode", "sessionId": B },
+        }),
+    )
+    .await;
+    let bounced_again = frame_seen_within(&mut ws, Duration::from_secs(1), |v| {
+        v["type"] == "error" && v["code"] == "SESSION_IDENTITY_MISMATCH"
+    })
+    .await;
+    assert!(
+        !bounced_again,
+        "a matching expectedSessionRef must be delivered, not bounced"
     );
 
     // ── Phase 2 — the restart story: kill, then replay EXACTLY what a

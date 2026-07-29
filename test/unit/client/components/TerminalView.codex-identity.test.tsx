@@ -378,6 +378,73 @@ describe('TerminalView codex identity', () => {
     expect(sentMessages().filter((msg) => msg?.type === 'terminal.create')).toHaveLength(1)
   })
 
+  it('suppresses the mismatch repair path when actualSessionRef already equals the pane current ref (stale rebind-window bounce)', async () => {
+    const store = createStore({
+      kind: 'terminal',
+      createRequestId: 'req-old',
+      status: 'running',
+      mode: 'codex',
+      shell: 'system',
+      terminalId: 'term-old',
+      serverInstanceId: 'srv-old',
+      streamId: 'stream-old',
+      sessionRef: {
+        provider: 'codex',
+        sessionId: 'thread-new',
+      },
+      codexDurability: {
+        schemaVersion: 1,
+        state: 'durable',
+        durableThreadId: 'thread-new',
+      },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalViewFromStore tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.attach' && msg.terminalId === 'term-old')).toBe(true)
+    })
+
+    wsHarness.send.mockClear()
+
+    act(() => {
+      wsHarness.emit({
+        type: 'error',
+        code: 'SESSION_IDENTITY_MISMATCH',
+        terminalId: 'term-old',
+        expectedSessionRef: { provider: 'codex', sessionId: 'thread-old' },
+        // The echoed actual ref equals the pane's CURRENT ref: the rebind
+        // fold already applied; this bounce is the self-healing race.
+        actualSessionRef: { provider: 'codex', sessionId: 'thread-new' },
+        message: 'stale bounce',
+      })
+    })
+
+    // RED/GREEN pivot: on unmodified code the handler's notice-only branch
+    // writes '[Resume blocked] ...' to the xterm; after the suppression
+    // early-return it writes NOTHING. The notice may travel the async write
+    // queue (TerminalView.tsx writeQueueRef, ~:996-999 in
+    // writeLocalXtermNotice), so flush before asserting absence.
+    const wroteResumeBlocked = () =>
+      runtimeHarness.terminals.some((term) =>
+        term.write.mock.calls.some(([data]: [string]) => String(data).includes('[Resume blocked]')))
+    await act(async () => { await Promise.resolve() })
+    expect(wroteResumeBlocked()).toBe(false)
+
+    // Regression guards (these pass BOTH before and after implementation —
+    // they are NOT the RED signal): no teardown, no repair create, pane
+    // untouched.
+    const leaf = findLeaf(store.getState().panes.layouts['tab-1'], 'pane-1')
+    expect(leaf?.content.kind).toBe('terminal')
+    expect((leaf?.content as TerminalPaneContent).terminalId).toBe('term-old')
+    expect((leaf?.content as TerminalPaneContent).status).toBe('running')
+    expect(sentMessages().filter((msg) => msg?.type === 'terminal.create')).toHaveLength(0)
+  })
+
   it('preserves a durable-identity breadcrumb instead of silently wiping restoreError when a codex pane has no resumable identity on INVALID_TERMINAL_ID', async () => {
     // Regression test: previously this branch persisted a totally clean slate
     // (restoreError: undefined) the instant the live terminal died with no
