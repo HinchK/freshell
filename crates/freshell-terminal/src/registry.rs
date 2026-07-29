@@ -2921,7 +2921,7 @@ mod tests {
 
         // (a) legacy subscriber (no capability) — must get `terminal.output` only.
         let (legacy_sink, legacy_seen) = collector();
-        reg.attach("T", 1, legacy_sink, Some("legacy".into()), 0, false, None);
+        let _ = reg.attach("T", 1, legacy_sink, Some("legacy".into()), 0, false, None);
         let legacy = outputs(&legacy_seen);
         assert!(
             !legacy.is_empty(),
@@ -2944,7 +2944,7 @@ mod tests {
         // `terminal.output.batch`, reassembling to the SAME bytes, with UTF-16
         // endOffsets and a self-consistent serializedBytes.
         let (batch_sink, batch_seen) = collector();
-        reg.attach("T", 2, batch_sink, Some("batch".into()), 0, true, None);
+        let _ = reg.attach("T", 2, batch_sink, Some("batch".into()), 0, true, None);
         let bs = batches(&batch_seen);
         assert!(
             !bs.is_empty(),
@@ -2991,7 +2991,7 @@ mod tests {
         reg.feed("T", frame(1, "a\u{1F600}b\r\n", "S")); // a😀b␍␊
 
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("m".into()), 0, true, None);
+        let _ = reg.attach("T", 1, sink, Some("m".into()), 0, true, None);
         let bs = batches(&seen);
         assert_eq!(bs.len(), 1);
         let b = &bs[0];
@@ -3044,7 +3044,7 @@ mod tests {
         reg.insert_headless("T", "S");
 
         let (sink_a, seen_a) = collector();
-        reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None);
         reg.feed("T", frame(1, "before\r\n", "S"));
         assert_eq!(outputs(&seen_a).len(), 1);
 
@@ -3060,7 +3060,7 @@ mod tests {
 
         // A fresh attach replays the FULL scrollback (both frames).
         let (sink_b, seen_b) = collector();
-        reg.attach("T", 2, sink_b, Some("b".into()), 0, false, None);
+        let _ = reg.attach("T", 2, sink_b, Some("b".into()), 0, false, None);
         let replayed = outputs(&seen_b);
         assert_eq!(
             replayed.iter().map(|f| f.data.as_str()).collect::<Vec<_>>(),
@@ -3075,9 +3075,9 @@ mod tests {
 
         let (sink_a, seen_a) = collector();
         let (sink_b, seen_b) = collector();
-        reg.attach("T", 1, sink_a, Some("aaa".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink_a, Some("aaa".into()), 0, false, None);
         // Second attach: geometry authority flips to multi_client_unknown.
-        reg.attach("T", 2, sink_b, Some("bbb".into()), 0, false, None);
+        let _ = reg.attach("T", 2, sink_b, Some("bbb".into()), 0, false, None);
         let ready_b = attach_ready(&seen_b).unwrap();
         assert_eq!(
             ready_b.geometry_authority,
@@ -3101,7 +3101,7 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink_a, seen_a) = collector();
-        reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink_a, Some("a".into()), 0, false, None);
         for i in 1..=5 {
             reg.feed("T", frame(i, &format!("line-{i}\r\n"), "S"));
         }
@@ -3111,7 +3111,7 @@ mod tests {
         // with sinceSeq=3. Only frames 4 and 5 are replayed (seqStart > 3).
         reg.detach("T", 1);
         let (sink_r, seen_r) = collector();
-        reg.attach("T", 2, sink_r, Some("a2".into()), 3, false, None);
+        let _ = reg.attach("T", 2, sink_r, Some("a2".into()), 3, false, None);
         let ready = attach_ready(&seen_r).unwrap();
         assert_eq!(ready.effective_since_seq, Some(3));
         assert_eq!(ready.replay_from_seq, 4);
@@ -3130,7 +3130,7 @@ mod tests {
         reg.feed("T", frame(1, "old\r\n", "S"));
 
         let (sink, seen) = collector();
-        reg.attach("T", 7, sink, Some("z".into()), 0, false, None);
+        let _ = reg.attach("T", 7, sink, Some("z".into()), 0, false, None);
         // A live frame produced AFTER attach must arrive after the replayed one.
         reg.feed("T", frame(2, "new\r\n", "S"));
 
@@ -3182,7 +3182,7 @@ mod tests {
         reg.insert_headless("T", "S");
         let rev_before = reg.revision();
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
 
         assert!(reg.kill("T"));
         assert!(!reg.is_running("T"), "killed terminal is removed");
@@ -3210,8 +3210,8 @@ mod tests {
         reg.insert_headless("T-b", "S2");
         let (sink_a, seen_a) = collector();
         let (sink_b, seen_b) = collector();
-        reg.attach("T-a", 1, sink_a, None, 0, false, None);
-        reg.attach("T-b", 2, sink_b, None, 0, false, None);
+        let _ = reg.attach("T-a", 1, sink_a, None, 0, false, None);
+        let _ = reg.attach("T-b", 2, sink_b, None, 0, false, None);
         let rev_before = reg.revision();
 
         let killed = reg.kill_all();
@@ -3497,7 +3497,7 @@ mod tests {
         assert!(!dir[0].has_clients);
 
         let (sink, _seen) = collector();
-        reg.attach("T", 9, sink, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 9, sink, Some("a".into()), 0, false, None);
         assert!(reg.directory()[0].has_clients);
         reg.detach("T", 9);
         assert!(!reg.directory()[0].has_clients);
@@ -3648,8 +3648,8 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
-        reg.attach("T", 1, sink, Some("a".into()), 0, false, None); // conn 1 is attached
-                                                                    // conn 2 reconnects with another socket attached and no prior attachment of its own.
+        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None); // conn 1 is attached
+                                                                             // conn 2 reconnects with another socket attached and no prior attachment of its own.
         let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
         assert_eq!(out, AttachResizeStatus::Skipped);
         assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
@@ -3661,8 +3661,8 @@ mod tests {
         reg.insert_headless("T", "S");
         let (sink1, _seen1) = collector();
         let (sink2, _seen2) = collector();
-        reg.attach("T", 1, sink1, Some("a".into()), 0, false, None);
-        reg.attach("T", 2, sink2, Some("b".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink1, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 2, sink2, Some("b".into()), 0, false, None);
         // conn 2 already has an attachment -> resize even though conn 1 is also attached
         // (Node: existingAttachment wins over hasOtherAttachedSockets).
         let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
@@ -3698,8 +3698,8 @@ mod tests {
         reg.insert_headless("T2", "S2");
         let (sink1, seen1) = collector();
         let (sink2, seen2) = collector();
-        reg.attach("T1", 42, sink1, Some("a".into()), 0, false, None);
-        reg.attach("T2", 42, sink2, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T1", 42, sink1, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T2", 42, sink2, Some("a".into()), 0, false, None);
 
         reg.remove_connection(42);
         // Both terminals survive; the swept connection receives no further output.
@@ -4008,7 +4008,7 @@ mod tests {
         reg.feed("T", frame(2, "abcdefghij", "S")); // another 10 bytes -> over cap
 
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
         let replayed = outputs(&seen);
         // Whole-frame FIFO eviction keeps at least one frame; the FIRST frame
         // must have been evicted once the second pushed bytes over the cap.
@@ -4026,7 +4026,7 @@ mod tests {
         reg.feed("T", frame(2, "abcdefghij", "S"));
 
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None);
         let replayed = outputs(&seen);
         assert_eq!(
             replayed.len(),
@@ -4058,7 +4058,7 @@ mod tests {
         reg_ascii.feed("A", frame(1, "abcdef", "S")); // 6 chars, 6 bytes
         reg_ascii.feed("A", frame(2, "ghijkl", "S")); // 6 chars, 6 bytes -> 12 total, at cap
         let (sink_a, seen_a) = collector();
-        reg_ascii.attach("A", 1, sink_a, Some("r".into()), 0, false, None);
+        let _ = reg_ascii.attach("A", 1, sink_a, Some("r".into()), 0, false, None);
         let ascii_chars: usize = outputs(&seen_a)
             .iter()
             .map(|f| f.data.chars().count())
