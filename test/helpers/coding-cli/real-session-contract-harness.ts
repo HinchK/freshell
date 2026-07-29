@@ -1284,15 +1284,17 @@ export function queryOpencodeSessionRow(dbPath: string, sessionId: string): {
   id: string
   title: string
   directory: string
+  parent_id: string | null
 } | null {
   const database = new DatabaseSync(dbPath)
   try {
     return database
-      .prepare('select id, title, directory from session where id = ? limit 1')
+      .prepare('select id, title, directory, parent_id from session where id = ? limit 1')
       .get(sessionId) as {
         id: string
         title: string
         directory: string
+        parent_id: string | null
       } | null
   } finally {
     database.close()
@@ -1303,6 +1305,7 @@ export async function waitForOpencodeDbSession(dbPath: string, sessionId: string
   id: string
   title: string
   directory: string
+  parent_id: string | null
 }> {
   return waitFor(`OpenCode DB row ${sessionId}`, async () => {
     if (!(await pathExists(dbPath))) {
