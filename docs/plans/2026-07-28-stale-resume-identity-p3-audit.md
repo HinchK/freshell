@@ -4,25 +4,69 @@ This document records the audit findings that led to descoping pane↔CLI-sessio
 
 ## amplifier
 
-**Why rebind was descoped (validated A8):** The originally-planned fork-lineage detection would have corrupted the durable pane ledger on the live substrate (8,535 session dirs / 8,083 `events.jsonl`, plus the installed `amplifier_app_cli 0.1.1` source).
+**Status: descope STANDS — amplifier needs no rebind mechanism, by construction.**
 
-**Findings:**
-
-- amplifier's TUI has `/fork` but NO `/resume`/session picker (`amplifier_app_cli/main.py:398-412`).
-- `/fork` does NOT rebind the running pane's session: `_fork_session` (`main.py:1113-1226`) creates the fork dir and prints "Resume with: `amplifier session resume <id>`" while the live session remains the old one — there is NO legitimate rebind trigger; rebinding on `/fork` would be actively wrong (the user keeps talking in the OLD session).
-- 0 of 2,509 real `session:start` records carry `parent_id` (top-level key absent everywhere; `data.parent_id` non-null in 0) — fork lineage lives in `metadata.json` (`parent_id` + `forked_from_turn`, `fork.py:158-171`).
-- The originally-planned predicate ("new session dir whose `session:start` carries `parent_id == watched id`, or a `session:fork` event referencing it") would match exactly the 5,553 subagent dirs (69% of the substrate) whose FIRST event is `session:fork` with `data.parent_id` = the parent session's id — spawned immediately after the pane's Enter, i.e. inside any Enter-anchored window → the pane would be rebound onto a subagent dir and the true binding durably retired `Superseded` (the A4 corruption shape).
-- Future work (short note): a deterministic amplifier signal would need upstream lineage in `session:start` (or a hook analogous to claude's SessionStart). Until then amplifier keeps today's behavior — no mid-session rebind, no added corruption risk.
+**Findings (verified against amplifier_app_cli):**
+- There is NO in-TUI session switching at all: `amplifier_app_cli/main.py:369-411`
+  is the exhaustive interactive command dict — no `/resume`, no session-switch
+  command of any kind.
+- `/fork` creates a new session directory, but the LIVE pane keeps its original
+  session id — rebinding on `/fork` would be wrong (the pane's identity does not
+  change; the fork is a copy, not a navigation).
+- One `create_session` per process; `session_id` is fixed at construction. The
+  id a pane launches with is the id it dies with.
+- Conclusion: the resume-launch identity handling on this branch is complete for
+  amplifier; no signal producer or consumer is needed.
 
 ## opencode
 
-**Why rebind was descoped (validated A9 confirmed-with-corrections + A10 FALSIFIED):** The originally-planned two-window correlation rebind is a heuristic with real false-positive drivers that would durably retire the true binding `Superseded`. Recording the audit is the P3 deliverable.
+**Status: rebind SHIPPED (2026-07-28, feat/opencode-tui-rebind) — the passive-detection descope stands; the follow-up plugin signal predicted below is now the mechanism.**
 
-**Findings:**
+**Findings (passive detection — still true, still banned):**
+- In-TUI switching (`session_new` / `session_list` / `session_child_cycle`,
+  `@opencode-ai/sdk` `dist/gen/types.gen.d.ts:673,677,821,825`) is pure client
+  navigation (`route.navigate`) — writes NOTHING to disk. Passive detection is
+  impossible; `time_updated` correlation has non-switch writers (external
+  prompts, compaction `setSummary`, `setPermission`, …) and remains a
+  hijack-capable false-positive machine. NEVER use it.
+- `session.parent_id` is populated only for subagent children (verified against
+  `~/.local/share/opencode/opencode.db`) — no user-fork lineage substrate.
 
-- Switching sessions in the v1.18.8 TUI is PURE CLIENT NAVIGATION with zero DB write (`packages/tui/src/component/dialog-session-list.tsx:283` — `route.navigate(...)`); the chosen row's `time_updated` advances only on the NEXT prompt Enter (`packages/opencode/src/session/prompt.ts:1058` `sessions.touch`).
-- `time_updated` is a real NOT NULL integer COLUMN on `session` (not JSON `$.time.updated`).
-- Freshell's `list_sessions_since` floors on `time_created` (`crates/freshell-sessions/src/parse/opencode.rs:185`) and cannot express "updated-in-range" — a pre-existing switch target is filtered out; a new SQL variant would have been required.
-- User forks (`session.fork`) set NO `parentID` (lineage = title-suffix convention only; `parent_id` is used solely for subagent child sessions) — a lineage-variant detector has no substrate field to key on.
-- The correlation rebind is UNSAFE: non-switch writers of `session.time_updated` at the installed v1.18.8 include external prompts (a second TUI, ACP/IDE, `opencode run` loops — `opencode-ralph-loop` is installed on this machine), auto-compaction `setSummary`, `setAgentModel`, `setPermission`, revert stage/clear, `setShare`, `setWorkspace`, and API `setMetadata`. An externally-advanced session passes every planned guard (no live owner, A13 vacuous) → false-positive hijack of the pane + durable `Superseded` retirement of the true binding.
-- Future work (short note): a deterministic path would be an opencode plugin/event signal (follow-up research) — never row-update correlation. Until then opencode keeps today's behavior (stale resume remains unfixed for opencode: status quo, no corruption added).
+**Shipped mechanism (active signal, opencode 1.18.8/1.18.9 — validated on
+both; opencode SELF-UPDATES in place, observed live during validation):**
+- The TUI plugin host loads plugins ONLY from TUI config sources (global
+  `<config-dir>/opencode/tui.json|jsonc`, an `OPENCODE_TUI_CONFIG`-pointed
+  file, project `tui.json|jsonc` walk-up, `.opencode`-dir tui.json);
+  main-config plugins (opencode.json / `OPENCODE_CONFIG_CONTENT`) load as
+  SERVER plugins only and never reach the TUI host. TUI config sources MERGE
+  and plugin arrays UNION (dedup by file URL), so the injected file never
+  suppresses the user's own TUI config (`~/.config/opencode` untouched; env
+  is per-PTY so only freshell-spawned panes are affected).
+- Freshell ships `extensions/opencode/freshell-rebind-plugin.ts`, installs it
+  plus a plugin-only `tui.json` to `~/.freshell/opencode/`
+  (`opencode_plugin.rs`), and injects `OPENCODE_TUI_CONFIG=<that tui.json>`
+  per-pane (`crates/freshell-platform/src/cli_launch.rs`). Kill switch:
+  `FRESHELL_OPENCODE_REBIND=0/false` skips injection (future-version drift
+  mitigation); a user-set `OPENCODE_TUI_CONFIG` also skips (their value
+  wins). The plugin reads `FRESHELL_TERMINAL_ID` and emits claude-shaped
+  signal files (`~/.freshell/session-signals/opencode/<tid>__<nonce>.json`)
+  on every switch; PRIMARY edge = 1s `api.route.current` poll, latency
+  accelerators = slot re-renders (`session_prompt`/`sidebar_title` — both
+  have visibility gaps, so never the only edge); dedupe on repeat ids.
+- Consumer: `crates/freshell-ws/src/opencode_signal.rs` — sorted drain,
+  `ses_[A-Za-z0-9]+` shape validation (rejects warn-logged as
+  `opencode_signal_rejected`), then the claude guard ladder (live pane +
+  provider match, same-id no-op, A13, ledger A8, fresh-agent guard) and the
+  pinned fan-out ending in `terminal.session.associated` + `previousSessionId`.
+  D1 drain semantics: act-then-delete with on-disk RETENTION for signals
+  whose pane is momentarily absent (~10-min staleness cap); FIRST-BIND
+  arbitration for never-bound live panes (the signal outranks the opencode
+  locator and the bind disarms it); RETIRED-PANE rebind (moves the persisted
+  ref so a later restore resumes the new id). The route-derived id is
+  user-facing by construction (no bus consultation ⇒ no `parent_id`
+  cross-check needed).
+- Degradation: `--pure`/`OPENCODE_PURE` disables plugins; plugin init failure
+  is non-fatal in opencode (1.18.8/1.18.9, source-verified across every
+  loader path); a user-set `OPENCODE_TUI_CONFIG` or the kill switch skips
+  injection — all yield exactly today's no-rebind behavior. Crown test:
+  `crates/freshell-ws/tests/opencode_switch_rebind.rs`.
