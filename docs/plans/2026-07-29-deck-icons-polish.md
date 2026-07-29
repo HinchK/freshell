@@ -7,9 +7,9 @@
 
 **Goal:** Make the default "Status icons" Stream Deck tile style look like freshell itself: circle letter avatars identical to the tab bar's RepoIcon, all deck text in Inter, a palette derived from the app's own color tokens, and the bottom status dot replaced by tab-bar-style tinted coding-agent icons drawn next to the repo icon.
 
-**Architecture:** All changes are client-only and live in `src/deck/` plus small shared-constant extractions from the tab bar components. The rendering pipeline is: Redux store → `deck-selectors.ts` (`DeckModel`) → `frame.ts` (`KeySpec`) → `tile-renderer.ts` (canvas draw via injectable `Ctx2D`) → `deck-controller.ts` (diff + paint) → WebHID device or `VirtualDeckPanel.tsx` emulator. We widen the narrow `Ctx2D` type for circles, add a font-loading module with a controller repaint hook, re-derive color constants with a documented token mapping, and plumb per-tab agent-pane icon data (`paneIcons`) through selectors → frame → renderer, deleting the `dot` from the icons `KeySpec`. Agent icons exist only as React SVG components, so a new `provider-icon-svg.ts` serializes them with `renderToStaticMarkup`, injects the tint color, and feeds them through the existing `IconImageCache` (keeping its blank-draw detection).
+**Architecture:** All changes are client-only and live in `src/deck/` plus small shared-constant extractions from the tab bar components. The rendering pipeline is: Redux store → `deck-selectors.ts` (`DeckModel`) → `frame.ts` (`KeySpec`) → `tile-renderer.ts` (canvas draw via injectable `Ctx2D`) → `deck-controller.ts` (diff + paint) → WebHID device or `VirtualDeckPanel.tsx` emulator. We widen the narrow `Ctx2D` type for circles, add a font-loading module with a controller repaint hook, re-derive color constants with a documented token mapping (the pane-icon tint colors live in a shared leaf module, `src/deck/pane-tint-colors.ts`, so both `frame.ts` and `tile-renderer.ts` can import them without a runtime cycle), and plumb per-tab agent-pane icon data (`paneIcons`) through selectors → frame → renderer, deleting the `dot` from the icons `KeySpec`. Agent icons exist only as React SVG components, so a new `provider-icon-svg.ts` serializes them with `renderToStaticMarkup`, injects the tint color, and feeds them through the existing `IconImageCache` (keeping its blank-draw detection). CRITICAL repaint contract (verified against `deck-controller.ts`: `repaint()` skips any key whose `JSON.stringify(spec)` matches the last painted one, and the icon-cache notify does NOT bypass that diff): each pane icon's readiness is stamped INTO the `KeySpec` at frame-build time — `buildFrame` computes `ready: iconReady(providerIconDataUrl(provider, PANE_TINT_COLORS[tint]))`, which both starts the async load (`bitmapFor` loads on first miss) and makes the completed decode flip the spec JSON so the key repaints — exactly mirroring the existing repo-icon `TileIcon.ready` mechanism (`frame.ts` `ready: icon.url !== null && iconReady(icon.url)`).
 
-**Tech Stack:** TypeScript, React 18.3, Redux Toolkit, Canvas 2D, Vite 5, `@fontsource/inter` (new dep), Vitest + jsdom (recorded-draw-call testing — no real canvas in tests).
+**Tech Stack:** TypeScript, React 18.3, Redux Toolkit, Canvas 2D, Vite 6.4.1, `@fontsource/inter` (new dep), Vitest + jsdom (recorded-draw-call testing — no real canvas in tests).
 
 ## Global Constraints
 
@@ -398,6 +398,12 @@ Create `src/deck/deck-font.ts`:
 // jsdom has no document.fonts: every path here degrades to a silent no-op
 // (console.error is fatal in tests; a missing font is expected, not
 // exceptional — same rule as icon-image-cache.ts).
+// Two verified FontFaceSet facts shape this module: (1) fonts.load('400 16px
+// "Inter"') uses load()'s default sample text (a single space), so it loads
+// only the latin-subset face — non-Latin deck text stays in the sans-serif
+// fallback (accepted as fine for v1); (2) load() REJECTS on a broken src, so
+// the .catch below is MANDATORY (without it a failed load is an unhandled
+// rejection, which is fatal under the test rules).
 
 export const DECK_FONT_FAMILY = 'Inter'
 /** Family list for ctx.font strings: Inter once loaded, sans-serif before. */
@@ -506,10 +512,24 @@ describe('fonts (Inter)', () => {
 
 (Note: `renderTab` accepts any `KeySpec` — it just calls `renderKey`; check its local signature and widen the parameter type from the tab-spec builder type to `KeySpec` if needed. `renderStrip` must be added to the imports from `@/deck/tile-renderer` if not present.)
 
+Also update the Task 2-era avatar assertion in this same file — it pins the exact `sans-serif` font string that this task retires. In the test `'unready or letter-only icon draws RepoIcon\'s circle avatar + centered white letter'` (added in Task 2), change:
+
+```ts
+  expect(letter?.font).toBe(`600 ${Math.round(slot.size * REPO_AVATAR_FONT_RATIO)}px sans-serif`)
+```
+
+to:
+
+```ts
+  expect(letter?.font).toBe(`600 ${Math.round(slot.size * REPO_AVATAR_FONT_RATIO)}px ${DECK_FONT_STACK}`)
+```
+
+(`DECK_FONT_STACK` is already being added to this file's imports in this step. This is the only pre-Task-4 assertion in the file that pins a full font string — the file's other font assertions are the new ones above — so with this edit the update set is complete.)
+
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `npm run test:vitest -- run test/unit/client/deck/tile-renderer.test.ts --config config/vitest/vitest.config.ts`
-Expected: FAIL — fonts are still `sans-serif` without weights, `CONTROL_LABEL_FONT_SIZE` is not exported.
+Expected: FAIL — fonts are still `sans-serif` without weights, `CONTROL_LABEL_FONT_SIZE` is not exported, and the updated Task 2 avatar assertion now expects `${DECK_FONT_STACK}`.
 
 - [ ] **Step 3: Implement**
 
@@ -649,21 +669,22 @@ git commit -m "feat(deck): force full repaint once Inter loads (injectable fontR
 
 ### Task 6: Cohesive palette derived from freshell's tokens
 
-Re-derive the icons-style/control-key constants from the app's own tokens (`src/theme-variables.css`, TabItem's tailwind classes) and document the mapping in a comment block. Value changes: `TILE_BG` `#0a0a0a`→`#09090b` (`--background` dark), `TILE_FILL_GREEN` `#a7f3d0`→`#d1fae5` (`bg-emerald-100`, the tab bar's actual green-fill token, light variant for LCD legibility), `CONTROL_BG` `#101036`→`#27272a` (`bg-muted` dark), `CONTROL_DIM` `#8888aa`→`#a1a1aa` (`text-muted-foreground` dark), `APPROVE_COLOR` `#22c55e`→`#21c45d` (`--success`, fixing 1-off drift), `STOP_COLOR` `#ef4444`→`#dc2828` (`--destructive` light variant `hsl(0 72% 51%)`, vivid enough for the LCD). Renames: `DOT_GREEN`→`STATUS_GREEN`, `DOT_BLUE`→`STATUS_BLUE` (values already exact token matches — they become the pane-icon tints in Task 10). `BAR_TOP_BORDER` (`#21c45d` = `--success` exactly) and `ACTIVE_COLOR`/`BANNER_FILL`/`EMPTY_BG` keep their values but join the mapping doc. `PREVIEW_*` and `RING_COLORS` are pinned (classic style).
+Re-derive the icons-style/control-key constants from the app's own tokens (`src/theme-variables.css`, TabItem's tailwind classes) and document the mapping in a comment block. Value changes: `TILE_BG` `#0a0a0a`→`#09090b` (`--background` dark), `TILE_FILL_GREEN` `#a7f3d0`→`#d1fae5` (`bg-emerald-100`, the tab bar's actual green-fill token, light variant for LCD legibility), `CONTROL_BG` `#101036`→`#27272a` (`bg-muted` dark), `CONTROL_DIM` `#8888aa`→`#a1a1aa` (`text-muted-foreground` dark), `APPROVE_COLOR` `#22c55e`→`#21c45d` (`--success`, fixing 1-off drift), `STOP_COLOR` `#ef4444`→`#dc2828` (`--destructive` light variant `hsl(0 72% 51%)`, vivid enough for the LCD). The pane-icon tint colors MOVE to a new shared leaf module `src/deck/pane-tint-colors.ts`: `DOT_GREEN`/`DOT_BLUE` become `STATUS_GREEN`/`STATUS_BLUE` there (values already exact token matches), joined by the four remaining TabItem tint states (`STATUS_AMBER`/`STATUS_RED`/`STATUS_MUTED`/`STATUS_MUTED_DIM`). They live in their own module — not tile-renderer.ts — because Task 9's `buildFrame` (frame.ts) must compute the SAME tinted data URLs the renderer uses to stamp per-icon readiness into the KeySpec, and a shared leaf module keeps the deck import graph runtime-acyclic (tile-renderer's import of frame.ts is type-only, but frame → tile-renderer value imports would still be a fragile shape). `BAR_TOP_BORDER` (`#21c45d` = `--success` exactly) and `ACTIVE_COLOR`/`BANNER_FILL`/`EMPTY_BG` keep their values but join the mapping doc. `PREVIEW_*` and `RING_COLORS` are pinned (classic style).
 
 **Files:**
+- Create: `src/deck/pane-tint-colors.ts`
 - Modify: `src/deck/tile-renderer.ts`
 - Test: `test/unit/client/deck/tile-renderer.test.ts`
 
 **Interfaces:**
 - Consumes: nothing new.
-- Produces (used by Tasks 9-10 and tests): `STATUS_GREEN` (`'#21c45d'`), `STATUS_BLUE` (`'#3b82f6'`) replace `DOT_GREEN`/`DOT_BLUE`. `DOT_SIZE` remains (removed in Task 9). All other names unchanged.
+- Produces (used by Tasks 9-10 and tests): from `@/deck/pane-tint-colors`: `STATUS_GREEN` (`'#21c45d'`), `STATUS_BLUE` (`'#3b82f6'`), `STATUS_AMBER` (`'#f59f0a'`), `STATUS_RED` (`'#dc2828'`), `STATUS_MUTED` (`'#a1a1aa'`), `STATUS_MUTED_DIM` (`'rgba(161,161,170,0.4)'`). `DOT_GREEN`/`DOT_BLUE` are deleted from tile-renderer.ts (the dot code imports `STATUS_GREEN`/`STATUS_BLUE` until Task 9 deletes the dot). `DOT_SIZE` remains in tile-renderer.ts (removed in Task 9). All other names unchanged.
 
 - [ ] **Step 1: Write the failing tests**
 
 In `test/unit/client/deck/tile-renderer.test.ts`:
 
-1. Change the imports from `@/deck/tile-renderer`: `DOT_GREEN`→`STATUS_GREEN`, `DOT_BLUE`→`STATUS_BLUE`; add `CONTROL_BG`, `CONTROL_DIM`, `STOP_COLOR`, `PREVIEW_TEXT_COLOR` if missing; update the two usages in the status-dot test accordingly.
+1. Change the imports: remove `DOT_GREEN, DOT_BLUE` from the `@/deck/tile-renderer` import and add a new line `import { STATUS_GREEN, STATUS_BLUE, STATUS_AMBER, STATUS_RED, STATUS_MUTED, STATUS_MUTED_DIM } from '@/deck/pane-tint-colors'`; add `CONTROL_BG`, `CONTROL_DIM`, `STOP_COLOR`, `PREVIEW_TEXT_COLOR` to the tile-renderer import if missing; update the two usages in the status-dot test to `STATUS_GREEN`/`STATUS_BLUE`.
 2. De-hardcode the literal color assertions (they bypass constants today): line ~110 `'#a8a8a8'`→`PREVIEW_TEXT_COLOR`, line ~175 `'#101036'`→`CONTROL_BG`, line ~210 `'#a7f3d0'`→`TILE_FILL_GREEN`.
 3. Add the mapping lock test:
 
@@ -675,6 +696,10 @@ describe('palette derives from the app UI tokens (mapping block in tile-renderer
     expect(BAR_TOP_BORDER).toBe('#21c45d')   // --success: hsl(142 71% 45%)
     expect(STATUS_GREEN).toBe('#21c45d')     // text-success (pane running tint)
     expect(STATUS_BLUE).toBe('#3b82f6')      // text-blue-500 (pane busy tint)
+    expect(STATUS_AMBER).toBe('#f59f0a')     // --warning: hsl(38 92% 50%) (text-warning)
+    expect(STATUS_RED).toBe('#dc2828')       // --destructive light: hsl(0 72% 51%) (text-destructive)
+    expect(STATUS_MUTED).toBe('#a1a1aa')     // text-muted-foreground dark: hsl(240 5% 65%)
+    expect(STATUS_MUTED_DIM).toBe('rgba(161,161,170,0.4)') // text-muted-foreground/40 dark
     expect(ACTIVE_COLOR).toBe('#ffffff')     // white active ring
     expect(CONTROL_BG).toBe('#27272a')       // bg-muted dark
     expect(CONTROL_DIM).toBe('#a1a1aa')      // text-muted-foreground dark
@@ -699,7 +724,36 @@ Expected: FAIL — old values / `STATUS_GREEN` not exported.
 
 - [ ] **Step 3: Implement**
 
-In `src/deck/tile-renderer.ts`, replace the constants block (lines 18-50) documentation and values. Keep `PREVIEW_*`, `RING_COLORS`, `BANNER_*`, `TITLE_FONT_SIZE`, `ACTIVE_COLOR`, `DOT_SIZE`, `ICON_GAP`, `DISABLED_ACTION_COLOR`, `EMPTY_BG`, `STRIP_FONT_SIZE`, `MAX_TITLE_CHARS` where noted; apply this exact mapping block and the changed values:
+First create `src/deck/pane-tint-colors.ts` (a leaf module: NO imports — both `frame.ts` (Task 9) and `tile-renderer.ts` import it, so it must depend on nothing in `src/deck/`):
+
+```ts
+// ============================================================================
+// PANE-ICON TINT COLORS — TabItem.tsx's icon tint classes projected to canvas
+// hex, derived from freshell's own UI tokens. KEEP IN SYNC: when an app token
+// changes, update the deck constant to match (same rule as tile-renderer.ts's
+// palette block). These live in their own leaf module because BOTH frame.ts
+// (which stamps per-icon readiness by computing the tinted data URL at
+// frame-build time) and tile-renderer.ts (which draws) need them — a shared
+// leaf module keeps the deck import graph free of runtime cycles.
+//
+//   deck constant     <- app source token                                  value
+//   STATUS_GREEN      <- text-success       (TabItem pane running tint)    hsl(142 71% 45%) = #21c45d
+//   STATUS_BLUE       <- text-blue-500      (TabItem pane busy tint)       #3b82f6
+//   STATUS_AMBER      <- --warning / text-warning                          hsl(38 92% 50%)  = #f59f0a
+//   STATUS_RED        <- --destructive light / text-destructive            hsl(0 72% 51%)   = #dc2828
+//   STATUS_MUTED      <- text-muted-foreground dark                        hsl(240 5% 65%)  = #a1a1aa
+//   STATUS_MUTED_DIM  <- text-muted-foreground/40 dark                     rgba(161,161,170,0.4)
+// ============================================================================
+
+export const STATUS_GREEN = '#21c45d'
+export const STATUS_BLUE = '#3b82f6'
+export const STATUS_AMBER = '#f59f0a'
+export const STATUS_RED = '#dc2828'
+export const STATUS_MUTED = '#a1a1aa'
+export const STATUS_MUTED_DIM = 'rgba(161,161,170,0.4)'
+```
+
+Then in `src/deck/tile-renderer.ts`, replace the constants block (lines 18-50) documentation and values. Keep `PREVIEW_*`, `RING_COLORS`, `BANNER_*`, `TITLE_FONT_SIZE`, `ACTIVE_COLOR`, `DOT_SIZE`, `ICON_GAP`, `DISABLED_ACTION_COLOR`, `EMPTY_BG`, `STRIP_FONT_SIZE`, `MAX_TITLE_CHARS` where noted; delete `DOT_GREEN`/`DOT_BLUE`; apply this exact mapping block and the changed values:
 
 ```ts
 // ============================================================================
@@ -714,8 +768,9 @@ In `src/deck/tile-renderer.ts`, replace the constants block (lines 18-50) docume
 //                        light-theme variant: the dark-theme emerald-900/40
 //                        fill is illegible at key size on the LCD.
 //   BAR_TOP_BORDER    <- border-t-success / --success (TabItem bar-on-top) hsl(142 71% 45%) = #21c45d
-//   STATUS_GREEN      <- text-success       (TabItem pane running tint)    hsl(142 71% 45%) = #21c45d
-//   STATUS_BLUE       <- text-blue-500      (TabItem pane busy tint)       #3b82f6
+//   STATUS_* pane-icon tints (text-success, text-blue-500, ...) live in
+//   pane-tint-colors.ts — shared with frame.ts, which computes the tinted
+//   data URLs at frame-build time.
 //   ACTIVE_COLOR      <- white active ring (deck-only affordance)          #ffffff
 //   BANNER_FILL       <- black scrim over the tile (shared w/ previews)    rgba(0,0,0,0.667)
 //   CONTROL_BG        <- bg-muted dark      (src/theme-variables.css)      hsl(240 4% 16%)  = #27272a
@@ -734,15 +789,13 @@ Changed lines:
 ```ts
 export const TILE_BG = '#09090b'
 export const TILE_FILL_GREEN = '#d1fae5'
-export const STATUS_GREEN = '#21c45d'
-export const STATUS_BLUE = '#3b82f6'
 export const CONTROL_BG = '#27272a'
 export const CONTROL_DIM = '#a1a1aa'
 export const APPROVE_COLOR = '#21c45d'
 export const STOP_COLOR = '#dc2828'
 ```
 
-Update the two usages of `DOT_GREEN`/`DOT_BLUE` in `drawIconsTab` to `STATUS_GREEN`/`STATUS_BLUE`. Grep to confirm no other references remain:
+Add the import `import { STATUS_GREEN, STATUS_BLUE } from './pane-tint-colors'` and update the two usages of `DOT_GREEN`/`DOT_BLUE` in `drawIconsTab` to `STATUS_GREEN`/`STATUS_BLUE` (the dot itself is deleted in Task 9; this import goes with it). Grep to confirm no other references remain:
 
 ```bash
 grep -rn "DOT_GREEN\|DOT_BLUE" src/ test/
@@ -758,7 +811,7 @@ Expected: PASS. Then `npm run typecheck` — clean.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/deck/tile-renderer.ts test/unit/client/deck/tile-renderer.test.ts
+git add src/deck/pane-tint-colors.ts src/deck/tile-renderer.ts test/unit/client/deck/tile-renderer.test.ts
 git commit -m "feat(deck): re-derive tile palette from the app's UI tokens with documented mapping"
 ```
 
@@ -774,9 +827,9 @@ The coding-agent icons exist ONLY as React SVG components drawing with `currentC
 
 **Interfaces:**
 - Consumes: `PROVIDER_ICONS`, `DefaultProviderIcon` from `@/components/icons/provider-icons`; `resolveFreshAgentType` from `@/lib/fresh-agent-registry`; `react-dom/server` (first use in the repo — react-dom 18.3.1 is already installed, no dependency change).
-- Produces (used by Task 10):
+- Produces (used by Tasks 9 and 10):
   - `export function providerIconSvg(provider: string, colorHex: string): string` — standalone tinted SVG markup; provider is a terminal `mode` (e.g. `'claude'`) or fresh-agent `sessionType` (e.g. `'freshclaude'`); unknown → `DefaultProviderIcon`. Memoized per `(provider, colorHex)`.
-  - `export function providerIconDataUrl(provider: string, colorHex: string): string` — `data:image/svg+xml;utf8,<encoded markup>` (stable string: safe as an `IconImageCache`/diff key).
+  - `export function providerIconDataUrl(provider: string, colorHex: string): string` — `data:image/svg+xml;utf8,<encoded markup>` (stable string: safe as an `IconImageCache`/diff key). LOAD-BEARING determinism: Task 9's `buildFrame` and Task 10's renderer must compute byte-identical URLs for the same `(provider, tint)` — the frame stamps `ready` by probing the cache with this URL and the renderer fetches the bitmap with it. The memoization + stable-URL test below locks that contract.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -909,7 +962,7 @@ Plumb agent identity + tint from the store to the deck model. `panesForTab` alre
 - Consumes: existing module-internal helpers `panesForTab`, `getBusyPaneIdsForTab`, `activityInputs` (all already used by `getTabStatusFlags` in this file); `isNonShellMode` from `@/lib/coding-cli-utils` (new import).
 - Produces (used by Tasks 9-10):
   - `export type TilePaneTint = 'blue' | 'green' | 'amber' | 'red' | 'mutedDim' | 'muted'`
-  - `export type TilePaneIcon = { provider: string; tint: TilePaneTint }`
+  - `export type TilePaneIcon = { provider: string; tint: TilePaneTint }` — deliberately NO `ready` field here: readiness is a frame-level concern (it depends on the icon cache, not the store), stamped by `buildFrame` in Task 9 exactly as it is for repo icons (`TileRepoIcon` has no `ready` either; `TileIcon` does).
   - `export function getTabPaneIcons(state: RootState, tab: Tab): TilePaneIcon[]` — agent panes only, layout order, UNCAPPED (renderer caps + badges).
   - `DeckTab` gains `paneIcons: TilePaneIcon[]`; `selectDeckModel` populates it.
 
@@ -1063,34 +1116,64 @@ git commit -m "feat(deck): derive per-tab agent pane icons with tab-bar tint rul
 
 ---
 
-### Task 9: KeySpec carries paneIcons; the status dot is deleted
+### Task 9: KeySpec carries paneIcons with frame-stamped readiness; the status dot is deleted
 
 Replace `dot` with `paneIcons` in the icons-style `KeySpec` and delete the dot rendering. After this task the dot is gone everywhere on the wire and the canvas (the renderer draws the pane icons in Task 10). `DeckTab.dot` and `tile-state.ts` stay untouched (sorting/priority unchanged).
 
+REPAINT CONTRACT (this is why the spec entries carry `ready` — validated fact, not a guess): `DeckController.repaint()` skips any key whose `JSON.stringify(spec)` equals the last painted one (`if (this.lastPaintedSpecs[keyIndex] === json) return`), and the icon-cache notify subscription calls plain `repaint()` with no invalidation. Repo icons survive this only because `buildFrame` stamps `ready: iconReady(url)` into each `TileIcon`, so a completed decode flips the JSON and un-skips the key. Pane icons must use the SAME mechanism: `buildFrame` computes each pane icon's tinted data URL (`providerIconDataUrl(provider, PANE_TINT_COLORS[tint])` — deterministic/memoized, Task 7) and stamps `ready: iconReady(dataUrl)`. Since the production `iconReady` is `(url) => iconCache.bitmapFor(url) !== null` and `bitmapFor` STARTS the load on first miss, the first frame also kicks off the async decode. The spec carries only small fields (`{ provider, tint, ready }`) — never the multi-KB data URL itself, which would bloat every JSON diff and e2e wire assertion. (This also puts `frame.ts` → `provider-icon-svg.ts`/`pane-tint-colors.ts` value imports in place: acyclic, since those two modules import nothing from `src/deck/`; `tile-renderer.ts` → `frame.ts` stays type-only.)
+
 **Files:**
 - Modify: `src/deck/frame.ts`
+- Modify: `src/deck/pane-tint-colors.ts`
 - Modify: `src/deck/tile-renderer.ts`
 - Test: `test/unit/client/deck/frame.test.ts`, `test/unit/client/deck/tile-renderer.test.ts`, `test/e2e/stream-deck-flow.test.tsx`
 
 **Interfaces:**
-- Consumes: `TilePaneIcon` from `./deck-selectors` (Task 8).
-- Produces: icons-style `KeySpec` member becomes
-  `{ kind: 'tab'; style: 'icons'; tabId: string; title: string; active: boolean; fill: TileFill; paneIcons: TilePaneIcon[]; icons: TileIcon[] }`
-  (`dot` removed; `DOT_SIZE` deleted from the renderer). Task 10 renders `paneIcons`.
+- Consumes: `TilePaneIcon`/`TilePaneTint` from `./deck-selectors` (Task 8), `providerIconDataUrl` from `./provider-icon-svg` (Task 7), `STATUS_*` from `./pane-tint-colors` (Task 6).
+- Produces:
+  - `src/deck/pane-tint-colors.ts` gains `export const PANE_TINT_COLORS: Record<TilePaneTint, string>` (used here by `buildFrame` and in Task 10 by the renderer).
+  - `frame.ts` gains `export type TilePaneIconSpec = TilePaneIcon & { ready: boolean }`; the icons-style `KeySpec` member becomes
+    `{ kind: 'tab'; style: 'icons'; tabId: string; title: string; active: boolean; fill: TileFill; paneIcons: TilePaneIconSpec[]; icons: TileIcon[] }`
+    (`dot` removed; `DOT_SIZE` deleted from the renderer). Task 10 renders `paneIcons`, drawing only entries with `ready: true`.
 
 - [ ] **Step 1: Write the failing tests (frame level)**
 
-In `test/unit/client/deck/frame.test.ts`:
+In `test/unit/client/deck/frame.test.ts` (add imports: `providerIconDataUrl` from `@/deck/provider-icon-svg`, `PANE_TINT_COLORS` from `@/deck/pane-tint-colors` — this pulls `react-dom/server` into the suite's module graph, which Task 7 already proved jsdom-safe):
 
 1. `makeDeckTab` defaults (updated in Task 8) need NO change here: `DeckTab` still has `dot` (tile-state is untouched), so keep `dot: null` in the fixture defaults. Only the `KeySpec` loses `dot`.
-2. Update the primary carry test (lines ~84-108, `'buildFrame carries fill/dot/icons onto tab keys...'`): rename it to `'buildFrame carries fill/paneIcons/icons onto tab keys, with iconReady resolving readiness'`; in the fixture tab replace nothing (keep `dot: 'green'` on the DeckTab — it is simply no longer carried) but add `paneIcons: [{ provider: 'claude', tint: 'green' }]`; in the asserted KeySpec replace `dot: 'green',` with `paneIcons: [{ provider: 'claude', tint: 'green' }],`. Import `TilePaneIcon` if the file annotates types.
+2. Update the primary carry test (the `'buildFrame carries fill/dot/icons onto tab keys...'` test): rename it to `'buildFrame carries fill/paneIcons/icons onto tab keys, with iconReady resolving readiness'`; in the fixture tab replace nothing (keep `dot: 'green'` on the DeckTab — it is simply no longer carried) but add `paneIcons: [{ provider: 'claude', tint: 'green' }]`; in the asserted KeySpec replace `dot: 'green',` with `paneIcons: [{ provider: 'claude', tint: 'green', ready: false }],` — `ready` is `false` because the test's fake `iconReady` (`(url) => url === '/api/repo-icon?cwd=%2Fr%2Fa'`) answers `true` only for the repo-icon URL, never for a pane-icon data URL. Import `TilePaneIcon` if the file annotates types.
+3. Add the readiness-stamping test (the mechanism that makes post-decode repaints work):
+
+```ts
+it('pane icon readiness is stamped from iconReady using the tinted data URL', () => {
+  const m: DeckModel = {
+    activeTabId: 't1', tileStyle: 'status-icons',
+    tabs: [makeDeckTab({ id: 't1', title: 'alpha', active: true, paneIcons: [{ provider: 'claude', tint: 'green' }] })],
+  }
+  const url = providerIconDataUrl('claude', PANE_TINT_COLORS.green)
+  const asked: string[] = []
+  const build = (ready: boolean) => buildFrame({
+    model: m, caps: MINI_CAPS, page: 1, actionLayer: null,
+    iconReady: (u) => { asked.push(u); return ready }, previewFor: noPreview,
+  })
+  const before = build(false)
+  // buildFrame consults iconReady with the EXACT URL the renderer will pass to
+  // getIcon — in production that call (bitmapFor) also STARTS the async load.
+  expect(asked).toContain(url)
+  expect(before.keys[0]).toMatchObject({ paneIcons: [{ provider: 'claude', tint: 'green', ready: false }] })
+  const after = build(true)
+  expect(after.keys[0]).toMatchObject({ paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] })
+  // The decode flips the spec JSON — this is what un-skips the controller's per-key diff.
+  expect(JSON.stringify(after.keys[0])).not.toBe(JSON.stringify(before.keys[0]))
+})
+```
 
 - [ ] **Step 2: Write the failing tests (renderer level)**
 
 In `test/unit/client/deck/tile-renderer.test.ts`:
 
-1. In the `tabSpec()` builder (~line 80), replace `dot: null` with `paneIcons: []`.
-2. Delete the status-dot test (`'status dot: green and blue variants at bottom-center; absent when null'`, ~lines 150-157) and remove `DOT_SIZE` (and now-unused `STATUS_*` if unreferenced until Task 10) from the imports.
+1. In the `tabSpec()` builder (near the top of the `renderKey` describe area), replace `dot: null` with `paneIcons: []`.
+2. Delete the status-dot test (`'status dot: green and blue variants at bottom-center; absent when null'`) and remove `DOT_SIZE` from the `@/deck/tile-renderer` import. Keep the `@/deck/pane-tint-colors` import — the Task 6 mapping-lock test still uses all six `STATUS_*` constants.
 3. Add the regression test:
 
 ```ts
@@ -1103,37 +1186,84 @@ it('no status dot: a plain icons tile draws only the background and the banner',
 
 - [ ] **Step 3: Update the e2e KeySpec assertions**
 
-In `test/e2e/stream-deck-flow.test.tsx` (the renderer is stubbed to encode KeySpec JSON, so these assert the wire format): apply the mechanical rule — a `dot: 'green'` expectation becomes `paneIcons: [{ provider: P, tint: 'green' }]`, `dot: 'blue'` becomes `paneIcons: [{ provider: P, tint: 'blue' }]`, `dot: null`/absent becomes `paneIcons: []`, where `P` is the fixture pane's mode/sessionType for that tab (read the `makeDeckStore` fixture at the top of the file; its terminal panes use a coding mode, typically `'claude'`).
+In `test/e2e/stream-deck-flow.test.tsx` (the renderer is stubbed to encode KeySpec JSON, so these assert the wire format): apply the mechanical rule —
 
-Known assertion sites (from a repo-wide `.dot` sweep): lines ~230, ~234, ~238 (exact `toEqual` — must list `paneIcons` and no `dot`), ~256, ~259, ~267, ~410, ~411 (`toMatchObject` — replace the `dot` key with the `paneIcons` array). After editing, run the suite and reconcile any remaining diffs against the fixture (the diff output shows the actual `paneIcons` values produced by the real selectors — verify they match the rule above rather than blindly copying).
+- `dot: 'green'` becomes `paneIcons: [{ provider: P, tint: 'green', ready: false }]`
+- `dot: 'blue'` becomes `paneIcons: [{ provider: P, tint: 'blue', ready: false }]`
+- `dot: null`/absent becomes `paneIcons: []`
+
+where `P` is the fixture pane's provider for that tab: `'claude'` for `makeDeckStore`'s terminal panes (they are `mode: 'claude'`), `'freshclaude'` for the tab selected by the `freshAgentTab` option (read the fixture at the top of the file).
+
+`ready` is ALWAYS `false` on the wire in this suite — do not chase a `true`: the controller's default `IconImageCache` loads through `new Image()`, and jsdom never fires `onload`/decodes ANY image (data URLs included), so `iconReady(dataUrl)` stays `false` on every frame. (The false→true flip is proven with an injected deferred-loader cache in Task 11.)
+
+Known assertion sites (from a repo-wide `.dot` sweep, anchored by test name): `'tabs appear on keys with titles, fills, dots, and icons'` (three exact `toEqual` — must list `paneIcons` and no `dot`; the t3 key uses `provider: 'freshclaude'` since that test sets `freshAgentTab: 3`), `'tile fill and dot track state changes'` (three `toMatchObject` — replace the `dot` key with the `paneIcons` array; its t3 is also the fresh-agent tab), `'busy and idle-running tabs expose blue/green dots'` (two `toMatchObject`, both `'claude'`). Update the `dot`/`dots` wording in those three test names to `paneIcons` while you are there. After editing, run the suite and reconcile any remaining diffs against the fixture (the diff output shows the actual `paneIcons` values produced by the real selectors — verify they match the rule above rather than blindly copying).
 
 - [ ] **Step 4: Run tests to verify they fail**
 
 Run: `npm run test:vitest -- run test/unit/client/deck/frame.test.ts test/unit/client/deck/tile-renderer.test.ts test/e2e/stream-deck-flow.test.tsx --config config/vitest/vitest.config.ts`
-Expected: FAIL — `paneIcons` is not a `KeySpec` field (TS), the renderer still draws the dot rect.
+Expected: FAIL — `paneIcons` is not a `KeySpec` field (TS), `PANE_TINT_COLORS` is not exported, the renderer still draws the dot rect.
 
 - [ ] **Step 5: Implement**
+
+In `src/deck/pane-tint-colors.ts`, append (a type-only import — the module stays a runtime leaf):
+
+```ts
+import type { TilePaneTint } from './deck-selectors'
+
+/** TabItem.tsx pane-icon tint classes -> canvas colors (keyed by Task 8's TilePaneTint). */
+export const PANE_TINT_COLORS: Record<TilePaneTint, string> = {
+  blue: STATUS_BLUE,
+  green: STATUS_GREEN,
+  amber: STATUS_AMBER,
+  red: STATUS_RED,
+  muted: STATUS_MUTED,
+  mutedDim: STATUS_MUTED_DIM,
+}
+```
+
+(Move the `import type` line to the top of the file with the other statements; shown here together for clarity.)
 
 In `src/deck/frame.ts`:
 
 1. Line 3: drop `TileDot` from the `tile-state` import (keep `TileFill`).
-2. Line 2 area: extend the deck-selectors import: `import type { DeckModel, TilePaneIcon } from './deck-selectors'`
-3. Line 10, the icons member becomes:
+2. Line 2 area: extend the deck-selectors import to `import type { DeckModel, TilePaneIcon } from './deck-selectors'`, and add the two value imports (both are runtime leaves — no cycle; tile-renderer's import of frame.ts is type-only):
 
 ```ts
-  | { kind: 'tab'; style: 'icons'; tabId: string; title: string; active: boolean; fill: TileFill; paneIcons: TilePaneIcon[]; icons: TileIcon[] }
+import { PANE_TINT_COLORS } from './pane-tint-colors'
+import { providerIconDataUrl } from './provider-icon-svg'
 ```
 
-4. In `buildFrame` (line 122), replace `fill: tab.fill, dot: tab.dot,` with:
+3. Below `TileIcon`, add the spec-level pane-icon type, and make the icons member use it:
 
 ```ts
-            fill: tab.fill, paneIcons: tab.paneIcons,
+export type TilePaneIconSpec = TilePaneIcon & { ready: boolean }
+```
+
+```ts
+  | { kind: 'tab'; style: 'icons'; tabId: string; title: string; active: boolean; fill: TileFill; paneIcons: TilePaneIconSpec[]; icons: TileIcon[] }
+```
+
+4. In `buildFrame` (the icons-style branch), replace `fill: tab.fill, dot: tab.dot,` with:
+
+```ts
+            fill: tab.fill,
+            // Readiness must live IN the spec: the controller's repaint() skips
+            // keys whose JSON is unchanged, so the decode completing has to flip
+            // a spec field to trigger the repaint — same mechanism as the repo
+            // icons below. iconReady (bitmapFor in production) also STARTS the
+            // async load on first miss, so the first frame kicks off the fetch.
+            // The URL is recomputed, never stored: providerIconDataUrl is
+            // memoized, and the spec stays small (no multi-KB data URLs).
+            paneIcons: tab.paneIcons.map((icon) => ({
+              ...icon,
+              ready: iconReady(providerIconDataUrl(icon.provider, PANE_TINT_COLORS[icon.tint])),
+            })),
 ```
 
 In `src/deck/tile-renderer.ts`:
 
 5. Delete the dot block in `drawIconsTab` (the `// 3. Status dot...` comment and the `if (spec.dot) {...}` statement).
-6. Delete `export const DOT_SIZE = 8` and the `/** Status dot: ... */` comment above `STATUS_GREEN` (replace with `/** Pane-icon tint colors (tab bar's text-success / text-blue-500). */`). Keep `STATUS_GREEN`/`STATUS_BLUE` — Task 10 uses them.
+6. Delete `export const DOT_SIZE = 8` and the now-unreferenced `import { STATUS_GREEN, STATUS_BLUE } from './pane-tint-colors'` line (Task 10 re-imports what it needs from there).
 7. Renumber the remaining `drawIconsTab` step comments (banner becomes `// 3.`, rings `// 4.`).
 
 - [ ] **Step 6: Run tests to verify they pass**
@@ -1144,41 +1274,39 @@ Expected: PASS. `npm run typecheck` — clean (`grep -rn "spec.dot\|DOT_SIZE" sr
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/deck/frame.ts src/deck/tile-renderer.ts test/unit/client/deck/frame.test.ts test/unit/client/deck/tile-renderer.test.ts test/e2e/stream-deck-flow.test.tsx
-git commit -m "feat(deck): replace the icons-tile status dot with paneIcons in the KeySpec"
+git add src/deck/frame.ts src/deck/pane-tint-colors.ts src/deck/tile-renderer.ts test/unit/client/deck/frame.test.ts test/unit/client/deck/tile-renderer.test.ts test/e2e/stream-deck-flow.test.tsx
+git commit -m "feat(deck): replace the icons-tile status dot with readiness-stamped paneIcons in the KeySpec"
 ```
 
 ---
 
 ### Task 10: Render tinted agent icons beside the repo icon (+N overflow badge)
 
-Draw the tab bar's presentation on the key: repo icon (or circle letter avatar) first, then up to 2 tinted agent icons, then a `+N` badge for hidden agent panes (blue when a hidden pane is busy — TabItem's overflow rule). Tabs with no agent panes keep today's repo-icons-only row (up to 3). Tinted icons come from `providerIconDataUrl` through the injected `IconSource` (the real pipeline passes `IconImageCache.bitmapFor`, so async load + blank-draw probe + repaint-on-load all keep working; before the data URL decodes, the slot is simply empty for one frame).
+Draw the tab bar's presentation on the key: repo icon (or circle letter avatar) first, then up to 2 tinted agent icons, then a `+N` badge for hidden agent panes (blue when a hidden pane is busy — TabItem's overflow rule). Tabs with no agent panes keep today's repo-icons-only row (up to 3). Tinted icons mirror the repo-icon pattern exactly: the renderer calls `getIcon(providerIconDataUrl(...))` ONLY when the spec entry says `ready: true` (Task 9's `buildFrame` stamped it after consulting — and thereby starting — the cache load). An unready slot stays empty; when the decode completes, the cache notify triggers a repaint, `buildFrame` flips `ready` in the spec JSON, the controller's diff un-skips the key, and the icon appears. The blank-draw probe and silent-failure handling in `IconImageCache` are untouched.
 
 **Files:**
 - Modify: `src/deck/tile-renderer.ts`
 - Test: `test/unit/client/deck/tile-renderer.test.ts`
 
 **Interfaces:**
-- Consumes: `spec.paneIcons: TilePaneIcon[]` (Task 9), `providerIconDataUrl` (Task 7), `STATUS_GREEN`/`STATUS_BLUE` (Task 6), `DECK_FONT_STACK` (Task 3).
+- Consumes: `spec.paneIcons: TilePaneIconSpec[]` (Task 9), `providerIconDataUrl` (Task 7), `PANE_TINT_COLORS`/`STATUS_GREEN`/`STATUS_BLUE`/`STATUS_MUTED` from `@/deck/pane-tint-colors` (Tasks 6/9), `DECK_FONT_STACK` (Task 3).
 - Produces:
   - `export const MAX_KEY_PANE_ICONS = 2`
   - `export const OVERFLOW_FONT_SIZE = 10`
-  - `export const STATUS_AMBER = '#f59f0a'` (`--warning: hsl(38 92% 50%)`), `export const STATUS_RED = '#dc2828'` (`--destructive` light), `export const STATUS_MUTED = '#a1a1aa'` (`text-muted-foreground` dark), `export const STATUS_MUTED_DIM = 'rgba(161,161,170,0.4)'` (`text-muted-foreground/40`)
-  - `export const PANE_TINT_COLORS: Record<TilePaneTint, string>`
 
 - [ ] **Step 1: Write the failing tests**
 
-In `test/unit/client/deck/tile-renderer.test.ts`, add imports (`MAX_KEY_PANE_ICONS`, `PANE_TINT_COLORS`, `STATUS_BLUE`, `STATUS_GREEN`, `STATUS_MUTED`, `OVERFLOW_FONT_SIZE` from `@/deck/tile-renderer`; `providerIconDataUrl` from `@/deck/provider-icon-svg`) and a new describe block. Note `renderTab`'s second parameter is the `IconSource`.
+In `test/unit/client/deck/tile-renderer.test.ts`, add imports (`MAX_KEY_PANE_ICONS`, `OVERFLOW_FONT_SIZE` from `@/deck/tile-renderer`; `PANE_TINT_COLORS` added to the existing `@/deck/pane-tint-colors` import — `STATUS_BLUE`/`STATUS_GREEN`/`STATUS_MUTED` are already imported there since Task 6; `providerIconDataUrl` from `@/deck/provider-icon-svg`) and a new describe block. Note `renderTab`'s second parameter is the `IconSource`. The `ready` flag and the `IconSource` return are SEPARATE gates, mirroring repo icons: `ready: false` means the renderer never calls `getIcon` (buildFrame said the bitmap is not cached yet); `ready: true` + `getIcon → null` covers a probe-failed/evicted cache entry. Both draw nothing; both are tested.
 
 ```ts
 describe('agent pane icons (tab-bar presentation)', () => {
   const repoIcon = { url: null, letter: 'B', hue: 200, ready: false }
   const bitmap = {} as CanvasImageSource
 
-  it('requests the tinted provider icon and draws it beside the repo avatar', () => {
+  it('requests the tinted provider icon (only when ready) and draws it beside the repo avatar', () => {
     const requested: string[] = []
     const { images, circles } = renderTab(
-      tabSpec({ icons: [repoIcon], paneIcons: [{ provider: 'claude', tint: 'blue' }] }),
+      tabSpec({ icons: [repoIcon], paneIcons: [{ provider: 'claude', tint: 'blue', ready: true }] }),
       (url) => { requested.push(url); return bitmap },
     )
     expect(requested).toEqual([providerIconDataUrl('claude', STATUS_BLUE)])
@@ -1190,16 +1318,16 @@ describe('agent pane icons (tab-bar presentation)', () => {
 
   it('caps drawn agent icons at MAX_KEY_PANE_ICONS and folds the rest into a +N badge', () => {
     const paneIcons = [
-      { provider: 'claude', tint: 'green' as const },
-      { provider: 'codex', tint: 'green' as const },
-      { provider: 'gemini', tint: 'green' as const },
-      { provider: 'opencode', tint: 'blue' as const },
+      { provider: 'claude', tint: 'green' as const, ready: true },
+      { provider: 'codex', tint: 'green' as const, ready: true },
+      { provider: 'gemini', tint: 'green' as const, ready: true },
+      { provider: 'opencode', tint: 'blue' as const, ready: true },
     ]
     const requested: string[] = []
     const { texts } = renderTab(tabSpec({ icons: [repoIcon], paneIcons }), (url) => { requested.push(url); return bitmap })
     expect(requested).toEqual([
-      providerIconDataUrl('claude', STATUS_GREEN),
-      providerIconDataUrl('codex', STATUS_GREEN),
+      providerIconDataUrl('claude', PANE_TINT_COLORS.green),
+      providerIconDataUrl('codex', PANE_TINT_COLORS.green),
     ])
     const badge = texts.find((t) => t.text === '+2')
     expect(badge).toBeDefined()
@@ -1209,14 +1337,14 @@ describe('agent pane icons (tab-bar presentation)', () => {
   })
 
   it('badge is muted when no hidden pane is busy', () => {
-    const paneIcons = Array.from({ length: 3 }, () => ({ provider: 'claude', tint: 'green' as const }))
+    const paneIcons = Array.from({ length: 3 }, () => ({ provider: 'claude', tint: 'green' as const, ready: true }))
     const { texts } = renderTab(tabSpec({ icons: [], paneIcons }), () => bitmap)
     expect(texts.find((t) => t.text === '+1')?.style).toBe(STATUS_MUTED)
   })
 
   it('with agent icons present, repo icons collapse to the first one', () => {
     const icons = [repoIcon, { ...repoIcon, letter: 'C', hue: 10 }, { ...repoIcon, letter: 'D', hue: 20 }]
-    const { circles } = renderTab(tabSpec({ icons, paneIcons: [{ provider: 'claude', tint: 'green' }] }), () => bitmap)
+    const { circles } = renderTab(tabSpec({ icons, paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] }), () => bitmap)
     expect(circles).toHaveLength(1) // only the first repo avatar
   })
 
@@ -1226,8 +1354,18 @@ describe('agent pane icons (tab-bar presentation)', () => {
     expect(circles).toHaveLength(3)
   })
 
-  it('an unloaded tinted icon draws nothing (slot fills on the cache-notify repaint)', () => {
-    const { images } = renderTab(tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green' }] }), () => null)
+  it('an unready pane icon draws nothing and never hits the icon source (slot fills on the cache-notify repaint, which flips ready in the spec)', () => {
+    const requested: string[] = []
+    const { images } = renderTab(
+      tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green', ready: false }] }),
+      (url) => { requested.push(url); return bitmap },
+    )
+    expect(images).toHaveLength(0)
+    expect(requested).toHaveLength(0) // buildFrame owns load-starting; the renderer only draws
+  })
+
+  it('a ready flag with a cache miss (probe-failed/evicted bitmap) still draws nothing', () => {
+    const { images } = renderTab(tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] }), () => null)
     expect(images).toHaveLength(0)
   })
 })
@@ -1242,27 +1380,10 @@ Expected: FAIL — `MAX_KEY_PANE_ICONS` not exported; no data URLs requested.
 
 In `src/deck/tile-renderer.ts`:
 
-1. Imports: `import { providerIconDataUrl } from './provider-icon-svg'` and `import type { TilePaneTint } from './deck-selectors'`.
-2. Constants (in the palette block, with mapping comments in the same style as Task 6):
+1. Imports: `import { providerIconDataUrl } from './provider-icon-svg'` and `import { PANE_TINT_COLORS, STATUS_BLUE, STATUS_MUTED } from './pane-tint-colors'` (the tint constants and `PANE_TINT_COLORS` already exist there — Tasks 6/9; the badge below uses `STATUS_BLUE`/`STATUS_MUTED`).
+2. Constants (next to the other layout constants):
 
 ```ts
-/** --warning: hsl(38 92% 50%) (text-warning). */
-export const STATUS_AMBER = '#f59f0a'
-/** --destructive light: hsl(0 72% 51%) (text-destructive). */
-export const STATUS_RED = '#dc2828'
-/** text-muted-foreground dark: hsl(240 5% 65%). */
-export const STATUS_MUTED = '#a1a1aa'
-/** text-muted-foreground/40 dark. */
-export const STATUS_MUTED_DIM = 'rgba(161,161,170,0.4)'
-/** TabItem.tsx pane-icon tint classes -> canvas colors. */
-export const PANE_TINT_COLORS: Record<TilePaneTint, string> = {
-  blue: STATUS_BLUE,
-  green: STATUS_GREEN,
-  amber: STATUS_AMBER,
-  red: STATUS_RED,
-  muted: STATUS_MUTED,
-  mutedDim: STATUS_MUTED_DIM,
-}
 /** Agent icons drawn per key; hidden panes fold into the +N badge (TabItem rule, key-sized). */
 export const MAX_KEY_PANE_ICONS = 2
 export const OVERFLOW_FONT_SIZE = 10
@@ -1308,10 +1429,13 @@ export const OVERFLOW_FONT_SIZE = 10
   })
   paneIcons.forEach((icon, i) => {
     const { x, y, size } = slots[repoIcons.length + i]
-    // Tinted agent icon via the icon cache: async decode + drawn-empty probe;
-    // an unloaded slot stays empty until the cache-notify repaint. 5-arg
+    // Mirror the repo-icon pattern above: draw ONLY when buildFrame stamped
+    // ready (it consulted the cache with this same memoized URL, which also
+    // started the async load). An unready slot stays empty; when the decode
+    // completes, the cache notify repaints, buildFrame flips `ready` in the
+    // spec JSON, and the controller's diff un-skips this key. 5-arg
     // drawImage is mandatory (see the repo-icon comment above).
-    const bitmap = getIcon(providerIconDataUrl(icon.provider, PANE_TINT_COLORS[icon.tint]))
+    const bitmap = icon.ready ? getIcon(providerIconDataUrl(icon.provider, PANE_TINT_COLORS[icon.tint])) : null
     if (bitmap) ctx.drawImage(bitmap, x, y, size, size)
   })
   if (hidden.length > 0 && slots.length > 0) {
@@ -1352,7 +1476,7 @@ Prove the production path end to end (store → selectors → frame → real ass
 
 - [ ] **Step 1: Write the failing e2e test**
 
-In `test/e2e/stream-deck-flow.test.tsx`, inside the `describe('tile styles')` block (added by commit `196f3e16`, ~line 460), add a full-pipeline test using the file's existing fixtures (`setup`/`makeDeckStore` with a busy pane — the fixture exposes a busy option; mirror how the neighboring `dot`-era tests marked a tab busy):
+In `test/e2e/stream-deck-flow.test.tsx`, inside the `describe('tile styles')` block (added by commit `196f3e16`), add two full-pipeline tests using the file's existing fixtures (`setup`/`makeDeckStore` with a busy pane — the fixture exposes a `busy: string[]` option; mirror how the neighboring `dot`-era tests marked a tab busy). Add `providerIconDataUrl` (`@/deck/provider-icon-svg`) and `PANE_TINT_COLORS` (`@/deck/pane-tint-colors`) to the file's imports for the second test.
 
 ```tsx
 it('icons style: busy agent pane surfaces as a blue-tinted paneIcon on the wire', () => {
@@ -1361,12 +1485,34 @@ it('icons style: busy agent pane surfaces as a blue-tinted paneIcon on the wire'
   expect(spec).toMatchObject({
     kind: 'tab',
     style: 'icons',
-    paneIcons: [{ provider: 'claude', tint: 'blue' }],
+    // ready is false: jsdom never decodes images, so the default cache never
+    // reports a bitmap — this asserts the pre-decode wire state.
+    paneIcons: [{ provider: 'claude', tint: 'blue', ready: false }],
+  })
+})
+
+it('icons style: pane icon flips to ready on the wire when its data URL decodes (A1 falsification fix, proven on the real controller+cache)', async () => {
+  // Mirrors the repo-icon deferred-loader test above: the REAL IconImageCache
+  // with a hand-resolved loader. buildFrame's iconReady probe (bitmapFor)
+  // starts the load with the tinted data URL; resolving it fires the cache
+  // notify, and the repaint must flip `ready` in the spec JSON — the diff-skip
+  // in DeckController would otherwise never repaint this key.
+  const { loader, pending } = deferredLoader()
+  const cache = new IconImageCache(loader)
+  const { device } = setup({ tabs: 1 }, undefined, defaultSettings, { iconCache: cache })
+  expect(decodeKey(device, 0)).toMatchObject({
+    paneIcons: [{ provider: 'claude', tint: 'green', ready: false }],
+  })
+  const url = providerIconDataUrl('claude', PANE_TINT_COLORS.green)
+  pending.get(url)!.resolve({} as CanvasImageSource) // frame-time probe already requested this exact URL
+  await vi.advanceTimersByTimeAsync(0)
+  expect(decodeKey(device, 0)).toMatchObject({
+    paneIcons: [{ provider: 'claude', tint: 'green', ready: true }],
   })
 })
 ```
 
-(Adapt the option names, key index, and provider to the file's actual fixture — the pattern to copy is the former `dot: 'blue'` test updated in Task 9 at ~line 411. The load-bearing assertion is `paneIcons: [{ provider: <fixture mode>, tint: 'blue' }]` flowing from real store state.)
+(Adapt the option names, key index, and provider to the file's actual fixture — the pattern to copy is the former `dot: 'blue'` test updated in Task 9 and the `'repo icons: unready at first paint...'` deferred-loader test. The load-bearing assertions are `paneIcons: [{ provider: <fixture mode>, tint: 'blue', ready: false }]` flowing from real store state, and the false→true `ready` flip after decode — the latter is THE proof that the readiness-stamping design survives the controller's JSON diff-skip.)
 
 - [ ] **Step 2: Run to verify it exercises the pipeline**
 
@@ -1405,12 +1551,14 @@ git commit -m "test(deck): e2e proof of tinted paneIcons pipeline + final gates 
 **1. Spec coverage:**
 - Change 1 (circle avatar, shared algorithm/constants, same casing/proportions/white letter): Tasks 1-2 (import/share via `repoAvatarColor` + `REPO_AVATAR_FONT_RATIO` + already-shared `hueFromString`). ✓
 - Change 2 (Inter everywhere on the deck: banner, avatar letters, pager, action, strip; local asset, no CDN; FontFace load + repaint; sans-serif fallback): Tasks 3-5. Preview tile pinned per the "previews unchanged" clause — decision documented in Global Constraints. ✓
-- Change 3 (palette from app tokens, hue-preserving, documented mapping): Task 6 (+ Task 10's tint colors carry the same mapping comments). ✓
-- Change 4 (dot removed; repo icon + tinted agent icons like the tab bar; cap/ordering/overflow adapted; canvas tinting; blank-draw detection preserved; tile-state untouched; no-agent tabs show repo icon only): Tasks 7-10, proven e2e in Task 11. ✓
+- Change 3 (palette from app tokens, hue-preserving, documented mapping): Task 6 (`tile-renderer.ts` block + the `pane-tint-colors.ts` block carry the token-mapping comments). ✓
+- Change 4 (dot removed; repo icon + tinted agent icons like the tab bar; cap/ordering/overflow adapted; canvas tinting; blank-draw detection preserved; tile-state untouched; no-agent tabs show repo icon only): Tasks 7-10, proven e2e in Task 11 — including the post-decode repaint, which works because Task 9 stamps `ready` into the KeySpec (the controller's JSON diff-skip makes a spec-invariant icon unpaintable; see the validation note below). The blank-draw probe, `icon-image-cache.ts`, and `tile-state.ts` remain untouched, and the PINNED preview regions are never edited by any task. ✓
 - Scope/quality (previews untouched, sorting/interaction/settings unchanged, TDD, suites green, lint+typecheck, virtual deck verified, branch on origin/main): Global Constraints + Task 11. ✓
 
-**1b. No silent deferrals:** No stubs or mocks stand in for production behavior. Canvas tests use the repo's established recorded-draw-call harness (the only possible approach — jsdom has no canvas), and Task 11's e2e test plus the VirtualDeckPanel suite prove the real store→wire→renderer path; the optional manual check covers real-pixel confirmation. Font loading is exercised against a real `FontFaceSet` contract with an injectable hook (production default `whenDeckFontReady` is itself unit-tested). No requirement was moved to future work.
+**1b. No silent deferrals:** No stubs or mocks stand in for production behavior. Canvas tests use the repo's established recorded-draw-call harness (the only possible approach — jsdom has no canvas), and Task 11's e2e tests plus the VirtualDeckPanel suite prove the real store→wire→renderer path; the optional manual check covers real-pixel confirmation. The pane-icon repaint-after-decode contract specifically is proven on the REAL `DeckController` + REAL `IconImageCache` (only the image loader is a hand-resolved deferred — the same fixture the existing repo-icon test uses, since jsdom cannot decode images): Task 11's ready-flip e2e test fails if the controller's JSON diff-skip ever swallows the post-decode repaint. Font loading is exercised against a real `FontFaceSet` contract with an injectable hook (production default `whenDeckFontReady` is itself unit-tested). No requirement was moved to future work.
 
-**2. Placeholder scan:** No TBD/TODO/"similar to Task N"; every code step shows the code. The two places implementers must adapt to fixture internals (Task 9 Step 3, Task 11 Step 1) give the exact mechanical rule and the file locations, because the e2e fixture bodies are test-local details best read in place.
+**2. Placeholder scan:** No TBD/TODO/"similar to Task N"; every code step shows the code. The two places implementers must adapt to fixture internals (Task 9 Step 3, Task 11 Step 1) give the exact mechanical rule — including the fixed `ready: false` wire value in jsdom and the exact provider per fixture tab — and the file locations, because the e2e fixture bodies are test-local details best read in place.
 
-**3. Type consistency:** `repoAvatarColor(hue: number): string` / `REPO_AVATAR_FONT_RATIO` (T1) used in T2/T10; `Ctx2D` widened with `beginPath|arc|fill` (T2) matched by harness + `noopCtx`; `DECK_FONT_STACK` (T3) used in T4/T10; `fontReady?: (onReady: () => void) => () => void` (T5) matches `whenDeckFontReady`'s signature (T3); `STATUS_GREEN`/`STATUS_BLUE` (T6) used in T9/T10 tests and `PANE_TINT_COLORS`; `TilePaneTint`/`TilePaneIcon`/`getTabPaneIcons` (T8) consumed by T9 `KeySpec` and T10 renderer; `providerIconDataUrl(provider, colorHex)` (T7) called with `PANE_TINT_COLORS[tint]` (T10). Consistent.
+**3. Type consistency:** `repoAvatarColor(hue: number): string` / `REPO_AVATAR_FONT_RATIO` (T1) used in T2/T10; `Ctx2D` widened with `beginPath|arc|fill` (T2) matched by harness + `noopCtx`; `DECK_FONT_STACK` (T3) used in T4/T10; `fontReady?: (onReady: () => void) => () => void` (T5) matches `whenDeckFontReady`'s signature (T3); `STATUS_*` tint constants live in `pane-tint-colors.ts` (T6, a runtime-leaf module) and are consumed by the T6 dot code (until T9 deletes it), the T6 mapping-lock test, and T10's badge; `providerIconDataUrl(provider, colorHex)` (T7) is deterministic/memoized and called with `PANE_TINT_COLORS[tint]` identically in T9's `buildFrame` and T10's renderer (same URL = same cache entry). The paneIcons shape end to end: `TilePaneIcon = { provider, tint }` produced by `getTabPaneIcons`/`DeckTab.paneIcons` (T8, no `ready` — readiness is frame-level) → `buildFrame` maps it to `TilePaneIconSpec = TilePaneIcon & { ready: boolean }` in the icons `KeySpec` (T9) → renderer draws only `ready: true` entries via `getIcon(providerIconDataUrl(...))` (T10) → unit fixtures (`tabSpec` paneIcons, frame.test.ts assertions) and e2e wire assertions all carry `{ provider, tint, ready }` (T9-T11) — and `PANE_TINT_COLORS: Record<TilePaneTint, string>` (T9) is keyed by T8's `TilePaneTint`. Import graph stays runtime-acyclic: `pane-tint-colors.ts` and `provider-icon-svg.ts` import nothing from `src/deck/`; `frame.ts` imports both as values; `tile-renderer.ts` imports both as values and `frame.ts` types only. Consistent.
+
+**Validation update (A1 falsification):** The load-bearing-assumption audit FALSIFIED the original design's assumption that the icon-cache notify→repaint would repaint keys whose KeySpec JSON is unchanged (`deck-controller.ts` `repaint()` diff-skips byte-identical specs; `lastPaintedSpecs` is never force-cleared). A `{ provider, tint }`-only paneIcons spec would therefore never repaint after the tinted data URL decoded. Tasks 6/9/10/11 were reworked accordingly: `buildFrame` now stamps `ready: iconReady(providerIconDataUrl(provider, PANE_TINT_COLORS[tint]))` into every pane-icon spec entry (starting the load at frame time, mirroring repo icons' `TileIcon.ready`), the tint colors moved to the shared leaf module `pane-tint-colors.ts` so frame and renderer compute identical URLs without import cycles, the renderer draws only ready entries, and Task 11 proves the false→true flip on the real controller + cache.
