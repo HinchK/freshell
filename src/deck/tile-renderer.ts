@@ -2,6 +2,8 @@ import type { DeckCapabilities } from './deck-device'
 import type { DeckAction, KeySpec, RingColor } from './frame'
 import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
 import { DECK_FONT_STACK } from './deck-font'
+import { providerIconDataUrl } from './provider-icon-svg'
+import { PANE_TINT_COLORS, STATUS_BLUE, STATUS_MUTED } from './pane-tint-colors'
 
 // Canvas draw layer: converts a KeySpec into an RGBA pixel buffer via an
 // injectable 2D-context factory (jsdom returns null from getContext, so tests
@@ -74,6 +76,14 @@ export const STRIP_FONT_SIZE = 22
 export const CONTROL_LABEL_FONT_SIZE = 11
 export const CONTROL_VALUE_FONT_SIZE = 15
 export const MAX_TITLE_CHARS = 10
+export const MAX_KEY_PANE_ICONS = 2
+export const OVERFLOW_FONT_SIZE = 10
+/**
+ * Max row slots (icons + badge). iconLayout guarantees on-key fit only up to
+ * 3 slots (4 slots overflow an 80px key by 1px and a 72px key by 9px), so the
+ * +N badge COUNTS AS A SLOT and drawn agent icons shrink to make room for it.
+ */
+const MAX_ROW_SLOTS = 3
 
 export function previewGeometry(width: number, height: number): { lines: number; columns: number } {
   return {
@@ -171,9 +181,25 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
   ctx.fillStyle = spec.fill === 'none' ? TILE_BG : TILE_FILL_GREEN
   ctx.fillRect(0, 0, w, h)
 
-  // 2. Centered repo icons; letter avatar while loading, on failure, or when the repo has no icon.
-  const slots = iconLayout(w, h, spec.icons.length)
-  spec.icons.forEach((icon, i) => {
+  // 2. Center row mirrors the tab bar's pane-icon presentation (TabItem.tsx
+  //    renderIcons): repo icon (or circle letter avatar) first, then up to
+  //    MAX_KEY_PANE_ICONS tinted agent icons, then a +N badge for hidden agent
+  //    panes (blue when a hidden pane is busy). Unlike TabItem's flex row
+  //    (badge = additive 4th sibling), canvas has no auto-layout and
+  //    iconLayout only fits 3 slots on-key, so the badge OCCUPIES A ROW SLOT:
+  //    when it appears, drawn agent icons shrink so repo + agents + badge
+  //    never exceed MAX_ROW_SLOTS — the whole row (badge included) stays
+  //    centered and fully on-key. Tabs with no agent panes keep the
+  //    repo-icons-only row (up to 3, as before).
+  const repoIcons = spec.paneIcons.length > 0 ? spec.icons.slice(0, 1) : spec.icons
+  let drawnCount = Math.min(spec.paneIcons.length, MAX_KEY_PANE_ICONS)
+  if (spec.paneIcons.length > drawnCount && repoIcons.length + drawnCount + 1 > MAX_ROW_SLOTS) {
+    drawnCount = MAX_ROW_SLOTS - 1 - repoIcons.length // give the badge its slot
+  }
+  const paneIcons = spec.paneIcons.slice(0, drawnCount)
+  const hidden = spec.paneIcons.slice(drawnCount)
+  const slots = iconLayout(w, h, repoIcons.length + paneIcons.length + (hidden.length > 0 ? 1 : 0))
+  repoIcons.forEach((icon, i) => {
     const { x, y, size } = slots[i]
     const bitmap = icon.url && icon.ready ? getIcon(icon.url) : null
     if (bitmap) {
@@ -199,6 +225,28 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
     const letterWidth = ctx.measureText(icon.letter).width
     ctx.fillText(icon.letter, Math.round(cx - letterWidth / 2), Math.round(cy + size * (0.5 / 16)))
   })
+  paneIcons.forEach((icon, i) => {
+    const { x, y, size } = slots[repoIcons.length + i]
+    // Mirror the repo-icon pattern above: draw ONLY when buildFrame stamped
+    // ready (it consulted the cache with this same memoized URL, which also
+    // started the async load). An unready slot stays empty; when the decode
+    // completes, the cache notify repaints, buildFrame flips `ready` in the
+    // spec JSON, and the controller's diff un-skips this key. 5-arg
+    // drawImage is mandatory (see the repo-icon comment above).
+    const bitmap = icon.ready ? getIcon(providerIconDataUrl(icon.provider, PANE_TINT_COLORS[icon.tint])) : null
+    if (bitmap) ctx.drawImage(bitmap, x, y, size, size)
+  })
+  if (hidden.length > 0) {
+    // The badge renders horizontally centered inside the row slot reserved
+    // for it above (slots.length >= 1 is guaranteed: the badge itself was
+    // counted in the iconLayout call), so it can never clip off the key.
+    const slot = slots[slots.length - 1]
+    const label = `+${hidden.length}`
+    ctx.font = `600 ${OVERFLOW_FONT_SIZE}px ${DECK_FONT_STACK}`
+    ctx.textBaseline = 'middle'
+    ctx.fillStyle = hidden.some((p) => p.tint === 'blue') ? STATUS_BLUE : STATUS_MUTED
+    ctx.fillText(label, Math.round(slot.x + (slot.size - ctx.measureText(label).width) / 2), slot.y + slot.size / 2)
+  }
 
   // 3. Title banner across the top (unchanged treatment).
   ctx.fillStyle = BANNER_FILL

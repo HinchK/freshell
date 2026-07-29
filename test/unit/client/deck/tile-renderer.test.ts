@@ -5,8 +5,10 @@ import {
   APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
   TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
   CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
+  MAX_KEY_PANE_ICONS, OVERFLOW_FONT_SIZE,
 } from '@/deck/tile-renderer'
-import { STATUS_GREEN, STATUS_BLUE, STATUS_AMBER, STATUS_RED, STATUS_MUTED, STATUS_MUTED_DIM } from '@/deck/pane-tint-colors'
+import { STATUS_GREEN, STATUS_BLUE, STATUS_AMBER, STATUS_RED, STATUS_MUTED, STATUS_MUTED_DIM, PANE_TINT_COLORS } from '@/deck/pane-tint-colors'
+import { providerIconDataUrl } from '@/deck/provider-icon-svg'
 import type { Ctx2D, IconSource } from '@/deck/tile-renderer'
 import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
 import { DECK_FONT_STACK } from '@/deck/deck-font'
@@ -297,5 +299,86 @@ describe('palette derives from the app UI tokens (mapping block in tile-renderer
     expect(PREVIEW_BG).toBe('#0a0a0a')
     expect(PREVIEW_TEXT_COLOR).toBe('#a8a8a8')
     expect(RING_COLORS).toEqual({ amber: '#f59e0b', green: '#22c55e', blue: '#3b82f6' })
+  })
+})
+
+describe('agent pane icons (tab-bar presentation)', () => {
+  const repoIcon = { url: null, letter: 'B', hue: 200, ready: false }
+  const bitmap = {} as CanvasImageSource
+
+  it('requests the tinted provider icon (only when ready) and draws it beside the repo avatar', () => {
+    const requested: string[] = []
+    const { images, circles } = renderTab(
+      tabSpec({ icons: [repoIcon], paneIcons: [{ provider: 'claude', tint: 'blue', ready: true }] }),
+      (url) => { requested.push(url); return bitmap },
+    )
+    expect(requested).toEqual([providerIconDataUrl('claude', STATUS_BLUE)])
+    const slots = iconLayout(80, 80, 2)
+    // Slot 0: letter avatar circle; slot 1: the tinted agent icon.
+    expect(circles[0].cx).toBe(slots[0].x + slots[0].size / 2)
+    expect(images).toEqual([{ x: slots[1].x, y: slots[1].y, w: slots[1].size, h: slots[1].size }])
+  })
+
+  it('folds hidden agent icons into a +N badge that occupies a centered, on-key row slot', () => {
+    const paneIcons = [
+      { provider: 'claude', tint: 'green' as const, ready: true },
+      { provider: 'codex', tint: 'green' as const, ready: true },
+      { provider: 'gemini', tint: 'green' as const, ready: true },
+      { provider: 'opencode', tint: 'blue' as const, ready: true },
+    ]
+    const requested: string[] = []
+    const { texts } = renderTab(tabSpec({ icons: [repoIcon], paneIcons }), (url) => { requested.push(url); return bitmap })
+    // The badge occupies the third row slot, so with a repo icon present only
+    // ONE agent icon is drawn (repo + 1 agent + badge = MAX_ROW_SLOTS = 3);
+    // the other three panes fold into +3.
+    expect(requested).toEqual([providerIconDataUrl('claude', PANE_TINT_COLORS.green)])
+    const badge = texts.find((t) => t.text === '+3')
+    expect(badge).toBeDefined()
+    // A hidden pane is busy -> blue badge (TabItem's overflow rule).
+    expect(badge?.style).toBe(STATUS_BLUE)
+    expect(badge?.font).toBe(`600 ${OVERFLOW_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    // Badge geometry: horizontally centered in the reserved LAST slot of the
+    // 3-slot row, vertically at slot middle - so the whole composition (badge
+    // included) is centered and never clips off the key. The harness stubs
+    // measureText at 6px/char ('+3' -> 12).
+    const last = iconLayout(80, 80, 3)[2]
+    expect(badge?.x).toBe(Math.round(last.x + (last.size - 12) / 2))
+    expect(badge?.y).toBe(last.y + last.size / 2)
+    expect((badge?.x ?? Number.NaN) + 12).toBeLessThanOrEqual(80) // fully on-key
+  })
+
+  it('badge is muted when no hidden pane is busy; MAX_KEY_PANE_ICONS binds when no repo icon competes for slots', () => {
+    const paneIcons = Array.from({ length: 3 }, () => ({ provider: 'claude', tint: 'green' as const, ready: true }))
+    const { texts, images } = renderTab(tabSpec({ icons: [], paneIcons }), () => bitmap)
+    // No repo icon: 2 agent icons + badge fill the 3 slots exactly.
+    expect(images).toHaveLength(MAX_KEY_PANE_ICONS)
+    expect(texts.find((t) => t.text === '+1')?.style).toBe(STATUS_MUTED)
+  })
+
+  it('with agent icons present, repo icons collapse to the first one', () => {
+    const icons = [repoIcon, { ...repoIcon, letter: 'C', hue: 10 }, { ...repoIcon, letter: 'D', hue: 20 }]
+    const { circles } = renderTab(tabSpec({ icons, paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] }), () => bitmap)
+    expect(circles).toHaveLength(1) // only the first repo avatar
+  })
+
+  it('without agent panes, up to 3 repo icons render exactly as before', () => {
+    const icons = [repoIcon, { ...repoIcon, letter: 'C', hue: 10 }, { ...repoIcon, letter: 'D', hue: 20 }]
+    const { circles } = renderTab(tabSpec({ icons, paneIcons: [] }))
+    expect(circles).toHaveLength(3)
+  })
+
+  it('an unready pane icon draws nothing and never hits the icon source (slot fills on the cache-notify repaint, which flips ready in the spec)', () => {
+    const requested: string[] = []
+    const { images } = renderTab(
+      tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green', ready: false }] }),
+      (url) => { requested.push(url); return bitmap },
+    )
+    expect(images).toHaveLength(0)
+    expect(requested).toHaveLength(0) // buildFrame owns load-starting; the renderer only draws
+  })
+
+  it('a ready flag with a cache miss (probe-failed/evicted bitmap) still draws nothing', () => {
+    const { images } = renderTab(tabSpec({ icons: [], paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] }), () => null)
+    expect(images).toHaveLength(0)
   })
 })
