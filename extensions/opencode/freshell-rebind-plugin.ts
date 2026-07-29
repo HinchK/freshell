@@ -52,7 +52,14 @@ function defaultWriteFile(dir: string, name: string, body: string): void {
 }
 
 export function createEmitter(deps: EmitterDeps): (candidate: unknown) => void {
-  const home = deps.env.HOME ?? deps.env.USERPROFILE
+  // Mirror the Rust consumer's home resolution (OpencodeSignalWatcher::
+  // default_root is cfg-gated: USERPROFILE only on Windows, HOME otherwise)
+  // — otherwise a Windows git-bash/MSYS shell with HOME set would emit
+  // signals into a directory the server never sweeps.
+  const home =
+    process.platform === 'win32'
+      ? (deps.env.USERPROFILE ?? deps.env.HOME)
+      : (deps.env.HOME ?? deps.env.USERPROFILE)
   const terminalId = deps.env.FRESHELL_TERMINAL_ID
   if (!home || !terminalId) return () => {}
   const dir = join(home, '.freshell', 'session-signals', 'opencode')

@@ -60,6 +60,27 @@ describe('createEmitter', () => {
     expect(writes.map((w) => JSON.parse(w.body).session_id)).toEqual(['ses_a', 'ses_b', 'ses_a'])
   })
 
+  it('mirrors the consumer home precedence: USERPROFILE wins on win32, HOME elsewhere', () => {
+    // The Rust consumer (OpencodeSignalWatcher::default_root) is cfg-gated:
+    // USERPROFILE only on Windows, HOME otherwise. The producer must agree,
+    // or a git-bash/MSYS Windows user with HOME set would emit signals into
+    // a directory the server never sweeps.
+    const both = { HOME: '/msys/home/u', USERPROFILE: 'C:\\Users\\u', FRESHELL_TERMINAL_ID: 't' }
+    const realPlatform = process.platform
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+    try {
+      createEmitter(deps(both))({ sessionID: 'ses_win1' })
+      expect(writes).toHaveLength(1)
+      expect(writes[0].dir.startsWith('C:\\Users\\u')).toBe(true)
+    } finally {
+      Object.defineProperty(process, 'platform', { value: realPlatform })
+    }
+    writes.splice(0)
+    createEmitter(deps(both))({ sessionID: 'ses_nix1' })
+    expect(writes).toHaveLength(1)
+    expect(writes[0].dir).toBe('/msys/home/u/.freshell/session-signals/opencode')
+  })
+
   it('never writes without FRESHELL_TERMINAL_ID or a home dir', () => {
     createEmitter(deps({ HOME: '/h' }))({ sessionID: 'ses_a' })
     createEmitter(deps({ FRESHELL_TERMINAL_ID: 't' }))({ sessionID: 'ses_a' })

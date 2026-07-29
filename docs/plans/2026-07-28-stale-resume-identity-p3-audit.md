@@ -1,6 +1,6 @@
 # Audit: P3 — stale-resume-identity rebind descope
 
-This document records the audit findings that led to descoping pane↔CLI-session rebinding for specific providers. Each section captures the validated findings for a provider and the rationale for not shipping rebind code.
+This document records the audit findings that led to descoping pane↔CLI-session rebinding for specific providers. Each section captures the validated findings for a provider and the rationale for not shipping rebind code — except opencode, where the passive-detection descope stands but an active-signal mechanism ultimately shipped (2026-07-28).
 
 ## amplifier
 
