@@ -17,7 +17,7 @@ import claudeActivityReducer, { upsertClaudeActivity } from '@/store/claudeActiv
 import amplifierActivityReducer from '@/store/amplifierActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import repoIconsReducer, { type RepoIconEntry } from '@/store/repoIconsSlice'
 import type { Tab } from '@/store/types'
@@ -27,6 +27,7 @@ import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
 import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
 import { IconImageCache } from '@/deck/icon-image-cache'
+import { registerTerminalTextReader, resetTerminalTextRegistryForTests } from '@/deck/terminal-text-registry'
 import type { KeySpec } from '@/deck/frame'
 
 const reducer = {
@@ -52,6 +53,12 @@ type DeckStoreOpts = {
   terminalMeta?: Record<string, { cwd?: string; repoRoot?: string; checkoutRoot?: string }>
   /** Seed state.repoIcons.byCwd. */
   repoIcons?: Record<string, RepoIconEntry>
+  /**
+   * Seed settings.localSettings.streamDeck.tileStyle through the production
+   * patch action (updateSettingsLocal), BEFORE any controller starts, so the
+   * live-settings setup (setupLive) sees it on its first paint.
+   */
+  tileStyle?: DeckTileStyle
 }
 
 // Local extraction of the deck-controller unit-suite fixture builder: tabs
@@ -77,7 +84,7 @@ function makeDeckStore(opts: DeckStoreOpts = {}) {
   const busyByTerminalId = Object.fromEntries(
     (opts.busy ?? []).map((terminalId) => [terminalId, { terminalId, phase: 'busy', updatedAt: 1 }]),
   )
-  return configureStore({
+  const store = configureStore({
     reducer,
     preloadedState: {
       ...(opts.terminalMeta
@@ -118,6 +125,10 @@ function makeDeckStore(opts: DeckStoreOpts = {}) {
       },
     } as never,
   })
+  if (opts.tileStyle !== undefined) {
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: opts.tileStyle } }))
+  }
+  return store
 }
 
 // Spec-encoding renderer + decoder: the "pixels" are the KeySpec JSON, so
@@ -159,6 +170,23 @@ function setup(
   return { store, device, controller }
 }
 
+// Like setup(), but the controller reads settings live from the real store,
+// so dispatching a settings patch changes controller behavior mid-session.
+function setupLive(opts: DeckStoreOpts = {}, caps?: DeckCapabilities) {
+  const store = makeDeckStore(opts)
+  const device = new FakeDeckDevice(caps)
+  const controller = new DeckController({
+    store: store as never,
+    device,
+    renderKey: (spec) => encodeSpec(spec),
+    renderStrip: (text) => new TextEncoder().encode(text) as unknown as Uint8ClampedArray,
+    settings: () => store.getState().settings.settings.streamDeck,
+  })
+  controller.start()
+  activeController = controller
+  return { store, device, controller }
+}
+
 // Deferred icon loader, ported from icon-image-cache.test.ts: resolve/reject each
 // url by hand. jsdom never loads images, so post-load assertions REQUIRE this.
 function deferredLoader() {
@@ -182,6 +210,7 @@ beforeEach(() => {
 afterEach(() => {
   activeController?.stop()
   activeController = null
+  resetTerminalTextRegistryForTests()
   vi.useRealTimers()
 })
 
@@ -425,5 +454,70 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     expect(store.getState().tabs.activeTabId).toBe('t3')
     holdKey(device, 1, 600) // long-press whatever now occupies key 1
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'action', action: 'back' })
+  })
+})
+
+describe('tile styles', () => {
+  it('classic style: tabs appear with titles, previews, and rings, in tab-bar order', () => {
+    registerTerminalTextReader('term-1', () => ['$ npm test', 'PASS'])
+    setupLive({ tabs: 3, activeTab: 't1', busy: ['term-2'], attention: { t3: true } })
+    // start in default style, flip to classic through the production settings path
+    // (or preload localSettings if makeDeckStore supports it — either is fine)
+    // ...dispatch happens in the switch test below; here seed classic directly:
+    activeController!.stop()
+    const { device: d2 } = setupLive({ tabs: 3, activeTab: 't1', busy: ['term-2'], attention: { t3: true }, tileStyle: 'terminal-previews' })
+    expect(decodeKey(d2, 0)).toMatchObject({
+      kind: 'tab', style: 'preview', tabId: 't1',
+      previewLines: ['$ npm test', 'PASS'], active: true,
+    })
+    // tab-bar order, NOT attention-sorted: t3 (attention) stays on key 2
+    expect(decodeKey(d2, 1)).toMatchObject({ tabId: 't2', ring: 'blue' })
+    expect(decodeKey(d2, 2)).toMatchObject({ tabId: 't3', ring: 'green' })
+  })
+
+  it('switching styles live repaints, reorders, and stops/starts polling — no reload', () => {
+    let n = 0
+    registerTerminalTextReader('term-1', () => [`line ${n++}`])
+    const { store, device } = setupLive({ tabs: 3, activeTab: 't1', attention: { t3: true } })
+    // default: icons style, attention-sorted (t3 first)
+    expect(decodeKey(device, 0)).toMatchObject({ style: 'icons', tabId: 't3', fill: 'green' })
+
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: 'terminal-previews' } }))
+    // sanity: the patch survived the shared-settings whitelists (guards a silent no-op; see task brief Step 1)
+    expect(store.getState().settings.settings.streamDeck.tileStyle).toBe('terminal-previews')
+    // live re-sort to tab-bar order + preview specs
+    expect(decodeKey(device, 0)).toMatchObject({ style: 'preview', tabId: 't1' })
+    expect(decodeKey(device, 2)).toMatchObject({ style: 'preview', tabId: 't3', ring: 'green' })
+    // polling is live: changing text repaints within 3s
+    const before = decodeKey(device, 0)!
+    vi.advanceTimersByTime(3_000)
+    expect(decodeKey(device, 0)).not.toEqual(before)
+
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: 'status-icons' } }))
+    // back to sorted icons style...
+    expect(decodeKey(device, 0)).toMatchObject({ style: 'icons', tabId: 't3' })
+    // ...and polling stops: 3s of changing text paints nothing
+    device.keyImages.clear()
+    vi.advanceTimersByTime(3_000)
+    expect(device.keyImages.size).toBe(0)
+  })
+
+  it('mid-press style switch does not retarget the press', () => {
+    const { store, device } = setupLive({ tabs: 3, activeTab: 't1', attention: { t3: true } })
+    // key 0 is t3 (sorted). Press down, flip style (re-sorts to tab-bar order), release.
+    device.emit({ type: 'keyDown', keyIndex: 0 })
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: 'terminal-previews' } }))
+    device.emit({ type: 'keyUp', keyIndex: 0 })
+    expect(store.getState().tabs.activeTabId).toBe('t3') // press-snapshot guard holds across the flip
+  })
+
+  it('Deck+ strip counts waiting as attention OR pending approval, in both styles', () => {
+    const { store, device } = setupLive({ tabs: 2, freshAgentTab: 2, attention: { t1: true } }, PLUS_CAPS)
+    store.dispatch(addPermissionRequest({
+      sessionId: 's1', sessionType: 'freshclaude', provider: 'claude', requestId: 'r1',
+    }))
+    expect(decodeStrip(device)).toContain('2 waiting')
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: 'terminal-previews' } }))
+    expect(decodeStrip(device)).toContain('2 waiting')
   })
 })
