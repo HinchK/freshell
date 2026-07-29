@@ -1493,10 +1493,12 @@ private probeRepoIcons(): void {
 
 Call sites: once in `start()` (after the initial repaint), and in `onStoreChange` on EVERY store change, BEFORE the `modelJson === this.lastModelJson` bail-out. This placement is load-bearing: the store events that first make a cwd resolvable — `upsertTerminalMeta`/`setTerminalMetaSnapshot` enriching `terminalMeta.byTerminalId` — do NOT change the model JSON (with no `repoIcons.byCwd` entry yet, `icons` is `[]` both before and after), so a probe placed after the bail-out would never fire in exactly the TabBar-less leader scenario this probe exists for. Pre-bail-out probing is cheap (a Set build over tabs/panes per store change; it dispatches only for unprobed cwds) and cannot loop: the thunk's synchronous `pending` entry lands in `repoIcons.byCwd`, so the `!state.repoIcons.byCwd[cwd]` guard skips that cwd on the re-entrant store change, and when the meta arrives the model JSON changes and the normal repaint path takes over. If the controller's `store` field is typed too narrowly to dispatch thunks, type it with the app store's `AppDispatch` (the same store type `focusTabFromDeck` already dispatches through) rather than casting at the call site.
 
+8. Fixture prerequisite for Step 4's suite-wide run: `test/unit/client/deck/deck-manager.test.ts` starts REAL controllers through `DeckManager` (`deck-manager.ts:95-103`; seven of its tests assert `status === 'connected'`, e.g. `:123`/`:131`), and `probeRepoIcons()` unconditionally dereferences `state.terminalMeta.byTerminalId` and `state.repoIcons.byCwd` even with zero tabs — unlike Task 4's per-tab reads, which never fire on that suite's empty tab list. That suite's `makeStore()` (`deck-manager.test.ts:81-97` — no options, no `preloadedState`) registers 11 reducers but NOT `terminalMeta`/`repoIcons` (Task 4 Step 4 point 2 covered only the deck-controller/e2e/VirtualDeckPanel suites). Register both real reducers in its reducer map too — `terminalMeta` (default export of `@/store/terminalMetaSlice`) and `repoIcons` (default export of `@/store/repoIconsSlice`) — otherwise every deck-manager test that reaches `start()` throws a TypeError that `runLeaderConnect`'s catch swallows into `handleOpenError`, `status` never reaches `'connected'`, and the store-subscriber path throws on every subsequent dispatch. No seeding is needed; the slices' initial `{ byTerminalId: {} }` / `{ byCwd: {} }` states are exactly what these tests want (no cwds resolvable, probe dispatches nothing).
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npm run test:vitest -- run test/unit/client/deck/ test/e2e/stream-deck-flow.test.tsx --config config/vitest/vitest.config.ts`
-Expected: controller tests PASS. The e2e suite's preview expectations now decode `previewLines: []` — update those expectations (full preview deletion lands in Task 9). Then `npm run typecheck:client` — clean.
+Expected: controller tests PASS; `deck-manager.test.ts` PASSES because of step 3.8's reducer registration (without it, every manager test that starts a controller dies in `probeRepoIcons`). The e2e suite's preview expectations now decode `previewLines: []` — update those expectations (full preview deletion lands in Task 9). Then `npm run typecheck:client` — clean.
 
 - [ ] **Step 5: Commit**
 
@@ -1714,10 +1716,11 @@ git commit -m "feat(deck): snapshot key target at press-down so re-sorts cannot 
 
 **Interfaces:**
 - Consumes: everything above through the REAL store + REAL `DeckController` + `FakeDeckDevice` + spec-encoding renderer; `IconImageCache` with a deferred fake loader; fixture-builder extensions from Tasks 2–4 (`paneStatus`, `terminalMeta`, `repoIcons` seeding — port them into this suite's `makeDeckStore`).
+- Harness extensions (REQUIRED before writing the scenarios — this suite does not have them yet): (a) this suite's `setup()` is currently `setup(opts = {}, caps?, settings = defaultSettings)` (`stream-deck-flow.test.tsx:121-134`, controller constructed at `:124-130` with `store`/`device`/`renderKey`/`renderStrip`/`settings`) — extend it with a FOURTH parameter of extra `DeckController` constructor options, spread LAST into that constructor call (mirror of the controller suite's 3rd `setup` arg from Task 8); JavaScript silently ignores extra arguments, so without this the repo-icon scenario's `{ iconCache: cache }` would be dropped, the controller would fall back to the global singleton cache with the default loader, and `pending.get(url)` would return `undefined` (TypeError on `.resolve`). (b) Port the `deferredLoader` helper from Task 6's `icon-image-cache.test.ts` into this file — it does not exist here (repo-wide it lives only where Task 6/8 add it).
 - Fixtures note (layout-less transient): fixture stores must seed `state.panes.layouts` entries for every created tab (the real `addTab` never does — tabsSlice.ts:296), OR expectations must explicitly account for `panesForTab`'s synthesized single-pane fallback (Task 2) — otherwise sort/icon expectations flake on the layout-less transient.
 - Produces: user-story coverage for the redesign.
 
-- [ ] **Step 1: Write the new scenarios (they must fail only if the feature regresses — write them, run, expect PASS since Tasks 1–10 landed; any failure here is a real integration bug to fix before commit)**
+- [ ] **Step 1: Write the new scenarios (first apply BOTH harness extensions from the Interfaces section — the `setup()` 4th param and the ported `deferredLoader` — then write the scenarios, run, expect PASS since Tasks 1–10 landed; once the harness extensions are in place, any failure here is a real integration bug to fix before commit)**
 
 Add these scenarios (full code, following the suite's existing `setup()`/`decodeKey` style):
 
@@ -1750,6 +1753,9 @@ it('busy and idle-running tabs expose blue/green dots', () => {
 })
 
 it('repo icons: unready at first paint, repaint to ready when the bitmap loads', async () => {
+  // Requires both harness extensions (Interfaces): setup()'s 4th extra-controller-options
+  // param (else { iconCache } is silently ignored and pending stays empty) and the
+  // deferredLoader helper ported from icon-image-cache.test.ts.
   const { loader, pending } = deferredLoader()
   const cache = new IconImageCache(loader)
   const { device } = setup({
