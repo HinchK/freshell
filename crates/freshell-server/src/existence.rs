@@ -1008,4 +1008,286 @@ mod tests {
         let _ = std::fs::remove_dir_all(&good);
         let _ = std::fs::remove_dir_all(&empty);
     }
+
+    /// END-TO-END proof of the opencode rebind dead-session fix (promoted
+    /// from spike/child-session-restart @ d505ad0c, which proved the RED
+    /// state against unfixed code: the child claim derived
+    /// DeadSession{session_not_on_disk} and chain-correction buried the
+    /// superseded root too). After a pane is rebound (signal lane) to a
+    /// CHILD session id, a restart must Respawn it — and a stale claim for
+    /// the superseded ROOT must chain-correct (rung 2b) to the child and
+    /// Respawn there.
+    ///
+    /// Real components end-to-end — NO fakes for the probe, index, listing,
+    /// ledger, locator, or verdict derivation:
+    ///   real `OpencodeSource` over a temp `opencode.db` -> real
+    ///   `SessionIndex` -> real `IndexExistenceProbe` with the production
+    ///   `opencode_db_locator` + real `PaneLedger` (post-rebind state via
+    ///   `resolve_pending`, the SAME API the signal rebind lane's write hook
+    ///   calls) -> real `freshell_ws::reconcile::derive_verdicts` with
+    ///   restart-empty terminal/identity registries.
+    #[tokio::test]
+    async fn child_session_rebound_pane_restart_yields_respawn() {
+        use freshell_protocol::{ReconcilePane, ReconcileVerdict, SessionLocator};
+        use freshell_sessions::directory_index::OpencodeSource;
+        use freshell_terminal::TerminalRegistry;
+        use freshell_ws::identity::TerminalIdentityRegistry;
+        use freshell_ws::pane_ledger::{BindingWrite, PaneLedger, RetiredReason, RowState};
+        use freshell_ws::reconcile::{derive_verdicts, ReconcileDeps};
+
+        // Opencode-shaped ids: ses_ + 26 alphanumerics.
+        const ROOT: &str = "ses_root0000000000000000000000";
+        const CHILD: &str = "ses_child000000000000000000000"; // parent_id = ROOT
+        const ROOT2: &str = "ses_root2222222222222222222222"; // control: never rebound
+
+        // -- 1. Temp opencode data home: root + child (subagent) rows ------
+        let base = std::env::temp_dir().join(format!(
+            "freshell-child-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let data_home = base.join("opencode");
+        std::fs::create_dir_all(&data_home).expect("mkdir opencode data home");
+        let cwd_dir = base.join("proj");
+        std::fs::create_dir_all(&cwd_dir).expect("mkdir cwd");
+        let cwd = cwd_dir.to_string_lossy().to_string();
+        {
+            // Same schema shape as crates/freshell-sessions/tests/
+            // opencode_sqlite.rs `create_full_schema` (includes parent_id).
+            let conn =
+                rusqlite::Connection::open(data_home.join("opencode.db")).expect("open fixture db");
+            conn.execute_batch(
+                "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+                 CREATE TABLE session (
+                    id TEXT PRIMARY KEY,
+                    directory TEXT,
+                    title TEXT,
+                    time_created INTEGER,
+                    time_updated INTEGER,
+                    time_archived INTEGER,
+                    project_id TEXT,
+                    parent_id TEXT
+                 );
+                 CREATE TABLE part (session_id TEXT, data TEXT);
+                 CREATE TABLE message (session_id TEXT, data TEXT);",
+            )
+            .expect("create schema");
+            conn.execute(
+                "INSERT INTO session VALUES (?1, ?2, 'Root', 1000, 5000, NULL, NULL, NULL)",
+                rusqlite::params![ROOT, cwd],
+            )
+            .expect("insert root");
+            conn.execute(
+                "INSERT INTO session VALUES (?1, ?2, 'Child (subagent)', 2000, 6000, NULL, NULL, ?3)",
+                rusqlite::params![CHILD, cwd, ROOT],
+            )
+            .expect("insert child");
+            conn.execute(
+                "INSERT INTO session VALUES (?1, ?2, 'Root 2', 1000, 4000, NULL, NULL, NULL)",
+                rusqlite::params![ROOT2, cwd],
+            )
+            .expect("insert root2");
+        }
+
+        // -- 2. Real SessionIndex over the real OpencodeSource -------------
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(OpencodeSource::new(data_home.clone())) as Arc<dyn SessionSource>],
+            Duration::from_millis(50),
+            None,
+        ));
+
+        // -- 3. Real PaneLedger with the post-rebind state ------------------
+        // Faithful reproduction of the signal lane's writes, via the SAME
+        // API `ledger_resolve_identity` calls (`resolve_pending`), in the
+        // production order: pending marker at spawn -> first-bind resolution
+        // to ROOT -> signal rebind to CHILD (child bound row FIRST, then
+        // ROOT retired as Superseded{supersededBy}).
+        let ledger_root = base.join("ledger");
+        std::fs::create_dir_all(&ledger_root).expect("mkdir ledger root");
+        let ledger = Arc::new(PaneLedger::new(Some(ledger_root)));
+        ledger
+            .record_pending("t-pane1", "opencode", Some(&cwd), 1_000)
+            .expect("pending marker");
+        ledger
+            .resolve_pending(&BindingWrite {
+                provider: "opencode",
+                session_id: ROOT,
+                terminal_id: "t-pane1",
+                mode: "opencode",
+                cwd: Some(&cwd),
+                create_request_id: None,
+                now_ms: 2_000,
+            })
+            .expect("first bind: root");
+        ledger
+            .resolve_pending(&BindingWrite {
+                provider: "opencode",
+                session_id: CHILD,
+                terminal_id: "t-pane1",
+                mode: "opencode",
+                cwd: Some(&cwd),
+                create_request_id: None,
+                now_ms: 3_000,
+            })
+            .expect("signal rebind: child");
+        // Control pane: ROOT2 bound to its own terminal, never superseded.
+        ledger
+            .resolve_pending(&BindingWrite {
+                provider: "opencode",
+                session_id: ROOT2,
+                terminal_id: "t-pane2",
+                mode: "opencode",
+                cwd: Some(&cwd),
+                create_request_id: None,
+                now_ms: 2_500,
+            })
+            .expect("control bind: root2");
+
+        // Sanity: the ledger holds the exact post-rebind shape the signal
+        // lane produces (old row Retired/Superseded -> child; child Bound).
+        let old = ledger
+            .load_binding("opencode", ROOT)
+            .expect("root row exists");
+        assert_eq!(old.state, RowState::Retired);
+        assert_eq!(old.retired_reason, Some(RetiredReason::Superseded));
+        assert_eq!(
+            old.superseded_by.as_ref().map(|l| l.session_id.as_str()),
+            Some(CHILD)
+        );
+        let new = ledger
+            .load_binding("opencode", CHILD)
+            .expect("child row exists");
+        assert_eq!(new.state, RowState::Bound);
+
+        // -- 4. Real probe: index + ledger + PRODUCTION opencode locator ---
+        let probe = IndexExistenceProbe::new(
+            Arc::clone(&index),
+            Some(Arc::clone(&ledger)),
+            HashMap::from([("opencode".to_string(), data_home.clone())]),
+        )
+        .with_opencode_session_locator(opencode_db_locator(data_home.clone()));
+
+        // Cold-index path stays honest Unknown — the fallback lives ONLY in
+        // the warm-snapshot arm and must never manufacture answers before
+        // the index publishes.
+        assert_eq!(
+            probe.exists("opencode", CHILD),
+            SessionExistence::Unknown,
+            "cold index answers Unknown, never a guessed Absent or a \
+             fallback-manufactured Present"
+        );
+
+        index.warm().await;
+
+        // -- 5. Probe answers after restart ---------------------------------
+        assert_eq!(
+            probe.exists("opencode", ROOT),
+            SessionExistence::Present,
+            "root session (parent_id NULL) is listed by the opencode source"
+        );
+        assert_eq!(
+            probe.exists("opencode", CHILD),
+            SessionExistence::Present,
+            "THE FIX: the child row is hidden from the listing by the \
+             `parent_id IS NULL` root filter, but the by-id DB fallback \
+             finds it — the probe now agrees with the attach arm"
+        );
+        assert!(probe.ever_observed("opencode", CHILD));
+
+        // -- 6. Restart-shaped reconcile through the REAL derivation --------
+        // Empty registries: no terminal survives a server restart.
+        let registry = TerminalRegistry::new();
+        let identity = TerminalIdentityRegistry::new();
+        let deps = ReconcileDeps {
+            registry: &registry,
+            identity: &identity,
+            existence: &probe,
+            pane_ledger: &ledger,
+            fresh_agent: None,
+        };
+        let pane = |n: u32, sid: &str| ReconcilePane {
+            pane_key: format!("pane-{n}"),
+            kind: Some("terminal".to_string()),
+            mode: Some("opencode".to_string()),
+            create_request_id: Some(format!("cr-{n}")),
+            terminal_id: Some(format!("t-pane{n}")),
+            server_instance_id: None,
+            session_ref: Some(SessionLocator {
+                provider: "opencode".to_string(),
+                session_id: sid.to_string(),
+            }),
+            resume_session_id: None,
+            status: None,
+        };
+        let verdicts = derive_verdicts(
+            &deps,
+            &[
+                pane(1, CHILD), // the rebound pane presenting its child bookmark
+                pane(2, ROOT2), // control: a plain root-session pane
+                pane(3, ROOT),  // a stale claim for the superseded ROOT
+            ],
+        );
+
+        // (a) The rebound pane's child bookmark survives: Respawn AT the child.
+        assert_eq!(
+            verdicts[0].verdict,
+            ReconcileVerdict::Respawn,
+            "child-rebound pane after restart: got {:?} (reason {:?})",
+            verdicts[0].verdict,
+            verdicts[0].reason
+        );
+        assert_eq!(
+            verdicts[0]
+                .session_ref
+                .as_ref()
+                .map(|l| l.session_id.as_str()),
+            Some(CHILD)
+        );
+
+        // (b) Control: a never-rebound root-session pane stays Respawn.
+        assert_eq!(
+            verdicts[1].verdict,
+            ReconcileVerdict::Respawn,
+            "control root pane after restart: got {:?} (reason {:?})",
+            verdicts[1].verdict,
+            verdicts[1].reason
+        );
+        assert_eq!(
+            verdicts[1]
+                .session_ref
+                .as_ref()
+                .map(|l| l.session_id.as_str()),
+            Some(ROOT2)
+        );
+
+        // (c) The stale superseded-ROOT claim is chain-corrected (ledger
+        // rung 2b) to the child terminus — which the fallback now finds —
+        // so it Respawns AT the child, marked corrected. No more chain
+        // poisoning: one rebind no longer buries both bookmarks.
+        assert_eq!(
+            verdicts[2].verdict,
+            ReconcileVerdict::Respawn,
+            "stale superseded-root claim after restart: got {:?} (reason {:?})",
+            verdicts[2].verdict,
+            verdicts[2].reason
+        );
+        assert_eq!(
+            verdicts[2]
+                .session_ref
+                .as_ref()
+                .map(|l| l.session_id.as_str()),
+            Some(CHILD),
+            "the superseded ROOT claim resolves to the CHILD chain terminus"
+        );
+        assert_eq!(
+            verdicts[2].corrected,
+            Some(true),
+            "the server overrode the differing client claim"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
