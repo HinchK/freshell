@@ -131,6 +131,25 @@ fetch_state_coherent() {
   return 1
 }
 
+uncovered_terminals() {
+  # THE coverage check, shared by capture (pre-restart gate) and verify
+  # (post-restart defense in depth) -- single home so the two call sites can
+  # never diverge. Emits the COMPLETE set of running terminals in the
+  # capture-shaped JSON file $1 that are covered by NO persisted open-tab
+  # snapshot pane, one terminalId per line (empty output == full coverage).
+  # Returns jq's status; callers must check it explicitly (:2544 convention).
+  # NOTE (docs indented on purpose): column-0 comments leak into --help.
+  # `. as $t | ($covered | index($t))` binds the id BEFORE indexing -- piping
+  # into `$covered` would rebind `.` to the array and search it for ITSELF
+  # (the :2563 scoping bug); do not "simplify" it.
+  jq -r '
+    ([.terminals[] | select(.status=="running") | .terminalId]) as $live
+    | ([.devices | to_entries[] | .value.records // [] | .[]
+         | select(.status=="open") | .panes // [] | .[]
+         | .payload.liveTerminal.terminalId | select(. != null)]) as $covered
+    | [ $live[] | select(. as $t | ($covered | index($t)) == null) ] | .[]' "$1"
+}
+
 case "$CMD" in
   capture)
     [[ -n "$OUT" ]] || { echo "ERROR: capture requires --out FILE" >&2; exit 2; }
@@ -193,17 +212,14 @@ case "$CMD" in
     # the OK path with exit 1 before its `exit 0`.
     cleanup() { if $AFTER_OWNED; then rm -f "$AFTER"; fi; }
 
-    # Coverage guard (:2559): compute the COMPLETE set of running terminals at
-    # capture that are covered by NO persisted snapshot pane, and FAIL listing them
-    # if that set is nonempty. `. as $t | $covered | index($t)` binds the id to a
-    # variable BEFORE indexing -- piping into `$covered` would otherwise rebind `.`
-    # to the array and search it for ITSELF (the :2563 scoping bug).
-    uncovered=$(jq -r '
-      ([.terminals[] | select(.status=="running") | .terminalId]) as $live
-      | ([.devices | to_entries[] | .value.records // [] | .[]
-           | select(.status=="open") | .panes // [] | .[]
-           | .payload.liveTerminal.terminalId | select(. != null)]) as $covered
-      | [ $live[] | select(. as $t | ($covered | index($t)) == null) ] | .[]' "$BEFORE")
+    # Coverage guard (:2559): the coverage jq lives in the shared
+    # uncovered_terminals helper above. Kept in verify as DEFENSE IN DEPTH:
+    # a before-file produced by an older script version or by an operator-
+    # overridden capture must still be flagged here, before the identity
+    # diff. Decision and output format are unchanged (pinned by
+    # test/unit/server/deploy-tab-diff-coverage-gate.test.ts).
+    if ! uncovered=$(uncovered_terminals "$BEFORE"); then
+      echo "ERROR: computing coverage guard failed" >&2; cleanup; exit 1; fi
     if [[ -n "$uncovered" ]]; then
       n=$(printf '%s\n' "$uncovered" | grep -c .)
       echo "FAIL: ${n} running terminal(s) at capture are covered by NO persisted snapshot pane (tabs-sync persistence/coverage gap):" >&2
