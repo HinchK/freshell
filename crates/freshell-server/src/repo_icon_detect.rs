@@ -1681,6 +1681,26 @@ mod tier4_tests {
             assert_eq!(detect_icon(root), first);
         }
     }
+
+    /// Manual verification against real local directories. Never runs in CI.
+    /// Usage:
+    ///   ICON_PROBE_DIRS="/home/dan/code/glowforge:/home/dan/code/winpepper" \
+    ///     cargo test -p freshell-server manual_real_dir_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual probe against real local directories via ICON_PROBE_DIRS"]
+    fn manual_real_dir_probe() {
+        let dirs = std::env::var("ICON_PROBE_DIRS").unwrap_or_default();
+        assert!(!dirs.is_empty(), "set ICON_PROBE_DIRS=/path/a:/path/b");
+        for dir in dirs.split(':').filter(|s| !s.is_empty()) {
+            let start = std::time::Instant::now();
+            let found = detect_icon(std::path::Path::new(dir));
+            println!(
+                "probe {dir}: {:?} ({} ms)",
+                found,
+                start.elapsed().as_millis()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
