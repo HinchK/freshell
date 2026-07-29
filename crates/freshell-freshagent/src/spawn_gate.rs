@@ -186,6 +186,22 @@ impl SpawnGate {
         }
     }
 
+    /// Acquire a spawn permit with no caller-side cancellation (kata znhn
+    /// item 4). Two doors have no connection whose death should cancel the
+    /// wait — the REST door and the auto-resume respawn door. They used to
+    /// mint never-fired watch channels at every call site; that wart belongs
+    /// to the gate. The never-fired sender now lives HERE, held across the
+    /// acquire, so `Cancelled` is unreachable by construction (kata bccd
+    /// item 3: no caller-side sender exists to drop). The timeout still
+    /// bounds the wait.
+    pub async fn acquire_uncancellable(
+        &self,
+        timeout: Duration,
+    ) -> Result<OwnedSemaphorePermit, SpawnGateError> {
+        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        self.acquire(timeout, &mut cancel_rx).await
+    }
+
     pub fn queued_total(&self) -> u64 {
         self.queued_total.load(Ordering::Relaxed)
     }
@@ -211,6 +227,61 @@ mod tests {
 
     fn cancel_pair() -> (watch::Sender<bool>, watch::Receiver<bool>) {
         watch::channel(false)
+    }
+
+    #[tokio::test]
+    async fn acquire_uncancellable_waits_for_a_permit_and_never_cancels() {
+        let gate = Arc::new(SpawnGate::new(1, 64));
+        let (_tx, mut rx) = cancel_pair();
+        let held = gate
+            .acquire(Duration::from_secs(1), &mut rx)
+            .await
+            .expect("holder");
+        let g2 = Arc::clone(&gate);
+        let waiter =
+            tokio::spawn(async move { g2.acquire_uncancellable(Duration::from_secs(5)).await });
+        // Deterministic queue barrier (established idiom in this module).
+        for _ in 0..200 {
+            if gate.queued_total() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(gate.queued_total(), 1, "uncancellable waiter must queue");
+        drop(held);
+        assert!(
+            waiter.await.unwrap().is_ok(),
+            "waiter acquires after release"
+        );
+        assert_eq!(gate.cancellations(), 0, "Cancelled must be unreachable");
+    }
+
+    #[tokio::test]
+    async fn acquire_uncancellable_times_out_as_timeout_not_cancelled() {
+        let gate = SpawnGate::new(1, 64);
+        let (_tx, mut rx) = cancel_pair();
+        let _held = gate
+            .acquire(Duration::from_secs(1), &mut rx)
+            .await
+            .expect("holder");
+        let err = gate
+            .acquire_uncancellable(Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SpawnGateError::Timeout);
+        assert_eq!(gate.timeouts(), 1);
+        assert_eq!(gate.cancellations(), 0);
+    }
+
+    #[tokio::test]
+    async fn acquire_uncancellable_rejects_queue_full_loudly() {
+        let gate = SpawnGate::new(0, 0);
+        let err = gate
+            .acquire_uncancellable(Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        assert_eq!(err, SpawnGateError::QueueFull);
+        assert_eq!(gate.queue_rejections(), 1);
     }
 
     #[tokio::test]

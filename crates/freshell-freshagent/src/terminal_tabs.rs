@@ -1049,17 +1049,14 @@ pub(crate) async fn spawn_terminal_pane(
     // server wiring keep legacy behavior.
     let spawn_permit = match state.spawn_gate() {
         Some(rest_gate) => {
-            // The gate's acquire is cancellable via a watch channel (the WS
-            // door wires its per-connection cancel signal). REST has no such
-            // signal: hold a live, never-fired sender for the whole acquire
-            // (dropping it early would read as "connection gone" =>
-            // Cancelled). If the HTTP request itself is dropped while
-            // QUEUED, axum drops this future and the gate's queue-slot
-            // guard reclaims the slot — nothing has been spawned yet.
-            let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+            // Uncancellable acquire (kata znhn item 4): REST has no
+            // connection whose death should cancel the wait — the gate owns
+            // that semantics now. If the HTTP request is dropped while
+            // QUEUED, axum drops this future and the gate's queue-slot guard
+            // reclaims the slot — nothing has been spawned yet.
             match rest_gate
                 .gate
-                .acquire(rest_gate.timeout, &mut cancel_rx)
+                .acquire_uncancellable(rest_gate.timeout)
                 .await
             {
                 Ok(permit) => Some(permit),
