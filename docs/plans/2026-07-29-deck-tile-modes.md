@@ -147,6 +147,8 @@ Run: `grep -n "idleTimeoutSeconds" shared/settings.ts src/store/browserPreferenc
 
 Every line that mentions `idleTimeoutSeconds` is a site the new `tileStyle` field must also be added to (type, defaults, patch normalizer, resolve/compose/seed helpers around `shared/settings.ts:1298/:1389/:1451`, persistence builder). Keep the list; the round-trip test in Step 2 fails until all are covered.
 
+Three of these sites are **explicit string whitelists that silently drop unknown streamDeck keys** (verified): the `pickKeys(raw.streamDeck, ['enabled','brightness','idleBrightness','idleTimeoutSeconds'])` list in `extractLegacyLocalSettingsSeed` (`shared/settings.ts` ~:1451-1456), the identical list in `normalizeExtractedLocalSeed` (~:631-648), and the per-field `buildLocalSettingsPatch` streamDeck section (`browserPreferencesPersistence.ts:145-152`). Missing any of them means `tileStyle` is stripped with no compile error — `updateSettingsLocal` dispatches silently no-op and cross-window sync never carries the field. The grep above catches all three; treat them as mandatory, not optional. (Cross-window note, verified: with these sites covered and `tileStyle` on `DeckModel` (Task 4), a style change in one browser window reaches a deck led by another window live via the existing `crossTabSync` receive path — no new sync machinery is needed; latency is the persistence layer's ~500 ms debounce.)
+
 - [ ] **Step 2: Write the failing tests**
 
 Add to `test/unit/shared/settings.stream-deck.test.ts` (follow the file's existing imports/fixtures; it already tests defaults, resolve→`buildLocalSettingsPatch` round-trips, and the no-patch-at-defaults rule):
@@ -271,7 +273,7 @@ Expected: FAIL — no `group` role, no such buttons.
 
 - [ ] **Step 3: Implement**
 
-`settings-controls.tsx` — upgrade `SegmentedControl` (all existing call sites keep working; the new props are optional/behavior-preserving):
+`settings-controls.tsx` — upgrade `SegmentedControl` (all existing call sites keep working; the new props are optional/behavior-preserving). Verified: existing call-site tests query `getByRole('button', { name })` only, which this upgrade preserves; the repo's jsx-a11y config has no rule demanding `radiogroup`/`aria-checked`, and `role="group"`+`aria-label` already passes lint elsewhere (`FreshAgentComposer.tsx:569`, `Pane.tsx:82`); `aria-pressed` toggle buttons are the documented WAI-ARIA APG Button pattern. (Note: `TabsView.tsx:297` has a private duplicate `SegmentedControl` that does NOT inherit this upgrade — out of scope, leave it alone.)
 
 ```tsx
 export function SegmentedControl({
@@ -488,7 +490,17 @@ In `test/unit/client/deck/deck-selectors.test.ts`:
     expect(model.tabs.filter((t) => t.pendingApproval)).toHaveLength(1)
 ```
 
-(b) New tests in the `selectDeckModel` describe (reuse the describe's existing state-builder — the same one its sort/stability tests use; set the tile style directly on the built state):
+(b) New tests in the `selectDeckModel` describe (reuse the describe's existing state-builder — the same one its sort/stability tests use). Store/reducer-produced state is **deeply frozen** (RTK/immer auto-freeze — verified: direct mutation throws `Cannot assign to read only property`); do NOT assign onto the built state. Follow the file's own idiom — `withTabAttentionStyle` at `deck-selectors.test.ts:214-218` (`structuredClone`, mutate the clone, reselect) — by adding a sibling helper:
+
+```ts
+function withTileStyle(state: RootState, tileStyle: DeckTileStyle): RootState {
+  const clone = structuredClone(state) as { settings: { settings: { streamDeck: { tileStyle: string } } } }
+  clone.settings.settings.streamDeck.tileStyle = tileStyle
+  return clone as unknown as RootState
+}
+```
+
+(match `withTabAttentionStyle`'s exact typing style rather than this sketch):
 
 ```ts
   it('exposes the tile style on the model (default status-icons)', () => {
@@ -497,8 +509,8 @@ In `test/unit/client/deck/deck-selectors.test.ts`:
   })
 
   it('terminal-previews style keeps raw tab-bar order (no priority sort)', () => {
-    const state = /* the same state the existing sort test uses, where sorting reorders tabs */
-    state.settings.settings.streamDeck.tileStyle = 'terminal-previews'
+    const base = /* the same state the existing sort test uses, where sorting reorders tabs */
+    const state = withTileStyle(base, 'terminal-previews')  // clone idiom — direct mutation throws (frozen state)
     const model = selectDeckModel(state)
     expect(model.tileStyle).toBe('terminal-previews')
     expect(model.tabs.map((t) => t.id)).toEqual(state.tabs.tabs.map((t) => t.id))
@@ -1082,13 +1094,13 @@ git commit -m "feat(deck): restore preview capture polling, gated to the termina
 - Consumes: everything above through the REAL store + REAL `DeckController` + `FakeDeckDevice`; `registerTerminalTextReader`/`resetTerminalTextRegistryForTests` (Task 3); the settings reducer's local-patch action.
 - Produces: end-to-end proof of every user-facing requirement.
 
-- [ ] **Step 1: Confirm the settings patch action name**
+- [ ] **Step 1: Note the settings patch action (verified)**
 
-Open `src/store/settingsSlice.ts` (local-patch reducers ~:110-125) and note the exported action that applies a `LocalSettingsPatch` (prior survey identified `mergeLocalSettings`). Use that exact export below wherever `mergeLocalSettings` appears.
+The production action is `updateSettingsLocal(payload: LocalSettingsPatch)` (`src/store/settingsSlice.ts:117-122`, exported ~:136) — NOT `mergeLocalSettings`, which is a pure helper imported from `@shared/settings`. Verified: its reducer recomputes the resolved `state.settings.settings` inline in the same dispatch, so asserting synchronously after `store.dispatch(updateSettingsLocal(...))` is valid — no settle step needed. One trap (verified): the payload is filtered through `extractLegacyLocalSettingsSeed` (`settingsSlice.ts:45-50`), so if Task 1 missed any of its whitelist sites the dispatch silently no-ops — the first new test below therefore includes a sanity assertion that the patch actually landed in `state.settings.localSettings`.
 
 - [ ] **Step 2: Write the failing tests**
 
-Add to `test/e2e/stream-deck-flow.test.tsx`. Imports: `registerTerminalTextReader`, `resetTerminalTextRegistryForTests` from `@/deck/terminal-text-registry`; the settings action from `@/store/settingsSlice`. Add `resetTerminalTextRegistryForTests()` to the existing `afterEach`. Add a live-settings setup variant next to `setup()`:
+Add to `test/e2e/stream-deck-flow.test.tsx`. Imports: `registerTerminalTextReader`, `resetTerminalTextRegistryForTests` from `@/deck/terminal-text-registry`; `updateSettingsLocal` from `@/store/settingsSlice`. Add `resetTerminalTextRegistryForTests()` to the existing `afterEach`. Add a live-settings setup variant next to `setup()`:
 
 ```tsx
 // Like setup(), but the controller reads settings live from the real store,
@@ -1137,7 +1149,9 @@ describe('tile styles', () => {
     // default: icons style, attention-sorted (t3 first)
     expect(decodeKey(device, 0)).toMatchObject({ style: 'icons', tabId: 't3', fill: 'green' })
 
-    store.dispatch(mergeLocalSettings({ streamDeck: { tileStyle: 'terminal-previews' } }))
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: 'terminal-previews' } }))
+    // sanity: the patch survived the shared-settings whitelists (guards a silent no-op; see Step 1)
+    expect(store.getState().settings.settings.streamDeck.tileStyle).toBe('terminal-previews')
     // live re-sort to tab-bar order + preview specs
     expect(decodeKey(device, 0)).toMatchObject({ style: 'preview', tabId: 't1' })
     expect(decodeKey(device, 2)).toMatchObject({ style: 'preview', tabId: 't3', ring: 'green' })
@@ -1146,7 +1160,7 @@ describe('tile styles', () => {
     vi.advanceTimersByTime(3_000)
     expect(decodeKey(device, 0)).not.toEqual(before)
 
-    store.dispatch(mergeLocalSettings({ streamDeck: { tileStyle: 'status-icons' } }))
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: 'status-icons' } }))
     // back to sorted icons style...
     expect(decodeKey(device, 0)).toMatchObject({ style: 'icons', tabId: 't3' })
     // ...and polling stops: 3s of changing text paints nothing
@@ -1159,7 +1173,7 @@ describe('tile styles', () => {
     const { store, device } = setupLive({ tabs: 3, activeTab: 't1', attention: { t3: true } })
     // key 0 is t3 (sorted). Press down, flip style (re-sorts to tab-bar order), release.
     device.emit({ type: 'keyDown', keyIndex: 0 })
-    store.dispatch(mergeLocalSettings({ streamDeck: { tileStyle: 'terminal-previews' } }))
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: 'terminal-previews' } }))
     device.emit({ type: 'keyUp', keyIndex: 0 })
     expect(store.getState().tabs.activeTabId).toBe('t3')  // press-snapshot guard holds across the flip
   })
@@ -1170,13 +1184,13 @@ describe('tile styles', () => {
       sessionId: 's1', sessionType: 'freshclaude', provider: 'claude', requestId: 'r1',
     }))
     expect(decodeStrip(device)).toContain('2 waiting')
-    store.dispatch(mergeLocalSettings({ streamDeck: { tileStyle: 'terminal-previews' } }))
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: 'terminal-previews' } }))
     expect(decodeStrip(device)).toContain('2 waiting')
   })
 })
 ```
 
-Fixture adaptations required (make them, don't skip): (a) if `makeDeckStore` has no `tileStyle` opt, add one that preloads `settings.localSettings.streamDeck.tileStyle` (or dispatch `mergeLocalSettings` right after store creation — either way the first test must start classic BEFORE the controller's first paint, or assert post-dispatch state instead); (b) the `addPermissionRequest` import and `freshAgentTab` wiring already exist — copy from the existing test `'tile fill and dot track state changes'`; (c) `attention`/`busy` opt shapes come from the existing scenarios.
+Fixture adaptations required (make them, don't skip): (a) if `makeDeckStore` has no `tileStyle` opt, add one that preloads `settings.localSettings.streamDeck.tileStyle` (or dispatch `updateSettingsLocal` right after store creation — either way the first test must start classic BEFORE the controller's first paint, or assert post-dispatch state instead); (b) the `addPermissionRequest` import and `freshAgentTab` wiring already exist — copy from the existing test `'tile fill and dot track state changes'`; (c) `attention`/`busy` opt shapes come from the existing scenarios.
 
 - [ ] **Step 3: Run tests to verify they fail**
 
