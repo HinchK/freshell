@@ -55,17 +55,23 @@ const runtimeMocks = vi.hoisted(() => ({
   instances: [] as Array<{ fit: ReturnType<typeof vi.fn> }>,
 }))
 
-vi.mock('@/lib/ws-client', () => ({
-  getWsClient: () => ({
-    send: wsMocks.send,
-    connect: wsMocks.connect,
-    onMessage: wsMocks.onMessage,
-    onReconnect: wsMocks.onReconnect,
-    get isReady() {
-      return wsMocks.isReady
-    },
-  }),
-}))
+// Keep the REAL module exports (RECONCILE_VERDICT_WAIT_MS is defined ONCE in
+// ws-client -- never redefined here) and stub only the client accessor.
+vi.mock('@/lib/ws-client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/ws-client')>()
+  return {
+    ...actual,
+    getWsClient: () => ({
+      send: wsMocks.send,
+      connect: wsMocks.connect,
+      onMessage: wsMocks.onMessage,
+      onReconnect: wsMocks.onReconnect,
+      get isReady() {
+        return wsMocks.isReady
+      },
+    }),
+  }
+})
 
 function setWsIsReady(value: boolean) {
   wsMocks.isReady = value
@@ -2224,6 +2230,145 @@ describe('TerminalView lifecycle updates', () => {
       msg?.type === 'terminal.create' && msg.requestId === newRequestId
     )
     expect(createCalls).toHaveLength(1)
+  })
+
+  // Branch-5 / reconcile-verdict interaction (design invariant 7): once the
+  // reconcile flow owns a pane's fate, the INVALID_TERMINAL_ID auto-recovery
+  // must stand down. Without this guard, a post-restart attach error resumes
+  // the very session a dead_session verdict just declared dead -- observed in
+  // the Task 11 e2e wall as duplicate `claude --resume <deleted-session>`
+  // PTYs that the adjudication panel never adopts.
+  function setupReconcileOwnedPane(panesExtra: Record<string, unknown>) {
+    const tabId = 'tab-reconcile-owned'
+    const paneId = 'pane-reconcile-owned'
+    const terminalId = 'term-reconcile-owned'
+
+    const paneContent: TerminalPaneContent = {
+      kind: 'terminal',
+      createRequestId: 'req-reconcile-owned',
+      status: 'running',
+      mode: 'claude',
+      shell: 'system',
+      terminalId,
+      sessionRef: {
+        provider: 'claude',
+        sessionId: '550e8400-e29b-41d4-a716-446655440042',
+      },
+      initialCwd: '/tmp',
+    }
+
+    const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        settings: settingsReducer,
+        connection: connectionReducer,
+      },
+      preloadedState: {
+        tabs: {
+          tabs: [{
+            id: tabId,
+            mode: 'claude',
+            status: 'running',
+            title: 'Claude',
+            titleSetByUser: false,
+            terminalId,
+            createRequestId: paneContent.createRequestId,
+          }],
+          activeTabId: tabId,
+        },
+        panes: {
+          layouts: { [tabId]: root },
+          activePane: { [tabId]: paneId },
+          paneTitles: {},
+          ...panesExtra,
+        },
+        settings: createSettingsState(),
+        connection: { status: 'connected', error: null },
+      },
+    })
+
+    return { store, tabId, paneId, terminalId, paneContent }
+  }
+
+  it('does not auto-recover from INVALID_TERMINAL_ID while the pane awaits dead-session adjudication', async () => {
+    const { store, tabId, paneId, terminalId, paneContent } = setupReconcileOwnedPane({
+      deadSessionAdjudication: [{
+        tabId: 'tab-reconcile-owned',
+        paneId: 'pane-reconcile-owned',
+        title: 'Claude',
+        mode: 'claude',
+        sessionRef: { provider: 'claude', sessionId: '550e8400-e29b-41d4-a716-446655440042' },
+      }],
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    wsMocks.send.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        terminalId,
+      })
+    })
+
+    // The pane is untouched: no minted recovery createRequestId, no
+    // resume-create sent -- the adjudication panel owns the next step.
+    const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+    expect(layout.content.createRequestId).toBe('req-reconcile-owned')
+    expect(layout.content.terminalId).toBe(terminalId)
+    expect(layout.content.status).toBe('running')
+    const createCalls = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
+    expect(createCalls).toHaveLength(0)
+  })
+
+  it('does not auto-recover from INVALID_TERMINAL_ID during the bounded pre-verdict reconcile window', async () => {
+    const { store, tabId, paneId, terminalId, paneContent } = setupReconcileOwnedPane({
+      reconcilePendingPanes: { 'tab-reconcile-owned:pane-reconcile-owned': Date.now() },
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+    })
+
+    wsMocks.send.mockClear()
+
+    act(() => {
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Unknown terminalId',
+        terminalId,
+      })
+    })
+
+    // The in-flight verdict drives the pane; the error round must not race
+    // it with an eager resume-create.
+    const layout = store.getState().panes.layouts[tabId] as { type: 'leaf'; content: any }
+    expect(layout.content.createRequestId).toBe('req-reconcile-owned')
+    expect(layout.content.terminalId).toBe(terminalId)
+    expect(layout.content.status).toBe('running')
+    const createCalls = wsMocks.send.mock.calls.filter(([msg]) => msg?.type === 'terminal.create')
+    expect(createCalls).toHaveLength(0)
   })
 
   it('marks durable INVALID_TERMINAL_ID reconnects as restore regardless of wasRestore', async () => {

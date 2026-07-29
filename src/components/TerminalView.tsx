@@ -583,6 +583,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   )
   const reconcilePendingSinceRef = useRef<number | undefined>(reconcilePendingSince)
   reconcilePendingSinceRef.current = reconcilePendingSince
+  // Branch-5 / reconcile-verdict interaction (design invariant 7): a pane
+  // listed in the dead-session adjudication panel is owned by the user's
+  // explicit panel decision -- the INVALID_TERMINAL_ID auto-recovery must
+  // stand down for it (see the attach-error handler below).
+  const isDeadSessionAdjudicated = useAppSelector(
+    (s) => (s.panes.deadSessionAdjudication ?? []).some(
+      (entry) => entry.tabId === tabId && entry.paneId === paneId,
+    ),
+  )
+  const isDeadSessionAdjudicatedRef = useRef(isDeadSessionAdjudicated)
+  isDeadSessionAdjudicatedRef.current = isDeadSessionAdjudicated
   const verdictWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const connectionErrorCode = useAppSelector((s) => s.connection.lastErrorCode)
   const settings = useAppSelector((s) => s.settings.settings)
@@ -4743,6 +4754,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // This prevents an infinite respawn loop when terminals fail immediately
           // (e.g., due to permission errors on cwd). User must explicitly restart.
           if (currentTerminalId && current?.status !== 'exited') {
+            // Branch-5 / reconcile-verdict interaction (design invariant 7):
+            // when the reconcile flow owns this pane's fate, stand down --
+            // - listed in the dead-session adjudication panel: the verdict
+            //   already declared the session dead; minting a recovery create
+            //   here would resume it as an orphan PTY the panel never adopts
+            //   (duplicate `--resume <dead-session>` spawns after a restart).
+            // - reconcile-pending within the bounded verdict window: the
+            //   verdict fold (attach/respawn/dead_session) drives the next
+            //   create/attach round. On timeout the pending flag clears and
+            //   the next attach-error round takes the recovery below -- the
+            //   ensure() re-fire re-attaches, so this can never wedge.
+            if (isDeadSessionAdjudicatedRef.current) return
+            if (
+              reconcilePendingSinceRef.current !== undefined
+              && Date.now() - reconcilePendingSinceRef.current < RECONCILE_VERDICT_WAIT_MS
+            ) {
+              return
+            }
             const restoreMode = current?.mode || (paneContent.kind === 'terminal' ? paneContent.mode : 'shell')
             const isCodingCliMode = restoreMode !== 'shell'
             const hasCodexCapturedRestoreState = current?.mode === 'codex' && Boolean(current.codexDurability?.candidate)
