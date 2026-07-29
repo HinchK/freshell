@@ -600,7 +600,13 @@ function clearTerminalContentForRecreate(
 // Reconcile notice copy — exact strings reused by later tasks/tests.
 export const RECONCILE_NOTICE_CORRECTED = 'Session identity corrected by server — this pane now points at its live session.'
 export const RECONCILE_NOTICE_DUPLICATE = 'A duplicate terminal for this session was detected and ignored.'
+// PIN 3 (§4.2 "fresh by race, not by intent"): the server restarted while
+// this pane's session identity was still being established — loud, distinct,
+// and phrased to match the restart-contract wall's breadcrumb probe.
+export const RECONCILE_NOTICE_FRESH_BY_RACE =
+  "This pane couldn't be resumed — the server restarted before its session identity was captured. Started a fresh session."
 export function reconcileFreshNotice(reason: string): string {
+  if (reason === 'fresh_by_race') return RECONCILE_NOTICE_FRESH_BY_RACE
   return `Started fresh (${reason}).`
 }
 
