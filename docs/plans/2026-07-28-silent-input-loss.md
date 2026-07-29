@@ -7,7 +7,7 @@
 
 **Goal:** Input typed across a server restart either ARRIVES (in order, byte-exact) or the user SEES that it didn't — never silent loss.
 
-**Architecture:** Two-sided fix for a proven root cause. Server (Rust): `terminal.input` to an unknown terminalId currently vanishes into a pure no-op (`registry.rs:1148`) with no wire reply, and `terminal.attach` to an unknown id silently discards `AttachOutcome{found:false}` (`terminal.rs:3172-3180`) — both get wire replies (`terminal.input.blocked{reason:unknown_terminal}` and `error{INVALID_TERMINAL_ID}` respectively). Client (TS): the three loss windows (blind reconnect replay of queued input; keystrokes fired at the pre-restart id before staleness is detected; keystrokes silently dropped by `if (!tid) return` while un-anchored) are closed by filtering `terminal.input` out of the reconnect replay and buffering keystrokes in a bounded per-pane ring that flushes after the pane's next anchor (`terminal.created` / current-generation `terminal.attach.ready`), with a visible xterm notice on overflow/timeout/terminal-gone.
+**Architecture:** Two-sided fix for a proven root cause. Server (Rust): `terminal.input` to an unknown terminalId currently vanishes into a pure no-op (`registry.rs:1203`) with no wire reply, and `terminal.attach` to an unknown id silently discards `AttachOutcome{found:false}` (`terminal.rs:3488-3496`) — both get wire replies (`terminal.input.blocked{reason:unknown_terminal}` and `error{INVALID_TERMINAL_ID}` respectively). Client (TS): the three loss windows (blind reconnect replay of queued input; keystrokes fired at the pre-restart id before staleness is detected; keystrokes silently dropped by `if (!tid) return` while un-anchored) are closed by filtering `terminal.input` out of the reconnect replay and buffering keystrokes in a bounded per-pane ring that flushes after the pane's next anchor (`terminal.created` / current-generation `terminal.attach.ready`), with a visible xterm notice on overflow/timeout/terminal-gone.
 
 **Tech Stack:** Rust (axum/tokio, `freshell-ws`, `freshell-terminal`, `freshell-protocol`), TypeScript/React (`ws-client.ts`, `TerminalView.tsx`), Vitest, Playwright (rust-chromium project), frozen WS contract (`shared/ws-protocol.ts` → `npm run contract:generate` → `port/contract/*.json` → Rust pin tests).
 
@@ -15,7 +15,7 @@ The diagnosis in the kata is proven at the raw-WS protocol level. The RED tests 
 
 ## Global Constraints
 
-- Worktree: `/home/dan/code/freshell/.worktrees/silent-input-loss`, branch `fix/silent-input-loss`, based on current `origin/main` (e28d0910 or newer — verify with `git fetch` in Task 1). ALL commands below run from the worktree root unless stated.
+- Worktree: `/home/dan/code/freshell/.worktrees/silent-input-loss`, branch `fix/silent-input-loss`, based on current `origin/main` (ca88b825 or newer — verify with `git fetch` in Task 1). ALL Rust line refs in this plan are against ca88b825 (qmpk), which deleted `crates/freshell-ws/src/amplifier_association.rs` — the `TerminalInput` arm has only the codex + opencode seams. ALL commands below run from the worktree root unless stated.
 - NEVER use ports 3001/3002 (the user's LIVE server runs on 3002). The e2e fixture picks ephemeral ports itself and asserts `port !== 3001`; never override that.
 - NEVER restart the user's server. NEVER use broad kill patterns (`pkill -f freshell` etc.). The e2e fixture kills only its own pid-verified processes.
 - Coordinated test runs: check `npm run test:status` first; if another holder is active, WAIT (never kill a foreign holder). Full suite: `FRESHELL_TEST_SUMMARY="silent-input-loss: <what>" env -u FRESHELL_BIND_HOST npm test`. Single vitest files: `npm run test:vitest -- run --config config/vitest/vitest.config.ts <file>` (never raw `npx vitest`).
@@ -38,7 +38,7 @@ The diagnosis in the kata is proven at the raw-WS protocol level. The RED tests 
 | `crates/freshell-protocol/src/server_messages.rs:260-269` | Modify | Add `UnknownTerminal` variant to `TerminalInputBlockedReason` |
 | `crates/freshell-protocol/tests/roundtrip.rs` | Modify | Round-trip + frozen-schema conformance test for the new reason |
 | `crates/freshell-terminal/src/registry.rs` | Modify | `input()` returns `InputOutcome{found}`; `#[must_use]` on `InputOutcome` and `AttachOutcome`; unit tests |
-| `crates/freshell-freshagent/src/terminal_tabs.rs:1687` | Modify | Second `registry.input()` caller (REST send-keys): consume the outcome, warn on not-found |
+| `crates/freshell-freshagent/src/terminal_tabs.rs:1946` | Modify | Second `registry.input()` caller (REST send-keys): consume the outcome, warn on not-found |
 | `crates/freshell-ws/src/terminal.rs` | Modify | `TerminalInput` arm emits `terminal.input.blocked{unknown_terminal}` on not-found; `handle_attach` returns the `error{INVALID_TERMINAL_ID}` frame on `found:false`; doc-comment fixes; pure-builder unit tests |
 | `crates/freshell-ws/tests/unknown_terminal_reply.rs` | Create | WS integration tests: input→blocked frame; attach→error frame; live-input round-trip guard |
 | `src/lib/ws-client.ts:294-296` | Modify | Filter `terminal.input` out of the blind reconnect replay |
@@ -85,7 +85,7 @@ git log --oneline -1 HEAD
 git merge-base --is-ancestor origin/main HEAD && echo BASE-OK || echo BASE-STALE
 ```
 
-Expected: `BASE-OK` — `origin/main` (e28d0910 or newer) is an ancestor of HEAD. HEAD will NOT equal origin/main: the branch already carries the plan-doc commits, and that is fine. If `BASE-STALE` (origin/main has moved past this branch's base): `git merge origin/main` (a plain merge, NOT `--ff-only` — the branch has its own commits, so fast-forward is impossible), resolve any conflicts, and re-run the ancestor check before proceeding.
+Expected: `BASE-OK` — `origin/main` (ca88b825 or newer) is an ancestor of HEAD. HEAD will NOT equal origin/main: the branch already carries the plan-doc commits, and that is fine. If `BASE-STALE` (origin/main has moved past this branch's base): `git merge origin/main` (a plain merge, NOT `--ff-only` — the branch has its own commits, so fast-forward is impossible), resolve any conflicts, and re-run the ancestor check before proceeding.
 
 - [ ] **Step 2: Install node deps + tsx symlink (worktree quirk)**
 
@@ -287,18 +287,18 @@ git commit -m "feat(protocol): add unknown_terminal terminal.input.blocked reaso
 ### Task 3: Registry — `input()` reports found/not-found
 
 **Files:**
-- Modify: `crates/freshell-terminal/src/registry.rs` (struct near :586, `input()` at :1131-1160, existing tests at :3697-3711/:4019/:4077)
-- Modify: `crates/freshell-ws/src/terminal.rs:633-635` (transitional `let _ =`)
-- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs:1687`
+- Modify: `crates/freshell-terminal/src/registry.rs` (struct near :595, `input()` at :1195-1224, existing tests at :3824/:4138/:4196)
+- Modify: `crates/freshell-ws/src/terminal.rs:636-638` (transitional `let _ =`)
+- Modify: `crates/freshell-freshagent/src/terminal_tabs.rs:1946`
 - Test: `crates/freshell-terminal/src/registry.rs` unit tests
 
 **Interfaces:**
-- Consumes: existing `AttachOutcome { pub found: bool }` (`registry.rs:586-592`) as the shape precedent; test helpers `insert_headless`, `collector` (`registry.rs:2695-2768`).
+- Consumes: existing `AttachOutcome { pub found: bool }` (`registry.rs:595-601`) as the shape precedent; test helpers `insert_headless`, `collector` (`registry.rs:2792-2835`).
 - Produces: `pub struct InputOutcome { pub found: bool }` (`#[must_use]`, derives `Debug, Clone, Copy, PartialEq, Eq`) and `pub fn input(&self, terminal_id: &str, data: &[u8]) -> InputOutcome`. Task 4 branches on `.found`; the freshagent caller warns on `!found`.
 
 - [ ] **Step 1: Write the failing unit tests**
 
-In the registry test module (next to `attach_to_unknown_terminal_reports_not_found` at `registry.rs:3010`):
+In the registry test module (next to `attach_to_unknown_terminal_reports_not_found` at `registry.rs:3130`):
 
 ```rust
     #[test]
@@ -331,7 +331,7 @@ Expected: FAIL to compile (`input()` returns `()`, no `.found`). Compile-failure
 
 - [ ] **Step 3: Implement `InputOutcome` and the new return**
 
-Add next to `AttachOutcome` (`registry.rs` ~:594):
+Add next to `AttachOutcome` (`registry.rs` ~:602, just before `AttachResizeStatus`):
 
 ```rust
 /// Outcome of [`TerminalRegistry::input`]: whether the terminal existed (the
@@ -347,7 +347,7 @@ pub struct InputOutcome {
 }
 ```
 
-Replace `input()` (`registry.rs:1131-1160`) with (note the doc comment loses its now-false trailing `No wire reply.`, and the overloaded `None => false` is disentangled into `(found, tapped_mode)`):
+Replace `input()` (`registry.rs:1195-1224`) with (note the doc comment loses its now-false trailing `No wire reply.`, and the overloaded `None => false` is disentangled into `(found, tapped_mode)`):
 
 ```rust
     /// `terminal.input` write path (`terminal-registry.ts:3867-3894`): write bytes to
@@ -395,7 +395,7 @@ If `InputOutcome` is not automatically re-exported, mirror however `AttachOutcom
 
 - [ ] **Step 4: Update every caller (the `#[must_use]` will point at them)**
 
-1. `crates/freshell-ws/src/terminal.rs:633-635` — transitional until Task 4 branches on it:
+1. `crates/freshell-ws/src/terminal.rs:636-638` — transitional until Task 4 branches on it:
 
 ```rust
             // Outcome consumed for real in the next commit (kata dtfn):
@@ -404,7 +404,7 @@ If `InputOutcome` is not automatically re-exported, mirror however `AttachOutcom
                 .input(&input.terminal_id, input.data.as_bytes());
 ```
 
-2. `crates/freshell-freshagent/src/terminal_tabs.rs:1687` — the REST agent-API send-keys path (adapt the variable names to the surrounding code, which calls `registry.input(&terminal_id, text.as_bytes());` in statement position):
+2. `crates/freshell-freshagent/src/terminal_tabs.rs:1946` — the REST agent-API send-keys path (adapt the variable names to the surrounding code, which calls `registry.input(&terminal_id, text.as_bytes());` in statement position):
 
 ```rust
         let outcome = registry.input(&terminal_id, text.as_bytes());
@@ -413,7 +413,7 @@ If `InputOutcome` is not automatically re-exported, mirror however `AttachOutcom
         }
 ```
 
-3. Existing registry tests at `registry.rs:3698` (`reg.input("T", b"ls\n");`), `:4019` (`reg.input("T-act", b"\r");`), `:4077` (`reg.input("T-shell", b"\r");`) — make each assert the outcome, e.g. `assert!(reg.input("T", b"ls\n").found);`.
+3. Existing registry tests at `registry.rs:3824` (`reg.input("T", b"ls\n");`), `:4138` (`reg.input("T-act", b"\r");`), `:4196` (`reg.input("T-shell", b"\r");`) — make each assert the outcome, e.g. `assert!(reg.input("T", b"ls\n").found);`.
 
 - [ ] **Step 5: Run tests + workspace compile**
 
@@ -436,7 +436,7 @@ git commit -m "refactor(terminal): registry input() reports found/not-found (kat
 ### Task 4: WS server — unknown-id `terminal.input` answers `terminal.input.blocked`
 
 **Files:**
-- Modify: `crates/freshell-ws/src/terminal.rs` (module doc :17, `TerminalInput` arm :622-654, imports :61-66, new pure builder + unit test)
+- Modify: `crates/freshell-ws/src/terminal.rs` (module doc :17, `TerminalInput` arm :625-648, imports :61-65, new pure builder + unit test)
 - Create: `crates/freshell-ws/tests/unknown_terminal_reply.rs`
 - Test: both of the above
 
@@ -504,9 +504,9 @@ Expected: `input_to_unknown_terminal_answers_input_blocked` FAILS with `no termi
 
 In `crates/freshell-ws/src/terminal.rs`:
 
-1. Extend the `freshell_protocol` import at :61-66 with `TerminalInputBlocked, TerminalInputBlockedReason`.
+1. Extend the `freshell_protocol` import at :61-65 with `TerminalInputBlocked, TerminalInputBlockedReason`.
 2. Update the module doc line :17 from `//! terminal.input   -> registry.input()  (pty.write; no wire reply)` to `//! terminal.input   -> registry.input()  (pty.write; terminal.input.blocked{unknown_terminal} on unknown id)`.
-3. Add the pure builder next to `invalid_dims_error` (~:3213), same testable-pure-fn pattern:
+3. Add the pure builder next to `invalid_dims_error` (grep for `fn invalid_dims_error`), same testable-pure-fn pattern:
 
 ```rust
 /// The `terminal.input.blocked{reason:unknown_terminal}` frame for a
@@ -523,7 +523,7 @@ fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
 }
 ```
 
-4. Rewrite the `TerminalInput` arm (:622-654). Keep the existing Lane-B2 comment and the codex `note_possible_submit` await exactly where they are (the codex seam must still run before the write); branch on the outcome; run the amplifier/opencode seams only on the found path (both are documented no-ops for unknown terminals anyway):
+4. Rewrite the `TerminalInput` arm (:625-648). Keep the existing Lane-B2 comment and the codex `note_possible_submit` await exactly where they are (the codex seam must still run before the write); branch on the outcome; run the opencode seam only on the found path (it is a documented no-op for unknown terminals anyway). Note: ca88b825 deleted the amplifier seam from this arm (`amplifier_association.rs` no longer exists) — the arm's only seams are codex (pre-write) and opencode (post-write):
 
 ```rust
         ClientMessage::TerminalInput(input) => {
@@ -547,17 +547,8 @@ fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
                 // input-blocked frame the client renders as a visible notice.
                 return send(ws_tx, &unknown_terminal_input_blocked(&input.terminal_id)).await;
             }
-            // Restore-across-restart fix: an armed amplifier terminal's first
-            // Enter/submit opens the locator's Enter↔session-dir correlation
-            // window. No-ops for every other terminal/mode (never armed) and
-            // for non-submit-shaped input.
-            crate::amplifier_association::note_possible_submit(
-                state,
-                &input.terminal_id,
-                &input.data,
-            );
-            // Restore-across-restart fix (opencode): sibling seam for an
-            // armed opencode terminal's first Enter/submit. No-ops for every
+            // Restore-across-restart fix (opencode): seam for an armed
+            // opencode terminal's first Enter/submit. No-ops for every
             // other terminal/mode and for non-submit-shaped input.
             crate::opencode_association::note_possible_submit(
                 state,
@@ -568,7 +559,7 @@ fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
         }
 ```
 
-5. Add the builder unit test to the existing `#[cfg(test)]` module that holds `invalid_dims_error_serializes_as_invalid_message` (~:4534-4569):
+5. Add the builder unit test to the existing `#[cfg(test)]` module that holds `invalid_dims_error_serializes_as_invalid_message` (:4882-4887 — the last test in the file; insert before the module's closing `}` at :4888/EOF):
 
 ```rust
     /// Kata dtfn: the unknown-id input reply serializes to the exact frozen
@@ -610,13 +601,13 @@ git commit -m "fix(server): answer terminal.input.blocked for input to an unknow
 ### Task 5: WS server — unknown-id `terminal.attach` answers `error{INVALID_TERMINAL_ID}`
 
 **Files:**
-- Modify: `crates/freshell-ws/src/terminal.rs` (`handle_attach` :3135-3181, its call site :614-621)
+- Modify: `crates/freshell-ws/src/terminal.rs` (`handle_attach` :3457-3497, its call site :617-624)
 - Modify: `crates/freshell-terminal/src/registry.rs` (`#[must_use]` on `AttachOutcome`, doc comment)
 - Modify: `crates/freshell-ws/tests/unknown_terminal_reply.rs` (new test)
 - Test: same files
 
 **Interfaces:**
-- Consumes: `AttachOutcome{found}` (already returned by `registry.attach`, currently discarded); `ErrorMsg`/`ErrorCode::InvalidTerminalId` construction pattern from `handle_kill` (`terminal.rs:3289-3300`); `crate::now_iso()`.
+- Consumes: `AttachOutcome{found}` (already returned by `registry.attach`, currently discarded); `ErrorMsg`/`ErrorCode::InvalidTerminalId` construction pattern from `handle_kill` (`terminal.rs:3609-3619`); `crate::now_iso()`.
 - Produces: `fn handle_attach(...) -> Option<ServerMessage>` (None = attached; Some = the error frame for the async call site to `send`). Wire behavior: attach to an unknown id draws `error{code:"INVALID_TERMINAL_ID", message:"Terminal not running", requestId:<attachRequestId>, terminalId:<id>}`. Exited-but-registered terminals still return `found:true` + synthetic `terminal.exit` (unchanged).
 
 - [ ] **Step 1: Write the failing WS integration test**
@@ -662,7 +653,7 @@ Expected: FAIL with `no error frame within 20 messages` / timeout — the second
 
 This mirrors the repo's `kill_and_broadcast`/`handle_kill` split (sync core returns, async half sends). In `crates/freshell-ws/src/terminal.rs`:
 
-1. `handle_attach` (:3135-3181): change the signature and tail. Keep the body (identity stamp, TERM-07 resize, registry.attach call) unchanged except for consuming the outcome; fix the doc-comment parenthetical at :3140 which documents behavior the port had lost:
+1. `handle_attach` (:3457-3497): change the signature and tail. Keep the body (identity stamp, TERM-07 resize, registry.attach call) unchanged except for consuming the outcome; fix the doc-comment parenthetical at :3455-3456 which documents behavior the port had lost:
 
 ```rust
 /// `terminal.attach` — resolve the terminal in the shared registry and attach THIS
@@ -682,7 +673,7 @@ fn handle_attach(
 ) -> Option<ServerMessage> {
 ```
 
-and replace the final `state.registry.attach(...)` statement (:3172-3180) with:
+and replace the final `state.registry.attach(...)` statement (:3488-3496) with:
 
 ```rust
     let outcome = state.registry.attach(
@@ -718,7 +709,7 @@ and replace the final `state.registry.attach(...)` statement (:3172-3180) with:
 }
 ```
 
-2. The call site (:614-621):
+2. The call site (:617-624):
 
 ```rust
         ClientMessage::TerminalAttach(attach) => {
@@ -733,7 +724,7 @@ and replace the final `state.registry.attach(...)` statement (:3172-3180) with:
         }
 ```
 
-3. `crates/freshell-terminal/src/registry.rs` — add `#[must_use]` to `AttachOutcome` (:586-592) so the discard can never silently return (the compiler now guards the invariant this task restores):
+3. `crates/freshell-terminal/src/registry.rs` — add `#[must_use]` to `AttachOutcome` (:595-601) so the discard can never silently return (the compiler now guards the invariant this task restores):
 
 ```rust
 /// Outcome of an [`TerminalRegistry::attach`]: whether the terminal existed (the
@@ -1790,8 +1781,8 @@ Expected: the task-by-task commit ladder from this plan; push succeeds. Do NOT o
 ## Self-Review (performed while writing; recorded for the plan reviewer)
 
 **1. Spec coverage.**
-- Server input silence (`terminal.rs:622-654` + `registry.rs:1148`) → Tasks 3–4.
-- Adjacent attach regression (`registry.rs:971-988` outcome discarded at `terminal.rs:3172-3180`; stale parity doc at :3140/:588) → Task 5 (incl. doc fixes).
+- Server input silence (`terminal.rs:625-648` + `registry.rs:1203`) → Tasks 3–4.
+- Adjacent attach regression (`registry.rs:1034-1044` outcome discarded at `terminal.rs:3488-3496`; stale parity doc at :3455-3456/:596) → Task 5 (incl. doc fixes).
 - Contract ritual for the new `unknown_terminal` reason (TS source + regen + BOTH pins in one commit; `test:port` green) → Task 2.
 - Client loss window 1 (blind replay of queued input, `ws-client.ts:294-302`) → Task 6 (filter) + Task 7 (buffer catches what would have queued).
 - Client loss window 2 (keystrokes at the old id before staleness detection) → Task 7's `awaitingAnchorRef` (buffers from transport loss until the next anchor) + the server's `unknown_terminal` reply as the wire-level backstop for any frame that still reaches a dead id.
@@ -1805,5 +1796,7 @@ Expected: the task-by-task commit ladder from this plan; push succeeds. Do NOT o
 **2. Placeholder scan.** No copy-directive placeholders remain (Task 9 composes the shared `pane-picker.ts` helpers directly). Three "adapt to the harness's actual shape" notes (Task 7 Step 1 `fireData`, Task 7 item 12's App-harness clone, Task 8 Step 1 error-injection) each come with complete working code plus the named in-file mechanism to align with; the contracts being asserted are fully specified.
 
 **3. Load-bearing validation (Stage 2) — findings applied.** 23 assumptions surfaced, 21 validated (ledger: `.worktrees/.the-usual-logs/silent-input-loss/load-bearing-ledger.md`). Falsified → fixed in this plan: A2 (stale-id blocked frames were silently dropped → `lastKnownTerminalIdRef` match, Task 7 item 14 / invariant 10b); A7 (two `sendInput`-bypassing user senders: Shift+Enter :2126-2133 and firewall App.tsx:1493-1509 → Task 7 items 11-12 / invariant 1, the firewall deferral pinned in `App.firewall-command.test.tsx`); A8 (close-race: ref-lagged gate would feed Task 6's filter NEW silent loss → synchronous `ws.isReady` getter in the gate + race test, invariant 9); A13 (request-mode-bypass DECRPM sender was left bufferable → droppable, invariant 5); A15 (anchor's `term.clear()` wipes pre-anchor loss notices → deferred re-write via the reconcileNotice pattern, invariant 3 + Task 7 item 7 + survival test); A23 (harness-01's retry loop also absorbed slow-recreate flake → 60s budgets in Tasks 9-10). Verified corrections folded in: 11th attach call site (quarantine repair :884, invariant 7); flush placement after the sessionRef fold :4066 (A11); `ZOD_BACKED_SERVER_MESSAGES` is a test-side list (Task 2); pane-picker helpers exist (Task 9); creating-overlay `pointer-events-none` (A14, invariant 10a); headless-input warn (A16, Task 3). Accepted residuals (recorded in the ledger with alternatives considered): in-flight frame loss on a dying socket (browser-level, needs an ack protocol — out of scope); TUI-CLI early-input TCSAFLUSH behavior (bash proven 60/60 byte-intact; TUIs unverified); xterm-core DA/CPR auto-replies entering `onData` (output-quiet while un-anchored; post-anchor behavior pre-existing). Re-check of 1b after these edits: every new requirement (race gate, deferred notice, stray-sender folding incl. the firewall deferral, overlay fix) lands on production code with a pinning test in Tasks 6-9 — no stubs, no deferrals.
+
+**5. Base rebase (fresheyes iteration 3).** origin/main advanced to ca88b825 (qmpk) after this plan was authored; Task 1's BASE-STALE branch will merge it. That commit deleted `crates/freshell-ws/src/amplifier_association.rs` and removed the amplifier seam from the `TerminalInput` arm, so Task 4's verbatim arm replacement was rewritten against ca88b825 (codex pre-write seam + opencode post-write seam only; opencode comment text matches ca88b825 verbatim), and every Rust line anchor in Tasks 3–5 and this self-review was refreshed against ca88b825 (`git show ca88b825:<file>` verified): `terminal.rs` imports :61-65, TerminalInput arm :625-648, transitional `registry.input` statement :636-638, TerminalAttach call site :617-624, `handle_attach` :3457-3497 (doc parenthetical :3455-3456, final attach statement :3488-3496), `handle_kill` ErrorMsg :3609-3619, builder test module tail :4882-4887 (EOF `}` :4888); `registry.rs` `input()` :1195-1224 (PTY write :1203), `AttachOutcome` :595-601, `attach` :1034-1044, test anchors :3130/:3824/:4138/:4196, helpers :2792-2835; `terminal_tabs.rs` caller :1946. ca88b825 touched NO frontend/Node/protocol/contract files (`src/`, `server/`, `shared/`, `port/contract/`, `crates/freshell-protocol/` all untouched), so all TS-side anchors and the contract counts (29/57/86) are unaffected.
 
 **4. Type consistency.** `InputOutcome{found}` defined in Task 3, consumed as `outcome.found` in Task 4 and the freshagent caller. `handle_attach(...) -> Option<ServerMessage>` defined and consumed in Task 5. `sendInput(data, opts?: {droppable?: boolean})`, `bufferPendingInput(data)`, `flushPendingInput(tid)`, `discardPendingInput('timeout'|'terminal_gone')`, `notifyPendingInputLoss('overflow'|'timeout'|'terminal_gone')` used consistently across Task 7's steps and Task 8's test. Wire strings consistent throughout: `terminal.input.blocked` / `unknown_terminal` / `INVALID_TERMINAL_ID` / `"Terminal not running"`.
