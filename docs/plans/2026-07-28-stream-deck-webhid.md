@@ -176,7 +176,8 @@ streamDeck: {
 // 5) composeResolvedSettings (~:1330) — alongside `notifications: local.notifications`:
 streamDeck: local.streamDeck,
 
-// 6) extractLegacyLocalSettingsSeed (~:1372) — following the notifications normalizer shape:
+// 6) extractLegacyLocalSettingsSeed (~:1372) — following the notifications key-selection shape
+// (notifications does this inline via pickKeys at ~:1407):
 const sd = record?.streamDeck
 if (sd && typeof sd === 'object') {
   const out: Partial<LocalSettings['streamDeck']> = {}
@@ -186,9 +187,38 @@ if (sd && typeof sd === 'object') {
   if (typeof (sd as any).idleTimeoutSeconds === 'number') out.idleTimeoutSeconds = (sd as any).idleTimeoutSeconds
   if (Object.keys(out).length > 0) seed.streamDeck = out
 }
+
+// 7) normalizeExtractedLocalSeed (~:474-625) — REQUIRED, this is the whitelist gate.
+// extractLegacyLocalSettingsSeed ends with `return normalizeExtractedLocalSeed(patch)`
+// (~:1410), and that normalizer builds a fresh object from hard-coded sections only —
+// any section it does not enumerate is silently DROPPED, which would both fail this
+// task's Step 6 and make the runtime enable path a silent no-op: updateSettingsLocal
+// routes every patch through normalizeLocalPatch → extractLegacyLocalSettingsSeed
+// (src/store/settingsSlice.ts:45-50, :117-121), so Task 11's
+// `store.dispatch(updateSettingsLocal({ streamDeck: { enabled: true } }))` and
+// Task 13's enable toggle depend on this block. Mirror the notifications block
+// (~:614-622) alongside it:
+if (isRecord(patch.streamDeck)) {
+  const streamDeck: LocalSettingsPatch['streamDeck'] = {}
+  if (typeof patch.streamDeck.enabled === 'boolean') {
+    streamDeck.enabled = patch.streamDeck.enabled as boolean
+  }
+  if (typeof patch.streamDeck.brightness === 'number') {
+    streamDeck.brightness = patch.streamDeck.brightness as number
+  }
+  if (typeof patch.streamDeck.idleBrightness === 'number') {
+    streamDeck.idleBrightness = patch.streamDeck.idleBrightness as number
+  }
+  if (typeof patch.streamDeck.idleTimeoutSeconds === 'number') {
+    streamDeck.idleTimeoutSeconds = patch.streamDeck.idleTimeoutSeconds as number
+  }
+  if (Object.keys(streamDeck).length > 0) {
+    normalized.streamDeck = streamDeck
+  }
+}
 ```
 
-Also check `mergeLocalSettings` (:1269) — if it enumerates sections explicitly (like `notifications`), add a `streamDeck` merge line there too.
+Also check `mergeLocalSettings` (:1269) — if it enumerates sections explicitly (like `notifications`), add a `streamDeck` merge line there too. Note the existing full-shape `toEqual` assertions in `test/unit/shared/settings.test.ts` (~:382 extract, ~:548 strip) may need their expected objects extended if they break on the new section — extend the expectations, do not weaken them.
 
 - [ ] **Step 4: Add the persistence allowlist entry**
 
@@ -1261,8 +1291,11 @@ describe('renderKey', () => {
     expect(texts.some((t) => t.text === 'build' && t.style === '#ffffff')).toBe(true)     // title
     const blue = rects.filter((r) => r.style === RING_COLORS.blue)
     const white = rects.filter((r) => r.style === ACTIVE_COLOR && r.h <= 1)
-    expect(blue).toHaveLength(3 * 4)   // 3px status ring
-    expect(white).toHaveLength(2 * 4)  // 2px active ring at inset 3
+    expect(blue).toHaveLength(3 * 4)   // 3px status ring: 3 frames x 4 rects each
+    // The h <= 1 filter matches ONLY the top+bottom strips of each 1px frame (2 per
+    // frame); drawRing paints verticals as single TALL rects (h = h - 2*o), which the
+    // filter deliberately excludes to avoid counting anything else white on the tile.
+    expect(white).toHaveLength(2 * 2)  // 2px active ring at inset 3: 2 frames x 2 horizontal strips
   })
 
   it('status-only tile paints a 4px ring; active-only a 3px white ring', () => {
@@ -1273,7 +1306,8 @@ describe('renderKey', () => {
       return cap!.rects
     }
     expect(make('green', false).filter((r) => r.style === RING_COLORS.green)).toHaveLength(4 * 4)
-    expect(make(null, true).filter((r) => r.style === ACTIVE_COLOR && r.h <= 1)).toHaveLength(3 * 4)
+    // Same h <= 1 caveat as above: 3 frames x 2 horizontal strips each (verticals are tall rects).
+    expect(make(null, true).filter((r) => r.style === ACTIVE_COLOR && r.h <= 1)).toHaveLength(3 * 2)
   })
 
   it('pager key renders PAGE / n/m / NEXT > on the control background', () => {
@@ -1374,21 +1408,41 @@ git commit -m "feat(deck): canvas tile and strip renderer with validated geometr
 **Interfaces:**
 - Consumes/produces: the `freshAgent.approval.respond` allow decision becomes exactly `{ behavior: 'allow' }` (schema `shared/ws-protocol.ts:521-529` types `decision` as an open record — no schema change). Deny path unchanged.
 
-- [ ] **Step 1: Update the four pinned assertions to require the absence of `updatedInput` (RED)**
+- [ ] **Step 1: Update the two CLIENT assertions to require the absence of `updatedInput` (RED)**
 
-In each of the four test sites, change the expected decision from `{ behavior: 'allow', updatedInput: {} }` to `{ behavior: 'allow' }` and add an explicit absence assertion where the frame object is available, e.g.:
+The RED gate is the two client test sites only. Task 6 changes no server code, so the
+server test CANNOT be part of the RED gate: `ws-handler-fresh-agent.test.ts:431` is the
+test's *own fixture* (the `ws.send(...)` frame the test itself constructs) and `:467`
+asserts the server passes that fixture through verbatim to `resolveApproval` — update
+both together and the server test passes immediately, before any client fix.
+
+At the two client sites (`FreshAgentView.test.tsx:326`, `:392`), change the expected
+decision from `{ behavior: 'allow', updatedInput: {} }` to `{ behavior: 'allow' }` and
+add an explicit absence assertion where the frame object is available, e.g.:
 
 ```ts
 expect(sent.decision).toEqual({ behavior: 'allow' })
 expect('updatedInput' in sent.decision).toBe(false)
 ```
 
-(For the server test at `:467`: `expect(runtimeManager.resolveApproval).toHaveBeenCalledWith(locator, 'approval-1', { behavior: 'allow' })` — `toHaveBeenCalledWith` uses deep equality, which fails while the extra key is present.)
+- [ ] **Step 2: Run the client suite to verify the RED gate fails**
 
-- [ ] **Step 2: Run tests to verify they fail**
+Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx`
+Expected: the 2 updated client assertions FAIL (decision still carries `updatedInput: {}`).
 
-Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` and `npm run test:vitest -- run test/unit/server/ws-handler-fresh-agent.test.ts --config config/vitest/vitest.server.config.ts` (the server test runs under the server config; if that flag path fails, run it via `npm run test:vitest -- run test/unit/server/ws-handler-fresh-agent.test.ts` and use whichever config the file's header/existing CI uses).
-Expected: the 4 updated assertions FAIL (decision still carries `updatedInput: {}`).
+- [ ] **Step 2b: Update the server test's fixture+assertion pair to document the new wire shape (passes immediately — NOT a RED gate)**
+
+In `test/unit/server/ws-handler-fresh-agent.test.ts`, update the fixture at `:431` (the
+decision inside the frame the test sends) from `{ behavior: 'allow', updatedInput: {} }`
+to `{ behavior: 'allow' }`, and the paired assertion at `:467` to
+`expect(runtimeManager.resolveApproval).toHaveBeenCalledWith(locator, 'approval-1', { behavior: 'allow' })`
+(`toHaveBeenCalledWith` uses deep equality). Update BOTH together — updating only `:467`
+leaves a test that can never pass, since nothing in this task changes the frame the
+fixture sends.
+
+Run: `npm run test:vitest -- run test/unit/server/ws-handler-fresh-agent.test.ts --config config/vitest/vitest.server.config.ts` (if that flag path fails, run it via `npm run test:vitest -- run test/unit/server/ws-handler-fresh-agent.test.ts` and use whichever config the file's header/existing CI uses).
+Expected: PASS immediately (the server passes the decision through verbatim; this pair
+documents the new `{ behavior: 'allow' }` wire shape rather than gating the client fix).
 
 - [ ] **Step 3: Fix both client sites (GREEN)**
 
@@ -1408,7 +1462,7 @@ decision: { behavior: 'allow' },
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run the same two commands. Expected: PASS, including the rest of both suites.
+Run the client command from Step 2 and the server command from Step 2b. Expected: PASS, including the rest of both suites.
 
 - [ ] **Step 5: Commit**
 
