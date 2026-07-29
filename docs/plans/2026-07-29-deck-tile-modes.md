@@ -1072,7 +1072,12 @@ Production call sites (`deck-manager.ts:95-101`, `VirtualDeckPanel.tsx:82-88`) a
 - [ ] **Step 5: Run the controller suite + e2e compile check**
 
 Run: `npm run test:vitest -- run test/unit/client/deck/deck-controller.test.ts test/e2e/stream-deck-flow.test.tsx --config config/vitest/vitest.config.ts`
-Expected: controller suite PASS. The e2e file fails to compile until its `defaultSettings()` gains `tileStyle: 'status-icons' as const` — make that one-line fixture edit here; all existing e2e scenarios must then PASS unchanged (the Deck+ strip test still reads `1 waiting` because its `attention: { t2: true }` seed satisfies the union).
+Expected: controller suite PASS. The e2e file needs two small fixture edits here before its scenarios pass (test files are outside the tsconfig `include` and Vitest strips types, so neither omission fails compilation — the signal is runtime/assertion behavior, not a compile error):
+
+1. Add `tileStyle: 'status-icons' as const` to its `defaultSettings()` fixture. (Without it, `tileStyle` is `undefined` at runtime, which behaves as status-icons — make the edit anyway so the fixture matches the settings type.)
+2. In the `'tabs appear on keys with titles, fills, dots, and icons'` scenario (~lines 198-209), add `style: 'icons'` to each of the three strict `toEqual` tab-spec expectations. Task 6's tab `KeySpec` now carries a `style` field, and strict `toEqual` fails on the extra property — without this edit those three assertions FAIL.
+
+After both edits, all existing e2e scenarios must PASS unchanged (the Deck+ strip test still reads `1 waiting` because its `attention: { t2: true }` seed satisfies the union).
 
 - [ ] **Step 6: Typecheck + commit**
 
