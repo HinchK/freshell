@@ -532,6 +532,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_icon_found_by_deep_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("deep");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let assets = repo.join("src/App/Assets");
+        fs::create_dir_all(&assets).unwrap();
+        // Minimal valid ICO (same byte layout as tier4_tests::write_ico).
+        let mut ico = vec![0u8, 0, 1, 0, 1, 0];
+        ico.extend_from_slice(&[64, 64, 0, 0, 1, 0, 32, 0]);
+        ico.extend_from_slice(&40u32.to_le_bytes());
+        ico.extend_from_slice(&22u32.to_le_bytes());
+        ico.resize(22 + 40, 0);
+        fs::write(assets.join("AppIcon.ico"), ico).unwrap();
+
+        let uri = format!(
+            "/api/repo-icon/meta?cwd={}",
+            urlencoding_encode(&repo.to_string_lossy())
+        );
+        let meta = get(router(test_state()), &uri, true, &[]).await;
+        assert_eq!(meta.status(), StatusCode::OK);
+        assert_eq!(body_json(meta).await["hasIcon"], true);
+        let icon = get(router(test_state()), &icon_uri(&repo), true, &[]).await;
+        assert_eq!(icon.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
     async fn worktree_cwd_resolves_to_main_repo_icon() {
         let tmp = tempfile::tempdir().unwrap();
         let main_repo = mkrepo_with_icon(&tmp); // "proj", has public/favicon.svg
