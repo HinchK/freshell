@@ -3314,6 +3314,39 @@ describe('TerminalView lifecycle updates', () => {
     expectTerminalWriteContaining(term, 'Input not sent: the terminal no longer exists on the server.')
   })
 
+  it('shows generic notice for unrecognized terminal.input.blocked reason (future-proofing)', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-test',
+      status: 'running',
+      mode: 'shell',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.input.blocked',
+        terminalId: 'term-test',
+        reason: 'some_future_reason' as any,
+      })
+    })
+
+    const term = terminalInstances[0]
+    // Verify the generic notice is written
+    expectTerminalWriteContaining(term, 'Input not sent.')
+    // Verify [undefined] is NOT written
+    expect(term.write).not.toHaveBeenCalledWith(expect.stringContaining('undefined'))
+  })
+
   it('buffers keystrokes typed while un-anchored and flushes them byte-exact after terminal.created', async () => {
     // Pane mid-recreate: no terminalId yet (the old silent-drop window).
     const { store, tabId, paneId, paneContent } = setupThemeTerminal({

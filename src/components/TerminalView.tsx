@@ -4561,7 +4561,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const previous = lastInputBlockedNoticeRef.current
           if (!previous || previous.reason !== reason || now - previous.at >= INPUT_BLOCKED_NOTICE_THROTTLE_MS) {
             lastInputBlockedNoticeRef.current = { reason, at: now }
-            writeLocalXtermNotice(term, `\r\n[${terminalInputBlockedNotice(reason)}]\r\n`)
+            writeLocalXtermNotice(term, `\r\n[${terminalInputBlockedNotice(reason) ?? 'Input not sent.'}]\r\n`)
           }
           return
         }
