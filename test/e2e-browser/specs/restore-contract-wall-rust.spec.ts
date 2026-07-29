@@ -1818,14 +1818,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // EXPECTED-FAIL WALL PIN -- P1.8+P1.9 (D3, §4.2): no server-side durable
-    // pane-identity record exists; with localStorage gone the binding is lost
-    // even though the pre-allocated claude session id was server-minted.
-    // FLIP when the pane-identity ledger + "recover my panes" surface land.
-    test.fail(
-      e2eServerKind === 'rust',
-      'P1.8+P1.9 (D3): pane created <5s before SIGKILL is unrecoverable after browser loss',
-    )
+    // P1.8+P1.9 (D3, §4.2) LANDED -- pin flipped: the claude binding row is
+    // written durably to the pane-identity ledger BEFORE the PTY spawn, so a
+    // SIGKILL moments after spawn (before any snapshot cadence) still leaves
+    // a recoverable row. After browser-state loss the recovery inventory
+    // reports it (recoverable: true) and the "recover my panes" offer
+    // (data-testid="recovery-offer-panel") surfaces it -- the poll below
+    // accepts either an auto-restored pane or the visible offer.
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-5s-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -1917,8 +1916,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
             if (hit) return true
           }
           const recoverOffer = await page
-            .getByText(/recover .*pane/i)
-            .first()
+            .getByTestId('recovery-offer-panel')
             .isVisible()
             .catch(() => false)
           return recoverOffer
