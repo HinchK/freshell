@@ -1196,10 +1196,11 @@ This file is TypeScript, but it is an opt-in external-provider contract test (no
 
 **Files:**
 - Modify: `test/integration/real/coding-cli-session-contract.test.ts` (add one `it(...)` inside the existing opencode `describe` lane, ~lines 576-710)
+- Modify: `test/helpers/coding-cli/real-session-contract-harness.ts` (extend `queryOpencodeSessionRow` to also select `parent_id` — additive; existing callers read only `id`/`title`/`directory` and are unaffected)
 - Test: same file (vitest, `config/vitest/vitest.server.config.ts`)
 
 **Interfaces:**
-- Consumes: the existing harness `test/helpers/coding-cli/real-session-contract-harness.js` — `ProbeWorkspace.create`, `seedOpencodeHomes`, `startOpencodeServe`, `waitForOpencodeDbSession`, `waitForJsonLine`, `requireAvailableBinary` (already imported at the top of the test file). The gate variables `opencodeProbe`, `realProviderContractsEnabled`, `opencodeBinary` and the `describeOpencode` lane already exist in the file.
+- Consumes: the existing harness `test/helpers/coding-cli/real-session-contract-harness.js` — `ProbeWorkspace.create`, `seedOpencodeHomes`, `startOpencodeServe`, `waitForOpencodeDbSession` (extended in Step 2 to also return `parent_id`), `waitForJsonLine`, `requireAvailableBinary` (already imported at the top of the test file). The gate variables `opencodeProbe`, `realProviderContractsEnabled`, `opencodeBinary` and the `describeOpencode` lane already exist in the file.
 - Produces: nothing consumed later — external-behavior validation.
 
 - [ ] **Step 1: Read the existing opencode lane and harness signatures**
@@ -1208,7 +1209,15 @@ Read `test/integration/real/coding-cli-session-contract.test.ts` (the `describeO
 
 - [ ] **Step 2: Write the failing (skipped-by-default) test**
 
-Add inside the existing `describeOpencode(...)` block, after the last existing `it(...)`:
+First, extend the harness so the child-parent verification below is actually observable. In `test/helpers/coding-cli/real-session-contract-harness.ts`, `queryOpencodeSessionRow` (~lines 1283-1300) currently runs `select id, title, directory from session where id = ? limit 1` and returns `{ id, title, directory } | null`; `waitForOpencodeDbSession` (~lines 1302-1313) wraps it. Change the SQL to:
+
+```sql
+select id, title, directory, parent_id from session where id = ? limit 1
+```
+
+and add `parent_id` (nullable string) to the returned object and its type. This is additive — every existing caller reads only `id`/`title`/`directory` and is unaffected. (`parent_id` is a real column of opencode's `session` table: it is the exact column the production listing filters on, `crates/freshell-sessions/src/parse/opencode.rs` `parent_id IS NULL`, and the column this plan's Task 2 fixtures insert.)
+
+Then add inside the existing `describeOpencode(...)` block, after the last existing `it(...)`:
 
 ```ts
     // Attach-arm premise of freshell's opencode existence fallback
@@ -1260,8 +1269,10 @@ Add inside the existing `describeOpencode(...)` block, after the last existing `
         expect(childSessionId).not.toBe(rootSessionId)
 
         // 3. Verify the child row landed in sqlite with parent_id = root.
+        //    (LOAD-BEARING: proves the session under test really is a CHILD;
+        //    requires this task's harness extension returning parent_id.)
         const childRow = await waitForOpencodeDbSession(homes.dbPath, childSessionId)
-        expect(childRow.parent_id ?? childRow.parentID).toBe(rootSessionId)
+        expect(childRow.parent_id).toBe(rootSessionId)
 
         // 4. THE PREMISE: the real CLI resolves the CHILD id via --session.
         const childRun = await workspace.spawnProcess(
@@ -1286,7 +1297,7 @@ Add inside the existing `describeOpencode(...)` block, after the last existing `
     }, 300_000)
 ```
 
-Adapt mechanics to the file's actual conventions found in Step 1: if `startOpencodeServe` returns a differently-named base-URL field or requires stop/teardown, follow the existing opencode test's usage; if `waitForOpencodeDbSession` returns camelCase columns, keep the `parent_id ?? parentID` tolerance or match its actual shape; if `ProbeWorkspace` cleanup is named differently (e.g. `dispose`), use that. If the installed opencode's serve API does not accept `parentID` on `POST /session` (check its OpenAPI document at `${serve.baseUrl}/doc` before concluding), child creation is not scriptable: per the locked scope decision, REMOVE this test, and record the rationale (what was attempted, what the API offered) in the commit message and in a comment where the test would have been. Do NOT fake the child by inserting a sqlite row yourself — a synthetic row validates nothing about the real attach arm.
+Adapt mechanics to the file's actual conventions found in Step 1: if `startOpencodeServe` returns a differently-named base-URL field or requires stop/teardown, follow the existing opencode test's usage; if `ProbeWorkspace` cleanup is named differently (e.g. `dispose`), use that. The child-parent verification (the harness `parent_id` extension above plus the `expect(childRow.parent_id).toBe(rootSessionId)` assertion) is LOAD-BEARING — it proves the session under test is genuinely a child before Step 4 exercises the attach arm; do NOT drop or weaken it. If the installed opencode's `session` table names the column differently (check with `PRAGMA table_info(session)` against `homes.dbPath`), select that actual column in the harness extension and assert it equals `rootSessionId`; if no parent column exists at all, treat that the same as the `parentID`-not-accepted branch below (child creation not verifiable — remove the test with recorded rationale), never as license to assert less. If the installed opencode's serve API does not accept `parentID` on `POST /session` (check its OpenAPI document at `${serve.baseUrl}/doc` before concluding), child creation is not scriptable: per the locked scope decision, REMOVE this test, and record the rationale (what was attempted, what the API offered) in the commit message and in a comment where the test would have been. Do NOT fake the child by inserting a sqlite row yourself — a synthetic row validates nothing about the real attach arm.
 
 - [ ] **Step 3: Verify the gated-off (default) path**
 
@@ -1305,7 +1316,7 @@ Expected, in order of preference:
 - [ ] **Step 5: Commit**
 
 ```bash
-git add test/integration/real/coding-cli-session-contract.test.ts
+git add test/integration/real/coding-cli-session-contract.test.ts test/helpers/coding-cli/real-session-contract-harness.ts
 git commit -m "test(real): opencode resolves child session ids via --session (fallback premise)"
 ```
 
