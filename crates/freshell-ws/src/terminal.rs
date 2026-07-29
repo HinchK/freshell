@@ -2196,11 +2196,19 @@ pub(crate) async fn handle_create(
     // (:1649) and the spawn below makes that id OBSERVABLE (argv, logged
     // synchronously by the e2e fakes). A SIGKILL landing right after spawn
     // must still find a durable ledger row, or the recovery inventory has
-    // nothing to offer after browser loss. The post-spawn binding write
-    // (:2420 arm) re-records the same (provider, session_id) key with the
-    // resolved cwd — a benign re-write. Failure policy identical to that
-    // arm: never blocks the create, surfaced LIVE.
-    if mode == "claude" {
+    // nothing to offer after browser loss. Scoped to the fresh
+    // preallocation ONLY (`claude_fresh_prealloc`: this create minted the
+    // UUID, so the row is provably exclusive) — a resume/restore create's
+    // row belongs to the prior epoch and is already durable; writing it
+    // here, BEFORE any evidence the spawn succeeds, would let a failing or
+    // race-losing resume create rewrite live_terminal_id/create_request_id
+    // to a terminal that never spawns (and the failure-branch delete below
+    // deliberately never touches non-fresh rows). The post-spawn binding
+    // write (the `create_meta_record` arm below) re-records the same
+    // (provider, session_id) key with the resolved cwd — a benign re-write
+    // — and stays the ONLY writer for resume creates. Failure policy
+    // identical to that arm: never blocks the create, surfaced LIVE.
+    if claude_fresh_prealloc {
         if let Some(session_id) = resume_session_id.as_deref() {
             let ledger = std::sync::Arc::clone(&state.pane_ledger);
             let write_session_id = session_id.to_string();
