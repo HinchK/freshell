@@ -265,7 +265,7 @@ pub(crate) fn broadcast_terminal_session_associated(
             cwd,
             display_subdir: None,
             is_dirty: None,
-            provider: Some("codex".to_string()),
+            provider: Some(provider.to_string()),
             repo_root: None,
             session_id: Some(session_id.to_string()),
             token_usage: None,

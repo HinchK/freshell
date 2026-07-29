@@ -22,10 +22,9 @@
 
 use std::path::{Path, PathBuf};
 
-// NOTE: the sweep-interval const (OPENCODE_SIGNAL_SWEEP_INTERVAL) is added in
-// Task 5 together with its only consumer, spawn_opencode_signal_sweep —
-// introducing it here would make this task's `clippy -D warnings` gate fail
-// as dead_code.
+use crate::terminal::now_ms;
+use crate::WsState;
+
 /// Retention cap for unacted signal files (D1.1): a signal whose pane never
 /// (re)appears is reaped after this age instead of living forever.
 pub(crate) const STALE_SIGNAL_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(600);
@@ -142,6 +141,237 @@ fn parse_signal_file(path: &Path) -> Option<OpencodeSignal> {
             .and_then(|v| v.as_str())
             .map(str::to_string),
     })
+}
+
+/// Drain opencode switch signals and rebind panes through the guarded lane.
+/// `pub` so integration tests drive drains deterministically.
+///
+/// Guard ladder (drain_and_rebind_claude's ladder + the D1 extensions from
+/// the 2026-07-28 validation pass; the producer is per-terminal by
+/// construction — the plugin reads FRESHELL_TERMINAL_ID from its own PTY
+/// env — so codex's D7 old-owner predicate is subsumed by the live-pane +
+/// provider-match check, exactly as in the claude lane):
+///   (0)  identity row present with provider opencode, PLUS two extensions:
+///   (0a) FIRST-BIND ARBITRATION (D1.2, also resolves the locator race):
+///        no identity row, but the registry shows a LIVE never-bound
+///        opencode pane (mode=="opencode", Running,
+///        resume_session_id.is_none()) ⇒ first bind through guards (2)-(4),
+///        cwd from the registry entry, previousSessionId None. The signal
+///        is user-facing route truth and outranks the locator's DB
+///        heuristic; the bind itself disarms the locator
+///        (opencode_association.rs:127 rejects once
+///        resume_session_id.is_some()). No pane at all ⇒ RETAIN the file.
+///   (0b) RETIRED-PANE REBIND (D1.3): identity row RETIRED with provider
+///        opencode and a different session id ⇒ run guards (2)-(4), then
+///        identity.upsert + immediate re-retire (upsert clears the retired
+///        flag; retire preserves fields), SKIP registry.set_meta (no live
+///        row), await ledger_resolve_identity (G3 supersede), broadcast
+///        `associated` with previousSessionId — the frozen client applies
+///        association by layout presence, not liveness
+///        (src/lib/terminal-session-association.ts:84-105), so the
+///        persisted pane ref moves and a future restore resumes the NEW id.
+///   (1) same-id no-op (the plugin dedupes, but the initial route poll
+///   re-reports the bound id at startup), (2) A13 no live owner of the
+///   target, (3) ledger A8 retired-inclusive, (4) fresh-agent sessions
+///   never bind terminal panes.
+/// ACT-THEN-DELETE (D1.1): sig.path is removed only after the signal was
+/// acted on (rebound, same-id no-op, or a deliberate guard refusal); files
+/// with no actionable pane are RETAINED for later sweeps (the watcher's
+/// staleness cap reaps abandoned ones).
+/// NEVER any activity/row-correlation fallback: no signal ⇒ no rebind.
+pub async fn drain_and_rebind_opencode(state: &WsState, watcher: &OpencodeSignalWatcher) {
+    // drain() is sync fs I/O -> blocking pool (claude_signal.rs pattern).
+    let drain_watcher = watcher.clone();
+    let signals = match tokio::task::spawn_blocking(move || drain_watcher.drain()).await {
+        Ok(signals) => signals,
+        Err(join_error) => {
+            tracing::warn!(
+                error = %join_error,
+                "opencode_signal_drain_panicked: blocking drain task panicked, skipping this cycle"
+            );
+            return;
+        }
+    };
+    for sig in signals {
+        let acted = apply_opencode_signal(state, &sig).await;
+        if acted {
+            let _ = std::fs::remove_file(&sig.path); // act-then-delete (D1.1)
+        }
+        // Not acted ⇒ the file stays for a later sweep (retention).
+    }
+}
+
+/// Guards (2)-(4): A13 live-owner, ledger A8 retired-inclusive, fresh-agent.
+/// `false` (warn-logged where meaningful) = the target session must NOT be
+/// bound to this terminal — a deliberate refusal, which still counts as
+/// ACTED ON for act-then-delete purposes.
+fn target_session_guards_pass(state: &WsState, sig: &OpencodeSignal) -> bool {
+    if let Some(owner) =
+        state
+            .registry
+            .live_session_owner(Some(&state.identity), "opencode", &sig.session_id)
+    {
+        tracing::warn!(terminal_id = %sig.terminal_id, owner = %owner,
+            "opencode_rebind_refused: target session already live-owned (A13)");
+        return false;
+    }
+    if let Some(existing) = state
+        .identity
+        .find_by_session_including_retired("opencode", &sig.session_id)
+    {
+        if existing != sig.terminal_id {
+            tracing::warn!(terminal_id = %sig.terminal_id,
+                "opencode_rebind_refused: session_bound_elsewhere");
+            return false;
+        }
+    }
+    if state
+        .pane_ledger
+        .lookup_by_session("opencode", &sig.session_id)
+        .is_some_and(|r| r.row.pane_kind.as_deref() == Some("fresh-agent"))
+    {
+        return false;
+    }
+    true
+}
+
+/// PINNED fan-out for live panes: identity -> meta -> ledger(await) ->
+/// associated THEN meta.updated.
+async fn rebind_fanout(
+    state: &WsState,
+    sig: &OpencodeSignal,
+    cwd: Option<&str>,
+    previous: Option<String>,
+) {
+    state.identity.upsert(
+        &sig.terminal_id,
+        Some("opencode"),
+        Some(&sig.session_id),
+        cwd,
+        now_ms(),
+    );
+    state.registry.set_meta(
+        &sig.terminal_id,
+        None,
+        None,
+        Some("opencode".to_string()),
+        Some(sig.session_id.clone()),
+    );
+    crate::pane_ledger::ledger_resolve_identity(
+        state,
+        &sig.terminal_id,
+        "opencode",
+        &sig.session_id,
+        cwd,
+    )
+    .await;
+    crate::codex_identity::broadcast_terminal_session_associated(
+        state,
+        "opencode",
+        &sig.terminal_id,
+        &sig.session_id,
+        cwd.map(str::to_string),
+        previous,
+    );
+}
+
+/// One signal through the ladder. Returns whether the signal was ACTED ON
+/// (delete the file) vs skipped (retain it for a later sweep).
+async fn apply_opencode_signal(state: &WsState, sig: &OpencodeSignal) -> bool {
+    let Some(current) = state.identity.get(&sig.terminal_id) else {
+        // (0a) D1.2 first-bind arbitration — the registry's per-terminal
+        // identity probe carries exactly the fields the arbitration needs
+        // (mode / status / resume_session_id / cwd).
+        let Some(entry) = state.registry.probe(&sig.terminal_id) else {
+            return false; // no pane (yet): RETAIN for a later sweep
+        };
+        if entry.mode != "opencode"
+            || entry.status != freshell_protocol::TerminalRunStatus::Running
+            || entry.resume_session_id.is_some()
+        {
+            return false; // not a live never-bound opencode pane: RETAIN
+        }
+        if !target_session_guards_pass(state, sig) {
+            return true; // deliberate refusal — acted
+        }
+        tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
+            source = ?sig.source,
+            "opencode_rebind: first bind via TUI signal (signal outranks locator)");
+        rebind_fanout(state, sig, entry.cwd.as_deref(), None).await;
+        return true;
+    };
+
+    if current.provider.as_deref() != Some("opencode") {
+        return false; // foreign-provider row: never touch; RETAIN until stale
+    }
+    if current.session_id.as_deref() == Some(sig.session_id.as_str()) {
+        return true; // same-id no-op — acted
+    }
+    if !target_session_guards_pass(state, sig) {
+        return true; // A13 / ledger A8 / fresh-agent refusal — acted
+    }
+
+    let previous = current.session_id.clone();
+    if current.retired {
+        // (0b) D1.3 retired-pane rebind: the pane died after the switch but
+        // the signal survived (retention). Move the persisted ref so a
+        // future restore resumes the NEW id.
+        tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
+            source = ?sig.source, "opencode_rebind: retired pane ref moved to new session");
+        state.identity.upsert(
+            &sig.terminal_id,
+            Some("opencode"),
+            Some(&sig.session_id),
+            current.cwd.as_deref(),
+            now_ms(),
+        );
+        // upsert cleared the retired flag; re-retire preserves fields.
+        state.identity.retire(&sig.terminal_id);
+        // SKIP registry.set_meta: no live row.
+        crate::pane_ledger::ledger_resolve_identity(
+            state,
+            &sig.terminal_id,
+            "opencode",
+            &sig.session_id,
+            current.cwd.as_deref(),
+        )
+        .await;
+        crate::codex_identity::broadcast_terminal_session_associated(
+            state,
+            "opencode",
+            &sig.terminal_id,
+            &sig.session_id,
+            current.cwd.clone(),
+            previous,
+        );
+        return true;
+    }
+
+    // (0) live pane — the ordinary rebind path.
+    tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
+        source = ?sig.source, "opencode_rebind: TUI plugin reported a new session id");
+    rebind_fanout(state, sig, current.cwd.as_deref(), previous).await;
+    true
+}
+
+/// Sweep cadence — mirrors CLAUDE_SIGNAL_SWEEP_INTERVAL (claude_signal.rs:24):
+/// signal files are rare (one per in-TUI switch) so 1s is comfortably fresh
+/// and comfortably cheap. Introduced here (not in Task 4) because this is its
+/// only consumer — an unused private const would fail Task 4's
+/// `clippy -D warnings` gate.
+const OPENCODE_SIGNAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Spawned by `freshell-server` boot next to the sibling sweeps (mirrors
+/// `spawn_claude_signal_sweep`'s task shape): periodically drain the signal
+/// root and process any rebinds, off the per-connection select loops.
+pub fn spawn_opencode_signal_sweep(state: WsState, watcher: OpencodeSignalWatcher) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(OPENCODE_SIGNAL_SWEEP_INTERVAL);
+        loop {
+            ticker.tick().await;
+            drain_and_rebind_opencode(&state, &watcher).await;
+        }
+    });
 }
 
 #[cfg(test)]

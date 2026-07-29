@@ -618,4 +618,117 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&ledger_dir);
     }
+
+    /// D1.2's LOCATOR half (the signal half lives in
+    /// `tests/opencode_switch_rebind.rs` Phase 8, which cannot reach the
+    /// `pub(crate)` `drain_and_associate`): once a TUI-plugin signal
+    /// first-bind has set the pane's registry `resume_session_id`, a later
+    /// `Located` event for the same pane must be REJECTED by the
+    /// `terminal_already_bound` check — the signal is user-facing route
+    /// truth and outranks the locator's DB heuristic. The reject emits only
+    /// a `tracing::warn!` (no frame, no event), so REJECTION IS ASSERTED BY
+    /// ABSENCE OF EFFECT: no identity row, registry meta unchanged, no
+    /// ledger binding for the located candidate.
+    #[tokio::test]
+    async fn signal_bound_terminal_rejects_a_later_located_event() {
+        let home = unique_temp_dir("d12-locator-arbitration");
+        let ledger_dir = unique_temp_dir("d12-locator-arbitration-ledger");
+        let (state, _rx) = state_with_locator_and_ledger(home.clone(), &ledger_dir);
+        let db = open_seed_db(&home);
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "opencode",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("opencode".to_string()), None);
+
+        // The fresh create armed the locator (resume id still None) and the
+        // user submitted — the locator's evaluation window is open.
+        maybe_arm(&state, "t1", "opencode", Some("/tmp"), None);
+        note_possible_submit(&state, "t1", "\r");
+
+        // A TUI-plugin signal first-bind lands mid-flight: the registry meta
+        // now carries the signal-bound session id (exactly the footprint the
+        // signal bind leaves behind, opencode_signal.rs).
+        state.registry.set_meta(
+            "t1",
+            None,
+            None,
+            Some("opencode".to_string()),
+            Some("ses_hhhhhhhhhhhhhhhhhhhhhhhhhh".to_string()),
+        );
+
+        // Seed a DIFFERENT session row that would otherwise associate.
+        insert_session(&db, "ses_dbcandidate", "/tmp", crate::terminal::now_ms());
+
+        // Drive drains until the locator EMITS its Located event — `tick`
+        // disarms the terminal on emission, so armed_count reaching 0 is the
+        // positive proof that a Located event reached the reject check (not
+        // merely that the locator never resolved).
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut emitted = false;
+        for _ in 0..40 {
+            drain_and_associate(&state).await;
+            if state.opencode_locator.as_ref().unwrap().armed_count() == 0 {
+                emitted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            emitted,
+            "the locator must emit a Located event for the seeded session"
+        );
+
+        // Rejection by absence of effect.
+        assert!(
+            state.identity.get("t1").is_none(),
+            "the rejected Located event must not seed an identity row"
+        );
+        let entry = state
+            .registry
+            .directory()
+            .into_iter()
+            .find(|e| e.terminal_id == "t1")
+            .expect("registry must list t1");
+        assert_eq!(
+            entry.resume_session_id.as_deref(),
+            Some("ses_hhhhhhhhhhhhhhhhhhhhhhhhhh"),
+            "the signal-bound session id must be untouched"
+        );
+        assert!(
+            state
+                .pane_ledger
+                .lookup_by_session("opencode", "ses_dbcandidate")
+                .is_none(),
+            "no ledger binding may be written for the rejected candidate"
+        );
+
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+    }
 }
