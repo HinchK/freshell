@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 
@@ -21,7 +21,7 @@ import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import StreamDeckSettings from '@/components/settings/StreamDeckSettings'
 
 function renderSection(
-  streamDeck = { enabled: true, brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300 },
+  streamDeck = { enabled: true, brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300, tileStyle: 'status-icons' as const },
 ) {
   const store = configureStore({ reducer: { deck: deckReducer, settings: settingsReducer } })
   const applyLocalSetting = vi.fn()
@@ -142,5 +142,19 @@ describe('StreamDeckSettings', () => {
     fireEvent.change(input, { target: { value: '20' } })
     fireEvent.keyDown(input, { key: 'Enter' })
     expect(applyLocalSetting).toHaveBeenCalledWith({ streamDeck: { idleBrightness: 20 } })
+  })
+
+  it('offers the tile style choice with Status icons selected by default', () => {
+    renderSection()
+    const group = screen.getByRole('group', { name: /tile style/i })
+    const statusIcons = within(group).getByRole('button', { name: /status icons/i })
+    expect(statusIcons).toHaveAttribute('aria-pressed', 'true')
+    expect(within(group).getByRole('button', { name: /terminal previews/i })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('selecting Terminal previews patches streamDeck.tileStyle', () => {
+    const { applyLocalSetting } = renderSection()
+    fireEvent.click(screen.getByRole('button', { name: /terminal previews/i }))
+    expect(applyLocalSetting).toHaveBeenCalledWith({ streamDeck: { tileStyle: 'terminal-previews' } })
   })
 })
