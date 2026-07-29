@@ -219,7 +219,7 @@ async fn serve_icon(
         Ok((_, None)) => return crate::files::not_found("No repo icon detected"),
         Err(failure) => return failure_response(failure),
     };
-    let Ok(bytes) = std::fs::read(&icon.path) else {
+    let Ok(mut bytes) = std::fs::read(&icon.path) else {
         return crate::files::not_found("No repo icon detected");
     };
     let ext = icon
@@ -232,6 +232,17 @@ async fn serve_icon(
     // file may have changed between detection and serving.
     if ext == "svg" && svg_is_dangerous(&String::from_utf8_lossy(&bytes)) {
         return crate::files::not_found("No repo icon detected");
+    }
+    let mut content_type = content_type_for(&ext);
+    // .icns cannot render in <img>; serve the embedded PNG instead.
+    if ext == "icns" {
+        match crate::repo_icon_detect::icns_embedded_png(&bytes) {
+            Some(png) => {
+                bytes = png;
+                content_type = "image/png";
+            }
+            None => return crate::files::not_found("No repo icon detected"),
+        }
     }
     let mtime_ms = icon
         .mtime
@@ -254,10 +265,7 @@ async fn serve_icon(
     }
     let mut resp = (StatusCode::OK, bytes).into_response();
     let h = resp.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type_for(&ext)),
-    );
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     h.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=60"),
@@ -440,6 +448,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serves_icns_winner_as_png() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("proj");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        // Build an icns wrapping a 128x128 synthetic PNG (same layout as icns_tests).
+        let mut png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&128u32.to_be_bytes());
+        png.extend_from_slice(&128u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut body = b"ic07".to_vec();
+        body.extend_from_slice(&((png.len() as u32) + 8).to_be_bytes());
+        body.extend_from_slice(&png);
+        let mut icns = b"icns".to_vec();
+        icns.extend_from_slice(&((body.len() as u32) + 8).to_be_bytes());
+        icns.extend_from_slice(&body);
+        fs::write(repo.join("icon.icns"), icns).unwrap();
+
+        let resp = get(router(test_state()), &icon_uri(&repo), true, &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &bytes[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+    }
+
+    #[tokio::test]
     async fn no_icon_is_404_and_meta_has_icon_false() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("bare");
@@ -529,6 +569,32 @@ mod tests {
             get(r2, &icon_uri(&repo), true, &[]).await.status(),
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn serves_icon_found_by_deep_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("deep");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        let assets = repo.join("src/App/Assets");
+        fs::create_dir_all(&assets).unwrap();
+        // Minimal valid ICO (same byte layout as tier4_tests::write_ico).
+        let mut ico = vec![0u8, 0, 1, 0, 1, 0];
+        ico.extend_from_slice(&[64, 64, 0, 0, 1, 0, 32, 0]);
+        ico.extend_from_slice(&40u32.to_le_bytes());
+        ico.extend_from_slice(&22u32.to_le_bytes());
+        ico.resize(22 + 40, 0);
+        fs::write(assets.join("AppIcon.ico"), ico).unwrap();
+
+        let uri = format!(
+            "/api/repo-icon/meta?cwd={}",
+            urlencoding_encode(&repo.to_string_lossy())
+        );
+        let meta = get(router(test_state()), &uri, true, &[]).await;
+        assert_eq!(meta.status(), StatusCode::OK);
+        assert_eq!(body_json(meta).await["hasIcon"], true);
+        let icon = get(router(test_state()), &icon_uri(&repo), true, &[]).await;
+        assert_eq!(icon.status(), StatusCode::OK);
     }
 
     #[tokio::test]

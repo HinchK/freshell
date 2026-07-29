@@ -48,6 +48,38 @@ pub(crate) fn ico_largest_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     best
 }
 
+/// ICNS container: 8-byte header (b"icns" + BE total len), then elements of
+/// 4-byte type + 4-byte BE len (incl. the 8-byte element header) + payload.
+/// Modern element types carry raw PNG; return the widest embedded PNG.
+pub(crate) fn icns_embedded_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() < 8 || &bytes[0..4] != b"icns" {
+        return None;
+    }
+    let mut off = 8usize;
+    let mut best: Option<(u32, Vec<u8>)> = None;
+    while off + 8 <= bytes.len() {
+        let len = u32::from_be_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]) as usize;
+        if len < 8 || off + len > bytes.len() {
+            break;
+        }
+        let data = &bytes[off + 8..off + len];
+        if data.len() >= 8 && data[0..8] == PNG_SIG {
+            let width = png_dimensions(data).map(|(w, _)| w).unwrap_or(0);
+            if best.as_ref().is_none_or(|(bw, _)| width > *bw) {
+                best = Some((width, data.to_vec()));
+            }
+        }
+        off += len;
+    }
+    best.map(|(_, png)| png)
+}
+
 /// Best-effort SVG dimensions from width/height attributes or viewBox.
 /// Unknown dimensions are acceptable (caller treats `None` as "no aspect data").
 pub(crate) fn svg_dimensions(text: &str) -> Option<(f64, f64)> {
@@ -144,11 +176,17 @@ pub(crate) fn framework_default_name(bytes: &[u8]) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 pub(crate) const TIER1: i64 = 100;
 pub(crate) const TIER2: i64 = 80;
 pub(crate) const TIER3: i64 = 60;
+pub(crate) const TIER4: i64 = 40;
+/// Deep-scan bounds: directory levels below the repo root, and total
+/// directory entries examined (files + dirs) before the walk gives up.
+const MAX_WALK_DEPTH: usize = 4;
+const MAX_WALK_ENTRIES: usize = 8000;
 
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_SVG_BYTES: u64 = 256 * 1024;
@@ -165,7 +203,7 @@ const REJECTED_PATH_COMPONENTS: &[&str] = &[
     "out",
     "coverage",
 ];
-const REJECTED_EXTENSIONS: &[&str] = &["icns", "xml", "icon"];
+const REJECTED_EXTENSIONS: &[&str] = &["xml", "icon"];
 
 #[derive(Debug, Clone)]
 pub(crate) struct Candidate {
@@ -211,11 +249,17 @@ pub(crate) fn score_candidate(repo_root: &Path, cand: &Candidate) -> Option<i64>
     let mut score = cand.tier_base + cand.extra;
     let is_raster = matches!(
         ext.as_str(),
-        "png" | "ico" | "jpg" | "jpeg" | "gif" | "webp"
+        "png" | "ico" | "jpg" | "jpeg" | "gif" | "webp" | "icns"
     );
     let dims: Option<(f64, f64)> = match ext.as_str() {
         "png" => png_dimensions(&bytes).map(|(w, h)| (f64::from(w), f64::from(h))),
         "ico" => ico_largest_dimensions(&bytes).map(|(w, h)| (f64::from(w), f64::from(h))),
+        "icns" => {
+            let Some(png) = icns_embedded_png(&bytes) else {
+                return None; // .icns with no embedded PNG cannot be served
+            };
+            png_dimensions(&png).map(|(w, h)| (f64::from(w), f64::from(h)))
+        }
         "svg" => {
             let text = String::from_utf8_lossy(&bytes);
             if svg_is_dangerous(&text) {
@@ -256,7 +300,7 @@ pub(crate) fn score_candidate(repo_root: &Path, cand: &Candidate) -> Option<i64>
     if stem == "icon" {
         score += 5;
     }
-    if matches!(ext.as_str(), "png" | "ico" | "svg") {
+    if matches!(ext.as_str(), "png" | "ico" | "svg" | "icns") {
         score += 5;
     }
     Some(score)
@@ -328,6 +372,87 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
         return None;
     }
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// Directory basenames a deep scan must never enter.
+fn walk_dir_excluded(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.starts_with('.')
+        || REJECTED_PATH_COMPONENTS.contains(&lower.as_str())
+        || matches!(
+            lower.as_str(),
+            "target" | "bin" | "obj" | "__pycache__" | "venv" | "__fixtures__"
+        )
+}
+
+/// First `<tag>…</tag>` inner text (naive but sufficient for MSBuild props).
+fn extract_xml_tag_value(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim().to_string())
+}
+
+/// Collect `*.csproj` files up to `depth` == 2 directory levels below root.
+fn collect_csprojs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_symlink = path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true);
+        if is_symlink {
+            continue;
+        }
+        if path.is_dir() {
+            if depth < 2 && !walk_dir_excluded(name) {
+                collect_csprojs(&path, depth + 1, out);
+            }
+        } else if name.to_lowercase().ends_with(".csproj") {
+            out.push(path);
+        }
+    }
+}
+
+/// .NET: `<ApplicationIcon>` in any .csproj near the root (WinPepper pattern).
+fn csproj_candidates(sink: &mut CandidateSink) {
+    let root = sink.repo_root.clone();
+    let mut csprojs: Vec<PathBuf> = Vec::new();
+    collect_csprojs(&root, 0, &mut csprojs);
+    csprojs.sort();
+    // 32, not 10: winpepper already has 14 csprojs within depth <= 2 and the
+    // target sorts at index 5 today — keep headroom so new sibling dirs
+    // (artifacts/, packaging/, ...) can't evict the real manifest.
+    csprojs.truncate(32);
+    for csproj in csprojs {
+        let meta = match std::fs::metadata(&csproj) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() || meta.len() > 1_048_576 {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&csproj) else {
+            continue;
+        };
+        let Some(icon_rel) = extract_xml_tag_value(&text, "ApplicationIcon") else {
+            continue;
+        };
+        let normalized = icon_rel.replace('\\', "/");
+        if normalized.is_empty() || normalized.starts_with('/') || normalized.contains("..") {
+            continue;
+        }
+        let base = csproj.parent().unwrap_or(&root).to_path_buf();
+        sink.push(base.join(normalized), TIER1);
+    }
 }
 
 /// Resolve a web-style src: relative to its document dir; absolute `/x`
@@ -587,6 +712,8 @@ pub(crate) fn tier1(sink: &mut CandidateSink) {
     web_manifest_candidates(sink);
     // 6. index.html <link rel=icon>.
     index_html_candidates(sink);
+    // 7. .NET: csproj ApplicationIcon.
+    csproj_candidates(sink);
 }
 
 fn tier2(sink: &mut CandidateSink) {
@@ -616,6 +743,10 @@ fn tier2(sink: &mut CandidateSink) {
         "build/icon.png",
         "build/icon.ico",
         "build/appicon.png",
+        "android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png",
+        "android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png",
+        "android/app/src/main/res/mipmap-xhdpi/ic_launcher.png",
+        "android/app/src/main/res/mipmap-hdpi/ic_launcher.png",
     ];
     for rel in FIXED {
         sink.push(root.join(rel), TIER2);
@@ -645,7 +776,7 @@ fn tier2(sink: &mut CandidateSink) {
 /// Shallow scan of `dir` for files whose lowercase basename starts with one of
 /// `prefixes` and has an icon-ish extension. Lexicographic order for determinism.
 fn push_dir_prefix_matches(sink: &mut CandidateSink, dir: &Path, prefixes: &[&str], tier: i64) {
-    const EXTS: &[&str] = &["svg", "png", "ico", "webp", "jpg"];
+    const EXTS: &[&str] = &["svg", "png", "ico", "webp", "jpg", "icns"];
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -675,6 +806,13 @@ fn tier3(sink: &mut CandidateSink) {
         sink.push(root.join(format!("logo.{ext}")), TIER3); // GitLab parity
     }
     sink.push(root.join("app-icon.png"), TIER3);
+    sink.push(root.join("icon.ico"), TIER3);
+    sink.push(root.join("app.ico"), TIER3);
+    sink.push(root.join("favicon.svg"), TIER3);
+    sink.push(root.join("favicon.png"), TIER3);
+    for ext in ["png", "svg", "ico"] {
+        sink.push(root.join(format!("appicon.{ext}")), TIER3);
+    }
     for name in ["logo", "icon"] {
         for ext in ["png", "svg"] {
             sink.push(root.join(".github").join(format!("{name}.{ext}")), TIER3);
@@ -693,16 +831,123 @@ fn tier3(sink: &mut CandidateSink) {
         "docs",
         "doc",
     ] {
-        push_dir_prefix_matches(sink, &root.join(dir), &["icon", "logo"], TIER3);
+        push_dir_prefix_matches(
+            sink,
+            &root.join(dir),
+            &["icon", "logo", "appicon", "app-icon", "app_icon", "favicon"],
+            TIER3,
+        );
     }
 }
 
-/// The v1 detector entry point: bounded tiered scan, scored, deterministic.
+/// Name-match strength for the deep scan. `None` = not icon-like at all.
+fn stem_name_bonus(stem_lower: &str) -> Option<i64> {
+    if matches!(
+        stem_lower,
+        "icon" | "appicon" | "app-icon" | "app_icon" | "favicon"
+    ) {
+        return Some(10);
+    }
+    if stem_lower.starts_with("appicon")
+        || stem_lower.starts_with("app-icon")
+        || stem_lower.starts_with("app_icon")
+        || stem_lower.starts_with("favicon")
+        || stem_lower.starts_with("icon-")
+        || stem_lower.starts_with("icon_")
+        || stem_lower == "logo"
+    {
+        return Some(5);
+    }
+    if stem_lower.starts_with("icon")
+        || stem_lower.starts_with("logo")
+        || stem_lower.ends_with("-icon")
+        || stem_lower.ends_with("_icon")
+        || stem_lower.ends_with("-logo")
+        || stem_lower.ends_with("_logo")
+    {
+        return Some(3);
+    }
+    None
+}
+
+/// Tier 4: bounded breadth-first deep scan. BFS guarantees shallow candidates
+/// enumerate first (winning `order` tiebreaks) and that the entry budget is
+/// spent near the root where real icons live. Depth penalty (-2/level) plus
+/// the name bonus ride the `extra` field so `score_candidate` stays untouched.
+fn tier4_walk(sink: &mut CandidateSink, max_entries: usize) {
+    const EXTS: &[&str] = &["svg", "png", "ico", "webp", "jpg", "jpeg", "gif", "icns"];
+    let root = sink.repo_root.clone();
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    queue.push_back((root, 0));
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let in_appiconset = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.to_lowercase().ends_with(".appiconset"));
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            visited += 1;
+            if visited > max_entries {
+                return;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let is_symlink = path
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(true);
+            if is_symlink {
+                continue;
+            }
+            if path.is_dir() {
+                if depth < MAX_WALK_DEPTH && !walk_dir_excluded(name) {
+                    queue.push_back((path, depth + 1));
+                }
+                continue;
+            }
+            let ext_ok = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| EXTS.contains(&e.to_lowercase().as_str()));
+            if !ext_ok {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let bonus = if in_appiconset {
+                Some(5)
+            } else {
+                stem_name_bonus(&stem)
+            };
+            let Some(bonus) = bonus else {
+                continue;
+            };
+            let depth_penalty = 2 * depth as i64;
+            sink.push_extra(path.clone(), TIER4, bonus - depth_penalty);
+        }
+    }
+}
+
+fn tier4(sink: &mut CandidateSink) {
+    tier4_walk(sink, MAX_WALK_ENTRIES);
+}
+
+/// The detector entry point: bounded tiered scan, scored, deterministic.
 pub(crate) fn detect_icon(repo_root: &Path) -> Option<PathBuf> {
     let mut sink = CandidateSink::new(repo_root.to_path_buf());
     tier1(&mut sink);
     tier2(&mut sink);
     tier3(&mut sink);
+    tier4(&mut sink);
     let root = sink.repo_root.clone();
     pick_best(&root, sink.out)
 }
@@ -854,6 +1099,8 @@ mod scoring_tests {
             score_candidate(&root, &cand(&root, "node_modules/pkg/icon.png", TIER3, 0)),
             None
         );
+        // .icns is no longer rejected by extension, but one without an
+        // embedded PNG (here: not even a valid ICNS container) is rejected.
         fs::write(root.join("icon.icns"), b"whatever").unwrap();
         assert_eq!(
             score_candidate(&root, &cand(&root, "icon.icns", TIER3, 0)),
@@ -1062,6 +1309,66 @@ mod tier1_tests {
         assert!(has(&cands, root, "fav.svg"));
         assert!(!has(&cands, root, "fav48.png"));
     }
+
+    #[test]
+    fn csproj_application_icon_is_tier1_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("src/Winpepper.App");
+        std::fs::create_dir_all(proj.join("Assets")).unwrap();
+        std::fs::write(
+            proj.join("Winpepper.App.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
+  </PropertyGroup>
+</Project>"#,
+        )
+        .unwrap();
+        std::fs::write(proj.join("Assets/AppIcon.ico"), b"stub").unwrap();
+        let cands = candidates_for(dir.path());
+        assert!(has(
+            &cands,
+            dir.path(),
+            "src/Winpepper.App/Assets/AppIcon.ico"
+        ));
+        let c = cands
+            .iter()
+            .find(|c| c.path.ends_with("Assets/AppIcon.ico"))
+            .unwrap();
+        assert_eq!(c.tier_base, TIER1);
+    }
+
+    #[test]
+    fn csproj_icon_path_traversal_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Evil.csproj"),
+            "<Project><PropertyGroup><ApplicationIcon>..\\..\\/etc/passwd</ApplicationIcon></PropertyGroup></Project>",
+        )
+        .unwrap();
+        let cands = candidates_for(dir.path());
+        assert!(!cands
+            .iter()
+            .any(|c| c.path.to_string_lossy().contains("passwd")));
+    }
+
+    #[test]
+    fn csproj_scan_skips_excluded_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = dir.path().join(".worktrees/dup");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(
+            hidden.join("Dup.csproj"),
+            "<Project><PropertyGroup><ApplicationIcon>x.ico</ApplicationIcon></PropertyGroup></Project>",
+        )
+        .unwrap();
+        std::fs::write(hidden.join("x.ico"), b"stub").unwrap();
+        let cands = candidates_for(dir.path());
+        assert!(!cands
+            .iter()
+            .any(|c| c.path.to_string_lossy().contains(".worktrees")));
+    }
 }
 
 #[cfg(test)]
@@ -1154,5 +1461,313 @@ mod detect_tests {
             assert_eq!(detect_icon(root), first);
         }
         assert_eq!(first, Some(root.join("assets/icon-a.png"))); // lexicographic dir order
+    }
+}
+
+#[cfg(test)]
+mod static_candidates_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Synthetic PNG: signature + IHDR only (png_dimensions reads just the header).
+    fn write_png(path: &Path, w: u32, h: u32) {
+        let mut bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&w.to_be_bytes());
+        bytes.extend_from_slice(&h.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Minimal valid single-image ICO: 6-byte header + one 16-byte dir entry
+    /// + zero-filled image data (ico_largest_dimensions reads the dir entry).
+    fn write_ico(path: &Path, w: u8, h: u8) {
+        let mut bytes = vec![0u8, 0, 1, 0, 1, 0];
+        bytes.extend_from_slice(&[w, h, 0, 0, 1, 0, 32, 0]);
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&22u32.to_le_bytes());
+        bytes.resize(22 + 40, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn finds_android_mipmap_launcher_icon() {
+        let dir = tempfile::tempdir().unwrap();
+        let res = dir.path().join("android/app/src/main/res/mipmap-xxxhdpi");
+        std::fs::create_dir_all(&res).unwrap();
+        write_png(&res.join("ic_launcher.png"), 192, 192);
+        assert_eq!(detect_icon(dir.path()), Some(res.join("ic_launcher.png")));
+    }
+
+    #[test]
+    fn finds_root_app_ico() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ico(&dir.path().join("app.ico"), 64, 64);
+        assert_eq!(detect_icon(dir.path()), Some(dir.path().join("app.ico")));
+    }
+
+    #[test]
+    fn finds_root_appicon_png() {
+        let dir = tempfile::tempdir().unwrap();
+        write_png(&dir.path().join("appicon.png"), 128, 128);
+        assert_eq!(
+            detect_icon(dir.path()),
+            Some(dir.path().join("appicon.png"))
+        );
+    }
+
+    #[test]
+    fn asset_dir_prefix_scan_matches_appicon_and_favicon() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("resources")).unwrap();
+        write_png(&dir.path().join("resources/appicon-main.png"), 128, 128);
+        assert_eq!(
+            detect_icon(dir.path()),
+            Some(dir.path().join("resources/appicon-main.png"))
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir2.path().join("assets")).unwrap();
+        write_png(&dir2.path().join("assets/favicon.png"), 64, 64);
+        assert_eq!(
+            detect_icon(dir2.path()),
+            Some(dir2.path().join("assets/favicon.png"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod tier4_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn write_png(path: &Path, w: u32, h: u32) {
+        let mut bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&w.to_be_bytes());
+        bytes.extend_from_slice(&h.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn write_ico(path: &Path, w: u8, h: u8) {
+        let mut bytes = vec![0u8, 0, 1, 0, 1, 0];
+        bytes.extend_from_slice(&[w, h, 0, 0, 1, 0, 32, 0]);
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&22u32.to_le_bytes());
+        bytes.resize(22 + 40, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    const SQUARE_SVG: &str = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 128 128\"/>";
+
+    /// Glowforge shape: container root, empty root public/, real icon two
+    /// levels down inside a sub-project, plus false-positive mines.
+    #[test]
+    fn finds_subproject_favicon_in_container_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("public")).unwrap(); // empty decoy
+        std::fs::create_dir_all(root.join("gf-creative-studio/public")).unwrap();
+        std::fs::write(
+            root.join("gf-creative-studio/public/favicon.svg"),
+            SQUARE_SVG,
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("gf-design-system/design-system-assets/icons")).unwrap();
+        std::fs::write(
+            root.join("gf-design-system/design-system-assets/icons/glowforge-icon.svg"),
+            SQUARE_SVG,
+        )
+        .unwrap();
+        // Mines: coverage report favicon and hidden plugin-cache icon.
+        std::fs::create_dir_all(root.join("coverage/lcov-report")).unwrap();
+        write_png(&root.join("coverage/lcov-report/favicon.png"), 32, 32);
+        std::fs::create_dir_all(root.join(".factory/assets")).unwrap();
+        write_png(&root.join(".factory/assets/app-icon.png"), 128, 128);
+
+        assert_eq!(
+            detect_icon(root),
+            Some(root.join("gf-creative-studio/public/favicon.svg"))
+        );
+    }
+
+    /// WinPepper shape (without the csproj — pure walk): depth-3 AppIcon.ico
+    /// wins over a wide README banner; bin/ copies are never entered.
+    #[test]
+    fn finds_deep_appicon_and_ignores_banner_and_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let assets = root.join("src/Winpepper.App/Assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        write_ico(&assets.join("AppIcon.ico"), 64, 64);
+        std::fs::create_dir_all(root.join("docs/assets")).unwrap();
+        write_png(&root.join("docs/assets/header.png"), 2000, 400); // aspect 5 -> hard reject
+        let bin = root.join("src/Winpepper.App/bin/Release/publish/Assets");
+        std::fs::create_dir_all(&bin).unwrap();
+        write_ico(&bin.join("AppIcon.ico"), 64, 64);
+
+        assert_eq!(detect_icon(root), Some(assets.join("AppIcon.ico")));
+    }
+
+    #[test]
+    fn shallower_candidate_wins_over_deeper_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b/c/d")).unwrap();
+        write_png(&root.join("a/favicon.png"), 128, 128);
+        write_png(&root.join("b/c/d/favicon.png"), 128, 128);
+        assert_eq!(detect_icon(root), Some(root.join("a/favicon.png")));
+    }
+
+    #[test]
+    fn walk_respects_entry_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("zz")).unwrap();
+        // Budget of 3 entries: aaa.txt, bbb.txt, then budget exhausts before zz/ contents.
+        std::fs::write(root.join("aaa.txt"), b"x").unwrap();
+        std::fs::write(root.join("bbb.txt"), b"x").unwrap();
+        write_png(&root.join("zz/icon.png"), 64, 64);
+        let mut sink = CandidateSink::new(root.to_path_buf());
+        tier4_walk(&mut sink, 3);
+        assert!(sink.out.is_empty());
+        // Full budget finds it.
+        let mut sink2 = CandidateSink::new(root.to_path_buf());
+        tier4_walk(&mut sink2, 8000);
+        assert_eq!(sink2.out.len(), 1);
+    }
+
+    #[test]
+    fn walk_does_not_exceed_max_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let deep = root.join("l1/l2/l3/l4/l5");
+        std::fs::create_dir_all(&deep).unwrap();
+        write_png(&deep.join("icon.png"), 64, 64); // depth 5 -> beyond MAX_WALK_DEPTH=4
+        assert_eq!(detect_icon(root), None);
+    }
+
+    #[test]
+    fn appiconset_contents_are_candidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let set = root.join("ios/App/Assets.xcassets/AppIcon.appiconset");
+        std::fs::create_dir_all(&set).unwrap();
+        write_png(&set.join("100.png"), 100, 100); // no icon-like stem; dir rule applies
+        assert_eq!(detect_icon(root), Some(set.join("100.png")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_symlinked_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::os::unix::fs::symlink(root, root.join("a/loop")).unwrap();
+        // Must terminate and find nothing.
+        assert_eq!(detect_icon(root), None);
+    }
+
+    #[test]
+    fn walk_is_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("x")).unwrap();
+        std::fs::create_dir_all(root.join("y")).unwrap();
+        write_png(&root.join("x/logo.png"), 64, 64);
+        write_png(&root.join("y/logo.png"), 64, 64);
+        let first = detect_icon(root);
+        for _ in 0..5 {
+            assert_eq!(detect_icon(root), first);
+        }
+    }
+
+    /// Manual verification against real local directories. Never runs in CI.
+    /// Usage:
+    ///   ICON_PROBE_DIRS="/home/dan/code/glowforge:/home/dan/code/winpepper" \
+    ///     cargo test -p freshell-server manual_real_dir_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual probe against real local directories via ICON_PROBE_DIRS"]
+    fn manual_real_dir_probe() {
+        let dirs = std::env::var("ICON_PROBE_DIRS").unwrap_or_default();
+        assert!(!dirs.is_empty(), "set ICON_PROBE_DIRS=/path/a:/path/b");
+        for dir in dirs.split(':').filter(|s| !s.is_empty()) {
+            let start = std::time::Instant::now();
+            let found = detect_icon(std::path::Path::new(dir));
+            println!(
+                "probe {dir}: {:?} ({} ms)",
+                found,
+                start.elapsed().as_millis()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod icns_tests {
+    use super::*;
+
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&w.to_be_bytes());
+        bytes.extend_from_slice(&h.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes
+    }
+
+    /// ICNS container wrapping the given elements: (type, payload).
+    fn icns_bytes(elements: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        for (typ, data) in elements {
+            body.extend_from_slice(*typ);
+            body.extend_from_slice(&((data.len() as u32) + 8).to_be_bytes());
+            body.extend_from_slice(data);
+        }
+        let mut out = b"icns".to_vec();
+        out.extend_from_slice(&((body.len() as u32) + 8).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn extracts_largest_embedded_png() {
+        let small = png_bytes(32, 32);
+        let large = png_bytes(256, 256);
+        let icns = icns_bytes(&[(b"ic04", &small), (b"ic09", &large)]);
+        let extracted = icns_embedded_png(&icns).unwrap();
+        assert_eq!(png_dimensions(&extracted), Some((256, 256)));
+    }
+
+    #[test]
+    fn icns_without_png_yields_none() {
+        let icns = icns_bytes(&[(b"ic04", b"notapng")]);
+        assert!(icns_embedded_png(&icns).is_none());
+        assert!(icns_embedded_png(b"garbage").is_none());
+    }
+
+    #[test]
+    fn detects_icns_icon_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let png = png_bytes(128, 128);
+        let icns = icns_bytes(&[(b"ic07", &png)]);
+        std::fs::write(root.join("assets/AppIcon.icns"), icns).unwrap();
+        assert_eq!(detect_icon(root), Some(root.join("assets/AppIcon.icns")));
+    }
+
+    #[test]
+    fn icns_without_embedded_png_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let icns = icns_bytes(&[(b"is32", b"\x00\x01\x02\x03")]);
+        std::fs::write(root.join("icon.icns"), icns).unwrap();
+        assert_eq!(detect_icon(root), None);
     }
 }
