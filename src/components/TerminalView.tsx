@@ -312,6 +312,23 @@ function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string 
   }
 }
 
+// Silent-loss fix (kata dtfn): bounds for the per-pane pending-input buffer.
+// Small on purpose -- this holds human keystrokes across a reconnect window,
+// not bulk pastes of arbitrary size.
+const PENDING_INPUT_MAX_CHUNKS = 256
+const PENDING_INPUT_MAX_BYTES = 16 * 1024
+const PENDING_INPUT_TIMEOUT_MS = 30_000
+
+type PendingInputLossReason = 'overflow' | 'timeout' | 'terminal_gone'
+
+const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
+  overflow:
+    'Input not sent: too much was typed while the terminal was reconnecting. Retype it once the prompt is back.',
+  timeout:
+    'Input not sent: the terminal did not reconnect in time. Retype it once the prompt is back.',
+  terminal_gone: 'Input not sent: the terminal went away before it could be delivered.',
+}
+
 type StartupProbeReplayDiscardState = {
   remainder: string | null
   buffered: string
@@ -670,6 +687,51 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const tapCountRef = useRef(0)
   const terminalFirstOutputMarkedRef = useRef(false)
   const lastInputBlockedNoticeRef = useRef<{ reason: TerminalInputBlockedReason; at: number } | null>(null)
+  // Kata dtfn: keystrokes typed while the pane is un-anchored (no terminalId,
+  // transport not ready, or post-disconnect before the next anchor) are held
+  // here and flushed IN ORDER after the pane's next anchor. Raw data strings
+  // only -- frames are re-built at flush time so expectedSessionRef reflects
+  // the flush-time content (terminal-view-utils.ts snapshots it at build time).
+  const pendingInputRef = useRef<{
+    chunks: string[]
+    bytes: number
+    timer: ReturnType<typeof setTimeout> | null
+  }>({ chunks: [], bytes: 0, timer: null })
+  const lastPendingInputNoticeRef = useRef<{ reason: string; at: number } | null>(null)
+  // Ledger A15: a loss notice written while un-anchored is wiped by the next
+  // anchor's term.clear()/re-hydrate. Record it here and re-write it after the
+  // anchor (the reconcileNotice deferred pattern).
+  const pendingLossNoticeRef = useRef<string | null>(null)
+  // Ledger A2: the terminal.input.blocked backstop must stay visible even when
+  // the frame carries the pane's JUST-DEAD id (recovery clears terminalIdRef).
+  // Set whenever the pane acquires a defined tid; never cleared by recovery.
+  const lastKnownTerminalIdRef = useRef<string | undefined>(undefined)
+  // True from any observed connection-status TRANSITION away from 'ready'
+  // until the pane's next anchor: the current terminalId is unverified (the
+  // server may have restarted) and input must buffer rather than fire at a
+  // possibly-dead id. Transition-latched, NOT value-latched: a pane mounted
+  // under a static non-ready status must not latch (while the transport is
+  // actually down, the gate's synchronous `ws.isReady === false` arm buffers),
+  // and the sibling TerminalView suites preload constant statuses.
+  const awaitingAnchorRef = useRef(false)
+  // Previous observed status for the transition detection; seeded with the
+  // mount-time value so the sync effect's first run can never latch.
+  const connectionStatusRef = useRef<string>(connectionStatus)
+
+  useEffect(() => {
+    const prev = connectionStatusRef.current
+    connectionStatusRef.current = connectionStatus
+    if (connectionStatus !== 'ready' && prev !== connectionStatus) {
+      // Kata dtfn: a TRANSITION away from 'ready' (production statuses:
+      // 'disconnected' | 'connecting' | 'ready') is a transport loss -- the
+      // pane's terminalId is unverified until the next anchor
+      // (terminal.created / current-generation attach.ready). The status
+      // VALUE alone never latches: the ref is seeded with the mount-time
+      // status, so the first run is a no-op by construction (see the ref
+      // comment; design invariants 4 and 9).
+      awaitingAnchorRef.current = true
+    }
+  }, [connectionStatus])
 
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
@@ -1041,6 +1103,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         })
       }
       terminalIdRef.current = terminalContent.terminalId
+      if (terminalContent.terminalId) {
+        // Ledger A2: remember every acquired tid (never cleared by recovery)
+        // so the terminal.input.blocked backstop can match the just-dead id.
+        lastKnownTerminalIdRef.current = terminalContent.terminalId
+      }
       if (terminalContent.terminalId !== prevTerminalId) {
         resetParserAppliedSurface()
         geometryEpochRef.current = 1
@@ -1147,14 +1214,110 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     lastSessionActivityAtRef.current = 0
   }, [terminalContent?.resumeSessionId])
 
+  const notifyPendingInputLoss = useCallback((reason: PendingInputLossReason) => {
+    log.warn('pending_input_dropped', { tabId, paneId: paneIdRef.current, reason })
+    const now = Date.now()
+    const previous = lastPendingInputNoticeRef.current
+    if (previous && previous.reason === reason && now - previous.at < INPUT_BLOCKED_NOTICE_THROTTLE_MS) {
+      return
+    }
+    lastPendingInputNoticeRef.current = { reason, at: now }
+    // Write NOW for immediate feedback, and RECORD for a post-anchor re-write:
+    // the next anchor's term.clear()/re-hydrate would otherwise wipe it
+    // (ledger A15; design invariant 3).
+    pendingLossNoticeRef.current = `\r\n[${PENDING_INPUT_LOSS_NOTICE[reason]}]\r\n`
+    const term = termRef.current
+    if (term) {
+      writeLocalXtermNotice(term, pendingLossNoticeRef.current)
+    }
+  }, [tabId, writeLocalXtermNotice])
+
+  const discardPendingInput = useCallback((reason: 'timeout' | 'terminal_gone') => {
+    const buf = pendingInputRef.current
+    if (buf.timer !== null) {
+      clearTimeout(buf.timer)
+      buf.timer = null
+    }
+    if (buf.chunks.length === 0) return
+    buf.chunks = []
+    buf.bytes = 0
+    notifyPendingInputLoss(reason)
+  }, [notifyPendingInputLoss])
+
+  const bufferPendingInput = useCallback((data: string) => {
+    const buf = pendingInputRef.current
+    if (
+      buf.chunks.length >= PENDING_INPUT_MAX_CHUNKS
+      || buf.bytes + data.length > PENDING_INPUT_MAX_BYTES
+    ) {
+      // Overflow: refuse the NEW keystroke VISIBLY. Dropping the oldest would
+      // be silent loss of already-accepted bytes -- the design goal is
+      // "arrives byte-exact, or the user SEES that it didn't".
+      notifyPendingInputLoss('overflow')
+      return
+    }
+    buf.chunks.push(data)
+    buf.bytes += data.length
+    if (buf.timer === null) {
+      buf.timer = setTimeout(() => {
+        buf.timer = null
+        discardPendingInput('timeout')
+      }, PENDING_INPUT_TIMEOUT_MS)
+    }
+  }, [notifyPendingInputLoss, discardPendingInput])
+
+  const flushPendingInput = useCallback((tid: string) => {
+    awaitingAnchorRef.current = false
+    const buf = pendingInputRef.current
+    if (buf.timer !== null) {
+      clearTimeout(buf.timer)
+      buf.timer = null
+    }
+    if (buf.chunks.length === 0) return
+    const chunks = buf.chunks
+    buf.chunks = []
+    buf.bytes = 0
+    for (const data of chunks) {
+      // One frame per buffered chunk, re-built at flush time (fresh
+      // expectedSessionRef for the NEW terminal identity).
+      ws.send(buildTerminalInputMessage(contentRef.current, tid, data))
+    }
+  }, [ws])
+
   // Attention clearing is NOT done here: sendInput is shared by synthetic callers
   // (scroll-translation, DECRQM/startup auto-replies) that must not dismiss green.
   // Real-engagement clearing lives in the term.onData handler (see clearAttentionOnEngagement).
-  const sendInput = useCallback((data: string) => {
+  const sendInput = useCallback((data: string, opts?: { droppable?: boolean }) => {
     const tid = terminalIdRef.current
-    if (!tid) return
+    // Ledger A8 / design invariant 9: the `ws.isReady` getter is the SYNCHRONOUS
+    // transport truth -- the socket's close event flips it immediately, while
+    // Redux-fed state lags a task. Without this arm, a keystroke in that gap
+    // would land in ws-client's pendingMessages and be silently discarded by
+    // Task 6's reconnect filter. `ws` here is the WsClient instance itself
+    // (`const ws = useMemo(() => getWsClient(), [])`) and `isReady` is
+    // a GETTER (`get isReady()`, ws-client.ts) -- read it as a property,
+    // never call it. The explicit `=== false` is deliberate: only a transport
+    // KNOWN to be down buffers. In production it is exactly `!ws.isReady`
+    // (the getter always returns a boolean); in the component test fleet it
+    // keeps the sibling suites' minimal ws mocks ({ send, connect, onMessage,
+    // onReconnect } -- no isReady) on their existing pass-through behavior.
+    // There is intentionally NO direct Redux-status arm: the status feeds the
+    // transition-latched awaitingAnchorRef instead (invariants 4 and 9).
+    if (!tid || awaitingAnchorRef.current || ws.isReady === false) {
+      if (opts?.droppable) {
+        // Synthetic replies (DECRQM/OSC auto-answers, scroll translation)
+        // answer the OLD terminal's output -- replaying them into a NEW pty
+        // would inject garbage. Dropping them here is their pre-fix behavior.
+        return
+      }
+      // Kata dtfn: never drop user keystrokes on the floor. Buffer until the
+      // pane re-anchors; overflow/timeout surfaces a visible notice.
+      bufferPendingInput(data)
+      return
+    }
+    flushPendingInput(tid) // defensive ordering if a flush anchor raced us
     ws.send(buildTerminalInputMessage(contentRef.current, tid, data))
-  }, [ws])
+  }, [ws, bufferPendingInput, flushPendingInput])
 
   const translateScrollLinesToInput = useCallback((term: Terminal, lines: number): boolean => {
     if (!terminalIdRef.current || lines === 0) return false
@@ -1169,7 +1332,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     const sequence = scrollLinesToCursorKeys(lines, term.modes.applicationCursorKeysMode)
     if (!sequence) return false
 
-    sendInput(sequence)
+    // Synthetic scroll translation answers the OLD terminal's output --
+    // droppable, never buffered for a NEW pty (design invariant 5).
+    sendInput(sequence, { droppable: true })
     return true
   }, [sendInput])
 
@@ -1598,7 +1763,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       mode,
     })) {
       for (const reply of startup.replies) {
-        sendInput(reply)
+        // Synthetic auto-reply to the OLD terminal's output -- droppable, never
+        // buffered for a NEW pty (design invariant 5 / ledger A13).
+        sendInput(reply, { droppable: true })
       }
     }
 
@@ -1884,7 +2051,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     layoutSchedulerRef.current = layoutScheduler
 
     term.open(containerRef.current)
-    const requestModeBypass = registerTerminalRequestModeBypass(term, sendInput, { terminalInstanceId })
+    // Synthetic DECRPM mode reports answer the OLD terminal's output --
+    // droppable, never buffered for a NEW pty (ledger A13). sendInput is
+    // passed as a reference here, so wrap it to pin the droppable flag.
+    const requestModeBypass = registerTerminalRequestModeBypass(term, (d) => sendInput(d, { droppable: true }), { terminalInstanceId })
     term.attachCustomWheelEventHandler((event) => {
       const lines = event.deltaY < 0 ? -1 : event.deltaY > 0 ? 1 : 0
       if (!translateScrollLinesToInput(term, lines)) {
@@ -2125,13 +2295,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         return false
       }
 
-      // Shift+Enter -> send newline (same as Ctrl+J)
+      // Shift+Enter -> send newline (same as Ctrl+J). Folded through sendInput
+      // (ledger A7): the raw frame bypassed the buffer gate, so a Shift+Enter
+      // in a loss window would queue in ws-client and be silently discarded by
+      // the reconnect replay filter.
       if (event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && event.key === 'Enter' && event.type === 'keydown' && !event.repeat) {
         event.preventDefault()
-        const tid = terminalIdRef.current
-        if (tid) {
-          ws.send({ type: 'terminal.input', terminalId: tid, data: '\n' })
-        }
+        sendInput('\n')
         return false
       }
 
@@ -3073,6 +3243,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
         lastSentViewportRef.current = null
         terminalIdRef.current = undefined
+        // Kata dtfn: launch failed -- buffered keystrokes have no terminal to
+        // reach. Discard VISIBLY (design invariant 3).
+        discardPendingInput('terminal_gone')
         launchAttemptRef.current = null
         applySeqState(createAttachSeqState())
         updateContent({ terminalId: undefined, streamId: undefined, status: 'error' })
@@ -3102,6 +3275,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         forgetSentViewport(terminalId)
         lastSentViewportRef.current = null
         terminalIdRef.current = undefined
+        // Kata dtfn: the restored terminal exited -- discard buffered
+        // keystrokes VISIBLY (design invariant 3).
+        discardPendingInput('terminal_gone')
         applySeqState(createAttachSeqState())
         updateContent({
           terminalId: undefined,
@@ -3996,6 +4172,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           if (!nextSeqState.pendingReplay) {
             markAttachComplete()
           }
+
+          // Kata dtfn anchor 2: a current-generation attach.ready verifies the
+          // pane's terminalId -- flush buffered keystrokes at it (invariant 3).
+          if (typeof msg.terminalId === 'string' && msg.terminalId === terminalIdRef.current) {
+            lastKnownTerminalIdRef.current = msg.terminalId
+            flushPendingInput(msg.terminalId)
+          }
+          // Ledger A15: re-write a loss notice recorded while un-anchored --
+          // the attach's clear/hydrate wiped the immediate write.
+          if (pendingLossNoticeRef.current) {
+            writeLocalXtermNotice(term, pendingLossNoticeRef.current)
+            pendingLossNoticeRef.current = null
+          }
         }
 
         if (msg.type === 'terminal.created' && msg.requestId === reqId) {
@@ -4046,6 +4235,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const createdCwd = typeof msg.cwd === 'string' && msg.cwd.trim() ? msg.cwd : undefined
           const createdSessionUpdates = buildSessionAssociationContentUpdates(contentRef.current, createdSessionRef)
           terminalIdRef.current = newId
+          // Ledger A2: remember the acquired tid so the terminal.input.blocked
+          // backstop still matches after a recovery path clears terminalIdRef.
+          lastKnownTerminalIdRef.current = newId
           updateContent({
             terminalId: newId,
             serverInstanceId: serverInstanceIdRef.current,
@@ -4067,6 +4259,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               syncContentRefWithSessionAssociation(createdSessionRef)
             }
           }
+          // Kata dtfn anchor 1 (ledger A11): flush buffered keystrokes AFTER
+          // the created sessionRef is folded into contentRef above, so each
+          // rebuilt frame snapshots the NEW identity (invariant 2/3).
+          flushPendingInput(newId)
           // Also update tab status
           const currentTab = tabRef.current
           if (currentTab) {
@@ -4114,6 +4310,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           if (createdReconcileNotice) {
             writeLocalXtermNotice(term, `\r\n${createdReconcileNotice}\r\n`)
             dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
+          }
+          // Ledger A15: re-write a loss notice recorded while un-anchored --
+          // the anchor's term.clear()/re-hydrate above wiped the immediate
+          // write (same deferred pattern as reconcileNotice).
+          if (pendingLossNoticeRef.current) {
+            writeLocalXtermNotice(term, pendingLossNoticeRef.current)
+            pendingLossNoticeRef.current = null
           }
         }
 
@@ -4247,6 +4450,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           // We must clear both the ref AND the Redux state because the ref sync effect
           // would otherwise reset the ref from the Redux state on re-render.
           terminalIdRef.current = undefined
+          // Kata dtfn: the terminal is gone -- buffered keystrokes can never
+          // be delivered. Discard VISIBLY (design invariant 3).
+          discardPendingInput('terminal_gone')
           applySeqState(createAttachSeqState())
           updateContent({ terminalId: undefined, streamId: undefined, status: 'exited' })
           const exitTab = tabRef.current
@@ -4329,7 +4535,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           }
         }
 
-        if (msg.type === 'terminal.input.blocked' && msg.terminalId === tid) {
+        // Ledger A2 / invariant 10b: also match the pane's last-known tid --
+        // recovery paths clear terminalIdRef, and a backstop frame for the
+        // just-dead id must stay visible.
+        if (msg.type === 'terminal.input.blocked' && (msg.terminalId === tid || msg.terminalId === lastKnownTerminalIdRef.current)) {
           const reason = msg.reason as TerminalInputBlockedReason
           log.warn('terminal_input_blocked', {
             tabId,
@@ -4376,6 +4585,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           forgetSentViewport(staleTerminalId)
           lastSentViewportRef.current = null
           terminalIdRef.current = undefined
+          // Kata dtfn: identity change -- buffered keystrokes were typed at a
+          // terminal whose identity is being abandoned. Discard VISIBLY
+          // (design invariant 3).
+          discardPendingInput('terminal_gone')
           deferredAttachStateRef.current = {
             mode: 'none',
             pendingIntent: null,
@@ -4825,6 +5038,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
 
     ensure()
 
+    // Captured in the effect body (not the cleanup) to satisfy
+    // react-hooks/exhaustive-deps; the ref object itself is stable.
+    const pendingBuf = pendingInputRef.current
+
     return () => {
       clearRateLimitRetry()
       // Cancel only the timer: the reserve window and the invalid-terminal
@@ -4839,6 +5056,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
       }
       unsub()
       unsubReconnect()
+      // Kata dtfn: never leak the pending-input timeout across effect
+      // re-fires/unmounts. Silent clear -- the buffer itself survives in the
+      // ref for the next anchor (recovery holds, invariant 3).
+      if (pendingBuf.timer !== null) {
+        clearTimeout(pendingBuf.timer)
+        pendingBuf.timer = null
+      }
       if (hydrationRegisteredRef.current) {
         getHydrationQueue().unregister(paneIdRef.current)
         hydrationRegisteredRef.current = false
@@ -4882,6 +5106,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
     handleTerminalOutput,
     attachTerminal,
     clearQuarantineRepair,
+    discardPendingInput,
+    flushPendingInput,
     getCheckpointDeltaReplayDecision,
     getTerminalCheckpointStreamId,
     isCurrentAttachMessage,
@@ -5012,7 +5238,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         </div>
       )}
       {showBlockingSpinner && (
-        <div className="absolute inset-0 flex items-center justify-center bg-background/80">
+        // pointer-events-none (ledger A14 / invariant 10a): this overlay is
+        // informational -- a mid-recreate click must not blur xterm and kill
+        // onData delivery (loss ABOVE the buffer layer).
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/80">
           <div className="flex flex-col items-center gap-3">
             <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
             <span className="text-sm text-muted-foreground">Starting terminal...</span>

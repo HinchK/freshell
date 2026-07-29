@@ -175,6 +175,9 @@ export default function App() {
   const settings = useAppSelector((s) => s.settings.settings)
   const settingsLoaded = useAppSelector((s) => s.settings.loaded)
   const connectionLastError = useAppSelector((s) => s.connection.lastError)
+  // Kata dtfn: reactive readiness signal for the firewall-command deferral --
+  // the effect below re-runs when the status flips back to 'ready'.
+  const connectionStatus = useAppSelector((s) => s.connection.status)
   const networkStatus = useAppSelector((s) => s.network.status)
   const perfAuditEnabled = typeof window !== 'undefined'
     && new URLSearchParams(window.location.search).has('perfAudit')
@@ -1502,11 +1505,21 @@ export default function App() {
     const terminalId = layout.content.terminalId
     if (!terminalId) return // terminal not ready yet
 
-    // Terminal is running — send the firewall command
+    // Kata dtfn (ledger A7): defer until the transport is actually ready.
+    // WsClient.send can queue this frame un-ready or silently drop it
+    // (intentionalClose early-return; oldest-eviction at the queue cap), and
+    // the self-clear below destroys the only retry state. Leaving
+    // pendingFirewallCommand SET is the deferral: the reactive
+    // connectionStatus dependency re-runs this effect when readiness returns.
+    // `isReady` is a synchronous getter (property read, never a call) -- it
+    // covers the close race where Redux still says 'ready' (invariant 9).
     const ws = getWsClient()
+    if (connectionStatus !== 'ready' || ws.isReady === false) return
+
+    // Terminal is running — send the firewall command
     ws.send({ type: 'terminal.input', terminalId, data: command + '\n' })
     setPendingFirewallCommand(null)
-  }, [pendingFirewallCommand, paneLayouts])
+  }, [pendingFirewallCommand, paneLayouts, connectionStatus])
 
   // Keyboard shortcuts
   useEffect(() => {

@@ -33,6 +33,10 @@ const wsMocks = vi.hoisted(() => ({
   connect: vi.fn().mockResolvedValue(undefined),
   onMessage: vi.fn(),
   onReconnect: vi.fn().mockReturnValue(() => {}),
+  // Controllable synchronous transport-readiness seam, matching the real
+  // WsClient `get isReady()` (ws-client.ts). Defaults true so the suite's
+  // existing send assertions keep their pass-through behavior.
+  isReady: true,
 }))
 
 const terminalThemeMocks = vi.hoisted(() => ({
@@ -57,8 +61,15 @@ vi.mock('@/lib/ws-client', () => ({
     connect: wsMocks.connect,
     onMessage: wsMocks.onMessage,
     onReconnect: wsMocks.onReconnect,
+    get isReady() {
+      return wsMocks.isReady
+    },
   }),
 }))
+
+function setWsIsReady(value: boolean) {
+  wsMocks.isReady = value
+}
 
 vi.mock('@/lib/terminal-themes', () => ({
   getTerminalTheme: terminalThemeMocks.getTerminalTheme,
@@ -317,6 +328,12 @@ function sentMessages() {
   return wsMocks.send.mock.calls.map(([msg]) => msg)
 }
 
+function fireData(term: any, data: string) {
+  const handler = term.onData.mock.calls.at(-1)?.[0]
+  expect(handler, 'xterm onData handler must be registered').toBeTruthy()
+  act(() => handler(data))
+}
+
 describe('TerminalView lifecycle updates', () => {
   let messageHandler: ((msg: any) => void) | null = null
   let reconnectHandler: (() => void) | null = null
@@ -332,6 +349,7 @@ describe('TerminalView lifecycle updates', () => {
     resetPersistFlushListenersForTests()
     latestAttachRequestIdByTerminal.clear()
     latestStreamIdByTerminal.clear()
+    wsMocks.isReady = true
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
       if (
@@ -3149,6 +3167,222 @@ describe('TerminalView lifecycle updates', () => {
 
     const term = terminalInstances[0]
     expectTerminalWriteContaining(term, 'Input not sent: the terminal no longer exists on the server.')
+  })
+
+  it('buffers keystrokes typed while un-anchored and flushes them byte-exact after terminal.created', async () => {
+    // Pane mid-recreate: no terminalId yet (the old silent-drop window).
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: undefined,
+      status: 'creating',
+      mode: 'shell',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+    const term = terminalInstances[0]
+
+    fireData(term, 'echo dtfn-')
+    fireData(term, 'marker')
+    fireData(term, '\r')
+
+    // Nothing sent yet -- buffered, not dropped, not fired at a stale id.
+    expect(sentMessages().filter((m) => m?.type === 'terminal.input')).toEqual([])
+
+    // The pane anchors: terminal.created with this pane's createRequestId.
+    const createMsg = sentMessages().find((m) => m?.type === 'terminal.create')
+    expect(createMsg).toBeTruthy()
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: createMsg.requestId,
+        terminalId: 'term-new',
+      })
+    })
+
+    const inputs = sentMessages().filter(
+      (m) => m?.type === 'terminal.input' && m.terminalId === 'term-new',
+    )
+    expect(inputs.map((m) => m.data)).toEqual(['echo dtfn-', 'marker', '\r'])
+  })
+
+  it('surfaces a visible notice when the pending-input buffer overflows', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: undefined,
+      status: 'creating',
+      mode: 'shell',
+    })
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+    const term = terminalInstances[0]
+
+    for (let i = 0; i < 257; i++) fireData(term, 'x') // cap is 256 chunks
+
+    expectTerminalWriteContaining(term, 'too much was typed while the terminal was reconnecting')
+    expect(sentMessages().filter((m) => m?.type === 'terminal.input')).toEqual([])
+  })
+
+  it('surfaces a visible notice when buffered input times out un-anchored', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: undefined,
+      status: 'creating',
+      mode: 'shell',
+    })
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+    const term = terminalInstances[0]
+
+    vi.useFakeTimers()
+    try {
+      fireData(term, 'doomed keystrokes')
+      act(() => {
+        vi.advanceTimersByTime(30_001)
+      })
+      expectTerminalWriteContaining(term, 'the terminal did not reconnect in time')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('discards buffered input with a visible notice when the terminal exits', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-exiting',
+      status: 'running',
+      mode: 'shell',
+    })
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+    const term = terminalInstances[0]
+
+    // Force the send gate to BUFFER while terminalIdRef is STILL SET: drop
+    // the mock's synchronous `isReady` (the same controllable seam the
+    // close-race test below adds to the suite's ws mock). Buffering before
+    // the exit is what makes the exit-discard path observable -- an exit
+    // sent first would clear the tid and a later duplicate exit is swallowed
+    // by the handler's `msg.terminalId === tid` gate.
+    setWsIsReady(false)
+    fireData(term, 'typed at a corpse')
+    // RED pre-fix on THIS assertion too: pre-fix sendInput sends whenever
+    // tid is set, so a terminal.input frame appears here before the fix.
+    expect(sentMessages().filter((m) => m?.type === 'terminal.input')).toEqual([])
+
+    // terminal.exit for the still-set tid passes the handler's
+    // `msg.terminalId === tid` gate and hits the discard site:
+    // discardPendingInput('terminal_gone') drops the buffer and
+    // writes the visible notice (design invariant 3).
+    act(() => {
+      messageHandler!({ type: 'terminal.exit', terminalId: 'term-exiting', exitCode: 0 })
+    })
+    expectTerminalWriteContaining(term, 'Input not sent')
+    expect(sentMessages().filter((m) => m?.type === 'terminal.input')).toEqual([])
+  })
+
+  it('buffers keystrokes when the socket is already closed but the status ref still says ready (close race)', async () => {
+    // Ledger A8: onclose flips WsClient._state synchronously; Redux/refs lag a
+    // task. A keystroke in that gap must BUFFER, not enter ws-client's
+    // pendingMessages (where the Task 6 filter would silently discard it).
+    // Seam: the suite's ws mock exposes a controllable synchronous
+    // `isReady` (defaulting true, matching ws-client.ts `get isReady()`).
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-live',
+      status: 'running',
+      mode: 'shell',
+    })
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+    const term = terminalInstances[0]
+
+    // Socket dead (the race window). Construction makes the isReady arm the
+    // ONLY arm that can buffer here: terminalIdRef is set (so `!tid` is cold)
+    // and the store's preloaded status is STATIC -- it never transitions, so
+    // the sync effect never latches awaitingAnchorRef. Delete the
+    // `ws.isReady === false` arm from the gate and this test fails (the frame
+    // is sent). That is the pin for design invariant 9 / ledger A8.
+    setWsIsReady(false)
+
+    fireData(term, 'echo raced\r')
+    expect(sentMessages().filter((m) => m?.type === 'terminal.input')).toEqual([])
+  })
+
+  it('re-writes the loss notice after the pane re-anchors (term.clear survival)', async () => {
+    // Ledger A15: the anchor's term.clear()/re-hydrate wipes notices written
+    // while un-anchored; the deferred re-write must land AFTER the anchor.
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: undefined,
+      status: 'creating',
+      mode: 'shell',
+    })
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+    const term = terminalInstances[0]
+
+    vi.useFakeTimers()
+    try {
+      fireData(term, 'doomed')
+      act(() => {
+        vi.advanceTimersByTime(30_001) // timeout -> immediate notice write
+      })
+      const writesBeforeAnchor = term.write.mock.calls.length
+
+      const createMsg = sentMessages().find((m) => m?.type === 'terminal.create')
+      act(() => {
+        messageHandler!({
+          type: 'terminal.created',
+          requestId: createMsg.requestId,
+          terminalId: 'term-new',
+        })
+      })
+      // The notice is written AGAIN after the anchor (post-clear), so it
+      // survives the hydrate wipe.
+      const noticeWritesAfterAnchor = term.write.mock.calls
+        .slice(writesBeforeAnchor)
+        .filter((c: any[]) => String(c[0]).includes('did not reconnect in time'))
+      expect(noticeWritesAfterAnchor.length).toBeGreaterThan(0)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('mirrors canonical durable identity to pane and tab on terminal.session.associated', async () => {
