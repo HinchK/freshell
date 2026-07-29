@@ -215,14 +215,11 @@ Run:
 ```bash
 npm run test:vitest -- run test/unit/server/deploy-tab-diff-coverage-gate.test.ts --config config/vitest/vitest.server.config.ts
 ```
-Expected: `2 passed`. If either fails, the fixture shape is wrong — fix the fixture (compare against the artifact shape in `scripts/deploy-tab-diff.sh` lines 107–114), do NOT touch the script in this task.
+Expected: `2 passed`. (First invocation also runs the server config's `globalSetup` — `test/setup/server-global-setup.ts` builds the server entry — so allow extra time on the first run.) If either test fails, the fixture shape is wrong — fix the fixture (compare against the artifact shape in `scripts/deploy-tab-diff.sh` lines 107–114), do NOT touch the script in this task.
 
-- [ ] **Step 3: Typecheck the new test file**
+Note (verified during plan validation): NO tsconfig in this repo includes `test/**`, so `npm run typecheck` cannot see this file — there is no typecheck step for it. Vitest's esbuild transpile in Step 2 is the only type gate that applies to test files; a type error would fail the run there.
 
-Run: `npm run typecheck`
-Expected: clean exit (no new errors).
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
 git add test/unit/server/deploy-tab-diff-coverage-gate.test.ts
@@ -322,7 +319,7 @@ git commit -m "refactor(deploy-tab-diff): extract shared uncovered_terminals cov
 **Interfaces:**
 - Consumes: `uncovered_terminals FILE` from Task 2; test helpers `runScript`/`term`/`pane`/`openRecord` from Task 1.
 - Produces:
-  - bash function `report_uncovered STATE_FILE SEVERITY UNCOVERED_IDS` — prints to stderr a `${SEVERITY}: ${n} running terminal(s) at capture are covered by NO persisted snapshot pane (tabs-sync persistence/coverage gap):` header followed by one `  - <terminalId> (mode=<m>, cwd=<c>, title=<t>)` line per id (enriched from `STATE_FILE`'s `.terminals[]`; missing fields print `?`; on any enrichment failure falls back to bare `  - <id>` lines). `SEVERITY` is the literal word `FAIL` or `WARNING`. `UNCOVERED_IDS` is the newline-separated output of `uncovered_terminals`.
+  - bash function `report_uncovered STATE_FILE SEVERITY UNCOVERED_IDS` — prints to stderr a `${SEVERITY}: ${n} running terminal(s) at capture are covered by NO persisted snapshot pane (tabs-sync persistence/coverage gap):` header followed by one `  - <terminalId> (mode=<m>, cwd=<c>, title=<t>, session=<provider|none>)` line per id (enriched from `STATE_FILE`'s `.terminals[]`; missing fields print `?`; `session=` shows `.sessionRef.provider` when the entry carries a session identity at capture time — presence-tested, never string-matched, since `sessionRef` is an object `{provider, sessionId}` that is OMITTED for plain shells — else `none`; on any enrichment failure falls back to bare `  - <id>` lines). `SEVERITY` is the literal word `FAIL` or `WARNING`. `UNCOVERED_IDS` is the newline-separated output of `uncovered_terminals`. Rationale (verified against server source during plan validation): losing coverage loses the PANE (PTY, scrollback, placement) for every uncovered terminal, but session-bearing terminals (claude/opencode/codex with `sessionRef`) can have their *session* manually recovered post-restart via the recovery inventory, while `session=none` terminals are lost outright — the report must not overstate the loss.
   - global `ALLOW_UNCOVERED` (bash `true`/`false` string, default `false`), set by the `--allow-uncovered` flag (no argument).
   - Exit code `4` from `capture` when uncovered terminals exist and `--allow-uncovered` was not passed. Task 4 documents both.
   - Test helper `makeRoutedCurl(tmp, fixtures)` and fixture constants `INDEX`, `DEVICE(records)` (code below) — Task 4 does not need them, but they live in this file.
@@ -388,12 +385,21 @@ const DEVICE = (records: unknown[]) => ({
 })
 
 describe('deploy-tab-diff capture coverage gate', () => {
-  it('halts with exit 4 on uncovered running terminals, still writes the artifact, and lists them enriched with mode/cwd/title', async () => {
+  it('halts with exit 4 on uncovered running terminals, still writes the artifact, and lists them enriched with mode/cwd/title/session', async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-gate-'))
     try {
       const terminals = [
         term('term-covered', 'running', { mode: 'shell', title: 'Covered', cwd: '/tmp' }),
-        term('term-orphan', 'running', { mode: 'claude', title: 'Orphan work', cwd: '/home/dan/proj' }),
+        // sessionRef present -> the report must classify it session=claude
+        // (session identity survives a restart via manual recovery even though
+        // the pane/PTY is lost). /api/terminals emits sessionRef as an OBJECT
+        // {provider, sessionId}, omitted entirely for plain shells.
+        term('term-orphan', 'running', {
+          mode: 'claude',
+          title: 'Orphan work',
+          cwd: '/home/dan/proj',
+          sessionRef: { provider: 'claude', sessionId: 's-orphan' },
+        }),
       ]
       const { binDir, env } = await makeRoutedCurl(tmp, {
         index: INDEX,
@@ -411,8 +417,9 @@ describe('deploy-tab-diff capture coverage gate', () => {
       expect(r.out).toContain(
         'FAIL: 1 running terminal(s) at capture are covered by NO persisted snapshot pane (tabs-sync persistence/coverage gap):',
       )
-      // Enriched list: id + mode/cwd/title pulled from the artifact's own .terminals[].
-      expect(r.out).toContain('  - term-orphan (mode=claude, cwd=/home/dan/proj, title=Orphan work)')
+      // Enriched list: id + mode/cwd/title/session pulled from the artifact's
+      // own .terminals[] (session=<provider> because sessionRef is present).
+      expect(r.out).toContain('  - term-orphan (mode=claude, cwd=/home/dan/proj, title=Orphan work, session=claude)')
       expect(r.out).not.toMatch(/- term-covered/)
       // The artifact WAS written (needed for diagnosis) and messaging says so.
       expect(r.out).toMatch(/WAS written to/)
@@ -456,6 +463,8 @@ describe('deploy-tab-diff capture coverage gate', () => {
     try {
       const terminals = [
         term('term-covered', 'running', { mode: 'shell', title: 'Covered', cwd: '/tmp' }),
+        // Deliberately NO sessionRef here: this test exercises the other
+        // classifier branch (session=none = unrecoverable outright).
         term('term-orphan', 'running', { mode: 'claude', title: 'Orphan work', cwd: '/home/dan/proj' }),
       ]
       const { binDir, env } = await makeRoutedCurl(tmp, {
@@ -472,7 +481,7 @@ describe('deploy-tab-diff capture coverage gate', () => {
       expect(r.out).toContain(
         'WARNING: 1 running terminal(s) at capture are covered by NO persisted snapshot pane (tabs-sync persistence/coverage gap):',
       )
-      expect(r.out).toContain('  - term-orphan (mode=claude, cwd=/home/dan/proj, title=Orphan work)')
+      expect(r.out).toContain('  - term-orphan (mode=claude, cwd=/home/dan/proj, title=Orphan work, session=none)')
       expect(r.out).not.toContain('FAIL')
       const artifact = JSON.parse(await fs.readFile(out, 'utf8'))
       expect(artifact.terminals).toHaveLength(2)
@@ -515,11 +524,18 @@ URL="" TOKEN="${FRESHELL_TOKEN:-}" OUT="" BEFORE="" AFTER_IN="" ALLOW_UNCOVERED=
 report_uncovered() {
   # Uncovered-terminal report to stderr for the CAPTURE gate: a severity
   # header ($2: FAIL or WARNING) with the count, then one
-  #   - <terminalId> (mode=..., cwd=..., title=...)
+  #   - <terminalId> (mode=..., cwd=..., title=..., session=...)
   # line per id in $3 (newline-separated), enriched from the capture file
   # $1's own .terminals[] -- the data is already in the artifact, no extra
-  # fetch, and the script stays GET-only. Enrichment is best-effort: on any
-  # failure fall back to bare ids rather than mask the coverage report.
+  # fetch, and the script stays GET-only. session= is the recoverability
+  # split: .sessionRef is an OBJECT {provider, sessionId} the server emits
+  # only for terminals with a session identity at capture time (omitted for
+  # plain shells), so test PRESENCE, never string-match it. session=none
+  # means the terminal is unrecoverable outright; a provider name means the
+  # session (not the pane/PTY/scrollback) can be manually recovered
+  # post-restart via recover-my-panes / provider resume.
+  # Enrichment is best-effort: on any failure fall back to bare ids rather
+  # than mask the coverage report.
   # Ids travel via temp file + --slurpfile, never --argjson (ARG_MAX).
   local state_file="$1" severity="$2" uncovered="$3"
   local n ids_tmp=""
@@ -530,7 +546,7 @@ report_uncovered() {
      && jq -r --slurpfile ids "$ids_tmp" '
           (.terminals | map({key: .terminalId, value: .}) | from_entries) as $byId
           | $ids[0][] | . as $t | ($byId[$t] // {}) as $info
-          | "  - \($t) (mode=\($info.mode // "?"), cwd=\($info.cwd // "?"), title=\($info.title // "?"))"' \
+          | "  - \($t) (mode=\($info.mode // "?"), cwd=\($info.cwd // "?"), title=\($info.title // "?"), session=\(if ($info.sessionRef // null) != null then ($info.sessionRef.provider // "yes") else "none" end))"' \
           "$state_file" >&2; then
     :
   else
@@ -545,22 +561,26 @@ report_uncovered() {
 ```bash
     # COVERAGE GATE (:2559, pre-restart edition): the same guard verify runs,
     # moved to BEFORE the restart. If any running terminal is covered by no
-    # persisted open-tab pane, restoring from this capture would permanently
-    # lose it (the PTY dies with the server) -- discovering that in verify,
-    # AFTER the restart, is too late (2026-07-29 incident: 9 of 28 running
-    # terminals uncovered and killed). The artifact is ALWAYS published first
-    # (diagnosis needs it); the gate only decides messaging and exit status:
-    # 4 = coverage gap (distinct from 1 = capture unusable), or a WARNING +
-    # exit 0 under --allow-uncovered (the operator's informed-consent path).
+    # persisted open-tab pane, restoring from this capture permanently loses
+    # its PANE -- PTY, scrollback, pane placement die with the server; a
+    # terminal WITH a session identity (session=<provider> in the report) can
+    # have its session manually recovered afterwards via recover-my-panes,
+    # session=none terminals are lost outright. Discovering the gap in
+    # verify, AFTER the restart, is too late (2026-07-29 incident: 9 of 28
+    # running terminals uncovered and killed). The artifact is ALWAYS
+    # published first (diagnosis needs it); the gate only decides messaging
+    # and exit status: 4 = coverage gap (distinct from 1 = capture unusable),
+    # or a WARNING + exit 0 under --allow-uncovered (the operator's
+    # informed-consent path).
     if ! uncovered=$(uncovered_terminals "$OUT"); then
       echo "ERROR: computing capture coverage gate failed" >&2; exit 1; fi
     if [[ -n "$uncovered" ]]; then
       if $ALLOW_UNCOVERED; then
         report_uncovered "$OUT" "WARNING" "$uncovered"
-        echo "WARNING: proceeding despite the coverage gap (--allow-uncovered): a restart now will permanently kill the terminals listed above." >&2
+        echo "WARNING: proceeding despite the coverage gap (--allow-uncovered): a restart now permanently kills the panes listed above (session=none entries are unrecoverable; session-bearing ones only via manual recovery)." >&2
       else
         report_uncovered "$OUT" "FAIL" "$uncovered"
-        echo "FAIL: the capture artifact WAS written to ${OUT} (keep it for diagnosis), but a restart/restore from this state would permanently lose the terminals listed above." >&2
+        echo "FAIL: the capture artifact WAS written to ${OUT} (keep it for diagnosis), but a restart/restore from this state permanently loses the panes listed above (PTY, scrollback, placement); session=none terminals are lost outright, session-bearing ones survive only as manually recoverable sessions." >&2
         echo "Fix tabs-sync coverage (open the affected tabs in a connected client) and re-capture, or re-run with --allow-uncovered to accept the loss." >&2
         exit 4
       fi
@@ -640,15 +660,18 @@ Expected: 5 pass, the new help test **FAILS** (`--allow-uncovered` not found in 
 #
 # capture GATES on coverage (docs/plans/2026-07-29-capture-coverage-gate.md):
 # if any running terminal is covered by NO persisted open-tab snapshot pane,
-# a restart would permanently kill it, so capture prints the uncovered list
-# (with mode/cwd/title), still writes the artifact for diagnosis, and exits 4.
-# Pass --allow-uncovered to accept the loss: same list as a WARNING, exit 0.
+# a restart permanently kills its pane (PTY, scrollback, placement --
+# session=none terminals are lost outright; session-bearing ones survive only
+# as manually recoverable sessions), so capture prints the uncovered list
+# (with mode/cwd/title/session), still writes the artifact for diagnosis, and
+# exits 4. Pass --allow-uncovered to accept the loss: same list as a WARNING,
+# exit 0.
 # verify re-runs the same guard on the before-file (defense in depth against
 # artifacts from older script versions or --allow-uncovered captures).
 #
 # Exit codes: 0 ok; 1 operational failure or post-restart divergence;
 # 2 usage; 4 capture coverage gap (artifact written, but restoring from it
-# would lose running terminals).
+# would lose running terminal panes).
 #
 # READ-ONLY against the server (GETs only). Exit non-zero on any divergence.
 # NEVER point this at a server you do not operate. Requires curl + jq.
