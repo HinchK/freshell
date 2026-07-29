@@ -2334,13 +2334,13 @@ export function resetStreamDeckManagerForTests(): void
 Manager behavior:
 - `installStreamDeckManager`: idempotent singleton (module-level state + reset-for-tests, per the `useEnsureExtensionsRegistry` pattern). If `!isWebHidSupported()` → `setDeckStatus({ status: 'unsupported' })` and do nothing else. Subscribes to the store watching `state.settings.settings.streamDeck.enabled`:
   - **On install, evaluate the current value first — do not wait for a transition.** Local settings hydrate synchronously from localStorage at store creation (`src/store/settingsSlice.ts:67-83` `loadInitialLocalSettings`), so for a returning user `enabled` is already `true` before `useStreamDeck()` installs the manager and no enabled-transition will ever be observed. Seed the subscription's change detector with `prev = false` (NOT the current store value) so an already-true `enabled` runs the exact same enable path below immediately at install time. This is the feature's headline persistence behavior — reload the page → silent `getDevices()` auto-reconnect — promised by Task 16's README copy ("auto-reconnects afterwards") and the Memory-Saver checkpoint; it is pinned by the "already enabled at install" test in Step 1.
-  - enabled turning true → **Web Locks leader election wraps the enable lifecycle**: call `navigator.locks.request('freshell-stream-deck', { mode: 'exclusive' }, () => leaderGate)` where `leaderGate` is a deferred promise the manager resolves on disable/uninstall — the lock is held for the manager's enabled lifetime. Until the lock callback runs (another freshell window is the leader) → `setDeckStatus({ status: 'in-use' })` (this is the same-origin "in use elsewhere / another window" case). When the callback runs, this window is the leader — including leadership handoff: when the previous leader closes or disables, the lock releases and this waiting window acquires it, then connects. As leader: `setDeckStatus({status:'connecting'})`; `getGranted()`; device → adopt; `null` → `'disconnected'` (waiting for the user to press Connect); `DeckOpenError('in-use')` → `'in-use'` + arm retry (secondary signal: an OS app holds the device exclusively, e.g. an exclusive-mode holder on Windows — concurrent opens generally SUCCEED, see the locked exclusivity decision). If `navigator.locks` is missing (old browser / jsdom), skip the election and proceed as leader.
-  - enabled turning false → resolve `leaderGate` (releases the Web Lock so a waiting window can take over), tear down controller (`controller.stop()`, `device.close()`), `'disconnected'`.
+  - enabled turning true → **Web Locks leader election wraps the enable lifecycle**: create a fresh `AbortController` for this enable cycle (`cycleAbort`) and call `navigator.locks.request('freshell-stream-deck', { mode: 'exclusive', signal: cycleAbort.signal }, () => { ... leaderGate })` where `leaderGate` is a deferred promise the manager resolves on disable/uninstall — the lock is held for the manager's enabled lifetime. The `signal` is essential: it is the ONLY way to withdraw a `locks.request` that is still queued behind another window's lock (without it, a disabled window would later seize the lock on handoff and connect with its toggle off). Catch and swallow the `AbortError` the aborted request rejects with. Until the lock callback runs (another freshell window is the leader) → `setDeckStatus({ status: 'in-use' })` (this is the same-origin "in use elsewhere / another window" case). When the callback runs, this window is the leader — including leadership handoff: when the previous leader closes or disables, the lock releases and this waiting window acquires it. **First thing inside the lock callback, re-check `store.getState().settings.settings.streamDeck.enabled` and that the manager is still installed with the same enable cycle (`cycleAbort.signal.aborted === false`); if not, return immediately (releasing the lock) without touching state or the device** — belt-and-suspenders for any path where the abort loses the race with the grant. Otherwise connect as leader: `setDeckStatus({status:'connecting'})`; `getGranted()`; device → adopt; `null` → `'disconnected'` (waiting for the user to press Connect); `DeckOpenError('in-use')` → `'in-use'` + arm retry (secondary signal: an OS app holds the device exclusively, e.g. an exclusive-mode holder on Windows — concurrent opens generally SUCCEED, see the locked exclusivity decision). If `navigator.locks` is missing (old browser / jsdom), skip the election and proceed as leader.
+  - enabled turning false → `cycleAbort.abort()` (withdraws a still-queued `locks.request` so this window never becomes leader after the user turned it off — the disable-while-waiting case — and prevents a later re-enable from double-queuing; a fresh enable cycle creates a fresh controller), resolve `leaderGate` (releases the Web Lock, if held, so a waiting window can take over), tear down controller (`controller.stop()`, `device.close()`), `'disconnected'`. Pinned by the "disable while waiting" test in Step 1.
 - Adopt(device): create `DeckController` with `settings: () => store.getState().settings.settings.streamDeck`, `start()`, `setDeckStatus({ status: 'connected', model: caps.model, keyCount: caps.keyCount })`; `device.onDisconnect(...)` → teardown → `'disconnected'` (hotplug replug then reconnects via the HID `connect` event below). Note: `device.onDisconnect` is driven by the transport's `navigator.hid` `'disconnect'` listener + write-rejection fallback — the lib's `'error'` event never fires and nothing may depend on it.
 - Hotplug: `navigator.hid.addEventListener('connect', ...)` → if enabled, leader, and not connected, try `getGranted()` again.
 - In-use retry: `window` listeners on `focus` and `visibilitychange` (when visible) → if status `in-use`, enabled, **and this window holds the leader lock**, retry `getGranted()` (covers the OS-app case; the non-leader case resolves itself via lock handoff, not retry).
 - `requestDeckConnect()`: `request()` (user gesture); adopt on success; `null` (picker cancel — or Electron's handler-less `requestDevice()`, which always resolves `[]`) → keep prior status, clean no-op; `in-use` → `'in-use'`. Only meaningful for the leader; a non-leader window keeps status `'in-use'`.
-- The uninstall function removes all listeners and tears down (used by tests and HMR safety).
+- The uninstall function removes all listeners, calls `cycleAbort.abort()` (so a queued lock request from a torn-down manager can never fire its callback later — HMR safety), resolves `leaderGate`, and tears down (used by tests and HMR safety).
 - `useStreamDeck()`: `useEffect(() => installStreamDeckManager(storeFromUseAppStore), [])` — one-liner hook using `useAppStore()`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -2383,20 +2383,34 @@ function stubHid() {
 }
 
 // jsdom has no navigator.locks either: a minimal exclusive-lock stub with FIFO
-// handoff, for the leader-election tests. The manager treats a missing
-// navigator.locks as "immediately leader", so the other tests need no stub.
+// handoff and AbortSignal support (per the Web Locks spec, aborting the signal
+// of a still-queued request withdraws it and rejects with AbortError), for the
+// leader-election tests. The manager treats a missing navigator.locks as
+// "immediately leader", so the other tests need no stub.
 function stubLocks() {
   let busy = false
-  const waiters: Array<() => void> = []
+  const waiters: Array<{ grant: () => void }> = []
   const locks = {
-    async request(name: string, _opts: unknown, cb: (lock: unknown) => unknown) {
-      if (busy) await new Promise<void>((r) => waiters.push(r))
+    async request(name: string, opts: { mode?: string; signal?: AbortSignal }, cb: (lock: unknown) => unknown) {
+      const signal = opts?.signal
+      if (signal?.aborted) throw new DOMException('aborted', 'AbortError')
+      if (busy) {
+        await new Promise<void>((resolve, reject) => {
+          const entry = { grant: resolve }
+          waiters.push(entry)
+          signal?.addEventListener('abort', () => {
+            const i = waiters.indexOf(entry)
+            if (i >= 0) waiters.splice(i, 1) // withdrawn: handoff skips this waiter
+            reject(new DOMException('aborted', 'AbortError'))
+          })
+        })
+      }
       busy = true
       try {
         return await cb({ name })
       } finally {
         busy = false
-        waiters.shift()?.()
+        waiters.shift()?.grant()
       }
     },
   }
@@ -2483,6 +2497,27 @@ it('non-leader window shows in-use while another window holds the leader lock, c
   await vi.waitFor(() => expect(store.getState().deck.status).toBe('in-use'))
   releaseOther() // leader closes/disables -> lock handoff
   await vi.waitFor(() => expect(store.getState().deck.status).toBe('connected'))
+})
+
+it('disable while waiting for the leader lock withdraws the request; later handoff must NOT connect', async () => {
+  // The disable-while-waiting case: without the AbortSignal the queued request
+  // would fire on handoff and connect with the toggle OFF. A pending
+  // locks.request can only be withdrawn via its signal - resolving leaderGate
+  // does not dequeue it.
+  const locks = stubLocks()
+  let releaseOther: () => void = () => {}
+  void locks.request('freshell-stream-deck', { mode: 'exclusive' }, () => new Promise<void>((r) => { releaseOther = r }))
+  const store = makeStore()
+  const getGranted = vi.fn(async () => new FakeDeckDevice())
+  uninstall = installStreamDeckManager(store as never, { request: vi.fn(), getGranted })
+  store.dispatch(updateSettingsLocal({ streamDeck: { enabled: true } }))
+  await vi.waitFor(() => expect(store.getState().deck.status).toBe('in-use'))
+  store.dispatch(updateSettingsLocal({ streamDeck: { enabled: false } })) // aborts the queued request
+  await vi.waitFor(() => expect(store.getState().deck.status).toBe('disconnected'))
+  releaseOther() // previous leader hands off; the withdrawn request must not run
+  await new Promise((r) => setTimeout(r, 25))
+  expect(store.getState().deck.status).toBe('disconnected')
+  expect(getGranted).not.toHaveBeenCalled()
 })
 
 it('requestDeckConnect adopts the picked device; picker cancel (or Electron []) keeps prior status', async () => {
