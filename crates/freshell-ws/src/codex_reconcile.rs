@@ -57,8 +57,15 @@ impl RolloutTailer {
 
     /// Read bytes appended since the last read and return the COMPLETE lines
     /// among them; an unterminated trailing fragment is buffered for the next
-    /// read. IO errors and a shrunk file yield an empty batch (fail quiet;
-    /// the deadman covers a wedged lane).
+    /// read. IO errors and a shrunk file yield an empty batch -- fail quiet;
+    /// the codex busy-deadman (kata namg) retries the read every
+    /// BUSY_DEADMAN_MS while the terminal stays busy, so a transient IO
+    /// error costs at most one window. DEFERRED (adjudicated, kata namg /
+    /// docs/plans/2026-07-29-codex-lane-self-healing.md D2): a
+    /// TailerReadOutcome-style loud degrade signal + LaneRetry-equivalent
+    /// bounded re-attach (amplifier parity) -- a permanently unreadable
+    /// rollout currently retries quietly on the deadman cadence instead of
+    /// degrading loudly.
     pub(crate) fn read_new_lines(&mut self) -> Vec<String> {
         let Ok(mut file) = std::fs::File::open(&self.path) else {
             return Vec::new();

@@ -353,7 +353,7 @@ impl ActivityHub {
         let frames = {
             let mut inner = self.inner.lock().expect("activity hub lock");
             let bind = inner.codex.bind_session(terminal_id, session_id);
-            let frames = codex_frames(&mut inner.idle, bind);
+            let (frames, _force_reads) = codex_frames(&mut inner.idle, bind);
             // Re-attach REPLACES the lane: a mid-session fork moves the pane to a
             // NEW rollout file; keeping the old tailer would keep busy/turn
             // signals keyed to the abandoned parent file (stale-tailer defect,
@@ -390,7 +390,8 @@ impl ActivityHub {
             }
             let now = crate::terminal::now_ms();
             let effects = inner.codex.reconcile_rollout(terminal_id, &events, now);
-            codex_frames(&mut inner.idle, effects)
+            let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+            frames
         };
         self.emit(frames);
     }
@@ -476,7 +477,8 @@ impl ActivityHub {
                 let frames = {
                     let mut inner = self.inner.lock().expect("activity hub lock");
                     let effects = inner.codex.bind_session(&terminal_id, &session_id);
-                    codex_frames(&mut inner.idle, effects)
+                    let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                    frames
                 };
                 self.emit(frames);
             }
@@ -521,7 +523,8 @@ impl ActivityHub {
                                 resume_session_id.as_deref(),
                                 at,
                             );
-                            frames.extend(codex_frames(&mut inner.idle, effects));
+                            let (mut f, _force_reads) = codex_frames(&mut inner.idle, effects);
+                            frames.append(&mut f);
                         }
                         "amplifier" => {
                             inner.modes.insert(terminal_id.clone(), mode.clone());
@@ -612,7 +615,8 @@ impl ActivityHub {
                         }
                         "codex" => {
                             let effects = inner.codex.note_input(&terminal_id, &data, at);
-                            codex_frames(&mut inner.idle, effects)
+                            let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                            frames
                         }
                         "amplifier" => {
                             let effects = inner.amplifier.note_input(&terminal_id, &data, at);
@@ -641,7 +645,8 @@ impl ActivityHub {
                         }
                         "codex" => {
                             let effects = inner.codex.note_output(&terminal_id, &data, at);
-                            codex_frames(&mut inner.idle, effects)
+                            let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                            frames
                         }
                         "amplifier" => {
                             inner.amplifier.note_output(&terminal_id, at);
@@ -669,7 +674,8 @@ impl ActivityHub {
                         }
                         "codex" => {
                             let effects = inner.codex.note_exit(&terminal_id);
-                            codex_frames(&mut inner.idle, effects)
+                            let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                            frames
                         }
                         "amplifier" => {
                             let effects = inner.amplifier.note_exit(&terminal_id);
@@ -952,16 +958,17 @@ impl ActivityHub {
     }
 
     /// The one-shot deadline fired: run every tracker's expiry + the idle
-    /// gate, then service any amplifier force-read requests.
+    /// gate, then service any codex + amplifier force-read requests.
     fn expire_due(&self) {
         let now = now_ms();
-        let (frames, force_reads, reattaches) = {
+        let (frames, codex_force_reads, force_reads, reattaches) = {
             let mut inner = self.inner.lock().expect("activity hub lock");
             let mut frames = Vec::new();
             let claude = inner.claude.expire(now);
             frames.extend(claude_frames(&mut inner.idle, claude));
             let codex = inner.codex.expire(now);
-            frames.extend(codex_frames(&mut inner.idle, codex));
+            let (mut f, codex_force_reads) = codex_frames(&mut inner.idle, codex);
+            frames.append(&mut f);
             let amplifier = inner.amplifier.expire(now);
             let (mut f, force_reads) = amplifier_frames(&mut inner.idle, amplifier);
             frames.append(&mut f);
@@ -985,9 +992,16 @@ impl ActivityHub {
                     ));
                 }
             }
-            (frames, force_reads, reattaches)
+            (frames, codex_force_reads, force_reads, reattaches)
         };
         self.emit(frames);
+        // KATA namg: service codex deadman force-reads -- the self-healing
+        // floor for a missed rollout fs event. drain_codex_lane no-ops when
+        // the lane is gone (get_mut miss), which is correct: exit tears the
+        // tracker down with the lane, and a re-attach replaces both.
+        for terminal_id in codex_force_reads {
+            self.drain_codex_lane(&terminal_id);
+        }
         for terminal_id in force_reads {
             self.drain_lane(&terminal_id);
         }
@@ -1112,11 +1126,14 @@ fn claude_frames(
     frames
 }
 
+/// Codex effects additionally surface force-read requests (the lane drains
+/// them after the lock is released -- expire_due only; kata namg).
 fn codex_frames(
     idle: &mut IdleGate,
     effects: Vec<TrackerEffect<CodexActivityRecord>>,
-) -> Vec<ServerMessage> {
+) -> (Vec<ServerMessage>, Vec<String>) {
     let mut frames = Vec::new();
+    let mut force_reads = Vec::new();
     for effect in effects {
         match effect {
             TrackerEffect::Changed { upsert, remove } => {
@@ -1154,10 +1171,10 @@ fn codex_frames(
                     completion_seq,
                 ));
             }
-            TrackerEffect::ForceRead { .. } => {}
+            TrackerEffect::ForceRead { terminal_id, .. } => force_reads.push(terminal_id),
         }
     }
-    frames
+    (frames, force_reads)
 }
 
 /// Amplifier effects additionally surface force-read requests (the lane
@@ -2516,6 +2533,119 @@ mod tests {
         .expect("turn complete from the reconcile lane");
         assert_eq!(complete["sessionId"], "sess-1");
         assert_eq!(complete["provider"], "codex");
+    }
+
+    /// KATA namg: a missed inotify event must not silence
+    /// terminal.turn.complete forever. Deterministic simulation of the miss:
+    /// unwatch the lane's inotify watch BEFORE the task_complete append (the
+    /// append then emits no fs event -- exactly the shape of a kernel queue
+    /// overflow dropping the last append of a turn), and assert the
+    /// busy-deadman force-read (shrunk to test scale) still delivers the
+    /// completion -- exactly once, with exactly one idle chime after it
+    /// (idle-gate interaction pin: a ForceRead-triggered late completion
+    /// must not double-chime and must carry the correct idle reason).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_missed_fs_event_self_heals_via_deadman_force_read() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial upsert");
+
+        // Rollout shows an unresolved turn: the lane seeds busy on attach.
+        let (_guard, rollout) =
+            codex_rollout_fixture(&[codex_event_line("task_started", now - 5_000)]);
+        hub.attach_codex_rollout("t1", "sess-1", &rollout);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("seeded busy upsert");
+
+        // Simulate the missed event + shrink the deadman to test scale.
+        {
+            use notify::Watcher;
+            let mut inner = hub.inner.lock().unwrap();
+            inner.codex.set_busy_deadman_ms(500);
+            let lane = inner.codex_lanes.get_mut("t1").expect("lane installed");
+            lane._watcher.unwatch(&rollout).expect("unwatch");
+        }
+
+        // The turn completes on disk -- but with the watch dropped, NO
+        // CodexFsChange will ever arrive for this append.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .expect("append");
+            writeln!(f, "{}", codex_event_line("task_complete", now + 1_000)).expect("write");
+        }
+
+        // Barrier: the hub loop recomputes its one-shot deadline only when
+        // it processes an event, and it is currently parked on the deadline
+        // computed BEFORE the shrink. Any event re-arms it.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t2".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: crate::terminal::now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t2"
+        })
+        .await
+        .expect("barrier upsert for t2");
+
+        // RED today: without the expire_due force-read drain this NEVER
+        // arrives (the missed append is re-read by nothing).
+        let complete = next_frame_matching(&mut rx, "terminal.turn.complete", 10_000, |v| {
+            v["terminalId"] == "t1"
+        })
+        .await
+        .expect("turn complete delivered by the deadman force-read");
+        assert_eq!(complete["provider"], "codex");
+        assert_eq!(complete["sessionId"], "sess-1");
+
+        // Exactly one chime.
+        assert!(
+            next_frame_matching(&mut rx, "terminal.turn.complete", 1_000, |v| {
+                v["terminalId"] == "t1"
+            })
+            .await
+            .is_none(),
+            "the self-healed completion must not double-chime"
+        );
+
+        // Idle-gate interaction: one idle, correct reason (no queued
+        // submits in this flow -> grace).
+        let idle =
+            next_frame_matching(&mut rx, "terminal.idle", 5_000, |v| v["terminalId"] == "t1")
+                .await
+                .expect("terminal.idle after the self-healed completion");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_matching(&mut rx, "terminal.idle", 1_000, |v| {
+                v["terminalId"] == "t1"
+            })
+            .await
+            .is_none(),
+            "exactly one idle emission"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
