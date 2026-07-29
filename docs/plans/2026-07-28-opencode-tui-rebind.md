@@ -483,6 +483,11 @@ mod tests {
 }
 ```
 
+> **Historical note (2026-07-29, rebind-review-polish):** this pinned
+> expectation was superseded — `plugin_file_spec` now percent-encodes to the
+> canonical WHATWG form (`file:///a/b%20c/p.ts`); see
+> `crates/freshell-platform/src/opencode_plugin.rs::file_spec_is_a_canonical_file_url`.
+
 If `tempfile` is not already a dev-dependency of `freshell-platform`, add it to `crates/freshell-platform/Cargo.toml` under `[dev-dependencies]` (it is already used elsewhere in the workspace).
 
 - [ ] **Step 2: Run tests to verify they fail to compile**

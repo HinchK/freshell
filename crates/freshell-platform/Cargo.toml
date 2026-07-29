@@ -6,10 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
-# Deterministic core needs no external crates: pure std logic with injected IO.
+# Deterministic core: std + serde_json + percent-encoding, with injected IO.
 # The deferred live-process modules (tokio::process/reqwest for netsh/ipconfig/etc.)
 # will add deps when implemented in a later sub-step.
 [dependencies]
+percent-encoding = "2"
 serde_json = { workspace = true }
 
 [dev-dependencies]

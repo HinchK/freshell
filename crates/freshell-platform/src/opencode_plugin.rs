@@ -5,6 +5,7 @@
 //! sources merge and plugin arrays union, so a plugin-only file can never
 //! shadow the user's own TUI config.
 
+use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -27,14 +28,48 @@ pub fn tui_config_path(home: &Path) -> PathBuf {
     home.join(".freshell").join("opencode").join("tui.json")
 }
 
+/// File-URL *path* percent-encode set: byte-parity with `pathToFileURL` as
+/// implemented by Node v22 AND Bun (opencode's runtime) -- oracle-verified
+/// 2026-07-29 by differential sweep on the installed Bun 1.3.14 / Node
+/// v22.21.1. STRICTER than the WHATWG-minimal path set: C0 controls + DEL
+/// (both in `CONTROLS`), space, `"` `#` `<` `>` `?` backtick `[` `\` `]`
+/// `^` `{` `|` `}` `~`, plus `%` itself so pre-existing escapes round-trip
+/// literally. `/` separators and the Windows drive `:` stay bare; non-ASCII
+/// bytes are always UTF-8 percent-encoded by `utf8_percent_encode`.
+const FILE_URL_PATH_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}')
+    .add(b'~');
+
 /// `file://` spec for the tui.json `plugin` array. Unix: `file:///abs`.
-/// Windows drive paths get forward slashes and a third slash.
+/// Windows drive paths get forward slashes and a third slash. The path is
+/// percent-encoded to `pathToFileURL` parity (Node v22 == Bun, opencode's
+/// runtime): opencode dedupes plugin origins by exact file-URL string and
+/// Bun's `import()` hard-fails (silently, for the pane lifetime) on raw
+/// `#`/`?`/`%`, so byte-identical output is load-bearing.
 pub fn plugin_file_spec(plugin_path: &Path) -> String {
-    let s = plugin_path.display().to_string().replace('\\', "/");
-    if s.starts_with('/') {
-        format!("file://{s}")
+    let raw = plugin_path.display().to_string();
+    if raw.starts_with('/') {
+        // Posix absolute path: `\` is an ordinary filename byte here --
+        // percent-encoded (%5C, pathToFileURL parity), never a separator.
+        format!("file://{}", utf8_percent_encode(&raw, FILE_URL_PATH_SET))
     } else {
-        format!("file:///{s}")
+        // Windows drive path: separators become `/`, third slash added.
+        let s = raw.replace('\\', "/");
+        format!("file:///{}", utf8_percent_encode(&s, FILE_URL_PATH_SET))
     }
 }
 
@@ -139,10 +174,40 @@ mod tests {
     }
 
     #[test]
-    fn file_spec_is_a_file_url() {
+    fn file_spec_is_a_canonical_file_url() {
+        // Expected values match `pathToFileURL(p).href` under BOTH Node v22
+        // and Bun 1.3.14 (opencode's runtime; oracle-verified 2026-07-29) --
+        // the form Bun imports and opencode dedupes plugin origins by.
+        let cases: &[(&str, &str)] = &[
+            ("/a/b/p.ts", "file:///a/b/p.ts"),
+            ("/a/b c/p.ts", "file:///a/b%20c/p.ts"),
+            ("/a/b#c/p.ts", "file:///a/b%23c/p.ts"),
+            ("/a/b?c/p.ts", "file:///a/b%3Fc/p.ts"),
+            ("/a/b%41c/p.ts", "file:///a/b%2541c/p.ts"),
+            ("/a/100%/p.ts", "file:///a/100%25/p.ts"),
+            (
+                "/home/\u{fc}n\u{ef}/p.ts",
+                "file:///home/%C3%BCn%C3%AF/p.ts",
+            ),
+            // pathToFileURL is stricter than the WHATWG-minimal path set:
+            ("/a/x~y/p.ts", "file:///a/x%7Ey/p.ts"),
+            ("/a/[b]/p.ts", "file:///a/%5Bb%5D/p.ts"),
+            ("/a/b^c/p.ts", "file:///a/b%5Ec/p.ts"),
+            ("/a/b|c/p.ts", "file:///a/b%7Cc/p.ts"),
+            // posix backslash is an ordinary byte -- encoded, not a separator:
+            (r"/a/b\c/p.ts", "file:///a/b%5Cc/p.ts"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                &plugin_file_spec(Path::new(input)),
+                expected,
+                "input: {input}"
+            );
+        }
+        // Windows drive path: forward slashes, third slash, ':' NOT escaped.
         assert_eq!(
-            plugin_file_spec(Path::new("/a/b c/p.ts")),
-            "file:///a/b c/p.ts"
+            plugin_file_spec(Path::new(r"C:\Users\dev\p.ts")),
+            "file:///C:/Users/dev/p.ts"
         );
     }
 }

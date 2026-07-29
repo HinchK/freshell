@@ -182,7 +182,8 @@ A codex upgrade re-opens every codex-behavior item below.
     artifacts. Filename timestamp and `YYYY/MM/DD` dir are precomputed at
     session construction — can predate on-disk creation by the whole idle
     gap / cross midnight; the locator never filters on either. Resumed
-    sessions append to their existing file (no new file) — consistent with
+    sessions append to their existing file (no new file, CLI-launch resume; 
+    in-TUI /resume may fork — see the corrected note below) — consistent with
     the arm gate refusing resume panes.
 14. **(A10/A7, confirmed) Env + frozen client.** The PTY child inherits the
     server env minus a STRIP_ENV list that touches neither `CODEX_HOME` nor
@@ -268,6 +269,14 @@ impl CodexLocator {
 }
 ```
 
+> **Historical note (2026-07-29, rebind-review-polish):** this interface
+> block predates the fork lane added by the 2026-07-28 stale-resume-identity
+> effort. The shipped `CodexLocator` additionally exposes
+> `CODEX_FORK_WINDOW_MS`, `struct ForkLocated`, `watch_fork`,
+> `note_fork_submit`, and `tick_forks` — see
+> `crates/freshell-sessions/src/codex_locator.rs` for the authoritative
+> surface.
+
 Design notes to encode in the module doc (deliberate deviations from the
 opencode locator, each with rationale — the codex-behavior facts below are
 validated against codex source @ rust-v0.145.0 and a 3,858-rollout local
@@ -324,10 +333,15 @@ corpus; see "Validated Premises" above):
   normalized cwd, no candidate with that cwd binds for any of them —
   staggered deadlines must not let one pane grab a sibling's rollout
   uncontested.
-- Resumed codex sessions append to their EXISTING rollout file (no new file)
-  — consistent with the arm gate refusing resume panes. Compressed rollout
-  artifacts (`.jsonl.zst`, present in 0.145.0 source) are excluded by the
-  `.jsonl` suffix filter; fresh sessions always write plain `.jsonl`.
+- CLI-launch `codex resume <id>` appends to the EXISTING rollout file (no new
+  file) — consistent with the arm gate refusing resume panes. In-TUI
+  `/resume` is DIFFERENT: it MAY fork intermittently (upstream bug
+  openai/codex#34972) into a NEW rollout file with a NEW session id,
+  `forked_from_id` lineage and `thread_source:"user"`; the ForkWatch lane
+  (added 2026-07-28, stale-resume-identity) exists for exactly that case.
+  Compressed rollout artifacts (`.jsonl.zst`, present in 0.145.0 source) are
+  excluded by the `.jsonl` suffix filter; fresh sessions always write plain
+  `.jsonl`. *(Corrected 2026-07-29, rebind-review-polish.)*
 - Scans happen ONLY at arm time, at the FIRST `note_submit` (the re-snapshot
   above), and at deadline evaluations (never on idle
   ticks — proven by `fs_scan_count`; a pending candidate keeps its window's
@@ -594,10 +608,17 @@ module is the RED state for a new module.
 //!   (prefilter-grade at best), NEVER `payload.session_id` (fork/resume
 //!   LINEAGE: matches a FOREIGN session in 54/144 sampled real rollouts) —
 //!   same predicate as `freshell-ws`'s `first_line_owns`.
-//! - Resumed codex sessions append to their EXISTING rollout file (no new
-//!   file) — consistent with the arm gate refusing resume panes. Compressed
-//!   artifacts (`.jsonl.zst`, present in 0.145.0 source) fail the `.jsonl`
-//!   suffix filter; fresh sessions always write plain `.jsonl`.
+//! - CLI-launch `codex resume <id>` appends to the EXISTING rollout file (no
+//!   new file; statistically supported across thousands of freshell-launched
+//!   sessions -- no live test) -- consistent with the arm gate refusing
+//!   resume panes. In-TUI `/resume` is DIFFERENT: it MAY fork --
+//!   INTERMITTENTLY (upstream bug openai/codex#34972; may be fixed away
+//!   upstream): a NEW rollout file with a NEW session id, `forked_from_id`
+//!   lineage and `thread_source:"user"` (verified on disk 2026-07-27,
+//!   019fa60f -> 019fa613). The ForkWatch lane exists for exactly that case
+//!   and is OPPORTUNISTIC/best-effort: when no fork happens it is simply
+//!   idle. Compressed artifacts (`.jsonl.zst`) fail the `.jsonl` suffix
+//!   filter.
 //!
 //! Zero cost when idle: scans happen only at arm, at the FIRST `note_submit`
 //! (the re-snapshot), and at due Enter-anchored

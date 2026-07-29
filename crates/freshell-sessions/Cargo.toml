@@ -36,6 +36,9 @@ tracing = "0.1"
 # The opencode SQLite parity test builds fixture databases with a writable connection
 # before the parser opens them read-only (same bundled engine, unified by cargo).
 rusqlite = { version = "0.31", features = ["bundled"] }
+# codex_locator's warn-once-per-window test installs a thread-local layer
+# that counts the codex_fork_ambiguous WARN events.
+tracing-subscriber = "0.3"
 # SESSION-07: unique temp-file names for `search.rs`'s file-content search
 # tests (same version/feature set as every other crate's `uuid` dependency).
 uuid = { version = "1", features = ["v4"] }
