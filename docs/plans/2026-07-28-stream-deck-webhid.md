@@ -185,7 +185,7 @@ if (sd && typeof sd === 'object') {
   if (typeof (sd as any).brightness === 'number') out.brightness = (sd as any).brightness
   if (typeof (sd as any).idleBrightness === 'number') out.idleBrightness = (sd as any).idleBrightness
   if (typeof (sd as any).idleTimeoutSeconds === 'number') out.idleTimeoutSeconds = (sd as any).idleTimeoutSeconds
-  if (Object.keys(out).length > 0) seed.streamDeck = out
+  if (Object.keys(out).length > 0) patch.streamDeck = out
 }
 
 // 7) normalizeExtractedLocalSeed (~:474-625) — REQUIRED, this is the whitelist gate.
@@ -2333,6 +2333,7 @@ export function resetStreamDeckManagerForTests(): void
 
 Manager behavior:
 - `installStreamDeckManager`: idempotent singleton (module-level state + reset-for-tests, per the `useEnsureExtensionsRegistry` pattern). If `!isWebHidSupported()` → `setDeckStatus({ status: 'unsupported' })` and do nothing else. Subscribes to the store watching `state.settings.settings.streamDeck.enabled`:
+  - **On install, evaluate the current value first — do not wait for a transition.** Local settings hydrate synchronously from localStorage at store creation (`src/store/settingsSlice.ts:67-83` `loadInitialLocalSettings`), so for a returning user `enabled` is already `true` before `useStreamDeck()` installs the manager and no enabled-transition will ever be observed. Seed the subscription's change detector with `prev = false` (NOT the current store value) so an already-true `enabled` runs the exact same enable path below immediately at install time. This is the feature's headline persistence behavior — reload the page → silent `getDevices()` auto-reconnect — promised by Task 16's README copy ("auto-reconnects afterwards") and the Memory-Saver checkpoint; it is pinned by the "already enabled at install" test in Step 1.
   - enabled turning true → **Web Locks leader election wraps the enable lifecycle**: call `navigator.locks.request('freshell-stream-deck', { mode: 'exclusive' }, () => leaderGate)` where `leaderGate` is a deferred promise the manager resolves on disable/uninstall — the lock is held for the manager's enabled lifetime. Until the lock callback runs (another freshell window is the leader) → `setDeckStatus({ status: 'in-use' })` (this is the same-origin "in use elsewhere / another window" case). When the callback runs, this window is the leader — including leadership handoff: when the previous leader closes or disables, the lock releases and this waiting window acquires it, then connects. As leader: `setDeckStatus({status:'connecting'})`; `getGranted()`; device → adopt; `null` → `'disconnected'` (waiting for the user to press Connect); `DeckOpenError('in-use')` → `'in-use'` + arm retry (secondary signal: an OS app holds the device exclusively, e.g. an exclusive-mode holder on Windows — concurrent opens generally SUCCEED, see the locked exclusivity decision). If `navigator.locks` is missing (old browser / jsdom), skip the election and proceed as leader.
   - enabled turning false → resolve `leaderGate` (releases the Web Lock so a waiting window can take over), tear down controller (`controller.stop()`, `device.close()`), `'disconnected'`.
 - Adopt(device): create `DeckController` with `settings: () => store.getState().settings.settings.streamDeck`, `start()`, `setDeckStatus({ status: 'connected', model: caps.model, keyCount: caps.keyCount })`; `device.onDisconnect(...)` → teardown → `'disconnected'` (hotplug replug then reconnects via the HID `connect` event below). Note: `device.onDisconnect` is driven by the transport's `navigator.hid` `'disconnect'` listener + write-rejection fallback — the lib's `'error'` event never fires and nothing may depend on it.
@@ -2432,6 +2433,21 @@ it('auto-reconnects a previously granted deck when the toggle turns on', async (
   await vi.waitFor(() => expect(store.getState().deck.status).toBe('connected'))
   expect(store.getState().deck).toMatchObject({ model: 'Fake Mini', keyCount: 6 })
   expect(device.brightnessHistory[0]).toBe(100) // controller started
+})
+
+it('auto-reconnects on install when enabled is already true (page-reload persistence)', async () => {
+  // Returning-user path: settings hydrate synchronously from localStorage BEFORE the
+  // manager installs, so there is no enabled transition to observe — install itself
+  // must evaluate the current value and run the enable path. A transition-only
+  // change detector (prev seeded from the current store value) fails this test.
+  const store = makeStore()
+  store.dispatch(updateSettingsLocal({ streamDeck: { enabled: true } }))
+  const device = new FakeDeckDevice()
+  const getGranted = vi.fn(async () => device)
+  uninstall = installStreamDeckManager(store as never, { request: vi.fn(), getGranted })
+  // No further dispatches after install: the connection must come from the install-time check.
+  await vi.waitFor(() => expect(store.getState().deck.status).toBe('connected'))
+  expect(getGranted).toHaveBeenCalledTimes(1)
 })
 
 it('disabling the toggle tears down cleanly', async () => { /* enable as above, then
