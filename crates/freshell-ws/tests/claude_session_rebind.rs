@@ -18,6 +18,9 @@
 //! Phase 6 (first-bind, P2): a fresh claude pane's resume identity is the
 //!   spawn-time preallocated --session-id, NOT signal consumption; it stays
 //!   intact even after an external actor destroys every signal file.
+//! Phase 7 (foreign provider, Discard): a signal naming a SHELL-mode pane is
+//!   explicitly ignored and CONSUMED (Discard, not Retain) -- no associated
+//!   frame, file deleted, so it cannot warn-log every sweep for 10 minutes.
 //!
 //! Determinism: the test calls `drain_and_rebind_claude` directly on a state
 //! handle (the brief's preferred shape) instead of racing a spawned sweep
@@ -694,6 +697,56 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         Some(preallocated_id.as_str()),
         "a fresh claude pane must keep its preallocated resume identity even \
          when every signal file is destroyed by an external actor"
+    );
+
+    // ── Phase 7 — foreign provider (Discard): a signal addressed to a
+    // SHELL-mode pane is explicitly ignored (logged) and CONSUMED — it can
+    // never become actionable (a pane's mode never changes), so retaining it
+    // would just warn-log every 1s sweep for 10 minutes (unbounded noise).
+    // Ports opencode_switch_rebind.rs's foreign-provider phase.
+    let created7 = send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-claude-rebind-7",
+            "mode": "shell",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        }),
+    )
+    .await;
+    let tid7 = created7["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    // A valid claude UUID bound nowhere — the mode guard must fire before
+    // any session-ownership probe even matters.
+    let foreign_claim = "77777777-8888-4999-8aaa-bbbbccccdddd";
+    let discard_path = signal_root.join(format!("{tid7}__9100000000000000000-1.json"));
+    std::fs::write(
+        &discard_path,
+        format!(
+            r#"{{"session_id":"{foreign_claim}","source":"resume","hook_event_name":"SessionStart"}}"#
+        ),
+    )
+    .expect("write foreign-provider signal");
+    freshell_ws::claude_signal::drain_and_rebind_claude(&state, &watcher).await;
+    tokio::task::yield_now().await;
+    // Discard => consumed, NOT retained (this is what distinguishes Discard
+    // from Retain: a Retain regression would warn-log every sweep for 10min).
+    assert!(
+        !discard_path.exists(),
+        "a foreign-provider signal file must be CONSUMED (Discard), not retained"
+    );
+    // Absence proof: the shell pane was never rebound (Phase 5 pattern).
+    let moved = frame_seen_within(&mut ws, Duration::from_secs(1), |v| {
+        v["type"] == "terminal.session.associated" && v["terminalId"] == tid7.as_str()
+    })
+    .await;
+    assert!(
+        !moved,
+        "a foreign-provider pane must never be rebound by a claude signal"
     );
 
     state.fresh_claude.shutdown().await; // reap the fake node child
