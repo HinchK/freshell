@@ -122,6 +122,9 @@ const RUST_ONLY_SPECS = [
   // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
   // restartAbrupt(); hidden panes must rebind without being revealed.
   /hidden-pane-rebind-rust\.spec\.ts$/,
+  // Freshclaude zero-turn restart (kata 09v1): imports RustServer directly
+  // for restartAbrupt(); a VISIBLE zero-turn pane must resume, never die.
+  /freshclaude-zero-turn-restart-rust\.spec\.ts$/,
   // Wave-A integration preflight: cross-lane interaction proofs (A1xA3
   // ledger-join coherence, A2xA3 dual claude identity stores). Imports
   // RustServer directly for restartAbrupt().
@@ -303,6 +306,9 @@ export default defineConfig({
         // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
         // restartAbrupt(); hidden panes must rebind without being revealed.
         /hidden-pane-rebind-rust\.spec\.ts$/,
+        // Freshclaude zero-turn restart (kata 09v1): imports RustServer directly
+        // for restartAbrupt(); a VISIBLE zero-turn pane must resume, never die.
+        /freshclaude-zero-turn-restart-rust\.spec\.ts$/,
         // Wave-A integration preflight: cross-lane interaction proofs (A1xA3
         // ledger-join coherence, A2xA3 dual claude identity stores). Imports
         // RustServer directly for restartAbrupt().
