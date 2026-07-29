@@ -764,5 +764,88 @@ describe.sequential('coding cli real provider session contract', () => {
         await workspace.cleanup().catch(() => undefined)
       }
     }, 240_000)
+
+    // Attach-arm premise of freshell's opencode existence fallback
+    // (crates/freshell-server/src/existence.rs): `opencode run --session <id>`
+    // resolves session ids by id — INCLUDING child sessions (parent_id set),
+    // which opencode's own list surfaces hide. If this test genuinely fails
+    // (opencode refuses a child id), the fallback's premise is wrong: STOP
+    // and surface, do not ship the fallback on it.
+    it('resolves a CHILD session id (parent_id set) via --session', async () => {
+      const opencodePath = requireAvailableBinary(opencodeBinary, opencodeProbe)
+      const workspace = await ProbeWorkspace.create('opencode-child-attach')
+      try {
+        const homes = await seedOpencodeHomes(workspace)
+        const runEnv = {
+          XDG_DATA_HOME: homes.dataHome,
+          XDG_CONFIG_HOME: homes.configHome,
+        }
+
+        // 1. Create a ROOT session with the real CLI.
+        const rootRun = await workspace.spawnProcess(
+          opencodePath,
+          [
+            'run',
+            'Reply with exactly: child-attach-root-ok',
+            '--format',
+            'json',
+            '--dangerously-skip-permissions',
+          ],
+          { env: runEnv },
+        )
+        const rootStep = await waitForJsonLine(rootRun, (value) => value?.type === 'step_start', 60_000)
+        const rootSessionId = rootStep.sessionID as string
+        expect(rootSessionId).toMatch(/^ses_/)
+        expect((await rootRun.waitForExit(60_000)).code).toBe(0)
+
+        // 2. Create a real CHILD session (parent_id = root) via the real
+        //    opencode server API — the same session.create surface the TUI's
+        //    subagent/task flows use.
+        const serve = await startOpencodeServe(
+          workspace,
+          opencodePath,
+          runEnv,
+          note.providers.opencode.globalHealthPath,
+        )
+        const createResponse = await fetch(`${serve.baseUrl}/session`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ parentID: rootSessionId, title: 'child-attach-probe' }),
+        })
+        expect(createResponse.ok).toBe(true)
+        const created = await createResponse.json() as { id: string }
+        const childSessionId = created.id
+        expect(childSessionId).toMatch(/^ses_/)
+        expect(childSessionId).not.toBe(rootSessionId)
+
+        // 3. Verify the child row landed in sqlite with parent_id = root.
+        //    (LOAD-BEARING: proves the session under test really is a CHILD;
+        //    requires this task's harness extension returning parent_id.)
+        const childRow = await waitForOpencodeDbSession(homes.dbPath, childSessionId)
+        expect(childRow.parent_id).toBe(rootSessionId)
+
+        // 4. THE PREMISE: the real CLI resolves the CHILD id via --session.
+        const childRun = await workspace.spawnProcess(
+          opencodePath,
+          [
+            'run',
+            '--session',
+            childSessionId,
+            'Reply with exactly: child-attach-ok',
+            '--format',
+            'json',
+            '--dangerously-skip-permissions',
+          ],
+          { env: runEnv },
+        )
+        const childStep = await waitForJsonLine(childRun, (value) => value?.type === 'step_start', 60_000)
+        expect(childStep.sessionID).toBe(childSessionId)
+        expect((await childRun.waitForExit(60_000)).code).toBe(0)
+
+        await serve.process.stop()
+      } finally {
+        await workspace.cleanup().catch(() => undefined)
+      }
+    }, 300_000)
   })
 })
