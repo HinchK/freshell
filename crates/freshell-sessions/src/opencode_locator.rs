@@ -1,5 +1,5 @@
 //! `OpencodeLocator` — deterministic PTY↔session association for FRESH opencode
-//! terminal panes. Sibling module to [`crate::amplifier_locator`]
+//! terminal panes. Sibling module to the deleted `amplifier_locator` (kata qmpk)
 //! (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md`, §8: a
 //! provider-parameterized locator was explicitly rejected — the two providers'
 //! detection substrates share zero code).
@@ -53,7 +53,7 @@
 //! [`OpencodeLocator::tick`] performs **zero** SQLite reads whenever zero
 //! terminals are armed — there is nothing a tick could resolve with no armed
 //! terminal to correlate against. Mirrors
-//! [`crate::amplifier_locator::AmplifierLocator::tick`]'s identical
+//! the deleted `AmplifierLocator::tick`'s identical
 //! short-circuit and rationale.
 //!
 //! ## Bounded reads only (never the full `session` table)
@@ -72,7 +72,8 @@ use std::sync::Mutex;
 
 use crate::parse::opencode::{OpencodeProvider, OpencodeSessionRow};
 
-/// `WINDOW_MS` (mirrors `AMPLIFIER_DIR_APPEAR_WINDOW_MS`): how long after the
+/// `WINDOW_MS` (mirrors the deleted `AMPLIFIER_DIR_APPEAR_WINDOW_MS`, kata
+/// qmpk): how long after the
 /// first Enter/submit a candidate session row may still appear and correlate.
 /// Also reused (spec §4.4) as the spawn-anchored fallback duration when no
 /// Enter has been observed yet.
@@ -137,7 +138,8 @@ pub struct OpencodeLocator {
     /// Counts every bounded `list_sessions_since` read this locator issues —
     /// test/diagnostic hook proving the idle short-circuit in
     /// [`OpencodeLocator::tick`] performs literally zero further DB reads
-    /// while no terminal is armed (mirrors `AmplifierLocator::fs_scan_count`).
+    /// while no terminal is armed (mirrors the deleted
+    /// `AmplifierLocator::fs_scan_count`, kata qmpk).
     db_scan_count: AtomicU64,
 }
 
@@ -168,7 +170,8 @@ impl OpencodeLocator {
     }
 
     /// How many bounded `list_sessions_since` reads have run so far
-    /// (test/diagnostic hook, mirrors `AmplifierLocator::fs_scan_count`).
+    /// (test/diagnostic hook, mirrors the deleted
+    /// `AmplifierLocator::fs_scan_count`, kata qmpk).
     pub fn db_scan_count(&self) -> u64 {
         self.db_scan_count.load(Ordering::SeqCst)
     }
@@ -339,7 +342,7 @@ impl OpencodeLocator {
             }
             if matches.len() > 1 {
                 // Never guess: refuse and log (mirrors
-                // `amplifier_locator.rs`'s ambiguity refusal).
+                // the deleted `amplifier_locator.rs`'s ambiguity refusal).
                 tracing::warn!(
                     terminal_id = %terminal_id,
                     candidates = ?matches.iter().map(|r| r.session_id.clone()).collect::<Vec<_>>(),
@@ -363,7 +366,7 @@ impl OpencodeLocator {
     }
 }
 
-/// Lexical cwd normalization (mirrors `amplifier_locator::normalize_cwd`):
+/// Lexical cwd normalization (mirrors the deleted `amplifier_locator`'s):
 /// trailing-slash / separator only — no realpath; `std::fs::canonicalize` is
 /// used opportunistically where the path exists.
 pub(crate) fn normalize_cwd(input: &str) -> String {
