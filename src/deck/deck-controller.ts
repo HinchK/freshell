@@ -16,10 +16,13 @@ import type { DeckStore } from './deck-actions'
 import type { KeySpec } from './frame'
 import type { DeckModel } from './deck-selectors'
 import type { RootState } from '@/store/store'
+import type { DeckTileStyle } from '@shared/settings'
 import { ACTION_KEYS, buildFrame, clampPage, pageCount, planLayout, visibleTabs } from './frame'
 import { findApproveTarget, findStopTarget, panesForTab, selectDeckModel } from './deck-selectors'
 import { executeDeckStop, focusTabFromDeck, sendDeckApproval } from './deck-actions'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
+import { findPaneContent } from '@/lib/pane-utils'
+import { getTerminalTextSnapshot } from './terminal-text-registry'
 import { fetchRepoIconMeta } from '@/store/repoIconsSlice'
 import { resolvePaneRepoCwd } from '@/lib/repo-icon'
 import { IconImageCache, getIconImageCache } from './icon-image-cache'
@@ -30,7 +33,7 @@ export type DeckControllerOptions = {
   device: DeckDevice
   renderKey?: (spec: KeySpec, caps: DeckCapabilities) => Uint8ClampedArray
   renderStrip?: (text: string, width: number, height: number) => Uint8ClampedArray
-  settings: () => { brightness: number; idleBrightness: number; idleTimeoutSeconds: number }
+  settings: () => { brightness: number; idleBrightness: number; idleTimeoutSeconds: number; tileStyle: DeckTileStyle }
   now?: () => number
   iconCache?: IconImageCache
 }
@@ -42,6 +45,9 @@ export const LONG_PRESS_MS = 500
 export const ACTION_LAYER_TIMEOUT_MS = 10_000
 export const STOP_ESCALATE_MS = 5_000
 export const TICK_MS = 500
+// Deliberate exception to the file's TIMING RULE: this is a refresh cadence, not a
+// duration — under background setInterval throttling previews simply refresh slower.
+export const PREVIEW_REFRESH_TICKS = 6 // previews re-checked every 3s
 
 export class DeckController {
   private readonly store: DeckControllerOptions['store']
@@ -60,6 +66,7 @@ export class DeckController {
   private dimmed = false
   private lastPaintedSpecs: string[] = []
   private lastStripText: string | null = null
+  private tickCount = 0
   private lastModelJson: string | null = null
   private lastTabsPerPage: number | null = null
 
@@ -133,7 +140,7 @@ export class DeckController {
       // bitmapFor both reports readiness and requests the load - first paint
       // of a tile with an unloaded icon starts the fetch.
       iconReady: (url) => this.iconCache.bitmapFor(url) !== null,
-      previewFor: () => [],
+      previewFor: (tabId) => this.previewFor(state, tabId),
     })
     let painted = false
     frame.keys.forEach((spec, keyIndex) => {
@@ -160,6 +167,17 @@ export class DeckController {
       approveEnabled: findApproveTarget(state, tabId) !== null,
       stopEnabled: findStopTarget(state, tabId) !== null,
     }
+  }
+
+  private previewFor(state: RootState, tabId: string): string[] {
+    const paneId = state.panes.activePane[tabId]
+    const layout = state.panes.layouts[tabId]
+    if (!paneId || !layout) return []
+    const content = findPaneContent(layout, paneId)
+    if (content && content.kind === 'terminal' && content.terminalId) {
+      return getTerminalTextSnapshot(content.terminalId) ?? []
+    }
+    return []
   }
 
   /**
@@ -195,6 +213,9 @@ export class DeckController {
     // synchronous pending entry makes the byCwd guard skip that cwd on the
     // re-entrant store change.
     this.probeRepoIcons()
+    // ORDERING (load-bearing): compare the model JSON BEFORE any xterm buffer
+    // reads - previewFor is only invoked by repaint, which we skip entirely
+    // when the model is unchanged.
     const model = selectDeckModel(state)
     const modelJson = JSON.stringify(model)
     if (modelJson === this.lastModelJson) return
@@ -366,6 +387,9 @@ export class DeckController {
 
   private tick(): void {
     this.dutyChecks()
+    if (this.settings().tileStyle !== 'terminal-previews') return
+    this.tickCount++
+    if (this.tickCount % PREVIEW_REFRESH_TICKS === 0) this.repaint() // picks up xterm buffer changes
   }
 
   private noteActivity(): void {

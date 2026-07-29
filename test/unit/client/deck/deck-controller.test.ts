@@ -17,6 +17,8 @@ import settingsReducer, { updateSettingsLocal } from '@/store/settingsSlice'
 import terminalMetaReducer, { upsertTerminalMeta } from '@/store/terminalMetaSlice'
 import repoIconsReducer, { type RepoIconEntry } from '@/store/repoIconsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import type { DeckTileStyle } from '@shared/settings'
+import { registerTerminalTextReader, resetTerminalTextRegistryForTests } from '@/deck/terminal-text-registry'
 import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
 import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
@@ -46,6 +48,13 @@ type StoreOpts = {
   repoIcons?: Record<string, RepoIconEntry>
   /** Dispatch updateSettingsLocal({ panes: { repoIconsOnTabs } }) BEFORE the controller starts. */
   repoIconsOnTabs?: boolean
+  /**
+   * Tile style. Seeds BOTH the store settings (selectDeckModel reads
+   * state.settings.settings.streamDeck.tileStyle) and the controller's
+   * settings() thunk (tick gating) - production call sites pass the whole
+   * streamDeck settings object, so the two are always consistent there.
+   */
+  tileStyle?: DeckTileStyle
 }
 
 // Mirrors the Task 3 fixture builder, parameterized by tab count: tabs t1..tN,
@@ -111,6 +120,9 @@ function makeStore(opts: StoreOpts = {}) {
     // setup() constructs and starts the controller.
     store.dispatch(updateSettingsLocal({ panes: { repoIconsOnTabs: opts.repoIconsOnTabs } }))
   }
+  if (opts.tileStyle !== undefined) {
+    store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: opts.tileStyle } }))
+  }
   return store
 }
 
@@ -135,7 +147,7 @@ function deferredLoader() {
   return { loader, pending }
 }
 
-const settings = () => ({ brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300 })
+const settings = () => ({ brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300, tileStyle: 'status-icons' as const })
 
 let activeController: DeckController | null = null
 
@@ -147,7 +159,7 @@ function setup(opts: StoreOpts = {}, caps?: DeckCapabilities, extra?: Partial<De
     device,
     renderKey: (spec) => encodeSpec(spec),
     renderStrip: (text) => new TextEncoder().encode(text) as unknown as Uint8ClampedArray,
-    settings,
+    settings: opts.tileStyle !== undefined ? () => ({ ...settings(), tileStyle: opts.tileStyle! }) : settings,
     ...extra,
   })
   controller.start()
@@ -175,6 +187,7 @@ beforeEach(() => {
 afterEach(() => {
   activeController?.stop()
   activeController = null
+  resetTerminalTextRegistryForTests()
   vi.useRealTimers()
 })
 
@@ -381,14 +394,34 @@ describe('DeckController', () => {
     expect(after.kind === 'tab' && after.icons[0].ready).toBe(true)
   })
 
-  it('no periodic repaint: 3s of ticks paints nothing while the store is unchanged', () => {
-    // The terminal-preview machinery is deleted (Task 9); repaints are store-driven
-    // only. The structural guarantee is Task 9's dead-reference grep gate; this
-    // asserts the observable behavior.
+  it('status-icons style: 3s of ticks paints nothing even when terminal text changes', () => {
+    // A CHANGING reader is what makes this RED if polling leaks into the new style.
+    let n = 0
+    const unregister = registerTerminalTextReader('term-1', () => [`line ${n++}`])
     const { device } = setup({ tabCount: 1 })
     device.keyImages.clear()
     vi.advanceTimersByTime(3_000)
     expect(device.keyImages.size).toBe(0)
+    unregister()
+  })
+
+  it('terminal-previews style: changing terminal text repaints within PREVIEW_REFRESH_TICKS', () => {
+    let n = 0
+    const unregister = registerTerminalTextReader('term-1', () => [`line ${n++}`])
+    const { device } = setup({ tabCount: 1, tileStyle: 'terminal-previews' })
+    device.keyImages.clear()
+    vi.advanceTimersByTime(3_000)
+    expect(device.keyImages.size).toBeGreaterThan(0)
+    unregister()
+  })
+
+  it('terminal-previews style: static terminal text does not repaint on ticks', () => {
+    const unregister = registerTerminalTextReader('term-1', () => ['same line'])
+    const { device } = setup({ tabCount: 1, tileStyle: 'terminal-previews' })
+    device.keyImages.clear()
+    vi.advanceTimersByTime(3_000)
+    expect(device.keyImages.size).toBe(0) // spec JSON unchanged -> per-key diff skips
+    unregister()
   })
 
   it('dispatches fetchRepoIconMeta for tab cwds even when settings.panes.repoIconsOnTabs is false (deck owns the probe)', () => {

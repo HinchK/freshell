@@ -22,6 +22,7 @@ import terminalMetaReducer from '@/store/terminalMetaSlice'
 import repoIconsReducer, { type RepoIconEntry } from '@/store/repoIconsSlice'
 import type { Tab } from '@/store/types'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import type { DeckTileStyle } from '@shared/settings'
 import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
 import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
@@ -132,8 +133,8 @@ function decodeStrip(device: FakeDeckDevice): string | null {
   return device.stripImage ? new TextDecoder().decode(device.stripImage.rgba as unknown as Uint8Array) : null
 }
 
-type DeckSettings = { brightness: number; idleBrightness: number; idleTimeoutSeconds: number }
-const defaultSettings = (): DeckSettings => ({ brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300 })
+type DeckSettings = { brightness: number; idleBrightness: number; idleTimeoutSeconds: number; tileStyle: DeckTileStyle }
+const defaultSettings = (): DeckSettings => ({ brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 300, tileStyle: 'status-icons' as const })
 
 let activeController: DeckController | null = null
 
@@ -196,15 +197,15 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     // Status-priority sort: t2 attention (greenFill) < t3 waiting fresh-agent
     // (greenIcon) < t1 busy (blueIcon), so busy t1 lands after the others.
     expect(decodeKey(device, 0)).toEqual({
-      kind: 'tab', tabId: 't2', title: 'tab2', active: false,
+      kind: 'tab', style: 'icons', tabId: 't2', title: 'tab2', active: false,
       fill: 'green', dot: 'green', icons: [],
     })
     expect(decodeKey(device, 1)).toEqual({
-      kind: 'tab', tabId: 't3', title: 'tab3', active: false,
+      kind: 'tab', style: 'icons', tabId: 't3', title: 'tab3', active: false,
       fill: 'none', dot: 'green', icons: [],
     })
     expect(decodeKey(device, 2)).toEqual({
-      kind: 'tab', tabId: 't1', title: 'tab1', active: true,
+      kind: 'tab', style: 'icons', tabId: 't1', title: 'tab1', active: true,
       fill: 'none', dot: 'blue', icons: [],
     })
   })
