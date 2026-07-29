@@ -1935,21 +1935,19 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // EXPECTED-FAIL WALL PIN -- P1.8 (§2.4/§4.2 pending markers): killing the
-    // server inside the opencode locator's ~2s correlation window loses the
-    // minted identity permanently, and the pane restores SILENTLY FRESH --
-    // no resume, no breadcrumb. FLIP when ledger pending markers land
-    // (fresh-by-race must be visible) or the identity is captured in time.
-    // DETERMINISM: the fake's session-row write is held behind
-    // FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH and this test NEVER creates the
-    // gate file before the kill, so the identity provably cannot land
-    // pre-kill. Without the gate, the 150ms locator sweep (main.rs:1112)
-    // can beat the SIGKILL a few percent of runs -> unexpected PASS of this
-    // pin -> hard suite failure.
-    test.fail(
-      e2eServerKind === 'rust',
-      'P1.8 (§2.4): SIGKILL inside locator window yields silent fresh, no breadcrumb',
-    )
+    // P1.8 (§2.4/§4.2 pending markers) LANDED -- pin flipped: killing the
+    // server inside the opencode locator's ~2s correlation window is no
+    // longer silently fresh. The server derives a loud Fresh{fresh_by_race}
+    // verdict from the pending marker that survives the restart (keyed by
+    // the client's stale terminalId), and the client renders a DOM-visible
+    // breadcrumb (data-testid="fresh-by-race-notice") matching the probe
+    // regex below.
+    // DETERMINISM (pre-kill phase): the fake's session-row write is held
+    // behind FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH and this test NEVER
+    // creates the gate file before the kill, so the identity provably
+    // cannot land pre-kill -- the race loss is guaranteed, not a few-percent
+    // 150ms-sweep coin flip. The gate is opened only AFTER restart, to
+    // prove the re-armed locator (P1.10) captures identity end to end.
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-locwin-'))
     const argLogPath = path.join(sharedRoot, 'opencode-argv.jsonl')
     // Deliberately never created -- see the DETERMINISM note above.
@@ -2004,6 +2002,22 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         .isVisible()
         .catch(() => false)
       expect(resumed || breadcrumbVisible).toBe(true)
+
+      // P1.10 end-to-end (landed; pinned unit-side by opencode_association.rs
+      // restore_created_pane_without_identity_arms_and_resolves_into_the_
+      // ledger): the restore-created pane lacks identity, so the locator
+      // re-armed at restore-create. Open the fake's row gate NOW and submit —
+      // the re-armed locator must capture a ses_ identity post-restart.
+      await fs.writeFile(rowGatePath, '')
+      await page.locator('.xterm').last().click()
+      await page.keyboard.type('hello again after restart')
+      await page.keyboard.press('Enter')
+      await expect
+        .poll(async () => {
+          const l = await findLeafById(harness, tabId, leaf.id)
+          return l?.content?.sessionRef?.sessionId ?? null
+        }, { timeout: 30_000 })
+        .toMatch(/^ses_/)
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
