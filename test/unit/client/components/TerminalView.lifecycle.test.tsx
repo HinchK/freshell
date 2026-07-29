@@ -3811,6 +3811,69 @@ describe('TerminalView lifecycle updates', () => {
     }
   })
 
+  it('recovers from a post-restart attach error and delivers buffered keystrokes to the recreated terminal', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-pre-restart',
+      status: 'running',
+      mode: 'shell',
+    })
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(reconnectHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+    const term = terminalInstances[0]
+
+    // Server restarted; transport reconnects; the pane re-attaches its OLD id.
+    act(() => {
+      reconnectHandler!()
+    })
+    const attach = sentMessages()
+      .filter((m) => m?.type === 'terminal.attach' && m.terminalId === 'term-pre-restart')
+      .at(-1)
+    expect(attach).toBeTruthy()
+
+    // The restarted Rust server now answers loudly (kata dtfn, Task 5).
+    act(() => {
+      messageHandler!({
+        type: 'error',
+        code: 'INVALID_TERMINAL_ID',
+        message: 'Terminal not running',
+        requestId: attach.attachRequestId,
+        terminalId: 'term-pre-restart',
+        timestamp: new Date().toISOString(),
+      })
+    })
+
+    // Branch-5 recovery: pane re-creates (a fresh terminal.create goes out).
+    const create = sentMessages().filter((m) => m?.type === 'terminal.create').at(-1)
+    expect(create).toBeTruthy()
+
+    // Keystrokes typed in the recovery window buffer (tid is cleared)...
+    fireData(term, 'echo survived\\r')
+    expect(
+      sentMessages().filter((m) => m?.type === 'terminal.input' && m.terminalId === 'term-pre-restart'),
+    ).toEqual([])
+
+    // ...and flush, in order, to the recreated terminal.
+    act(() => {
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: create.requestId,
+        terminalId: 'term-post-restart',
+      })
+    })
+    const flushed = sentMessages().filter(
+      (m) => m?.type === 'terminal.input' && m.terminalId === 'term-post-restart',
+    )
+    expect(flushed.map((m) => m.data)).toEqual(['echo survived\\r'])
+  })
+
   describe('non-blocking reconnect', () => {
     function setupNonBlockingTerminal(connectionStatus: 'ready' | 'disconnected') {
       const tabId = 'tab-non-blocking'
