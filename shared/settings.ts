@@ -24,6 +24,7 @@ const OSC52_CLIPBOARD_VALUES = ['ask', 'always', 'never'] as const
 const TERMINAL_RENDERER_VALUES = ['auto', 'webgl', 'canvas'] as const
 const DEFAULT_NEW_PANE_VALUES = ['ask', 'shell', 'browser', 'editor'] as const
 const TAB_ATTENTION_STYLE_VALUES = ['highlight', 'pulse', 'darken', 'none'] as const
+export const DECK_TILE_STYLE_VALUES = ['status-icons', 'terminal-previews'] as const
 const ATTENTION_DISMISS_VALUES = ['click', 'type'] as const
 const SESSION_OPEN_MODE_VALUES = ['tab', 'split'] as const
 const SIDEBAR_SORT_MODE_VALUES = ['recency', 'recency-pinned', 'activity', 'project'] as const
@@ -95,6 +96,7 @@ export type Osc52ClipboardPolicy = (typeof OSC52_CLIPBOARD_VALUES)[number]
 export type TerminalRendererMode = (typeof TERMINAL_RENDERER_VALUES)[number]
 export type DefaultNewPane = (typeof DEFAULT_NEW_PANE_VALUES)[number]
 export type TabAttentionStyle = (typeof TAB_ATTENTION_STYLE_VALUES)[number]
+export type DeckTileStyle = (typeof DECK_TILE_STYLE_VALUES)[number]
 export type AttentionDismiss = (typeof ATTENTION_DISMISS_VALUES)[number]
 export type SessionOpenMode = (typeof SESSION_OPEN_MODE_VALUES)[number]
 export type SidebarSortMode = (typeof SIDEBAR_SORT_MODE_VALUES)[number]
@@ -225,6 +227,7 @@ export type LocalSettings = {
     brightness: number
     idleBrightness: number
     idleTimeoutSeconds: number
+    tileStyle: DeckTileStyle
   }
 }
 
@@ -260,6 +263,7 @@ const Osc52ClipboardSchema = z.enum(OSC52_CLIPBOARD_VALUES)
 const TerminalRendererSchema = z.enum(TERMINAL_RENDERER_VALUES)
 const DefaultNewPaneSchema = z.enum(DEFAULT_NEW_PANE_VALUES)
 const TabAttentionStyleSchema = z.enum(TAB_ATTENTION_STYLE_VALUES)
+const DeckTileStyleSchema = z.enum(DECK_TILE_STYLE_VALUES)
 const AttentionDismissSchema = z.enum(ATTENTION_DISMISS_VALUES)
 const SessionOpenModeSchema = z.enum(SESSION_OPEN_MODE_VALUES)
 const ExternalEditorSchema = z.enum(EXTERNAL_EDITOR_VALUES)
@@ -642,6 +646,9 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     if (typeof patch.streamDeck.idleTimeoutSeconds === 'number') {
       streamDeck.idleTimeoutSeconds = patch.streamDeck.idleTimeoutSeconds as number
     }
+    if (DeckTileStyleSchema.safeParse(patch.streamDeck.tileStyle).success) {
+      streamDeck.tileStyle = patch.streamDeck.tileStyle as DeckTileStyle
+    }
     if (Object.keys(streamDeck).length > 0) {
       normalized.streamDeck = streamDeck
     }
@@ -897,6 +904,7 @@ export const defaultLocalSettings: LocalSettings = {
     brightness: 100,
     idleBrightness: 10,
     idleTimeoutSeconds: 300,
+    tileStyle: 'status-icons',
   },
 }
 
@@ -1452,7 +1460,7 @@ export function extractLegacyLocalSettingsSeed(
     maybeAssignNested(
       patch,
       'streamDeck',
-      pickKeys(raw.streamDeck, ['enabled', 'brightness', 'idleBrightness', 'idleTimeoutSeconds']),
+      pickKeys(raw.streamDeck, ['enabled', 'brightness', 'idleBrightness', 'idleTimeoutSeconds', 'tileStyle']),
     )
   }
 
