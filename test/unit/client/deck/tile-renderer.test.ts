@@ -6,16 +6,20 @@ import {
   TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, DOT_GREEN, DOT_BLUE, DOT_SIZE,
 } from '@/deck/tile-renderer'
 import type { Ctx2D, IconSource } from '@/deck/tile-renderer'
+import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
 import type { KeySpec, RingColor } from '@/deck/frame'
 
 type Rect = { x: number; y: number; w: number; h: number; style: string }
 type Text = { text: string; x: number; y: number; style: string; font: string }
 type Img = { x: number; y: number; w: number; h: number }
+type Circle = { cx: number; cy: number; r: number; style: string }
 
 function recordingCtx(width: number, height: number) {
   const rects: Rect[] = []
   const texts: Text[] = []
   const images: Img[] = []
+  const circles: Circle[] = []
+  let pendingArc: { cx: number; cy: number; r: number } | null = null
   const ctx = {
     fillStyle: '#000000' as string,
     font: '',
@@ -29,10 +33,20 @@ function recordingCtx(width: number, height: number) {
     drawImage(_src: CanvasImageSource, x: number, y: number, w: number, h: number) {
       images.push({ x, y, w, h })
     },
+    beginPath() {
+      pendingArc = null
+    },
+    arc(cx: number, cy: number, r: number) {
+      pendingArc = { cx, cy, r }
+    },
+    fill() {
+      if (pendingArc) circles.push({ ...pendingArc, style: String(this.fillStyle) })
+      pendingArc = null
+    },
     measureText(t: string) { return { width: t.length * 6 } as TextMetrics },
     getImageData() { return { data: new Uint8ClampedArray(width * height * 4) } as ImageData },
   } as unknown as Ctx2D
-  return { ctx, rects, texts, images }
+  return { ctx, rects, texts, images, circles }
 }
 
 describe('title fitting', () => {
@@ -95,8 +109,8 @@ function renderTab(spec: KeySpec, getIcon?: IconSource) {
     return captured.ctx
   }
   const out = renderKey(spec, MINI_CAPS, factory, getIcon)
-  const { rects, texts, images } = captured!
-  return { out, rects, texts, images }
+  const { rects, texts, images, circles } = captured!
+  return { out, rects, texts, images, circles }
 }
 
 describe('renderKey', () => {
@@ -138,13 +152,22 @@ describe('renderKey', () => {
     expect(images).toEqual([{ x: slot.x, y: slot.y, w: slot.size, h: slot.size }])
   })
 
-  it('unready or letter-only icon draws the hue swatch + white letter fallback', () => {
-    const { rects, texts, images } = renderTab(
+  it('unready or letter-only icon draws RepoIcon\'s circle avatar + centered white letter', () => {
+    const { rects, texts, images, circles } = renderTab(
       tabSpec({ icons: [{ url: null, letter: 'B', hue: 200, ready: false }] }),
     )
     expect(images).toHaveLength(0)
-    expect(rects.some((r) => r.style === 'hsl(200, 60%, 42%)')).toBe(true)
-    expect(texts.some((t) => t.text === 'B' && t.style === '#ffffff')).toBe(true)
+    const slot = iconLayout(80, 80, 1)[0]
+    // Exact replica of RepoIcon's SVG: full-slot circle, shared color function.
+    expect(circles).toEqual([
+      { cx: slot.x + slot.size / 2, cy: slot.y + slot.size / 2, r: slot.size / 2, style: repoAvatarColor(200) },
+    ])
+    // The old square swatch is gone.
+    expect(rects.some((r) => r.style === repoAvatarColor(200))).toBe(false)
+    const letter = texts.find((t) => t.text === 'B')
+    expect(letter?.style).toBe('#ffffff')
+    // 9/16 of the diameter, weight 600 (slot.size is 30 on the 80x80 Mini -> 17px).
+    expect(letter?.font).toBe(`600 ${Math.round(slot.size * REPO_AVATAR_FONT_RATIO)}px sans-serif`)
   })
 
   it('status dot: green and blue variants at bottom-center; absent when null', () => {

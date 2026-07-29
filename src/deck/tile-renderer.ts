@@ -1,5 +1,6 @@
 import type { DeckCapabilities } from './deck-device'
 import type { DeckAction, KeySpec, RingColor } from './frame'
+import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
 
 // Canvas draw layer: converts a KeySpec into an RGBA pixel buffer via an
 // injectable 2D-context factory (jsdom returns null from getContext, so tests
@@ -7,7 +8,7 @@ import type { DeckAction, KeySpec, RingColor } from './frame'
 
 export type Ctx2D = Pick<
   CanvasRenderingContext2D,
-  'fillRect' | 'fillText' | 'measureText' | 'getImageData' | 'drawImage'
+  'fillRect' | 'fillText' | 'measureText' | 'getImageData' | 'drawImage' | 'beginPath' | 'arc' | 'fill'
 > & { fillStyle: string | CanvasGradient | CanvasPattern; font: string; textBaseline: CanvasTextBaseline }
 
 export type IconSource = (url: string) => CanvasImageSource | null
@@ -158,14 +159,20 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
       ctx.drawImage(bitmap, x, y, size, size)
       return
     }
-    // Letter avatar (canvas analogue of RepoIcon's SVG circle): hue swatch + white letter.
-    ctx.fillStyle = `hsl(${icon.hue}, 60%, 42%)`
-    ctx.fillRect(x, y, size, size)
-    ctx.font = `600 ${Math.round(size * 0.6)}px sans-serif`
-    ctx.textBaseline = 'top'
+    // Letter avatar: exact canvas replica of RepoIcon's SVG — circle filling
+    // the slot, letter at 9/16 of the diameter, weight 600, white, with
+    // RepoIcon's +0.5/16 optical nudge below true center (y=8.5 in a 16-unit box).
+    const cx = x + size / 2
+    const cy = y + size / 2
+    ctx.fillStyle = repoAvatarColor(icon.hue)
+    ctx.beginPath()
+    ctx.arc(cx, cy, size / 2, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.font = `600 ${Math.round(size * REPO_AVATAR_FONT_RATIO)}px sans-serif`
+    ctx.textBaseline = 'middle'
     ctx.fillStyle = '#ffffff'
     const letterWidth = ctx.measureText(icon.letter).width
-    ctx.fillText(icon.letter, Math.round(x + (size - letterWidth) / 2), Math.round(y + size * 0.2))
+    ctx.fillText(icon.letter, Math.round(cx - letterWidth / 2), Math.round(cy + size * (0.5 / 16)))
   })
 
   // 3. Status dot: the tab bar's green/blue icon-tint states, visible on the deck.

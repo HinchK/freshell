@@ -27,6 +27,9 @@ function noopCtx(width: number, height: number): Ctx2D {
     fillRect: () => {},
     fillText: () => {},
     drawImage: () => {},
+    beginPath: () => {},
+    arc: () => {},
+    fill: () => {},
     measureText: () => ({ width: 0 }) as TextMetrics,
     getImageData: () => ({ data: new Uint8ClampedArray(width * height * 4) }) as ImageData,
   }
