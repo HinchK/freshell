@@ -4,7 +4,7 @@
 //! determinism rationale — the test drives `drain_and_rebind_opencode`
 //! directly on a state handle instead of racing a spawned sweep timer),
 //! with the opencode deltas: `--session` resume args, `ses_`-shaped ids,
-//! an ENABLED pane ledger (row-level G3 supersede assertions), and eight
+//! an ENABLED pane ledger (row-level G3 supersede assertions), and nine
 //! phases:
 //!   1. mid-session rebind (A→B) + provider-correct meta.updated + ledger G3
 //!   2. restart resumes the NEW id (argv `--session B`, never A)
@@ -14,6 +14,7 @@
 //!   6. no-signal regression (the `--pure`/plugin-missing story)
 //!   7. dead-pane retired rebind (D1.3) + restore resumes the moved ref
 //!   8. first-bind arbitration (D1.2's signal half) on a never-bound pane
+//!   9. retention: a no-pane signal is RETAINED on disk across sweeps
 //!
 //! ONE test fn: the phases share server/env state (OPENCODE_CMD /
 //! OPENCODE_ARGV_CAPTURE_PATH are process-wide) and the one-owner-forever
@@ -52,6 +53,8 @@ const F: &str = "ses_ffffffffffffffffffffffffff";
 const G: &str = "ses_gggggggggggggggggggggggggg";
 #[cfg(unix)]
 const H: &str = "ses_hhhhhhhhhhhhhhhhhhhhhhhhhh";
+#[cfg(unix)]
+const I: &str = "ses_iiiiiiiiiiiiiiiiiiiiiiiiii";
 
 /// Fake opencode that records its argv (one token per line, atomically via
 /// tmp+mv) to `$OPENCODE_ARGV_CAPTURE_PATH` before parking — the argv-capture
@@ -770,6 +773,37 @@ async fn tui_switch_signal_rebinds_and_restart_resumes_the_new_id() {
         0,
         "the acted-on signal file must be deleted (act-then-delete)"
     );
+
+    // ── Phase 9 — retention: a signal naming a NONEXISTENT pane is not
+    // actionable — the ladder returns false and the file is RETAINED on
+    // disk for later sweeps (the RETAIN branch of act-then-delete, D1.1),
+    // stably across repeated drains, and never emits an associated frame.
+    let retained_tid = "no-such-pane-retention";
+    write_opencode_signal(&signal_root, retained_tid, 60, I);
+    let retained_path = signal_root.join(format!("{retained_tid}__{:014}-000001-1.json", 60));
+    freshell_ws::opencode_signal::drain_and_rebind_opencode(&state, &watcher).await;
+    tokio::task::yield_now().await;
+    assert!(
+        retained_path.exists(),
+        "a no-pane signal must be RETAINED on disk, not deleted (act-then-delete)"
+    );
+    let moved = frame_seen_within(&mut ws, Duration::from_secs(1), |v| {
+        v["type"] == "terminal.session.associated" && v["terminalId"] == retained_tid
+    })
+    .await;
+    assert!(
+        !moved,
+        "a no-pane signal must never produce an associated frame"
+    );
+    // Retention is stable across sweeps, not a one-drain artifact.
+    freshell_ws::opencode_signal::drain_and_rebind_opencode(&state, &watcher).await;
+    tokio::task::yield_now().await;
+    assert!(
+        retained_path.exists(),
+        "the retained signal must survive a SECOND drain (stable retention)"
+    );
+    // Leave the signal dir empty, as every acted-on phase asserts.
+    std::fs::remove_file(&retained_path).expect("clean up the retained signal");
 
     registry.kill(&tid2);
     registry.kill(&tid3);
