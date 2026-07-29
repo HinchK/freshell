@@ -153,7 +153,7 @@ comments written in Task 4 at `codex_reconcile.rs:58-61` and the module-doc
 deviation entry in Task 3 both name it) so it cannot be silently lost.
 This is NOT an unresolved coverage gap: the spec explicitly authorizes this
 deferral path with these exact conditions, and both conditions are met by
-concrete steps below (Task 3 Step 3 (3h), Task 4 Step 3d).
+concrete steps below (Task 3 Step 3 (3i), Task 4 Step 3d).
 
 Named residual risks recorded with this deferral (load-bearing validation,
 ledger A1/A6 — these fall in the deferred piece-3/attach-retry territory and
@@ -169,6 +169,21 @@ follow-up kata for the first two at landing):
   the busy edge itself was never observed, no force-read floor exists.
 - **Rollout semantics pinned at codex 0.145.0:** append-only-mid-turn was
   verified at that version; `.zst` archival timing unverified.
+
+One further named residual, found by independent (fresh-eyes) review of this
+plan and NOT piece-3 territory: **amplifier deadman anchor-pinning
+(hot-loop; latent in the amplifier lane, fixed in the codex port).**
+`amplifier/tracker.rs::note_output` (`:266-275`) resets only
+`force_read_logged` on Busy liveness; a FIRED `next_force_read_at` stays
+armed, so output resuming after a deadman fire pins that lane's
+`next_deadline()` at a past instant while the fire guard
+(`idle_age > window`) is false — the hub loop computes `wait = 0` and spins
+`expire_due` until the turn ends. The codex port disarms the anchor on
+liveness (Task 3 Step 3g, red-first pinned by
+`resumed_output_disarms_the_fired_deadman_anchor`); the matching one-line
+amplifier fix is OUT OF SCOPE for this kata (budget freeze; amplifier
+tracker changes were never in the spec) — include it in the follow-up kata
+recommended above.
 
 Additionally, to close the strict reading of the spec's "note it in the
 kata comment" condition: at landing time, post a one-line deferral comment
@@ -204,7 +219,7 @@ unrelated pending-decay timing.
 No new files. All changes are additive edits to three existing files:
 
 - **Modify:** `crates/freshell-ws/src/activity.rs` — new private free fn `fs_event_is_relevant` (near the other free fns, e.g. above `hub_next_deadline` at `:1042`); both watcher closures (`:332-348` codex, `:738-762` amplifier) call it; `codex_frames` (`:1107-1153`) returns `(Vec<ServerMessage>, Vec<String>)`; its 8 call sites (`:367, :404, :490, :535, :626, :655, :683, :987`) updated; `expire_due` (`:977-1039`) drains codex force-reads via `drain_codex_lane`; new tests in `mod tests`.
-- **Modify:** `crates/freshell-activity/src/codex.rs` — `TerminalActivity` gains `force_read_logged`/`next_force_read_at`; `CodexActivityTracker` gains `busy_deadman_ms` (+ manual `Default`, + `set_busy_deadman_ms`); `expire()` deadman arm rewritten; `next_deadline()` Busy arm consults `next_force_read_at`; module doc deviation entry added; tests rewritten/added.
+- **Modify:** `crates/freshell-activity/src/codex.rs` — `TerminalActivity` gains `force_read_logged`/`next_force_read_at`; `CodexActivityTracker` gains `busy_deadman_ms` (+ manual `Default`, + `set_busy_deadman_ms`); `expire()` deadman arm rewritten; `next_deadline()` Busy arm consults `next_force_read_at`; `note_output`'s Busy/Pending liveness branches disarm a fired deadman anchor; module doc deviation entry added; tests rewritten/added.
 - **Modify:** `crates/freshell-ws/src/codex_reconcile.rs` — doc-comment truth-up only (`:58-61`), naming the now-real deadman and the deferred degrade-signal piece.
 
 This is one subsystem (the codex/amplifier activity status lanes) — a single
@@ -486,7 +501,7 @@ git commit -m "fix(ws): forward notify Rescan (IN_Q_OVERFLOW) on codex and ampli
 ### Task 3: Codex busy-deadman emits ForceRead and stays Busy (tracker)
 
 **Files:**
-- Modify: `crates/freshell-activity/src/codex.rs` — module doc (`:19-36`), `TerminalActivity` struct (`:82-108`), `track_terminal` init (`:177-194`), `CodexActivityTracker` struct + `Default` (`:139-143`), `note_input` (`:332-367`, the D1 staleness escape), `expire()` (`:420-453`), `next_deadline()` (`:455-486`)
+- Modify: `crates/freshell-activity/src/codex.rs` — module doc (`:19-36`), `TerminalActivity` struct (`:82-108`), `track_terminal` init (`:177-194`), `CodexActivityTracker` struct + `Default` (`:139-143`), `note_input` (`:332-367`, the D1 staleness escape), `expire()` (`:420-453`), `next_deadline()` (`:455-486`), `note_output` liveness branches (`:371-418`)
 - Test: `crates/freshell-activity/src/codex.rs` `mod tests` (`:617` onward)
 
 **Interfaces:**
@@ -572,6 +587,48 @@ depends on it):
     }
 ```
 
+Add the fire-then-resume hot-loop guard pin (fresh-eyes review, iteration 1:
+the amplifier idiom copied as-is never clears a fired anchor when Busy-phase
+output resumes, so `next_deadline()` returns a constant PAST instant while
+the fire guard `idle_age > window` is false — the hub loop computes
+`wait = 0` and spins `expire_due` until the turn ends):
+
+```rust
+    #[test]
+    fn resumed_output_disarms_the_fired_deadman_anchor() {
+        // KATA namg: a deadman fire arms next_force_read_at; if output then
+        // resumes mid-turn, the liveness refresh must DISARM the anchor.
+        // Otherwise next_deadline()'s Busy arm returns the stale (past)
+        // anchor while expire()'s fire guard stays false -- nothing ever
+        // fires or re-arms, and the hub loop spins at wait = 0 until the
+        // turn ends. (Latent in the amplifier template, which resets only
+        // the warn latch on liveness; fixed in this port -- see D2.)
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("s1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200); // seeded busy
+        let d0 = tracker.next_deadline().expect("busy arms the deadman");
+        assert_eq!(force_reads(&tracker.expire(d0)), 1, "silent busy fires");
+
+        // Output resumes mid-turn: the refresh must re-base the deadline
+        // in the FUTURE relative to the new observation.
+        let resume_at = d0 + 50;
+        tracker.note_output("t1", "still streaming", resume_at);
+        assert_eq!(
+            tracker.next_deadline(),
+            Some(resume_at + BUSY_DEADMAN_MS + 1),
+            "resumed liveness disarms the fired anchor (no wait=0 hot-loop)"
+        );
+        assert!(
+            tracker.expire(resume_at + 1).is_empty(),
+            "a live turn never fires the deadman"
+        );
+
+        // A fresh full window of silence after the resume fires again.
+        let again = tracker.expire(resume_at + BUSY_DEADMAN_MS + 1);
+        assert_eq!(force_reads(&again), 1);
+    }
+```
+
 Add the test-scale override pin (Task 4's hub test depends on this):
 
 ```rust
@@ -638,6 +695,7 @@ still queue; that behavior is already pinned by the existing
 cargo test -p freshell-activity -- \
   codex::tests::deadman_force_reads_and_stays_busy_then_repeats \
   codex::tests::busy_deadline_follows_the_force_read_rearm \
+  codex::tests::resumed_output_disarms_the_fired_deadman_anchor \
   codex::tests::deadman_window_is_overridable_for_test_scale \
   codex::tests::submit_into_stale_busy_starts_fresh_pending_and_completes_once
 ```
@@ -647,7 +705,8 @@ positional filter.)
 
 Expected: FAIL to compile (`set_busy_deadman_ms` not found). That is the red.
 (If you comment out the override test to check the others: red with
-`force_reads == 0` and `phase == Unknown` — today's demotion — and the
+`force_reads == 0` and `phase == Unknown` — today's demotion — the resume
+test red at its first assert for the same reason, and the
 staleness-escape test red with phase `Busy` and zero completions — today's
 queued branch.)
 
@@ -827,7 +886,46 @@ Also change the Pending arm's liveness term (`codex.rs:476`) — leave it on
 covered by the override (see the field doc). No edit needed there; just do
 not "helpfully" convert it.
 
-3g. `note_input` staleness escape (D1; `codex.rs:332-367`) — the retired
+3g. `note_output` liveness branches (`codex.rs:371-418`) — disarm the
+deadman on resumed output (the fire-then-resume hot-loop guard; a deliberate
+DIVERGENCE from the amplifier template, which resets only the warn latch —
+see the named residual in D2). Both non-clearing liveness branches (the
+`count == 0` ordinary-output branch at `:378-383` and the `clear_count == 0`
+non-clearing-signal branch at `:386-391`) currently read identically:
+
+```rust
+        if state.phase == CodexPhase::Busy || state.phase == CodexPhase::Pending {
+            state.last_observed_at = at;
+        }
+```
+
+Extend BOTH to:
+
+```rust
+        if state.phase == CodexPhase::Busy || state.phase == CodexPhase::Pending {
+            state.last_observed_at = at;
+            // Deadman disarm (kata namg): observed output IS liveness --
+            // clear a fired anchor + warn latch so next_deadline()'s Busy
+            // arm re-bases on the refreshed last_observed_at. An armed
+            // stale anchor would pin the deadline at a PAST instant while
+            // the fire guard (idle_age > window) is false: expire() never
+            // fires/re-arms and the hub loop spins at wait = 0 until the
+            // turn ends. (Latent in amplifier/tracker.rs:266-275, which
+            // resets only force_read_logged; divergence recorded in the
+            // module doc and plan D2.)
+            state.force_read_logged = false;
+            state.next_force_read_at = None;
+        }
+```
+
+(The BEL-consuming path (`clear_count > 0`, `:393-417`) needs no edit: every
+path that keeps or returns a terminal to Busy runs through a
+`phase = CodexPhase::Busy` assignment, which 3c already resets, and
+completion paths leave Busy. For Pending the two fields are dormant — the
+deadman reads them only while Busy — so the unconditional reset inside the
+shared Busy/Pending branch is safe.)
+
+3h. `note_input` staleness escape (D1; `codex.rs:332-367`) — the retired
 demotion's one behavioral consumer, preserved at the submit site. Two edits
 inside the existing function; everything else stays byte-for-byte:
 
@@ -868,7 +966,7 @@ diverge from the pinned old behavior. Note the field-borrow shape:
 `self.busy_deadman_ms` is a disjoint field read while `state` borrows
 `self.states` — this compiles as-is.)
 
-3h. Module doc — append a third entry to the deviation list
+3i. Module doc — append a third entry to the deviation list
 (`codex.rs:19-36`, after deviation 2):
 
 ```rust
@@ -877,7 +975,11 @@ diverge from the pinned old behavior. Note the field-borrow shape:
 //!    `TrackerEffect::ForceRead` (the hub drains it via `drain_codex_lane`)
 //!    and STAYS busy, repeating every window -- it no longer flips
 //!    Busy->Unknown on a timer. This is the amplifier lane's G4
-//!    missed-signal floor (see `amplifier/tracker.rs`), ported because the
+//!    missed-signal floor (see `amplifier/tracker.rs`) -- with one
+//!    divergence: resumed output DISARMS a fired force-read anchor (the
+//!    `note_output` liveness reset), because an armed stale anchor pins
+//!    `next_deadline()` at a past instant and hot-loops the hub (latent in
+//!    the template; see the plan's D2 residual note). Ported because the
 //!    rollout lane is a single unbroken inotify->mpsc->drain chain with zero
 //!    redundant delivery: one missed fs event used to silence
 //!    terminal.turn.complete forever. The retired demotion's ONE behavioral
@@ -896,11 +998,12 @@ diverge from the pinned old behavior. Note the field-borrow shape:
 cargo test -p freshell-activity -- \
   codex::tests::deadman_force_reads_and_stays_busy_then_repeats \
   codex::tests::busy_deadline_follows_the_force_read_rearm \
+  codex::tests::resumed_output_disarms_the_fired_deadman_anchor \
   codex::tests::deadman_window_is_overridable_for_test_scale \
   codex::tests::submit_into_stale_busy_starts_fresh_pending_and_completes_once
 ```
 
-Expected: PASS (4 tests).
+Expected: PASS (5 tests).
 
 - [ ] **Step 5: Re-derive the two demotion-dependent tests**
 
@@ -916,7 +1019,7 @@ Expected failures: `busy_deadman_demotes_to_unknown_and_reconcile_repromotes`
 `dup_bel_chunk_after_stale_accepted_completes_exactly_once`
 (`codex.rs:1003-1022` — its setup comment says "demote to Unknown"; the
 demotion no longer happens, but its stale-silence `note_input` now takes the
-D1 staleness escape (3g) into the same fresh-pending path, so its
+D1 staleness escape (3h) into the same fresh-pending path, so its
 completion assertions may even stay green — replace it regardless, because
 its name and setup comments now lie about the mechanism). Everything else
 must still pass — in particular
@@ -1413,8 +1516,8 @@ workflow with the final review verdict.
 
 **1. Spec coverage.**
 - Fix piece 1 (Rescan on BOTH lanes, forwarded as the existing FsChange messages) → Task 2. The spec's "add EventKind::Other (or gate on flag()==Some(Flag::Rescan))" — the flag-gate option is taken, with a source-verified reason (kqueue flagless `Other`), documented in D3 and the code comment.
-- Fix piece 2 (codex self-healing floor mirroring amplifier: `expire()` emits ForceRead on the busy-deadman path; `codex_frames`' dead arm forwards into a force-reads list; `expire_due` drains via `drain_codex_lane`) → Tasks 3 + 4. The requested stay-Busy-vs-Unknown evaluation → D1 (stay Busy on the timer path, amplifier mirror, PLUS the submit-time staleness escape after the original clause (c) was falsified by a full state-machine trace — ledger A2; the escape preserves the retired demotion's one behavioral consumer at the same threshold, red-first pinned in Task 3 Step 1). Bounded worst case ≤ `BUSY_DEADMAN_MS` → pinned by the Task 4 hub test (scaled window) and the Task 3 repeat pin.
-- Optional piece 3 → D2: deferred with the spec's two required notes (plan D2 here; kata comment in code at Task 4 Step 3d and the module-doc deviation at Task 3 Step 3h) — the deferral text was verified against the recovered spec verbatim (ledger A7), and D2 now also NAMES the uncovered residual risks (silent attach failure, busy-edge loss) plus the landing-time kata comment. Not silently skipped.
+- Fix piece 2 (codex self-healing floor mirroring amplifier: `expire()` emits ForceRead on the busy-deadman path; `codex_frames`' dead arm forwards into a force-reads list; `expire_due` drains via `drain_codex_lane`) → Tasks 3 + 4. The requested stay-Busy-vs-Unknown evaluation → D1 (stay Busy on the timer path, amplifier mirror, PLUS the submit-time staleness escape after the original clause (c) was falsified by a full state-machine trace — ledger A2; the escape preserves the retired demotion's one behavioral consumer at the same threshold, red-first pinned in Task 3 Step 1). Bounded worst case ≤ `BUSY_DEADMAN_MS` → pinned by the Task 4 hub test (scaled window) and the Task 3 repeat pin. Fresh-eyes review (iteration 1) found the amplifier idiom alone leaves a FIRED anchor pinned in the past when Busy output resumes (hub `wait = 0` hot-loop) → Task 3 Step 3g disarms the anchor on `note_output` liveness, red-first pinned by `resumed_output_disarms_the_fired_deadman_anchor`; the template's own latent copy is a named residual in D2.
+- Optional piece 3 → D2: deferred with the spec's two required notes (plan D2 here; kata comment in code at Task 4 Step 3d and the module-doc deviation at Task 3 Step 3i) — the deferral text was verified against the recovered spec verbatim (ledger A7), and D2 now also NAMES the uncovered residual risks (silent attach failure, busy-edge loss) plus the landing-time kata comment. Not silently skipped.
 - Test (1) synthetic Rescan, both lanes, red today → Task 2 Steps 1–3 + the both-closures grep check (Step 6); fidelity argument in D3.
 - Test (2) tracker deadman ForceRead mirroring amplifier's test, red today → Task 3 Steps 1–2.
 - Test (3) hub-level watch-dropped-before-task_complete, deterministic, red today → Task 4 Steps 1–2 (unwatch seam is in-crate module privacy, the only seam that exists — verified; no synthetic load).
