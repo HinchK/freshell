@@ -34,6 +34,26 @@
 //!    disjoint clock domains, so the turn-key alone cannot dedupe them).
 //! 2. **Zero-polling**: `next_deadline()` + one-shot hub timer instead of the
 //!    5s sweep (`ACTIVITY_SWEEP_MS`), same as [`crate::claude`].
+//! 3. **The busy-deadman self-heals instead of demoting** (kata namg): a
+//!    busy terminal silent past [`BUSY_DEADMAN_MS`] emits
+//!    `TrackerEffect::ForceRead` (the hub drains it via `drain_codex_lane`)
+//!    and STAYS busy, repeating every window -- it no longer flips
+//!    Busy->Unknown on a timer. This is the amplifier lane's G4
+//!    missed-signal floor (see `amplifier/tracker.rs`) -- with one
+//!    divergence: resumed output DISARMS a fired force-read anchor (the
+//!    `note_output` liveness reset), because an armed stale anchor pins
+//!    `next_deadline()` at a past instant and hot-loops the hub (latent in
+//!    the template; see the plan's D2 residual note). Ported because the
+//!    rollout lane is a single unbroken inotify->mpsc->drain chain with zero
+//!    redundant delivery: one missed fs event used to silence
+//!    terminal.turn.complete forever. The retired demotion's ONE behavioral
+//!    consumer -- a user submit into a wedged pane -- is preserved by the
+//!    submit-time staleness escape in `note_input` (silence past the window
+//!    at submit time takes the fresh-pending path, same threshold as the
+//!    old demotion). The tailer's fail-quiet IO errors are
+//!    retried on the same cadence; a LaneRetry-equivalent loud-degrade path
+//!    (TailerReadOutcome parity) is deliberately DEFERRED -- see
+//!    docs/plans/2026-07-29-codex-lane-self-healing.md (D2).
 
 use std::collections::HashMap;
 
@@ -106,6 +126,12 @@ struct TerminalActivity {
     last_observed_at: i64,
     last_emitted_turn_key: Option<i64>,
     parser_state: ParserState,
+    /// Deadman self-heal (kata namg; mirror of amplifier/tracker.rs:51-52):
+    /// warn-once latch for the stuck-busy force-read log line.
+    force_read_logged: bool,
+    /// Deadman re-arm anchor: the busy force-read repeats every
+    /// `busy_deadman_ms` while the silence persists.
+    next_force_read_at: Option<i64>,
 }
 
 impl TerminalActivity {
@@ -136,15 +162,38 @@ fn changed(previous: Option<&CodexActivityRecord>, next: CodexActivityRecord) ->
     }]
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CodexActivityTracker {
     states: HashMap<String, TerminalActivity>,
     ledger: TurnCompletionLedger,
+    /// Busy-deadman window; [`BUSY_DEADMAN_MS`] in production. Overridable
+    /// (test-scale hook) because there is no clock abstraction -- `expire`
+    /// takes wall-clock ms and the hub uses `now_ms()`. Drives ONLY the
+    /// busy-deadman + its `next_deadline` arm; the pending-liveness window
+    /// stays on the constant.
+    busy_deadman_ms: i64,
+}
+
+impl Default for CodexActivityTracker {
+    fn default() -> Self {
+        Self {
+            states: HashMap::new(),
+            ledger: TurnCompletionLedger::default(),
+            busy_deadman_ms: BUSY_DEADMAN_MS,
+        }
+    }
 }
 
 impl CodexActivityTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test-scale hook: override the busy-deadman window (production
+    /// default [`BUSY_DEADMAN_MS`]). Hub-level tests shrink it so the
+    /// missed-event self-heal (kata namg) runs in test time.
+    pub fn set_busy_deadman_ms(&mut self, ms: i64) {
+        self.busy_deadman_ms = ms;
     }
 
     pub fn list(&self) -> Vec<CodexActivityRecord> {
@@ -191,6 +240,8 @@ impl CodexActivityTracker {
             last_observed_at: at,
             last_emitted_turn_key: None,
             parser_state: ParserState::new(),
+            force_read_logged: false,
+            next_force_read_at: None,
         };
         let next = state.to_record();
         self.states.insert(terminal_id.to_string(), state);
@@ -261,6 +312,8 @@ impl CodexActivityTracker {
                     .unwrap_or(true)
             {
                 state.phase = CodexPhase::Busy;
+                state.force_read_logged = false;
+                state.next_force_read_at = None;
                 state.accepted_start_at = Some(started_at);
                 state.updated_at = at;
                 state.last_observed_at = at;
@@ -337,11 +390,23 @@ impl CodexActivityTracker {
             return Vec::new();
         }
         let previous = state.to_record();
+        // KATA namg (D1): submit-time staleness escape -- the one
+        // behavioral consumer of the retired Busy->Unknown demotion. A
+        // submit into a Busy terminal SILENT past the deadman window is a
+        // user acting on a wedged/phantom turn (the deadman force-reads
+        // could not heal it): treat it as a FRESH pending turn -- the old
+        // demotion's submit semantics at the same threshold -- instead of
+        // queueing behind a turn end that will never come (queueing would
+        // spend the real turn's single BEL clearing the phantom: zero
+        // completions, no chime). Measured BEFORE last_observed_at is
+        // refreshed by this very submit.
+        let stale_busy =
+            state.phase == CodexPhase::Busy && at - state.last_observed_at > self.busy_deadman_ms;
         state.last_submit_at = Some(at);
         state.pending_until = Some(at + PENDING_SUBMIT_GATE_MS);
         state.pending_freshness_at = Some(at);
         state.last_observed_at = at;
-        if state.phase == CodexPhase::Busy {
+        if state.phase == CodexPhase::Busy && !stale_busy {
             if state.queued_submit_at.is_none() {
                 state.queued_submit_at = Some(at);
             }
@@ -350,7 +415,7 @@ impl CodexActivityTracker {
             return changed(Some(&previous), next);
         }
 
-        if state.phase == CodexPhase::Idle || state.phase == CodexPhase::Unknown {
+        if state.phase == CodexPhase::Idle || state.phase == CodexPhase::Unknown || stale_busy {
             // A fresh pending turn starts here: any armed BEL-echo swallow
             // (CE1) belongs to a PREVIOUS reconciled turn and is stale.
             state.swallow_next_bel = false;
@@ -378,6 +443,17 @@ impl CodexActivityTracker {
         if count == 0 {
             if state.phase == CodexPhase::Busy || state.phase == CodexPhase::Pending {
                 state.last_observed_at = at;
+                // Deadman disarm (kata namg): observed output IS liveness --
+                // clear a fired anchor + warn latch so next_deadline()'s Busy
+                // arm re-bases on the refreshed last_observed_at. An armed
+                // stale anchor would pin the deadline at a PAST instant while
+                // the fire guard (idle_age > window) is false: expire() never
+                // fires/re-arms and the hub loop spins at wait = 0 until the
+                // turn ends. (Latent in amplifier/tracker.rs:266-275, which
+                // resets only force_read_logged; divergence recorded in the
+                // module doc and plan D2.)
+                state.force_read_logged = false;
+                state.next_force_read_at = None;
             }
             return Vec::new();
         }
@@ -386,6 +462,17 @@ impl CodexActivityTracker {
         if clear_count == 0 {
             if state.phase == CodexPhase::Busy || state.phase == CodexPhase::Pending {
                 state.last_observed_at = at;
+                // Deadman disarm (kata namg): observed output IS liveness --
+                // clear a fired anchor + warn latch so next_deadline()'s Busy
+                // arm re-bases on the refreshed last_observed_at. An armed
+                // stale anchor would pin the deadline at a PAST instant while
+                // the fire guard (idle_age > window) is false: expire() never
+                // fires/re-arms and the hub loop spins at wait = 0 until the
+                // turn ends. (Latent in amplifier/tracker.rs:266-275, which
+                // resets only force_read_logged; divergence recorded in the
+                // module doc and plan D2.)
+                state.force_read_logged = false;
+                state.next_force_read_at = None;
             }
             return Vec::new();
         }
@@ -421,6 +508,7 @@ impl CodexActivityTracker {
     /// pending-decay + busy-deadman transitions, deadline-driven.
     pub fn expire(&mut self, at: i64) -> Vec<CodexEffect> {
         let mut effects = Vec::new();
+        let busy_deadman_ms = self.busy_deadman_ms;
         for state in self.states.values_mut() {
             let previous = state.to_record();
 
@@ -438,12 +526,38 @@ impl CodexActivityTracker {
                     state.pending_submit_at = None;
                     state.pending_freshness_at = None;
                 }
-            } else if state.phase == CodexPhase::Busy
-                && at - state.last_observed_at > BUSY_DEADMAN_MS
-            {
-                state.phase = CodexPhase::Unknown;
-                state.updated_at = at;
-                state.last_observed_at = at;
+            } else if state.phase == CodexPhase::Busy {
+                // Deadman (kata namg; mirror of amplifier/tracker.rs:332-357):
+                // a busy terminal silent past the window requests a rollout
+                // force-read and STAYS busy -- never fabricate a completion,
+                // never demote on a timer. The hub drains the force-read via
+                // drain_codex_lane; the offset-based tailer catches up fully,
+                // so a missed inotify event costs at most one window instead
+                // of a silent-forever stall. Repeats every window while the
+                // silence persists (each repeat also retries a fail-quiet
+                // tailer read).
+                let idle_age_ms = at - state.last_observed_at;
+                let due = state
+                    .next_force_read_at
+                    .map(|next| at >= next)
+                    .unwrap_or(idle_age_ms > busy_deadman_ms);
+                if idle_age_ms > busy_deadman_ms && due {
+                    if !state.force_read_logged {
+                        state.force_read_logged = true;
+                        tracing::warn!(
+                            component = "codex-activity-tracker",
+                            event = "codex_activity_deadman_force_read",
+                            terminal_id = %state.terminal_id,
+                            age_ms = idle_age_ms,
+                            "Codex terminal silent past deadman; requesting rollout force-read (staying busy)."
+                        );
+                    }
+                    state.next_force_read_at = Some(at + busy_deadman_ms);
+                    effects.push(TrackerEffect::ForceRead {
+                        terminal_id: state.terminal_id.clone(),
+                        at,
+                    });
+                }
             }
 
             let next = state.to_record();
@@ -479,7 +593,11 @@ impl CodexActivityTracker {
                     };
                     Some(gate.max(freshness).max(liveness))
                 }
-                CodexPhase::Busy => Some(state.last_observed_at + BUSY_DEADMAN_MS + 1),
+                CodexPhase::Busy => Some(
+                    state
+                        .next_force_read_at
+                        .unwrap_or(state.last_observed_at + self.busy_deadman_ms + 1),
+                ),
                 _ => None,
             })
             .min()
@@ -639,6 +757,13 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn force_reads(effects: &[CodexEffect]) -> usize {
+        effects
+            .iter()
+            .filter(|e| matches!(e, TrackerEffect::ForceRead { .. }))
+            .count()
     }
 
     #[test]
@@ -935,21 +1060,24 @@ mod tests {
     }
 
     #[test]
-    fn busy_deadman_demotes_to_unknown_and_reconcile_repromotes() {
-        // The busy-deadman (previously structurally dead) is now reachable:
-        // a seeded busy with no observation for BUSY_DEADMAN_MS goes Unknown
-        // instead of lying blue forever; a NEWER unresolved start re-promotes.
+    fn busy_deadman_defers_while_output_liveness_continues() {
+        // KATA namg replacement for the retired Busy->Unknown demotion pin:
+        // the deadman fires on SILENCE, so rollout/PTY observations that
+        // refresh last_observed_at keep deferring it.
         let mut tracker = CodexActivityTracker::new();
-        tracker.track_terminal("t1", None, 0);
-        tracker.reconcile_rollout("t1", &started(100), 200);
+        tracker.track_terminal("t1", Some("s1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200); // seeded busy
+        tracker.note_output("t1", "streaming...", 100_000); // liveness
         assert!(
-            tracker.next_deadline().is_some(),
-            "busy arms the deadman timer"
+            tracker.expire(200 + BUSY_DEADMAN_MS + 1).is_empty(),
+            "observed at 100_000: not yet silent past the window"
         );
-        let effects = tracker.expire(200 + BUSY_DEADMAN_MS + 1);
-        assert_eq!(phases(&effects), vec![CodexPhase::Unknown]);
-        let re = tracker.reconcile_rollout("t1", &started(500_000), 500_100);
-        assert_eq!(phases(&re), vec![CodexPhase::Busy]);
+        let effects = tracker.expire(100_000 + BUSY_DEADMAN_MS + 1);
+        assert_eq!(
+            force_reads(&effects),
+            1,
+            "silence measured from the last observation"
+        );
     }
 
     #[test]
@@ -1001,23 +1129,164 @@ mod tests {
     }
 
     #[test]
-    fn dup_bel_chunk_after_stale_accepted_completes_exactly_once() {
-        // Load-bearing validation CE2: transition_pending_after_turn_clear
-        // must null accepted_start_at. A deadman-demoted seeded busy leaves a
-        // stale accepted anchor; without the fix, a dup-BEL chunk (real PTY
-        // behavior, see the existing dup-BEL test) fires TWO completions in
-        // one note_output call -- pending-key chime then stale-accepted chime.
+    fn dup_bel_chunk_after_stale_busy_submit_completes_exactly_once() {
+        // CE2 re-derived for the self-healing deadman (kata namg): the
+        // deadman no longer demotes to Unknown; instead, a submit into the
+        // stale-silent Busy terminal takes the D1 staleness escape into a
+        // FRESH pending turn (note_input, same threshold as the retired
+        // demotion). A dup-BEL chunk (real PTY behavior, see the existing
+        // dup-BEL test) must still stamp exactly ONE completion for the one
+        // physical turn end -- the pending-clear path nulls the phantom's
+        // stale accepted anchor, so the second BEL of the chunk finds no
+        // turn to complete. The load-bearing invariant is one completion
+        // per physical turn end, regardless of which branch armed it.
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t1", Some("thread-1"), 0);
         tracker.reconcile_rollout("t1", &started(100), 200); // seeded busy, accepted=100
-        tracker.expire(200 + BUSY_DEADMAN_MS + 1); // demote to Unknown
-        let submit_at = 200 + BUSY_DEADMAN_MS + 1_000;
-        tracker.note_input("t1", "\r", submit_at); // new pending turn
+        tracker.expire(200 + BUSY_DEADMAN_MS + 1); // deadman fires; stays busy
+        let submit_at = 200 + BUSY_DEADMAN_MS + 1_000; // silence > window: stale
+        tracker.note_input("t1", "\r", submit_at); // staleness escape: fresh pending
         let bel = tracker.note_output("t1", "\u{07}\u{07}", submit_at + 500);
         assert_eq!(
             completions(&bel).len(),
             1,
             "one turn end -> exactly one completion, even for a dup-BEL chunk"
+        );
+    }
+
+    #[test]
+    fn deadman_force_reads_and_stays_busy_then_repeats() {
+        // KATA namg: the codex busy-deadman self-heals instead of demoting.
+        // A busy terminal silent past the window requests a rollout
+        // force-read and STAYS busy -- never fabricate a completion, never
+        // demote on a timer -- and repeats every window while the silence
+        // persists (each repeat also retries a fail-quiet tailer read).
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("s1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200); // seeded busy
+
+        let effects = tracker.expire(200 + BUSY_DEADMAN_MS + 1);
+        assert_eq!(
+            force_reads(&effects),
+            1,
+            "silent busy requests a force-read"
+        );
+        assert_eq!(
+            tracker.list()[0].phase,
+            CodexPhase::Busy,
+            "the deadman never demotes on a timer"
+        );
+        assert!(
+            phases(&effects).is_empty(),
+            "staying busy is not a public change -- no Changed frame"
+        );
+
+        // Not due again until the repeat interval.
+        assert!(tracker.expire(200 + BUSY_DEADMAN_MS + 2).is_empty());
+
+        // Still silent a full window later: fires again.
+        let again = tracker.expire(200 + 2 * BUSY_DEADMAN_MS + 2);
+        assert_eq!(force_reads(&again), 1);
+    }
+
+    #[test]
+    fn busy_deadline_follows_the_force_read_rearm() {
+        // Pin RELATIVE to next_deadline() rather than assuming which
+        // observation timestamp seeded last_observed_at.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("s1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200);
+        let d0 = tracker
+            .next_deadline()
+            .expect("busy arms the deadman timer");
+        let fired = tracker.expire(d0);
+        assert_eq!(
+            force_reads(&fired),
+            1,
+            "expiring at the armed deadline fires"
+        );
+        assert_eq!(
+            tracker.next_deadline(),
+            Some(d0 + BUSY_DEADMAN_MS),
+            "after the fire the deadline follows the re-arm anchor"
+        );
+    }
+
+    #[test]
+    fn resumed_output_disarms_the_fired_deadman_anchor() {
+        // KATA namg: a deadman fire arms next_force_read_at; if output then
+        // resumes mid-turn, the liveness refresh must DISARM the anchor.
+        // Otherwise next_deadline()'s Busy arm returns the stale (past)
+        // anchor while expire()'s fire guard stays false -- nothing ever
+        // fires or re-arms, and the hub loop spins at wait = 0 until the
+        // turn ends. (Latent in the amplifier template, which resets only
+        // the warn latch on liveness; fixed in this port -- see D2.)
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("s1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200); // seeded busy
+        let d0 = tracker.next_deadline().expect("busy arms the deadman");
+        assert_eq!(force_reads(&tracker.expire(d0)), 1, "silent busy fires");
+
+        // Output resumes mid-turn: the refresh must re-base the deadline
+        // in the FUTURE relative to the new observation.
+        let resume_at = d0 + 50;
+        tracker.note_output("t1", "still streaming", resume_at);
+        assert_eq!(
+            tracker.next_deadline(),
+            Some(resume_at + BUSY_DEADMAN_MS + 1),
+            "resumed liveness disarms the fired anchor (no wait=0 hot-loop)"
+        );
+        assert!(
+            tracker.expire(resume_at + 1).is_empty(),
+            "a live turn never fires the deadman"
+        );
+
+        // A fresh full window of silence after the resume fires again.
+        let again = tracker.expire(resume_at + BUSY_DEADMAN_MS + 1);
+        assert_eq!(force_reads(&again), 1);
+    }
+
+    #[test]
+    fn deadman_window_is_overridable_for_test_scale() {
+        let mut tracker = CodexActivityTracker::new();
+        tracker.set_busy_deadman_ms(500);
+        tracker.track_terminal("t1", Some("s1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200);
+        let d0 = tracker
+            .next_deadline()
+            .expect("busy arms the (shrunk) deadman timer");
+        assert!(d0 <= 200 + 501, "the shrunk window drives the deadline");
+        let effects = tracker.expire(d0);
+        assert_eq!(force_reads(&effects), 1);
+        assert_eq!(tracker.list()[0].phase, CodexPhase::Busy);
+    }
+
+    #[test]
+    fn submit_into_stale_busy_starts_fresh_pending_and_completes_once() {
+        // KATA namg (D1): the retired Busy->Unknown demotion had exactly ONE
+        // behavioral consumer -- a user submit into a wedged (phantom-Busy)
+        // terminal took the fresh-pending branch, and the next BEL completed
+        // exactly once. Preserve that consumer directly at the submit site:
+        // a submit into a Busy terminal SILENT past the deadman window
+        // starts a FRESH pending turn (same threshold as the old demotion)
+        // instead of queueing behind a turn end that will never come --
+        // queueing would spend the real turn's single BEL on the phantom
+        // and never chime.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("s1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200); // phantom busy
+        let submit_at = 200 + 2 * BUSY_DEADMAN_MS; // still silent: stale
+        tracker.note_input("t1", "\r", submit_at);
+        assert_eq!(
+            tracker.list()[0].phase,
+            CodexPhase::Pending,
+            "a stale-busy submit rescues a fresh pending turn (not a queue)"
+        );
+        let bel = tracker.note_output("t1", "\u{07}", submit_at + 500);
+        assert_eq!(
+            completions(&bel).len(),
+            1,
+            "the real turn's single BEL completes exactly once"
         );
     }
 }

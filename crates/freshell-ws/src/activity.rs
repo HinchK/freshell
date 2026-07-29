@@ -317,30 +317,19 @@ impl ActivityHub {
             );
             return;
         }
-        // Watcher: mirror the amplifier watcher (activity.rs:412-436) EXACTLY.
-        // The closure captures only the hub-event sender + terminal id (never
-        // a hub clone: that would put an Arc cycle inside HubInner and let the
+        // Watcher: mirror the amplifier watcher EXACTLY. The closure
+        // captures only the hub-event sender + terminal id (never a hub
+        // clone: that would put an Arc cycle inside HubInner and let the
         // notify thread emit frames out of order with the hub task). The
-        // event-kind filter is the amplifier one VERBATIM (copy the matches!
-        // expression from activity.rs:422-430): our own tail read triggers
-        // Access(..) events and an atime-driven Modify(Metadata(..)) --
-        // forwarding either would self-trigger one extra read per real read,
-        // breaking the zero-polling accounting.
+        // event filter is the SHARED `fs_event_is_relevant` (same fn as the
+        // amplifier lane): data-mutation kinds only, plus the Rescan
+        // miss-recovery override -- see its doc comment (kata namg).
         let tx = self.tx.clone();
         let watched_terminal = terminal_id.to_string();
         let mut watcher =
             match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 let Ok(event) = res else { return };
-                let relevant = matches!(
-                    event.kind,
-                    notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
-                        | notify::EventKind::Modify(notify::event::ModifyKind::Any)
-                        | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
-                        | notify::EventKind::Create(_)
-                        | notify::EventKind::Remove(_)
-                        | notify::EventKind::Any
-                );
-                if relevant {
+                if fs_event_is_relevant(&event) {
                     let _ = tx.send(HubEvent::CodexFsChange {
                         terminal_id: watched_terminal.clone(),
                     });
@@ -364,7 +353,7 @@ impl ActivityHub {
         let frames = {
             let mut inner = self.inner.lock().expect("activity hub lock");
             let bind = inner.codex.bind_session(terminal_id, session_id);
-            let frames = codex_frames(&mut inner.idle, bind);
+            let (frames, _force_reads) = codex_frames(&mut inner.idle, bind);
             // Re-attach REPLACES the lane: a mid-session fork moves the pane to a
             // NEW rollout file; keeping the old tailer would keep busy/turn
             // signals keyed to the abandoned parent file (stale-tailer defect,
@@ -401,7 +390,8 @@ impl ActivityHub {
             }
             let now = crate::terminal::now_ms();
             let effects = inner.codex.reconcile_rollout(terminal_id, &events, now);
-            codex_frames(&mut inner.idle, effects)
+            let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+            frames
         };
         self.emit(frames);
     }
@@ -487,7 +477,8 @@ impl ActivityHub {
                 let frames = {
                     let mut inner = self.inner.lock().expect("activity hub lock");
                     let effects = inner.codex.bind_session(&terminal_id, &session_id);
-                    codex_frames(&mut inner.idle, effects)
+                    let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                    frames
                 };
                 self.emit(frames);
             }
@@ -532,7 +523,8 @@ impl ActivityHub {
                                 resume_session_id.as_deref(),
                                 at,
                             );
-                            frames.extend(codex_frames(&mut inner.idle, effects));
+                            let (mut f, _force_reads) = codex_frames(&mut inner.idle, effects);
+                            frames.append(&mut f);
                         }
                         "amplifier" => {
                             inner.modes.insert(terminal_id.clone(), mode.clone());
@@ -623,7 +615,8 @@ impl ActivityHub {
                         }
                         "codex" => {
                             let effects = inner.codex.note_input(&terminal_id, &data, at);
-                            codex_frames(&mut inner.idle, effects)
+                            let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                            frames
                         }
                         "amplifier" => {
                             let effects = inner.amplifier.note_input(&terminal_id, &data, at);
@@ -652,7 +645,8 @@ impl ActivityHub {
                         }
                         "codex" => {
                             let effects = inner.codex.note_output(&terminal_id, &data, at);
-                            codex_frames(&mut inner.idle, effects)
+                            let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                            frames
                         }
                         "amplifier" => {
                             inner.amplifier.note_output(&terminal_id, at);
@@ -680,7 +674,8 @@ impl ActivityHub {
                         }
                         "codex" => {
                             let effects = inner.codex.note_exit(&terminal_id);
-                            codex_frames(&mut inner.idle, effects)
+                            let (frames, _force_reads) = codex_frames(&mut inner.idle, effects);
+                            frames
                         }
                         "amplifier" => {
                             let effects = inner.amplifier.note_exit(&terminal_id);
@@ -736,24 +731,12 @@ impl ActivityHub {
         let tx = self.tx.clone();
         let watched_terminal = terminal_id.to_string();
         let watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-            // Only DATA-mutation events drive a tail read. This matters for
-            // the zero-polling guarantee: our OWN read opens the file, which
-            // inotify reports as `Access(..)` (IN_OPEN/IN_CLOSE_NOWRITE) and
-            // — via the atime update — `Modify(Metadata(..))` (IN_ATTRIB).
-            // Forwarding either would self-trigger one extra read per real
-            // read. Appends arrive as `Modify(Data(..))` (IN_MODIFY);
-            // `Create`/`Remove`/`Modify(Name)` cover rotation edge cases
-            // (which the tailer then reports as file_reset/read_error).
+            // Event filter: the SHARED `fs_event_is_relevant` (same fn as
+            // the codex lane) -- data-mutation kinds only (zero-polling:
+            // our own reads must not self-trigger), plus the Rescan
+            // miss-recovery override. See its doc comment (kata namg).
             if let Ok(event) = res {
-                if matches!(
-                    event.kind,
-                    notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
-                        | notify::EventKind::Modify(notify::event::ModifyKind::Any)
-                        | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
-                        | notify::EventKind::Create(_)
-                        | notify::EventKind::Remove(_)
-                        | notify::EventKind::Any
-                ) {
+                if fs_event_is_relevant(&event) {
                     let _ = tx.send(HubEvent::AmplifierFsChange {
                         terminal_id: watched_terminal.clone(),
                     });
@@ -975,16 +958,17 @@ impl ActivityHub {
     }
 
     /// The one-shot deadline fired: run every tracker's expiry + the idle
-    /// gate, then service any amplifier force-read requests.
+    /// gate, then service any codex + amplifier force-read requests.
     fn expire_due(&self) {
         let now = now_ms();
-        let (frames, force_reads, reattaches) = {
+        let (frames, codex_force_reads, force_reads, reattaches) = {
             let mut inner = self.inner.lock().expect("activity hub lock");
             let mut frames = Vec::new();
             let claude = inner.claude.expire(now);
             frames.extend(claude_frames(&mut inner.idle, claude));
             let codex = inner.codex.expire(now);
-            frames.extend(codex_frames(&mut inner.idle, codex));
+            let (mut f, codex_force_reads) = codex_frames(&mut inner.idle, codex);
+            frames.append(&mut f);
             let amplifier = inner.amplifier.expire(now);
             let (mut f, force_reads) = amplifier_frames(&mut inner.idle, amplifier);
             frames.append(&mut f);
@@ -1008,9 +992,16 @@ impl ActivityHub {
                     ));
                 }
             }
-            (frames, force_reads, reattaches)
+            (frames, codex_force_reads, force_reads, reattaches)
         };
         self.emit(frames);
+        // KATA namg: service codex deadman force-reads -- the self-healing
+        // floor for a missed rollout fs event. drain_codex_lane no-ops when
+        // the lane is gone (get_mut miss), which is correct: exit tears the
+        // tracker down with the lane, and a re-attach replaces both.
+        for terminal_id in codex_force_reads {
+            self.drain_codex_lane(&terminal_id);
+        }
         for terminal_id in force_reads {
             self.drain_lane(&terminal_id);
         }
@@ -1037,6 +1028,37 @@ impl ActivityHub {
             self.attach_lane(&terminal_id, &session_id, &events_path, AttachAt::Eof);
         }
     }
+}
+
+/// Shared fs-event filter for the codex and amplifier tail watchers.
+///
+/// Kind filter: only DATA-mutation events drive a tail read. This is the
+/// zero-polling guarantee: our OWN read opens the file, which inotify
+/// reports as `Access(..)` (IN_OPEN/IN_CLOSE_NOWRITE) and -- via the atime
+/// update -- `Modify(Metadata(..))` (IN_ATTRIB); forwarding either would
+/// self-trigger one extra read per real read. Appends arrive as
+/// `Modify(Data(..))` (IN_MODIFY); `Create`/`Remove`/`Modify(Name)` cover
+/// rotation edge cases.
+///
+/// Rescan override (kata namg): notify's inotify backend reports kernel
+/// IN_Q_OVERFLOW as `Event::new(EventKind::Other).set_flag(Flag::Rescan)`
+/// (notify-6.1.1 inotify.rs:208-211) -- "you may have missed events,
+/// re-check". It is the library's ONE miss-recovery signal; dropping it
+/// leaves a lane silently wedged until an unrelated future write. Gate on
+/// `need_rescan()` rather than `EventKind::Other`: the kqueue backend emits
+/// flagless `Other` as a `_ =>` catch-all (kqueue.rs:271), which must NOT
+/// trigger reads.
+fn fs_event_is_relevant(event: &notify::Event) -> bool {
+    event.need_rescan()
+        || matches!(
+            event.kind,
+            notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
+                | notify::EventKind::Modify(notify::event::ModifyKind::Any)
+                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                | notify::EventKind::Create(_)
+                | notify::EventKind::Remove(_)
+                | notify::EventKind::Any
+        )
 }
 
 fn hub_next_deadline(inner: &HubInner) -> Option<i64> {
@@ -1104,11 +1126,14 @@ fn claude_frames(
     frames
 }
 
+/// Codex effects additionally surface force-read requests (the lane drains
+/// them after the lock is released -- expire_due only; kata namg).
 fn codex_frames(
     idle: &mut IdleGate,
     effects: Vec<TrackerEffect<CodexActivityRecord>>,
-) -> Vec<ServerMessage> {
+) -> (Vec<ServerMessage>, Vec<String>) {
     let mut frames = Vec::new();
+    let mut force_reads = Vec::new();
     for effect in effects {
         match effect {
             TrackerEffect::Changed { upsert, remove } => {
@@ -1146,10 +1171,10 @@ fn codex_frames(
                     completion_seq,
                 ));
             }
-            TrackerEffect::ForceRead { .. } => {}
+            TrackerEffect::ForceRead { terminal_id, .. } => force_reads.push(terminal_id),
         }
     }
-    frames
+    (frames, force_reads)
 }
 
 /// Amplifier effects additionally surface force-read requests (the lane
@@ -1283,6 +1308,44 @@ mod tests {
         timeout_ms: u64,
     ) -> Option<serde_json::Value> {
         next_frame_matching(rx, wanted, timeout_ms, |_| true).await
+    }
+
+    /// KATA namg: notify's inotify backend reports kernel IN_Q_OVERFLOW as
+    /// Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)) -- "events
+    /// were dropped, re-check the file" (notify-6.1.1 inotify.rs:208-211).
+    /// Both lane watchers must forward it as an fs-change so a real overflow
+    /// triggers an immediate catch-up read. Gate on the Rescan FLAG, not on
+    /// EventKind::Other: the kqueue backend emits flagless Other as a
+    /// catch-all (kqueue.rs:271), which must NOT trigger reads, and our own
+    /// tail reads produce Access events which must never self-trigger
+    /// (zero-polling invariant).
+    #[test]
+    fn rescan_overflow_is_relevant_but_flagless_other_and_access_are_not() {
+        use notify::event::{AccessKind, Flag};
+        use notify::{Event, EventKind};
+
+        let overflow = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        assert!(
+            fs_event_is_relevant(&overflow),
+            "IN_Q_OVERFLOW rescan must trigger a catch-up read"
+        );
+
+        let flagless_other = Event::new(EventKind::Other);
+        assert!(
+            !fs_event_is_relevant(&flagless_other),
+            "kqueue catch-all Other (no Rescan flag) must not trigger reads"
+        );
+
+        let access = Event::new(EventKind::Access(AccessKind::Any));
+        assert!(
+            !fs_event_is_relevant(&access),
+            "our own tail reads (Access) must never self-trigger"
+        );
+
+        let append = Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )));
+        assert!(fs_event_is_relevant(&append), "real appends still read");
     }
 
     fn amplifier_line(event: &str) -> String {
@@ -2470,6 +2533,119 @@ mod tests {
         .expect("turn complete from the reconcile lane");
         assert_eq!(complete["sessionId"], "sess-1");
         assert_eq!(complete["provider"], "codex");
+    }
+
+    /// KATA namg: a missed inotify event must not silence
+    /// terminal.turn.complete forever. Deterministic simulation of the miss:
+    /// unwatch the lane's inotify watch BEFORE the task_complete append (the
+    /// append then emits no fs event -- exactly the shape of a kernel queue
+    /// overflow dropping the last append of a turn), and assert the
+    /// busy-deadman force-read (shrunk to test scale) still delivers the
+    /// completion -- exactly once, with exactly one idle chime after it
+    /// (idle-gate interaction pin: a ForceRead-triggered late completion
+    /// must not double-chime and must carry the correct idle reason).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_missed_fs_event_self_heals_via_deadman_force_read() {
+        let (hub, mut rx) = hub();
+        let now = crate::terminal::now_ms();
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t1".into(),
+                mode: "codex".into(),
+                resume_session_id: Some("sess-1".into()),
+                at: now,
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t1"
+        })
+        .await
+        .expect("initial upsert");
+
+        // Rollout shows an unresolved turn: the lane seeds busy on attach.
+        let (_guard, rollout) =
+            codex_rollout_fixture(&[codex_event_line("task_started", now - 5_000)]);
+        hub.attach_codex_rollout("t1", "sess-1", &rollout);
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["phase"] == "busy"
+        })
+        .await
+        .expect("seeded busy upsert");
+
+        // Simulate the missed event + shrink the deadman to test scale.
+        {
+            use notify::Watcher;
+            let mut inner = hub.inner.lock().unwrap();
+            inner.codex.set_busy_deadman_ms(500);
+            let lane = inner.codex_lanes.get_mut("t1").expect("lane installed");
+            lane._watcher.unwatch(&rollout).expect("unwatch");
+        }
+
+        // The turn completes on disk -- but with the watch dropped, NO
+        // CodexFsChange will ever arrive for this append.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .expect("append");
+            writeln!(f, "{}", codex_event_line("task_complete", now + 1_000)).expect("write");
+        }
+
+        // Barrier: the hub loop recomputes its one-shot deadline only when
+        // it processes an event, and it is currently parked on the deadline
+        // computed BEFORE the shrink. Any event re-arms it.
+        observer_send(
+            &hub,
+            ActivityEvent::Created {
+                terminal_id: "t2".into(),
+                mode: "codex".into(),
+                resume_session_id: None,
+                at: crate::terminal::now_ms(),
+            },
+        );
+        next_frame_matching(&mut rx, "codex.activity.updated", 3_000, |v| {
+            v["upsert"][0]["terminalId"] == "t2"
+        })
+        .await
+        .expect("barrier upsert for t2");
+
+        // RED today: without the expire_due force-read drain this NEVER
+        // arrives (the missed append is re-read by nothing).
+        let complete = next_frame_matching(&mut rx, "terminal.turn.complete", 10_000, |v| {
+            v["terminalId"] == "t1"
+        })
+        .await
+        .expect("turn complete delivered by the deadman force-read");
+        assert_eq!(complete["provider"], "codex");
+        assert_eq!(complete["sessionId"], "sess-1");
+
+        // Exactly one chime.
+        assert!(
+            next_frame_matching(&mut rx, "terminal.turn.complete", 1_000, |v| {
+                v["terminalId"] == "t1"
+            })
+            .await
+            .is_none(),
+            "the self-healed completion must not double-chime"
+        );
+
+        // Idle-gate interaction: one idle, correct reason (no queued
+        // submits in this flow -> grace).
+        let idle =
+            next_frame_matching(&mut rx, "terminal.idle", 5_000, |v| v["terminalId"] == "t1")
+                .await
+                .expect("terminal.idle after the self-healed completion");
+        assert_eq!(idle["reason"], "grace");
+        assert!(
+            next_frame_matching(&mut rx, "terminal.idle", 1_000, |v| {
+                v["terminalId"] == "t1"
+            })
+            .await
+            .is_none(),
+            "exactly one idle emission"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
