@@ -378,7 +378,7 @@ git commit -m "feat(deck): getTabStatusFlags - busy/attention/greenIcon from the
 
 - [ ] **Step 1: Write the failing test**
 
-Add to `test/unit/client/deck/deck-selectors.test.ts`. Extend the fixture builder to support seeding `repoIcons.byCwd` and `terminalMeta.byTerminalId` via `preloadedState` (both are plain records). Fixture panes in this suite are claude-mode terminals, so `resolvePaneRepoCwd` uses `meta?.repoRoot || meta?.checkoutRoot || meta?.cwd || content.initialCwd || tab?.initialCwd` — seed `terminalMeta.byTerminalId['term-1'] = { cwd: '/repos/alpha' }` (match the record shape used by the `terminalMeta` slice; check its initial state for exact field names).
+Add to `test/unit/client/deck/deck-selectors.test.ts`. First register the real `terminalMeta` and `repoIcons` reducers in this suite's store-builder `configureStore` reducer map (`terminalMeta` from `@/store/terminalMetaSlice`, `repoIcons` from `@/store/repoIconsSlice` — both slices export their reducer) — they are absent today, and `configureStore` silently ignores `preloadedState` keys that have no matching reducer, so seeding without the reducers is a silent no-op. Then extend the fixture builder to support seeding `repoIcons.byCwd` and `terminalMeta.byTerminalId` via `preloadedState` (both are plain records). Fixture panes in this suite are claude-mode terminals, so `resolvePaneRepoCwd` uses `meta?.repoRoot || meta?.checkoutRoot || meta?.cwd || content.initialCwd || tab?.initialCwd` — seed `terminalMeta.byTerminalId['term-1'] = { cwd: '/repos/alpha' }` (match the record shape used by the `terminalMeta` slice; check its initial state for exact field names).
 
 ```ts
 describe('getTabRepoIcons', () => {
@@ -642,9 +642,14 @@ export function selectDeckModel(state: RootState): DeckModel {
 - [ ] **Step 4: Run tests to verify they pass — and check downstream compile**
 
 Run: `npm run test:vitest -- run test/unit/client/deck/ --config config/vitest/vitest.config.ts`
-Expected: `deck-selectors.test.ts` PASS. `frame.test.ts` / `deck-controller.test.ts` may fail on fixture DeckTab shapes (they construct model objects) — update their fixture tab objects to include the new fields (add `busy:false, attention:false, fill:'none', dot:null, priority:4, repoIcons:[]` as appropriate; a local `makeDeckTab(over)` helper in each test file keeps this readable). The e2e suite also builds models indirectly through the real store — run it too:
+Expected: `deck-selectors.test.ts` PASS. Two distinct downstream failure modes — do not confuse them:
 
-`npm run test:vitest -- run test/e2e/stream-deck-flow.test.tsx --config config/vitest/vitest.config.ts`
+1. `frame.test.ts` constructs `DeckTab` model objects directly — update its fixture tab objects to include the new fields (add `busy:false, attention:false, fill:'none', dot:null, priority:4, repoIcons:[]` as appropriate; a local `makeDeckTab(over)` helper keeps this readable).
+2. `deck-controller.test.ts`, `test/e2e/stream-deck-flow.test.tsx`, and `test/unit/client/components/VirtualDeckPanel.test.tsx` build REAL stores (`configureStore` with ~10 reducers) that register neither `terminalMeta` nor `repoIcons` — the moment the controller calls the new `selectDeckModel`, `getTabRepoIcons` reads `state.terminalMeta.byTerminalId` and every test in those suites crashes with a TypeError. Fix by adding the real reducers to each fixture store's reducer map: `terminalMeta` (from `@/store/terminalMetaSlice`) and `repoIcons` (from `@/store/repoIconsSlice`). `preloadedState` seeding alone is NOT a fix — `configureStore` silently ignores preloadedState keys with no matching reducer. (This reducer registration is also the prerequisite that makes Task 8's and Task 11's `terminalMeta`/`repoIcons` seeding work.)
+
+Run the store-backed suites too:
+
+`npm run test:vitest -- run test/e2e/stream-deck-flow.test.tsx test/unit/client/components/VirtualDeckPanel.test.tsx --config config/vitest/vitest.config.ts`
 
 The e2e "tabs appear on keys" scenario asserts key order from tab order — with sorting, a busy t1 now lands after green-icon tabs. Update expected key indices to the sorted order (this is the intended behavior change). Then:
 
@@ -1304,6 +1309,8 @@ In `test/unit/client/deck/deck-controller.test.ts` (uses the spec-encoding rende
 
 ```ts
 import { IconImageCache } from '@/deck/icon-image-cache'
+import { registerTerminalTextReader } from '@/deck/terminal-text-registry'
+import { upsertTerminalMeta } from '@/store/terminalMetaSlice'
 
 it('repaints keys when an icon bitmap finishes loading (cache subscription)', async () => {
   // Deferred loader as in icon-image-cache.test.ts
@@ -1322,11 +1329,23 @@ it('repaints keys when an icon bitmap finishes loading (cache subscription)', as
   expect(after.kind === 'tab' && after.icons[0].ready).toBe(true)
 })
 
-it('no periodic preview repaint: 3s of ticks with unchanged state paints nothing new', () => {
+it('no periodic preview repaint: 3s of ticks paints nothing even when terminal text changes', () => {
+  // A reader with a CHANGING snapshot is what makes this test able to go RED: with
+  // no reader registered, previewFor already yields [] and the per-key spec-JSON
+  // diff suppresses every paint, so the assertion would pass against unmodified
+  // code (vacuous). With the reader, current code's PREVIEW_REFRESH_TICKS branch
+  // repaints key 0 at the ~3s tick (new previewLines -> spec differs) and the test
+  // fails; it goes green only when previewFor and the tick branch are deleted.
+  // (Task 9 deletes the registry module itself; when it does, rework this test to
+  // drop the reader registration - the no-repaint guarantee becomes structural via
+  // Task 9's grep gate on PREVIEW_REFRESH_TICKS/registerTerminalTextReader.)
+  let n = 0
+  const unregister = registerTerminalTextReader('term-1', () => [`line ${n++}`])
   const { device } = setup({ tabs: 1 })
   device.keyImages.clear()
   vi.advanceTimersByTime(3_000)
   expect(device.keyImages.size).toBe(0)
+  unregister()
 })
 
 it('dispatches fetchRepoIconMeta for tab cwds even when settings.panes.repoIconsOnTabs is false (deck owns the probe)', () => {
@@ -1346,16 +1365,28 @@ it('does not re-probe a cwd already present in state.repoIcons.byCwd', () => {
   })
   expect(store.getState().repoIcons.byCwd['/repos/alpha'].status).toBe('ready') // untouched, no 'loading' overwrite
 })
+
+it('probes a cwd that only becomes resolvable AFTER start (late terminalMeta, model JSON unchanged)', () => {
+  // Fixture panes have no initialCwd, so nothing is resolvable at start(). A later
+  // upsertTerminalMeta makes term-1's cwd resolvable but does NOT change the deck
+  // model JSON (icons stay [] until meta AND repoIcons both exist), so this test
+  // proves the probe runs BEFORE onStoreChange's model-JSON bail-out - the exact
+  // TabBar-less leader scenario the deck-owned probe exists for.
+  const { store } = setup({ tabs: 1 }) // no terminalMeta seeded
+  expect(store.getState().repoIcons.byCwd['/repos/alpha']).toBeUndefined()
+  store.dispatch(upsertTerminalMeta([{ terminalId: 'term-1', cwd: '/repos/alpha', updatedAt: Date.now() }]))
+  expect(store.getState().repoIcons.byCwd['/repos/alpha']).toMatchObject({ status: 'loading' })
+})
 ```
 
 (If the suite's real `api` layer throws synchronously in jsdom, `vi.mock('@/lib/api', ...)` it with a never-resolving `get` — the probe assertions only need the thunk's synchronous `pending` entry.)
 
-Extend the suite's `setup()` helper to accept extra `DeckController` options (4th arg) and to seed `terminalMeta`/`repoIcons` preloaded state (mirror Task 3's fixture additions). Also update/remove the existing test that asserts the 3s preview refresh (the suite has diff-paint tests around `PREVIEW_REFRESH_TICKS`).
+Extend the suite's `setup()` helper to accept a settings override (3rd arg) and extra `DeckController` options (4th arg), and extend the fixture builder to seed `terminalMeta`/`repoIcons` via `preloadedState` — this works only because Task 4 already registered the real `terminalMeta`/`repoIcons` reducers in this suite's reducer map (`configureStore` silently drops preloadedState keys with no matching reducer). Note this suite has NO existing preview or `PREVIEW_REFRESH_TICKS` tests to update or remove — the only preview coverage lives in `test/e2e/stream-deck-flow.test.tsx` (exact `toEqual` assertions on full KeySpecs including `previewLines`); those e2e expectations are updated in Step 4.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `npm run test:vitest -- run test/unit/client/deck/deck-controller.test.ts --config config/vitest/vitest.config.ts`
-Expected: FAIL — no `iconCache` option; icons never become ready; the 3s tick still repaints (registry snapshot reads); no probe dispatch exists yet, so `state.repoIcons.byCwd['/repos/alpha']` is `undefined` in the probe tests.
+Expected: FAIL — no `iconCache` option; icons never become ready; the no-periodic-repaint test fails because the registered reader's changing snapshot makes the `PREVIEW_REFRESH_TICKS` tick repaint key 0 with new `previewLines`; no probe dispatch exists yet, so `state.repoIcons.byCwd['/repos/alpha']` stays `undefined` in the un-gated probe test and the late-terminalMeta test. (The no-re-probe test guards the implementation once it exists and may already pass here — that is fine; the other probe tests carry the RED gate.)
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1433,7 +1464,7 @@ private probeRepoIcons(): void {
 }
 ```
 
-Call sites: once in `start()` (after the initial repaint), and in `onStoreChange` whenever the model JSON differs — i.e. inside the existing branch that already triggers `repaint()`, after the bail-out check (a probe result mutates `repoIcons`, which changes the model, which re-enters `onStoreChange` and repaints — no extra subscription needed). If the controller's `store` field is typed too narrowly to dispatch thunks, type it with the app store's `AppDispatch` (the same store type `focusTabFromDeck` already dispatches through) rather than casting at the call site.
+Call sites: once in `start()` (after the initial repaint), and in `onStoreChange` on EVERY store change, BEFORE the `modelJson === this.lastModelJson` bail-out. This placement is load-bearing: the store events that first make a cwd resolvable — `upsertTerminalMeta`/`setTerminalMetaSnapshot` enriching `terminalMeta.byTerminalId` — do NOT change the model JSON (with no `repoIcons.byCwd` entry yet, `icons` is `[]` both before and after), so a probe placed after the bail-out would never fire in exactly the TabBar-less leader scenario this probe exists for. Pre-bail-out probing is cheap (a Set build over tabs/panes per store change; it dispatches only for unprobed cwds) and cannot loop: the thunk's synchronous `pending` entry lands in `repoIcons.byCwd`, so the `!state.repoIcons.byCwd[cwd]` guard skips that cwd on the re-entrant store change, and when the meta arrives the model JSON changes and the normal repaint path takes over. If the controller's `store` field is typed too narrowly to dispatch thunks, type it with the app store's `AppDispatch` (the same store type `focusTabFromDeck` already dispatches through) rather than casting at the call site.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -1534,8 +1565,12 @@ it('acts on the tab displayed at press-down even if the sort changes mid-press',
   // t1 greenIcon (key 0), t2 greenIcon (key 1)
   const { store, device } = setup({ tabs: 2, activeTab: 't1' })
   device.emit({ type: 'keyDown', keyIndex: 1 })            // user is pressing "t2"
-  // Mid-press: t2 gains attention -> re-sort moves t2 to key 0; key 1 now shows t1
-  store.dispatch(markTabAttention('t2'))                    // use the suite's existing attention dispatch helper/action
+  // Mid-press: t2 gains attention -> re-sort moves t2 to key 0; key 1 now shows t1.
+  // NOTE the object payload: markTabAttention takes { tabId } (the suite already
+  // dispatches markTabAttention({ tabId: 't1' }) elsewhere) - a bare-string payload
+  // would silently never set attentionByTab, no re-sort would occur, and this test
+  // would pass vacuously against unmodified code.
+  store.dispatch(markTabAttention({ tabId: 't2' }))
   vi.advanceTimersByTime(100)
   device.emit({ type: 'keyUp', keyIndex: 1 })
   // Snapshot guard: the press focuses t2 (what the user saw), not t1 (what the slot shows now)
@@ -1554,7 +1589,7 @@ it('press on a tab that was closed mid-press is a no-op', () => {
 it('long-press opens the action layer for the press-down tab despite a mid-press re-sort', () => {
   const { store, device } = setup({ tabs: 2, activeTab: 't1' })
   device.emit({ type: 'keyDown', keyIndex: 1 })
-  store.dispatch(markTabAttention('t2'))
+  store.dispatch(markTabAttention({ tabId: 't2' }))
   vi.advanceTimersByTime(600)
   device.emit({ type: 'keyUp', keyIndex: 1 })
   // Action layer shows BACK/APPROVE/STOP; verify it targets t2 via the frame or controller state
@@ -1563,7 +1598,7 @@ it('long-press opens the action layer for the press-down tab despite a mid-press
 })
 ```
 
-Use whatever attention/close dispatch the suite already uses (the fixture builder seeds `turnCompletion.attentionByTab` — if there is no runtime action, dispatch the store's real `turnCompletion` slice action; check the slice's exported actions). The essential assertion: acting on key 1 after the re-sort affects **t2**.
+`markTabAttention` is the real runtime action, exported from `@/store/turnCompletionSlice` with payload `{ tabId: string }` — the suite already imports and dispatches it as `markTabAttention({ tabId: 't1' })`. After each attention dispatch, sanity-check the RED gate is armed: `expect(store.getState().turnCompletion.attentionByTab['t2']).toBe(true)` (or the slice's equivalent flag) — this guards against a payload-shape mistake making the mid-press re-sort never happen and the test passing vacuously. The essential assertion: acting on key 1 after the re-sort affects **t2**.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -1714,7 +1749,7 @@ it('pager pages over the SORTED order', () => {
 it('a mid-press re-sort does not retarget the press (e2e)', () => {
   const { store, device } = setup({ tabs: 2, activeTab: 't1' })
   device.emit({ type: 'keyDown', keyIndex: 1 })
-  store.dispatch(/* the suite's real turnCompletion attention action for t2 */)
+  store.dispatch(markTabAttention({ tabId: 't2' })) // from '@/store/turnCompletionSlice' - object payload
   vi.advanceTimersByTime(100)
   device.emit({ type: 'keyUp', keyIndex: 1 })
   expect(store.getState().tabs.activeTabId).toBe('t2')
