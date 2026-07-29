@@ -18,8 +18,10 @@ rebind lane and broadcast `terminal.session.associated` with
 `previousSessionId`, which the client folds via a deterministic supersession
 handshake (`src/lib/terminal-session-association.ts`). Deliverable 1 fixes a
 real latent client bug (stranded `tab.sessionMetadataByKey` entries).
-Deliverable 2 adds the missing Rust input-path identity guard (Node parity)
-plus client-side suppression of the self-healing race it creates.
+Deliverable 2 adds the missing Rust input-path identity guard (Node parity
+in frame shape, deliberately scoped to the opencode lane) plus client-side
+suppression of the spurious visible notice the self-healing race would
+otherwise produce.
 Deliverables 3 and 4 are pure coverage. Deliverable 5 adds log-only
 observability for silent plugin death.
 
@@ -31,8 +33,14 @@ the Rust binary via `include_str!`).
 
 ## Global Constraints
 
-- Base branch: `origin/main` @ `62fa0ff1`; work on branch
-  `feat/rebind-salvage-hardening` in worktree
+- Base branch: the branch was cut from `origin/main` @ `62fa0ff1`, but
+  **Task 0 (mandatory, FIRST implementation action) merges current
+  `origin/main` @ `e1f4d4c5` (PR #571 `fix/silent-input-loss`) into the
+  branch** — this plan's Task 4/5 edit points cite code (e.g.
+  `unknown_terminal_input_blocked`) that exists only post-#571. All code
+  anchors below describe the POST-MERGE tree; where a line number is
+  uncertain, the named function/handler is the authoritative anchor. Work
+  on branch `feat/rebind-salvage-hardening` in worktree
   `/home/dan/code/freshell/.worktrees/rebind-salvage-hardening`. All
   commands below run from that worktree root.
 - Reference branch `salvage/opencode-rebind-on-drift` is LOCAL-ONLY: never
@@ -90,11 +98,13 @@ Finding (static analysis of `62fa0ff1`):
   anywhere in `crates/`. All 9 `ErrorMsg` constructions hardcode
   `actual_session_ref: None`, and none carries that code.
 - **Worse: the `ClientMessage::TerminalInput` arm
-  (`crates/freshell-ws/src/terminal.rs:628-657`) parses
+  (post-merge ~`:628-660`; anchor by the arm, not the line) parses
   `expected_session_ref` and ignores it** — a stale-ref input frame right
-  after a rebind is silently delivered to the PTY. The Node reference
-  implementation rejects it (`server/ws-handler.ts:2902-2925`) and populates
-  `actualSessionRef` (`server/ws-handler.ts:939-966`).
+  after a rebind is silently delivered to the PTY. This holds at
+  `e1f4d4c5` too: #571 added the `unknown_terminal_input_blocked` bounce
+  to the arm but still never reads `expected_session_ref`. The Node
+  reference implementation rejects it (`server/ws-handler.ts:2902-2925`)
+  and populates `actualSessionRef` (`server/ws-handler.ts:939-966`).
 - **The wire contract already carries the field end-to-end** — TS type
   (`shared/ws-protocol.ts:716`), JSON schema
   (`port/contract/ws-server-messages.schema.json` `error.actualSessionRef`),
@@ -109,21 +119,49 @@ Finding (static analysis of `62fa0ff1`):
 
 **Resolution (per the spec's "ALSO populate it there" branch):** Deliverable
 2 is NOT dropped. Task 4 adds the input-path identity guard to the Rust
-server (Node parity, emitting SESSION_IDENTITY_MISMATCH with
-`actual_session_ref: Some(..)` — the first non-`None` in the Rust tree), and
-Task 5 ports the client suppression helper. One deliberate deviation from
-Node: when the client sends an expectation but the identity registry has not
-resolved yet (`(Some, None)`), the Rust guard **fails open** (delivers the
-input) instead of bouncing — the codex/opencode locators resolve within a
-~2s correlation window after spawn, and bouncing keystrokes during pane
-startup would be a regression Node does not have an equivalent exposure to.
+server (Node parity in frame shape and message, emitting
+SESSION_IDENTITY_MISMATCH with `actual_session_ref: Some(..)` — the first
+non-`None` in the Rust tree), and Task 5 ports the client suppression
+helper. Two deliberate deviations from Node:
+
+1. **The guard is scoped to the opencode lane** (both refs' provider ==
+   `"opencode"`; see Task 4 for the rationale, from the load-bearing audit
+   LB3): claude has an identical legitimate rebind swap window on every
+   in-TUI /clear-resume (`claude_signal.rs:192`), codex has one via fork
+   rebind (`codex_association.rs:207-220` → `codex_identity.rs:195-197`),
+   and the client fold's conflict-veto
+   (`terminal-session-association.ts:98-105`) can pin a pane on a stale
+   ref indefinitely. An all-provider guard would bounce legitimate
+   keystrokes across three providers; only the opencode signal-rebind lane
+   this plan hardens gets the guard.
+2. **`(Some, None)` fails open** (delivers the input) instead of bouncing.
+   Honest coverage claim (load-bearing audit LB4): unresolved identity is
+   NOT just a short spawn window. REST/fresh-agent-created resume panes
+   never reach the WS identity registry at all
+   (`terminal_tabs.rs:1396-1409`, `registry.rs:297-301`) yet carry a
+   client sessionRef — they are permanently `(Some, None)`. The guard
+   therefore protects WS-created/registry-seeded opencode panes;
+   permanently-`None` pane classes are a documented known limitation, and
+   fail-open is the only correct policy for them (a strict guard would
+   drop ALL their input forever). Out-of-scope observation surfaced by the
+   audit: REST-resumed opencode/claude panes' rebind lanes are dead
+   (their identity-row/never-bound preconditions can never be met) — a
+   latent pre-existing bug, not addressed here.
+
 The suppression helper itself fails toward the visible path on any
 absent/unparseable ref, as the spec requires.
 
 Ordering constraint: the client suppression only fires when the rebind fold
 has already synced `contentRef.current` (main does this synchronously on a
-`'reconciled'` result, `TerminalView.tsx:~4288`), so Tasks 4–5 land after
-the Deliverable-1 tasks.
+`'reconciled'` result — the contentRef sync in `TerminalView.tsx`,
+post-merge ~`:4507`), so Tasks 4–5 land after the Deliverable-1 tasks.
+Documented residual (load-bearing audit LB2, adjudicated accepted): there is
+NO delivery-order guarantee between the `associated` broadcast and an
+inline bounce on the same connection, so a keystroke typed INSIDE the swap
+window can still produce one truthful visible notice — see Task 5 for the
+full residual note. What Task 5 suppresses is the spurious visible notice
+for the already-self-healed (post-fold) race, not a repair storm — the
+mismatch handler's repair path never runs for the expected≠current shape.
 
 ## File structure (locked decomposition)
 
@@ -133,13 +171,13 @@ the Deliverable-1 tasks.
 | `test/unit/client/store/persistControl.test.ts` | Modify: new re-key describe block | 1 |
 | `src/lib/terminal-session-association.ts` | Modify: one-line caller wiring | 2 |
 | `test/unit/client/lib/terminal-session-association.test.ts` | Modify: `createState` tab-overrides param, re-key fold test, idempotence regression guards | 2, 3 |
-| `crates/freshell-ws/src/terminal.rs` | Modify: input-path identity guard + pure helpers + in-module tests | 4 |
+| `crates/freshell-ws/src/terminal.rs` | Modify: opencode-scoped input-path identity guard + pure helpers + in-module tests (incl. non-opencode passthrough) | 4 |
 | `crates/freshell-ws/tests/opencode_switch_rebind.rs` | Modify: new Phase 1b (stale-input bounce over the wire) | 4 |
 | `crates/freshell-protocol/tests/roundtrip.rs` | Modify: SESSION_IDENTITY_MISMATCH fixture | 4 |
 | `src/components/terminal-view-utils.ts` | Modify: add `isStaleSessionIdentityMismatch` | 5 |
 | `test/unit/client/components/terminal-view-utils.session-mismatch.test.ts` | Create: pure helper tests | 5 |
 | `src/components/TerminalView.tsx` | Modify: 4-line suppression early-return | 5 |
-| `test/unit/client/components/TerminalView.codex-identity.test.tsx` | Modify: suppression wiring test | 5 |
+| `test/unit/client/components/TerminalView.codex-identity.test.tsx` | Modify: suppression wiring test (RED keyed on the `[Resume blocked]` xterm write spy) | 5 |
 | `crates/freshell-ws/src/opencode_signal.rs` | Modify: hello discrimination in the drain, hello tracker, heartbeat WARN + in-module tests | 6 |
 | `extensions/opencode/freshell-rebind-plugin.ts` | Modify: `emitHello` at TUI startup | 7 |
 | `test/unit/server/opencode-rebind-plugin.test.ts` | Modify: hello emission tests | 7 |
@@ -149,6 +187,70 @@ the Deliverable-1 tasks.
 Scope check: all five deliverables harden one subsystem (terminal session
 rebind) and share test surfaces; one plan is correct. Deliverables 1–3 and 5
 are independent; 4 (e2e) lands last so it exercises the finished stack.
+
+---
+
+### Task 0: Merge current `origin/main` (`e1f4d4c5`, PR #571 fix/silent-input-loss) into the branch
+
+**Files:** none authored — a merge commit only.
+
+Why this is mandatory and FIRST (load-bearing validation, LB11): the branch
+was cut at `62fa0ff1`, but Tasks 4–5 cite post-#571 code — most concretely
+the `unknown_terminal_input_blocked` bounce in the `TerminalInput` arm,
+which does not exist at the old base. `git diff --stat 62fa0ff1..e1f4d4c5`
+shows the delta touches exactly Tasks 4–5's files
+(`crates/freshell-ws/src/terminal.rs` +84, `src/components/TerminalView.tsx`
++289, plus protocol/registry adjacencies) and does NOT touch any Task 1–3
+file (`src/store/persistControl.ts`, `src/lib/terminal-session-association.ts`,
+their tests) — so merging up front is conflict-free for the early tasks and
+makes every later anchor real. The delta EXTENDED (did not rewrite) the two
+edit regions; no design change follows from the merge.
+
+Post-merge anchor map (use the named function/handler when a line drifts):
+- `TerminalInput` arm: `crates/freshell-ws/src/terminal.rs` ~`:628-660`
+  (now: codex `note_possible_submit` → `registry.input` returning
+  `InputOutcome` → `unknown_terminal_input_blocked` bounce on
+  `!outcome.found` → opencode `note_possible_submit`).
+- SESSION_IDENTITY_MISMATCH handler: `TerminalView.tsx` ~`:4575` (was
+  ~`:4352`); its repair path now also calls
+  `discardPendingInput('terminal_gone')`.
+- `'reconciled'` contentRef sync: `TerminalView.tsx` ~`:4507` (was ~`:4288`).
+- `terminal.input.blocked` handler: `TerminalView.tsx` ~`:4552-4575` — a
+  SEPARATE lane; Tasks 4–5 do not touch it.
+
+Design-tension note (record it, do not "fix" it): #571's charter is "no
+silent input loss," and Task 5 deliberately makes the stale-window bounce
+silent (one dropped frame, no notice). This is NOT a charter violation —
+the dropped frame was addressed to an identity the pane no longer holds,
+and Node has identical semantics. A future kata must not "repair" Task 5's
+suppression back into a visible notice.
+
+- [ ] **Step 1: Merge**
+
+```bash
+git fetch origin
+git merge e1f4d4c5 -m "chore: merge origin/main @ e1f4d4c5 (PR #571 fix/silent-input-loss) before implementation"
+```
+Expected: clean merge (only `docs/plans/` exists on the branch). If git
+reports conflicts, resolve mechanically and STOP to re-verify the anchor
+map above before proceeding.
+
+- [ ] **Step 2: Verify the post-merge anchors exist**
+
+```bash
+grep -n "unknown_terminal_input_blocked" crates/freshell-ws/src/terminal.rs | head -3
+grep -n "SESSION_IDENTITY_MISMATCH" src/components/TerminalView.tsx | head -3
+```
+Expected: both non-empty (the first was absent at `62fa0ff1`).
+
+- [ ] **Step 3: Baseline gates on the merged tree**
+
+```bash
+cargo test -p freshell-ws
+npm run typecheck
+```
+Expected: green before any plan work starts (retry `auto_resume_e2e` once
+if it flakes — known, pre-existing).
 
 ---
 
@@ -540,6 +642,13 @@ including this re-key — only fire for single-pane tabs
 (`isSinglePaneTerminalMatch`). That is main's existing invariant for ALL
 tab-side rebind state, not a regression introduced here.
 
+Minor note (LB6, verified): a browser tab that is disconnected during the
+rebind broadcast stays on the old key until reload (the reconnect
+`terminal.inventory` reconcile carries no `previousSessionId`) — accepted
+eventual consistency; metadata is never stranded, since the cross-tab
+merge narrows to the preferred key (verified by executing the real
+`hydrateTabs` reducer in both recency orders).
+
 ---
 
 ### Task 3: Duplicate-rebind idempotence regression guards (tests only)
@@ -663,12 +772,15 @@ and use subject `fix(client): make the rebind fold idempotent on repeat broadcas
 
 ---
 
-### Task 4: Rust input-path identity guard emitting SESSION_IDENTITY_MISMATCH with `actual_session_ref`
+### Task 4: Rust input-path identity guard (opencode-scoped) emitting SESSION_IDENTITY_MISMATCH with `actual_session_ref`
+
+Requires Task 0's merge (`e1f4d4c5`): this task's edit region and the
+`unknown_terminal_input_blocked` shape template exist only post-#571.
 
 **Files:**
 - Modify: `crates/freshell-ws/src/terminal.rs` — the
-  `ClientMessage::TerminalInput` arm (currently `:628-657`) + two new pure
-  helpers + a new in-module test mod
+  `ClientMessage::TerminalInput` arm (post-merge ~`:628-660`; anchor by the
+  arm) + two new pure helpers + a new in-module test mod
 - Modify: `crates/freshell-ws/tests/opencode_switch_rebind.rs` — new
   "Phase 1b" after Phase 1
 - Modify: `crates/freshell-protocol/tests/roundtrip.rs` — add a
@@ -679,16 +791,36 @@ and use subject `fix(client): make the rebind fold idempotent on repeat broadcas
   (`crates/freshell-ws/src/identity.rs:145`); `ErrorMsg` / `ErrorCode::SessionIdentityMismatch`
   / `SessionLocator` from `freshell-protocol` (all existing); the arm's
   existing `send(ws_tx, &msg).await` helper (see the adjacent
-  `unknown_terminal_input_blocked` bounce in the same arm for the exact
-  send-and-return shape).
+  `unknown_terminal_input_blocked` bounce in the same arm — added by #571,
+  present only after Task 0's merge — for the exact send-and-return shape).
 - Produces: on a `terminal.input` frame whose `expected_session_ref` is
-  `Some` AND the terminal's canonical identity is `Some` AND they differ,
-  the server sends
+  `Some` AND the terminal's canonical identity is `Some` AND **both refs'
+  provider is `"opencode"`** AND they differ, the server sends
   `error{code: SESSION_IDENTITY_MISMATCH, terminalId, expectedSessionRef, actualSessionRef: Some(canonical)}`
   and does NOT write to the PTY. `(None, _)` and `(Some, None)` deliver as
-  before (fail-open — see the precondition finding above). Task 5's client
-  suppression consumes the `actualSessionRef` echo. Wire message string
-  matches Node: `"Terminal session does not match the expected session."`.
+  before (fail-open — see the precondition finding above), and ANY
+  non-opencode `(Some, Some)` divergence also delivers (passthrough).
+  Task 5's client suppression consumes the `actualSessionRef` echo. Wire
+  message string matches Node:
+  `"Terminal session does not match the expected session."`.
+
+Why the guard is opencode-scoped (LB3, do not widen without a new audit):
+the identity-registry write-site audit found legitimate (Some, Some)
+divergence windows in ALL three providers — claude upserts a NEW session id
+on every in-TUI /clear-resume (`claude_signal.rs:192`), codex on fork
+rebind (`codex_association.rs:207-220` → `codex_identity.rs:195-197`) —
+and the client fold's conflict-veto
+(`terminal-session-association.ts:98-105`) can pin a pane on a stale ref
+indefinitely (chained rebinds/refused folds), during which today's
+keystrokes are delivered correctly to the live PTY. An all-provider guard
+would convert all of those into bounced (lost) keystrokes. Scoping to the
+opencode lane — the one this plan's signal-rebind hardening actually
+changes — keeps Node's frame shape while bounding the blast radius. The
+discriminator is the refs themselves (`provider == "opencode"` on BOTH
+expected and canonical): the canonical `SessionLocator` already carries the
+provider, so no extra registry lookup is needed, and a cross-provider
+disagreement (a shape this plan never produces) fails open rather than
+bouncing.
 
 - [ ] **Step 1: Write the failing unit tests**
 
@@ -716,13 +848,36 @@ mod input_identity_tests {
 
     #[test]
     fn unresolved_identity_fails_open() {
-        // Deliberately laxer than attach_geometry_identity_ok: during the
-        // codex/opencode locator correlation window (~2s) canonical identity
-        // is None while a restored client already sends an expectation.
-        // Never drop keystrokes at pane startup.
+        // Deliberately laxer than attach_geometry_identity_ok: canonical
+        // identity is None not only during the opencode locator correlation
+        // window after spawn but PERMANENTLY for REST/fresh-agent-created
+        // resume panes (they never reach the WS identity registry) -- while
+        // the client already sends an expectation. Never drop their
+        // keystrokes: (Some, None) fails open, for life if need be.
         assert!(input_session_identity_ok(
             Some(&locator("opencode", "ses_a")),
             None
+        ));
+    }
+
+    #[test]
+    fn non_opencode_divergence_passes_through() {
+        // Guard scope (LB3): claude (/clear-resume) and codex (fork rebind)
+        // have LEGITIMATE identity swap windows -- a divergent (Some, Some)
+        // pair outside the opencode lane must deliver, not bounce.
+        assert!(input_session_identity_ok(
+            Some(&locator("claude", "ses_a")),
+            Some(&locator("claude", "ses_b"))
+        ));
+        assert!(input_session_identity_ok(
+            Some(&locator("codex", "thread_a")),
+            Some(&locator("codex", "thread_b"))
+        ));
+        // Cross-provider disagreement (never produced by this plan's lanes)
+        // also fails open.
+        assert!(input_session_identity_ok(
+            Some(&locator("codex", "ses_a")),
+            Some(&locator("opencode", "ses_b"))
         ));
     }
 
@@ -779,13 +934,23 @@ In `crates/freshell-ws/src/terminal.rs`, next to
 `attach_geometry_identity_ok` (`:3597` region), add:
 
 ```rust
-/// Input-path identity guard (Node parity: `server/ws-handler.ts:2902-2925`
-/// `inputIfSessionMatches`). Deliberately LAXER than
-/// `attach_geometry_identity_ok` in the `(Some, None)` case: during the
-/// codex/opencode locator correlation window the client may already hold a
-/// restored sessionRef while the identity registry has not resolved yet --
-/// attach's silent resize-skip is harmless there, a dropped keystroke is
-/// not, so unresolved identity FAILS OPEN and the input is delivered.
+/// Input-path identity guard (Node-parity FRAME, `server/ws-handler.ts:2902-2925`
+/// `inputIfSessionMatches`, but deliberately NARROWER in scope). Two
+/// deviations, both load-bearing:
+/// 1. SCOPE: the guard bounces only when BOTH refs are `provider ==
+///    "opencode"`. Claude (`claude_signal.rs:192`, every in-TUI
+///    /clear-resume) and codex (`codex_association.rs:207-220` fork rebind)
+///    have legitimate identity swap windows, and the client fold's
+///    conflict-veto can pin a pane on a stale ref indefinitely -- an
+///    all-provider guard would bounce keystrokes that are delivered
+///    correctly today. Only the opencode signal-rebind lane this plan
+///    hardens is guarded; everything else passes through.
+/// 2. Deliberately LAXER than `attach_geometry_identity_ok` in the
+///    `(Some, None)` case: canonical identity is None during the opencode
+///    locator correlation window AND permanently for REST/fresh-agent-created
+///    resume panes (they never reach the WS identity registry) -- attach's
+///    silent resize-skip is harmless there, a dropped keystroke is not, so
+///    unresolved identity FAILS OPEN and the input is delivered.
 fn input_session_identity_ok(
     expected: Option<&SessionLocator>,
     canonical: Option<&SessionLocator>,
@@ -793,7 +958,12 @@ fn input_session_identity_ok(
     match (expected, canonical) {
         (None, _) => true,
         (Some(_), None) => true,
-        (Some(e), Some(c)) => e == c,
+        (Some(e), Some(c)) => {
+            if e.provider != "opencode" || c.provider != "opencode" {
+                return true;
+            }
+            e == c
+        }
     }
 }
 
@@ -830,7 +1000,7 @@ Run:
 ```bash
 cargo test -p freshell-ws input_identity_tests
 ```
-Expected: PASS (5 tests).
+Expected: PASS (6 tests).
 
 - [ ] **Step 4: Wire the guard into the TerminalInput arm and add the wire-level integration proof (RED first)**
 
@@ -841,11 +1011,14 @@ and before Phase 2. Phase 1 has just rebound terminal `tid1` from session
 `A` to session `B`, so its canonical identity is `B`:
 
 ```rust
-    // ────── Phase 1b — stale-expectation input bounce (Node parity,
-    // server/ws-handler.ts:2902-2925): an in-flight terminal.input still
+    // ────── Phase 1b — stale-expectation input bounce (Node-parity frame,
+    // server/ws-handler.ts:2902-2925; guard SCOPED to the opencode lane,
+    // which this rebind is): an in-flight terminal.input still
     // carrying the OLD ref A after the A→B rebind is bounced with
     // SESSION_IDENTITY_MISMATCH echoing actualSessionRef=B and is NOT
     // delivered; a frame carrying the NEW ref B is delivered with no error.
+    // (Non-opencode divergence never bounces — pinned by the in-module
+    // test non_opencode_divergence_passes_through.)
     send_json(
         &mut ws,
         json!({
@@ -935,18 +1108,20 @@ identity registry did not follow the rebind — investigate
 covers the meta registry, this covers the identity registry).
 
 4c. GREEN — wire the guard. In the `ClientMessage::TerminalInput` arm
-(`crates/freshell-ws/src/terminal.rs:628`), insert the guard as the FIRST
+(post-merge ~`:628-660`; anchor by the arm), insert the guard as the FIRST
 statement of the arm (before `codex_association::note_possible_submit` —
 a bounced frame must not arm the codex first-submit lane either):
 
 ```rust
         ClientMessage::TerminalInput(input) => {
-            // Node parity (server/ws-handler.ts:2902-2925): a terminal.input
-            // frame whose expectedSessionRef no longer matches the terminal's
-            // canonical identity is bounced with SESSION_IDENTITY_MISMATCH
-            // (actualSessionRef populated) instead of being written to a PTY
-            // the client no longer means. Unresolved identity fails open --
-            // see input_session_identity_ok.
+            // Node-parity frame (server/ws-handler.ts:2902-2925), scoped to
+            // the opencode lane (see input_session_identity_ok): a
+            // terminal.input frame whose opencode expectedSessionRef no
+            // longer matches the terminal's canonical opencode identity is
+            // bounced with SESSION_IDENTITY_MISMATCH (actualSessionRef
+            // populated) instead of being written to a PTY the client no
+            // longer means. Unresolved identity and non-opencode lanes fail
+            // open -- see input_session_identity_ok.
             if let Some(expected) = input.expected_session_ref.as_ref() {
                 let canonical = state.identity.session_ref_for(&input.terminal_id);
                 if !input_session_identity_ok(Some(expected), canonical.as_ref()) {
@@ -961,15 +1136,18 @@ a bounced frame must not arm the codex first-submit lane either):
                     .await;
                 }
             }
-            // ...existing arm body unchanged (note_possible_submit,
-            // registry.input, unknown_terminal_input_blocked, opencode
-            // note_possible_submit, `true`)...
+            // ...existing arm body unchanged (codex note_possible_submit,
+            // registry.input -> InputOutcome, the #571
+            // unknown_terminal_input_blocked bounce on !outcome.found,
+            // opencode note_possible_submit, `true`)...
         }
 ```
 
 (Follow the arm's existing bounce for the exact `return send(...).await`
 shape — the `unknown_terminal_input_blocked` path a few lines below does
-exactly this.)
+exactly this. Ordering note: the guard early-returns BEFORE
+`registry.input`, so a bounced input produces exactly ONE refusal frame —
+it can never also trip the unknown-terminal bounce.)
 
 - [ ] **Step 5: Run the integration test to verify it passes**
 
@@ -1012,14 +1190,26 @@ git commit -m "feat(ws): bounce stale-identity terminal.input with SESSION_IDENT
 
 ### Task 5: Client suppression of stale identity-mismatch bounces
 
+Requires Task 0's merge (`e1f4d4c5`): #571 changed 289 lines in
+`TerminalView.tsx`, including inside the mismatch handler.
+
+What this task actually suppresses (corrected by the load-bearing audit,
+LB1): for the stale-bounce shape (frame `expectedSessionRef` ≠ pane current
+ref), the existing handler takes a NOTICE-ONLY branch — it writes
+`[Resume blocked] …` to the xterm and returns. No teardown, no
+`terminal.create`; the repair path runs only when expected == current. So
+the deliverable is suppressing a **spurious visible notice for the
+already-self-healed race**, not preventing a repair storm.
+
 **Files:**
 - Modify: `src/components/terminal-view-utils.ts` (add import + private
   helper + exported `isStaleSessionIdentityMismatch`)
 - Create: `test/unit/client/components/terminal-view-utils.session-mismatch.test.ts`
 - Modify: `src/components/TerminalView.tsx` (import + 4-line early return
-  at `:~4352`)
+  in the SESSION_IDENTITY_MISMATCH handler, post-merge ~`:4575`; anchor by
+  the handler, not the line)
 - Modify: `test/unit/client/components/TerminalView.codex-identity.test.tsx`
-  (one wiring test)
+  (one wiring test keyed on the `[Resume blocked]` xterm write)
 
 **Interfaces:**
 - Consumes: `msg.actualSessionRef` on the error frame (already on the TS
@@ -1088,11 +1278,14 @@ function sessionRefsEqual(
   return left?.provider === right?.provider && left?.sessionId === right?.sessionId
 }
 
-/** The rebind swap window (~1 WS RTT) can bounce in-flight input sent with
- *  the OLD ref. When the server's error echoes an actualSessionRef that
- *  already equals the pane's CURRENT sessionRef, the rebind fold has
- *  applied and this is a stale-window bounce: suppress it silently (no
- *  notice, no repair). Unparseable/absent refs fail toward the visible path. */
+/** The rebind swap window (sub-second: identity upsert -> ledger fsync ->
+ *  broadcast -> client fold) can bounce in-flight input sent with the OLD
+ *  ref. When the server's error echoes an actualSessionRef that already
+ *  equals the pane's CURRENT sessionRef, the rebind fold has applied and
+ *  this is a stale POST-fold bounce: suppress it silently (no notice, no
+ *  repair). A bounce that OUTRUNS the fold stays visible by design (LB2
+ *  residual, see the task notes). Unparseable/absent refs fail toward the
+ *  visible path. */
 export function isStaleSessionIdentityMismatch(
   currentSessionRef: unknown,
   actualSessionRef: unknown,
@@ -1112,12 +1305,24 @@ Run the Step-2 command again. Expected: PASS (3 tests).
 
 - [ ] **Step 4: Write the failing wiring test**
 
+RED-signal design (corrected by the load-bearing audit, LB1): on unmodified
+code the expected≠current frame takes the NOTICE-ONLY branch — pane state
+is untouched and no `terminal.create` is sent — so assertions on those
+alone would be born GREEN. The only observable that flips with Task 5's
+early return is the `[Resume blocked]` xterm write. The RED/GREEN pivot is
+therefore its PRESENCE on unmodified code vs its ABSENCE afterwards,
+observed via the file's mocked `@xterm/xterm` `Terminal.write` spy (the
+mock at ~`:110-121` records `write = vi.fn((data, cb) => ...)` and pushes
+every instance onto `runtimeHarness.terminals` — verify the exact shape in
+the file). The pane-untouched/no-create assertions are KEPT as regression
+guards, not as the RED signal.
+
 In `test/unit/client/components/TerminalView.codex-identity.test.tsx`, next
 to the existing test
 `'repairs stale runtime plumbing on SESSION_IDENTITY_MISMATCH and reissues a restore create'`
 (~`:306`), add (reusing that file's `createStore`, `TerminalViewFromStore`,
-`wsHarness`, `sentMessages`, `findLeaf` helpers exactly as the existing
-test does):
+`wsHarness`, `sentMessages`, `findLeaf`, `runtimeHarness` helpers exactly
+as the existing tests do):
 
 ```tsx
   it('suppresses the mismatch repair path when actualSessionRef already equals the pane current ref (stale rebind-window bounce)', async () => {
@@ -1166,7 +1371,20 @@ test does):
       })
     })
 
-    // Nothing happens: no teardown, no repair create, pane untouched.
+    // RED/GREEN pivot: on unmodified code the handler's notice-only branch
+    // writes '[Resume blocked] ...' to the xterm; after the suppression
+    // early-return it writes NOTHING. The notice may travel the async write
+    // queue (TerminalView.tsx writeQueueRef, ~:996-999 in
+    // writeLocalXtermNotice), so flush before asserting absence.
+    const wroteResumeBlocked = () =>
+      runtimeHarness.terminals.some((term) =>
+        term.write.mock.calls.some(([data]: [string]) => String(data).includes('[Resume blocked]')))
+    await act(async () => { await Promise.resolve() })
+    expect(wroteResumeBlocked()).toBe(false)
+
+    // Regression guards (these pass BOTH before and after implementation —
+    // they are NOT the RED signal): no teardown, no repair create, pane
+    // untouched.
     const leaf = findLeaf(store.getState().panes.layouts['tab-1'], 'pane-1')
     expect(leaf?.content.kind).toBe('terminal')
     expect((leaf?.content as TerminalPaneContent).terminalId).toBe('term-old')
@@ -1183,9 +1401,19 @@ Run:
 ```bash
 npm run test:vitest -- test/unit/client/components/TerminalView.codex-identity.test.tsx --run
 ```
-Expected: the new test FAILS (the handler currently runs the repair/notice
-path — `terminalId` gets cleared / a `terminal.create` is reissued). All
-pre-existing tests pass.
+Expected: the new test FAILS on the `wroteResumeBlocked()` assertion — the
+unmodified handler takes its notice-only branch for this expected≠current
+frame and writes `[Resume blocked] stale bounce` to the mocked terminal.
+(It does NOT clear `terminalId` or reissue a `terminal.create` — that is
+why the write spy, not pane state, is the RED signal.) All pre-existing
+tests pass.
+
+CALIBRATE the RED before trusting it: if the assertion unexpectedly passes
+on unmodified code, first invert it (`.toBe(true)`) and confirm the notice
+IS present — if presence is only observable after a longer flush, wrap the
+absence check in `waitFor`/additional microtask flushes until the inverted
+(presence) form passes deterministically, then restore `.toBe(false)`. A
+RED that never saw the notice is vacuous.
 
 - [ ] **Step 5: Wire the early return**
 
@@ -1206,7 +1434,8 @@ import {
 one.)
 
 2. Insert the early return as the FIRST statements inside the mismatch
-   handler at `:~4352`:
+   handler (post-merge ~`:4575`; anchor by the
+   `msg.code === 'SESSION_IDENTITY_MISMATCH'` condition):
 ```tsx
         if (msg.type === 'error' && msg.code === 'SESSION_IDENTITY_MISMATCH' && msg.terminalId === tid) {
           // Stale-window bounce after a rebind -- the pane already folded
@@ -1218,10 +1447,35 @@ one.)
           ...
 ```
 
+Composition note (post-#571): the handler's repair path now also calls
+`discardPendingInput('terminal_gone')`. The suppression early-return fires
+BEFORE it — correct: a stale-window bounce is not an identity abandonment,
+and buffered input must survive. Real mismatches still discard + repair.
+
 Accepted, documented behavior: a suppressed bounce means that ONE input
 frame was dropped (the server did not write it to the PTY). Node has the
 identical semantics; there is no retry — the user's next keystroke carries
-the new ref.
+the new ref. This deliberate silence is NOT a violation of #571's
+no-silent-input-loss charter (see Task 0's design-tension note): the
+dropped frame was addressed to an identity the pane no longer holds.
+
+Documented residual (LB2, adjudicated ACCEPTED — do not redesign): there is
+NO delivery-order guarantee between the `associated` broadcast and an
+inline input bounce on the same connection. The connection loop's
+`tokio::select!` is unbiased (`terminal.rs:236`), and the rebind tail is
+identity upsert → awaited ledger fsync → broadcast
+(`opencode_signal.rs:246-268`) — so an input processed inside that window
+bounces before the broadcast even exists on the bus. Consequence: a
+keystroke typed inside the sub-second swap window can produce ONE truthful
+visible `[Resume blocked]` notice and is dropped; the broadcast folds
+moments later and subsequent input flows. This task's suppression covers
+only POST-fold stale bounces (current ref already equals the echoed
+`actualSessionRef`). Alternatives were considered and rejected: a second
+grace-window suppression arm (false-suppression risk for REAL mismatches),
+routing the bounce through the ordered broadcast channel (disproportionate
+server redesign for a sub-second window), and a client self-heal fold of
+the echoed `actualSessionRef` (enlarges the anti-hijack trust surface the
+fold's conflict-veto exists to protect). Document; do not "fix".
 
 - [ ] **Step 6: Run tests to verify green**
 
@@ -1921,6 +2175,15 @@ head-scratcher failures):
 - Rebind signals are act-then-delete and refused signals are also consumed
   — `fs.access` failing on the signal path is a real assertion channel
   proving the sweep ran.
+- WsCapture liveness (LB9): the broadcast bus (capacity 1024) CLOSES a
+  lagging connection with code 4008 (`terminal.rs:402-418`), and `WsCapture`
+  has no close detection — a silently-dead capture makes
+  `expectNoMatchingFrame` pass vacuously. The never-steal negative is
+  therefore only conclusive together with a POSITIVE liveness proof on the
+  SAME capture connection AFTER the negative window (the sesD control
+  below, which observes a later frame on `capture2` and fails loudly if the
+  socket died). Do not remove, reorder, or re-home that control onto a
+  fresh capture.
 
 - [ ] **Step 1: Register the spec (rust-only)**
 
@@ -2308,6 +2571,11 @@ test.describe('OpenCode signal-driven rebind (Rust only)', () => {
       // sweep, same pane) was alive by rebinding pane 1 to an UNOWNED
       // session on it and observing success. Deliberately LAST: it moves
       // pane 1 off sesB after every sesB persistence assertion completed.
+      // Double duty (LB9): this waitFor runs on the SAME capture2 socket as
+      // the negative window above — a bus-lag close (4008, no close
+      // detection in WsCapture) would have silenced capture2 and made the
+      // negative vacuous, but then THIS positive proof times out and fails
+      // the spec. The negative is only concluded after this succeeds.
       const sesD = `ses_e2eliveness${Date.now()}`
       await writeOpencodeSignal(info.homeDir, restoredTerminalId1, 4, sesD)
       await capture2.waitFor(
@@ -2480,3 +2748,29 @@ now_ms)` (Task 6 impl/tests), `emitHello(deps: EmitterDeps)` (Task 7),
 `input_session_identity_mismatch_error(terminal_id, expected, actual)`
 (Task 4 impl/tests/arm), signal payload `{"session_id", "source"}` vs hello
 `{"hello": true, "source"}` consistent across Tasks 6, 7, and 8.
+
+**4. Load-bearing validation amendments (post-plan review).** The
+load-bearing-assumption pass (`.worktrees/.the-usual-logs/
+rebind-salvage-hardening/load-bearing-ledger.md`) drove these changes,
+already folded into the tasks above:
+- LB11 (verified, mandatory change): Task 0 merge of `origin/main @
+  e1f4d4c5` added as the first implementation action; client/server
+  anchors refreshed to the post-merge tree; #571 design-tension note
+  recorded in Task 0 and Task 5.
+- LB3 (falsified): Task 4's guard scoped to the opencode lane (both refs'
+  provider == `"opencode"`), with a non-opencode passthrough unit test.
+- LB4 (falsified): fail-open coverage re-worded — permanently-`(Some,None)`
+  pane classes (REST/fresh-agent resumes) are a documented known
+  limitation, not a ~2s startup window; fail-open policy itself vindicated.
+- LB1 (falsified): Task 5's wiring test re-keyed to the `[Resume blocked]`
+  xterm write spy (presence = RED on unmodified code, absence = GREEN);
+  pane-untouched/no-create assertions demoted to regression guards;
+  Deliverable-2 framing corrected (spurious notice, not repair storm).
+- LB2 (falsified, accepted): pre-fold bounce residual documented in Task 5
+  (one truthful visible notice + one dropped keystroke inside the swap
+  window); no redesign.
+- LB9 (verified, hardened): Task 8's never-steal negative explicitly tied
+  to the same-connection sesD liveness sentinel (bus lag-close 4008 makes
+  an unsentineled negative vacuous).
+- LB6 (verified): disconnected-tab eventual-consistency note added to
+  Task 2.
