@@ -74,16 +74,25 @@ impl ClaudeSignalWatcher {
     /// single-shot; leaving junk behind would re-fail every sweep forever).
     /// In-flight `*.tmp` files (the hook's atomic write staging) are left
     /// alone.
+    /// drain() sorts by filename (timestamp-first nonces => deterministic last-write-wins under rapid A->B->A switching on nanosecond-precision date; the second-granularity fallback degrades same-second order to pid order).
     pub fn drain(&self) -> Vec<ClaudeSignal> {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return Vec::new(); // no dir yet: no claude pane has ever signaled
         };
+        let mut paths: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect();
+        // Deterministic last-write-wins (mirrors opencode_signal.rs): the
+        // producer nonce is timestamp-first and width-stable, so a filename
+        // sort is emission order on nanosecond-precision `date` (GNU; on the
+        // second-granularity fallback, same-second order degrades to pid
+        // order -- see the producer's doc comment); the consumer applies
+        // signals in sequence, so the newest signal per terminal wins.
+        paths.sort();
         let mut signals = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
+        for path in paths {
             if let Some(sig) = parse_signal_file(&path) {
                 signals.push(sig);
             }
@@ -263,6 +272,57 @@ mod tests {
             0,
             "processed AND malformed files deleted"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn drain_returns_signals_sorted_by_filename_oldest_first() {
+        let root =
+            std::env::temp_dir().join(format!("freshell-claude-sig-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Timestamp-first nonces (Task 1 shape). Written in REVERSE of
+        // emission order so read_dir/creation order cannot fake a pass.
+        let emissions = [
+            (
+                "1769000000000000001-11",
+                "aaaaaaaa-0000-4000-8000-000000000001",
+            ),
+            (
+                "1769000000000000002-11",
+                "aaaaaaaa-0000-4000-8000-000000000002",
+            ),
+            (
+                "1769000000000000003-99",
+                "aaaaaaaa-0000-4000-8000-000000000003",
+            ),
+            (
+                "1769000000000000004-42",
+                "aaaaaaaa-0000-4000-8000-000000000004",
+            ),
+            (
+                "1769000000000000005-42",
+                "aaaaaaaa-0000-4000-8000-000000000005",
+            ),
+            (
+                "1769000000000000006-07",
+                "aaaaaaaa-0000-4000-8000-000000000006",
+            ),
+        ];
+        for (nonce, sid) in emissions.iter().rev() {
+            std::fs::write(
+                root.join(format!("t1__{nonce}.json")),
+                format!(r#"{{"session_id":"{sid}","source":"resume"}}"#),
+            )
+            .unwrap();
+        }
+        let watcher = ClaudeSignalWatcher::new(root.clone());
+        let signals = watcher.drain();
+        let got: Vec<&str> = signals.iter().map(|s| s.session_id.as_str()).collect();
+        let want: Vec<&str> = emissions.iter().map(|(_, sid)| *sid).collect();
+        assert_eq!(got, want, "drain must be filename-sorted (emission order)");
+        // Existing delete-on-read semantics are unchanged.
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
