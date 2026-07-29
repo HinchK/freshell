@@ -147,6 +147,10 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       if (!sentinelPid) throw new Error('sentinel failed to spawn (no pid)')
       expect(isProcessAlive(sentinelPid)).toBe(true)
 
+      const tabId = (await harness.getActiveTabId())!
+      const terminalIdBefore = (await harness.getPaneLayout(tabId))?.content?.terminalId as string
+      expect(terminalIdBefore).toBeTruthy()
+
       // --- (3) restart the SAME owned server against the SAME home/port/token ---
       const priorPort = info.port
       const priorPid = info.pid
@@ -194,50 +198,23 @@ test.describe('HARNESS-01: owned Rust-server fixture', () => {
       // buffer just missing the marker). The catch below dumps exactly
       // that state before rethrowing. The spec-level test.setTimeout(180_000)
       // already anticipated slow full-suite runs.
-      // DEFLAKE (f3wp refresh, evidence /tmp/f3wp-refresh/e2e-rundiag1.log):
-      // under load the FIRST post-restart command can arrive at the PTY with
-      // its HEAD truncated (buffer showed the marker's uuid TAIL plus
-      // "command not found" -- the leading "echo HARNESS01-..." bytes were
-      // dropped while the pane was still recreating/reattaching). The
-      // contract is "the recreated pane round-trips a command", not "no
-      // input byte is ever dropped mid-reattach", so retry with a DISTINCT
-      // marker per attempt (a stale partial echo of attempt N can never
-      // satisfy attempt N+1). NOTE: the head-truncation itself is a
-      // possible product-level issue (typed input during the recreate
-      // window can be silently lost) -- tracked as kata `dtfn` and listed
-      // in the plan doc's findings ledger
-      // (docs/plans/2026-07-27-deflake-load-flakes.md); this loop only
-      // de-flakes the harness contract.
-      let roundTripped = false
-      // DEFLAKE (f3wp council round 2, B4): the prior version kept only the
-      // LAST attempt's error, silently discarding earlier ones. When all 3
-      // attempts fail for genuinely different reasons (e.g. attempt 1
-      // head-truncated, attempt 2 wedged, attempt 3 timed out clean), the
-      // final thrown diagnostic must show every attempt's failure, not just
-      // the last -- otherwise the reported cause can be actively misleading
-      // about what actually happened on earlier attempts.
-      const attemptErrors: unknown[] = []
-      for (let attempt = 1; attempt <= 3 && !roundTripped; attempt++) {
-        const marker = `HARNESS01-POST-RESTART-${attempt}-${randomUUID()}`
-        try {
-          await terminal.executeCommand(`echo ${marker}`)
-          await terminal.waitForOutput(marker, { timeout: 30_000 })
-          roundTripped = true
-        } catch (attemptError) {
-          // eslint-disable-next-line no-console
-          console.log(`[harness-01] post-restart round-trip attempt ${attempt} failed: ${attemptError}`)
-          attemptErrors.push(attemptError)
-        }
-      }
+      // Deterministic post-restart gate (kata dtfn fix): wait for the pane
+      // to re-anchor (new terminalId via terminal.created) before typing.
+      // The former 3-attempt marker retry papered over silently-lost input
+      // during the recreate window; with the buffered-input fix the FIRST
+      // attempt must round-trip.
+      const terminalIdAfter: string = await expect
+        .poll(async () => {
+          const tid = (await harness.getPaneLayout(tabId))?.content?.terminalId ?? null
+          return tid && tid !== terminalIdBefore ? tid : null
+        }, { timeout: 30_000 })
+        .not.toBeNull()
+        .then(async () => (await harness.getPaneLayout(tabId))?.content?.terminalId as string)
+
+      const marker2 = `HARNESS01-POST-RESTART-${randomUUID()}`
       try {
-        if (!roundTripped) {
-          throw new Error(
-            attemptErrors.length
-              ? `post-restart round-trip failed after ${attemptErrors.length} attempt(s) -- ` +
-                attemptErrors.map((err, i) => `[attempt ${i + 1}] ${err}`).join(' | ')
-              : 'post-restart round-trip never attempted',
-          )
-        }
+        await terminal.executeCommand(`echo ${marker2}`)
+        await terminal.waitForOutput(marker2, { timeout: 30_000, terminalId: terminalIdAfter })
       } catch (error) {
         const wsReadyState = await page
           .evaluate(() => window.__FRESHELL_TEST_HARNESS__?.getWsReadyState() ?? '<harness missing>')
