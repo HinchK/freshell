@@ -289,6 +289,18 @@ mod tests {
 
     #[test]
     fn drain_parses_and_deletes_signal_files() {
+        // Guard, not asserted on: this test's junk__1.json hits the
+        // `claude_signal_rejected` warn callsite. Under parallel test
+        // execution, the FIRST thread to hit a callsite registers its
+        // interest; with a single registered dispatcher, tracing-core's
+        // `JustOne` rebuilder computes interest from the REGISTERING
+        // thread's default subscriber -- none here would cache
+        // `Interest::never` globally and silently swallow the warn that
+        // drain_warns_on_rejected_files asserts on. Holding a capture
+        // guard (the opencode lane's idiom: every test that can hit a
+        // capture-asserted callsite holds one) makes registration always
+        // see a live subscriber.
+        let (_events, _guard) = crate::invariants::capture::capture();
         let root = std::env::temp_dir().join(format!("freshell-claude-sig-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
