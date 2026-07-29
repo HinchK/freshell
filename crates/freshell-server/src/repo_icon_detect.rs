@@ -616,6 +616,10 @@ fn tier2(sink: &mut CandidateSink) {
         "build/icon.png",
         "build/icon.ico",
         "build/appicon.png",
+        "android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png",
+        "android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png",
+        "android/app/src/main/res/mipmap-xhdpi/ic_launcher.png",
+        "android/app/src/main/res/mipmap-hdpi/ic_launcher.png",
     ];
     for rel in FIXED {
         sink.push(root.join(rel), TIER2);
@@ -675,6 +679,13 @@ fn tier3(sink: &mut CandidateSink) {
         sink.push(root.join(format!("logo.{ext}")), TIER3); // GitLab parity
     }
     sink.push(root.join("app-icon.png"), TIER3);
+    sink.push(root.join("icon.ico"), TIER3);
+    sink.push(root.join("app.ico"), TIER3);
+    sink.push(root.join("favicon.svg"), TIER3);
+    sink.push(root.join("favicon.png"), TIER3);
+    for ext in ["png", "svg", "ico"] {
+        sink.push(root.join(format!("appicon.{ext}")), TIER3);
+    }
     for name in ["logo", "icon"] {
         for ext in ["png", "svg"] {
             sink.push(root.join(".github").join(format!("{name}.{ext}")), TIER3);
@@ -693,7 +704,12 @@ fn tier3(sink: &mut CandidateSink) {
         "docs",
         "doc",
     ] {
-        push_dir_prefix_matches(sink, &root.join(dir), &["icon", "logo"], TIER3);
+        push_dir_prefix_matches(
+            sink,
+            &root.join(dir),
+            &["icon", "logo", "appicon", "app-icon", "app_icon", "favicon"],
+            TIER3,
+        );
     }
 }
 
@@ -1154,5 +1170,78 @@ mod detect_tests {
             assert_eq!(detect_icon(root), first);
         }
         assert_eq!(first, Some(root.join("assets/icon-a.png"))); // lexicographic dir order
+    }
+}
+
+#[cfg(test)]
+mod static_candidates_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Synthetic PNG: signature + IHDR only (png_dimensions reads just the header).
+    fn write_png(path: &Path, w: u32, h: u32) {
+        let mut bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&w.to_be_bytes());
+        bytes.extend_from_slice(&h.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Minimal valid single-image ICO: 6-byte header + one 16-byte dir entry
+    /// + zero-filled image data (ico_largest_dimensions reads the dir entry).
+    fn write_ico(path: &Path, w: u8, h: u8) {
+        let mut bytes = vec![0u8, 0, 1, 0, 1, 0];
+        bytes.extend_from_slice(&[w, h, 0, 0, 1, 0, 32, 0]);
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+        bytes.extend_from_slice(&22u32.to_le_bytes());
+        bytes.resize(22 + 40, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn finds_android_mipmap_launcher_icon() {
+        let dir = tempfile::tempdir().unwrap();
+        let res = dir.path().join("android/app/src/main/res/mipmap-xxxhdpi");
+        std::fs::create_dir_all(&res).unwrap();
+        write_png(&res.join("ic_launcher.png"), 192, 192);
+        assert_eq!(detect_icon(dir.path()), Some(res.join("ic_launcher.png")));
+    }
+
+    #[test]
+    fn finds_root_app_ico() {
+        let dir = tempfile::tempdir().unwrap();
+        write_ico(&dir.path().join("app.ico"), 64, 64);
+        assert_eq!(detect_icon(dir.path()), Some(dir.path().join("app.ico")));
+    }
+
+    #[test]
+    fn finds_root_appicon_png() {
+        let dir = tempfile::tempdir().unwrap();
+        write_png(&dir.path().join("appicon.png"), 128, 128);
+        assert_eq!(
+            detect_icon(dir.path()),
+            Some(dir.path().join("appicon.png"))
+        );
+    }
+
+    #[test]
+    fn asset_dir_prefix_scan_matches_appicon_and_favicon() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("resources")).unwrap();
+        write_png(&dir.path().join("resources/appicon-main.png"), 128, 128);
+        assert_eq!(
+            detect_icon(dir.path()),
+            Some(dir.path().join("resources/appicon-main.png"))
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir2.path().join("assets")).unwrap();
+        write_png(&dir2.path().join("assets/favicon.png"), 64, 64);
+        assert_eq!(
+            detect_icon(dir2.path()),
+            Some(dir2.path().join("assets/favicon.png"))
+        );
     }
 }
