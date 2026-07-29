@@ -339,6 +339,50 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
                     ..base(pane, ReconcileVerdict::Respawn)
                 };
             }
+            // Claude carve-out (never-conversed preallocation, PIN 1): claude
+            // terminals get a server-preallocated --session-id at create and
+            // the binding row is durable before the answer — but the
+            // transcript file only appears on first output. Ledger-bound +
+            // Absent + never SEEN on disk therefore means "created, never
+            // conversed", not dead: Respawn is the actionable verdict. The
+            // e2e fake accepts --resume and restores; REAL claude (verified
+            // v2.1.220) errors-and-exits on a not-found --resume id, which
+            // §7.5 respawn_exhausted converges to a loud DeadSession --
+            // never silent (a --session-id start-intent respawn was
+            // rejected: it would silently reuse a conversed-then-deleted
+            // id). Kata 09v1's locator fallback
+            // (freshell-server existence.rs) already converts
+            // exists-but-unparseable into Present => Respawn; this arm covers
+            // never-created — two halves of one rule, no overlap. A
+            // transcript that WAS observed on disk and is now gone falls
+            // through to the loud dead_session below (rows 4/4b hazard
+            // guard). Cross-restart deleted-with-prior-conversation is
+            // indistinguishable from never-conversed by these signals and
+            // takes the same escape the amplifier arm accepts: §7.5's
+            // respawn_exhausted convergence ends a respawn <-> instant-exit
+            // loop in an actionable dead_session, never thrash.
+            if sref.provider == "claude"
+                && deps
+                    .pane_ledger
+                    .ever_bound(&sref.provider, &sref.session_id)
+                && !deps
+                    .existence
+                    .ever_observed_on_disk(&sref.provider, &sref.session_id)
+            {
+                if deps.registry.respawn_exhausted(&key) {
+                    return PaneVerdict {
+                        session_ref: Some(sref),
+                        reason: Some("respawn_exhausted".to_string()),
+                        ..base(pane, ReconcileVerdict::DeadSession)
+                    };
+                }
+                let corrected = corrected_flag(pane.session_ref.as_ref(), Some(&sref));
+                return PaneVerdict {
+                    session_ref: Some(sref),
+                    corrected,
+                    ..base(pane, ReconcileVerdict::Respawn)
+                };
+            }
             // dead_session is gated on the identity having been SEEN on disk
             // at least once — never a data-loss-shaped verdict for an
             // identity disk has no memory of (§5.3 rows 4/4b).
@@ -653,6 +697,62 @@ mod tests {
         let v = f.one(p);
         assert_eq!(v.verdict, ReconcileVerdict::Respawn);
         assert_eq!(v.session_ref, Some(sref("amplifier", "s-gcd")));
+    }
+
+    /// PIN 1 red test: a claude pane whose session id was preallocated at
+    /// create (ledger-bound, durable) but which NEVER conversed has no
+    /// transcript file -> Absent. That is not an immediately-dead state:
+    /// respawning with --resume mirrors the amplifier arm. Against the
+    /// wall's fake CLI the pane restores; REAL claude (verified v2.1.220)
+    /// errors-and-exits on a not-found id, which §7.5 respawn_exhausted
+    /// converges to a loud, actionable DeadSession -- never silent.
+    /// Kata 09v1's locator fallback covers
+    /// exists-but-unparseable; this covers never-created.
+    #[test]
+    fn claude_never_conversed_yields_respawn_not_dead_session() {
+        let f = Fixture::new();
+        f.ledger
+            .record_binding(&crate::pane_ledger::BindingWrite {
+                provider: "claude",
+                session_id: "s-never",
+                terminal_id: "T-never",
+                mode: "claude",
+                cwd: None,
+                create_request_id: Some("cr-never"),
+                now_ms: 1_000,
+            })
+            .expect("record binding");
+        let mut p = pane("cr-never");
+        p.session_ref = Some(sref("claude", "s-never"));
+        // Probe default: Absent, never observed on disk.
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Respawn);
+        assert_eq!(v.session_ref, Some(sref("claude", "s-never")));
+    }
+
+    /// PIN 1 hazard guard: a claude transcript that WAS seen on disk and is
+    /// now gone is a real data-loss shape — stays loud dead_session even
+    /// though the identity is ledger-bound (rows 4/4b unchanged).
+    #[test]
+    fn claude_deleted_after_conversation_stays_dead_session() {
+        let f = Fixture::new();
+        f.ledger
+            .record_binding(&crate::pane_ledger::BindingWrite {
+                provider: "claude",
+                session_id: "s-gone2",
+                terminal_id: "T-gone2",
+                mode: "claude",
+                cwd: None,
+                create_request_id: Some("cr-gone2"),
+                now_ms: 1_000,
+            })
+            .expect("record binding");
+        f.probe.mark_observed("claude", "s-gone2");
+        let mut p = pane("cr-gone2");
+        p.session_ref = Some(sref("claude", "s-gone2"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::DeadSession);
+        assert_eq!(v.reason.as_deref(), Some("session_not_on_disk"));
     }
 
     /// Row 5 (§9.1 test 6): cold index on a known provider → honest
