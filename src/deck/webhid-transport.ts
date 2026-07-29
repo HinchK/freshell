@@ -165,11 +165,19 @@ class WebHidDeckDevice implements DeckDevice {
   }
 
   async setBrightness(percent: number): Promise<void> {
-    await this.lib.setBrightness(percent)
+    try {
+      await this.lib.setBrightness(percent)
+    } catch (error) {
+      await this.handleWriteFailure('setBrightness', error)
+    }
   }
 
   async clear(): Promise<void> {
-    await this.lib.clearPanel()
+    try {
+      await this.lib.clearPanel()
+    } catch (error) {
+      await this.handleWriteFailure('clearPanel', error)
+    }
   }
 
   async close(): Promise<void> {

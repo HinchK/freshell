@@ -135,6 +135,39 @@ describe('webhid transport', () => {
     expect(lib.close).toHaveBeenCalled()
   })
 
+  it('absorbs rejected writes on all four write paths — fire-and-forget callers must never see a rejection', async () => {
+    const lib = new FakeLibDeck()
+    lib.PRODUCT_NAME = 'Stream Deck +'
+    lib.CONTROLS = plusControls()
+    const granted: FakeHidDevice = { vendorId: ELGATO, productId: 0x0084 }
+    stubHid([granted])
+    openDevice.mockResolvedValueOnce(lib)
+    const dev = (await getGrantedWebHidDeck())!
+    const gone = new DOMException('The device is gone.', 'NetworkError')
+    lib.fillKeyBuffer.mockRejectedValueOnce(gone)
+    lib.fillLcd.mockRejectedValueOnce(gone)
+    lib.setBrightness.mockRejectedValueOnce(gone)
+    lib.clearPanel.mockRejectedValueOnce(gone)
+    await expect(dev.setKeyImage(0, new Uint8ClampedArray(4))).resolves.toBeUndefined()
+    await expect(dev.setTouchStripImage(new Uint8ClampedArray(4), 1, 1)).resolves.toBeUndefined()
+    await expect(dev.setBrightness(50)).resolves.toBeUndefined()
+    await expect(dev.clear()).resolves.toBeUndefined()
+  })
+
+  it('a rejected brightness write probes getDevices and fires onDisconnect when the device is gone', async () => {
+    const lib = new FakeLibDeck()
+    const granted: FakeHidDevice = { vendorId: ELGATO, productId: 0x0063 }
+    const hid = stubHid([granted])
+    openDevice.mockResolvedValueOnce(lib)
+    const dev = (await getGrantedWebHidDeck())!
+    const cb = vi.fn()
+    dev.onDisconnect(cb)
+    lib.setBrightness.mockRejectedValueOnce(new DOMException('gone', 'NetworkError'))
+    hid.getDevices.mockResolvedValueOnce([]) // unplugged: no longer enumerable
+    await dev.setBrightness(30)
+    expect(cb).toHaveBeenCalledTimes(1)
+  })
+
   it('maps a NetworkError DOMException from openDevice to DeckOpenError(in-use)', async () => {
     stubHid([{ vendorId: ELGATO, productId: 0x0063 }])
     openDevice.mockRejectedValueOnce(new DOMException('Failed to open the device.', 'NetworkError'))
