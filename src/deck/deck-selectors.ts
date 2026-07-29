@@ -4,7 +4,7 @@ import type { FreshAgentPaneContent, PaneContent, PaneNode, TerminalPaneContent 
 import type { TabStatusFlags } from './tile-state'
 import { tileFill, tileDot, tilePriority, type TileFill, type TileDot } from './tile-state'
 import { collectPaneEntries } from '@/lib/pane-utils'
-import { getBusyPaneIdsForTab, hasWaitingPrompt, resolvePaneActivity } from '@/lib/pane-activity'
+import { getBusyPaneIdsForTab, resolvePaneActivity } from '@/lib/pane-activity'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { buildRepoIconUrl, pathBasename, resolvePaneRepoCwd } from '@/lib/repo-icon'
 import { hueFromString } from '@/components/icons/RepoIcon'
@@ -39,13 +39,6 @@ function freshAgentSessionFor(state: RootState, content: FreshAgentPaneContent) 
   return state.freshAgent.sessions[makeFreshAgentSessionKey({
     sessionType: content.sessionType, provider: content.provider, sessionId: content.sessionId,
   })]
-}
-
-export function tabHasPendingApproval(state: RootState, tabId: string): boolean {
-  const layout = state.panes.layouts[tabId]
-  if (!layout) return false
-  return collectPaneEntries(layout).some((entry) =>
-    entry.content.kind === 'fresh-agent' && hasWaitingPrompt(freshAgentSessionFor(state, entry.content)))
 }
 
 /**
