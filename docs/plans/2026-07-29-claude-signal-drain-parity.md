@@ -43,12 +43,13 @@ The signal lane is **rebind-only**: `claude_signal.rs` no-ops on the startup sig
 
 - Worktree: `/home/dan/code/freshell/.worktrees/claude-signal-drain-parity`, branch `fix/claude-signal-drain-parity`, based on `origin/main` @ `90c027a4`. Do all work there.
 - Red-green-refactor TDD; frequent, focused commits. **Do NOT create a PR — stop after pushing the branch.**
-- **NEVER touch the production Rust server on port 3002.** Production is RUNNING the destructive drain right now and sweeps `~/.freshell/session-signals/claude/` every ~1s: **all tests MUST use isolated temp signal directories** (`tempfile::tempdir()` passed to `ClaudeSignalWatcher::new`), never `default_root()`/the real `$HOME` path — or production will eat test fixtures and tests could eat production's signals.
+- **NEVER touch the production Rust server on port 3002.** Production is RUNNING the destructive drain right now and sweeps `~/.freshell/session-signals/claude/` every ~1s: **all tests MUST use isolated temp signal directories** (`tempfile::tempdir()` in unit tests, or the integration harness's existing pid-scoped `std::env::temp_dir()` subdirs — both isolated — passed to `ClaudeSignalWatcher::new`), never `default_root()`/the real `$HOME` path — or production will eat test fixtures and tests could eat production's signals.
 - Do not regress: #573 salvage-hardening, #574 codex self-healing, #575 polish (deterministic drain ordering, `SignalDisposition` semantics, portable nonce, warn-once fork-ambiguity), hello/HelloTracker semantics, one-writer invariant, A13, D7/D8, "when unsure do nothing".
 - Consumption semantics only — rebind policy (guard chain, no first-bind-via-signal, no retired-pane ref move for claude) is unchanged.
 - Hook command strings (`CLAUDE_SESSION_START_COMMAND_UNIX`/`_WINDOWS`, `cli_launch.rs:222,230`) are byte-pinned by goldens (`cli_launch_goldens.rs`) — do NOT modify them; `.tmp` cleanup is consumer-side (mirroring `opencode_signal.rs:146-157`).
 - Verification gates (run from the worktree root): `test -d node_modules || npm ci --no-audit --no-fund` (cargo tests depend on it); `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo clippy -p freshell-opencode --features real-transport --all-targets -- -D warnings`; `cargo test --workspace`; coordinated JS via `npm run check` (never bare vitest); contract freeze via `npm run contract:generate && git diff --exit-code -- port/contract`. Prefix broad test runs with `FRESHELL_TEST_SUMMARY="<reason>"`.
 - `docs/plans/` docs are working/agent docs; README.md remains the only end-user markdown doc — do not add other end-user docs.
+- **npm-ci precondition (validated):** the `freshell-ws` INTEGRATION tests (e.g. `claude_session_rebind`, `opencode_switch_rebind`) hard-require installed npm deps: pane creation runs MCP injection, which resolves `node_modules/tsx/dist/loader.mjs` from the repo root at runtime (`mcp_inject.rs:110-139`); when it is absent the server replies with a create error and the test fails as `timed out waiting for a terminal.created frame` (common/mod.rs:934) after ~5s. If you see that signature, it is the missing `npm ci`, NOT your change. `cargo test -p freshell-ws --lib` does not need node_modules.
 
 ## File Structure
 
@@ -253,10 +254,10 @@ git commit -m "fix(claude-signal): reap stale signals and orphaned .tmp staging,
 
 ### Task 2: Act-then-delete with explicit `SignalDisposition` (the core P1 fix)
 
-`drain()` stops deleting valid files; `ClaudeSignal` carries its `path`; a new module-private `apply_claude_signal` returns `SignalDisposition`; the consumer loop deletes only `Acted`/`Discard` files. Unknown-terminal signals are **retained** — the multi-instance hazard is closed. Foreign-provider signals get `Discard` + warn; the pane-ledger fresh-agent refusal gains a warn (P3). Guard set, guard order, and fan-out order are byte-identical to today.
+`drain()` stops deleting valid files; `ClaudeSignal` carries its `path`; a new module-private `apply_claude_signal` returns `SignalDisposition`; the consumer loop deletes only `Acted`/`Discard` files. Unknown-terminal signals are **retained** — the multi-instance hazard is closed. Foreign-provider signals get `Discard` + warn; the pane-ledger fresh-agent refusal gains a warn (P3). Guard set, guard order, and fan-out order are byte-identical to today, with one validated nuance: today's COMBINED `retired || provider != "claude"` guard (`claude_signal.rs:160-162`) is split into the disposition table's two arms (foreign-provider Discard+warn, then retired Acted) — behavior-preserving for file fate, except a retired+foreign-provider pane now emits the `claude_signal_ignored` warn where it was silent before. That is deliberate (detectability); reviewers should not flag it as drift.
 
 **Files:**
-- Modify: `crates/freshell-ws/src/claude_signal.rs` (module header `:1-22`, `ClaudeSignal` struct `:35-41`, `drain()` valid-file arm, `parse_signal_file` `:110-130`, `drain_and_rebind_claude` `:139-244`, unit tests)
+- Modify: `crates/freshell-ws/src/claude_signal.rs` (module `//!` header `:1-14`, `ClaudeSignal` struct `:35-41`, `drain()` valid-file arm, `parse_signal_file` `:110-130`, `drain_and_rebind_claude` `:139-244`, unit tests)
 - Modify: `crates/freshell-ws/tests/claude_session_rebind.rs` (two assertion-message/comment updates only — Phase 3's "single-shot" wording and Phase 4's delete-on-read wording; the assertions themselves still hold because refusals map to `Acted` ⇒ deleted)
 
 **Interfaces:**
@@ -507,7 +508,7 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
     }
 ```
 
-3g. Update the module header comment (`claude_signal.rs:1-22`) to state the new contract, e.g. append: "Drain is NON-DESTRUCTIVE for valid signals — the consumer deletes a file only after acting on it (act-then-delete, D1.1, mirroring opencode_signal.rs): a signal for a terminal id unknown to this instance is RETAINED so the owning instance (another freshell server sharing $HOME) can consume it, bounded by opencode_signal's STALE_SIGNAL_MAX_AGE. Foreign-provider signals are warn-logged and consumed (`SignalDisposition::Discard`); orphaned `.tmp` staging is reaped on the same TTL."
+3g. Update the module header comment (`claude_signal.rs:1-14`) to state the new contract, e.g. append: "Drain is NON-DESTRUCTIVE for valid signals — the consumer deletes a file only after acting on it (act-then-delete, D1.1, mirroring opencode_signal.rs): a signal for a terminal id unknown to this instance is RETAINED so the owning instance (another freshell server sharing $HOME) can consume it, bounded by opencode_signal's STALE_SIGNAL_MAX_AGE. Foreign-provider signals are warn-logged and consumed (`SignalDisposition::Discard`); orphaned `.tmp` staging is reaped on the same TTL."
 
 - [ ] **Step 4: Run unit tests to verify green**
 
@@ -517,7 +518,7 @@ Expected: PASS — 6 tests (`drain_parses_retains_valid_files_and_consumes_rejec
 
 - [ ] **Step 5: Update integration-test wording, run it**
 
-In `crates/freshell-ws/tests/claude_session_rebind.rs`: Phase 3's `read_dir(signal_root).count() == 0` assertion holds (refusal ⇒ `Acted` ⇒ deleted) — update its message from "the refused signal file must still be consumed (single-shot)" to "a deliberate refusal counts as acted on: the file is consumed (act-then-delete)". Same wording update for Phase 4's file-absence assertion. No behavioral edits.
+In `crates/freshell-ws/tests/claude_session_rebind.rs`: Phase 3's `read_dir(signal_root).count() == 0` assertion holds (refusal ⇒ `Acted` ⇒ deleted) — update its message from "the refused signal file must still be consumed (single-shot)" to "a deliberate refusal counts as acted on: the file is consumed (act-then-delete)". Phase 4's file-absence assertion (`:578-580`) carries NO message — its delete-on-read wording lives in the COMMENT just above it (`:574-577`); update that comment with the same act-then-delete wording. No behavioral edits.
 
 Run: `cargo test -p freshell-ws --test claude_session_rebind`
 
