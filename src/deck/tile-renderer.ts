@@ -5,12 +5,12 @@ import type { DeckAction, KeySpec, RingColor } from './frame'
 // injectable 2D-context factory (jsdom returns null from getContext, so tests
 // always inject a fake context; defaultCtxFactory is runtime-only).
 
-export type Ctx2D = Pick<CanvasRenderingContext2D,
-  'fillRect' | 'fillText' | 'measureText' | 'getImageData'> & {
-  fillStyle: string | CanvasGradient | CanvasPattern
-  font: string
-  textBaseline: CanvasTextBaseline
-}
+export type Ctx2D = Pick<
+  CanvasRenderingContext2D,
+  'fillRect' | 'fillText' | 'measureText' | 'getImageData' | 'drawImage'
+> & { fillStyle: string | CanvasGradient | CanvasPattern; font: string; textBaseline: CanvasTextBaseline }
+
+export type IconSource = (url: string) => CanvasImageSource | null
 export type CtxFactory = (width: number, height: number) => Ctx2D
 export type KeyRenderer = (spec: KeySpec, caps: DeckCapabilities) => Uint8ClampedArray
 export type StripRenderer = (text: string, width: number, height: number) => Uint8ClampedArray
@@ -30,6 +30,16 @@ export const RING_COLORS: Record<Exclude<RingColor, null>, string> = {
   blue: '#3b82f6',
 }
 export const ACTIVE_COLOR = '#ffffff'
+export const TILE_BG = '#0a0a0a'
+/** Light green fill - the tab bar's emerald attention fill, tuned for the LCD (emerald-200). */
+export const TILE_FILL_GREEN = '#a7f3d0'
+/** The tab bar's bar-on-top green (--success, hsl(142 71% 45%)). */
+export const BAR_TOP_BORDER = '#21c45d'
+/** Status dot: the tab bar's icon tint colors (text-success / text-blue-500). */
+export const DOT_GREEN = '#21c45d'
+export const DOT_BLUE = '#3b82f6'
+export const DOT_SIZE = 8
+export const ICON_GAP = 3
 export const STOP_COLOR = '#ef4444'
 export const APPROVE_COLOR = '#22c55e'
 export const DISABLED_ACTION_COLOR = '#555555'
@@ -63,6 +73,19 @@ export function fitLabel(measure: (t: string) => number, text: string, maxWidth:
   return `${t}…`
 }
 
+/** Centered icon slots in the area below the title banner. */
+export function iconLayout(w: number, h: number, count: number): Array<{ x: number; y: number; size: number }> {
+  if (count <= 0) return []
+  const areaTop = BANNER_HEIGHT
+  const areaH = h - areaTop
+  const scale = count === 1 ? 0.5 : 0.3
+  const size = Math.round(Math.min(w, areaH) * scale)
+  const rowW = count * size + (count - 1) * ICON_GAP
+  const x0 = Math.round((w - rowW) / 2)
+  const y = Math.round(areaTop + (areaH - size) / 2)
+  return Array.from({ length: count }, (_, i) => ({ x: x0 + i * (size + ICON_GAP), y, size }))
+}
+
 export function drawRing(ctx: Ctx2D, w: number, h: number, color: string, width: number, inset = 0): void {
   ctx.fillStyle = color
   for (let i = 0; i < width; i++) {
@@ -82,39 +105,53 @@ function drawCenteredText(ctx: Ctx2D, text: string, w: number, y: number): void 
 const ACTION_LABELS: Record<DeckAction, string> = { back: 'BACK', approve: 'APPROVE', stop: 'STOP' }
 const ACTION_RING: Record<DeckAction, string> = { back: ACTIVE_COLOR, approve: APPROVE_COLOR, stop: STOP_COLOR }
 
-function drawTab(
-  ctx: Ctx2D, w: number, h: number,
-  spec: Extract<KeySpec, { kind: 'tab' }>,
-): void {
-  ctx.fillStyle = PREVIEW_BG
+function drawTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, { kind: 'tab' }>, getIcon: IconSource): void {
+  // 1. Background mirrors the tab bar state: no fill / green fill / barTop (fill + border below).
+  ctx.fillStyle = spec.fill === 'none' ? TILE_BG : TILE_FILL_GREEN
   ctx.fillRect(0, 0, w, h)
 
-  const { lines, columns } = previewGeometry(w, h)
-  const body = cropPreviewLines(spec.previewLines, lines, columns)
-  ctx.font = `${PREVIEW_FONT_SIZE}px monospace`
-  ctx.textBaseline = 'top'
-  ctx.fillStyle = PREVIEW_TEXT_COLOR
-  const baseY = h - body.length * PREVIEW_LINE_HEIGHT - 2
-  body.forEach((line, i) => {
-    if (line.trim() === '') return
-    ctx.fillText(line, PREVIEW_LEFT_MARGIN, baseY + i * PREVIEW_LINE_HEIGHT)
+  // 2. Centered repo icons; letter avatar while loading, on failure, or when the repo has no icon.
+  const slots = iconLayout(w, h, spec.icons.length)
+  spec.icons.forEach((icon, i) => {
+    const { x, y, size } = slots[i]
+    const bitmap = icon.url && icon.ready ? getIcon(icon.url) : null
+    if (bitmap) {
+      // ALWAYS pass explicit destination width AND height: dimensionless (viewBox-only)
+      // SVGs draw blank without them (verified headless Chromium 145; the server serves
+      // dimensionless SVGs first-class - repo_icon_detect.rs:51-52). Never call the
+      // 3-arg drawImage(image, dx, dy) form anywhere in this module.
+      ctx.drawImage(bitmap, x, y, size, size)
+      return
+    }
+    // Letter avatar (canvas analogue of RepoIcon's SVG circle): hue swatch + white letter.
+    ctx.fillStyle = `hsl(${icon.hue}, 60%, 42%)`
+    ctx.fillRect(x, y, size, size)
+    ctx.font = `600 ${Math.round(size * 0.6)}px sans-serif`
+    ctx.textBaseline = 'top'
+    ctx.fillStyle = '#ffffff'
+    const letterWidth = ctx.measureText(icon.letter).width
+    ctx.fillText(icon.letter, Math.round(x + (size - letterWidth) / 2), Math.round(y + size * 0.2))
   })
 
+  // 3. Status dot: the tab bar's green/blue icon-tint states, visible on the deck.
+  if (spec.dot) {
+    ctx.fillStyle = spec.dot === 'green' ? DOT_GREEN : DOT_BLUE
+    ctx.fillRect(Math.round((w - DOT_SIZE) / 2), h - DOT_SIZE - 5, DOT_SIZE, DOT_SIZE)
+  }
+
+  // 4. Title banner across the top (unchanged treatment).
   ctx.fillStyle = BANNER_FILL
   ctx.fillRect(0, 0, w, BANNER_HEIGHT)
-
   ctx.font = `${TITLE_FONT_SIZE}px sans-serif`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 4)
   drawCenteredText(ctx, label, w, 2)
 
-  const ringColor = spec.ring ? RING_COLORS[spec.ring] : null
-  if (ringColor && spec.active) {
-    drawRing(ctx, w, h, ringColor, 3, 0)
-    drawRing(ctx, w, h, ACTIVE_COLOR, 2, 3)
-  } else if (ringColor) {
-    drawRing(ctx, w, h, ringColor, 4, 0)
+  // 5. Borders/rings: barTop green border; white ring marks the active tab.
+  if (spec.fill === 'barTop') {
+    drawRing(ctx, w, h, BAR_TOP_BORDER, 3, 0)
+    if (spec.active) drawRing(ctx, w, h, ACTIVE_COLOR, 2, 3)
   } else if (spec.active) {
     drawRing(ctx, w, h, ACTIVE_COLOR, 3, 0)
   }
@@ -156,7 +193,12 @@ function drawAction(
   drawRing(ctx, w, h, spec.enabled ? ACTION_RING[spec.action] : DISABLED_ACTION_COLOR, 3, 0)
 }
 
-export function renderKey(spec: KeySpec, caps: DeckCapabilities, createCtx: CtxFactory): Uint8ClampedArray {
+export function renderKey(
+  spec: KeySpec,
+  caps: DeckCapabilities,
+  createCtx: CtxFactory,
+  getIcon: IconSource = () => null,
+): Uint8ClampedArray {
   const w = caps.keyPixelWidth
   const h = caps.keyPixelHeight
   const ctx = createCtx(w, h)
@@ -166,7 +208,7 @@ export function renderKey(spec: KeySpec, caps: DeckCapabilities, createCtx: CtxF
       ctx.fillRect(0, 0, w, h)
       break
     case 'tab':
-      drawTab(ctx, w, h, spec)
+      drawTab(ctx, w, h, spec, getIcon)
       break
     case 'pager':
       drawPager(ctx, w, h, spec)
