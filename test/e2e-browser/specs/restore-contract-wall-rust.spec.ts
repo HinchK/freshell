@@ -1470,37 +1470,18 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // tabs), and a 300 s budget recreates the same sum-of-gates > timeout
     // defect the f3wp double-restart fix (:2068-2076) removed at 180 s.
     // 600 s covers the worst case with margin, matching that sibling.
-    // NOTE the test.fail pin below: on a load-starved run the 300 s TEST
-    // timeout fired BEFORE the pin's expected in-test red was reached, and
-    // a test-level timeout does not satisfy the pin -- so the underfunded
-    // budget reds the whole run despite the expected-fail marking.
+    // NOTE (historical): while this test carried a test.fail pin, a
+    // load-starved run's 300 s TEST timeout fired BEFORE the pin's expected
+    // in-test red was reached, and a test-level timeout does not satisfy a
+    // pin -- so the underfunded budget reds the whole run. The generous
+    // budget stays.
     test.setTimeout(600_000)
-    // EXPECTED-FAIL WALL PIN -- P0.1: this is the composed ruler; it flips
-    // green only when every per-pane contract above is green un-pinned.
-    // HISTORY: the first observed red (run of 2026-07-24) was the freshclaude
-    // identity poll -- that P0.2 client identity-persistence gap has since
-    // CLOSED (#562: sessionRef persists + sessionRef-first reader; pinned by
-    // Contract G above and specs/freshclaude-identity-persistence-rust
-    // .spec.ts), so it is NO LONGER this pin's reason.
-    // CURRENT OBSERVED RED (verified pre-existing at the PR #562/#563
-    // council close-out): the composed ruler fails at the CLAUDE TERMINAL
-    // \u00a72.2 leg -- the post-restart `--resume <claudePreallocatedId>` argv
-    // poll below never goes green UNDER COMPOSITION, even though the same
-    // contract passes in its standalone per-pane test.
-    // The hidden-tab legs (F8/P1.11) PASSED in this composition: the
-    // dead-terminal census DID reach hidden tabs' layouts -- the plan flagged
-    // this ordering as runtime-dependent and verdict-neutral (both candidates
-    // are post-restart contract assertions). The freshcodex/freshopencode
-    // identity polls pass VACUOUSLY from persisted state (they measure
-    // persistence, not restore).
-    // FLIP DISCIPLINE (council, PR #562/#563 close-out): leg G's identity
-    // assertions alone are NOT liveness proof -- its post-attach turn-send is.
-    // Flip only when the composed ruler GENUINELY passes 3x consecutively;
-    // delete this pin when the last per-pane pin is retired.
-    test.fail(
-      e2eServerKind === 'rust',
-      'P0.1: composed all-pane ruler; red until remaining P1.x land -- current observed red: the claude terminal §2.2 --resume argv leg under composition (the former P0.2 freshclaude identity gap closed in #562)',
-    )
+    // THE RULER IS LIVE (P0.1, last wall pin retired): the composed all-pane
+    // ruler runs un-pinned. Its final two reds closed as (1) the claude
+    // never-conversed carve-out (reconcile derives Respawn; the post-restart
+    // --resume argv leg passes under composition) and (2) the quiet-client
+    // alert count excluding monaco's structural aria scaffold -- see the
+    // assertion note at the end of this test.
 
     const CODEX_SESSION_ID = '99999999-8888-4777-8666-555555555555'
     const SESSION_TITLE = 'ruler codex session'
@@ -1802,7 +1783,17 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // known benign alert source is the transient history-load-error banner
       // from the snapshot fetch racing pane creation -- see
       // createFreshclaudePane's note above.)
-      await expect(page.getByRole('alert')).toHaveCount(0)
+      // Monaco's aria scaffold is excluded: setARIAContainer (monaco-editor
+      // esm/vs/base/browser/ui/aria/aria.js) permanently mounts exactly two
+      // EMPTY `role="alert"` divs (.monaco-alert) the moment the editor pane
+      // loads -- screen-reader announcement slots, not user-facing alerts.
+      // Unlike restore-sync05 (this assertion's donor), THIS composition has
+      // an editor pane (pane-ruler-editor above), so a bare getByRole('alert')
+      // count is structurally >=2 here regardless of restart behavior. Every
+      // product alert (Pane error banner, TerminalExitBanner, fresh-agent
+      // banners, ConnectionErrorOverlay, ...) lacks .monaco-alert and is
+      // still counted.
+      await expect(page.locator('[role="alert"]:not(.monaco-alert)')).toHaveCount(0)
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
@@ -1818,14 +1809,13 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // EXPECTED-FAIL WALL PIN -- P1.8+P1.9 (D3, §4.2): no server-side durable
-    // pane-identity record exists; with localStorage gone the binding is lost
-    // even though the pre-allocated claude session id was server-minted.
-    // FLIP when the pane-identity ledger + "recover my panes" surface land.
-    test.fail(
-      e2eServerKind === 'rust',
-      'P1.8+P1.9 (D3): pane created <5s before SIGKILL is unrecoverable after browser loss',
-    )
+    // P1.8+P1.9 (D3, §4.2) LANDED -- pin flipped: the claude binding row is
+    // written durably to the pane-identity ledger BEFORE the PTY spawn, so a
+    // SIGKILL moments after spawn (before any snapshot cadence) still leaves
+    // a recoverable row. After browser-state loss the recovery inventory
+    // reports it (recoverable: true) and the "recover my panes" offer
+    // (data-testid="recovery-offer-panel") surfaces it -- the poll below
+    // accepts either an auto-restored pane or the visible offer.
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-5s-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -1917,8 +1907,7 @@ test.describe('Restore Contract Wall (P0.1)', () => {
             if (hit) return true
           }
           const recoverOffer = await page
-            .getByText(/recover .*pane/i)
-            .first()
+            .getByTestId('recovery-offer-panel')
             .isVisible()
             .catch(() => false)
           return recoverOffer
@@ -1935,21 +1924,19 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     e2eServerKind,
   }) => {
     expect(e2eServerKind).toBe('rust')
-    // EXPECTED-FAIL WALL PIN -- P1.8 (§2.4/§4.2 pending markers): killing the
-    // server inside the opencode locator's ~2s correlation window loses the
-    // minted identity permanently, and the pane restores SILENTLY FRESH --
-    // no resume, no breadcrumb. FLIP when ledger pending markers land
-    // (fresh-by-race must be visible) or the identity is captured in time.
-    // DETERMINISM: the fake's session-row write is held behind
-    // FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH and this test NEVER creates the
-    // gate file before the kill, so the identity provably cannot land
-    // pre-kill. Without the gate, the 150ms locator sweep (main.rs:1112)
-    // can beat the SIGKILL a few percent of runs -> unexpected PASS of this
-    // pin -> hard suite failure.
-    test.fail(
-      e2eServerKind === 'rust',
-      'P1.8 (§2.4): SIGKILL inside locator window yields silent fresh, no breadcrumb',
-    )
+    // P1.8 (§2.4/§4.2 pending markers) LANDED -- pin flipped: killing the
+    // server inside the opencode locator's ~2s correlation window is no
+    // longer silently fresh. The server derives a loud Fresh{fresh_by_race}
+    // verdict from the pending marker that survives the restart (keyed by
+    // the client's stale terminalId), and the client renders a DOM-visible
+    // breadcrumb (data-testid="fresh-by-race-notice") matching the probe
+    // regex below.
+    // DETERMINISM (pre-kill phase): the fake's session-row write is held
+    // behind FAKE_OPENCODE_TERMINAL_ROW_GATE_PATH and this test NEVER
+    // creates the gate file before the kill, so the identity provably
+    // cannot land pre-kill -- the race loss is guaranteed, not a few-percent
+    // 150ms-sweep coin flip. The gate is opened only AFTER restart, to
+    // prove the re-armed locator (P1.10) captures identity end to end.
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-wall-locwin-'))
     const argLogPath = path.join(sharedRoot, 'opencode-argv.jsonl')
     // Deliberately never created -- see the DETERMINISM note above.
@@ -2004,6 +1991,22 @@ test.describe('Restore Contract Wall (P0.1)', () => {
         .isVisible()
         .catch(() => false)
       expect(resumed || breadcrumbVisible).toBe(true)
+
+      // P1.10 end-to-end (landed; pinned unit-side by opencode_association.rs
+      // restore_created_pane_without_identity_arms_and_resolves_into_the_
+      // ledger): the restore-created pane lacks identity, so the locator
+      // re-armed at restore-create. Open the fake's row gate NOW and submit —
+      // the re-armed locator must capture a ses_ identity post-restart.
+      await fs.writeFile(rowGatePath, '')
+      await page.locator('.xterm').last().click()
+      await page.keyboard.type('hello again after restart')
+      await page.keyboard.press('Enter')
+      await expect
+        .poll(async () => {
+          const l = await findLeafById(harness, tabId, leaf.id)
+          return l?.content?.sessionRef?.sessionId ?? null
+        }, { timeout: 30_000 })
+        .toMatch(/^ses_/)
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })

@@ -9,6 +9,7 @@ import { setVirtualDeckOpen } from '@/store/deckSlice'
 import { FakeDeckDevice, MINI_CAPS, PLUS_CAPS } from '@/deck/fake-deck-device'
 import { DeckController } from '@/deck/deck-controller'
 import { renderKey, renderStrip, type Ctx2D, type CtxFactory } from '@/deck/tile-renderer'
+import { getIconImageCache } from '@/deck/icon-image-cache'
 import { SegmentedControl } from '@/components/settings/settings-controls'
 
 type Profile = 'mini' | 'plus'
@@ -25,6 +26,7 @@ function noopCtx(width: number, height: number): Ctx2D {
     textBaseline: 'top' as CanvasTextBaseline,
     fillRect: () => {},
     fillText: () => {},
+    drawImage: () => {},
     measureText: () => ({ width: 0 }) as TextMetrics,
     getImageData: () => ({ data: new Uint8ClampedArray(width * height * 4) }) as ImageData,
   }
@@ -81,7 +83,7 @@ export default function VirtualDeckPanel() {
     const controller = new DeckController({
       store,
       device,
-      renderKey: (spec, c) => renderKey(spec, c, safeCtxFactory),
+      renderKey: (spec, c) => renderKey(spec, c, safeCtxFactory, (url) => getIconImageCache().bitmapFor(url)),
       renderStrip: (text, width, height) => renderStrip(text, width, height, safeCtxFactory),
       settings: () => store.getState().settings.settings.streamDeck,
     })

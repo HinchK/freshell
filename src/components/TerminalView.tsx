@@ -17,6 +17,7 @@ import {
   clearPaneReconcileNotice,
   clearReconcilePendingPane,
   consumePaneRefreshRequest,
+  RECONCILE_NOTICE_FRESH_BY_RACE,
   repairCodexIdentityMismatch,
   resetPaneForReconcileCreate,
   splitPane,
@@ -101,7 +102,6 @@ import {
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
-import { useTerminalTextRegistration } from '@/deck/terminal-text-registry'
 import { findLocalFilePaths } from '@/lib/path-utils'
 import { findUrls } from '@/lib/url-utils'
 import { openExternalUrl, shouldOpenLinkExternally } from '@/lib/open-url'
@@ -164,6 +164,7 @@ import {
   scrollLinesToCursorKeys,
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
+import { useTerminalTextRegistration } from '@/deck/terminal-text-registry'
 import { buildRestoreError, sanitizeSessionRef } from '@shared/session-contract'
 
 const log = createLogger('TerminalView')
@@ -633,6 +634,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const [searchQuery, setSearchQuery] = useState('')
   const keyboardInsetPx = useKeyboardInset()
   const [mobileCtrlActive, setMobileCtrlActive] = useState(false)
+  // PIN 3: the fresh-by-race breadcrumb must be readable by the DOM text
+  // layer (assistive tech + the restart-contract wall's getByText probe) —
+  // the xterm canvas write below is invisible to both.
+  const [freshByRaceNotice, setFreshByRaceNotice] = useState<string | null>(null)
+  useEffect(() => {
+    if (!freshByRaceNotice) return
+    const t = setTimeout(() => setFreshByRaceNotice(null), 10_000)
+    return () => clearTimeout(t)
+  }, [freshByRaceNotice])
   const setPendingLinkUriRef = useRef(setPendingLinkUri)
   const mobileCtrlActiveRef = useRef(false)
 
@@ -750,7 +760,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
 
-  // Register live terminal text reader for Stream Deck previews
+  // Register live terminal text reader for Stream Deck previews (classic tile style)
   useTerminalTextRegistration(terminalContent?.terminalId, termRef)
 
   const extensions = useAppSelector((s) => s.extensions?.entries ?? [], shallowEqual)
@@ -4326,6 +4336,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const createdReconcileNotice = contentRef.current?.reconcileNotice
           if (createdReconcileNotice) {
             writeLocalXtermNotice(term, `\r\n${createdReconcileNotice}\r\n`)
+            if (createdReconcileNotice === RECONCILE_NOTICE_FRESH_BY_RACE) {
+              setFreshByRaceNotice(createdReconcileNotice)
+            }
             dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
           }
           // Ledger A15: re-write a loss notice recorded while un-anchored --
@@ -5243,6 +5256,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         onTouchEnd={isMobile ? handleMobileTouchEnd : undefined}
         onTouchCancel={isMobile ? handleMobileTouchEnd : undefined}
       />
+      {freshByRaceNotice ? (
+        <div
+          role="status"
+          data-testid="fresh-by-race-notice"
+          className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-amber-100/90 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/80 dark:text-amber-100"
+        >
+          {freshByRaceNotice}
+        </div>
+      ) : null}
       {isMobile && (
         <div
           data-testid="mobile-terminal-toolbar"

@@ -31,6 +31,7 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 const FAKE_CLAUDE_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-claude-cli.mjs')
+const FAKE_CODEX_CLI_SOURCE = path.resolve(__dirname, '../fixtures/fake-codex-cli.mjs')
 
 // ---------------------------------------------------------------------------
 // Shared helpers (per-spec copies -- see file doc comment)
@@ -154,6 +155,131 @@ async function writeClaudeTranscript(
     timestamp: '2026-07-22T10:00:00.000Z',
   })
   await fs.writeFile(claudeTranscriptPath(homeDir, sessionId), `${line}\n`, 'utf8')
+}
+
+// --- codex dead-session fixtures (PIN 1 blast radius) ---
+//
+// The batched-adjudication scenario needs panes that reconcile to
+// dead_session after a deleted-while-down restart. That shape no longer
+// exists for claude: the never-observed-on-disk carve-out (reconcile.rs
+// Absent arm) derives Respawn for ledger-bound claude ids the new server
+// epoch has never seen on disk. Codex has no Absent-arm carve-out, so a
+// ledger-bound codex session whose rollout file is gone stays
+// dead_session{session_not_on_disk} -- exactly the batching fixture this
+// contract needs. Session fixture shape donor: restore-contract-wall-rust
+// .spec.ts's seedCodexHome.
+
+const CODEX_DEAD_SESSION_A = 'aaaaaaaa-1111-4222-8333-000000000001'
+const CODEX_DEAD_SESSION_B = 'aaaaaaaa-1111-4222-8333-000000000002'
+const CODEX_DEAD_TITLE_A = 'adoption dead codex A'
+const CODEX_DEAD_TITLE_B = 'adoption dead codex B'
+
+function codexSessionPath(homeDir: string, sessionId: string): string {
+  return path.join(homeDir, '.codex', 'sessions', `${sessionId}.jsonl`)
+}
+
+/**
+ * Codex home seed: wizard-bypass config with codex enabled PLUS
+ * ~/.codex/sessions fixture transcripts. setupHome re-runs on every
+ * boot/restart, so the fixtures are written ONLY when the sessions dir is
+ * first created -- a restart after the test deletes individual session
+ * files must NOT resurrect them (same doctrine as seedClaudeHome's
+ * "deliberately does NOT write transcripts" note).
+ */
+function seedCodexAdoptionHome(
+  sessions: Array<{ id: string; title: string }>,
+  projectDir: string,
+): (homeDir: string) => Promise<void> {
+  return async (homeDir: string) => {
+    const freshellDir = path.join(homeDir, '.freshell')
+    await fs.mkdir(freshellDir, { recursive: true })
+    await fs.writeFile(
+      path.join(freshellDir, 'config.json'),
+      JSON.stringify(
+        {
+          version: 1,
+          settings: { codingCli: { enabledProviders: ['codex'] } },
+        },
+        null,
+        2,
+      ),
+    )
+    const sessionsDir = path.join(homeDir, '.codex', 'sessions')
+    const dirExists = await fs.access(sessionsDir).then(
+      () => true,
+      () => false,
+    )
+    if (dirExists) return
+    await fs.mkdir(sessionsDir, { recursive: true })
+    for (const s of sessions) {
+      const lines = [
+        JSON.stringify({
+          timestamp: '2026-07-21T08:00:00.000Z',
+          type: 'session_meta',
+          payload: { id: s.id, cwd: projectDir },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-21T08:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: `${s.title} request 1` }],
+          },
+        }),
+        JSON.stringify({
+          timestamp: '2026-07-21T08:00:02.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text: `${s.title} reply 1` }],
+          },
+        }),
+      ]
+      await fs.writeFile(path.join(sessionsDir, `${s.id}.jsonl`), `${lines.join('\n')}\n`)
+    }
+  }
+}
+
+/**
+ * Open a seeded codex session from the sidebar history (opens in a NEW tab;
+ * the resume create records a durable pane-ledger binding, so 'ever
+ * observed' survives a restart). Returns the pane's tab + leaf ids once the
+ * pane is live with the expected sessionRef.
+ */
+async function openSeededCodexSession(
+  page: Page,
+  harness: TestHarness,
+  title: string,
+  sessionId: string,
+): Promise<{ tabId: string; leafId: string }> {
+  const sessionList = page.getByTestId('sidebar-session-list')
+  await expect(sessionList).toBeVisible({ timeout: 15_000 })
+  const sessionItem = page.getByText(title, { exact: false }).first()
+  await expect(sessionItem).toBeVisible({ timeout: 15_000 })
+  const tabCountBefore = await harness.getTabCount()
+  await sessionItem.click()
+  await expect(async () => {
+    expect(await harness.getTabCount()).toBe(tabCountBefore + 1)
+  }).toPass({ timeout: 15_000 })
+  const tabId = (await harness.getActiveTabId())!
+  const leafId: string = await expect
+    .poll(async () => {
+      const layout = await harness.getPaneLayout(tabId)
+      const leaf = findLeavesByMode(layout, 'codex').find(
+        (l) => l?.content?.terminalId && l?.content?.sessionRef?.sessionId === sessionId,
+      )
+      return leaf?.id ?? null
+    }, { timeout: 20_000 })
+    .not.toBeNull()
+    .then(async () => {
+      const layout = await harness.getPaneLayout(tabId)
+      return findLeavesByMode(layout, 'codex').find(
+        (l) => l?.content?.sessionRef?.sessionId === sessionId,
+      )!.id
+    })
+  return { tabId, leafId }
 }
 
 /** Boot an owned RustServer, navigate, and wait for harness + WS. */
@@ -423,38 +549,43 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-adopt-dead-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
-    const argLogPath = path.join(sharedRoot, 'claude-argv.jsonl')
-    const fakeClaudePath = await installFakeCli(
-      FAKE_CLAUDE_CLI_SOURCE,
-      'claude',
+    const fakeCodexPath = await installFakeCli(
+      FAKE_CODEX_CLI_SOURCE,
+      'codex',
       path.join(sharedRoot, 'bin'),
     )
     const { server, harness, info } = await bootAdoption(page, {
-      env: { CLAUDE_CMD: fakeClaudePath, FAKE_CLAUDE_ARGV_LOG: argLogPath },
-      setupHome: seedClaudeHome(),
+      env: { CODEX_CMD: fakeCodexPath },
+      setupHome: seedCodexAdoptionHome(
+        [
+          { id: CODEX_DEAD_SESSION_A, title: CODEX_DEAD_TITLE_A },
+          { id: CODEX_DEAD_SESSION_B, title: CODEX_DEAD_TITLE_B },
+        ],
+        projectDir,
+      ),
     })
     try {
-      // 1. Two fake-CLI claude panes, each with an on-disk fixture transcript
-      //    (the durable pane ledger records the bindings, so 'ever observed'
-      //    survives the restart); verify both live.
+      // 1. Two fake-CLI codex panes opened from the seeded sidebar history
+      //    (the resume creates record durable pane-ledger bindings, so
+      //    'ever observed' survives the restart); verify both live.
       await selectShellIfPickerShowing(page)
-      const tabId = (await harness.getActiveTabId())!
       await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
-      const paneA = await openClaudePaneAndGetLeaf(page, harness, tabId, projectDir, argLogPath)
-      await writeClaudeTranscript(info.homeDir, paneA.sessionId, projectDir)
-      const paneB = await openClaudePaneAndGetLeaf(page, harness, tabId, projectDir, argLogPath)
-      await writeClaudeTranscript(info.homeDir, paneB.sessionId, projectDir)
-      expect(paneB.sessionId).not.toBe(paneA.sessionId)
-      for (const pane of [paneA, paneB]) {
-        await expect
-          .poll(async () => (await findLeafById(harness, tabId, pane.leaf.id))?.content?.sessionRef?.sessionId ?? null, {
-            timeout: 20_000,
-          })
-          .toBe(pane.sessionId)
-      }
+      const paneA = await openSeededCodexSession(
+        page,
+        harness,
+        CODEX_DEAD_TITLE_A,
+        CODEX_DEAD_SESSION_A,
+      )
+      const paneB = await openSeededCodexSession(
+        page,
+        harness,
+        CODEX_DEAD_TITLE_B,
+        CODEX_DEAD_SESSION_B,
+      )
+      expect(paneB.tabId).not.toBe(paneA.tabId)
       await expect
         .poll(async () =>
-          (await listTerminals(info)).filter((t) => t.mode === 'claude' && t.status === 'running').length,
+          (await listTerminals(info)).filter((t) => t.mode === 'codex' && t.status === 'running').length,
         { timeout: 20_000 })
         .toBe(2)
       await flushPersistence(page)
@@ -463,9 +594,11 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
 
       // 2. Stop + delete both session files + start on the SAME home/port/
       //    token (RustServer.restart() -- the isolated HOME is never touched
-      //    in between, so the deletion below is exactly "gone while down").
-      await fs.rm(claudeTranscriptPath(info.homeDir, paneA.sessionId))
-      await fs.rm(claudeTranscriptPath(info.homeDir, paneB.sessionId))
+      //    in between, so the deletion below is exactly "gone while down";
+      //    the seed's dir-exists guard keeps setupHome from resurrecting
+      //    the deleted fixtures on the restart boot).
+      await fs.rm(codexSessionPath(info.homeDir, CODEX_DEAD_SESSION_A))
+      await fs.rm(codexSessionPath(info.homeDir, CODEX_DEAD_SESSION_B))
       await server.restart()
       await waitForWsReady(page)
 
@@ -482,14 +615,14 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
 
       // Click "Start fresh here" on the FIRST row -> that pane becomes a
       // live terminal (same createRequestId -- the reducer preserves it;
-      // exactly ONE running claude PTY serves it).
+      // exactly ONE running codex PTY serves it).
       await dialog.getByRole('listitem').first().getByRole('button', { name: 'Start fresh here' }).click()
 
       // Exactly one of the two panes is now a live fresh terminal...
       await expect
         .poll(async () => {
           const contents = await Promise.all(
-            [paneA, paneB].map(async (p) => (await findLeafById(harness, tabId, p.leaf.id))?.content),
+            [paneA, paneB].map(async (p) => (await findLeafById(harness, p.tabId, p.leafId))?.content),
           )
           const live = contents.filter(
             (c) => c?.status === 'running' && c?.terminalId && !c?.restoreError,
@@ -497,11 +630,11 @@ test.describe('reconcile client adoption (rust server, real SPA)', () => {
           return live.length
         }, { timeout: 60_000 })
         .toBe(1)
-      //    ...backed by EXACTLY ONE running claude PTY server-side (one
+      //    ...backed by EXACTLY ONE running codex PTY server-side (one
       //    create for the pane's createRequestId, no duplicates).
       await expect
         .poll(async () =>
-          (await listTerminals(info)).filter((t) => t.mode === 'claude' && t.status === 'running').length,
+          (await listTerminals(info)).filter((t) => t.mode === 'codex' && t.status === 'running').length,
         { timeout: 30_000 })
         .toBe(1)
 

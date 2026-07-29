@@ -1,11 +1,14 @@
 import type { DeckCapabilities } from './deck-device'
 import type { DeckModel } from './deck-selectors'
+import type { TileFill, TileDot } from './tile-state'
 
 export type RingColor = 'amber' | 'green' | 'blue' | null
 export type DeckAction = 'back' | 'approve' | 'stop'
+export type TileIcon = { url: string | null; letter: string; hue: number; ready: boolean }
 export type KeySpec =
   | { kind: 'empty' }
-  | { kind: 'tab'; tabId: string; title: string; previewLines: string[]; ring: RingColor; active: boolean }
+  | { kind: 'tab'; style: 'icons'; tabId: string; title: string; active: boolean; fill: TileFill; dot: TileDot; icons: TileIcon[] }
+  | { kind: 'tab'; style: 'preview'; tabId: string; title: string; active: boolean; previewLines: string[]; ring: RingColor }
   | { kind: 'pager'; page: number; pageCount: number }
   | { kind: 'action'; action: DeckAction; enabled: boolean }
 export type StripSpec = { text: string } | null
@@ -67,13 +70,14 @@ function toAscii(text: string): string {
 }
 
 export function stripText(
-  model: { tabs: Array<{ title: string; active: boolean; status: { busy: boolean; amber: boolean } }> },
+  model: { tabs: Array<{ title: string; active: boolean; busy: boolean; attention: boolean; pendingApproval: boolean }> },
   page: number, pages: number,
 ): string {
   const active = model.tabs.find((t) => t.active)
-  const busy = model.tabs.filter((t) => t.status.busy).length
-  const amber = model.tabs.filter((t) => t.status.amber).length
-  return toAscii(`${active?.title ?? '-'}  |  page ${page}/${pages}  |  ${busy} busy  ${amber} waiting`)
+  const busyCount = model.tabs.filter((t) => t.busy).length
+  // "waiting" = needs attention (turn complete) OR waiting for approval — each tab once.
+  const waitingCount = model.tabs.filter((t) => t.attention || t.pendingApproval).length
+  return toAscii(`${active?.title ?? '-'}  |  page ${page}/${pages}  |  ${busyCount} busy  ${waitingCount} waiting`)
 }
 
 export type FrameInputs = {
@@ -81,10 +85,12 @@ export type FrameInputs = {
   caps: DeckCapabilities
   page: number
   actionLayer: { tabId: string; approveEnabled: boolean; stopEnabled: boolean } | null
+  iconReady: (url: string) => boolean
+  /** Live terminal tail for a tab; only invoked for terminal-previews style. */
   previewFor: (tabId: string) => string[]
 }
 
-export function buildFrame({ model, caps, page, actionLayer, previewFor }: FrameInputs): FrameSpec {
+export function buildFrame({ model, caps, page, actionLayer, iconReady, previewFor }: FrameInputs): FrameSpec {
   const plan = planLayout(caps, model.tabs.length)
   const pages = pageCount(model.tabs.length, plan.tabsPerPage)
   const keys: KeySpec[] = Array.from({ length: plan.keyCount }, () => ({ kind: 'empty' as const }))
@@ -104,10 +110,21 @@ export function buildFrame({ model, caps, page, actionLayer, previewFor }: Frame
   plan.tabSlots.forEach((keyIndex, slot) => {
     const tab = visible[slot]
     if (!tab) return
-    keys[keyIndex] = {
-      kind: 'tab', tabId: tab.id, title: tab.title,
-      previewLines: previewFor(tab.id), ring: ringColor(tab.status), active: tab.active,
-    }
+    keys[keyIndex] =
+      model.tileStyle === 'terminal-previews'
+        ? {
+            kind: 'tab', style: 'preview', tabId: tab.id, title: tab.title, active: tab.active,
+            previewLines: previewFor(tab.id),
+            ring: ringColor({ busy: tab.busy, green: tab.attention, amber: tab.pendingApproval }),
+          }
+        : {
+            kind: 'tab', style: 'icons', tabId: tab.id, title: tab.title, active: tab.active,
+            fill: tab.fill, dot: tab.dot,
+            icons: tab.repoIcons.map((icon) => ({
+              ...icon,
+              ready: icon.url !== null && iconReady(icon.url),
+            })),
+          }
   })
   if (plan.pagerKey !== null) keys[plan.pagerKey] = { kind: 'pager', page: current, pageCount: pages }
   return { keys, strip }

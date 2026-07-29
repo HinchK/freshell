@@ -6,9 +6,11 @@ import { setVirtualDeckOpen, type DeckSliceState } from '@/store/deckSlice'
 import { requestDeckConnect } from '@/deck/deck-manager'
 import { isElectronClient, isWebHidSupported } from '@/lib/webhid-support'
 import type { SettingsSectionProps } from './settings-types'
+import type { DeckTileStyle } from '../../../shared/settings'
 import {
   SettingsSection,
   SettingsRow,
+  SegmentedControl,
   SteppedRangeInput,
   Toggle,
 } from './settings-controls'
@@ -70,6 +72,24 @@ export default function StreamDeckSettings({
           aria-label="Enable Stream Deck"
           onChange={(enabled) => {
             applyLocalSetting({ streamDeck: { enabled } })
+          }}
+        />
+      </SettingsRow>
+
+      <SettingsRow
+        label="Tile style"
+        description="Status icons shows repo icons with status backgrounds, sorted by attention. Terminal previews shows live terminal output with status rings, in tab-bar order."
+      >
+        <SegmentedControl
+          value={streamDeck.tileStyle}
+          aria-label="Tile style"
+          options={[
+            { value: 'status-icons', label: 'Status icons' },
+            { value: 'terminal-previews', label: 'Terminal previews' },
+          ]}
+          onChange={(v: string) => {
+            const tileStyle = v as DeckTileStyle
+            applyLocalSetting({ streamDeck: { tileStyle } })
           }}
         />
       </SettingsRow>

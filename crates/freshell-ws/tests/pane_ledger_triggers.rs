@@ -115,6 +115,78 @@ async fn claude_preallocation_writes_a_binding_row_synchronously() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn failed_claude_resume_create_leaves_prior_binding_row_untouched() {
+    // PIN 2 asymmetry guard: the pre-spawn binding write is scoped to the
+    // FRESH preallocation only (`claude_fresh_prealloc`). A claude RESUME
+    // create whose spawn fails (or loses the duplicate-live race) must NOT
+    // rewrite the prior epoch's binding row — pre-spawn there is no evidence
+    // the spawn will succeed, and a rewrite would point the durable ledger
+    // at a never-spawned terminal (ghost `ledgerOnly` recovery offer,
+    // defeating the `pending_for_terminal` reader rule).
+    let dir = unique_ledger_dir("claude-resume-fail");
+    // A claude spec whose binary does not exist: the PTY spawn fails with
+    // NotFound BEFORE any fork (pty.rs resolve contract) — exactly the
+    // failing resume create the asymmetry is about.
+    let mut broken_claude = sleeper_cli_spec("claude");
+    broken_claude.default_cmd = "freshell-test-no-such-claude-binary".to_string();
+    let (url, _registry, server_ledger) = spawn_server_with_ledger(vec![broken_claude], &dir).await;
+
+    // Prior epoch: session S is already bound (e.g. written by the epoch
+    // that originally owned it). Seed through the SERVER'S Arc so its
+    // write-through index sees the row.
+    let session_id = "11111111-2222-4333-8444-555555555555";
+    let seeded_at = 1_111;
+    server_ledger
+        .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+            provider: "claude",
+            session_id,
+            terminal_id: "term-prior-epoch",
+            mode: "claude",
+            cwd: Some("/prior/cwd"),
+            create_request_id: Some("req-prior-epoch"),
+            now_ms: seeded_at,
+        })
+        .expect("seed prior-epoch binding row");
+    let seeded = server_ledger
+        .load_binding("claude", session_id)
+        .expect("seeded row present");
+
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-resume-loser",
+        "mode": "claude",
+        "shell": "system",
+        "resumeSessionId": session_id,
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let err = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(err["code"], "PTY_SPAWN_FAILED");
+    assert_eq!(err["requestId"], "req-resume-loser");
+
+    // The prior epoch's row is byte-for-byte untouched: no live_terminal_id
+    // / create_request_id rewrite, no last_observed_at bump.
+    let after = server_ledger
+        .load_binding("claude", session_id)
+        .expect("row still present after failed resume create");
+    assert_eq!(
+        after, seeded,
+        "a failed claude RESUME create must not mutate the binding row"
+    );
+    // And a fresh on-disk reader agrees (durability, not just index state).
+    let reread = PaneLedger::new(Some(dir.clone()));
+    let disk = reread
+        .load_binding("claude", session_id)
+        .expect("row on disk");
+    assert_eq!(disk.live_terminal_id.as_deref(), Some("term-prior-epoch"));
+    assert_eq!(disk.create_request_id.as_deref(), Some("req-prior-epoch"));
+    assert_eq!(disk.last_observed_at, seeded_at);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn fresh_identity_bearing_pane_gets_a_pending_marker_at_spawn() {
     // Trigger (d): identity in flight (fresh codex — no resume id) ->
     // durable pending marker from spawn until resolution.

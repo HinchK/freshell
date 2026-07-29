@@ -442,6 +442,43 @@ fn delete_pending_is_a_noop_when_missing() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+#[test]
+fn deleted_binding_row_is_gone_for_recovery_readers() {
+    // PIN 2 (Step 4b): a pre-spawn claude binding whose spawn then FAILED is
+    // deleted so it can never surface as a ghost `ledgerOnly` recovery offer.
+    // `list_bindings` is THE reader that feeds the recovery inventory
+    // (`recovery_inventory.rs` build_inventory), so "gone" is judged there.
+    let root = temp_root("del-binding");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    ledger
+        .record_binding(&write("claude", "sess-failed", "t1", 1_000))
+        .expect("write ok");
+    assert!(ledger
+        .list_bindings()
+        .iter()
+        .any(|r| r.session_id == "sess-failed"));
+
+    ledger
+        .delete_binding("claude", "sess-failed")
+        .expect("delete ok");
+
+    // Gone for the recovery-inventory reader, the raw read, AND on disk
+    // (a construction-time rescan must not resurrect it).
+    assert!(!ledger
+        .list_bindings()
+        .iter()
+        .any(|r| r.session_id == "sess-failed"));
+    assert!(ledger.load_binding("claude", "sess-failed").is_none());
+    let gen2 = PaneLedger::new(Some(root.clone()));
+    assert!(gen2.load_binding("claude", "sess-failed").is_none());
+
+    // Idempotent: deleting a missing row is Ok (mirror of delete_pending).
+    ledger
+        .delete_binding("claude", "sess-failed")
+        .expect("missing row is Ok");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 fn never_absent(_p: &str, _s: &str) -> bool {
     false
 }

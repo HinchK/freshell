@@ -57,16 +57,24 @@ export function SegmentedControl({
   value,
   options,
   onChange,
+  'aria-label': ariaLabel,
 }: {
   value: string
   options: { value: string; label: string }[]
   onChange: (value: string) => void
+  'aria-label'?: string
 }) {
   return (
-    <div className="flex w-full min-w-0 flex-wrap bg-muted rounded-md p-0.5 md:w-auto md:min-w-[12rem]">
+    <div
+      role="group"
+      aria-label={ariaLabel}
+      className="flex w-full min-w-0 flex-wrap bg-muted rounded-md p-0.5 md:w-auto md:min-w-[12rem]"
+    >
       {options.map((opt) => (
         <button
           key={opt.value}
+          type="button"
+          aria-pressed={value === opt.value}
           onClick={() => onChange(opt.value)}
           className={cn(
             'min-h-10 flex-1 px-3 py-1 text-xs rounded-md transition-colors md:min-h-0 md:flex-none',

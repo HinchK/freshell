@@ -46,6 +46,17 @@ pub trait SessionExistenceProbe: Send + Sync {
     /// only raised for an identity disk has some memory of — a never-observed
     /// (stale/typo) claim falls through to `fresh`.
     fn ever_observed(&self, provider: &str, session_id: &str) -> bool;
+
+    /// "Seen on disk" strictly: true only if this process actually observed
+    /// the session artifact on disk (index snapshots, or the claude
+    /// locator-fallback hit). Unlike `ever_observed`, durable ledger bindings
+    /// do NOT count — a binding proves the identity was minted, not that a
+    /// transcript ever existed (PIN 1: the claude never-conversed carve-out
+    /// keys on this distinction). Default: delegate to `ever_observed`, which
+    /// is already disk-only for fakes without a ledger.
+    fn ever_observed_on_disk(&self, provider: &str, session_id: &str) -> bool {
+        self.ever_observed(provider, session_id)
+    }
 }
 
 /// The no-index fallback (mirrors `session_index: None` in
