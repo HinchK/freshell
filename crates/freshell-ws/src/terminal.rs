@@ -14,7 +14,7 @@
 //! ```text
 //! terminal.create  -> registry.create() spawns + registers a running PTY (no attach)
 //! terminal.attach  -> registry.attach(): attach.ready, replay scrollback, stream live
-//! terminal.input   -> registry.input()  (pty.write; no wire reply)
+//! terminal.input   -> registry.input()  (pty.write; terminal.input.blocked{unknown_terminal} on unknown id)
 //! terminal.resize  -> registry.resize()
 //! terminal.detach  -> registry.detach() (PTY KEEPS RUNNING — background session)
 //! terminal.kill    -> registry.kill()   (terminal.exit fanned out to every viewer)
@@ -60,8 +60,9 @@ use freshell_platform::{
 };
 use freshell_protocol::{
     ClientMessage, ErrorCode, ErrorMsg, Pong, ServerMessage, SessionLocator, Shell, TerminalAttach,
-    TerminalCreate, TerminalCreated, TerminalIdOnly, TerminalKill, TerminalMetaRecord,
-    TerminalMetaUpdated, TerminalResize,
+    TerminalCreate, TerminalCreated, TerminalIdOnly, TerminalInputBlocked,
+    TerminalInputBlockedReason, TerminalKill, TerminalMetaRecord, TerminalMetaUpdated,
+    TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -633,10 +634,16 @@ async fn handle_client_text(
             // Enter of an armed codex pane scans (7-9 ms warm — A6).
             crate::codex_association::note_possible_submit(state, &input.terminal_id, &input.data)
                 .await;
-            // Outcome consumed for real in the next commit (kata dtfn):
-            let _ = state
+            let outcome = state
                 .registry
                 .input(&input.terminal_id, input.data.as_bytes());
+            if !outcome.found {
+                // Silent-loss fix (kata dtfn): an unknown terminalId used to
+                // produce TOTAL SILENCE — no error, no ack — so keystrokes
+                // racing a server restart vanished. Answer with the
+                // input-blocked frame the client renders as a visible notice.
+                return send(ws_tx, &unknown_terminal_input_blocked(&input.terminal_id)).await;
+            }
             // Restore-across-restart fix (opencode): seam for an armed
             // opencode terminal's first Enter/submit. No-ops for every
             // other terminal/mode and for non-submit-shaped input.
@@ -3549,6 +3556,19 @@ fn invalid_dims_error(cols: i64, rows: i64) -> ServerMessage {
     })
 }
 
+/// The `terminal.input.blocked{reason:unknown_terminal}` frame for a
+/// `terminal.input` whose terminalId is not in the registry (kata dtfn: this
+/// used to be TOTAL SILENCE). The reference answers
+/// `error{INVALID_TERMINAL_ID,'Terminal not running'}` (`ws-handler.ts:2991-3002`);
+/// the port uses the richer input-blocked frame the client already renders as
+/// a visible xterm notice (`TerminalView.tsx` terminalInputBlockedNotice).
+fn unknown_terminal_input_blocked(terminal_id: &str) -> ServerMessage {
+    ServerMessage::TerminalInputBlocked(TerminalInputBlocked {
+        reason: TerminalInputBlockedReason::UnknownTerminal,
+        terminal_id: terminal_id.to_string(),
+    })
+}
+
 /// `terminal.resize` — resize the shared PTY (`registry.resize`); no dedicated wire
 /// reply. `unchanged` when the geometry already matches.
 fn handle_resize(resize: TerminalResize, state: &WsState) {
@@ -4848,7 +4868,7 @@ mod attach_geometry_tests {
 
 #[cfg(test)]
 mod terminal_dims_range_tests {
-    use super::{invalid_dims_error, terminal_dims_in_range};
+    use super::{invalid_dims_error, terminal_dims_in_range, unknown_terminal_input_blocked};
 
     #[test]
     fn rejects_zero_and_one_below_node_floor() {
@@ -4885,5 +4905,21 @@ mod terminal_dims_range_tests {
         let value = serde_json::to_value(invalid_dims_error(0, -5)).expect("serialize");
         assert_eq!(value["type"], "error");
         assert_eq!(value["code"], "INVALID_MESSAGE");
+    }
+
+    /// Kata dtfn: the unknown-id input reply serializes to the exact frozen
+    /// wire shape the client's input-blocked handler consumes.
+    #[test]
+    fn unknown_terminal_input_blocked_serializes_the_wire_shape() {
+        let msg = unknown_terminal_input_blocked("t-gone");
+        let json = serde_json::to_value(&msg).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "type": "terminal.input.blocked",
+                "reason": "unknown_terminal",
+                "terminalId": "t-gone",
+            })
+        );
     }
 }
