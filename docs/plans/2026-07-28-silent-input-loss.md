@@ -45,21 +45,23 @@ The diagnosis in the kata is proven at the raw-WS protocol level. The RED tests 
 | `test/unit/client/lib/ws-client.test.ts` | Modify | RED test for the replay filter |
 | `src/components/TerminalView.tsx` | Modify | `unknown_terminal` notice string; pending-input ring buffer (gate in `sendInput`, flush on anchors, discard+notice on terminal states/overflow/timeout) |
 | `test/unit/client/components/TerminalView.lifecycle.test.tsx` | Modify | Client tests: notice for `unknown_terminal`; buffer/flush byte-exact; overflow; timeout; exit-discard; attach-error recovery pin |
+| `src/App.tsx` | Modify | Firewall-command effect: readiness-gated deferral (reactive `connection.status` dep + synchronous `isReady` check) |
+| `test/unit/client/components/App.firewall-command.test.tsx` | Create | Pin: firewall command defers while un-ready, sends exactly once after ready |
 | `test/e2e-browser/specs/silent-input-loss-rust.spec.ts` | Create | The discriminating e2e scenario as a spec |
 | `test/e2e-browser/playwright.config.ts` | Modify | Register the new spec in `RUST_ONLY_SPECS` / rust-chromium `testMatch` |
 | `test/e2e-browser/specs/harness-01-rust-server.spec.ts:197-240` | Modify | Replace the 3-attempt marker retry with a deterministic new-terminalId anchor wait |
 
 Design invariants locked in here:
 
-1. **The buffer lives in TerminalView, not ws-client.** ws-client has no pane concept (fields keyed only by `requestId`/`terminalId`); TerminalView knows the pane, the old/new tid, and the anchor events. ws-client's only change is dropping `terminal.input` from the blind replay (defense in depth — with the TerminalView gate, input should rarely reach `pendingMessages` at all). Validation (ledger A7) found two user-origin senders that bypass `sendInput`: the Shift+Enter raw `terminal.input` frame (`TerminalView.tsx:2126-2133`) and the firewall-command effect (`App.tsx:1497-1509`) — Task 7 folds the first through `sendInput` and gates the second on synchronous transport readiness, so neither can be silently discarded by Task 6's filter.
+1. **The buffer lives in TerminalView, not ws-client.** ws-client has no pane concept (fields keyed only by `requestId`/`terminalId`); TerminalView knows the pane, the old/new tid, and the anchor events. ws-client's only change is dropping `terminal.input` from the blind replay (defense in depth — with the TerminalView gate, input should rarely reach `pendingMessages` at all). Validation (ledger A7) found two user-origin senders that bypass `sendInput`: the Shift+Enter raw `terminal.input` frame (`TerminalView.tsx:2126-2133`) and the firewall-command effect (`App.tsx:1497-1509`) — Task 7 folds the first through `sendInput` and defers the second on readiness (a reactive `connection.status` dependency plus the synchronous `isReady` check, Task 7 item 12) with its own pin test, so neither can be silently discarded by Task 6's filter.
 2. **Buffer raw `data` strings, never pre-built messages.** `buildTerminalInputMessage` snapshots `expectedSessionRef` at build time (`terminal-view-utils.ts:56`); a stale snapshot flushed at the new terminal would draw `SESSION_IDENTITY_MISMATCH`. Rebuild each frame at flush time.
 3. **Anchors that flush:** `terminal.created` for this pane's `requestId` (`TerminalView.tsx:4045`) and current-generation `terminal.attach.ready` for the current tid (`TerminalView.tsx:3838`, gated by `isCurrentAttachMessage`). **Terminal states that discard (with a visible notice):** `terminal.exit` (:4246), `failLaunch` (:3072), `settleCleanRestoreStartupExit` (:3101), `SESSION_IDENTITY_MISMATCH` (:4375 — identity change). **Recovery states that hold:** launch retry/redrive (:3158/:3240) and the INVALID_TERMINAL_ID recovery branches (:4577/:4639). **Flush placement (ledger A11):** in the `terminal.created` handler the flush runs AFTER the created `sessionRef` is folded into `contentRef` (:4046-4066), so rebuilt frames carry the NEW identity (flushing at :4045 would snapshot the pre-create ref — vacuous against the Rust server, which never reads `expected_session_ref` on input, but wrong for Node parity and future-proofing). **Notices must survive the anchor (ledger A15):** `attachTerminal` calls `term.clear()` on the restart path (:2581, forced by the checkpoint-invalid fallback :2545-2552) and `terminal.created` re-hydrates (:4106) — a loss notice written while un-anchored gets wiped; Task 7 therefore also RECORDS the notice and re-writes it after the next anchor's clear, using the same deferred-notice pattern the codebase already uses for `reconcileNotice` (:4110-4116, :4787-4791).
-4. **`awaitingAnchor` closes loss window 2.** From the moment the connection leaves `'ready'` until the pane's next anchor, `sendInput` buffers even though `terminalIdRef` is still set — the old id is unverified and may be dead. This is what makes the e2e marker arrive byte-exact instead of half-blocked/half-flushed.
+4. **`awaitingAnchor` closes loss window 2.** From the moment the connection leaves `'ready'` until the pane's next anchor, `sendInput` buffers even though `terminalIdRef` is still set — the old id is unverified and may be dead. This is what makes the e2e marker arrive byte-exact instead of half-blocked/half-flushed. The latch is set on an observed status TRANSITION away from `'ready'` (the sync effect compares against the previously observed status), never on the status VALUE alone: a pane that mounts under a static non-ready status has the synchronous `ws.isReady === false` arm (invariant 9) covering it while the transport is actually down, and initial-connect pre-anchor sends match pre-fix behavior, backstopped by Task 4's `unknown_terminal` reply and Task 5's attach error. (This also keeps the sibling TerminalView test suites — which preload constant statuses into their stores — out of the latch by construction.)
 5. **Synthetic input is droppable, not bufferable.** DECRQM/OSC auto-replies and scroll-translation answer the OLD terminal's output; replaying them into a NEW pty would inject garbage. Those call sites pass `{ droppable: true }` and are silently dropped when not immediately sendable (their pre-fix behavior). The droppable set is THREE call sites (ledger A13): the DECRQM/OSC reply path (:1598), scroll translation (:1169), AND the request-mode bypass responder (:1884 → `request-mode-bypass.ts:256`), which emits synthetic DECRPM reports — buffering those would flush mode-report garbage into the new pty. Residual (accepted): xterm.js-core auto-replies (DA/CPR) enter `onData` indistinguishably from keystrokes; while un-anchored the dead terminal produces no output to answer, so exposure is negligible, and post-anchor replay-triggered replies are pre-existing behavior untouched by this plan.
 6. **The attach error must carry `requestId: attachRequestId` + `terminalId`** — the client's acceptance gate (`TerminalView.tsx:4442-4451`) requires both to match the current attach generation. Message text `"Terminal not running"` for Node parity (`server/ws-handler.ts:2730-2735`).
 7. **Attach-error blast radius (studied per call site before enabling the error):** all eleven attach call sites funnel into the single INVALID_TERMINAL_ID handler (`TerminalView.tsx:4442-4661`). Verdicts: transport_reconnect (:4727) → branch-5 recovery, desirable (this is the TS-server behavior the Rust port lost); hidden rebind (:2786/:2793) and reveal (:2762) → safe (branch 5 while hidden re-enters background hydration); `terminal.created` attach (:4106) → bounded launch-retry ladder, safe; refresh (:2708), attach.ready re-attaches (:3903/:3938), load-more (:4922) → safe; quarantine-repair re-attach (`attachTerminalRef.current?.(...)` at :884, surfaced by validation — ledger A4) → safe (its poll gate :868-878 self-cancels and every recovery branch runs `clearQuarantineRepair`); reconcile-verdict attach (:4777) → highest risk (branch 5 mints a new createRequestId after a just-folded verdict) — but the error only fires when the server genuinely lacks the terminal, in which case recreating is correct. No flow depends on silence; none needs restructuring. Task 8 pins the recovery path in a unit test; Task 11 re-runs the hidden-pane-rebind and reconcile e2e specs as the regression wall.
 8. **Exited-but-still-registered terminals keep `found:true`** (registry `attach` synthesizes `terminal.exit`; registry `input` still bumps activity). Only ids absent from the registry (never created, or killed/removed, or pre-restart) are `found:false`. (Deliberate divergence, ledger A22: the Node reference ALSO errors on attach to exited-but-registered terminals (`ws-handler.ts:2738+`); the Rust port keeps registry semantics — `found:true` + synthetic exit — and only the unknown-id case errors.)
-9. **The send gate reads transport readiness synchronously (ledger A8).** `WebSocket.onclose` flips the ws client's `_state` synchronously (`ws-client.ts:504`) but the Redux→React status refs lag at least a task; a keystroke in that gap would pass a ref-only gate, land in `pendingMessages`, and be silently discarded by Task 6's filter — NEW loss on a mere transport blip (pre-fix, that frame was actually delivered). `sendInput`'s gate therefore also consults the client's synchronous `isReady` (`ws-client.ts:389`), and Task 7 pins the race with a stale-status test.
+9. **The send gate reads transport readiness synchronously (ledger A8).** `WebSocket.onclose` flips the ws client's `_state` synchronously (`ws-client.ts:504`) but the Redux→React status refs lag at least a task; a keystroke in that gap would pass a ref-only gate, land in `pendingMessages`, and be silently discarded by Task 6's filter — NEW loss on a mere transport blip (pre-fix, that frame was actually delivered). `sendInput`'s gate therefore consults the client's synchronous `isReady` getter (`ws-client.ts:389`) as its ONLY transport arm, written `ws.isReady === false` — deliberate on both counts. No direct Redux-status arm: production statuses are `'disconnected' | 'connecting' | 'ready'` (`'connected'` is a WsClient-internal state, never dispatched to the store), and whenever the socket is genuinely down `isReady` is already false, so a status arm adds nothing in production while breaking the component test fleet (four sibling TerminalView suites preload a constant `'connected'` into their stores; the Redux status instead feeds the transition-latched `awaitingAnchorRef`, invariant 4). The `=== false` comparison: none of the seven TerminalView suites that assert sent `terminal.input` frames put `isReady` on their minimal ws mocks (`{ send, connect, onMessage, onReconnect }`), so an absent getter must read as ready — in production the getter always returns a boolean, making `=== false` exactly `!ws.isReady`. Task 7 pins the race with a close-race test constructed so the `isReady` arm is the ONLY arm that can buffer.
 10. **Input capture and notice visibility above the buffer (ledger A2, A14).** (a) The `status:'creating'` blocking overlay (:5011) gets `pointer-events-none` — it is `absolute inset-0`, and a mid-window click would blur xterm and silently kill `onData` delivery (the e2e's exact click-then-type gesture; loss ABOVE the buffer layer). (b) The `terminal.input.blocked` handler matches `terminalIdRef.current` only, and the recovery paths clear that ref (:3158/:3240) — a backstop frame for the just-dead id would be silently dropped; Task 7 keeps a `lastKnownTerminalIdRef` (set whenever the pane gets a defined tid, NOT cleared by recovery) and the blocked handler also matches it.
 
 ---
@@ -856,10 +858,12 @@ git commit -m "fix(client): never blind-replay queued terminal.input on reconnec
 
 **Files:**
 - Modify: `src/components/TerminalView.tsx`
+- Modify: `src/App.tsx` (item 12 — firewall-command deferral)
 - Test: `test/unit/client/components/TerminalView.lifecycle.test.tsx`
+- Test (create): `test/unit/client/components/App.firewall-command.test.tsx` (item 12's pin)
 
 **Interfaces:**
-- Consumes: `terminalIdRef`, `contentRef`, `termRef`, `writeLocalXtermNotice(term, data)` (:977-1021), `buildTerminalInputMessage(content, terminalId, data)` (`terminal-view-utils.ts:46`), the `connectionStatus` value TerminalView already selects from Redux (`state.connection.status`; used at ~:4930 for `showInlineOfflineStatus`), `INPUT_BLOCKED_NOTICE_THROTTLE_MS`, anchor handlers `terminal.created` (:3998-4115) and `terminal.attach.ready` (:3838, `isCurrentAttachMessage`-gated), terminal-state sites `failLaunch` (:3072), `settleCleanRestoreStartupExit` (:3101), `terminal.exit` (:4227-4248), `SESSION_IDENTITY_MISMATCH` (:4366-4382).
+- Consumes: `terminalIdRef`, `contentRef`, `termRef`, `writeLocalXtermNotice(term, data)` (:977-1021), `buildTerminalInputMessage(content, terminalId, data)` (`terminal-view-utils.ts:46`), the `connectionStatus` value TerminalView already selects from Redux (`state.connection.status`, selected at :546 near the top of the component body, feeding `showInlineOfflineStatus` at :4932 — reuse that binding, do not add a second selector), `INPUT_BLOCKED_NOTICE_THROTTLE_MS`, anchor handlers `terminal.created` (:3998-4115) and `terminal.attach.ready` (:3838, `isCurrentAttachMessage`-gated), terminal-state sites `failLaunch` (:3072), `settleCleanRestoreStartupExit` (:3101), `terminal.exit` (:4227-4248), `SESSION_IDENTITY_MISMATCH` (:4366-4382).
 - Produces: `sendInput(data: string, opts?: { droppable?: boolean })` — same callback identity/usage for all existing callers (the second arg is optional); internal helpers `bufferPendingInput(data)`, `flushPendingInput(tid)`, `discardPendingInput(reason)`, `notifyPendingInputLoss(reason)`; ref `awaitingAnchorRef`. Task 8's test and the e2e spec rely on: keystrokes buffered while un-anchored flush IN ORDER, one `terminal.input` frame per buffered chunk, against the flush-time tid.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1041,7 +1045,12 @@ Two more RED tests (validation findings — ledger A8, A15):
     })
     const term = terminalInstances[0]
 
-    // Socket dead, Redux still 'ready' (the race window).
+    // Socket dead (the race window). Construction makes the isReady arm the
+    // ONLY arm that can buffer here: terminalIdRef is set (so `!tid` is cold)
+    // and the store's preloaded status is STATIC -- it never transitions, so
+    // the sync effect never latches awaitingAnchorRef. Delete the
+    // `ws.isReady === false` arm from the gate and this test fails (the frame
+    // is sent). That is the pin for design invariant 9 / ledger A8.
     setWsIsReady(false) // however the mock exposes the control
 
     fireData(term, 'echo raced\r')
@@ -1152,21 +1161,33 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
   // the frame carries the pane's JUST-DEAD id (recovery clears terminalIdRef).
   // Set whenever the pane acquires a defined tid; never cleared by recovery.
   const lastKnownTerminalIdRef = useRef<string | undefined>(undefined)
-  // True from any transport loss until the pane's next anchor: the current
-  // terminalId is unverified (the server may have restarted) and input must
-  // buffer rather than fire at a possibly-dead id.
+  // True from any observed connection-status TRANSITION away from 'ready'
+  // until the pane's next anchor: the current terminalId is unverified (the
+  // server may have restarted) and input must buffer rather than fire at a
+  // possibly-dead id. Transition-latched, NOT value-latched: a pane mounted
+  // under a static non-ready status must not latch (while the transport is
+  // actually down, the gate's synchronous `ws.isReady === false` arm buffers),
+  // and the sibling TerminalView suites preload constant statuses.
   const awaitingAnchorRef = useRef(false)
-  const connectionStatusRef = useRef<string>('ready')
+  // Previous observed status for the transition detection; seeded with the
+  // mount-time value so the sync effect's first run can never latch.
+  const connectionStatusRef = useRef<string>(connectionStatus)
 ```
 
-3. Sync effect. TerminalView already selects the connection status from Redux (the `connectionStatus` variable feeding `showInlineOfflineStatus`, ~:4930). If that selector is declared below `sendInput`, add a dedicated `useAppSelector((state) => state.connection.status)` near the component's other selectors so this effect can live above `sendInput`; don't select twice permanently — reuse one binding for both uses:
+3. Sync effect. TerminalView already selects the connection status from Redux at :546, near the top of the component body (it feeds `showInlineOfflineStatus` at :4932) — the refs above and this effect both sit below it, so reuse that `connectionStatus` binding; no new selector is needed:
 
 ```ts
   useEffect(() => {
+    const prev = connectionStatusRef.current
     connectionStatusRef.current = connectionStatus
-    if (connectionStatus !== 'ready') {
-      // Kata dtfn: transport loss un-verifies the pane's terminalId until the
-      // next anchor (terminal.created / current-generation attach.ready).
+    if (connectionStatus !== 'ready' && prev !== connectionStatus) {
+      // Kata dtfn: a TRANSITION away from 'ready' (production statuses:
+      // 'disconnected' | 'connecting' | 'ready') is a transport loss -- the
+      // pane's terminalId is unverified until the next anchor
+      // (terminal.created / current-generation attach.ready). The status
+      // VALUE alone never latches: the ref is seeded with the mount-time
+      // status, so the first run is a no-op by construction (see the ref
+      // comment; design invariants 4 and 9).
       awaitingAnchorRef.current = true
     }
   }, [connectionStatus])
@@ -1251,15 +1272,21 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
 ```ts
   const sendInput = useCallback((data: string, opts?: { droppable?: boolean }) => {
     const tid = terminalIdRef.current
-    // Ledger A8 / design invariant 9: the `ws.isReady` getter is the SYNCHRONOUS truth —
-    // the socket's close event flips it immediately, while the Redux-fed
-    // connectionStatusRef lags a task. Without it, a keystroke in that gap
+    // Ledger A8 / design invariant 9: the `ws.isReady` getter is the SYNCHRONOUS
+    // transport truth -- the socket's close event flips it immediately, while
+    // Redux-fed state lags a task. Without this arm, a keystroke in that gap
     // would land in ws-client's pendingMessages and be silently discarded by
     // Task 6's reconnect filter. `ws` here is the WsClient instance itself
     // (`const ws = useMemo(() => getWsClient(), [])`, :588) and `isReady` is
     // a GETTER (`get isReady()`, ws-client.ts:389) -- read it as a property,
-    // never call it.
-    if (!tid || awaitingAnchorRef.current || connectionStatusRef.current !== 'ready' || !ws.isReady) {
+    // never call it. The explicit `=== false` is deliberate: only a transport
+    // KNOWN to be down buffers. In production it is exactly `!ws.isReady`
+    // (the getter always returns a boolean); in the component test fleet it
+    // keeps the sibling suites' minimal ws mocks ({ send, connect, onMessage,
+    // onReconnect } -- no isReady) on their existing pass-through behavior.
+    // There is intentionally NO direct Redux-status arm: the status feeds the
+    // transition-latched awaitingAnchorRef instead (invariants 4 and 9).
+    if (!tid || awaitingAnchorRef.current || ws.isReady === false) {
       if (opts?.droppable) {
         // Synthetic replies (DECRQM/OSC auto-answers, scroll translation)
         // answer the OLD terminal's output -- replaying them into a NEW pty
@@ -1304,7 +1331,61 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
 
 11. Fold the Shift+Enter raw sender through the gate (ledger A7): the raw `terminal.input` frame built at :2126-2133 bypasses `sendInput` entirely — replace it with a `sendInput(<same data>)` call so Shift+Enter input buffers like every other keystroke instead of being queued and silently discarded by Task 6's filter.
 
-12. Gate the firewall-command sender (ledger A7): the effect at `App.tsx:1497-1509` sends a `terminal.input` frame and clears `pendingFirewallCommand` unconditionally. Make it send-and-clear ONLY when the connection is ready (the `ws.isReady` getter — a property read, NOT a call; synchronous, invariant 9); otherwise leave `pendingFirewallCommand` set so the effect re-fires when the status returns to ready. No buffering machinery needed — deferral via the existing pending state is sufficient.
+12. Gate the firewall-command sender (ledger A7): the effect at `App.tsx:1493-1509` sends a `terminal.input` frame and clears `pendingFirewallCommand` unconditionally — and `WsClient.send` can queue it un-ready or silently drop it (early return on `intentionalClose`, `ws-client.ts:674`; oldest-eviction at the queue cap, :717-722), after which the self-clear has already destroyed the only retry state. No buffering machinery needed — deferral via the existing pending state is sufficient — but the deferral needs a REACTIVE readiness signal. Three coordinated changes:
+
+    - In `src/App.tsx`, add `const connectionStatus = useAppSelector((state) => state.connection.status)` next to the component's existing connection selector (`state.connection.lastError`, :177). App.tsx does not currently select the status, and the effect's deps `[pendingFirewallCommand, paneLayouts]` contain nothing reactive to readiness — gating on the non-reactive `ws.isReady` getter alone would strand the command forever (nothing re-fires the effect when readiness returns).
+    - In the effect: before the `ws.send`, early-return — leaving `pendingFirewallCommand` SET — unless `connectionStatus === 'ready' && ws.isReady !== false` (`isReady` is a getter — property read, never a call; the synchronous check covers invariant 9's close race where Redux still says 'ready'). Append `connectionStatus` to the dependency array — THAT is the deferral mechanism: the status flip back to `'ready'` re-runs the effect and the still-pending command sends then. (Residual, accepted: if `isReady` alone is false while the status still reads 'ready', the send waits for the next status change; every disconnect/reconnect cycle produces one — App.tsx itself dispatches `setStatus` through 'disconnected'/'connecting'/'ready' at :1430-1457.)
+    - Pin it in a NEW file `test/unit/client/components/App.firewall-command.test.tsx` (a new file, not `App.test.tsx` — the pin needs its own `SettingsView` mock and `vi.mock` is file-scoped). Clone the `App.test.tsx` harness preamble: the ws-client mock with the live `get isReady()` getter over mutable `wsState` (:41-65), the Sidebar stub whose 'Go settings' button drives `onNavigate('settings')` (:118-120), the `TabContent` stub (:135-137), and `createTestStore()`/`renderApp()` (:193-269 — real reducers + explicit `preloadedState`) — but REPLACE its `SettingsView` stub (which drops the `onFirewallTerminal` prop) with one that forwards it onto a button:
+
+```tsx
+vi.mock('@/components/SettingsView', () => ({
+  default: ({ onFirewallTerminal }: { onFirewallTerminal?: (c: { tabId: string; command: string }) => void }) => (
+    <button
+      type="button"
+      data-testid="fire-firewall"
+      onClick={() => onFirewallTerminal?.({ tabId: 'tab-fw', command: 'sudo ufw allow 8022' })}
+    >
+      fire
+    </button>
+  ),
+}))
+```
+
+    The RED test — fails pre-fix, because today the effect sends immediately regardless of readiness:
+
+```tsx
+  it('defers the firewall command while un-ready and sends it exactly once after ready', async () => {
+    // createTestStore adjusted for this test: preload connection.status
+    // 'connecting' (a real pre-ready production status) and keep
+    // wsState.isReady = false; preload panes.layouts['tab-fw'] as a ROOT
+    // LEAF with a terminalId -- the effect reads only paneLayouts[tabId]
+    // (:1500-1502):
+    //   { type: 'leaf', id: 'pane-fw', content: { kind: 'terminal',
+    //     mode: 'shell', shell: 'system', createRequestId: 'req-fw',
+    //     status: 'running', terminalId: 'term-fw' } }
+    const store = createTestStore()
+    renderApp(store)
+    fireEvent.click(screen.getByTitle('Go settings'))
+    // SettingsView is lazy (App.tsx:110) -- findBy waits out the Suspense.
+    fireEvent.click(await screen.findByTestId('fire-firewall'))
+
+    // Guard: the harness must actually be un-ready here.
+    expect(store.getState().connection.status).not.toBe('ready')
+    // RED pre-fix: today the effect has already sent, un-ready.
+    expect(mockSend).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'terminal.input' }))
+
+    act(() => {
+      wsState.isReady = true
+      store.dispatch(setStatus('ready')) // import { setStatus } from '@/store/connectionSlice'
+    })
+    await waitFor(() => {
+      expect(mockSend).toHaveBeenCalledWith({ type: 'terminal.input', terminalId: 'term-fw', data: 'sudo ufw allow 8022\n' })
+    })
+    expect(mockSend.mock.calls.filter((c) => c[0]?.type === 'terminal.input')).toHaveLength(1)
+  })
+```
+
+    Plus a happy-path pin in the same file (preload status `'ready'` and `wsState.isReady = true` from the start → the frame sends immediately, exactly once). Adapt the store-preload plumbing to the cloned harness's actual shape; the contracts asserted are exact: no `terminal.input` frame before readiness, exactly one after.
 
 13. Make the `status:'creating'` overlay click-transparent (ledger A14 / invariant 10a): add `pointer-events-none` to the absolute-inset overlay at :5011 so a mid-recreate click cannot blur xterm and kill `onData` delivery (loss above the buffer). The overlay is informational; it must not eat interaction.
 
@@ -1314,18 +1395,19 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
 
 ```bash
 npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components/TerminalView.lifecycle.test.tsx
+npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components/App.firewall-command.test.tsx
 npm run test:vitest -- run --config config/vitest/vitest.config.ts test/unit/client/components
 npm run lint
 npm run typecheck
 ```
 
-Expected: all PASS. The component sweep guards the `sendInput` signature change and the new effect deps against the other 29 TerminalView suites.
+Expected: all PASS. The component sweep guards the `sendInput` signature change and the new effect deps against the other TerminalView suites — and it stays green BY CONSTRUCTION of the gate: the `ws.isReady === false` arm treats the sibling suites' isReady-less ws mocks (`{ send, connect, onMessage, onReconnect }`) as ready, and `awaitingAnchorRef` latches only on status TRANSITIONS, so the constant preloaded store fixtures (`'connected'` in keyboard :163/:215/:275, mobile-viewport :109, codex-identity :185; `'ready'` in osc52 :222, scroll-input-policy :166, touch-scroll-input-policy :155) never latch and their `terminal.input` send assertions keep passing.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/components/TerminalView.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx
-git commit -m "fix(client): buffer un-anchored keystrokes and flush after re-anchor (kata dtfn)"
+git add src/components/TerminalView.tsx src/App.tsx test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/App.firewall-command.test.tsx
+git commit -m "fix(client): buffer un-anchored keystrokes, flush after re-anchor, defer firewall command until ready (kata dtfn)"
 ```
 
 ---
@@ -1714,14 +1796,14 @@ Expected: the task-by-task commit ladder from this plan; push succeeds. Do NOT o
 - Client loss window 1 (blind replay of queued input, `ws-client.ts:294-302`) → Task 6 (filter) + Task 7 (buffer catches what would have queued).
 - Client loss window 2 (keystrokes at the old id before staleness detection) → Task 7's `awaitingAnchorRef` (buffers from transport loss until the next anchor) + the server's `unknown_terminal` reply as the wire-level backstop for any frame that still reaches a dead id.
 - Client loss window 3 (`if (!tid) return`) → Task 7's buffer, flushed at `terminal.created`/attach.ready, discarded-with-notice on exit/failLaunch/clean-exit/identity-change, overflow/timeout → notice.
-- Attach-call-site study before enabling the error (waves A–D machinery) → design invariant 7 (all ten sites triaged with verdicts) + Task 8 unit pin + Task 11 e2e wall; no flow was found to depend on silence.
+- Attach-call-site study before enabling the error (waves A–D machinery) → design invariant 7 (all eleven sites triaged with verdicts) + Task 8 unit pin + Task 11 e2e wall; no flow was found to depend on silence.
 - Tests demanded by the spec: Rust input-blocked RED (Task 4 Step 2), attach InvalidTerminalId RED (Task 5 Step 2), registry found/not-found unit (Task 3), replay-filter client test (Task 6), byte-exact flush (Task 7/8), overflow/timeout notices (Task 7), the discriminating e2e scenario (Task 9), harness-01 retry-loop replacement (Task 10), restore-contract-wall + hidden-pane-rebind + reconcile e2e (Task 11).
 - Repo rules: worktree from origin/main + base green (Task 1), gates list (Task 11), ephemeral ports / never 3001/3002 / never restart the user's server / no broad kills (Global Constraints), push-no-PR (Task 11 Step 4).
 
 **1b. No silent deferrals.** Every user-facing requirement lands on a production outcome proven without stubs: the wire replies are proven by real-server WS integration tests (Tasks 4–5), the client behavior by vitest against the real component (mocked transport is the established suite pattern, backed by the real-browser/real-server e2e in Task 9 that proves the end-to-end arrival guarantee in production wiring). No stub stands in for required behavior; no requirement was moved to known-limitations/future-work. No UNRESOLVED COVERAGE GAPs.
 
-**2. Placeholder scan.** One deliberate copy directive exists (Task 9: `selectFirstShellFromPicker` copied verbatim from a named source range, with an explicit instruction that the placeholder line must not survive the step) — a copy instruction with an exact source, not a TBD. Two "adapt to the mock's actual shape" notes (Task 7 Step 1 `fireData`, Task 8 Step 1 error-injection) each come with complete working code plus the named in-file mechanism to align with; the contracts being asserted are fully specified.
+**2. Placeholder scan.** No copy-directive placeholders remain (Task 9 composes the shared `pane-picker.ts` helpers directly). Three "adapt to the harness's actual shape" notes (Task 7 Step 1 `fireData`, Task 7 item 12's App-harness clone, Task 8 Step 1 error-injection) each come with complete working code plus the named in-file mechanism to align with; the contracts being asserted are fully specified.
 
-**3. Load-bearing validation (Stage 2) — findings applied.** 23 assumptions surfaced, 21 validated (ledger: `.worktrees/.the-usual-logs/silent-input-loss/load-bearing-ledger.md`). Falsified → fixed in this plan: A2 (stale-id blocked frames were silently dropped → `lastKnownTerminalIdRef` match, Task 7 item 14 / invariant 10b); A7 (two `sendInput`-bypassing user senders: Shift+Enter :2126-2133 and firewall App.tsx:1497-1509 → Task 7 items 11-12 / invariant 1); A8 (close-race: ref-lagged gate would feed Task 6's filter NEW silent loss → synchronous `ws.isReady` getter in the gate + race test, invariant 9); A13 (request-mode-bypass DECRPM sender was left bufferable → droppable, invariant 5); A15 (anchor's `term.clear()` wipes pre-anchor loss notices → deferred re-write via the reconcileNotice pattern, invariant 3 + Task 7 item 7 + survival test); A23 (harness-01's retry loop also absorbed slow-recreate flake → 60s budgets in Tasks 9-10). Verified corrections folded in: 11th attach call site (quarantine repair :884, invariant 7); flush placement after the sessionRef fold :4066 (A11); `ZOD_BACKED_SERVER_MESSAGES` is a test-side list (Task 2); pane-picker helpers exist (Task 9); creating-overlay `pointer-events-none` (A14, invariant 10a); headless-input warn (A16, Task 3). Accepted residuals (recorded in the ledger with alternatives considered): in-flight frame loss on a dying socket (browser-level, needs an ack protocol — out of scope); TUI-CLI early-input TCSAFLUSH behavior (bash proven 60/60 byte-intact; TUIs unverified); xterm-core DA/CPR auto-replies entering `onData` (output-quiet while un-anchored; post-anchor behavior pre-existing). Re-check of 1b after these edits: every new requirement (race gate, deferred notice, stray-sender folding, overlay fix) lands on production code with a pinning test in Tasks 6-9 — no stubs, no deferrals.
+**3. Load-bearing validation (Stage 2) — findings applied.** 23 assumptions surfaced, 21 validated (ledger: `.worktrees/.the-usual-logs/silent-input-loss/load-bearing-ledger.md`). Falsified → fixed in this plan: A2 (stale-id blocked frames were silently dropped → `lastKnownTerminalIdRef` match, Task 7 item 14 / invariant 10b); A7 (two `sendInput`-bypassing user senders: Shift+Enter :2126-2133 and firewall App.tsx:1493-1509 → Task 7 items 11-12 / invariant 1, the firewall deferral pinned in `App.firewall-command.test.tsx`); A8 (close-race: ref-lagged gate would feed Task 6's filter NEW silent loss → synchronous `ws.isReady` getter in the gate + race test, invariant 9); A13 (request-mode-bypass DECRPM sender was left bufferable → droppable, invariant 5); A15 (anchor's `term.clear()` wipes pre-anchor loss notices → deferred re-write via the reconcileNotice pattern, invariant 3 + Task 7 item 7 + survival test); A23 (harness-01's retry loop also absorbed slow-recreate flake → 60s budgets in Tasks 9-10). Verified corrections folded in: 11th attach call site (quarantine repair :884, invariant 7); flush placement after the sessionRef fold :4066 (A11); `ZOD_BACKED_SERVER_MESSAGES` is a test-side list (Task 2); pane-picker helpers exist (Task 9); creating-overlay `pointer-events-none` (A14, invariant 10a); headless-input warn (A16, Task 3). Accepted residuals (recorded in the ledger with alternatives considered): in-flight frame loss on a dying socket (browser-level, needs an ack protocol — out of scope); TUI-CLI early-input TCSAFLUSH behavior (bash proven 60/60 byte-intact; TUIs unverified); xterm-core DA/CPR auto-replies entering `onData` (output-quiet while un-anchored; post-anchor behavior pre-existing). Re-check of 1b after these edits: every new requirement (race gate, deferred notice, stray-sender folding incl. the firewall deferral, overlay fix) lands on production code with a pinning test in Tasks 6-9 — no stubs, no deferrals.
 
 **4. Type consistency.** `InputOutcome{found}` defined in Task 3, consumed as `outcome.found` in Task 4 and the freshagent caller. `handle_attach(...) -> Option<ServerMessage>` defined and consumed in Task 5. `sendInput(data, opts?: {droppable?: boolean})`, `bufferPendingInput(data)`, `flushPendingInput(tid)`, `discardPendingInput('timeout'|'terminal_gone')`, `notifyPendingInputLoss('overflow'|'timeout'|'terminal_gone')` used consistently across Task 7's steps and Task 8's test. Wire strings consistent throughout: `terminal.input.blocked` / `unknown_terminal` / `INVALID_TERMINAL_ID` / `"Terminal not running"`.
