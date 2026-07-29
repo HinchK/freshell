@@ -186,6 +186,15 @@ pub async fn drain_and_rebind_claude(state: &WsState, watcher: &ClaudeSignalWatc
                 continue;
             }
         }
+        // Cross-kind (D7): a LIVE freshclaude sidecar owning this session is
+        // just as much "the one writer on S's JSONL" as a live PTY. The
+        // durable ledger guard below is blind to a sidecar whose row hasn't
+        // landed yet. Mirrors codex_claim_refused (codex_identity.rs:159).
+        if state.fresh_claude.has_live_session(&sig.session_id).await {
+            tracing::warn!(terminal_id = %sig.terminal_id, session_id = %sig.session_id,
+                "claude_rebind_refused: freshagent_live_session");
+            continue;
+        }
         if state
             .pane_ledger
             .lookup_by_session("claude", &sig.session_id)
