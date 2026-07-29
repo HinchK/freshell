@@ -291,8 +291,16 @@ export class WsClient {
       }
       this.preReadyCreateQueue.clear()
 
+      // Reconnect replay must not blind-fire terminal.attach (recovery
+      // re-attaches deliberately) NOR terminal.input (kata dtfn: the queued
+      // frames carry the PRE-restart terminalId; the server answers
+      // terminal.input.blocked{unknown_terminal} at best, and the bytes are
+      // gone. TerminalView buffers un-anchored keystrokes and flushes them
+      // after the pane's next anchor instead).
       const pendingMessages = isReconnect
-        ? this.pendingMessages.filter((queued) => !isTerminalAttachMessage(queued))
+        ? this.pendingMessages.filter(
+            (queued) => !isTerminalAttachMessage(queued) && !isTerminalInputMessage(queued),
+          )
         : this.pendingMessages
       this.pendingMessages = []
 

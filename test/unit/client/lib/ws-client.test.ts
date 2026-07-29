@@ -468,6 +468,30 @@ describe('WsClient.connect', () => {
     ])
   })
 
+  it('drops queued terminal.input on reconnect instead of replaying it against a stale terminalId', async () => {
+    const c = new WsClient('ws://example/ws')
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p1
+    MockWebSocket.instances[0]._close(1006, 'server restart')
+
+    // Typed while the socket was down: the old terminalId is baked in and the
+    // restarted server has never heard of it -- replaying is silent loss.
+    c.send({ type: 'terminal.input', terminalId: 'term-old', data: 'echo lost\r' })
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready' })
+    await p2
+
+    const inputs = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'terminal.input')
+    expect(inputs).toEqual([])
+  })
+
   it('filters invalid sidebarOpenSessions before sending hello', async () => {
     const c = new WsClient('ws://example/ws')
     c.setHelloExtensionProvider(() => ({
