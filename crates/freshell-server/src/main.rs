@@ -594,7 +594,17 @@ async fn main() -> ExitCode {
                 // keeps the pure index answer — identical to pre-fix behavior.
                 .with_claude_transcript_locator(std::sync::Arc::new(|session_id: &str| {
                     freshell_freshagent::locate_transcript(session_id)
-                })),
+                }))
+                // Opencode rebind fix: the SAME by-id DB truth the attach arm
+                // trusts (`opencode --session <id>` resolves children and
+                // directory-less roots the root-filtered listing hides), so
+                // reconcile and attach can never disagree about whether an
+                // opencode session exists. Points at the SAME data home the
+                // OpencodeSource above uses. Unreadable DB => Unknown
+                // (bounded deferral), never a false dead_session.
+                .with_opencode_session_locator(existence::opencode_db_locator(
+                    freshell_sessions::parse::default_opencode_data_home(),
+                )),
             ),
             None => std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         },

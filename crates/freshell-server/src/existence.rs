@@ -20,6 +20,14 @@
 //!   file; crash-window partial writes), so the R10b index gate excludes it —
 //!   file present ⇒ `Present`, so reconcile agrees with the attach arm and
 //!   never adjudicates dead a transcript the attach arm would try to resume.
+//! * warm snapshot `Absent` for provider `opencode` with a session locator
+//!   installed => re-checked BY ID against `opencode.db` (rebind
+//!   dead-session fix): child rows (`parent_id` set), directory-less
+//!   roots, and archived rows are DB-present yet index-invisible — the
+//!   listing is root-filtered, drops cwd-less rows, and excludes archived
+//!   — while the attach arm (`opencode --session <id>`, session.get by
+//!   id, which has none of those filters) resolves them all. Row present
+//!   => `Present`; unreadable DB => `Unknown`, never `Absent`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -40,6 +48,30 @@ const KNOWN_PROVIDERS: [&str; 4] = ["claude", "codex", "opencode", "amplifier"];
 /// unit-testable without process-global env mutation; precedent:
 /// `codex_rollout_locator` (main.rs).
 pub type ClaudeTranscriptLocator = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + Sync>;
+
+/// Answer from the injected opencode by-id DB check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpencodeDbAnswer {
+    /// A `session` row with the id exists in `opencode.db` (archived
+    /// included — the attach arm's session.get has no archived filter).
+    Present,
+    /// No such row — including "no DB file at all" (opencode never ran here).
+    Absent,
+    /// The DB exists but could not be read (WAL lock contention, corruption,
+    /// io error, schema variance). LOAD-BEARING: the probe maps this to
+    /// `Unknown`, NEVER `Absent` — Absent-on-error would adjudicate live
+    /// sessions dead under transient lock contention.
+    Unreadable,
+}
+
+/// Injected by-id opencode DB check, mirroring [`ClaudeTranscriptLocator`]
+/// (kata 09v1 pattern: the probe must agree with the ATTACH ARM). Opencode's
+/// attach arm is `opencode --session <id>` — session.get by id, children
+/// included — while the index listing is root-filtered
+/// (`parent_id IS NULL`, parse/opencode.rs) and drops directory-less rows.
+/// A closure (not a direct call) keeps this probe unit-testable; precedent:
+/// `claude_transcript_locator` above.
+pub type OpencodeSessionLocator = Arc<dyn Fn(&str) -> OpencodeDbAnswer + Send + Sync>;
 
 pub struct IndexExistenceProbe {
     index: Arc<SessionIndex>,
@@ -64,6 +96,17 @@ pub struct IndexExistenceProbe {
     /// against raw file existence before being finalized. `None` (tests,
     /// callers that never set it) keeps the pure index answer.
     claude_transcript_locator: Option<ClaudeTranscriptLocator>,
+    /// Opencode by-id fallback (rebind dead-session fix): a session row can
+    /// be in opencode.db yet index-invisible — the listing filters
+    /// `parent_id IS NULL` (children hidden), drops NULL/empty
+    /// `directory` rows (some roots hidden), and excludes archived rows
+    /// (which the attach arm still resolves) — so the warm snapshot answers
+    /// a false Absent while the attach arm (`opencode --session <id>`)
+    /// would resolve it. When set, a warm-index Absent for provider
+    /// "opencode" is re-checked by id against the DB before being
+    /// finalized. `None` (tests, callers that never set it) keeps the pure
+    /// index answer.
+    opencode_session_locator: Option<OpencodeSessionLocator>,
 }
 
 impl IndexExistenceProbe {
@@ -78,6 +121,7 @@ impl IndexExistenceProbe {
             ledger,
             provider_roots,
             claude_transcript_locator: None,
+            opencode_session_locator: None,
         }
     }
 
@@ -85,6 +129,14 @@ impl IndexExistenceProbe {
     /// doc). Chained at the single production construction site in main.rs.
     pub fn with_claude_transcript_locator(mut self, locator: ClaudeTranscriptLocator) -> Self {
         self.claude_transcript_locator = Some(locator);
+        self
+    }
+
+    /// Builder-style: install the by-id sqlite fallback for opencode (see
+    /// the field doc). Chained at the single production construction site
+    /// in main.rs.
+    pub fn with_opencode_session_locator(mut self, locator: OpencodeSessionLocator) -> Self {
+        self.opencode_session_locator = Some(locator);
         self
     }
 
@@ -105,6 +157,24 @@ impl IndexExistenceProbe {
             observed.insert(item.key());
         }
     }
+}
+
+/// Production opencode locator: by-id check against
+/// `<data_home>/opencode.db` via
+/// `freshell_sessions::parse::session_exists_by_id` — read-only open, 250ms
+/// busy timeout (NOT the listing's 5000ms; `exists()` is sync on the
+/// reconcile path), no archived/parent/directory filters (attach parity:
+/// opencode's session.get has none of them). Missing DB file => `Absent`
+/// (opencode never ran); any read error => `Unreadable` (=> the probe
+/// answers `Unknown`).
+pub fn opencode_db_locator(data_home: PathBuf) -> OpencodeSessionLocator {
+    Arc::new(move |session_id: &str| {
+        match freshell_sessions::parse::session_exists_by_id(&data_home, session_id) {
+            Ok(true) => OpencodeDbAnswer::Present,
+            Ok(false) => OpencodeDbAnswer::Absent,
+            Err(_) => OpencodeDbAnswer::Unreadable,
+        }
+    })
 }
 
 impl SessionExistenceProbe for IndexExistenceProbe {
@@ -168,6 +238,39 @@ impl SessionExistenceProbe for IndexExistenceProbe {
                         }
                     }
                 }
+                // Opencode by-id fallback (rebind dead-session fix): the
+                // index listing is root-filtered (`parent_id IS NULL`,
+                // parse/opencode.rs) and drops directory-less rows, so a
+                // rebound CHILD session id — or a cwd-less root — is
+                // DB-present yet index-invisible and the warm snapshot
+                // answers a false Absent, while the attach arm
+                // (`opencode --session <id>` -> session.get by id, no
+                // parent/directory/archived filters) resolves it. The two
+                // arms must agree: before finalizing Absent for
+                // opencode, consult the SAME by-id DB truth. An unreadable
+                // DB (WAL lock contention, corruption) is honest Unknown —
+                // reconcile's bounded deferral retries — NEVER Absent. The
+                // listing's root-only query itself stays intact for History.
+                if provider == "opencode" {
+                    if let Some(locator) = &self.opencode_session_locator {
+                        match locator(session_id) {
+                            OpencodeDbAnswer::Present => {
+                                // A fallback hit is an on-disk observation:
+                                // feed the monotone observed-set (module-doc
+                                // invariant), same as the claude arm above.
+                                self.observed
+                                    .lock()
+                                    .expect("observed set lock")
+                                    .insert(format!("{provider}:{session_id}"));
+                                return SessionExistence::Present;
+                            }
+                            OpencodeDbAnswer::Unreadable => {
+                                return SessionExistence::Unknown;
+                            }
+                            OpencodeDbAnswer::Absent => {}
+                        }
+                    }
+                }
                 SessionExistence::Absent
             }
         }
@@ -198,7 +301,7 @@ impl SessionExistenceProbe for IndexExistenceProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use freshell_sessions::directory_index::{ClaudeSource, SessionSource};
+    use freshell_sessions::directory_index::{ClaudeSource, OpencodeSource, SessionSource};
     use std::time::Duration;
 
     fn temp_claude_home(tag: &str) -> std::path::PathBuf {
@@ -615,5 +718,294 @@ mod tests {
             "the observed-set must remember identities disk has seen"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn temp_opencode_data_home(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "freshell-existence-opencode-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir opencode data home");
+        dir
+    }
+
+    /// Same schema shape as crates/freshell-sessions/tests/opencode_sqlite.rs
+    /// `create_full_schema` (and the spike fixture). Row tuple:
+    /// (id, directory, parent_id, time_archived).
+    #[allow(clippy::type_complexity)] // fixture row tuple, documented above
+    fn seed_opencode_db(
+        data_home: &std::path::Path,
+        rows: &[(&str, Option<&str>, Option<&str>, Option<i64>)],
+    ) {
+        let conn =
+            rusqlite::Connection::open(data_home.join("opencode.db")).expect("open fixture db");
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                directory TEXT,
+                title TEXT,
+                time_created INTEGER,
+                time_updated INTEGER,
+                time_archived INTEGER,
+                project_id TEXT,
+                parent_id TEXT
+             );
+             CREATE TABLE part (session_id TEXT, data TEXT);
+             CREATE TABLE message (session_id TEXT, data TEXT);",
+        )
+        .expect("create schema");
+        for (id, directory, parent_id, time_archived) in rows {
+            conn.execute(
+                "INSERT INTO session VALUES (?1, ?2, 'T', 1000, 5000, ?4, NULL, ?3)",
+                rusqlite::params![id, directory, parent_id, time_archived],
+            )
+            .expect("insert session row");
+        }
+    }
+
+    fn opencode_probe_over(
+        data_home: &std::path::Path,
+    ) -> (IndexExistenceProbe, Arc<SessionIndex>) {
+        let index = Arc::new(SessionIndex::with_ttl_and_cache_path(
+            vec![Arc::new(OpencodeSource::new(data_home.to_path_buf())) as Arc<dyn SessionSource>],
+            Duration::from_millis(50),
+            None,
+        ));
+        (
+            IndexExistenceProbe::new(
+                Arc::clone(&index),
+                None,
+                HashMap::from([("opencode".to_string(), data_home.to_path_buf())]),
+            ),
+            index,
+        )
+    }
+
+    /// Rebind fix RED: a CHILD session row (parent_id set) IS in
+    /// opencode.db, but the listing's `parent_id IS NULL` root filter hides
+    /// it from the index — the probe must answer Present via the by-id DB
+    /// fallback, because the attach arm (`opencode --session <id>`) would
+    /// resolve it.
+    #[tokio::test]
+    async fn child_opencode_session_row_on_disk_is_present_not_absent() {
+        let home = temp_opencode_data_home("child-row");
+        seed_opencode_db(
+            &home,
+            &[
+                ("ses_root0000000000000000000000", Some("/tmp/p"), None, None),
+                (
+                    "ses_child000000000000000000000",
+                    Some("/tmp/p"),
+                    Some("ses_root0000000000000000000000"),
+                    None,
+                ),
+            ],
+        );
+        let (probe, index) = opencode_probe_over(&home);
+        let probe = probe.with_opencode_session_locator(opencode_db_locator(home.clone()));
+        index.warm().await;
+        assert_eq!(
+            probe.exists("opencode", "ses_child000000000000000000000"),
+            SessionExistence::Present,
+            "the row exists on disk (the attach arm would resolve it) — the \
+             probe must agree with the by-id DB check, not the root-filtered index"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Fallback-Present feeds the monotone observed-set (module-doc
+    /// invariant), same as the claude fallback, so a LATER genuine deletion
+    /// still derives loud dead_session even without a ledger.
+    #[tokio::test]
+    async fn opencode_fallback_present_feeds_ever_observed() {
+        let home = temp_opencode_data_home("fallback-observed");
+        seed_opencode_db(
+            &home,
+            &[
+                ("ses_root0000000000000000000000", Some("/tmp/p"), None, None),
+                (
+                    "ses_child000000000000000000000",
+                    Some("/tmp/p"),
+                    Some("ses_root0000000000000000000000"),
+                    None,
+                ),
+            ],
+        );
+        let (probe, index) = opencode_probe_over(&home);
+        let probe = probe.with_opencode_session_locator(opencode_db_locator(home.clone()));
+        index.warm().await;
+        assert_eq!(
+            probe.exists("opencode", "ses_child000000000000000000000"),
+            SessionExistence::Present
+        );
+        assert!(
+            probe.ever_observed("opencode", "ses_child000000000000000000000"),
+            "a fallback hit is an on-disk observation and must feed ever_observed"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// HAZARD GUARD (must not regress): an id GENUINELY absent from the DB
+    /// stays Absent even with the locator installed — the fallback must
+    /// never weaken positive denial.
+    #[tokio::test]
+    async fn genuinely_missing_opencode_id_stays_absent_with_locator_installed() {
+        let home = temp_opencode_data_home("hazard-guard");
+        seed_opencode_db(
+            &home,
+            &[("ses_root0000000000000000000000", Some("/tmp/p"), None, None)],
+        );
+        let (probe, index) = opencode_probe_over(&home);
+        let probe = probe.with_opencode_session_locator(opencode_db_locator(home.clone()));
+        index.warm().await;
+        assert_eq!(
+            probe.exists("opencode", "ses_missing0000000000000000000"),
+            SessionExistence::Absent,
+            "no row anywhere: warm-index Absent AND by-id miss => Absent"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The fallback is OPENCODE-scoped (mirror of
+    /// `codex_absent_never_consults_the_claude_locator`): a claude Absent
+    /// must stay Absent even when the installed opencode locator would
+    /// answer Present for any id.
+    #[tokio::test]
+    async fn claude_absent_never_consults_the_opencode_locator() {
+        let home = temp_claude_home("claude-opencode-gate");
+        let (probe, index) = probe_over(&home);
+        let probe =
+            probe.with_opencode_session_locator(Arc::new(|_sid: &str| OpencodeDbAnswer::Present));
+        index.warm().await;
+        assert_eq!(
+            probe.exists("claude", "0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d"),
+            SessionExistence::Absent,
+            "the by-id DB fallback is provider-gated to opencode only"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Same gate for codex.
+    #[tokio::test]
+    async fn codex_absent_never_consults_the_opencode_locator() {
+        let home = temp_claude_home("codex-opencode-gate");
+        let (probe, index) = probe_over(&home);
+        let probe =
+            probe.with_opencode_session_locator(Arc::new(|_sid: &str| OpencodeDbAnswer::Present));
+        index.warm().await;
+        assert_eq!(
+            probe.exists("codex", "thread-1"),
+            SessionExistence::Absent,
+            "the by-id DB fallback is provider-gated to opencode only"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A ROOT row with NULL directory is returned by the listing SQL but
+    /// dropped at mapping (parse/opencode.rs ~:314-317) — index-invisible
+    /// yet DB-present. The fallback must find it.
+    #[tokio::test]
+    async fn directory_less_opencode_root_row_is_present_via_fallback() {
+        let home = temp_opencode_data_home("dirless-root");
+        seed_opencode_db(
+            &home,
+            &[("ses_dirless0000000000000000000", None, None, None)],
+        );
+        let (probe, index) = opencode_probe_over(&home);
+        let probe = probe.with_opencode_session_locator(opencode_db_locator(home.clone()));
+        index.warm().await;
+        assert_eq!(
+            probe.exists("opencode", "ses_dirless0000000000000000000"),
+            SessionExistence::Present,
+            "directory-less roots are real attachable rows the listing drops"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// PINNED: an archived row (time_archived set) is PRESENT via the
+    /// fallback — attach parity. The listing excludes archived rows
+    /// (parse/opencode.rs:204, `time_archived IS NULL`), but opencode's
+    /// attach arm resolves them: `Session.get` has NO archived filter and
+    /// a live `opencode --session <archived-id>` attach succeeds
+    /// (load-bearing validation against v1.18.9). Answering Absent here
+    /// would kill the bookmark of an attachable session — the exact bug
+    /// class this fix removes.
+    #[tokio::test]
+    async fn archived_opencode_row_is_present_attach_parity() {
+        let home = temp_opencode_data_home("archived");
+        seed_opencode_db(
+            &home,
+            &[(
+                "ses_arch0000000000000000000000",
+                Some("/tmp/p"),
+                None,
+                Some(9999),
+            )],
+        );
+        let (probe, index) = opencode_probe_over(&home);
+        let probe = probe.with_opencode_session_locator(opencode_db_locator(home.clone()));
+        index.warm().await;
+        assert_eq!(
+            probe.exists("opencode", "ses_arch0000000000000000000000"),
+            SessionExistence::Present,
+            "archived rows are index-invisible but attachable — the probe \
+             must agree with the attach arm"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// LOAD-BEARING: an unreadable DB (here: a DIRECTORY where the file
+    /// should be — the corruption/io-error class) answers Unknown, NEVER
+    /// Absent. Absent-on-error would recreate the dead-session bug under
+    /// WAL lock contention. Reconcile turns Unknown into
+    /// error{index_warming} + its single bounded deferral, then re-derives.
+    /// The index is warmed over a separate GOOD home so the warm-snapshot
+    /// arm (where the fallback lives) is actually exercised.
+    #[tokio::test]
+    async fn unreadable_opencode_db_answers_unknown_never_absent() {
+        let good = temp_opencode_data_home("unreadable-good");
+        seed_opencode_db(
+            &good,
+            &[("ses_root0000000000000000000000", Some("/tmp/p"), None, None)],
+        );
+        let broken = temp_opencode_data_home("unreadable-broken");
+        std::fs::create_dir_all(broken.join("opencode.db")).expect("mkdir dir-as-db");
+        let (probe, index) = opencode_probe_over(&good);
+        let probe = probe.with_opencode_session_locator(opencode_db_locator(broken.clone()));
+        index.warm().await;
+        assert_eq!(
+            probe.exists("opencode", "ses_child000000000000000000000"),
+            SessionExistence::Unknown,
+            "read failure is honest ignorance — reconcile defers and retries; \
+             it must never become a false Absent"
+        );
+        let _ = std::fs::remove_dir_all(&good);
+        let _ = std::fs::remove_dir_all(&broken);
+    }
+
+    /// A MISSING DB file is a normal Absent (opencode never ran here) —
+    /// distinct from the unreadable case above.
+    #[tokio::test]
+    async fn missing_opencode_db_file_stays_absent() {
+        let good = temp_opencode_data_home("missing-db-good");
+        seed_opencode_db(
+            &good,
+            &[("ses_root0000000000000000000000", Some("/tmp/p"), None, None)],
+        );
+        let empty = temp_opencode_data_home("missing-db-empty");
+        let (probe, index) = opencode_probe_over(&good);
+        let probe = probe.with_opencode_session_locator(opencode_db_locator(empty.clone()));
+        index.warm().await;
+        assert_eq!(
+            probe.exists("opencode", "ses_child000000000000000000000"),
+            SessionExistence::Absent
+        );
+        let _ = std::fs::remove_dir_all(&good);
+        let _ = std::fs::remove_dir_all(&empty);
     }
 }
