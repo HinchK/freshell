@@ -557,6 +557,12 @@ impl FreshOpencodeState {
             // Already materialized: THE continuity fix — reuse it, no new session.
             real_id
         } else {
+            // Deliberately ungated (bccd item 4, council D-D evaluate-and-decide;
+            // same decision as the REST send-keys cold arm in lib.rs): the
+            // single-flighted singleton manager bounds sidecar forks to AT MOST
+            // ONE server-wide, and gating would starve the spawn budget on
+            // ~50-70s worst-case cold-start holds (see the lib.rs comment for
+            // the arithmetic). Revisit if the sidecar ever grows fork fan-out.
             let created = match manager.create_session(None, None, cwd.as_deref()).await {
                 Ok(created) => created,
                 Err(err) => {
