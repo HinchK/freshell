@@ -52,6 +52,10 @@ pub const CODEX_REMOTE_NON_LOOPBACK_MESSAGE: &str =
 /// launches. Council fence: S4's wiring is FLAG-GATED, default OFF — legacy's proxy path
 /// exists to feed durability binding (S5), so the launch mechanism ships dark until S5's
 /// consumers land; S5 + the flag-default flip land together.
+///
+/// D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH): flipping this default ON must
+/// revisit the ~226s REST permit-hold (grep for D-C-REVISIT; decision in
+/// docs/plans/2026-07-27-rest-spawn-gate.md §D-C).
 pub const FRESHELL_CODEX_MANAGED_LAUNCH_ENV: &str = "FRESHELL_CODEX_MANAGED_LAUNCH";
 
 /// Whether the managed-launch flag value enables the S4 wiring. Only the exact string

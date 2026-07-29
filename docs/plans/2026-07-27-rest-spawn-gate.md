@@ -112,6 +112,8 @@ documented here, and MUST be revisited if/when S5 flips the default ON
 (likely a separate sidecar budget covering both doors). Task 9's report
 carries this forward.
 
+> Tripwire (added 2026-07-29, kata bccd item 5): grep `D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH)` — marker comments sit at the REST call site (`terminal_tabs.rs`) and on the flag const (`launch_plan.rs`) so the default flip cannot ship without hitting this decision.
+
 **D-D. Codex sidecar evaluation.** (The kata has NO numbered items — its
 sidecar mention is the un-numbered aside *"Also noted: the codex-sidecar
 launch path bypasses the gate similarly"*, and it is NOT in the kata's
