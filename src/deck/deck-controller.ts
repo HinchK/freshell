@@ -133,6 +133,7 @@ export class DeckController {
       // bitmapFor both reports readiness and requests the load - first paint
       // of a tile with an unloaded icon starts the fetch.
       iconReady: (url) => this.iconCache.bitmapFor(url) !== null,
+      previewFor: () => [],
     })
     let painted = false
     frame.keys.forEach((spec, keyIndex) => {

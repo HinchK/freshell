@@ -2,11 +2,13 @@ import type { DeckCapabilities } from './deck-device'
 import type { DeckModel } from './deck-selectors'
 import type { TileFill, TileDot } from './tile-state'
 
+export type RingColor = 'amber' | 'green' | 'blue' | null
 export type DeckAction = 'back' | 'approve' | 'stop'
 export type TileIcon = { url: string | null; letter: string; hue: number; ready: boolean }
 export type KeySpec =
   | { kind: 'empty' }
-  | { kind: 'tab'; tabId: string; title: string; active: boolean; fill: TileFill; dot: TileDot; icons: TileIcon[] }
+  | { kind: 'tab'; style: 'icons'; tabId: string; title: string; active: boolean; fill: TileFill; dot: TileDot; icons: TileIcon[] }
+  | { kind: 'tab'; style: 'preview'; tabId: string; title: string; active: boolean; previewLines: string[]; ring: RingColor }
   | { kind: 'pager'; page: number; pageCount: number }
   | { kind: 'action'; action: DeckAction; enabled: boolean }
 export type StripSpec = { text: string } | null
@@ -56,6 +58,13 @@ export function visibleTabs<T>(tabs: T[], page: number, tabsPerPage: number): T[
   return tabs.slice(start, start + tabsPerPage)
 }
 
+export function ringColor(status: { busy: boolean; green: boolean; amber: boolean }): RingColor {
+  if (status.amber) return 'amber'
+  if (status.green) return 'green'
+  if (status.busy) return 'blue'
+  return null
+}
+
 function toAscii(text: string): string {
   return text.replace(/[^\x20-\x7e]/g, '?')
 }
@@ -77,9 +86,11 @@ export type FrameInputs = {
   page: number
   actionLayer: { tabId: string; approveEnabled: boolean; stopEnabled: boolean } | null
   iconReady: (url: string) => boolean
+  /** Live terminal tail for a tab; only invoked for terminal-previews style. */
+  previewFor: (tabId: string) => string[]
 }
 
-export function buildFrame({ model, caps, page, actionLayer, iconReady }: FrameInputs): FrameSpec {
+export function buildFrame({ model, caps, page, actionLayer, iconReady, previewFor }: FrameInputs): FrameSpec {
   const plan = planLayout(caps, model.tabs.length)
   const pages = pageCount(model.tabs.length, plan.tabsPerPage)
   const keys: KeySpec[] = Array.from({ length: plan.keyCount }, () => ({ kind: 'empty' as const }))
@@ -99,14 +110,21 @@ export function buildFrame({ model, caps, page, actionLayer, iconReady }: FrameI
   plan.tabSlots.forEach((keyIndex, slot) => {
     const tab = visible[slot]
     if (!tab) return
-    keys[keyIndex] = {
-      kind: 'tab', tabId: tab.id, title: tab.title, active: tab.active,
-      fill: tab.fill, dot: tab.dot,
-      icons: tab.repoIcons.map((icon) => ({
-        ...icon,
-        ready: icon.url !== null && iconReady(icon.url),
-      })),
-    }
+    keys[keyIndex] =
+      model.tileStyle === 'terminal-previews'
+        ? {
+            kind: 'tab', style: 'preview', tabId: tab.id, title: tab.title, active: tab.active,
+            previewLines: previewFor(tab.id),
+            ring: ringColor({ busy: tab.busy, green: tab.attention, amber: tab.pendingApproval }),
+          }
+        : {
+            kind: 'tab', style: 'icons', tabId: tab.id, title: tab.title, active: tab.active,
+            fill: tab.fill, dot: tab.dot,
+            icons: tab.repoIcons.map((icon) => ({
+              ...icon,
+              ready: icon.url !== null && iconReady(icon.url),
+            })),
+          }
   })
   if (plan.pagerKey !== null) keys[plan.pagerKey] = { kind: 'pager', page: current, pageCount: pages }
   return { keys, strip }

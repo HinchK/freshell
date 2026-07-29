@@ -1,5 +1,5 @@
 import type { DeckCapabilities } from './deck-device'
-import type { DeckAction, KeySpec } from './frame'
+import type { DeckAction, KeySpec, RingColor } from './frame'
 
 // Canvas draw layer: converts a KeySpec into an RGBA pixel buffer via an
 // injectable 2D-context factory (jsdom returns null from getContext, so tests
@@ -15,6 +15,17 @@ export type CtxFactory = (width: number, height: number) => Ctx2D
 export type KeyRenderer = (spec: KeySpec, caps: DeckCapabilities) => Uint8ClampedArray
 export type StripRenderer = (text: string, width: number, height: number) => Uint8ClampedArray
 
+export const PREVIEW_BG = '#0a0a0a'
+export const PREVIEW_TEXT_COLOR = '#a8a8a8'
+export const PREVIEW_FONT_SIZE = 11
+export const PREVIEW_LINE_HEIGHT = 13
+export const PREVIEW_CHAR_WIDTH = 5.5
+export const PREVIEW_LEFT_MARGIN = 3
+export const RING_COLORS: Record<Exclude<RingColor, null>, string> = {
+  amber: '#f59e0b',
+  green: '#22c55e',
+  blue: '#3b82f6',
+}
 export const BANNER_HEIGHT = 20
 export const BANNER_FILL = 'rgba(0,0,0,0.667)'
 export const TITLE_FONT_SIZE = 16
@@ -37,6 +48,19 @@ export const CONTROL_DIM = '#8888aa'
 export const EMPTY_BG = '#000000'
 export const STRIP_FONT_SIZE = 22
 export const MAX_TITLE_CHARS = 10
+
+export function previewGeometry(width: number, height: number): { lines: number; columns: number } {
+  return {
+    lines: Math.max(1, Math.floor((height - BANNER_HEIGHT - 2) / PREVIEW_LINE_HEIGHT) + 1),
+    columns: Math.max(1, Math.floor((width - PREVIEW_LEFT_MARGIN) / PREVIEW_CHAR_WIDTH)),
+  }
+}
+
+export function cropPreviewLines(lines: string[], maxLines: number, maxColumns: number): string[] {
+  const out = [...lines]
+  while (out.length > 0 && out[out.length - 1].trim() === '') out.pop()
+  return out.slice(-maxLines).map((l) => l.slice(0, maxColumns))
+}
 
 export function truncateTitle(title: string): string {
   return title.length > MAX_TITLE_CHARS ? `${title.slice(0, MAX_TITLE_CHARS - 1)}…` : title
@@ -81,7 +105,42 @@ function drawCenteredText(ctx: Ctx2D, text: string, w: number, y: number): void 
 const ACTION_LABELS: Record<DeckAction, string> = { back: 'BACK', approve: 'APPROVE', stop: 'STOP' }
 const ACTION_RING: Record<DeckAction, string> = { back: ACTIVE_COLOR, approve: APPROVE_COLOR, stop: STOP_COLOR }
 
-function drawTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, { kind: 'tab' }>, getIcon: IconSource): void {
+function drawPreviewTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, { kind: 'tab'; style: 'preview' }>): void {
+  ctx.fillStyle = PREVIEW_BG
+  ctx.fillRect(0, 0, w, h)
+
+  const { lines, columns } = previewGeometry(w, h)
+  const body = cropPreviewLines(spec.previewLines, lines, columns)
+  ctx.font = `${PREVIEW_FONT_SIZE}px monospace`
+  ctx.textBaseline = 'top'
+  ctx.fillStyle = PREVIEW_TEXT_COLOR
+  const baseY = h - body.length * PREVIEW_LINE_HEIGHT - 2
+  body.forEach((line, i) => {
+    if (line.trim() === '') return
+    ctx.fillText(line, PREVIEW_LEFT_MARGIN, baseY + i * PREVIEW_LINE_HEIGHT)
+  })
+
+  ctx.fillStyle = BANNER_FILL
+  ctx.fillRect(0, 0, w, BANNER_HEIGHT)
+
+  ctx.font = `${TITLE_FONT_SIZE}px sans-serif`
+  ctx.textBaseline = 'top'
+  ctx.fillStyle = ACTIVE_COLOR
+  const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 4)
+  drawCenteredText(ctx, label, w, 2)
+
+  const ring = spec.ring ? RING_COLORS[spec.ring] : null
+  if (ring && spec.active) {
+    drawRing(ctx, w, h, ring, 3, 0)
+    drawRing(ctx, w, h, ACTIVE_COLOR, 2, 3)
+  } else if (ring) {
+    drawRing(ctx, w, h, ring, 4, 0)
+  } else if (spec.active) {
+    drawRing(ctx, w, h, ACTIVE_COLOR, 3, 0)
+  }
+}
+
+function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, { kind: 'tab'; style: 'icons' }>, getIcon: IconSource): void {
   // 1. Background mirrors the tab bar state: no fill / green fill / barTop (fill + border below).
   ctx.fillStyle = spec.fill === 'none' ? TILE_BG : TILE_FILL_GREEN
   ctx.fillRect(0, 0, w, h)
@@ -131,6 +190,11 @@ function drawTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, { kind
   } else if (spec.active) {
     drawRing(ctx, w, h, ACTIVE_COLOR, 3, 0)
   }
+}
+
+function drawTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, { kind: 'tab' }>, getIcon: IconSource): void {
+  if (spec.style === 'preview') return drawPreviewTab(ctx, w, h, spec)
+  drawIconsTab(ctx, w, h, spec, getIcon)
 }
 
 function drawPager(
