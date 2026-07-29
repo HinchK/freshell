@@ -11,11 +11,32 @@
 //!   ⇒ the probe answers Absent ⇒ verdict `fresh` (identity never observed)
 //!   or `dead_session` (ledger already bound it). Acceptable either way:
 //!   zero turns means there is no conversation content to lose.
+//! - On-disk-but-index-invisible CLAUDE transcripts are the OPPOSITE
+//!   asymmetry (kata 09v1): a claude transcript can exist on disk yet carry
+//!   no cwd-bearing line (the e2e fixture creates a 0-byte file at session
+//!   create; crash-window partial writes can leave the same shape), so the
+//!   directory index's R10b gate excludes it and the warm index answers
+//!   Absent — while the attach arm (freshell-freshagent claude_snapshot.rs)
+//!   trusts raw file existence and would attempt resume on it. The
+//!   IndexExistenceProbe (freshell-server existence.rs) therefore falls back
+//!   to the attach arm's raw-file check (locate_transcript) before finalizing
+//!   Absent for claude ⇒ Present ⇒ OnDisk ⇒ respawn, never dead_session.
+//!   Do NOT re-extend the codex "acceptable either way" reasoning to claude:
+//!   adjudicating dead a transcript the attach arm would try to resume is the
+//!   two-arms-disagree bug this fix cures; if a resume genuinely cannot
+//!   succeed (validated: the real CLI prompt-exits on unresumable ids), the
+//!   pane converges to the honest, bounded dead_session{respawn_exhausted}
+//!   via the respawn cap instead of a false session_not_on_disk.
 //! - WATCH: codex `.jsonl.zst` cold-rollout compression (vendor feature,
 //!   default-OFF today) would hide ≥7-day-old sessions from the `.jsonl`-only
 //!   index walk ⇒ false Absent. Revisit if the vendor flag graduates.
-//! - WATCH: CLAUDE_CONFIG_DIR/CLAUDE_HOME reader/writer split (pre-existing
-//!   wave-A exposure, out of scope this lane).
+//! - WATCH (narrowed by kata 09v1): CLAUDE_CONFIG_DIR/CLAUDE_HOME
+//!   reader/writer split — the existence probe's claude Absent-fallback now
+//!   reads the attach arm's FULL ordered candidate-root set
+//!   (CLAUDE_CONFIG_DIR > CLAUDE_HOME > $HOME/.claude via
+//!   locate_transcript), so RECONCILE verdicts no longer depend on the
+//!   single-root index walk for file existence. The History index walk
+//!   itself still reads one root; that residual listing exposure remains.
 
 use freshell_protocol::{PaneVerdict, ReconcilePane, ReconcileVerdict, SessionLocator};
 
