@@ -22,6 +22,7 @@ import paneRuntimeActivityReducer from './paneRuntimeActivitySlice'
 import { networkReducer } from './networkSlice'
 import tabRegistryReducer from './tabRegistrySlice'
 import extensionsReducer from './extensionsSlice'
+import deckReducer from './deckSlice'
 import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
@@ -66,6 +67,8 @@ export const store = configureStore({
     network: networkReducer,
     tabRegistry: tabRegistryReducer,
     extensions: extensionsReducer,
+    // Ephemeral device state — never persisted (allowlist rule)
+    deck: deckReducer,
   },
   middleware: (getDefault) =>
     getDefault({

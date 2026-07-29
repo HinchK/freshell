@@ -41,6 +41,7 @@ import { useOrientation } from '@/hooks/useOrientation'
 import { useFullscreen } from '@/hooks/useFullscreen'
 import { useElectronExternalLinks } from '@/hooks/useElectronExternalLinks'
 import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotifications'
+import { useStreamDeck } from '@/hooks/useStreamDeck'
 import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
 import { startTabRegistrySync } from '@/store/tabRegistrySync'
@@ -167,6 +168,7 @@ export default function App() {
   useThemeEffect()
   useTurnCompletionNotifications()
   useElectronExternalLinks()
+  useStreamDeck()
 
   const dispatch = useAppDispatch()
   const appStore = useAppStore()
