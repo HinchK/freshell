@@ -121,6 +121,12 @@ pub struct CliLaunchInputs<'a> {
     /// the reference's `port > 65535` throw condition is representable (G-O4).
     pub opencode_server: Option<(&'a str, i64)>,
     pub mcp_injection: McpInjection,
+    /// Precomputed by the IO layer (like `mcp_injection` — this resolver never
+    /// does fs I/O): `Some(<abs path to the freshell-owned tui.json>)` when the
+    /// opencode rebind-plugin install succeeded at the call site, `None`
+    /// otherwise (non-opencode pane, unresolvable home, or install failure —
+    /// skip injection, degrading to today's no-rebind behavior).
+    pub opencode_rebind_tui_config: Option<String>,
 }
 
 /// The `resolveCodingCliCommand` throw conditions as typed errors with
@@ -254,6 +260,20 @@ fn merged_env_truthy(
         return if v.is_empty() { None } else { Some(v.clone()) };
     }
     env_truthy(parent, key)
+}
+
+/// Merged-view env lookup with JS spread semantics: a key present in
+/// `command_env` (even empty) SHADOWS the process env. Companion to
+/// [`merged_env_truthy`], returning the value instead of truthiness.
+fn merged_env_value(
+    parent: &dyn Env,
+    command_env: &BTreeMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    if let Some(v) = command_env.get(key) {
+        return Some(v.clone());
+    }
+    parent.get(key)
 }
 
 /// `resolveGoogleApiKey` (`server/opencode-launch.ts:7-9`):
@@ -418,6 +438,30 @@ pub fn resolve_coding_cli_command(
         let overrides = get_opencode_env_overrides(env, &command_env);
         for (k, v) in overrides {
             command_env.insert(k, v);
+        }
+        // Freshell TUI rebind plugin (docs/plans/2026-07-28-opencode-tui-rebind.md):
+        // the IO layer installed the plugin + plugin-only tui.json into
+        // ~/.freshell/opencode/ and passed the tui.json path via
+        // inputs.opencode_rebind_tui_config (the mcp_injection precedent — this
+        // resolver stays pure). Point this pane's TUI at it via OPENCODE_TUI_CONFIG.
+        // Main-config plugins (opencode.json / OPENCODE_CONFIG_CONTENT) load as
+        // SERVER plugins only and never reach the TUI plugin host; TUI config
+        // sources MERGE and plugin arrays UNION, so the injected plugin-only file
+        // can never shadow user config (validated on opencode 1.18.8/1.18.9).
+        // Skips (each degrades to today's no-rebind behavior): user-set
+        // OPENCODE_TUI_CONFIG (a path var cannot be merged — preserve the user's
+        // value), the FRESHELL_OPENCODE_REBIND=0/false kill switch (opencode
+        // self-updates in place), and a None input (unresolvable home or install
+        // failure at the IO layer, which warn-logs and never blocks the launch).
+        let rebind_disabled = matches!(
+            merged_env_value(env, &command_env, "FRESHELL_OPENCODE_REBIND").as_deref(),
+            Some("0") | Some("false")
+        );
+        let user_tui_config = merged_env_value(env, &command_env, "OPENCODE_TUI_CONFIG");
+        if !rebind_disabled && user_tui_config.is_none() {
+            if let Some(tui_config) = &inputs.opencode_rebind_tui_config {
+                command_env.insert("OPENCODE_TUI_CONFIG".to_string(), tui_config.clone());
+            }
         }
     }
     if inputs.mode == "codex" {

@@ -531,6 +531,39 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
     mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
 }
 
+/// Freshell opencode TUI rebind plugin, REST side — the IO-layer half of the
+/// injection (`cli_launch.rs` consumes the result via
+/// `CliLaunchInputs::opencode_rebind_tui_config`, the `mcp_injection`
+/// precedent; same precompute as the WS create path,
+/// `crates/freshell-ws/src/terminal.rs::opencode_rebind_precompute`): install
+/// the plugin + plugin-only tui.json under the real process env's home and
+/// return the tui.json path. Home resolution mirrors
+/// `ClaudeSignalWatcher::default_root` (`claude_signal.rs:52-66`):
+/// `%USERPROFILE%` on Windows, `$HOME` otherwise; empty/unset ⇒ `None` ⇒
+/// skip injection. Install failure warn-logs and returns `None` — it must
+/// never block the launch.
+fn opencode_rebind_precompute() -> Option<String> {
+    #[cfg(windows)]
+    let base = std::env::var("USERPROFILE").ok()?;
+    #[cfg(not(windows))]
+    let base = std::env::var("HOME").ok()?;
+    if base.is_empty() {
+        return None;
+    }
+    match freshell_platform::opencode_plugin::ensure_rebind_plugin_installed(std::path::Path::new(
+        &base,
+    )) {
+        Ok(tui_config) => Some(tui_config.display().to_string()),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "opencode_rebind_plugin_install_failed: launching without rebind signal"
+            );
+            None
+        }
+    }
+}
+
 /// `agentRouteErrorStatus` (`router.ts:54-59`), scoped to the launch errors this
 /// branch can produce: `CodexLaunchConfigError` → 400 (an input error — invalid
 /// sandbox); every other launch failure (runtime/proxy IO, planner shutdown) → 500.
@@ -1277,6 +1310,16 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             );
         }
 
+        // Freshell opencode TUI rebind plugin: the install (fs I/O) happens
+        // HERE at the IO layer; the pure resolver only reads the result from
+        // CliLaunchInputs (mcp_injection precedent). Failure must never block
+        // the launch.
+        let opencode_rebind_tui_config = if mode == "opencode" {
+            opencode_rebind_precompute()
+        } else {
+            None
+        };
+
         let inputs = CliLaunchInputs {
             mode: &mode,
             target,
@@ -1307,6 +1350,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                 .as_ref()
                 .map(|ep| (ep.hostname.as_str(), ep.port as i64)),
             mcp_injection,
+            opencode_rebind_tui_config,
         };
         let launch = match resolve_coding_cli_command(&state.cli_commands, &inputs, &RealEnv) {
             Ok(l) => l,

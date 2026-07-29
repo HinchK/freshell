@@ -1001,6 +1001,37 @@ fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> boo
     mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
 }
 
+/// Freshell opencode TUI rebind plugin — the IO-layer half of the injection
+/// (`cli_launch.rs` consumes the result via
+/// `CliLaunchInputs::opencode_rebind_tui_config`, the `mcp_injection`
+/// precedent): install the plugin + plugin-only tui.json under the real
+/// process env's home and return the tui.json path. Home resolution mirrors
+/// `ClaudeSignalWatcher::default_root` (`claude_signal.rs:52-66`):
+/// `%USERPROFILE%` on Windows, `$HOME` otherwise; empty/unset ⇒ `None` ⇒
+/// skip injection. Install failure warn-logs and returns `None` — it must
+/// never block the launch.
+fn opencode_rebind_precompute() -> Option<String> {
+    #[cfg(windows)]
+    let base = std::env::var("USERPROFILE").ok()?;
+    #[cfg(not(windows))]
+    let base = std::env::var("HOME").ok()?;
+    if base.is_empty() {
+        return None;
+    }
+    match freshell_platform::opencode_plugin::ensure_rebind_plugin_installed(std::path::Path::new(
+        &base,
+    )) {
+        Ok(tui_config) => Some(tui_config.display().to_string()),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "opencode_rebind_plugin_install_failed: launching without rebind signal"
+            );
+            None
+        }
+    }
+}
+
 /// Provider settings `codingCli.providers[mode]` (`ws:2317-2319`) as
 /// `(permission_mode, model, sandbox)`, with the codex strip (`ws:2464-2465`
 /// — model/sandbox/permissionMode route to the app-server plan instead).
@@ -1986,6 +2017,16 @@ pub(crate) async fn handle_create(
         }
     };
 
+    // Freshell opencode TUI rebind plugin: the install (fs I/O) happens HERE at
+    // the IO layer; the pure resolver only reads the result from
+    // CliLaunchInputs (mcp_injection precedent). Failure must never block the
+    // launch.
+    let opencode_rebind_tui_config = if mode == "opencode" {
+        opencode_rebind_precompute()
+    } else {
+        None
+    };
+
     // The full `resolveCodingCliCommand` (`tr:274-375`) — typed throws surface as
     // `error` frames with the reference-exact message; never a bare-command launch.
     let inputs = CliLaunchInputs {
@@ -2001,6 +2042,7 @@ pub(crate) async fn handle_create(
             .as_ref()
             .map(|ep| (ep.hostname.as_str(), ep.port as i64)),
         mcp_injection,
+        opencode_rebind_tui_config,
     };
     let cli = match resolve_coding_cli_command(&state.cli_commands, &inputs, &RealEnv) {
         Ok(l) => l,
@@ -2612,6 +2654,15 @@ pub async fn respawn_agent_terminal(
         Err(e) => return Err(RespawnError::LaunchUnresolvable(e.message)),
     };
 
+    // Freshell opencode TUI rebind plugin — same IO-layer precompute as
+    // `handle_create` (the respawn seam derives launch params identically;
+    // failure must never block the launch).
+    let opencode_rebind_tui_config = if mode == "opencode" {
+        opencode_rebind_precompute()
+    } else {
+        None
+    };
+
     // The full `resolveCodingCliCommand` — typed throws surface as
     // `LaunchUnresolvable`; never a bare-command launch.
     let inputs = CliLaunchInputs {
@@ -2627,6 +2678,7 @@ pub async fn respawn_agent_terminal(
             .as_ref()
             .map(|ep| (ep.hostname.as_str(), ep.port as i64)),
         mcp_injection,
+        opencode_rebind_tui_config,
     };
     let cli = match resolve_coding_cli_command(&state.cli_commands, &inputs, &RealEnv) {
         Ok(l) => l,

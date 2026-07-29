@@ -862,6 +862,18 @@ async fn main() -> ExitCode {
             freshell_ws::claude_signal::ClaudeSignalWatcher::new(signal_root),
         );
     }
+    // Opencode TUI-plugin signal sweep — drains the signal files the injected
+    // freshell-rebind plugin writes
+    // (`$HOME/.freshell/session-signals/opencode/<terminal_id>__<nonce>.json`)
+    // and rebinds a live opencode pane whose TUI navigated to a NEW session
+    // mid-session (session_new / session_list / session_child_cycle). `None`
+    // root (unresolvable HOME) skips the sweep, mirroring the claude sweep.
+    if let Some(signal_root) = freshell_ws::opencode_signal::OpencodeSignalWatcher::default_root() {
+        freshell_ws::opencode_signal::spawn_opencode_signal_sweep(
+            ws_state.clone(),
+            freshell_ws::opencode_signal::OpencodeSignalWatcher::new(signal_root),
+        );
+    }
     // DIAG-05: the diag router's `sessionsProjects` reads the SAME session
     // index (clone before the move below into `session_directory_state`).
     let diag_session_index = session_index.clone();
