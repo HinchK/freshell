@@ -455,6 +455,27 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     holdKey(device, 1, 600) // long-press whatever now occupies key 1
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'action', action: 'back' })
   })
+
+  describe('deck font loading', () => {
+    it('font ready forces a full repaint of otherwise-unchanged keys, and stop() cancels the wait', () => {
+      let fontCb: (() => void) | null = null
+      let cancelled = false
+      const { device, controller } = setup({ tabs: 2 }, undefined, defaultSettings, {
+        fontReady: (onReady) => {
+          fontCb = onReady
+          return () => { cancelled = true }
+        },
+      })
+      expect(fontCb).not.toBeNull()
+      // Steady state: nothing changed, so a plain repaint would paint zero keys.
+      device.keyImages.clear()
+      fontCb!()
+      // The font hook invalidates the diff cache -> every visible key repaints.
+      expect(device.keyImages.size).toBeGreaterThan(0)
+      controller.stop()
+      expect(cancelled).toBe(true)
+    })
+  })
 })
 
 describe('tile styles', () => {

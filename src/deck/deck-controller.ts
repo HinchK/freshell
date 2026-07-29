@@ -27,6 +27,7 @@ import { fetchRepoIconMeta } from '@/store/repoIconsSlice'
 import { resolvePaneRepoCwd } from '@/lib/repo-icon'
 import { IconImageCache, getIconImageCache } from './icon-image-cache'
 import { defaultCtxFactory, renderKey as canvasRenderKey, renderStrip as canvasRenderStrip } from './tile-renderer'
+import { whenDeckFontReady } from './deck-font'
 
 export type DeckControllerOptions = {
   store: DeckStore & { subscribe(cb: () => void): () => void }
@@ -36,6 +37,8 @@ export type DeckControllerOptions = {
   settings: () => { brightness: number; idleBrightness: number; idleTimeoutSeconds: number; tileStyle: DeckTileStyle }
   now?: () => number
   iconCache?: IconImageCache
+  /** Injectable font-ready hook (defaults to whenDeckFontReady); tests drive it directly. */
+  fontReady?: (onReady: () => void) => () => void
 }
 
 /** What a key displayed at press-down - snapshotted so re-sorts can't retarget a press. */
@@ -76,6 +79,9 @@ export class DeckController {
   private intervalId: ReturnType<typeof setInterval> | null = null
   private onVisibilityChange: (() => void) | null = null
 
+  private readonly fontReady: (onReady: () => void) => () => void
+  private cancelFontWait: (() => void) | null = null
+
   constructor(options: DeckControllerOptions) {
     this.store = options.store
     this.device = options.device
@@ -85,6 +91,7 @@ export class DeckController {
     this.renderStripFn = options.renderStrip ?? ((text, width, height) => canvasRenderStrip(text, width, height, defaultCtxFactory))
     this.settings = options.settings
     this.now = options.now ?? (() => Date.now())
+    this.fontReady = options.fontReady ?? whenDeckFontReady
   }
 
   start(): void {
@@ -93,6 +100,13 @@ export class DeckController {
     this.repaint()
     this.probeRepoIcons()
     this.unsubscribeIcons = this.iconCache.subscribe(() => this.repaint())
+    this.cancelFontWait = this.fontReady(() => {
+      // A font load changes no KeySpec, so the JSON diff (repaint(), line ~148)
+      // would paint nothing: invalidate the caches to force a real repaint in Inter.
+      this.lastPaintedSpecs = []
+      this.lastStripText = null
+      this.repaint()
+    })
     this.unsubscribeStore = this.store.subscribe(() => this.onStoreChange())
     this.unsubscribeInput = this.device.onInput((event) => this.handleInput(event))
     this.intervalId = setInterval(() => this.tick(), TICK_MS)
@@ -110,6 +124,8 @@ export class DeckController {
     this.unsubscribeInput = null
     this.unsubscribeIcons?.()
     this.unsubscribeIcons = null
+    this.cancelFontWait?.()
+    this.cancelFontWait = null
     if (this.intervalId !== null) {
       clearInterval(this.intervalId)
       this.intervalId = null
