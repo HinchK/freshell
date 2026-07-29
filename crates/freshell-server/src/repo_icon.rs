@@ -219,7 +219,7 @@ async fn serve_icon(
         Ok((_, None)) => return crate::files::not_found("No repo icon detected"),
         Err(failure) => return failure_response(failure),
     };
-    let Ok(bytes) = std::fs::read(&icon.path) else {
+    let Ok(mut bytes) = std::fs::read(&icon.path) else {
         return crate::files::not_found("No repo icon detected");
     };
     let ext = icon
@@ -232,6 +232,17 @@ async fn serve_icon(
     // file may have changed between detection and serving.
     if ext == "svg" && svg_is_dangerous(&String::from_utf8_lossy(&bytes)) {
         return crate::files::not_found("No repo icon detected");
+    }
+    let mut content_type = content_type_for(&ext);
+    // .icns cannot render in <img>; serve the embedded PNG instead.
+    if ext == "icns" {
+        match crate::repo_icon_detect::icns_embedded_png(&bytes) {
+            Some(png) => {
+                bytes = png;
+                content_type = "image/png";
+            }
+            None => return crate::files::not_found("No repo icon detected"),
+        }
     }
     let mtime_ms = icon
         .mtime
@@ -254,10 +265,7 @@ async fn serve_icon(
     }
     let mut resp = (StatusCode::OK, bytes).into_response();
     let h = resp.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(content_type_for(&ext)),
-    );
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     h.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=60"),
@@ -437,6 +445,38 @@ mod tests {
         )
         .await;
         assert_eq!(resp2.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[tokio::test]
+    async fn serves_icns_winner_as_png() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("proj");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        // Build an icns wrapping a 128x128 synthetic PNG (same layout as icns_tests).
+        let mut png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&128u32.to_be_bytes());
+        png.extend_from_slice(&128u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        let mut body = b"ic07".to_vec();
+        body.extend_from_slice(&((png.len() as u32) + 8).to_be_bytes());
+        body.extend_from_slice(&png);
+        let mut icns = b"icns".to_vec();
+        icns.extend_from_slice(&((body.len() as u32) + 8).to_be_bytes());
+        icns.extend_from_slice(&body);
+        fs::write(repo.join("icon.icns"), icns).unwrap();
+
+        let resp = get(router(test_state()), &icon_uri(&repo), true, &[]).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers().get("content-type").unwrap(), "image/png");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            &bytes[0..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
     }
 
     #[tokio::test]

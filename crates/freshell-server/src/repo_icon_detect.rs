@@ -48,6 +48,38 @@ pub(crate) fn ico_largest_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     best
 }
 
+/// ICNS container: 8-byte header (b"icns" + BE total len), then elements of
+/// 4-byte type + 4-byte BE len (incl. the 8-byte element header) + payload.
+/// Modern element types carry raw PNG; return the widest embedded PNG.
+pub(crate) fn icns_embedded_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() < 8 || &bytes[0..4] != b"icns" {
+        return None;
+    }
+    let mut off = 8usize;
+    let mut best: Option<(u32, Vec<u8>)> = None;
+    while off + 8 <= bytes.len() {
+        let len = u32::from_be_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]) as usize;
+        if len < 8 || off + len > bytes.len() {
+            break;
+        }
+        let data = &bytes[off + 8..off + len];
+        if data.len() >= 8 && data[0..8] == PNG_SIG {
+            let width = png_dimensions(data).map(|(w, _)| w).unwrap_or(0);
+            if best.as_ref().is_none_or(|(bw, _)| width > *bw) {
+                best = Some((width, data.to_vec()));
+            }
+        }
+        off += len;
+    }
+    best.map(|(_, png)| png)
+}
+
 /// Best-effort SVG dimensions from width/height attributes or viewBox.
 /// Unknown dimensions are acceptable (caller treats `None` as "no aspect data").
 pub(crate) fn svg_dimensions(text: &str) -> Option<(f64, f64)> {
@@ -171,7 +203,7 @@ const REJECTED_PATH_COMPONENTS: &[&str] = &[
     "out",
     "coverage",
 ];
-const REJECTED_EXTENSIONS: &[&str] = &["icns", "xml", "icon"];
+const REJECTED_EXTENSIONS: &[&str] = &["xml", "icon"];
 
 #[derive(Debug, Clone)]
 pub(crate) struct Candidate {
@@ -217,11 +249,17 @@ pub(crate) fn score_candidate(repo_root: &Path, cand: &Candidate) -> Option<i64>
     let mut score = cand.tier_base + cand.extra;
     let is_raster = matches!(
         ext.as_str(),
-        "png" | "ico" | "jpg" | "jpeg" | "gif" | "webp"
+        "png" | "ico" | "jpg" | "jpeg" | "gif" | "webp" | "icns"
     );
     let dims: Option<(f64, f64)> = match ext.as_str() {
         "png" => png_dimensions(&bytes).map(|(w, h)| (f64::from(w), f64::from(h))),
         "ico" => ico_largest_dimensions(&bytes).map(|(w, h)| (f64::from(w), f64::from(h))),
+        "icns" => {
+            let Some(png) = icns_embedded_png(&bytes) else {
+                return None; // .icns with no embedded PNG cannot be served
+            };
+            png_dimensions(&png).map(|(w, h)| (f64::from(w), f64::from(h)))
+        }
         "svg" => {
             let text = String::from_utf8_lossy(&bytes);
             if svg_is_dangerous(&text) {
@@ -262,7 +300,7 @@ pub(crate) fn score_candidate(repo_root: &Path, cand: &Candidate) -> Option<i64>
     if stem == "icon" {
         score += 5;
     }
-    if matches!(ext.as_str(), "png" | "ico" | "svg") {
+    if matches!(ext.as_str(), "png" | "ico" | "svg" | "icns") {
         score += 5;
     }
     Some(score)
@@ -734,7 +772,7 @@ fn tier2(sink: &mut CandidateSink) {
 /// Shallow scan of `dir` for files whose lowercase basename starts with one of
 /// `prefixes` and has an icon-ish extension. Lexicographic order for determinism.
 fn push_dir_prefix_matches(sink: &mut CandidateSink, dir: &Path, prefixes: &[&str], tier: i64) {
-    const EXTS: &[&str] = &["svg", "png", "ico", "webp", "jpg"];
+    const EXTS: &[&str] = &["svg", "png", "ico", "webp", "jpg", "icns"];
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -833,7 +871,7 @@ fn stem_name_bonus(stem_lower: &str) -> Option<i64> {
 /// spent near the root where real icons live. Depth penalty (-2/level) plus
 /// the name bonus ride the `extra` field so `score_candidate` stays untouched.
 fn tier4_walk(sink: &mut CandidateSink, max_entries: usize) {
-    const EXTS: &[&str] = &["svg", "png", "ico", "webp", "jpg", "jpeg", "gif"];
+    const EXTS: &[&str] = &["svg", "png", "ico", "webp", "jpg", "jpeg", "gif", "icns"];
     let root = sink.repo_root.clone();
     let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
     queue.push_back((root, 0));
@@ -1057,6 +1095,8 @@ mod scoring_tests {
             score_candidate(&root, &cand(&root, "node_modules/pkg/icon.png", TIER3, 0)),
             None
         );
+        // .icns is no longer rejected by extension, but one without an
+        // embedded PNG (here: not even a valid ICNS container) is rejected.
         fs::write(root.join("icon.icns"), b"whatever").unwrap();
         assert_eq!(
             score_candidate(&root, &cand(&root, "icon.icns", TIER3, 0)),
@@ -1640,5 +1680,70 @@ mod tier4_tests {
         for _ in 0..5 {
             assert_eq!(detect_icon(root), first);
         }
+    }
+}
+
+#[cfg(test)]
+mod icns_tests {
+    use super::*;
+
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut bytes: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&w.to_be_bytes());
+        bytes.extend_from_slice(&h.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes
+    }
+
+    /// ICNS container wrapping the given elements: (type, payload).
+    fn icns_bytes(elements: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        for (typ, data) in elements {
+            body.extend_from_slice(*typ);
+            body.extend_from_slice(&((data.len() as u32) + 8).to_be_bytes());
+            body.extend_from_slice(data);
+        }
+        let mut out = b"icns".to_vec();
+        out.extend_from_slice(&((body.len() as u32) + 8).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn extracts_largest_embedded_png() {
+        let small = png_bytes(32, 32);
+        let large = png_bytes(256, 256);
+        let icns = icns_bytes(&[(b"ic04", &small), (b"ic09", &large)]);
+        let extracted = icns_embedded_png(&icns).unwrap();
+        assert_eq!(png_dimensions(&extracted), Some((256, 256)));
+    }
+
+    #[test]
+    fn icns_without_png_yields_none() {
+        let icns = icns_bytes(&[(b"ic04", b"notapng")]);
+        assert!(icns_embedded_png(&icns).is_none());
+        assert!(icns_embedded_png(b"garbage").is_none());
+    }
+
+    #[test]
+    fn detects_icns_icon_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        let png = png_bytes(128, 128);
+        let icns = icns_bytes(&[(b"ic07", &png)]);
+        std::fs::write(root.join("assets/AppIcon.icns"), icns).unwrap();
+        assert_eq!(detect_icon(root), Some(root.join("assets/AppIcon.icns")));
+    }
+
+    #[test]
+    fn icns_without_embedded_png_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let icns = icns_bytes(&[(b"is32", b"\x00\x01\x02\x03")]);
+        std::fs::write(root.join("icon.icns"), icns).unwrap();
+        assert_eq!(detect_icon(root), None);
     }
 }
