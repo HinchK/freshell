@@ -291,6 +291,7 @@ type TerminalInputBlockedReason =
   | 'codex_recovery_pending'
   | 'codex_clean_exit_decision_pending'
   | 'codex_lifecycle_loss_pending'
+  | 'unknown_terminal'
 
 function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string {
   switch (reason) {
@@ -306,6 +307,8 @@ function terminalInputBlockedNotice(reason: TerminalInputBlockedReason): string 
       return 'Input not sent: Codex did not provide restore state before startup timed out. Start a new Codex pane or resume inside Codex.'
     case 'codex_identity_unavailable':
       return 'Input not sent: Codex did not provide restorable session state. Start a new Codex pane or resume inside Codex.'
+    case 'unknown_terminal':
+      return 'Input not sent: the terminal no longer exists on the server.'
   }
 }
 

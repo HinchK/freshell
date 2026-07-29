@@ -462,3 +462,17 @@ fn tabs_sync_ack_roundtrips_with_and_without_persist_fields() {
         other => panic!("expected TabsSyncAck, got {other:?}"),
     }
 }
+
+#[test]
+fn terminal_input_blocked_unknown_terminal_roundtrips_and_conforms() {
+    // Silent-loss fix (kata dtfn): the first Rust emitter of
+    // `terminal.input.blocked` uses this reason for input to an unknown id.
+    let wire = r#"{"type":"terminal.input.blocked","reason":"unknown_terminal","terminalId":"t1"}"#;
+    match server_roundtrip(wire, "terminal.input.blocked") {
+        ServerMessage::TerminalInputBlocked(b) => {
+            assert_eq!(b.reason, TerminalInputBlockedReason::UnknownTerminal);
+            assert_eq!(b.terminal_id, "t1");
+        }
+        other => panic!("expected TerminalInputBlocked, got {other:?}"),
+    }
+}

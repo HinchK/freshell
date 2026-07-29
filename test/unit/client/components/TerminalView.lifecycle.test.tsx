@@ -3121,6 +3121,36 @@ describe('TerminalView lifecycle updates', () => {
     expectTerminalWriteContaining(term, 'Input not sent: Codex is checking whether the session is still active. Try again in a moment.')
   })
 
+  it('shows feedback when input is blocked because the terminal no longer exists', async () => {
+    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+      terminalId: 'term-gone',
+      status: 'running',
+      mode: 'shell',
+    })
+
+    render(
+      <Provider store={store}>
+        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+      </Provider>
+    )
+
+    await waitFor(() => {
+      expect(messageHandler).not.toBeNull()
+      expect(terminalInstances.length).toBeGreaterThan(0)
+    })
+
+    act(() => {
+      messageHandler!({
+        type: 'terminal.input.blocked',
+        terminalId: 'term-gone',
+        reason: 'unknown_terminal',
+      })
+    })
+
+    const term = terminalInstances[0]
+    expectTerminalWriteContaining(term, 'Input not sent: the terminal no longer exists on the server.')
+  })
+
   it('mirrors canonical durable identity to pane and tab on terminal.session.associated', async () => {
     const tabId = 'tab-session-assoc'
     const paneId = 'pane-session-assoc'
