@@ -19,11 +19,13 @@ import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import settingsReducer from '@/store/settingsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
-import repoIconsReducer from '@/store/repoIconsSlice'
+import repoIconsReducer, { type RepoIconEntry } from '@/store/repoIconsSlice'
+import type { Tab } from '@/store/types'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
-import { DeckController } from '@/deck/deck-controller'
+import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
+import { IconImageCache } from '@/deck/icon-image-cache'
 import type { KeySpec } from '@/deck/frame'
 
 const reducer = {
@@ -38,11 +40,17 @@ const s1Key = makeFreshAgentSessionKey({ sessionType: 'freshclaude', provider: '
 
 type DeckStoreOpts = {
   tabs?: number // tab count (t1..tN), default 2
+  activeTab?: string // tabs.activeTabId seed, default 't1'
   busy?: string[] // terminalIds marked busy via claudeActivity
   attention?: Record<string, boolean> // attentionByTab seed
   freshAgentTab?: number // 1-based tab index hosting the fresh-agent pane (session s1)
   pendingPermissions?: Record<string, { requestId: string }>
   freshAgentRunning?: boolean
+  paneStatus?: Record<string, Tab['status']> // per-pane content status override (p1..pN)
+  /** Seed state.terminalMeta.byTerminalId (terminalId/updatedAt filled in). */
+  terminalMeta?: Record<string, { cwd?: string; repoRoot?: string; checkoutRoot?: string }>
+  /** Seed state.repoIcons.byCwd. */
+  repoIcons?: Record<string, RepoIconEntry>
 }
 
 // Local extraction of the deck-controller unit-suite fixture builder: tabs
@@ -61,7 +69,7 @@ function makeDeckStore(opts: DeckStoreOpts = {}) {
       type: 'leaf', id: `p${i}`,
       content: isAgent
         ? { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', sessionId: 's1', createRequestId: `c${i}`, status: 'running' }
-        : { kind: 'terminal', terminalId: `term-${i}`, createRequestId: `c${i}`, status: 'running', mode: 'claude' },
+        : { kind: 'terminal', terminalId: `term-${i}`, createRequestId: `c${i}`, status: opts.paneStatus?.[`p${i}`] ?? 'running', mode: 'claude' },
     }
     activePane[`t${i}`] = `p${i}`
   }
@@ -71,7 +79,17 @@ function makeDeckStore(opts: DeckStoreOpts = {}) {
   return configureStore({
     reducer,
     preloadedState: {
-      tabs: { tabs, activeTabId: 't1', renameRequestTabId: null, tombstones: [] },
+      ...(opts.terminalMeta
+        ? {
+            terminalMeta: {
+              byTerminalId: Object.fromEntries(Object.entries(opts.terminalMeta).map(
+                ([terminalId, meta]) => [terminalId, { terminalId, updatedAt: 0, ...meta }],
+              )),
+            },
+          }
+        : {}),
+      ...(opts.repoIcons ? { repoIcons: { byCwd: opts.repoIcons } } : {}),
+      tabs: { tabs, activeTabId: opts.activeTab ?? 't1', renameRequestTabId: null, tombstones: [] },
       panes: {
         layouts, activePane,
         paneTitles: {}, paneTitleSetByUser: {}, renameRequestTabId: null, renameRequestPaneId: null,
@@ -119,7 +137,12 @@ const defaultSettings = (): DeckSettings => ({ brightness: 100, idleBrightness: 
 
 let activeController: DeckController | null = null
 
-function setup(opts: DeckStoreOpts = {}, caps?: DeckCapabilities, settings: () => DeckSettings = defaultSettings) {
+function setup(
+  opts: DeckStoreOpts = {},
+  caps?: DeckCapabilities,
+  settings: () => DeckSettings = defaultSettings,
+  extra?: Partial<DeckControllerOptions>,
+) {
   const store = makeDeckStore(opts)
   const device = new FakeDeckDevice(caps)
   const controller = new DeckController({
@@ -128,10 +151,20 @@ function setup(opts: DeckStoreOpts = {}, caps?: DeckCapabilities, settings: () =
     renderKey: (spec) => encodeSpec(spec),
     renderStrip: (text) => new TextEncoder().encode(text) as unknown as Uint8ClampedArray,
     settings,
+    ...extra,
   })
   controller.start()
   activeController = controller
   return { store, device, controller }
+}
+
+// Deferred icon loader, ported from icon-image-cache.test.ts: resolve/reject each
+// url by hand. jsdom never loads images, so post-load assertions REQUIRE this.
+function deferredLoader() {
+  const pending = new Map<string, { resolve: (b: CanvasImageSource) => void; reject: (e: Error) => void }>()
+  const loader = (url: string) =>
+    new Promise<CanvasImageSource>((resolve, reject) => pending.set(url, { resolve, reject }))
+  return { loader, pending }
 }
 
 function holdKey(device: FakeDeckDevice, keyIndex: number, ms: number) {
@@ -319,5 +352,77 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     expect(device.keyImages.size).toBe(0) // no repaints after stop
     expect(device.stripImage).toBeNull()
     expect(device.brightnessHistory.length).toBe(brightnessCalls)
+  })
+
+  it('keys are sorted by status priority and stable within groups', () => {
+    // 5 tabs: t1 exited(rest), t2 busy(blue), t3 idle-running(green icon),
+    // t4 attention(green fill), t5 active+attention(barTop)
+    const { device } = setup({
+      tabs: 5, activeTab: 't5',
+      paneStatus: { p1: 'exited' }, busy: ['term-2'], attention: { t4: true, t5: true },
+    })
+    const ids = [0, 1, 2, 3, 4].map((k) => {
+      const spec = decodeKey(device, k)
+      return spec?.kind === 'tab' ? spec.tabId : null
+    })
+    expect(ids).toEqual(['t5', 't4', 't3', 't2', 't1'])
+  })
+
+  it('tiles carry the three background treatments and the active ring flag', () => {
+    const { device } = setup({ tabs: 3, activeTab: 't1', attention: { t1: true, t2: true } })
+    expect(decodeKey(device, 0)).toMatchObject({ tabId: 't1', fill: 'barTop', active: true })
+    expect(decodeKey(device, 1)).toMatchObject({ tabId: 't2', fill: 'green', active: false })
+    expect(decodeKey(device, 2)).toMatchObject({ tabId: 't3', fill: 'none', active: false })
+  })
+
+  it('busy and idle-running tabs expose blue/green dots', () => {
+    const { device } = setup({ tabs: 2, busy: ['term-2'] })
+    expect(decodeKey(device, 0)).toMatchObject({ tabId: 't1', dot: 'green' }) // idle running
+    expect(decodeKey(device, 1)).toMatchObject({ tabId: 't2', dot: 'blue' })  // busy sorts after green
+  })
+
+  it('repo icons: unready at first paint, repaint to ready when the bitmap loads', async () => {
+    // Requires both harness extensions (Interfaces): setup()'s 4th extra-controller-options
+    // param (else { iconCache } is silently ignored and pending stays empty) and the
+    // deferredLoader helper ported from icon-image-cache.test.ts.
+    const { loader, pending } = deferredLoader()
+    const cache = new IconImageCache(loader)
+    const { device } = setup({
+      tabs: 1,
+      terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
+      repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
+    }, undefined, defaultSettings, { iconCache: cache })
+    const before = decodeKey(device, 0)
+    expect(before).toMatchObject({ icons: [{ letter: 'A', ready: false }] })
+    pending.get((before as Extract<KeySpec, { kind: 'tab' }>).icons[0].url!)!.resolve({} as CanvasImageSource)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(decodeKey(device, 0)).toMatchObject({ icons: [{ letter: 'A', ready: true }] })
+  })
+
+  it('pager pages over the SORTED order', () => {
+    // 8 tabs on a 6-key Mini -> 5 tab slots + pager. Make t8 attention: it must appear on page 1 key 0.
+    const { device } = setup({ tabs: 8, attention: { t8: true } })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't8' })
+    expect(decodeKey(device, 5)).toMatchObject({ kind: 'pager', page: 1, pageCount: 2 })
+    device.press(5) // next page
+    // Sorted order: t8,t1,t2,t3,t4 on page 1 (5 tab slots); t5,t6,t7 on page 2.
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't5' })
+  })
+
+  it('a mid-press re-sort does not retarget the press (e2e)', () => {
+    const { store, device } = setup({ tabs: 2, activeTab: 't1' })
+    device.emit({ type: 'keyDown', keyIndex: 1 })
+    store.dispatch(markTabAttention({ tabId: 't2' })) // from '@/store/turnCompletionSlice' - object payload
+    vi.advanceTimersByTime(100)
+    device.emit({ type: 'keyUp', keyIndex: 1 })
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+  })
+
+  it('short-press focuses, long-press opens the action layer - on the sorted layout', () => {
+    const { store, device } = setup({ tabs: 3, attention: { t3: true } }) // t3 sorts to key 0
+    device.press(0)
+    expect(store.getState().tabs.activeTabId).toBe('t3')
+    holdKey(device, 1, 600) // long-press whatever now occupies key 1
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'action', action: 'back' })
   })
 })
