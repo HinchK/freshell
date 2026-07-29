@@ -120,6 +120,7 @@ export class DeckController {
       page: this.page,
       actionLayer: this.actionLayerInputs(state),
       previewFor: (tabId) => this.previewFor(state, tabId),
+      iconReady: () => false, // stub; Task 8 wires the real icon cache
     })
     let painted = false
     frame.keys.forEach((spec, keyIndex) => {

@@ -1,11 +1,14 @@
 import type { DeckCapabilities } from './deck-device'
 import type { DeckModel } from './deck-selectors'
+import type { TileFill, TileDot } from './tile-state'
 
 export type RingColor = 'amber' | 'green' | 'blue' | null
 export type DeckAction = 'back' | 'approve' | 'stop'
+export type TileIcon = { url: string | null; letter: string; hue: number; ready: boolean }
 export type KeySpec =
   | { kind: 'empty' }
-  | { kind: 'tab'; tabId: string; title: string; previewLines: string[]; ring: RingColor; active: boolean }
+  | { kind: 'tab'; tabId: string; title: string; previewLines: string[]; ring: RingColor;
+      active: boolean; fill: TileFill; dot: TileDot; icons: TileIcon[] }
   | { kind: 'pager'; page: number; pageCount: number }
   | { kind: 'action'; action: DeckAction; enabled: boolean }
 export type StripSpec = { text: string } | null
@@ -82,9 +85,10 @@ export type FrameInputs = {
   page: number
   actionLayer: { tabId: string; approveEnabled: boolean; stopEnabled: boolean } | null
   previewFor: (tabId: string) => string[]
+  iconReady: (url: string) => boolean
 }
 
-export function buildFrame({ model, caps, page, actionLayer, previewFor }: FrameInputs): FrameSpec {
+export function buildFrame({ model, caps, page, actionLayer, previewFor, iconReady }: FrameInputs): FrameSpec {
   const plan = planLayout(caps, model.tabs.length)
   const pages = pageCount(model.tabs.length, plan.tabsPerPage)
   const keys: KeySpec[] = Array.from({ length: plan.keyCount }, () => ({ kind: 'empty' as const }))
@@ -107,6 +111,11 @@ export function buildFrame({ model, caps, page, actionLayer, previewFor }: Frame
     keys[keyIndex] = {
       kind: 'tab', tabId: tab.id, title: tab.title,
       previewLines: previewFor(tab.id), ring: ringColor(tab.status), active: tab.active,
+      fill: tab.fill, dot: tab.dot,
+      icons: tab.repoIcons.map((icon) => ({
+        ...icon,
+        ready: icon.url !== null && iconReady(icon.url),
+      })),
     }
   })
   if (plan.pagerKey !== null) keys[plan.pagerKey] = { kind: 'pager', page: current, pageCount: pages }

@@ -167,12 +167,15 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     // (greenIcon) < t1 busy (blueIcon), so busy t1 lands after the others.
     expect(decodeKey(device, 0)).toEqual({
       kind: 'tab', tabId: 't2', title: 'tab2', previewLines: [], ring: 'green', active: false,
+      fill: 'green', dot: 'green', icons: [],
     })
     expect(decodeKey(device, 1)).toEqual({
       kind: 'tab', tabId: 't3', title: 'tab3', previewLines: [], ring: 'amber', active: false,
+      fill: 'none', dot: 'green', icons: [],
     })
     expect(decodeKey(device, 2)).toEqual({
       kind: 'tab', tabId: 't1', title: 'tab1', previewLines: ['$ npm test', 'PASS'], ring: 'blue', active: true,
+      fill: 'none', dot: 'blue', icons: [],
     })
   })
 

@@ -20,6 +20,7 @@ function model(n: number, activeId = 'tab-0'): DeckModel {
   }
 }
 const noPreview = () => []
+const noIcon = () => false
 
 describe('planLayout', () => {
   it('mini, 3 tabs: keys mode, no pager, 6 tab slots', () => {
@@ -63,7 +64,7 @@ describe('ringColor priority', () => {
 
 describe('buildFrame', () => {
   it('tabs fit: all tab tiles, active flag set, rest empty', () => {
-    const frame = buildFrame({ model: model(3), caps: MINI_CAPS, page: 1, actionLayer: null, previewFor: noPreview })
+    const frame = buildFrame({ model: model(3), caps: MINI_CAPS, page: 1, actionLayer: null, previewFor: noPreview, iconReady: noIcon })
     expect(frame.keys).toHaveLength(6)
     expect(frame.keys[0]).toMatchObject({ kind: 'tab', tabId: 'tab-0', title: 'Tab 0', active: true })
     expect(frame.keys[2]).toMatchObject({ kind: 'tab', tabId: 'tab-2', active: false })
@@ -71,10 +72,10 @@ describe('buildFrame', () => {
     expect(frame.strip).toBeNull()
   })
   it('overflow: pager key at 5 with page/pageCount; page 2 shows the tail', () => {
-    const f1 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 1, actionLayer: null, previewFor: noPreview })
+    const f1 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 1, actionLayer: null, previewFor: noPreview, iconReady: noIcon })
     expect(f1.keys[5]).toEqual({ kind: 'pager', page: 1, pageCount: 2 })
     expect((f1.keys[0] as { tabId: string }).tabId).toBe('tab-0')
-    const f2 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 2, actionLayer: null, previewFor: noPreview })
+    const f2 = buildFrame({ model: model(8), caps: MINI_CAPS, page: 2, actionLayer: null, previewFor: noPreview, iconReady: noIcon })
     expect((f2.keys[0] as { tabId: string }).tabId).toBe('tab-5')
     expect(f2.keys[3]).toEqual({ kind: 'empty' })
     expect(f2.keys[5]).toEqual({ kind: 'pager', page: 2, pageCount: 2 })
@@ -82,18 +83,42 @@ describe('buildFrame', () => {
   it('action layer replaces the frame', () => {
     const frame = buildFrame({
       model: model(3), caps: MINI_CAPS, page: 1,
-      actionLayer: { tabId: 'tab-1', approveEnabled: false, stopEnabled: true }, previewFor: noPreview,
+      actionLayer: { tabId: 'tab-1', approveEnabled: false, stopEnabled: true }, previewFor: noPreview, iconReady: noIcon,
     })
     expect(frame.keys[ACTION_KEYS.back]).toEqual({ kind: 'action', action: 'back', enabled: true })
     expect(frame.keys[ACTION_KEYS.approve]).toEqual({ kind: 'action', action: 'approve', enabled: false })
     expect(frame.keys[ACTION_KEYS.stop]).toEqual({ kind: 'action', action: 'stop', enabled: true })
     expect(frame.keys[3]).toEqual({ kind: 'empty' })
   })
+  it('buildFrame carries fill/dot/icons onto tab keys, with iconReady resolving readiness', () => {
+    const model = {
+      activeTabId: 't1',
+      tabs: [makeDeckTab({
+        id: 't1', title: 'alpha', active: true, fill: 'barTop', dot: 'green',
+        repoIcons: [
+          { url: '/api/repo-icon?cwd=%2Fr%2Fa', letter: 'A', hue: 120 },
+          { url: null, letter: 'B', hue: 200 },
+        ],
+      })],
+    }
+    const frame = buildFrame({
+      model, caps: MINI_CAPS, page: 1, actionLayer: null,
+      previewFor: () => [],
+      iconReady: (url) => url === '/api/repo-icon?cwd=%2Fr%2Fa',
+    })
+    expect(frame.keys[0]).toMatchObject({
+      kind: 'tab', tabId: 't1', fill: 'barTop', dot: 'green',
+      icons: [
+        { url: '/api/repo-icon?cwd=%2Fr%2Fa', letter: 'A', hue: 120, ready: true },
+        { url: null, letter: 'B', hue: 200, ready: false },
+      ],
+    })
+  })
   it('full mode fills the strip and never emits a pager', () => {
     const m = model(10)
     m.tabs[1].status.busy = true
     m.tabs[2].status.amber = true
-    const frame = buildFrame({ model: m, caps: PLUS_CAPS, page: 1, actionLayer: null, previewFor: noPreview })
+    const frame = buildFrame({ model: m, caps: PLUS_CAPS, page: 1, actionLayer: null, previewFor: noPreview, iconReady: noIcon })
     expect(frame.keys.every((k) => k.kind !== 'pager')).toBe(true)
     expect(frame.strip).toEqual({ text: 'Tab 0  |  page 1/2  |  1 busy  1 waiting' })
   })
