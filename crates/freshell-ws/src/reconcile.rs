@@ -289,6 +289,26 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
         if pane.mode.as_deref() == Some("shell") {
             return base(pane, ReconcileVerdict::Fresh);
         }
+        // §4.2 pending-marker read (PIN 3): a durable pending marker keyed by
+        // the client's stale terminal id means identity establishment was in
+        // flight when the server died — fresh by RACE, not by intent. The
+        // reason is distinct and surfaced (client breadcrumb). The read is
+        // deliberately IDEMPOTENT and read-only (amends §6 decision 5's
+        // consumption clause): the client re-sends pane.reconcile on every
+        // WS ready because a response can be dropped (App.tsx:1029-1053) —
+        // consuming the marker at derive would turn that retry into a
+        // silent no_recoverable_identity. Markers are still never promoted;
+        // locator resolution or the ledger's GC deletes them, and a
+        // recreated pane's new terminal id makes the old marker
+        // unreachable.
+        if let Some(tid) = pane.terminal_id.as_deref() {
+            if deps.pane_ledger.pending_for_terminal(tid).is_some() {
+                return PaneVerdict {
+                    reason: Some("fresh_by_race".to_string()),
+                    ..base(pane, ReconcileVerdict::Fresh)
+                };
+            }
+        }
         return PaneVerdict {
             reason: Some("no_recoverable_identity".to_string()),
             ..base(pane, ReconcileVerdict::Fresh)
@@ -820,6 +840,67 @@ mod tests {
         let v = f.one(pane("cr-9"));
         assert_eq!(v.verdict, ReconcileVerdict::Fresh);
         assert_eq!(v.reason.as_deref(), Some("no_recoverable_identity"));
+    }
+
+    /// PIN 3 red test (§4.2 pending-marker read): identity establishment was
+    /// in flight when the server died (durable pending marker, keyed by the
+    /// dead epoch's terminal id) -> the verdict is fresh, but LOUD:
+    /// fresh_by_race, never a silent no_recoverable_identity.
+    #[test]
+    fn pending_marker_yields_fresh_by_race_not_silent_fresh() {
+        let f = Fixture::new();
+        f.ledger
+            .record_pending("T-race", "opencode", None, 1_000)
+            .expect("record pending");
+        let mut p = pane("cr-race");
+        p.mode = Some("opencode".to_string());
+        p.terminal_id = Some("T-race".to_string());
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Fresh);
+        assert_eq!(v.reason.as_deref(), Some("fresh_by_race"));
+    }
+
+    /// Delivery-safety pin (validated design change): the marker read is
+    /// IDEMPOTENT and read-only. The client re-sends pane.reconcile on
+    /// every WS ready precisely because a response can be dropped
+    /// (App.tsx:1029-1053); consuming the marker at derive would turn that
+    /// retry into a silent no_recoverable_identity — losing the breadcrumb
+    /// to the exact churn PIN 3 eliminates. A retry must derive the same
+    /// loud verdict, and the marker must still exist afterwards.
+    #[test]
+    fn marker_read_is_idempotent_across_reconciles() {
+        let f = Fixture::new();
+        f.ledger
+            .record_pending("T-race2", "opencode", None, 1_000)
+            .expect("record pending");
+        let mut p = pane("cr-race2");
+        p.mode = Some("opencode".to_string());
+        p.terminal_id = Some("T-race2".to_string());
+        let first = f.one(p);
+        assert_eq!(first.reason.as_deref(), Some("fresh_by_race"));
+        let mut p2 = pane("cr-race2");
+        p2.mode = Some("opencode".to_string());
+        p2.terminal_id = Some("T-race2".to_string());
+        let second = f.one(p2);
+        assert_eq!(second.verdict, ReconcileVerdict::Fresh);
+        assert_eq!(second.reason.as_deref(), Some("fresh_by_race"));
+        assert!(f.ledger.pending_for_terminal("T-race2").is_some());
+    }
+
+    /// Shell panes stay bare fresh even with a stray marker — the marker
+    /// read sits behind the shell early-return.
+    #[test]
+    fn shell_pane_ignores_pending_markers() {
+        let f = Fixture::new();
+        f.ledger
+            .record_pending("T-sh", "shell", None, 1_000)
+            .expect("record pending");
+        let mut p = pane("cr-sh");
+        p.mode = Some("shell".to_string());
+        p.terminal_id = Some("T-sh".to_string());
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Fresh);
+        assert_eq!(v.reason, None);
     }
 
     /// Row 10: malformed entries → invalid{reason}, never omission.
