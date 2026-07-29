@@ -70,7 +70,7 @@ Fixes review item 3 (GNU-only `date +%s%N`) and the *producer* half of item 2 (t
 **Files:**
 - Modify: `crates/freshell-platform/src/cli_launch.rs:197-211` (doc comment + `CLAUDE_SESSION_START_COMMAND_UNIX`)
 - Modify: `crates/freshell-platform/src/cli_launch_goldens.rs` (`CLAUDE_SETTINGS_UNIX` at `:10` and the unix argv goldens `g_c1_claude_linux_fresh_defaults_resolver_level` `:124`, `g_c2_claude_resume_permission_mode_plan` `:144`, `g_c3_claude_start_intent_session_id` `:168` — they embed the settings blob)
-- Test: new unit tests in `crates/freshell-platform/src/cli_launch.rs`'s existing `#[cfg(test)] mod tests` (find it with `grep -n "mod tests" crates/freshell-platform/src/cli_launch.rs`)
+- Test: new unit tests in a NEW `#[cfg(test)] mod tests` module added to `crates/freshell-platform/src/cli_launch.rs`. The file currently has NO in-file unit-test module (`grep -n "mod tests" crates/freshell-platform/src/cli_launch.rs` returns nothing); its only test attachment is the `#[path = "cli_launch_goldens.rs"] mod cli_argv_goldens_file;` mount near `:591`. Step 1 creates the module.
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
@@ -88,7 +88,17 @@ n=$(date +%s%N 2>/dev/null); case "$n" in *[!0-9]*|"") n="$(date +%s)000000000";
 
 - [ ] **Step 1: Write the failing unit tests**
 
-In `crates/freshell-platform/src/cli_launch.rs`'s `#[cfg(test)] mod tests`, add (adjust the `use super::*;` context to match the module's existing tests):
+`crates/freshell-platform/src/cli_launch.rs` has no in-file unit-test module yet, so CREATE one: at the end of the file (after the existing `#[cfg(test)] #[path = "cli_launch_goldens.rs"] mod cli_argv_goldens_file;` mount near `:591`), add
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // <the three items below go here>
+}
+```
+
+and place the following const + tests inside it (with this placement the test paths are `cli_launch::tests::...`, so Step 2's `--lib cli_launch` filter matches them):
 
 ```rust
     /// Single source of truth for the portable nonce logic embedded in
