@@ -10,24 +10,24 @@ import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 
 /**
- * Codex status completeness (Rust only) — the G3 gap: a FRESH codex terminal
- * (created with no resume id) whose persisted rollout is announced by the
- * client (`terminal.codex.candidate.persisted`) must ADOPT that identity, and
- * the adoption must be observable on the wire — an identity-bearing
- * `codex.activity.updated` upsert, then a `terminal.turn.complete` frame that
- * carries the adopted `sessionId`.
+ * Codex status completeness (Rust only) — wire-level proof that codex panes
+ * carry complete, identity-bearing status: an abrupt server restart mid-turn
+ * restores the pane, seeds busy from the rollout, and completes with the
+ * rollout's `sessionId` (G9); and two concurrent servers keep fully
+ * independent codex status streams.
  *
- * NOTE (validated scope): no Rust code emits `terminal.codex.durability.updated`
- * today, so the production client never sends this candidate frame against the
- * Rust server — the trigger chain goes live at S5. This spec's raw-WS injection
- * is the established protocol-level proof of the server-side adopt path (same
- * pattern as `crates/freshell-ws/tests/codex_candidate_persisted.rs`); it is
- * honest evidence for the SERVER half of G3-fresh, and the plan documents the
- * S5 dependency explicitly rather than claiming production-trigger coverage.
+ * NOTE: this file originally also contained a fresh-pane test driving the
+ * client-announced candidate channel (`terminal.codex.candidate.persisted`).
+ * That channel was retired in 4767b7ec ("feat(ws)!: retire
+ * terminal.codex.candidate.persisted writer") — the server's only handler arm
+ * is accept-and-ignore, and codex identity has exactly one writer: the
+ * server-side rollout locator. The orphaned test was removed; its live-behavior
+ * coverage lives in `crates/freshell-ws/tests/codex_locator_activity.rs`
+ * (fresh-pane identity via the locator) and
+ * `crates/freshell-ws/tests/codex_candidate_inert.rs` (the accept-and-ignore
+ * contract).
  *
- * Rust-only (`playwright.config.ts` registers this under `rust-chromium`):
- * the candidate-adopt path lives entirely in the Rust port
- * (`crates/freshell-ws/src/codex_candidate.rs` + `crates/freshell-activity`).
+ * Rust-only (`playwright.config.ts` registers this under `rust-chromium`).
  */
 
 const __filename = fileURLToPath(import.meta.url)
@@ -302,88 +302,6 @@ async function waitForRestoredCodexTerminalId(
 
 test.describe('Codex status completeness (Rust only)', () => {
   test.setTimeout(240_000)
-
-  test('fresh codex terminal: candidate adoption stamps sessionId on turn-complete', async ({
-    page,
-    e2eServerKind,
-  }) => {
-    expect(e2eServerKind).toBe('rust')
-    const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-codex-status-'))
-    const fakeCodex = await installFakeCli(path.join(sharedRoot, 'bin'), 'codex', FAKE_BEL_CLI)
-    let rolloutPath = ''
-    const server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
-      construct: {
-        env: { CODEX_CMD: fakeCodex },
-        setupHome: async (homeDir) => {
-          const freshellDir = path.join(homeDir, '.freshell')
-          await fs.mkdir(freshellDir, { recursive: true })
-          await fs.writeFile(
-            path.join(freshellDir, 'config.json'),
-            JSON.stringify(
-              { version: 1, settings: { codingCli: { enabledProviders: ['codex'] } } },
-              null,
-              2,
-            ),
-          )
-          rolloutPath = await seedRollout(homeDir, THREAD_A)
-        },
-      },
-    })
-    const info = await server.start()
-    const capture = new WsCapture(info.baseUrl, info.token)
-    try {
-      await capture.ready()
-      const harness = await bootAndConnect(page, info)
-      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
-      const tabId = await harness.getActiveTabId()
-
-      // FRESH codex pane -- created with no resume id: the G3 gap state.
-      const terminalId = await openCliPaneAndGetTerminalId(page, harness, tabId!, /Codex/i, 'codex')
-      await expect
-        .poll(async () => {
-          const buffer = await harness.getTerminalBuffer(terminalId)
-          return typeof buffer === 'string' && buffer.includes('fake-cli>')
-        }, { timeout: 15_000 })
-        .toBe(true)
-
-      // The client announces the persisted rollout (candidate adoption).
-      // Field casing verified against the Rust protocol type
-      // (`TerminalCodexCandidatePersisted`, client_messages.rs:227-232,
-      // rename_all = "camelCase"): terminalId / candidateThreadId /
-      // rolloutPath / capturedAt (required i64 — omitting it rejects the
-      // frame on deserialize).
-      capture.send({
-        type: 'terminal.codex.candidate.persisted',
-        terminalId,
-        candidateThreadId: THREAD_A,
-        rolloutPath,
-        capturedAt: Date.now(),
-      })
-      // Adoption is observable on the wire: identity upsert...
-      await capture.waitFor(
-        (f) =>
-          f.type === 'codex.activity.updated' &&
-          f.upsert?.some((r: any) => r.terminalId === terminalId && r.sessionId === THREAD_A),
-        10_000,
-        'adopted identity upsert',
-      )
-
-      // ...and the payoff: a full turn's completion carries the sessionId.
-      await typePromptIntoLastPane(page, 'do the thing')
-      const complete = await capture.waitFor(
-        (f) => f.type === 'terminal.turn.complete' && f.terminalId === terminalId,
-        15_000,
-        'identity-bearing turn complete',
-      )
-      expect(complete.provider).toBe('codex')
-      expect(complete.sessionId).toBe(THREAD_A)
-    } finally {
-      capture.close()
-      await server.stop().catch(() => {})
-      await fs.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
-    }
-  })
 
   test('restartAbrupt mid-codex-turn: restored pane seeds busy from the rollout, then completes with identity', async ({
     page,
