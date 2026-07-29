@@ -3812,14 +3812,17 @@ describe('TerminalView lifecycle updates', () => {
   })
 
   it('recovers from a post-restart attach error and delivers buffered keystrokes to the recreated terminal', async () => {
-    const { store, tabId, paneId, paneContent } = setupThemeTerminal({
+    const { store, tabId, paneId } = setupThemeTerminal({
       terminalId: 'term-pre-restart',
       status: 'running',
       mode: 'shell',
     })
+    // Use TerminalViewFromStore: the real PaneContainer passes store-derived
+    // pane content, so branch-5 recovery's new createRequestId re-fires the
+    // create effect. A static paneContent prop would never deliver it.
     render(
       <Provider store={store}>
-        <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        <TerminalViewFromStore tabId={tabId} paneId={paneId} />
       </Provider>
     )
     await waitFor(() => {
