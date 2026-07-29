@@ -596,7 +596,20 @@ impl Default for TerminalRegistry {
 /// `attach.ready` + replay were enqueued to the caller's sink) — `false` mirrors the
 /// reference's `INVALID_TERMINAL_ID` (attach to an unknown/exited terminal).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
 pub struct AttachOutcome {
+    pub found: bool,
+}
+
+/// Outcome of [`TerminalRegistry::input`]: whether the terminal existed (the
+/// bytes were written to its PTY when one is attached; headless terminals
+/// still count as found and take the activity bump). `false` mirrors the
+/// reference's unknown-id input reply (`server/ws-handler.ts:2991-3002`) —
+/// the WS layer answers `terminal.input.blocked{reason:unknown_terminal}`,
+/// the REST send-keys path logs a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub struct InputOutcome {
     pub found: bool,
 }
 
@@ -1193,23 +1206,31 @@ impl TerminalRegistry {
     }
 
     /// `terminal.input` write path (`terminal-registry.ts:3867-3894`): write bytes to
-    /// the PTY; bump `lastActivityAt` and the DEV-0009 meaningful-activity reap clock. No wire reply.
-    pub fn input(&self, terminal_id: &str, data: &[u8]) {
-        let tapped_mode = {
+    /// the PTY; bump `lastActivityAt` and the DEV-0009 meaningful-activity reap clock.
+    /// Unknown terminal => `InputOutcome { found: false }` (kata dtfn: previously a
+    /// silent no-op; the caller now replies on the wire).
+    pub fn input(&self, terminal_id: &str, data: &[u8]) -> InputOutcome {
+        let (found, tapped_mode) = {
             let mut inner = self.inner.lock().expect("registry lock");
             match inner.terminals.get_mut(terminal_id) {
                 Some(handle) => {
                     if let Some(pty) = handle.pty.as_mut() {
                         let _ = pty.write_input(data);
+                    } else {
+                        // Headless rows have no PTY to receive bytes. Unreachable in
+                        // production today (`register_headless` has no production
+                        // callers — ledger A16), but never let input vanish without
+                        // a trace (kata dtfn).
+                        tracing::warn!(terminal_id, "input_to_headless_terminal_dropped");
                     }
                     let mut s = handle.shared.lock().expect("terminal lock");
                     let now = now_ms();
                     s.last_activity_at = now;
                     // User keystrokes are always meaningful (DEV-0009).
                     s.last_meaningful_activity_at = now;
-                    s.mode != "shell"
+                    (true, s.mode != "shell")
                 }
-                None => false,
+                None => (false, false),
             }
         };
         // TERM-15/TERM-16 tap (outside the registry lock): CLI-mode input
@@ -1221,6 +1242,7 @@ impl TerminalRegistry {
                 at: now_ms(),
             });
         }
+        InputOutcome { found }
     }
 
     /// Node-parity geometry floor (`broker.ts:672-673`):
@@ -3136,6 +3158,25 @@ mod tests {
     }
 
     #[test]
+    fn input_to_unknown_terminal_reports_not_found() {
+        // Silent-loss fix (kata dtfn): the None branch used to be a pure no-op.
+        let reg = TerminalRegistry::new();
+        let out = reg.input("nope", b"lost bytes");
+        assert!(!out.found);
+    }
+
+    #[test]
+    fn input_to_headless_terminal_reports_found() {
+        // Headless => no PTY write, but the terminal EXISTS: found must be true
+        // (the activity bump in input_write_resets_the_idle_reap_clock depends
+        // on headless input still counting).
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let out = reg.input("T", b"ls\n");
+        assert!(out.found);
+    }
+
+    #[test]
     fn kill_removes_terminal_notifies_subscribers_and_bumps_revision() {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
@@ -3821,7 +3862,7 @@ mod tests {
         reg.insert_headless("T", "S");
         reg.set_auto_kill_idle_minutes(1);
         reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
-        reg.input("T", b"ls\n");
+        assert!(reg.input("T", b"ls\n").found);
 
         let killed = reg.enforce_idle_kills();
 
@@ -4036,7 +4077,7 @@ mod tests {
             frame(2, "\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}", "S"),
         );
         let (sink_b, seen_b) = collector();
-        reg_box.attach("B", 1, sink_b, Some("r".into()), 0, false, None);
+        let _ = reg_box.attach("B", 1, sink_b, Some("r".into()), 0, false, None);
         let box_chars: usize = outputs(&seen_b)
             .iter()
             .map(|f| f.data.chars().count())
@@ -4135,7 +4176,7 @@ mod tests {
         );
 
         // Input fires synchronously on write.
-        reg.input("T-act", b"\r");
+        assert!(reg.input("T-act", b"\r").found);
         assert!(
             seen.lock().unwrap().iter().any(|e| matches!(
                 e,
@@ -4193,7 +4234,7 @@ mod tests {
 
         // Give the PTY time to produce output; the tap must stay silent for
         // Input/Output on a plain shell (zero per-chunk overhead).
-        reg.input("T-shell", b"\r");
+        assert!(reg.input("T-shell", b"\r").found);
         assert!(
             wait_for(2_000, || {
                 // Wait until the PTY produced SOMETHING (visible via replay),
@@ -4256,7 +4297,7 @@ mod tests {
         }
 
         let (sink, seen) = collector();
-        reg.attach("T", 1, sink, Some("r".into()), 0, false, None);
+        let _ = reg.attach("T", 1, sink, Some("r".into()), 0, false, None);
         let retained_chars: usize = outputs(&seen).iter().map(|f| f.data.chars().count()).sum();
         assert!(
             retained_chars as i64 <= cap,

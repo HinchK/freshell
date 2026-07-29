@@ -633,7 +633,8 @@ async fn handle_client_text(
             // Enter of an armed codex pane scans (7-9 ms warm — A6).
             crate::codex_association::note_possible_submit(state, &input.terminal_id, &input.data)
                 .await;
-            state
+            // Outcome consumed for real in the next commit (kata dtfn):
+            let _ = state
                 .registry
                 .input(&input.terminal_id, input.data.as_bytes());
             // Restore-across-restart fix (opencode): seam for an armed
@@ -3485,7 +3486,7 @@ fn handle_attach(
             .resize_for_attach(&attach.terminal_id, conn_id, attach.intent, cols, rows);
     }
 
-    state.registry.attach(
+    let _ = state.registry.attach(
         &attach.terminal_id,
         conn_id,
         Arc::clone(conn_sink),
