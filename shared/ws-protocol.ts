@@ -867,7 +867,7 @@ export type TerminalCodexDurabilityUpdatedMessage = {
 export type TerminalInputBlockedMessage = {
   type: 'terminal.input.blocked'
   terminalId: string
-  reason: 'codex_identity_pending' | 'codex_identity_capture_timeout' | 'codex_identity_unavailable' | 'codex_recovery_pending' | 'codex_clean_exit_decision_pending' | 'codex_lifecycle_loss_pending'
+  reason: 'codex_identity_pending' | 'codex_identity_capture_timeout' | 'codex_identity_unavailable' | 'codex_recovery_pending' | 'codex_clean_exit_decision_pending' | 'codex_lifecycle_loss_pending' | 'unknown_terminal'
 }
 
 export type TerminalsChangedMessage = {

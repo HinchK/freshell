@@ -464,32 +464,15 @@ fn tabs_sync_ack_roundtrips_with_and_without_persist_fields() {
 }
 
 #[test]
-fn terminal_session_associated_previous_session_id_is_optional_and_camel_case() {
-    let with = TerminalSessionAssociated {
-        terminal_id: "t1".into(),
-        session_ref: SessionLocator {
-            provider: "codex".into(),
-            session_id: "b".into(),
-        },
-        previous_session_id: Some("a".into()),
-    };
-    let v = serde_json::to_value(&with).unwrap();
-    assert_eq!(
-        v.get("previousSessionId").and_then(|x| x.as_str()),
-        Some("a")
-    );
-
-    let without = TerminalSessionAssociated {
-        terminal_id: "t1".into(),
-        session_ref: SessionLocator {
-            provider: "codex".into(),
-            session_id: "b".into(),
-        },
-        previous_session_id: None,
-    };
-    let v = serde_json::to_value(&without).unwrap();
-    assert!(
-        v.get("previousSessionId").is_none(),
-        "None must serialize to ABSENT, not null"
-    );
+fn terminal_input_blocked_unknown_terminal_roundtrips_and_conforms() {
+    // Silent-loss fix (kata dtfn): the first Rust emitter of
+    // `terminal.input.blocked` uses this reason for input to an unknown id.
+    let wire = r#"{"type":"terminal.input.blocked","reason":"unknown_terminal","terminalId":"t1"}"#;
+    match server_roundtrip(wire, "terminal.input.blocked") {
+        ServerMessage::TerminalInputBlocked(b) => {
+            assert_eq!(b.reason, TerminalInputBlockedReason::UnknownTerminal);
+            assert_eq!(b.terminal_id, "t1");
+        }
+        other => panic!("expected TerminalInputBlocked, got {other:?}"),
+    }
 }

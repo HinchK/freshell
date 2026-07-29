@@ -1987,7 +1987,10 @@ pub(crate) fn maybe_send_keys(
             locator.note_submit(&terminal_id, now_ms());
         }
     }
-    registry.input(&terminal_id, text.as_bytes());
+    let outcome = registry.input(&terminal_id, text.as_bytes());
+    if !outcome.found {
+        tracing::warn!(terminal_id = %terminal_id, "send_keys_to_unknown_terminal");
+    }
     // Feed the opencode locator's Enter<->session correlation
     // (`is_submit_input`/`note_possible_submit`,
     // `crates/freshell-ws/src/opencode_association.rs`): a REST-created

@@ -122,6 +122,9 @@ const RUST_ONLY_SPECS = [
   // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
   // restartAbrupt(); hidden panes must rebind without being revealed.
   /hidden-pane-rebind-rust\.spec\.ts$/,
+  // Silent input loss (kata dtfn): imports RustServer directly for restart();
+  // input typed in the reconnect-before-reattach window must arrive byte-exact.
+  /silent-input-loss-rust\.spec\.ts$/,
   // Freshclaude zero-turn restart (kata 09v1): imports RustServer directly
   // for restartAbrupt(); a VISIBLE zero-turn pane must resume, never die.
   /freshclaude-zero-turn-restart-rust\.spec\.ts$/,
@@ -306,6 +309,10 @@ export default defineConfig({
         // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
         // restartAbrupt(); hidden panes must rebind without being revealed.
         /hidden-pane-rebind-rust\.spec\.ts$/,
+        // Silent input loss (kata dtfn): imports RustServer directly for
+        // restart(); input typed in the reconnect-before-reattach window must
+        // arrive byte-exact in the recreated terminal.
+        /silent-input-loss-rust\.spec\.ts$/,
         // Freshclaude zero-turn restart (kata 09v1): imports RustServer directly
         // for restartAbrupt(); a VISIBLE zero-turn pane must resume, never die.
         /freshclaude-zero-turn-restart-rust\.spec\.ts$/,

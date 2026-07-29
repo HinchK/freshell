@@ -2354,7 +2354,8 @@
             "codex_identity_unavailable",
             "codex_recovery_pending",
             "codex_clean_exit_decision_pending",
-            "codex_lifecycle_loss_pending"
+            "codex_lifecycle_loss_pending",
+            "unknown_terminal"
           ],
           "type": "string"
         },
