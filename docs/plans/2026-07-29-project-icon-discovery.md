@@ -20,7 +20,7 @@
 - **Never restart the live Rust server on port 3002** (requires the user's explicit "APPROVED" — not needed by this plan; verification uses tests, not the live server).
 - **No protocol / meta-payload changes.** `GET /api/repo-icon` and `/api/repo-icon/meta` response shapes are unchanged. No client changes.
 - **Commits:** author must be `Dan Shapiro <3732858+danshapiro@users.noreply.github.com>` (already configured — do not override). Never use `dan@danshapiro.com` as git author. Focused, atomic commits.
-- **PR pre-approval:** the user has ALREADY EXPLICITLY APPROVED PR creation AND merge: "land it on main via PR (approved)". Task 6 pushes the branch, creates the PR targeting `main`, waits for required checks, merges, and fast-forwards local `main`. This satisfies the AGENTS.md rule requiring explicit approval before `gh pr create`.
+- **PR pre-approval:** the user has ALREADY EXPLICITLY APPROVED PR creation AND merge — verified verbatim in the root session transcript: "Do this first, with the usual, and land it on main via PR (approved)". Task 6 pushes the branch, creates the PR targeting `main`, waits for required checks, merges, and fast-forwards local `main`. This satisfies the AGENTS.md rule requiring explicit approval before `gh pr create`. **SCOPE BOUNDARY:** the approval covers the icon-discovery work ONLY — the same user message explicitly defers the follow-on work (placeholder pixel fix, uniform tab widths, tab color/state changes) as "not to be landed until I approve". The branch must contain nothing from that follow-on scope, and approval does not waive CI: merge only on green required checks (`typecheck-client`, `clippy` — enforced via repo rulesets).
 - **No broad npm test runs needed** (no client code touched). If any broad run is ever needed, use the coordinated runner (`npm run test:unit` / `npm test`), never raw `npx vitest`.
 - **`docs/index.html` is NOT updated** (no user-visible UI change; the original icon feature made the same call).
 - **Ordering hazard:** `CandidateSink.order` is a global monotonic counter that advances even for missing paths (`repo_icon_detect.rs:311-322`). Adding candidate sites shifts every later order value and can change tiebreaks at equal score. After each task, run the FULL `cargo test -p freshell-server repo_icon` suite and fix any order-sensitive expectations honestly (adjust the test's fixture, not the assertion semantics).
@@ -31,7 +31,7 @@
 `detect_icon()` (`crates/freshell-server/src/repo_icon_detect.rs:700-708`) runs `tier1` (manifest-declared, score 100) → `tier2` (24 fixed conventional paths, 80) → `tier3` (root/asset-dir shallow prefix scan, 60) → `pick_best`. **Maximum search depth today is ~2 directory levels and there is no recursion anywhere** — that's why icons like `src/Winpepper.App/Assets/AppIcon.ico` (depth 3, declared in a `.csproj`) and a sub-project's `public/favicon.svg` inside a container directory (depth 2 under a root with no manifest) are missed. `score_candidate` (`:181-263`) applies modifiers (+15 square, +10 dims 32–512, +5 stem=="icon", +5 png/ico/svg, −20 aspect>1.6) and hard rejections (aspect>2.5, raster w<16, >2MB / SVG>256KB, `REJECTED_PATH_COMPONENTS`, `REJECTED_EXTENSIONS` incl. `icns`, framework-default sha256 blacklist, dangerous SVG). `pick_best` (`:265-288`) sorts by score, then enumeration order, then shortest rel path, then lexicographic.
 
 Real-world test cases this plan must fix (verified on this machine, see Task 5):
-- `/home/dan/code/glowforge` — container dir of 4 sibling projects; zero images at root; root `public/` exists but is EMPTY. Real icons: `gf-creative-studio/public/favicon.svg` (depth 2, 9,522 B, referenced by that subproject's `index.html`), `gf-creative-studio/public/glowforge-icon.svg` (depth 2), `gf-design-system/design-system-assets/icons/glowforge-icon.svg` (depth 3). False-positive mines: `coverage/lcov-report/favicon.png` (istanbul), `.factory/**/assets/app-icon.png` (plugin cache), ~17,580 image files total (cypress fixtures/screenshots).
+- `/home/dan/code/glowforge` — container dir of 4 sibling projects; zero images at root; root `public/` exists but is EMPTY. Real icons: `gf-creative-studio/public/glowforge-icon.svg` (depth 2), `gf-design-system/design-system-assets/icons/glowforge-icon.svg` (depth 3). CAUTION: `gf-creative-studio/public/favicon.svg` (depth 2, 9,522 B, referenced by that subproject's `index.html`) is byte-identical to the `vite-default-logo-2026` framework-default sha256 blacklist entry (`repo_icon_detect.rs:110-113`) — it is the stock Vite favicon and is hard-rejected BY DESIGN; do not "fix" that rejection. Verified expected winner: `gf-creative-studio/public/glowforge-icon.svg` (scores 54 — non-square aspect 1.21, so the modest score is expected — vs. the `icons.svg` sprite mine at 44). False-positive mines: `coverage/lcov-report/favicon.png` (istanbul), `.factory/**/assets/app-icon.png` (plugin cache), ~17,580 image files total (cypress fixtures/screenshots).
 - `/home/dan/code/winpepper` — .NET app. Real icon: `src/Winpepper.App/Assets/AppIcon.ico` (depth 3, 41,230 B), declared at `src/Winpepper.App/Winpepper.App.csproj:17` as `<ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>`. Mines: `docs/assets/header.png` (687 KB wide README banner at depth 2), `tests/*/bin/**/EmptyFiles/image/empty.ico` NuGet placeholders, `bin/**/publish/Assets/` build copies, `.worktrees/` duplicates.
 
 ---
@@ -196,7 +196,7 @@ git commit -m "feat(repo-icon): broaden static icon candidates (android mipmap, 
 **Interfaces:**
 - Consumes: `CandidateSink::push`, `TIER1`, `REJECTED_PATH_COMPONENTS`.
 - Produces (used by Task 3):
-  - `fn walk_dir_excluded(name: &str) -> bool` — true for directory basenames that deep scans must not enter: hidden (leading `.`), any `REJECTED_PATH_COMPONENTS` entry, or `target`/`bin`/`obj`/`__pycache__`/`venv`.
+  - `fn walk_dir_excluded(name: &str) -> bool` — true for directory basenames that deep scans must not enter: hidden (leading `.`), any `REJECTED_PATH_COMPONENTS` entry, or `target`/`bin`/`obj`/`__pycache__`/`venv`/`__fixtures__` (the last because `REJECTED_PATH_COMPONENTS` matches `fixtures` exactly and misses the dunder convention).
   - `fn extract_xml_tag_value(text: &str, tag: &str) -> Option<String>` — first `<tag>…</tag>` inner text.
   - `fn collect_csprojs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>)` — recursive to depth ≤ 2 (dir levels below root), skipping excluded/symlinked dirs.
 
@@ -277,7 +277,7 @@ fn walk_dir_excluded(name: &str) -> bool {
         || REJECTED_PATH_COMPONENTS.contains(&lower.as_str())
         || matches!(
             lower.as_str(),
-            "target" | "bin" | "obj" | "__pycache__" | "venv"
+            "target" | "bin" | "obj" | "__pycache__" | "venv" | "__fixtures__"
         )
 }
 
@@ -324,7 +324,10 @@ fn csproj_candidates(sink: &mut CandidateSink) {
     let mut csprojs: Vec<PathBuf> = Vec::new();
     collect_csprojs(&root, 0, &mut csprojs);
     csprojs.sort();
-    csprojs.truncate(10);
+    // 32, not 10: winpepper already has 14 csprojs within depth <= 2 and the
+    // target sorts at index 5 today — keep headroom so new sibling dirs
+    // (artifacts/, packaging/, ...) can't evict the real manifest.
+    csprojs.truncate(32);
     for csproj in csprojs {
         let Ok(text) = std::fs::read_to_string(&csproj) else {
             continue;
@@ -687,6 +690,7 @@ Notes for the implementer:
 - Hidden dirs are excluded from the walk (`walk_dir_excluded`), which covers `.git`, `.worktrees`, `.factory`, `.venv`, `.next`, `.cache`. Tier 3 still probes `.github` explicitly, so nothing regresses there.
 - `coverage`, `fixtures`, `tests`, `dist`, `node_modules`, `vendor` etc. are pruned at walk time via `REJECTED_PATH_COMPONENTS` inside `walk_dir_excluded`, AND still hard-rejected at score time for candidates from other tiers — defense in depth.
 - Files found by both tier3 and tier4 (e.g. root `icon.png`) simply become two candidates for the same path; `pick_best` handles that (higher-tier one wins).
+- TIE-SAFETY (load-bearing, verified by exhaustive score enumeration): tier-4's maximum possible total (85) exactly EQUALS tier-1's minimum; the "tier-4 never beats tier-1" guarantee rests on ties breaking by enumeration order, i.e. on `detect_icon` pushing tiers sequentially (1→2→3→4) onto ONE sink. Do not reorder the tier calls or split enumeration across sinks.
 
 - [ ] **Step 4: Run tests to verify they pass, plus the full icon suite**
 
@@ -1033,7 +1037,7 @@ ICON_PROBE_DIRS="/home/dan/code/glowforge:/home/dan/code/winpepper" \
 
 Expected (acceptance criteria from the spec):
 - **winpepper** MUST resolve to `Some(.../src/Winpepper.App/Assets/AppIcon.ico)` (Tier-1 csproj `<ApplicationIcon>`; the icon exists and must be found). Note: `detect_icon` runs on the repo root as given — if the probe prints a different-but-plausible AppIcon variant (e.g. one of the `AppIcon-*.ico` siblings), that still satisfies "SOMETHING over NOTHING" but investigate why the csproj-declared one didn't win before accepting it.
-- **glowforge** MUST resolve to `Some(...)` — expected `.../gf-creative-studio/public/favicon.svg` or another plausible glowforge SVG (e.g. `glowforge-icon.svg`); it must NOT be `coverage/lcov-report/favicon.png` or anything under a hidden directory.
+- **glowforge** MUST resolve to `Some(...)` — expected `.../gf-creative-studio/public/glowforge-icon.svg` (verified against the real tree: it outscores every reachable candidate). It must NOT be `gf-creative-studio/public/favicon.svg` — that file is the stock Vite favicon, byte-identical to the framework-default blacklist entry, and its rejection is correct behavior, not a regression. It must NOT be `coverage/lcov-report/favicon.png` or anything under a hidden directory.
 - Each probe should complete in well under a second (bounded walk); if glowforge takes multiple seconds, reduce cost by checking the exclusion list against what the walk visits — do not raise the caps.
 
 If either expectation fails, this task is NOT done: diagnose (add a temporary `--nocapture` println or a focused unit test reproducing the real layout in a tempdir fixture), fix in the appropriate earlier task's code, keep all tests green, and re-run the probe.
@@ -1055,7 +1059,9 @@ git commit -m "test(repo-icon): add ignored manual probe for real-directory veri
 
 ### Task 6: Land it — push, PR, checks, merge, fast-forward main
 
-**Pre-approval:** The user already explicitly approved BOTH PR creation and merge for this change ("land it on main via PR (approved)"). Do not ask again.
+**Pre-approval:** The user already explicitly approved BOTH PR creation and merge for this change — verified verbatim in the root session transcript: "Do this first, with the usual, and land it on main via PR (approved)". Do not ask again. The approval is scoped to icon discovery only (see Global Constraints SCOPE BOUNDARY) and does not waive required checks.
+
+**Environment notes (verified):** gh 2.45.0 is authenticated as `danshapiro` (push+admin on origin `danshapiro/freshell`) — two gh accounts are configured; stay on the active `danshapiro` account. Non-interactive shells may lack `~/.cargo/bin` on PATH — if `cargo` is not found, `export PATH="$HOME/.cargo/bin:$PATH"` first. Required checks (`typecheck-client`, `clippy`) are enforced via repo rulesets, so `gh pr checks --watch` is meaningful (note: the classic branch-protection API 404s; rules live at `gh api repos/{owner}/{repo}/rules/branches/main` if ever needed).
 
 **Files:** none (git/GitHub operations only).
 
@@ -1071,7 +1077,11 @@ cargo test -p freshell-server repo_icon
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 git status --short   # expect: clean (all work committed)
+git log --oneline main..HEAD           # every commit must be icon-discovery scope
+git diff --stat main...HEAD            # expect ONLY repo_icon* files + docs/plans/2026-07-29-project-icon-discovery.md
 ```
+
+Scope gate: the user's pre-approval covers icon discovery ONLY. If the diff touches anything outside `crates/freshell-server/src/repo_icon*.rs` and this plan document (e.g. tab-width/tab-color/placeholder-pixel work), STOP — do not create the PR; that work needs separate approval.
 
 - [ ] **Step 2: Push the branch**
 
@@ -1138,5 +1148,7 @@ Note: deployment/restart of the live 3002 server is OUT OF SCOPE — a server re
 **1b. No silent deferrals:** No stubs, mocks, or fake providers stand in for required behavior. The observable production outcomes: deep icons detected (tier4 unit + detect tests), served over the real router (Task 3 Step 5 HTTP test; Task 4 Step 6 icns HTTP test), and confirmed against the real directories (Task 5 probe). The only "stub" bytes are Task 2's tier-1 enumeration tests (enumeration ≠ scoring, and scoring of real ico bytes is covered by Task 3's tests and Task 3 Step 5 end-to-end). No requirement is moved to known limitations/future work. (The live-3002 restart exclusion is not a scope reduction — the spec's verification requirement is met by the real-directory probe, and restarting production explicitly requires separate user approval per AGENTS.md.)
 
 **2. Placeholder scan:** No TBD/TODO/"handle edge cases" steps; every code step shows the code. Two tests (Task 3 Step 5, Task 4 Step 6) intentionally instruct mirroring existing in-module helper signatures (`test_state`, `get`, `body_json` at `repo_icon.rs:285-557`) — full test bodies are given; only helper call shapes may need mechanical adaptation to code the implementer can see right next to the test.
+
+**Stage-2 load-bearing validation addendum (2026-07-29):** All 10 load-bearing assumptions verified against the real machine (ledger: `.worktrees/.the-usual-logs/project-icon-discovery/load-bearing-ledger.md`). Corrections applied: (a) glowforge's `favicon.svg` is the stock Vite favicon (byte-identical to the `vite-default-logo-2026` blacklist entry) — expected winner corrected to `glowforge-icon.svg` in Current State and Task 5; (b) `collect_csprojs` truncation raised 10→32 (14 csprojs already within depth ≤2 of winpepper); (c) `__fixtures__` added to `walk_dir_excluded`; (d) tier-4/tier-1 tie-safety note added to Task 3 (tier-4 max 85 = tier-1 min; sequential tier pushes are load-bearing); (e) Task 6 gained a verified pre-approval quote, a scope gate (approval covers icon discovery only — follow-on tab work must not land), and environment notes (gh account, PATH, ruleset-enforced checks). Verified baseline: current `repo_icon` suite 43/43 green, fmt+clippy clean, toolchain 1.96.0. Self-review re-run over edited tasks: no new stubs/deferrals (1b holds — edits only tighten acceptance criteria and bounds); no placeholders introduced; interface texts updated to match code changes (`walk_dir_excluded`, truncate).
 
 **3. Type consistency:** `walk_dir_excluded(name: &str) -> bool` defined in Task 2, consumed in Task 3. `icns_embedded_png(bytes: &[u8]) -> Option<Vec<u8>>` defined `pub(crate)` in Task 4 detector, consumed by `repo_icon.rs` in the same task. `tier4_walk(sink: &mut CandidateSink, max_entries: usize)` matches its test usage. `TIER4: i64` matches `tier_base: i64`. `push_extra(path, tier_base, extra)` matches the existing sink signature (`repo_icon_detect.rs:146`). Consistent throughout.
