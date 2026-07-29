@@ -220,6 +220,7 @@ export type SettingsTab =
   | 'Workspace'
   | 'Naming'
   | 'Network'
+  | 'Stream Deck'
   | 'Advanced'
 
 /** Click a tab button in the settings tabbed navigation to switch sections. */

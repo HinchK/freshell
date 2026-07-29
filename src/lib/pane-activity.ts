@@ -45,6 +45,14 @@ export function resolveFreshAgentSessionKey(
   return `${provider}:${sessionId}`
 }
 
+export function hasWaitingPrompt(
+  session: Pick<FreshAgentSessionState, 'pendingPermissions' | 'pendingQuestions'> | undefined,
+): boolean {
+  if (!session) return false
+  return Object.keys(session.pendingPermissions).length > 0
+    || Object.keys(session.pendingQuestions).length > 0
+}
+
 export function isFreshAgentBusy(
   content: FreshAgentPaneContent,
   session: FreshAgentSessionState | undefined,

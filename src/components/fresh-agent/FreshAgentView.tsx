@@ -2211,7 +2211,9 @@ export function FreshAgentView({
           provider: current.provider,
           ...(cwd ? { cwd } : {}),
           requestId: approval.requestId,
-          decision: { behavior: 'allow', updatedInput: {} },
+          // A defined updatedInput (even {}) wholesale REPLACES the tool input server-side
+          // (sdk-bridge resolves the decision verbatim). Omit the key entirely.
+          decision: { behavior: 'allow' },
         })
       }
     }
@@ -2341,7 +2343,7 @@ export function FreshAgentView({
         ...(freshOpenCodeRouteCwd ? { cwd: freshOpenCodeRouteCwd } : {}),
         requestId,
         decision: allow
-          ? { behavior: 'allow', updatedInput: {} }
+          ? { behavior: 'allow' }
           : { behavior: 'deny', message: 'Denied by user', interrupt: false },
       })
     }

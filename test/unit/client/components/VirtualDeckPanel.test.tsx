@@ -1,0 +1,118 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { Provider } from 'react-redux'
+import { configureStore } from '@reduxjs/toolkit'
+
+const sendMock = vi.fn()
+vi.mock('@/lib/ws-client', () => ({ getWsClient: () => ({ send: sendMock }) }))
+
+import tabsReducer from '@/store/tabsSlice'
+import panesReducer from '@/store/panesSlice'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
+import freshAgentReducer from '@/store/freshAgentSlice'
+import codexActivityReducer from '@/store/codexActivitySlice'
+import claudeActivityReducer from '@/store/claudeActivitySlice'
+import amplifierActivityReducer from '@/store/amplifierActivitySlice'
+import opencodeActivityReducer from '@/store/opencodeActivitySlice'
+import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
+import settingsReducer from '@/store/settingsSlice'
+import deckReducer, { setVirtualDeckOpen } from '@/store/deckSlice'
+import VirtualDeckPanel from '@/components/VirtualDeckPanel'
+
+const reducer = {
+  tabs: tabsReducer, panes: panesReducer, turnCompletion: turnCompletionReducer,
+  freshAgent: freshAgentReducer, codexActivity: codexActivityReducer,
+  claudeActivity: claudeActivityReducer, amplifierActivity: amplifierActivityReducer,
+  opencodeActivity: opencodeActivityReducer, paneRuntimeActivity: paneRuntimeActivityReducer,
+  settings: settingsReducer, deck: deckReducer,
+}
+
+// Mirrors the Task 3 fixture builder with two seeded tabs: tabs t1/t2, terminal
+// leaf panes p1/p2 with terminalId term-N (mode 'claude').
+function makeStore() {
+  const tabCount = 2
+  const tabs = Array.from({ length: tabCount }, (_, i) => ({
+    id: `t${i + 1}`, createRequestId: `c${i + 1}`, title: `tab${i + 1}`, status: 'running', mode: 'shell', createdAt: i + 1,
+  }))
+  const layouts: Record<string, unknown> = {}
+  const activePane: Record<string, string> = {}
+  for (let i = 1; i <= tabCount; i++) {
+    layouts[`t${i}`] = {
+      type: 'leaf', id: `p${i}`,
+      content: { kind: 'terminal', terminalId: `term-${i}`, createRequestId: `c${i}`, status: 'running', mode: 'claude' },
+    }
+    activePane[`t${i}`] = `p${i}`
+  }
+  return configureStore({
+    reducer,
+    preloadedState: {
+      tabs: { tabs, activeTabId: 't1', renameRequestTabId: null, tombstones: [] },
+      panes: {
+        layouts, activePane,
+        paneTitles: {}, paneTitleSetByUser: {}, renameRequestTabId: null, renameRequestPaneId: null,
+        zoomedPane: {}, refreshRequestsByPane: {}, restoreFallbackAttemptsByPane: {},
+      },
+    } as never,
+  })
+}
+
+function renderPanel() {
+  const store = makeStore()
+  render(
+    <Provider store={store}>
+      <VirtualDeckPanel />
+    </Provider>,
+  )
+  return store
+}
+
+function openPanel(store: ReturnType<typeof makeStore>) {
+  act(() => {
+    store.dispatch(setVirtualDeckOpen(true))
+  })
+}
+
+describe('VirtualDeckPanel', () => {
+  afterEach(() => {
+    cleanup()
+  })
+
+  it('renders nothing while closed, opens with a dialog and 6 key buttons on Mini', () => {
+    const store = renderPanel()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    openPanel(store)
+    expect(screen.getByRole('dialog', { name: 'Virtual Stream Deck' })).toBeTruthy()
+    expect(screen.getAllByRole('button', { name: /deck key/i })).toHaveLength(6)
+  })
+
+  it('clicking key 2 focuses tab 2 in the store (short press)', () => {
+    const store = renderPanel()
+    openPanel(store)
+    expect(store.getState().tabs.activeTabId).toBe('t1')
+    const key2 = screen.getByRole('button', { name: 'Deck key 2' })
+    fireEvent.pointerDown(key2)
+    fireEvent.pointerUp(key2)
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+  })
+
+  it('switching to the Plus profile shows 8 keys and dial controls', () => {
+    const store = renderPanel()
+    openPanel(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Plus' }))
+    expect(screen.getAllByRole('button', { name: /deck key/i })).toHaveLength(8)
+    expect(screen.getByRole('button', { name: 'Dial 1 rotate left' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Dial 1 rotate right' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Press dial 1' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Dial 2 rotate left' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Dial 2 rotate right' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Press dial 2' })).toBeTruthy()
+  })
+
+  it('close button clears virtualDeckOpen', () => {
+    const store = renderPanel()
+    openPanel(store)
+    fireEvent.click(screen.getByRole('button', { name: 'Close virtual deck' }))
+    expect(store.getState().deck.virtualDeckOpen).toBe(false)
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+})

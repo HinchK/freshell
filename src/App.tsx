@@ -41,6 +41,7 @@ import { useOrientation } from '@/hooks/useOrientation'
 import { useFullscreen } from '@/hooks/useFullscreen'
 import { useElectronExternalLinks } from '@/hooks/useElectronExternalLinks'
 import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotifications'
+import { useStreamDeck } from '@/hooks/useStreamDeck'
 import { useDrag } from '@use-gesture/react'
 import { installCrossTabSync } from '@/store/crossTabSync'
 import { startTabRegistrySync } from '@/store/tabRegistrySync'
@@ -57,6 +58,7 @@ import { DeadSessionPanel } from '@/components/DeadSessionPanel'
 import { ReconcileWarmingBanner } from '@/components/ReconcileWarmingBanner'
 import { SetupWizard } from '@/components/SetupWizard'
 import { RecoveryOfferPanel } from '@/components/RecoveryOfferPanel'
+import VirtualDeckPanel from '@/components/VirtualDeckPanel'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { fetchNetworkStatus } from '@/store/networkSlice'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
@@ -167,6 +169,7 @@ export default function App() {
   useThemeEffect()
   useTurnCompletionNotifications()
   useElectronExternalLinks()
+  useStreamDeck()
 
   const dispatch = useAppDispatch()
   const appStore = useAppStore()
@@ -1908,6 +1911,8 @@ npm run serve`}</pre>
       )}
       {/* LANE B3 (recover-my-panes): self-gating recovery offer — see docs/plans/2026-07-26-recover-my-panes.md */}
       <RecoveryOfferPanel />
+      {/* In-app Stream Deck emulator — self-hides unless deck.virtualDeckOpen */}
+      <VirtualDeckPanel />
       </div>
     </ContextMenuProvider>
   )

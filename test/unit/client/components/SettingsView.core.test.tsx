@@ -51,6 +51,7 @@ describe('SettingsView core sections', () => {
         'Workspace',
         'Naming',
         'Network',
+        'Stream Deck',
         'Advanced',
       ])
       expect(screen.queryByRole('button', { name: /manage extensions/i })).not.toBeInTheDocument()
