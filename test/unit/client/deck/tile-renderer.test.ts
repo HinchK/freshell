@@ -2,10 +2,11 @@ import { describe, expect, it } from 'vitest'
 import { MINI_CAPS } from '@/deck/fake-deck-device'
 import {
   cropPreviewLines, drawRing, fitLabel, iconLayout, previewGeometry, renderKey, renderStrip, truncateTitle,
-  APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, PREVIEW_TEXT_COLOR, RING_COLORS,
-  TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, DOT_GREEN, DOT_BLUE, DOT_SIZE,
+  APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
+  TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, DOT_SIZE, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
   CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
 } from '@/deck/tile-renderer'
+import { STATUS_GREEN, STATUS_BLUE, STATUS_AMBER, STATUS_RED, STATUS_MUTED, STATUS_MUTED_DIM } from '@/deck/pane-tint-colors'
 import type { Ctx2D, IconSource } from '@/deck/tile-renderer'
 import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
 import { DECK_FONT_STACK } from '@/deck/deck-font'
@@ -123,7 +124,7 @@ describe('renderKey', () => {
     expect(rects.some((r) => r.y === 0 && r.h === 20 && r.style.startsWith('rgba'))).toBe(true) // banner
     expect(texts.some((t) => t.text === 'build' && t.style === '#ffffff')).toBe(true)           // title
     expect(rects.filter((r) => r.style === ACTIVE_COLOR)).toHaveLength(0)
-    expect(texts.filter((t) => t.style === '#a8a8a8')).toHaveLength(0) // no preview text anywhere on the tile
+    expect(texts.filter((t) => t.style === PREVIEW_TEXT_COLOR)).toHaveLength(0) // no preview text anywhere on the tile
   })
 
   it('green fill state paints the light-green background', () => {
@@ -174,9 +175,9 @@ describe('renderKey', () => {
 
   it('status dot: green and blue variants at bottom-center; absent when null', () => {
     const green = renderTab(tabSpec({ dot: 'green' }))
-    expect(green.rects.some((r) => r.style === DOT_GREEN && r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(true)
+    expect(green.rects.some((r) => r.style === STATUS_GREEN && r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(true)
     const blue = renderTab(tabSpec({ dot: 'blue' }))
-    expect(blue.rects.some((r) => r.style === DOT_BLUE && r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(true)
+    expect(blue.rects.some((r) => r.style === STATUS_BLUE && r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(true)
     const none = renderTab(tabSpec())
     expect(none.rects.some((r) => r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(false)
   })
@@ -197,7 +198,7 @@ describe('renderKey', () => {
     let cap: ReturnType<typeof recordingCtx> | null = null
     renderKey({ kind: 'pager', page: 2, pageCount: 3 }, MINI_CAPS, (w, h) => (cap = recordingCtx(w, h)).ctx)
     const { rects, texts } = cap!
-    expect(rects[0].style).toBe('#101036')
+    expect(rects[0].style).toBe(CONTROL_BG)
     expect(texts.map((t) => t.text)).toEqual(expect.arrayContaining(['PAGE', '2/3', 'NEXT >']))
   })
 
@@ -232,7 +233,7 @@ describe('renderKey preview style', () => {
 
   it('icons style still renders fills (dispatch regression)', () => {
     const { rects } = renderTab(tabSpec({ fill: 'green' }))
-    expect(rects.some((r) => r.style === '#a7f3d0')).toBe(true) // emerald-200 green fill
+    expect(rects.some((r) => r.style === TILE_FILL_GREEN)).toBe(true) // emerald-100 green fill
   })
 })
 
@@ -274,5 +275,30 @@ describe('fonts (Inter)', () => {
     const { texts } = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls'] }))
     expect(texts.find((t) => t.text === '$ ls')?.font).toBe('11px monospace')
     expect(texts.find((t) => t.text === 'build')?.font).toBe(`${TITLE_FONT_SIZE}px sans-serif`)
+  })
+})
+
+describe('palette derives from the app UI tokens (mapping block in tile-renderer.ts)', () => {
+  it('matches the documented app-token values', () => {
+    expect(TILE_BG).toBe('#09090b')          // --background dark: hsl(240 10% 4%)
+    expect(TILE_FILL_GREEN).toBe('#d1fae5')  // bg-emerald-100 (TabItem green-filled tab)
+    expect(BAR_TOP_BORDER).toBe('#21c45d')   // --success: hsl(142 71% 45%)
+    expect(STATUS_GREEN).toBe('#21c45d')     // text-success (pane running tint)
+    expect(STATUS_BLUE).toBe('#3b82f6')      // text-blue-500 (pane busy tint)
+    expect(STATUS_AMBER).toBe('#f59f0a')     // --warning: hsl(38 92% 50%) (text-warning)
+    expect(STATUS_RED).toBe('#dc2828')       // --destructive light: hsl(0 72% 51%) (text-destructive)
+    expect(STATUS_MUTED).toBe('#a1a1aa')     // text-muted-foreground dark: hsl(240 5% 65%)
+    expect(STATUS_MUTED_DIM).toBe('rgba(161,161,170,0.4)') // text-muted-foreground/40 dark
+    expect(ACTIVE_COLOR).toBe('#ffffff')     // white active ring
+    expect(CONTROL_BG).toBe('#27272a')       // bg-muted dark
+    expect(CONTROL_DIM).toBe('#a1a1aa')      // text-muted-foreground dark
+    expect(APPROVE_COLOR).toBe('#21c45d')    // --success
+    expect(STOP_COLOR).toBe('#dc2828')       // --destructive light: hsl(0 72% 51%)
+  })
+
+  it('classic previews palette is PINNED', () => {
+    expect(PREVIEW_BG).toBe('#0a0a0a')
+    expect(PREVIEW_TEXT_COLOR).toBe('#a8a8a8')
+    expect(RING_COLORS).toEqual({ amber: '#f59e0b', green: '#22c55e', blue: '#3b82f6' })
   })
 })

@@ -2,6 +2,7 @@ import type { DeckCapabilities } from './deck-device'
 import type { DeckAction, KeySpec, RingColor } from './frame'
 import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
 import { DECK_FONT_STACK } from './deck-font'
+import { STATUS_GREEN, STATUS_BLUE } from './pane-tint-colors'
 
 // Canvas draw layer: converts a KeySpec into an RGBA pixel buffer via an
 // injectable 2D-context factory (jsdom returns null from getContext, so tests
@@ -31,22 +32,45 @@ export const RING_COLORS: Record<Exclude<RingColor, null>, string> = {
 export const BANNER_HEIGHT = 20
 export const BANNER_FILL = 'rgba(0,0,0,0.667)'
 export const TITLE_FONT_SIZE = 16
-export const ACTIVE_COLOR = '#ffffff'
-export const TILE_BG = '#0a0a0a'
-/** Light green fill - the tab bar's emerald attention fill, tuned for the LCD (emerald-200). */
-export const TILE_FILL_GREEN = '#a7f3d0'
-/** The tab bar's bar-on-top green (--success, hsl(142 71% 45%)). */
+
+// ============================================================================
+// DECK PALETTE — derived from freshell's own UI palette so the deck reads as
+// part of the app. KEEP IN SYNC: when an app token changes, update the deck
+// constant to match. Lightness/opacity may be tuned for the small dark LCD;
+// hues must stay the app's (see docs/plans/2026-07-29-deck-icons-polish.md).
+//
+//   deck constant     <- app source token (where it lives)                 value
+//   TILE_BG           <- --background dark  (src/theme-variables.css)      hsl(240 10% 4%)  = #09090b
+//   TILE_FILL_GREEN   <- bg-emerald-100     (TabItem.tsx green-filled tab) #d1fae5
+//                        light-theme variant: the dark-theme emerald-900/40
+//                        fill is illegible at key size on the LCD.
+//   BAR_TOP_BORDER    <- border-t-success / --success (TabItem bar-on-top) hsl(142 71% 45%) = #21c45d
+//   STATUS_* pane-icon tints (text-success, text-blue-500, ...) live in
+//   pane-tint-colors.ts — shared with frame.ts, which computes the tinted
+//   data URLs at frame-build time.
+//   ACTIVE_COLOR      <- white active ring (deck-only affordance)          #ffffff
+//   BANNER_FILL       <- black scrim over the tile (shared w/ previews)    rgba(0,0,0,0.667)
+//   CONTROL_BG        <- bg-muted dark      (src/theme-variables.css)      hsl(240 4% 16%)  = #27272a
+//   CONTROL_DIM       <- text-muted-foreground dark                        hsl(240 5% 65%)  = #a1a1aa
+//   APPROVE_COLOR     <- --success                                         #21c45d
+//   STOP_COLOR        <- --destructive light: hsl(0 72% 51%)               #dc2828
+//                        (light variant: the dark-theme destructive is too
+//                        dull for an action ring on the LCD)
+//   PREVIEW_* / RING_COLORS: classic terminal-previews style — PINNED,
+//   deliberately not re-derived (that style must not change).
+// ============================================================================
+
+export const TILE_BG = '#09090b'
+export const TILE_FILL_GREEN = '#d1fae5'
 export const BAR_TOP_BORDER = '#21c45d'
-/** Status dot: the tab bar's icon tint colors (text-success / text-blue-500). */
-export const DOT_GREEN = '#21c45d'
-export const DOT_BLUE = '#3b82f6'
+export const ACTIVE_COLOR = '#ffffff'
 export const DOT_SIZE = 8
 export const ICON_GAP = 3
-export const STOP_COLOR = '#ef4444'
-export const APPROVE_COLOR = '#22c55e'
+export const CONTROL_BG = '#27272a'
+export const CONTROL_DIM = '#a1a1aa'
+export const APPROVE_COLOR = '#21c45d'
+export const STOP_COLOR = '#dc2828'
 export const DISABLED_ACTION_COLOR = '#555555'
-export const CONTROL_BG = '#101036'
-export const CONTROL_DIM = '#8888aa'
 export const EMPTY_BG = '#000000'
 export const STRIP_FONT_SIZE = 22
 export const CONTROL_LABEL_FONT_SIZE = 11
@@ -180,7 +204,7 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
 
   // 3. Status dot: the tab bar's green/blue icon-tint states, visible on the deck.
   if (spec.dot) {
-    ctx.fillStyle = spec.dot === 'green' ? DOT_GREEN : DOT_BLUE
+    ctx.fillStyle = spec.dot === 'green' ? STATUS_GREEN : STATUS_BLUE
     ctx.fillRect(Math.round((w - DOT_SIZE) / 2), h - DOT_SIZE - 5, DOT_SIZE, DOT_SIZE)
   }
 
