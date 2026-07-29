@@ -198,8 +198,8 @@ n=$(date +%s%N 2>/dev/null); case "$n" in *[!0-9]*|"") n="$(date +%s)000000000";
 
 **preserving each literal's existing escaping style** (the goldens store the JSON-encoded form of the command, so `"` appears as `\"` or `\\\"` depending on nesting — mirror exactly how the surrounding old bytes escape `$d`'s quotes). `g_c4_claude_native_windows_target` embeds the Windows settings and must NOT change (the grep above should not match it).
 
-Run: `cargo test -p freshell-platform --lib cli_launch_goldens`
-Expected: FAIL — `claude_settings_json_bytes_are_pinned` (and g_c1–g_c3) now pin the new bytes while the constant still produces the old ones.
+Run: `cargo test -p freshell-platform --lib cli_argv_goldens_file`
+Expected: FAIL — `claude_settings_json_bytes_are_pinned` (and g_c1–g_c3) now pin the new bytes while the constant still produces the old ones. (The goldens file is mounted inside `cli_launch.rs` as `#[path = "cli_launch_goldens.rs"] mod cli_argv_goldens_file;`, so the test paths are `cli_launch::cli_argv_goldens_file::...` — the filter must be `cli_argv_goldens_file`, not the file name.)
 
 - [ ] **Step 4: Change the constant (GREEN)**
 
