@@ -36,22 +36,24 @@ These facts were verified by direct code reading; task steps cite them. Implemen
 - **Blue icon** ⟺ `busyPaneIds.includes(paneId)` → `text-blue-500` `#3b82f6`.
 - Repo icons are **never tinted** in the tab bar (`TabItem.tsx:133` passes no color class); pane icons are tinted via `currentColor`. No CSS filters anywhere.
 
-**Repo icon pipeline**: per-pane cwd via `resolvePaneRepoCwd(content, tab, state.terminalMeta.byTerminalId)` (`src/lib/repo-icon.ts:13-27`); probed meta cached at `state.repoIcons.byCwd` as `RepoIconEntry { status: 'loading'|'ready'|'error'; repoRoot?; checkoutRoot?; repoName?; hasIcon? }` (`src/store/repoIconsSlice.ts:5-11`); real icon = `<img src={buildRepoIconUrl(cwd)}>` (`/api/repo-icon?cwd=…`), fallback = letter avatar with `hsl(hueFromString(repoName), 60%, 42%)` circle + white letter (`src/components/icons/RepoIcon.tsx:33-65`; `hueFromString` exported at `:19`). Distinct repo icons cap at 3 (`MAX_REPO_ICONS = 3`, `TabItem.tsx:35`), silently truncated. `TabBar.tsx` (~`:229-242`) dispatches `fetchRepoIconMeta(cwd)` probes for all visible tabs' panes — the tab bar is always mounted in the app shell, so the deck can read `state.repoIcons.byCwd` without probing.
+**Repo icon pipeline**: per-pane cwd via `resolvePaneRepoCwd(content, tab, state.terminalMeta.byTerminalId)` (`src/lib/repo-icon.ts:13-27`); probed meta cached at `state.repoIcons.byCwd` as `RepoIconEntry { status: 'loading'|'ready'|'error'; repoRoot?; checkoutRoot?; repoName?; hasIcon? }` (`src/store/repoIconsSlice.ts:5-11`); real icon = `<img src={buildRepoIconUrl(cwd)}>` (`/api/repo-icon?cwd=…`), fallback = letter avatar with `hsl(hueFromString(repoName), 60%, 42%)` circle + white letter (`src/components/icons/RepoIcon.tsx:33-65`; `hueFromString` exported at `:19`). Distinct repo icons cap at 3 (`MAX_REPO_ICONS = 3`, `TabItem.tsx:35`), silently truncated. **Probing (corrected by validation):** `TabBar.tsx:240` is the ONLY `fetchRepoIconMeta` dispatcher in the app, gated at `:230` by `if (!repoIconsOnTabs) return` (setting defaults true, `:189`), and TabBar is *conditionally* mounted (`App.tsx:1644` — hidden in the mobile-landscape terminal view) while deck leader election (`deck-manager.ts:166-203`; the lock-less fallback makes every window an auto-leader) can elect a window whose TabBar is unmounted. The deck therefore CANNOT rely on TabBar to populate `state.repoIcons.byCwd`: the DeckController owns its own probe, un-gated by `repoIconsOnTabs` (Task 8). Double-probing alongside TabBar is harmless — the thunk self-dedupes via its `condition` guard (`repoIconsSlice.ts:36-40`).
+
+**Rust-server terminal-meta coverage (accepted parity limitation):** on the shipping Rust server the `terminal.inventory` handshake carries no terminal meta (`freshell-ws/lib.rs:465-468` hard-codes an empty `terminal_meta`), and only create-time pushes carry a bare `cwd`. `resolvePaneRepoCwd` therefore resolves via the `initialCwd` fallback for coding-CLI/fresh-agent panes and resolves nothing for plain-shell panes. Deck icon coverage on Rust thus EQUALS the tab bar's existing coverage (same resolver, degrades identically); tiles without a resolvable cwd render title-only by design. This is an accepted, documented parity limitation — not a bug this plan fixes.
 
 **Deck internals** (`src/deck/`): `KeySpec` in `frame.ts:6-10` (tab variant: `{ kind:'tab'; tabId; title; previewLines; ring; active }`); `renderKey(spec, caps, createCtx)` with narrow `Ctx2D = Pick<CanvasRenderingContext2D,'fillRect'|'fillText'|'measureText'|'getImageData'> + {fillStyle,font,textBaseline}` (`tile-renderer.ts:8-13`) — **no `drawImage`**; per-key paint cache is `JSON.stringify(spec)` (`deck-controller.ts:126`) so *anything a tile draws must be a KeySpec field*; controller repaint bail-out is `JSON.stringify(selectDeckModel(state))` (`deck-controller.ts:164-176`); preview machinery is `terminal-text-registry.ts` (xterm buffer readers) with sole producer `TerminalView.tsx:103,676-677` and sole consumer `DeckController.previewFor` (`deck-controller.ts:151-160,24`) — **nothing else uses it**; `keyDown` stores only a timestamp (`deck-controller.ts:185-188`) and `handleKeyUp` re-resolves slot→tab from live state at release (`:204-234`) — **no press snapshot exists today**; `selectDeckModel` maps `state.tabs.tabs` verbatim (no sort anywhere); `buildFrame` (`frame.ts:87-113`) assigns keys via `planLayout` + `visibleTabs`; pager = last key when `tabCount > keyCount`, Deck+ pages via dial 1; `VirtualDeckPanel.tsx` uses the same `renderKey` + a real `DeckController` over `FakeDeckDevice` (`:11,81-88`), with `noopCtx`/`safeCtxFactory` (`:21-38`).
 
-**Test landscape**: unit tests in `test/unit/client/deck/`, e2e (fake transport, Vitest not Playwright) in `test/e2e/stream-deck-flow.test.tsx`; renderer tests use a `recordingCtx()` drawing-call spy; controller/e2e tests use spec-encoding renderers (`encodeSpec`/`decodeKey` — pixels are KeySpec JSON); jsdom canvas `getContext` is stubbed to `null`; **no image-loading mock exists** (jsdom `Image` never fires `onload` — tests must inject a fake loader); `makeDeckStore(opts)` fixture builder is deliberately duplicated in `deck-controller.test.ts`, `stream-deck-flow.test.tsx`, `VirtualDeckPanel.test.tsx`.
+**Test landscape**: unit tests in `test/unit/client/deck/`, e2e (fake transport, Vitest not Playwright) in `test/e2e/stream-deck-flow.test.tsx`; renderer tests use a `recordingCtx()` drawing-call spy; controller/e2e tests use spec-encoding renderers (`encodeSpec`/`decodeKey` — pixels are KeySpec JSON); jsdom canvas `getContext` is stubbed to `null`; **no image-loading mock exists** — verified: with this vitest config (no `environmentOptions`), Vitest constructs JSDOM with `resources: undefined`, so jsdom 25.0.1 uses `NoOpResourceLoader`: `Image`s never fetch, never fire `load`/`error`, never complete. Consequences: (a) tests MUST inject the fake loader for any post-load assertion (default-loader promises pend forever in jsdom — harmless but never resolving); (b) `IconImageCache` error paths must be silent (no `console.error`/`console.warn` — `console.error` is fatal in tests); (c) nobody may add `environmentOptions.jsdom.resources` or `userAgent` to the vitest config — either silently enables real fetching and would break these suites. `makeDeckStore(opts)` fixture builder is deliberately duplicated in `deck-controller.test.ts`, `stream-deck-flow.test.tsx`, `VirtualDeckPanel.test.tsx`.
 
 ## Design decisions (settled — carry through all tasks)
 
 1. **Sort lives in `selectDeckModel`.** The spec says short-press, long-press, dials, paging all "operate on the sorted order" — sorting the model gives that everywhere for free (dial-0 tab cycling included), and the model-JSON bail-out repaints automatically on re-sorts. Sort is stable (`Array.prototype.sort` is spec-stable): priority ascending, tab-bar order preserved within groups.
 2. **Priority buckets** (0 = leftmost keys): 0 bar-on-top (`attention && active`), 1 green-filled (`attention && !active`), 2 green-icon (not busy, has a running pane), 3 blue-icon (any busy pane), 4 rest. A tab with both busy and green panes classifies **blue-icon** (busy dominates: "still working"). Attention is gated on `tabAttentionStyle !== 'none'` (mirroring the tab bar: with `'none'` the bar/fill states don't exist). With style `'darken'` the tab bar shows a darkened treatment instead of green; the deck keeps its single green palette (the *condition* is shared; the deck has one fixed skin).
-3. **Green-icon condition is the tab bar's literal condition** (`status === 'running'` and not busy, non-terminal panes always `'running'`). Consequence: most healthy idle tabs are bucket 2 and bucket 4 holds only tabs whose panes are all exited/error/creating (or tabs with no panes). This is faithful to the tab bar's own coloring — do not "improve" it.
+3. **Green-icon condition is the tab bar's literal condition** (`status === 'running'` and not busy, non-terminal panes always `'running'`). Consequence: most healthy idle tabs are bucket 2 and bucket 4 holds only tabs whose panes are all exited/error/creating (or tabs with no panes). This is faithful to the tab bar's own coloring — do not "improve" it. Tabs with no `state.panes.layouts` entry are a real transient (`addTab` never seeds a layout; `PaneLayout.tsx:30-35` initializes it post-paint) and classify via `panesForTab`'s synthesized single pane from `tab.mode`/`tab.status` (Task 2), mirroring `TabBar.tsx:203-221` — so "tabs with no panes" means genuinely mode-less tabs only.
 4. **Status dot instead of tinted icons.** The tab bar never tints *repo* icons — green/blue tinting applies to *pane* icons. The deck centers repo icons (per spec), so the green-icon/blue-icon states are made visible with a small status dot (bottom-center of the tile) using the exact tab-bar tint colors (`#21c45d` / `#3b82f6`) and the exact same conditions. This mirrors the tab bar's own `StatusDot` fallback vocabulary (`fill-success` / `fill-blue-500`).
 5. **Backgrounds:** `none` → `#0a0a0a` (existing near-black); `green` (green-filled state) → solid light green `#a7f3d0` (emerald-200 — recognizably the tab bar's emerald attention fill, tuned for the small LCD); `barTop` (bar-on-top state) → same light green fill **plus** a 3px `#21c45d` border ring (the tab bar's `--success` bar color). Active tab keeps a white ring: 3px at inset 0 normally, 2px at inset 3 when the barTop border occupies inset 0 (matching today's status+active ring nesting).
 6. **Status rings are removed entirely**, including the amber pending-approval ring — the spec replaces rings with the three-state background and doesn't map amber. Pending approval still works via the long-press action layer (`findApproveTarget` untouched).
-7. **Repo icons on tiles ignore `settings.panes.repoIconsOnTabs`** (a tab-bar clutter preference; the deck tile needs its center glyph) and derive from **all** panes in the tab (distinct repos, first-appearance order, cap 3) — the tab bar additionally only considers the first 3 pane icons when picking repo groups; the deck follows the headline "cap repo icons at 3" rule. Resolution logic (cwd → meta → url/letter/hue) is shared, not reimplemented.
-8. **Icon bitmaps:** singleton `IconImageCache` with injectable loader; while loading or on failure the renderer draws the letter avatar (hue swatch + white letter — canvas analogue of `RepoIcon`'s SVG circle; drawn as a square to keep `Ctx2D` minimal). A tab with no repo info renders title-only (banner + fill + dot + rings). Icon readiness is a KeySpec field (`ready`) so loads trigger repaints through the per-key diff; the controller subscribes to the cache and repaints on load completion.
+7. **Repo icons on tiles ignore `settings.panes.repoIconsOnTabs`** (a tab-bar clutter preference; the deck tile needs its center glyph) and derive from **all** panes in the tab (distinct repos, first-appearance order, cap 3) — the tab bar additionally only considers the first 3 pane icons when picking repo groups; the deck follows the headline "cap repo icons at 3" rule. Resolution logic (cwd → meta → url/letter/hue) is shared, not reimplemented. **The deck OWNS its own icon-meta probing:** the DeckController dispatches `fetchRepoIconMeta(cwd)` for every distinct resolved cwd of the tabs it renders, UN-gated by `repoIconsOnTabs` (Task 8) — this is what makes this decision actually deliverable, since `TabBar.tsx:240` is the app's only other dispatcher, is gated on that very setting (`:230`), and is conditionally mounted (`App.tsx:1644`). Double-probing alongside TabBar is harmless: the thunk self-dedupes (`repoIconsSlice.ts:36-40`).
+8. **Icon bitmaps:** singleton `IconImageCache` with injectable loader; while loading or on failure (load error, **or** the cache's post-load drawn-empty probe detecting a blank draw — Task 6) the renderer draws the letter avatar (hue swatch + white letter — canvas analogue of `RepoIcon`'s SVG circle; drawn as a square to keep `Ctx2D` minimal). A tab with no repo info renders title-only (banner + fill + dot + rings). Icon readiness is a KeySpec field (`ready`) so loads trigger repaints through the per-key diff; the controller subscribes to the cache and repaints on load completion.
 9. **Press-snapshot guard:** `keyDown` resolves and stores the key's target (`pager` / `tab tabId` / `none`); `keyUp` acts on the snapshot, so a re-sort between press-down and press-up acts on the tab that was displayed at press-down. If the snapshot tab no longer exists at release, the press is a no-op.
 10. **Idle dimming, multi-window locking, action layer, dials: unchanged** (they now simply see the sorted model). Re-sort repaints waking a dimmed deck is pre-existing behavior for any repaint (`deck-controller.ts:138`) and stays as-is.
 
@@ -60,11 +62,11 @@ These facts were verified by direct code reading; task steps cite them. Implemen
 | File | Change | Responsibility |
 |---|---|---|
 | `src/deck/tile-state.ts` | **Create** | Pure per-tab tile classification: `TileFill`, `TileDot`, `TabStatusFlags`, `tileFill()`, `tileDot()`, `tilePriority()` |
-| `src/deck/icon-image-cache.ts` | **Create** | Singleton async bitmap cache for repo icons (injectable loader, subscribe/notify, permanent-failure caching) |
-| `src/deck/deck-selectors.ts` | Modify | `getTabStatusFlags`, `getTabRepoIcons`, reshaped + sorted `selectDeckModel`; delete `getTabRingStatus`/`TabRingStatus` at cleanup |
+| `src/deck/icon-image-cache.ts` | **Create** | Singleton async bitmap cache for repo icons (injectable loader, subscribe/notify, permanent-failure caching, runtime drawn-empty probe for blank-drawing SVGs) |
+| `src/deck/deck-selectors.ts` | Modify | `panesForTab` (layout-or-synthesized pane entries), `getTabStatusFlags`, `getTabRepoIcons`, reshaped + sorted `selectDeckModel`; delete `getTabRingStatus`/`TabRingStatus` at cleanup |
 | `src/deck/frame.ts` | Modify | `KeySpec` tab variant gains `fill`/`dot`/`icons`, loses `previewLines`/`ring`; `buildFrame` takes `iconReady` instead of `previewFor`; `ringColor`/`RingColor` deleted; `stripText` counts from flags |
 | `src/deck/tile-renderer.ts` | Modify | New `drawTab` (fill, icons, dot, banner, rings); `Ctx2D` gains `drawImage`; `iconLayout()`; preview constants/helpers deleted |
-| `src/deck/deck-controller.ts` | Modify | Icon-cache wiring (iconReady + subscribe→repaint + getIcon into default renderer), preview path removal, press-down target snapshot |
+| `src/deck/deck-controller.ts` | Modify | Icon-cache wiring (iconReady + subscribe→repaint + getIcon into default renderer), un-gated `fetchRepoIconMeta` probe dispatch per resolved cwd, preview path removal, press-down target snapshot |
 | `src/deck/terminal-text-registry.ts` | **Delete** | Dead preview machinery (sole consumer was the deck) |
 | `src/components/TerminalView.tsx` | Modify | Remove `useTerminalTextRegistration` hook call + import (lines ~103, ~676-677) |
 | `src/components/VirtualDeckPanel.tsx` | Modify | `noopCtx` gains `drawImage`; renderer closure passes the icon cache |
@@ -77,8 +79,8 @@ These facts were verified by direct code reading; task steps cite them. Implemen
 | `test/unit/client/deck/terminal-text-registry.test.tsx` | **Delete** | With its module |
 | `test/e2e/stream-deck-flow.test.tsx` | Modify | Updated KeySpec expectations; new scenarios: sort priority, three backgrounds, icon fallback→ready, sorted paging, mid-press re-sort |
 
-Interfaces consumed from outside `src/deck/` (read-only, all verified to exist):
-`getBusyPaneIdsForTab` (`@/lib/pane-activity`), `collectPaneEntries(node: PaneNode): Array<{ paneId: string; content: PaneContent }>` (`@/lib/pane-utils:72-80`), `resolvePaneRepoCwd`, `pathBasename`, `buildRepoIconUrl` (`@/lib/repo-icon`), `hueFromString` (`@/components/icons/RepoIcon`), `state.terminalMeta.byTerminalId`, `state.repoIcons.byCwd`, `state.turnCompletion.attentionByTab`, `state.settings.settings.panes.tabAttentionStyle`.
+Interfaces consumed from outside `src/deck/` (all verified to exist; read-only **except** the one dispatch noted below):
+`getBusyPaneIdsForTab` (`@/lib/pane-activity`), `collectPaneEntries(node: PaneNode): Array<{ paneId: string; content: PaneContent }>` (`@/lib/pane-utils:72-80`), `resolvePaneRepoCwd`, `pathBasename`, `buildRepoIconUrl` (`@/lib/repo-icon`), `hueFromString` (`@/components/icons/RepoIcon`), `state.terminalMeta.byTerminalId`, `state.repoIcons.byCwd`, `state.turnCompletion.attentionByTab`, `state.settings.settings.panes.tabAttentionStyle`. The deck also **dispatches** `fetchRepoIconMeta` from `@/store/repoIconsSlice` (Task 8) — the sole store write the deck performs; the thunk's own `condition` guard (`repoIconsSlice.ts:36-40`) makes it idempotent per cwd, so the deck stays a pure reader of everything else.
 
 ---
 
@@ -222,7 +224,7 @@ git commit -m "feat(deck): pure tile classification - fill, dot, and sort priori
 
 **Interfaces:**
 - Consumes: `TabStatusFlags` from Task 1; existing private `activityInputs(state)` helper (`deck-selectors.ts:13-22`); `getBusyPaneIdsForTab` from `@/lib/pane-activity`; `collectPaneEntries` from `@/lib/pane-utils` (already imported in this file for `tabHasPendingApproval` — verify the import list at the top of the file and add it if it's imported elsewhere).
-- Produces: `getTabStatusFlags(state: RootState, tab: Tab): TabStatusFlags` — exact per-tab busy/attention/greenIcon derivation reused by Task 4.
+- Produces: `getTabStatusFlags(state: RootState, tab: Tab): TabStatusFlags` — exact per-tab busy/attention/greenIcon derivation reused by Task 4 — and `panesForTab(state: RootState, tab: Tab): Array<{ paneId: string; content: PaneContent }>` — layout-or-synthesized pane entries, reused by Task 3 (`getTabRepoIcons`) and Task 8 (probe dispatch).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -262,8 +264,21 @@ describe('getTabStatusFlags', () => {
     const state = store.getState()
     expect(getTabStatusFlags(state, state.tabs.tabs[0]).greenIcon).toBe(false)
   })
+
+  it('tab with NO pane layout classifies from the synthesized pane (tab.mode/tab.status), matching the tab bar', () => {
+    // Real transient: addTab (tabsSlice.ts:296) never seeds a layout — PaneLayout.tsx:30-35
+    // initializes it in a post-paint useEffect, persisted-state restore can omit layout entries,
+    // and the deck repaints synchronously per dispatch, so it WILL paint layout-less tabs.
+    const store = makeStore({ tabs: 1 })
+    const state = store.getState()
+    const tab = state.tabs.tabs[0] // fixture tab: mode 'claude', status 'running'
+    const noLayout = { ...state, panes: { ...state.panes, layouts: {} } } as typeof state
+    expect(getTabStatusFlags(noLayout, tab)).toEqual({ busy: false, attention: false, greenIcon: true })
+  })
 })
 ```
+
+If the fixture builder's tabs lack `mode`/`status` fields, extend it to set them (`mode: 'claude', status: 'running'`) — the synthesis fallback reads the tab's own fields, exactly like `TabBar.tsx:203-221`.
 
 If the suite's fixture builder has no `paneStatus` option, extend it: it constructs `TerminalPaneContent` leaves — add `status: opts.paneStatus?.[paneId] ?? 'running'`. Add a small local `withTabAttentionStyle(state, style)` helper that returns a state copy with `settings.settings.panes.tabAttentionStyle` overridden (structured clone + assignment is fine for a test).
 
@@ -280,6 +295,33 @@ In `src/deck/deck-selectors.ts`, add (import `collectPaneEntries` from `@/lib/pa
 import type { TabStatusFlags } from './tile-state'
 
 /**
+ * Pane entries for a tab, tolerant of layout-less tabs. This transient is REAL:
+ * addTab (tabsSlice.ts:296) never seeds a layout — PaneLayout.tsx:30-35 initializes
+ * it in a post-paint useEffect, and persisted-state restore can omit layout entries —
+ * while the deck repaints synchronously per dispatch, so it WILL paint such tabs.
+ * Mirrors the tab bar's live synthesis fallback (TabBar.tsx:203-221): synthesize a
+ * single terminal pane from the tab's own fields. Do NOT touch TabBar; this is the
+ * deck-local twin of that fallback.
+ */
+export function panesForTab(state: RootState, tab: Tab): Array<{ paneId: string; content: PaneContent }> {
+  const layout = state.panes.layouts[tab.id]
+  if (layout) return collectPaneEntries(layout)
+  if (!tab.mode) return []
+  return [{
+    paneId: tab.id,
+    content: {
+      kind: 'terminal' as const,
+      mode: tab.mode,
+      shell: tab.shell,
+      createRequestId: tab.createRequestId,
+      status: tab.status,
+      sessionRef: tab.sessionRef,
+      initialCwd: tab.initialCwd,
+    },
+  }]
+}
+
+/**
  * Per-tab status flags, derived from the SAME conditions the tab bar uses:
  * - busy: any pane busy (getBusyPaneIdsForTab, TabBar.tsx:329-338)
  * - attention: turnCompletion.attentionByTab gated on tabAttentionStyle !== 'none'
@@ -293,8 +335,7 @@ export function getTabStatusFlags(state: RootState, tab: Tab): TabStatusFlags {
     paneLayouts: state.panes.layouts as Record<string, PaneNode | undefined>,
     ...activityInputs(state),
   })
-  const layout = state.panes.layouts[tab.id]
-  const entries = layout ? collectPaneEntries(layout) : []
+  const entries = panesForTab(state, tab) // layout entries, or the synthesized single pane
   const greenIcon = entries.some(({ paneId, content }) => {
     if (busyIds.includes(paneId)) return false
     const status = content.kind === 'terminal' ? content.status : 'running'
@@ -332,7 +373,7 @@ git commit -m "feat(deck): getTabStatusFlags - busy/attention/greenIcon from the
 - Test: `test/unit/client/deck/deck-selectors.test.ts`
 
 **Interfaces:**
-- Consumes: `resolvePaneRepoCwd(content, tab, terminalMetaById)`, `pathBasename`, `buildRepoIconUrl` from `@/lib/repo-icon`; `hueFromString` from `@/components/icons/RepoIcon`; `collectPaneEntries`; `state.terminalMeta.byTerminalId`; `state.repoIcons.byCwd` (`RepoIconEntry`).
+- Consumes: `resolvePaneRepoCwd(content, tab, terminalMetaById)`, `pathBasename`, `buildRepoIconUrl` from `@/lib/repo-icon`; `hueFromString` from `@/components/icons/RepoIcon`; `panesForTab` (Task 2 — layout-or-synthesized pane entries); `state.terminalMeta.byTerminalId`; `state.repoIcons.byCwd` (`RepoIconEntry`).
 - Produces: `type TileRepoIcon = { url: string | null; letter: string; hue: number }` and `getTabRepoIcons(state: RootState, tab: Tab): TileRepoIcon[]` (max 3, distinct repos, first-appearance order) — consumed by Task 4's model and Task 5's KeySpec.
 
 - [ ] **Step 1: Write the failing test**
@@ -375,6 +416,19 @@ describe('getTabRepoIcons', () => {
     const state = store.getState()
     expect(getTabRepoIcons(state, state.tabs.tabs[0])).toEqual([])
   })
+
+  it('tab with NO pane layout derives its icon from the synthesized pane (tab.initialCwd), matching the tab bar', () => {
+    const store = makeStore({
+      tabs: 1,
+      repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
+    })
+    const state = store.getState()
+    const tab = { ...state.tabs.tabs[0], initialCwd: '/repos/alpha' }
+    const noLayout = { ...state, panes: { ...state.panes, layouts: {} } } as typeof state
+    expect(getTabRepoIcons(noLayout, tab)).toEqual([
+      { url: buildRepoIconUrl('/repos/alpha'), letter: 'A', hue: hueFromString('alpha') },
+    ])
+  })
 })
 ```
 
@@ -405,21 +459,21 @@ export type TileRepoIcon = {
 
 /**
  * Repo icons for a tab, using the SAME resolution pipeline as the tab bar
- * (TabBar.tsx getPaneEntries -> repoIconInfoByCwd): resolvePaneRepoCwd per pane,
- * meta from state.repoIcons.byCwd (probed by the always-mounted TabBar),
- * distinct repos in first-appearance order, capped at 3, silently truncated.
+ * (TabBar.tsx getPaneEntries -> repoIconInfoByCwd): resolvePaneRepoCwd per pane
+ * (panesForTab supplies layout entries or the TabBar.tsx:203-221-style synthesized
+ * pane for layout-less tabs), meta from state.repoIcons.byCwd (probed by the
+ * DeckController itself in Task 8; TabBar also probes when mounted), distinct
+ * repos in first-appearance order, capped at 3, silently truncated.
  * Deliberate divergences from TabItem: considers ALL panes (not just the first
  * 3 pane icons) and ignores settings.panes.repoIconsOnTabs (deck tiles always
  * show their center glyph).
  */
 export function getTabRepoIcons(state: RootState, tab: Tab): TileRepoIcon[] {
-  const layout = state.panes.layouts[tab.id]
-  if (!layout) return []
   const terminalMetaById = state.terminalMeta.byTerminalId
   const byCwd = state.repoIcons.byCwd
   const seen = new Set<string>()
   const icons: TileRepoIcon[] = []
-  for (const entry of collectPaneEntries(layout)) {
+  for (const entry of panesForTab(state, tab)) {
     const cwd = resolvePaneRepoCwd(entry.content, tab, terminalMetaById)
     if (!cwd) continue
     const meta = byCwd[cwd]
@@ -720,11 +774,17 @@ git commit -m "feat(deck): KeySpec gains fill/dot/icons; buildFrame resolves ico
 - Test: `test/unit/client/deck/icon-image-cache.test.ts`
 
 **Interfaces:**
-- Consumes: nothing app-specific (DOM `Image` in the default loader only).
+- Consumes: nothing app-specific (DOM `Image` in the default loader, `document.createElement('canvas')` in the default probe only).
 - Produces (Tasks 7, 8, 12 rely on):
-  - `class IconImageCache { constructor(loader?: IconLoader); bitmapFor(url: string): CanvasImageSource | null; subscribe(cb: () => void): () => void }`
+  - `class IconImageCache { constructor(loader?: IconLoader, probe?: IconProbe); bitmapFor(url: string): CanvasImageSource | null; subscribe(cb: () => void): () => void }`
   - `type IconLoader = (url: string) => Promise<CanvasImageSource>`
+  - `type IconProbe = (bitmap: CanvasImageSource) => boolean` (true = bitmap actually draws pixels)
+  - `hasDrawnPixels(data: Uint8ClampedArray): boolean` (pure threshold logic, exported for tests)
   - `getIconImageCache(): IconImageCache` (singleton), `resetIconImageCacheForTests(cache?: IconImageCache): void`
+
+**Verified jsdom constraints (A3):** under this vitest config (no `environmentOptions`), jsdom 25.0.1 uses `NoOpResourceLoader` — `Image`s never fetch, never fire `load`/`error`, never complete. Therefore: (a) tests MUST always inject the fake loader for any post-load assertion (default-loader promises pend forever in jsdom — harmless but never resolving); (b) every `IconImageCache` error path must be silent — no `console.error`/`console.warn` anywhere in this module (`console.error` is fatal in tests); (c) nobody may add `environmentOptions.jsdom.resources` or `userAgent` to the vitest config — either silently enables real fetching and would break these suites.
+
+**Verified drawn-empty trap (A4):** headless Chromium 145 confirms PNG, .ico, SVGs with width/height, and viewBox-only SVGs all draw non-blank at 96×96 when `drawImage` gets EXPLICIT width/height args — but the server verifiably serves dimensionless SVGs (`repo_icon_detect.rs:51-52` "Unknown dimensions are acceptable"), and two servable shapes fire `onload` yet draw ~0 pixels (no-viewBox SVGs with off-viewport content; width/height=0 SVGs). xmlns-less SVGs fail at load (the `onerror` fallback covers them). So after a successful load the cache runs a runtime-only drawn-empty probe (below) and records near-blank draws as FAILED, making the letter avatar render. The probe lives in the cache — not the tile renderer — so `Ctx2D` stays minimal.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -732,7 +792,7 @@ Create `test/unit/client/deck/icon-image-cache.test.ts`:
 
 ```ts
 import { describe, it, expect, vi } from 'vitest'
-import { IconImageCache, getIconImageCache, resetIconImageCacheForTests } from '@/deck/icon-image-cache'
+import { IconImageCache, getIconImageCache, resetIconImageCacheForTests, hasDrawnPixels } from '@/deck/icon-image-cache'
 
 const fakeBitmap = { width: 16, height: 16 } as unknown as CanvasImageSource
 
@@ -773,6 +833,30 @@ describe('IconImageCache', () => {
     expect(pending.size).toBe(1) // no second load attempt
   })
 
+  it('drawn-empty probe failing records the entry as FAILED (letter avatar renders), no retry', async () => {
+    const { loader, pending } = deferredLoader()
+    const cache = new IconImageCache(loader, () => false) // injected probe: "drew ~0 pixels"
+    const listener = vi.fn()
+    cache.subscribe(listener)
+    cache.bitmapFor('/i/blank-svg')
+    pending.get('/i/blank-svg')!.resolve(fakeBitmap)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(listener).toHaveBeenCalledTimes(1)
+    expect(cache.bitmapFor('/i/blank-svg')).toBe(null) // failed, like a load error
+    expect(pending.size).toBe(1) // permanent: no second load attempt
+  })
+
+  it('drawn-empty probe passing keeps the bitmap', async () => {
+    const { loader, pending } = deferredLoader()
+    const cache = new IconImageCache(loader, () => true)
+    cache.bitmapFor('/i/ok')
+    pending.get('/i/ok')!.resolve(fakeBitmap)
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(cache.bitmapFor('/i/ok')).toBe(fakeBitmap)
+  })
+
   it('unsubscribe stops notifications', async () => {
     const { loader, pending } = deferredLoader()
     const cache = new IconImageCache(loader)
@@ -795,6 +879,23 @@ describe('IconImageCache', () => {
     resetIconImageCacheForTests()
   })
 })
+
+describe('hasDrawnPixels (drawn-empty threshold)', () => {
+  const px = (alphas: number[]): Uint8ClampedArray => {
+    const data = new Uint8ClampedArray(alphas.length * 4)
+    alphas.forEach((a, i) => { data[i * 4 + 3] = a })
+    return data
+  }
+  it('false for a fully transparent draw', () => {
+    expect(hasDrawnPixels(px(new Array(100).fill(0)))).toBe(false)
+  })
+  it('true at >= 1% alpha coverage', () => {
+    expect(hasDrawnPixels(px([255, ...new Array(99).fill(0)]))).toBe(true) // exactly 1%
+  })
+  it('false just below 1% coverage', () => {
+    expect(hasDrawnPixels(px([255, ...new Array(199).fill(0)]))).toBe(false) // 0.5%
+  })
+})
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -814,6 +915,8 @@ Create `src/deck/icon-image-cache.ts`:
 // controller) are notified so tiles repaint with the real icon.
 // Failures are cached permanently for the session (like <img onError> ->
 // letter avatar; the server caches negatives too).
+// All error paths are SILENT - no console.error/console.warn (console.error is
+// fatal in tests, and a failed icon is expected, not exceptional).
 
 export type IconLoader = (url: string) => Promise<CanvasImageSource>
 
@@ -825,13 +928,50 @@ const defaultLoader: IconLoader = (url) =>
     img.src = url
   })
 
+/** True when the decoded bitmap actually draws pixels (guards the SVG drawn-empty trap). */
+export type IconProbe = (bitmap: CanvasImageSource) => boolean
+
+export const DRAWN_EMPTY_PROBE_SIZE = 16
+/** Minimum fraction of non-transparent pixels for a draw to count as visible. */
+export const DRAWN_EMPTY_MIN_ALPHA_COVERAGE = 0.01
+
+/** Pure threshold logic (exported for unit tests): >= 1% of pixels have alpha > 0. */
+export function hasDrawnPixels(data: Uint8ClampedArray): boolean {
+  const pixels = data.length / 4
+  let opaque = 0
+  for (let i = 3; i < data.length; i += 4) {
+    if (data[i] > 0) opaque++
+  }
+  return pixels > 0 && opaque / pixels >= DRAWN_EMPTY_MIN_ALPHA_COVERAGE
+}
+
+// Runtime-only drawn-empty probe. The server serves dimensionless SVGs first-class
+// (repo_icon_detect.rs:51-52 "Unknown dimensions are acceptable"), and two servable
+// shapes fire onload yet draw ~0 pixels in real Chromium (no-viewBox SVGs with
+// off-viewport content; width/height=0 SVGs). Draw into a small internal canvas with
+// EXPLICIT destination dims and count alpha; near-blank -> treat as failure so the
+// letter avatar renders. In jsdom, getContext returns null: skip and trust the load.
+const defaultProbe: IconProbe = (bitmap) => {
+  const canvas = document.createElement('canvas')
+  canvas.width = DRAWN_EMPTY_PROBE_SIZE
+  canvas.height = DRAWN_EMPTY_PROBE_SIZE
+  const ctx = canvas.getContext('2d')
+  if (!ctx) return true // jsdom / no 2D context: cannot probe, trust the load
+  ctx.clearRect(0, 0, DRAWN_EMPTY_PROBE_SIZE, DRAWN_EMPTY_PROBE_SIZE)
+  ctx.drawImage(bitmap, 0, 0, DRAWN_EMPTY_PROBE_SIZE, DRAWN_EMPTY_PROBE_SIZE)
+  return hasDrawnPixels(ctx.getImageData(0, 0, DRAWN_EMPTY_PROBE_SIZE, DRAWN_EMPTY_PROBE_SIZE).data)
+}
+
 export class IconImageCache {
   private bitmaps = new Map<string, CanvasImageSource>()
   private failed = new Set<string>()
   private pending = new Set<string>()
   private listeners = new Set<() => void>()
 
-  constructor(private loader: IconLoader = defaultLoader) {}
+  constructor(
+    private loader: IconLoader = defaultLoader,
+    private probe: IconProbe = defaultProbe,
+  ) {}
 
   /** Returns the decoded bitmap, or null while loading / after failure. Requests the load on first miss. */
   bitmapFor(url: string): CanvasImageSource | null {
@@ -842,7 +982,11 @@ export class IconImageCache {
       void this.loader(url).then(
         (bitmap) => {
           this.pending.delete(url)
-          this.bitmaps.set(url, bitmap)
+          if (this.probe(bitmap)) {
+            this.bitmaps.set(url, bitmap)
+          } else {
+            this.failed.add(url) // drew ~0 pixels: record as FAILED -> letter avatar
+          }
           this.notify()
         },
         () => {
@@ -886,7 +1030,7 @@ Expected: PASS.
 
 ```bash
 git add src/deck/icon-image-cache.ts test/unit/client/deck/icon-image-cache.test.ts
-git commit -m "feat(deck): IconImageCache - async repo-icon bitmaps with letter-avatar fallback semantics"
+git commit -m "feat(deck): IconImageCache - async repo-icon bitmaps with letter-avatar fallback and drawn-empty probe"
 ```
 
 ---
@@ -1053,7 +1197,7 @@ export function iconLayout(w: number, h: number, count: number): Array<{ x: numb
 }
 ```
 
-4. Rewrite `drawTab` (replace the whole function; the preview-drawing block is deleted from `drawTab` here, the helpers/constants themselves are deleted in Task 9):
+4. Rewrite `drawTab` (replace the whole function; the preview-drawing block is deleted from `drawTab` here, the helpers/constants themselves are deleted in Task 9). Rule carried from validation (A4): every `drawImage` call takes EXPLICIT destination width and height — that is what rescues viewBox-only SVGs from drawing blank; the drawn-empty shapes that explicit dims cannot rescue are caught by Task 6's cache-side probe, so the renderer stays probe-free:
 
 ```ts
 function drawTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, { kind: 'tab' }>, getIcon: IconSource): void {
@@ -1067,6 +1211,10 @@ function drawTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, { kind
     const { x, y, size } = slots[i]
     const bitmap = icon.url && icon.ready ? getIcon(icon.url) : null
     if (bitmap) {
+      // ALWAYS pass explicit destination width AND height: dimensionless (viewBox-only)
+      // SVGs draw blank without them (verified headless Chromium 145; the server serves
+      // dimensionless SVGs first-class - repo_icon_detect.rs:51-52). Never call the
+      // 3-arg drawImage(image, dx, dy) form anywhere in this module.
       ctx.drawImage(bitmap, x, y, size, size)
       return
     }
@@ -1147,8 +1295,8 @@ git commit -m "feat(deck): tab-bar-matching tile rendering - fills, repo icons, 
 - Test: `test/unit/client/deck/deck-controller.test.ts`
 
 **Interfaces:**
-- Consumes: `IconImageCache`/`getIconImageCache` (Task 6), `renderKey` 4-arg form (Task 7).
-- Produces: `DeckControllerOptions` gains `iconCache?: IconImageCache`; `previewFor` and the 3s preview repaint are gone (Task 9 deletes the registry module itself).
+- Consumes: `IconImageCache`/`getIconImageCache` (Task 6), `renderKey` 4-arg form (Task 7), `panesForTab` (Task 2), `resolvePaneRepoCwd` (`@/lib/repo-icon`), `fetchRepoIconMeta` (`@/store/repoIconsSlice` — the deck's sole store write; the thunk self-dedupes, `repoIconsSlice.ts:36-40`).
+- Produces: `DeckControllerOptions` gains `iconCache?: IconImageCache`; the controller OWNS repo-icon meta probing (un-gated by `settings.panes.repoIconsOnTabs` — Design decision 7; TabBar cannot be relied on: its probe at `TabBar.tsx:240` is gated at `:230` and TabBar is conditionally mounted, `App.tsx:1644`); `previewFor` and the 3s preview repaint are gone (Task 9 deletes the registry module itself).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1180,14 +1328,34 @@ it('no periodic preview repaint: 3s of ticks with unchanged state paints nothing
   vi.advanceTimersByTime(3_000)
   expect(device.keyImages.size).toBe(0)
 })
+
+it('dispatches fetchRepoIconMeta for tab cwds even when settings.panes.repoIconsOnTabs is false (deck owns the probe)', () => {
+  // No repoIcons seeded: the controller itself must probe /repos/alpha. TabBar cannot be
+  // relied on (its probe is gated on repoIconsOnTabs and TabBar is conditionally mounted).
+  const settings = { ...defaultSettings, panes: { ...defaultSettings.panes, repoIconsOnTabs: false } }
+  const { store } = setup({ tabs: 1, terminalMeta: { 'term-1': { cwd: '/repos/alpha' } } }, undefined, settings)
+  // The thunk's pending case records { status: 'loading' } synchronously on dispatch.
+  expect(store.getState().repoIcons.byCwd['/repos/alpha']).toMatchObject({ status: 'loading' })
+})
+
+it('does not re-probe a cwd already present in state.repoIcons.byCwd', () => {
+  const { store } = setup({
+    tabs: 1,
+    terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
+    repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
+  })
+  expect(store.getState().repoIcons.byCwd['/repos/alpha'].status).toBe('ready') // untouched, no 'loading' overwrite
+})
 ```
+
+(If the suite's real `api` layer throws synchronously in jsdom, `vi.mock('@/lib/api', ...)` it with a never-resolving `get` — the probe assertions only need the thunk's synchronous `pending` entry.)
 
 Extend the suite's `setup()` helper to accept extra `DeckController` options (4th arg) and to seed `terminalMeta`/`repoIcons` preloaded state (mirror Task 3's fixture additions). Also update/remove the existing test that asserts the 3s preview refresh (the suite has diff-paint tests around `PREVIEW_REFRESH_TICKS`).
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run: `npm run test:vitest -- run test/unit/client/deck/deck-controller.test.ts --config config/vitest/vitest.config.ts`
-Expected: FAIL — no `iconCache` option; icons never become ready; the 3s tick still repaints (registry snapshot reads).
+Expected: FAIL — no `iconCache` option; icons never become ready; the 3s tick still repaints (registry snapshot reads); no probe dispatch exists yet, so `state.repoIcons.byCwd['/repos/alpha']` is `undefined` in the probe tests.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1236,6 +1404,37 @@ const frame = buildFrame({
 
 6. Also remove the "ORDERING (load-bearing)" comment in `onStoreChange` referencing previews (`:164-170`) — the bail-out itself stays.
 
+7. Own the repo-icon meta probe. The deck cannot rely on TabBar to populate `state.repoIcons.byCwd`: `TabBar.tsx:240` is the app's only other dispatcher, gated at `:230` on `repoIconsOnTabs`, and TabBar is conditionally mounted (`App.tsx:1644`) while leader election (`deck-manager.ts:166-203`) can elect a window without it. Add to `deck-controller.ts`:
+
+```ts
+import { fetchRepoIconMeta } from '@/store/repoIconsSlice'
+import { resolvePaneRepoCwd } from '@/lib/repo-icon'
+import { panesForTab } from './deck-selectors'
+
+/**
+ * Probe repo-icon meta for every distinct resolved cwd of the tabs we render.
+ * Deliberately UN-gated by settings.panes.repoIconsOnTabs (Design decision 7:
+ * deck tiles always show their center glyph). Double-probing alongside a
+ * mounted TabBar is harmless - the thunk self-dedupes (repoIconsSlice.ts:36-40).
+ */
+private probeRepoIcons(): void {
+  const state = this.store.getState()
+  const terminalMetaById = state.terminalMeta.byTerminalId
+  const cwds = new Set<string>()
+  for (const tab of state.tabs.tabs) {
+    for (const entry of panesForTab(state, tab)) {
+      const cwd = resolvePaneRepoCwd(entry.content, tab, terminalMetaById)
+      if (cwd) cwds.add(cwd)
+    }
+  }
+  for (const cwd of cwds) {
+    if (!state.repoIcons.byCwd[cwd]) this.store.dispatch(fetchRepoIconMeta(cwd))
+  }
+}
+```
+
+Call sites: once in `start()` (after the initial repaint), and in `onStoreChange` whenever the model JSON differs — i.e. inside the existing branch that already triggers `repaint()`, after the bail-out check (a probe result mutates `repoIcons`, which changes the model, which re-enters `onStoreChange` and repaints — no extra subscription needed). If the controller's `store` field is typed too narrowly to dispatch thunks, type it with the app store's `AppDispatch` (the same store type `focusTabFromDeck` already dispatches through) rather than casting at the call site.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `npm run test:vitest -- run test/unit/client/deck/ test/e2e/stream-deck-flow.test.tsx --config config/vitest/vitest.config.ts`
@@ -1245,7 +1444,7 @@ Expected: controller tests PASS. The e2e suite's preview expectations now decode
 
 ```bash
 git add src/deck/deck-controller.ts src/deck/frame.ts test/unit/client/deck/ test/e2e/stream-deck-flow.test.tsx
-git commit -m "feat(deck): controller loads repo icons via IconImageCache and drops the preview repaint"
+git commit -m "feat(deck): controller loads repo icons via IconImageCache, owns the meta probe, drops the preview repaint"
 ```
 
 ---
@@ -1452,6 +1651,7 @@ git commit -m "feat(deck): snapshot key target at press-down so re-sorts cannot 
 
 **Interfaces:**
 - Consumes: everything above through the REAL store + REAL `DeckController` + `FakeDeckDevice` + spec-encoding renderer; `IconImageCache` with a deferred fake loader; fixture-builder extensions from Tasks 2–4 (`paneStatus`, `terminalMeta`, `repoIcons` seeding — port them into this suite's `makeDeckStore`).
+- Fixtures note (layout-less transient): fixture stores must seed `state.panes.layouts` entries for every created tab (the real `addTab` never does — tabsSlice.ts:296), OR expectations must explicitly account for `panesForTab`'s synthesized single-pane fallback (Task 2) — otherwise sort/icon expectations flake on the layout-less transient.
 - Produces: user-story coverage for the redesign.
 
 - [ ] **Step 1: Write the new scenarios (they must fail only if the feature regresses — write them, run, expect PASS since Tasks 1–10 landed; any failure here is a real integration bug to fix before commit)**
@@ -1596,7 +1796,8 @@ Do NOT create a PR — stop after committing; PR creation requires explicit user
 
 **1. Spec coverage:**
 - Title on top (unchanged banner) → Task 7 step 3 (§4 of `drawTab`).
-- Repo icons centered, tab-bar pipeline reuse, cap-3 → Tasks 3, 5, 7; async load + cache + fallback → Tasks 6, 7, 8; no-repo tab renders title-only → Task 7 (`icons: []` → no draws) + Task 3 test.
+- Repo icons centered, tab-bar pipeline reuse, cap-3 → Tasks 3, 5, 7; async load + cache + fallback → Tasks 6, 7, 8; no-repo tab renders title-only → Task 7 (`icons: []` → no draws) + Task 3 test; deck-owned un-gated `fetchRepoIconMeta` probing (TabBar's probe is setting-gated and conditionally mounted, so the deck cannot rely on it) → Design decision 7 + Task 8 step 3.7; drawn-empty SVG guard (<1% alpha coverage → entry FAILED → letter avatar) → Task 6; explicit-dims `drawImage` rule → Task 7; Rust-server icon-coverage parity documented as an accepted scope note (Investigation results).
+- Layout-less tabs (a real transient: `addTab` never seeds a layout) classify and derive icons via `panesForTab`'s synthesized single pane mirroring `TabBar.tsx:203-221` (TabBar itself untouched) → Tasks 2, 3; e2e fixtures seed layouts or account for the fallback → Task 11.
 - Preview removal + dead machinery deletion (registry, TerminalView hook, 3s repaint, preview constants) with `/capture` untouched → Tasks 8, 9 (grep gate in Task 9 step 4).
 - Three background treatments driven by shared tab-bar conditions + exact color mapping → Tasks 1, 2, 7 (colors from verified `theme-variables.css` / Tailwind values).
 - Icon tinting: investigation showed the tab bar never tints repo icons (only pane icons); green/blue visibility on deck is delivered via the status dot with the same conditions/colors → Design decision 4, Tasks 1, 7.
@@ -1607,8 +1808,8 @@ Do NOT create a PR — stop after committing; PR creation requires explicit user
 - Client-only; tab bar unchanged (read-only reuse; `hueFromString` fallback note in Task 3 keeps a single implementation).
 - Unit + e2e coverage for sort priority and the three backgrounds → Tasks 1, 4 (unit), 11 (e2e). Lint/typecheck/coordinated suite → Task 12.
 
-**1b. No silent deferrals:** The only test doubles are the established suite seams (spec-encoding renderer, `FakeDeckDevice`, fake icon loader) — the same doubles the merged feature already ships with; production behavior (real canvas via `defaultCtxFactory`, real `Image` loader, WebHID transport) is exercised at runtime and unchanged in kind. No requirement is stubbed without a production path: the default `IconLoader` uses a real `Image` (Task 6), and the default renderer path passes the real cache (Task 8 step 3.2). No "known limitations" introduced.
+**1b. No silent deferrals:** The only test doubles are the established suite seams (spec-encoding renderer, `FakeDeckDevice`, fake icon loader) plus the injectable drawn-empty probe — every double has a production path: the default `IconLoader` uses a real `Image` (Task 6), the default `IconProbe` draws into a real probe canvas with its pure threshold logic (`hasDrawnPixels`) unit-tested directly (Task 6), the default renderer path passes the real cache (Task 8 step 3.2), and the probe dispatch uses the real `fetchRepoIconMeta` thunk in tests and production alike (Task 8 step 3.7). One documented limitation, accepted deliberately (not silent): Rust-server icon coverage equals the tab bar's existing coverage — same resolver, same degradation (Investigation results scope note).
 
-**2. Placeholder scan:** Two intentional adapt-to-fixture instructions remain (Task 2/3: "match the fixture builder actually present in the file") — these are file-drift guards with concrete fallback code shown, not deferrals. The Task 3 cap/dedupe test body is specified by exact expected behavior with construction guidance; implementer writes the fixture wiring. All other steps carry full code.
+**2. Placeholder scan:** Two intentional adapt-to-fixture instructions remain (Task 2/3: "match the fixture builder actually present in the file") — these are file-drift guards with concrete fallback code shown, not deferrals. The Task 3 cap/dedupe test body is specified by exact expected behavior with construction guidance; implementer writes the fixture wiring. The validation-driven additions (layout-fallback tests, `panesForTab`, probe-dispatch tests + `probeRepoIcons`, drawn-empty probe + `hasDrawnPixels` tests) all carry full runnable code. All other steps carry full code.
 
-**3. Type consistency check:** `TileFill`/`TileDot`/`TabStatusFlags` (Task 1) ← used in Tasks 2, 4, 5, 7. `TileRepoIcon { url, letter, hue }` (Task 3) → `TileIcon = TileRepoIcon & { ready }` shape (Task 5) → renderer reads `icon.url/letter/hue/ready` (Task 7). `iconReady(url) => boolean` named consistently (Tasks 5, 8). `IconImageCache.bitmapFor/subscribe` consistent (Tasks 6, 7, 8, 11). `DeckTab` transitional `status` added Task 4, removed Task 9 — both sides documented. `renderKey` 4-arg signature consistent (Tasks 7, 8, VirtualDeckPanel).
+**3. Type consistency check:** `TileFill`/`TileDot`/`TabStatusFlags` (Task 1) ← used in Tasks 2, 4, 5, 7. `panesForTab(state, tab): Array<{ paneId; content }>` (Task 2) ← used by `getTabStatusFlags` (Task 2), `getTabRepoIcons` (Task 3), `probeRepoIcons` (Task 8). `TileRepoIcon { url, letter, hue }` (Task 3) → `TileIcon = TileRepoIcon & { ready }` shape (Task 5) → renderer reads `icon.url/letter/hue/ready` (Task 7). `iconReady(url) => boolean` named consistently (Tasks 5, 8). `IconImageCache` constructor `(loader?: IconLoader, probe?: IconProbe)` with `bitmapFor/subscribe` consistent (Tasks 6, 7, 8, 11); `IconProbe`/`hasDrawnPixels` (Task 6) have their production path in `defaultProbe`. `DeckTab` transitional `status` added Task 4, removed Task 9 — both sides documented. `renderKey` 4-arg signature consistent (Tasks 7, 8, VirtualDeckPanel).
