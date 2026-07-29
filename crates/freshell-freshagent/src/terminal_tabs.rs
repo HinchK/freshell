@@ -38,11 +38,11 @@ use axum::response::Response;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live};
+use freshell_platform::detect::{host_os_live, is_windows, is_wsl_env_live, HostOs};
 use freshell_platform::mcp_inject::{cleanup_mcp_config, generate_mcp_injection, RealMcpRuntime};
 use freshell_platform::spawn::{
     cli_provider_target, resolve_coding_cli_command, resolve_mcp_cwd, resolve_shell,
-    CliLaunchInputs, LaunchIntent,
+    resolve_unix_shell_cwd, CliLaunchInputs, LaunchIntent,
 };
 use freshell_platform::{
     build_cli_spawn_spec, build_spawn_spec, build_windows_cli_spawn_spec, CliLaunch, Env, RealEnv,
@@ -447,16 +447,17 @@ fn wrap_terminal_spawn_error(
     }
 }
 
-/// Arm the amplifier/opencode session locator for a freshly-created REST
-/// terminal, iff it's a fresh (non-resuming) pane of the matching mode with a
-/// resolved cwd -- mirrors `crates/freshell-ws/src/amplifier_association::maybe_arm`
-/// / `opencode_association::maybe_arm` EXACTLY (same shared-instance `arm()`
-/// call, same argument shape); those wrapper fns are `pub(crate)` inside
-/// `freshell-ws` and unreachable from this crate (circular-dependency
-/// boundary, see this module's top doc), so this is the thin, crate-local
-/// equivalent -- the actual mode/resume/cwd admission logic lives ONCE, inside
-/// `AmplifierLocator::arm`/`OpencodeLocator::arm` themselves (shared by both
-/// crates via `freshell-sessions`), not duplicated here.
+/// Arm the opencode session locator for a freshly-created REST terminal,
+/// iff it's a fresh (non-resuming) pane of the matching mode with a
+/// resolved cwd -- mirrors `crates/freshell-ws/src/opencode_association::maybe_arm`
+/// EXACTLY (same shared-instance `arm()` call, same argument shape); that
+/// wrapper fn is `pub(crate)` inside `freshell-ws` and unreachable from this
+/// crate (circular-dependency boundary, see this module's top doc), so this
+/// is the thin, crate-local equivalent -- the actual mode/resume/cwd
+/// admission logic lives ONCE, inside `OpencodeLocator::arm` itself (shared
+/// by both crates via `freshell-sessions`), not duplicated here. (The
+/// amplifier arm was deleted with the correlation-window locator, kata qmpk
+/// — amplifier identity is launcher-assigned at create time.)
 fn arm_locators_for_fresh_pane(
     state: &FreshAgentState,
     terminal_id: &str,
@@ -464,9 +465,6 @@ fn arm_locators_for_fresh_pane(
     cwd: Option<&str>,
     resume_session_id: Option<&str>,
 ) {
-    if let Some(locator) = &state.amplifier_locator {
-        locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
-    }
     if let Some(locator) = &state.opencode_locator {
         locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
     }
@@ -545,6 +543,38 @@ fn codex_launch_error_response(
         CodexLaunchError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
     fail_json(status, error.to_string())
+}
+
+/// REST mapping of a spawn-gate rejection (WS analogue:
+/// `spawn_gate_error_parts` in freshell-ws/src/terminal.rs).
+/// QueueFull -> 429: the caller should back off and retry.
+/// Timeout   -> 503: spawn capacity unavailable right now.
+/// The retry guidance lives in the MESSAGE because the MCP bridge
+/// (server/mcp/freshell-tool.ts) surfaces only the message text, not the
+/// HTTP status. Body key is `code`+`message` (never `error`) so the MCP
+/// http-client's `data.error || data.message` precedence keeps showing the
+/// human message.
+fn spawn_gate_error_response(err: crate::spawn_gate::SpawnGateError) -> Response {
+    match err {
+        crate::spawn_gate::SpawnGateError::QueueFull => crate::fail_json_code(
+            StatusCode::TOO_MANY_REQUESTS,
+            "SPAWN_QUEUE_FULL",
+            "Too many concurrent terminal spawns; retry shortly".to_string(),
+        ),
+        crate::spawn_gate::SpawnGateError::Timeout => crate::fail_json_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SPAWN_TIMEOUT",
+            "Timed out waiting for a terminal spawn slot".to_string(),
+        ),
+        // Unreachable on the REST door: the handler holds its cancel
+        // sender (never fired, never dropped) across the whole acquire.
+        // Mapped like Timeout so an impossible arm still fails safe.
+        crate::spawn_gate::SpawnGateError::Cancelled => crate::fail_json_code(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SPAWN_TIMEOUT",
+            "Timed out waiting for a terminal spawn slot".to_string(),
+        ),
+    }
 }
 
 /// The resumeSessionId ECHO (`router.ts:177`):
@@ -674,7 +704,7 @@ pub(crate) async fn spawn_terminal_pane(
         .get("shell")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
+    let mut cwd = body.get("cwd").and_then(Value::as_str).map(str::to_string);
 
     // Stable pane identity key (reconciliation-handshake design §5.5,
     // precondition 2): honor a caller-supplied key (snapshot restore passes
@@ -702,6 +732,189 @@ pub(crate) async fn spawn_terminal_pane(
     }
 
     let (mut resume_session_id, accepted_session_ref) = derive_resume_identity(body, &mode)?;
+
+    // Hoisted spawn-environment inputs, computed ONCE (Task 8's WS pattern,
+    // REST twin): the amplifier windows-arm guard below and the spawn-spec
+    // construction in `settle_gated_create` (its `windows_like` branch pick,
+    // terminal_tabs.rs `spec = match &launch {...}`) must evaluate the SAME
+    // values so guard and spawn can never disagree — `host_os`/`is_wsl` are
+    // threaded through [`GatedSettleInputs`] instead of being re-read there.
+    let host_os = host_os_live();
+    let is_wsl = is_wsl_env_live();
+    let shell_type = shell_str
+        .as_deref()
+        .and_then(ShellType::parse)
+        .unwrap_or(ShellType::System);
+    let effective_shell = resolve_shell(shell_type, host_os, is_wsl);
+    let windows_like = is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
+
+    // Launcher-assigned amplifier identity (kata qmpk) — REST twin of the WS
+    // block in `crates/freshell-ws/src/terminal.rs` (Tasks 8-9), covering
+    // POST /api/tabs, /api/panes/:id/split, and /respawn (every caller
+    // funnels through this function). Sequential with (not replacing) the
+    // D7 liveness guard below (PR #540) and the PR #559 spawn gate.
+    // ORDERING IS LOAD-BEARING: the stub — including events.jsonl — must be
+    // written BEFORE registry.create (the activity events-lane resolver
+    // attaches at create time), and writing it HERE, before the detach
+    // point, keeps every client-visible 4xx synchronous.
+    let mut amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession> = None;
+    if mode == "amplifier" {
+        // A10/B1 guard — REST twin of the WS windows-arm reject: a
+        // client-supplied `shell` can route the spawn to
+        // build_windows_cli_spawn_spec, whose cwd handling is a DIFFERENT
+        // transformation than the one the stub slug is computed from.
+        if windows_like {
+            return Err(fail_json(
+                StatusCode::BAD_REQUEST,
+                "Amplifier terminals require the default system shell on a unix host (cwd is part of the session identity contract).".to_string(),
+            ));
+        }
+        if resume_session_id
+            .as_deref()
+            .is_some_and(|s| s.starts_with("terminal:"))
+        {
+            // Defense-in-depth against the old correlation bug's poisoned
+            // persisted tab state: `terminal:<id>` is Freshell's own
+            // synthetic sidebar placeholder, never a resumable session.
+            return Err(fail_json(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Invalid amplifier sessionRef '{}': synthetic terminal placeholder ids are not resumable sessions.",
+                    resume_session_id.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+        // Launcher-assigned identity: a fresh (non-restore) create mints the
+        // session UUID up front. Legacy persisted panes with NO resume id
+        // and `restore: true` spawn a fresh identity-less amplifier (no
+        // preallocation on restore — accepted scope clarification).
+        let is_restore = body.get("restore").and_then(Value::as_bool) == Some(true);
+        if resume_session_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_none()
+            && !is_restore
+        {
+            resume_session_id = Some(Uuid::new_v4().to_string());
+        }
+        if let Some(requested) = resume_session_id.as_deref() {
+            // Friendly pre-check; race-free enforcement is inside
+            // TerminalRegistry::create (Task 7) and mapped to 409 in
+            // `settle_gated_create`'s failure branch.
+            if freshell_terminal::registry::has_live_resume(
+                &registry.identity_probe_rows(),
+                "amplifier",
+                requested,
+            ) {
+                return Err(fail_json(
+                    StatusCode::CONFLICT,
+                    format!("Amplifier session {requested} is already open in a live terminal."),
+                ));
+            }
+            // ONE effective spawn cwd (F4). The falsified path this closes:
+            // cwd=None used to flow into build_cli_spawn_spec → spec.cwd =
+            // None → the PTY inherited the BROKER's own cwd while the stub
+            // sat under slug($HOME) — silent divergence. Compute the
+            // effective cwd ONCE (explicit validated cwd, else $HOME),
+            // verify it is a dir, slug the stub from it, and assign it back
+            // so the spawn plumbing receives the SAME value.
+            let raw_effective_cwd = match cwd
+                .clone()
+                .or_else(|| std::env::var("HOME").ok().filter(|v| !v.is_empty()))
+            {
+                Some(c) => c,
+                None => {
+                    return Err(fail_json(
+                        StatusCode::BAD_REQUEST,
+                        "Amplifier requires a resolvable working directory (cwd is part of the session identity contract).".to_string(),
+                    ));
+                }
+            };
+            // A10/B2 guard (validated falsification): REST's is_dir check
+            // above ADMITS relative paths, but build_cli_spawn_spec resolves
+            // a relative cwd to None (resolve_unix_shell_cwd) and the PTY
+            // then inherits the BROKER's cwd while the stub slugs the
+            // canonicalized path — silent divergence. Run the SAME
+            // transformation the spawn layer applies (idempotent for
+            // absolute unix paths) and reject what it cannot represent.
+            let Some(mut effective_cwd) =
+                resolve_unix_shell_cwd(Some(raw_effective_cwd.as_str()), &RealEnv, is_wsl)
+            else {
+                return Err(fail_json(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Amplifier working directory \"{raw_effective_cwd}\" must be an absolute path."
+                    ),
+                ));
+            };
+            if !std::path::Path::new(&effective_cwd).is_dir() {
+                return Err(fail_json(
+                    StatusCode::BAD_REQUEST,
+                    format!("Amplifier working directory \"{effective_cwd}\" does not exist."),
+                ));
+            }
+            let ensured = freshell_sessions::amplifier_stub::resolve_amplifier_home()
+                .ok_or_else(|| {
+                    "amplifier home unresolvable (no FRESHELL_AMPLIFIER_HOME and no HOME)"
+                        .to_string()
+                })
+                .and_then(|amp_home| {
+                    freshell_sessions::amplifier_stub::ensure_session(
+                        &amp_home,
+                        requested,
+                        &effective_cwd,
+                        // terminal_id is minted later in settle_gated_create;
+                        // the stub's freshell_terminal_id is a durable-linkage
+                        // bonus, not a key — record the createRequestId.
+                        &create_request_id,
+                    )
+                    .map_err(|e| e.to_string())
+                });
+            match ensured {
+                Ok(ensured) => {
+                    // Requested resume FOUND under a different slug than
+                    // slug(effective_cwd) (F4): cwd is part of amplifier's
+                    // identity contract — resuming from elsewhere finds
+                    // nothing. Spawn at the session's own working_dir, or
+                    // reject loudly if it no longer exists.
+                    if ensured.found_under_divergent_slug {
+                        match ensured
+                            .working_dir_of_existing
+                            .as_deref()
+                            .filter(|d| std::path::Path::new(d).is_dir())
+                        {
+                            Some(existing_dir) => effective_cwd = existing_dir.to_string(),
+                            None => {
+                                return Err(fail_json(
+                                    StatusCode::BAD_REQUEST,
+                                    format!(
+                                        "Amplifier session {requested} was created in {}, which no longer exists.",
+                                        ensured
+                                            .working_dir_of_existing
+                                            .as_deref()
+                                            .unwrap_or("an unknown directory")
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    // CRITICAL (F4): the registry row and build_cli_spawn_spec
+                    // must receive the effective cwd, never None.
+                    cwd = Some(effective_cwd);
+                    amplifier_stub = Some(ensured);
+                }
+                Err(detail) => {
+                    // Fail LOUD: spawning `amplifier resume <id>` without a
+                    // resumable dir would hang a doomed CLI (the exact
+                    // failure mode this feature deletes).
+                    return Err(fail_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to pre-create amplifier session {requested}: {detail}"),
+                    ));
+                }
+            }
+        }
+    }
 
     // D7 live-session guard, REST rung -- mirrors the WS terminal.create guard
     // (freshell-ws/src/terminal.rs D7 block) via the shared
@@ -792,6 +1005,152 @@ pub(crate) async fn spawn_terminal_pane(
         }
     }
 
+    // Server-wide spawn gate — the SAME instance the WS terminal.create path
+    // uses (ONE global concurrency budget; wired by freshell-server main.rs;
+    // docs/plans/2026-07-27-rest-spawn-gate.md). Placed on the shared path of
+    // EVERY mode, before terminal_id minting — i.e. before MCP config
+    // generation, opencode port allocation, and the codex managed-launch
+    // plan — so the permit also bounds the REST-reachable sidecar spawn and
+    // rejection needs NO cleanup (the session-ref lease above releases via
+    // its own Drop). `None` (unwired) = ungated: unit-test states without
+    // server wiring keep legacy behavior.
+    let spawn_permit = match state.spawn_gate() {
+        Some(rest_gate) => {
+            // The gate's acquire is cancellable via a watch channel (the WS
+            // door wires its per-connection cancel signal). REST has no such
+            // signal: hold a live, never-fired sender for the whole acquire
+            // (dropping it early would read as "connection gone" =>
+            // Cancelled). If the HTTP request itself is dropped while
+            // QUEUED, axum drops this future and the gate's queue-slot
+            // guard reclaims the slot — nothing has been spawned yet.
+            let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+            match rest_gate
+                .gate
+                .acquire(rest_gate.timeout, &mut cancel_rx)
+                .await
+            {
+                Ok(permit) => Some(permit),
+                Err(err) => {
+                    // Deliberate ordering trade-off: the amplifier stub is
+                    // written BEFORE this gate acquire (keeping every
+                    // client-visible 4xx synchronous), so a gate rejection
+                    // leaves a fresh stub behind. A stub written for a spawn
+                    // that never happened is litter — GC it (only one THIS
+                    // create wrote, and only while provably never used).
+                    if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
+                        let _ =
+                            freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
+                    }
+                    return Err(spawn_gate_error_response(err));
+                }
+            }
+        }
+        None => None,
+    };
+
+    // F1 (council enn3; prior art da5d9b5c, pinned by the WS door's
+    // `create_gate::hold_permit_across`): everything from here to the
+    // settled terminal runs on a DETACHED task that OWNS the permit, the
+    // session-ref lease, and (for codex) the launch plan. This handler
+    // future is droppable at every await — a client abort (`curl
+    // --max-time` does it) must NOT release the permit while the
+    // uncancellable `spawn_blocking` fork proceeds (that was the gate
+    // escape), nor skip the post-spawn bookkeeping (set_meta / lease bind /
+    // codex adopt / `terminal_panes`+`pane_tabs`). With the settle task
+    // detached, an aborted create is FULLY BOOKKEPT — never a
+    // half-initialized orphan. (The WS door solves the same hazard by
+    // spawning its settled restore create: `spawn_gated_restore_create`.)
+    let settle = tokio::spawn(settle_gated_create(GatedSettleInputs {
+        permit: spawn_permit,
+        state: state.clone(),
+        body: body.clone(),
+        tab_id: tab_id.to_string(),
+        pane_id: pane_id.to_string(),
+        mode,
+        shell_str,
+        cwd,
+        resume_session_id,
+        accepted_session_ref,
+        create_request_id,
+        session_ref_lease,
+        registry,
+        host_os,
+        is_wsl,
+        amplifier_stub,
+    }));
+    match settle.await {
+        Ok(result) => result,
+        // JoinError = panic inside the settle task (the task's own
+        // spawn_blocking JoinError arm already maps fork panics into the
+        // 400 rollback path below). RAII (permit, lease) released on the
+        // task's unwind.
+        Err(join_err) => Err(fail_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("terminal create task panicked: {join_err}"),
+        )),
+    }
+}
+
+/// Owned inputs for [`settle_gated_create`]: the settle task must be
+/// `'static` (it outlives an aborted handler future by design), so every
+/// input moves in by value.
+struct GatedSettleInputs {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    state: FreshAgentState,
+    body: Value,
+    tab_id: String,
+    pane_id: String,
+    mode: String,
+    shell_str: Option<String>,
+    cwd: Option<String>,
+    resume_session_id: Option<String>,
+    accepted_session_ref: Option<SessionLocator>,
+    create_request_id: String,
+    session_ref_lease: Option<RestSessionRefLease>,
+    registry: freshell_terminal::TerminalRegistry,
+    /// Hoisted spawn-environment inputs (Task 11): computed ONCE in
+    /// [`spawn_terminal_pane`] so the amplifier windows-arm guard there and
+    /// the spawn-spec construction here can never disagree.
+    host_os: HostOs,
+    is_wsl: bool,
+    /// Launcher-assigned amplifier identity: the stub [`spawn_terminal_pane`]
+    /// pre-created for this create (Task 11) — consumed here for the
+    /// spawn-failure GC and the exit hook's never-used-stub GC.
+    amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession>,
+}
+
+/// The spawn-to-settled tail of [`spawn_terminal_pane`], run on a detached
+/// `tokio::spawn` so a dropped (client-aborted) handler future can neither
+/// release the spawn-gate permit early nor leave the created terminal
+/// half-bookkept — the F1 fix (see the call site's comment). The permit is
+/// held from before the PTY fork until every settle step (meta, lease bind,
+/// codex adopt, pane bookkeeping) completed — the same spawn-to-settled
+/// scope the WS door pins with `hold_permit_across`.
+async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnResult, Response> {
+    let mut inputs = inputs;
+    // Bound FIRST so it drops LAST (locals drop in reverse declaration
+    // order): the permit outlives every settle step below, on success and
+    // on every early-return Err(...) alike — never call `.forget()`.
+    let _spawn_permit = inputs.permit.take();
+    let GatedSettleInputs {
+        permit: _,
+        state,
+        body,
+        tab_id,
+        pane_id,
+        mode,
+        shell_str,
+        cwd,
+        mut resume_session_id,
+        accepted_session_ref,
+        create_request_id,
+        mut session_ref_lease,
+        registry,
+        host_os,
+        is_wsl,
+        amplifier_stub,
+    } = inputs;
+
     let terminal_id = Uuid::new_v4().to_string();
     let stream_id = Uuid::new_v4().to_string();
 
@@ -805,14 +1164,14 @@ pub(crate) async fn spawn_terminal_pane(
     let child_env: BTreeMap<String, String>;
 
     if mode == "shell" {
-        let host_os = host_os_live();
-        let is_wsl = is_wsl_env_live();
+        // `host_os`/`is_wsl` arrive from `spawn_terminal_pane` (hoisted, Task
+        // 11) — computed once so the amplifier guard and this spawn agree.
         let shell_type = shell_str
             .as_deref()
             .and_then(ShellType::parse)
             .unwrap_or(ShellType::System);
         let overrides =
-            build_terminal_base_env(&RealEnv, &terminal_id, Some(tab_id), Some(pane_id));
+            build_terminal_base_env(&RealEnv, &terminal_id, Some(&tab_id), Some(&pane_id));
         spec = build_spawn_spec(
             shell_type,
             host_os,
@@ -826,8 +1185,6 @@ pub(crate) async fn spawn_terminal_pane(
         );
         child_env = freshell_terminal::build_child_env_from_process(&spec);
     } else {
-        let host_os = host_os_live();
-        let is_wsl = is_wsl_env_live();
         let shell_type = shell_str
             .as_deref()
             .and_then(ShellType::parse)
@@ -959,7 +1316,7 @@ pub(crate) async fn spawn_terminal_pane(
         let effective_shell = resolve_shell(shell_type, host_os, is_wsl);
         let windows_like = is_windows(host_os) || (is_wsl && effective_shell != ShellType::System);
         let overrides =
-            build_terminal_base_env(&RealEnv, &terminal_id, Some(tab_id), Some(pane_id));
+            build_terminal_base_env(&RealEnv, &terminal_id, Some(&tab_id), Some(&pane_id));
 
         spec = match &launch {
             Some(l) if windows_like => build_windows_cli_spawn_spec(
@@ -994,8 +1351,8 @@ pub(crate) async fn spawn_terminal_pane(
 
     // Exit hook (`tr:1479-1510` finishTerminalPtyExit, mirrored from
     // `crates/freshell-ws/src/terminal.rs:937-972`): cleanupMcpConfig BEFORE
-    // registry bookkeeping, then disarm both locators -- so a REST-created
-    // amplifier/opencode pane's armed entry is never left dangling on exit,
+    // registry bookkeeping, then disarm the opencode locator -- so a
+    // REST-created opencode pane's armed entry is never left dangling on exit,
     // exactly like the WS path's on_exit closes this same gap (the parity
     // fix this slice's scope item 2 requires). KNOWN GAP (documented, not
     // silently dropped): unlike the WS on_exit, this hook cannot call
@@ -1011,8 +1368,15 @@ pub(crate) async fn spawn_terminal_pane(
         let cleanup_mode = mode.clone();
         let cleanup_cwd = mcp_cwd.clone();
         let registry_for_exit = registry.clone();
-        let amplifier_locator = state.amplifier_locator.clone();
         let opencode_locator = state.opencode_locator.clone();
+        // Launcher-assigned amplifier identity (Task 11, REST twin of the WS
+        // Task 10 hook): only a stub THIS create wrote (`created == true`) is
+        // ours to GC on exit; found/existing sessions are never touched.
+        let amplifier_stub_gc: Option<(std::path::PathBuf, String)> = amplifier_stub
+            .as_ref()
+            .filter(|s| s.created)
+            .zip(resume_session_id.as_ref())
+            .map(|(s, sid)| (s.session_dir.clone(), sid.clone()));
         Some(Box::new(move |exit_code: i64| {
             cleanup_mcp_config(&RealMcpRuntime, &tid, &cleanup_mode, cleanup_cwd.as_deref());
             registry_for_exit.finish_pty_exit(&tid, exit_code);
@@ -1022,26 +1386,78 @@ pub(crate) async fn spawn_terminal_pane(
             // path's on_exit (`crates/freshell-ws/src/terminal.rs`).
             freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .notify_terminal_exit(&tid);
-            if let Some(locator) = &amplifier_locator {
-                locator.disarm(&tid);
-            }
             if let Some(locator) = &opencode_locator {
                 locator.disarm(&tid);
+            }
+            // GC the never-used stub this create pre-wrote. Runs AFTER
+            // finish_pty_exit (our own row is no longer Running). Guarded
+            // (GC-vs-second-resume race, F5/V7): a NEW live terminal may
+            // already be resuming this same id — deleting the dir out from
+            // under it would doom its resume, so skip in that case.
+            if let Some((session_dir, session_id)) = &amplifier_stub_gc {
+                if freshell_terminal::registry::has_other_live_resume(
+                    &registry_for_exit.identity_probe_rows(),
+                    "amplifier",
+                    session_id,
+                    &tid,
+                ) {
+                    tracing::debug!(
+                        terminal_id = %tid,
+                        session_id = %session_id,
+                        "amplifier_stub_gc: skipped — another live terminal holds this resume id"
+                    );
+                } else if freshell_sessions::amplifier_stub::gc_stub_if_unused(session_dir) {
+                    tracing::debug!(
+                        terminal_id = %tid,
+                        dir = %session_dir.display(),
+                        "amplifier_stub_gc: removed never-used pre-created session"
+                    );
+                }
             }
         }))
     };
 
-    if let Err(err) = registry.create(
-        &spec,
-        &child_env,
-        terminal_id.clone(),
-        stream_id,
-        &mode,
-        resume_session_id.as_deref(),
-        Some(create_request_id.as_str()), // create_request_id: REST accept-or-mint key (this task)
-        None,                             // ring_max_bytes: registry default
-        on_exit,
-    ) {
+    // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
+    // spawns occupy a permit + a blocking thread, never an async worker (WS
+    // lane ledger A4: on hosts with nproc <= spawn_concurrency, N inline
+    // blocking spawns would wedge the runtime incl. the timer driver, and
+    // gate timeouts could never fire). The permit stays held throughout
+    // BECAUSE this whole function runs on the detached settle task that owns
+    // it (F1): a client abort drops only the handler future, never this
+    // task, so the fork can no longer outlive its permit. Mirrors the WS
+    // door (`crates/freshell-ws/src/terminal.rs`). Values consumed by the
+    // call and unused afterwards (`child_env`, `stream_id`, `on_exit`)
+    // move in without cloning.
+    let spawn_registry = registry.clone();
+    let spawn_spec = spec.clone();
+    let spawn_terminal_id = terminal_id.clone();
+    let spawn_mode = mode.clone();
+    let spawn_resume = resume_session_id.clone();
+    let spawn_request_id = create_request_id.clone();
+    let create_result = match tokio::task::spawn_blocking(move || {
+        spawn_registry.create(
+            &spawn_spec,
+            &child_env,
+            spawn_terminal_id,
+            stream_id,
+            &spawn_mode,
+            spawn_resume.as_deref(),
+            Some(spawn_request_id.as_str()), // create_request_id: REST accept-or-mint key (this task)
+            None,                            // ring_max_bytes: registry default
+            on_exit,
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        // JoinError (incl. panic inside the closure) surfaces as a spawn
+        // failure into the unchanged rollback + 400 path below, same as the
+        // WS path.
+        Err(join_err) => Err(std::io::Error::other(format!(
+            "terminal spawn task panicked: {join_err}"
+        ))),
+    };
+    if let Err(err) = create_result {
         // Nothing was recorded yet (no tab, no pane, no map entry) -> rollback
         // is a no-op by construction, EXCEPT the MCP config file(s)
         // `generate_mcp_injection` may already have written -- clean those up
@@ -1049,6 +1465,30 @@ pub(crate) async fn spawn_terminal_pane(
         // cleanup path).
         if mode != "shell" {
             cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+        }
+        // Task 7's race-free duplicate-live-resume enforcement inside
+        // registry.create (F5/V7): the friendly pre-check in
+        // `spawn_terminal_pane` is check-then-act — concurrent WS/REST
+        // creates can both pass it. Map the registry's distinguishable error
+        // to the SAME user-facing 409. ORDER IS LOAD-BEARING: this
+        // early-return must precede the stub GC below — `ensure_session` is
+        // not serialized, so two truly concurrent creates of one id can BOTH
+        // observe "no dir yet" and race the mkdir; the LOSER here can hold
+        // `created == true` while the WINNER's live terminal is already
+        // using the dir, and GC'ing it would delete the winner's session
+        // out from under it.
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(fail_json(
+                StatusCode::CONFLICT,
+                format!(
+                    "Amplifier session {} is already open in a live terminal.",
+                    resume_session_id.as_deref().unwrap_or_default()
+                ),
+            ));
+        }
+        // A stub written for a spawn that never happened is pure litter.
+        if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
+            let _ = freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
         }
         // DEV-0006 S4: a planned-but-unadopted codex launch dies with the failed create
         // (`cleanupUnadoptedCodexLaunch`, `router.ts:445`) — sidecar + proxy torn down.
@@ -1116,7 +1556,7 @@ pub(crate) async fn spawn_terminal_pane(
     // admission checks live inside `arm()` itself, see
     // `arm_locators_for_fresh_pane`'s doc comment).
     arm_locators_for_fresh_pane(
-        state,
+        &state,
         &terminal_id,
         &mode,
         cwd.as_deref(),
@@ -1504,19 +1944,16 @@ pub(crate) fn maybe_send_keys(
         }
     }
     registry.input(&terminal_id, text.as_bytes());
-    // Feed the amplifier/opencode locator's Enter<->session correlation
+    // Feed the opencode locator's Enter<->session correlation
     // (`is_submit_input`/`note_possible_submit`,
-    // `crates/freshell-ws/src/amplifier_association.rs:29-33,66-72`): a
-    // REST-created fresh amplifier/opencode pane only associates once its
-    // FIRST submit-shaped input (a bare CR/LF run) is observed here -- a
-    // REST `send-keys` must feed the SAME shared locator the WS `terminal.input`
-    // path does, or a REST-driven Enter would silently never open the
-    // locator's correlation window. No-ops (`note_submit` itself checks
-    // "is this terminal armed?") for every non-armed/non-Enter case.
+    // `crates/freshell-ws/src/opencode_association.rs`): a REST-created
+    // fresh opencode pane only associates once its FIRST submit-shaped
+    // input (a bare CR/LF run) is observed here -- a REST `send-keys` must
+    // feed the SAME shared locator the WS `terminal.input` path does, or a
+    // REST-driven Enter would silently never open the locator's correlation
+    // window. No-ops (`note_submit` itself checks "is this terminal
+    // armed?") for every non-armed/non-Enter case.
     if is_submit_input(text) {
-        if let Some(locator) = &state.amplifier_locator {
-            locator.note_submit(&terminal_id, now_ms());
-        }
         if let Some(locator) = &state.opencode_locator {
             locator.note_submit(&terminal_id, now_ms());
         }
@@ -1525,7 +1962,7 @@ pub(crate) fn maybe_send_keys(
 }
 
 /// `isSubmitInput` (`shared/turn-complete-signal.ts:125-127`, mirrored from
-/// `crates/freshell-ws/src/amplifier_association.rs:29-33`): the input is
+/// `crates/freshell-ws/src/opencode_association.rs`'s twin): the input is
 /// ONLY a run of CR/LF bytes -- an Enter keypress, possibly repeated.
 /// Anything else (real text, control sequences, partial lines) is not a
 /// submit.
@@ -1711,7 +2148,31 @@ mod tests {
     use std::sync::Arc;
     use tower::util::ServiceExt;
 
+    /// Launcher-assigned amplifier identity (F7/V9): REST amplifier creates
+    /// now WRITE stub dirs into the amplifier home — sandbox every test that
+    /// can reach one so no test ever touches the real `~/.amplifier`.
+    /// `set_var` is process-global: ONE shared value per test process, same
+    /// OnceLock pattern as
+    /// `crates/freshell-ws/tests/common/mod.rs::isolate_amplifier_home`.
+    fn isolate_amplifier_home() -> std::path::PathBuf {
+        static AMP_HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        AMP_HOME
+            .get_or_init(|| {
+                let amp_home = std::env::temp_dir().join(format!(
+                    "freshell-freshagent-amp-home-{}",
+                    std::process::id()
+                ));
+                let _ = std::fs::create_dir_all(&amp_home);
+                std::env::set_var("FRESHELL_AMPLIFIER_HOME", &amp_home);
+                amp_home
+            })
+            .clone()
+    }
+
     fn state_with_registry() -> FreshAgentState {
+        // Every REST test that can reach an amplifier create flows through
+        // this constructor — isolate at the choke point (Task 11 Step 1).
+        let _ = isolate_amplifier_home();
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
             .with_terminal_registry(freshell_terminal::TerminalRegistry::new())
@@ -2555,12 +3016,6 @@ mod tests {
         std::fs::read_to_string(path).unwrap_or_default()
     }
 
-    fn state_with_amplifier_locator(home: std::path::PathBuf) -> FreshAgentState {
-        state_with_registry().with_amplifier_locator(Some(std::sync::Arc::new(
-            freshell_sessions::amplifier_locator::AmplifierLocator::new(home),
-        )))
-    }
-
     fn state_with_opencode_locator(home: std::path::PathBuf) -> FreshAgentState {
         state_with_registry().with_opencode_locator(Some(std::sync::Arc::new(
             freshell_sessions::opencode_locator::OpencodeLocator::new(home),
@@ -2578,8 +3033,8 @@ mod tests {
             std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(root));
         let state = state_with_registry().with_codex_locator(Some(locator.clone()));
         // Some(...) matches the sibling test-helper convention: the existing
-        // locator tests pass Some(std::sync::Arc::new(...)) (terminal_tabs.rs:2327-2337)
-        // because the builders take Option (with_amplifier_locator, lib.rs:362-368).
+        // locator tests pass Some(std::sync::Arc::new(...)) because the
+        // builders take Option (with_opencode_locator / with_codex_locator).
 
         arm_locators_for_fresh_pane(&state, "term-codex-1", "codex", Some("/tmp/proj"), None);
 
@@ -2590,13 +3045,44 @@ mod tests {
         );
     }
 
+    /// A recording spec whose `resume_args` mirror the REAL amplifier
+    /// manifest (`extensions/amplifier/freshell.json`: `["resume",
+    /// "{{sessionId}}"]`, no `--resume` flag) so the recorded argv is the
+    /// launcher-assigned identity contract's exact `amplifier resume <uuid>`
+    /// shape (minus argv[0], which the recorder script does not capture).
+    fn amplifier_recording_cli_spec(
+        argv_file: &std::path::Path,
+    ) -> freshell_platform::CliCommandSpec {
+        let mut spec = recording_cli_spec("amplifier", argv_file);
+        spec.resume_args = Some(vec!["resume".to_string(), "{{sessionId}}".to_string()]);
+        spec
+    }
+
+    /// The stub dir the launcher-assigned pre-create must have written for
+    /// `session_id` launched from `cwd`:
+    /// `$FRESHELL_AMPLIFIER_HOME/projects/<cwd_slug(canonical cwd)>/sessions/<id>`.
+    fn expected_stub_dir(cwd: &str, session_id: &str) -> std::path::PathBuf {
+        let canonical = freshell_sessions::amplifier_stub::canonical_cwd(cwd);
+        let slug = freshell_sessions::amplifier_stub::cwd_slug(&canonical.to_string_lossy());
+        isolate_amplifier_home()
+            .join("projects")
+            .join(slug)
+            .join("sessions")
+            .join(session_id)
+    }
+
+    /// Task 11 (launcher-assigned identity, REST twin of the WS Task 8
+    /// contract): a fresh `POST /api/tabs {mode:"amplifier"}` mints the
+    /// session UUID, pre-creates the on-disk stub BEFORE spawn, spawns
+    /// `amplifier resume <uuid>`, and promotes the minted id into the
+    /// broadcast `paneContent.sessionRef` (EDEV-07).
     #[tokio::test]
-    async fn create_amplifier_tab_fresh_spawns_recorded_argv_with_no_resume_and_arms_locator() {
-        let home = unique_temp_home("amplifier-fresh");
+    async fn create_amplifier_tab_fresh_mints_identity_prestubs_and_spawns_resume_argv() {
         let argv_file = unique_argv_file("amplifier-fresh");
-        let state = state_with_amplifier_locator(home.clone()).with_cli_commands(
-            std::sync::Arc::new(vec![recording_cli_spec("amplifier", &argv_file)]),
-        );
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(vec![
+            amplifier_recording_cli_spec(&argv_file),
+        ]));
+        let mut rx = state.broadcast_tx.subscribe();
         let tmp = std::env::temp_dir();
         let (status, body) = post(
             app(state.clone()),
@@ -2613,30 +3099,87 @@ mod tests {
             .unwrap()
             .is_running(&terminal_id));
 
-        // Locator ARMED for the fresh amplifier pane (scope item 2's parity
-        // fix -- REST-created amplifier panes previously never armed).
+        // 1) Recorded argv is exactly `resume <uuid>` (the recorder captures
+        //    "$@" — everything after the program itself).
+        let argv = read_argv_file_eventually(&argv_file).await;
+        let lines: Vec<&str> = argv.lines().collect();
+        assert_eq!(lines.len(), 2, "expected `resume <uuid>` argv, got: {argv}");
+        assert_eq!(lines[0], "resume", "argv: {argv}");
+        let minted = Uuid::parse_str(lines[1])
+            .expect("minted amplifier session id must parse as a Uuid")
+            .to_string();
+
+        // 2) The stub dir exists under slug(canonical cwd) with the designed
+        //    shape: metadata.json + empty transcript.jsonl + empty events.jsonl.
+        let stub_dir = expected_stub_dir(&tmp.to_string_lossy(), &minted);
+        assert!(stub_dir.is_dir(), "missing stub dir {}", stub_dir.display());
+        assert!(stub_dir.join("metadata.json").is_file());
+        let transcript = stub_dir.join("transcript.jsonl");
+        assert!(transcript.is_file());
+        assert_eq!(std::fs::read(&transcript).unwrap(), b"", "transcript empty");
+        let events = stub_dir.join("events.jsonl");
+        assert!(events.is_file(), "events.jsonl is load-bearing");
+        assert_eq!(std::fs::read(&events).unwrap(), b"", "events empty");
+
+        // 3) The broadcast paneContent carries the minted identity as a
+        //    canonical sessionRef (EDEV-07 promotion — uuids pass
+        //    plausible_resume_session_id for amplifier).
+        let mut pane_content = None;
+        while let Ok(frame) = rx.try_recv() {
+            let msg: Value = serde_json::from_str(&frame).unwrap();
+            if msg["command"] == json!("tab.create") {
+                pane_content = msg
+                    .get("payload")
+                    .and_then(|p| p.get("paneContent"))
+                    .cloned();
+            }
+        }
+        let pane_content = pane_content.expect("no tab.create broadcast");
         assert_eq!(
-            state.amplifier_locator.as_ref().unwrap().armed_count(),
-            1,
-            "fresh amplifier REST create must arm the shared locator"
+            pane_content["sessionRef"],
+            json!({ "provider": "amplifier", "sessionId": minted }),
+            "paneContent: {pane_content}"
         );
 
-        // No resume args in the recorded argv (fresh launch).
-        let argv = read_argv_file_eventually(&argv_file).await;
-        assert!(!argv.contains("--resume"), "fresh launch argv: {argv}");
-
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
-        let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_file(&argv_file);
     }
 
+    /// Defense-in-depth against the old correlation bug's poisoned persisted
+    /// tab state (REST twin of the WS guard): `terminal:<id>` is Freshell's
+    /// own synthetic sidebar placeholder, never a resumable amplifier session.
     #[tokio::test]
-    async fn create_amplifier_tab_disarms_locator_on_exit() {
-        let home = unique_temp_home("amplifier-disarm");
-        let argv_file = unique_argv_file("amplifier-disarm");
-        let state = state_with_amplifier_locator(home.clone()).with_cli_commands(
-            std::sync::Arc::new(vec![recording_cli_spec("amplifier", &argv_file)]),
-        );
+    async fn create_amplifier_tab_rejects_terminal_placeholder_ref_with_400() {
+        let argv_file = unique_argv_file("amplifier-placeholder");
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(vec![
+            amplifier_recording_cli_spec(&argv_file),
+        ]));
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "amplifier",
+                "cwd": tmp.to_string_lossy(),
+                "sessionRef": { "provider": "amplifier", "sessionId": "terminal:abc" }
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let msg = body["message"].as_str().unwrap();
+        assert!(msg.contains("synthetic terminal placeholder"), "{msg}");
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// Same-id double-resume guard, REST rung: never spawn a second
+    /// `amplifier resume <sid>` while a live terminal owns <sid>.
+    #[tokio::test]
+    async fn create_amplifier_tab_rejects_duplicate_live_resume_with_409() {
+        let argv_file = unique_argv_file("amplifier-dup");
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(vec![
+            amplifier_recording_cli_spec(&argv_file),
+        ]));
         let tmp = std::env::temp_dir();
         let (status, body) = post(
             app(state.clone()),
@@ -2647,24 +3190,83 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
-        assert_eq!(state.amplifier_locator.as_ref().unwrap().armed_count(), 1);
-
         let registry = state.terminal_registry.clone().unwrap();
+        let sid = registry
+            .probe(&terminal_id)
+            .expect("registry row for first create")
+            .resume_session_id
+            .expect("fresh amplifier create must mint a resume session id");
+
+        let (status2, body2) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "amplifier",
+                "cwd": tmp.to_string_lossy(),
+                "sessionRef": { "provider": "amplifier", "sessionId": sid }
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status2, StatusCode::CONFLICT, "{body2}");
+        let msg = body2["message"].as_str().unwrap();
+        assert!(msg.contains("already open in a live terminal"), "{msg}");
+
         registry.kill(&terminal_id);
-        // `kill` drives the PTY's on_exit hook synchronously-enough that a
-        // short bounded poll always observes the disarm.
-        for _ in 0..30 {
-            if state.amplifier_locator.as_ref().unwrap().armed_count() == 0 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
+        let _ = std::fs::remove_file(&argv_file);
+    }
+
+    /// F4 falsified-path fix, REST rung: a create with NO cwd must compute
+    /// ONE effective cwd ($HOME), slug the stub from it, AND hand the same
+    /// value to the spawn/registry — never let `cwd = None` flow into
+    /// `build_cli_spawn_spec` while the stub sits under slug($HOME) (the PTY
+    /// would inherit the BROKER's own cwd — silent divergence).
+    #[tokio::test]
+    async fn create_amplifier_tab_with_no_cwd_stubs_under_home_slug() {
+        let argv_file = unique_argv_file("amplifier-nocwd");
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(vec![
+            amplifier_recording_cli_spec(&argv_file),
+        ]));
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({ "mode": "amplifier" }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
+        let registry = state.terminal_registry.clone().unwrap();
+        let row = registry.probe(&terminal_id).expect("registry row");
+        let home = std::env::var("HOME").expect("HOME set in test env");
         assert_eq!(
-            state.amplifier_locator.as_ref().unwrap().armed_count(),
-            0,
-            "on_exit must disarm the locator (parity with the WS create path)"
+            row.cwd.as_deref(),
+            Some(home.as_str()),
+            "registry row cwd must be $HOME, never None"
         );
-        let _ = std::fs::remove_dir_all(&home);
+        let sid = row
+            .resume_session_id
+            .expect("fresh amplifier create must mint a resume session id");
+
+        // Stub under slug(canonical($HOME))...
+        let home_stub = expected_stub_dir(&home, &sid);
+        assert!(
+            home_stub.is_dir(),
+            "stub must land under the $HOME slug: {}",
+            home_stub.display()
+        );
+        // ...and NEVER under the broker's own cwd slug.
+        let broker_cwd = std::env::current_dir().unwrap();
+        let broker_stub = expected_stub_dir(&broker_cwd.to_string_lossy(), &sid);
+        if broker_stub != home_stub {
+            assert!(
+                !broker_stub.exists(),
+                "stub must never land under the broker's own cwd: {}",
+                broker_stub.display()
+            );
+        }
+
+        registry.kill(&terminal_id);
         let _ = std::fs::remove_file(&argv_file);
     }
 
@@ -3233,6 +3835,329 @@ mod tests {
         registry.kill(&shell_tid);
     }
 
+    // ── REST spawn-gate tests (kata enn3) ──────────────────────────────────
+
+    fn shell_create_body() -> Value {
+        json!({
+            "mode": "shell",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        })
+    }
+
+    #[tokio::test]
+    async fn zero_permit_gate_times_out_rest_create_with_503() {
+        // 0 permits => acquire can never succeed => deterministic Timeout.
+        // The cheapest "gate is actually on the REST path" pin (same trick
+        // as crates/freshell-ws/tests/create_protection.rs).
+        let state = state_with_registry();
+        state.set_spawn_gate(
+            Arc::new(crate::spawn_gate::SpawnGate::new(0, 64)),
+            std::time::Duration::from_millis(100),
+        );
+        let (status, body) = post(app(state), "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(body["code"], json!("SPAWN_TIMEOUT"));
+        assert_eq!(
+            body["message"],
+            json!("Timed out waiting for a terminal spawn slot")
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_cap_exceeded_rest_create_is_429_spawn_queue_full() {
+        // 0 permits AND 0 queue slots => the very first waiter is rejected
+        // loudly with QueueFull (no wait at all).
+        let state = state_with_registry();
+        state.set_spawn_gate(
+            Arc::new(crate::spawn_gate::SpawnGate::new(0, 0)),
+            std::time::Duration::from_secs(5),
+        );
+        let (status, body) = post(app(state), "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+        assert_eq!(body["status"], json!("error"));
+        assert_eq!(body["code"], json!("SPAWN_QUEUE_FULL"));
+        assert_eq!(
+            body["message"],
+            json!("Too many concurrent terminal spawns; retry shortly")
+        );
+    }
+
+    #[tokio::test]
+    async fn split_and_respawn_also_flow_through_the_gate() {
+        // Create a real pane while UNGATED (OnceLock unset), then wire a
+        // 0-permit gate and prove split AND respawn hit it too — the gate
+        // lives in spawn_terminal_pane, the one shared seam.
+        let state = state_with_registry();
+        let registry = state.terminal_registry.clone().unwrap();
+        let router = app(state.clone());
+        let (_tab_id, pane_id, shell_tid) = create_shell_tab(router.clone()).await;
+
+        state.set_spawn_gate(
+            Arc::new(crate::spawn_gate::SpawnGate::new(0, 64)),
+            std::time::Duration::from_millis(100),
+        );
+
+        let mut split_body = shell_create_body();
+        split_body["direction"] = json!("vertical");
+        let (status, body) = post(
+            router.clone(),
+            &format!("/api/panes/{pane_id}/split"),
+            split_body,
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "split: {body}");
+        assert_eq!(body["code"], json!("SPAWN_TIMEOUT"));
+
+        let (status, body) = post(
+            router,
+            &format!("/api/panes/{pane_id}/respawn"),
+            shell_create_body(),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "respawn: {body}");
+        assert_eq!(body["code"], json!("SPAWN_TIMEOUT"));
+
+        registry.kill(&shell_tid);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fifteen_plus_rest_create_burst_is_bounded_and_all_complete() {
+        // Concurrency-1 gate: at most ONE request may hold the spawn permit
+        // at a time, so a 16-burst must serialize through the gate — the
+        // queued_total counter proves the burst actually queued (bounded
+        // in-flight) instead of spawning in parallel, and every request
+        // still completes (FIFO drain, nothing dropped).
+        let state = state_with_registry();
+        let registry = state.terminal_registry.clone().unwrap();
+        let gate = Arc::new(crate::spawn_gate::SpawnGate::new(1, 64));
+        state.set_spawn_gate(Arc::clone(&gate), std::time::Duration::from_secs(30));
+        let router = app(state);
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let r = router.clone();
+            handles.push(tokio::spawn(async move {
+                post(r, "/api/tabs", shell_create_body(), true).await
+            }));
+        }
+        let mut terminal_ids = Vec::new();
+        for h in handles {
+            let (status, body) = h.await.expect("request task");
+            assert_eq!(status, StatusCode::OK, "{body}");
+            terminal_ids.push(body["data"]["terminalId"].as_str().unwrap().to_string());
+        }
+        // With 16 near-simultaneous arrivals and 1 permit, the overwhelming
+        // majority must have queued. (The fast path skips the counter when
+        // the queue is momentarily empty, hence >= 8, not == 15.)
+        assert!(
+            gate.queued_total() >= 8,
+            "burst did not queue through the gate: queued_total={}",
+            gate.queued_total()
+        );
+        assert_eq!(gate.queue_rejections(), 0, "no loud rejections expected");
+        assert_eq!(gate.timeouts(), 0, "no permit-wait timeouts expected");
+
+        for tid in &terminal_ids {
+            registry.kill(tid);
+        }
+    }
+
+    #[tokio::test]
+    async fn held_permit_blocks_rest_create_until_released() {
+        // End-to-end permit accounting at the REST seam: while the single
+        // permit is held (here by the test itself — in production, by the
+        // OTHER door), REST creates time out; after release they succeed.
+        let state = state_with_registry();
+        let registry = state.terminal_registry.clone().unwrap();
+        let gate = Arc::new(crate::spawn_gate::SpawnGate::new(1, 64));
+        state.set_spawn_gate(Arc::clone(&gate), std::time::Duration::from_millis(200));
+        let router = app(state);
+
+        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let held = gate
+            .acquire(std::time::Duration::from_secs(1), &mut cancel_rx)
+            .await
+            .expect("test holds the only permit");
+        let (status, body) = post(router.clone(), "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["code"], json!("SPAWN_TIMEOUT"));
+
+        drop(held);
+        let (status, body) = post(router, "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        registry.kill(body["data"]["terminalId"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_spawn_releases_its_permit() {
+        // Concurrency-1 gate: if a FAILED spawn leaked its permit, the next
+        // create could never acquire and would 503. Force the failure with a
+        // registered CLI whose command does not exist (reuses the local
+        // recording_cli_spec helper, pointing default_cmd at a nonexistent
+        // path instead of its script).
+        let argv_file = unique_argv_file("gate-broken-spawn");
+        let broken = {
+            let mut spec = recording_cli_spec("brokencli", &argv_file);
+            spec.default_cmd = "/nonexistent/definitely-missing-binary".to_string();
+            spec
+        };
+        let state = state_with_registry().with_cli_commands(Arc::new(vec![broken]));
+        let registry = state.terminal_registry.clone().unwrap();
+        state.set_spawn_gate(
+            Arc::new(crate::spawn_gate::SpawnGate::new(1, 64)),
+            std::time::Duration::from_millis(500),
+        );
+        let router = app(state);
+
+        let (status, body) = post(
+            router.clone(),
+            "/api/tabs",
+            json!({
+                "mode": "brokencli",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "spawn should fail: {body}");
+
+        // The failed spawn's RAII permit must be back: a healthy create
+        // succeeds instead of hitting SPAWN_TIMEOUT on the 1-permit gate.
+        let (status, body) = post(router, "/api/tabs", shell_create_body(), true).await;
+        assert_eq!(status, StatusCode::OK, "permit leaked? {body}");
+        registry.kill(body["data"]["terminalId"].as_str().unwrap());
+    }
+
+    /// F1 (council enn3): the RAII spawn-gate permit lived in the DROPPABLE
+    /// axum handler future while the uncancellable `spawn_blocking` fork did
+    /// not capture it. A client abort (`curl --max-time 2` does it) dropped
+    /// the future, releasing the permit while the detached fork proceeded —
+    /// gate escaped exactly under load (`max concurrent registry.create >
+    /// spawn_concurrency`) — AND skipped every post-spawn bookkeeping step
+    /// (`set_meta`, `terminal_panes`/`pane_tabs`) — a half-initialized
+    /// orphan. Same bug class as WS prior art da5d9b5c (permit released
+    /// before settle), pinned there by `create_gate::hold_permit_across`.
+    ///
+    /// Choreography per iteration (the council's named breaking input:
+    /// aborted HTTP creates in a loop): the test holds the ONLY permit, a
+    /// create queues behind it, the test releases, then aborts the request
+    /// task while the fork is in flight. Two assertions:
+    ///  1. Gate bound (`<= spawn_concurrency`): re-acquiring the single
+    ///     permit is only possible once the aborted create fully settled —
+    ///     so at the moment the test holds it, no half-settled terminal may
+    ///     exist.
+    ///  2. No orphan: every terminal the registry gained must be fully
+    ///     bookkept (a `terminal_panes` entry points at it and its meta
+    ///     mode was recorded).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abort_burst_rest_creates_stay_gated_and_leave_no_half_bookkept_terminal() {
+        let state = state_with_registry();
+        let registry = state.terminal_registry.clone().unwrap();
+        let gate = Arc::new(crate::spawn_gate::SpawnGate::new(1, 64));
+        state.set_spawn_gate(Arc::clone(&gate), std::time::Duration::from_secs(30));
+        let router = app(state.clone());
+
+        let inventory_ids = |registry: &freshell_terminal::TerminalRegistry| {
+            registry
+                .inventory()
+                .into_iter()
+                .map(|t| t.terminal_id)
+                .collect::<std::collections::HashSet<String>>()
+        };
+        let bookkept = |state: &FreshAgentState, tid: &str| {
+            state
+                .terminal_panes
+                .lock()
+                .expect("terminal_panes mutex")
+                .values()
+                .any(|e| e.terminal_id == tid)
+        };
+
+        let mut forked_iterations = 0u32;
+        let mut all_forked: Vec<String> = Vec::new();
+        for i in 0..20u64 {
+            let before = inventory_ids(&registry);
+
+            // Hold the only permit so the request deterministically QUEUES.
+            let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+            let held = gate
+                .acquire(std::time::Duration::from_secs(5), &mut cancel_rx)
+                .await
+                .expect("test acquires the only permit");
+            let queued_before = gate.queued_total();
+
+            let r = router.clone();
+            let req =
+                tokio::spawn(async move { post(r, "/api/tabs", shell_create_body(), true).await });
+            // Wait until the request is a queued waiter (held permit => the
+            // fast path fails and the waiter counts toward queued_total).
+            let mut waited = 0u32;
+            while gate.queued_total() == queued_before {
+                waited += 1;
+                assert!(waited < 2000, "request never queued on the gate");
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+
+            // Release the permit to the queued create, give it a sliver of
+            // runway (sweep the abort across the fork window), then ABORT
+            // the handler future — the simulated client disconnect.
+            drop(held);
+            tokio::time::sleep(std::time::Duration::from_micros(200 * i)).await;
+            req.abort();
+            let _ = req.await;
+
+            // Did this iteration actually fork? (An abort landing before the
+            // granted permit was ever polled forks nothing — inconclusive.)
+            let mut new_terminals: Vec<String> = Vec::new();
+            for _ in 0..200u32 {
+                new_terminals = inventory_ids(&registry)
+                    .difference(&before)
+                    .cloned()
+                    .collect();
+                if !new_terminals.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            if new_terminals.is_empty() {
+                continue;
+            }
+            forked_iterations += 1;
+            all_forked.extend(new_terminals.iter().cloned());
+
+            // Assertion 1 — gate bound: the single permit must be
+            // re-acquirable ONLY once the aborted create fully settled.
+            let (_cancel_tx2, mut cancel_rx2) = tokio::sync::watch::channel(false);
+            let reacquired = gate
+                .acquire(std::time::Duration::from_secs(10), &mut cancel_rx2)
+                .await
+                .expect("permit must return after the aborted create settles");
+
+            // Assertion 2 — no half-initialized orphan: while WE hold the
+            // only permit, every forked terminal is fully bookkept.
+            for tid in &new_terminals {
+                assert!(
+                    bookkept(&state, tid),
+                    "aborted create escaped the gate and left a half-initialized orphan: \
+                     terminal {tid} exists in the registry but has no terminal_panes entry \
+                     (iteration {i})"
+                );
+            }
+            drop(reacquired);
+        }
+
+        assert!(
+            forked_iterations >= 1,
+            "abort sweep never landed inside the fork window; widen the sweep"
+        );
+        for tid in &all_forked {
+            registry.kill(tid);
+        }
+    }
+
     // ── D8 session-ref lease, REST rung (ks38) ──────────────────────────────
 
     /// `claim_session_ref` takes a u64 wall-clock ms; reuse the module's
@@ -3494,83 +4419,6 @@ mod tests {
         );
 
         state.terminal_registry.clone().unwrap().kill(&terminal_id);
-        let _ = std::fs::remove_file(&argv_file);
-    }
-
-    #[tokio::test]
-    async fn send_keys_enter_feeds_amplifier_locator_and_tick_locates_session() {
-        let home = unique_temp_home("amplifier-e2e");
-        let argv_file = unique_argv_file("amplifier-e2e");
-        let state = state_with_amplifier_locator(home.clone()).with_cli_commands(
-            std::sync::Arc::new(vec![recording_cli_spec("amplifier", &argv_file)]),
-        );
-        let router = app(state.clone());
-        let cwd_dir = home.join("workspace-cwd");
-        std::fs::create_dir_all(&cwd_dir).unwrap();
-        let (status, body) = post(
-            router.clone(),
-            "/api/tabs",
-            json!({ "mode": "amplifier", "cwd": cwd_dir.to_string_lossy() }),
-            true,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let pane_id = body["data"]["paneId"].as_str().unwrap().to_string();
-        let terminal_id = body["data"]["terminalId"].as_str().unwrap().to_string();
-        assert_eq!(state.amplifier_locator.as_ref().unwrap().armed_count(), 1);
-
-        // REST send-keys with a lone Enter must feed the SAME shared locator
-        // the WS `terminal.input` path feeds (`maybe_send_keys` ->
-        // `is_submit_input` -> `note_submit`) -- proven here by driving the
-        // locator's own `tick()` directly (the periodic sweep's core
-        // mechanism, `freshell_sessions::amplifier_locator::AmplifierLocator::tick`,
-        // is public and crate-reachable; the WS-owned broadcast fan-out
-        // `drain_and_associate` wraps is NOT reachable from this crate --
-        // see this module's doc comment -- so THAT half is covered by
-        // `crates/freshell-ws/src/amplifier_association.rs`'s own test
-        // suite, not duplicated here).
-        let (send_status, _) = post(
-            router.clone(),
-            &format!("/api/panes/{pane_id}/send-keys"),
-            json!({ "data": "\r" }),
-            true,
-        )
-        .await;
-        assert_eq!(send_status, StatusCode::OK);
-
-        let dir = home
-            .join("projects")
-            .join("proj")
-            .join("sessions")
-            .join("sess-rest-e2e");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("events.jsonl"),
-            format!(
-                "{{\"event\":\"session:start\"}}\n{{\"event\":\"session:config\",\"working_dir\":\"{}\"}}\n",
-                cwd_dir.display()
-            ),
-        )
-        .unwrap();
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let mut located_ids: Vec<String> = Vec::new();
-        for _ in 0..30 {
-            let located = state.amplifier_locator.as_ref().unwrap().tick(now_ms());
-            located_ids.extend(located.into_iter().map(|l| l.session_id));
-            if !located_ids.is_empty() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        assert!(
-            located_ids.contains(&"sess-rest-e2e".to_string()),
-            "expected the REST-armed + REST-note_submit'd terminal to correlate with the new \
-             session dir via tick(); located: {located_ids:?}"
-        );
-
-        state.terminal_registry.clone().unwrap().kill(&terminal_id);
-        let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_file(&argv_file);
     }
 

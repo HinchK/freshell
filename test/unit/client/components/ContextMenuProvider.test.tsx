@@ -6,7 +6,7 @@ import { Provider } from 'react-redux'
 
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer, { initLayout, updatePaneContent } from '@/store/panesSlice'
-import sessionsReducer from '@/store/sessionsSlice'
+import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import settingsReducer from '@/store/settingsSlice'
 import extensionsReducer from '@/store/extensionsSlice'
@@ -1514,6 +1514,63 @@ describe('ContextMenuProvider', () => {
     await user.click(screen.getByRole('menuitem', { name: 'Copy resume command' }))
 
     expect(clipboardMocks.copyText).toHaveBeenCalledWith(`claude --resume ${VALID_SESSION_ID}`)
+  })
+
+  it('deletes a sidebar session and removes it from store state immediately without waiting for a refresh', async () => {
+    const user = userEvent.setup()
+    const store = createStoreWithSession()
+    // The sidebar window has the session committed too — the delete must
+    // propagate to BOTH top-level projects and the window.
+    store.dispatch(commitSessionWindowVisibleRefresh({
+      surface: 'sidebar',
+      projects: store.getState().sessions.projects,
+      totalSessions: 1,
+      hasMore: false,
+      oldestLoadedTimestamp: 2000,
+      oldestLoadedSessionId: `claude:${VALID_SESSION_ID}`,
+    } as any))
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+          >
+            Sidebar Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByRole('menuitem', { name: 'Delete' }))
+    await user.click(screen.getByRole('button', { name: 'Delete' }))
+
+    await waitFor(() => {
+      expect(apiMocks.delete).toHaveBeenCalledWith(
+        `/api/sessions/${encodeURIComponent(`claude:${VALID_SESSION_ID}`)}`,
+      )
+    })
+
+    // The removal is dispatched directly after the API call — the session is
+    // gone from both top-level projects and the sidebar window without any
+    // refresh having resolved.
+    await waitFor(() => {
+      const sessions = store.getState().sessions
+      expect(
+        sessions.projects.flatMap((p: any) => p.sessions).some((s: any) => s.sessionId === VALID_SESSION_ID),
+      ).toBe(false)
+      expect(
+        (sessions.windows?.sidebar?.projects ?? []).flatMap((p: any) => p.sessions)
+          .some((s: any) => s.sessionId === VALID_SESSION_ID),
+      ).toBe(false)
+    })
   })
 
   it('keeps built-in sidebar resume command available before extension registry hydration', async () => {

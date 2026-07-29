@@ -122,6 +122,9 @@ const RUST_ONLY_SPECS = [
   // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
   // restartAbrupt(); hidden panes must rebind without being revealed.
   /hidden-pane-rebind-rust\.spec\.ts$/,
+  // Freshclaude zero-turn restart (kata 09v1): imports RustServer directly
+  // for restartAbrupt(); a VISIBLE zero-turn pane must resume, never die.
+  /freshclaude-zero-turn-restart-rust\.spec\.ts$/,
   // Wave-A integration preflight: cross-lane interaction proofs (A1xA3
   // ledger-join coherence, A2xA3 dual claude identity stores). Imports
   // RustServer directly for restartAbrupt().
@@ -144,6 +147,14 @@ const RUST_ONLY_SPECS = [
   /freshagent-settings-resume-rust\.spec\.ts$/,
   // imports RustServer directly; restart()/ledger semantics are rust-only (P1.14)
   /sidebar-registry-sync-rust\.spec\.ts$/,
+  // Lane D1: agent crash auto-resume — rust-server-only spec.
+  /agent-crash-autoresume-rust\.spec\.ts$/,
+  // Kata enn3: REST spawn-gate burst; owns its RustServer.
+  // See docs/plans/2026-07-27-rest-spawn-gate.md
+  /rest-spawn-gate-rust\.spec\.ts$/,
+  // P0.2 lane D4: freshclaude durable identity across reload + SIGKILL +
+  // stale-sessionRef dead_session guard. Imports RustServer for restartAbrupt().
+  /freshclaude-identity-persistence-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -295,6 +306,9 @@ export default defineConfig({
         // Hidden-pane rebind (F8 / P1.11): imports RustServer directly for
         // restartAbrupt(); hidden panes must rebind without being revealed.
         /hidden-pane-rebind-rust\.spec\.ts$/,
+        // Freshclaude zero-turn restart (kata 09v1): imports RustServer directly
+        // for restartAbrupt(); a VISIBLE zero-turn pane must resume, never die.
+        /freshclaude-zero-turn-restart-rust\.spec\.ts$/,
         // Wave-A integration preflight: cross-lane interaction proofs (A1xA3
         // ledger-join coherence, A2xA3 dual claude identity stores). Imports
         // RustServer directly for restartAbrupt().
@@ -318,6 +332,14 @@ export default defineConfig({
         // P1.14 (Lane C1): sidebar/tab-registry sync pinning suite -- imports
         // RustServer directly; restart()/ledger semantics are rust-only.
         /sidebar-registry-sync-rust\.spec\.ts$/,
+        // Lane D1: agent crash auto-resume — rust-server-only spec.
+        /agent-crash-autoresume-rust\.spec\.ts$/,
+        // Kata enn3: REST spawn-gate burst; owns its RustServer.
+        // See docs/plans/2026-07-27-rest-spawn-gate.md
+        /rest-spawn-gate-rust\.spec\.ts$/,
+        // P0.2 lane D4: freshclaude durable identity across reload + SIGKILL +
+        // stale-sessionRef dead_session guard. Imports RustServer for restartAbrupt().
+        /freshclaude-identity-persistence-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

@@ -86,6 +86,16 @@ export default function PanesSettings({
           />
         </SettingsRow>
 
+        <SettingsRow label="Repo icons on tabs" description="Show the repository's icon next to each coding-agent icon on tabs.">
+          <Toggle
+            checked={settings.panes?.repoIconsOnTabs ?? true}
+            aria-label="Toggle repo icons on tabs"
+            onChange={(checked) => {
+              applyLocalSetting({ panes: { repoIconsOnTabs: checked } })
+            }}
+          />
+        </SettingsRow>
+
         <SettingsRow label="Tab completion indicator">
           <SegmentedControl
             value={settings.panes?.tabAttentionStyle ?? 'highlight'}

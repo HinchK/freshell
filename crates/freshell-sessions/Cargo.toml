@@ -14,6 +14,8 @@ serde_json = { workspace = true }
 # `directory_index.rs`'s `rust-session-cache.json`) -- the boot-time cold-scan
 # fix (5min -> seconds on a real 8.7GB+2.2GB corpus).
 serde = { workspace = true }
+# Timestamp serialization for amplifier stub metadata (ISO-8601 RFC-3339).
+chrono = { workspace = true }
 # chokidar -> notify: the session-indexer file watcher (ADR Decision 1.1, deps=notify).
 notify = "6"
 # node:sqlite -> rusqlite: the opencode.db read-only listing parser. `bundled`
@@ -37,3 +39,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 # SESSION-07: unique temp-file names for `search.rs`'s file-content search
 # tests (same version/feature set as every other crate's `uuid` dependency).
 uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+# amplifier_stub's rollback-on-partial-write test needs a deterministic,
+# thread-scoped (not process-global) permission-denied write failure:
+# `unshare(CLONE_FS)` + `umask()`. Same version freshell-ws already pins
+# directly for `pane_ledger`'s `flock(2)`.
+libc = "0.2"

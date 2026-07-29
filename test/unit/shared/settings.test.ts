@@ -6,6 +6,7 @@ import {
   createDefaultServerSettings,
   extractLegacyLocalSettingsSeed,
   migrateLegacyFreshAgentSettingsInput,
+  mergeLocalSettings,
   mergeServerSettings,
   resolveLocalSettings,
   stripLocalSettings,
@@ -602,6 +603,32 @@ describe('shared settings contract', () => {
   it('rejects multirowTabs in server patch schema', () => {
     const schema = buildServerSettingsPatchSchema()
     expect(schema.safeParse({ panes: { multirowTabs: true } }).success).toBe(false)
+  })
+
+  describe('panes.repoIconsOnTabs (browser-local)', () => {
+    it('defaults to true', () => {
+      const local = resolveLocalSettings(undefined)
+      expect(local.panes.repoIconsOnTabs).toBe(true)
+    })
+
+    it('applies a boolean patch', () => {
+      const local = resolveLocalSettings({ panes: { repoIconsOnTabs: false } })
+      expect(local.panes.repoIconsOnTabs).toBe(false)
+    })
+
+    it('merges patches preserving other pane keys', () => {
+      const merged = mergeLocalSettings(
+        { panes: { iconsOnTabs: false } },
+        { panes: { repoIconsOnTabs: false } },
+      )
+      expect(merged.panes?.iconsOnTabs).toBe(false)
+      expect(merged.panes?.repoIconsOnTabs).toBe(false)
+    })
+
+    it('is rejected by the server patch schema (stays local)', () => {
+      const schema = buildServerSettingsPatchSchema()
+      expect(schema.safeParse({ panes: { repoIconsOnTabs: true } }).success).toBe(false)
+    })
   })
 
   describe('deprecated fresh-agent font scale is dropped', () => {

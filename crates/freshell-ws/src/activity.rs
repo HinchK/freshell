@@ -223,10 +223,16 @@ impl ActivityHub {
         })
     }
 
-    /// Attach an amplifier events lane for a freshly-ASSOCIATED terminal
-    /// (called by [`crate::amplifier_association`] once the locator resolves).
-    /// `Start` replays the young file from byte 0 — the recorded
-    /// `prompt:submit` is what confirms the tracker's provisional busy.
+    /// Test-only model of the create-time events-lane attach: enqueues the
+    /// same `HubEvent::AmplifierAttach` (with `AttachAt::Start`) the
+    /// production `ActivityEvent::Created` resolver arm enqueues for an
+    /// amplifier terminal whose `events.jsonl` already exists. Its production
+    /// caller was the deleted post-spawn amplifier association (kata qmpk —
+    /// identity is launcher-assigned at create time now); the unit tests
+    /// below keep using it to pin real lane behavior. `Start` replays the
+    /// young file from byte 0 — the recorded `prompt:submit` is what
+    /// confirms the tracker's provisional busy.
+    #[cfg(test)]
     pub fn attach_amplifier_association(
         &self,
         terminal_id: &str,
@@ -1567,6 +1573,22 @@ mod tests {
         .expect("bind upsert");
         assert_eq!(bound["upsert"][0]["terminalId"], "t1");
 
+        // DEFLAKE (f3wp refresh): the bind upsert can broadcast BEFORE the
+        // attach's initial drain has incremented `tail_reads` (observed once
+        // under workspace load, /tmp/f3wp-refresh/cargo-run5.log:
+        // `reads_after_attach >= 1` failed on a one-shot read taken right
+        // after the bind frame). Poll to the attach-read edge instead of
+        // racing it -- the attach performs exactly one drain read with no
+        // writes pending, so the settled counter is what the zero-polling
+        // stability assertion below then holds against, unchanged.
+        let attach_read_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while hub.stats().tail_reads.load(Ordering::SeqCst) < 1 {
+            assert!(
+                tokio::time::Instant::now() < attach_read_deadline,
+                "attach never performed its initial tail read"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
         let reads_after_attach = hub.stats().tail_reads.load(Ordering::SeqCst);
         assert!(reads_after_attach >= 1);
 

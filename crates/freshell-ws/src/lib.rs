@@ -21,7 +21,7 @@
 //! wire bytes are contract-locked.
 
 pub mod activity;
-pub mod amplifier_association;
+pub mod auto_resume;
 pub mod backpressure;
 pub mod claude_signal;
 pub mod codex_association;
@@ -32,7 +32,7 @@ pub(crate) mod create_gate;
 pub mod create_limit;
 pub mod existence;
 pub mod identity;
-pub(crate) mod invariants;
+pub mod invariants;
 pub mod opencode_association;
 pub mod origin;
 pub mod pane_ledger;
@@ -98,6 +98,11 @@ pub struct WsState {
     /// Carries `ui.command` / `freshAgent.session.materialized` / `sessions.changed`
     /// during a fresh-agent turn, which the oracle's capture socket records.
     pub broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    /// Lane D1: natural-exit crash events for the auto-resume hub. The
+    /// receiver half is consumed by `auto_resume::spawn_auto_resume_hub`
+    /// (Task 5); until then tests drain it directly (construction sites
+    /// without a consumer drop the receiver — sends are best-effort).
+    pub auto_resume_tx: tokio::sync::mpsc::UnboundedSender<crate::auto_resume::CrashEvent>,
     /// The freshcodex WS fresh-agent slice: the post-handshake loop dispatches
     /// `freshAgent.create` / `freshAgent.send` (codex) here, which spawns the codex
     /// app-server sidecar and broadcasts `freshAgent.created` / `freshAgent.send.accepted`
@@ -229,16 +234,6 @@ pub struct WsState {
     /// both the `hello` frame and every later `terminal.*` frame on this
     /// connection are bounded identically.
     pub ws_max_payload_bytes: usize,
-    /// The amplifier session locator (restore-across-restart fix,
-    /// `docs/plans/2026-07-18-amplifier-restore-spec.md`): correlates a fresh
-    /// amplifier PTY's first Enter/submit with the new
-    /// `~/.amplifier/projects/.../sessions/<id>/` dir amplifier lazily creates,
-    /// so the terminal can be bound to a session identity and `terminal.rs`'s
-    /// generic resume-id derivation can drive `amplifier resume <id>` on
-    /// restart. `None` when the provider home couldn't be resolved (mirrors
-    /// `SessionDirectoryState::session_index`'s `Option` convention) -- every
-    /// [`crate::amplifier_association`] entry point no-ops in that case.
-    pub amplifier_locator: Option<Arc<freshell_sessions::amplifier_locator::AmplifierLocator>>,
     /// Reconciliation handshake (design §5.1): the disk-truth probe behind the
     /// `pane.reconcile.request` verdict derivation — "does `provider:sessionId`
     /// exist on disk?" with defined Present/Absent/Unknown semantics. Backed by
@@ -271,8 +266,9 @@ pub struct WsState {
     /// `terminal.rs`'s generic resume-id derivation can drive
     /// `opencode --session <id>` on restart. `None` when the data home
     /// couldn't be resolved — every [`crate::opencode_association`] entry
-    /// point no-ops in that case. Sibling to `amplifier_locator` (spec §8: a
-    /// provider-parameterized locator was explicitly rejected).
+    /// point no-ops in that case. Sibling to the deleted amplifier locator
+    /// (spec §8: a provider-parameterized locator was explicitly rejected;
+    /// amplifier identity is now launcher-assigned at create time, kata qmpk).
     pub opencode_locator: Option<Arc<freshell_sessions::opencode_locator::OpencodeLocator>>,
     /// The codex terminal-pane rollout locator (Lane B2): correlates a fresh
     /// codex PTY's first Enter with the new rollout JSONL codex writes under
@@ -775,6 +771,7 @@ mod tests {
             boot_id: Arc::new("boot-2222".to_string()),
             settings: Arc::new(test_settings()),
             broadcast_tx: Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
             fresh_codex: freshell_freshagent::FreshCodexState::new(
                 Arc::clone(&auth_token),
                 Arc::clone(&broadcast_tx),
@@ -801,7 +798,6 @@ mod tests {
             shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             create_dedupe: std::sync::Arc::new(crate::create_dedupe::CreateDedupe::default()),
             config_fallback: None,
-            amplifier_locator: None,
             opencode_locator: None,
             codex_locator: None,
             activity: None,
@@ -987,7 +983,34 @@ mod tests {
         // handshake on a second, independent call.
         let late_connection = build_handshake(&s);
 
-        assert_eq!(first_connection, late_connection);
+        // DEFLAKE (f3wp): `ready.timestamp` is wall-clock at build time, so
+        // two handshakes built across a millisecond boundary legitimately
+        // differ in that one field (flipped twice under cargo-workspace
+        // load: left/right identical except `.725Z` vs `.726Z`). Neutralize
+        // ONLY the timestamp; every other field must still match exactly.
+        // Assert the timestamp is RFC3339-parseable BEFORE blanking it below --
+        // otherwise a malformed/missing timestamp would silently pass through
+        // the "<normalized>" substitution instead of failing the test.
+        if let Some(ServerMessage::Ready(r)) = first_connection
+            .iter()
+            .find(|m| matches!(m, ServerMessage::Ready(_)))
+        {
+            chrono::DateTime::parse_from_rfc3339(&r.timestamp)
+                .expect("ready.timestamp must be RFC3339-parseable");
+        }
+        let normalize = |msgs: Vec<ServerMessage>| -> Vec<ServerMessage> {
+            msgs.into_iter()
+                .map(|m| match m {
+                    ServerMessage::Ready(mut r) => {
+                        r.timestamp = String::from("<normalized>");
+                        ServerMessage::Ready(r)
+                    }
+                    other => other,
+                })
+                .collect()
+        };
+        let late_connection = normalize(late_connection);
+        assert_eq!(normalize(first_connection), late_connection);
         assert!(
             late_connection
                 .iter()

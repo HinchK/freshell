@@ -1,11 +1,15 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { render as renderWithoutStore, screen, fireEvent, cleanup } from '@testing-library/react'
+import type { ReactElement } from 'react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import PaneHeader from '@/components/panes/PaneHeader'
 import freshAgentReducer, { freshAgentSnapshotReceived, sessionInit } from '@/store/freshAgentSlice'
+import repoIconsReducer from '@/store/repoIconsSlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
 import { formatPaneRuntimeLabel, formatPaneRuntimeTooltip } from '@/lib/format-terminal-title-meta'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import type { PaneContent } from '@/store/paneTypes'
 
 vi.mock('lucide-react', () => ({
   X: ({ className }: { className?: string }) => (
@@ -52,6 +56,12 @@ vi.mock('@/components/icons/PaneIcon', () => ({
   ),
 }))
 
+vi.mock('@/components/icons/RepoIcon', () => ({
+  default: ({ info, className }: { info?: { repoKey?: string; repoName?: string }; className?: string }) => (
+    <svg data-testid="repo-icon" data-repo-key={info?.repoKey} data-repo-name={info?.repoName} className={className} />
+  ),
+}))
+
 vi.mock('@/components/fresh-agent/FreshAgentSettingsButton', () => ({
   default: () => (
     <button type="button" aria-label="Agent settings" title="Agent settings" data-testid="settings-button-stub" />
@@ -64,8 +74,15 @@ function makeTerminalContent(mode = 'shell') {
 
 function makeFreshAgentStore() {
   return configureStore({
-    reducer: { freshAgent: freshAgentReducer },
+    reducer: { freshAgent: freshAgentReducer, repoIcons: repoIconsReducer, terminalMeta: terminalMetaReducer },
   })
+}
+
+// PaneHeader reads the store (repo icons); in the app it always renders under
+// the Redux Provider, so mirror that by default. Tests that need a specific
+// store still nest their own <Provider>, which takes precedence.
+function render(ui: ReactElement) {
+  return renderWithoutStore(<Provider store={makeFreshAgentStore()}>{ui}</Provider>)
 }
 
 function makeFreshAgentSnapshot(
@@ -618,6 +635,46 @@ describe('PaneHeader', () => {
       const identity = screen.getByText('freshcodex')
       expect(identity.getAttribute('class')).toContain('text-blue-500')
       expect(screen.queryByTestId('pane-icon')).toBeNull()
+    })
+  })
+
+  describe('repo icon', () => {
+    it('renders a repo icon next to the pane icon when repo meta is cached', () => {
+      const store = makeFreshAgentStore()
+      store.dispatch({
+        type: 'repoIcons/fetchMeta/fulfilled',
+        meta: { arg: '/repo/a' },
+        payload: { repoRoot: '/repo/a', checkoutRoot: '/repo/a', repoName: 'a', hasIcon: false },
+      })
+      render(
+        <Provider store={store}>
+          <PaneHeader
+            title="My Terminal"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            content={{ kind: 'terminal', mode: 'claude', createRequestId: 'r', status: 'running', initialCwd: '/repo/a' } as PaneContent}
+          />
+        </Provider>,
+      )
+      expect(screen.getByTestId('repo-icon')).toBeTruthy()
+      expect(screen.getByTestId('repo-icon').getAttribute('class') || '').toContain('h-3.5 w-3.5')
+    })
+
+    it('renders no repo icon for plain shell panes', () => {
+      const store = makeFreshAgentStore()
+      render(
+        <Provider store={store}>
+          <PaneHeader
+            title="My Terminal"
+            status="running"
+            isActive={true}
+            onClose={vi.fn()}
+            content={{ kind: 'terminal', mode: 'shell', createRequestId: 'r', status: 'running', initialCwd: '/repo/a' } as PaneContent}
+          />
+        </Provider>,
+      )
+      expect(screen.queryByTestId('repo-icon')).toBeNull()
     })
   })
 
