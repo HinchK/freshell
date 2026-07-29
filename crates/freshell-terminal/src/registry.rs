@@ -3650,7 +3650,7 @@ mod tests {
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
         let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, None); // conn 1 is attached
-                                                                             // conn 2 reconnects with another socket attached and no prior attachment of its own.
+                                                                            // conn 2 reconnects with another socket attached and no prior attachment of its own.
         let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
         assert_eq!(out, AttachResizeStatus::Skipped);
         assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
