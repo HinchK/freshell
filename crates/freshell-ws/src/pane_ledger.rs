@@ -586,6 +586,32 @@ impl PaneLedger {
         self.write_binding(root, &mut index, &row)
     }
 
+    /// Hard-delete one binding row (file first, then index — the mirror of
+    /// [`Self::delete_pending`]'s atomic delete; missing file == already
+    /// gone). PIN 2 (Step 4b): the ONLY caller is the spawn-failure branch
+    /// of a FRESH claude preallocation — its pre-spawn row describes a pane
+    /// that never existed, and left in place it would surface as a ghost
+    /// `ledgerOnly` recovery offer for ~30 days. Never used for resume
+    /// creates: their row belongs to the prior epoch and must stay
+    /// recoverable.
+    pub fn delete_binding(&self, provider: &str, session_id: &str) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let result = match std::fs::remove_file(Self::binding_path(root, provider, session_id)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+        if result.is_ok() {
+            index
+                .bindings
+                .remove(&(provider.to_string(), session_id.to_string()));
+        }
+        result
+    }
+
     /// Raw single-row read from the index (no chain following — that is
     /// `lookup_by_session`, Task 2). Memory-only (V1.md read policy).
     pub fn load_binding(&self, provider: &str, session_id: &str) -> Option<BindingRow> {
