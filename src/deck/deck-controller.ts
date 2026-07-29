@@ -35,6 +35,9 @@ export type DeckControllerOptions = {
   iconCache?: IconImageCache
 }
 
+/** What a key displayed at press-down - snapshotted so re-sorts can't retarget a press. */
+type PressTarget = { kind: 'pager' } | { kind: 'tab'; tabId: string } | { kind: 'none' }
+
 export const LONG_PRESS_MS = 500
 export const ACTION_LAYER_TIMEOUT_MS = 10_000
 export const STOP_ESCALATE_MS = 5_000
@@ -51,7 +54,7 @@ export class DeckController {
 
   private page = 1
   private actionLayer: { tabId: string; openedAt: number } | null = null
-  private pressedAt = new Map<number, number>()
+  private pressedAt = new Map<number, { at: number; target: PressTarget }>()
   private lastStopAt = new Map<string, number>() // per paneId
   private lastActivityAt = 0
   private dimmed = false
@@ -208,7 +211,7 @@ export class DeckController {
     this.dutyChecks()
     switch (event.type) {
       case 'keyDown':
-        this.pressedAt.set(event.keyIndex, this.now())
+        this.pressedAt.set(event.keyIndex, { at: this.now(), target: this.resolveKeyTarget(event.keyIndex) })
         this.noteActivity()
         break
       case 'keyUp':
@@ -226,34 +229,45 @@ export class DeckController {
     }
   }
 
+  /** What this key DISPLAYS right now - captured at press-down so re-sorts can't retarget a press. */
+  private resolveKeyTarget(keyIndex: number): PressTarget {
+    const model = selectDeckModel(this.store.getState())
+    const plan = planLayout(this.device.capabilities, model.tabs.length)
+    if (plan.pagerKey !== null && keyIndex === plan.pagerKey) return { kind: 'pager' }
+    const slot = plan.tabSlots.indexOf(keyIndex)
+    if (slot === -1) return { kind: 'none' }
+    const pages = pageCount(model.tabs.length, plan.tabsPerPage)
+    const tab = visibleTabs(model.tabs, clampPage(this.page, pages), plan.tabsPerPage)[slot]
+    return tab ? { kind: 'tab', tabId: tab.id } : { kind: 'none' }
+  }
+
   private handleKeyUp(keyIndex: number): void {
-    const downAt = this.pressedAt.get(keyIndex)
+    const press = this.pressedAt.get(keyIndex)
     this.pressedAt.delete(keyIndex)
     this.noteActivity()
-    if (downAt === undefined) return // unmatched release
+    if (press === undefined) return // unmatched release
     if (this.actionLayer) {
       this.handleActionKey(keyIndex)
       return
     }
-    const duration = this.now() - downAt
-    const state = this.store.getState()
-    const model = selectDeckModel(state)
-    const plan = planLayout(this.device.capabilities, model.tabs.length)
-    const pages = pageCount(model.tabs.length, plan.tabsPerPage)
-    if (plan.pagerKey !== null && keyIndex === plan.pagerKey) {
+    const duration = this.now() - press.at
+    if (press.target.kind === 'pager') {
+      const model = selectDeckModel(this.store.getState())
+      const plan = planLayout(this.device.capabilities, model.tabs.length)
+      const pages = pageCount(model.tabs.length, plan.tabsPerPage)
       this.page = this.page >= pages ? 1 : this.page + 1
       this.repaint()
       return
     }
-    const slot = plan.tabSlots.indexOf(keyIndex)
-    if (slot === -1) return
-    const tab = visibleTabs(model.tabs, clampPage(this.page, pages), plan.tabsPerPage)[slot]
-    if (!tab) return // empty slot
+    if (press.target.kind !== 'tab') return
+    const tabId = press.target.tabId
+    const model = selectDeckModel(this.store.getState())
+    if (!model.tabs.some((tab) => tab.id === tabId)) return // tab closed mid-press
     if (duration >= LONG_PRESS_MS) {
-      this.actionLayer = { tabId: tab.id, openedAt: this.now() }
+      this.actionLayer = { tabId, openedAt: this.now() }
       this.repaint()
     } else {
-      focusTabFromDeck(this.store, tab.id)
+      focusTabFromDeck(this.store, tabId)
       this.repaint() // optimistic immediacy; store subscription repaints too
     }
   }

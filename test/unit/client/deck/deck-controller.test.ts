@@ -4,7 +4,7 @@ const sendMock = vi.fn()
 vi.mock('@/lib/ws-client', () => ({ getWsClient: () => ({ send: sendMock }) }))
 
 import { configureStore } from '@reduxjs/toolkit'
-import tabsReducer from '@/store/tabsSlice'
+import tabsReducer, { closeTab } from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 import turnCompletionReducer, { markTabAttention } from '@/store/turnCompletionSlice'
 import freshAgentReducer from '@/store/freshAgentSlice'
@@ -197,6 +197,48 @@ describe('DeckController', () => {
     expect(state.tabs.activeTabId).toBe('t2')
     expect(state.turnCompletion.attentionByTab.t2).toBeFalsy()
     expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', active: true, fill: 'none' })
+  })
+
+  it('acts on the tab displayed at press-down even if the sort changes mid-press', () => {
+    // t1 greenIcon (key 0), t2 greenIcon (key 1); active tab defaults to t1.
+    const { store, device } = setup({ tabCount: 2 })
+    device.emit({ type: 'keyDown', keyIndex: 1 }) // user is pressing "t2"
+    // Mid-press: t2 gains attention -> re-sort moves t2 to key 0; key 1 now shows t1.
+    store.dispatch(markTabAttention({ tabId: 't2' }))
+    // Sanity: the RED gate is armed - attention actually set, re-sort actually happened.
+    expect(store.getState().turnCompletion.attentionByTab.t2).toBe(true)
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't2' })
+    vi.advanceTimersByTime(100)
+    device.emit({ type: 'keyUp', keyIndex: 1 })
+    // Snapshot guard: the press focuses t2 (what the user saw), not t1 (what the slot shows now)
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+  })
+
+  it('press on a tab that was closed mid-press is a no-op', () => {
+    const { store, device } = setup({ tabCount: 2 })
+    device.emit({ type: 'keyDown', keyIndex: 1 })
+    store.dispatch(closeTab('t2'))
+    expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(['t1']) // t2 really gone mid-press
+    vi.advanceTimersByTime(100)
+    device.emit({ type: 'keyUp', keyIndex: 1 })
+    expect(store.getState().tabs.activeTabId).toBe('t1')
+  })
+
+  it('long-press opens the action layer for the press-down tab despite a mid-press re-sort', () => {
+    // t2 is a fresh-agent pane with pending permission r1 -> APPROVE is enabled only
+    // if the action layer targets t2; t1 is a plain terminal (approve target null).
+    const { store, device } = setup({ tabCount: 2, freshAgentTab: true, pendingPermissions: { r1: { requestId: 'r1' } } })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2' }) // pre-press: t2 on key 1
+    device.emit({ type: 'keyDown', keyIndex: 1 })
+    store.dispatch(markTabAttention({ tabId: 't2' }))
+    // Sanity: the RED gate is armed - attention set, mid-press re-sort moved t2 to key 0.
+    expect(store.getState().turnCompletion.attentionByTab.t2).toBe(true)
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't2' })
+    vi.advanceTimersByTime(600)
+    device.emit({ type: 'keyUp', keyIndex: 1 })
+    // Action layer opened, targeting the press-down tab t2 (approve enabled via r1)
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'action', action: 'back' })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'action', action: 'approve', enabled: true })
   })
 
   it('store changes repaint only changed keys', () => {
