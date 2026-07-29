@@ -14,7 +14,12 @@
 //! else before any guard runs, warn-logging rejects for detectability);
 //! and drain is NON-DESTRUCTIVE for valid signals — the consumer deletes a
 //! file only after acting on it (act-then-delete, D1.1), with a ~10-minute
-//! staleness reap for signals nobody ever acts on.
+//! staleness reap for signals nobody ever acts on. Two bounded-junk rules:
+//! signals addressed to a FOREIGN-provider pane are permanently
+//! unactionable (a pane's mode/provider never changes), so they are
+//! warn-logged once and consumed (`SignalDisposition::Discard`) instead of
+//! being silently re-read every sweep; and orphaned `.tmp` staging files
+//! (writer died before the rename) are reaped on the same staleness TTL.
 //!
 //! Deliberately NOT a WsState field: the sweep task owns the watcher
 //! (claude_signal.rs:12-14 — WsState is an exhaustive struct literal in
@@ -83,16 +88,32 @@ impl OpencodeSignalWatcher {
     /// and invalid-shape files are warn-logged (`opencode_signal_rejected`)
     /// and deleted (single-shot semantics — junk must not re-fail every
     /// sweep). Files older than STALE_SIGNAL_MAX_AGE are reaped without
-    /// emitting. `*.tmp` staging files are ignored.
+    /// emitting. Fresh `*.tmp` staging files are ignored; stale ones
+    /// (orphaned by a dead writer) are reaped on the same TTL.
     pub fn drain(&self) -> Vec<OpencodeSignal> {
         let Ok(entries) = std::fs::read_dir(&self.root) else {
             return Vec::new(); // no dir yet: no opencode pane has ever signaled
         };
-        let mut paths: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-            .collect();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("json") => paths.push(path),
+                Some("tmp") => {
+                    // Orphaned atomic-write staging (writer died before the
+                    // rename): reap on the same TTL so junk stays bounded.
+                    let stale = std::fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > STALE_SIGNAL_MAX_AGE);
+                    if stale {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+                _ => {}
+            }
+        }
         paths.sort();
         let mut signals = Vec::new();
         for path in paths {
@@ -175,8 +196,9 @@ fn parse_signal_file(path: &Path) -> Option<OpencodeSignal> {
 ///   target, (3) ledger A8 retired-inclusive, (4) fresh-agent sessions
 ///   never bind terminal panes.
 /// ACT-THEN-DELETE (D1.1): sig.path is removed only after the signal was
-/// acted on (rebound, same-id no-op, or a deliberate guard refusal); files
-/// with no actionable pane are RETAINED for later sweeps (the watcher's
+/// acted on (rebound, same-id no-op, or a deliberate guard refusal) or
+/// discarded as permanently unactionable (foreign-provider pane); files
+/// with no actionable pane YET are RETAINED for later sweeps (the watcher's
 /// staleness cap reaps abandoned ones).
 /// NEVER any activity/row-correlation fallback: no signal ⇒ no rebind.
 pub async fn drain_and_rebind_opencode(state: &WsState, watcher: &OpencodeSignalWatcher) {
@@ -193,11 +215,13 @@ pub async fn drain_and_rebind_opencode(state: &WsState, watcher: &OpencodeSignal
         }
     };
     for sig in signals {
-        let acted = apply_opencode_signal(state, &sig).await;
-        if acted {
-            let _ = std::fs::remove_file(&sig.path); // act-then-delete (D1.1)
+        match apply_opencode_signal(state, &sig).await {
+            SignalDisposition::Acted | SignalDisposition::Discard => {
+                let _ = std::fs::remove_file(&sig.path); // act/discard-then-delete (D1.1)
+            }
+            // Not actionable YET => the file stays for a later sweep.
+            SignalDisposition::Retain => {}
         }
-        // Not acted ⇒ the file stays for a later sweep (retention).
     }
 }
 
@@ -275,40 +299,66 @@ async fn rebind_fanout(
     );
 }
 
-/// One signal through the ladder. Returns whether the signal was ACTED ON
-/// (delete the file) vs skipped (retain it for a later sweep).
-async fn apply_opencode_signal(state: &WsState, sig: &OpencodeSignal) -> bool {
+/// Outcome of applying one signal: `Acted` (rebind done), `Retain` (might
+/// become actionable later -- keep the file for the next sweep), `Discard`
+/// (permanently unactionable -- consume the file so it neither accumulates
+/// nor re-logs; deleting a signal degrades only to no-rebind, per the
+/// module's degradation policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalDisposition {
+    Acted,
+    Retain,
+    Discard,
+}
+
+/// One signal through the ladder. Returns the file's disposition: `Acted`
+/// and `Discard` delete the file; `Retain` keeps it for a later sweep.
+async fn apply_opencode_signal(state: &WsState, sig: &OpencodeSignal) -> SignalDisposition {
     let Some(current) = state.identity.get(&sig.terminal_id) else {
         // (0a) D1.2 first-bind arbitration — the registry's per-terminal
         // identity probe carries exactly the fields the arbitration needs
         // (mode / status / resume_session_id / cwd).
         let Some(entry) = state.registry.probe(&sig.terminal_id) else {
-            return false; // no pane (yet): RETAIN for a later sweep
+            return SignalDisposition::Retain; // no pane (yet): RETAIN for a later sweep
         };
-        if entry.mode != "opencode"
-            || entry.status != freshell_protocol::TerminalRunStatus::Running
+        if entry.mode != "opencode" {
+            // Foreign-provider pane (registry row): a pane's mode never
+            // changes, so this signal can never become actionable. Explicit
+            // ignore-with-log + consume (A8 detectability, bounded noise).
+            tracing::warn!(terminal_id = %sig.terminal_id, session_id = %sig.session_id,
+                mode = %entry.mode, source = ?sig.source,
+                "opencode_signal_ignored: pane belongs to another provider, consuming file");
+            return SignalDisposition::Discard;
+        }
+        if entry.status != freshell_protocol::TerminalRunStatus::Running
             || entry.resume_session_id.is_some()
         {
-            return false; // not a live never-bound opencode pane: RETAIN
+            return SignalDisposition::Retain; // not a live never-bound opencode pane
         }
         if !target_session_guards_pass(state, sig) {
-            return true; // deliberate refusal — acted
+            return SignalDisposition::Acted; // deliberate refusal — acted
         }
         tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
             source = ?sig.source,
             "opencode_rebind: first bind via TUI signal (signal outranks locator)");
         rebind_fanout(state, sig, entry.cwd.as_deref(), None).await;
-        return true;
+        return SignalDisposition::Acted;
     };
 
     if current.provider.as_deref() != Some("opencode") {
-        return false; // foreign-provider row: never touch; RETAIN until stale
+        // Foreign-provider identity row: never touch the pane (one-writer /
+        // D7) -- and never actionable (a pane's provider does not change),
+        // so consume instead of silently re-reading it every sweep.
+        tracing::warn!(terminal_id = %sig.terminal_id, session_id = %sig.session_id,
+            provider = ?current.provider, source = ?sig.source,
+            "opencode_signal_ignored: identity row belongs to another provider, consuming file");
+        return SignalDisposition::Discard;
     }
     if current.session_id.as_deref() == Some(sig.session_id.as_str()) {
-        return true; // same-id no-op — acted
+        return SignalDisposition::Acted; // same-id no-op — acted
     }
     if !target_session_guards_pass(state, sig) {
-        return true; // A13 / ledger A8 / fresh-agent refusal — acted
+        return SignalDisposition::Acted; // A13 / ledger A8 / fresh-agent refusal — acted
     }
 
     let previous = current.session_id.clone();
@@ -344,14 +394,14 @@ async fn apply_opencode_signal(state: &WsState, sig: &OpencodeSignal) -> bool {
             current.cwd.clone(),
             previous,
         );
-        return true;
+        return SignalDisposition::Acted;
     }
 
     // (0) live pane — the ordinary rebind path.
     tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
         source = ?sig.source, "opencode_rebind: TUI plugin reported a new session id");
     rebind_fanout(state, sig, current.cwd.as_deref(), previous).await;
-    true
+    SignalDisposition::Acted
 }
 
 /// Sweep cadence — mirrors CLAUDE_SIGNAL_SWEEP_INTERVAL (claude_signal.rs:24):
@@ -478,6 +528,39 @@ mod tests {
         let watcher = OpencodeSignalWatcher::new(dir.path().to_path_buf());
         assert!(watcher.drain().is_empty());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn drain_reaps_stale_tmp_staging_files_but_keeps_fresh_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        write_signal(
+            &root,
+            "t1__00000000000001-000001-1.json",
+            r#"{"session_id":"ses_abc123"}"#,
+        );
+        write_signal(&root, "t1__00000000000002-000001-1.tmp", "in-flight");
+        write_signal(&root, "t1__00000000000003-000001-1.tmp", "orphaned");
+        let stale = std::time::SystemTime::now()
+            - STALE_SIGNAL_MAX_AGE
+            - std::time::Duration::from_secs(60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("t1__00000000000003-000001-1.tmp"))
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        let watcher = OpencodeSignalWatcher::new(root.clone());
+        let signals = watcher.drain();
+        assert_eq!(signals.len(), 1, "the valid json still parses");
+        assert_eq!(
+            remaining(&root),
+            vec![
+                "t1__00000000000001-000001-1.json".to_string(), // retained: act-then-delete
+                "t1__00000000000002-000001-1.tmp".to_string(),  // fresh staging: untouched
+            ],
+            "the orphaned stale .tmp must be reaped"
+        );
     }
 
     #[test]
