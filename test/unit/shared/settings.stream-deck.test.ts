@@ -15,6 +15,7 @@ describe('streamDeck local settings section', () => {
       brightness: 100,
       idleBrightness: 10,
       idleTimeoutSeconds: 300,
+      tileStyle: 'status-icons',
     })
   })
 
@@ -27,6 +28,7 @@ describe('streamDeck local settings section', () => {
       brightness: 100,
       idleBrightness: 10,
       idleTimeoutSeconds: 60,
+      tileStyle: 'status-icons',
     })
     const patch = buildLocalSettingsPatch(resolved)
     expect(patch.streamDeck).toEqual({ enabled: true, idleTimeoutSeconds: 60 })
@@ -47,8 +49,39 @@ describe('streamDeck local settings section', () => {
 
   it('survives the legacy seed normalizer (load path)', () => {
     const seed = extractLegacyLocalSettingsSeed({
-      streamDeck: { enabled: true, brightness: 80 },
+      streamDeck: { enabled: true, brightness: 80, tileStyle: 'terminal-previews' },
     })
-    expect(seed?.streamDeck).toEqual({ enabled: true, brightness: 80 })
+    expect(seed?.streamDeck).toEqual({
+      enabled: true,
+      brightness: 80,
+      tileStyle: 'terminal-previews',
+    })
+  })
+})
+
+describe('streamDeck.tileStyle', () => {
+  it('defaults to status-icons', () => {
+    expect(defaultLocalSettings.streamDeck.tileStyle).toBe('status-icons')
+  })
+
+  it('round-trips terminal-previews through patch normalization and persistence', () => {
+    const resolved = resolveLocalSettings({
+      streamDeck: { tileStyle: 'terminal-previews' },
+    })
+    expect(resolved.streamDeck.tileStyle).toBe('terminal-previews')
+    const patch = buildLocalSettingsPatch(resolved)
+    expect(patch.streamDeck?.tileStyle).toBe('terminal-previews')
+  })
+
+  it('drops invalid tileStyle values during extraction', () => {
+    const seed = extractLegacyLocalSettingsSeed({
+      streamDeck: { tileStyle: 'sparkly' },
+    })
+    expect(seed?.streamDeck?.tileStyle).toBeUndefined()
+  })
+
+  it('produces no persisted entry at the default value', () => {
+    const local = resolveLocalSettings({})
+    expect(buildLocalSettingsPatch(local).streamDeck?.tileStyle).toBeUndefined()
   })
 })

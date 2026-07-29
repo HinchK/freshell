@@ -102,7 +102,6 @@ import {
 import { useMobile } from '@/hooks/useMobile'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
 import { useEnsureExtensionsRegistry } from '@/hooks/useEnsureExtensionsRegistry'
-import { useTerminalTextRegistration } from '@/deck/terminal-text-registry'
 import { findLocalFilePaths } from '@/lib/path-utils'
 import { findUrls } from '@/lib/url-utils'
 import { openExternalUrl, shouldOpenLinkExternally } from '@/lib/open-url'
@@ -165,6 +164,7 @@ import {
   scrollLinesToCursorKeys,
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
+import { useTerminalTextRegistration } from '@/deck/terminal-text-registry'
 import { buildRestoreError, sanitizeSessionRef } from '@shared/session-contract'
 
 const log = createLogger('TerminalView')
@@ -760,7 +760,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
 
-  // Register live terminal text reader for Stream Deck previews
+  // Register live terminal text reader for Stream Deck previews (classic tile style)
   useTerminalTextRegistration(terminalContent?.terminalId, termRef)
 
   const extensions = useAppSelector((s) => s.extensions?.entries ?? [], shallowEqual)

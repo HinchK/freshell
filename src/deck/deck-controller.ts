@@ -16,12 +16,16 @@ import type { DeckStore } from './deck-actions'
 import type { KeySpec } from './frame'
 import type { DeckModel } from './deck-selectors'
 import type { RootState } from '@/store/store'
+import type { DeckTileStyle } from '@shared/settings'
 import { ACTION_KEYS, buildFrame, clampPage, pageCount, planLayout, visibleTabs } from './frame'
-import { findApproveTarget, findStopTarget, selectDeckModel } from './deck-selectors'
+import { findApproveTarget, findStopTarget, panesForTab, selectDeckModel } from './deck-selectors'
 import { executeDeckStop, focusTabFromDeck, sendDeckApproval } from './deck-actions'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { findPaneContent } from '@/lib/pane-utils'
 import { getTerminalTextSnapshot } from './terminal-text-registry'
+import { fetchRepoIconMeta } from '@/store/repoIconsSlice'
+import { resolvePaneRepoCwd } from '@/lib/repo-icon'
+import { IconImageCache, getIconImageCache } from './icon-image-cache'
 import { defaultCtxFactory, renderKey as canvasRenderKey, renderStrip as canvasRenderStrip } from './tile-renderer'
 
 export type DeckControllerOptions = {
@@ -29,14 +33,20 @@ export type DeckControllerOptions = {
   device: DeckDevice
   renderKey?: (spec: KeySpec, caps: DeckCapabilities) => Uint8ClampedArray
   renderStrip?: (text: string, width: number, height: number) => Uint8ClampedArray
-  settings: () => { brightness: number; idleBrightness: number; idleTimeoutSeconds: number }
+  settings: () => { brightness: number; idleBrightness: number; idleTimeoutSeconds: number; tileStyle: DeckTileStyle }
   now?: () => number
+  iconCache?: IconImageCache
 }
+
+/** What a key displayed at press-down - snapshotted so re-sorts can't retarget a press. */
+type PressTarget = { kind: 'pager' } | { kind: 'tab'; tabId: string } | { kind: 'none' }
 
 export const LONG_PRESS_MS = 500
 export const ACTION_LAYER_TIMEOUT_MS = 10_000
 export const STOP_ESCALATE_MS = 5_000
 export const TICK_MS = 500
+// Deliberate exception to the file's TIMING RULE: this is a refresh cadence, not a
+// duration — under background setInterval throttling previews simply refresh slower.
 export const PREVIEW_REFRESH_TICKS = 6 // previews re-checked every 3s
 
 export class DeckController {
@@ -46,10 +56,11 @@ export class DeckController {
   private readonly renderStripFn: (text: string, width: number, height: number) => Uint8ClampedArray
   private readonly settings: DeckControllerOptions['settings']
   private readonly now: () => number
+  private readonly iconCache: IconImageCache
 
   private page = 1
   private actionLayer: { tabId: string; openedAt: number } | null = null
-  private pressedAt = new Map<number, number>()
+  private pressedAt = new Map<number, { at: number; target: PressTarget }>()
   private lastStopAt = new Map<string, number>() // per paneId
   private lastActivityAt = 0
   private dimmed = false
@@ -61,13 +72,16 @@ export class DeckController {
 
   private unsubscribeStore: (() => void) | null = null
   private unsubscribeInput: (() => void) | null = null
+  private unsubscribeIcons: (() => void) | null = null
   private intervalId: ReturnType<typeof setInterval> | null = null
   private onVisibilityChange: (() => void) | null = null
 
   constructor(options: DeckControllerOptions) {
     this.store = options.store
     this.device = options.device
-    this.renderKeyFn = options.renderKey ?? ((spec, caps) => canvasRenderKey(spec, caps, defaultCtxFactory))
+    this.iconCache = options.iconCache ?? getIconImageCache()
+    this.renderKeyFn = options.renderKey ??
+      ((spec, caps) => canvasRenderKey(spec, caps, defaultCtxFactory, (url) => this.iconCache.bitmapFor(url)))
     this.renderStripFn = options.renderStrip ?? ((text, width, height) => canvasRenderStrip(text, width, height, defaultCtxFactory))
     this.settings = options.settings
     this.now = options.now ?? (() => Date.now())
@@ -77,6 +91,8 @@ export class DeckController {
     this.lastActivityAt = this.now()
     void this.device.setBrightness(this.settings().brightness)
     this.repaint()
+    this.probeRepoIcons()
+    this.unsubscribeIcons = this.iconCache.subscribe(() => this.repaint())
     this.unsubscribeStore = this.store.subscribe(() => this.onStoreChange())
     this.unsubscribeInput = this.device.onInput((event) => this.handleInput(event))
     this.intervalId = setInterval(() => this.tick(), TICK_MS)
@@ -92,6 +108,8 @@ export class DeckController {
     this.unsubscribeStore = null
     this.unsubscribeInput?.()
     this.unsubscribeInput = null
+    this.unsubscribeIcons?.()
+    this.unsubscribeIcons = null
     if (this.intervalId !== null) {
       clearInterval(this.intervalId)
       this.intervalId = null
@@ -119,6 +137,9 @@ export class DeckController {
       caps,
       page: this.page,
       actionLayer: this.actionLayerInputs(state),
+      // bitmapFor both reports readiness and requests the load - first paint
+      // of a tile with an unloaded icon starts the fetch.
+      iconReady: (url) => this.iconCache.bitmapFor(url) !== null,
       previewFor: (tabId) => this.previewFor(state, tabId),
     })
     let painted = false
@@ -159,10 +180,39 @@ export class DeckController {
     return []
   }
 
+  /**
+   * Probe repo-icon meta for every distinct resolved cwd of the tabs we render.
+   * Deliberately UN-gated by settings.panes.repoIconsOnTabs (Design decision 7:
+   * deck tiles always show their center glyph). Double-probing alongside a
+   * mounted TabBar is harmless - the thunk self-dedupes (repoIconsSlice.ts:36-40).
+   */
+  private probeRepoIcons(): void {
+    const state = this.store.getState()
+    const terminalMetaById = state.terminalMeta.byTerminalId
+    const cwds = new Set<string>()
+    for (const tab of state.tabs.tabs) {
+      for (const entry of panesForTab(state, tab)) {
+        const cwd = resolvePaneRepoCwd(entry.content, tab, terminalMetaById)
+        if (cwd) cwds.add(cwd)
+      }
+    }
+    for (const cwd of cwds) {
+      if (!state.repoIcons.byCwd[cwd]) this.store.dispatch(fetchRepoIconMeta(cwd))
+    }
+  }
+
   // --- store subscription ---
 
   private onStoreChange(): void {
     const state = this.store.getState()
+    // Probe BEFORE the model-JSON bail-out: the store events that first make a
+    // cwd resolvable (upsertTerminalMeta/setTerminalMetaSnapshot) do NOT change
+    // the model JSON (icons stay [] until meta AND repoIcons both exist), so a
+    // probe placed after the bail-out would never fire in the TabBar-less
+    // leader scenario this probe exists for. It cannot loop: the thunk's
+    // synchronous pending entry makes the byCwd guard skip that cwd on the
+    // re-entrant store change.
+    this.probeRepoIcons()
     // ORDERING (load-bearing): compare the model JSON BEFORE any xterm buffer
     // reads - previewFor is only invoked by repaint, which we skip entirely
     // when the model is unchanged.
@@ -183,7 +233,7 @@ export class DeckController {
     this.dutyChecks()
     switch (event.type) {
       case 'keyDown':
-        this.pressedAt.set(event.keyIndex, this.now())
+        this.pressedAt.set(event.keyIndex, { at: this.now(), target: this.resolveKeyTarget(event.keyIndex) })
         this.noteActivity()
         break
       case 'keyUp':
@@ -201,34 +251,45 @@ export class DeckController {
     }
   }
 
+  /** What this key DISPLAYS right now - captured at press-down so re-sorts can't retarget a press. */
+  private resolveKeyTarget(keyIndex: number): PressTarget {
+    const model = selectDeckModel(this.store.getState())
+    const plan = planLayout(this.device.capabilities, model.tabs.length)
+    if (plan.pagerKey !== null && keyIndex === plan.pagerKey) return { kind: 'pager' }
+    const slot = plan.tabSlots.indexOf(keyIndex)
+    if (slot === -1) return { kind: 'none' }
+    const pages = pageCount(model.tabs.length, plan.tabsPerPage)
+    const tab = visibleTabs(model.tabs, clampPage(this.page, pages), plan.tabsPerPage)[slot]
+    return tab ? { kind: 'tab', tabId: tab.id } : { kind: 'none' }
+  }
+
   private handleKeyUp(keyIndex: number): void {
-    const downAt = this.pressedAt.get(keyIndex)
+    const press = this.pressedAt.get(keyIndex)
     this.pressedAt.delete(keyIndex)
     this.noteActivity()
-    if (downAt === undefined) return // unmatched release
+    if (press === undefined) return // unmatched release
     if (this.actionLayer) {
       this.handleActionKey(keyIndex)
       return
     }
-    const duration = this.now() - downAt
-    const state = this.store.getState()
-    const model = selectDeckModel(state)
-    const plan = planLayout(this.device.capabilities, model.tabs.length)
-    const pages = pageCount(model.tabs.length, plan.tabsPerPage)
-    if (plan.pagerKey !== null && keyIndex === plan.pagerKey) {
+    const duration = this.now() - press.at
+    if (press.target.kind === 'pager') {
+      const model = selectDeckModel(this.store.getState())
+      const plan = planLayout(this.device.capabilities, model.tabs.length)
+      const pages = pageCount(model.tabs.length, plan.tabsPerPage)
       this.page = this.page >= pages ? 1 : this.page + 1
       this.repaint()
       return
     }
-    const slot = plan.tabSlots.indexOf(keyIndex)
-    if (slot === -1) return
-    const tab = visibleTabs(model.tabs, clampPage(this.page, pages), plan.tabsPerPage)[slot]
-    if (!tab) return // empty slot
+    if (press.target.kind !== 'tab') return
+    const tabId = press.target.tabId
+    const model = selectDeckModel(this.store.getState())
+    if (!model.tabs.some((tab) => tab.id === tabId)) return // tab closed mid-press
     if (duration >= LONG_PRESS_MS) {
-      this.actionLayer = { tabId: tab.id, openedAt: this.now() }
+      this.actionLayer = { tabId, openedAt: this.now() }
       this.repaint()
     } else {
-      focusTabFromDeck(this.store, tab.id)
+      focusTabFromDeck(this.store, tabId)
       this.repaint() // optimistic immediacy; store subscription repaints too
     }
   }
@@ -326,6 +387,7 @@ export class DeckController {
 
   private tick(): void {
     this.dutyChecks()
+    if (this.settings().tileStyle !== 'terminal-previews') return
     this.tickCount++
     if (this.tickCount % PREVIEW_REFRESH_TICKS === 0) this.repaint() // picks up xterm buffer changes
   }
