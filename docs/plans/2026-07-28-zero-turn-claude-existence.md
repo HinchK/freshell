@@ -41,10 +41,17 @@
 | `crates/freshell-ws/src/reconcile_freshagent.rs` | Modify | Module doc (`:8-18`): add the claude zero-turn asymmetry bullet; update the CLAUDE_CONFIG_DIR WATCH bullet |
 | `test/e2e-browser/specs/freshclaude-zero-turn-restart-rust.spec.ts` | Create | NEW companion e2e: VISIBLE zero-turn freshclaude pane survives abrupt restart |
 | `test/e2e-browser/playwright.config.ts` | Modify | Register the new spec in `RUST_ONLY_SPECS` (~`:81-155`) AND `rust-chromium.testMatch` (~`:208-337`) |
+| `test/e2e-browser/helpers/test-server.ts` | Modify | `applyIsolatedHomeEnvironment`: delete `CLAUDE_CONFIG_DIR` (isolation guard — the fix makes reconcile verdicts newly depend on that root) |
 
 Crate dependency note (verified): `freshell-server` already depends on `freshell-freshagent` (`crates/freshell-server/Cargo.toml`, `freshell-freshagent = { path = "../freshell-freshagent" }`), so no cross-crate injection trait is needed — only a visibility promotion. The closure injection into the probe is for decoupling + testability (precedent: `codex_rollout_locator` at `main.rs:482-486`), not to satisfy the dependency graph.
 
 Root-set note (deliberate behavior change, called out for reviewers): the index-backed probe today sees ONE claude root (`CLAUDE_HOME` else `$HOME/.claude` via `session_directory::claude_home`); `locate_transcript` scans the attach arm's full ordered candidate set (`CLAUDE_CONFIG_DIR` > `CLAUDE_HOME` > `$HOME/.claude`, env-resolved at call time, deduped). Adopting the attach arm's set is the point — the two arms must agree — and it incidentally closes the `CLAUDE_CONFIG_DIR` reader/writer-split WATCH declared in `reconcile_freshagent.rs:17-18` for the reconcile arm (the History index walk still reads one root). Task 5 updates that WATCH comment.
+
+**Validated-reality note (load-bearing validation, 2026-07-28 — see `.worktrees/.the-usual-logs/zero-turn-claude-existence/load-bearing-ledger.md`):** two claims the plan originally asserted were tested against the REAL claude CLI (2.1.220) and the REAL production sidecar (`crates/freshell-claude-sidecar/index.mjs` + `@anthropic-ai/claude-agent-sdk`) in a blackholed sandbox, and both are **false**: (a) the real CLI does NOT create the transcript file at session create — it materializes the file (and the durable UUID via `sdk.session.init`) only at the FIRST TURN; (b) `claude --resume` (uuid or path form, `-p` or interactive) REJECTS a 0-byte transcript ("No conversation found…", exit 1, prompt exit — it never silently starts a new session). Consequences for this plan: the create-time 0-byte transcript is a shape constructed by the E2E FIXTURE (which also mints the durable identity); the nearest production-reachable shapes are crash-window partial/cwd-less transcripts — i.e. the broader class "on disk but R10b-excluded", which this fix also covers. The fix's mechanism and target verdict are UNCHANGED (the kata's acceptance e2e fixes the verdict at respawn, and under the fixture resume succeeds), but the justifying invariant is corrected to: **reconcile must never adjudicate dead an on-disk transcript the attach arm would attempt to resume; if a respawn genuinely cannot succeed, the pane converges to the honest, bounded `dead_session{respawn_exhausted}` via the respawn cap** (prompt-exit on failed resume verified, so the cap always converges). No plan text, code comment, or commit message may assert "the real CLI creates the transcript at session create" or "a 0-byte transcript is resumable" — tasks below were rewritten accordingly.
+
+**Consumer/failure-mode note (deliberate behavior changes, called out for reviewers):** the probe is shared by BOTH verdict arms, so the fallback also changes the TERMINAL arm (`crates/freshell-ws/src/reconcile.rs:274`): a terminal claude pane bound to a zero-turn session flips from `dead_session{session_not_on_disk}` to `respawn` (PTY relaunch `claude --resume <id>`) — the same attach-arm agreement this fix exists to create; no existing test pins the old terminal shape (reconcile.rs unit tests inject explicit probe answers; the reconcile-handshake dead-session e2e deletes the file, which still answers Absent). Second, zero-turn claude moves from the no-burn branch into the respawn-cap branch (stage-1 survey §4d, accepted deliberately): a pane whose respawn repeatedly fails now converges to `dead_session{respawn_exhausted}` after `FRESH_AGENT_RESPAWN_CAP` (=3) burned answers (terminal arm: the registry's §7.5 generation cap) instead of an instant-but-false `session_not_on_disk`. The loud immediate guard is unchanged for genuinely-deleted transcripts (Task 2's `genuinely_missing_transcript_stays_absent_with_locator_installed`). Do NOT exempt fallback hits from the burn — that would reopen unbounded respawn thrash for unresumable sessions.
+
+**Perf note (measured):** the sync `locate_transcript` walk inside `exists()` was benchmarked against the real store (87 project dirs / 2096 transcripts, ext4 WSL2): worst-case MISS across 3 roots p50=2.8ms / p95=4.1ms, and recurrence is bounded (reconcile is client-request-driven with no re-derivation loop). No caching needed now; if a store grows ~10×, negative caching in the locator closure is the pre-identified escape hatch.
 
 ---
 
@@ -131,9 +138,13 @@ No commit for this task (no file changes). Record the RED output (the failing as
 Append inside the existing `#[cfg(test)] mod tests` block of `crates/freshell-server/src/existence.rs` (after the existing helper fns `temp_claude_home` / `write_session` / `probe_over` / `new_test_probe_with_ledger`; `use super::*;` is already at the top of the module, which brings `Arc`, `HashMap`, `PathBuf`, and — once Step 3 lands — `ClaudeTranscriptLocator` into scope):
 
 ```rust
-    /// A zero-turn claude transcript: the real CLI creates the file at
-    /// session-create time, BEFORE any turn — 0 bytes, no cwd-bearing line,
-    /// fails the index's R10b gate — yet `claude --resume <uuid>` works on it.
+    /// A zero-turn claude transcript as the E2E FIXTURE constructs it at
+    /// session create: 0 bytes, no cwd-bearing line, fails the index's R10b
+    /// gate. (Validated against claude CLI 2.1.220: the REAL CLI materializes
+    /// the transcript only at first turn and rejects resume of a 0-byte file;
+    /// this shape stands in for the broader on-disk-but-R10b-excluded class,
+    /// e.g. crash-window partial transcripts. See the plan's Validated-reality
+    /// note: the invariant is arm-agreement, not resumability.)
     fn write_zero_turn_session(claude_home: &std::path::Path, session_id: &str) {
         std::fs::write(
             claude_home
@@ -156,8 +167,9 @@ Append inside the existing `#[cfg(test)] mod tests` block of `crates/freshell-se
     }
 
     /// Kata 09v1 RED: a zero-turn claude transcript (0-byte file, on disk from
-    /// session create) must answer Present, never Absent — the attach arm
-    /// resumes it, so reconcile must not adjudicate it dead. Today the R10b
+    /// session create in the fixture) must answer Present, never Absent — the
+    /// attach arm would attempt resume on it, so reconcile must not
+    /// adjudicate it dead. Today the R10b
     /// cwd gate excludes it from the index and the warm snapshot answers a
     /// false Absent.
     #[tokio::test]
@@ -171,8 +183,8 @@ Append inside the existing `#[cfg(test)] mod tests` block of `crates/freshell-se
         assert_eq!(
             probe.exists("claude", session_id),
             SessionExistence::Present,
-            "the file exists on disk (attach arm would resume it) — the probe \
-             must agree with the raw-file check, not the R10b-gated index"
+            "the file exists on disk (the attach arm would attempt resume) — \
+             the probe must agree with the raw-file check, not the R10b-gated index"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -266,10 +278,11 @@ pub type ClaudeTranscriptLocator = Arc<dyn Fn(&str) -> Option<PathBuf> + Send + 
 3b. Add the field to the struct (after `provider_roots`):
 
 ```rust
-    /// Zero-turn claude fallback (kata 09v1): claude transcripts exist on disk
-    /// from session create, BEFORE any turn — but a 0-byte transcript has no
-    /// cwd-bearing line, so the index's R10b gate excludes it and the warm
-    /// snapshot answers a false Absent while the attach arm would resume it.
+    /// Zero-turn claude fallback (kata 09v1): a claude transcript can be on
+    /// disk yet index-invisible — no cwd-bearing line (the e2e sidecar's
+    /// create-time 0-byte file; crash-window partial writes) — so the index's
+    /// R10b gate excludes it and the warm snapshot answers a false Absent
+    /// while the attach arm would attempt resume on it.
     /// When set, a warm-index Absent for provider "claude" is re-checked
     /// against raw file existence before being finalized. `None` (tests,
     /// callers that never set it) keeps the pure index answer.
@@ -320,14 +333,15 @@ with:
                 if hit {
                     return SessionExistence::Present;
                 }
-                // Zero-turn claude fallback (kata 09v1): claude transcripts
-                // exist on disk from session create, BEFORE any turn — but a
-                // 0-byte transcript has no cwd-bearing line, so the index's
-                // R10b gate (directory_index.rs::parse_claude_file) excludes
-                // it and the warm snapshot answers a false Absent, while the
-                // attach arm (claude.rs::handle_attach via
+                // Zero-turn claude fallback (kata 09v1): a claude transcript
+                // can be on disk yet carry no cwd-bearing line (e2e fixture's
+                // create-time 0-byte file; crash-window partial writes), so
+                // the index's R10b gate
+                // (directory_index.rs::parse_claude_file) excludes it and the
+                // warm snapshot answers a false Absent, while the attach arm
+                // (claude.rs::handle_attach via
                 // claude_snapshot::locate_transcript) trusts raw file
-                // existence and resumes it. The two arms must agree: before
+                // existence and attempts resume. The two arms must agree: before
                 // finalizing Absent for claude, consult the SAME raw-file
                 // check. CLAUDE-scoped only — zero-turn codex genuinely has
                 // no rollout file (reconcile_freshagent.rs module doc) — and
@@ -355,11 +369,11 @@ with:
 
 ```rust
 //! * warm snapshot `Absent` for provider `claude` with a transcript locator
-//!   installed → re-checked against raw file existence (kata 09v1): a
-//!   zero-turn claude transcript exists on disk from session create but has
-//!   no cwd line, so the R10b index gate excludes it — file present ⇒
-//!   `Present`, so reconcile agrees with the attach arm and never falsely
-//!   adjudicates a resumable session dead.
+//!   installed → re-checked against raw file existence (kata 09v1): a claude
+//!   transcript can be on disk yet cwd-less (e2e fixture's create-time 0-byte
+//!   file; crash-window partial writes), so the R10b index gate excludes it —
+//!   file present ⇒ `Present`, so reconcile agrees with the attach arm and
+//!   never adjudicates dead a transcript the attach arm would try to resume.
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -386,9 +400,10 @@ Expected: all clean/PASS.
 git add crates/freshell-server/src/existence.rs
 git commit -m "fix(reconcile): raw-file fallback for warm-index Absent on claude (kata 09v1)
 
-A zero-turn claude transcript (0-byte, created at session create) fails
+A zero-turn claude transcript (0-byte, created at session create by the
+e2e sidecar fixture; stands in for any on-disk-but-cwd-less shape) fails
 the index's R10b cwd gate, so IndexExistenceProbe answered a false
-Absent while the attach arm's raw-file check would resume it -- Absent +
+Absent while the attach arm's raw-file check would attempt resume -- Absent +
 ever_bound ledger row => GoneObserved => dead_session{session_not_on_disk}.
 Add an injectable claude transcript locator consulted before finalizing
 a warm-index Absent for provider claude. Claude-scoped (zero-turn codex
@@ -418,9 +433,11 @@ In `crates/freshell-freshagent/src/claude_snapshot.rs`, change the function (cur
 /// Positive denial (attach) and snapshot 404 both require a miss EVERYWHERE.
 /// `pub` + re-exported at the crate root (kata 09v1): `freshell-server`'s
 /// `IndexExistenceProbe` consults this SAME check before finalizing a
-/// warm-index `Absent` for claude — zero-turn transcripts are 0-byte, fail
-/// the index's R10b cwd gate, yet ARE resumable, so the reconcile arm and
-/// the attach arm must share one definition of "the transcript exists".
+/// warm-index `Absent` for claude — an on-disk transcript can be cwd-less
+/// (fixture's create-time 0-byte file; crash-window partial writes) and so
+/// fail the index's R10b cwd gate while the attach arm would still attempt
+/// resume on it; the reconcile arm and the attach arm must share one
+/// definition of "the transcript exists".
 pub fn locate_transcript(session_id: &str) -> Option<PathBuf> {
     claude_home_candidates()
         .iter()
@@ -511,6 +528,8 @@ npm run test:e2e -- --project=rust-chromium specs/hidden-pane-rebind-rust.spec.t
 ```
 Expected: **PASS — both tests** (the fresh-agent test that was RED in Task 1 Step 5, and the terminal test which must stay green). This is the kata's acceptance criterion.
 
+**Known contingency (pre-analyzed during load-bearing validation — see the ledger):** the attach/rebind arm can emit a create with a PATH-shaped `resumeSessionId` (`…/<uuid>.jsonl`), and the fake sidecar crashes on it — uncaught ENOENT in `fake-claude-sidecar.mjs` `transcriptPath()` (~`:104` path-joins the path-shaped id), exiting before `created` (the REAL production sidecar instead reports a graceful `sdk.result error_during_execution`). Convergence via the reconcile-respawn UUID create is expected but has no green precedent. If this run stays RED with that signature in the sidecar request log (an `attach-resume-…` create carrying a path-shaped `resumeSessionId`, then sidecar exit), harden the fixture's `transcriptPath()` to accept path-shaped ids (use the basename's uuid, mirroring the real sidecar's tolerance) as a small, pre-approved additional change; record it in the task report and add the file to this task's commit.
+
 - [ ] **Step 7: Commit**
 
 ```bash
@@ -533,6 +552,7 @@ Every other freshclaude-restart e2e sends a turn before restarting (satisfying R
 **Files:**
 - Create: `test/e2e-browser/specs/freshclaude-zero-turn-restart-rust.spec.ts`
 - Modify: `test/e2e-browser/playwright.config.ts` (two registration points)
+- Modify: `test/e2e-browser/helpers/test-server.ts` (one-line `CLAUDE_CONFIG_DIR` isolation guard, Step 2c)
 
 **Interfaces:**
 - Consumes: `RustServer` (`restartAbrupt()`), `TestHarness`, `openPanePicker`, the fake claude sidecar fixture, and the per-spec helper convention (helpers are COPIED from a donor spec, never imported across specs — see the header of `restore-contract-wall-rust.spec.ts`).
@@ -549,9 +569,11 @@ Create `test/e2e-browser/specs/freshclaude-zero-turn-restart-rust.spec.ts`. Star
  * restart (RustServer.restartAbrupt(): SIGKILL + revive on the same
  * home/port/token) and resume in place -- never be adjudicated dead.
  *
- * Why this spec exists: the fake sidecar (like the real claude CLI) creates
- * the transcript file AT SESSION CREATE, before any turn -- a 0-byte .jsonl.
- * That file fails the session index's R10b cwd gate, so pre-fix the
+ * Why this spec exists: the fake sidecar creates the transcript file AT
+ * SESSION CREATE, before any turn -- a 0-byte .jsonl. (Validated: the REAL
+ * CLI materializes the transcript only at first turn; the fixture's shape
+ * stands in for any on-disk-but-R10b-excluded transcript, e.g. crash-window
+ * partial writes.) That file fails the session index's R10b cwd gate, so pre-fix the
  * reconcile existence probe answered Absent while the attach arm's raw-file
  * check would happily resume it => DeadSession{session_not_on_disk} and the
  * 'Dead sessions' dialog. Every OTHER freshclaude-restart spec sends a turn
@@ -679,6 +701,18 @@ In `test/e2e-browser/playwright.config.ts`:
 
 2b. Add to the `rust-chromium` project's `testMatch` array (~`:208-337`) an entry in the SAME format as the existing `hidden-pane-rebind-rust.spec.ts` entry there (copy that line, substitute the new filename).
 
+2c. Neutralize `CLAUDE_CONFIG_DIR` in the e2e isolation helper (validated gap: `applyIsolatedHomeEnvironment` in `test/e2e-browser/helpers/test-server.ts` ~`:59-87` sets `HOME`/`CLAUDE_HOME`/`CODEX_HOME`/`XDG_DATA_HOME` and deletes `HOMEDRIVE`/`HOMEPATH`, but never clears `CLAUDE_CONFIG_DIR` — it is the HIGHEST-priority root for both the fake sidecar and, post-fix, the server's `locate_transcript` fallback, so an ambient value would break isolation and split the index root from the fallback root). In `applyIsolatedHomeEnvironment`, next to the existing `HOMEDRIVE`/`HOMEPATH` deletes, add:
+
+```ts
+  // Kata 09v1: CLAUDE_CONFIG_DIR outranks CLAUDE_HOME for BOTH the sidecar
+  // and the server's claude transcript-existence fallback; an ambient value
+  // would escape the isolated home. Both server spawn paths route through
+  // this helper, so deleting it here is the complete remedy.
+  delete nextEnv.CLAUDE_CONFIG_DIR
+```
+
+(Unset on the current machine — this is a determinism guard for other machines/CI, justified now because the fix makes reconcile verdicts newly depend on that root.)
+
 - [ ] **Step 3: Run the new spec — GREEN on the fixed binary**
 
 Run:
@@ -690,7 +724,7 @@ Expected: PASS (Task 3's fixed release binary is current). Also verify project r
 - [ ] **Step 4: Commit**
 
 ```bash
-git add test/e2e-browser/specs/freshclaude-zero-turn-restart-rust.spec.ts test/e2e-browser/playwright.config.ts
+git add test/e2e-browser/specs/freshclaude-zero-turn-restart-rust.spec.ts test/e2e-browser/playwright.config.ts test/e2e-browser/helpers/test-server.ts
 git commit -m "test(e2e): visible zero-turn freshclaude pane survives abrupt restart (kata 09v1)
 
 Closes the coverage gap that mislabeled 09v1 as hidden-pane-specific:
@@ -716,18 +750,22 @@ in-place resume + no Dead-sessions dialog + stable createRequestId."
 In the module doc of `crates/freshell-ws/src/reconcile_freshagent.rs`, after the existing zero-turn-codex bullet (the one ending "zero turns means there is no conversation content to lose."), insert:
 
 ```rust
-//! - Zero-turn CLAUDE sessions are the OPPOSITE asymmetry (kata 09v1): the
-//!   claude CLI creates the transcript file at session-create time, BEFORE
-//!   any turn (0 bytes), and `claude --resume <uuid>` works on it — the
-//!   attach arm (freshell-freshagent claude_snapshot.rs) depends on exactly
-//!   that. But a 0-byte transcript has no cwd-bearing line, so the directory
-//!   index's R10b gate excludes it and the warm index answers Absent. The
+//! - On-disk-but-index-invisible CLAUDE transcripts are the OPPOSITE
+//!   asymmetry (kata 09v1): a claude transcript can exist on disk yet carry
+//!   no cwd-bearing line (the e2e fixture creates a 0-byte file at session
+//!   create; crash-window partial writes can leave the same shape), so the
+//!   directory index's R10b gate excludes it and the warm index answers
+//!   Absent — while the attach arm (freshell-freshagent claude_snapshot.rs)
+//!   trusts raw file existence and would attempt resume on it. The
 //!   IndexExistenceProbe (freshell-server existence.rs) therefore falls back
 //!   to the attach arm's raw-file check (locate_transcript) before finalizing
 //!   Absent for claude ⇒ Present ⇒ OnDisk ⇒ respawn, never dead_session.
 //!   Do NOT re-extend the codex "acceptable either way" reasoning to claude:
-//!   for claude the file exists and the session IS resumable, so dead_session
-//!   would be a false positive, not a harmless no-content verdict.
+//!   adjudicating dead a transcript the attach arm would try to resume is the
+//!   two-arms-disagree bug this fix cures; if a resume genuinely cannot
+//!   succeed (validated: the real CLI prompt-exits on unresumable ids), the
+//!   pane converges to the honest, bounded dead_session{respawn_exhausted}
+//!   via the respawn cap instead of a false session_not_on_disk.
 ```
 
 And replace the final WATCH bullet — currently:
@@ -767,10 +805,13 @@ git commit -m "docs(reconcile): record the claude zero-turn asymmetry next to th
 
 The module doc explained zero-turn acceptability with codex-only
 reasoning (no rollout file until first persisted turn -- 'acceptable
-either way'). Claude is the opposite: the transcript exists pre-turn by
-design and the attach arm depends on it, so a dead_session there is a
-false positive. Also narrow the CLAUDE_CONFIG_DIR WATCH: the existence
-probe's fallback now reads the attach arm's full candidate-root set."
+either way'). Claude is the opposite: a transcript can be on disk yet
+cwd-less (fixture create-time file; crash-window partial writes), and
+the attach arm would attempt resume on it, so dead_session there is the
+two-arms-disagree false positive; failed respawns converge to the
+honest respawn_exhausted via the cap. Also narrow the CLAUDE_CONFIG_DIR
+WATCH: the existence probe's fallback now reads the attach arm's full
+candidate-root set."
 ```
 
 ---
@@ -805,13 +846,21 @@ Expected: PASS on both.
 
 - [ ] **Step 3: Red-proof the companion spec against the frozen pre-fix binary**
 
-The companion spec must be shown to catch the bug it pins. Run it once against Task 1's saved pre-fix binary (the `FRESHELL_E2E_RUST_SERVER_BIN` override fails closed if the path is not an executable file):
+The companion spec must be shown to catch the bug it pins. Run it once against Task 1's saved pre-fix binary (the `FRESHELL_E2E_RUST_SERVER_BIN` override fails closed if the path is not an executable file). If `/tmp/freshell-09v1-prefix-server` is MISSING (tmp cleaners / reboots between tasks), rebuild it first from the recorded pre-fix base:
+
+```bash
+git worktree add /tmp/09v1-prefix-rebuild 53673c2c
+(cd /tmp/09v1-prefix-rebuild && cargo build --release -p freshell-server)
+cp /tmp/09v1-prefix-rebuild/target/release/freshell-server /tmp/freshell-09v1-prefix-server
+chmod +x /tmp/freshell-09v1-prefix-server
+git worktree remove --force /tmp/09v1-prefix-rebuild
+```
 
 ```bash
 FRESHELL_E2E_RUST_SERVER_BIN=/tmp/freshell-09v1-prefix-server \
   npm run test:e2e -- --project=rust-chromium specs/freshclaude-zero-turn-restart-rust.spec.ts
 ```
-Expected: **FAIL** (pre-fix server adjudicates the zero-turn session dead — the resumed-poll times out and/or the Dead-sessions dialog assertion trips). Record the failure output in the task report. If it unexpectedly PASSES, the spec is not pinning the bug — STOP and fix the spec (compare against the hidden-pane spec's discriminators) before proceeding.
+Expected: **FAIL** (pre-fix server adjudicates the zero-turn session dead — the resumed-poll times out and/or the Dead-sessions dialog assertion trips). Record the failure output in the task report. If it unexpectedly PASSES, the spec is not pinning the bug — STOP and fix the spec (compare against the hidden-pane spec's discriminators) before proceeding; first check the run's rust-server JSONL log for the second boot's `session_index_warm` vs `/ws 101` ordering to rule out a cold-index (`Unknown`⇒respawn) race misfire (validated as ~0.9s-margin unlikely, but it is the one known misfire shape).
 
 Then confirm GREEN on the real (fixed) binary:
 ```bash
@@ -870,4 +919,5 @@ rm -f /tmp/freshell-09v1-prefix-server
 | Test (3) NEW visible zero-turn companion e2e | Task 4 (+ Task 6 Step 3 red-proof against the frozen pre-fix binary) |
 | Test (4) wall: 15 pass / 3 pins fail-as-expected; investigate any flip | Task 6 Step 5 |
 | Repo rules: base green first, coordinator WAIT, ephemeral ports, no 3001/3002, no server restart, no broad kills, gates, push-no-PR | Task 1 Steps 1–3, Global Constraints, Task 6 |
+| Load-bearing validation (2026-07-28): A1/A2 falsified (real CLI materializes transcript at first turn; 0-byte not resumable) — all rationale/doc/commit text corrected; terminal-arm + respawn-cap behavior changes called out; perf measured; fixture path-resume-crash contingency; /tmp binary rebuild fallback; CLAUDE_CONFIG_DIR guard | Validated-reality / Consumer-failure-mode / Perf notes (File Structure section); Tasks 2, 3 Step 6, 4 Step 2c, 5, 6 Step 3; full ledger at `.worktrees/.the-usual-logs/zero-turn-claude-existence/load-bearing-ledger.md` |
 | No stubs/mocks standing in for required behavior | The fake claude sidecar is the suite's ESTABLISHED provider seam (used by the acceptance spec and the wall itself); it reproduces the real CLI's create-time transcript behavior, which is the load-bearing precondition. The Rust-side fake locator closures test the probe's own logic; the REAL `locate_transcript` wiring is exercised end-to-end by Tasks 3/4/6 e2e against the release binary. No requirement is deferred. |
