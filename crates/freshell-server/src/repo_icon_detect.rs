@@ -330,6 +330,83 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
+/// Directory basenames a deep scan must never enter.
+fn walk_dir_excluded(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.starts_with('.')
+        || REJECTED_PATH_COMPONENTS.contains(&lower.as_str())
+        || matches!(
+            lower.as_str(),
+            "target" | "bin" | "obj" | "__pycache__" | "venv" | "__fixtures__"
+        )
+}
+
+/// First `<tag>…</tag>` inner text (naive but sufficient for MSBuild props).
+fn extract_xml_tag_value(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let end = text[start..].find(&close)? + start;
+    Some(text[start..end].trim().to_string())
+}
+
+/// Collect `*.csproj` files up to `depth` == 2 directory levels below root.
+fn collect_csprojs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_symlink = path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true);
+        if is_symlink {
+            continue;
+        }
+        if path.is_dir() {
+            if depth < 2 && !walk_dir_excluded(name) {
+                collect_csprojs(&path, depth + 1, out);
+            }
+        } else if name.to_lowercase().ends_with(".csproj") {
+            out.push(path);
+        }
+    }
+}
+
+/// .NET: `<ApplicationIcon>` in any .csproj near the root (WinPepper pattern).
+fn csproj_candidates(sink: &mut CandidateSink) {
+    let root = sink.repo_root.clone();
+    let mut csprojs: Vec<PathBuf> = Vec::new();
+    collect_csprojs(&root, 0, &mut csprojs);
+    csprojs.sort();
+    // 32, not 10: winpepper already has 14 csprojs within depth <= 2 and the
+    // target sorts at index 5 today — keep headroom so new sibling dirs
+    // (artifacts/, packaging/, ...) can't evict the real manifest.
+    csprojs.truncate(32);
+    for csproj in csprojs {
+        let Ok(text) = std::fs::read_to_string(&csproj) else {
+            continue;
+        };
+        if text.len() > 1_048_576 {
+            continue;
+        }
+        let Some(icon_rel) = extract_xml_tag_value(&text, "ApplicationIcon") else {
+            continue;
+        };
+        let normalized = icon_rel.replace('\\', "/");
+        if normalized.is_empty() || normalized.starts_with('/') || normalized.contains("..") {
+            continue;
+        }
+        let base = csproj.parent().unwrap_or(&root).to_path_buf();
+        sink.push(base.join(normalized), TIER1);
+    }
+}
+
 /// Resolve a web-style src: relative to its document dir; absolute `/x`
 /// probed against public/, static/, then the repo root. Remote/data URLs skipped.
 fn resolve_web_src(root: &Path, doc_dir: &Path, src: &str) -> Vec<PathBuf> {
@@ -587,6 +664,8 @@ pub(crate) fn tier1(sink: &mut CandidateSink) {
     web_manifest_candidates(sink);
     // 6. index.html <link rel=icon>.
     index_html_candidates(sink);
+    // 7. .NET: csproj ApplicationIcon.
+    csproj_candidates(sink);
 }
 
 fn tier2(sink: &mut CandidateSink) {
@@ -1077,6 +1156,66 @@ mod tier1_tests {
         let cands = candidates_for(root);
         assert!(has(&cands, root, "fav.svg"));
         assert!(!has(&cands, root, "fav48.png"));
+    }
+
+    #[test]
+    fn csproj_application_icon_is_tier1_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("src/Winpepper.App");
+        std::fs::create_dir_all(proj.join("Assets")).unwrap();
+        std::fs::write(
+            proj.join("Winpepper.App.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
+  </PropertyGroup>
+</Project>"#,
+        )
+        .unwrap();
+        std::fs::write(proj.join("Assets/AppIcon.ico"), b"stub").unwrap();
+        let cands = candidates_for(dir.path());
+        assert!(has(
+            &cands,
+            dir.path(),
+            "src/Winpepper.App/Assets/AppIcon.ico"
+        ));
+        let c = cands
+            .iter()
+            .find(|c| c.path.ends_with("Assets/AppIcon.ico"))
+            .unwrap();
+        assert_eq!(c.tier_base, TIER1);
+    }
+
+    #[test]
+    fn csproj_icon_path_traversal_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Evil.csproj"),
+            "<Project><PropertyGroup><ApplicationIcon>..\\..\\/etc/passwd</ApplicationIcon></PropertyGroup></Project>",
+        )
+        .unwrap();
+        let cands = candidates_for(dir.path());
+        assert!(!cands
+            .iter()
+            .any(|c| c.path.to_string_lossy().contains("passwd")));
+    }
+
+    #[test]
+    fn csproj_scan_skips_excluded_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = dir.path().join(".worktrees/dup");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(
+            hidden.join("Dup.csproj"),
+            "<Project><PropertyGroup><ApplicationIcon>x.ico</ApplicationIcon></PropertyGroup></Project>",
+        )
+        .unwrap();
+        std::fs::write(hidden.join("x.ico"), b"stub").unwrap();
+        let cands = candidates_for(dir.path());
+        assert!(!cands
+            .iter()
+            .any(|c| c.path.to_string_lossy().contains(".worktrees")));
     }
 }
 
