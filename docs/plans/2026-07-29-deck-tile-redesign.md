@@ -271,14 +271,17 @@ describe('getTabStatusFlags', () => {
     // and the deck repaints synchronously per dispatch, so it WILL paint layout-less tabs.
     const store = makeStore({ tabs: 1 })
     const state = store.getState()
-    const tab = state.tabs.tabs[0] // fixture tab: mode 'claude', status 'running'
+    // Fixture tabs carry mode: 'shell' (verified in all three suites' builders - only pane
+    // CONTENTS are mode 'claude'). The synthesized pane inherits tab.mode, and a shell-mode
+    // pane never yields greenIcon - so override the tab under test.
+    const tab = { ...state.tabs.tabs[0], mode: 'claude' as const, status: 'running' as const }
     const noLayout = { ...state, panes: { ...state.panes, layouts: {} } } as typeof state
     expect(getTabStatusFlags(noLayout, tab)).toEqual({ busy: false, attention: false, greenIcon: true })
   })
 })
 ```
 
-If the fixture builder's tabs lack `mode`/`status` fields, extend it to set them (`mode: 'claude', status: 'running'`) — the synthesis fallback reads the tab's own fields, exactly like `TabBar.tsx:203-221`.
+The fixture builders' tabs already HAVE `mode`/`status` fields — but with `mode: 'shell'`, not `'claude'` (verified: all three suites build tabs as `{ ..., status: 'running', mode: 'shell' }`; only pane contents are `mode: 'claude'`). The synthesis fallback reads the tab's own fields, exactly like `TabBar.tsx:203-221`, which is why both layout-less tests above/below override `mode` on the tab object they pass instead of relying on fixture defaults — a shell-mode synthesized pane yields neither `greenIcon` nor a resolvable repo cwd.
 
 If the suite's fixture builder has no `paneStatus` option, extend it: it constructs `TerminalPaneContent` leaves — add `status: opts.paneStatus?.[paneId] ?? 'running'`. Add a small local `withTabAttentionStyle(state, style)` helper that returns a state copy with `settings.settings.panes.tabAttentionStyle` overridden (structured clone + assignment is fine for a test).
 
@@ -423,7 +426,10 @@ describe('getTabRepoIcons', () => {
       repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
     })
     const state = store.getState()
-    const tab = { ...state.tabs.tabs[0], initialCwd: '/repos/alpha' }
+    // Fixture tabs are mode: 'shell', and resolvePaneRepoCwd resolves terminal panes only
+    // when their mode is non-shell (isNonShellMode); the synthesized pane inherits tab.mode.
+    // Override mode alongside initialCwd or the icon can never appear.
+    const tab = { ...state.tabs.tabs[0], mode: 'claude' as const, initialCwd: '/repos/alpha' }
     const noLayout = { ...state, panes: { ...state.panes, layouts: {} } } as typeof state
     expect(getTabRepoIcons(noLayout, tab)).toEqual([
       { url: buildRepoIconUrl('/repos/alpha'), letter: 'A', hue: hueFromString('alpha') },
@@ -582,7 +588,7 @@ describe('selectDeckModel (sorted, tile fields)', () => {
 })
 ```
 
-The fixture builders' documented options are `tabs`, `busy`, `attention`, `freshAgentTab`, `pendingPermissions`, `freshAgentRunning` — they default the active tab to `t1`. Add an `activeTab?: string` option (sets `preloadedState.tabs.activeTabId`) wherever these tests (and Tasks 10–11) pass it.
+The fixture APIs differ per suite (verified — adapt each snippet to the helper actually present): `deck-selectors.test.ts` has `makeState(overrides)` (options `claudeBusy`/`attention`/`pendingPermissions`/`freshAgentRunning`; returns a plain state object, not a store); `deck-controller.test.ts` has `makeStore(opts)` with `tabCount`/`claudeBusy`/`attention`/`freshAgentTab`/`pendingPermissions`/`freshAgentRunning`; only the e2e suite's `makeDeckStore` takes `tabs`. All default the active tab to `t1`. Add an `activeTab?: string` option (sets `preloadedState.tabs.activeTabId` / the built state's `activeTabId`) to whichever builder a test passes it to — only needed where a test wants a non-`t1` active tab.
 
 Also update any existing `selectDeckModel` tests in this file that assert the old `{ id, title, active, status }` shape — extend their expected objects with the new fields (or switch them to `toMatchObject`).
 
@@ -802,21 +808,28 @@ import { IconImageCache, getIconImageCache, resetIconImageCacheForTests, hasDraw
 const fakeBitmap = { width: 16, height: 16 } as unknown as CanvasImageSource
 
 function deferredLoader() {
+  // NOTE: `pending` is a Map keyed by url, so a duplicate load for the same url would
+  // overwrite the same key and `pending.size` could never detect it. `calls()` counts
+  // actual loader invocations - that is the ONLY signal that can catch duplicate loads
+  // or a retry-after-failure implementation.
   const pending = new Map<string, { resolve: (b: CanvasImageSource) => void; reject: (e: Error) => void }>()
-  const loader = (url: string) =>
-    new Promise<CanvasImageSource>((resolve, reject) => pending.set(url, { resolve, reject }))
-  return { loader, pending }
+  let loads = 0
+  const loader = (url: string) => {
+    loads++
+    return new Promise<CanvasImageSource>((resolve, reject) => pending.set(url, { resolve, reject }))
+  }
+  return { loader, pending, calls: () => loads }
 }
 
 describe('IconImageCache', () => {
   it('returns null while loading, kicks off exactly one load per url, notifies on completion', async () => {
-    const { loader, pending } = deferredLoader()
+    const { loader, pending, calls } = deferredLoader()
     const cache = new IconImageCache(loader)
     const listener = vi.fn()
     cache.subscribe(listener)
     expect(cache.bitmapFor('/i/a')).toBe(null)
     expect(cache.bitmapFor('/i/a')).toBe(null) // second call: no second load
-    expect(pending.size).toBe(1)
+    expect(calls()).toBe(1) // loader invoked exactly once (pending.size can't see dupes)
     pending.get('/i/a')!.resolve(fakeBitmap)
     await Promise.resolve() // flush microtasks
     await Promise.resolve()
@@ -825,7 +838,7 @@ describe('IconImageCache', () => {
   })
 
   it('caches failures permanently (null forever, no retry) and still notifies', async () => {
-    const { loader, pending } = deferredLoader()
+    const { loader, pending, calls } = deferredLoader()
     const cache = new IconImageCache(loader)
     const listener = vi.fn()
     cache.subscribe(listener)
@@ -835,11 +848,15 @@ describe('IconImageCache', () => {
     await Promise.resolve()
     expect(listener).toHaveBeenCalledTimes(1)
     expect(cache.bitmapFor('/i/broken')).toBe(null)
-    expect(pending.size).toBe(1) // no second load attempt
+    expect(cache.bitmapFor('/i/broken')).toBe(null)
+    // The load-bearing no-retry assertion: post-failure reads never re-invoke the loader.
+    // (A retrying implementation would re-kick the load on every bitmapFor -> fetch/repaint
+    // loop in production; pending.size stays 1 either way, so it proves nothing.)
+    expect(calls()).toBe(1)
   })
 
   it('drawn-empty probe failing records the entry as FAILED (letter avatar renders), no retry', async () => {
-    const { loader, pending } = deferredLoader()
+    const { loader, pending, calls } = deferredLoader()
     const cache = new IconImageCache(loader, () => false) // injected probe: "drew ~0 pixels"
     const listener = vi.fn()
     cache.subscribe(listener)
@@ -849,7 +866,7 @@ describe('IconImageCache', () => {
     await Promise.resolve()
     expect(listener).toHaveBeenCalledTimes(1)
     expect(cache.bitmapFor('/i/blank-svg')).toBe(null) // failed, like a load error
-    expect(pending.size).toBe(1) // permanent: no second load attempt
+    expect(calls()).toBe(1) // permanent: the post-failure read above did not re-invoke the loader
   })
 
   it('drawn-empty probe passing keeps the bitmap', async () => {
@@ -1317,10 +1334,10 @@ it('repaints keys when an icon bitmap finishes loading (cache subscription)', as
   const { loader, pending } = deferredLoader()
   const cache = new IconImageCache(loader)
   const { device } = setup({
-    tabs: 1,
+    tabCount: 1,
     terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
     repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
-  }, undefined, defaultSettings, { iconCache: cache })
+  }, undefined, { iconCache: cache })
   const before = decodeKey(device, 0)!
   expect(before.kind === 'tab' && before.icons[0].ready).toBe(false)
   pending.get(before.kind === 'tab' ? before.icons[0].url! : '')!.resolve({} as CanvasImageSource)
@@ -1341,7 +1358,7 @@ it('no periodic preview repaint: 3s of ticks paints nothing even when terminal t
   // Task 9's grep gate on PREVIEW_REFRESH_TICKS/registerTerminalTextReader.)
   let n = 0
   const unregister = registerTerminalTextReader('term-1', () => [`line ${n++}`])
-  const { device } = setup({ tabs: 1 })
+  const { device } = setup({ tabCount: 1 })
   device.keyImages.clear()
   vi.advanceTimersByTime(3_000)
   expect(device.keyImages.size).toBe(0)
@@ -1351,15 +1368,25 @@ it('no periodic preview repaint: 3s of ticks paints nothing even when terminal t
 it('dispatches fetchRepoIconMeta for tab cwds even when settings.panes.repoIconsOnTabs is false (deck owns the probe)', () => {
   // No repoIcons seeded: the controller itself must probe /repos/alpha. TabBar cannot be
   // relied on (its probe is gated on repoIconsOnTabs and TabBar is conditionally mounted).
-  const settings = { ...defaultSettings, panes: { ...defaultSettings.panes, repoIconsOnTabs: false } }
-  const { store } = setup({ tabs: 1, terminalMeta: { 'term-1': { cwd: '/repos/alpha' } } }, undefined, settings)
+  // repoIconsOnTabs is an EXISTING app setting (state.settings.settings.panes, default
+  // true) - NOT the controller's brightness-only settings() option. It must be false
+  // BEFORE the controller starts (flipping it after start proves nothing: the probe
+  // already ran under the default), hence the fixture option below, which the builder
+  // applies via store.dispatch(updateSettingsLocal({ panes: { repoIconsOnTabs: false } }))
+  // before setup() constructs the controller (precedent: deck-manager.test.ts:128; the
+  // suite already registers settingsReducer).
+  const { store } = setup({
+    tabCount: 1,
+    terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
+    repoIconsOnTabs: false,
+  })
   // The thunk's pending case records { status: 'loading' } synchronously on dispatch.
   expect(store.getState().repoIcons.byCwd['/repos/alpha']).toMatchObject({ status: 'loading' })
 })
 
 it('does not re-probe a cwd already present in state.repoIcons.byCwd', () => {
   const { store } = setup({
-    tabs: 1,
+    tabCount: 1,
     terminalMeta: { 'term-1': { cwd: '/repos/alpha' } },
     repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
   })
@@ -1372,7 +1399,7 @@ it('probes a cwd that only becomes resolvable AFTER start (late terminalMeta, mo
   // model JSON (icons stay [] until meta AND repoIcons both exist), so this test
   // proves the probe runs BEFORE onStoreChange's model-JSON bail-out - the exact
   // TabBar-less leader scenario the deck-owned probe exists for.
-  const { store } = setup({ tabs: 1 }) // no terminalMeta seeded
+  const { store } = setup({ tabCount: 1 }) // no terminalMeta seeded
   expect(store.getState().repoIcons.byCwd['/repos/alpha']).toBeUndefined()
   store.dispatch(upsertTerminalMeta([{ terminalId: 'term-1', cwd: '/repos/alpha', updatedAt: Date.now() }]))
   expect(store.getState().repoIcons.byCwd['/repos/alpha']).toMatchObject({ status: 'loading' })
@@ -1381,7 +1408,7 @@ it('probes a cwd that only becomes resolvable AFTER start (late terminalMeta, mo
 
 (If the suite's real `api` layer throws synchronously in jsdom, `vi.mock('@/lib/api', ...)` it with a never-resolving `get` — the probe assertions only need the thunk's synchronous `pending` entry.)
 
-Extend the suite's `setup()` helper to accept a settings override (3rd arg) and extra `DeckController` options (4th arg), and extend the fixture builder to seed `terminalMeta`/`repoIcons` via `preloadedState` — this works only because Task 4 already registered the real `terminalMeta`/`repoIcons` reducers in this suite's reducer map (`configureStore` silently drops preloadedState keys with no matching reducer). Note this suite has NO existing preview or `PREVIEW_REFRESH_TICKS` tests to update or remove — the only preview coverage lives in `test/e2e/stream-deck-flow.test.tsx` (exact `toEqual` assertions on full KeySpecs including `previewLines`); those e2e expectations are updated in Step 4.
+This suite's REAL fixture API (verified): `makeStore(opts: StoreOpts)` with options `tabCount`/`claudeBusy`/`attention`/`freshAgentTab`/`pendingPermissions`/`freshAgentRunning`, and `setup(opts, caps)` with TWO params. There is NO `defaultSettings` identifier in this file (it exists only in the e2e suite, where it is a function returning deck-brightness `DeckSettings` — unrelated to app settings); the controller's `settings()` option here is `const settings` at `deck-controller.test.ts:105` and stays untouched. Extend the machinery as follows: (a) `setup()` gains a 3rd arg of extra `DeckController` constructor options (spread last — used above for `iconCache`); (b) `StoreOpts` gains `terminalMeta?` / `repoIcons?`, seeded via `preloadedState` — this works only because Task 4 already registered the real `terminalMeta`/`repoIcons` reducers in this suite's reducer map (`configureStore` silently drops preloadedState keys with no matching reducer); (c) `StoreOpts` gains `repoIconsOnTabs?: boolean` — when set, `makeStore` dispatches `updateSettingsLocal({ panes: { repoIconsOnTabs } })` (import from `@/store/settingsSlice`; `settingsReducer` is already registered in this suite) on the store before returning it, so the value is in place before `setup()` constructs and starts the controller (precedent: `deck-manager.test.ts:128`). Note this suite has NO existing preview or `PREVIEW_REFRESH_TICKS` tests to update or remove — the only preview coverage lives in `test/e2e/stream-deck-flow.test.tsx` (exact `toEqual` assertions on full KeySpecs including `previewLines`); those e2e expectations are updated in Step 4.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -1532,8 +1559,8 @@ Expected: FAIL — produced KeySpecs still carry `previewLines`/`ring`, `status`
 Run: `npm run test:vitest -- run test/unit/client/deck/ test/e2e/stream-deck-flow.test.tsx test/unit/client/components/VirtualDeckPanel.test.tsx --config config/vitest/vitest.config.ts`
 Expected: PASS.
 
-Run: `grep -rn "terminal-text-registry\|registerTerminalTextReader\|getTerminalTextSnapshot\|useTerminalTextRegistration\|readXtermTail\|previewLines\|previewGeometry\|cropPreviewLines\|ringColor\|RingColor\|RING_COLORS\|getTabRingStatus\|TabRingStatus\|PREVIEW_REFRESH_TICKS" src/ test/ shared/`
-Expected: **no matches** (confirms zero dead references; `/api/panes/:id/capture` in `server/` is untouched by design).
+Run: `grep -rn "terminal-text-registry\|registerTerminalTextReader\|getTerminalTextSnapshot\|useTerminalTextRegistration\|readXtermTail\|previewLines\|previewGeometry\|cropPreviewLines\|ringColor\|RingColor\|RING_COLORS\|getTabRingStatus\|TabRingStatus\|PREVIEW_REFRESH_TICKS" src/ test/ shared/ --exclude=SettingsView.core.test.tsx`
+Expected: **no matches** (confirms zero dead references). The `--exclude` is required: `test/unit/client/components/SettingsView.core.test.tsx:68-69` has an unrelated local `previewLines` variable (settings terminal-preview UI, not the deck) that pre-dates this work and stays. If any OTHER match appears, it is a real dead reference — fix it. `/api/panes/:id/capture` in `server/` is untouched by design.
 
 Run: `npm run typecheck:client` — clean. Run: `npm run lint` — clean.
 
@@ -1562,8 +1589,9 @@ In `test/unit/client/deck/deck-controller.test.ts` (fake timers; store from the 
 
 ```ts
 it('acts on the tab displayed at press-down even if the sort changes mid-press', () => {
-  // t1 greenIcon (key 0), t2 greenIcon (key 1)
-  const { store, device } = setup({ tabs: 2, activeTab: 't1' })
+  // t1 greenIcon (key 0), t2 greenIcon (key 1). This suite's builder is
+  // makeStore({ tabCount }) and it already defaults the active tab to t1.
+  const { store, device } = setup({ tabCount: 2 })
   device.emit({ type: 'keyDown', keyIndex: 1 })            // user is pressing "t2"
   // Mid-press: t2 gains attention -> re-sort moves t2 to key 0; key 1 now shows t1.
   // NOTE the object payload: markTabAttention takes { tabId } (the suite already
@@ -1578,16 +1606,16 @@ it('acts on the tab displayed at press-down even if the sort changes mid-press',
 })
 
 it('press on a tab that was closed mid-press is a no-op', () => {
-  const { store, device } = setup({ tabs: 2, activeTab: 't1' })
+  const { store, device } = setup({ tabCount: 2 })
   device.emit({ type: 'keyDown', keyIndex: 1 })
-  store.dispatch(closeTab('t2'))                            // suite's existing tab-close action
+  store.dispatch(closeTab('t2'))                            // async thunk from @/store/tabsSlice - import it; dispatches fine on the fixture store
   vi.advanceTimersByTime(100)
   device.emit({ type: 'keyUp', keyIndex: 1 })
   expect(store.getState().tabs.activeTabId).toBe('t1')
 })
 
 it('long-press opens the action layer for the press-down tab despite a mid-press re-sort', () => {
-  const { store, device } = setup({ tabs: 2, activeTab: 't1' })
+  const { store, device } = setup({ tabCount: 2 })
   device.emit({ type: 'keyDown', keyIndex: 1 })
   store.dispatch(markTabAttention({ tabId: 't2' }))
   vi.advanceTimersByTime(600)
