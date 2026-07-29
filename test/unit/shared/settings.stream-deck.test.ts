@@ -49,9 +49,13 @@ describe('streamDeck local settings section', () => {
 
   it('survives the legacy seed normalizer (load path)', () => {
     const seed = extractLegacyLocalSettingsSeed({
-      streamDeck: { enabled: true, brightness: 80 },
+      streamDeck: { enabled: true, brightness: 80, tileStyle: 'terminal-previews' },
     })
-    expect(seed?.streamDeck).toEqual({ enabled: true, brightness: 80 })
+    expect(seed?.streamDeck).toEqual({
+      enabled: true,
+      brightness: 80,
+      tileStyle: 'terminal-previews',
+    })
   })
 })
 
