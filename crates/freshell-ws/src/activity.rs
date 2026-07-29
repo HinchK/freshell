@@ -317,30 +317,19 @@ impl ActivityHub {
             );
             return;
         }
-        // Watcher: mirror the amplifier watcher (activity.rs:412-436) EXACTLY.
-        // The closure captures only the hub-event sender + terminal id (never
-        // a hub clone: that would put an Arc cycle inside HubInner and let the
+        // Watcher: mirror the amplifier watcher EXACTLY. The closure
+        // captures only the hub-event sender + terminal id (never a hub
+        // clone: that would put an Arc cycle inside HubInner and let the
         // notify thread emit frames out of order with the hub task). The
-        // event-kind filter is the amplifier one VERBATIM (copy the matches!
-        // expression from activity.rs:422-430): our own tail read triggers
-        // Access(..) events and an atime-driven Modify(Metadata(..)) --
-        // forwarding either would self-trigger one extra read per real read,
-        // breaking the zero-polling accounting.
+        // event filter is the SHARED `fs_event_is_relevant` (same fn as the
+        // amplifier lane): data-mutation kinds only, plus the Rescan
+        // miss-recovery override -- see its doc comment (kata namg).
         let tx = self.tx.clone();
         let watched_terminal = terminal_id.to_string();
         let mut watcher =
             match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 let Ok(event) = res else { return };
-                let relevant = matches!(
-                    event.kind,
-                    notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
-                        | notify::EventKind::Modify(notify::event::ModifyKind::Any)
-                        | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
-                        | notify::EventKind::Create(_)
-                        | notify::EventKind::Remove(_)
-                        | notify::EventKind::Any
-                );
-                if relevant {
+                if fs_event_is_relevant(&event) {
                     let _ = tx.send(HubEvent::CodexFsChange {
                         terminal_id: watched_terminal.clone(),
                     });
@@ -736,24 +725,12 @@ impl ActivityHub {
         let tx = self.tx.clone();
         let watched_terminal = terminal_id.to_string();
         let watcher = notify::recommended_watcher(move |res: Result<notify::Event, _>| {
-            // Only DATA-mutation events drive a tail read. This matters for
-            // the zero-polling guarantee: our OWN read opens the file, which
-            // inotify reports as `Access(..)` (IN_OPEN/IN_CLOSE_NOWRITE) and
-            // — via the atime update — `Modify(Metadata(..))` (IN_ATTRIB).
-            // Forwarding either would self-trigger one extra read per real
-            // read. Appends arrive as `Modify(Data(..))` (IN_MODIFY);
-            // `Create`/`Remove`/`Modify(Name)` cover rotation edge cases
-            // (which the tailer then reports as file_reset/read_error).
+            // Event filter: the SHARED `fs_event_is_relevant` (same fn as
+            // the codex lane) -- data-mutation kinds only (zero-polling:
+            // our own reads must not self-trigger), plus the Rescan
+            // miss-recovery override. See its doc comment (kata namg).
             if let Ok(event) = res {
-                if matches!(
-                    event.kind,
-                    notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
-                        | notify::EventKind::Modify(notify::event::ModifyKind::Any)
-                        | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
-                        | notify::EventKind::Create(_)
-                        | notify::EventKind::Remove(_)
-                        | notify::EventKind::Any
-                ) {
+                if fs_event_is_relevant(&event) {
                     let _ = tx.send(HubEvent::AmplifierFsChange {
                         terminal_id: watched_terminal.clone(),
                     });
@@ -1039,6 +1016,37 @@ impl ActivityHub {
     }
 }
 
+/// Shared fs-event filter for the codex and amplifier tail watchers.
+///
+/// Kind filter: only DATA-mutation events drive a tail read. This is the
+/// zero-polling guarantee: our OWN read opens the file, which inotify
+/// reports as `Access(..)` (IN_OPEN/IN_CLOSE_NOWRITE) and -- via the atime
+/// update -- `Modify(Metadata(..))` (IN_ATTRIB); forwarding either would
+/// self-trigger one extra read per real read. Appends arrive as
+/// `Modify(Data(..))` (IN_MODIFY); `Create`/`Remove`/`Modify(Name)` cover
+/// rotation edge cases.
+///
+/// Rescan override (kata namg): notify's inotify backend reports kernel
+/// IN_Q_OVERFLOW as `Event::new(EventKind::Other).set_flag(Flag::Rescan)`
+/// (notify-6.1.1 inotify.rs:208-211) -- "you may have missed events,
+/// re-check". It is the library's ONE miss-recovery signal; dropping it
+/// leaves a lane silently wedged until an unrelated future write. Gate on
+/// `need_rescan()` rather than `EventKind::Other`: the kqueue backend emits
+/// flagless `Other` as a `_ =>` catch-all (kqueue.rs:271), which must NOT
+/// trigger reads.
+fn fs_event_is_relevant(event: &notify::Event) -> bool {
+    event.need_rescan()
+        || matches!(
+            event.kind,
+            notify::EventKind::Modify(notify::event::ModifyKind::Data(_))
+                | notify::EventKind::Modify(notify::event::ModifyKind::Any)
+                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                | notify::EventKind::Create(_)
+                | notify::EventKind::Remove(_)
+                | notify::EventKind::Any
+        )
+}
+
 fn hub_next_deadline(inner: &HubInner) -> Option<i64> {
     [
         inner.claude.next_deadline(),
@@ -1283,6 +1291,44 @@ mod tests {
         timeout_ms: u64,
     ) -> Option<serde_json::Value> {
         next_frame_matching(rx, wanted, timeout_ms, |_| true).await
+    }
+
+    /// KATA namg: notify's inotify backend reports kernel IN_Q_OVERFLOW as
+    /// Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan)) -- "events
+    /// were dropped, re-check the file" (notify-6.1.1 inotify.rs:208-211).
+    /// Both lane watchers must forward it as an fs-change so a real overflow
+    /// triggers an immediate catch-up read. Gate on the Rescan FLAG, not on
+    /// EventKind::Other: the kqueue backend emits flagless Other as a
+    /// catch-all (kqueue.rs:271), which must NOT trigger reads, and our own
+    /// tail reads produce Access events which must never self-trigger
+    /// (zero-polling invariant).
+    #[test]
+    fn rescan_overflow_is_relevant_but_flagless_other_and_access_are_not() {
+        use notify::event::{AccessKind, Flag};
+        use notify::{Event, EventKind};
+
+        let overflow = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        assert!(
+            fs_event_is_relevant(&overflow),
+            "IN_Q_OVERFLOW rescan must trigger a catch-up read"
+        );
+
+        let flagless_other = Event::new(EventKind::Other);
+        assert!(
+            !fs_event_is_relevant(&flagless_other),
+            "kqueue catch-all Other (no Rescan flag) must not trigger reads"
+        );
+
+        let access = Event::new(EventKind::Access(AccessKind::Any));
+        assert!(
+            !fs_event_is_relevant(&access),
+            "our own tail reads (Access) must never self-trigger"
+        );
+
+        let append = Event::new(EventKind::Modify(notify::event::ModifyKind::Data(
+            notify::event::DataChange::Any,
+        )));
+        assert!(fs_event_is_relevant(&append), "real appends still read");
     }
 
     fn amplifier_line(event: &str) -> String {
