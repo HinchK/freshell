@@ -5,9 +5,9 @@
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
 > for tracking.
 
-**Goal:** Implement both council follow-up katas as one batch — kata `znhn` (persistent crash trace, flap-loop circuit breaker + cancel affordance, settle frames for guard-aborted auto-resumes, uncancellable spawn-gate acquire, Relaunch copy) and kata `bccd` (Retry-After on the 429, deterministic burst-test pin, cancel-sender pin superseded by construction, opencode sidecar cold-start gating, D-C revisit tripwire).
+**Goal:** Implement both council follow-up katas as one batch — kata `znhn` (persistent crash trace, flap-loop circuit breaker + cancel affordance, settle frames for guard-aborted auto-resumes, uncancellable spawn-gate acquire, Relaunch copy) and kata `bccd` (Retry-After on the 429, deterministic burst-test pin, cancel-sender pin superseded by construction, opencode sidecar cold-start gating decision (evaluate-and-decide — decided: do NOT gate, D-7), D-C revisit tripwire).
 
-**Architecture:** Server-side, the auto-resume hub (`crates/freshell-ws/src/auto_resume.rs`) gains a settle frame (a new `RuntimeStatus::Exited` on the existing `terminal.status` broadcast) emitted on every silent settle path, a cross-reset flap circuit breaker (rolling-window cycle counter in the hub's attempts map), and a user-cancel door (new client message `terminal.autoResumeCancel`). Client-side, the 30s notice-TTL guessing apparatus is deleted (frames are now deterministic), the ephemeral "resumed" strip is replaced by a **persistent, dismissible crash trace stored on pane content** (persists automatically — pane-content persistence is a denylist), and the exit banner gains cancel/dismiss affordances plus honest copy. The spawn gate gains `acquire_uncancellable` (the dummy-channel wart moves into the gate), the REST 429 gains `Retry-After`, and the opencode sidecar cold-start acquires a permit.
+**Architecture:** Server-side, the auto-resume hub (`crates/freshell-ws/src/auto_resume.rs`) gains a settle frame (a new `RuntimeStatus::Exited` on the existing `terminal.status` broadcast) emitted on every silent settle path, a cross-reset flap circuit breaker (rolling-window cycle counter in the hub's attempts map), and a user-cancel door (new client message `terminal.autoResumeCancel`). Client-side, the 30s notice-TTL guessing apparatus is deleted (frames are now deterministic), the ephemeral "resumed" strip is replaced by a **persistent, dismissible crash trace stored on pane content** (persists automatically — pane-content persistence is a denylist), and the exit banner gains cancel/dismiss affordances plus honest copy. The spawn gate gains `acquire_uncancellable` (the dummy-channel wart moves into the gate), the REST 429 gains `Retry-After`, and the opencode sidecar cold-start stays deliberately UNGATED (D-7 reversed at validation — the single-flighted singleton bounds the fork; gating would starve the budget; recorded in code comments at both doors).
 
 **Tech Stack:** Rust (axum, tokio, serde; crates `freshell-ws`, `freshell-freshagent`, `freshell-protocol`, `freshell-terminal`, `freshell-server`, `freshell-codex`), React + Redux Toolkit + TypeScript client, Vitest unit tests, Playwright e2e (`rust-chromium` project), frozen WS contract (`port/contract/*.json` + Rust inventory pins).
 
@@ -30,31 +30,31 @@
 
 ### D-1. Settle frame shape (znhn item 3)
 
-`RuntimeStatus` gains a third variant `Exited` (serialized `"exited"`), carried on the **existing** `terminal.status` frame — no new server frame type, so `SERVER_MESSAGE_TYPES` stays at 57. `TerminalStatus` already has optional `reason`/`exitCode`/`attempt`/`maxAttempts` fields; it gains one optional `resumeCycles` (breaker settles only). The frame is broadcast with the OLD (crashed) terminal id — the client already matches old ids via `selectLastTerminalIdFrom` (`TerminalView.tsx:4357`). Every settle path for agent-mode events emits it (uniform "every settle is loud"); the clean-exit settle frame is harmless client-side (no notice exists; the alert condition requires a non-zero exit record).
+`RuntimeStatus` gains a third variant `Exited` (serialized `"exited"`), carried on the **existing** `terminal.status` frame — no new server frame type, so `SERVER_MESSAGE_TYPES` stays at 57. `TerminalStatus` already has optional `reason`/`exitCode`/`attempt`/`maxAttempts` fields; it gains one optional `resumeCycles` (breaker settles only). The frame is broadcast with the OLD (crashed) terminal id — the client already matches old ids via `selectLastTerminalIdFrom` (`TerminalView.tsx:4357`). Every settle path for agent-mode events emits it (uniform "every settle is loud"). The clean-exit settle frame is harmless client-side for VERIFIED reasons (validation A1/A6): the settle-frame handler is lifecycle-slice-only (content-inert), and the client's `terminal.status` content-write allowlist (`TerminalView.tsx:4378-4381`, admits only `running|recovering`) blocks `'exited'` from ever touching pane content or pane status; the only writer of `'exited'` pane status (`TerminalView.tsx:4487`) dispatches `recordTerminalExit` (`:4432`) FIRST in the same synchronous handler, so a clean exit records code 0 before any alert evaluation — the codeless-alert branch (`TerminalView.tsx:5232-5239`, which fires when NO exit record exists) is unreachable from a settle frame alone. Stated plainly: cross-channel ordering (`terminal.exit` on the per-connection sink vs the settle frame on the broadcast bus, merged by an unbiased `select!` — `terminal.rs:325-334`) is NOT guaranteed, so the content-write allowlist is the load-bearing barrier — Task 9 pins it with an out-of-order settle-frame test.
 
 ### D-2. Flap circuit breaker thresholds (znhn item 2)
 
-A **bounded circuit breaker**, not escalating backoff: the hub is fully serialized (one task; a backoff sleep delays every pane's resume — `auto_resume.rs:213-217`), so per-pane escalating sleeps of 30s+ would starve all other panes. Chosen semantics: a **cycle** = one successful auto-resume (a `terminal.replaced` emission). Cycles are recorded per `createRequestId` with wall-clock timestamps, pruned to a rolling window at each crash, and **never reset by healthy generations** (that is the cross-reset bound the council asked for — it also bounds the out-of-band-`kill` resurrection loop, which is indistinguishable from a crash). Defaults: **5 cycles per rolling hour** (`AUTO_RESUME_DEFAULT_MAX_CYCLES = 5`, `AUTO_RESUME_DEFAULT_CYCLE_WINDOW_MS = 3_600_000`), env-overridable (`FRESHELL_AUTO_RESUME_MAX_CYCLES`, `FRESHELL_AUTO_RESUME_CYCLE_WINDOW_MS`) for e2e. When a crash arrives with cycles ≥ max, `decide` settles `flap_circuit_breaker`; the settle frame carries `resumeCycles` and the client renders "`<mode>` crashed N times — auto-resume paused". Relaunch stays available; a re-crash after manual relaunch re-settles immediately until the window drains — bounded and loud, never infinite and silent (user ruling). For e2e testability two more knobs become env-overridable: the hub healthy-lifetime (`FRESHELL_AUTO_RESUME_HEALTHY_LIFETIME_MS`, default 30_000) and the registry respawn liveness window (`FRESHELL_RESPAWN_LIVENESS_WINDOW_MS`, wired in `main.rs` through the existing `pub fn set_respawn_liveness_window_ms` setter, `registry.rs:743`) — without the latter, sub-30s flap cycles trip the registry generation cap (3) before the breaker can ever fire.
+A **bounded circuit breaker**, not escalating backoff: the hub is fully serialized (one task; a backoff sleep delays every pane's resume — `auto_resume.rs:213-217`), so per-pane escalating sleeps of 30s+ would starve all other panes. Chosen semantics: a **cycle** = one successful auto-resume (a `terminal.replaced` emission). Cycles are recorded per `createRequestId` with wall-clock timestamps, pruned to a rolling window at each crash, and **never reset by healthy generations** (that is the cross-reset bound the council asked for — it also bounds the out-of-band-`kill` resurrection loop, which is indistinguishable from a crash). Defaults: **5 cycles per rolling hour** (`AUTO_RESUME_DEFAULT_MAX_CYCLES = 5`, `AUTO_RESUME_DEFAULT_CYCLE_WINDOW_MS = 3_600_000`), env-overridable (`FRESHELL_AUTO_RESUME_MAX_CYCLES`, `FRESHELL_AUTO_RESUME_CYCLE_WINDOW_MS`) for e2e. When a crash arrives with cycles ≥ max, `decide` settles `flap_circuit_breaker`; the settle frame carries `resumeCycles` and the client renders "`<mode>` crashed N times — auto-resume paused". Relaunch stays available; a re-crash after manual relaunch re-settles immediately until the window drains — bounded and loud, never infinite and silent (user ruling). For e2e testability two more knobs become env-overridable: the hub healthy-lifetime (`FRESHELL_AUTO_RESUME_HEALTHY_LIFETIME_MS`, default 30_000) and the registry respawn liveness window (`FRESHELL_RESPAWN_LIVENESS_WINDOW_MS`, wired in `main.rs` through the existing `pub fn set_respawn_liveness_window_ms` setter, `registry.rs:743`) — without the latter, sub-30s flap cycles trip the registry generation cap (3) before the breaker can ever fire. Verification record (A2): manual Relaunch preserves `createRequestId` — `resetPaneForReconcileCreate` keeps it (`panesSlice.ts:1932-1934`, "PRESERVING createRequestId (D4)") and the WS create stamps it onto the new generation (`terminal.rs:2247` → `:2260`) — so breaker history survives manual Relaunch, as this design requires. Opencode durable-replacement and recovery-plan restore mint fresh ids — genuinely new identities; the budget refill there is accepted.
 
 ### D-3. Persistent crash trace replaces the ephemeral "resumed" strip (znhn item 1)
 
-The trace lives on **pane content** (`TerminalPaneContent.crashTrace`) because pane-content persistence is a **denylist** (`stripTransientSessionFields` spreads `...rest`) — a new field persists automatically, no `persistMiddleware` change, no `PANES_SCHEMA_VERSION` bump (schemas use `.passthrough()`; absent = safe `undefined`). The ephemeral `terminalLifecycle` slice cannot host it (slice-level persistence is an allowlist that deliberately excludes it). The `kind: 'resumed'` notice is retired — `foldTerminalReplacement` now clears the notice and the trace is the post-resume indicator. The trace renders as `role="status"` + `data-testid="crash-trace"` (NOT `role="alert"` — four e2e tests assert `getByRole('alert')).toHaveCount(0)` on the happy path). With settle frames on every path (D-1) and terminal.exit already clearing notices, the recovering notice is fully frame-driven, so **both halves of the 30s TTL apparatus are deleted** (selector filter + `TerminalView` re-render timer + the `AUTO_RESUME_NOTICE_TTL_MS` constant).
+The trace lives on **pane content** (`TerminalPaneContent.crashTrace`) because pane-content persistence is a **denylist** (`stripTransientSessionFields` spreads `...rest`) — a new field persists automatically, no `persistMiddleware` change, no `PANES_SCHEMA_VERSION` bump (schemas use `.passthrough()`; absent = safe `undefined`). The ephemeral `terminalLifecycle` slice cannot host it (slice-level persistence is an allowlist that deliberately excludes it). The `kind: 'resumed'` notice is retired — `foldTerminalReplacement` now clears the notice and the trace is the post-resume indicator. The trace renders as `role="status"` + `data-testid="crash-trace"` (NOT `role="alert"` — four e2e tests assert `getByRole('alert')).toHaveCount(0)` on the happy path). With settle frames on every path (D-1) and terminal.exit already clearing notices, the recovering notice is fully frame-driven, so **both halves of the 30s TTL apparatus are deleted** (selector filter + `TerminalView` re-render timer + the `AUTO_RESUME_NOTICE_TTL_MS` constant). **Backstop decision (added at validation — A3 falsified the no-backstop design):** the settle/replaced frames ride a fire-and-forget bounded broadcast (`main.rs:210`, cap 1024, no replay), and lagged receivers are force-closed with 4008 (`terminal.rs:407-423`) — so a missed frame is possible and, uncorrected, a stale recovering notice would lie FOREVER (it masks the exit alert, `TerminalExitBanner.tsx:16`). Because every missed-frame path necessarily passes through a WS reconnect (lag forces a close; disconnects reconnect), the client clears stale recovering notices on WS reconnect (`clearRecoveringNotices`, Task 9). Frames stay the primary mechanism; reconnect-clear is the backstop; no TTL returns.
 
 ### D-4. Cancel affordance flow (znhn item 2)
 
-New client message `terminal.autoResumeCancel { terminalId }` (the OLD terminal id from the recovering frame). The WS handler (a) inserts the id into a new `WsState.auto_resume_cancels` set and (b) **broadcasts the settle frame immediately** (reason `"auto-resume cancelled"`) so the notice clears on click, not after the backoff sleep. The hub's post-sleep guard consumes the flag first (`take_cancel`) and settles silently (log only — the frame already went out). A cancel with no pending resume leaves a small string in the set (bounded: one entry per click, consumed on the next crash of that id or never) — accepted. The Rust `ClientMessage` match is exhaustive with no catch-all, so the new variant, its handler, the `WsState` field, protocol pins, and the Node-server case arm (`server/ws-handler.ts` `default:` sends `UNKNOWN_MESSAGE` — a no-op arm is required) all land in ONE commit (Task 8).
+New client message `terminal.autoResumeCancel { terminalId }` (the OLD terminal id from the recovering frame). The WS handler **validates the terminalId against the registry first** (the kill-handler precedent): an unknown id is ignored with a log — no insert, no broadcast — which kills both unbounded client-controlled set growth and spoofed settle broadcasts (validation A5 falsified the no-validation design). For a known id the handler (a) inserts it into a new `WsState.auto_resume_cancels` set and (b) **broadcasts the settle frame immediately** (reason `"auto-resume cancelled"`) so the notice clears on click, not after the backoff sleep. The hub's post-sleep guard consumes the flag first (`take_cancel`) and **ALSO emits the settle frame** (same reason, `"auto-resume cancelled"` — idempotent client-side: `recordAutoResumeSettled` on an already-settled entry is a no-op-shaped overwrite) instead of settling silently: a late-consumed or pre-seeded cancel is always loud and can never strand a recovering notice (the poisoned-flag path — a cancel pre-seeded on a live id silently suppressing that terminal's FUTURE resume — is thereby defused). Residual: a validated cancel with no pending resume leaves one registry-known id in the set until the next crash of that id consumes it — bounded by the registry and always settled loudly when consumed. The Rust `ClientMessage` match is exhaustive with no catch-all, so the new variant, its handler, the `WsState` field, protocol pins, and the Node-server case arm (`server/ws-handler.ts` `default:` sends `UNKNOWN_MESSAGE` — a no-op arm is required) all land in ONE commit (Task 8).
 
 ### D-5. Retry-After (bccd item 1)
 
-`Retry-After: <secs>` header (the council's ask, HTTP convention) **plus** a `retryAfterMs` body field (house convention — session-lease `SESSION_RESERVED`; the MCP bridge surfaces only `message` text, so the prose hint stays too). Value: the gate wait bound `rest_gate.timeout` (default 10s) — the queue drains within roughly one timeout window; no other duration exists at the rejection point. Scope: the 429 (`SPAWN_QUEUE_FULL`) only, per the kata. `spawn_gate_error_response` gains a `retry_after: Duration` parameter and becomes `pub(crate)` (Task 4 reuses it).
+`Retry-After: <secs>` header (the council's ask, HTTP convention) **plus** a `retryAfterMs` body field (house convention — session-lease `SESSION_RESERVED`; the MCP bridge surfaces only `message` text, so the prose hint stays too). Value: the gate wait bound `rest_gate.timeout` (default 10s) — the queue drains within roughly one timeout window; no other duration exists at the rejection point. Scope: the 429 (`SPAWN_QUEUE_FULL`) only, per the kata. `spawn_gate_error_response` gains a `retry_after: Duration` parameter and stays private to `terminal_tabs.rs` (the planned `pub(crate)` widening existed solely for Task 4's gate reuse, dropped with D-7's reversal).
 
 ### D-6. Deterministic burst-test pin (bccd item 2)
 
 The flaky `queued_total() >= 8` is replaced by **pre-holding the gate's single permit before firing the burst**: while the budget is fully held, the fast path cannot fire, so `queued_total()` reaches **exactly 16** (deterministic), and **zero** requests may complete (`!h.is_finished()`) — that pins max-in-flight ≤ budget without probabilistic counters. This mirrors the established re-acquire precedent (`abort_burst_rest_creates_stay_gated...`, `terminal_tabs.rs:4104`). No gate instrumentation is added: a peak-in-flight gauge would require changing `acquire`'s return type to an RAII newtype across ~15 call/test sites — YAGNI.
 
-### D-7. Opencode sidecar cold-start gating (bccd item 4) — DECISION: gate it
+### D-7. Opencode sidecar cold-start gating (bccd item 4) — DECISION REVERSED at validation: do NOT gate
 
-The sidecar cold-start is a REST-reachable process fork; the gate's semantics are "one server-wide budget for every fork door". The cold-start arm of `send_keys` (`crates/freshell-freshagent/src/lib.rs:1586-1596`) acquires **one** permit via `acquire_uncancellable` around `manager.create_session(...)` (which runs `ensure_started` = spawn + bounded health wait). Warm sends take the `durable_id` branch and never touch the gate. Singleton-ness (double-mutex single-flight) means at most one fork ever happens; the permit is held across a bounded wait — the known hazard (holding a permit while blocked on the `running` mutex held by a permit-less WS caller) is deadlock-free and bounded, accepted. The **WS** materialize door (`opencode_ws.rs:542`) stays ungated with a deliberate code comment: council D-D ruled on REST-reachable forks, and the shared singleton bounds it — recorded in the kata comment (Task 13).
+The plan-time decision was to gate the cold-start arm of `send_keys`; validation (A10) FALSIFIED its load-bearing "bounded wait" premise with arithmetic. Worst-case permit hold ≈ **50–70s**: `health_timeout = 20_000ms` (`serve.rs:303`) + `request_timeout = 30_000ms` (`serve.rs:308,546` — the POST /session runs under the permit), and the serialized `running`-mutex queue adds ~20s per failing holder — vs the 10s gate waits at every other door. Worse, k cold first-sends would hold k permits while queued on the singleton mutex, so k ≥ budget cold panes starve ALL spawn doors. Meanwhile the double-mutex single-flight already bounds actual sidecar forks to AT MOST ONE server-wide — so the gate adds starvation without reducing fork concurrency. Moving the acquire inside the single-flight would invert lock order (cycle hazard), and plumbing the gate into `freshell-opencode`'s spawn site is a disproportionate cross-crate change. **Council D-D evaluate-and-decide outcome: the singleton bounds the fork; gating starves.** Both doors — the `send_keys` cold arm (`crates/freshell-freshagent/src/lib.rs:1586-1596`) AND the WS materialize door (`opencode_ws.rs:542`) — get deliberate code comments recording this decision + arithmetic (Task 4, comments-only); the kata comment records it too (Task 13).
 
 ### D-8. Cancel-sender pin test (bccd item 3) — superseded by construction
 
@@ -62,7 +62,7 @@ After Task 1 the REST door holds **no cancel sender at all** — `acquire_uncanc
 
 ### D-9. Relaunch-mid-respawn orphan race (znhn item 6) — resolved structurally
 
-The race's UI trigger was the notice TTL: with `FRESHELL_AUTO_RESUME_DELAYS_MS > 30000` the recovering notice expired before the backoff finished, exposing the alert bar (with Relaunch) while a respawn was still planned. Tasks 6+9 delete the TTL and make the notice frame-driven, so the alert bar can no longer appear while a resume is pending, at any delay value. A unit test pins this (Task 9, step 1), and the residual server-side ordering (REST-door relaunch during backoff) remains covered by the existing `session_owned_live` guard — which now also emits a settle frame. Kata comment records the resolution (Task 13).
+The race's UI trigger was the notice TTL: with `FRESHELL_AUTO_RESUME_DELAYS_MS > 30000` the recovering notice expired before the backoff finished, exposing the alert bar (with Relaunch) while a respawn was still planned. Tasks 6+9 delete the TTL and make the notice frame-driven, so the alert bar can no longer appear while a resume is pending, at any delay value. A unit test pins this (Task 9, step 1), and the residual server-side ordering (REST-door relaunch during backoff) remains covered by the existing `session_owned_live` guard — which now also emits a settle frame. Kata comment records the resolution (Task 13). **Accepted residuals (recorded at validation, with the D-3 reconnect backstop):** (a) after a reconnect during a still-pending resume, the reconnect-clear removes the recovering notice, so the exit alert may transiently appear until `terminal.replaced` folds it — honest and accepted (the alternative was a forever-lying notice); (b) a missed `terminal.replaced` frame loses that crash's trace entry — accepted.
 
 ### D-10. Patience window honesty (znhn item 1b)
 
@@ -75,12 +75,12 @@ One sentence appended to `docs/plans/2026-07-27-agent-crash-resilience.md` §D-5
 | File | Change | Task |
 |---|---|---|
 | `crates/freshell-freshagent/src/spawn_gate.rs` | Modify: add `acquire_uncancellable` + 3 pin tests | 1 |
-| `crates/freshell-freshagent/src/terminal_tabs.rs` | Modify: migrate REST acquire; `spawn_gate_error_response` signature + `pub(crate)` + Retry-After; D-C marker; burst test rewrite; 429 header test | 1, 2, 3 |
+| `crates/freshell-freshagent/src/terminal_tabs.rs` | Modify: migrate REST acquire; `spawn_gate_error_response` signature (stays private) + Retry-After; D-C marker; burst test rewrite; 429 header test | 1, 2, 3 |
 | `crates/freshell-ws/src/terminal.rs` | Modify: migrate respawn acquire; `terminal.autoResumeCancel` match arm + handler | 1, 8 |
 | `crates/freshell-codex/src/launch_plan.rs` | Modify: D-C marker on flag doc comment | 2 |
 | `docs/plans/2026-07-27-rest-spawn-gate.md` | Modify: D-C tripwire note | 2 |
-| `crates/freshell-freshagent/src/lib.rs` | Modify: gate opencode cold-start in `send_keys`; tests | 4 |
-| `crates/freshell-freshagent/src/opencode_ws.rs` | Modify: deliberate-ungated comment | 4 |
+| `crates/freshell-freshagent/src/lib.rs` | Modify: comment-only — deliberate do-not-gate record in the `send_keys` cold arm (D-7 reversed) | 4 |
+| `crates/freshell-freshagent/src/opencode_ws.rs` | Modify: comment-only — deliberate-ungated record at the WS materialize door (D-7 reversed) | 4 |
 | `crates/freshell-protocol/src/server_messages.rs` | Modify: `RuntimeStatus::Exited`, `TerminalStatus.resume_cycles` | 5 |
 | `crates/freshell-protocol/src/client_messages.rs` | Modify: `TerminalAutoResumeCancel` variant + struct, `CLIENT_MESSAGE_TYPES` 29→30 | 8 |
 | `crates/freshell-protocol/tests/roundtrip.rs` | Modify: settle-frame + cancel roundtrip tests | 5, 8 |
@@ -105,7 +105,7 @@ One sentence appended to `docs/plans/2026-07-27-agent-crash-resilience.md` §D-5
 | `test/e2e-browser/fixtures/fake-crashing-claude-cli.mjs` | Modify: `FAKE_CRASH_LIVE_MS` flap mode | 12 |
 | `test/e2e-browser/specs/agent-crash-autoresume-rust.spec.ts` | Modify: 3 new tests | 12 |
 
-Anything not in this table is out of scope. Scope check: the two katas share the spawn gate (znhn item 4 IS the enabler for bccd items 2–4) and the auto-resume protocol work is one coherent chain — one plan, strictly ordered tasks, each independently testable.
+Anything not in this table is out of scope. Scope check: the two katas share the spawn gate (znhn item 4 IS the enabler for bccd items 2–3; bccd item 4 was decided at validation as do-not-gate, D-7) and the auto-resume protocol work is one coherent chain — one plan, strictly ordered tasks, each independently testable.
 
 ---
 
@@ -158,7 +158,7 @@ Expected: all green. (Full-suite gates run in Task 13; `npm test` is coordinator
 
 **Interfaces:**
 - Consumes: `SpawnGate::acquire(&self, timeout: Duration, cancel: &mut watch::Receiver<bool>) -> Result<OwnedSemaphorePermit, SpawnGateError>` (existing).
-- Produces: `pub async fn acquire_uncancellable(&self, timeout: Duration) -> Result<OwnedSemaphorePermit, SpawnGateError>` — used by Tasks 3 and 4.
+- Produces: `pub async fn acquire_uncancellable(&self, timeout: Duration) -> Result<OwnedSemaphorePermit, SpawnGateError>` — consumed by this task's two door migrations (REST + auto-resume respawn, znhn#4/bccd#3) and by Task 3's test pre-hold.
 
 - [ ] **Step 1: Write the failing pin tests** — add to `mod tests` in `spawn_gate.rs` (the module already has `cancel_pair()` at `:212` and uses `Arc`, `Duration`, `tokio::time::sleep`):
 
@@ -296,7 +296,7 @@ git commit -m "feat(spawn-gate): acquire_uncancellable owns the never-fired canc
 
 **Interfaces:**
 - Consumes: `crate::fail_json_code(StatusCode, &str, String) -> Response` (lib.rs:1336); `RestSpawnGate { gate, timeout }`.
-- Produces: `pub(crate) fn spawn_gate_error_response(err: SpawnGateError, retry_after: std::time::Duration) -> Response` — reused by Task 4. 429 body gains `retryAfterMs: number`; 429 response gains `Retry-After: <secs>` header.
+- Produces: `fn spawn_gate_error_response(err: SpawnGateError, retry_after: std::time::Duration) -> Response` (stays private — D-5). 429 body gains `retryAfterMs: number`; 429 response gains `Retry-After: <secs>` header.
 
 - [ ] **Step 1: Extend the failing test** — in `queue_cap_exceeded_rest_create_is_429_spawn_queue_full` (`terminal_tabs.rs:3913`), after the existing status/code assertions, add assertions on the header and body field. The test configures its gate timeout via `state.set_spawn_gate(gate, <duration>)`; assert against that same duration (if the test uses `Duration::from_secs(30)`, expect `"30"` and `30000`):
 
@@ -326,7 +326,7 @@ Expected: FAIL — no `retry-after` header / no `retryAfterMs` field (or compile
 /// the MCP bridge (server/mcp/freshell-tool.ts) surfaces only message text.
 /// Timeout -> 503: spawn capacity unavailable right now.
 /// Body key is `code`+`message` (never `error`).
-pub(crate) fn spawn_gate_error_response(
+fn spawn_gate_error_response(
     err: crate::spawn_gate::SpawnGateError,
     retry_after: std::time::Duration,
 ) -> Response {
@@ -475,6 +475,8 @@ git commit -m "feat(rest): Retry-After on SPAWN_QUEUE_FULL 429 + D-C revisit tri
     }
 ```
 
+Payload note (validated A9): determinism of "zero completions while the permit is held" was verified for the EXISTING payload specifically — every pre-gate early-return passes for exactly the `shell_create_body()` request + auth the current burst tests use. The rewritten test must keep the request payload AND auth byte-identical to the existing burst tests' `shell_create_body()`; any payload change re-opens the pre-gate early-return question.
+
 - [ ] **Step 2: Run to verify it fails/compiles honestly**
 
 Run: `cargo test -p freshell-freshagent fifteen_plus_rest_create_burst -- --nocapture`
@@ -494,107 +496,57 @@ git commit -m "test(rest): burst test pins max-in-flight <= budget deterministic
 
 ---
 
-### Task 4: Gate the opencode sidecar cold-start (bccd 4)
+### Task 4: Opencode sidecar cold-start — deliberate DO-NOT-GATE comments (bccd 4, D-7 reversed)
 
 **Files:**
-- Modify: `crates/freshell-freshagent/src/lib.rs` (`send_keys` cold-start arm at `:1583-1596`; inline tests near `:2694`)
+- Modify: `crates/freshell-freshagent/src/lib.rs` (comment in the `send_keys` cold-start arm at `:1583-1596`)
 - Modify: `crates/freshell-freshagent/src/opencode_ws.rs` (comment near `:542`)
 
 **Interfaces:**
-- Consumes: `FreshAgentState::spawn_gate() -> Option<RestSpawnGate>` (`lib.rs:310`), `acquire_uncancellable` (Task 1), `pub(crate) spawn_gate_error_response(err, retry_after)` (Task 2), test harness `FreshAgentState::set_manager_for_test` (`lib.rs:536`) + `NoopSpawner`/`FakeAllocator`/`NoopEventSource`, template test `rest_send_keys_materialization_records_binding` (`lib.rs:2694`).
-- Produces: the cold-start fork consults the shared spawn gate; rejection returns the same 429/503 envelopes as the create door.
+- Consumes: D-7 (DECISION REVERSED at validation — do NOT gate; the singleton bounds the fork, gating starves).
+- Produces: two deliberate code comments recording the evaluate-and-decide outcome + arithmetic at both fork doors. No behavior change, no gate acquisition, no new tests.
 
-- [ ] **Step 1: Write the failing tests** — inline in `lib.rs`'s test module, modeled byte-for-byte on the harness of `rest_send_keys_materialization_records_binding` (`:2694` — same state/pane/router setup, `timeout: 0`, no real `opencode` binary):
+**TDD note:** this is a comments-only task — there is no behavior to pin, so no red test is required (documented decision, not a silent deferral; see D-7 and the Self-Review).
 
-```rust
-    #[tokio::test]
-    async fn opencode_cold_start_send_keys_is_gated_and_queue_full_is_429() {
-        // Same setup as rest_send_keys_materialization_records_binding, but
-        // the gate has zero permits and zero queue slots: the cold-start
-        // (no durable_id) send-keys must be rejected BY THE GATE before any
-        // sidecar work happens.
-        // <copy the state/pane/manager/router setup from :2694>
-        state.set_spawn_gate(
-            Arc::new(crate::spawn_gate::SpawnGate::new(0, 0)),
-            std::time::Duration::from_millis(50),
-        );
-        // <issue the same send-keys request as :2694 against a pane WITHOUT durable_id>
-        assert_eq!(status, 429);
-        assert_eq!(body["code"], "SPAWN_QUEUE_FULL");
-        assert!(body["retryAfterMs"].is_u64());
-    }
-
-    #[tokio::test]
-    async fn opencode_cold_start_queues_behind_the_held_spawn_permit() {
-        // Gate (1, 64) with the permit pre-held by the test: the cold-start
-        // send-keys must QUEUE (queued_total == 1) and complete only after
-        // release — proof the fork door actually flows through the gate.
-        // <same setup as :2694>
-        let gate = Arc::new(crate::spawn_gate::SpawnGate::new(1, 64));
-        state.set_spawn_gate(Arc::clone(&gate), std::time::Duration::from_secs(5));
-        let held = gate
-            .acquire_uncancellable(std::time::Duration::from_secs(1))
-            .await
-            .unwrap();
-        let task = tokio::spawn(/* the send-keys request future */);
-        for _ in 0..200 {
-            if gate.queued_total() == 1 { break; }
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-        assert_eq!(gate.queued_total(), 1, "cold start must wait on the gate");
-        drop(held);
-        let response = task.await.unwrap();
-        // <same success assertion as :2694>
-    }
-```
-Also assert in the second test (or a third, if cleaner) that a pane **with** `durable_id` (warm path) does NOT consult the gate: with the permit held, the warm send-keys response must not be 429/503-`SPAWN_TIMEOUT`.
-
-- [ ] **Step 2: Run to verify failure**
-
-Run: `cargo test -p freshell-freshagent opencode_cold_start`
-Expected: FAIL — cold start currently never touches the gate (first test gets a non-429; second never queues).
-
-- [ ] **Step 3: Implement** — in `send_keys` (`lib.rs`), inside the cold-start `else` arm (`:1586`), immediately before `manager.create_session(...)`:
+- [ ] **Step 1: Add the REST-door comment** — in `send_keys` (`lib.rs`), at the top of the cold-start `else` arm (`:1586`), immediately before `manager.create_session(...)`:
 
 ```rust
-            // bccd item 4 (council enn3 D-D follow-up): the sidecar
-            // cold-start is a REST-reachable process fork — it must consult
-            // the same server-wide spawn gate as every other fork door.
-            // Singleton double-mutex single-flight means at most one fork
-            // ever happens, so this is a single-permit acquire held only
-            // across the cold-start (spawn + bounded health wait). Warm
-            // sends take the durable_id branch and never reach this arm.
-            let _spawn_permit = match state.spawn_gate() {
-                Some(g) => match g.gate.acquire_uncancellable(g.timeout).await {
-                    Ok(permit) => Some(permit),
-                    Err(err) => {
-                        return crate::terminal_tabs::spawn_gate_error_response(err, g.timeout)
-                    }
-                },
-                None => None, // unwired (unit-test states) = legacy ungated
-            };
+            // bccd item 4 (council enn3 D-D evaluate-and-decide) — DELIBERATELY
+            // UNGATED. Decision reversed at plan validation: gating this
+            // cold-start would hold a spawn permit for a worst-case ~50-70s
+            // (health_timeout 20_000ms serve.rs:303 + request_timeout 30_000ms
+            // serve.rs:308,546 under the permit; the serialized `running`-mutex
+            // queue adds ~20s per failing holder) vs the 10s gate waits at
+            // every other door — and k cold first-sends queued on the singleton
+            // mutex would hold k permits, starving ALL spawn doors. The
+            // double-mutex single-flight already bounds actual sidecar forks
+            // to AT MOST ONE server-wide: the gate would add starvation
+            // without reducing fork concurrency. Moving the acquire inside
+            // the single-flight would invert lock order (cycle hazard).
+            // Decision record: docs/plans/2026-07-29-znhn-bccd-followups.md §D-7.
 ```
-(The permit drops at the end of the `else` block — after `create_session` returns.) Ensure `spawn_gate_error_response` is reachable: Task 2 made it `pub(crate)`; if `terminal_tabs` is not already a visible module path, adjust to the crate's actual module layout (compiler-guided).
 
-Add the deliberate-scope comment in `opencode_ws.rs` at the materialize cold-start (`:542` area):
+- [ ] **Step 2: Add the WS-door comment** — in `opencode_ws.rs` at the materialize cold-start (`:542` area):
 
 ```rust
-        // Deliberately ungated (bccd item 4 scope): council D-D ruled on
-        // REST-reachable forks; this WS materialize path shares the same
-        // single-flighted singleton manager, so at most one sidecar fork
-        // exists server-wide. Revisit if the WS door grows fork fan-out.
+        // Deliberately ungated (bccd item 4, council D-D evaluate-and-decide;
+        // same decision as the REST send-keys cold arm in lib.rs): the
+        // single-flighted singleton manager bounds sidecar forks to AT MOST
+        // ONE server-wide, and gating would starve the spawn budget on
+        // ~50-70s worst-case cold-start holds (see the lib.rs comment for
+        // the arithmetic). Revisit if the sidecar ever grows fork fan-out.
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [ ] **Step 3: Verify comments-only** — `git diff` shows only comment lines; then run:
 
-Run: `cargo test -p freshell-freshagent && cargo fmt --check && cargo clippy -p freshell-freshagent --all-targets -- -D warnings`
-Expected: PASS.
+Run: `cargo test -p freshell-freshagent 2>&1 | tail -3 && cargo fmt --check && cargo clippy -p freshell-freshagent --all-targets -- -D warnings`
+Expected: PASS (no behavior change).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add crates/freshell-freshagent/src/lib.rs crates/freshell-freshagent/src/opencode_ws.rs
-git commit -m "feat(opencode): sidecar cold-start acquires a spawn-gate permit (bccd#4)"
+git commit -m "docs(opencode): record the do-not-gate decision at both sidecar fork doors (bccd#4, D-7 reversed)"
 ```
 
 ---
@@ -789,7 +741,7 @@ Trait addition (`AutoResumeDriver`):
     }
 ```
 
-Hub body: at **every** `driver.log_settled(...)` site (`:240` decide-settle inside the `ev.mode != "shell"` guard, `:264` pre-respawn guard, `:268` session_lease_held, `:295` lease_completion_lost, `:301` respawn_failed), add `driver.emit_settled(&ev.terminal_id, <same reason>, None);` immediately before the `log_settled` call. (Task 7 threads a real `resume_cycles` value into the breaker settle; Task 8 adds the one settle site that must NOT emit.)
+Hub body: at **every** `driver.log_settled(...)` site (`:240` decide-settle inside the `ev.mode != "shell"` guard, `:264` pre-respawn guard, `:268` session_lease_held, `:295` lease_completion_lost, `:301` respawn_failed), add `driver.emit_settled(&ev.terminal_id, <same reason>, None);` immediately before the `log_settled` call. (Task 7 threads a real `resume_cycles` value into the breaker settle; Task 8 adds the user-cancel settle site, which ALSO emits — reason `"auto-resume cancelled"`, idempotent with the handler's immediate frame.)
 
 - [ ] **Step 4: Run to verify pass**
 
@@ -946,7 +898,7 @@ Hub changes:
                     None => (0, 0),
                 };
 ```
-- Eviction branch (`:242-246`): **reset attempts only, keep cycles** — replace `attempts.remove(k)` with `if let Some(h) = attempts.get_mut(k) { h.attempts = 0; }` (the existing "never evicted on exhaustion" posture is preserved; cycles must survive healthy resets by design).
+- Eviction branch (`:242-246`): **reset attempts only, keep cycles** — replace `attempts.remove(k)` with `if let Some(h) = attempts.get_mut(k) { h.attempts = 0; }` (the existing "never evicted on exhaustion" posture is preserved; cycles must survive healthy resets by design). **AND replace the const in the eviction-branch CONDITION at `:242`** — `ev.lifetime_ms >= AUTO_RESUME_HEALTHY_LIFETIME_MS` becomes `ev.lifetime_ms >= cfg.healthy_lifetime_ms` (the same config value threaded into `decide` — validated A8: with an env of 500ms, a const/cfg split leaves stale attempts after a breaker settle and drains the budget one retry early). The supervisor panic-health site (`auto_resume.rs:169`) deliberately STAYS on the compile-time const — add a code comment there documenting the split (panic-health is orthogonal to attempts/cycles and must not follow the e2e knob).
 - Attempt write (`:251`): `attempts.entry(key.clone()).or_default().attempts = attempt;`
 - Breaker settle: in the settle branch, thread the count — `driver.emit_settled(&ev.terminal_id, reason, if reason == "flap_circuit_breaker" { Some(recent_cycles) } else { None });`
 - On successful respawn (the `emit_replaced` arm): `attempts.entry(key.clone()).or_default().cycles.push(crate::terminal::now_ms());` (re-fetch the entry — the earlier borrow ended before the awaits).
@@ -1001,6 +953,17 @@ Hub changes:
         // reset) → verify the successful resumes still accumulated cycles by
         // tripping the breaker at the configured max.
     }
+
+    #[tokio::test]
+    async fn eviction_and_decide_agree_on_the_configured_healthy_lifetime() {
+        // Between-thresholds pin (validated A8): cfg.healthy_lifetime_ms =
+        // 500, generation lifetime ~1_000ms — ABOVE the config but BELOW the
+        // 30_000 compile-time const. Both the decide-time reset AND the
+        // eviction-branch condition (:242) must treat this as healthy: after
+        // the crash, the entry's attempts are 0 (evicted/reset) and the next
+        // resume starts at attempt 1. The planned 60_000 lifetimes in the
+        // tests above CANNOT detect a const/cfg split — this one can.
+    }
 ```
 (Write the bodies against the existing `FakeDriver` helpers — `drain()`, the crash-event constructor, and frame accessors are at `:893-1076`; follow `healthy_generation_resets_attempts` (`:1145`) for the event/lifetime idiom. FakeDriver gains a `respawn_count()` helper if one doesn't already exist.)
 
@@ -1034,7 +997,7 @@ git commit -m "feat(auto-resume): flap-loop circuit breaker — bounded and loud
 
 **Interfaces:**
 - Consumes: `emit_settled`/settle frame (Tasks 5–6); dispatch pattern of `handle_client_text` (`terminal.rs:483-520`, exhaustive match, arms return `bool`); `handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) -> bool` (`:3847`) as the shape template.
-- Produces (used by Tasks 9, 12): client→server message `{ type: 'terminal.autoResumeCancel', terminalId: string }`; on receipt the server broadcasts the settle frame immediately (reason `"auto-resume cancelled"`) and the hub's pending resume aborts silently; `WsState.auto_resume_cancels: Arc<std::sync::Mutex<std::collections::HashSet<String>>>`; driver method `fn take_cancel(&self, terminal_id: &str) -> bool`.
+- Produces (used by Tasks 9, 12): client→server message `{ type: 'terminal.autoResumeCancel', terminalId: string }`; on receipt the server VALIDATES the id against the registry (unknown → log + ignore: no insert, no broadcast — D-4, validated A5), then broadcasts the settle frame immediately (reason `"auto-resume cancelled"`); the hub's `take_cancel` arm aborts the pending resume and ALSO emits the settle frame (same reason — idempotent client-side), so a late-consumed or pre-seeded cancel can never strand a recovering notice; `WsState.auto_resume_cancels: Arc<std::sync::Mutex<std::collections::HashSet<String>>>`; driver method `fn take_cancel(&self, terminal_id: &str) -> bool`.
 
 - [ ] **Step 1: Write the failing protocol tests** —
 
@@ -1081,9 +1044,11 @@ Enum variant (in the `#[serde(tag = "type")]` enum, matching neighbors' style):
 
 ```rust
     /// Pending user cancels for planned auto-resumes, keyed by the OLD
-    /// (crashed) terminal id (znhn item 2). Inserted by the WS handler,
-    /// consumed by the hub's post-sleep guard. Bounded: one entry per
-    /// cancel click, removed on consumption.
+    /// (crashed) terminal id (znhn item 2). Inserted by the WS handler
+    /// ONLY after registry validation (unknown ids never enter — D-4),
+    /// consumed by the hub's post-sleep guard, which re-emits the settle
+    /// frame so a consumed cancel is always loud. Bounded: one
+    /// registry-known entry per cancel click, removed on consumption.
     pub auto_resume_cancels: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ```
 Fix every `WsState { ... }` literal the compiler reports (production wiring in `freshell-server/src/main.rs`, harness literals in `crates/freshell-ws/tests/common/mod.rs:157,233,313,390,475,556,636,718`, and any unit-test literals) with `auto_resume_cancels: Default::default(),`.
@@ -1101,9 +1066,17 @@ Handler (near `handle_kill`):
 ```rust
 /// znhn item 2: flag the pending resume for the hub's post-sleep guard AND
 /// settle the client IMMEDIATELY — the notice must clear on click, not
-/// after the backoff sleep completes. The hub consumes the flag and settles
-/// silently (this frame is the loud half).
+/// after the backoff sleep completes. The id is VALIDATED against the
+/// registry first (D-4, kill-handler precedent): an unknown id is ignored
+/// with a log — no insert, no broadcast — so the set cannot grow without
+/// bound and spoofed ids cannot broadcast settle frames. The hub consumes
+/// the flag post-sleep and re-emits the settle frame (idempotent), so a
+/// late-consumed cancel is always loud.
 fn handle_auto_resume_cancel(cancel: TerminalAutoResumeCancel, state: &WsState) {
+    if !state.registry.exists(&cancel.terminal_id) {
+        tracing::info!(terminal_id = %cancel.terminal_id, "terminal.auto_resume.cancel_unknown_id_ignored");
+        return;
+    }
     state
         .auto_resume_cancels
         .lock()
@@ -1138,8 +1111,13 @@ Hub: FIRST post-sleep guard (before `pre_respawn_guard`):
 
 ```rust
                     if driver.take_cancel(&ev.terminal_id) {
-                        // The cancel handler already broadcast the settle
-                        // frame — log only, no second frame.
+                        // D-4 (validated A5): re-emit the settle frame here
+                        // too. The handler's immediate frame covers the
+                        // click-latency story; THIS frame guarantees a
+                        // late-consumed or pre-seeded cancel is loud and can
+                        // never strand a recovering notice. Idempotent
+                        // client-side (recordAutoResumeSettled).
+                        driver.emit_settled(&ev.terminal_id, "auto-resume cancelled", None);
                         driver.log_settled(&ev.terminal_id, "user_cancelled");
                         continue;
                     }
@@ -1149,18 +1127,34 @@ Hub: FIRST post-sleep guard (before `pre_respawn_guard`):
 
 ```rust
     #[tokio::test]
-    async fn user_cancel_during_backoff_aborts_the_respawn_silently() {
+    async fn user_cancel_during_backoff_aborts_the_respawn_and_settles_loud() {
         // Crash schedules a resume; the cancel lands during the backoff.
-        // The hub must consume the flag, respawn NOTHING, and emit NO
-        // settle frame of its own (the WS handler's immediate frame is the
-        // loud half).
+        // The hub must consume the flag, respawn NOTHING, and EMIT the
+        // settle frame itself (D-4, validated A5): the take_cancel arm is
+        // loud so a late-consumed or pre-seeded cancel can never strand a
+        // recovering notice. Idempotent with the WS handler's immediate
+        // frame — the client folds duplicates.
         // <FakeDriver harness>; driver.set_cancelled("t1") BEFORE sending
         // the crash event (the flag is checked post-sleep).
-        // after drain(): respawn_count == 0; settled_frames() is EMPTY;
+        // after drain(): respawn_count == 0; settled_frames() contains
+        // ("t1", "auto-resume cancelled", None);
         // log records contain ("t1", "user_cancelled").
     }
 ```
-Run: `cargo test -p freshell-ws auto_resume && cargo test -p freshell-protocol`
+And the handler-side validation test (in `terminal.rs`'s tests or the WS integration harness, following the kill-handler unknown-id precedent):
+
+```rust
+    #[tokio::test]
+    async fn cancel_with_an_unknown_terminal_id_is_ignored_and_the_set_does_not_grow() {
+        // D-4 (validated A5): unknown id -> log + return. Assert (a) no
+        // settle frame is broadcast, (b) state.auto_resume_cancels stays
+        // EMPTY — the set is bounded by registry-known ids, a client cannot
+        // grow it with spoofed ids or pre-poison a future resume.
+    }
+```
+The immediate handler-side broadcast for a KNOWN id stays exactly as specified in Step 3 — the click-latency story is unchanged.
+
+Run: `cargo test -p freshell-ws auto_resume && cargo test -p freshell-ws terminal && cargo test -p freshell-protocol`
 Expected: PASS.
 
 - [ ] **Step 5: TS + Node side + contract regen** —
@@ -1215,14 +1209,17 @@ git commit -m "feat(auto-resume): terminal.autoResumeCancel — user opts out of
 
 **Interfaces:**
 - Consumes: settle frame `terminal.status { status: 'exited', terminalId, resumeCycles? }` (Tasks 5–8); `terminal.autoResumeCancel` send (Task 8); `WsClient.send(msg: unknown)` (`src/lib/ws-client.ts:681`; TerminalView already holds `const ws = useMemo(() => getWsClient(), [])` at `:622` and calls e.g. `ws.send({ type: 'terminal.detach', terminalId: tid })` at `:2889`; tests mock it via the hoisted `wsMocks.send`).
-- Produces (used by Tasks 10–12): slice action `recordAutoResumeSettled({ paneId, resumeCycles?, at })`; `PaneLifecycleEntry.settle?: { resumeCycles?: number; at: number }`; selector `selectResumeCycles(root, paneId)`; `TerminalExitBannerProps.onCancelAutoResume`; NO TTL anywhere (constant, selector filter, and re-render timer all deleted).
+- Produces (used by Tasks 10–12): slice action `recordAutoResumeSettled({ paneId, resumeCycles?, at })`; `PaneLifecycleEntry.settle?: { resumeCycles?: number; at: number }`; selector `selectResumeCycles(root, paneId)`; slice action `clearRecoveringNotices()` (the D-3 reconnect backstop — clears every stale `kind: 'recovering'` notice); `TerminalExitBannerProps.onCancelAutoResume`; NO TTL anywhere (constant, selector filter, and re-render timer all deleted). **Hard rule (D-1, validated):** the new settle-frame handling dispatches ONLY into `terminalLifecycleSlice` — it must NEVER write pane content or pane status (`updateContent`/`updateTab`); the `terminal.status` content-write allowlist (`running|recovering` only, `TerminalView.tsx:4378-4381`) is the load-bearing barrier against out-of-order settle frames and stays untouched.
 
 - [ ] **Step 1: Write the failing tests** —
 
 Replace the TTL-degradation test (`TerminalView.exitBanner.test.tsx:363-391`) with the frame-driven pair (this is ALSO the znhn item 6 pin — the alert can never appear while a resume is pending, at any delay value):
 
 ```tsx
-  it('keeps the recovering notice up indefinitely without a settle frame (no timer degradation — znhn#6 pin)', async () => {
+  it('keeps the recovering notice up while the socket stays connected without a settle frame (no timer degradation — znhn#6 pin)', async () => {
+    // Scope (D-3, validated): "no timer degradation" holds WHILE CONNECTED.
+    // A disconnect/reconnect clears stale notices via the reconnect backstop
+    // (tested below) — missed-frame paths always pass through a reconnect.
     vi.useFakeTimers()
     // seed: lifecycle { lastTerminalId: 'term-crashed', exit: { exitCode: 1, at: Date.now() },
     //   notice: { kind: 'recovering', attempt: 1, maxAttempts: 2, exitCode: 1, at: Date.now() } }, status 'exited'
@@ -1232,6 +1229,30 @@ Replace the TTL-degradation test (`TerminalView.exitBanner.test.tsx:363-391`) wi
     expect(screen.getByText('claude crashed (exit 1) — auto-resuming, attempt 1/2')).toBeInTheDocument()
     expect(screen.queryByRole('alert')).toBeNull()
     vi.useRealTimers()
+  })
+
+  it('an out-of-order exited settle frame never touches pane content or status (D-1 allowlist pin)', async () => {
+    // seed: a LIVE pane — content.terminalId === 'term-live', status 'running',
+    // lifecycle.lastTerminalId 'term-live' (no terminal.exit received yet).
+    await act(async () => {
+      messageHandler!({ type: 'terminal.status', terminalId: 'term-live', status: 'exited', reason: 'retries_exhausted' })
+    })
+    // Cross-channel ordering (broadcast settle vs per-connection terminal.exit)
+    // is NOT guaranteed (unbiased select!, terminal.rs:325-334): the settle
+    // handler is lifecycle-only, and the running|recovering content-write
+    // allowlist must block 'exited' from pane content/status.
+    // walk the store: pane content.status still 'running', terminalId still 'term-live'
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('a recovering notice does not survive a reconnect (D-3 backstop pin)', async () => {
+    // seed the recovering notice as above; then fire the ws reconnect
+    // callback the harness captured (the same hook TerminalView registers
+    // via ws.onReconnect).
+    await act(async () => {
+      reconnectHandler!()
+    })
+    expect(screen.queryByText(/auto-resuming/)).toBeNull()
   })
 
   it('clears the recovering notice the moment the settle frame arrives', async () => {
@@ -1256,6 +1277,8 @@ Slice tests (`terminalLifecycleSlice.test.ts`): replace the TTL-expiry case with
 ```ts
   it('selectActiveNoticeFrom returns the notice with no TTL — settles are frame-driven', () => { /* seed notice with at: 0; expect returned regardless of now */ })
   it('recordAutoResumeSettled clears the notice and records resumeCycles', () => { /* dispatch; expect entry.notice undefined, entry.settle = { resumeCycles: 3, at } */ })
+  it('clearRecoveringNotices clears every recovering notice (D-3 reconnect backstop)', () => { /* seed two panes with recovering notices + one settle; dispatch; expect both notices undefined, settle/exit untouched */ })
+  it('recordTerminalExit clears prior settle state (stale resumeCycles cannot leak into a later crash banner)', () => { /* seed entry.settle = { resumeCycles: 5, at: 1 }; dispatch recordTerminalExit; expect entry.settle undefined */ })
 ```
 
 Banner test (`TerminalExitBanner.test.tsx`): the recovering-notice case now also asserts the cancel button (`getByRole('button', { name: 'Cancel auto-resume for claude' })`).
@@ -1297,7 +1320,22 @@ export const selectActiveNotice = (root: { terminalLifecycle?: TerminalLifecycle
 export const selectResumeCycles = (root: { terminalLifecycle?: TerminalLifecycleState }, paneId: string) =>
   root.terminalLifecycle?.byPaneId[paneId]?.settle?.resumeCycles
 ```
-- Export `recordAutoResumeSettled` with the other actions.
+- Second new reducer — the D-3 reconnect backstop:
+
+```ts
+    // D-3 backstop (validated): the settle/replaced frames are fire-and-forget
+    // on a bounded broadcast (no replay; lagged receivers are force-closed),
+    // so every missed-frame path necessarily passes through a WS reconnect.
+    // Clearing stale recovering notices on reconnect makes a lying notice
+    // impossible; frames stay the primary mechanism. No TTL returns.
+    clearRecoveringNotices(state) {
+      for (const entry of Object.values(state.byPaneId)) {
+        if (entry?.notice?.kind === 'recovering') delete entry.notice
+      }
+    },
+```
+- `recordTerminalExit` additionally deletes any prior `entry.settle` (stale-settle leak fix, validated A15): a new crash must never inherit an earlier breaker settle's `resumeCycles`, or the alert would read "crashed N times — auto-resume paused" on a non-breaker crash.
+- Export `recordAutoResumeSettled` and `clearRecoveringNotices` with the other actions.
 
 - [ ] **Step 4: Implement TerminalView + banner** —
 - Delete the TTL re-render block (`TerminalView.tsx:603-619`: the `setNoticeExpiryTick` state + effect) and the `AUTO_RESUME_NOTICE_TTL_MS` import; change `selectActiveNotice(s, paneId, Date.now())` → `selectActiveNotice(s, paneId)`.
@@ -1314,7 +1352,15 @@ export const selectResumeCycles = (root: { terminalLifecycle?: TerminalLifecycle
           )
         }
 ```
-(Guard the existing `updateContent({ status })`/`updateTab({ status })` branch so a settle frame for a dead old terminal doesn't touch live content — it already only fires when `msg.terminalId === tid`, which is cleared on exit; verify and leave as-is.)
+**Hard rule (D-1, validated A1/A6):** this settle handling dispatches ONLY into `terminalLifecycleSlice` — never `updateContent`/`updateTab`. Do NOT rely on `content.terminalId` having been cleared by `terminal.exit` first: cross-channel ordering is unguaranteed (unbiased `select!`, `terminal.rs:325-334`). The existing content-write allowlist (`msg.status === 'running' || msg.status === 'recovering'`, `:4378-4381`) is the load-bearing barrier that keeps an out-of-order `'exited'` frame away from pane content/status — leave it exactly as-is; the new out-of-order pin test from Step 1 locks it.
+- Reconnect backstop (D-3): in the established reconnect handling (`ws.onReconnect` handler area, `TerminalView.tsx:4934-4998` — wire it where reconnect is already handled), dispatch `clearRecoveringNotices()`:
+
+```tsx
+        // D-3 backstop: any missed settle/replaced frame necessarily passed
+        // through this reconnect (bounded broadcast, no replay; lag force-
+        // closes the socket). Stale recovering notices must not survive it.
+        dispatch(clearRecoveringNotices())
+```
 - Banner wiring: pass `onCancelAutoResume` at the mount (`:5333-5356`):
 
 ```tsx
@@ -1424,6 +1470,13 @@ git commit -m "feat(client): frame-driven auto-resume notices — delete the 30s
     // seed entry with a recovering notice; dispatch foldTerminalReplacement;
     // expect entry.notice undefined, entry.exit undefined, lastTerminalId advanced
   })
+  it('a replacement clears prior settle state (stale resumeCycles cannot leak into a later crash banner)', () => {
+    // seed entry.settle = { resumeCycles: 5, at: 1 }; dispatch
+    // foldTerminalReplacement; expect entry.settle undefined — pairs with
+    // Task 9's recordTerminalExit pin (validated A15: nothing else ever
+    // deletes the settle state, and the REST-door relaunch/reconcile never
+    // advances lastTerminalId).
+  })
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -1473,7 +1526,7 @@ Field on `TerminalPaneContent` (after `reconcileEpoch`):
 ```
 (Match the helper's real signature — if `clearPaneReconcileNotice` calls it differently, copy that call shape.) Export both actions at `:2236-2237` alongside the others; import `CrashTrace` from `./paneTypes`.
 
-`terminalLifecycleSlice.ts` — in `foldTerminalReplacement`, replace the `kind: 'resumed'` notice assignment with `delete e.notice` (keep the `delete e.exit` + `lastTerminalId` advance). Narrow `AutoResumeNotice.kind` to `'recovering'` and update any test-harness types that referenced `'resumed'`.
+`terminalLifecycleSlice.ts` — in `foldTerminalReplacement`, replace the `kind: 'resumed'` notice assignment with `delete e.notice` (keep the `delete e.exit` + `lastTerminalId` advance), and **also `delete e.settle`** (stale-settle leak fix, validated A15: the REST-door relaunch/reconcile never clears/advances `lastTerminalId` and nothing else deletes the entry's `settle`, so without this a stale breaker `resumeCycles` could leak into a LATER crash's alert copy). Narrow `AutoResumeNotice.kind` to `'recovering'` and update any test-harness types that referenced `'resumed'`.
 
 `TerminalView.tsx` — in the `terminal.replaced` handler (`:4392-4423`), after `foldTerminalReplacement(...)`:
 
@@ -1780,6 +1833,8 @@ if (liveMs > 0) {
   })
 ```
 
+Margin note for the flap test (deferred assumption A7): the breaker-banner text assertion is the primary proof. If the argv-count assertion (`length == 4`) proves flaky on CI, raise `FAKE_CRASH_LIVE_MS` (e.g. 1000 → 2000) keeping `FRESHELL_AUTO_RESUME_MAX_CYCLES=3` — tune the knobs, never weaken the assertions.
+
 - [ ] **Step 3: Reconcile the four existing tests with the new UI** — run the whole spec and fix assertions that the feature legitimately changed (expected: the `once` test's resumed-strip expectations now match the crash trace via the `/auto-resum/` status filter; the Relaunch test's button locator is by aria-label and unchanged; alert-count-0 assertions hold because the trace is `role="status"`). Do NOT weaken assertions — update copy expectations only where this plan changed the copy.
 
 - [ ] **Step 4: Run**
@@ -1842,7 +1897,7 @@ Expected: all PASS; the restore-contract-wall must stay green with ZERO `test.fa
 ```bash
 kata comment znhn -m "Follow-ups landed on feat/znhn-bccd-followups: (1) persistent crash trace on pane content — survives reload, dismissible, role=status data-testid=crash-trace; patience-window sentence added to crash-resilience plan D-5. (2) flap circuit breaker: 5 successful auto-resumes per createRequestId per rolling hour (FRESHELL_AUTO_RESUME_MAX_CYCLES / _CYCLE_WINDOW_MS), settles 'flap_circuit_breaker' with typed resumeCycles + 'crashed N times — auto-resume paused' banner; cancel button on the recovering notice sends terminal.autoResumeCancel (settle frame emitted immediately). Escalating backoff rejected: the hub is serialized, long sleeps would starve other panes. (3) settle frame = RuntimeStatus 'exited' on terminal.status, emitted on EVERY silent settle path; client 30s TTL apparatus deleted. (4) SpawnGate::acquire_uncancellable added, both dummy-channel callers migrated. (5) Relaunch copy: 'Relaunch — resumes this conversation' when sessionRef.provider matches (copy stays plain 'Relaunch' on the provider-mismatch degrade path). (6) orphan race resolved structurally: with the TTL gone the alert bar cannot appear while a resume is pending at ANY delay value — pinned by the no-timer-degradation unit test; the in-flight window is covered by the session_owned_live guard which now also emits a settle frame."
 
-kata comment bccd -m "Follow-ups landed on feat/znhn-bccd-followups: (1) 429 SPAWN_QUEUE_FULL now carries Retry-After header + retryAfterMs body field (value = gate wait bound, default 10s). (2) burst test deflaked: test pre-holds the single permit, so queued_total()==16 exactly and zero requests may complete while the budget is held — pins max-in-flight <= budget deterministically. (3) cancel-sender pin superseded BY CONSTRUCTION: acquire_uncancellable (znhn#4) owns the never-fired sender inside the gate, so no caller-side sender exists to drop; semantics pinned by acquire_uncancellable_waits_for_a_permit_and_never_cancels / _times_out_as_timeout_not_cancelled / _rejects_queue_full_loudly. (4) opencode sidecar cold-start now acquires a single spawn-gate permit in the REST send-keys cold path (rejection reuses the 429/503 envelopes); the WS materialize door stays deliberately ungated (D-D ruled on REST-reachable forks; single-flighted singleton bounds it — comment in opencode_ws.rs). (5) D-C tripwire: grep D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH) — markers at the REST call site + the flag const, note appended to the rest-spawn-gate plan doc."
+kata comment bccd -m "Follow-ups landed on feat/znhn-bccd-followups: (1) 429 SPAWN_QUEUE_FULL now carries Retry-After header + retryAfterMs body field (value = gate wait bound, default 10s). (2) burst test deflaked: test pre-holds the single permit, so queued_total()==16 exactly and zero requests may complete while the budget is held — pins max-in-flight <= budget deterministically. (3) cancel-sender pin superseded BY CONSTRUCTION: acquire_uncancellable (znhn#4) owns the never-fired sender inside the gate, so no caller-side sender exists to drop; semantics pinned by acquire_uncancellable_waits_for_a_permit_and_never_cancels / _times_out_as_timeout_not_cancelled / _rejects_queue_full_loudly. (4) opencode sidecar cold-start gating: evaluate-and-decide outcome REVERSED at plan validation — do NOT gate. Measured bounds: gating would hold a permit ~50-70s worst case (health_timeout 20s + request_timeout 30s under the permit; serialized running-mutex adds ~20s per failing holder) vs 10s waits at every other door, and k>=budget cold first-sends queued on the singleton mutex would starve ALL spawn doors — while the double-mutex single-flight already bounds sidecar forks to AT MOST ONE server-wide, so gating adds starvation without reducing fork concurrency. Deliberate do-not-gate comments recorded at BOTH doors (lib.rs send-keys cold arm + opencode_ws.rs materialize). (5) D-C tripwire: grep D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH) — markers at the REST call site + the flag const, note appended to the rest-spawn-gate plan doc."
 ```
 
 - [ ] **Step 5: Push the branch — NO PR**
@@ -1862,29 +1917,33 @@ Expected: branch pushed. Do NOT open a PR — landing happens outside this workf
 | Item | Task(s) | Production outcome proved by |
 |---|---|---|
 | znhn 1 crash trace + patience sentence | 10 (+12) | e2e: trace visible after auto-resume, survives reload, dismissible; doc sentence in crash-resilience plan D-5 |
-| znhn 2 circuit breaker + cancel affordance | 7, 8, 9, 11 (+12) | e2e: breaker banner after 3 flaps, argv log pinned at 4; cancel clears notice <3s and respawn count stays 1 |
-| znhn 3 settle frame for guard-aborts (deletes TTL apparatus) | 5, 6, 9 | hub tests: settle frame on every silent path; client tests: no timer degradation + frame-driven clear; e2e cancel test exercises the settle frame end-to-end |
+| znhn 2 circuit breaker + cancel affordance | 7, 8, 9, 11 (+12) | e2e: breaker banner after 3 flaps, argv log pinned at 4; cancel clears notice <3s and respawn count stays 1; cancel HARDENED (D-4, validated A5): registry validation pinned by the unknown-id-ignored test, loud `take_cancel` pinned by the hub settle-frame test; between-thresholds hub test pins the eviction/decide cfg agreement (A8) |
+| znhn 3 settle frame for guard-aborts (deletes TTL apparatus) | 5, 6, 9 | hub tests: settle frame on every silent path; client tests: no-timer-degradation-while-connected + frame-driven clear + out-of-order allowlist pin (D-1) + reconnect-backstop pin (`clearRecoveringNotices`, D-3); e2e cancel test exercises the settle frame end-to-end |
 | znhn 4 acquire_uncancellable + migrate both callers | 1 | gate unit pins; both call sites migrated (compile-verified; REST + respawn suites green) |
 | znhn 5 Relaunch copy | 11 | component tests incl. the provider-mismatch degrade path (copy stays honest) |
 | znhn 6 orphan race (evaluate-and-decide) | 9 (pin test), 13 (kata comment) | resolved structurally by TTL deletion — D-9 records the reasoning |
 | bccd 1 Retry-After on 429 | 2 | REST unit test asserts header + retryAfterMs |
 | bccd 2 burst-test deflake → deterministic max-in-flight pin | 3 | rewritten test, 10× determinism run |
-| bccd 3 cancel-sender pin | 1 (superseded — D-8) | new-API semantics pinned instead; kata comment records the supersession |
-| bccd 4 sidecar cold-start gating (evaluate-and-decide) | 4 | DECIDED: gate it (D-7); tests pin 429-when-full and queue-behind-held-permit; WS door deliberately out of scope with comment |
+| bccd 3 cancel-sender pin | 1 (superseded — D-8) | new-API semantics pinned instead; consumers are Task 1's two door migrations + Task 3's test pre-hold; kata comment records the supersession |
+| bccd 4 sidecar cold-start gating (evaluate-and-decide) | 4 | DECIDED: do NOT gate (D-7 reversed at validation with measured bounds — ~50-70s worst-case permit hold vs 10s waits; singleton already bounds the fork to one); deliberate comments at both doors (lib.rs cold arm + opencode_ws.rs) |
 | bccd 5 D-C revisit tripwire | 2 | grep-able markers at both sites + plan-doc note |
 | Cross-cutting: contract regen + both pins same-commit | 5, 8 | `test:port`, `cargo test -p freshell-protocol`, restore-contract-wall zero pins (13) |
 
-No item is deferred; both evaluate-and-decide items (znhn 6, bccd 4) are decided and implemented/pinned in-plan. **No unresolved coverage gaps.**
+No item is deferred; both evaluate-and-decide items are decided in-plan — znhn 6 resolved structurally and pinned, bccd 4 decided as do-not-gate (D-7 reversed at validation) and documented in code comments at both doors. **No unresolved coverage gaps.**
 
-**1b. No silent deferrals:** every user-facing behavior lands with a production path and an e2e or integration proof (table above). The only test doubles are the established ones (FakeDriver for hub logic — production driver covered by `auto_resume_e2e.rs` + Playwright; NoopSpawner for the sidecar gate rejection — the gate rejection fires before any spawn, and the queue-behind-permit test proves the door is on the gate). The WS-door opencode cold-start is a deliberate, documented scope decision (council D-D ruled on REST), not a silent deferral — recorded in code comment + kata comment.
+**1b. No silent deferrals:** every user-facing behavior lands with a production path and an e2e or integration proof (table above). The only test doubles are the established ones (FakeDriver for hub logic — production driver covered by `auto_resume_e2e.rs` + Playwright). Task 4 is a DOCUMENTED DECISION, not a silent deferral: D-7 was reversed at validation with measured bounds (the singleton already bounds the fork to one; gating would starve the spawn budget on ~50-70s worst-case holds), and the outcome is comments-only — deliberate do-not-gate comments at BOTH sidecar fork doors plus the kata comment. Comments-only work needs no red test, so no test double stands in for a behavior there.
 
-**2. Placeholder scan:** the remaining `<copy the ... setup from :2694>` / "KEEP the existing payload" markers in Tasks 3 and 4 are deliberate **splice anchors into existing test bodies quoted by line number** — the implementer copies working in-repo code rather than this plan duplicating (and drifting from) it; every NEW behavior has complete code. Test skeletons in Tasks 6–7 name their exact harness templates by line. No "TBD"/"add error handling"/"similar to Task N" anywhere.
+**2. Placeholder scan:** the remaining "KEEP the existing payload" markers in Task 3 are deliberate **splice anchors into existing test bodies quoted by line number** — the implementer copies working in-repo code (byte-identical `shell_create_body()` payload + auth, per the validated A9 note) rather than this plan duplicating (and drifting from) it; every NEW behavior has complete code. (Task 4's former `<copy ... from :2694>` anchors are gone with its rewrite to comments-only.) Test skeletons in Tasks 6–9 name their exact harness templates by line. No "TBD"/"add error handling"/"similar to Task N" anywhere.
 
 **3. Type consistency check (cross-task):**
-- `acquire_uncancellable(timeout: Duration) -> Result<OwnedSemaphorePermit, SpawnGateError>` — defined Task 1, consumed Tasks 3, 4 with matching signatures. ✓
-- `spawn_gate_error_response(err, retry_after: Duration)` `pub(crate)` — Task 2 defines, Task 4 consumes with `(err, g.timeout)`. ✓
+- `acquire_uncancellable(timeout: Duration) -> Result<OwnedSemaphorePermit, SpawnGateError>` — defined Task 1, consumed by Task 1's two door migrations (REST + respawn) and Task 3's test pre-hold with matching signatures (Task 4 no longer consumes it — comments-only after the D-7 reversal). ✓
+- `spawn_gate_error_response(err, retry_after: Duration)` — Task 2 changes the signature; it stays PRIVATE to `terminal_tabs.rs` (the pub(crate) widening was dropped with D-7's reversal); sole caller is the REST door at `:1077` with `(err, rest_gate.timeout)`. ✓
 - `TerminalStatus.resume_cycles: Option<i64>` / TS `resumeCycles?: number` — Task 5 defines; Task 6 `emit_settled(resume_cycles: Option<u32>)` maps via `i64::from`; Task 8 handler passes `None`; Task 9 reads `msg.resumeCycles`; Task 11 renders it. ✓
 - `recordAutoResumeSettled({ paneId, resumeCycles?, at })` + `selectResumeCycles` — Task 9 defines, Task 11 consumes. ✓
+- `clearRecoveringNotices()` (no payload) — Task 9 defines the reducer, exports it, and dispatches it from the `ws.onReconnect` handling (`TerminalView.tsx:4934-4998`); the reconnect-backstop unit test consumes the same name. ✓
+- `take_cancel` settle emission — Task 8's hub arm calls `emit_settled(&ev.terminal_id, "auto-resume cancelled", None)`, the SAME signature Task 6 defines and the SAME reason string the WS handler broadcasts (idempotent pair); the hub test asserts the `("t1", "auto-resume cancelled", None)` tuple. ✓
+- Eviction cfg threading — Task 7 threads `cfg.healthy_lifetime_ms` (from `HubConfig`) into BOTH `decide`'s `healthy_lifetime_ms` param and the eviction-branch condition at `:242`; only the supervisor panic-health site (`:169`) keeps the compile-time const (documented split); the between-thresholds test pins the agreement. ✓
+- Settle-state clearing — Task 9's `recordTerminalExit` and Task 10's `foldTerminalReplacement` both `delete entry.settle` (A15 leak fix); each has a unit pin ("stale resumeCycles cannot leak into a later crash banner"). ✓
 - `CrashTrace { exitCode, resumedAtMs }` — Task 10 defines; banner + e2e (`crash-trace` testid, `Dismiss ${mode} crash notice`) consume the same names. ✓
 - Cancel wire: `{ type: 'terminal.autoResumeCancel', terminalId }` identical in Rust serde rename (Task 8), TS schema (Task 8), client send (Task 9), e2e button flow (Task 12). ✓
 - Env knob names identical across Task 7 (definitions) and Task 12 (e2e rig): `FRESHELL_AUTO_RESUME_MAX_CYCLES`, `FRESHELL_AUTO_RESUME_CYCLE_WINDOW_MS`, `FRESHELL_AUTO_RESUME_HEALTHY_LIFETIME_MS`, `FRESHELL_RESPAWN_LIVENESS_WINDOW_MS`. ✓
