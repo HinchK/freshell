@@ -38,7 +38,7 @@ vitest suite via `npm test`.
 - Quality gates (all must pass before push): `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, coordinated `env -u FRESHELL_BIND_HOST npm test` (set `FRESHELL_TEST_SUMMARY`; WAIT if the coordinator gate is held by another agent — never kill a foreign holder), `npm run test:port`, release build + relevant e2e specs (`terminal-activity-rust`, `idle-gate-semantics-rust`, `codex-status-completeness-rust`, `amplifier-lane-resilience-rust`) on ephemeral ports.
 - NEVER touch ports 3001/3002 (the user's LIVE server runs on 3002). NEVER restart the user's server. NEVER use broad kill patterns (`pkill -f ...`, `pkill node`).
 - This is a SHARED host: do NOT generate synthetic load to chase reproduction. The deterministic watch-drop simulation in Task 4 is the repro.
-- Do NOT widen the 30 s budget of `fresh_pane_locator_identity_reaches_activity_and_turn_complete` (`crates/freshell-ws/tests/codex_locator_activity.rs:100`). The 10s→30s widening was symptom-masking; with this fix the budget is fine as-is.
+- Do NOT widen the 30 s budget of `fresh_pane_locator_identity_reaches_activity_and_turn_complete` (`crates/freshell-ws/tests/codex_locator_activity.rs:100`). Attribution (verified against the record — `git show f2c505e9` and `docs/plans/2026-07-27-deflake-load-flakes.md`): the 10s→30s widening absorbed the DELAYED-under-load frame class (a late frame at 15.43 s); the LOST-frame class this plan fixes blew even the 30 s budget (35.42 s, "plausibly never arrived") and was filed as kata namg. The budget stays as-is: 30 s absorbs delayed delivery; this fix bounds the lost-event class via the Rescan forward + deadman force-read.
 - PR POLICY: do NOT create a PR. Push the branch and stop; landing happens outside with the final review verdict.
 - Commits: focused and atomic, conventional style, referencing `kata namg`.
 - Git identity: commits must use the repo-configured `Dan Shapiro <3732858+danshapiro@users.noreply.github.com>`; never write `dan@danshapiro.com` into git config.
@@ -73,27 +73,70 @@ crate's own predicate: `matches!(self.flag(), Some(Flag::Rescan))`) instead —
 this is the "or gate on `event.flag()==Some(Flag::Rescan)`" option the spec
 explicitly allows, and it also catches FSEvents' MustScanSubDirs rescans.
 
+Load-bearing validation addendum (assumption ledger in
+`.worktrees/.the-usual-logs/codex-lane-self-healing/load-bearing-ledger.md`):
+
+- Incident attribution: the recorded kata-namg incident's `task_complete`
+  WAS durably present at the watched path (kata body: the append was
+  expect-guarded; the failure was the never-delivered frame), so the
+  deadman force-read (Piece 2) is the incident's actual remedy. A kernel
+  Q_OVERFLOW is implausible for that specific incident (each lane owns a
+  dedicated inotify instance, `activity.rs:165-169`; default queue depth
+  16384 vs. 2-3 events in the test) — Piece 1 is production-plausibility
+  hardening mandated by the spec, not the incident fix.
+- Codex rollout files are effectively append-only mid-turn (resume opens
+  append-mode; forks create NEW files handled by adoption-layer lane
+  replacement at `activity.rs:368-378`; rollback is an appended marker), so
+  the same-path offset tail-read behind `drain_codex_lane` is sufficient
+  recovery for every realistically swallowable event kind.
+- The flake history of `codex_locator_activity.rs` distinguishes two
+  classes (see Global Constraints): DELAYED-under-load (absorbed by the
+  existing 30 s budget, commit `f2c505e9`) vs. LOST (this fix; blew even
+  30 s). Task 5 Step 2's gate runs unloaded and passes on baseline — Task
+  4's deterministic test, not that gate, is what proves the fix.
+
 ## Adjudicated Design Decisions
 
-**D1 — Deadman semantics: STAY Busy (mirror amplifier), do not keep the
-Unknown flip.** The spec asks this to be evaluated and documented. Decision:
-match amplifier exactly. Rationale: (a) "never fabricate a completion, never
-demote on a timer" is the amplifier lane's adjudicated stance
+**D1 — Deadman semantics: STAY Busy (mirror amplifier) + a submit-time
+staleness escape for the demotion's one behavioral consumer.** The spec asks
+this to be evaluated and documented. Decision: match amplifier on the timer
+path, and preserve the retired demotion's submit semantics directly at the
+submit site. Rationale: (a) "never fabricate a completion, never demote on a
+timer" is the amplifier lane's adjudicated stance
 (`amplifier/tracker.rs:13-15`) and the force-read now provides the honest
 answer — if the rollout holds the missed `task_complete`, the drain delivers
 it within one window; if the turn is genuinely still running, Busy is the
 truthful phase; (b) staying Busy keeps `next_deadline()` armed, so the
 force-read REPEATS every window — which also retries the tailer's fail-quiet
 IO errors (part of Piece 3's failure class) for free; the old Unknown flip
-disarmed the timer permanently; (c) no codex-specific reason to deviate was
-found: `CodexPhase::Unknown` remains a valid enum variant (protocol
-unchanged), and the one behavior consumer of the demotion — a user submit on
-a wedged terminal taking the fresh-pending branch instead of the
-queued-submit branch — still yields exactly one completion per turn end
-(re-pinned in Task 3). Consequences handled in Task 3: the two tracker tests
-that pin/depend on the demotion (`busy_deadman_demotes_to_unknown_and_reconcile_repromotes`,
-`codex.rs:937-953`, and `dup_bel_chunk_after_stale_accepted_completes_exactly_once`,
-`codex.rs:1003-1022`) are re-derived, not deleted.
+disarmed the timer permanently; (c) VALIDATED CORRECTION (load-bearing
+check, ledger A2 — the original claim here was falsified by a full
+state-machine trace): with the demotion simply removed, the demotion's one
+behavioral consumer — a user submit on a wedged (phantom-Busy) terminal —
+takes the queued-submit branch, and the user's real turn's single BEL is
+spent clearing the phantom (`transition_after_turn_clear` re-arms Pending;
+`record_completion_if_idle` refuses non-Idle at `codex.rs:606-608`): ZERO
+completions, no chime, ~2 min of lying blue, strictly worse than the old
+demotion's rescue (submit ≥120 s after silence → fresh pending → exactly one
+completion, pinned by `dup_bel_chunk_after_stale_accepted_completes_exactly_once`).
+Therefore `note_input`'s Busy branch gains a staleness escape: a submit into
+a Busy terminal whose silence exceeds `busy_deadman_ms` (measured BEFORE the
+submit refreshes `last_observed_at`) takes the fresh-pending path — the old
+demotion's exact submit semantics at the same threshold, event-driven
+instead of timer-driven, so untouched panes still never demote. Alternatives
+considered and rejected: keep-plan-as-is (accepts a strictly-worse dominant
+sub-case), demote-after-N-fruitless-force-reads (widens the zero-chime
+exposure window to N×120 s and re-introduces timer demotion).
+`CodexPhase::Unknown` remains a valid enum variant (protocol unchanged; the
+turn-clear guard at `codex.rs:294` keeps accepting it). Consequences handled
+in Task 3: the two tracker tests that pin/depend on the demotion
+(`busy_deadman_demotes_to_unknown_and_reconcile_repromotes`, `codex.rs:937-953`,
+and `dup_bel_chunk_after_stale_accepted_completes_exactly_once`,
+`codex.rs:1003-1022`) are re-derived, not deleted, and the escape gets its
+own red-first pin. Known residual (pre-existing in BOTH regimes, not a
+regression): a submit into a phantom-Busy pane while it is still FRESH
+(silence < window) queues and loses the chime — the old demotion never
+protected that sub-case either; out of scope here.
 
 **D2 — Optional third piece (tailer degrade signal / codex LaneRetry
 parity): DEFERRED, loudly.** The spec permits deferral if noted in the plan
@@ -110,7 +153,29 @@ comments written in Task 4 at `codex_reconcile.rs:58-61` and the module-doc
 deviation entry in Task 3 both name it) so it cannot be silently lost.
 This is NOT an unresolved coverage gap: the spec explicitly authorizes this
 deferral path with these exact conditions, and both conditions are met by
-concrete steps below (Task 3 Step 6, Task 4 Step 3).
+concrete steps below (Task 3 Step 3 (3h), Task 4 Step 3d).
+
+Named residual risks recorded with this deferral (load-bearing validation,
+ledger A1/A6 — these fall in the deferred piece-3/attach-retry territory and
+are listed so the deferral cannot silently hide them; recommend filing a
+follow-up kata for the first two at landing):
+
+- **Silent attach failure:** `attach_codex_rollout`'s three warn-and-return
+  exits (`activity.rs:311-319`, `:350-353`, `:355-362`) have no retry and no
+  test-visible signal; a passing bind assertion does not prove attach
+  succeeded (bind and attach are separate channel events). If the lane never
+  attaches, neither piece 1 nor piece 2 helps (no watcher, no Busy seed).
+- **Busy-edge loss:** the deadman arms only while the tracker is Busy; if
+  the busy edge itself was never observed, no force-read floor exists.
+- **Rollout semantics pinned at codex 0.145.0:** append-only-mid-turn was
+  verified at that version; `.zst` archival timing unverified.
+
+Additionally, to close the strict reading of the spec's "note it in the
+kata comment" condition: at landing time, post a one-line deferral comment
+ON kata namg itself (the code comments citing kata namg satisfy the loose
+reading; the kata currently has zero comments). Attach or reference the
+spec text there too — its grants currently live only in session
+transcripts.
 
 **D3 — Testing the Rescan path without synthetic load.** Kernel Q_OVERFLOW
 cannot be produced deterministically without flooding inotify (forbidden:
@@ -164,11 +229,25 @@ git fetch origin
 git log --oneline -1 origin/main
 git merge-base --is-ancestor origin/main HEAD && echo "BASE OK" || echo "BASE STALE - rebase onto origin/main first"
 git status --short
+# Line-anchor drift guard (ledger A3): the plan's edit targets are
+# line-anchored against e1f4d4c5. Any upstream change to the touched files
+# invalidates them.
+git log --oneline e1f4d4c5..origin/main -- \
+  crates/freshell-ws/src/activity.rs \
+  crates/freshell-activity/src/codex.rs \
+  crates/freshell-ws/src/codex_reconcile.rs \
+  crates/freshell-ws/tests/codex_locator_activity.rs
 ```
 
 Expected: `BASE OK` (branch `fix/codex-lane-self-healing` at `e1f4d4c5` or
-newer), clean status. If `BASE STALE`, run `git rebase origin/main` (there
-are no local commits yet, so this is trivial) and re-verify.
+newer), status clean apart from committed plan docs. If `BASE STALE`, run
+`git rebase origin/main` (the branch carries only the plan-docs commit, so
+this is near-trivial) and re-verify. The drift-guard `git log` must print
+NOTHING: if any commit touches those four files, do not follow the plan's
+line numbers blindly — re-locate every cited anchor by grep (the plan
+already names the symbols) before Task 2, and if the drift is semantic
+(the audited functions changed behavior), STOP and report instead of
+proceeding.
 
 - [ ] **Step 2: Node deps**
 
@@ -389,9 +468,11 @@ Access/atime exclusion still holds because the kind list is unchanged).
 grep -n "ModifyKind::Data" crates/freshell-ws/src/activity.rs
 ```
 
-Expected: exactly ONE match — inside `fs_event_is_relevant`. If the codex or
-amplifier closure still contains its own `matches!` kind list, the refactor
-is incomplete; fix before committing.
+Expected: exactly TWO matches — one inside `fs_event_is_relevant`, one
+inside the new unit test from Step 1 (its `append` case constructs a
+`Modify(Data(..))` event). NEITHER may be inside the codex or amplifier
+watcher closure; if a closure still contains its own `matches!` kind list,
+the refactor is incomplete; fix before committing.
 
 - [ ] **Step 7: Commit**
 
@@ -405,7 +486,7 @@ git commit -m "fix(ws): forward notify Rescan (IN_Q_OVERFLOW) on codex and ampli
 ### Task 3: Codex busy-deadman emits ForceRead and stays Busy (tracker)
 
 **Files:**
-- Modify: `crates/freshell-activity/src/codex.rs` — module doc (`:19-36`), `TerminalActivity` struct (`:82-108`), `track_terminal` init (`:177-194`), `CodexActivityTracker` struct + `Default` (`:139-143`), `expire()` (`:420-453`), `next_deadline()` (`:455-486`)
+- Modify: `crates/freshell-activity/src/codex.rs` — module doc (`:19-36`), `TerminalActivity` struct (`:82-108`), `track_terminal` init (`:177-194`), `CodexActivityTracker` struct + `Default` (`:139-143`), `note_input` (`:332-367`, the D1 staleness escape), `expire()` (`:420-453`), `next_deadline()` (`:455-486`)
 - Test: `crates/freshell-activity/src/codex.rs` `mod tests` (`:617` onward)
 
 **Interfaces:**
@@ -414,6 +495,7 @@ git commit -m "fix(ws): forward notify Rescan (IN_Q_OVERFLOW) on codex and ampli
   - `CodexActivityTracker::expire(&mut self, at: i64) -> Vec<CodexEffect>` now MAY contain `TrackerEffect::ForceRead` entries (busy terminal silent past the window; repeats every window; phase stays `CodexPhase::Busy`).
   - `pub fn set_busy_deadman_ms(&mut self, ms: i64)` on `CodexActivityTracker`.
   - `next_deadline()` keeps returning `Some(..)` while a terminal is Busy (re-armed by each fire), so the hub timer keeps waking.
+  - `note_input` D1 staleness escape (tracker-internal behavior, no signature change): a submit into a Busy terminal silent past `busy_deadman_ms` takes the fresh-pending path instead of queueing (the retired demotion's submit semantics, same threshold).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -509,17 +591,65 @@ Add the test-scale override pin (Task 4's hub test depends on this):
     }
 ```
 
+Add the D1 submit-time staleness escape pin (validated correction, ledger
+A2: without this, removing the demotion makes a submit into a wedged pane
+lose its chime entirely — the single real BEL gets spent clearing the
+phantom turn):
+
+```rust
+    #[test]
+    fn submit_into_stale_busy_starts_fresh_pending_and_completes_once() {
+        // KATA namg (D1): the retired Busy->Unknown demotion had exactly ONE
+        // behavioral consumer -- a user submit into a wedged (phantom-Busy)
+        // terminal took the fresh-pending branch, and the next BEL completed
+        // exactly once. Preserve that consumer directly at the submit site:
+        // a submit into a Busy terminal SILENT past the deadman window
+        // starts a FRESH pending turn (same threshold as the old demotion)
+        // instead of queueing behind a turn end that will never come --
+        // queueing would spend the real turn's single BEL on the phantom
+        // and never chime.
+        let mut tracker = CodexActivityTracker::new();
+        tracker.track_terminal("t1", Some("s1"), 0);
+        tracker.reconcile_rollout("t1", &started(100), 200); // phantom busy
+        let submit_at = 200 + 2 * BUSY_DEADMAN_MS; // still silent: stale
+        tracker.note_input("t1", "\r", submit_at);
+        assert_eq!(
+            tracker.list()[0].phase,
+            CodexPhase::Pending,
+            "a stale-busy submit rescues a fresh pending turn (not a queue)"
+        );
+        let bel = tracker.note_output("t1", "\u{07}", submit_at + 500);
+        assert_eq!(
+            completions(&bel).len(),
+            1,
+            "the real turn's single BEL completes exactly once"
+        );
+    }
+```
+
+(A submit into a FRESH busy terminal — silence within the window — must
+still queue; that behavior is already pinned by the existing
+`queued_submit_rearms_pending_after_the_bel_and_completes_each_turn`
+(`codex.rs:691-709`), which stays untouched and must stay green.)
+
 - [ ] **Step 2: Run them to make sure they fail**
 
 ```bash
-cargo test -p freshell-activity codex::tests::deadman_force_reads_and_stays_busy_then_repeats \
+cargo test -p freshell-activity -- \
+  codex::tests::deadman_force_reads_and_stays_busy_then_repeats \
   codex::tests::busy_deadline_follows_the_force_read_rearm \
-  codex::tests::deadman_window_is_overridable_for_test_scale
+  codex::tests::deadman_window_is_overridable_for_test_scale \
+  codex::tests::submit_into_stale_busy_starts_fresh_pending_and_completes_once
 ```
+
+(Multiple test filters must go after `--`; cargo itself accepts only one
+positional filter.)
 
 Expected: FAIL to compile (`set_busy_deadman_ms` not found). That is the red.
 (If you comment out the override test to check the others: red with
-`force_reads == 0` and `phase == Unknown` — today's demotion.)
+`force_reads == 0` and `phase == Unknown` — today's demotion — and the
+staleness-escape test red with phase `Busy` and zero completions — today's
+queued branch.)
 
 - [ ] **Step 3: Implement the tracker changes**
 
@@ -697,7 +827,48 @@ Also change the Pending arm's liveness term (`codex.rs:476`) — leave it on
 covered by the override (see the field doc). No edit needed there; just do
 not "helpfully" convert it.
 
-3g. Module doc — append a third entry to the deviation list
+3g. `note_input` staleness escape (D1; `codex.rs:332-367`) — the retired
+demotion's one behavioral consumer, preserved at the submit site. Two edits
+inside the existing function; everything else stays byte-for-byte:
+
+First, compute staleness BEFORE the observation timestamps are refreshed
+(insert after `let previous = state.to_record();` at `:339`):
+
+```rust
+        // KATA namg (D1): submit-time staleness escape -- the one
+        // behavioral consumer of the retired Busy->Unknown demotion. A
+        // submit into a Busy terminal SILENT past the deadman window is a
+        // user acting on a wedged/phantom turn (the deadman force-reads
+        // could not heal it): treat it as a FRESH pending turn -- the old
+        // demotion's submit semantics at the same threshold -- instead of
+        // queueing behind a turn end that will never come (queueing would
+        // spend the real turn's single BEL clearing the phantom: zero
+        // completions, no chime). Measured BEFORE last_observed_at is
+        // refreshed by this very submit.
+        let stale_busy = state.phase == CodexPhase::Busy
+            && at - state.last_observed_at > self.busy_deadman_ms;
+```
+
+Second, route a stale-busy submit past the queued branch and through the
+same stale-state hygiene the Unknown branch already has — change the two
+conditions (`:344` and `:353`):
+
+```rust
+        if state.phase == CodexPhase::Busy && !stale_busy {
+```
+
+```rust
+        if state.phase == CodexPhase::Idle || state.phase == CodexPhase::Unknown || stale_busy {
+```
+
+(Do NOT clear `accepted_start_at` here — the old post-demotion path left it
+stale too, and the pending-clear path nulls it on the next BEL (CE2, the
+`transition_pending_after_turn_clear` anchor-null); clearing it here would
+diverge from the pinned old behavior. Note the field-borrow shape:
+`self.busy_deadman_ms` is a disjoint field read while `state` borrows
+`self.states` — this compiles as-is.)
+
+3h. Module doc — append a third entry to the deviation list
 (`codex.rs:19-36`, after deviation 2):
 
 ```rust
@@ -709,7 +880,11 @@ not "helpfully" convert it.
 //!    missed-signal floor (see `amplifier/tracker.rs`), ported because the
 //!    rollout lane is a single unbroken inotify->mpsc->drain chain with zero
 //!    redundant delivery: one missed fs event used to silence
-//!    terminal.turn.complete forever. The tailer's fail-quiet IO errors are
+//!    terminal.turn.complete forever. The retired demotion's ONE behavioral
+//!    consumer -- a user submit into a wedged pane -- is preserved by the
+//!    submit-time staleness escape in `note_input` (silence past the window
+//!    at submit time takes the fresh-pending path, same threshold as the
+//!    old demotion). The tailer's fail-quiet IO errors are
 //!    retried on the same cadence; a LaneRetry-equivalent loud-degrade path
 //!    (TailerReadOutcome parity) is deliberately DEFERRED -- see
 //!    docs/plans/2026-07-29-codex-lane-self-healing.md (D2).
@@ -718,12 +893,14 @@ not "helpfully" convert it.
 - [ ] **Step 4: Run the new tests to verify they pass**
 
 ```bash
-cargo test -p freshell-activity codex::tests::deadman_force_reads_and_stays_busy_then_repeats \
+cargo test -p freshell-activity -- \
+  codex::tests::deadman_force_reads_and_stays_busy_then_repeats \
   codex::tests::busy_deadline_follows_the_force_read_rearm \
-  codex::tests::deadman_window_is_overridable_for_test_scale
+  codex::tests::deadman_window_is_overridable_for_test_scale \
+  codex::tests::submit_into_stale_busy_starts_fresh_pending_and_completes_once
 ```
 
-Expected: PASS (3 tests).
+Expected: PASS (4 tests).
 
 - [ ] **Step 5: Re-derive the two demotion-dependent tests**
 
@@ -734,12 +911,18 @@ cargo test -p freshell-activity
 ```
 
 Expected failures: `busy_deadman_demotes_to_unknown_and_reconcile_repromotes`
-(`codex.rs:937-953` — pins the removed demotion) and
+(`codex.rs:937-953` — pins the removed demotion; any phase assertion on
+`Unknown` now sees `Busy`) and possibly
 `dup_bel_chunk_after_stale_accepted_completes_exactly_once`
-(`codex.rs:1003-1022` — its setup comment says "demote to Unknown"; with the
-new semantics the terminal stays Busy, so its `note_input` takes the
-queued-submit branch and the scenario changes meaning). Everything else must
-still pass — in particular `deadline_driven_expiry_converges_for_a_quiet_submit`
+(`codex.rs:1003-1022` — its setup comment says "demote to Unknown"; the
+demotion no longer happens, but its stale-silence `note_input` now takes the
+D1 staleness escape (3g) into the same fresh-pending path, so its
+completion assertions may even stay green — replace it regardless, because
+its name and setup comments now lie about the mechanism). Everything else
+must still pass — in particular
+`queued_submit_rearms_pending_after_the_bel_and_completes_each_turn`
+(`codex.rs:691-709`, the FRESH-busy queued branch, untouched by the
+staleness escape) and `deadline_driven_expiry_converges_for_a_quiet_submit`
 (`codex.rs:748-762`), which starts from Pending, reaches Idle, and converges;
 if it hangs, the Pending arm was wrongly converted in 3f.
 
@@ -776,24 +959,28 @@ of `note_output` and keep the same two assertions. The pinned invariant is
 channel.)
 
 REPLACE `dup_bel_chunk_after_stale_accepted_completes_exactly_once` with the
-re-derived CE2 pin:
+re-derived CE2 pin (same load-bearing invariant; the rescue mechanism is now
+the D1 submit-time staleness escape instead of the timer demotion):
 
 ```rust
     #[test]
-    fn dup_bel_chunk_during_deadman_busy_completes_exactly_once() {
+    fn dup_bel_chunk_after_stale_busy_submit_completes_exactly_once() {
         // CE2 re-derived for the self-healing deadman (kata namg): the
-        // deadman no longer demotes to Unknown, so a user submit during the
-        // silent stretch takes the queued-submit branch (phase == Busy =>
-        // queue). A dup-BEL chunk (real PTY behavior, see the existing
+        // deadman no longer demotes to Unknown; instead, a submit into the
+        // stale-silent Busy terminal takes the D1 staleness escape into a
+        // FRESH pending turn (note_input, same threshold as the retired
+        // demotion). A dup-BEL chunk (real PTY behavior, see the existing
         // dup-BEL test) must still stamp exactly ONE completion for the one
-        // physical turn end -- the load-bearing invariant is one completion
-        // per turn end, regardless of which branch armed it.
+        // physical turn end -- the pending-clear path nulls the phantom's
+        // stale accepted anchor, so the second BEL of the chunk finds no
+        // turn to complete. The load-bearing invariant is one completion
+        // per physical turn end, regardless of which branch armed it.
         let mut tracker = CodexActivityTracker::new();
         tracker.track_terminal("t1", Some("thread-1"), 0);
         tracker.reconcile_rollout("t1", &started(100), 200); // seeded busy, accepted=100
         tracker.expire(200 + BUSY_DEADMAN_MS + 1); // deadman fires; stays busy
-        let submit_at = 200 + BUSY_DEADMAN_MS + 1_000;
-        tracker.note_input("t1", "\r", submit_at); // queued submit on the busy turn
+        let submit_at = 200 + BUSY_DEADMAN_MS + 1_000; // silence > window: stale
+        tracker.note_input("t1", "\r", submit_at); // staleness escape: fresh pending
         let bel = tracker.note_output("t1", "\u{07}\u{07}", submit_at + 500);
         assert_eq!(
             completions(&bel).len(),
@@ -803,13 +990,13 @@ re-derived CE2 pin:
     }
 ```
 
-If this assertion fails because the queued-branch semantics legitimately
-differ (e.g. the dup BEL drains the queue and re-arms rather than emitting),
-do NOT force it green by weakening to `<= 1`: read the surrounding
-queued-submit tests (`stacked submits` family) to derive the correct expected
-frame sequence, pin THAT, and keep the "exactly one completion per physical
-turn end" invariant as the assertion message. Document the derivation in the
-test comment.
+If this assertion fails because the pending-clear semantics legitimately
+differ (e.g. the dup BEL re-arms rather than emitting), do NOT force it
+green by weakening to `<= 1`: read the surrounding queued-submit tests
+(`stacked submits` family) and the old test's CE2 comments to derive the
+correct expected frame sequence, pin THAT, and keep the "exactly one
+completion per physical turn end" invariant as the assertion message.
+Document the derivation in the test comment.
 
 - [ ] **Step 6: Full crate green**
 
@@ -1176,6 +1363,15 @@ Expected: the grep finds the existing budget at `:100` UNCHANGED by this
 branch (verify with `git diff origin/main -- crates/freshell-ws/tests/` →
 empty), and the test PASSES. Do not widen the budget for any reason.
 
+Honest scope note (ledger A4): this gate runs unloaded and passed 10/10 on
+the pre-fix baseline, so a green run here does NOT by itself prove the fix
+— Task 4's deterministic watch-drop test is the discriminator. Both
+historical failures of this test were load-only. Contingency if it fails
+here: rerun ONCE solo; a pass on the solo rerun under an otherwise loaded
+host is the DELAYED-under-load class (out of this plan's scope — record it,
+do not widen, do not chase reproduction on the shared host); a reproducible
+solo failure is new and blocks the push — report it.
+
 - [ ] **Step 3: Coordinated JS suites**
 
 ```bash
@@ -1217,8 +1413,8 @@ workflow with the final review verdict.
 
 **1. Spec coverage.**
 - Fix piece 1 (Rescan on BOTH lanes, forwarded as the existing FsChange messages) → Task 2. The spec's "add EventKind::Other (or gate on flag()==Some(Flag::Rescan))" — the flag-gate option is taken, with a source-verified reason (kqueue flagless `Other`), documented in D3 and the code comment.
-- Fix piece 2 (codex self-healing floor mirroring amplifier: `expire()` emits ForceRead on the busy-deadman path; `codex_frames`' dead arm forwards into a force-reads list; `expire_due` drains via `drain_codex_lane`) → Tasks 3 + 4. The requested stay-Busy-vs-Unknown evaluation → D1 (stay Busy, amplifier mirror, documented). Bounded worst case ≤ `BUSY_DEADMAN_MS` → pinned by the Task 4 hub test (scaled window) and the Task 3 repeat pin.
-- Optional piece 3 → D2: deferred with the spec's two required notes (plan D2 here; kata comment in code at Task 4 Step 3d and the module-doc deviation at Task 3 Step 3g). Not silently skipped.
+- Fix piece 2 (codex self-healing floor mirroring amplifier: `expire()` emits ForceRead on the busy-deadman path; `codex_frames`' dead arm forwards into a force-reads list; `expire_due` drains via `drain_codex_lane`) → Tasks 3 + 4. The requested stay-Busy-vs-Unknown evaluation → D1 (stay Busy on the timer path, amplifier mirror, PLUS the submit-time staleness escape after the original clause (c) was falsified by a full state-machine trace — ledger A2; the escape preserves the retired demotion's one behavioral consumer at the same threshold, red-first pinned in Task 3 Step 1). Bounded worst case ≤ `BUSY_DEADMAN_MS` → pinned by the Task 4 hub test (scaled window) and the Task 3 repeat pin.
+- Optional piece 3 → D2: deferred with the spec's two required notes (plan D2 here; kata comment in code at Task 4 Step 3d and the module-doc deviation at Task 3 Step 3h) — the deferral text was verified against the recovered spec verbatim (ledger A7), and D2 now also NAMES the uncovered residual risks (silent attach failure, busy-edge loss) plus the landing-time kata comment. Not silently skipped.
 - Test (1) synthetic Rescan, both lanes, red today → Task 2 Steps 1–3 + the both-closures grep check (Step 6); fidelity argument in D3.
 - Test (2) tracker deadman ForceRead mirroring amplifier's test, red today → Task 3 Steps 1–2.
 - Test (3) hub-level watch-dropped-before-task_complete, deterministic, red today → Task 4 Steps 1–2 (unwatch seam is in-crate module privacy, the only seam that exists — verified; no synthetic load).
