@@ -675,6 +675,7 @@ async function main() {
       terminalId?: string
       provider?: CodingCliProviderName
       sessionId?: string
+      previousSessionId?: string
     }
     if (event.provider !== 'codex') return
     if (!event.terminalId || !event.sessionId) return
@@ -687,6 +688,7 @@ async function main() {
         terminalId: event.terminalId,
         sessionId: event.sessionId,
         source: 'codex_durability',
+        ...(event.previousSessionId ? { previousSessionId: event.previousSessionId } : {}),
       })
     } catch (err) {
       log.warn({ err, terminalId: event.terminalId, sessionId: event.sessionId }, 'Failed to broadcast Codex session association')

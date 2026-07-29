@@ -25,6 +25,7 @@ import CodingAgentsSettings from '@/components/settings/CodingAgentsSettings'
 import PanesSettings from '@/components/settings/PanesSettings'
 import NamingSettings from '@/components/settings/NamingSettings'
 import NetworkSettings from '@/components/settings/NetworkSettings'
+import StreamDeckSettings from '@/components/settings/StreamDeckSettings'
 
 const SERVER_TEXT_SETTINGS_DEBOUNCE_MS = 500
 
@@ -35,6 +36,7 @@ const sections = [
   { id: 'workspace', label: 'Workspace' },
   { id: 'naming', label: 'Naming' },
   { id: 'network', label: 'Network' },
+  { id: 'stream-deck', label: 'Stream Deck' },
   { id: 'advanced', label: 'Advanced' },
 ] as const
 
@@ -147,6 +149,7 @@ export default function SettingsView({ onNavigate, onFirewallTerminal, onSharePa
                 onSharePanel={onSharePanel}
               />
             )}
+            {activeSection === 'stream-deck' && <StreamDeckSettings {...sectionProps} />}
             {activeSection === 'advanced' && <AdvancedSettings {...sectionProps} />}
           </div>
 

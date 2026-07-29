@@ -24,7 +24,15 @@ function StatusDot({ status, busy }: { status: TerminalStatus; busy?: boolean })
   return <Circle className={cn('h-2 w-2', busy ? 'fill-blue-500 text-blue-500' : getTerminalStatusDotClassName(status))} />
 }
 
-const MAX_TAB_ICONS = 6
+/** Max pane-type icons shown per tab; panes beyond this fold into the '+N' badge. */
+const MAX_PANE_ICONS = 3
+
+/**
+ * Max distinct repo icons shown per tab (locked decision: each icon group
+ * is capped independently at 3). Repos beyond the cap are silently
+ * truncated -- the '+N' badge counts hidden panes only.
+ */
+const MAX_REPO_ICONS = 3
 
 export interface TabItemProps {
   tab: Tab
@@ -82,10 +90,10 @@ export default function TabItem({
       return <StatusDot status={tab.status} busy={busy} />
     }
 
-    const visible = paneEntries.slice(0, MAX_TAB_ICONS)
-    const overflow = paneEntries.length - MAX_TAB_ICONS
+    const visible = paneEntries.slice(0, MAX_PANE_ICONS)
+    const overflow = paneEntries.length - MAX_PANE_ICONS
     const hiddenBusyPane = paneEntries
-      .slice(MAX_TAB_ICONS)
+      .slice(MAX_PANE_ICONS)
       .some((entry) => busyPaneIds.includes(entry.paneId))
 
     // Group visible entries by repo identity (first-appearance order) so each
@@ -106,11 +114,24 @@ export default function TabItem({
       groups.push({ key, info, entries: [entry] })
     }
 
+    // Cap distinct repo icons independently of the pane cap. The visible
+    // slice (<= MAX_PANE_ICONS entries) cannot yield more repo groups than
+    // that today; this guard keeps the repo-icon bound at 3 even if
+    // MAX_PANE_ICONS changes.
+    const repoIconKeys = new Set(
+      groups
+        .filter((group) => group.info)
+        .slice(0, MAX_REPO_ICONS)
+        .map((group) => group.key),
+    )
+
     return (
       <span className="flex items-center gap-0.5">
         {groups.map((group) => (
           <span key={group.key} className="flex items-center gap-0.5">
-            {group.info && <RepoIcon info={group.info} className="h-3 w-3 shrink-0" />}
+            {group.info && repoIconKeys.has(group.key) && (
+              <RepoIcon info={group.info} className="h-3 w-3 shrink-0" />
+            )}
             {group.entries.map(({ paneId, content }) => {
               const status: TerminalStatus = content.kind === 'terminal' ? content.status : 'running'
               const isBusy = busyPaneIds.includes(paneId)

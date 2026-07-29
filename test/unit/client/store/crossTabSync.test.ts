@@ -269,6 +269,74 @@ describe('crossTabSync', () => {
     })
   })
 
+  it('keeps a locally rebound sessionRef when a stale tab broadcast still carries the old sessionId', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+
+    // Local pane was rebound (server-authoritative) to new-id.
+    store.dispatch(hydratePanes({
+      layouts: {
+        'tab-1': {
+          type: 'leaf',
+          id: 'pane-a',
+          content: {
+            kind: 'terminal',
+            mode: 'codex',
+            createRequestId: 'req-a',
+            status: 'running',
+            terminalId: 'term-local',
+            sessionRef: {
+              provider: 'codex',
+              sessionId: 'new-id',
+            },
+          },
+        } as any,
+      },
+      activePane: { 'tab-1': 'pane-a' },
+      paneTitles: {},
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    // A stale tab flushes a layout that still carries the superseded old-id.
+    const remoteRaw = JSON.stringify({
+      version: 3,
+      tabs: { activeTabId: null, tabs: [] },
+      panes: {
+        version: 6,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-a',
+            content: {
+              kind: 'terminal',
+              mode: 'codex',
+              createRequestId: 'req-a',
+              status: 'running',
+              terminalId: 'term-local',
+              sessionRef: {
+                provider: 'codex',
+                sessionId: 'old-id',
+              },
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-a' },
+        paneTitles: {},
+      },
+      tombstones: [],
+    })
+
+    window.dispatchEvent(new StorageEvent('storage', { key: LAYOUT_STORAGE_KEY, newValue: remoteRaw }))
+
+    const layout = store.getState().panes.layouts['tab-1'] as any
+    expect(layout.content.sessionRef).toEqual({
+      provider: 'codex',
+      sessionId: 'new-id',
+    })
+  })
+
   it('dedupes identical persisted payloads delivered via both storage and BroadcastChannel', () => {
     const dispatchSpy = vi.fn()
     const storeLike = {

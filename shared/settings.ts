@@ -220,6 +220,12 @@ export type LocalSettings = {
   notifications: {
     soundEnabled: boolean
   }
+  streamDeck: {
+    enabled: boolean
+    brightness: number
+    idleBrightness: number
+    idleTimeoutSeconds: number
+  }
 }
 
 export type LocalSettingsPatch = DeepPartial<LocalSettings>
@@ -235,6 +241,7 @@ export type ResolvedSettings = {
   sidebar: ServerSettings['sidebar'] & LocalSettings['sidebar']
   ai: ServerSettings['ai']
   notifications: LocalSettings['notifications']
+  streamDeck: LocalSettings['streamDeck']
   codingCli: ServerSettings['codingCli']
   panes: ServerSettings['panes'] & LocalSettings['panes']
   editor: ServerSettings['editor']
@@ -621,6 +628,25 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     }
   }
 
+  if (isRecord(patch.streamDeck)) {
+    const streamDeck: LocalSettingsPatch['streamDeck'] = {}
+    if (typeof patch.streamDeck.enabled === 'boolean') {
+      streamDeck.enabled = patch.streamDeck.enabled as boolean
+    }
+    if (typeof patch.streamDeck.brightness === 'number') {
+      streamDeck.brightness = patch.streamDeck.brightness as number
+    }
+    if (typeof patch.streamDeck.idleBrightness === 'number') {
+      streamDeck.idleBrightness = patch.streamDeck.idleBrightness as number
+    }
+    if (typeof patch.streamDeck.idleTimeoutSeconds === 'number') {
+      streamDeck.idleTimeoutSeconds = patch.streamDeck.idleTimeoutSeconds as number
+    }
+    if (Object.keys(streamDeck).length > 0) {
+      normalized.streamDeck = streamDeck
+    }
+  }
+
   return Object.keys(normalized).length > 0 ? normalized : undefined
 }
 
@@ -865,6 +891,12 @@ export const defaultLocalSettings: LocalSettings = {
   },
   notifications: {
     soundEnabled: true,
+  },
+  streamDeck: {
+    enabled: false,
+    brightness: 100,
+    idleBrightness: 10,
+    idleTimeoutSeconds: 300,
   },
 }
 
@@ -1263,6 +1295,7 @@ export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings 
     },
     freshAgent: mergeDefined(defaultLocalSettings.freshAgent, freshAgentPatch),
     notifications: mergeDefined(defaultLocalSettings.notifications, patch?.notifications),
+    streamDeck: mergeDefined(defaultLocalSettings.streamDeck, patch?.streamDeck),
   }
 }
 
@@ -1324,6 +1357,14 @@ export function mergeLocalSettings(base: LocalSettingsPatch | undefined, patch: 
     next.notifications = notifications as LocalSettingsPatch['notifications']
   }
 
+  const streamDeck = mergeDefined(
+    (base?.streamDeck || {}) as Record<string, unknown>,
+    patch.streamDeck as Record<string, unknown> | undefined,
+  )
+  if (Object.keys(streamDeck).length > 0) {
+    next.streamDeck = streamDeck as LocalSettingsPatch['streamDeck']
+  }
+
   return next
 }
 
@@ -1345,6 +1386,7 @@ export function composeResolvedSettings(server: ServerSettings, local: LocalSett
     },
     ai: { ...server.ai },
     notifications: { ...local.notifications },
+    streamDeck: { ...local.streamDeck },
     codingCli: {
       ...server.codingCli,
       enabledProviders: [...server.codingCli.enabledProviders],
@@ -1405,6 +1447,13 @@ export function extractLegacyLocalSettingsSeed(
   }
   if (isRecord(raw.notifications)) {
     maybeAssignNested(patch, 'notifications', pickKeys(raw.notifications, ['soundEnabled']))
+  }
+  if (isRecord(raw.streamDeck)) {
+    maybeAssignNested(
+      patch,
+      'streamDeck',
+      pickKeys(raw.streamDeck, ['enabled', 'brightness', 'idleBrightness', 'idleTimeoutSeconds']),
+    )
   }
 
   return normalizeExtractedLocalSeed(patch)

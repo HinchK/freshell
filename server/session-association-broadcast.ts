@@ -181,6 +181,12 @@ export function broadcastTerminalSessionAssociation(opts: {
   terminalId: string
   sessionId: string
   source: AssociationBroadcastSource
+  /**
+   * Present ONLY on a server-authoritative mid-session rebind (e.g. codex fork
+   * handoff). Forwarded onto the terminal.session.associated message so the
+   * client accepts the overwrite of its current sessionRef.
+   */
+  previousSessionId?: string
 }): void {
   recordSessionLifecycleEvent({
     kind: 'session_association_broadcast',
@@ -197,6 +203,7 @@ export function broadcastTerminalSessionAssociation(opts: {
       provider: opts.provider,
       sessionId: opts.sessionId,
     },
+    ...(opts.previousSessionId ? { previousSessionId: opts.previousSessionId } : {}),
   })
 
   const metaUpsert = opts.terminalMetadata.associateSession(

@@ -142,6 +142,15 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
     patch.notifications = notifications
   }
 
+  const streamDeck: LocalSettingsPatch['streamDeck'] = {}
+  assignChangedScalar(streamDeck, localSettings.streamDeck, defaultLocalSettings.streamDeck, 'enabled')
+  assignChangedScalar(streamDeck, localSettings.streamDeck, defaultLocalSettings.streamDeck, 'brightness')
+  assignChangedScalar(streamDeck, localSettings.streamDeck, defaultLocalSettings.streamDeck, 'idleBrightness')
+  assignChangedScalar(streamDeck, localSettings.streamDeck, defaultLocalSettings.streamDeck, 'idleTimeoutSeconds')
+  if (Object.keys(streamDeck).length > 0) {
+    patch.streamDeck = streamDeck
+  }
+
   return patch
 }
 

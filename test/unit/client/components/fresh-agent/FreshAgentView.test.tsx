@@ -323,8 +323,12 @@ describe('FreshAgentView', () => {
       sessionType: 'freshclaude',
       provider: 'claude',
       requestId: 'approval-1',
-      decision: { behavior: 'allow', updatedInput: {} },
+      decision: { behavior: 'allow' },
     })
+    const approvalCall = (wsMock.send as any).mock.calls.find((call: any[]) =>
+      call[0].requestId === 'approval-1'
+    )
+    expect('updatedInput' in approvalCall[0].decision).toBe(false)
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.question.respond',
       sessionId: CLAUDE_THREAD_ID,
@@ -389,8 +393,12 @@ describe('FreshAgentView', () => {
       provider: 'opencode',
       cwd: '/repo/route-aware',
       requestId: 'approval-route',
-      decision: { behavior: 'allow', updatedInput: {} },
+      decision: { behavior: 'allow' },
     })
+    const approvalRouteCall = (wsMock.send as any).mock.calls.find((call: any[]) =>
+      call[0].requestId === 'approval-route'
+    )
+    expect('updatedInput' in approvalRouteCall[0].decision).toBe(false)
     expect(wsMock.send).toHaveBeenCalledWith({
       type: 'freshAgent.question.respond',
       sessionId: 'ses_route_responses',

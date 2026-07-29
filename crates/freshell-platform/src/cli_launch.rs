@@ -121,6 +121,12 @@ pub struct CliLaunchInputs<'a> {
     /// the reference's `port > 65535` throw condition is representable (G-O4).
     pub opencode_server: Option<(&'a str, i64)>,
     pub mcp_injection: McpInjection,
+    /// Precomputed by the IO layer (like `mcp_injection` — this resolver never
+    /// does fs I/O): `Some(<abs path to the freshell-owned tui.json>)` when the
+    /// opencode rebind-plugin install succeeded at the call site, `None`
+    /// otherwise (non-opencode pane, unresolvable home, or install failure —
+    /// skip injection, degrading to today's no-rebind behavior).
+    pub opencode_rebind_tui_config: Option<String>,
 }
 
 /// The `resolveCodingCliCommand` throw conditions as typed errors with
@@ -188,42 +194,52 @@ pub const CLAUDE_BELL_COMMAND_UNIX: &str = "sh -lc \"printf '\\a' > /dev/tty 2>/
 /// `'\\\\.\\CONOUT$'` unescapes to `\\.\CONOUT$`, the Win32 console device path).
 pub const CLAUDE_BELL_COMMAND_WINDOWS: &str = "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"$bell=[char]7; $ok=$false; try {[System.IO.File]::AppendAllText('\\\\.\\CONOUT$', [string]$bell); $ok=$true} catch {}; if (-not $ok) { try {[Console]::Out.Write($bell); $ok=$true} catch {} }; if (-not $ok) { try {[Console]::Error.Write($bell)} catch {} }\"";
 
-/// `JSON.stringify`-compatible string escaping (the subset JSON.stringify
-/// performs: `\` `"` and control chars; the bell payloads only contain the
-/// first two, but the helper is complete for safety).
-fn json_escape_into(out: &mut String, s: &str) {
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\u{08}' => out.push_str("\\b"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\u{0c}' => out.push_str("\\f"),
-            '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-}
+/// SessionStart fires with the CURRENT session id on startup/resume/clear --
+/// the deterministic signal for claude's in-TUI session switches. On claude
+/// 2.1.220 plain /resume does NOT fork (`--fork-session` is the opt-in; the
+/// docs reserve the `fork` source for it) -- the hook delivers the SELECTED
+/// session's id, which is exactly what the rebind needs whether or not a
+/// fork occurred (claude writes NO lineage field on disk either way;
+/// verified 2026-07-27/28). Atomic tmp+rename; never blocks or fails the
+/// CLI (trailing `|| true`).
+///
+/// Degradation notes (validated A7): `disableAllHooks: true` in user
+/// settings, an enterprise `allowManagedHooksOnly` policy, or a `--bare`
+/// launch silently disable the injected hook -- graceful degradation to
+/// today's stale-resume behavior (no rebind), never corruption; freshell
+/// cannot detect it.
+pub const CLAUDE_SESSION_START_COMMAND_UNIX: &str = "sh -lc 'd=\"$HOME/.freshell/session-signals/claude\"; f=\"$d/${FRESHELL_TERMINAL_ID:-unknown}__$$-$(date +%s%N)\"; mkdir -p \"$d\" && cat > \"$f.tmp\" && mv \"$f.tmp\" \"$f.json\"' 2>/dev/null || true";
 
-/// The claude `--settings` payload: compact `JSON.stringify` of the Stop-hook
-/// settings object (`terminal-registry.ts:216-238`) —
-/// `{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"<bell>"}]}]}}`.
-/// Exact bytes pinned by the §4 goldens (`CLAUDE_SETTINGS_UNIX`/`_WIN`) and
-/// verified against the live original.
+/// Windows twin of [`CLAUDE_SESSION_START_COMMAND_UNIX`] (see its doc for the
+/// semantics + A7 degradation notes): reads the hook's stdin JSON via
+/// `[Console]::In.ReadToEnd()` and writes it atomically (tmp + `Move-Item`)
+/// to `%USERPROFILE%\.freshell\session-signals\claude\<FRESHELL_TERMINAL_ID>__<ticks>.json`,
+/// mirroring the [`CLAUDE_BELL_COMMAND_WINDOWS`] powershell one-liner style —
+/// the whole body is a `try {..} catch {}` so it never blocks or fails the CLI.
+pub const CLAUDE_SESSION_START_COMMAND_WINDOWS: &str = "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"try { $tid = if ($env:FRESHELL_TERMINAL_ID) { $env:FRESHELL_TERMINAL_ID } else { 'unknown' }; $d = Join-Path $env:USERPROFILE '.freshell\\session-signals\\claude'; New-Item -ItemType Directory -Force -Path $d | Out-Null; $f = Join-Path $d ($tid + '__' + [DateTime]::UtcNow.Ticks); [System.IO.File]::WriteAllText($f + '.tmp', [Console]::In.ReadToEnd()); Move-Item -Force ($f + '.tmp') ($f + '.json') } catch {}\"";
+
+/// The claude `--settings` payload: compact JSON of the hook settings object
+/// (`terminal-registry.ts:216-238` origin, P4 extends it) —
+/// `{"hooks":{"SessionStart":[...],"Stop":[...]}}` with the session-id signal
+/// hook first and the bell Stop hook unchanged. Built via `serde_json` (the
+/// workspace enables `preserve_order`, so key order is insertion order:
+/// `SessionStart` before `Stop`). Exact bytes pinned by the §4 goldens
+/// (`CLAUDE_SETTINGS_UNIX`/`_WIN`).
 pub fn claude_settings_json(target: ProviderTarget) -> String {
-    let bell = match target {
-        ProviderTarget::Windows => CLAUDE_BELL_COMMAND_WINDOWS,
-        ProviderTarget::Unix => CLAUDE_BELL_COMMAND_UNIX,
+    let (session_start, bell) = match target {
+        ProviderTarget::Windows => (
+            CLAUDE_SESSION_START_COMMAND_WINDOWS,
+            CLAUDE_BELL_COMMAND_WINDOWS,
+        ),
+        ProviderTarget::Unix => (CLAUDE_SESSION_START_COMMAND_UNIX, CLAUDE_BELL_COMMAND_UNIX),
     };
-    let mut out =
-        String::from("{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"");
-    json_escape_into(&mut out, bell);
-    out.push_str("\"}]}]}}");
-    out
+    serde_json::json!({
+        "hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": session_start}]}],
+            "Stop": [{"hooks": [{"type": "command", "command": bell}]}],
+        }
+    })
+    .to_string()
 }
 
 /// Truthy env lookup (JS `env.X` truthiness: unset and `''` are both falsy).
@@ -244,6 +260,20 @@ fn merged_env_truthy(
         return if v.is_empty() { None } else { Some(v.clone()) };
     }
     env_truthy(parent, key)
+}
+
+/// Merged-view env lookup with JS spread semantics: a key present in
+/// `command_env` (even empty) SHADOWS the process env. Companion to
+/// [`merged_env_truthy`], returning the value instead of truthiness.
+fn merged_env_value(
+    parent: &dyn Env,
+    command_env: &BTreeMap<String, String>,
+    key: &str,
+) -> Option<String> {
+    if let Some(v) = command_env.get(key) {
+        return Some(v.clone());
+    }
+    parent.get(key)
 }
 
 /// `resolveGoogleApiKey` (`server/opencode-launch.ts:7-9`):
@@ -408,6 +438,30 @@ pub fn resolve_coding_cli_command(
         let overrides = get_opencode_env_overrides(env, &command_env);
         for (k, v) in overrides {
             command_env.insert(k, v);
+        }
+        // Freshell TUI rebind plugin (docs/plans/2026-07-28-opencode-tui-rebind.md):
+        // the IO layer installed the plugin + plugin-only tui.json into
+        // ~/.freshell/opencode/ and passed the tui.json path via
+        // inputs.opencode_rebind_tui_config (the mcp_injection precedent — this
+        // resolver stays pure). Point this pane's TUI at it via OPENCODE_TUI_CONFIG.
+        // Main-config plugins (opencode.json / OPENCODE_CONFIG_CONTENT) load as
+        // SERVER plugins only and never reach the TUI plugin host; TUI config
+        // sources MERGE and plugin arrays UNION, so the injected plugin-only file
+        // can never shadow user config (validated on opencode 1.18.8/1.18.9).
+        // Skips (each degrades to today's no-rebind behavior): user-set
+        // OPENCODE_TUI_CONFIG (a path var cannot be merged — preserve the user's
+        // value), the FRESHELL_OPENCODE_REBIND=0/false kill switch (opencode
+        // self-updates in place), and a None input (unresolvable home or install
+        // failure at the IO layer, which warn-logs and never blocks the launch).
+        let rebind_disabled = matches!(
+            merged_env_value(env, &command_env, "FRESHELL_OPENCODE_REBIND").as_deref(),
+            Some("0") | Some("false")
+        );
+        let user_tui_config = merged_env_value(env, &command_env, "OPENCODE_TUI_CONFIG");
+        if !rebind_disabled && user_tui_config.is_none() {
+            if let Some(tui_config) = &inputs.opencode_rebind_tui_config {
+                command_env.insert("OPENCODE_TUI_CONFIG".to_string(), tui_config.clone());
+            }
         }
     }
     if inputs.mode == "codex" {

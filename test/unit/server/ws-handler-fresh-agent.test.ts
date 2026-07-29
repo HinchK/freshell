@@ -428,7 +428,7 @@ describe('WsHandler fresh-agent routing', () => {
         sessionType: 'freshcodex',
         provider: 'codex',
         requestId: 'approval-1',
-        decision: { behavior: 'allow', updatedInput: {} },
+        decision: { behavior: 'allow' },
       }))
       ws.send(JSON.stringify({
         type: 'freshAgent.question.respond',
@@ -464,7 +464,7 @@ describe('WsHandler fresh-agent routing', () => {
           settings: { cwd: '/repo', model: 'gpt-5.4-mini', effort: 'low' },
         })
         expect(runtimeManager.interrupt).toHaveBeenCalledWith(locator)
-        expect(runtimeManager.resolveApproval).toHaveBeenCalledWith(locator, 'approval-1', { behavior: 'allow', updatedInput: {} })
+        expect(runtimeManager.resolveApproval).toHaveBeenCalledWith(locator, 'approval-1', { behavior: 'allow' })
         expect(runtimeManager.answerQuestion).toHaveBeenCalledWith(locator, 'question-1', { proceed: 'yes' })
         expect(runtimeManager.fork).toHaveBeenCalledWith(locator, undefined)
         expect(runtimeManager.subscribe).toHaveBeenCalledWith(
