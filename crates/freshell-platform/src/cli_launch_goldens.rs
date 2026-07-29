@@ -7,7 +7,7 @@ use crate::spawn::{build_windows_cli_spawn_spec, quote_powershell_literal, Shell
 
 /// `CLAUDE_SETTINGS_UNIX` (§4 conventions) — exact compact-JSON bytes:
 /// `SessionStart` (session-id signal file hook, P4) then `Stop` (bell).
-const CLAUDE_SETTINGS_UNIX: &str = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sh -lc 'd=\"$HOME/.freshell/session-signals/claude\"; f=\"$d/${FRESHELL_TERMINAL_ID:-unknown}__$$-$(date +%s%N)\"; mkdir -p \"$d\" && cat > \"$f.tmp\" && mv \"$f.tmp\" \"$f.json\"' 2>/dev/null || true"}]}],"Stop":[{"hooks":[{"type":"command","command":"sh -lc \"printf '\\a' > /dev/tty 2>/dev/null || true\""}]}]}}"#;
+const CLAUDE_SETTINGS_UNIX: &str = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sh -lc 'd=\"$HOME/.freshell/session-signals/claude\"; n=$(date +%s%N 2>/dev/null); case \"$n\" in *[!0-9]*|\"\") n=\"$(date +%s)000000000\";; esac; f=\"$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$\"; mkdir -p \"$d\" && cat > \"$f.tmp\" && mv \"$f.tmp\" \"$f.json\"' 2>/dev/null || true"}]}],"Stop":[{"hooks":[{"type":"command","command":"sh -lc \"printf '\\a' > /dev/tty 2>/dev/null || true\""}]}]}}"#;
 
 /// `CLAUDE_SETTINGS_WIN` — compact JSON: `SessionStart` (signal file hook,
 /// `\` appears in JSON as `\\`) then `Stop` (the windows bell string;

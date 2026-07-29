@@ -208,7 +208,18 @@ pub const CLAUDE_BELL_COMMAND_WINDOWS: &str = "powershell.exe -NoLogo -NoProfile
 /// launch silently disable the injected hook -- graceful degradation to
 /// today's stale-resume behavior (no rebind), never corruption; freshell
 /// cannot detect it.
-pub const CLAUDE_SESSION_START_COMMAND_UNIX: &str = "sh -lc 'd=\"$HOME/.freshell/session-signals/claude\"; f=\"$d/${FRESHELL_TERMINAL_ID:-unknown}__$$-$(date +%s%N)\"; mkdir -p \"$d\" && cat > \"$f.tmp\" && mv \"$f.tmp\" \"$f.json\"' 2>/dev/null || true";
+///
+/// Nonce portability + ordering contract: `%N` is GNU-only (BSD/macOS echo a
+/// literal `N`), so the nonce is built via a POSIX fallback -- timestamp
+/// FIRST (19 digits, zero-stable width; second-granularity where %N is
+/// unavailable), shell pid as tiebreaker. Digits and `-` only, so it can
+/// never contain the `__` filename delimiter, and a lexicographic filename
+/// sort in the consumer (`claude_signal.rs::drain`) is emission order on
+/// nanosecond-precision `date` (GNU) -- deterministic last-write-wins under
+/// rapid A->B->A switching. On the second-granularity fallback, same-second
+/// same-terminal order degrades to pid-string order (not guaranteed emission
+/// order) -- a residual sub-second ambiguity, corrected by the next signal.
+pub const CLAUDE_SESSION_START_COMMAND_UNIX: &str = "sh -lc 'd=\"$HOME/.freshell/session-signals/claude\"; n=$(date +%s%N 2>/dev/null); case \"$n\" in *[!0-9]*|\"\") n=\"$(date +%s)000000000\";; esac; f=\"$d/${FRESHELL_TERMINAL_ID:-unknown}__$n-$$\"; mkdir -p \"$d\" && cat > \"$f.tmp\" && mv \"$f.tmp\" \"$f.json\"' 2>/dev/null || true";
 
 /// Windows twin of [`CLAUDE_SESSION_START_COMMAND_UNIX`] (see its doc for the
 /// semantics + A7 degradation notes): reads the hook's stdin JSON via
@@ -591,3 +602,95 @@ pub fn resolve_cli_launch(
 #[cfg(test)]
 #[path = "cli_launch_goldens.rs"]
 mod cli_argv_goldens_file;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Single source of truth for the portable nonce logic embedded in
+    /// CLAUDE_SESSION_START_COMMAND_UNIX; the contains() test below keeps
+    /// the two in sync so the executable tests exercise the real snippet.
+    const CLAUDE_SIGNAL_NONCE_SNIPPET: &str =
+        "n=$(date +%s%N 2>/dev/null); case \"$n\" in *[!0-9]*|\"\") n=\"$(date +%s)000000000\";; esac";
+
+    #[test]
+    fn session_start_command_embeds_the_portable_nonce_snippet() {
+        assert!(
+            CLAUDE_SESSION_START_COMMAND_UNIX.contains(CLAUDE_SIGNAL_NONCE_SNIPPET),
+            "the unix SessionStart hook must build its nonce with the portable snippet"
+        );
+        assert!(
+            !CLAUDE_SESSION_START_COMMAND_UNIX.contains("__$$-"),
+            "nonce must be timestamp-first (pid last), not pid-first"
+        );
+    }
+
+    /// BSD/macOS `date` has no %N: it echoes a literal `N`. The snippet must
+    /// detect that and fall back to a zero-padded, digits-only nonce so the
+    /// consumer's filename sort stays correct on every platform.
+    #[cfg(unix)]
+    #[test]
+    fn nonce_snippet_is_all_digits_even_without_gnu_date() {
+        let dir =
+            std::env::temp_dir().join(format!("freshell-bsd-date-stub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("date");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"+%s%N\" ]; then echo 1769000000N; else echo 1769000000; fi\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "PATH=\"{}:$PATH\"; {}; printf %s \"$n\"",
+                dir.display(),
+                CLAUDE_SIGNAL_NONCE_SNIPPET
+            ))
+            .output()
+            .unwrap();
+        let n = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(
+            n, "1769000000000000000",
+            "BSD fallback: seconds + 9 zero digits"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// GNU date passthrough: full nanosecond precision is preserved.
+    #[cfg(unix)]
+    #[test]
+    fn nonce_snippet_preserves_gnu_precision() {
+        let dir =
+            std::env::temp_dir().join(format!("freshell-gnu-date-stub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = dir.join("date");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\nif [ \"$1\" = \"+%s%N\" ]; then echo 1769000000123456789; else echo 1769000000; fi\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "PATH=\"{}:$PATH\"; {}; printf %s \"$n\"",
+                dir.display(),
+                CLAUDE_SIGNAL_NONCE_SNIPPET
+            ))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "1769000000123456789"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
