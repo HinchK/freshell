@@ -674,7 +674,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const terminalContent = isTerminal ? paneContent : null
 
   // Register live terminal text reader for Stream Deck previews
-  useTerminalTextRegistration(terminalContent?.terminalId, termRef as never)
+  useTerminalTextRegistration(terminalContent?.terminalId, termRef)
 
   const extensions = useAppSelector((s) => s.extensions?.entries ?? [], shallowEqual)
   const shouldResolveProviderBehavior = isTerminal && providerUsesExtensionTerminalBehavior(terminalContent?.mode)
