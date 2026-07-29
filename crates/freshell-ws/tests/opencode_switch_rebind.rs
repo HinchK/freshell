@@ -895,6 +895,44 @@ async fn tui_switch_signal_rebinds_and_restart_resumes_the_new_id() {
     // Leave the signal dir empty, as every acted-on phase asserts.
     std::fs::remove_file(&retained_path).expect("clean up the retained signal");
 
+    // ---- Phase 10: a signal addressed to a FOREIGN-provider pane is
+    // explicitly ignored (logged) and CONSUMED -- it can never become
+    // actionable (a pane's mode never changes), so retaining it would just
+    // re-reject it silently every sweep for 10 minutes (unbounded noise).
+    let created_foreign = send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-oc-rebind-10",
+            "mode": "shell",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        }),
+    )
+    .await;
+    let tid_foreign = created_foreign["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+
+    write_opencode_signal(&signal_root, &tid_foreign, 10, "ses_foreignclaim0001");
+    freshell_ws::opencode_signal::drain_and_rebind_opencode(&state, &watcher).await;
+    // The pane was not touched...
+    assert!(
+        !frame_seen_within(&mut ws, std::time::Duration::from_secs(2), |v| {
+            v["type"] == "terminal.session.associated" && v["terminalId"] == tid_foreign.as_str()
+        })
+        .await,
+        "a foreign-provider pane must never be rebound by an opencode signal"
+    );
+    // ...and the file was consumed, not silently retained.
+    assert_eq!(
+        std::fs::read_dir(&signal_root).unwrap().count(),
+        0,
+        "foreign-provider signal files must be consumed (bounded), not retained"
+    );
+
+    registry.kill(&tid_foreign);
     registry.kill(&tid2);
     registry.kill(&tid3);
     registry.kill(&tid5);
