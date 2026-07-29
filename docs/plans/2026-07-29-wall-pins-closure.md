@@ -159,7 +159,7 @@ git commit -m "feat(existence): split ever_observed_on_disk from ever_observed (
 - Consumes: `SessionExistenceProbe::ever_observed_on_disk(provider, session_id) -> bool` (Task 1); `ReconcileDeps.pane_ledger: &PaneLedger` with `ever_bound(&self, provider: &str, session_id: &str) -> bool`; existing helpers `base(pane, verdict)`, `corrected_flag(claim, resolved)`, `deps.registry.respawn_exhausted(&key)`.
 - Produces: claude Absent-arm behavior — `Respawn` (carrying `session_ref`) for ledger-bound, never-disk-observed claude identities; unchanged `DeadSession{session_not_on_disk}` for disk-observed-then-deleted; unchanged everything else. The composed-ruler wall leg depends on this.
 
-**Design decision (record in the code comment, verbatim rationale):** the carve-out mirrors the amplifier arm but is narrower — it requires (a) `sref.provider == "claude"`, (b) a durable ledger binding (`ever_bound`), and (c) the transcript never having been SEEN on disk (`!ever_observed_on_disk`). Condition (c) preserves the hazard guard within a boot (a deleted transcript that WAS observed stays an immediate `DeadSession{session_not_on_disk}` — existing test `row4_absent_but_ever_observed_yields_dead_session` keeps passing unchanged). Across a restart, a conversed-then-deleted transcript is indistinguishable from never-conversed by these signals; that case takes the same escape the amplifier arm already accepts — §7.5's `respawn_exhausted` convergence ends a respawn↔instant-exit loop in an actionable `DeadSession{respawn_exhausted}`, never thrash and never silent. Coherence with PR #565: the locator fallback fires only when a transcript FILE EXISTS (converting false-Absent to Present ⇒ Respawn); this arm fires only in the true-Absent branch (file never created). Zero overlap, two halves of one rule: "a claude identity the disk has no memory of is respawnable; one the disk remembers and lost is dead."
+**Design decision (record in the code comment, verbatim rationale):** the carve-out mirrors the amplifier arm but is narrower — it requires (a) `sref.provider == "claude"`, (b) a durable ledger binding (`ever_bound`), and (c) the transcript never having been SEEN on disk (`!ever_observed_on_disk`). Condition (c) preserves the hazard guard within a boot (a deleted transcript that WAS observed stays an immediate `DeadSession{session_not_on_disk}` — existing test `row4_absent_but_ever_observed_yields_dead_session` keeps passing unchanged). Across a restart, a conversed-then-deleted transcript is indistinguishable from never-conversed by these signals; that case takes the same escape the amplifier arm already accepts — §7.5's `respawn_exhausted` convergence ends a respawn↔instant-exit loop in an actionable `DeadSession{respawn_exhausted}`, never thrash and never silent. **Verified real-CLI semantics (load-bearing validation, claude v2.1.220 binary inspection — `.the-usual-logs/wall-pins-closure/reports/V2-real-claude-contract.md`):** `--resume <not-found id>` prints an error and exits 1 in both the print and interactive entrypoints — it does NOT recreate a transcript. Against real claude this carve-out's value is therefore loud convergence (respawn → fast exit → respawn_exhausted → actionable DeadSession), while the wall's fake CLI accepts `--resume` and restores. A `--session-id` (start-intent) respawn was considered and REJECTED: real claude's in-use guard is disk-based, so it would SILENTLY start fresh under a conversed-then-deleted id — the exact silence this contract forbids. Coherence with PR #565: the locator fallback fires only when a transcript FILE EXISTS (converting false-Absent to Present ⇒ Respawn); this arm fires only in the true-Absent branch (file never created). Zero overlap, two halves of one rule: "a claude identity the disk has no memory of is respawnable; one the disk remembers and lost is dead."
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -168,9 +168,12 @@ In `crates/freshell-ws/src/reconcile.rs` `mod tests`, after `amplifier_absent_ev
 ```rust
     /// PIN 1 red test: a claude pane whose session id was preallocated at
     /// create (ledger-bound, durable) but which NEVER conversed has no
-    /// transcript file -> Absent. That is not a dead state: claude's
-    /// --resume/--session-id recreates the file on first output (mirror of
-    /// the amplifier arm). Kata 09v1's locator fallback covers
+    /// transcript file -> Absent. That is not an immediately-dead state:
+    /// respawning with --resume mirrors the amplifier arm. Against the
+    /// wall's fake CLI the pane restores; REAL claude (verified v2.1.220)
+    /// errors-and-exits on a not-found id, which §7.5 respawn_exhausted
+    /// converges to a loud, actionable DeadSession -- never silent.
+    /// Kata 09v1's locator fallback covers
     /// exists-but-unparseable; this covers never-created.
     #[test]
     fn claude_never_conversed_yields_respawn_not_dead_session() {
@@ -235,8 +238,13 @@ In `crates/freshell-ws/src/reconcile.rs`, in the `SessionExistence::Absent` arm,
             // the binding row is durable before the answer — but the
             // transcript file only appears on first output. Ledger-bound +
             // Absent + never SEEN on disk therefore means "created, never
-            // conversed", not dead: claude's --resume/--session-id recreates
-            // the file on first output. Kata 09v1's locator fallback
+            // conversed", not dead: Respawn is the actionable verdict. The
+            // e2e fake accepts --resume and restores; REAL claude (verified
+            // v2.1.220) errors-and-exits on a not-found --resume id, which
+            // §7.5 respawn_exhausted converges to a loud DeadSession --
+            // never silent (a --session-id start-intent respawn was
+            // rejected: it would silently reuse a conversed-then-deleted
+            // id). Kata 09v1's locator fallback
             // (freshell-server existence.rs) already converts
             // exists-but-unparseable into Present => Respawn; this arm covers
             // never-created — two halves of one rule, no overlap. A
@@ -284,6 +292,20 @@ git add crates/freshell-ws/src/reconcile.rs
 git commit -m "fix(reconcile): claude never-conversed sessions respawn instead of dead_session (PIN 1)"
 ```
 
+- [ ] **Step 5b: Update the collateral spec pinned to the old claude verdict (validated blast radius)**
+
+Load-bearing validation found exactly one green e2e test that pins the behavior this carve-out inverts: `test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts:418-480` ("dead sessions → ONE batched panel") builds claude panes that are ledger-bound, deletes their transcripts while the server is down, restarts, and asserts the batched "Dead sessions" dialog. Under the carve-out that shape now derives `Respawn` (ever_bound + never observed on disk in the NEW epoch) — the dialog never appears and the test goes deterministically red.
+
+Update the test to preserve its actual contract (multiple dead sessions batch into one panel) without depending on the claude deleted-while-down shape: switch the dead-session fixture panes to a provider WITHOUT an Absent-arm carve-out (codex or opencode — their Absent still derives `DeadSession`), or use an in-boot observed-then-deleted claude shape (which stays `DeadSession` per the hazard guard). Keep the batching assertions otherwise equivalent; do not weaken the contract.
+
+Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium reconcile-client-adoption-rust.spec.ts`
+Expected: red before the update (the batched-panel leg), green after it — record both in the commit body.
+
+```bash
+git add test/e2e-browser/specs/reconcile-client-adoption-rust.spec.ts
+git commit -m "test(e2e): dead-session batching no longer keys on claude deleted-while-down (PIN 1 carve-out derives Respawn there)"
+```
+
 - [ ] **Step 6: Prove the ruler leg flips (RED signal = unexpected pass)**
 
 Build and run the still-pinned ruler leg:
@@ -294,6 +316,8 @@ npx playwright test --config test/e2e-browser/playwright.config.ts --project=rus
 ```
 
 Expected: the run FAILS with Playwright's "passed unexpectedly" error for the `test.fail`-annotated ruler — that is the flip signal. (The ruler has `test.setTimeout(600_000)`; expect up to 10 minutes.)
+
+(Baseline validation at `c1c67464` confirmed the ruler's only recorded error is the claude `--resume` argv poll at `:1753` — but the ruler aborts at its first failing await, so the sub-assertions AFTER `:1762` (codex/opencode resume, fresh* rehydration, etc.) have never executed under composition on this commit. A newly-surfaced red there is possible once the claude leg passes; it takes the contingency path below — re-diagnosis, never re-pin.)
 
 **If instead the ruler still fails expectedly** (a leg OTHER than the claude `--resume` argv poll is red), do NOT delete the pin here — record the failing leg's error verbatim in the commit-message body of a `wip` note commit, continue to Task 3, and re-attempt this flip in Task 8 Step 2. If it still cannot flip there, HALT the workflow and report the evidence (never re-pin).
 
@@ -325,16 +349,17 @@ git commit -m "test(wall): flip the composed-ruler pin — claude never-converse
 
 ---
 
-### Task 3: Pin 3 server — pending-marker read → `fresh_by_race`, one-shot consumption
+### Task 3: Pin 3 server — pending-marker read → `fresh_by_race`, idempotent read-only
+
+**Design decision (validated — supersedes the brief's one-shot consumption):** load-bearing validation FALSIFIED delete-at-derive consumption: the client re-sends `pane.reconcile` on EVERY WS ready precisely because a response can be dropped (`App.tsx:1029-1053` — "a result is not guaranteed (deferral, drop, error frame), so reconnect covers loss windows"), and the server's send is best-effort (`terminal.rs:76`). Consuming the marker before/around the send means a dropped response makes the retry derive a silent `no_recoverable_identity` — losing the breadcrumb to the exact churn Pin 3 exists to eliminate. The marker read is therefore READ-ONLY and IDEMPOTENT: every reconcile that still sees the marker derives the same loud `fresh_by_race`. Markers are still never promoted; locator resolution or the ledger's existing GC deletes them, and a recreated pane's new terminal id makes the old marker unreachable, so repeated breadcrumbs do not occur in practice. (Bonus: this keeps `pane-ledger-restart-rust.spec.ts:182,246,318` — which pin markers PRESERVED across restart — green.) Accepted residual: a pane recreated by the census fallback under a new terminal id leaves its old marker dormant until GC (no breadcrumb — same as today for that shape).
 
 **Files:**
-- Modify: `crates/freshell-ws/src/reconcile.rs` (the no-identity Fresh path at lines ~286–296; new pub helper; `mod tests`)
-- Modify: `crates/freshell-ws/src/terminal.rs` (`handle_pane_reconcile`, ~line 3282; verdicts computed at `:3330-3333`, response sent at `:3382-3388`)
+- Modify: `crates/freshell-ws/src/reconcile.rs` (the no-identity Fresh path at lines ~286–296; `mod tests`)
 - Test: `crates/freshell-ws/src/reconcile.rs` `mod tests`
 
 **Interfaces:**
-- Consumes: `PaneLedger::pending_for_terminal(&self, terminal_id: &str) -> Option<PendingMarker>` (reader-rule: `None` if a binding row covers the terminal — `pane_ledger.rs:787`); `PaneLedger::record_pending(&self, terminal_id: &str, mode: &str, cwd: Option<&str>, now_ms: i64) -> io::Result<()>`; `PaneLedger::delete_pending(&self, terminal_id: &str) -> io::Result<()>`; `ReconcilePane.terminal_id: Option<String>` (the client's stale pre-kill terminal id — the marker's key).
-- Produces: new verdict reason string `"fresh_by_race"` on `Fresh` verdicts (free-form field — no contract regeneration); `pub fn fresh_by_race_marker_tids(panes: &[ReconcilePane], verdicts: &[PaneVerdict]) -> Vec<String>` in `reconcile.rs` (verdicts are 1:1 with request order — documented on `PaneVerdict.pane_key`); marker consumption in `handle_pane_reconcile`. Task 4's client breadcrumb keys on the literal reason string `fresh_by_race`.
+- Consumes: `PaneLedger::pending_for_terminal(&self, terminal_id: &str) -> Option<PendingMarker>` (reader-rule: `None` if a binding row covers the terminal — `pane_ledger.rs:787`); `PaneLedger::record_pending(&self, terminal_id: &str, mode: &str, cwd: Option<&str>, now_ms: i64) -> io::Result<()>` (tests only); `ReconcilePane.terminal_id: Option<String>` (the client's stale pre-kill terminal id — the marker's key).
+- Produces: new verdict reason string `"fresh_by_race"` on `Fresh` verdicts (free-form field — no contract regeneration), derived idempotently from the marker's presence. Task 4's client breadcrumb keys on the literal reason string `fresh_by_race`. No `terminal.rs` change and no deletion helper.
 
 **Load-bearing verification folded in (Step 1):** the design claims the client re-presents the dead epoch's `terminalId` on post-restart reconcile (that is the marker join key — markers are keyed by `terminal_id`, and `createRequestId` is not stored on markers). The pinned leg itself proves the client retains it (its settle-poll at `:1988-1995` waits for `content.terminalId` to CHANGE from the pre-kill value, so the pre-kill value was present). Confirm the reconcile REQUEST carries it: `grep -n "terminalId" src/lib/pane-reconcile.ts | head -30` — the request builder must include the pane's current `terminalId`. If (and only if) it demonstrably does not, STOP this task and report: the fallback design (extending `PendingMarker` with an optional `create_request_id` field and joining on that) is a schema change that needs plan-review, not an inline improvisation.
 
@@ -363,11 +388,15 @@ In `crates/freshell-ws/src/reconcile.rs` `mod tests`:
         assert_eq!(v.reason.as_deref(), Some("fresh_by_race"));
     }
 
-    /// One-shot semantics (§6 decision 5): once the marker is consumed, a
-    /// later reconcile derives the plain labeled fresh — the breadcrumb
-    /// fires exactly once.
+    /// Delivery-safety pin (validated design change): the marker read is
+    /// IDEMPOTENT and read-only. The client re-sends pane.reconcile on
+    /// every WS ready precisely because a response can be dropped
+    /// (App.tsx:1029-1053); consuming the marker at derive would turn that
+    /// retry into a silent no_recoverable_identity — losing the breadcrumb
+    /// to the exact churn PIN 3 eliminates. A retry must derive the same
+    /// loud verdict, and the marker must still exist afterwards.
     #[test]
-    fn consumed_marker_reverts_to_no_recoverable_identity() {
+    fn marker_read_is_idempotent_across_reconciles() {
         let f = Fixture::new();
         f.ledger
             .record_pending("T-race2", "opencode", None, 1_000)
@@ -375,17 +404,15 @@ In `crates/freshell-ws/src/reconcile.rs` `mod tests`:
         let mut p = pane("cr-race2");
         p.mode = Some("opencode".to_string());
         p.terminal_id = Some("T-race2".to_string());
-        let first = f.one(p.clone());
+        let first = f.one(p);
         assert_eq!(first.reason.as_deref(), Some("fresh_by_race"));
-        // Consume, as handle_pane_reconcile does for fresh_by_race verdicts.
-        let tids = fresh_by_race_marker_tids(&[p.clone()], &[first]);
-        assert_eq!(tids, vec!["T-race2".to_string()]);
-        for tid in &tids {
-            f.ledger.delete_pending(tid).expect("delete pending");
-        }
-        let second = f.one(p);
+        let mut p2 = pane("cr-race2");
+        p2.mode = Some("opencode".to_string());
+        p2.terminal_id = Some("T-race2".to_string());
+        let second = f.one(p2);
         assert_eq!(second.verdict, ReconcileVerdict::Fresh);
-        assert_eq!(second.reason.as_deref(), Some("no_recoverable_identity"));
+        assert_eq!(second.reason.as_deref(), Some("fresh_by_race"));
+        assert!(f.ledger.pending_for_terminal("T-race2").is_some());
     }
 
     /// Shell panes stay bare fresh even with a stray marker — the marker
@@ -405,14 +432,12 @@ In `crates/freshell-ws/src/reconcile.rs` `mod tests`:
     }
 ```
 
-(If `ReconcilePane` does not derive `Clone`, build `p` twice from the same literal instead of `p.clone()`.)
-
 - [ ] **Step 3: Run to verify RED**
 
 Run: `cargo test -p freshell-ws --lib reconcile`
-Expected: `pending_marker_yields_fresh_by_race_not_silent_fresh` FAILS with reason `no_recoverable_identity`; `consumed_marker_reverts_...` fails to compile (`fresh_by_race_marker_tids` undefined); `shell_pane_ignores_pending_markers` PASSES (pins existing behavior).
+Expected: `pending_marker_yields_fresh_by_race_not_silent_fresh` and `marker_read_is_idempotent_across_reconciles` FAIL with reason `no_recoverable_identity`; `shell_pane_ignores_pending_markers` PASSES (pins existing behavior).
 
-- [ ] **Step 4: Implement the read + the helper**
+- [ ] **Step 4: Implement the read**
 
 In `crates/freshell-ws/src/reconcile.rs`, replace the no-identity else-branch (lines ~286–296) body:
 
@@ -427,10 +452,15 @@ In `crates/freshell-ws/src/reconcile.rs`, replace the no-identity else-branch (l
         // §4.2 pending-marker read (PIN 3): a durable pending marker keyed by
         // the client's stale terminal id means identity establishment was in
         // flight when the server died — fresh by RACE, not by intent. The
-        // reason is distinct and surfaced (client breadcrumb); the caller
-        // consumes the marker so the breadcrumb fires exactly once
-        // (§6 decision 5: markers are never promoted — resolution or
-        // consumption deletes them).
+        // reason is distinct and surfaced (client breadcrumb). The read is
+        // deliberately IDEMPOTENT and read-only (amends §6 decision 5's
+        // consumption clause): the client re-sends pane.reconcile on every
+        // WS ready because a response can be dropped (App.tsx:1029-1053) —
+        // consuming the marker at derive would turn that retry into a
+        // silent no_recoverable_identity. Markers are still never promoted;
+        // locator resolution or the ledger's GC deletes them, and a
+        // recreated pane's new terminal id makes the old marker
+        // unreachable.
         if let Some(tid) = pane.terminal_id.as_deref() {
             if deps.pane_ledger.pending_for_terminal(tid).is_some() {
                 return PaneVerdict {
@@ -446,48 +476,12 @@ In `crates/freshell-ws/src/reconcile.rs`, replace the no-identity else-branch (l
     };
 ```
 
-And add the pub helper (near `derive_verdicts`, outside `mod tests`):
+- [ ] **Step 5: Confirm no consumption wiring exists or is needed (delivery-safety design)**
 
-```rust
-/// PIN 3 / §6 decision 5 one-shot: the terminal ids whose verdicts were
-/// labeled fresh_by_race — the caller deletes their pending markers so the
-/// breadcrumb fires exactly once. Verdicts are 1:1 with request order
-/// (see `PaneVerdict::pane_key`).
-pub fn fresh_by_race_marker_tids(panes: &[ReconcilePane], verdicts: &[PaneVerdict]) -> Vec<String> {
-    panes
-        .iter()
-        .zip(verdicts)
-        .filter(|(_, v)| v.reason.as_deref() == Some("fresh_by_race"))
-        .filter_map(|(p, _)| p.terminal_id.clone())
-        .collect()
-}
-```
+No `terminal.rs` change: the derive path in `reconcile.rs` is the READ side's only touch point (see this task's design decision — delete-at-derive was falsified by load-bearing validation). Confirm and record in the commit body:
 
-- [ ] **Step 5: Wire consumption into `handle_pane_reconcile`**
-
-In `crates/freshell-ws/src/terminal.rs`, inside `async fn handle_pane_reconcile` (~:3282), after `let mut verdicts` is fully computed (`:3333`, after the `catch_unwind` derive closure resolves) and BEFORE the `PaneReconcileResult` send (`:3382`):
-
-```rust
-    // PIN 3 one-shot: fresh_by_race verdicts consume their pending markers —
-    // the next reconcile for the same dead terminal derives a plain
-    // no_recoverable_identity. Blocking-pool, same budget reasoning as every
-    // other ledger write site (V1.md).
-    let race_tids = crate::reconcile::fresh_by_race_marker_tids(&request.panes, &verdicts);
-    if !race_tids.is_empty() {
-        let ledger = std::sync::Arc::clone(&state.pane_ledger);
-        tokio::task::spawn_blocking(move || {
-            for tid in race_tids {
-                if let Err(err) = ledger.delete_pending(&tid) {
-                    tracing::warn!(terminal_id = %tid, error = %err, "pane_ledger_marker_delete_failed_on_fresh_by_race");
-                }
-            }
-        })
-        .await
-        .ok();
-    }
-```
-
-(Match the module-path style already used at `:3330` for `derive_verdicts` — if it's imported unqualified, call `fresh_by_race_marker_tids` unqualified too. If `verdicts` at that point is inside a different scope/shape than a plain `Vec<PaneVerdict>`, place this block wherever both `request.panes` and the final verdicts vec are in scope, still before the send.)
+Run: `grep -n "delete_pending" crates/freshell-ws/src/*.rs`
+Expected: call sites only in locator-resolution/exit-hook/GC paths and `pane_ledger.rs` itself — NONE in `handle_pane_reconcile`. (For reference, the alignment fact the old design leaned on was verified anyway: `derive_verdicts` is a total, order-preserving 1:1 map — reconcile.rs:45-64 — and `handle_pane_reconcile` passes untransformed `&request.panes` at `:3330`/`:3368`.)
 
 - [ ] **Step 6: Run to verify GREEN**
 
@@ -504,8 +498,8 @@ Expected: no diff, all green.
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings`
 
 ```bash
-git add crates/freshell-ws/src/reconcile.rs crates/freshell-ws/src/terminal.rs
-git commit -m "feat(reconcile): pending-marker read derives loud fresh_by_race with one-shot consumption (PIN 3 server)"
+git add crates/freshell-ws/src/reconcile.rs
+git commit -m "feat(reconcile): pending-marker read derives loud fresh_by_race, idempotent read-only (PIN 3 server)"
 ```
 
 ---
@@ -607,7 +601,7 @@ In `src/components/TerminalView.tsx`:
           }
 ```
 
-(Only the `if (createdReconcileNotice === ...)` lines are new; keep the rest byte-identical. The attach-path site at ~`:5040` is left unchanged — a fresh verdict always arrives via `terminal.created`.)
+(Only the `if (createdReconcileNotice === ...)` lines are new; keep the rest byte-identical. The attach-path site at ~`:5040` is left unchanged — verified: a fresh verdict's fold clears `terminalId` and stores the notice (`panesSlice.ts:1948,1951,1982-1983`), so the drive effect takes the CREATE branch (`TerminalView.tsx:5009` vs `:5076`) and the notice is consumed at this site in the same handler invocation that sets the new `terminalId` (`:4258-4262`). Accepted residual: a dropped `terminal.created` that later routes via attach skips the overlay — low-probability, and Task 3's idempotent marker read re-labels the next reconcile anyway.)
 
 (d) In the root JSX at ~line 5228, inside the `wrapperRef` div (which has `relative` when visible), as a sibling of the `containerRef` xterm div:
 
@@ -704,7 +698,7 @@ Immediately after the existing `expect(resumed || breadcrumbVisible).toBe(true)`
 npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium restore-contract-wall-rust.spec.ts -g "SIGKILL-inside-locator-window"
 ```
 
-Expected: PASS, twice sequentially. If the re-capture poll is the flaky part (locator window mechanics), investigate against the green `freshopencode` leg (`:1051`) which exercises the same fake row-gate machinery — do not delete the assertion to get green.
+Expected: PASS, twice sequentially. If the re-capture poll is the flaky part (locator window mechanics), investigate the row-gate machinery directly: the fake's gate-poll → db-row write (`test/e2e-browser/fixtures/fake-opencode-terminal.mjs`, writes the `ses_` row to the `XDG_DATA_HOME/opencode/opencode.db` the locator watches) and the locator sweep (`opencode_locator.rs` — 150ms sweep; a late Enter re-opens an expired window). NOTE (validated): the `freshopencode` leg (`:1051`) is NOT a comparator — it uses the SIDECAR fake, not the row gate. `restartAbrupt` relaunches with identical env (`helpers/rust-server.ts:413-447,477-492`), so the gate env survives the restart. Do not delete the assertion to get green.
 
 - [ ] **Step 6: Commit**
 
@@ -839,7 +833,15 @@ And add the anchor comment on the line directly above the PTY `spawn_blocking` c
     // PIN2_PTY_SPAWN_ANCHOR: the spawn makes preallocated identity observable.
 ```
 
-Notes for the implementer: (1) this fires for claude resume-creates too — their binding row already exists from a prior epoch, so the re-write is a no-op refresh; (2) `MARKER_MODES` correctly still excludes claude (claude has create-time identity and no post-spawn resolver — this write IS its durability story; record this answer to the brief's "should claude also get a marker?" question in the commit body: no — a binding row before spawn is strictly stronger than a marker); (3) the pre-spawn window for `MARKER_MODES` providers (their marker is also written post-spawn) is a known residual NOT exercised by any wall leg — do not fix it here (YAGNI; noted for a follow-up if a leg ever pins it).
+Notes for the implementer: (1) this fires for claude resume-creates too — the re-write retargets the existing `(provider, session_id)` row at the new terminal id pre-spawn. Validated benign: supersession keys on the freshly-minted tid, the two-bound-rows repair groups by tid, and every recovery path keys on `(provider, session_id)`, so the prior epoch stays recoverable even if this spawn fails or is killed mid-window; (2) `MARKER_MODES` correctly still excludes claude (claude has create-time identity and no post-spawn resolver — this write IS its durability story; record this answer to the brief's "should claude also get a marker?" question in the commit body: no — a binding row before spawn is strictly stronger than a marker); (3) the pre-spawn window for `MARKER_MODES` providers (their marker is also written post-spawn) is a known residual NOT exercised by any wall leg — do not fix it here (YAGNI; noted for a follow-up if a leg ever pins it).
+
+- [ ] **Step 4b: Clean up the row when the spawn FAILS (validated gap)**
+
+Load-bearing validation falsified "a row for a spawn-failed create is benign": the spawn-failure branch (`terminal.rs:2218-2275`) does no ledger cleanup, so a pre-spawn row for a failed FRESH claude create would surface as a ghost `ledgerOnly` recovery offer (a pane that never existed) for ~30 days. (Lock-safety at the insertion point WAS verified: only RAII guards already held across the existing spawn `.await` — no new hazard.)
+
+Capture at the preallocation site (`:1649`) whether this create is a fresh claude preallocation (e.g. `let claude_fresh_prealloc = true;` alongside the `Uuid::new_v4()` assignment; `false` otherwise). In the spawn-failure branch, when `claude_fresh_prealloc` holds, delete the just-written row: use the ledger's existing binding-removal API (grep `pane_ledger.rs` for the deletion used by supersession/repair; if none is exposed, add `pub fn delete_binding(&self, provider: &str, session_id: &str) -> io::Result<()>` mirroring `delete_pending`'s atomic delete), wired through the same `spawn_blocking` + `surface_write_failure` pattern as the write. Do NOT delete on resume-creates — that row belongs to the prior epoch and must stay recoverable (validated, note (1) above).
+
+Test: add a `pane_ledger` unit test `deleted_binding_row_is_gone_for_recovery_readers` (record binding → delete → the reader that feeds the recovery inventory no longer returns the row). The failure-branch wiring is covered by the per-task spec review plus the Step 2 ordering pin's anchors.
 
 - [ ] **Step 5: Run to verify GREEN**
 
@@ -881,6 +883,8 @@ The current probe can never match the shipped UI — `getByText(/recover .*pane/
 ```
 
 (The poll's other arm — a pane whose `sessionRef.sessionId === preallocatedId` — stays byte-identical; the contract is unchanged: auto-restored OR visibly offered.)
+
+Validated note: do NOT assert WHERE the entry lives in the inventory (`ledgerOnly` vs the `device.tabs` arm) — a pre-kill tabs-snapshot push (subscribe-driven, un-debounced) may race the SIGKILL and relocate the row between the two arms across runs; either way `recoverable` stays true and the panel renders. The testid + `recoverable` are the stable contract.
 
 - [ ] **Step 2: Prove the leg flips (unexpected pass)**
 
@@ -975,9 +979,10 @@ Expected: three consecutive fully-green runs, zero pins, zero unexpected passes.
 npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium hidden-pane-rebind-rust.spec.ts
 npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium reconcile-client-adoption-rust.spec.ts reconcile-completion-rust.spec.ts reconcile-handshake-rust.spec.ts
 npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium recover-my-panes-rust.spec.ts
+npx playwright test --config test/e2e-browser/playwright.config.ts --project=rust-chromium pane-ledger-restart-rust.spec.ts
 ```
 
-Expected: all green (`recover-my-panes` guards Task 6/7 against regressions in the offer flow; the reconcile suites guard Tasks 2–4).
+Expected: all green (`recover-my-panes` guards Task 6/7 against regressions in the offer flow; the reconcile suites guard Tasks 2–4 — note `reconcile-client-adoption` was already updated in Task 2 Step 5b; `pane-ledger-restart` pins markers PRESERVED across restart, which Task 3's read-only design deliberately keeps true — validated blast radius).
 
 - [ ] **Step 7: Push the branch — NO PR**
 
@@ -993,8 +998,8 @@ Do NOT open a pull request. Landing happens outside this workflow with the final
 ## Self-Review (performed against the task spec)
 
 **1. Spec coverage:**
-- Pin 1 claude carve-out mirroring amplifier → Task 2. PR #565 coherence (two halves, no overlap) → Task 2 design decision + comment. Named red test `claude_never_conversed_yields_respawn_not_dead_session` → Task 2 Step 1. Composed ruler leg → Task 2 Steps 6–8. True-positive hazard guard → Task 2 `claude_deleted_after_conversation_stays_dead_session` (in-boot, direct) + `respawn_exhausted` convergence for the cross-restart shape (explicit design decision, mirrored from the amplifier arm's accepted tradeoff).
-- Pin 3 read side before generic Fresh, marker lookup by terminalId lineage, distinct surfaced `fresh_by_race` → Task 3. Client fold breadcrumb visible → Task 4 (reason already flows through the fold; text + DOM visibility are where the change bites — noted explicitly). Contract-pinned check → verified NOT pinned; gates still run generate/test:port/protocol (Tasks 3, 8). P1.10 "verify then build" → verified LANDED (Task 5 Step 1 evidence) + end-to-end re-capture assertion added to the leg (Task 5 Step 4). Red tests: unit marker→fresh_by_race (Task 3), e2e breadcrumb + re-capture + pin flip (Task 5).
+- Pin 1 claude carve-out mirroring amplifier → Task 2. PR #565 coherence (two halves, no overlap) → Task 2 design decision + comment. Named red test `claude_never_conversed_yields_respawn_not_dead_session` → Task 2 Step 1. Composed ruler leg → Task 2 Steps 6–8. True-positive hazard guard → Task 2 `claude_deleted_after_conversation_stays_dead_session` (in-boot, direct) + `respawn_exhausted` convergence for the cross-restart shape (explicit design decision, mirrored from the amplifier arm's accepted tradeoff, and now grounded in VERIFIED real-CLI semantics — see the Task 2 design decision). Collateral blast radius (validated): the one green spec pinning the inverted claude verdict (`reconcile-client-adoption-rust.spec.ts`) is updated in Task 2 Step 5b.
+- Pin 3 read side before generic Fresh, marker lookup by terminalId lineage, distinct surfaced `fresh_by_race` → Task 3 (the brief's one-shot consumption was FALSIFIED by delivery-semantics validation and replaced with an idempotent read-only design — Task 3's design decision). Client fold breadcrumb visible → Task 4 (reason already flows through the fold; text + DOM visibility are where the change bites — noted explicitly). Contract-pinned check → verified NOT pinned; gates still run generate/test:port/protocol (Tasks 3, 8). P1.10 "verify then build" → verified LANDED (Task 5 Step 1 evidence) + end-to-end re-capture assertion added to the leg (Task 5 Step 4). Red tests: unit marker→fresh_by_race (Task 3), e2e breadcrumb + re-capture + pin flip (Task 5).
 - Pin 2 instrument FIRST → Task 6 Step 1 (empirical bindings-at-kill disambiguation, recorded). Candidate (a) boot-state unwired → disproven with evidence (wired via App.tsx:1926; green recover-my-panes e2e). Candidate (b) race → real code-level window; fixed by durability-before-spawn (Task 6). Claude marker question → answered explicitly (binding-before-spawn is strictly stronger; recorded in commit body). Red tests: wall leg (Task 7) + ordering pin `claude_binding_write_precedes_pty_spawn_in_handle_create` (Task 6, the unit-level pin on the broken link).
 - Gates: fmt/clippy/cargo test, npm test with summary + coordinator wait, test:port, lint, release build, full wall ×3 with zero pins, hidden-pane-rebind + reconcile (+ recover-my-panes) suites, ephemeral ports, no-PR push → Task 8 + Global Constraints. Fix order Pin 1 → Pin 3 → Pin 2 → task order 1–7.
 
@@ -1002,4 +1007,6 @@ Do NOT open a pull request. Landing happens outside this workflow with the final
 
 **2. Placeholder scan:** two steps intentionally reference sibling-test fixtures by exact name instead of inlining unknown fixture internals (Task 1 Step 1 construction lines; Task 5 Step 4 leaf-lookup fallback note) — in both, the assertions and target behavior are fully specified and the referenced fixture is named with file+line. No TBDs, no "handle edge cases", no test-less "write tests" steps.
 
-**3. Type consistency:** `ever_observed_on_disk(&self, provider: &str, session_id: &str) -> bool` used identically in Tasks 1 and 2; `fresh_by_race_marker_tids(panes: &[ReconcilePane], verdicts: &[PaneVerdict]) -> Vec<String>` defined (Task 3 Step 4) matches both call sites (Task 3 Steps 2 and 5); `RECONCILE_NOTICE_FRESH_BY_RACE` defined (Task 4 Step 3) matches the import (Task 4 Step 5) and the e2e regex (verified by the Task 4 unit test); `BindingWrite` field set (`provider, session_id, terminal_id, mode, cwd, create_request_id, now_ms`) is identical across Task 2, Task 3 (none), and Task 6, matching the existing write block at `terminal.rs:2434-2443`; the reason strings `fresh_by_race` / `no_recoverable_identity` / `session_not_on_disk` are used byte-identically across server, tests, and client.
+**3. Type consistency:** `ever_observed_on_disk(&self, provider: &str, session_id: &str) -> bool` used identically in Tasks 1 and 2; `RECONCILE_NOTICE_FRESH_BY_RACE` defined (Task 4 Step 3) matches the import (Task 4 Step 5) and the e2e regex (verified by the Task 4 unit test); `BindingWrite` field set (`provider, session_id, terminal_id, mode, cwd, create_request_id, now_ms`) is identical across Task 2, Task 3 (none), and Task 6, matching the existing write block at `terminal.rs:2434-2443`; the reason strings `fresh_by_race` / `no_recoverable_identity` / `session_not_on_disk` are used byte-identically across server, tests, and client.
+
+**4. Load-bearing validation round (post-plan, pre-execution):** 12 assumptions surfaced, all resolved — full ledger at `/home/dan/code/freshell/.worktrees/.the-usual-logs/wall-pins-closure/load-bearing-ledger.md` (validator evidence in `reports/V1..V7`). Verified (8): ruler's sole red cause is the claude argv poll (baseline run, JSON reporter — 12 non-pinned legs green); Respawn→`--resume` argv has no downstream existence gate; the recovery-offer chain works with a binding row alone (referenced-row rule only relocates the entry); notice routes through the created site; verdicts are 1:1 with request panes; resume-create pre-spawn rewrite is benign; row-gate env survives `restartAbrupt`; wall baseline stable. Falsified (4), plan updated accordingly: real claude `--resume` does NOT recreate a never-created transcript (Task 2 rationale corrected; `--session-id` alternative rejected as silent-fresh-hazardous); delete-at-derive marker consumption loses breadcrumbs to reconnect churn (Task 3 redesigned read-only/idempotent); a pre-spawn row for a spawn-FAILED fresh create becomes a ghost offer (Task 6 Step 4b cleanup added); two green specs pinned inverted behaviors (Task 2 Step 5b spec update; `pane-ledger-restart` kept green by the Task 3 redesign and added to Task 8 Step 6). Accepted residuals are recorded in the ledger's "Acceptable decisions" section.
