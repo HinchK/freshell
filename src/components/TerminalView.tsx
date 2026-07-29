@@ -162,6 +162,7 @@ import {
   scrollLinesToCursorKeys,
   shouldTranslateScrollToCursorKeys,
 } from '@/lib/terminal-behavior'
+import { useTerminalTextRegistration } from '@/deck/terminal-text-registry'
 import { buildRestoreError, sanitizeSessionRef } from '@shared/session-contract'
 
 const log = createLogger('TerminalView')
@@ -671,6 +672,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // Extract terminal-specific fields (safe because we check kind later)
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
+
+  // Register live terminal text reader for Stream Deck previews (classic tile style)
+  useTerminalTextRegistration(terminalContent?.terminalId, termRef)
 
   const extensions = useAppSelector((s) => s.extensions?.entries ?? [], shallowEqual)
   const shouldResolveProviderBehavior = isTerminal && providerUsesExtensionTerminalBehavior(terminalContent?.mode)
