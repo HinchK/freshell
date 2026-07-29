@@ -1470,37 +1470,18 @@ test.describe('Restore Contract Wall (P0.1)', () => {
     // tabs), and a 300 s budget recreates the same sum-of-gates > timeout
     // defect the f3wp double-restart fix (:2068-2076) removed at 180 s.
     // 600 s covers the worst case with margin, matching that sibling.
-    // NOTE the test.fail pin below: on a load-starved run the 300 s TEST
-    // timeout fired BEFORE the pin's expected in-test red was reached, and
-    // a test-level timeout does not satisfy the pin -- so the underfunded
-    // budget reds the whole run despite the expected-fail marking.
+    // NOTE (historical): while this test carried a test.fail pin, a
+    // load-starved run's 300 s TEST timeout fired BEFORE the pin's expected
+    // in-test red was reached, and a test-level timeout does not satisfy a
+    // pin -- so the underfunded budget reds the whole run. The generous
+    // budget stays.
     test.setTimeout(600_000)
-    // EXPECTED-FAIL WALL PIN -- P0.1: this is the composed ruler; it flips
-    // green only when every per-pane contract above is green un-pinned.
-    // HISTORY: the first observed red (run of 2026-07-24) was the freshclaude
-    // identity poll -- that P0.2 client identity-persistence gap has since
-    // CLOSED (#562: sessionRef persists + sessionRef-first reader; pinned by
-    // Contract G above and specs/freshclaude-identity-persistence-rust
-    // .spec.ts), so it is NO LONGER this pin's reason.
-    // CURRENT OBSERVED RED (verified pre-existing at the PR #562/#563
-    // council close-out): the composed ruler fails at the CLAUDE TERMINAL
-    // \u00a72.2 leg -- the post-restart `--resume <claudePreallocatedId>` argv
-    // poll below never goes green UNDER COMPOSITION, even though the same
-    // contract passes in its standalone per-pane test.
-    // The hidden-tab legs (F8/P1.11) PASSED in this composition: the
-    // dead-terminal census DID reach hidden tabs' layouts -- the plan flagged
-    // this ordering as runtime-dependent and verdict-neutral (both candidates
-    // are post-restart contract assertions). The freshcodex/freshopencode
-    // identity polls pass VACUOUSLY from persisted state (they measure
-    // persistence, not restore).
-    // FLIP DISCIPLINE (council, PR #562/#563 close-out): leg G's identity
-    // assertions alone are NOT liveness proof -- its post-attach turn-send is.
-    // Flip only when the composed ruler GENUINELY passes 3x consecutively;
-    // delete this pin when the last per-pane pin is retired.
-    test.fail(
-      e2eServerKind === 'rust',
-      'P0.1: composed all-pane ruler; red until remaining P1.x land -- current observed red: the claude terminal §2.2 --resume argv leg under composition (the former P0.2 freshclaude identity gap closed in #562)',
-    )
+    // THE RULER IS LIVE (P0.1, last wall pin retired): the composed all-pane
+    // ruler runs un-pinned. Its final two reds closed as (1) the claude
+    // never-conversed carve-out (reconcile derives Respawn; the post-restart
+    // --resume argv leg passes under composition) and (2) the quiet-client
+    // alert count excluding monaco's structural aria scaffold -- see the
+    // assertion note at the end of this test.
 
     const CODEX_SESSION_ID = '99999999-8888-4777-8666-555555555555'
     const SESSION_TITLE = 'ruler codex session'
