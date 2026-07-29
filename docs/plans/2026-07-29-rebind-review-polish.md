@@ -13,7 +13,7 @@
 
 ## Global Constraints
 
-- **NEVER touch the production Rust server on port 3002.** A live drill may be running concurrently against a scratch server on port 3499: do **not** stop/kill any freshell server processes, and do **not** use port 3499 in tests. (The existing integration tests bind ephemeral ports; keep it that way.)
+- **NEVER touch the production Rust server on port 3002.** A live drill may be running concurrently against a scratch server on port 3499: do **not** stop/kill any freshell server processes, and do **not** use port 3499 in tests. (The existing integration tests bind ephemeral ports; keep it that way. Audited 2026-07-29, load-bearing pass: all Rust test harnesses bind `127.0.0.1:0`; kills are own-child only; the npm test coordinator gates via a repo-hashed unix socket and signals only its own children — nothing binds 3002/3499 or pattern-kills processes.)
 - Red-Green-Refactor TDD for all behavior changes (Tasks 1–3, 5–7). Doc-only changes (Task 8) and pure code-moves (Task 4) are the explicitly named exception per `AGENTS.md:7` ("Red-Green-Refactor TDD for all changes but the most trivial (e.g. doc changes)").
 - Do not regress the rebind guarantees: **one-writer invariant, A13, D7/D8, ledger supersede semantics, and the "when unsure, do nothing" degradation policy** must all survive. The portability fix (Task 1) must not weaken nonce uniqueness.
 - Rust gates (CI, `-D warnings`): `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo clippy -p freshell-opencode --features real-transport --all-targets -- -D warnings`. Run per task before committing.
@@ -74,7 +74,7 @@ Fixes review item 3 (GNU-only `date +%s%N`) and the *producer* half of item 2 (t
 
 **Interfaces:**
 - Consumes: nothing from other tasks.
-- Produces: the new nonce shape `<19-digit zero-stable timestamp>-<pid>` in signal filenames `<terminal_id>__<nonce>.json`. Task 2's sorted drain relies on: digits-and-`-` only (never contains `__`), timestamp-FIRST, fixed 19-digit width (so lexicographic sort == emission order). `CLAUDE_SESSION_START_COMMAND_WINDOWS` is already timestamp-first (`[DateTime]::UtcNow.Ticks`) and is NOT changed.
+- Produces: the new nonce shape `<19-digit zero-stable timestamp>-<pid>` in signal filenames `<terminal_id>__<nonce>.json`. Task 2's sorted drain relies on: digits-and-`-` only (never contains `__`), timestamp-FIRST, fixed 19-digit width (so lexicographic sort == emission order wherever `date` has nanosecond precision; see the fallback-ordering residual below). `CLAUDE_SESSION_START_COMMAND_WINDOWS` is already timestamp-first (`[DateTime]::UtcNow.Ticks`) and is NOT changed.
 
 **Design.** New shell nonce logic (POSIX-portable; GNU nanosecond precision when available, second-granularity zero-padded fallback elsewhere — same effective uniqueness as today's BSD degradation of `$$-<sec>N`, i.e. (second, pid), so uniqueness is NOT weakened):
 
@@ -83,6 +83,8 @@ n=$(date +%s%N 2>/dev/null); case "$n" in *[!0-9]*|"") n="$(date +%s)000000000";
 ```
 
 `%s` is 10 digits and `%s%N` 19 digits until year 2286; the fallback pads to 19, so all nonces are width-stable. Nonce becomes `$n-$$` (timestamp first, pid tiebreaker second — the reverse of today's pid-first `$$-$(date +%s%N)`).
+
+**Fallback-ordering residual (validated 2026-07-29, load-bearing pass):** on non-GNU platforms the fallback timestamp is second-granularity, so two signals for the SAME terminal within the SAME second sort by the pid string — not guaranteed emission order (pid wraparound and digit-length boundaries both invert it). This is a documented residual, not a defect to fix here: it is strictly better than today's pid-first nonce (never time-ordered on ANY platform), it self-corrects on the next signal, and the alternatives fail (zero-padding `$$` fixes only the digit-length case, not wraparound; a per-invocation sequence is infeasible across separate `sh` processes — the opencode plugin's `seq` works only because it is one long-lived process). All doc-comment and commit wording below is scoped accordingly — keep it that way.
 
 - [ ] **Step 1: Write the failing unit tests**
 
@@ -215,8 +217,11 @@ Extend the doc comment above it (keep every existing sentence — the A7 degrada
 /// FIRST (19 digits, zero-stable width; second-granularity where %N is
 /// unavailable), shell pid as tiebreaker. Digits and `-` only, so it can
 /// never contain the `__` filename delimiter, and a lexicographic filename
-/// sort in the consumer (`claude_signal.rs::drain`) is emission order --
-/// deterministic last-write-wins under rapid A->B->A switching.
+/// sort in the consumer (`claude_signal.rs::drain`) is emission order on
+/// nanosecond-precision `date` (GNU) -- deterministic last-write-wins under
+/// rapid A->B->A switching. On the second-granularity fallback, same-second
+/// same-terminal order degrades to pid-string order (not guaranteed emission
+/// order) -- a residual sub-second ambiguity, corrected by the next signal.
 ```
 
 - [ ] **Step 5: Run the full crate tests to verify they pass**
@@ -235,7 +240,9 @@ git commit -m "fix(freshell-platform): portable timestamp-first claude SessionSt
 date +%s%N is GNU-only; BSD/macOS degraded the nonce to a literal N and
 made the timestamp useless for ordering. POSIX fallback keeps 19-digit
 width-stable digits-only nonces, timestamp-first so the consumer's
-filename sort (next commit) is emission order. Uniqueness is preserved:
+filename sort (next commit) is emission order on GNU date (on the
+second-granularity fallback, same-second order degrades to pid order --
+documented residual, self-correcting). Uniqueness is preserved:
 GNU keeps ns precision; elsewhere (second, pid) -- same as before."
 ```
 
@@ -317,8 +324,10 @@ Replace the body of `drain` (`claude_signal.rs:77-93`) with:
             .collect();
         // Deterministic last-write-wins (mirrors opencode_signal.rs): the
         // producer nonce is timestamp-first and width-stable, so a filename
-        // sort is emission order; the consumer applies signals in sequence,
-        // so the newest signal per terminal wins.
+        // sort is emission order on nanosecond-precision `date` (GNU; on the
+        // second-granularity fallback, same-second order degrades to pid
+        // order -- see the producer's doc comment); the consumer applies
+        // signals in sequence, so the newest signal per terminal wins.
         paths.sort();
         let mut signals = Vec::new();
         for path in paths {
@@ -331,7 +340,7 @@ Replace the body of `drain` (`claude_signal.rs:77-93`) with:
     }
 ```
 
-Append one line to the doc comment at `:68-76`: `/// drain() sorts by filename (timestamp-first nonces => deterministic last-write-wins under rapid A->B->A switching).`
+Append one line to the doc comment at `:68-76`: `/// drain() sorts by filename (timestamp-first nonces => deterministic last-write-wins under rapid A->B->A switching on nanosecond-precision date; the second-granularity fallback degrades same-second order to pid order).`
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -348,8 +357,10 @@ git commit -m "fix(freshell-ws): sort claude signal drain for deterministic last
 
 Bare read_dir order made rapid A->B->A switches within one sweep window
 land nondeterministically. Filename sort over the timestamp-first nonces
-(previous commit) makes drain order emission order, matching the
-opencode lane's already-shipped contract."
+(previous commit) makes drain order emission order on GNU date (the
+second-granularity fallback degrades same-second order to pid order --
+documented residual), matching the opencode lane's already-shipped
+contract."
 ```
 
 ---
@@ -761,7 +772,7 @@ ambiguous hits are unchanged."
 
 ### Task 6: Canonical percent-encoded `file://` plugin URL
 
-Fixes review item 7. `plugin_file_spec` (`crates/freshell-platform/src/opencode_plugin.rs:32-39`) builds the URL with a raw `format!` — a home dir containing `#`/`?` truncates the path, `%`+hex silently decodes to the wrong path (Bun's `import()` then hard-fails **silently for the pane lifetime** — it caches failed imports), and space/non-ASCII break opencode's dedup-by-file-URL contract. Correct target: the WHATWG form `pathToFileURL`/`Url::from_file_path` produce. Use `percent-encoding` (2.3.2 is already in `Cargo.lock` — no new transitive tree; the full `url` crate is heavier than this crate's "pure std + injected IO" posture needs).
+Fixes review item 7. `plugin_file_spec` (`crates/freshell-platform/src/opencode_plugin.rs:32-39`) builds the URL with a raw `format!` — a home dir containing `#`/`?` truncates the path, `%`+hex silently decodes to the wrong path (Bun's `import()` then hard-fails **silently for the pane lifetime** — it caches failed imports), and space/non-ASCII break opencode's dedup-by-file-URL contract. Correct target: byte-identity with `pathToFileURL(p).href` as produced by opencode's own runtime — **oracle-verified 2026-07-29 (load-bearing pass) on the installed Bun 1.3.14 and Node v22.21.1, which agree byte-for-byte on posix paths**; opencode dedupes plugin entries by exact spec-string equality, so parity is load-bearing. Note this set is STRICTER than the WHATWG-minimal path set: `[ \ ] ^ | ~` are percent-encoded too, and a posix `\` is an ordinary byte to encode (%5C), never a separator. Use `percent-encoding` (2.3.2 is already in `Cargo.lock` — no new transitive tree; the full `url` crate is heavier than this crate's "pure std + injected IO" posture needs).
 
 **Files:**
 - Modify: `crates/freshell-platform/Cargo.toml` (add `percent-encoding = "2"`; amend the "no external crates" header comment if one exists there)
@@ -779,8 +790,9 @@ Replace `file_spec_is_a_file_url` (`opencode_plugin.rs:141-147`) with:
 ```rust
     #[test]
     fn file_spec_is_a_canonical_file_url() {
-        // Expected values match Node's `pathToFileURL(p).href` -- the WHATWG
-        // form Bun imports and opencode dedupes plugin origins by.
+        // Expected values match `pathToFileURL(p).href` under BOTH Node v22
+        // and Bun 1.3.14 (opencode's runtime; oracle-verified 2026-07-29) --
+        // the form Bun imports and opencode dedupes plugin origins by.
         let cases: &[(&str, &str)] = &[
             ("/a/b/p.ts", "file:///a/b/p.ts"),
             ("/a/b c/p.ts", "file:///a/b%20c/p.ts"),
@@ -789,6 +801,13 @@ Replace `file_spec_is_a_file_url` (`opencode_plugin.rs:141-147`) with:
             ("/a/b%41c/p.ts", "file:///a/b%2541c/p.ts"),
             ("/a/100%/p.ts", "file:///a/100%25/p.ts"),
             ("/home/\u{fc}n\u{ef}/p.ts", "file:///home/%C3%BCn%C3%AF/p.ts"),
+            // pathToFileURL is stricter than the WHATWG-minimal path set:
+            ("/a/x~y/p.ts", "file:///a/x%7Ey/p.ts"),
+            ("/a/[b]/p.ts", "file:///a/%5Bb%5D/p.ts"),
+            ("/a/b^c/p.ts", "file:///a/b%5Ec/p.ts"),
+            ("/a/b|c/p.ts", "file:///a/b%7Cc/p.ts"),
+            // posix backslash is an ordinary byte -- encoded, not a separator:
+            (r"/a/b\c/p.ts", "file:///a/b%5Cc/p.ts"),
         ];
         for (input, expected) in cases {
             assert_eq!(
@@ -819,11 +838,14 @@ In `opencode_plugin.rs`, replace `plugin_file_spec` (and its doc comment at `:30
 ```rust
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 
-/// WHATWG file-URL *path* percent-encode set (canonical parity with Node's
-/// `pathToFileURL`): C0 controls, space, `"` `#` `<` `>` `?` backtick `{`
-/// `}`, plus `%` itself so pre-existing escapes round-trip literally.
-/// `/` separators and the Windows drive `:` stay bare; non-ASCII bytes are
-/// always UTF-8 percent-encoded by `utf8_percent_encode`.
+/// File-URL *path* percent-encode set: byte-parity with `pathToFileURL` as
+/// implemented by Node v22 AND Bun (opencode's runtime) -- oracle-verified
+/// 2026-07-29 by differential sweep on the installed Bun 1.3.14 / Node
+/// v22.21.1. STRICTER than the WHATWG-minimal path set: C0 controls + DEL
+/// (both in `CONTROLS`), space, `"` `#` `<` `>` `?` backtick `[` `\` `]`
+/// `^` `{` `|` `}` `~`, plus `%` itself so pre-existing escapes round-trip
+/// literally. `/` separators and the Windows drive `:` stay bare; non-ASCII
+/// bytes are always UTF-8 percent-encoded by `utf8_percent_encode`.
 const FILE_URL_PATH_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'"')
@@ -832,22 +854,32 @@ const FILE_URL_PATH_SET: &AsciiSet = &CONTROLS
     .add(b'<')
     .add(b'>')
     .add(b'?')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
     .add(b'`')
     .add(b'{')
-    .add(b'}');
+    .add(b'|')
+    .add(b'}')
+    .add(b'~');
 
 /// `file://` spec for the tui.json `plugin` array. Unix: `file:///abs`.
 /// Windows drive paths get forward slashes and a third slash. The path is
-/// percent-encoded to the canonical WHATWG form: opencode dedupes plugin
-/// origins by file URL and Bun's `import()` hard-fails (silently, for the
-/// pane lifetime) on raw `#`/`?`/`%`, so canonical output is load-bearing.
+/// percent-encoded to `pathToFileURL` parity (Node v22 == Bun, opencode's
+/// runtime): opencode dedupes plugin origins by exact file-URL string and
+/// Bun's `import()` hard-fails (silently, for the pane lifetime) on raw
+/// `#`/`?`/`%`, so byte-identical output is load-bearing.
 pub fn plugin_file_spec(plugin_path: &Path) -> String {
-    let s = plugin_path.display().to_string().replace('\\', "/");
-    let encoded = utf8_percent_encode(&s, FILE_URL_PATH_SET).to_string();
-    if s.starts_with('/') {
-        format!("file://{encoded}")
+    let raw = plugin_path.display().to_string();
+    if raw.starts_with('/') {
+        // Posix absolute path: `\` is an ordinary filename byte here --
+        // percent-encoded (%5C, pathToFileURL parity), never a separator.
+        format!("file://{}", utf8_percent_encode(&raw, FILE_URL_PATH_SET))
     } else {
-        format!("file:///{encoded}")
+        // Windows drive path: separators become `/`, third slash added.
+        let s = raw.replace('\\', "/");
+        format!("file:///{}", utf8_percent_encode(&s, FILE_URL_PATH_SET))
     }
 }
 ```
@@ -887,6 +919,8 @@ canonical WHATWG form (pathToFileURL parity) via percent-encoding."
 ### Task 7: Explicit, bounded handling of foreign/orphaned opencode signal files
 
 Fixes review item 8. Two silent-retain sites in `apply_opencode_signal` (`crates/freshell-ws/src/opencode_signal.rs`) drop foreign-provider signals with **no log** and leave the file to be re-read and re-rejected every 1s for up to 10 minutes: the identity-row check at `:304-306` and the `entry.mode != "opencode"` half of the registry check at `:288-293`. A pane's mode/provider never changes, so these signals are *permanently* unactionable — the honest bounded behavior is warn-once + consume (deleting a signal only degrades to no-rebind, which the module's documented degradation policy already accepts; pane identity is never touched, so "when unsure, do nothing" is preserved). Also: `.tmp` staging files orphaned by a dead writer are never reaped — bound them with the existing TTL.
+
+*(Load-bearing validation, 2026-07-29: the permanence premise is verified — registry `mode` is stamped at row birth under lock with no foreign-provider mutation sites (the 2026-07-22 fix removed the old transient-"shell" window), identity `provider` is always the birth mode and only same-provider lanes rewrite it, and terminal ids are fresh UUIDv4, never recycled. The identity-row Discard below also matches `provider: None` rows — safe today because no production lane seeds provider-less identity rows; keep that behavior. All named rebind guarantees constrain acting, never require it, so consuming a file degrades only to no-rebind.)*
 
 **Files:**
 - Modify: `crates/freshell-ws/src/opencode_signal.rs` (`drain` `:87-120`, `drain_and_rebind_opencode` loop `:195-201`, `apply_opencode_signal` `:286-306`, module-header contract lines `:11-17`)
@@ -1160,6 +1194,11 @@ No new code. This is the whole-system proof that the eight changes compose, plus
 
 **Interfaces:** none.
 
+- [ ] **Step 0: Ensure JS deps are installed (fresh-worktree prerequisite)**
+
+Run: `test -d node_modules || npm ci --no-audit --no-fund`
+Why: `cargo test --workspace` DEPENDS on `node_modules` — the freshell-freshagent unit tests resolve the `tsx` MCP dependency from it (`mcp_inject.rs:126`); without it, 12 `terminal_tabs::tests` fail with `Unable to resolve MCP dependency "tsx"` and fail-fast leaves later crates untested (observed 2026-07-29 on this worktree before `npm ci` was run during plan validation). The coordinated `npm test` needs it too. `node_modules` was installed in this worktree during validation (npm ci, exit 0), so this step should be a no-op — the guard exists in case the workflow re-provisions the worktree.
+
 - [ ] **Step 1: Rust gates (CI parity)**
 
 ```bash
@@ -1172,7 +1211,7 @@ Expected: all clean. This closes deferred item D-8 ("confirm the clippy gate is 
 - [ ] **Step 2: Full workspace tests (local-only gate)**
 
 Run: `cargo test --workspace` (allow several minutes; the `freshell-ws` integration binaries boot real servers on ephemeral ports — they never touch 3002 or 3499)
-Expected: all green.
+Expected: all green. **Baseline recorded (2026-07-29, load-bearing pass, base + docs commit, after `npm ci`):** 44 test binaries green; one timing flake under heavy parallel machine load (`auto_resume_e2e::reconcile_after_replacement_attaches_to_the_new_terminal`, a 10s wait for `terminal.replaced` timed out) passed cleanly on immediate re-run (0.76s). If it trips again, re-run that one binary before treating it as a regression.
 
 - [ ] **Step 3: Coordinated JS suite + contract freeze**
 
@@ -1209,3 +1248,5 @@ Expected: empty (every change was committed in its task). Do **not** create a PR
 **2. Placeholder scan:** no TBDs; every code step shows the code. Three steps intentionally defer to named donor code at exact file:line (Phase-1 pane-creation body in Task 3, watcher constructor idioms in Tasks 2/7) because the donor is existing committed code the implementer opens anyway — not an unwritten artifact.
 
 **3. Type consistency:** `CLAUDE_SIGNAL_NONCE_SNIPPET` (Task 1, test-local const) is self-contained; `SignalDisposition` names match between Task 7's steps 5.1–5.3; `ambiguity_warned` matches between Task 5's steps 2/4; Task 5 consumes exactly the helper signatures Task 4's Produces block declares; `plugin_file_spec` signature is unchanged everywhere it is referenced.
+
+**4. Load-bearing validation pass (2026-07-29, workflow Stage 2) — re-review of the edited tasks:** 11 assumptions were surfaced and adjudicated (7 verified, 3 falsified-and-fixed, 1 deferred with an in-plan contingency); full ledger at `.worktrees/.the-usual-logs/rebind-review-polish/load-bearing-ledger.md`. Plan edits from falsified assumptions: **Task 6** — encode set corrected to `pathToFileURL` parity oracle-verified against the installed Bun 1.3.14 / Node v22.21.1 (added `[ \ ] ^ | ~`; posix `\` now percent-encoded, with the `\`→`/` rewrite confined to the Windows branch; 5 new executable table cases); **Tasks 1+2** — the ordering-contract wording narrowed to GNU-deterministic with a documented, self-correcting second-granularity fallback residual (design unchanged — verified strictly better than today on every platform); **Task 9** — new Step 0 (npm ci prerequisite) after the fresh worktree's missing `node_modules` failed 12 freshell-freshagent tests (`tsx` MCP resolution), plus a recorded baseline. Re-running items 1–3 over the edited tasks: spec coverage unchanged (no review items added or dropped; item 7 still → Task 6, items 2/3 still → Tasks 1+2); no silent deferrals introduced (1b: every edited behavior claim remains pinned by an executable test — the new table cases run in Step 2/4; the narrowed ordering claim is doc/commit wording, and its residual is explicitly documented rather than silently deferred); no new placeholders (all edited code steps still show the code); type consistency holds (`FILE_URL_PATH_SET` shape matches between Task 6's doc text, constant, and table; `plugin_file_spec` signature unchanged).
