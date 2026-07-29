@@ -207,3 +207,59 @@ describe('server-authoritative rebind (previousSessionId)', () => {
     expect(dispatched.map((action) => action.type)).toContain(flushPersistedLayoutNow.type)
   })
 })
+
+describe('duplicate rebind broadcasts (idempotence regression guards)', () => {
+  const boundPane = {
+    kind: 'terminal' as const,
+    terminalId: 'term-1',
+    createRequestId: 'req-1',
+    status: 'running' as const,
+    mode: 'opencode' as const,
+    shell: 'system' as const,
+    sessionRef: { provider: 'opencode', sessionId: 'ses_old' },
+  }
+
+  it('a stale repeat whose previousSessionId no longer matches the pane current ref dispatches nothing', () => {
+    // The pane has already moved on to ses_new2; an old rebind broadcast
+    // (ses_old -> ses_new) arrives late. The supersession handshake must
+    // veto it: previousSessionId (ses_old) is not the pane's current ref.
+    const dispatched: any[] = []
+    const dispatch = vi.fn((action) => dispatched.push(action))
+    const result = reconcileTerminalSessionAssociation({
+      dispatch,
+      getState: () => createState(
+        { ...boundPane, sessionRef: { provider: 'opencode', sessionId: 'ses_new2' } },
+        { sessionRef: { provider: 'opencode', sessionId: 'ses_new2' } },
+      ),
+      terminalId: 'term-1',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_new' },
+      previousSessionId: 'ses_old',
+    })
+    expect(result).toBe('conflict')
+    expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it('an identical repeat neither re-dispatches updateTab nor flushes the persisted layout again', () => {
+    // Post-first-rebind state: pane AND tab already carry ses_new. The tab
+    // override is REQUIRED: after the first rebind's flush, the persisted
+    // tab also carries the new ref -- and only a tab whose sessionRef
+    // already matches suppresses the tab-side flush
+    // (buildTerminalDurableSessionRefUpdate's tabNeedsSessionRef).
+    const dispatched: any[] = []
+    const dispatch = vi.fn((action) => dispatched.push(action))
+    const result = reconcileTerminalSessionAssociation({
+      dispatch,
+      getState: () => createState(
+        { ...boundPane, sessionRef: { provider: 'opencode', sessionId: 'ses_new' } },
+        { sessionRef: { provider: 'opencode', sessionId: 'ses_new' } },
+      ),
+      terminalId: 'term-1',
+      sessionRef: { provider: 'opencode', sessionId: 'ses_new' },
+      previousSessionId: 'ses_old',
+    })
+    expect(result).toBe('reconciled')
+    const types = dispatched.map((action) => action.type)
+    expect(types).not.toContain(flushPersistedLayoutNow.type)
+    expect(types).not.toContain(updateTab.type)
+  })
+})
