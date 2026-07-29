@@ -20,7 +20,7 @@
 - New dependencies (exact): `@elgato-stream-deck/webhid@^7.6.3` (dependencies), `@types/w3c-web-hid` (devDependencies). No other new deps.
 - Deck colors (verbatim): tile bg `#0a0a0a`; preview text `#a8a8a8`; busy blue `#3b82f6`; green `#22c55e`; amber `#f59e0b`; active white `#ffffff`; stop red `#ef4444`; disabled grey `#555555`; control-key bg `#101036`; control dim text `#8888aa`; empty key `#000000`.
 - Ring geometry (verbatim): status+active → status ring 3px at inset 0 + white ring 2px at inset 3; status only → 4px at inset 0; active only → white 3px at inset 0. Ring priority: **amber > green > blue**.
-- Preview geometry constants: font size 11, line height 13, char width 5.5, left margin 3, banner height 20, banner fill rgba(0,0,0,170/255), title font 16 white, 10-char title cap + `…` + pixel-fit.
+- Preview geometry constants (starting point, A12): font size 11, line height 13, char width 5.5, left margin 3, banner height 20, banner fill rgba(0,0,0,170/255), title font 16 white, 10-char title cap + `…` + pixel-fit. These constants came from PIL-rendered tuning and MAY be retuned at implementation via `measureText` if browser canvas metrics overflow tiles (browser 11px monospace advances ~6.6px vs the assumed 5.5px) — the unit tests pin whatever final constants ship.
 - Timings (verbatim): long-press ≥ 0.5s (measured on key release); action layer auto-close 10s; STOP escalation window 5s; idle timeout default 300s (0 disables); active brightness default 100; idle brightness default 10.
 - **Never send raw keys to a fresh-agent pane** (they become prompt text). Fresh-agent stop = WS `freshAgent.interrupt` only.
 - Approve decision payload is exactly `{ behavior: 'allow' }` — **`updatedInput` must be absent** (a defined `updatedInput`, even `{}`, wholesale replaces the tool input).
@@ -32,10 +32,11 @@
 
 - **Previews (spec wrinkle #5):** all tabs stay mounted (`src/App.tsx:1651`, `visibility:hidden` via `.tab-hidden`), so xterm instances and buffers are live for background tabs. Terminal panes read the live xterm buffer through a tiny reader registry (Task 11). Non-terminal panes (fresh-agent/browser/editor/picker/extension) render **title-only tiles**. No capture polling, no server involvement.
 - **Per-tab ring aggregation (spec wrinkle #4):** blue = `getBusyPaneIdsForTab(...)` (exactly what TabBar uses); green = `state.turnCompletion.attentionByTab[tabId]` (tab-level flag, exactly what TabBar uses); amber = any fresh-agent pane in the tab whose session has non-empty `pendingPermissions`/`pendingQuestions` (no tab-level amber exists today — Task 3 builds it, factoring out the existing `hasWaitingPrompt` predicate instead of duplicating it a third time).
-- **Exclusivity:** no Web Locks. WebHID `open()` failure (device held by another window/app) → status `in-use`, retry on `visibilitychange`/`focus`. This covers both other-app and second-freshell-window cases with zero new API surface.
+- **Exclusivity (redesigned after load-bearing review, A1+A2 falsified):** Chromium opens HID devices SHARED on all platforms (Windows `FILE_SHARE_READ|WRITE`, macOS non-seizing `kIOHIDOptionsTypeNone`, Linux plain `O_RDWR`) — a second tab of the same profile gets its own live connection with no error, so concurrent opens generally SUCCEED and `open()`-failure CANNOT be the exclusivity mechanism. Same-origin multi-window exclusivity uses a **Web Locks leader election**: `navigator.locks.request('freshell-stream-deck', ...)` held for the manager's enabled lifetime; non-leader windows show status `in-use` ("in use elsewhere / another window") and wait; when the leader closes/disables, the lock releases and a waiting window acquires it (leadership handoff). The `DeckOpenError('in-use')` mapping + retry on `visibilitychange`/`focus` is kept ONLY as a secondary signal for the other-OS-app case (e.g. an exclusive-mode holder on Windows). Recorded explicitly: cross-app contention mostly does NOT fail the open — both parties may paint and fight; the user resolves it by closing one. Accepted residual with a hardware checkpoint (see "Hardware checkpoints" at the end of this plan). Also: an open failure surfaces as a `NetworkError` DOMException that is indistinguishable from a Linux udev permission denial — status copy must say "in use by another app — or missing device permissions (Linux udev)".
 - **Focus press:** dispatch `dismissTabGreen(tabId)` (gated on `settings.panes.attentionDismiss === 'click'`) then `setActiveTab(tabId)` — byte-for-byte what a TabBar click does, and works when the window is unfocused.
 - **Browser Allow bug is real and in scope:** `FreshAgentView.tsx:2344` and `:2214` send `decision: { behavior: 'allow', updatedInput: {} }`; the server resolves it verbatim (`server/sdk-bridge.ts:771-783`). Task 6 fixes both client sites minimally (omit the key) and updates the 4 tests that pin `{}`. No server change.
 - **`docs/index.html`:** a settings section + optional debug panel is not a major default-experience change → no update. (Decision recorded here per AGENTS.md.)
+- **Electron (A11, decision recorded):** keep **zero `electron/` changes**. In the packaged Electron app `navigator.hid` exists but `requestDevice()` always resolves `[]` (no picker, no crash) and `getDevices()` is always `[]` (no persistence) because no `select-hid-device` handler is registered. The settings UI must be honest: detect Electron client-side (`navigator.userAgent.includes('Electron')`) and show a "not supported in the desktop app — use Chrome/Edge" message instead of a dead Connect button (Task 13). The connect flow treats `requestDevice() -> []` as a clean no-op everywhere — never index `[0]` blindly.
 - **Long-press semantics:** press duration measured at key-up; ≥0.5s opens the action layer, <0.5s focuses. Ports the hardware-validated behavior.
 - **Pager wraps; dial-1 paging clamps; dial-0 tab cycling wraps** (validated on prior branch).
 
@@ -56,7 +57,7 @@ New directory `src/deck/` (all client code):
 | `src/deck/deck-controller.ts` | The stateful coordinator: store subscription → frame diff → paint; input dispatch; long-press/action layer; paging; idle dim; tick loop. |
 | `src/deck/terminal-text-registry.ts` | terminalId → live-xterm-text reader registry + `readXtermTail` + registration hook. |
 | `src/deck/webhid-transport.ts` | `DeckDevice` implementation wrapping `@elgato-stream-deck/webhid`. |
-| `src/deck/deck-manager.ts` | Singleton lifecycle: enable/disable, request/auto-reconnect, hotplug, in-use retry; publishes status to `deckSlice`. |
+| `src/deck/deck-manager.ts` | Singleton lifecycle: Web Locks leader election, enable/disable, request/auto-reconnect, hotplug, in-use retry; publishes status to `deckSlice`. |
 | `src/lib/terminal-interrupt.ts` | `sendTerminalInterrupt(content, terminalId, key)` (modeled on `terminal-kill.ts`). |
 | `src/lib/webhid-support.ts` | `isWebHidSupported()` feature detection. |
 | `src/store/deckSlice.ts` | Runtime-only slice: connection status, model, keyCount, virtual-panel open flag. Never persisted. |
@@ -78,7 +79,7 @@ Modified files: `shared/settings.ts`, `src/store/browserPreferencesPersistence.t
 
 **Interfaces:**
 - Consumes: existing `LocalSettings`/`ResolvedSettings` machinery.
-- Produces: `LocalSettings['streamDeck'] = { enabled: boolean; brightness: number; idleBrightness: number; idleTimeoutSeconds: number }` (defaults `false`, `100`, `10`, `300`), visible at `state.settings.settings.streamDeck`; `isWebHidSupported(): boolean` from `@/lib/webhid-support`. Later tasks read `settings.streamDeck.*` and call `applyLocalSetting({ streamDeck: {...} })`.
+- Produces: `LocalSettings['streamDeck'] = { enabled: boolean; brightness: number; idleBrightness: number; idleTimeoutSeconds: number }` (defaults `false`, `100`, `10`, `300`), visible at `state.settings.settings.streamDeck`; `isWebHidSupported(): boolean` and `isElectronClient(): boolean` from `@/lib/webhid-support` (in Electron `navigator.hid` exists but is non-functional without main-process handlers — Task 13 uses `isElectronClient` to show honest messaging). Later tasks read `settings.streamDeck.*` and call `applyLocalSetting({ streamDeck: {...} })`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -208,6 +209,18 @@ if (Object.keys(streamDeck).length > 0) patch.streamDeck = streamDeck
 export function isWebHidSupported(): boolean {
   try {
     return typeof navigator !== 'undefined' && 'hid' in navigator
+  } catch {
+    return false
+  }
+}
+
+// In the packaged Electron app navigator.hid EXISTS but requestDevice() always
+// resolves [] (no picker) and getDevices() is always [] (no persistence) because
+// no select-hid-device handler is registered. Zero electron/ changes is a recorded
+// decision — the UI must detect Electron and message honestly instead.
+export function isElectronClient(): boolean {
+  try {
+    return typeof navigator !== 'undefined' && navigator.userAgent.includes('Electron')
   } catch {
     return false
   }
@@ -439,7 +452,7 @@ git commit -m "feat(deck): DeckDevice transport seam and fake transport"
 - Test: `test/unit/client/deck/deck-selectors.test.ts`
 
 **Interfaces:**
-- Consumes: `getBusyPaneIdsForTab`, `resolvePaneActivity` inputs (`src/lib/pane-activity.ts`), `collectPaneEntries`/`findPaneContent` (`src/lib/pane-utils.ts`), `makeFreshAgentSessionKey` (`@shared/fresh-agent`), `state.turnCompletion.attentionByTab`, `state.freshAgent.sessions`, `state.panes.layouts`, `state.tabs`.
+- Consumes: `getBusyPaneIdsForTab`, `resolvePaneActivity` inputs (`src/lib/pane-activity.ts`), `collectPaneEntries`/`findPaneContent` (`src/lib/pane-utils.ts`), `makeFreshAgentSessionKey` (`@shared/fresh-agent`), `getFreshOpenCodeRouteCwd` (`src/lib/fresh-opencode-route.ts:5`), `state.turnCompletion.attentionByTab`, `state.freshAgent.sessions`, `state.panes.layouts`, `state.tabs`.
 - Produces:
 
 ```ts
@@ -460,16 +473,19 @@ export type ApproveTarget = {
   sessionType: FreshAgentPaneContent['sessionType']
   provider: FreshAgentPaneContent['provider']
   requestId: string | number
+  cwd?: string   // REQUIRED for freshopencode sessions (server auth keys embed cwd); undefined otherwise
 }
 export function findApproveTarget(state: RootState, tabId: string): ApproveTarget | null
 
 export type StopTarget =
-  | { kind: 'fresh-agent'; sessionId: string; sessionType: FreshAgentPaneContent['sessionType']; provider: FreshAgentPaneContent['provider'] }
+  | { kind: 'fresh-agent'; sessionId: string; sessionType: FreshAgentPaneContent['sessionType']; provider: FreshAgentPaneContent['provider']; cwd?: string }
   | { kind: 'terminal'; paneId: string; terminalId: string; content: TerminalPaneContent }
 export function findStopTarget(state: RootState, tabId: string): StopTarget | null
 ```
 
 Semantics: `busy` = `getBusyPaneIdsForTab(...).length > 0` (same inputs TabBar wires at `TabBar.tsx:179-186`); `green` = `!!state.turnCompletion.attentionByTab[tab.id]`; `amber` = any fresh-agent pane entry whose session (looked up via `makeFreshAgentSessionKey({ sessionType, provider, sessionId })`) satisfies `hasWaitingPrompt`. `findApproveTarget` returns the first pending permission (fall back to first pending question's requestId only if no permissions — APPROVE targets permissions; if only questions are pending return `null`, questions need the full UI). `findStopTarget`: first **busy fresh-agent** pane wins; else first busy **terminal** pane with a defined `terminalId` (busy per `resolvePaneActivity`).
+
+**cwd rule (load-bearing, A8 falsified):** a cwd-less `freshAgent.interrupt` / `freshAgent.approval.respond` for a durable (`ses_`-prefixed) freshopencode session is rejected `UNAUTHORIZED` server-side — the auth key embeds cwd (`server/ws-handler.ts:1290-1293`) and the runtime manager also requires cwd. Both target lookups therefore derive `cwd` client-side via the existing `getFreshOpenCodeRouteCwd` (`src/lib/fresh-opencode-route.ts:5`): `getFreshOpenCodeRouteCwd(entry.content, { freshAgentSessions: state.freshAgent.sessions })` — it returns `undefined` for anything that isn't a freshopencode pane, so claude/codex/kilroy targets stay cwd-less (confirmed fine: their auth keys are plain `sessionType:provider:sessionId`). Targets also forward the pane's exact `sessionType` (e.g. kilroy sessions send `sessionType: 'kilroy'` with `provider: 'claude'`), matching what FreshAgentView sends.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -589,9 +605,58 @@ describe('deck-selectors', () => {
     expect(findStopTarget(busyAgent, 't2')).toEqual({
       kind: 'fresh-agent', sessionId: 's1', sessionType: 'freshclaude', provider: 'claude',
     })
+    expect(findStopTarget(busyAgent, 't2')).not.toHaveProperty('cwd') // claude stays cwd-less
     const busyTerm = makeState({ claudeBusy: true })
     expect(findStopTarget(busyTerm, 't1')).toMatchObject({ kind: 'terminal', paneId: 'p1', terminalId: 'term-1' })
     expect(findStopTarget(makeState(), 't1')).toBeNull()
+  })
+})
+
+describe('freshopencode targets carry cwd (server auth keys embed it — A8)', () => {
+  const oKey = makeFreshAgentSessionKey({ sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_1' })
+  function makeOpencodeState(overrides: { pendingPermissions?: Record<string, { requestId: string }>; running?: boolean } = {}) {
+    const store = configureStore({
+      reducer,
+      preloadedState: {
+        tabs: {
+          tabs: [{ id: 't3', createRequestId: 'c3', title: 'oc', status: 'running', mode: 'shell', createdAt: 3 }],
+          activeTabId: 't3', renameRequestTabId: null, tombstones: [],
+        },
+        panes: {
+          layouts: {
+            t3: { type: 'leaf', id: 'p3', content: { kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_1', createRequestId: 'c3', status: 'running', initialCwd: '/repo/a' } },
+          },
+          activePane: { t3: 'p3' },
+          paneTitles: {}, paneTitleSetByUser: {}, renameRequestTabId: null, renameRequestPaneId: null,
+          zoomedPane: {}, refreshRequestsByPane: {}, restoreFallbackAttemptsByPane: {},
+        },
+        freshAgent: {
+          sessions: {
+            [oKey]: {
+              sessionKey: oKey, threadId: 'ses_1', sessionType: 'freshopencode', provider: 'opencode', sessionId: 'ses_1',
+              status: overrides.running ? 'running' : 'idle', streamingActive: false,
+              pendingPermissions: overrides.pendingPermissions ?? {}, pendingQuestions: {},
+            },
+          },
+          pendingCreates: {}, pendingCreateFailures: {}, availableModels: [],
+        },
+      } as never,
+    })
+    return store.getState() as never
+  }
+
+  it('findApproveTarget includes cwd for a freshopencode pane', () => {
+    const state = makeOpencodeState({ pendingPermissions: { r9: { requestId: 'r9' } } })
+    expect(findApproveTarget(state, 't3')).toEqual({
+      sessionId: 'ses_1', sessionType: 'freshopencode', provider: 'opencode', requestId: 'r9', cwd: '/repo/a',
+    })
+  })
+
+  it('findStopTarget includes cwd for a busy freshopencode pane', () => {
+    const state = makeOpencodeState({ running: true })
+    expect(findStopTarget(state, 't3')).toEqual({
+      kind: 'fresh-agent', sessionId: 'ses_1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo/a',
+    })
   })
 })
 ```
@@ -627,6 +692,7 @@ import type { Tab } from '@/store/types'
 import type { FreshAgentPaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab, hasWaitingPrompt, resolvePaneActivity } from '@/lib/pane-activity'
+import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 
 export type TabRingStatus = { busy: boolean; green: boolean; amber: boolean }
@@ -689,6 +755,13 @@ export type ApproveTarget = {
   sessionType: FreshAgentPaneContent['sessionType']
   provider: FreshAgentPaneContent['provider']
   requestId: string | number
+  cwd?: string
+}
+
+// freshopencode auth keys embed cwd server-side; claude/codex/kilroy are cwd-less.
+// getFreshOpenCodeRouteCwd returns undefined for any non-freshopencode pane.
+function freshOpenCodeCwdFor(state: RootState, content: FreshAgentPaneContent): string | undefined {
+  return getFreshOpenCodeRouteCwd(content, { freshAgentSessions: state.freshAgent.sessions })
 }
 
 export function findApproveTarget(state: RootState, tabId: string): ApproveTarget | null {
@@ -699,11 +772,13 @@ export function findApproveTarget(state: RootState, tabId: string): ApproveTarge
     const session = freshAgentSessionFor(state, entry.content)
     const pending = session ? Object.values(session.pendingPermissions) : []
     if (pending.length > 0) {
+      const cwd = freshOpenCodeCwdFor(state, entry.content)
       return {
         sessionId: entry.content.sessionId,
         sessionType: entry.content.sessionType,
         provider: entry.content.provider,
         requestId: pending[0].requestId,
+        ...(cwd ? { cwd } : {}),
       }
     }
   }
@@ -711,7 +786,7 @@ export function findApproveTarget(state: RootState, tabId: string): ApproveTarge
 }
 
 export type StopTarget =
-  | { kind: 'fresh-agent'; sessionId: string; sessionType: FreshAgentPaneContent['sessionType']; provider: FreshAgentPaneContent['provider'] }
+  | { kind: 'fresh-agent'; sessionId: string; sessionType: FreshAgentPaneContent['sessionType']; provider: FreshAgentPaneContent['provider']; cwd?: string }
   | { kind: 'terminal'; paneId: string; terminalId: string; content: TerminalPaneContent }
 
 export function findStopTarget(state: RootState, tabId: string): StopTarget | null {
@@ -728,11 +803,13 @@ export function findStopTarget(state: RootState, tabId: string): StopTarget | nu
     })
     if (!isBusy) continue
     if (entry.content.kind === 'fresh-agent' && entry.content.sessionId) {
+      const cwd = freshOpenCodeCwdFor(state, entry.content)
       return {
         kind: 'fresh-agent',
         sessionId: entry.content.sessionId,
         sessionType: entry.content.sessionType,
         provider: entry.content.provider,
+        ...(cwd ? { cwd } : {}),
       }
     }
     if (!terminalHit && entry.content.kind === 'terminal' && entry.content.terminalId) {
@@ -1087,7 +1164,7 @@ export type KeyRenderer = (spec: KeySpec, caps: DeckCapabilities) => Uint8Clampe
 export type StripRenderer = (text: string, width: number, height: number) => Uint8ClampedArray
 ```
 
-Constants (verbatim, exported for tests): `PREVIEW_BG = '#0a0a0a'`, `PREVIEW_TEXT_COLOR = '#a8a8a8'`, `PREVIEW_FONT_SIZE = 11`, `PREVIEW_LINE_HEIGHT = 13`, `PREVIEW_CHAR_WIDTH = 5.5`, `PREVIEW_LEFT_MARGIN = 3`, `BANNER_HEIGHT = 20`, `BANNER_FILL = 'rgba(0,0,0,0.667)'`, `TITLE_FONT_SIZE = 16`, `RING_COLORS = { amber: '#f59e0b', green: '#22c55e', blue: '#3b82f6' }`, `ACTIVE_COLOR = '#ffffff'`, `STOP_COLOR = '#ef4444'`, `APPROVE_COLOR = '#22c55e'`, `DISABLED_ACTION_COLOR = '#555555'`, `CONTROL_BG = '#101036'`, `CONTROL_DIM = '#8888aa'`, `EMPTY_BG = '#000000'`, `STRIP_FONT_SIZE = 22`, `MAX_TITLE_CHARS = 10`.
+Constants (exported for tests; geometry values are the tuned starting point — see the retune note below): `PREVIEW_BG = '#0a0a0a'`, `PREVIEW_TEXT_COLOR = '#a8a8a8'`, `PREVIEW_FONT_SIZE = 11`, `PREVIEW_LINE_HEIGHT = 13`, `PREVIEW_CHAR_WIDTH = 5.5`, `PREVIEW_LEFT_MARGIN = 3`, `BANNER_HEIGHT = 20`, `BANNER_FILL = 'rgba(0,0,0,0.667)'`, `TITLE_FONT_SIZE = 16`, `RING_COLORS = { amber: '#f59e0b', green: '#22c55e', blue: '#3b82f6' }`, `ACTIVE_COLOR = '#ffffff'`, `STOP_COLOR = '#ef4444'`, `APPROVE_COLOR = '#22c55e'`, `DISABLED_ACTION_COLOR = '#555555'`, `CONTROL_BG = '#101036'`, `CONTROL_DIM = '#8888aa'`, `EMPTY_BG = '#000000'`, `STRIP_FONT_SIZE = 22`, `MAX_TITLE_CHARS = 10`.
 
 Geometry: `lines = max(1, floor((h - 20 - 2) / 13) + 1)`, `columns = max(1, floor((w - 3) / 5.5))` (80×80 → 5 lines × 14 cols; 120×120 → 8 × 21). Crop: strip trailing blank lines, keep last `lines`, first `columns` chars of each. Rings via nested 1px `fillRect` strips (top/bottom/left/right per pixel of width, offset by `inset + w`). Draw order: bg fill → preview lines bottom-up from `baseY = h - lines.length*13 - 2` at x=3 → banner rect (0,0,w,20) → centered title (fit to `w - 4`) → rings per the combination table. Pager key: `#101036` bg; `PAGE` (11px, `#8888aa`, y≈2, centered), `${page}/${pageCount}` (15px, white, centered both axes), `NEXT >` (11px, dim, bottom). Action keys: `#101036` bg, centered uppercase label (`BACK`/`APPROVE`/`STOP`, 15px, white), flat 3px ring in action color (white/green/red), or `#555555` when disabled. Empty key: solid `#000000`. `renderKey` returns `ctx.getImageData(0, 0, w, h).data`.
 
@@ -1368,7 +1445,9 @@ export function sendDeckApproval(target: import('./deck-selectors').ApproveTarge
 export function executeDeckStop(target: import('./deck-selectors').StopTarget, escalate: boolean): void
 ```
 
-Semantics: `focusTabFromDeck` = `if (state.settings.settings.panes.attentionDismiss === 'click') dispatch(dismissTabGreen(tabId))` then `dispatch(setActiveTab(tabId))`. `sendDeckApproval` sends `{ type: 'freshAgent.approval.respond', sessionId, sessionType, provider, requestId, decision: { behavior: 'allow' } }` — **no `updatedInput` key, no `cwd`**. `executeDeckStop`: fresh-agent → `{ type: 'freshAgent.interrupt', sessionId, sessionType, provider }`; terminal → `sendTerminalInterrupt(content, terminalId, escalate ? 'ctrl-c' : 'esc')`. (Escalation *timing* lives in the controller, Task 9 — this module is stateless.)
+Semantics: `focusTabFromDeck` = `if (state.settings.settings.panes.attentionDismiss === 'click') dispatch(dismissTabGreen(tabId))` then `dispatch(setActiveTab(tabId))`. `sendDeckApproval` sends `{ type: 'freshAgent.approval.respond', sessionId, sessionType, provider, requestId, ...(target.cwd ? { cwd: target.cwd } : {}), decision: { behavior: 'allow' } }` — **no `updatedInput` key**; `cwd` is present exactly when the target carries it (freshopencode — the server's auth key embeds cwd, and a cwd-less frame for a durable `ses_` session dies `UNAUTHORIZED`; claude/codex/kilroy targets have no `cwd`). The exact `sessionType` from the target is forwarded (kilroy sends `sessionType: 'kilroy'` with `provider: 'claude'`, matching FreshAgentView). `executeDeckStop`: fresh-agent → `{ type: 'freshAgent.interrupt', sessionId, sessionType, provider, ...(target.cwd ? { cwd: target.cwd } : {}) }`; terminal → `sendTerminalInterrupt(content, terminalId, escalate ? 'ctrl-c' : 'esc')`. (Escalation *timing* lives in the controller, Task 9 — this module is stateless.)
+
+**Accepted residual (A9):** after a WS reconnect or a fresh mount there is a transient window where per-connection fresh-agent auth isn't re-established yet (the client auto re-attaches every pane, paced by a rebind queue) — a deck action sent in that window is silently dropped (`UNAUTHORIZED` error frame with no requestId to correlate). Accepted: the user presses the key again; deck-actions stay fire-and-forget with no attach logic.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1420,6 +1499,16 @@ describe('sendDeckApproval', () => {
       requestId: 'r1', decision: { behavior: 'allow' },
     })
     expect('updatedInput' in frame.decision).toBe(false)
+    expect('cwd' in frame).toBe(false) // claude/codex/kilroy frames stay cwd-less
+  })
+
+  it('includes cwd for a freshopencode target (server auth keys embed it)', () => {
+    sendDeckApproval({ sessionId: 'ses_1', sessionType: 'freshopencode', provider: 'opencode', requestId: 'r9', cwd: '/repo/a' })
+    expect(sendMock.mock.calls[0][0]).toMatchObject({
+      type: 'freshAgent.approval.respond',
+      sessionId: 'ses_1', sessionType: 'freshopencode', provider: 'opencode',
+      requestId: 'r9', cwd: '/repo/a', decision: { behavior: 'allow' },
+    })
   })
 })
 
@@ -1430,6 +1519,14 @@ describe('executeDeckStop', () => {
     executeDeckStop({ kind: 'fresh-agent', sessionId: 's1', sessionType: 'freshclaude', provider: 'claude' }, false)
     expect(sendMock).toHaveBeenCalledWith({
       type: 'freshAgent.interrupt', sessionId: 's1', sessionType: 'freshclaude', provider: 'claude',
+    })
+    expect('cwd' in sendMock.mock.calls[0][0]).toBe(false)
+  })
+
+  it('freshopencode target -> interrupt frame carries cwd', () => {
+    executeDeckStop({ kind: 'fresh-agent', sessionId: 'ses_1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo/a' }, false)
+    expect(sendMock).toHaveBeenCalledWith({
+      type: 'freshAgent.interrupt', sessionId: 'ses_1', sessionType: 'freshopencode', provider: 'opencode', cwd: '/repo/a',
     })
   })
 
@@ -1504,6 +1601,9 @@ export function sendDeckApproval(target: ApproveTarget): void {
     sessionType: target.sessionType,
     provider: target.provider,
     requestId: target.requestId,
+    // freshopencode auth keys embed cwd server-side; cwd-less durable-opencode frames die UNAUTHORIZED.
+    // The selector (Task 3) sets target.cwd only for freshopencode; claude/codex/kilroy stay cwd-less.
+    ...(target.cwd ? { cwd: target.cwd } : {}),
     // A defined updatedInput (even {}) wholesale replaces the tool input. Omit it.
     decision: { behavior: 'allow' },
   })
@@ -1517,6 +1617,7 @@ export function executeDeckStop(target: StopTarget, escalate: boolean): void {
       sessionId: target.sessionId,
       sessionType: target.sessionType,
       provider: target.provider,
+      ...(target.cwd ? { cwd: target.cwd } : {}),
     })
     return
   }
@@ -1768,13 +1869,15 @@ export class DeckController {
 Behavior (single stateful class; private fields `page`, `actionLayer: { tabId, openedAt } | null`, `pressedAt: Map<number, number>`, `lastStopAt: Map<string, number>` (per paneId), `lastActivityAt`, `dimmed`, `lastPaintedSpecs: string[]` (JSON of each key spec), `lastStripText: string | null`, `tickCount`):
 
 1. **Painting**: `repaint()` computes `buildFrame({ model: selectDeckModel(store.getState()), caps, page, actionLayer: actionLayerInputs(), previewFor })` where `previewFor(tabId)` finds the tab's focused pane (`state.panes.activePane[tabId]`, then `findPaneContent`) and, when it is a terminal pane with a `terminalId`, returns `getTerminalTextSnapshot(terminalId) ?? []`; else `[]`. Diff per key on `JSON.stringify(spec)`; only changed keys go through `renderKey` → `device.setKeyImage`. Strip: painted only when `strip.text` changed. If any key/strip actually painted → `noteRepaintActivity()` (wakes from dim).
-2. **Store subscription**: on every store notification, recompute + clamp `page` to the new `pageCount` (rebuild page to 1 if `tabsPerPage` changed), and `repaint()`. Cheap guard: skip if `selectDeckModel` output and preview inputs are shallow-equal to last (JSON compare of the model — small).
+2. **Store subscription**: on every store notification, recompute + clamp `page` to the new `pageCount` (rebuild page to 1 if `tabsPerPage` changed), and `repaint()`. Cheap guard (ordering is load-bearing, A10a): the JSON compare of the `selectDeckModel` output happens **BEFORE any xterm buffer reads** — if the model is unchanged, skip without touching `previewFor`. Previews are only re-read on the periodic preview-refresh tick and on actual repaints (model changed), never on every dispatch. Benchmarked: 13.2 µs/dispatch at 20 tabs — no memoization needed.
 3. **Key input**: `keyDown` → `pressedAt.set(k, now())`, `noteActivity()`. `keyUp` → duration = `now() - pressedAt.pop(k)` (ignore unmatched). If action layer open → `handleActionKey(k)` regardless of duration. Else classify via `planLayout`: pager key → advance page (wrap past last page to 1) + repaint; tab slot with a visible tab → duration ≥ `LONG_PRESS_MS` ? open action layer (`actionLayer = { tabId, openedAt: now() }`, repaint) : `focusTabFromDeck(store, tabId)` (repaint happens via store subscription; also call `repaint()` directly for optimistic immediacy); empty slot → ignore.
 4. **Action layer**: `actionLayerInputs()` = `{ tabId, approveEnabled: findApproveTarget(state, tabId) !== null, stopEnabled: findStopTarget(state, tabId) !== null }`. `handleActionKey`: BACK(0) → close+repaint. APPROVE(1) → re-read target; `null` → stay open; else `sendDeckApproval(target)`, `store.dispatch(dismissTabGreen(tabId))` gated as in focus, close+repaint. STOP(2) → re-read target; `null` → stay open; else `escalate = target.kind === 'terminal' && lastStopAt has paneId within STOP_ESCALATE_MS`; `executeDeckStop(target, escalate)`; if terminal, `lastStopAt.set(paneId, now())`; close+repaint. Other keys → ignored.
 5. **Dials** (only when `planLayout(...).useDials`): `dialRotate` dial 0 → cycle active tab by ticks with wrap-around modulo over `model.tabs`, then `focusTabFromDeck`; dial 0 press → re-focus current active tab; dial 1 rotate → `page = clampPage(page + ticks, pages)` + repaint; dial 1 press → `page = 1` + repaint. All dial events `noteActivity()`.
 6. **Touch**: `touchTap` → `noteActivity()` only.
 7. **Idle dim**: every `TICK_MS` tick: close action layer if `now() - openedAt >= ACTION_LAYER_TIMEOUT_MS`; if `idleTimeoutSeconds > 0 && !dimmed && now() - lastActivityAt >= idleTimeoutSeconds * 1000` → `dimmed = true; device.setBrightness(idleBrightness)`. `noteActivity()`: `lastActivityAt = now()`; if dimmed → `dimmed = false; device.setBrightness(brightness)`. Waking input still performs its action (wake is not swallow). Every `PREVIEW_REFRESH_TICKS` ticks → `repaint()` (picks up xterm buffer changes; diffing keeps it cheap and only real changes count as activity).
-8. **start()**: `device.setBrightness(settings().brightness)`, initial `repaint()`, subscribe store, `device.onInput(...)`, `setInterval(tick, TICK_MS)`. **stop()**: tear all down; `void device.clear()`.
+8. **start()**: `device.setBrightness(settings().brightness)`, initial `repaint()`, subscribe store, `device.onInput(...)`, `setInterval(tick, TICK_MS)`, and a `document.addEventListener('visibilitychange', ...)` that runs a `tick()` catch-up pass when the tab becomes visible. **stop()**: tear all down (incl. the visibilitychange listener); `void device.clear()`.
+
+**Timing constraint (load-bearing, A4/A3 verified):** ALL durations — long-press classification, action-layer auto-close (10s), STOP escalation window (5s), idle dim — are computed from `Date.now()` deltas against event timestamps, **NEVER from tick counts**. Hidden tabs throttle `setInterval` to ~1/min (Chrome intensive throttling); tick-count math would inflate every duration ~120×. The 500ms tick may therefore fire as rarely as once a minute while hidden — acceptable degradation: auto-close late by ≤60s, dim late by ~60s, previews stale up to ~60s while hidden (invisible anyway). Reconcile timers on `visibilitychange` (item 8) and on any HID input event: run the same duty checks (`tick()` logic) at the top of every input handler — HID input dispatch is NOT throttled in background tabs (verified), so each press is an exact wakeup. Related residual (note in the README, Task 16): Chrome's Memory Saver can DISCARD a long-hidden tab despite the open HID connection (HID is not on the discard-exempt list) — the deck goes dark until the tab is revisited; accepted residual.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1916,19 +2019,21 @@ git commit -m "feat(deck): DeckController - diff painting, press routing, action
 - Test: `test/unit/client/deck/webhid-transport.test.ts`
 
 **Interfaces:**
-- Consumes: `@elgato-stream-deck/webhid` (`requestStreamDecks`, `getStreamDecks`, `StreamDeckWeb`: `CONTROLS`, `PRODUCT_NAME`, `fillKeyBuffer(index, buffer, { format: 'rgba' })`, `fillLcdRegion`/`fillLcd`, `setBrightness(0-100)`, `clearPanel`, `close`, events `down`/`up`/`rotate`/`lcdShortPress`/`error`). Full API notes: `.worktrees/.the-usual-logs/stream-deck-webhid/reports/webhid-lib.md`.
+- Consumes: `@elgato-stream-deck/webhid` (`requestStreamDecks`, **`openDevice(hidDevice)`** (public export), `StreamDeckWeb`: `CONTROLS`, `PRODUCT_NAME`, `fillKeyBuffer(index, buffer, { format: 'rgba' })`, `fillLcd`, `setBrightness(0-100)`, `clearPanel`, `close`, events `down`/`up`/`rotate`/`lcdShortPress`), plus `navigator.hid` (`getDevices()`, `'disconnect'` events). Full API notes: `.worktrees/.the-usual-logs/stream-deck-webhid/reports/webhid-lib.md`. **Do NOT use `getStreamDecks()`** — it silently swallows open failures (`.catch(() => null)` + filter, webhid `index.js:41-44`) and can never signal in-use.
 - Produces:
 
 ```ts
 // src/deck/webhid-transport.ts
 import type { DeckDevice } from './deck-device'
 export class DeckOpenError extends Error { constructor(readonly reason: 'in-use' | 'unknown', message: string) }
-export async function requestWebHidDeck(): Promise<DeckDevice | null>   // user gesture; null = user cancelled the picker
-export async function getGrantedWebHidDeck(): Promise<DeckDevice | null> // silent reconnect; null = no granted deck
-// both throw DeckOpenError('in-use') when open fails because the device is held elsewhere
+export async function requestWebHidDeck(): Promise<DeckDevice | null>   // user gesture; null = user cancelled the picker (or Electron's handler-less requestDevice() -> [])
+export async function getGrantedWebHidDeck(): Promise<DeckDevice | null> // silent reconnect: navigator.hid.getDevices() -> filter Elgato vendor -> lib openDevice() per device; null = no granted deck
+// both throw DeckOpenError('in-use') when the OS-level open fails: the failure surfaces as a
+// `NetworkError` DOMException (note: indistinguishable from a Linux udev permission denial —
+// which is why the UI status copy says "in use by another app — or missing device permissions (Linux udev)")
 ```
 
-Capability derivation: walk `deck.CONTROLS` — entries with `type: 'button'` contribute `keyCount`/`keyRows = max(row)+1`/`keyColumns = max(column)+1` and `keyPixelWidth/Height` from the button's `pixelSize`; `type: 'encoder'` entries → `dialCount`; `type: 'lcd-segment'` (or `lcdStrip` presence) → `hasTouchStrip` + strip pixel size. Event normalization: the library emits control objects — read `.index` defensively (`typeof arg === 'number' ? arg : arg.index`). `rotate` → `{ type: 'dialRotate', dialIndex, ticks: amount }`; `lcdShortPress` → `{ type: 'touchTap' }`. Attach a no-op-ish `error` listener that funnels into the disconnect callbacks (the lib REQUIRES an error listener; log via `createLogger('StreamDeckWebHid')`, never `console.error`). `setKeyImage` → `fillKeyBuffer(index, Buffer-free Uint8Array view, { format: 'rgba' })`; `setTouchStripImage` → `fillLcd`-family with explicit dimensions; `clear` → `clearPanel()`.
+Capability derivation: walk `deck.CONTROLS` — entries with `type: 'button'` contribute `keyCount`/`keyRows = max(row)+1`/`keyColumns = max(column)+1` and `keyPixelWidth/Height` from the button's `pixelSize`; `type: 'encoder'` entries → `dialCount`; `type: 'lcd-segment'` → `hasTouchStrip` + strip pixel size from its `pixelSize: { width: 800, height: 100 }` field (the control also carries `id: 0` and `drawRegions: true`). Key indices arrive in reading order (0 = top-left) on every model — the lib normalizes the 15-key right-to-left layout internally via `hidIndex`. Event normalization: the lib's `down`/`up` events fire for BOTH buttons and encoders, with control objects `{ type: 'button' | 'encoder', index, ... }` whose indices collide (Plus encoders 0-3 vs buttons 0-7) — the transport MUST branch on `control.type`: `button` → `keyDown`/`keyUp`; `encoder` → emit `{ type: 'dialPress', dialIndex: control.index }` on `down` (ignore the encoder `up`). `rotate` → `{ type: 'dialRotate', dialIndex, ticks: amount }`; `lcdShortPress` → `{ type: 'touchTap' }`. Error/disconnect lifecycle: the lib's `'error'` event **never fires** for Elgato webhid decks (webhid's only emit site is commented out, `hid-device.js:18`; the core relay is therefore dead) — **including on unplug**. Disconnect detection comes from `navigator.hid.addEventListener('disconnect', ...)`, matching `event.device` to the opened `HIDDevice`, plus write-promise rejections (`fillKeyBuffer`/`fillLcd` failures) as a secondary signal. Still attach a defensive `error` listener (harmless; log via `createLogger('StreamDeckWebHid')`, never `console.error`) — but nothing may rely on it. `setKeyImage` → `fillKeyBuffer(index, rgba, { format: 'rgba' })` — the lib accepts `Uint8ClampedArray` directly at exact `pixelSize` (no Node Buffer, no flipping — per-model flips are handled internally; wrong length throws `RangeError`); `setTouchStripImage` → `fillLcd(0, rgba, { format: 'rgba' })` — exactly one full-strip 800×100 RGBA buffer (320,000 bytes), the options argument is REQUIRED; `clear` → `clearPanel()`.
 
 - [ ] **Step 1: Install dependencies**
 
@@ -1937,43 +2042,80 @@ npm install @elgato-stream-deck/webhid@^7.6.3
 npm install -D @types/w3c-web-hid
 ```
 
-Verify: `npm run typecheck` still passes (add `"w3c-web-hid"` to `tsconfig` `types` only if `navigator.hid` references fail to resolve — Task 11 is the first to reference it).
+Verify: `npm run typecheck` still passes (add `"w3c-web-hid"` to `tsconfig` `types` only if `navigator.hid` references fail to resolve — this task references it in the transport). The lib bundles under Vite with zero config changes (verified by a build spike on vite 6.4.3): no polyfills, no shims, no `vite.config` edits.
 
 - [ ] **Step 2: Write the failing test (module mocked)**
 
 ```ts
 // test/unit/client/deck/webhid-transport.test.ts
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { EventEmitter } from 'node:events'
 
-const openDecks: FakeLibDeck[] = []
 class FakeLibDeck extends EventEmitter {
   PRODUCT_NAME = 'Stream Deck Mini'
-  CONTROLS = [
+  CONTROLS: Array<Record<string, unknown>> = [
     ...Array.from({ length: 6 }, (_, i) => ({
       type: 'button', index: i, row: Math.floor(i / 3), column: i % 3, pixelSize: { width: 80, height: 80 },
     })),
   ]
   fillKeyBuffer = vi.fn(async () => {})
+  fillLcd = vi.fn(async () => {})
   setBrightness = vi.fn(async () => {})
   clearPanel = vi.fn(async () => {})
   close = vi.fn(async () => {})
 }
-const requestStreamDecks = vi.fn(async () => openDecks)
-const getStreamDecks = vi.fn(async () => openDecks)
-vi.mock('@elgato-stream-deck/webhid', () => ({ requestStreamDecks, getStreamDecks }))
+function plusControls(): Array<Record<string, unknown>> {
+  return [
+    ...Array.from({ length: 8 }, (_, i) => ({
+      type: 'button', index: i, row: Math.floor(i / 4), column: i % 4, pixelSize: { width: 120, height: 120 },
+    })),
+    ...Array.from({ length: 4 }, (_, i) => ({ type: 'encoder', index: i, hidIndex: i })),
+    { type: 'lcd-segment', id: 0, pixelSize: { width: 800, height: 100 }, drawRegions: true },
+  ]
+}
+
+// The lib is mocked at the two exports the transport uses. getStreamDecks is
+// deliberately NOT exported here — the transport must not import it.
+const requestStreamDecks = vi.fn(async (): Promise<FakeLibDeck[]> => [])
+const openDevice = vi.fn(async (_dev: unknown): Promise<FakeLibDeck> => new FakeLibDeck())
+vi.mock('@elgato-stream-deck/webhid', () => ({
+  requestStreamDecks: (...a: never[]) => requestStreamDecks(...a),
+  openDevice: (...a: never[]) => openDevice(...a),
+}))
 
 import { getGrantedWebHidDeck, requestWebHidDeck, DeckOpenError } from '@/deck/webhid-transport'
 
+// jsdom has no navigator.hid: stub getDevices + disconnect events.
+type FakeHidDevice = { vendorId: number; productId: number }
+const ELGATO = 0x0fd9
+function stubHid(devices: FakeHidDevice[]) {
+  const listeners = new Map<string, Set<(e: unknown) => void>>()
+  const hid = {
+    getDevices: vi.fn(async () => devices),
+    addEventListener: (t: string, cb: (e: unknown) => void) => {
+      if (!listeners.has(t)) listeners.set(t, new Set())
+      listeners.get(t)!.add(cb)
+    },
+    removeEventListener: (t: string, cb: (e: unknown) => void) => listeners.get(t)?.delete(cb),
+    fire: (t: string, event: unknown) => listeners.get(t)?.forEach((cb) => cb(event)),
+  }
+  Object.defineProperty(navigator, 'hid', { value: hid, configurable: true })
+  return hid
+}
+
 beforeEach(() => {
-  openDecks.length = 0
   requestStreamDecks.mockClear()
-  getStreamDecks.mockClear()
+  openDevice.mockClear()
+  openDevice.mockImplementation(async () => new FakeLibDeck())
+})
+afterEach(() => {
+  Reflect.deleteProperty(navigator as object, 'hid')
 })
 
 describe('webhid transport', () => {
   it('derives capabilities from CONTROLS', async () => {
-    openDecks.push(new FakeLibDeck())
+    stubHid([]) // wrap() registers the navigator.hid disconnect listener
+    requestStreamDecks.mockResolvedValueOnce([new FakeLibDeck()])
     const dev = await requestWebHidDeck()
     expect(dev?.capabilities).toMatchObject({
       model: 'Stream Deck Mini', keyCount: 6, keyRows: 2, keyColumns: 3,
@@ -1981,24 +2123,56 @@ describe('webhid transport', () => {
     })
   })
 
-  it('returns null when the user cancels the picker', async () => {
+  it('returns null on an empty picker result (user cancel — or Electron, which always resolves [])', async () => {
     expect(await requestWebHidDeck()).toBeNull()
   })
 
-  it('forwards key events with normalized indices', async () => {
+  it('silent reconnect enumerates getDevices() and opens Elgato-vendor devices via the lib openDevice export', async () => {
+    const granted: FakeHidDevice = { vendorId: ELGATO, productId: 0x0063 }
+    stubHid([{ vendorId: 0x1234, productId: 0x1 }, granted])
+    const dev = await getGrantedWebHidDeck()
+    expect(dev).not.toBeNull()
+    expect(openDevice).toHaveBeenCalledTimes(1)
+    expect(openDevice).toHaveBeenCalledWith(granted)
+  })
+
+  it('returns null from getGrantedWebHidDeck when no Elgato device is granted', async () => {
+    stubHid([{ vendorId: 0x1234, productId: 0x1 }])
+    expect(await getGrantedWebHidDeck()).toBeNull()
+    expect(openDevice).not.toHaveBeenCalled()
+  })
+
+  it('forwards button events, branching on control.type', async () => {
     const lib = new FakeLibDeck()
-    openDecks.push(lib)
+    stubHid([{ vendorId: ELGATO, productId: 0x0063 }])
+    openDevice.mockResolvedValueOnce(lib)
     const dev = (await getGrantedWebHidDeck())!
     const seen: unknown[] = []
     dev.onInput((e) => seen.push(e))
-    lib.emit('down', { index: 4 })
-    lib.emit('up', { index: 4 })
+    lib.emit('down', { type: 'button', index: 4 })
+    lib.emit('up', { type: 'button', index: 4 })
     expect(seen).toEqual([{ type: 'keyDown', keyIndex: 4 }, { type: 'keyUp', keyIndex: 4 }])
+  })
+
+  it('encoder down does NOT become a keyDown — it becomes a dialPress (indices collide on the Plus)', async () => {
+    const lib = new FakeLibDeck()
+    lib.PRODUCT_NAME = 'Stream Deck +'
+    lib.CONTROLS = plusControls()
+    stubHid([{ vendorId: ELGATO, productId: 0x0084 }])
+    openDevice.mockResolvedValueOnce(lib)
+    const dev = (await getGrantedWebHidDeck())!
+    expect(dev.capabilities).toMatchObject({ dialCount: 4, hasTouchStrip: true, touchStripPixelWidth: 800, touchStripPixelHeight: 100 })
+    const seen: unknown[] = []
+    dev.onInput((e) => seen.push(e))
+    lib.emit('down', { type: 'encoder', index: 1 })
+    lib.emit('up', { type: 'encoder', index: 1 })
+    expect(seen).toEqual([{ type: 'dialPress', dialIndex: 1 }])
   })
 
   it('paints keys via fillKeyBuffer with rgba format and forwards brightness/clear/close', async () => {
     const lib = new FakeLibDeck()
-    openDecks.push(lib)
+    stubHid([{ vendorId: ELGATO, productId: 0x0063 }])
+    openDevice.mockResolvedValueOnce(lib)
     const dev = (await getGrantedWebHidDeck())!
     const buf = new Uint8ClampedArray(80 * 80 * 4)
     await dev.setKeyImage(2, buf)
@@ -2011,18 +2185,24 @@ describe('webhid transport', () => {
     expect(lib.close).toHaveBeenCalled()
   })
 
-  it('maps open failures to DeckOpenError(in-use)', async () => {
-    getStreamDecks.mockRejectedValueOnce(Object.assign(new Error('Failed to open the device'), { name: 'InvalidStateError' }))
-    await expect(getGrantedWebHidDeck()).rejects.toBeInstanceOf(DeckOpenError)
+  it('maps a NetworkError DOMException from openDevice to DeckOpenError(in-use)', async () => {
+    stubHid([{ vendorId: ELGATO, productId: 0x0063 }])
+    openDevice.mockRejectedValueOnce(new DOMException('Failed to open the device.', 'NetworkError'))
+    const failure = await getGrantedWebHidDeck().then(() => null, (e: unknown) => e)
+    expect(failure).toBeInstanceOf(DeckOpenError)
+    expect((failure as DeckOpenError).reason).toBe('in-use')
   })
 
-  it('funnels lib error events into disconnect listeners', async () => {
-    const lib = new FakeLibDeck()
-    openDecks.push(lib)
+  it('navigator.hid disconnect for the opened device drives onDisconnect (the lib error event never fires)', async () => {
+    const granted: FakeHidDevice = { vendorId: ELGATO, productId: 0x0063 }
+    const hid = stubHid([granted])
     const dev = (await getGrantedWebHidDeck())!
     const cb = vi.fn()
     dev.onDisconnect(cb)
-    lib.emit('error', new Error('device went away'))
+    hid.fire('disconnect', { device: { vendorId: 0x9999, productId: 0x1 } }) // some other device
+    expect(cb).not.toHaveBeenCalled()
+    hid.fire('disconnect', { device: granted })
+    hid.fire('disconnect', { device: granted })
     expect(cb).toHaveBeenCalledTimes(1)
   })
 })
@@ -2035,7 +2215,13 @@ Expected: FAIL — module not found.
 
 - [ ] **Step 4: Implement `src/deck/webhid-transport.ts`**
 
-Wrap a lib deck in a `WebHidDeckDevice implements DeckDevice` class doing the derivations/normalizations from the Interfaces block; `requestWebHidDeck` = `const decks = await requestStreamDecks(); return decks[0] ? wrap(decks[0]) : null` (wrap open failures: catch, inspect `error.name === 'InvalidStateError' || /open|in use|access/i.test(message)` → `DeckOpenError('in-use', ...)`, else `DeckOpenError('unknown', ...)`); same for `getGrantedWebHidDeck` with `getStreamDecks()`. For Plus support include `encoder`/`lcd-segment` handling per the report (`rotate` handler signature `(control, amount)`), guarded so a deck without those never registers them. Use `createLogger('StreamDeckWebHid')`.
+Wrap a lib deck in a `WebHidDeckDevice implements DeckDevice` class doing the derivations/normalizations from the Interfaces block.
+
+- `requestWebHidDeck` = `const decks = await requestStreamDecks(); return decks[0] ? wrap(decks[0]) : null` — an empty array means the user cancelled the picker OR the app is Electron (whose handler-less `requestDevice()` always resolves `[]`): treat it as a clean no-op everywhere, **never index `[0]` blindly**.
+- `getGrantedWebHidDeck` = enumerate `navigator.hid.getDevices()`, filter `device.vendorId === 0x0fd9` (Elgato), and call the lib's exported `openDevice(hidDevice)` on the first match — this is the only path where open failures are observable (`getStreamDecks()` swallows them). Return `null` when no Elgato device is granted.
+- Open-failure classification (both entry points): catch, and if `error instanceof DOMException && error.name === 'NetworkError'` → `DeckOpenError('in-use', ...)` (do NOT match on message text — it is unspecified; note this same `NetworkError` is what a missing Linux udev rule produces), else `DeckOpenError('unknown', ...)`.
+- `wrap(lib, hidDevice?)`: the `getGranted` path passes the `HIDDevice` it opened; the `request` path recovers it defensively via `(lib as { hid?: { device?: HIDDevice } }).hid?.device` (untyped but stable lib internals). Register `navigator.hid.addEventListener('disconnect', handler)` where `handler` fires the wrapper's disconnect listeners once iff `event.device` is the wrapped `HIDDevice` (remove the listener on `close()`). Secondary disconnect signal: if a `setKeyImage`/`setTouchStripImage` write promise rejects, log it and re-check `navigator.hid.getDevices()` — if the device is gone, fire the disconnect listeners. Attach a defensive `error` listener that only logs (it never fires for Elgato webhid decks — do not build any behavior on it).
+- Input wiring: `down`/`up` handlers receive a control object and MUST branch on `control.type` — `'button'` → `keyDown`/`keyUp` with `keyIndex: control.index`; `'encoder'` → `dialPress` with `dialIndex: control.index` on `down` only (ignore encoder `up`). For Plus support include `encoder`/`lcd-segment` handling per the report (`rotate` handler signature `(control, amount)`), guarded so a deck without those never registers them. Use `createLogger('StreamDeckWebHid')`.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -2062,7 +2248,7 @@ git commit -m "feat(deck): WebHID transport wrapping @elgato-stream-deck/webhid"
 - Test: `test/unit/client/deck/deck-manager.test.ts`
 
 **Interfaces:**
-- Consumes: Tasks 9–10, `isWebHidSupported`, `settings.streamDeck.*`.
+- Consumes: Tasks 9–10, `isWebHidSupported`, `settings.streamDeck.*`, `navigator.locks` (Web Locks leader election; treated as "immediately leader" when absent) and `navigator.hid` `connect` events (both stubbed in jsdom tests below).
 - Produces:
 
 ```ts
@@ -2093,12 +2279,12 @@ export function resetStreamDeckManagerForTests(): void
 
 Manager behavior:
 - `installStreamDeckManager`: idempotent singleton (module-level state + reset-for-tests, per the `useEnsureExtensionsRegistry` pattern). If `!isWebHidSupported()` → `setDeckStatus({ status: 'unsupported' })` and do nothing else. Subscribes to the store watching `state.settings.settings.streamDeck.enabled`:
-  - enabled turning true → `setDeckStatus({status:'connecting'})`; `getGranted()`; device → adopt; `null` → `'disconnected'` (waiting for the user to press Connect); `DeckOpenError('in-use')` → `'in-use'` + arm retry.
-  - enabled turning false → tear down controller (`controller.stop()`, `device.close()`), `'disconnected'`.
-- Adopt(device): create `DeckController` with `settings: () => store.getState().settings.settings.streamDeck`, `start()`, `setDeckStatus({ status: 'connected', model: caps.model, keyCount: caps.keyCount })`; `device.onDisconnect(...)` → teardown → `'disconnected'` (hotplug replug then reconnects via the HID `connect` event below).
-- Hotplug: `navigator.hid.addEventListener('connect', ...)` → if enabled and not connected, try `getGranted()` again; `'disconnect'` events are also observed as a fallback teardown trigger.
-- In-use retry: `window` listeners on `focus` and `visibilitychange` (when visible) → if status `in-use` and enabled, retry `getGranted()`.
-- `requestDeckConnect()`: `request()` (user gesture); adopt on success; picker-cancel → keep prior status; `in-use` → `'in-use'`.
+  - enabled turning true → **Web Locks leader election wraps the enable lifecycle**: call `navigator.locks.request('freshell-stream-deck', { mode: 'exclusive' }, () => leaderGate)` where `leaderGate` is a deferred promise the manager resolves on disable/uninstall — the lock is held for the manager's enabled lifetime. Until the lock callback runs (another freshell window is the leader) → `setDeckStatus({ status: 'in-use' })` (this is the same-origin "in use elsewhere / another window" case). When the callback runs, this window is the leader — including leadership handoff: when the previous leader closes or disables, the lock releases and this waiting window acquires it, then connects. As leader: `setDeckStatus({status:'connecting'})`; `getGranted()`; device → adopt; `null` → `'disconnected'` (waiting for the user to press Connect); `DeckOpenError('in-use')` → `'in-use'` + arm retry (secondary signal: an OS app holds the device exclusively, e.g. an exclusive-mode holder on Windows — concurrent opens generally SUCCEED, see the locked exclusivity decision). If `navigator.locks` is missing (old browser / jsdom), skip the election and proceed as leader.
+  - enabled turning false → resolve `leaderGate` (releases the Web Lock so a waiting window can take over), tear down controller (`controller.stop()`, `device.close()`), `'disconnected'`.
+- Adopt(device): create `DeckController` with `settings: () => store.getState().settings.settings.streamDeck`, `start()`, `setDeckStatus({ status: 'connected', model: caps.model, keyCount: caps.keyCount })`; `device.onDisconnect(...)` → teardown → `'disconnected'` (hotplug replug then reconnects via the HID `connect` event below). Note: `device.onDisconnect` is driven by the transport's `navigator.hid` `'disconnect'` listener + write-rejection fallback — the lib's `'error'` event never fires and nothing may depend on it.
+- Hotplug: `navigator.hid.addEventListener('connect', ...)` → if enabled, leader, and not connected, try `getGranted()` again.
+- In-use retry: `window` listeners on `focus` and `visibilitychange` (when visible) → if status `in-use`, enabled, **and this window holds the leader lock**, retry `getGranted()` (covers the OS-app case; the non-leader case resolves itself via lock handoff, not retry).
+- `requestDeckConnect()`: `request()` (user gesture); adopt on success; `null` (picker cancel — or Electron's handler-less `requestDevice()`, which always resolves `[]`) → keep prior status, clean no-op; `in-use` → `'in-use'`. Only meaningful for the leader; a non-leader window keeps status `'in-use'`.
 - The uninstall function removes all listeners and tears down (used by tests and HMR safety).
 - `useStreamDeck()`: `useEffect(() => installStreamDeckManager(storeFromUseAppStore), [])` — one-liner hook using `useAppStore()`.
 
@@ -2141,6 +2327,28 @@ function stubHid() {
   return hid
 }
 
+// jsdom has no navigator.locks either: a minimal exclusive-lock stub with FIFO
+// handoff, for the leader-election tests. The manager treats a missing
+// navigator.locks as "immediately leader", so the other tests need no stub.
+function stubLocks() {
+  let busy = false
+  const waiters: Array<() => void> = []
+  const locks = {
+    async request(name: string, _opts: unknown, cb: (lock: unknown) => unknown) {
+      if (busy) await new Promise<void>((r) => waiters.push(r))
+      busy = true
+      try {
+        return await cb({ name })
+      } finally {
+        busy = false
+        waiters.shift()?.()
+      }
+    },
+  }
+  Object.defineProperty(navigator, 'locks', { value: locks, configurable: true })
+  return locks
+}
+
 function makeStore() { /* configureStore with all reducers above incl. deck */ }
 
 let uninstall: (() => void) | null = null
@@ -2149,8 +2357,9 @@ afterEach(() => {
   uninstall?.()
   uninstall = null
   resetStreamDeckManagerForTests()
-  // remove the hid stub
+  // remove the hid + locks stubs
   Reflect.deleteProperty(navigator as object, 'hid')
+  Reflect.deleteProperty(navigator as object, 'locks')
 })
 
 it('marks unsupported and does nothing when navigator.hid is missing', () => {
@@ -2192,7 +2401,21 @@ it('open failure held-elsewhere -> in-use, retried on window focus', async () =>
   await vi.waitFor(() => expect(store.getState().deck.status).toBe('connected'))
 })
 
-it('requestDeckConnect adopts the picked device; picker cancel keeps prior status', async () => {
+it('non-leader window shows in-use while another window holds the leader lock, connects on handoff', async () => {
+  const locks = stubLocks()
+  // simulate the other freshell window's manager holding the leader lock
+  let releaseOther: () => void = () => {}
+  void locks.request('freshell-stream-deck', { mode: 'exclusive' }, () => new Promise<void>((r) => { releaseOther = r }))
+  const store = makeStore()
+  const device = new FakeDeckDevice()
+  uninstall = installStreamDeckManager(store as never, { request: vi.fn(), getGranted: vi.fn(async () => device) })
+  store.dispatch(updateSettingsLocal({ streamDeck: { enabled: true } }))
+  await vi.waitFor(() => expect(store.getState().deck.status).toBe('in-use'))
+  releaseOther() // leader closes/disables -> lock handoff
+  await vi.waitFor(() => expect(store.getState().deck.status).toBe('connected'))
+})
+
+it('requestDeckConnect adopts the picked device; picker cancel (or Electron []) keeps prior status', async () => {
   /* request resolves device -> connected; then reset, request resolves null -> status unchanged */
 })
 ```
@@ -2281,8 +2504,8 @@ git commit -m "feat(deck): register live terminal text readers for deck previews
 - Test: `test/unit/client/components/settings/StreamDeckSettings.test.tsx`
 
 **Interfaces:**
-- Consumes: `SettingsSectionProps` (`settings-types.ts`), `SettingsSection`/`SettingsRow`/`Toggle`/`SteppedRangeInput` (`settings-controls.tsx`), `isWebHidSupported`, `requestDeckConnect` (Task 11), `state.deck` + `setVirtualDeckOpen` (deckSlice), `applyLocalSetting`.
-- Produces: the settings tab. Controls: (a) "Enable Stream Deck" `Toggle` → `applyLocalSetting({ streamDeck: { enabled } })`; (b) "Connect Stream Deck" `<button type="button">` → `void requestDeckConnect()` (disabled unless enabled); (c) status line derived from `state.deck` (`Connected: {model} ({keyCount} keys)` / `Not connected` / `In use by another window or app` / error); (d) three numeric rows via `SteppedRangeInput` (idle timeout seconds 0–3600, allowed values `[0, 30, 60, 120, 300, 600, 1800, 3600]`; active brightness 10–100 step 10; idle brightness 0–100 step 10) each with explicit `aria-label`; (e) "Show virtual deck" `Toggle` → `dispatch(setVirtualDeckOpen(v))`. When `!isWebHidSupported()`: render the section with a short note `Stream Deck requires Chrome or Edge (WebHID). The virtual deck below still works.` — hide the connect button and status line, keep the enable/virtual controls visible but the connect flow unavailable.
+- Consumes: `SettingsSectionProps` (`settings-types.ts`), `SettingsSection`/`SettingsRow`/`Toggle`/`SteppedRangeInput` (`settings-controls.tsx`), `isWebHidSupported` + `isElectronClient` (`@/lib/webhid-support`, Task 1), `requestDeckConnect` (Task 11), `state.deck` + `setVirtualDeckOpen` (deckSlice), `applyLocalSetting`.
+- Produces: the settings tab. Controls: (a) "Enable Stream Deck" `Toggle` → `applyLocalSetting({ streamDeck: { enabled } })`; (b) "Connect Stream Deck" `<button type="button">` → `void requestDeckConnect()` (disabled unless enabled); (c) status line derived from `state.deck` (`Connected: {model} ({keyCount} keys)` / `Not connected` / `In use by another window or app — or missing device permissions (Linux udev)` / error); (d) three numeric rows via `SteppedRangeInput` (idle timeout seconds 0–3600, allowed values `[0, 30, 60, 120, 300, 600, 1800, 3600]`; active brightness 10–100 step 10; idle brightness 0–100 step 10) each with explicit `aria-label`; (e) "Show virtual deck" `Toggle` → `dispatch(setVirtualDeckOpen(v))`. When `!isWebHidSupported()`: render the section with a short note `Stream Deck requires Chrome or Edge (WebHID). The virtual deck below still works.` — hide the connect button and status line, keep the enable/virtual controls visible but the connect flow unavailable. When `isElectronClient()` (checked FIRST — in Electron `navigator.hid` exists but is non-functional: `requestDevice()` always resolves `[]`, no picker): show `Stream Deck is not supported in the desktop app — use Chrome or Edge.` instead of a dead Connect button (hide connect + status line, keep enable/virtual controls, same shape as the unsupported branch).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2299,7 +2522,11 @@ import { defaultSettings } from '@/store/settingsSlice'
 const requestDeckConnect = vi.fn(async () => {})
 vi.mock('@/deck/deck-manager', () => ({ requestDeckConnect: (...a: never[]) => requestDeckConnect(...a) }))
 const supported = vi.fn(() => true)
-vi.mock('@/lib/webhid-support', () => ({ isWebHidSupported: () => supported() }))
+const electron = vi.fn(() => false)
+vi.mock('@/lib/webhid-support', () => ({
+  isWebHidSupported: () => supported(),
+  isElectronClient: () => electron(),
+}))
 
 import StreamDeckSettings from '@/components/settings/StreamDeckSettings'
 
@@ -2347,6 +2574,15 @@ it('non-Chromium browsers get the requires-Chrome note and no connect button', (
   supported.mockReturnValueOnce(false)
   renderSection()
   expect(screen.getByText(/requires chrome or edge/i)).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: /connect stream deck/i })).toBeNull()
+})
+
+it('Electron gets the honest not-supported message instead of a dead connect button', () => {
+  // navigator.hid EXISTS in Electron but requestDevice() always resolves [] — the
+  // supported check alone would render a Connect button that can never work.
+  electron.mockReturnValueOnce(true)
+  renderSection()
+  expect(screen.getByText(/not supported in the desktop app/i)).toBeInTheDocument()
   expect(screen.queryByRole('button', { name: /connect stream deck/i })).toBeNull()
 })
 
@@ -2484,7 +2720,7 @@ git commit -m "test(deck): e2e flow suite over the fake transport (7 ported scen
 
 - [ ] **Step 1: README section**
 
-Add a concise section covering: what it does (tabs on keys, rings, press to focus, long-press APPROVE/STOP, paging, Deck+ dials/strip, idle dim); requirements (Chrome/Edge — WebHID; Elgato Stream Deck, primary target Mini); how to connect (Settings → Stream Deck → enable → Connect Stream Deck → pick the device; auto-reconnects afterwards); the virtual deck (Settings → Stream Deck → Show virtual deck — works without hardware); note that deck settings are per-browser-profile (localStorage). `docs/index.html`: intentionally not updated (settings-level feature, not a default-experience change).
+Add a concise section covering: what it does (tabs on keys, rings, press to focus, long-press APPROVE/STOP, paging, Deck+ dials/strip, idle dim); requirements (Chrome/Edge — WebHID; Elgato Stream Deck, primary target Mini; NOT supported in the freshell desktop app — use Chrome/Edge); how to connect (Settings → Stream Deck → enable → Connect Stream Deck → pick the device; auto-reconnects afterwards); the virtual deck (Settings → Stream Deck → Show virtual deck — works without hardware); note that deck settings are per-browser-profile (localStorage); **Linux udev rules** (hidraw device nodes default to root-only — add a udev rule for the Elgato vendor id `0fd9` to grant user access; without it the browser cannot open the deck, and the status line shows the combined wording "in use by another app — or missing device permissions (Linux udev)" because the browser cannot distinguish the two failure causes); **Memory Saver caveat** (Chrome's Memory Saver can discard a long-hidden freshell tab even with the deck connected — the deck goes dark until the tab is revisited; add freshell to Memory Saver's "Always keep this site active" list to avoid it). `docs/index.html`: intentionally not updated (settings-level feature, not a default-experience change).
 
 - [ ] **Step 2: Full verification**
 
@@ -2507,6 +2743,18 @@ git commit -m "docs: Stream Deck support - connecting, browser support, virtual 
 
 ---
 
+## Hardware checkpoints (post-implementation)
+
+Manual checks with a real deck — accepted residuals from the load-bearing review that CI cannot cover (do after merge, with the user):
+
+- **Second-holder open behavior per OS (A2):** with the Elgato Stream Deck software running on each of Windows/macOS/Linux, attempt a freshell connect (and vice versa) — research says concurrent opens generally SUCCEED and both parties paint (user resolves by closing one); confirm whether Windows Elgato software opens exclusive-mode (the one case where `DeckOpenError('in-use')` fires). Also: two same-profile freshell windows must resolve via the Web Locks leader election, not open failure. On Linux, verify the udev-rule vs in-use `NetworkError` ambiguity and the status copy.
+- **Backgrounded-window input soak (A3):** hide/minimize the freshell tab >5 min and >1 hr — key presses must still act promptly (HID input is unthrottled); verify timer duties catch up within a tick. Also observe Chrome Memory Saver: a long-hidden tab may be DISCARDED despite the open HID connection (deck goes dark until revisit — accepted residual, README-documented).
+- **Stream Deck+ dial presses (A5):** real dial-press traffic must map through `control.type === 'encoder'` → `dialPress` (never `keyDown`), with button presses unaffected.
+- **Sustained repaint soak (A14):** long repaint sessions watching for transient write-promise rejections (`fillKeyBuffer`/`fillLcd`) — confirm the secondary disconnect signal doesn't false-positive while the device is still attached.
+- **Memory-Saver discard behavior:** confirm the "Always keep this site active" exception prevents the discard, and that revisiting the tab auto-reconnects via `getDevices()`.
+
+---
+
 ## Self-Review
 
 **1. Spec coverage:**
@@ -2521,7 +2769,7 @@ git commit -m "docs: Stream Deck support - connecting, browser support, virtual 
 - Idle dimming (configurable, wake on activity incl. repaint-worthy changes) → Task 9, e2e #7.
 - Feature detection + non-Chromium note → Tasks 1, 13.
 - Settings section (toggle, connect gesture button, status line incl. in-use, numerics, virtual deck toggle) → Task 13.
-- Auto-reconnect, hotplug, exclusivity/in-use retry → Task 11.
+- Auto-reconnect, hotplug, exclusivity (Web Locks leader election + secondary in-use retry) → Task 11.
 - Client-side persistence via LocalSettings → Task 1.
 - A11y → Tasks 13, 14 + `npm run lint`.
 - State sources reuse (tabs/panes/activity/turn-complete/pending-permission) → Task 3.
@@ -2533,4 +2781,4 @@ git commit -m "docs: Stream Deck support - connecting, browser support, virtual 
 
 **2. Placeholder scan:** Task 9 Step 1 and Task 11 Step 1 list two test bodies in compressed comment form with explicit instruction to write them in full; all other steps carry complete code. No TBD/TODO items. Task 12 depends on locating an existing ref in `TerminalView.tsx` — the step provides both the primary path and the fallback (dedicated ref) with code.
 
-**3. Type consistency check:** `DeckCapabilities`/`DeckInputEvent`/`DeckDevice` (Task 2) used verbatim in Tasks 9–11, 14; `KeySpec`/`FrameSpec`/`ACTION_KEYS` (Task 4) match Task 5 renderer and Task 9 controller usage; `TabRingStatus`/`DeckModel`/`ApproveTarget`/`StopTarget` (Task 3) match Task 7/9 signatures; `sendDeckApproval(target)` takes `ApproveTarget` without `cwd` (deliberate — prior branch validated cwd-less frames against both servers); `executeDeckStop(target, escalate)` consistent between Tasks 7 and 9; `useTerminalTextRegistration(terminalId, termRef, maxLines?)` consistent between Tasks 8 and 12. `DeckOpenError` defined in Task 10, consumed in Task 11 tests. Settings field names (`enabled`, `brightness`, `idleBrightness`, `idleTimeoutSeconds`) consistent across Tasks 1, 9, 11, 13.
+**3. Type consistency check:** `DeckCapabilities`/`DeckInputEvent`/`DeckDevice` (Task 2) used verbatim in Tasks 9–11, 14; `KeySpec`/`FrameSpec`/`ACTION_KEYS` (Task 4) match Task 5 renderer and Task 9 controller usage; `TabRingStatus`/`DeckModel`/`ApproveTarget`/`StopTarget` (Task 3) match Task 7/9 signatures; `sendDeckApproval(target)` takes `ApproveTarget` whose optional `cwd` is set by the Task 3 selectors only for freshopencode targets (server auth keys embed cwd — A8) and spread into the frame by Task 7; claude/codex/kilroy frames stay cwd-less; `executeDeckStop(target, escalate)` consistent between Tasks 7 and 9; `useTerminalTextRegistration(terminalId, termRef, maxLines?)` consistent between Tasks 8 and 12. `DeckOpenError` defined in Task 10, consumed in Task 11 tests. Settings field names (`enabled`, `brightness`, `idleBrightness`, `idleTimeoutSeconds`) consistent across Tasks 1, 9, 11, 13.
