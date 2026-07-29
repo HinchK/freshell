@@ -1,6 +1,7 @@
 import type { DeckCapabilities } from './deck-device'
 import type { DeckAction, KeySpec, RingColor } from './frame'
 import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
+import { DECK_FONT_STACK } from './deck-font'
 
 // Canvas draw layer: converts a KeySpec into an RGBA pixel buffer via an
 // injectable 2D-context factory (jsdom returns null from getContext, so tests
@@ -48,6 +49,8 @@ export const CONTROL_BG = '#101036'
 export const CONTROL_DIM = '#8888aa'
 export const EMPTY_BG = '#000000'
 export const STRIP_FONT_SIZE = 22
+export const CONTROL_LABEL_FONT_SIZE = 11
+export const CONTROL_VALUE_FONT_SIZE = 15
 export const MAX_TITLE_CHARS = 10
 
 export function previewGeometry(width: number, height: number): { lines: number; columns: number } {
@@ -168,7 +171,7 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
     ctx.beginPath()
     ctx.arc(cx, cy, size / 2, 0, Math.PI * 2)
     ctx.fill()
-    ctx.font = `600 ${Math.round(size * REPO_AVATAR_FONT_RATIO)}px sans-serif`
+    ctx.font = `600 ${Math.round(size * REPO_AVATAR_FONT_RATIO)}px ${DECK_FONT_STACK}`
     ctx.textBaseline = 'middle'
     ctx.fillStyle = '#ffffff'
     const letterWidth = ctx.measureText(icon.letter).width
@@ -184,7 +187,7 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
   // 4. Title banner across the top (unchanged treatment).
   ctx.fillStyle = BANNER_FILL
   ctx.fillRect(0, 0, w, BANNER_HEIGHT)
-  ctx.font = `${TITLE_FONT_SIZE}px sans-serif`
+  ctx.font = `600 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 4)
@@ -212,17 +215,17 @@ function drawPager(
   ctx.fillRect(0, 0, w, h)
   ctx.textBaseline = 'top'
 
-  ctx.font = '11px sans-serif'
+  ctx.font = `400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.fillStyle = CONTROL_DIM
   drawCenteredText(ctx, 'PAGE', w, 2)
 
-  ctx.font = '15px sans-serif'
+  ctx.font = `600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.fillStyle = ACTIVE_COLOR
-  drawCenteredText(ctx, `${spec.page}/${spec.pageCount}`, w, (h - 15) / 2)
+  drawCenteredText(ctx, `${spec.page}/${spec.pageCount}`, w, (h - CONTROL_VALUE_FONT_SIZE) / 2)
 
-  ctx.font = '11px sans-serif'
+  ctx.font = `400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.fillStyle = CONTROL_DIM
-  drawCenteredText(ctx, 'NEXT >', w, h - 11 - 4)
+  drawCenteredText(ctx, 'NEXT >', w, h - CONTROL_LABEL_FONT_SIZE - 4)
 }
 
 function drawAction(
@@ -232,10 +235,10 @@ function drawAction(
   ctx.fillStyle = CONTROL_BG
   ctx.fillRect(0, 0, w, h)
 
-  ctx.font = '15px sans-serif'
+  ctx.font = `600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
-  drawCenteredText(ctx, ACTION_LABELS[spec.action], w, (h - 15) / 2)
+  drawCenteredText(ctx, ACTION_LABELS[spec.action], w, (h - CONTROL_VALUE_FONT_SIZE) / 2)
 
   drawRing(ctx, w, h, spec.enabled ? ACTION_RING[spec.action] : DISABLED_ACTION_COLOR, 3, 0)
 }
@@ -271,7 +274,7 @@ export function renderStrip(text: string, width: number, height: number, createC
   const ctx = createCtx(width, height)
   ctx.fillStyle = EMPTY_BG
   ctx.fillRect(0, 0, width, height)
-  ctx.font = `${STRIP_FONT_SIZE}px sans-serif`
+  ctx.font = `400 ${STRIP_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   drawCenteredText(ctx, text, width, (height - STRIP_FONT_SIZE) / 2)

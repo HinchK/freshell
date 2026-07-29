@@ -1,12 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import { MINI_CAPS } from '@/deck/fake-deck-device'
 import {
-  cropPreviewLines, drawRing, fitLabel, iconLayout, previewGeometry, renderKey, truncateTitle,
+  cropPreviewLines, drawRing, fitLabel, iconLayout, previewGeometry, renderKey, renderStrip, truncateTitle,
   APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, PREVIEW_TEXT_COLOR, RING_COLORS,
   TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, DOT_GREEN, DOT_BLUE, DOT_SIZE,
+  CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
 } from '@/deck/tile-renderer'
 import type { Ctx2D, IconSource } from '@/deck/tile-renderer'
 import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
+import { DECK_FONT_STACK } from '@/deck/deck-font'
 import type { KeySpec, RingColor } from '@/deck/frame'
 
 type Rect = { x: number; y: number; w: number; h: number; style: string }
@@ -167,7 +169,7 @@ describe('renderKey', () => {
     const letter = texts.find((t) => t.text === 'B')
     expect(letter?.style).toBe('#ffffff')
     // 9/16 of the diameter, weight 600 (slot.size is 30 on the 80x80 Mini -> 17px).
-    expect(letter?.font).toBe(`600 ${Math.round(slot.size * REPO_AVATAR_FONT_RATIO)}px sans-serif`)
+    expect(letter?.font).toBe(`600 ${Math.round(slot.size * REPO_AVATAR_FONT_RATIO)}px ${DECK_FONT_STACK}`)
   })
 
   it('status dot: green and blue variants at bottom-center; absent when null', () => {
@@ -231,5 +233,46 @@ describe('renderKey preview style', () => {
   it('icons style still renders fills (dispatch regression)', () => {
     const { rects } = renderTab(tabSpec({ fill: 'green' }))
     expect(rects.some((r) => r.style === '#a7f3d0')).toBe(true) // emerald-200 green fill
+  })
+})
+
+describe('fonts (Inter)', () => {
+  it('icons tile: banner title and avatar letter render in 600-weight Inter', () => {
+    const { texts } = renderTab(
+      tabSpec({ title: 'build', icons: [{ url: null, letter: 'B', hue: 200, ready: false }] }),
+    )
+    const title = texts.find((t) => t.text === 'build')
+    expect(title?.font).toBe(`600 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    const letter = texts.find((t) => t.text === 'B')
+    expect(letter?.font).toContain(`px ${DECK_FONT_STACK}`)
+    expect(letter?.font.startsWith('600 ')).toBe(true)
+  })
+
+  it('pager: dim labels are 400 Inter, the page count is 600 Inter', () => {
+    const { texts } = renderTab({ kind: 'pager', page: 2, pageCount: 3 })
+    expect(texts.find((t) => t.text === 'PAGE')?.font).toBe(`400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(texts.find((t) => t.text === 'NEXT >')?.font).toBe(`400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(texts.find((t) => t.text === '2/3')?.font).toBe(`600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+  })
+
+  it('action key labels render in 600 Inter', () => {
+    const { texts } = renderTab({ kind: 'action', action: 'approve', enabled: true })
+    expect(texts.find((t) => t.text === 'APPROVE')?.font).toBe(`600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+  })
+
+  it('strip text renders in 400 Inter', () => {
+    let captured: ReturnType<typeof recordingCtx> | null = null
+    const factory = (w: number, h: number) => {
+      captured = recordingCtx(w, h)
+      return captured.ctx
+    }
+    renderStrip('hello', 800, 100, factory)
+    expect(captured!.texts.find((t) => t.text === 'hello')?.font).toBe(`400 ${STRIP_FONT_SIZE}px ${DECK_FONT_STACK}`)
+  })
+
+  it('classic preview tile is PINNED: monospace body, sans-serif banner', () => {
+    const { texts } = renderTab(previewSpec({ title: 'build', previewLines: ['$ ls'] }))
+    expect(texts.find((t) => t.text === '$ ls')?.font).toBe('11px monospace')
+    expect(texts.find((t) => t.text === 'build')?.font).toBe(`${TITLE_FONT_SIZE}px sans-serif`)
   })
 })
