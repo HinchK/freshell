@@ -8,7 +8,7 @@ import type { DeckModel, DeckTab } from '@/deck/deck-selectors'
 function makeDeckTab(over: Partial<DeckTab> & Pick<DeckTab, 'id' | 'title'>): DeckTab {
   return {
     active: false, busy: false, attention: false, pendingApproval: false, fill: 'none', dot: null,
-    priority: 4, repoIcons: [], ...over,
+    priority: 4, repoIcons: [], paneIcons: [], ...over,
   }
 }
 function model(n: number, activeId = 'tab-0'): DeckModel {
