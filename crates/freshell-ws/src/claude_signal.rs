@@ -12,6 +12,15 @@
 //! Deliberate design: NO new `WsState` field -- the watcher is owned by the
 //! sweep task (every integration test constructs `WsState` as an exhaustive
 //! literal; a new field would touch ~27 test files for nothing).
+//!
+//! Drain is NON-DESTRUCTIVE for valid signals -- the consumer deletes a file
+//! only after acting on it (act-then-delete, D1.1, mirroring
+//! opencode_signal.rs): a signal for a terminal id unknown to this instance
+//! is RETAINED so the owning instance (another freshell server sharing
+//! $HOME) can consume it, bounded by opencode_signal's STALE_SIGNAL_MAX_AGE.
+//! Foreign-provider signals are warn-logged and consumed
+//! (`SignalDisposition::Discard`); orphaned `.tmp` staging is reaped on the
+//! same TTL.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +47,9 @@ pub struct ClaudeSignal {
     pub session_id: String,
     /// SessionStart's `source` field: "startup" | "resume" | "clear" | ...
     pub source: Option<String>,
+    /// The backing file, retained by `drain()` -- the consumer deletes it
+    /// only after acting on or explicitly discarding the signal (D1.1).
+    pub path: std::path::PathBuf,
 }
 
 impl ClaudeSignalWatcher {
@@ -65,7 +77,8 @@ impl ClaudeSignalWatcher {
         )
     }
 
-    /// Read+parse+DELETE every `*.json` in the root. Filename:
+    /// Read+parse every `*.json` in the root; valid files are RETAINED (the
+    /// consumer act-then-deletes, D1.1). Filename:
     /// `<terminal_id>__<nonce>.json` -- the terminal id is recovered by
     /// splitting the stem on the LAST `__` (`rsplit_once`): the nonce
     /// (`<timestamp>-<pid>` digits and `-`) can never contain `__`, so a LAST-split
@@ -115,10 +128,8 @@ impl ClaudeSignalWatcher {
                 continue;
             }
             match parse_signal_file(&path) {
-                Some(sig) => {
-                    signals.push(sig);
-                    let _ = std::fs::remove_file(&path);
-                }
+                // Retained: consumer act-then-deletes (D1.1).
+                Some(sig) => signals.push(sig),
                 None => {
                     // A silently-never-firing lane is the failure mode to
                     // avoid (A8 detectability): log rejects before consuming.
@@ -153,6 +164,7 @@ fn parse_signal_file(path: &Path) -> Option<ClaudeSignal> {
             .get("source")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        path: path.to_path_buf(),
     })
 }
 
@@ -180,94 +192,154 @@ pub async fn drain_and_rebind_claude(state: &WsState, watcher: &ClaudeSignalWatc
         }
     };
     for sig in signals {
-        // Registry row: must be a live claude pane.
-        let Some(current) = state.identity.get(&sig.terminal_id) else {
-            continue;
-        };
-        if current.retired || current.provider.as_deref() != Some("claude") {
-            continue;
-        }
-        if current.session_id.as_deref() == Some(sig.session_id.as_str()) {
-            // Load-bearing no-op (A7): SessionStart also fires on `startup`
-            // and on EVERY compaction (`compact`) with session_id == bound
-            // id -- one signal file per compaction. Same-id signals must
-            // stay silent no-ops; keep this guard.
-            continue;
-        }
-        // A13: the claimed id must have no live owner.
-        if let Some(owner) =
-            state
-                .registry
-                .live_session_owner(Some(&state.identity), "claude", &sig.session_id)
-        {
-            tracing::warn!(terminal_id = %sig.terminal_id, owner = %owner,
-                "claude_rebind_refused: target session already live-owned (A13)");
-            continue;
-        }
-        // Ledger A8 (retired-inclusive) + freshclaude guard, mirroring codex
-        // Guard A/C semantics.
-        if let Some(existing) = state
-            .identity
-            .find_by_session_including_retired("claude", &sig.session_id)
-        {
-            if existing != sig.terminal_id {
-                tracing::warn!(terminal_id = %sig.terminal_id,
-                    "claude_rebind_refused: session_bound_elsewhere");
-                continue;
+        match apply_claude_signal(state, &sig).await {
+            SignalDisposition::Acted | SignalDisposition::Discard => {
+                let _ = std::fs::remove_file(&sig.path); // act/discard-then-delete (D1.1)
             }
+            // Not actionable YET (or not this instance's pane) => the file
+            // stays for a later sweep; STALE_SIGNAL_MAX_AGE bounds it.
+            SignalDisposition::Retain => {}
         }
-        // Cross-kind (D7): a LIVE freshclaude sidecar owning this session is
-        // just as much "the one writer on S's JSONL" as a live PTY. The
-        // durable ledger guard below is blind to a sidecar whose row hasn't
-        // landed yet. Mirrors codex_claim_refused (codex_identity.rs:159).
-        if state.fresh_claude.has_live_session(&sig.session_id).await {
-            tracing::warn!(terminal_id = %sig.terminal_id, session_id = %sig.session_id,
-                "claude_rebind_refused: freshagent_live_session");
-            continue;
-        }
-        if state
-            .pane_ledger
-            .lookup_by_session("claude", &sig.session_id)
-            .is_some_and(|r| r.row.pane_kind.as_deref() == Some("fresh-agent"))
-        {
-            continue;
-        }
-        let previous = current.session_id.clone();
-        tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
-            source = ?sig.source, "claude_rebind: SessionStart reported a new session id");
-        // Same pinned order as the codex tail: identity -> meta -> ledger
-        // (awaited) -> associated THEN meta.updated.
-        state.identity.upsert(
-            &sig.terminal_id,
-            Some("claude"),
-            Some(&sig.session_id),
-            current.cwd.as_deref(),
-            now_ms(),
-        );
-        state.registry.set_meta(
-            &sig.terminal_id,
-            None,
-            None,
-            Some("claude".to_string()),
-            Some(sig.session_id.clone()),
-        );
-        crate::pane_ledger::ledger_resolve_identity(
-            state,
-            &sig.terminal_id,
-            "claude",
-            &sig.session_id,
-            current.cwd.as_deref(),
-        )
-        .await;
-        crate::codex_identity::broadcast_terminal_session_associated(
-            state,
-            "claude",
-            &sig.terminal_id,
-            &sig.session_id,
-            current.cwd.clone(),
-            previous,
-        );
     }
+}
+
+/// Outcome of applying one signal: `Acted` (rebind done, same-id no-op, or
+/// deliberate guard refusal), `Retain` (might become actionable later, or
+/// belongs to another freshell instance sharing $HOME -- keep the file for
+/// the next sweep; STALE_SIGNAL_MAX_AGE bounds orphans), `Discard`
+/// (permanently unactionable -- consume the file so it neither accumulates
+/// nor re-logs; deleting a signal degrades only to no-rebind).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalDisposition {
+    Acted,
+    Retain,
+    Discard,
+}
+
+/// One signal through the guard ladder. Returns the file's disposition:
+/// `Acted` and `Discard` delete the file; `Retain` keeps it for a later
+/// sweep. Mirrors opencode_signal.rs::apply_opencode_signal -- CONSUMPTION
+/// semantics only: claude rebind POLICY (no first-bind via signal, no
+/// retired-pane ref move) is deliberately unchanged.
+async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDisposition {
+    // Registry row: must be a live claude pane.
+    let Some(current) = state.identity.get(&sig.terminal_id) else {
+        // NEW: no identity row. Fresh claude panes seed their identity row
+        // synchronously at create (terminal.rs preallocation), so this is
+        // either a pane belonging to ANOTHER freshell instance sharing
+        // $HOME (retain so the owner can consume it) or a transient create
+        // race (retain until the row lands). Foreign-provider registry rows
+        // are permanently unactionable: discard with a log.
+        let Some(entry) = state.registry.probe(&sig.terminal_id) else {
+            return SignalDisposition::Retain; // unknown terminal: not ours (yet)
+        };
+        if entry.mode != "claude" {
+            tracing::warn!(terminal_id = %sig.terminal_id, session_id = %sig.session_id,
+                mode = %entry.mode, source = ?sig.source,
+                "claude_signal_ignored: pane belongs to another provider, consuming file");
+            return SignalDisposition::Discard;
+        }
+        return SignalDisposition::Retain; // claude pane whose identity row hasn't landed yet
+    };
+    if current.provider.as_deref() != Some("claude") {
+        // NEW: foreign-provider identity row -- never touch the pane
+        // (one-writer / D7) and never actionable (a pane's provider does
+        // not change), so consume instead of silently re-reading it.
+        tracing::warn!(terminal_id = %sig.terminal_id, session_id = %sig.session_id,
+            provider = ?current.provider, source = ?sig.source,
+            "claude_signal_ignored: identity row belongs to another provider, consuming file");
+        return SignalDisposition::Discard;
+    }
+    if current.retired {
+        // Policy unchanged: no retired-pane rebind for claude. A deliberate
+        // refusal counts as acted on (consume -- bounded noise).
+        return SignalDisposition::Acted;
+    }
+    if current.session_id.as_deref() == Some(sig.session_id.as_str()) {
+        // Load-bearing no-op (A7): SessionStart also fires on `startup`
+        // and on EVERY compaction (`compact`) with session_id == bound
+        // id -- one signal file per compaction. Same-id signals must
+        // stay silent no-ops; keep this guard.
+        return SignalDisposition::Acted;
+    }
+    // A13: the claimed id must have no live owner.
+    if let Some(owner) =
+        state
+            .registry
+            .live_session_owner(Some(&state.identity), "claude", &sig.session_id)
+    {
+        tracing::warn!(terminal_id = %sig.terminal_id, owner = %owner,
+            "claude_rebind_refused: target session already live-owned (A13)");
+        return SignalDisposition::Acted;
+    }
+    // Ledger A8 (retired-inclusive) + freshclaude guard, mirroring codex
+    // Guard A/C semantics.
+    if let Some(existing) = state
+        .identity
+        .find_by_session_including_retired("claude", &sig.session_id)
+    {
+        if existing != sig.terminal_id {
+            tracing::warn!(terminal_id = %sig.terminal_id,
+                "claude_rebind_refused: session_bound_elsewhere");
+            return SignalDisposition::Acted;
+        }
+    }
+    // Cross-kind (D7): a LIVE freshclaude sidecar owning this session is
+    // just as much "the one writer on S's JSONL" as a live PTY. The
+    // durable ledger guard below is blind to a sidecar whose row hasn't
+    // landed yet. Mirrors codex_claim_refused (codex_identity.rs:159).
+    if state.fresh_claude.has_live_session(&sig.session_id).await {
+        tracing::warn!(terminal_id = %sig.terminal_id, session_id = %sig.session_id,
+            "claude_rebind_refused: freshagent_live_session");
+        return SignalDisposition::Acted;
+    }
+    if state
+        .pane_ledger
+        .lookup_by_session("claude", &sig.session_id)
+        .is_some_and(|r| r.row.pane_kind.as_deref() == Some("fresh-agent"))
+    {
+        // NEW (was a bare continue): warn for detectability -- bounded
+        // because the refused file is consumed in the same pass.
+        tracing::warn!(terminal_id = %sig.terminal_id, session_id = %sig.session_id,
+            "claude_rebind_refused: ledger_fresh_agent_session");
+        return SignalDisposition::Acted;
+    }
+    let previous = current.session_id.clone();
+    tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
+        source = ?sig.source, "claude_rebind: SessionStart reported a new session id");
+    // Same pinned order as the codex tail: identity -> meta -> ledger
+    // (awaited) -> associated THEN meta.updated.
+    state.identity.upsert(
+        &sig.terminal_id,
+        Some("claude"),
+        Some(&sig.session_id),
+        current.cwd.as_deref(),
+        now_ms(),
+    );
+    state.registry.set_meta(
+        &sig.terminal_id,
+        None,
+        None,
+        Some("claude".to_string()),
+        Some(sig.session_id.clone()),
+    );
+    crate::pane_ledger::ledger_resolve_identity(
+        state,
+        &sig.terminal_id,
+        "claude",
+        &sig.session_id,
+        current.cwd.as_deref(),
+    )
+    .await;
+    crate::codex_identity::broadcast_terminal_session_associated(
+        state,
+        "claude",
+        &sig.terminal_id,
+        &sig.session_id,
+        current.cwd.clone(),
+        previous,
+    );
+    SignalDisposition::Acted
 }
 
 /// Spawned by `freshell-server` boot next to the locator sweeps (mirrors
@@ -288,7 +360,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drain_parses_and_deletes_signal_files() {
+    fn drain_parses_retains_valid_files_and_consumes_rejects() {
         // Guard, not asserted on: this test's junk__1.json hits the
         // `claude_signal_rejected` warn callsite. Under parallel test
         // execution, the FIRST thread to hit a callsite registers its
@@ -301,37 +373,44 @@ mod tests {
         // capture-asserted callsite holds one) makes registration always
         // see a live subscriber.
         let (_events, _guard) = crate::invariants::capture::capture();
-        let root = std::env::temp_dir().join(format!("freshell-claude-sig-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join("term-abc-123__42-9.json"),
+        let dir = tempfile::tempdir().unwrap();
+        write_file(
+            dir.path(),
+            "term-a__0000000000000000001-1.json",
             r#"{"session_id":"new-id","source":"resume","cwd":"/tmp/x","hook_event_name":"SessionStart"}"#,
-        ).unwrap();
-        std::fs::write(root.join("junk__1.json"), "not json").unwrap();
-        let w = ClaudeSignalWatcher::new(root.clone());
-        let got = w.drain();
-        assert_eq!(
-            got,
-            vec![ClaudeSignal {
-                terminal_id: "term-abc-123".into(),
-                session_id: "new-id".into(),
-                source: Some("resume".into()),
-            }]
         );
+        write_file(dir.path(), "junk__1.json", "not json");
+        let watcher = ClaudeSignalWatcher::new(dir.path().to_path_buf());
+        let signals = watcher.drain();
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].terminal_id, "term-a");
+        assert_eq!(signals[0].session_id, "new-id");
+        assert_eq!(signals[0].source.as_deref(), Some("resume"));
         assert_eq!(
-            std::fs::read_dir(&root).unwrap().count(),
-            0,
-            "processed AND malformed files deleted"
+            signals[0].path,
+            dir.path().join("term-a__0000000000000000001-1.json")
         );
-        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            signals[0].path.exists(),
+            "drain must NOT delete valid signal files: act-then-delete is the \
+             consumer's job (D1.1) -- a second instance sharing $HOME must not \
+             destroy signals it cannot act on"
+        );
+        assert!(
+            !dir.path().join("junk__1.json").exists(),
+            "malformed files stay single-shot (consumed)"
+        );
+        // Retention is stable: a second drain sees the same signal again.
+        assert_eq!(
+            watcher.drain().len(),
+            1,
+            "retained file re-emitted next sweep"
+        );
     }
 
     #[test]
     fn drain_returns_signals_sorted_by_filename_oldest_first() {
-        let root =
-            std::env::temp_dir().join(format!("freshell-claude-sig-order-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         // Timestamp-first nonces (Task 1 shape). Written in REVERSE of
         // emission order so read_dir/creation order cannot fake a pass.
         let emissions = [
@@ -362,19 +441,21 @@ mod tests {
         ];
         for (nonce, sid) in emissions.iter().rev() {
             std::fs::write(
-                root.join(format!("t1__{nonce}.json")),
+                dir.path().join(format!("t1__{nonce}.json")),
                 format!(r#"{{"session_id":"{sid}","source":"resume"}}"#),
             )
             .unwrap();
         }
-        let watcher = ClaudeSignalWatcher::new(root.clone());
+        let watcher = ClaudeSignalWatcher::new(dir.path().to_path_buf());
         let signals = watcher.drain();
         let got: Vec<&str> = signals.iter().map(|s| s.session_id.as_str()).collect();
         let want: Vec<&str> = emissions.iter().map(|(_, sid)| *sid).collect();
         assert_eq!(got, want, "drain must be filename-sorted (emission order)");
-        // Existing delete-on-read semantics are unchanged.
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
-        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            6,
+            "valid signals are RETAINED by drain (act-then-delete)"
+        );
     }
 
     fn write_file(dir: &std::path::Path, name: &str, body: &str) {

@@ -495,7 +495,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
     assert_eq!(
         std::fs::read_dir(&signal_root).unwrap().count(),
         0,
-        "the refused signal file must still be consumed (single-shot)"
+        "a deliberate refusal counts as acted on: the file is consumed (act-then-delete)"
     );
 
     // ---- Phase 4: cross-kind (D7) -- a signal claiming a session owned by a
@@ -574,7 +574,8 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         .await,
         "no rebind frame may be emitted for a refused claim"
     );
-    // ...and the refused signal file was still consumed (delete-on-read).
+    // ...and the deliberate refusal counts as acted on: the file is
+    // consumed (act-then-delete).
     assert!(!signal_root
         .join(format!("{tid4}__1769000000000000009-1.json"))
         .exists());
