@@ -941,3 +941,8 @@ fn disarm_clears_the_fork_watch() {
     assert!(locator.tick_forks(1_100).is_empty());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// Warn-once latch tests live in a `#[path]` child (this file sits against
+// the 1,000-line cap; same convention as `tabs_persist_validation_tests.rs`).
+#[path = "codex_locator_tests_warn.rs"]
+mod warn_once;

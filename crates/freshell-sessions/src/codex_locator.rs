@@ -180,6 +180,10 @@ struct ForkWatch {
     known_files: HashSet<PathBuf>,
     /// Enter-anchored scan window; scanning happens only while open.
     window_until_ms: Option<i64>,
+    /// Latch: the >=2-candidate ambiguity warn fired for the CURRENT window.
+    /// Log-only state -- refusal semantics never depend on it. Reset when a
+    /// new window opens (note_fork_submit).
+    ambiguity_warned: bool,
 }
 
 #[derive(Default)]
@@ -475,6 +479,7 @@ impl CodexLocator {
                 session_id: session_id.to_string(),
                 known_files,
                 window_until_ms: None,
+                ambiguity_warned: false,
             },
         );
         true
@@ -488,6 +493,7 @@ impl CodexLocator {
             return false;
         };
         watch.window_until_ms = Some(at_ms + CODEX_FORK_WINDOW_MS);
+        watch.ambiguity_warned = false;
         true
     }
 
@@ -559,8 +565,11 @@ impl CodexLocator {
                     watch.window_until_ms = None; // one-shot per fork
                 }
                 n => {
-                    tracing::warn!(terminal_id = %terminal_id, candidates = n,
-                        "codex_fork_ambiguous: multiple forks of one session in one window; refusing");
+                    if !watch.ambiguity_warned {
+                        watch.ambiguity_warned = true;
+                        tracing::warn!(terminal_id = %terminal_id, candidates = n,
+                            "codex_fork_ambiguous: multiple forks of one session in one window; refusing (silent for the rest of this window)");
+                    }
                 }
             }
         }
