@@ -68,6 +68,10 @@ use freshell_terminal::{build_child_env_from_process, FrameSink};
 
 use crate::WsState;
 
+#[cfg(test)]
+#[path = "terminal_create_ordering_tests.rs"]
+mod terminal_create_ordering_tests;
+
 /// The write half of a split axum WebSocket.
 pub(crate) type WsSink = SplitSink<WebSocket, Message>;
 
@@ -1616,6 +1620,11 @@ pub(crate) async fn handle_create(
     // ALWAYS gets a server-preallocated `--session-id` (`ws:2048-2064`).
     let mut launch_intent = LaunchIntent::Resume;
     let mut resume_session_id: Option<String> = None;
+    // PIN 2 (Step 4b): whether THIS create minted a fresh claude identity.
+    // Only such a create may delete its pre-spawn binding row on spawn
+    // failure — a resume-create's row belongs to the prior epoch and must
+    // stay recoverable.
+    let mut claude_fresh_prealloc = false;
     if mode != "shell" {
         let requested_ref = create.session_ref.as_ref().filter(|r| r.provider == mode);
         let should_preallocate_fresh_claude = mode == "claude"
@@ -1648,6 +1657,7 @@ pub(crate) async fn handle_create(
             // handler does not have.
             resume_session_id = Some(Uuid::new_v4().to_string());
             launch_intent = LaunchIntent::Start;
+            claude_fresh_prealloc = true;
         } else if should_preallocate_fresh_amplifier {
             resume_session_id = Some(Uuid::new_v4().to_string());
         } else {
@@ -2181,6 +2191,49 @@ pub(crate) async fn handle_create(
     // acquire happens here: for restore it would self-deadlock against that
     // outer permit; for non-restore it is bypassed on purpose.
 
+    // PIN2_CLAUDE_PRE_SPAWN_BINDING — P1.9 (D3) durability-before-
+    // observability: a fresh claude create preallocates its --session-id
+    // (:1649) and the spawn below makes that id OBSERVABLE (argv, logged
+    // synchronously by the e2e fakes). A SIGKILL landing right after spawn
+    // must still find a durable ledger row, or the recovery inventory has
+    // nothing to offer after browser loss. Scoped to the fresh
+    // preallocation ONLY (`claude_fresh_prealloc`: this create minted the
+    // UUID, so the row is provably exclusive) — a resume/restore create's
+    // row belongs to the prior epoch and is already durable; writing it
+    // here, BEFORE any evidence the spawn succeeds, would let a failing or
+    // race-losing resume create rewrite live_terminal_id/create_request_id
+    // to a terminal that never spawns (and the failure-branch delete below
+    // deliberately never touches non-fresh rows). The post-spawn binding
+    // write (the `create_meta_record` arm below) re-records the same
+    // (provider, session_id) key with the resolved cwd — a benign re-write
+    // — and stays the ONLY writer for resume creates. Failure policy
+    // identical to that arm: never blocks the create, surfaced LIVE.
+    if claude_fresh_prealloc {
+        if let Some(session_id) = resume_session_id.as_deref() {
+            let ledger = std::sync::Arc::clone(&state.pane_ledger);
+            let write_session_id = session_id.to_string();
+            let write_terminal_id = terminal_id.clone();
+            let write_mode = mode.clone();
+            let write_cwd = spec.cwd.clone();
+            let write_request_id = create.request_id.clone();
+            let now = now_ms();
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.record_binding(&crate::pane_ledger::BindingWrite {
+                    provider: "claude",
+                    session_id: &write_session_id,
+                    terminal_id: &write_terminal_id,
+                    mode: &write_mode,
+                    cwd: write_cwd.as_deref(),
+                    create_request_id: Some(&write_request_id),
+                    now_ms: now,
+                })
+            })
+            .await
+            .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+            crate::pane_ledger::surface_write_failure(state, &terminal_id, result);
+        }
+    }
+
     // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
     // spawns occupy a blocking thread (plus, on the gated restore path, the
     // caller-held permit), never an async worker (on small hosts, N inline
@@ -2192,6 +2245,7 @@ pub(crate) async fn handle_create(
     let spawn_mode = mode.clone();
     let spawn_resume_session_id = resume_session_id.clone();
     let spawn_create_request_id = create.request_id.clone();
+    // PIN2_PTY_SPAWN_ANCHOR: the spawn makes preallocated identity observable.
     let create_result = match tokio::task::spawn_blocking(move || {
         registry.create(
             &spawn_spec,
@@ -2216,6 +2270,26 @@ pub(crate) async fn handle_create(
         ))),
     };
     if let Err(err) = create_result {
+        // PIN 2 (Step 4b): the spawn FAILED, so the pre-spawn claude binding
+        // row (PIN2_CLAUDE_PRE_SPAWN_BINDING above) now describes a pane
+        // that never existed — left in place it would surface as a ghost
+        // `ledgerOnly` recovery offer for ~30 days. Delete it, but ONLY for
+        // a fresh preallocation (this create minted the id, so the row is
+        // exclusively ours); a resume-create's row belongs to the prior
+        // epoch and must stay recoverable. Same failure policy as the
+        // write: never blocks this (already failing) create, surfaced LIVE.
+        if claude_fresh_prealloc {
+            if let Some(session_id) = resume_session_id.as_deref() {
+                let ledger = std::sync::Arc::clone(&state.pane_ledger);
+                let delete_session_id = session_id.to_string();
+                let result = tokio::task::spawn_blocking(move || {
+                    ledger.delete_binding("claude", &delete_session_id)
+                })
+                .await
+                .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+                crate::pane_ledger::surface_write_failure(state, &terminal_id, result);
+            }
+        }
         // Task 7's race-free duplicate-live-resume enforcement inside
         // registry.create (F5/V7): the pre-check above is a friendly fast
         // path only — concurrent WS/REST creates can both pass it. Map the

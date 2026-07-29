@@ -17,6 +17,7 @@ import {
   clearPaneReconcileNotice,
   clearReconcilePendingPane,
   consumePaneRefreshRequest,
+  RECONCILE_NOTICE_FRESH_BY_RACE,
   repairCodexIdentityMismatch,
   resetPaneForReconcileCreate,
   splitPane,
@@ -633,6 +634,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   const [searchQuery, setSearchQuery] = useState('')
   const keyboardInsetPx = useKeyboardInset()
   const [mobileCtrlActive, setMobileCtrlActive] = useState(false)
+  // PIN 3: the fresh-by-race breadcrumb must be readable by the DOM text
+  // layer (assistive tech + the restart-contract wall's getByText probe) —
+  // the xterm canvas write below is invisible to both.
+  const [freshByRaceNotice, setFreshByRaceNotice] = useState<string | null>(null)
+  useEffect(() => {
+    if (!freshByRaceNotice) return
+    const t = setTimeout(() => setFreshByRaceNotice(null), 10_000)
+    return () => clearTimeout(t)
+  }, [freshByRaceNotice])
   const setPendingLinkUriRef = useRef(setPendingLinkUri)
   const mobileCtrlActiveRef = useRef(false)
 
@@ -4326,6 +4336,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
           const createdReconcileNotice = contentRef.current?.reconcileNotice
           if (createdReconcileNotice) {
             writeLocalXtermNotice(term, `\r\n${createdReconcileNotice}\r\n`)
+            if (createdReconcileNotice === RECONCILE_NOTICE_FRESH_BY_RACE) {
+              setFreshByRaceNotice(createdReconcileNotice)
+            }
             dispatch(clearPaneReconcileNotice({ tabId, paneId: paneIdRef.current }))
           }
           // Ledger A15: re-write a loss notice recorded while un-anchored --
@@ -5243,6 +5256,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         onTouchEnd={isMobile ? handleMobileTouchEnd : undefined}
         onTouchCancel={isMobile ? handleMobileTouchEnd : undefined}
       />
+      {freshByRaceNotice ? (
+        <div
+          role="status"
+          data-testid="fresh-by-race-notice"
+          className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-amber-100/90 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/80 dark:text-amber-100"
+        >
+          {freshByRaceNotice}
+        </div>
+      ) : null}
       {isMobile && (
         <div
           data-testid="mobile-terminal-toolbar"

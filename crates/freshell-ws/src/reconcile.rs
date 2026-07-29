@@ -289,6 +289,26 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
         if pane.mode.as_deref() == Some("shell") {
             return base(pane, ReconcileVerdict::Fresh);
         }
+        // §4.2 pending-marker read (PIN 3): a durable pending marker keyed by
+        // the client's stale terminal id means identity establishment was in
+        // flight when the server died — fresh by RACE, not by intent. The
+        // reason is distinct and surfaced (client breadcrumb). The read is
+        // deliberately IDEMPOTENT and read-only (amends §6 decision 5's
+        // consumption clause): the client re-sends pane.reconcile on every
+        // WS ready because a response can be dropped (App.tsx:1029-1053) —
+        // consuming the marker at derive would turn that retry into a
+        // silent no_recoverable_identity. Markers are still never promoted;
+        // locator resolution or the ledger's GC deletes them, and a
+        // recreated pane's new terminal id makes the old marker
+        // unreachable.
+        if let Some(tid) = pane.terminal_id.as_deref() {
+            if deps.pane_ledger.pending_for_terminal(tid).is_some() {
+                return PaneVerdict {
+                    reason: Some("fresh_by_race".to_string()),
+                    ..base(pane, ReconcileVerdict::Fresh)
+                };
+            }
+        }
         return PaneVerdict {
             reason: Some("no_recoverable_identity".to_string()),
             ..base(pane, ReconcileVerdict::Fresh)
@@ -325,6 +345,50 @@ fn verdict_for_pane(deps: &ReconcileDeps<'_>, pane: &ReconcilePane) -> PaneVerdi
             // convergence still applies — a respawn ↔ instant-exit loop ends
             // in an actionable dead_session, never thrash.
             if sref.provider == "amplifier" {
+                if deps.registry.respawn_exhausted(&key) {
+                    return PaneVerdict {
+                        session_ref: Some(sref),
+                        reason: Some("respawn_exhausted".to_string()),
+                        ..base(pane, ReconcileVerdict::DeadSession)
+                    };
+                }
+                let corrected = corrected_flag(pane.session_ref.as_ref(), Some(&sref));
+                return PaneVerdict {
+                    session_ref: Some(sref),
+                    corrected,
+                    ..base(pane, ReconcileVerdict::Respawn)
+                };
+            }
+            // Claude carve-out (never-conversed preallocation, PIN 1): claude
+            // terminals get a server-preallocated --session-id at create and
+            // the binding row is durable before the answer — but the
+            // transcript file only appears on first output. Ledger-bound +
+            // Absent + never SEEN on disk therefore means "created, never
+            // conversed", not dead: Respawn is the actionable verdict. The
+            // e2e fake accepts --resume and restores; REAL claude (verified
+            // v2.1.220) errors-and-exits on a not-found --resume id, which
+            // §7.5 respawn_exhausted converges to a loud DeadSession --
+            // never silent (a --session-id start-intent respawn was
+            // rejected: it would silently reuse a conversed-then-deleted
+            // id). Kata 09v1's locator fallback
+            // (freshell-server existence.rs) already converts
+            // exists-but-unparseable into Present => Respawn; this arm covers
+            // never-created — two halves of one rule, no overlap. A
+            // transcript that WAS observed on disk and is now gone falls
+            // through to the loud dead_session below (rows 4/4b hazard
+            // guard). Cross-restart deleted-with-prior-conversation is
+            // indistinguishable from never-conversed by these signals and
+            // takes the same escape the amplifier arm accepts: §7.5's
+            // respawn_exhausted convergence ends a respawn <-> instant-exit
+            // loop in an actionable dead_session, never thrash.
+            if sref.provider == "claude"
+                && deps
+                    .pane_ledger
+                    .ever_bound(&sref.provider, &sref.session_id)
+                && !deps
+                    .existence
+                    .ever_observed_on_disk(&sref.provider, &sref.session_id)
+            {
                 if deps.registry.respawn_exhausted(&key) {
                     return PaneVerdict {
                         session_ref: Some(sref),
@@ -655,6 +719,62 @@ mod tests {
         assert_eq!(v.session_ref, Some(sref("amplifier", "s-gcd")));
     }
 
+    /// PIN 1 red test: a claude pane whose session id was preallocated at
+    /// create (ledger-bound, durable) but which NEVER conversed has no
+    /// transcript file -> Absent. That is not an immediately-dead state:
+    /// respawning with --resume mirrors the amplifier arm. Against the
+    /// wall's fake CLI the pane restores; REAL claude (verified v2.1.220)
+    /// errors-and-exits on a not-found id, which §7.5 respawn_exhausted
+    /// converges to a loud, actionable DeadSession -- never silent.
+    /// Kata 09v1's locator fallback covers
+    /// exists-but-unparseable; this covers never-created.
+    #[test]
+    fn claude_never_conversed_yields_respawn_not_dead_session() {
+        let f = Fixture::new();
+        f.ledger
+            .record_binding(&crate::pane_ledger::BindingWrite {
+                provider: "claude",
+                session_id: "s-never",
+                terminal_id: "T-never",
+                mode: "claude",
+                cwd: None,
+                create_request_id: Some("cr-never"),
+                now_ms: 1_000,
+            })
+            .expect("record binding");
+        let mut p = pane("cr-never");
+        p.session_ref = Some(sref("claude", "s-never"));
+        // Probe default: Absent, never observed on disk.
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Respawn);
+        assert_eq!(v.session_ref, Some(sref("claude", "s-never")));
+    }
+
+    /// PIN 1 hazard guard: a claude transcript that WAS seen on disk and is
+    /// now gone is a real data-loss shape — stays loud dead_session even
+    /// though the identity is ledger-bound (rows 4/4b unchanged).
+    #[test]
+    fn claude_deleted_after_conversation_stays_dead_session() {
+        let f = Fixture::new();
+        f.ledger
+            .record_binding(&crate::pane_ledger::BindingWrite {
+                provider: "claude",
+                session_id: "s-gone2",
+                terminal_id: "T-gone2",
+                mode: "claude",
+                cwd: None,
+                create_request_id: Some("cr-gone2"),
+                now_ms: 1_000,
+            })
+            .expect("record binding");
+        f.probe.mark_observed("claude", "s-gone2");
+        let mut p = pane("cr-gone2");
+        p.session_ref = Some(sref("claude", "s-gone2"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::DeadSession);
+        assert_eq!(v.reason.as_deref(), Some("session_not_on_disk"));
+    }
+
     /// Row 5 (§9.1 test 6): cold index on a known provider → honest
     /// error{index_warming}, never dead_session, never optimistic respawn.
     /// (`retry` is deleted from the wire; the handler's bounded single
@@ -720,6 +840,67 @@ mod tests {
         let v = f.one(pane("cr-9"));
         assert_eq!(v.verdict, ReconcileVerdict::Fresh);
         assert_eq!(v.reason.as_deref(), Some("no_recoverable_identity"));
+    }
+
+    /// PIN 3 red test (§4.2 pending-marker read): identity establishment was
+    /// in flight when the server died (durable pending marker, keyed by the
+    /// dead epoch's terminal id) -> the verdict is fresh, but LOUD:
+    /// fresh_by_race, never a silent no_recoverable_identity.
+    #[test]
+    fn pending_marker_yields_fresh_by_race_not_silent_fresh() {
+        let f = Fixture::new();
+        f.ledger
+            .record_pending("T-race", "opencode", None, 1_000)
+            .expect("record pending");
+        let mut p = pane("cr-race");
+        p.mode = Some("opencode".to_string());
+        p.terminal_id = Some("T-race".to_string());
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Fresh);
+        assert_eq!(v.reason.as_deref(), Some("fresh_by_race"));
+    }
+
+    /// Delivery-safety pin (validated design change): the marker read is
+    /// IDEMPOTENT and read-only. The client re-sends pane.reconcile on
+    /// every WS ready precisely because a response can be dropped
+    /// (App.tsx:1029-1053); consuming the marker at derive would turn that
+    /// retry into a silent no_recoverable_identity — losing the breadcrumb
+    /// to the exact churn PIN 3 eliminates. A retry must derive the same
+    /// loud verdict, and the marker must still exist afterwards.
+    #[test]
+    fn marker_read_is_idempotent_across_reconciles() {
+        let f = Fixture::new();
+        f.ledger
+            .record_pending("T-race2", "opencode", None, 1_000)
+            .expect("record pending");
+        let mut p = pane("cr-race2");
+        p.mode = Some("opencode".to_string());
+        p.terminal_id = Some("T-race2".to_string());
+        let first = f.one(p);
+        assert_eq!(first.reason.as_deref(), Some("fresh_by_race"));
+        let mut p2 = pane("cr-race2");
+        p2.mode = Some("opencode".to_string());
+        p2.terminal_id = Some("T-race2".to_string());
+        let second = f.one(p2);
+        assert_eq!(second.verdict, ReconcileVerdict::Fresh);
+        assert_eq!(second.reason.as_deref(), Some("fresh_by_race"));
+        assert!(f.ledger.pending_for_terminal("T-race2").is_some());
+    }
+
+    /// Shell panes stay bare fresh even with a stray marker — the marker
+    /// read sits behind the shell early-return.
+    #[test]
+    fn shell_pane_ignores_pending_markers() {
+        let f = Fixture::new();
+        f.ledger
+            .record_pending("T-sh", "shell", None, 1_000)
+            .expect("record pending");
+        let mut p = pane("cr-sh");
+        p.mode = Some("shell".to_string());
+        p.terminal_id = Some("T-sh".to_string());
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Fresh);
+        assert_eq!(v.reason, None);
     }
 
     /// Row 10: malformed entries → invalid{reason}, never omission.
