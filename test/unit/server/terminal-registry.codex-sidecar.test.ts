@@ -1069,6 +1069,7 @@ describe('TerminalRegistry Codex sidecar ownership', () => {
       expect(sent).toContainEqual(expect.objectContaining({
         type: 'terminal.session.associated',
         sessionRef: { provider: 'codex', sessionId: 'thread-child' },
+        previousSessionId: 'thread-parent',
       }))
       expect(unboundEvents).toEqual([])
     } finally {

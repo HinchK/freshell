@@ -50,7 +50,7 @@ use serde::{Deserialize, Serialize};
 
 #[path = "pane_ledger_scan.rs"]
 mod pane_ledger_scan;
-pub use pane_ledger_scan::{BootScanReport, QuarantinedRow};
+pub use pane_ledger_scan::{BootScanReport, QuarantinedRow, PENDING_MARKER_ORPHAN_TTL_MS};
 
 /// Gates schema migration (spec §4.2): rows with a different version are
 /// quarantined loudly at boot, never silently reinterpreted.

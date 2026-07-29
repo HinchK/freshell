@@ -7,6 +7,24 @@
 //! (`crate::pane_ledger::BootScanReport`, ...) compiles unchanged.
 
 use super::*;
+use std::collections::HashSet;
+
+/// A pending marker whose terminal is not live and which is older than this
+/// is orphaned (server death before resolution -- the exit hook never ran).
+/// HONEST RATIONALE (validated A11, 2026-07-28): this rule is safe because
+/// NO production reader of pending markers exists at ANY age -- the only
+/// semantic read APIs (`pending_for_terminal`, pane_ledger.rs:779-791, and
+/// `list_pending_raw`, :794) have ZERO non-test callers (grep-verified); the
+/// often-cited boot_scan "fresh-by-race vs fresh-by-intent" reader is
+/// comments only, not implemented. The live-set guard does real work only in
+/// the PERIODIC sweep (protecting a live-but-unresolved pane, e.g. one
+/// starved by the Task 8 census shape). TTL is 7 DAYS for FORENSICS: the
+/// starvation diagnosis this plan is built on relied on multi-day-old
+/// on-disk markers (DirectorDeck, 2026-07-28); after the TTL, loud sweep
+/// logs are the remaining trail. If a real marker reader is ever
+/// implemented, this wall-clock TTL must be revisited (server-down time is
+/// indistinguishable from server-up time).
+pub const PENDING_MARKER_ORPHAN_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 /// A row the boot scan renamed aside because it could not be parsed.
 #[derive(Debug, Clone)]
@@ -186,10 +204,16 @@ impl PaneLedger {
     /// guard and skips items that no longer qualify. The write-through
     /// invariant is preserved: every file mutation and its index update
     /// still happen under ONE guard acquisition.
+    ///
+    /// `live_terminal_ids` feeds the orphan rule: the periodic caller passes
+    /// `Some(registry terminal ids)` (a terminal is live iff it appears in
+    /// the registry); `None` disables the orphan rule entirely (the boot
+    /// path — see `gc_locked`).
     pub fn gc(
         &self,
         now_ms: i64,
         transcript_absent: &dyn Fn(&str, &str) -> bool,
+        live_terminal_ids: Option<&HashSet<String>>,
     ) -> BootScanReport {
         let Some(root) = self.root.clone() else {
             return BootScanReport::default();
@@ -208,7 +232,14 @@ impl PaneLedger {
         };
         for terminal_id in marker_ids {
             let mut index = self.guard();
-            self.gc_marker_locked(&root, &mut index, &terminal_id, now_ms, &mut report);
+            self.gc_marker_locked(
+                &root,
+                &mut index,
+                &terminal_id,
+                now_ms,
+                live_terminal_ids,
+                &mut report,
+            );
         }
         for key in row_keys {
             let mut index = self.guard();
@@ -237,7 +268,11 @@ impl PaneLedger {
         let mut report = BootScanReport::default();
         let marker_ids: Vec<String> = index.pending.keys().cloned().collect();
         for terminal_id in marker_ids {
-            self.gc_marker_locked(root, index, &terminal_id, now_ms, &mut report);
+            // Boot path: `None` disables the orphan rule. At boot the
+            // registry is necessarily EMPTY (PTYs die with the process;
+            // restore is client-driven and post-serve), so running the
+            // orphan rule here would sweep EVERY old marker at EVERY boot.
+            self.gc_marker_locked(root, index, &terminal_id, now_ms, None, &mut report);
         }
         let row_keys: Vec<(String, String)> = index.bindings.keys().cloned().collect();
         for key in row_keys {
@@ -248,8 +283,9 @@ impl PaneLedger {
 
     /// Aged-marker sweep for ONE marker, under the caller's guard (A8/V7):
     /// part of the periodic subset per the `gc` contract, so a long-running
-    /// server bounds leaked-marker lifetime WITHOUT a restart. Only the TTL
-    /// case runs here — the covered-by-binding case is boot-only
+    /// server bounds leaked-marker lifetime WITHOUT a restart. The TTL case
+    /// and the orphan case (P2, gated on `live_terminal_ids` — `None`
+    /// disables it) run here — the covered-by-binding case is boot-only
     /// crash-window residue (boot_scan step 2, which also handles the TTL
     /// case at boot, so this finds nothing on the boot path). Re-reads the
     /// marker from the index: one resolved/removed between the snapshot and
@@ -260,12 +296,26 @@ impl PaneLedger {
         index: &mut LedgerIndex,
         terminal_id: &str,
         now_ms: i64,
+        live_terminal_ids: Option<&HashSet<String>>,
         report: &mut BootScanReport,
     ) {
         let Some(marker) = index.pending.get(terminal_id) else {
             return; // resolved/removed since the snapshot — no longer qualifies
         };
-        if now_ms - marker.spawned_at <= PENDING_MARKER_TTL_MS {
+        let aged_out = now_ms - marker.spawned_at > PENDING_MARKER_TTL_MS;
+        // Orphan rule (P2, PERIODIC sweep only): the exit hook deletes
+        // markers on PTY exit, but a SERVER death orphans them
+        // (terminal.rs:1738 never runs). Safe because NO production reader
+        // of pending markers exists (pane_ledger.rs:779-794 read APIs have
+        // zero non-test callers -- A11); the live-set guard does real work
+        // only here, protecting a live-but-unresolved pane (e.g. census
+        // starvation, Task 8). live_terminal_ids is None on the pre-serve
+        // boot path (registry empty, main.rs:603-630) -- boot never sweeps
+        // by this rule.
+        let orphaned = live_terminal_ids.is_some_and(|live| {
+            !live.contains(terminal_id) && now_ms - marker.spawned_at > PENDING_MARKER_ORPHAN_TTL_MS
+        });
+        if !aged_out && !orphaned {
             return;
         }
         match Self::remove_pending(root, index, terminal_id) {
@@ -273,7 +323,9 @@ impl PaneLedger {
                 tracing::warn!(
                     target: "freshell_ws::pane_ledger",
                     terminal_id = %terminal_id,
-                    "pane_ledger_stale_marker_swept: aged past TTL (periodic GC)"
+                    aged_out = aged_out,
+                    orphaned = orphaned,
+                    "pane_ledger_stale_marker_swept: aged past TTL or orphaned (periodic GC)"
                 );
                 report.stale_markers_removed.push(terminal_id.to_string());
             }

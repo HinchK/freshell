@@ -185,6 +185,7 @@ fn broadcast_terminal_session_associated(
             provider: "opencode".to_string(),
             session_id: session_id.to_string(),
         },
+        previous_session_id: None,
     });
     if let Ok(frame) = serde_json::to_string(&associated) {
         let _ = state.broadcast_tx.send(frame);

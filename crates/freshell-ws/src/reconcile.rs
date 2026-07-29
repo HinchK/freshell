@@ -30,6 +30,11 @@ pub struct ReconcileDeps<'a> {
     pub registry: &'a TerminalRegistry,
     pub identity: &'a TerminalIdentityRegistry,
     pub existence: &'a dyn SessionExistenceProbe,
+    /// Durable pane ledger (Task 7b): rung 2b of
+    /// [`resolve_authoritative_ref`] follows the `supersededBy` chain so a
+    /// stale claim for a session this server retired BEFORE a restart is
+    /// answered with the chain terminus, never echoed.
+    pub pane_ledger: &'a crate::pane_ledger::PaneLedger,
     /// Fresh-agent facts snapshot (campaign §4.3): `Some` only on a
     /// connection that negotiated `paneReconcileFreshAgentV1` AND presented
     /// fresh-agent panes; `None` keeps the frozen client's
@@ -125,6 +130,25 @@ fn resolve_authoritative_ref(
                     });
                 }
             }
+        }
+    }
+    // 2b. Durable ledger chain (A3): the claimed ref may name a session this
+    // server retired as Superseded BEFORE it restarted (mid-session rebind,
+    // Task 5 -- fsynced before announce). Follow the supersededBy chain to
+    // its terminus and answer with the terminus -- exactly the fresh-agent
+    // G3 reader rule (reconcile_freshagent.rs:82-90). Without this rung an
+    // absent-at-fork client + restart resumes the superseded parent (the
+    // 2026-07-27 incident; the parent rollout still exists on disk).
+    if let Some(claim) = pane.session_ref.as_ref() {
+        if let Some(resolved) = deps
+            .pane_ledger
+            .lookup_by_session(&claim.provider, &claim.session_id)
+            .filter(|r| r.corrected)
+        {
+            return Some(SessionLocator {
+                provider: claim.provider.clone(),
+                session_id: resolved.row.session_id,
+            });
         }
     }
     // 3. The client's structured claim (validated against disk by the caller).
@@ -402,18 +426,40 @@ mod tests {
         }
     }
 
+    /// Unique per-fixture ledger root — the same atomic-counter + pid
+    /// pattern as `pane_ledger_tests.rs`'s `temp_root` (no tempfile dep).
+    fn ledger_temp_root() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("reconcile-ledger-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create ledger temp root");
+        dir
+    }
+
     struct Fixture {
         registry: TerminalRegistry,
         identity: TerminalIdentityRegistry,
         probe: FakeProbe,
+        ledger: crate::pane_ledger::PaneLedger,
+        ledger_root: std::path::PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.ledger_root).ok();
+        }
     }
 
     impl Fixture {
         fn new() -> Self {
+            let ledger_root = ledger_temp_root();
             Self {
                 registry: TerminalRegistry::new(),
                 identity: TerminalIdentityRegistry::new(),
                 probe: FakeProbe::default(),
+                ledger: crate::pane_ledger::PaneLedger::new(Some(ledger_root.clone())),
+                ledger_root,
             }
         }
 
@@ -422,8 +468,26 @@ mod tests {
                 registry: &self.registry,
                 identity: &self.identity,
                 existence: &self.probe,
+                pane_ledger: &self.ledger,
                 fresh_agent: None,
             }
+        }
+
+        /// Durable bind (or mid-session rebind) via the SAME write path Task
+        /// 5's ledger test uses — `resolve_pending` writes the new bound row
+        /// FIRST, then retires any prior row for the terminal as Superseded.
+        fn ledger_bind(&self, provider: &str, session_id: &str, terminal_id: &str, now_ms: i64) {
+            self.ledger
+                .resolve_pending(&crate::pane_ledger::BindingWrite {
+                    provider,
+                    session_id,
+                    terminal_id,
+                    mode: provider,
+                    cwd: None,
+                    create_request_id: None,
+                    now_ms,
+                })
+                .expect("ledger bind");
         }
 
         fn headless(&self, id: &str, key: Option<&str>, mode: &str, created_at: i64) {
@@ -881,6 +945,76 @@ mod tests {
         assert_eq!(v.verdict, ReconcileVerdict::Respawn);
         assert_eq!(v.session_ref, Some(sref("claude", "s-server")));
         assert_eq!(v.corrected, Some(true));
+    }
+
+    // --- rung 2b: durable ledger-chain correction (A3 restart hole) --------
+
+    /// The A3 restart hole: ledger has A retired Superseded-by B (exactly
+    /// what Task 5's rebind writes and fsyncs); client claims A; no live
+    /// terminal; B's rollout exists on disk. The verdict must carry B
+    /// with corrected: Some(true) -- NOT echo A (the incident: restart +
+    /// absent client resumed the superseded parent).
+    #[test]
+    fn superseded_claim_resolves_to_chain_terminus_with_corrected_flag() {
+        let f = Fixture::new();
+        f.ledger_bind("codex", "aaaa-old", "t1", 1_000);
+        f.ledger_bind("codex", "bbbb-new", "t1", 2_000); // rebind: A retired Superseded-by B
+        f.probe.set("codex", "bbbb-new", SessionExistence::Present);
+
+        let mut p = pane("cr-a3");
+        p.mode = Some("codex".to_string());
+        p.session_ref = Some(sref("codex", "aaaa-old"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Respawn);
+        assert_eq!(v.session_ref, Some(sref("codex", "bbbb-new")));
+        assert_eq!(v.corrected, Some(true));
+    }
+
+    /// A -> B -> C in the ledger (two rebinds); claim A; probe: C Present.
+    #[test]
+    fn chained_supersession_resolves_to_the_terminus() {
+        let f = Fixture::new();
+        f.ledger_bind("codex", "aaaa-old", "t1", 1_000);
+        f.ledger_bind("codex", "bbbb-new", "t1", 2_000);
+        f.ledger_bind("codex", "cccc-new2", "t1", 3_000);
+        f.probe.set("codex", "cccc-new2", SessionExistence::Present);
+
+        let mut p = pane("cr-chain");
+        p.mode = Some("codex".to_string());
+        p.session_ref = Some(sref("codex", "aaaa-old"));
+        let v = f.one(p);
+        assert_eq!(v.verdict, ReconcileVerdict::Respawn);
+        assert_eq!(v.session_ref, Some(sref("codex", "cccc-new2")));
+        assert_eq!(v.corrected, Some(true));
+    }
+
+    /// Pins that the rung fires ONLY on Superseded chains: a claim with a
+    /// live (non-retired) ledger row AND a claim with no row at all both
+    /// keep today's rung-3 echo (session_ref == claim, corrected == None).
+    #[test]
+    fn unretired_claim_passes_through_unchanged() {
+        let f = Fixture::new();
+        // Bound (non-retired) row for D; no row at all for E.
+        f.ledger_bind("codex", "dddd-live", "t9", 1_000);
+        f.probe.set("codex", "dddd-live", SessionExistence::Present);
+        f.probe
+            .set("codex", "eeee-norow", SessionExistence::Present);
+
+        let mut p1 = pane("cr-d");
+        p1.mode = Some("codex".to_string());
+        p1.session_ref = Some(sref("codex", "dddd-live"));
+        let mut p2 = pane("cr-e");
+        p2.mode = Some("codex".to_string());
+        p2.session_ref = Some(sref("codex", "eeee-norow"));
+
+        let verdicts = derive_verdicts(&f.deps(), &[p1, p2]);
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts[0].verdict, ReconcileVerdict::Respawn);
+        assert_eq!(verdicts[0].session_ref, Some(sref("codex", "dddd-live")));
+        assert_eq!(verdicts[0].corrected, None);
+        assert_eq!(verdicts[1].verdict, ReconcileVerdict::Respawn);
+        assert_eq!(verdicts[1].session_ref, Some(sref("codex", "eeee-norow")));
+        assert_eq!(verdicts[1].corrected, None);
     }
 
     fn now_ms_for_test() -> i64 {

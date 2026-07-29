@@ -288,6 +288,53 @@ describe('codex-provider', () => {
     expect(meta.isSubagent).toBe(true)
   })
 
+  it('does not flag user forks (forked_from_id + thread_source=user) as subagents', async () => {
+    const fixturePath = path.join(
+      process.cwd(),
+      'test',
+      'fixtures',
+      'coding-cli',
+      'codex',
+      'fork-child-meta.sanitized.jsonl',
+    )
+    const content = await fsp.readFile(fixturePath, 'utf8')
+
+    const meta = parseCodexSessionContent(content)
+
+    // An in-TUI /resume continuation must stay sidebar-visible.
+    expect(meta.isSubagent).not.toBe(true)
+  })
+
+  it('keeps forks without thread_source classified as subagents (fail toward hiding)', () => {
+    const content = JSON.stringify({
+      timestamp: 't',
+      type: 'session_meta',
+      payload: { id: 'a', forked_from_id: 'b', cwd: '/tmp/x' },
+    })
+
+    const meta = parseCodexSessionContent(content)
+
+    expect(meta.isSubagent).toBe(true)
+  })
+
+  it('explicit subagent source always wins over thread_source=user', () => {
+    const content = JSON.stringify({
+      timestamp: 't',
+      type: 'session_meta',
+      payload: {
+        id: 'a',
+        forked_from_id: 'b',
+        thread_source: 'user',
+        source: { subagent: { thread_spawn: true } },
+        cwd: '/tmp/x',
+      },
+    })
+
+    const meta = parseCodexSessionContent(content)
+
+    expect(meta.isSubagent).toBe(true)
+  })
+
   it('does not include raw payload in normalized events', () => {
     const line = JSON.stringify({
       type: 'response_item',

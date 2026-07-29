@@ -23,6 +23,7 @@
 pub mod activity;
 pub mod auto_resume;
 pub mod backpressure;
+pub mod claude_signal;
 pub mod codex_association;
 pub(crate) mod codex_identity;
 pub(crate) mod codex_reconcile;

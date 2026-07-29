@@ -64,11 +64,13 @@ export function reconcileTerminalSessionAssociation({
   getState,
   terminalId,
   sessionRef: rawSessionRef,
+  previousSessionId,
 }: {
   dispatch: Dispatch
   getState: () => SessionAssociationState
   terminalId?: string
   sessionRef?: unknown
+  previousSessionId?: string
 }): TerminalSessionAssociationReconcileStatus {
   if (!terminalId) return 'ignored'
   const sessionRef = sanitizeSessionRef(rawSessionRef)
@@ -85,7 +87,19 @@ export function reconcileTerminalSessionAssociation({
     if (matches.length === 0) continue
 
     matchedAnyPane = true
-    if (matches.some(({ content }) => content.sessionRef && !sessionRefsEqual(content.sessionRef, sessionRef))) {
+    // A server-authoritative rebind (previousSessionId names the ref being
+    // superseded) is NOT a conflict: the deterministic supersession handshake
+    // -- accept only when the pane's current ref is exactly the superseded one.
+    const isAuthorizedRebind = (content: TerminalPaneContent): boolean =>
+      typeof previousSessionId === 'string'
+      && previousSessionId.length > 0
+      && content.sessionRef?.provider === sessionRef.provider
+      && content.sessionRef?.sessionId === previousSessionId
+    if (matches.some(({ content }) =>
+      content.sessionRef
+      && !sessionRefsEqual(content.sessionRef, sessionRef)
+      && !isAuthorizedRebind(content),
+    )) {
       conflictingPane = true
       continue
     }

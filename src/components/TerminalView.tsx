@@ -4277,6 +4277,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             getState: appStore.getState,
             terminalId: tid,
             sessionRef: msg.sessionRef,
+            previousSessionId: (msg as { previousSessionId?: string }).previousSessionId,
           })
           if (debugRef.current && associationResult === 'reconciled') {
             log.debug('[TRACE resumeSessionId] terminal.session.associated reconciled', {

@@ -302,7 +302,16 @@ export function parseCodexSessionContent(content: string): ParsedSessionMeta {
       if (isDirty === undefined && typeof payload?.git?.isDirty === 'boolean') {
         isDirty = payload.git.isDirty
       }
-      if (isSubagent === undefined && (isCodexSubagentSource(payload.source) || hasCodexForkedFromSession(payload))) {
+      // A forked_from_id with thread_source == "user" is an in-TUI
+      // /resume continuation -- the user's REAL session -- not a
+      // subagent (verified fork pair 019fa60f -> 019fa613; the child
+      // carries thread_source:"user"). thread_source ABSENT falls back
+      // to the old classification (fail toward hiding).
+      const forkedUserThread = hasCodexForkedFromSession(payload) && payload.thread_source === 'user'
+      if (
+        isSubagent === undefined &&
+        (isCodexSubagentSource(payload.source) || (hasCodexForkedFromSession(payload) && !forkedUserThread))
+      ) {
         isSubagent = true
       }
       if (payload.source === 'exec') {

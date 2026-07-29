@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
+import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
+import { flushPersistedLayoutNow } from '@/store/persistControl'
 
 function createState(content: Record<string, unknown>) {
   return {
@@ -20,6 +22,26 @@ function createState(content: Record<string, unknown>) {
       }],
     },
   } as any
+}
+
+function makeStateWithTerminalPane({
+  terminalId,
+  sessionRef,
+}: {
+  terminalId: string
+  sessionRef: { provider: string; sessionId: string }
+}) {
+  const dispatch = vi.fn()
+  const getState = () => createState({
+    kind: 'terminal',
+    terminalId,
+    createRequestId: 'req-1',
+    status: 'running',
+    mode: 'codex',
+    shell: 'system',
+    sessionRef,
+  })
+  return { dispatch, getState }
 }
 
 describe('terminal-session-association', () => {
@@ -88,6 +110,62 @@ describe('terminal-session-association', () => {
     })
 
     expect(result).toBe('ignored')
+    expect(dispatch).not.toHaveBeenCalled()
+  })
+})
+
+describe('server-authoritative rebind (previousSessionId)', () => {
+  it('rebinds when previousSessionId matches the pane current sessionRef', () => {
+    // pane holds { provider: 'codex', sessionId: 'old-id' }
+    const { dispatch, getState } = makeStateWithTerminalPane({
+      terminalId: 't1',
+      sessionRef: { provider: 'codex', sessionId: 'old-id' },
+    })
+    const result = reconcileTerminalSessionAssociation({
+      dispatch,
+      getState,
+      terminalId: 't1',
+      sessionRef: { provider: 'codex', sessionId: 'new-id' },
+      previousSessionId: 'old-id',
+    })
+    expect(result).toBe('reconciled')
+    expect(dispatch).toHaveBeenCalledWith(
+      reconcileTerminalSessionRefByTerminalId({
+        terminalId: 't1',
+        sessionRef: { provider: 'codex', sessionId: 'new-id' },
+      }),
+    )
+    expect(dispatch).toHaveBeenCalledWith(flushPersistedLayoutNow())
+  })
+
+  it('still conflicts when previousSessionId does NOT match the pane sessionRef', () => {
+    const { dispatch, getState } = makeStateWithTerminalPane({
+      terminalId: 't1',
+      sessionRef: { provider: 'codex', sessionId: 'some-other-id' },
+    })
+    const result = reconcileTerminalSessionAssociation({
+      dispatch,
+      getState,
+      terminalId: 't1',
+      sessionRef: { provider: 'codex', sessionId: 'new-id' },
+      previousSessionId: 'old-id',
+    })
+    expect(result).toBe('conflict')
+    expect(dispatch).not.toHaveBeenCalled()
+  })
+
+  it('still conflicts when previousSessionId is absent (write-once preserved)', () => {
+    const { dispatch, getState } = makeStateWithTerminalPane({
+      terminalId: 't1',
+      sessionRef: { provider: 'codex', sessionId: 'old-id' },
+    })
+    const result = reconcileTerminalSessionAssociation({
+      dispatch,
+      getState,
+      terminalId: 't1',
+      sessionRef: { provider: 'codex', sessionId: 'new-id' },
+    })
+    expect(result).toBe('conflict')
     expect(dispatch).not.toHaveBeenCalled()
   })
 })

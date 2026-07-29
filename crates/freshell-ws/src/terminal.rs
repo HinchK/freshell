@@ -2280,6 +2280,19 @@ pub(crate) async fn handle_create(
                 cwd.as_deref(),
                 resume.as_deref(),
             );
+            // Resume-launched codex panes are (correctly) refused by arm() --
+            // their session already exists. They DO need fork detection: an
+            // in-TUI /resume MAY fork to a NEW rollout (intermittent, upstream
+            // openai/codex#34972) and the pane would otherwise go permanently
+            // stale (incident 2026-07-27). `watch_fork` snapshots the sessions
+            // tree (bounded fs walk) -- already on the blocking pool here.
+            if mode == "codex" {
+                if let (Some(locator), Some(rsid)) =
+                    (state.codex_locator.as_ref(), resume.as_deref())
+                {
+                    locator.watch_fork(&terminal_id, rsid);
+                }
+            }
         })
         .await;
     }
@@ -3226,6 +3239,7 @@ async fn handle_pane_reconcile(
             registry: &state.registry,
             identity: &state.identity,
             existence: state.session_existence.as_ref(),
+            pane_ledger: &state.pane_ledger,
             fresh_agent: fresh_agent_snapshot.as_ref(),
         };
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
