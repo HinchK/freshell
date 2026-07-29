@@ -35,7 +35,7 @@ import { getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
 import { resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
-import { resolvePaneActivity } from '@/lib/pane-activity'
+import { hasWaitingPrompt, resolvePaneActivity } from '@/lib/pane-activity'
 import {
   resolveReopenPaneSessionTarget,
   type ReopenPaneActivity,
@@ -118,14 +118,6 @@ function findContextElement(start: HTMLElement | null): HTMLElement | null {
 
 function resolveContextId(value: string | undefined): ContextId {
   return isKnownContextId(value) ? value : ContextIds.Global
-}
-
-function hasWaitingPrompt(
-  session: Pick<FreshAgentSessionState, 'pendingPermissions' | 'pendingQuestions'> | undefined,
-): boolean {
-  if (!session) return false
-  return Object.keys(session.pendingPermissions).length > 0
-    || Object.keys(session.pendingQuestions).length > 0
 }
 
 function sameReopenTargetIdentity(
