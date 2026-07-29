@@ -80,9 +80,10 @@ cd /home/dan/code/freshell/.worktrees/silent-input-loss
 git fetch origin
 git log --oneline -1 origin/main
 git log --oneline -1 HEAD
+git merge-base --is-ancestor origin/main HEAD && echo BASE-OK || echo BASE-STALE
 ```
 
-Expected: HEAD equals `origin/main` (e28d0910 or newer). If origin/main moved past HEAD: `git merge --ff-only origin/main` (the branch has no commits yet).
+Expected: `BASE-OK` — `origin/main` (e28d0910 or newer) is an ancestor of HEAD. HEAD will NOT equal origin/main: the branch already carries the plan-doc commits, and that is fine. If `BASE-STALE` (origin/main has moved past this branch's base): `git merge origin/main` (a plain merge, NOT `--ff-only` — the branch has its own commits, so fast-forward is impossible), resolve any conflicts, and re-run the ancestor check before proceeding.
 
 - [ ] **Step 2: Install node deps + tsx symlink (worktree quirk)**
 
@@ -972,7 +973,7 @@ Then the tests (all use the file's existing `setupThemeTerminal`, `messageHandle
     }
   })
 
-  it('discards buffered input with a notice when the terminal exits', async () => {
+  it('discards buffered input with a visible notice when the terminal exits', async () => {
     const { store, tabId, paneId, paneContent } = setupThemeTerminal({
       terminalId: 'term-exiting',
       status: 'running',
@@ -989,24 +990,31 @@ Then the tests (all use the file's existing `setupThemeTerminal`, `messageHandle
     })
     const term = terminalInstances[0]
 
-    // Exit clears terminalIdRef -> subsequent keystrokes buffer...
-    act(() => {
-      messageHandler!({ type: 'terminal.exit', terminalId: 'term-exiting', exitCode: 0 })
-    })
+    // Force the send gate to BUFFER while terminalIdRef is STILL SET: drop
+    // the mock's synchronous `isReady` (the same controllable seam the
+    // close-race test below adds to the suite's ws mock). Buffering before
+    // the exit is what makes the exit-discard path observable -- an exit
+    // sent first would clear the tid and a later duplicate exit is swallowed
+    // by the handler's `msg.terminalId === tid` gate.
+    setWsIsReady(false)
     fireData(term, 'typed at a corpse')
-    // ...and a SECOND exit-shaped terminal-state (failLaunch/exit are the
-    // discard sites). Simplest deterministic discard trigger from outside:
-    // the timeout also discards, but the exit-state discard is what this
-    // test pins -- drive it by re-sending exit for the last terminalId.
+    // RED pre-fix on THIS assertion too: pre-fix sendInput sends whenever
+    // tid is set, so a terminal.input frame appears here before the fix.
+    expect(sentMessages().filter((m) => m?.type === 'terminal.input')).toEqual([])
+
+    // terminal.exit for the still-set tid passes the handler's
+    // `msg.terminalId === tid` gate and hits the discard site (Step 3
+    // item 8): discardPendingInput('terminal_gone') drops the buffer and
+    // writes the visible notice (design invariant 3).
     act(() => {
       messageHandler!({ type: 'terminal.exit', terminalId: 'term-exiting', exitCode: 0 })
     })
-
+    expectTerminalWriteContaining(term, 'Input not sent')
     expect(sentMessages().filter((m) => m?.type === 'terminal.input')).toEqual([])
   })
 ```
 
-Note on the last test: the first `terminal.exit` both clears the anchor AND discards (empty buffer — no notice); the keystroke then buffers; pin the visible-discard path however the handler wiring makes deterministic — if the duplicate-exit frame is swallowed by the `msg.terminalId === tid` gate (tid is already cleared), replace the second `act` with the fake-timer timeout pattern from the previous test and assert `expectTerminalWriteContaining(term, 'Input not sent')`. The contract being pinned: **typed-at-a-corpse bytes are never sent and never silently vanish.**
+Note on the last test: it pins the exit-discard path NON-vacuously — the notice assertion (`'Input not sent'`, the shared prefix of every loss notice) fails pre-fix, and the no-frames assertion fails pre-fix as well because pre-fix `sendInput` sends whenever tid is set. Do NOT drive the discard with a duplicate `terminal.exit` after the tid is cleared (the `msg.terminalId === tid` gate swallows it — the discard never fires and the test would pass vacuously), and do NOT substitute the fake-timer timeout (that pins the timeout notice, a different path already covered by the previous test). The contract being pinned: **typed-at-a-corpse bytes are never sent and never silently vanish — the exit-state discard itself surfaces the notice.**
 
 Two more RED tests (validation findings — ledger A8, A15):
 
@@ -1243,14 +1251,15 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
 ```ts
   const sendInput = useCallback((data: string, opts?: { droppable?: boolean }) => {
     const tid = terminalIdRef.current
-    // Ledger A8 / design invariant 9: ws.isReady() is the SYNCHRONOUS truth —
+    // Ledger A8 / design invariant 9: the `ws.isReady` getter is the SYNCHRONOUS truth —
     // the socket's close event flips it immediately, while the Redux-fed
     // connectionStatusRef lags a task. Without it, a keystroke in that gap
     // would land in ws-client's pendingMessages and be silently discarded by
-    // Task 6's reconnect filter. (If the ws hook wrapper doesn't already
-    // expose the client's `isReady` getter (ws-client.ts:389), add a one-line
-    // passthrough.)
-    if (!tid || awaitingAnchorRef.current || connectionStatusRef.current !== 'ready' || !ws.isReady()) {
+    // Task 6's reconnect filter. `ws` here is the WsClient instance itself
+    // (`const ws = useMemo(() => getWsClient(), [])`, :588) and `isReady` is
+    // a GETTER (`get isReady()`, ws-client.ts:389) -- read it as a property,
+    // never call it.
+    if (!tid || awaitingAnchorRef.current || connectionStatusRef.current !== 'ready' || !ws.isReady) {
       if (opts?.droppable) {
         // Synthetic replies (DECRQM/OSC auto-answers, scroll translation)
         // answer the OLD terminal's output -- replaying them into a NEW pty
@@ -1267,7 +1276,7 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
   }, [ws, bufferPendingInput, flushPendingInput])
 ```
 
-6. Mark the synthetic call sites droppable — the DECRQM/OSC-52 reply path (:1598), the scroll-translation path (`translateScrollLinesToInput`, :1169), AND the request-mode bypass responder registration (:1884 → `request-mode-bypass.ts:256`, which emits synthetic DECRPM reports; ledger A13 — buffering it would flush mode-report garbage into the NEW pty) pass `{ droppable: true }` as the second argument. The user-input call sites (`term.onData` :2033, keybar/paste :1689, ESC :2103) stay as-is.
+6. Mark the synthetic call sites droppable — the DECRQM/OSC-52 reply path (:1598), the scroll-translation path (`translateScrollLinesToInput`, :1169), AND the request-mode bypass responder registration (:1884 → `request-mode-bypass.ts:256`, which emits synthetic DECRPM reports; ledger A13 — buffering it would flush mode-report garbage into the NEW pty) pass `{ droppable: true }` as the second argument. At the two direct-call sites (:1598, `translateScrollLinesToInput`) that is a literal second argument; at :1884 `sendInput` is passed as a function REFERENCE into `registerTerminalRequestModeBypass(term, sendInput, …)` — there is no argument position there, so pass a wrapper instead: `(d) => sendInput(d, { droppable: true })`. The user-input call sites (`term.onData` :2033, keybar/paste :1689, ESC :2103) stay as-is.
 
 7. Flush at the anchors:
    - In the `terminal.created` handler, AFTER the created `sessionRef` is folded into `contentRef` (:4046-4066), not immediately at :4045: `flushPendingInput(newId)` (ledger A11 — rebuilt frames must snapshot the NEW identity; the Rust server ignores `expected_session_ref` on input, but flushing pre-fold would break Node parity and invariant 2's own rationale). Also set `lastKnownTerminalIdRef.current = newId` next to the tid assignment.
@@ -1295,7 +1304,7 @@ const PENDING_INPUT_LOSS_NOTICE: Record<PendingInputLossReason, string> = {
 
 11. Fold the Shift+Enter raw sender through the gate (ledger A7): the raw `terminal.input` frame built at :2126-2133 bypasses `sendInput` entirely — replace it with a `sendInput(<same data>)` call so Shift+Enter input buffers like every other keystroke instead of being queued and silently discarded by Task 6's filter.
 
-12. Gate the firewall-command sender (ledger A7): the effect at `App.tsx:1497-1509` sends a `terminal.input` frame and clears `pendingFirewallCommand` unconditionally. Make it send-and-clear ONLY when the connection is ready (`ws.isReady()` — synchronous, invariant 9); otherwise leave `pendingFirewallCommand` set so the effect re-fires when the status returns to ready. No buffering machinery needed — deferral via the existing pending state is sufficient.
+12. Gate the firewall-command sender (ledger A7): the effect at `App.tsx:1497-1509` sends a `terminal.input` frame and clears `pendingFirewallCommand` unconditionally. Make it send-and-clear ONLY when the connection is ready (the `ws.isReady` getter — a property read, NOT a call; synchronous, invariant 9); otherwise leave `pendingFirewallCommand` set so the effect re-fires when the status returns to ready. No buffering machinery needed — deferral via the existing pending state is sufficient.
 
 13. Make the `status:'creating'` overlay click-transparent (ledger A14 / invariant 10a): add `pointer-events-none` to the absolute-inset overlay at :5011 so a mid-recreate click cannot blur xterm and kill `onData` delivery (loss above the buffer). The overlay is informational; it must not eat interaction.
 
@@ -1713,6 +1722,6 @@ Expected: the task-by-task commit ladder from this plan; push succeeds. Do NOT o
 
 **2. Placeholder scan.** One deliberate copy directive exists (Task 9: `selectFirstShellFromPicker` copied verbatim from a named source range, with an explicit instruction that the placeholder line must not survive the step) — a copy instruction with an exact source, not a TBD. Two "adapt to the mock's actual shape" notes (Task 7 Step 1 `fireData`, Task 8 Step 1 error-injection) each come with complete working code plus the named in-file mechanism to align with; the contracts being asserted are fully specified.
 
-**3. Load-bearing validation (Stage 2) — findings applied.** 23 assumptions surfaced, 21 validated (ledger: `.worktrees/.the-usual-logs/silent-input-loss/load-bearing-ledger.md`). Falsified → fixed in this plan: A2 (stale-id blocked frames were silently dropped → `lastKnownTerminalIdRef` match, Task 7 item 14 / invariant 10b); A7 (two `sendInput`-bypassing user senders: Shift+Enter :2126-2133 and firewall App.tsx:1497-1509 → Task 7 items 11-12 / invariant 1); A8 (close-race: ref-lagged gate would feed Task 6's filter NEW silent loss → synchronous `ws.isReady()` in the gate + race test, invariant 9); A13 (request-mode-bypass DECRPM sender was left bufferable → droppable, invariant 5); A15 (anchor's `term.clear()` wipes pre-anchor loss notices → deferred re-write via the reconcileNotice pattern, invariant 3 + Task 7 item 7 + survival test); A23 (harness-01's retry loop also absorbed slow-recreate flake → 60s budgets in Tasks 9-10). Verified corrections folded in: 11th attach call site (quarantine repair :884, invariant 7); flush placement after the sessionRef fold :4066 (A11); `ZOD_BACKED_SERVER_MESSAGES` is a test-side list (Task 2); pane-picker helpers exist (Task 9); creating-overlay `pointer-events-none` (A14, invariant 10a); headless-input warn (A16, Task 3). Accepted residuals (recorded in the ledger with alternatives considered): in-flight frame loss on a dying socket (browser-level, needs an ack protocol — out of scope); TUI-CLI early-input TCSAFLUSH behavior (bash proven 60/60 byte-intact; TUIs unverified); xterm-core DA/CPR auto-replies entering `onData` (output-quiet while un-anchored; post-anchor behavior pre-existing). Re-check of 1b after these edits: every new requirement (race gate, deferred notice, stray-sender folding, overlay fix) lands on production code with a pinning test in Tasks 6-9 — no stubs, no deferrals.
+**3. Load-bearing validation (Stage 2) — findings applied.** 23 assumptions surfaced, 21 validated (ledger: `.worktrees/.the-usual-logs/silent-input-loss/load-bearing-ledger.md`). Falsified → fixed in this plan: A2 (stale-id blocked frames were silently dropped → `lastKnownTerminalIdRef` match, Task 7 item 14 / invariant 10b); A7 (two `sendInput`-bypassing user senders: Shift+Enter :2126-2133 and firewall App.tsx:1497-1509 → Task 7 items 11-12 / invariant 1); A8 (close-race: ref-lagged gate would feed Task 6's filter NEW silent loss → synchronous `ws.isReady` getter in the gate + race test, invariant 9); A13 (request-mode-bypass DECRPM sender was left bufferable → droppable, invariant 5); A15 (anchor's `term.clear()` wipes pre-anchor loss notices → deferred re-write via the reconcileNotice pattern, invariant 3 + Task 7 item 7 + survival test); A23 (harness-01's retry loop also absorbed slow-recreate flake → 60s budgets in Tasks 9-10). Verified corrections folded in: 11th attach call site (quarantine repair :884, invariant 7); flush placement after the sessionRef fold :4066 (A11); `ZOD_BACKED_SERVER_MESSAGES` is a test-side list (Task 2); pane-picker helpers exist (Task 9); creating-overlay `pointer-events-none` (A14, invariant 10a); headless-input warn (A16, Task 3). Accepted residuals (recorded in the ledger with alternatives considered): in-flight frame loss on a dying socket (browser-level, needs an ack protocol — out of scope); TUI-CLI early-input TCSAFLUSH behavior (bash proven 60/60 byte-intact; TUIs unverified); xterm-core DA/CPR auto-replies entering `onData` (output-quiet while un-anchored; post-anchor behavior pre-existing). Re-check of 1b after these edits: every new requirement (race gate, deferred notice, stray-sender folding, overlay fix) lands on production code with a pinning test in Tasks 6-9 — no stubs, no deferrals.
 
 **4. Type consistency.** `InputOutcome{found}` defined in Task 3, consumed as `outcome.found` in Task 4 and the freshagent caller. `handle_attach(...) -> Option<ServerMessage>` defined and consumed in Task 5. `sendInput(data, opts?: {droppable?: boolean})`, `bufferPendingInput(data)`, `flushPendingInput(tid)`, `discardPendingInput('timeout'|'terminal_gone')`, `notifyPendingInputLoss('overflow'|'timeout'|'terminal_gone')` used consistently across Task 7's steps and Task 8's test. Wire strings consistent throughout: `terminal.input.blocked` / `unknown_terminal` / `INVALID_TERMINAL_ID` / `"Terminal not running"`.
