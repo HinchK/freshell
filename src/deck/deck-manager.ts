@@ -17,8 +17,6 @@
 // SECONDARY signal for the other-OS-app case (e.g. an exclusive-mode holder on
 // Windows) — the same-origin case is handled by the lock, not by open failure.
 
-import type { Store } from '@reduxjs/toolkit'
-import type { RootState } from '@/store/store'
 import type { DeckDevice } from './deck-device'
 import { DeckController, type DeckControllerOptions } from './deck-controller'
 import { setDeckStatus } from '@/store/deckSlice'
@@ -51,7 +49,7 @@ type LocksApi = {
 }
 
 type Manager = {
-  store: Store<RootState>
+  store: DeckControllerOptions['store']
   transports: DeckTransports
   prevEnabled: boolean
   unsubscribeStore: (() => void) | null
@@ -95,9 +93,7 @@ function isEnabled(m: Manager): boolean {
 function adopt(m: Manager, device: DeckDevice): void {
   m.device = device
   const controller = new DeckController({
-    // Store<RootState>'s dispatch is the same function at runtime as the
-    // thunk-aware AppDispatch the controller's DeckStore type asks for.
-    store: m.store as unknown as DeckControllerOptions['store'],
+    store: m.store,
     device,
     settings: () => m.store.getState().settings.settings.streamDeck,
     ...(m.transports.renderKey ? { renderKey: m.transports.renderKey } : {}),
@@ -250,7 +246,7 @@ function uninstallManager(m: Manager): void {
   manager = null
 }
 
-export function installStreamDeckManager(store: Store<RootState>, transports?: DeckTransports): () => void {
+export function installStreamDeckManager(store: DeckControllerOptions['store'], transports?: DeckTransports): () => void {
   if (manager) return () => {} // idempotent singleton: the first install owns teardown
   if (!isWebHidSupported()) {
     store.dispatch(setDeckStatus({ status: 'unsupported' }))

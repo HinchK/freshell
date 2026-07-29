@@ -7,7 +7,7 @@ import { X } from 'lucide-react'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setVirtualDeckOpen } from '@/store/deckSlice'
 import { FakeDeckDevice, MINI_CAPS, PLUS_CAPS } from '@/deck/fake-deck-device'
-import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
+import { DeckController } from '@/deck/deck-controller'
 import { renderKey, renderStrip, type Ctx2D, type CtxFactory } from '@/deck/tile-renderer'
 import { SegmentedControl } from '@/components/settings/settings-controls'
 
@@ -79,9 +79,7 @@ export default function VirtualDeckPanel() {
     deviceRef.current = device
     const pressedKeys = pressedKeysRef.current
     const controller = new DeckController({
-      // Store<RootState>'s dispatch is the same function at runtime as the
-      // thunk-aware AppDispatch the controller's DeckStore type asks for.
-      store: store as unknown as DeckControllerOptions['store'],
+      store,
       device,
       renderKey: (spec, c) => renderKey(spec, c, safeCtxFactory),
       renderStrip: (text, width, height) => renderStrip(text, width, height, safeCtxFactory),

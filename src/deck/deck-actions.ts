@@ -9,7 +9,7 @@ export type DeckStore = { getState(): RootState; dispatch: AppDispatch }
 
 export function focusTabFromDeck(store: DeckStore, tabId: string): void {
   if (store.getState().settings.settings.panes.attentionDismiss === 'click') {
-    store.dispatch(dismissTabGreen(tabId) as never)
+    store.dispatch(dismissTabGreen(tabId))
   }
   store.dispatch(setActiveTab(tabId))
 }

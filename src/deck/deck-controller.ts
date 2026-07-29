@@ -246,7 +246,7 @@ export class DeckController {
       if (!target) return // disabled: stay open
       sendDeckApproval(target)
       if (state.settings.settings.panes.attentionDismiss === 'click') {
-        this.store.dispatch(dismissTabGreen(layer.tabId) as never)
+        this.store.dispatch(dismissTabGreen(layer.tabId))
       }
       this.closeActionLayer()
       return
