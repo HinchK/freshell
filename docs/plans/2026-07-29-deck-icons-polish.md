@@ -1282,7 +1282,7 @@ git commit -m "feat(deck): replace the icons-tile status dot with readiness-stam
 
 ### Task 10: Render tinted agent icons beside the repo icon (+N overflow badge)
 
-Draw the tab bar's presentation on the key: repo icon (or circle letter avatar) first, then up to 2 tinted agent icons, then a `+N` badge for hidden agent panes (blue when a hidden pane is busy — TabItem's overflow rule). Tabs with no agent panes keep today's repo-icons-only row (up to 3). Tinted icons mirror the repo-icon pattern exactly: the renderer calls `getIcon(providerIconDataUrl(...))` ONLY when the spec entry says `ready: true` (Task 9's `buildFrame` stamped it after consulting — and thereby starting — the cache load). An unready slot stays empty; when the decode completes, the cache notify triggers a repaint, `buildFrame` flips `ready` in the spec JSON, the controller's diff un-skips the key, and the icon appears. The blank-draw probe and silent-failure handling in `IconImageCache` are untouched.
+Draw the tab bar's presentation on the key: repo icon (or circle letter avatar) first, then tinted agent icons, then a `+N` badge for hidden agent panes (blue when a hidden pane is busy — TabItem's overflow rule). Unlike TabItem's flex row (where the badge is an additive 4th sibling), canvas has no auto-layout and `iconLayout` only guarantees on-key fit up to 3 slots (`iconLayout(80,80,4)` already overflows the key; 72px keys clip harder), so the badge OCCUPIES A ROW SLOT: when hidden panes exist, the number of drawn agent icons shrinks so that repo + drawn agents + badge never exceeds `MAX_ROW_SLOTS` (3), and the badge text renders centered inside the reserved last slot. This keeps the entire composition — badge included — centered and fully on-key at every key size. Tabs with no agent panes keep today's repo-icons-only row (up to 3). Tinted icons mirror the repo-icon pattern exactly: the renderer calls `getIcon(providerIconDataUrl(...))` ONLY when the spec entry says `ready: true` (Task 9's `buildFrame` stamped it after consulting — and thereby starting — the cache load). An unready slot stays empty; when the decode completes, the cache notify triggers a repaint, `buildFrame` flips `ready` in the spec JSON, the controller's diff un-skips the key, and the icon appears. The blank-draw probe and silent-failure handling in `IconImageCache` are untouched.
 
 **Files:**
 - Modify: `src/deck/tile-renderer.ts`
@@ -1316,7 +1316,7 @@ describe('agent pane icons (tab-bar presentation)', () => {
     expect(images).toEqual([{ x: slots[1].x, y: slots[1].y, w: slots[1].size, h: slots[1].size }])
   })
 
-  it('caps drawn agent icons at MAX_KEY_PANE_ICONS and folds the rest into a +N badge', () => {
+  it('folds hidden agent icons into a +N badge that occupies a centered, on-key row slot', () => {
     const paneIcons = [
       { provider: 'claude', tint: 'green' as const, ready: true },
       { provider: 'codex', tint: 'green' as const, ready: true },
@@ -1325,20 +1325,30 @@ describe('agent pane icons (tab-bar presentation)', () => {
     ]
     const requested: string[] = []
     const { texts } = renderTab(tabSpec({ icons: [repoIcon], paneIcons }), (url) => { requested.push(url); return bitmap })
-    expect(requested).toEqual([
-      providerIconDataUrl('claude', PANE_TINT_COLORS.green),
-      providerIconDataUrl('codex', PANE_TINT_COLORS.green),
-    ])
-    const badge = texts.find((t) => t.text === '+2')
+    // The badge occupies the third row slot, so with a repo icon present only
+    // ONE agent icon is drawn (repo + 1 agent + badge = MAX_ROW_SLOTS = 3);
+    // the other three panes fold into +3.
+    expect(requested).toEqual([providerIconDataUrl('claude', PANE_TINT_COLORS.green)])
+    const badge = texts.find((t) => t.text === '+3')
     expect(badge).toBeDefined()
     // A hidden pane is busy -> blue badge (TabItem's overflow rule).
     expect(badge?.style).toBe(STATUS_BLUE)
     expect(badge?.font).toBe(`600 ${OVERFLOW_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    // Badge geometry: horizontally centered in the reserved LAST slot of the
+    // 3-slot row, vertically at slot middle - so the whole composition (badge
+    // included) is centered and never clips off the key. The harness stubs
+    // measureText at 6px/char ('+3' -> 12).
+    const last = iconLayout(80, 80, 3)[2]
+    expect(badge?.x).toBe(Math.round(last.x + (last.size - 12) / 2))
+    expect(badge?.y).toBe(last.y + last.size / 2)
+    expect((badge?.x ?? Number.NaN) + 12).toBeLessThanOrEqual(80) // fully on-key
   })
 
-  it('badge is muted when no hidden pane is busy', () => {
+  it('badge is muted when no hidden pane is busy; MAX_KEY_PANE_ICONS binds when no repo icon competes for slots', () => {
     const paneIcons = Array.from({ length: 3 }, () => ({ provider: 'claude', tint: 'green' as const, ready: true }))
-    const { texts } = renderTab(tabSpec({ icons: [], paneIcons }), () => bitmap)
+    const { texts, images } = renderTab(tabSpec({ icons: [], paneIcons }), () => bitmap)
+    // No repo icon: 2 agent icons + badge fill the 3 slots exactly.
+    expect(images).toHaveLength(MAX_KEY_PANE_ICONS)
     expect(texts.find((t) => t.text === '+1')?.style).toBe(STATUS_MUTED)
   })
 
@@ -1387,6 +1397,12 @@ In `src/deck/tile-renderer.ts`:
 /** Agent icons drawn per key; hidden panes fold into the +N badge (TabItem rule, key-sized). */
 export const MAX_KEY_PANE_ICONS = 2
 export const OVERFLOW_FONT_SIZE = 10
+/**
+ * Max row slots (icons + badge). iconLayout guarantees on-key fit only up to
+ * 3 slots (4 slots overflow an 80px key by 1px and a 72px key by 9px), so the
+ * +N badge COUNTS AS A SLOT and drawn agent icons shrink to make room for it.
+ */
+const MAX_ROW_SLOTS = 3
 ```
 
 3. In `drawIconsTab`, replace block `// 2.` (the repo-icons loop from Task 2) with the combined row:
@@ -1395,12 +1411,21 @@ export const OVERFLOW_FONT_SIZE = 10
   // 2. Center row mirrors the tab bar's pane-icon presentation (TabItem.tsx
   //    renderIcons): repo icon (or circle letter avatar) first, then up to
   //    MAX_KEY_PANE_ICONS tinted agent icons, then a +N badge for hidden agent
-  //    panes (blue when a hidden pane is busy). Tabs with no agent panes keep
-  //    the repo-icons-only row (up to 3, as before).
-  const paneIcons = spec.paneIcons.slice(0, MAX_KEY_PANE_ICONS)
-  const hidden = spec.paneIcons.slice(MAX_KEY_PANE_ICONS)
-  const repoIcons = paneIcons.length > 0 ? spec.icons.slice(0, 1) : spec.icons
-  const slots = iconLayout(w, h, repoIcons.length + paneIcons.length)
+  //    panes (blue when a hidden pane is busy). Unlike TabItem's flex row
+  //    (badge = additive 4th sibling), canvas has no auto-layout and
+  //    iconLayout only fits 3 slots on-key, so the badge OCCUPIES A ROW SLOT:
+  //    when it appears, drawn agent icons shrink so repo + agents + badge
+  //    never exceed MAX_ROW_SLOTS — the whole row (badge included) stays
+  //    centered and fully on-key. Tabs with no agent panes keep the
+  //    repo-icons-only row (up to 3, as before).
+  const repoIcons = spec.paneIcons.length > 0 ? spec.icons.slice(0, 1) : spec.icons
+  let drawnCount = Math.min(spec.paneIcons.length, MAX_KEY_PANE_ICONS)
+  if (spec.paneIcons.length > drawnCount && repoIcons.length + drawnCount + 1 > MAX_ROW_SLOTS) {
+    drawnCount = MAX_ROW_SLOTS - 1 - repoIcons.length // give the badge its slot
+  }
+  const paneIcons = spec.paneIcons.slice(0, drawnCount)
+  const hidden = spec.paneIcons.slice(drawnCount)
+  const slots = iconLayout(w, h, repoIcons.length + paneIcons.length + (hidden.length > 0 ? 1 : 0))
   repoIcons.forEach((icon, i) => {
     const { x, y, size } = slots[i]
     const bitmap = icon.url && icon.ready ? getIcon(icon.url) : null
@@ -1438,12 +1463,16 @@ export const OVERFLOW_FONT_SIZE = 10
     const bitmap = icon.ready ? getIcon(providerIconDataUrl(icon.provider, PANE_TINT_COLORS[icon.tint])) : null
     if (bitmap) ctx.drawImage(bitmap, x, y, size, size)
   })
-  if (hidden.length > 0 && slots.length > 0) {
-    const last = slots[slots.length - 1]
+  if (hidden.length > 0) {
+    // The badge renders horizontally centered inside the row slot reserved
+    // for it above (slots.length >= 1 is guaranteed: the badge itself was
+    // counted in the iconLayout call), so it can never clip off the key.
+    const slot = slots[slots.length - 1]
+    const label = `+${hidden.length}`
     ctx.font = `600 ${OVERFLOW_FONT_SIZE}px ${DECK_FONT_STACK}`
     ctx.textBaseline = 'middle'
     ctx.fillStyle = hidden.some((p) => p.tint === 'blue') ? STATUS_BLUE : STATUS_MUTED
-    ctx.fillText(`+${hidden.length}`, last.x + last.size + ICON_GAP, last.y + last.size / 2)
+    ctx.fillText(label, Math.round(slot.x + (slot.size - ctx.measureText(label).width) / 2), slot.y + slot.size / 2)
   }
 ```
 
