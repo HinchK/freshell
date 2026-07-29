@@ -2,7 +2,6 @@ import type { DeckCapabilities } from './deck-device'
 import type { DeckAction, KeySpec, RingColor } from './frame'
 import { repoAvatarColor, REPO_AVATAR_FONT_RATIO } from '@/components/icons/RepoIcon'
 import { DECK_FONT_STACK } from './deck-font'
-import { STATUS_GREEN, STATUS_BLUE } from './pane-tint-colors'
 
 // Canvas draw layer: converts a KeySpec into an RGBA pixel buffer via an
 // injectable 2D-context factory (jsdom returns null from getContext, so tests
@@ -64,7 +63,6 @@ export const TILE_BG = '#09090b'
 export const TILE_FILL_GREEN = '#d1fae5'
 export const BAR_TOP_BORDER = '#21c45d'
 export const ACTIVE_COLOR = '#ffffff'
-export const DOT_SIZE = 8
 export const ICON_GAP = 3
 export const CONTROL_BG = '#27272a'
 export const CONTROL_DIM = '#a1a1aa'
@@ -202,13 +200,7 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
     ctx.fillText(icon.letter, Math.round(cx - letterWidth / 2), Math.round(cy + size * (0.5 / 16)))
   })
 
-  // 3. Status dot: the tab bar's green/blue icon-tint states, visible on the deck.
-  if (spec.dot) {
-    ctx.fillStyle = spec.dot === 'green' ? STATUS_GREEN : STATUS_BLUE
-    ctx.fillRect(Math.round((w - DOT_SIZE) / 2), h - DOT_SIZE - 5, DOT_SIZE, DOT_SIZE)
-  }
-
-  // 4. Title banner across the top (unchanged treatment).
+  // 3. Title banner across the top (unchanged treatment).
   ctx.fillStyle = BANNER_FILL
   ctx.fillRect(0, 0, w, BANNER_HEIGHT)
   ctx.font = `600 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
@@ -217,7 +209,7 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
   const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 4)
   drawCenteredText(ctx, label, w, 2)
 
-  // 5. Borders/rings: barTop green border; white ring marks the active tab.
+  // 4. Borders/rings: barTop green border; white ring marks the active tab.
   if (spec.fill === 'barTop') {
     drawRing(ctx, w, h, BAR_TOP_BORDER, 3, 0)
     if (spec.active) drawRing(ctx, w, h, ACTIVE_COLOR, 2, 3)

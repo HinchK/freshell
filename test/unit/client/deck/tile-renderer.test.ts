@@ -3,7 +3,7 @@ import { MINI_CAPS } from '@/deck/fake-deck-device'
 import {
   cropPreviewLines, drawRing, fitLabel, iconLayout, previewGeometry, renderKey, renderStrip, truncateTitle,
   APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR, PREVIEW_TEXT_COLOR, PREVIEW_BG, RING_COLORS,
-  TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, DOT_SIZE, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
+  TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, CONTROL_BG, CONTROL_DIM, STOP_COLOR,
   CONTROL_LABEL_FONT_SIZE, CONTROL_VALUE_FONT_SIZE, TITLE_FONT_SIZE, STRIP_FONT_SIZE,
 } from '@/deck/tile-renderer'
 import { STATUS_GREEN, STATUS_BLUE, STATUS_AMBER, STATUS_RED, STATUS_MUTED, STATUS_MUTED_DIM } from '@/deck/pane-tint-colors'
@@ -94,7 +94,7 @@ describe('cropPreviewLines', () => {
 
 const tabSpec = (over: Partial<Extract<KeySpec, { kind: 'tab'; style: 'icons' }>> = {}): KeySpec => ({
   kind: 'tab', style: 'icons', tabId: 't1', title: 'build',
-  active: false, fill: 'none', dot: null, icons: [], ...over,
+  active: false, fill: 'none', paneIcons: [], icons: [], ...over,
 })
 
 function previewSpec(overrides: Partial<Extract<KeySpec, { kind: 'tab'; style: 'preview' }>> = {}): KeySpec {
@@ -173,13 +173,10 @@ describe('renderKey', () => {
     expect(letter?.font).toBe(`600 ${Math.round(slot.size * REPO_AVATAR_FONT_RATIO)}px ${DECK_FONT_STACK}`)
   })
 
-  it('status dot: green and blue variants at bottom-center; absent when null', () => {
-    const green = renderTab(tabSpec({ dot: 'green' }))
-    expect(green.rects.some((r) => r.style === STATUS_GREEN && r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(true)
-    const blue = renderTab(tabSpec({ dot: 'blue' }))
-    expect(blue.rects.some((r) => r.style === STATUS_BLUE && r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(true)
-    const none = renderTab(tabSpec())
-    expect(none.rects.some((r) => r.w === DOT_SIZE && r.h === DOT_SIZE)).toBe(false)
+  it('no status dot: a plain icons tile draws only the background and the banner', () => {
+    const { rects } = renderTab(tabSpec())
+    // background + banner — nothing else (the dot used to be a third rect)
+    expect(rects).toHaveLength(2)
   })
 
   it('iconLayout: 1 icon centered large; 3 icons in a centered row below the banner', () => {

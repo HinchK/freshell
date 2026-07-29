@@ -215,7 +215,7 @@ afterEach(() => {
 })
 
 describe('Stream Deck e2e flows (fake transport, real store)', () => {
-  it('tabs appear on keys with titles, fills, dots, and icons', () => {
+  it('tabs appear on keys with titles, fills, paneIcons, and icons', () => {
     const { device } = setup({
       tabs: 3,
       busy: ['term-1'],
@@ -227,15 +227,15 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     // (greenIcon) < t1 busy (blueIcon), so busy t1 lands after the others.
     expect(decodeKey(device, 0)).toEqual({
       kind: 'tab', style: 'icons', tabId: 't2', title: 'tab2', active: false,
-      fill: 'green', dot: 'green', icons: [],
+      fill: 'green', paneIcons: [{ provider: 'claude', tint: 'green', ready: false }], icons: [],
     })
     expect(decodeKey(device, 1)).toEqual({
       kind: 'tab', style: 'icons', tabId: 't3', title: 'tab3', active: false,
-      fill: 'none', dot: 'green', icons: [],
+      fill: 'none', paneIcons: [{ provider: 'freshclaude', tint: 'green', ready: false }], icons: [],
     })
     expect(decodeKey(device, 2)).toEqual({
       kind: 'tab', style: 'icons', tabId: 't1', title: 'tab1', active: true,
-      fill: 'none', dot: 'blue', icons: [],
+      fill: 'none', paneIcons: [{ provider: 'claude', tint: 'blue', ready: false }], icons: [],
     })
   })
 
@@ -251,20 +251,20 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', active: true, fill: 'none' })
   })
 
-  it('tile fill and dot track state changes', () => {
+  it('tile fill and paneIcons track state changes', () => {
     const { store, device } = setup({ tabs: 3, freshAgentTab: 3 })
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', fill: 'none', dot: 'green' })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', fill: 'none', paneIcons: [{ provider: 'claude', tint: 'green', ready: false }] })
     store.dispatch(upsertClaudeActivity({ terminals: [{ terminalId: 'term-1', phase: 'busy', updatedAt: 1 }] }))
     // busy t1 (blueIcon) sorts after the green-icon tabs -> key 2
-    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't1', dot: 'blue' })
+    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't1', paneIcons: [{ provider: 'claude', tint: 'blue', ready: false }] })
     store.dispatch(markTabAttention({ tabId: 't1' }))
     // attention outranks busy; active+attention (barTop) sorts t1 back to key 0
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', fill: 'barTop' })
     store.dispatch(addPermissionRequest({
       sessionId: 's1', sessionType: 'freshclaude', provider: 'claude', requestId: 'r9',
     }))
-    // a pending approval suppresses busy on the fresh-agent tab: still a green-dot tile
-    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't3', fill: 'none', dot: 'green' })
+    // a pending approval suppresses busy on the fresh-agent tab: still a green pane-icon tile
+    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't3', fill: 'none', paneIcons: [{ provider: 'freshclaude', tint: 'green', ready: false }] })
   })
 
   it('overflow paging with wrap on the 6-key profile', () => {
@@ -405,10 +405,10 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     expect(decodeKey(device, 2)).toMatchObject({ tabId: 't3', fill: 'none', active: false })
   })
 
-  it('busy and idle-running tabs expose blue/green dots', () => {
+  it('busy and idle-running tabs expose blue/green paneIcons', () => {
     const { device } = setup({ tabs: 2, busy: ['term-2'] })
-    expect(decodeKey(device, 0)).toMatchObject({ tabId: 't1', dot: 'green' }) // idle running
-    expect(decodeKey(device, 1)).toMatchObject({ tabId: 't2', dot: 'blue' })  // busy sorts after green
+    expect(decodeKey(device, 0)).toMatchObject({ tabId: 't1', paneIcons: [{ provider: 'claude', tint: 'green', ready: false }] }) // idle running
+    expect(decodeKey(device, 1)).toMatchObject({ tabId: 't2', paneIcons: [{ provider: 'claude', tint: 'blue', ready: false }] })  // busy sorts after green
   })
 
   it('repo icons: unready at first paint, repaint to ready when the bitmap loads', async () => {

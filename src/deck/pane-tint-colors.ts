@@ -16,9 +16,21 @@
 //   STATUS_MUTED_DIM  <- text-muted-foreground/40 dark                     rgba(161,161,170,0.4)
 // ============================================================================
 
+import type { TilePaneTint } from './deck-selectors'
+
 export const STATUS_GREEN = '#21c45d'
 export const STATUS_BLUE = '#3b82f6'
 export const STATUS_AMBER = '#f59f0a'
 export const STATUS_RED = '#dc2828'
 export const STATUS_MUTED = '#a1a1aa'
 export const STATUS_MUTED_DIM = 'rgba(161,161,170,0.4)'
+
+/** TabItem.tsx pane-icon tint classes -> canvas colors (keyed by Task 8's TilePaneTint). */
+export const PANE_TINT_COLORS: Record<TilePaneTint, string> = {
+  blue: STATUS_BLUE,
+  green: STATUS_GREEN,
+  amber: STATUS_AMBER,
+  red: STATUS_RED,
+  muted: STATUS_MUTED,
+  mutedDim: STATUS_MUTED_DIM,
+}
