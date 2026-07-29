@@ -32,6 +32,7 @@
 - **AI-powered session titles** — Right-click any session and generate a Gemini-powered title based on conversation content
 - **Progressive sidebar search** — Two-phase search with instant local results followed by deep server-side content search
 - **Mobile responsive** — Auto-collapsing sidebar and overlay navigation for phones and tablets
+- **Stream Deck** — Drive freshell from an Elgato Stream Deck: tabs on keys with live previews and status rings, press to focus, long-press to approve or stop agents. See [Stream Deck](#stream-deck).
 
 ## Quick Start
 
@@ -63,6 +64,33 @@ npm run serve   # Production build and run
 ```
 
 `npm run serve` is intended for `main`. If you run it from another branch, Freshell asks for confirmation in an interactive terminal and refuses in non-interactive shells unless `FRESHELL_ALLOW_NON_MAIN_SERVE=1` is set.
+
+## Stream Deck
+
+Freshell can drive an Elgato Stream Deck straight from the browser. Each key shows a tab — title, live terminal preview, and a status ring (busy, needs attention, waiting for approval). Press a key to focus that tab; long-press (500 ms) to open an action layer with BACK / APPROVE / STOP keys (it closes itself after 10 s). When you have more tabs than keys, the last key pages through them (wrapping around). On a Stream Deck +, the dials cycle tabs and flip pages and the touch strip shows the active tab. The deck dims after a configurable idle timeout and wakes on activity.
+
+**Requirements**
+
+- Chrome or Edge (WebHID). Not supported in the freshell desktop app — use Chrome or Edge instead.
+- An Elgato Stream Deck. The Stream Deck Mini is the primary target; other models (including the Stream Deck + dials and touch strip) are driven by their reported capabilities.
+
+**Connecting:** Settings → Stream Deck → turn on **Enable Stream Deck**, click **Connect Stream Deck**, and pick the device in the browser prompt. After that first grant, freshell reconnects automatically — including after unplug/replug and page reloads. Deck settings are stored in the browser (localStorage), so they are per browser profile, not per freshell server.
+
+**Virtual deck:** Settings → Stream Deck → **Show virtual deck** opens an on-screen deck panel that mirrors the keys. It works without any hardware — and in browsers without WebHID.
+
+**Linux device permissions (udev):** hidraw device nodes default to root-only, so the browser cannot open the deck until you grant access to the Elgato vendor id (`0fd9`):
+
+```bash
+sudo tee /etc/udev/rules.d/50-elgato-stream-deck.rules >/dev/null <<'EOF'
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="0fd9", TAG+="uaccess"
+EOF
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Then unplug and replug the deck. Without the rule, the connection status shows "In use by another window or app — or missing device permissions (Linux udev)" — the browser cannot distinguish the two failure causes.
+
+**Chrome Memory Saver:** Chrome's Memory Saver can discard a long-hidden freshell tab even while the deck is connected — the deck goes dark until you revisit the tab. To avoid this, add your freshell URL to Memory Saver's "Always keep this site active" list (`chrome://settings/performance`).
 
 ## Keyboard Shortcuts
 
