@@ -10,6 +10,7 @@ import {
   resetPersistedPanesCacheForTests,
 } from '@/store/persistMiddleware'
 import {
+  buildTerminalDurableSessionRefUpdate,
   flushPersistedLayoutNow,
   getCanonicalDurableSessionId,
   getPreferredResumeSessionId,
@@ -88,5 +89,55 @@ describe('persistControl', () => {
 
     expect(getPreferredResumeSessionId(session)).toBe('00000000-0000-4000-8000-000000000321')
     expect(getCanonicalDurableSessionId(session)).toBe('00000000-0000-4000-8000-000000000321')
+  })
+})
+
+describe('buildTerminalDurableSessionRefUpdate metadata re-key', () => {
+  it('moves sessionMetadataByKey from the old session key to the new one on rebind', () => {
+    const update = buildTerminalDurableSessionRefUpdate({
+      provider: 'opencode',
+      sessionId: 'ses_new',
+      paneSessionRef: { provider: 'opencode', sessionId: 'ses_old' },
+      tabSessionRef: { provider: 'opencode', sessionId: 'ses_old' },
+      paneResumeSessionId: undefined,
+      tabResumeSessionId: undefined,
+      tabSessionMetadataByKey: {
+        'opencode:ses_old': { sessionType: 'opencode', firstUserMessage: 'hello world' },
+      },
+    })
+    expect(update?.tabUpdates?.sessionMetadataByKey).toBeDefined()
+    expect(update!.tabUpdates!.sessionMetadataByKey!['opencode:ses_new']).toMatchObject({ firstUserMessage: 'hello world' })
+    expect(update!.tabUpdates!.sessionMetadataByKey!['opencode:ses_old']).toBeUndefined()
+  })
+
+  it('returns null when nothing needs re-keying (metadata already under the new key)', () => {
+    const update = buildTerminalDurableSessionRefUpdate({
+      provider: 'opencode',
+      sessionId: 'ses_new',
+      paneSessionRef: { provider: 'opencode', sessionId: 'ses_new' },
+      tabSessionRef: { provider: 'opencode', sessionId: 'ses_new' },
+      paneResumeSessionId: undefined,
+      tabResumeSessionId: undefined,
+      tabSessionMetadataByKey: {
+        'opencode:ses_new': { sessionType: 'opencode' },
+      },
+    })
+    expect(update).toBeNull()
+  })
+
+  it('does not add a sessionMetadataByKey update when the metadata map is absent or empty', () => {
+    for (const tabSessionMetadataByKey of [undefined, {}]) {
+      const update = buildTerminalDurableSessionRefUpdate({
+        provider: 'opencode',
+        sessionId: 'ses_new',
+        paneSessionRef: { provider: 'opencode', sessionId: 'ses_old' },
+        tabSessionRef: { provider: 'opencode', sessionId: 'ses_old' },
+        paneResumeSessionId: undefined,
+        tabResumeSessionId: undefined,
+        tabSessionMetadataByKey,
+      })
+      expect(update?.tabUpdates?.sessionRef).toEqual({ provider: 'opencode', sessionId: 'ses_new' })
+      expect(update?.tabUpdates !== undefined && 'sessionMetadataByKey' in update.tabUpdates).toBe(false)
+    }
   })
 })

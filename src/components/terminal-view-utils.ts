@@ -1,4 +1,5 @@
 import type { SessionLocator, TerminalPaneContent } from '@/store/paneTypes'
+import { sanitizeSessionRef } from '@shared/session-contract'
 
 export type TerminalContentRef = { current: TerminalPaneContent | null }
 
@@ -141,4 +142,29 @@ export function buildCodexIdentityMismatchRepairContent(
     sessionRef: expectedSessionRef,
     codexDurability: matchingDurableCodexIdentity,
   }
+}
+
+function sessionRefsEqual(
+  left?: { provider?: string; sessionId?: string },
+  right?: { provider?: string; sessionId?: string },
+): boolean {
+  return left?.provider === right?.provider && left?.sessionId === right?.sessionId
+}
+
+/** The rebind swap window (sub-second: identity upsert -> ledger fsync ->
+ *  broadcast -> client fold) can bounce in-flight input sent with the OLD
+ *  ref. When the server's error echoes an actualSessionRef that already
+ *  equals the pane's CURRENT sessionRef, the rebind fold has applied and
+ *  this is a stale POST-fold bounce: suppress it silently (no notice, no
+ *  repair). A bounce that OUTRUNS the fold stays visible by design (LB2
+ *  residual, see the task notes). Unparseable/absent refs fail toward the
+ *  visible path. */
+export function isStaleSessionIdentityMismatch(
+  currentSessionRef: unknown,
+  actualSessionRef: unknown,
+): boolean {
+  const current = sanitizeSessionRef(currentSessionRef)
+  const actual = sanitizeSessionRef(actualSessionRef)
+  if (!current || !actual) return false
+  return sessionRefsEqual(current, actual)
 }

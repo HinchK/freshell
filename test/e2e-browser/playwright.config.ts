@@ -158,6 +158,8 @@ const RUST_ONLY_SPECS = [
   // P0.2 lane D4: freshclaude durable identity across reload + SIGKILL +
   // stale-sessionRef dead_session guard. Imports RustServer for restartAbrupt().
   /freshclaude-identity-persistence-rust\.spec\.ts$/,
+  // Signal-file rebind lane exists only on the Rust server (opencode_signal.rs).
+  /opencode-rebind-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -347,6 +349,8 @@ export default defineConfig({
         // P0.2 lane D4: freshclaude durable identity across reload + SIGKILL +
         // stale-sessionRef dead_session guard. Imports RustServer for restartAbrupt().
         /freshclaude-identity-persistence-rust\.spec\.ts$/,
+        // Signal-file rebind lane exists only on the Rust server (opencode_signal.rs).
+        /opencode-rebind-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL

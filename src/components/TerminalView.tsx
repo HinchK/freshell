@@ -54,6 +54,7 @@ import {
   buildTerminalInputMessage,
   buildTerminalResizeMessage,
   getCreateSessionStateFromRef,
+  isStaleSessionIdentityMismatch,
 } from '@/components/terminal-view-utils'
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { copyText, readText } from '@/lib/clipboard'
@@ -4573,6 +4574,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         }
 
         if (msg.type === 'error' && msg.code === 'SESSION_IDENTITY_MISMATCH' && msg.terminalId === tid) {
+          // Stale-window bounce after a rebind -- the pane already folded
+          // the new ref; the dropped frame carried the old one. Silent.
+          if (isStaleSessionIdentityMismatch(contentRef.current?.sessionRef, msg.actualSessionRef)) {
+            return
+          }
           const staleTerminalId = tid
           const current = contentRef.current
           const expectedSessionRef = sanitizeSessionRef(msg.expectedSessionRef)

@@ -220,6 +220,14 @@ fn rich_server_messages() {
         other => panic!("expected Error, got {other:?}"),
     }
 
+    // error — SESSION_IDENTITY_MISMATCH with a populated actualSessionRef
+    // (the stale-expectation terminal.input bounce).
+    let wire = r#"{"type":"error","code":"SESSION_IDENTITY_MISMATCH","message":"no such terminal","timestamp":"2026-07-05T00:00:00.000Z","requestId":"req-1","terminalId":"t1","terminalExitCode":1,"expectedSessionRef":{"provider":"opencode","sessionId":"ses_a"},"actualSessionRef":{"provider":"opencode","sessionId":"ses_b"}}"#;
+    match server_roundtrip(wire, "error") {
+        ServerMessage::Error(e) => assert_eq!(e.code, ErrorCode::SessionIdentityMismatch),
+        other => panic!("expected Error, got {other:?}"),
+    }
+
     // terminal.output.batch — segments[] with a barrier enum.
     let wire = r#"{"type":"terminal.output.batch","attachRequestId":"a1","data":"aGVsbG8=","segments":[{"seqStart":1,"seqEnd":3,"endOffset":5,"rawFrameCount":2,"barrier":"turn_complete","data":"aGk="}],"seqStart":1,"seqEnd":3,"serializedBytes":42,"source":"live","streamId":"s1","terminalId":"t1"}"#;
     match server_roundtrip(wire, "terminal.output.batch") {
