@@ -87,6 +87,12 @@ export function applyIsolatedHomeEnvironment(
     delete nextEnv.HOMEPATH
   }
 
+  // Kata 09v1: CLAUDE_CONFIG_DIR outranks CLAUDE_HOME for BOTH the sidecar
+  // and the server's claude transcript-existence fallback; an ambient value
+  // would escape the isolated home. Both server spawn paths route through
+  // this helper, so deleting it here is the complete remedy.
+  delete nextEnv.CLAUDE_CONFIG_DIR
+
   return nextEnv
 }
 

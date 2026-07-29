@@ -53,7 +53,14 @@ pub(crate) fn claude_home_candidates() -> Vec<PathBuf> {
 
 /// `find_transcript` across every candidate root, in resolution order.
 /// Positive denial (attach) and snapshot 404 both require a miss EVERYWHERE.
-pub(crate) fn locate_transcript(session_id: &str) -> Option<PathBuf> {
+/// `pub` + re-exported at the crate root (kata 09v1): `freshell-server`'s
+/// `IndexExistenceProbe` consults this SAME check before finalizing a
+/// warm-index `Absent` for claude — an on-disk transcript can be cwd-less
+/// (fixture's create-time 0-byte file; crash-window partial writes) and so
+/// fail the index's R10b cwd gate while the attach arm would still attempt
+/// resume on it; the reconcile arm and the attach arm must share one
+/// definition of "the transcript exists".
+pub fn locate_transcript(session_id: &str) -> Option<PathBuf> {
     claude_home_candidates()
         .iter()
         .find_map(|root| find_transcript(root, session_id))
