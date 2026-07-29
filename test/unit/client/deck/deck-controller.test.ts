@@ -14,6 +14,8 @@ import amplifierActivityReducer from '@/store/amplifierActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import settingsReducer from '@/store/settingsSlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
+import repoIconsReducer from '@/store/repoIconsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
@@ -25,7 +27,7 @@ const reducer = {
   freshAgent: freshAgentReducer, codexActivity: codexActivityReducer,
   claudeActivity: claudeActivityReducer, amplifierActivity: amplifierActivityReducer,
   opencodeActivity: opencodeActivityReducer, paneRuntimeActivity: paneRuntimeActivityReducer,
-  settings: settingsReducer,
+  settings: settingsReducer, terminalMeta: terminalMetaReducer, repoIcons: repoIconsReducer,
 }
 
 const s1Key = makeFreshAgentSessionKey({ sessionType: 'freshclaude', provider: 'claude', sessionId: 's1' })
@@ -156,8 +158,9 @@ describe('DeckController', () => {
 
   it('short press focuses the tab in the browser and dismisses green', () => {
     const { store, device } = setup({ attention: { t2: true } })
-    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', ring: 'green', active: false })
-    shortPress(device, 1)
+    // t2 has attention (priority 1) so it sorts ahead of green-icon t1 -> key 0
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't2', ring: 'green', active: false })
+    shortPress(device, 0)
     const state = store.getState()
     expect(state.tabs.activeTabId).toBe('t2')
     expect(state.turnCompletion.attentionByTab.t2).toBeFalsy()
@@ -229,13 +232,14 @@ describe('DeckController', () => {
 
   it('STOP on a busy terminal sends ESC, then Ctrl+C within 5s', () => {
     const { device } = setup({ claudeBusy: true })
-    longPress(device, 0)
+    // busy t1 (priority 3) sorts after green-icon t2 -> t1 lands on key 1
+    longPress(device, 1)
     expect(decodeKey(device, 2)).toEqual({ kind: 'action', action: 'stop', enabled: true })
     device.press(2)
     expect(sendMock.mock.calls[0][0]).toMatchObject({ type: 'terminal.input', terminalId: 'term-1', data: '\x1b' })
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab' })
     // second stop within the 5s escalation window -> Ctrl+C
-    longPress(device, 0)
+    longPress(device, 1)
     device.press(2)
     expect(sendMock.mock.calls[1][0]).toMatchObject({ type: 'terminal.input', terminalId: 'term-1', data: '\x03' })
   })

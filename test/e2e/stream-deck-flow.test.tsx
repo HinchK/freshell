@@ -18,6 +18,8 @@ import amplifierActivityReducer from '@/store/amplifierActivitySlice'
 import opencodeActivityReducer from '@/store/opencodeActivitySlice'
 import paneRuntimeActivityReducer from '@/store/paneRuntimeActivitySlice'
 import settingsReducer from '@/store/settingsSlice'
+import terminalMetaReducer from '@/store/terminalMetaSlice'
+import repoIconsReducer from '@/store/repoIconsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
@@ -30,7 +32,7 @@ const reducer = {
   freshAgent: freshAgentReducer, codexActivity: codexActivityReducer,
   claudeActivity: claudeActivityReducer, amplifierActivity: amplifierActivityReducer,
   opencodeActivity: opencodeActivityReducer, paneRuntimeActivity: paneRuntimeActivityReducer,
-  settings: settingsReducer,
+  settings: settingsReducer, terminalMeta: terminalMetaReducer, repoIcons: repoIconsReducer,
 }
 
 const s1Key = makeFreshAgentSessionKey({ sessionType: 'freshclaude', provider: 'claude', sessionId: 's1' })
@@ -161,21 +163,25 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
       freshAgentTab: 3,
       pendingPermissions: { r1: { requestId: 'r1' } },
     })
+    // Status-priority sort: t2 attention (greenFill) < t3 waiting fresh-agent
+    // (greenIcon) < t1 busy (blueIcon), so busy t1 lands after the others.
     expect(decodeKey(device, 0)).toEqual({
-      kind: 'tab', tabId: 't1', title: 'tab1', previewLines: ['$ npm test', 'PASS'], ring: 'blue', active: true,
-    })
-    expect(decodeKey(device, 1)).toEqual({
       kind: 'tab', tabId: 't2', title: 'tab2', previewLines: [], ring: 'green', active: false,
     })
-    expect(decodeKey(device, 2)).toEqual({
+    expect(decodeKey(device, 1)).toEqual({
       kind: 'tab', tabId: 't3', title: 'tab3', previewLines: [], ring: 'amber', active: false,
+    })
+    expect(decodeKey(device, 2)).toEqual({
+      kind: 'tab', tabId: 't1', title: 'tab1', previewLines: ['$ npm test', 'PASS'], ring: 'blue', active: true,
     })
   })
 
   it('press focuses the tab in this browser', () => {
     const { store, device } = setup({ tabs: 3, attention: { t2: true } })
     expect(store.getState().tabs.activeTabId).toBe('t1')
-    holdKey(device, 1, 100)
+    // t2 has attention (greenFill) so it sorts to key 0; after focus+dismiss
+    // all tabs are greenIcon again and t2 repaints at key 1 in tab-bar order
+    holdKey(device, 0, 100)
     const state = store.getState()
     expect(state.tabs.activeTabId).toBe('t2')
     expect(state.turnCompletion.attentionByTab.t2).toBeFalsy()
@@ -186,9 +192,11 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     const { store, device } = setup({ tabs: 3, freshAgentTab: 3 })
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', ring: null })
     store.dispatch(upsertClaudeActivity({ terminals: [{ terminalId: 'term-1', phase: 'busy', updatedAt: 1 }] }))
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', ring: 'blue' })
+    // busy t1 (blueIcon) sorts after the green-icon tabs -> key 2
+    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't1', ring: 'blue' })
     store.dispatch(markTabAttention({ tabId: 't1' }))
-    // green outranks blue even while the tab is still busy
+    // green outranks blue even while the tab is still busy; active+attention
+    // (barTop) sorts t1 back to key 0
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', ring: 'green' })
     store.dispatch(addPermissionRequest({
       sessionId: 's1', sessionType: 'freshclaude', provider: 'claude', requestId: 'r9',
@@ -230,20 +238,21 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
 
   it('STOP with escalation on a terminal pane; abandoned layer auto-closes', () => {
     const { device } = setup({ busy: ['term-1'] })
-    holdKey(device, 0, 600)
+    // busy t1 (blueIcon) sorts after green-icon t2 -> t1 lands on key 1
+    holdKey(device, 1, 600)
     expect(decodeKey(device, 2)).toEqual({ kind: 'action', action: 'stop', enabled: true })
     device.press(2)
     expect(sendMock.mock.calls[0][0]).toMatchObject({ type: 'terminal.input', terminalId: 'term-1', data: '\x1b' })
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab' })
     // second STOP within the 5s escalation window -> Ctrl+C
-    holdKey(device, 0, 600)
+    holdKey(device, 1, 600)
     device.press(2)
     expect(sendMock.mock.calls[1][0]).toMatchObject({ type: 'terminal.input', terminalId: 'term-1', data: '\x03' })
     // a layer left open auto-closes after the 10s timeout
-    holdKey(device, 0, 600)
+    holdKey(device, 1, 600)
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'action', action: 'back' })
     vi.advanceTimersByTime(10_500)
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1' })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't1' })
     expect(sendMock).toHaveBeenCalledTimes(2)
   })
 
@@ -265,9 +274,10 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
       PLUS_CAPS,
       () => ({ brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 1 }),
     )
-    // no pager key on the dial profile: all 8 keys are tab tiles
+    // no pager key on the dial profile: all 8 keys are tab tiles.
+    // Sorted order: busy t1 (blueIcon) lands last, so page 1 shows t2..t9.
     for (let k = 0; k < PLUS_CAPS.keyCount; k++) {
-      expect(decodeKey(device, k)).toMatchObject({ kind: 'tab', tabId: `t${k + 1}` })
+      expect(decodeKey(device, k)).toMatchObject({ kind: 'tab', tabId: `t${k + 2}` })
     }
     expect(decodeStrip(device)).toBe('tab1  |  page 1/2  |  1 busy  1 waiting')
     // dial 0 cycles the active tab and wraps in both directions
@@ -279,15 +289,15 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     expect(store.getState().tabs.activeTabId).toBe('t10') // wraps first -> last
     device.emit({ type: 'dialRotate', dialIndex: 0, ticks: 1 })
     expect(store.getState().tabs.activeTabId).toBe('t1') // wraps last -> first
-    // dial 1 pages, clamped at the last page
+    // dial 1 pages, clamped at the last page (sorted list: [t2..t10, t1])
     device.emit({ type: 'dialRotate', dialIndex: 1, ticks: 1 })
     expect(decodeStrip(device)).toContain('page 2/2')
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't9' })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't10' })
     device.emit({ type: 'dialRotate', dialIndex: 1, ticks: 1 })
     expect(decodeStrip(device)).toContain('page 2/2') // clamped
     device.emit({ type: 'dialPress', dialIndex: 1 })
     expect(decodeStrip(device)).toContain('page 1/2')
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1' })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't2' })
     // touchTap while dimmed restores brightness
     vi.advanceTimersByTime(1_500)
     expect(device.brightnessHistory[device.brightnessHistory.length - 1]).toBe(10)

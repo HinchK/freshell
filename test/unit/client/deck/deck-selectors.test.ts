@@ -42,27 +42,58 @@ function makeState(overrides: {
   terminalMeta?: Record<string, TerminalMetaRecord>
   repoIcons?: Record<string, RepoIconEntry>
   t1Layout?: PaneNode
+  /** When set, replaces the default 2-tab fixture with tabs t1..tN, each a terminal leaf pane pN (terminalId term-N, mode 'claude'). */
+  tabs?: number
+  activeTab?: string
+  /** terminalIds marked busy via claudeActivity (mirrors the e2e fixture's busy option). */
+  busy?: string[]
 } = {}) {
+  let tabsList: unknown[]
+  let layouts: Record<string, unknown>
+  let activePane: Record<string, string>
+  if (overrides.tabs !== undefined) {
+    const n = overrides.tabs
+    tabsList = Array.from({ length: n }, (_, i) => ({
+      id: `t${i + 1}`, createRequestId: `c${i + 1}`, title: `tab${i + 1}`, status: 'running', mode: 'shell', createdAt: i + 1,
+    }))
+    layouts = {}
+    activePane = {}
+    for (let i = 1; i <= n; i++) {
+      layouts[`t${i}`] = {
+        type: 'leaf', id: `p${i}`,
+        content: { kind: 'terminal', terminalId: `term-${i}`, createRequestId: `c${i}`, status: overrides.paneStatus?.[`p${i}`] ?? 'running', mode: 'claude' },
+      }
+      activePane[`t${i}`] = `p${i}`
+    }
+  } else {
+    tabsList = [
+      { id: 't1', createRequestId: 'c1', title: 'build', status: 'running', mode: 'shell', createdAt: 1 },
+      { id: 't2', createRequestId: 'c2', title: 'claude', status: 'running', mode: 'shell', createdAt: 2 },
+    ]
+    layouts = {
+      t1: overrides.t1Layout ?? { type: 'leaf', id: 'p1', content: { kind: 'terminal', terminalId: 'term-1', createRequestId: 'c1', status: overrides.paneStatus?.p1 ?? 'running', mode: 'claude' } },
+      t2: { type: 'leaf', id: 'p2', content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', sessionId: 's1', createRequestId: 'c2', status: 'running' } },
+    }
+    activePane = { t1: 'p1', t2: 'p2' }
+  }
+  const busyByTerminalId: Record<string, unknown> = Object.fromEntries(
+    (overrides.busy ?? []).map((terminalId) => [terminalId, { terminalId, phase: 'busy', updatedAt: 1 }]),
+  )
+  if (overrides.claudeBusy) busyByTerminalId['term-1'] = { phase: 'busy' }
   const store = configureStore({
     reducer,
     preloadedState: {
       tabs: {
-        tabs: [
-          { id: 't1', createRequestId: 'c1', title: 'build', status: 'running', mode: 'shell', createdAt: 1 },
-          { id: 't2', createRequestId: 'c2', title: 'claude', status: 'running', mode: 'shell', createdAt: 2 },
-        ],
-        activeTabId: 't1', renameRequestTabId: null, tombstones: [],
+        tabs: tabsList,
+        activeTabId: overrides.activeTab ?? 't1', renameRequestTabId: null, tombstones: [],
       },
       panes: {
-        layouts: {
-          t1: overrides.t1Layout ?? { type: 'leaf', id: 'p1', content: { kind: 'terminal', terminalId: 'term-1', createRequestId: 'c1', status: overrides.paneStatus?.p1 ?? 'running', mode: 'claude' } },
-          t2: { type: 'leaf', id: 'p2', content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', sessionId: 's1', createRequestId: 'c2', status: 'running' } },
-        },
-        activePane: { t1: 'p1', t2: 'p2' },
+        layouts,
+        activePane,
         paneTitles: {}, paneTitleSetByUser: {}, renameRequestTabId: null, renameRequestPaneId: null,
         zoomedPane: {}, refreshRequestsByPane: {}, restoreFallbackAttemptsByPane: {},
       },
-      claudeActivity: { byTerminalId: overrides.claudeBusy ? { 'term-1': { phase: 'busy' } } : {} },
+      claudeActivity: { byTerminalId: busyByTerminalId },
       terminalMeta: { byTerminalId: overrides.terminalMeta ?? {} },
       repoIcons: { byCwd: overrides.repoIcons ?? {} },
       turnCompletion: {
@@ -96,12 +127,12 @@ describe('deck-selectors', () => {
     const state = makeState({ claudeBusy: true })
     const tab = (state as { tabs: { tabs: unknown[] } }).tabs.tabs[0]
     expect(getTabRingStatus(state, tab as never).busy).toBe(true)
-    expect(selectDeckModel(state).tabs[0].status.busy).toBe(true)
+    expect(selectDeckModel(state).tabs.find((t) => t.id === 't1')!.status.busy).toBe(true)
   })
 
   it('attentionByTab -> green', () => {
     const state = makeState({ attention: { t1: true } })
-    expect(selectDeckModel(state).tabs[0].status.green).toBe(true)
+    expect(selectDeckModel(state).tabs.find((t) => t.id === 't1')!.status.green).toBe(true)
   })
 
   it('pending permission -> amber on the fresh-agent tab, and busy is suppressed', () => {
@@ -319,5 +350,46 @@ describe('getTabRepoIcons', () => {
     expect(getTabRepoIcons(noLayout, tab)).toEqual([
       { url: buildRepoIconUrl('/repos/alpha'), letter: 'A', hue: hueFromString('alpha') },
     ])
+  })
+})
+
+describe('selectDeckModel (sorted, tile fields)', () => {
+  it('sorts tabs by priority: barTop, greenFill, greenIcon, blueIcon, rest', () => {
+    // t1 exited pane (rest), t2 busy (blueIcon), t3 running idle (greenIcon),
+    // t4 attention inactive (greenFill), t5 attention + active (barTop)
+    const state = makeState({
+      tabs: 5,
+      activeTab: 't5',
+      paneStatus: { p1: 'exited' },
+      busy: ['term-2'],
+      attention: { t4: true, t5: true },
+    })
+    const model = selectDeckModel(state)
+    expect(model.tabs.map((t) => t.id)).toEqual(['t5', 't4', 't3', 't2', 't1'])
+    expect(model.tabs.map((t) => t.priority)).toEqual([0, 1, 2, 3, 4])
+  })
+
+  it('is stable within a priority group (tab-bar order preserved)', () => {
+    const state = makeState({ tabs: 3 }) // all three are greenIcon
+    const model = selectDeckModel(state)
+    expect(model.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
+  })
+
+  it('carries fill, dot, and repoIcons per tab', () => {
+    const state = makeState({
+      tabs: 2,
+      activeTab: 't1',
+      attention: { t1: true },
+      busy: ['term-2'],
+      terminalMeta: { 'term-1': meta('term-1', '/repos/alpha') },
+      repoIcons: { '/repos/alpha': { status: 'ready', repoRoot: '/repos/alpha', repoName: 'alpha', hasIcon: true } },
+    })
+    const model = selectDeckModel(state)
+    const t1 = model.tabs.find((t) => t.id === 't1')!
+    const t2 = model.tabs.find((t) => t.id === 't2')!
+    expect(t1.fill).toBe('barTop')
+    expect(t1.repoIcons).toEqual([{ url: buildRepoIconUrl('/repos/alpha'), letter: 'A', hue: hueFromString('alpha') }])
+    expect(t2.fill).toBe('none')
+    expect(t2.dot).toBe('blue')
   })
 })

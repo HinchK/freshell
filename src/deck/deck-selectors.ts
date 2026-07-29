@@ -2,6 +2,7 @@ import type { RootState } from '@/store/store'
 import type { Tab } from '@/store/types'
 import type { FreshAgentPaneContent, PaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { TabStatusFlags } from './tile-state'
+import { tileFill, tileDot, tilePriority, type TileFill, type TileDot } from './tile-state'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab, hasWaitingPrompt, resolvePaneActivity } from '@/lib/pane-activity'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
@@ -10,7 +11,20 @@ import { hueFromString } from '@/components/icons/RepoIcon'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 
 export type TabRingStatus = { busy: boolean; green: boolean; amber: boolean }
-export type DeckTab = { id: string; title: string; status: TabRingStatus; active: boolean }
+
+export type DeckTab = {
+  id: string
+  title: string
+  active: boolean
+  busy: boolean
+  attention: boolean
+  fill: TileFill
+  dot: TileDot
+  priority: number
+  repoIcons: TileRepoIcon[]
+  /** TRANSITIONAL: consumed by frame.ts ringColor/stripText until Task 9 removes rings. */
+  status: TabRingStatus
+}
 export type DeckModel = { tabs: DeckTab[]; activeTabId: string | null }
 
 function activityInputs(state: RootState) {
@@ -153,15 +167,27 @@ export function getTabStatusFlags(state: RootState, tab: Tab): TabStatusFlags {
 
 export function selectDeckModel(state: RootState): DeckModel {
   const activeTabId = state.tabs.activeTabId
-  return {
-    activeTabId,
-    tabs: state.tabs.tabs.map((tab) => ({
+  const tabs = state.tabs.tabs.map((tab) => {
+    const active = tab.id === activeTabId
+    const flags = getTabStatusFlags(state, tab)
+    return {
       id: tab.id,
       title: tab.title,
-      active: tab.id === activeTabId,
+      active,
+      busy: flags.busy,
+      attention: flags.attention,
+      fill: tileFill(active, flags),
+      dot: tileDot(flags),
+      priority: tilePriority(active, flags),
+      repoIcons: getTabRepoIcons(state, tab),
       status: getTabRingStatus(state, tab),
-    })),
-  }
+    }
+  })
+  // Status-priority sort; Array.prototype.sort is stable, so tab-bar order
+  // is preserved within each priority group. Paging slices this sorted list
+  // (visibleTabs), so the pager pages over the sorted order automatically.
+  tabs.sort((a, b) => a.priority - b.priority)
+  return { activeTabId, tabs }
 }
 
 export type ApproveTarget = {

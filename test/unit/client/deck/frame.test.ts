@@ -3,15 +3,20 @@ import { MINI_CAPS, PLUS_CAPS } from '@/deck/fake-deck-device'
 import {
   ACTION_KEYS, buildFrame, clampPage, pageCount, planLayout, ringColor, stripText, visibleTabs,
 } from '@/deck/frame'
-import type { DeckModel } from '@/deck/deck-selectors'
+import type { DeckModel, DeckTab } from '@/deck/deck-selectors'
 
 const quiet = { busy: false, green: false, amber: false }
+function makeDeckTab(over: Partial<DeckTab> & Pick<DeckTab, 'id' | 'title'>): DeckTab {
+  return {
+    active: false, busy: false, attention: false, fill: 'none', dot: null,
+    priority: 4, repoIcons: [], status: { ...quiet }, ...over,
+  }
+}
 function model(n: number, activeId = 'tab-0'): DeckModel {
   return {
     activeTabId: activeId,
-    tabs: Array.from({ length: n }, (_, i) => ({
-      id: `tab-${i}`, title: `Tab ${i}`, active: `tab-${i}` === activeId, status: { ...quiet },
-    })),
+    tabs: Array.from({ length: n }, (_, i) =>
+      makeDeckTab({ id: `tab-${i}`, title: `Tab ${i}`, active: `tab-${i}` === activeId })),
   }
 }
 const noPreview = () => []
