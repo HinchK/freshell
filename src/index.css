@@ -1,3 +1,7 @@
+/* Inter (local npm asset, weights used by the Stream Deck tiles — see src/deck/deck-font.ts). */
+@import '@fontsource/inter/400.css';
+@import '@fontsource/inter/600.css';
+
 @import './theme-variables.css';
 @tailwind base;
 @tailwind components;
