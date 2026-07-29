@@ -18,6 +18,27 @@ use freshell_ws::WsState;
 
 pub const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
+/// Launcher-assigned amplifier identity (F7/V9): tests that create
+/// amplifier terminals now WRITE stub dirs into the amplifier home.
+/// Isolate eagerly at this choke point so no test ever touches the real
+/// `~/.amplifier`. `set_var` is process-global: use ONE shared value per
+/// test process. Called by [`spawn_server_with_specs`] (the constructor
+/// every existing amplifier-creating ws test flows through — V7) AND
+/// directly by amplifier test files (defense in depth: 17 ws test files
+/// build `WsState` inline and would silently bypass the constructor).
+pub fn isolate_amplifier_home() -> std::path::PathBuf {
+    static AMP_HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    AMP_HOME
+        .get_or_init(|| {
+            let amp_home =
+                std::env::temp_dir().join(format!("freshell-ws-amp-home-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&amp_home);
+            std::env::set_var("FRESHELL_AMPLIFIER_HOME", &amp_home);
+            amp_home
+        })
+        .clone()
+}
+
 pub fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
         "ai": {},
@@ -91,6 +112,8 @@ pub async fn spawn_server() -> (String, freshell_terminal::TerminalRegistry) {
 pub async fn spawn_server_with_specs(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
 ) -> (String, freshell_terminal::TerminalRegistry) {
+    // F7/V9 choke point: BEFORE anything can reach an amplifier create.
+    let _ = isolate_amplifier_home();
     let auth_token = Arc::new(AUTH_TOKEN.to_string());
     let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
     let settings =
@@ -135,7 +158,6 @@ pub async fn spawn_server_with_specs(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,
@@ -212,7 +234,6 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,
@@ -293,7 +314,6 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,
@@ -371,7 +391,6 @@ pub async fn spawn_server_with_specs_and_state(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,
@@ -457,7 +476,6 @@ pub async fn spawn_server_with_ledger(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,
@@ -539,7 +557,6 @@ pub async fn spawn_server_with_specs_and_activity(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: Some(activity_hub.clone()),
@@ -620,7 +637,6 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: Some(std::sync::Arc::new(
             freshell_sessions::codex_locator::CodexLocator::new(codex_sessions_root.to_path_buf()),
@@ -632,8 +648,7 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
     };
 
     // Mirrors main.rs's sweep wiring; 150 ms is re-declared here because
-    // main.rs's AMPLIFIER_LOCATOR_SWEEP_INTERVAL is private to the server
-    // binary.
+    // main.rs's LOCATOR_SWEEP_INTERVAL is private to the server binary.
     freshell_ws::codex_association::spawn_codex_locator_sweep(
         state.clone(),
         std::time::Duration::from_millis(150),
@@ -707,7 +722,6 @@ pub async fn spawn_server_with_create_protect(
         shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
-        amplifier_locator: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,
