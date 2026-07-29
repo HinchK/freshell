@@ -617,8 +617,10 @@ async fn handle_client_text(
         }
         ClientMessage::TerminalAttach(attach) => {
             if terminal_dims_in_range(attach.cols, attach.rows) {
-                handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1);
-                true
+                match handle_attach(attach, state, conn_id, conn_sink, terminal_output_batch_v1) {
+                    Some(err) => send(ws_tx, &err).await,
+                    None => true,
+                }
             } else {
                 send(ws_tx, &invalid_dims_error(attach.cols, attach.rows)).await
             }
@@ -3460,15 +3462,17 @@ fn wrap_terminal_spawn_error(
 /// connection to it: the registry enqueues `terminal.attach.ready`, replays the
 /// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`), and
 /// registers the connection so live output fans out — all onto `conn_sink`, which
-/// the select loop drains to the socket. Attaching to an unknown terminal is a no-op
-/// (the reference surfaces `INVALID_TERMINAL_ID`; the SPA recreates on its own).
+/// the select loop drains to the socket. Attaching to an unknown terminal returns
+/// the reference's `error{INVALID_TERMINAL_ID, "Terminal not running"}` frame for
+/// the caller to send (`ws-handler.ts:2730-2735`; restored by kata dtfn — the SPA's
+/// recovery ladder recreates the pane). `None` = attached.
 fn handle_attach(
     attach: TerminalAttach,
     state: &WsState,
     conn_id: u64,
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
-) {
+) -> Option<ServerMessage> {
     // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
     // `attach.ready` from the shared identity registry (create-time
     // resume ids AND locator-associated ids both live there); the
@@ -3493,7 +3497,7 @@ fn handle_attach(
             .resize_for_attach(&attach.terminal_id, conn_id, attach.intent, cols, rows);
     }
 
-    let _ = state.registry.attach(
+    let outcome = state.registry.attach(
         &attach.terminal_id,
         conn_id,
         Arc::clone(conn_sink),
@@ -3502,6 +3506,27 @@ fn handle_attach(
         terminal_output_batch_v1,
         canonical_session_ref,
     );
+    if outcome.found {
+        return None;
+    }
+    // Kata dtfn: `AttachOutcome{found:false}` was silently discarded here,
+    // wedging any attach against an unknown id (stale pre-restart id, typo'd
+    // id, raced kill+attach). Restore the documented INVALID_TERMINAL_ID
+    // parity; requestId = attachRequestId so the client's attach-generation
+    // gate accepts it (attachRequestIds live in the `pane:N:nanoid` namespace,
+    // never colliding with createRequestIds — see ws-client's
+    // clearTrackedCreate-on-error behavior).
+    Some(ServerMessage::Error(ErrorMsg {
+        code: ErrorCode::InvalidTerminalId,
+        message: "Terminal not running".to_string(),
+        timestamp: crate::now_iso(),
+        actual_session_ref: None,
+        expected_session_ref: None,
+        request_id: attach.attach_request_id,
+        retry_after_ms: None,
+        terminal_id: Some(attach.terminal_id),
+        terminal_exit_code: None,
+    }))
 }
 
 /// Node's `resizeIfSessionMatches` identity guard

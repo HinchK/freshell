@@ -593,8 +593,9 @@ impl Default for TerminalRegistry {
 }
 
 /// Outcome of an [`TerminalRegistry::attach`]: whether the terminal existed (the
-/// `attach.ready` + replay were enqueued to the caller's sink) — `false` mirrors the
-/// reference's `INVALID_TERMINAL_ID` (attach to an unknown/exited terminal).
+/// `attach.ready` + replay were enqueued to the caller's sink) — `false` draws the
+/// reference's `INVALID_TERMINAL_ID` reply (attach to an unknown terminal; an
+/// exited-but-still-registered terminal is `found: true` + a synthetic exit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub struct AttachOutcome {

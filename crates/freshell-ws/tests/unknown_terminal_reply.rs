@@ -46,3 +46,28 @@ async fn input_to_live_terminal_round_trips_without_a_blocked_frame() {
         "live input must still round-trip; got output: {acc}"
     );
 }
+
+#[tokio::test]
+async fn attach_to_unknown_terminal_answers_invalid_terminal_id() {
+    let (url, _registry) = spawn_server().await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    attach_with(
+        &mut ws,
+        "no-such-terminal",
+        "att-dtfn-unknown",
+        "transport_reconnect",
+        120,
+        30,
+        None,
+    )
+    .await;
+
+    let frame = next_frame_of_type(&mut ws, "error").await;
+    assert_eq!(frame["code"], serde_json::json!("INVALID_TERMINAL_ID"));
+    assert_eq!(frame["terminalId"], serde_json::json!("no-such-terminal"));
+    // The client's attach-error acceptance gate (TerminalView.tsx:4442-4451)
+    // requires requestId === the attach generation's attachRequestId.
+    assert_eq!(frame["requestId"], serde_json::json!("att-dtfn-unknown"));
+    assert_eq!(frame["message"], serde_json::json!("Terminal not running"));
+}
