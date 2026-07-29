@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import { MINI_CAPS } from '@/deck/fake-deck-device'
 import {
-  cropPreviewLines, drawRing, fitLabel, iconLayout, previewGeometry, renderKey, truncateTitle,
-  RING_COLORS, ACTIVE_COLOR, DISABLED_ACTION_COLOR,
+  drawRing, fitLabel, iconLayout, renderKey, truncateTitle,
+  APPROVE_COLOR, ACTIVE_COLOR, DISABLED_ACTION_COLOR,
   TILE_BG, TILE_FILL_GREEN, BAR_TOP_BORDER, DOT_GREEN, DOT_BLUE, DOT_SIZE,
 } from '@/deck/tile-renderer'
 import type { Ctx2D, IconSource } from '@/deck/tile-renderer'
@@ -35,21 +35,6 @@ function recordingCtx(width: number, height: number) {
   return { ctx, rects, texts, images }
 }
 
-describe('previewGeometry', () => {
-  it('matches the hardware-anchored values', () => {
-    expect(previewGeometry(120, 120)).toEqual({ lines: 8, columns: 21 })
-    expect(previewGeometry(80, 80)).toEqual({ lines: 5, columns: 14 })
-    expect(previewGeometry(72, 72)).toEqual({ lines: 4, columns: 12 })
-  })
-})
-
-describe('cropPreviewLines', () => {
-  it('drops trailing blanks, keeps last N lines and first M columns', () => {
-    const lines = ['one', 'two-is-longer-than-five', 'three', '', '   ']
-    expect(cropPreviewLines(lines, 2, 5)).toEqual(['two-i', 'three'])
-  })
-})
-
 describe('title fitting', () => {
   it('truncateTitle caps at 10 chars with ellipsis', () => {
     expect(truncateTitle('short')).toBe('short')
@@ -76,7 +61,7 @@ describe('drawRing', () => {
 })
 
 const tabSpec = (over: Partial<Extract<KeySpec, { kind: 'tab' }>> = {}): KeySpec => ({
-  kind: 'tab', tabId: 't1', title: 'build', previewLines: [], ring: null,
+  kind: 'tab', tabId: 't1', title: 'build',
   active: false, fill: 'none', dot: null, icons: [], ...over,
 })
 
@@ -99,7 +84,7 @@ describe('renderKey', () => {
     expect(rects.some((r) => r.y === 0 && r.h === 20 && r.style.startsWith('rgba'))).toBe(true) // banner
     expect(texts.some((t) => t.text === 'build' && t.style === '#ffffff')).toBe(true)           // title
     expect(rects.filter((r) => r.style === ACTIVE_COLOR)).toHaveLength(0)
-    expect(texts.filter((t) => t.style === '#a8a8a8')).toHaveLength(0) // preview text gone from drawTab (literal: the constant dies in Task 9)
+    expect(texts.filter((t) => t.style === '#a8a8a8')).toHaveLength(0) // no preview text anywhere on the tile
   })
 
   it('green fill state paints the light-green background', () => {
@@ -175,6 +160,6 @@ describe('renderKey', () => {
       return cap!.rects
     }
     expect(rectsFor(false).some((r) => r.style === DISABLED_ACTION_COLOR)).toBe(true)
-    expect(rectsFor(true).some((r) => r.style === RING_COLORS.green)).toBe(true)
+    expect(rectsFor(true).some((r) => r.style === APPROVE_COLOR)).toBe(true)
   })
 })

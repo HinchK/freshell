@@ -1,5 +1,5 @@
 import type { DeckCapabilities } from './deck-device'
-import type { DeckAction, KeySpec, RingColor } from './frame'
+import type { DeckAction, KeySpec } from './frame'
 
 // Canvas draw layer: converts a KeySpec into an RGBA pixel buffer via an
 // injectable 2D-context factory (jsdom returns null from getContext, so tests
@@ -15,20 +15,9 @@ export type CtxFactory = (width: number, height: number) => Ctx2D
 export type KeyRenderer = (spec: KeySpec, caps: DeckCapabilities) => Uint8ClampedArray
 export type StripRenderer = (text: string, width: number, height: number) => Uint8ClampedArray
 
-export const PREVIEW_BG = '#0a0a0a'
-export const PREVIEW_TEXT_COLOR = '#a8a8a8'
-export const PREVIEW_FONT_SIZE = 11
-export const PREVIEW_LINE_HEIGHT = 13
-export const PREVIEW_CHAR_WIDTH = 5.5
-export const PREVIEW_LEFT_MARGIN = 3
 export const BANNER_HEIGHT = 20
 export const BANNER_FILL = 'rgba(0,0,0,0.667)'
 export const TITLE_FONT_SIZE = 16
-export const RING_COLORS: Record<Exclude<RingColor, null>, string> = {
-  amber: '#f59e0b',
-  green: '#22c55e',
-  blue: '#3b82f6',
-}
 export const ACTIVE_COLOR = '#ffffff'
 export const TILE_BG = '#0a0a0a'
 /** Light green fill - the tab bar's emerald attention fill, tuned for the LCD (emerald-200). */
@@ -48,19 +37,6 @@ export const CONTROL_DIM = '#8888aa'
 export const EMPTY_BG = '#000000'
 export const STRIP_FONT_SIZE = 22
 export const MAX_TITLE_CHARS = 10
-
-export function previewGeometry(width: number, height: number): { lines: number; columns: number } {
-  return {
-    lines: Math.max(1, Math.floor((height - BANNER_HEIGHT - 2) / PREVIEW_LINE_HEIGHT) + 1),
-    columns: Math.max(1, Math.floor((width - PREVIEW_LEFT_MARGIN) / PREVIEW_CHAR_WIDTH)),
-  }
-}
-
-export function cropPreviewLines(lines: string[], maxLines: number, maxColumns: number): string[] {
-  const out = [...lines]
-  while (out.length > 0 && out[out.length - 1].trim() === '') out.pop()
-  return out.slice(-maxLines).map((l) => l.slice(0, maxColumns))
-}
 
 export function truncateTitle(title: string): string {
   return title.length > MAX_TITLE_CHARS ? `${title.slice(0, MAX_TITLE_CHARS - 1)}…` : title

@@ -2,13 +2,11 @@ import type { DeckCapabilities } from './deck-device'
 import type { DeckModel } from './deck-selectors'
 import type { TileFill, TileDot } from './tile-state'
 
-export type RingColor = 'amber' | 'green' | 'blue' | null
 export type DeckAction = 'back' | 'approve' | 'stop'
 export type TileIcon = { url: string | null; letter: string; hue: number; ready: boolean }
 export type KeySpec =
   | { kind: 'empty' }
-  | { kind: 'tab'; tabId: string; title: string; previewLines: string[]; ring: RingColor;
-      active: boolean; fill: TileFill; dot: TileDot; icons: TileIcon[] }
+  | { kind: 'tab'; tabId: string; title: string; active: boolean; fill: TileFill; dot: TileDot; icons: TileIcon[] }
   | { kind: 'pager'; page: number; pageCount: number }
   | { kind: 'action'; action: DeckAction; enabled: boolean }
 export type StripSpec = { text: string } | null
@@ -58,25 +56,18 @@ export function visibleTabs<T>(tabs: T[], page: number, tabsPerPage: number): T[
   return tabs.slice(start, start + tabsPerPage)
 }
 
-export function ringColor(status: { busy: boolean; green: boolean; amber: boolean }): RingColor {
-  if (status.amber) return 'amber'
-  if (status.green) return 'green'
-  if (status.busy) return 'blue'
-  return null
-}
-
 function toAscii(text: string): string {
   return text.replace(/[^\x20-\x7e]/g, '?')
 }
 
 export function stripText(
-  model: { tabs: Array<{ title: string; active: boolean; status: { busy: boolean; amber: boolean } }> },
+  model: { tabs: Array<{ title: string; active: boolean; busy: boolean; attention: boolean }> },
   page: number, pages: number,
 ): string {
   const active = model.tabs.find((t) => t.active)
-  const busy = model.tabs.filter((t) => t.status.busy).length
-  const amber = model.tabs.filter((t) => t.status.amber).length
-  return toAscii(`${active?.title ?? '-'}  |  page ${page}/${pages}  |  ${busy} busy  ${amber} waiting`)
+  const busyCount = model.tabs.filter((t) => t.busy).length
+  const waitingCount = model.tabs.filter((t) => t.attention).length
+  return toAscii(`${active?.title ?? '-'}  |  page ${page}/${pages}  |  ${busyCount} busy  ${waitingCount} waiting`)
 }
 
 export type FrameInputs = {
@@ -108,9 +99,7 @@ export function buildFrame({ model, caps, page, actionLayer, iconReady }: FrameI
     const tab = visible[slot]
     if (!tab) return
     keys[keyIndex] = {
-      kind: 'tab', tabId: tab.id, title: tab.title,
-      previewLines: [], // field dies in Task 9
-      ring: ringColor(tab.status), active: tab.active,
+      kind: 'tab', tabId: tab.id, title: tab.title, active: tab.active,
       fill: tab.fill, dot: tab.dot,
       icons: tab.repoIcons.map((icon) => ({
         ...icon,

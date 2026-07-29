@@ -10,8 +10,6 @@ import { buildRepoIconUrl, pathBasename, resolvePaneRepoCwd } from '@/lib/repo-i
 import { hueFromString } from '@/components/icons/RepoIcon'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
 
-export type TabRingStatus = { busy: boolean; green: boolean; amber: boolean }
-
 export type DeckTab = {
   id: string
   title: string
@@ -22,8 +20,6 @@ export type DeckTab = {
   dot: TileDot
   priority: number
   repoIcons: TileRepoIcon[]
-  /** TRANSITIONAL: consumed by frame.ts ringColor/stripText until Task 9 removes rings. */
-  status: TabRingStatus
 }
 export type DeckModel = { tabs: DeckTab[]; activeTabId: string | null }
 
@@ -50,19 +46,6 @@ export function tabHasPendingApproval(state: RootState, tabId: string): boolean 
   if (!layout) return false
   return collectPaneEntries(layout).some((entry) =>
     entry.content.kind === 'fresh-agent' && hasWaitingPrompt(freshAgentSessionFor(state, entry.content)))
-}
-
-export function getTabRingStatus(state: RootState, tab: Tab): TabRingStatus {
-  const busy = getBusyPaneIdsForTab({
-    tab,
-    paneLayouts: state.panes.layouts as Record<string, PaneNode | undefined>,
-    ...activityInputs(state),
-  }).length > 0
-  return {
-    busy,
-    green: !!state.turnCompletion.attentionByTab[tab.id],
-    amber: tabHasPendingApproval(state, tab.id),
-  }
 }
 
 /**
@@ -180,7 +163,6 @@ export function selectDeckModel(state: RootState): DeckModel {
       dot: tileDot(flags),
       priority: tilePriority(active, flags),
       repoIcons: getTabRepoIcons(state, tab),
-      status: getTabRingStatus(state, tab),
     }
   })
   // Status-priority sort; Array.prototype.sort is stable, so tab-bar order

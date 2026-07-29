@@ -25,7 +25,6 @@ import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
 import { DeckController } from '@/deck/deck-controller'
 import type { KeySpec } from '@/deck/frame'
-import { registerTerminalTextReader, resetTerminalTextRegistryForTests } from '@/deck/terminal-text-registry'
 
 const reducer = {
   tabs: tabsReducer, panes: panesReducer, turnCompletion: turnCompletionReducer,
@@ -149,13 +148,11 @@ beforeEach(() => {
 afterEach(() => {
   activeController?.stop()
   activeController = null
-  resetTerminalTextRegistryForTests()
   vi.useRealTimers()
 })
 
 describe('Stream Deck e2e flows (fake transport, real store)', () => {
-  it('tabs appear on keys with titles, previews, and rings', () => {
-    registerTerminalTextReader('term-1', () => ['$ npm test', 'PASS'])
+  it('tabs appear on keys with titles, fills, dots, and icons', () => {
     const { device } = setup({
       tabs: 3,
       busy: ['term-1'],
@@ -166,17 +163,15 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     // Status-priority sort: t2 attention (greenFill) < t3 waiting fresh-agent
     // (greenIcon) < t1 busy (blueIcon), so busy t1 lands after the others.
     expect(decodeKey(device, 0)).toEqual({
-      kind: 'tab', tabId: 't2', title: 'tab2', previewLines: [], ring: 'green', active: false,
+      kind: 'tab', tabId: 't2', title: 'tab2', active: false,
       fill: 'green', dot: 'green', icons: [],
     })
     expect(decodeKey(device, 1)).toEqual({
-      kind: 'tab', tabId: 't3', title: 'tab3', previewLines: [], ring: 'amber', active: false,
+      kind: 'tab', tabId: 't3', title: 'tab3', active: false,
       fill: 'none', dot: 'green', icons: [],
     })
     expect(decodeKey(device, 2)).toEqual({
-      // previewLines is always [] since Task 8 (field dies in Task 9); the
-      // registered term-1 reader above is deliberately ignored.
-      kind: 'tab', tabId: 't1', title: 'tab1', previewLines: [], ring: 'blue', active: true,
+      kind: 'tab', tabId: 't1', title: 'tab1', active: true,
       fill: 'none', dot: 'blue', icons: [],
     })
   })
@@ -190,23 +185,23 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     const state = store.getState()
     expect(state.tabs.activeTabId).toBe('t2')
     expect(state.turnCompletion.attentionByTab.t2).toBeFalsy()
-    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', active: true, ring: null })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', active: true, fill: 'none' })
   })
 
-  it('ring colors track state changes', () => {
+  it('tile fill and dot track state changes', () => {
     const { store, device } = setup({ tabs: 3, freshAgentTab: 3 })
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', ring: null })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', fill: 'none', dot: 'green' })
     store.dispatch(upsertClaudeActivity({ terminals: [{ terminalId: 'term-1', phase: 'busy', updatedAt: 1 }] }))
     // busy t1 (blueIcon) sorts after the green-icon tabs -> key 2
-    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't1', ring: 'blue' })
+    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't1', dot: 'blue' })
     store.dispatch(markTabAttention({ tabId: 't1' }))
-    // green outranks blue even while the tab is still busy; active+attention
-    // (barTop) sorts t1 back to key 0
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', ring: 'green' })
+    // attention outranks busy; active+attention (barTop) sorts t1 back to key 0
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', fill: 'barTop' })
     store.dispatch(addPermissionRequest({
       sessionId: 's1', sessionType: 'freshclaude', provider: 'claude', requestId: 'r9',
     }))
-    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't3', ring: 'amber' })
+    // a pending approval suppresses busy on the fresh-agent tab: still a green-dot tile
+    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't3', fill: 'none', dot: 'green' })
   })
 
   it('overflow paging with wrap on the 6-key profile', () => {
@@ -275,12 +270,14 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
 
   it('Deck+ dials and strip: cycle, page clamp, strip text, touch wake', () => {
     const { store, device } = setup(
-      { tabs: 10, busy: ['term-1'], freshAgentTab: 2, pendingPermissions: { r1: { requestId: 'r1' } } },
+      { tabs: 10, busy: ['term-1'], attention: { t2: true }, freshAgentTab: 2, pendingPermissions: { r1: { requestId: 'r1' } } },
       PLUS_CAPS,
       () => ({ brightness: 100, idleBrightness: 10, idleTimeoutSeconds: 1 }),
     )
     // no pager key on the dial profile: all 8 keys are tab tiles.
-    // Sorted order: busy t1 (blueIcon) lands last, so page 1 shows t2..t9.
+    // Sorted order: t2 attention (greenFill) stays first, busy t1 (blueIcon)
+    // lands last, so page 1 shows t2..t9. Strip counts busy=1 (t1) and
+    // waiting=1 (t2 attention).
     for (let k = 0; k < PLUS_CAPS.keyCount; k++) {
       expect(decodeKey(device, k)).toMatchObject({ kind: 'tab', tabId: `t${k + 2}` })
     }

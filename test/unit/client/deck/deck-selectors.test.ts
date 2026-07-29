@@ -20,7 +20,7 @@ import type { RepoIconEntry } from '@/store/repoIconsSlice'
 import { buildRepoIconUrl } from '@/lib/repo-icon'
 import { hueFromString } from '@/components/icons/RepoIcon'
 import {
-  findApproveTarget, findStopTarget, getTabRepoIcons, getTabRingStatus, getTabStatusFlags, selectDeckModel,
+  findApproveTarget, findStopTarget, getTabRepoIcons, getTabStatusFlags, selectDeckModel,
 } from '@/deck/deck-selectors'
 
 const reducer = {
@@ -116,30 +116,27 @@ function makeState(overrides: {
 }
 
 describe('deck-selectors', () => {
-  it('quiet tabs have no ring', () => {
+  it('quiet tabs are neither busy nor attention', () => {
     const state = makeState()
     const model = selectDeckModel(state)
     expect(model.tabs).toHaveLength(2)
-    expect(model.tabs[0]).toMatchObject({ id: 't1', title: 'build', active: true, status: { busy: false, green: false, amber: false } })
+    expect(model.tabs[0]).toMatchObject({ id: 't1', title: 'build', active: true, busy: false, attention: false })
   })
 
-  it('busy terminal pane -> busy tab (blue)', () => {
+  it('busy terminal pane -> busy tab', () => {
     const state = makeState({ claudeBusy: true })
-    const tab = (state as { tabs: { tabs: unknown[] } }).tabs.tabs[0]
-    expect(getTabRingStatus(state, tab as never).busy).toBe(true)
-    expect(selectDeckModel(state).tabs.find((t) => t.id === 't1')!.status.busy).toBe(true)
+    expect(selectDeckModel(state).tabs.find((t) => t.id === 't1')!.busy).toBe(true)
   })
 
-  it('attentionByTab -> green', () => {
+  it('attentionByTab -> attention flag', () => {
     const state = makeState({ attention: { t1: true } })
-    expect(selectDeckModel(state).tabs.find((t) => t.id === 't1')!.status.green).toBe(true)
+    expect(selectDeckModel(state).tabs.find((t) => t.id === 't1')!.attention).toBe(true)
   })
 
-  it('pending permission -> amber on the fresh-agent tab, and busy is suppressed', () => {
+  it('pending permission suppresses busy on the fresh-agent tab', () => {
     const state = makeState({ pendingPermissions: { r1: { requestId: 'r1' } }, freshAgentRunning: true })
-    const t2 = selectDeckModel(state).tabs[1]
-    expect(t2.status.amber).toBe(true)
-    expect(t2.status.busy).toBe(false) // isFreshAgentBusy yields false while waiting
+    const t2 = selectDeckModel(state).tabs.find((t) => t.id === 't2')!
+    expect(t2.busy).toBe(false) // isFreshAgentBusy yields false while waiting
   })
 
   it('findApproveTarget returns the pending permission for the tab', () => {

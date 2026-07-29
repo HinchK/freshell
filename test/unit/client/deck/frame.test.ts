@@ -1,15 +1,14 @@
 import { describe, expect, it } from 'vitest'
 import { MINI_CAPS, PLUS_CAPS } from '@/deck/fake-deck-device'
 import {
-  ACTION_KEYS, buildFrame, clampPage, pageCount, planLayout, ringColor, stripText, visibleTabs,
+  ACTION_KEYS, buildFrame, clampPage, pageCount, planLayout, stripText, visibleTabs,
 } from '@/deck/frame'
 import type { DeckModel, DeckTab } from '@/deck/deck-selectors'
 
-const quiet = { busy: false, green: false, amber: false }
 function makeDeckTab(over: Partial<DeckTab> & Pick<DeckTab, 'id' | 'title'>): DeckTab {
   return {
     active: false, busy: false, attention: false, fill: 'none', dot: null,
-    priority: 4, repoIcons: [], status: { ...quiet }, ...over,
+    priority: 4, repoIcons: [], ...over,
   }
 }
 function model(n: number, activeId = 'tab-0'): DeckModel {
@@ -49,15 +48,6 @@ describe('page math', () => {
   })
   it('visibleTabs slices by page', () => {
     expect(visibleTabs([1, 2, 3, 4, 5, 6, 7, 8], 2, 5)).toEqual([6, 7, 8])
-  })
-})
-
-describe('ringColor priority', () => {
-  it('amber > green > blue > none', () => {
-    expect(ringColor({ busy: true, green: true, amber: true })).toBe('amber')
-    expect(ringColor({ busy: true, green: true, amber: false })).toBe('green')
-    expect(ringColor({ busy: true, green: false, amber: false })).toBe('blue')
-    expect(ringColor(quiet)).toBeNull()
   })
 })
 
@@ -114,8 +104,8 @@ describe('buildFrame', () => {
   })
   it('full mode fills the strip and never emits a pager', () => {
     const m = model(10)
-    m.tabs[1].status.busy = true
-    m.tabs[2].status.amber = true
+    m.tabs[1].busy = true
+    m.tabs[2].attention = true
     const frame = buildFrame({ model: m, caps: PLUS_CAPS, page: 1, actionLayer: null, iconReady: noIcon })
     expect(frame.keys.every((k) => k.kind !== 'pager')).toBe(true)
     expect(frame.strip).toEqual({ text: 'Tab 0  |  page 1/2  |  1 busy  1 waiting' })
@@ -125,7 +115,18 @@ describe('buildFrame', () => {
 describe('stripText', () => {
   it('uses - for no active tab and forces ASCII', () => {
     expect(stripText({ tabs: [] }, 1, 1)).toBe('-  |  page 1/1  |  0 busy  0 waiting')
-    expect(stripText({ tabs: [{ title: 'café', active: true, status: { busy: false, amber: false } }] }, 1, 1))
+    expect(stripText({ tabs: [{ title: 'café', active: true, busy: false, attention: false }] }, 1, 1))
       .toBe('caf?  |  page 1/1  |  0 busy  0 waiting')
+  })
+  it('stripText counts busy and waiting from tab flags', () => {
+    const model = {
+      activeTabId: 't1',
+      tabs: [
+        makeDeckTab({ id: 't1', title: 'alpha', active: true, busy: true }),
+        makeDeckTab({ id: 't2', title: 'beta', attention: true }),
+        makeDeckTab({ id: 't3', title: 'gamma' }),
+      ],
+    }
+    expect(stripText(model, 1, 1)).toContain('1 busy  1 waiting')
   })
 })

@@ -21,7 +21,6 @@ import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
 import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
 import { IconImageCache } from '@/deck/icon-image-cache'
-import { registerTerminalTextReader } from '@/deck/terminal-text-registry'
 import type { KeySpec } from '@/deck/frame'
 
 const reducer = {
@@ -183,7 +182,7 @@ describe('DeckController', () => {
   it('paints tab tiles in tab order with active ring and asserts brightness on start', () => {
     const { device } = setup()
     expect(device.brightnessHistory[0]).toBe(100)
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', title: 'tab1', active: true, ring: null })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', title: 'tab1', active: true })
     expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', title: 'tab2', active: false })
     expect(decodeKey(device, 2)).toEqual({ kind: 'empty' })
     expect(decodeKey(device, 5)).toEqual({ kind: 'empty' })
@@ -192,19 +191,19 @@ describe('DeckController', () => {
   it('short press focuses the tab in the browser and dismisses green', () => {
     const { store, device } = setup({ attention: { t2: true } })
     // t2 has attention (priority 1) so it sorts ahead of green-icon t1 -> key 0
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't2', ring: 'green', active: false })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't2', fill: 'green', active: false })
     shortPress(device, 0)
     const state = store.getState()
     expect(state.tabs.activeTabId).toBe('t2')
     expect(state.turnCompletion.attentionByTab.t2).toBeFalsy()
-    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', active: true, ring: null })
+    expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', active: true, fill: 'none' })
   })
 
   it('store changes repaint only changed keys', () => {
     const { store, device } = setup()
     device.keyImages.clear()
     store.dispatch(markTabAttention({ tabId: 't1' }))
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', ring: 'green' })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', fill: 'barTop' })
     expect(device.keyImages.has(1)).toBe(false)
     expect(device.keyImages.has(2)).toBe(false)
   })
@@ -340,23 +339,14 @@ describe('DeckController', () => {
     expect(after.kind === 'tab' && after.icons[0].ready).toBe(true)
   })
 
-  it('no periodic preview repaint: 3s of ticks paints nothing even when terminal text changes', () => {
-    // A reader with a CHANGING snapshot is what makes this test able to go RED: with
-    // no reader registered, previewFor already yields [] and the per-key spec-JSON
-    // diff suppresses every paint, so the assertion would pass against unmodified
-    // code (vacuous). With the reader, current code's PREVIEW_REFRESH_TICKS branch
-    // repaints key 0 at the ~3s tick (new previewLines -> spec differs) and the test
-    // fails; it goes green only when previewFor and the tick branch are deleted.
-    // (Task 9 deletes the registry module itself; when it does, rework this test to
-    // drop the reader registration - the no-repaint guarantee becomes structural via
-    // Task 9's grep gate on PREVIEW_REFRESH_TICKS/registerTerminalTextReader.)
-    let n = 0
-    const unregister = registerTerminalTextReader('term-1', () => [`line ${n++}`])
+  it('no periodic repaint: 3s of ticks paints nothing while the store is unchanged', () => {
+    // The terminal-preview machinery is deleted (Task 9); repaints are store-driven
+    // only. The structural guarantee is Task 9's dead-reference grep gate; this
+    // asserts the observable behavior.
     const { device } = setup({ tabCount: 1 })
     device.keyImages.clear()
     vi.advanceTimersByTime(3_000)
     expect(device.keyImages.size).toBe(0)
-    unregister()
   })
 
   it('dispatches fetchRepoIconMeta for tab cwds even when settings.panes.repoIconsOnTabs is false (deck owns the probe)', () => {
