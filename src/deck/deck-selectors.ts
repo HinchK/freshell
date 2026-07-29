@@ -4,11 +4,12 @@ import type { FreshAgentPaneContent, PaneContent, PaneNode, TerminalPaneContent 
 import type { TabStatusFlags } from './tile-state'
 import { tileFill, tileDot, tilePriority, type TileFill, type TileDot } from './tile-state'
 import { collectPaneEntries } from '@/lib/pane-utils'
-import { getBusyPaneIdsForTab, resolvePaneActivity } from '@/lib/pane-activity'
+import { getBusyPaneIdsForTab, hasWaitingPrompt, resolvePaneActivity } from '@/lib/pane-activity'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
 import { buildRepoIconUrl, pathBasename, resolvePaneRepoCwd } from '@/lib/repo-icon'
 import { hueFromString } from '@/components/icons/RepoIcon'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import type { DeckTileStyle } from '@shared/settings'
 
 export type DeckTab = {
   id: string
@@ -16,12 +17,13 @@ export type DeckTab = {
   active: boolean
   busy: boolean
   attention: boolean
+  pendingApproval: boolean
   fill: TileFill
   dot: TileDot
   priority: number
   repoIcons: TileRepoIcon[]
 }
-export type DeckModel = { tabs: DeckTab[]; activeTabId: string | null }
+export type DeckModel = { tabs: DeckTab[]; activeTabId: string | null; tileStyle: DeckTileStyle }
 
 function activityInputs(state: RootState) {
   return {
@@ -39,6 +41,13 @@ function freshAgentSessionFor(state: RootState, content: FreshAgentPaneContent) 
   return state.freshAgent.sessions[makeFreshAgentSessionKey({
     sessionType: content.sessionType, provider: content.provider, sessionId: content.sessionId,
   })]
+}
+
+export function tabHasPendingApproval(state: RootState, tabId: string): boolean {
+  const layout = state.panes.layouts[tabId]
+  if (!layout) return false
+  return collectPaneEntries(layout).some((entry) =>
+    entry.content.kind === 'fresh-agent' && hasWaitingPrompt(freshAgentSessionFor(state, entry.content)))
 }
 
 /**
@@ -143,6 +152,7 @@ export function getTabStatusFlags(state: RootState, tab: Tab): TabStatusFlags {
 
 export function selectDeckModel(state: RootState): DeckModel {
   const activeTabId = state.tabs.activeTabId
+  const tileStyle = state.settings.settings.streamDeck.tileStyle
   const tabs = state.tabs.tabs.map((tab) => {
     const active = tab.id === activeTabId
     const flags = getTabStatusFlags(state, tab)
@@ -152,17 +162,21 @@ export function selectDeckModel(state: RootState): DeckModel {
       active,
       busy: flags.busy,
       attention: flags.attention,
+      pendingApproval: tabHasPendingApproval(state, tab.id),
       fill: tileFill(active, flags),
       dot: tileDot(flags),
       priority: tilePriority(active, flags),
       repoIcons: getTabRepoIcons(state, tab),
     }
   })
-  // Status-priority sort; Array.prototype.sort is stable, so tab-bar order
-  // is preserved within each priority group. Paging slices this sorted list
-  // (visibleTabs), so the pager pages over the sorted order automatically.
-  tabs.sort((a, b) => a.priority - b.priority)
-  return { activeTabId, tabs }
+  if (tileStyle === 'status-icons') {
+    // Status-priority sort; Array.prototype.sort is stable, so tab-bar order
+    // is preserved within each priority group. Paging slices this sorted list
+    // (visibleTabs), so the pager pages over the sorted order automatically.
+    // Classic terminal-previews style keeps raw tab-bar order (pre-redesign behavior).
+    tabs.sort((a, b) => a.priority - b.priority)
+  }
+  return { activeTabId, tabs, tileStyle }
 }
 
 export type ApproveTarget = {

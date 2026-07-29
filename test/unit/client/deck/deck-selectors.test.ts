@@ -13,6 +13,7 @@ import settingsReducer from '@/store/settingsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
 import repoIconsReducer from '@/store/repoIconsSlice'
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import type { DeckTileStyle } from '@shared/settings'
 import type { Tab } from '@/store/types'
 import type { PaneNode } from '@/store/paneTypes'
 import type { TerminalMetaRecord } from '@/store/terminalMetaSlice'
@@ -137,6 +138,10 @@ describe('deck-selectors', () => {
     const state = makeState({ pendingPermissions: { r1: { requestId: 'r1' } }, freshAgentRunning: true })
     const t2 = selectDeckModel(state).tabs.find((t) => t.id === 't2')!
     expect(t2.busy).toBe(false) // isFreshAgentBusy yields false while waiting
+    const model = selectDeckModel(state)
+    const freshTab = model.tabs.find((t) => t.id === 't2')!
+    expect(freshTab.pendingApproval).toBe(true)
+    expect(model.tabs.filter((t) => t.pendingApproval)).toHaveLength(1)
   })
 
   it('findApproveTarget returns the pending permission for the tab', () => {
@@ -214,6 +219,12 @@ function tabsOf(state: never): Tab[] {
 function withTabAttentionStyle(state: never, style: 'none' | 'highlight'): never {
   const clone = structuredClone(state) as { settings: { settings: { panes: { tabAttentionStyle: string } } } }
   clone.settings.settings.panes.tabAttentionStyle = style
+  return clone as never
+}
+
+function withTileStyle(state: never, tileStyle: DeckTileStyle): never {
+  const clone = structuredClone(state) as { settings: { settings: { streamDeck: { tileStyle: string } } } }
+  clone.settings.settings.streamDeck.tileStyle = tileStyle
   return clone as never
 }
 
@@ -370,6 +381,33 @@ describe('selectDeckModel (sorted, tile fields)', () => {
     const state = makeState({ tabs: 3 }) // all three are greenIcon
     const model = selectDeckModel(state)
     expect(model.tabs.map((t) => t.id)).toEqual(['t1', 't2', 't3'])
+  })
+
+  it('exposes the tile style on the model (default status-icons)', () => {
+    const state = makeState({ tabs: 3 })
+    expect(selectDeckModel(state).tileStyle).toBe('status-icons')
+  })
+
+  it('terminal-previews style keeps raw tab-bar order (no priority sort)', () => {
+    // Same fixture as the priority-sort test: sorted order is t5,t4,t3,t2,t1,
+    // so raw tab-bar order (t1..t5) genuinely differs from sorted output.
+    const base = makeState({
+      tabs: 5,
+      activeTab: 't5',
+      paneStatus: { p1: 'exited' },
+      busy: ['term-2'],
+      attention: { t4: true, t5: true },
+    })
+    const state = withTileStyle(base, 'terminal-previews') // clone idiom — direct mutation throws (frozen state)
+    const model = selectDeckModel(state)
+    expect(model.tileStyle).toBe('terminal-previews')
+    expect(model.tabs.map((t) => t.id)).toEqual(tabsOf(state).map((t) => t.id))
+    expect(tabsOf(state).map((t) => t.id)).toEqual(['t1', 't2', 't3', 't4', 't5'])
+  })
+
+  it('quiet tabs report pendingApproval false', () => {
+    const state = makeState() // default fixture: no busy panes, no pending permissions
+    expect(selectDeckModel(state).tabs.every((t) => t.pendingApproval === false)).toBe(true)
   })
 
   it('carries fill, dot, and repoIcons per tab', () => {
