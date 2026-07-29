@@ -369,6 +369,61 @@ impl OpencodeProvider {
     }
 }
 
+/// Busy timeout for the existence probe's by-id lookup. Deliberately much
+/// shorter than `OPENCODE_DB_BUSY_TIMEOUT_MS` (5000ms): `exists()` runs
+/// synchronously on the reconcile path, once per pane — N panes x 5s of
+/// WAL lock contention would stall every restart. A still-locked DB is a
+/// transient read failure (`Err` => the probe answers Unknown and
+/// reconcile's bounded deferral retries), not evidence of absence.
+const EXISTENCE_BY_ID_BUSY_TIMEOUT_MS: u64 = 250;
+
+/// Existence-probe by-id lookup: does `<data_home>/opencode.db` hold a
+/// `session` row with this id?
+///
+/// Deliberately NO `parent_id` filter — the attach arm
+/// (`opencode --session <id>` -> session.get by id) resolves CHILD
+/// sessions the root-filtered listing hides — NO `directory` filter
+/// (directory-less roots are real, attachable rows the listing drops at
+/// mapping) — and NO `time_archived` filter: opencode's `Session.get`
+/// has no archived filter and a live attach to an archived session
+/// succeeds (validated against v1.18.9), so archived rows answer
+/// `Ok(true)`. The query matches the ATTACH arm, not the listing: any
+/// filter the attach arm lacks would answer "absent" for an attachable
+/// session — the false-dead-session bug class this function removes.
+/// Schema note: only `id` is referenced, so legacy schemas lacking
+/// `time_archived` answer normally.
+///
+/// - `Ok(false)` for a missing DB file (opencode never ran here) or no
+///   matching row;
+/// - `Err` for ANY read failure (lock contention, corruption, io error,
+///   schema variance). LOAD-BEARING: callers must treat `Err` as
+///   "unknown", never "absent" — an absent-on-error would let WAL lock
+///   contention adjudicate live sessions dead.
+pub fn session_exists_by_id(data_home: &Path, session_id: &str) -> Result<bool, OpencodeReadError> {
+    let db_path = data_home.join("opencode.db");
+    if !db_path.exists() {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| OpencodeReadError(e.to_string()))?;
+    conn.busy_timeout(std::time::Duration::from_millis(
+        EXISTENCE_BY_ID_BUSY_TIMEOUT_MS,
+    ))
+    .map_err(|e| OpencodeReadError(e.to_string()))?;
+    match conn.query_row(
+        "SELECT 1 FROM session WHERE id = ?1",
+        rusqlite::params![session_id],
+        |_| Ok(()),
+    ) {
+        Ok(()) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(OpencodeReadError(e.to_string())),
+    }
+}
+
 /// `defaultOpencodeDataHome` — `$XDG_DATA_HOME/opencode` -> win `LOCALAPPDATA/opencode`
 /// -> `~/.local/share/opencode`.
 pub fn default_opencode_data_home() -> PathBuf {
