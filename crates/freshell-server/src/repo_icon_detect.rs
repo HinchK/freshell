@@ -433,12 +433,16 @@ fn csproj_candidates(sink: &mut CandidateSink) {
     // (artifacts/, packaging/, ...) can't evict the real manifest.
     csprojs.truncate(32);
     for csproj in csprojs {
+        let meta = match std::fs::metadata(&csproj) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() || meta.len() > 1_048_576 {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(&csproj) else {
             continue;
         };
-        if text.len() > 1_048_576 {
-            continue;
-        }
         let Some(icon_rel) = extract_xml_tag_value(&text, "ApplicationIcon") else {
             continue;
         };
