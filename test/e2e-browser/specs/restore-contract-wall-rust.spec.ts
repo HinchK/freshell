@@ -1802,7 +1802,17 @@ test.describe('Restore Contract Wall (P0.1)', () => {
       // known benign alert source is the transient history-load-error banner
       // from the snapshot fetch racing pane creation -- see
       // createFreshclaudePane's note above.)
-      await expect(page.getByRole('alert')).toHaveCount(0)
+      // Monaco's aria scaffold is excluded: setARIAContainer (monaco-editor
+      // esm/vs/base/browser/ui/aria/aria.js) permanently mounts exactly two
+      // EMPTY `role="alert"` divs (.monaco-alert) the moment the editor pane
+      // loads -- screen-reader announcement slots, not user-facing alerts.
+      // Unlike restore-sync05 (this assertion's donor), THIS composition has
+      // an editor pane (pane-ruler-editor above), so a bare getByRole('alert')
+      // count is structurally >=2 here regardless of restart behavior. Every
+      // product alert (Pane error banner, TerminalExitBanner, fresh-agent
+      // banners, ConnectionErrorOverlay, ...) lacks .monaco-alert and is
+      // still counted.
+      await expect(page.locator('[role="alert"]:not(.monaco-alert)')).toHaveCount(0)
     } finally {
       await server.stop()
       await fs.rm(sharedRoot, { recursive: true, force: true })
