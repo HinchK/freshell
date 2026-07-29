@@ -15,6 +15,9 @@
 //! Phase 5 (multi-instance, P4): a signal naming a terminal id unknown to
 //!   this instance is RETAINED across drain cycles, never emits a frame,
 //!   and is reaped only after the staleness TTL.
+//! Phase 6 (first-bind, P2): a fresh claude pane's resume identity is the
+//!   spawn-time preallocated --session-id, NOT signal consumption; it stays
+//!   intact even after an external actor destroys every signal file.
 //!
 //! Determinism: the test calls `drain_and_rebind_claude` directly on a state
 //! handle (the brief's preferred shape) instead of racing a spawned sweep
@@ -636,6 +639,61 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
     assert!(
         !foreign_path.exists(),
         "an orphaned unknown-terminal signal must be reaped after the staleness TTL"
+    );
+
+    // ── Phase 6 — first-bind is signal-independent (P2): a fresh claude
+    // pane's resume identity comes from the spawn-time preallocated
+    // --session-id (terminal.rs fresh-create path), NOT from signal
+    // consumption. Even if an external actor (e.g. another instance's
+    // pre-parity destructive sweeper) destroys every signal file, the pane
+    // must still carry a usable sessionRef/resume identity.
+    //
+    // Create a fresh claude pane exactly the way Phase 1 does (no
+    // resumeSessionId, no sessionRef, no restore) and capture its
+    // terminal.created frame.
+    let capture_p6 = capture_for("pane6");
+    let _ = std::fs::remove_file(&capture_p6);
+    std::env::set_var("CLAUDE_ARGV_CAPTURE_PATH", &capture_p6);
+    let created6 = send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-claude-rebind-6",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        }),
+    )
+    .await;
+    let tid6 = created6["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let created_ref =
+        common::session_ref_of(&created6).expect("fresh claude carries a preallocated ref");
+    assert_eq!(created_ref["provider"], "claude");
+    let preallocated_id = created_ref["sessionId"]
+        .as_str()
+        .expect("fresh claude create must carry a preallocated session id")
+        .to_string();
+    assert_eq!(preallocated_id.len(), 36, "preallocated id is a UUID");
+    // External actor destroys EVERY signal file (the pre-fix production
+    // sweeper's behavior): wipe the whole signal dir.
+    if let Ok(entries) = std::fs::read_dir(&signal_root) {
+        for entry in entries.flatten() {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    // Sweep after the destruction: binding must be unaffected.
+    freshell_ws::claude_signal::drain_and_rebind_claude(&state, &watcher).await;
+    tokio::task::yield_now().await;
+    // The pane's resume identity is intact and usable (same read pattern
+    // Phase 1 uses to assert registry_resume_id(tid1) == B).
+    assert_eq!(
+        registry_resume_id(&registry, &tid6).as_deref(),
+        Some(preallocated_id.as_str()),
+        "a fresh claude pane must keep its preallocated resume identity even \
+         when every signal file is destroyed by an external actor"
     );
 
     state.fresh_claude.shutdown().await; // reap the fake node child
