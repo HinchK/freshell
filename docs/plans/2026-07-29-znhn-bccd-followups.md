@@ -1247,8 +1247,8 @@ Replace the TTL-degradation test (`TerminalView.exitBanner.test.tsx:363-391`) wi
 
   it('a recovering notice does not survive a reconnect (D-3 backstop pin)', async () => {
     // seed the recovering notice as above; then fire the ws reconnect
-    // callback the harness captured (the same hook TerminalView registers
-    // via ws.onReconnect).
+    // callback captured via the harness extension described below (the same
+    // hook TerminalView registers via ws.onReconnect).
     await act(async () => {
       reconnectHandler!()
     })
@@ -1271,6 +1271,25 @@ Replace the TTL-degradation test (`TerminalView.exitBanner.test.tsx:363-391`) wi
   })
 ```
 (Use the file's existing `makeStore`/`renderPane` harness at `:27-185`; explicit `cleanup()` stays in `afterEach`.)
+
+**Harness extension (required for the D-3 backstop test):** the harness does not yet capture the reconnect callback — `wsMocks.onReconnect` is only `vi.fn().mockReturnValue(() => {})` (`:31`), and only `messageHandler` gets a capturing `mockImplementation` in `beforeEach` (`:198-201`). Mirror that capture: next to the `messageHandler` declaration (`:97`) add
+
+```ts
+let reconnectHandler: (() => void) | null = null
+```
+
+and in `beforeEach`, alongside the existing `wsMocks.onMessage.mockImplementation(...)` capture, add
+
+```ts
+    wsMocks.onReconnect.mockImplementation((callback: () => void) => {
+      reconnectHandler = callback
+      return () => {
+        reconnectHandler = null
+      }
+    })
+```
+
+(TerminalView registers a zero-arg callback and keeps the returned unsubscribe: `unsubReconnect = ws.onReconnect(() => { ... })` at `TerminalView.tsx:4934`; `type ReconnectHandler = () => void`, `ws-client.ts:17`.)
 
 Slice tests (`terminalLifecycleSlice.test.ts`): replace the TTL-expiry case with:
 
@@ -1424,8 +1443,8 @@ git commit -m "feat(client): frame-driven auto-resume notices — delete the 30s
 - Modify: `docs/plans/2026-07-27-agent-crash-resilience.md` (§D-5, one sentence)
 
 **Interfaces:**
-- Consumes: `terminal.replaced` frame (existing); denylist persistence (`stripTransientSessionFields` — do NOT add `crashTrace` there); `findReconcileTerminalContent(state, paneId)` traversal helper (`panesSlice.ts:618`).
-- Produces (used by Tasks 11–12): `export type CrashTrace = { exitCode: number; resumedAtMs: number }` in `paneTypes.ts`; `TerminalPaneContent.crashTrace?: CrashTrace`; actions `setPaneCrashTrace({ paneId, crashTrace })` and `clearPaneCrashTrace({ paneId })`; banner props `crashTrace: CrashTrace | null`, `onDismissCrashTrace: () => void`; trace UI = `role="status"` + `data-testid="crash-trace"`, copy `"{mode} crashed (exit {N}) & auto-resumed at {HH:MM}"`, dismiss button aria-label `` `Dismiss ${mode} crash notice` ``.
+- Consumes: `terminal.replaced` frame (existing); denylist persistence (`stripTransientSessionFields` — do NOT add `crashTrace` there); `findReconcileTerminalContent(state, tabId, paneId)` traversal helper (module-private, `panesSlice.ts:618`) — the `TerminalPaneContent`-narrowed sibling of the `findReconcilePaneContent(state, tabId, paneId)` helper (`:631`) that the reconcile-notice reducers use; both take positional `(state, tabId, paneId)`.
+- Produces (used by Tasks 11–12): `export type CrashTrace = { exitCode: number; resumedAtMs: number }` in `paneTypes.ts`; `TerminalPaneContent.crashTrace?: CrashTrace`; actions `setPaneCrashTrace({ tabId, paneId, crashTrace })` and `clearPaneCrashTrace({ tabId, paneId })` (payloads carry `tabId` because the panes-tree traversal helpers are keyed `(state, tabId, paneId)`, exactly like `setPaneReconcileNotice`/`clearPaneReconcileNotice`); banner props `crashTrace: CrashTrace | null`, `onDismissCrashTrace: () => void`; trace UI = `role="status"` + `data-testid="crash-trace"`, copy `"{mode} crashed (exit {N}) & auto-resumed at {HH:MM}"`, dismiss button aria-label `` `Dismiss ${mode} crash notice` ``.
 
 - [ ] **Step 1: Write the failing tests** —
 
@@ -1507,24 +1526,24 @@ Field on `TerminalPaneContent` (after `reconcileEpoch`):
   crashTrace?: CrashTrace
 ```
 
-`panesSlice.ts` (mirror `setPaneReconcileNotice`/`clearPaneReconcileNotice` at `:2080-2096` exactly, same traversal helper):
+`panesSlice.ts` (mirror the payload and call shape of `setPaneReconcileNotice`/`clearPaneReconcileNotice` at `:2080-2096` — `{ tabId, paneId }` payloads, positional `(state, action.payload.tabId, action.payload.paneId)` call. Those reducers use `findReconcilePaneContent` (`:631`); use its `TerminalPaneContent`-narrowed sibling `findReconcileTerminalContent` (`:618`, same positional signature) because `crashTrace` exists only on `TerminalPaneContent`):
 
 ```ts
     // znhn item 1: persistent crash trace — written on terminal.replaced,
     // cleared only by user dismissal (pane close deletes the pane node).
     setPaneCrashTrace(
       state,
-      action: PayloadAction<{ paneId: string; crashTrace: CrashTrace }>
+      action: PayloadAction<{ tabId: string; paneId: string; crashTrace: CrashTrace }>
     ) {
-      const content = findReconcileTerminalContent(state, action.payload.paneId)
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
       if (content) content.crashTrace = action.payload.crashTrace
     },
-    clearPaneCrashTrace(state, action: PayloadAction<{ paneId: string }>) {
-      const content = findReconcileTerminalContent(state, action.payload.paneId)
+    clearPaneCrashTrace(state, action: PayloadAction<{ tabId: string; paneId: string }>) {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
       if (content && content.crashTrace) delete content.crashTrace
     },
 ```
-(Match the helper's real signature — if `clearPaneReconcileNotice` calls it differently, copy that call shape.) Export both actions at `:2236-2237` alongside the others; import `CrashTrace` from `./paneTypes`.
+Export both actions at `:2236-2237` alongside the others; import `CrashTrace` from `./paneTypes`.
 
 `terminalLifecycleSlice.ts` — in `foldTerminalReplacement`, replace the `kind: 'resumed'` notice assignment with `delete e.notice` (keep the `delete e.exit` + `lastTerminalId` advance), and **also `delete e.settle`** (stale-settle leak fix, validated A15: the REST-door relaunch/reconcile never clears/advances `lastTerminalId` and nothing else deletes the entry's `settle`, so without this a stale breaker `resumeCycles` could leak into a LATER crash's alert copy). Narrow `AutoResumeNotice.kind` to `'recovering'` and update any test-harness types that referenced `'resumed'`.
 
@@ -1533,11 +1552,13 @@ Field on `TerminalPaneContent` (after `reconcileEpoch`):
 ```tsx
           dispatch(
             setPaneCrashTrace({
+              tabId,
               paneId: paneIdRef.current,
               crashTrace: { exitCode: msg.exitCode, resumedAtMs: Date.now() },
             })
           )
 ```
+(`tabId` is a `TerminalView` prop, in scope everywhere; this same handler already passes it to `applyReconcileAttach({ tabId, paneId: paneIdRef.current, ... })` at `:4415-4420`.)
 `showExitBanner` (`:5209-5215`) gains the trace condition:
 
 ```tsx
@@ -1558,7 +1579,7 @@ Banner mount gains:
               (terminalContent.status === 'exited' && (exitRecord ? exitRecord.exitCode !== 0 : true)) ||
               (terminalContent.status === 'error' && Boolean(exitRecord && exitRecord.exitCode !== 0))
             }
-            onDismissCrashTrace={() => dispatch(clearPaneCrashTrace({ paneId }))}
+            onDismissCrashTrace={() => dispatch(clearPaneCrashTrace({ tabId, paneId }))}
 ```
 (Hoist the two settled-dead sub-expressions into a `const settledDead = ...` used by both `showExitBanner` and the prop — DRY.)
 
