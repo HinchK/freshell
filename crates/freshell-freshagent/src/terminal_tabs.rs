@@ -465,6 +465,7 @@ fn arm_locators_for_fresh_pane(
     mode: &str,
     cwd: Option<&str>,
     resume_session_id: Option<&str>,
+    managed_codex: bool,
 ) {
     if let Some(locator) = &state.opencode_locator {
         locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
@@ -473,8 +474,13 @@ fn arm_locators_for_fresh_pane(
     // (`crates/freshell-ws/src/codex_association.rs:46`) -- `CodexLocator::arm`
     // takes no timestamp (windows are Enter-anchored; arming schedules no
     // deadline, see `codex_locator.rs:166`).
-    if let Some(locator) = &state.codex_locator {
-        locator.arm(terminal_id, mode, true, resume_session_id, cwd);
+    // S5.b / D-03: managed panes bind identity from the proxy Candidate stream,
+    // so the CODEX locator never ARMS for them (mirrors
+    // `freshell_ws::codex_association::should_arm_codex_locator`).
+    if !managed_codex {
+        if let Some(locator) = &state.codex_locator {
+            locator.arm(terminal_id, mode, true, resume_session_id, cwd);
+        }
     }
 }
 
@@ -1596,6 +1602,9 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // exit hook above tears it down. Adoption only fails when the planner/sidecar is
     // already shutting down (server exit); legacy's thrown adopt fails the create, so
     // kill the just-spawned pty and surface the error (500 — not an input error).
+    // S5.b / D-03: capture "managed?" BEFORE the adopt below takes the launch
+    // out of the Option — the arm suppression further down keys off it.
+    let managed_codex = codex_launch.is_some();
     if let Some(launch) = codex_launch.take() {
         if let Err(message) = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
             .adopt(&terminal_id, launch, 0)
@@ -1625,6 +1634,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         &mode,
         cwd.as_deref(),
         resume_session_id.as_deref(),
+        managed_codex,
     );
 
     // D8 winner bind (REST rung): record sessionRef->terminalId in the
@@ -3103,7 +3113,30 @@ mod tests {
         // locator tests pass Some(std::sync::Arc::new(...)) because the
         // builders take Option (with_opencode_locator / with_codex_locator).
 
-        arm_locators_for_fresh_pane(&state, "term-codex-1", "codex", Some("/tmp/proj"), None);
+        // S5.b / D-03: a MANAGED codex pane binds identity from the proxy
+        // Candidate stream, so the REST door must never arm the codex locator.
+        arm_locators_for_fresh_pane(
+            &state,
+            "term-codex-0",
+            "codex",
+            Some("/tmp/proj"),
+            None,
+            true,
+        );
+        assert_eq!(
+            locator.armed_count(),
+            0,
+            "managed codex panes must never arm the locator (D-03)"
+        );
+
+        arm_locators_for_fresh_pane(
+            &state,
+            "term-codex-1",
+            "codex",
+            Some("/tmp/proj"),
+            None,
+            false,
+        );
 
         assert_eq!(
             locator.armed_count(),

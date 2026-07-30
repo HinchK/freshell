@@ -23,6 +23,14 @@ pub(crate) fn is_submit_input(data: &str) -> bool {
     !data.is_empty() && data.chars().all(|c| c == '\r' || c == '\n')
 }
 
+/// S5.b / D-03 (recorded rule): managed panes bind identity from the proxy
+/// Candidate stream; the disk locator must not race it for the first bind.
+/// Suppression happens HERE at arm time — never via `locator.disarm`, which
+/// would also kill the fork watch (`codex_locator.rs:263-267`).
+pub(crate) fn should_arm_codex_locator(mode: &str, managed_codex: bool) -> bool {
+    mode == "codex" && !managed_codex
+}
+
 /// Arm the locator for a freshly-created terminal, iff it's a fresh
 /// (non-resuming) `codex` pane with a resolved cwd. No-ops when the locator
 /// is unavailable (`WsState::codex_locator` is `None`) or the mode isn't
@@ -36,8 +44,9 @@ pub(crate) fn maybe_arm(
     mode: &str,
     cwd: Option<&str>,
     resume_session_id: Option<&str>,
+    managed_codex: bool,
 ) {
-    if mode != "codex" {
+    if !should_arm_codex_locator(mode, managed_codex) {
         return;
     }
     let Some(locator) = &state.codex_locator else {
@@ -378,15 +387,32 @@ mod tests {
     }
 
     #[test]
+    fn managed_panes_never_arm_the_locator_d03() {
+        assert!(should_arm_codex_locator("codex", false));
+        assert!(!should_arm_codex_locator("codex", true)); // D-03: proxy candidate is authoritative
+        assert!(!should_arm_codex_locator("shell", false));
+        assert!(!should_arm_codex_locator("claude", false));
+    }
+
+    #[test]
     fn maybe_arm_arms_a_fresh_codex_terminal_and_ignores_others() {
         let dir = unique_temp_dir("assoc-arm");
         let (state, _rx) = state_with_locator(dir.clone());
         let locator = state.codex_locator.as_ref().unwrap().clone();
-        maybe_arm(&state, "t1", "opencode", Some("/tmp"), None); // wrong mode
+        maybe_arm(&state, "t1", "opencode", Some("/tmp"), None, false); // wrong mode
         assert_eq!(locator.armed_count(), 0);
-        maybe_arm(&state, "t1", "codex", Some("/tmp"), Some("resume-id")); // resuming
+        maybe_arm(
+            &state,
+            "t1",
+            "codex",
+            Some("/tmp"),
+            Some("resume-id"),
+            false,
+        ); // resuming
         assert_eq!(locator.armed_count(), 0);
-        maybe_arm(&state, "t1", "codex", Some("/tmp"), None); // fresh
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None, true); // managed (D-03)
+        assert_eq!(locator.armed_count(), 0);
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None, false); // fresh
         assert_eq!(locator.armed_count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -396,7 +422,7 @@ mod tests {
         let dir = unique_temp_dir("assoc-submit");
         let (state, _rx) = state_with_locator(dir.clone());
         let locator = state.codex_locator.as_ref().unwrap().clone();
-        maybe_arm(&state, "t1", "codex", Some("/tmp"), None);
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None, false);
         note_possible_submit(&state, "t1", "hello").await;
         // Observable proof via the locator's own seam: "hello" must not have
         // consumed the window — a direct note_submit still returns true.
@@ -446,7 +472,7 @@ mod tests {
             .registry
             .set_meta("t1", None, None, Some("codex".to_string()), None);
 
-        maybe_arm(&state, "t1", "codex", Some("/tmp"), None);
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None, false);
 
         // OPEN THE WINDOW FIRST: windows are Enter-anchored (no spawn
         // window), so resolution requires a submit, and the FIRST submit
@@ -569,7 +595,7 @@ mod tests {
         // The restore-shaped arm: identity absent, so resume is None — the
         // exact argument shape terminal.rs's handle_create produces for a
         // restore:true create that carried no sessionRef.
-        maybe_arm(&state, "t1", "codex", Some("/tmp"), None);
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None, false);
         assert_eq!(state.codex_locator.as_ref().unwrap().armed_count(), 1);
 
         // The spawn-time pending marker (written by handle_create in
@@ -665,7 +691,7 @@ mod tests {
             .registry
             .set_meta("t1", None, None, Some("codex".to_string()), None);
 
-        maybe_arm(&state, "t1", "codex", Some("/tmp"), None);
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None, false);
         let locator = state.codex_locator.as_ref().unwrap().clone();
         assert_eq!(locator.armed_count(), 1);
 
@@ -771,7 +797,7 @@ mod tests {
             .registry
             .set_meta("t1", None, None, Some("codex".to_string()), None);
 
-        maybe_arm(&state, "t1", "codex", Some("/tmp"), None);
+        maybe_arm(&state, "t1", "codex", Some("/tmp"), None, false);
         let locator = state.codex_locator.as_ref().unwrap().clone();
         assert_eq!(locator.armed_count(), 1);
 

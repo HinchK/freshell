@@ -2424,6 +2424,10 @@ pub(crate) async fn handle_create(
         let mode = mode.clone();
         let cwd = resolved_cwd.clone();
         let resume = resume_session_id.clone();
+        // S5.b / D-03: managed panes bind identity from the proxy Candidate
+        // stream, so the locator never ARMS for them (suppressed inside
+        // `maybe_arm` -- never via `locator.disarm`).
+        let managed_codex = codex_remote_ws_url.is_some();
         let _ = tokio::task::spawn_blocking(move || {
             crate::codex_association::maybe_arm(
                 &state,
@@ -2431,6 +2435,7 @@ pub(crate) async fn handle_create(
                 &mode,
                 cwd.as_deref(),
                 resume.as_deref(),
+                managed_codex,
             );
             // Resume-launched codex panes are (correctly) refused by arm() --
             // their session already exists. They DO need fork detection: an
@@ -3014,6 +3019,10 @@ pub async fn respawn_agent_terminal(
         let mode = mode.clone();
         let cwd = resolved_cwd.clone();
         let resume = resume_session_id.clone();
+        // S5.b / D-03: managed panes bind identity from the proxy Candidate
+        // stream, so the locator never ARMS for them (suppressed inside
+        // `maybe_arm` -- never via `locator.disarm`).
+        let managed_codex = codex_remote_ws_url.is_some();
         let _ = tokio::task::spawn_blocking(move || {
             crate::codex_association::maybe_arm(
                 &state,
@@ -3021,6 +3030,7 @@ pub async fn respawn_agent_terminal(
                 &mode,
                 cwd.as_deref(),
                 resume.as_deref(),
+                managed_codex,
             );
         })
         .await;
