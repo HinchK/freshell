@@ -456,6 +456,89 @@ async fn manager_exit_for_unknown_terminal_is_a_noop() {
     manager.notify_terminal_exit("never-created");
 }
 
+// ── D-C-R sidecar planning budget (S5.e precondition) ─────────────────────────────
+
+/// A [`FakeRuntime`]-shaped runtime whose `ensure_ready` blocks on a shared
+/// [`tokio::sync::Notify`] so plans stay in flight until the test releases
+/// them — the knob that keeps budget permits occupied.
+struct BlockingRuntime {
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl CodexLaunchRuntime for BlockingRuntime {
+    fn ensure_ready(
+        &self,
+        cwd: Option<String>,
+    ) -> BoxFuture<'_, Result<CodexRuntimeReady, String>> {
+        Box::pin(async move {
+            self.release.notified().await;
+            // Released: stand up the file's real loopback echo upstream so
+            // the plan completes against a real socket.
+            let inner = FakeRuntime::start().await;
+            inner.ensure_ready(cwd).await
+        })
+    }
+
+    fn update_ownership_metadata(
+        &self,
+        _terminal_id: String,
+        _generation: u64,
+    ) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(async move { Ok(()) })
+    }
+}
+
+fn blocking_test_runtime_factory() -> (
+    freshell_codex::launch_lifecycle::CodexRuntimeFactory,
+    Arc<tokio::sync::Notify>,
+) {
+    let release = Arc::new(tokio::sync::Notify::new());
+    let factory_release = release.clone();
+    let factory: freshell_codex::launch_lifecycle::CodexRuntimeFactory = Box::new(move || {
+        Arc::new(BlockingRuntime {
+            release: factory_release.clone(),
+        }) as Arc<dyn CodexLaunchRuntime>
+    });
+    (factory, release)
+}
+
+#[tokio::test]
+async fn third_concurrent_plan_fails_fast_on_the_sidecar_budget() {
+    let (blocking_runtime_factory, release) = blocking_test_runtime_factory();
+    let manager = std::sync::Arc::new(
+        freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::with_plan_budget(
+            blocking_runtime_factory,
+            2,
+            std::time::Duration::from_millis(200),
+        ),
+    );
+    let input = freshell_codex::launch_plan::CodexLaunchPlanInput::default();
+    let m1 = manager.clone();
+    let a = tokio::spawn(async move {
+        m1.plan_create_with_retry(&CodexLaunchPlanInput::default(), 1)
+            .await
+    });
+    let m2 = manager.clone();
+    let b = tokio::spawn(async move {
+        m2.plan_create_with_retry(&CodexLaunchPlanInput::default(), 1)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await; // both hold the budget
+    let third = manager.plan_create_with_retry(&input, 1).await;
+    let err = third.expect_err("third concurrent plan must fail fast on the budget");
+    assert!(
+        err.to_string().contains("planning budget exhausted"),
+        "{err}"
+    );
+    release.notify_waiters();
+    let _ = a.await;
+    let _ = b.await;
+}
+
 // ── the spawn integration leg: real child + real proxy + fake TUI ─────────────────
 
 fn fake_app_server_command() -> String {

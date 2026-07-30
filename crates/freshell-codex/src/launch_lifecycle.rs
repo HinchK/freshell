@@ -450,6 +450,13 @@ struct AdoptedTerminalLaunch {
     drain: tokio::task::JoinHandle<()>,
 }
 
+/// D-C-REVISIT — RESOLVED (2026-07-30, spec S5.e precondition): sidecar
+/// planning budget covering BOTH doors. Bounds concurrent codex plans
+/// server-wide so a burst can never stack ~226s plan holds; waiters fail fast
+/// instead of queueing behind them.
+pub const CODEX_SIDECAR_PLAN_CONCURRENCY: usize = 2;
+pub const CODEX_SIDECAR_PLAN_WAIT: Duration = Duration::from_secs(30);
+
 /// The shared `resolve_codex_launch` seam (spec §5 Slice 4): plan → adopt-by-terminal-id →
 /// teardown-on-terminal-exit, used by BOTH the WS `terminal.create` codex branch and the
 /// REST `/api/tabs` codex branch. Teardown is decoupled from the (sync) PTY exit hook via
@@ -458,6 +465,8 @@ pub struct CodexTerminalLaunchManager {
     planner: CodexLaunchPlanner,
     adopted: Mutex<HashMap<String, AdoptedTerminalLaunch>>,
     teardown_tx: OnceLock<mpsc::UnboundedSender<AdoptedTerminalLaunch>>,
+    plan_budget: Arc<tokio::sync::Semaphore>,
+    plan_budget_wait: Duration,
 }
 
 impl CodexTerminalLaunchManager {
@@ -466,7 +475,21 @@ impl CodexTerminalLaunchManager {
             planner: CodexLaunchPlanner::new(runtime_factory),
             adopted: Mutex::new(HashMap::new()),
             teardown_tx: OnceLock::new(),
+            plan_budget: Arc::new(tokio::sync::Semaphore::new(CODEX_SIDECAR_PLAN_CONCURRENCY)),
+            plan_budget_wait: CODEX_SIDECAR_PLAN_WAIT,
         }
+    }
+
+    /// Test/DI constructor with an explicit sidecar planning budget.
+    pub fn with_plan_budget(
+        runtime_factory: CodexRuntimeFactory,
+        concurrency: usize,
+        wait: Duration,
+    ) -> Self {
+        let mut manager = Self::new(runtime_factory);
+        manager.plan_budget = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        manager.plan_budget_wait = wait;
+        manager
     }
 
     /// The process-wide manager over the REAL spawn runtime — legacy has exactly one
@@ -488,6 +511,19 @@ impl CodexTerminalLaunchManager {
         attempts: u32,
     ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
         self.ensure_teardown_worker();
+        let _budget =
+            match tokio::time::timeout(
+                self.plan_budget_wait,
+                self.plan_budget.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => return Err(CodexLaunchError::Failed(
+                    "codex sidecar planning budget exhausted; too many concurrent codex launches"
+                        .to_string(),
+                )),
+            };
         self.planner
             .plan_create_with_retry(input, attempts, CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS)
             .await

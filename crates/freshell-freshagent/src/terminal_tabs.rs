@@ -1059,46 +1059,6 @@ pub(crate) async fn spawn_terminal_pane(
         }
     }
 
-    // Server-wide spawn gate — the SAME instance the WS terminal.create path
-    // uses (ONE global concurrency budget; wired by freshell-server main.rs;
-    // docs/plans/2026-07-27-rest-spawn-gate.md). Placed on the shared path of
-    // EVERY mode, before terminal_id minting — i.e. before MCP config
-    // generation, opencode port allocation, and the codex managed-launch
-    // plan — so the permit also bounds the REST-reachable sidecar spawn and
-    // rejection needs NO cleanup (the session-ref lease above releases via
-    // its own Drop). `None` (unwired) = ungated: unit-test states without
-    // server wiring keep legacy behavior.
-    let spawn_permit = match state.spawn_gate() {
-        Some(rest_gate) => {
-            // Uncancellable acquire (kata znhn item 4): REST has no
-            // connection whose death should cancel the wait — the gate owns
-            // that semantics now. If the HTTP request is dropped while
-            // QUEUED, axum drops this future and the gate's queue-slot guard
-            // reclaims the slot — nothing has been spawned yet.
-            match rest_gate
-                .gate
-                .acquire_uncancellable(rest_gate.timeout)
-                .await
-            {
-                Ok(permit) => Some(permit),
-                Err(err) => {
-                    // Deliberate ordering trade-off: the amplifier stub is
-                    // written BEFORE this gate acquire (keeping every
-                    // client-visible 4xx synchronous), so a gate rejection
-                    // leaves a fresh stub behind. A stub written for a spawn
-                    // that never happened is litter — GC it (only one THIS
-                    // create wrote, and only while provably never used).
-                    if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
-                        let _ =
-                            freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
-                    }
-                    return Err(spawn_gate_error_response(err, rest_gate.timeout));
-                }
-            }
-        }
-        None => None,
-    };
-
     // F1 (council enn3; prior art da5d9b5c, pinned by the WS door's
     // `create_gate::hold_permit_across`): everything from here to the
     // settled terminal runs on a DETACHED task that OWNS the permit, the
@@ -1112,7 +1072,6 @@ pub(crate) async fn spawn_terminal_pane(
     // half-initialized orphan. (The WS door solves the same hazard by
     // spawning its settled restore create: `spawn_gated_restore_create`.)
     let settle = tokio::spawn(settle_gated_create(GatedSettleInputs {
-        permit: spawn_permit,
         state: state.clone(),
         body: body.clone(),
         tab_id: tab_id.to_string(),
@@ -1146,7 +1105,6 @@ pub(crate) async fn spawn_terminal_pane(
 /// `'static` (it outlives an aborted handler future by design), so every
 /// input moves in by value.
 struct GatedSettleInputs {
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
     state: FreshAgentState,
     body: Value,
     tab_id: String,
@@ -1178,13 +1136,12 @@ struct GatedSettleInputs {
 /// codex adopt, pane bookkeeping) completed — the same spawn-to-settled
 /// scope the WS door pins with `hold_permit_across`.
 async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnResult, Response> {
-    let mut inputs = inputs;
-    // Bound FIRST so it drops LAST (locals drop in reverse declaration
-    // order): the permit outlives every settle step below, on success and
-    // on every early-return Err(...) alike — never call `.forget()`.
-    let _spawn_permit = inputs.permit.take();
+    // D-C-R (2026-07-30): the spawn-gate permit is now acquired BELOW, after
+    // the (possibly ~long) codex managed plan, so codex planning never holds a
+    // server-wide spawn permit. Declared first so it drops last (RAII scope:
+    // acquire → PTY fork → every settle step → drop).
+    let mut _spawn_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
     let GatedSettleInputs {
-        permit: _,
         state,
         body,
         tab_id,
@@ -1286,13 +1243,12 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        // D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH): this plan runs UNDER
-        // the held spawn permit — plan_create_with_retry can hold it ~226s
-        // worst case (5 × SIDECAR_START_BUDGET 45s + 1s backoff) vs the 10s
-        // permit wait. Accepted while the flag defaults OFF. If the default
-        // ever flips ON, the permit-hold duration MUST be revisited (likely
-        // a separate sidecar budget covering both doors). Decision record:
-        // docs/plans/2026-07-27-rest-spawn-gate.md §D-C.
+        // D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH) — RESOLVED 2026-07-30
+        // (DEV-0006 S5.e precondition): this plan no longer runs under the
+        // held spawn permit (acquire moved below the plan, WS-auto-resume
+        // mirror), and concurrent plans are bounded by the manager's sidecar
+        // planning budget (CODEX_SIDECAR_PLAN_CONCURRENCY=2, fail-fast).
+        // Decision record: docs/plans/2026-07-27-rest-spawn-gate.md §D-C addendum.
         //
         // DEV-0006 S4 inc.2 (FLAG-GATED, default OFF — council fence): with
         // `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed app-server launch through
@@ -1486,6 +1442,40 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             }
         }))
     };
+
+    // Server-wide spawn gate — acquired AFTER the codex managed plan (D-C-R,
+    // 2026-07-30): mirrors the WS auto-resume door (plan → acquire → discard
+    // on rejection). Decision record: docs/plans/2026-07-27-rest-spawn-gate.md
+    // §D-C addendum. `None` (unwired) = ungated.
+    if let Some(rest_gate) = state.spawn_gate() {
+        match rest_gate
+            .gate
+            .acquire_uncancellable(rest_gate.timeout)
+            .await
+        {
+            Ok(permit) => _spawn_permit = Some(permit),
+            Err(err) => {
+                if let Some(launch) = codex_launch.take() {
+                    freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                        .discard(launch)
+                        .await;
+                }
+                // The SAME cleanup statements the PTY-spawn-failure arm below
+                // runs (MCP config cleanup + amplifier-stub GC): nothing has
+                // been spawned yet, but the mode branch above may already have
+                // written MCP config file(s), and the amplifier stub was
+                // pre-created in `spawn_terminal_pane` — both are litter for a
+                // create that will never happen.
+                if mode != "shell" {
+                    cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+                }
+                if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
+                    let _ = freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
+                }
+                return Err(spawn_gate_error_response(err, rest_gate.timeout));
+            }
+        }
+    }
 
     // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
     // spawns occupy a permit + a blocking thread, never an async worker (WS
