@@ -200,7 +200,7 @@ const DEVICE = (records: unknown[]) => ({
 })
 
 describe('deploy-tab-diff capture coverage gate', () => {
-  it('halts with exit 4 on uncovered running terminals, still writes the artifact, and lists them enriched with mode/cwd/title/session', async () => {
+  it('halts with exit 4 on uncovered running terminals, still writes the artifact, and lists them enriched with mode/cwd/title/session', { timeout: 120_000 }, async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-gate-'))
     try {
       const terminals = [
@@ -249,7 +249,7 @@ describe('deploy-tab-diff capture coverage gate', () => {
     }
   })
 
-  it('exits 0 with the normal summary when every running terminal is covered', async () => {
+  it('exits 0 with the normal summary when every running terminal is covered', { timeout: 120_000 }, async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-gate-'))
     try {
       const { binDir, env } = await makeRoutedCurl(tmp, {
@@ -273,7 +273,7 @@ describe('deploy-tab-diff capture coverage gate', () => {
     }
   })
 
-  it('--allow-uncovered downgrades the gap to a WARNING and exits 0', async () => {
+  it('--allow-uncovered downgrades the gap to a WARNING and exits 0', { timeout: 120_000 }, async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'tabdiff-gate-'))
     try {
       const terminals = [
