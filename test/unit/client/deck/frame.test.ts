@@ -9,7 +9,7 @@ import { PANE_TINT_COLORS } from '@/deck/pane-tint-colors'
 
 function makeDeckTab(over: Partial<DeckTab> & Pick<DeckTab, 'id' | 'title'>): DeckTab {
   return {
-    active: false, busy: false, attention: false, pendingApproval: false, fill: 'none',
+    active: false, busy: false, attention: false, pendingApproval: false, fill: 'none', dot: null,
     priority: 4, repoIcons: [], paneIcons: [], ...over,
   }
 }
@@ -88,7 +88,7 @@ describe('buildFrame', () => {
       activeTabId: 't1',
       tileStyle: 'status-icons',
       tabs: [makeDeckTab({
-        id: 't1', title: 'alpha', active: true, fill: 'barTop',
+        id: 't1', title: 'alpha', active: true, fill: 'barTop', dot: 'green',
         paneIcons: [{ provider: 'claude', tint: 'green' }],
         repoIcons: [
           { url: '/api/repo-icon?cwd=%2Fr%2Fa', letter: 'A', hue: 120 },

@@ -410,7 +410,7 @@ describe('selectDeckModel (sorted, tile fields)', () => {
     expect(selectDeckModel(state).tabs.every((t) => t.pendingApproval === false)).toBe(true)
   })
 
-  it('carries fill, paneIcons, and repoIcons per tab', () => {
+  it('carries fill, dot, and repoIcons per tab', () => {
     const state = makeState({
       tabs: 2,
       activeTab: 't1',
@@ -425,8 +425,7 @@ describe('selectDeckModel (sorted, tile fields)', () => {
     expect(t1.fill).toBe('barTop')
     expect(t1.repoIcons).toEqual([{ url: buildRepoIconUrl('/repos/alpha'), letter: 'A', hue: hueFromString('alpha') }])
     expect(t2.fill).toBe('none')
-    // the busy signal rides the pane icons (blue tint), not a status dot
-    expect(t2.paneIcons).toEqual([{ provider: 'claude', tint: 'blue' }])
+    expect(t2.dot).toBe('blue')
   })
 })
 
