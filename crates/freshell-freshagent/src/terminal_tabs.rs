@@ -464,6 +464,7 @@ fn arm_locators_for_fresh_pane(
     mode: &str,
     cwd: Option<&str>,
     resume_session_id: Option<&str>,
+    managed_codex: bool,
 ) {
     if let Some(locator) = &state.opencode_locator {
         locator.arm(terminal_id, mode, true, resume_session_id, cwd, now_ms());
@@ -472,8 +473,13 @@ fn arm_locators_for_fresh_pane(
     // (`crates/freshell-ws/src/codex_association.rs:46`) -- `CodexLocator::arm`
     // takes no timestamp (windows are Enter-anchored; arming schedules no
     // deadline, see `codex_locator.rs:166`).
-    if let Some(locator) = &state.codex_locator {
-        locator.arm(terminal_id, mode, true, resume_session_id, cwd);
+    // S5.b / D-03: managed panes bind identity from the proxy Candidate stream,
+    // so the CODEX locator never ARMS for them (mirrors
+    // `freshell_ws::codex_association::should_arm_codex_locator`).
+    if !managed_codex {
+        if let Some(locator) = &state.codex_locator {
+            locator.arm(terminal_id, mode, true, resume_session_id, cwd);
+        }
     }
 }
 
@@ -521,12 +527,12 @@ pub(crate) struct TerminalSpawnResult {
     pub(crate) cwd: Option<String>,
 }
 
-/// DEV-0006 S4 gate, REST side (council fence: FLAG-GATED, default OFF): a codex
-/// `POST /api/tabs` / pane-split create plans a managed app-server launch ONLY when the
-/// mode is codex AND the `FRESHELL_CODEX_MANAGED_LAUNCH` flag is exactly `"1"` — the
-/// SAME predicate the WS `terminal.create` branch gates on
-/// (`crates/freshell-ws/src/terminal.rs::codex_create_uses_managed_launch`). Flag OFF
-/// keeps the shipped plain-CLI REST codex behavior byte-identical.
+/// DEV-0006 gate, REST side (S5.e: default ON): a codex `POST /api/tabs` /
+/// pane-split create plans a managed app-server launch when the mode is codex,
+/// unless the `FRESHELL_CODEX_MANAGED_LAUNCH` flag is exactly `"0"` — the only
+/// opt-out back to the plain-CLI REST codex behavior. SAME predicate the WS
+/// `terminal.create` branch gates on
+/// (`crates/freshell-ws/src/terminal.rs::codex_create_uses_managed_launch`).
 fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> bool {
     mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
 }
@@ -1041,46 +1047,6 @@ pub(crate) async fn spawn_terminal_pane(
         }
     }
 
-    // Server-wide spawn gate — the SAME instance the WS terminal.create path
-    // uses (ONE global concurrency budget; wired by freshell-server main.rs;
-    // docs/plans/2026-07-27-rest-spawn-gate.md). Placed on the shared path of
-    // EVERY mode, before terminal_id minting — i.e. before MCP config
-    // generation, opencode port allocation, and the codex managed-launch
-    // plan — so the permit also bounds the REST-reachable sidecar spawn and
-    // rejection needs NO cleanup (the session-ref lease above releases via
-    // its own Drop). `None` (unwired) = ungated: unit-test states without
-    // server wiring keep legacy behavior.
-    let spawn_permit = match state.spawn_gate() {
-        Some(rest_gate) => {
-            // Uncancellable acquire (kata znhn item 4): REST has no
-            // connection whose death should cancel the wait — the gate owns
-            // that semantics now. If the HTTP request is dropped while
-            // QUEUED, axum drops this future and the gate's queue-slot guard
-            // reclaims the slot — nothing has been spawned yet.
-            match rest_gate
-                .gate
-                .acquire_uncancellable(rest_gate.timeout)
-                .await
-            {
-                Ok(permit) => Some(permit),
-                Err(err) => {
-                    // Deliberate ordering trade-off: the amplifier stub is
-                    // written BEFORE this gate acquire (keeping every
-                    // client-visible 4xx synchronous), so a gate rejection
-                    // leaves a fresh stub behind. A stub written for a spawn
-                    // that never happened is litter — GC it (only one THIS
-                    // create wrote, and only while provably never used).
-                    if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
-                        let _ =
-                            freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
-                    }
-                    return Err(spawn_gate_error_response(err, rest_gate.timeout));
-                }
-            }
-        }
-        None => None,
-    };
-
     // F1 (council enn3; prior art da5d9b5c, pinned by the WS door's
     // `create_gate::hold_permit_across`): everything from here to the
     // settled terminal runs on a DETACHED task that OWNS the permit, the
@@ -1094,7 +1060,6 @@ pub(crate) async fn spawn_terminal_pane(
     // half-initialized orphan. (The WS door solves the same hazard by
     // spawning its settled restore create: `spawn_gated_restore_create`.)
     let settle = tokio::spawn(settle_gated_create(GatedSettleInputs {
-        permit: spawn_permit,
         state: state.clone(),
         body: body.clone(),
         tab_id: tab_id.to_string(),
@@ -1128,7 +1093,6 @@ pub(crate) async fn spawn_terminal_pane(
 /// `'static` (it outlives an aborted handler future by design), so every
 /// input moves in by value.
 struct GatedSettleInputs {
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
     state: FreshAgentState,
     body: Value,
     tab_id: String,
@@ -1160,13 +1124,12 @@ struct GatedSettleInputs {
 /// codex adopt, pane bookkeeping) completed — the same spawn-to-settled
 /// scope the WS door pins with `hold_permit_across`.
 async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnResult, Response> {
-    let mut inputs = inputs;
-    // Bound FIRST so it drops LAST (locals drop in reverse declaration
-    // order): the permit outlives every settle step below, on success and
-    // on every early-return Err(...) alike — never call `.forget()`.
-    let _spawn_permit = inputs.permit.take();
+    // D-C-R (2026-07-30): the spawn-gate permit is now acquired BELOW, after
+    // the (possibly ~long) codex managed plan, so codex planning never holds a
+    // server-wide spawn permit. Declared first so it drops last (RAII scope:
+    // acquire → PTY fork → every settle step → drop).
+    let mut _spawn_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
     let GatedSettleInputs {
-        permit: _,
         state,
         body,
         tab_id,
@@ -1268,13 +1231,12 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        // D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH): this plan runs UNDER
-        // the held spawn permit — plan_create_with_retry can hold it ~226s
-        // worst case (5 × SIDECAR_START_BUDGET 45s + 1s backoff) vs the 10s
-        // permit wait. Accepted while the flag defaults OFF. If the default
-        // ever flips ON, the permit-hold duration MUST be revisited (likely
-        // a separate sidecar budget covering both doors). Decision record:
-        // docs/plans/2026-07-27-rest-spawn-gate.md §D-C.
+        // D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH) — RESOLVED 2026-07-30
+        // (DEV-0006 S5.e precondition): this plan no longer runs under the
+        // held spawn permit (acquire moved below the plan, WS-auto-resume
+        // mirror), and concurrent plans are bounded by the manager's sidecar
+        // planning budget (CODEX_SIDECAR_PLAN_CONCURRENCY=2, fail-fast).
+        // Decision record: docs/plans/2026-07-27-rest-spawn-gate.md §D-C addendum.
         //
         // DEV-0006 S4 inc.2 (FLAG-GATED, default OFF — council fence): with
         // `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed app-server launch through
@@ -1469,6 +1431,40 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         }))
     };
 
+    // Server-wide spawn gate — acquired AFTER the codex managed plan (D-C-R,
+    // 2026-07-30): mirrors the WS auto-resume door (plan → acquire → discard
+    // on rejection). Decision record: docs/plans/2026-07-27-rest-spawn-gate.md
+    // §D-C addendum. `None` (unwired) = ungated.
+    if let Some(rest_gate) = state.spawn_gate() {
+        match rest_gate
+            .gate
+            .acquire_uncancellable(rest_gate.timeout)
+            .await
+        {
+            Ok(permit) => _spawn_permit = Some(permit),
+            Err(err) => {
+                if let Some(launch) = codex_launch.take() {
+                    freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
+                        .discard(launch)
+                        .await;
+                }
+                // The SAME cleanup statements the PTY-spawn-failure arm below
+                // runs (MCP config cleanup + amplifier-stub GC): nothing has
+                // been spawned yet, but the mode branch above may already have
+                // written MCP config file(s), and the amplifier stub was
+                // pre-created in `spawn_terminal_pane` — both are litter for a
+                // create that will never happen.
+                if mode != "shell" {
+                    cleanup_mcp_config(&RealMcpRuntime, &terminal_id, &mode, mcp_cwd.as_deref());
+                }
+                if let Some(stub) = amplifier_stub.as_ref().filter(|s| s.created) {
+                    let _ = freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
+                }
+                return Err(spawn_gate_error_response(err, rest_gate.timeout));
+            }
+        }
+    }
+
     // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
     // spawns occupy a permit + a blocking thread, never an async worker (WS
     // lane ledger A4: on hosts with nproc <= spawn_concurrency, N inline
@@ -1584,6 +1580,9 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // exit hook above tears it down. Adoption only fails when the planner/sidecar is
     // already shutting down (server exit); legacy's thrown adopt fails the create, so
     // kill the just-spawned pty and surface the error (500 — not an input error).
+    // S5.b / D-03: capture "managed?" BEFORE the adopt below takes the launch
+    // out of the Option — the arm suppression further down keys off it.
+    let managed_codex = codex_launch.is_some();
     if let Some(launch) = codex_launch.take() {
         if let Err(message) = freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
             .adopt(&terminal_id, launch, 0)
@@ -1613,6 +1612,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         &mode,
         cwd.as_deref(),
         resume_session_id.as_deref(),
+        managed_codex,
     );
 
     // D8 winner bind (REST rung): record sessionRef->terminalId in the
@@ -2295,18 +2295,18 @@ mod tests {
 
     // ── DEV-0006 S4 inc.2: the REST codex managed-launch gate + resume echo ─────────────
 
-    /// Same council fence as the WS path: managed codex launch is FLAG-GATED,
-    /// default OFF; only mode=codex + flag exactly "1" plans a launch. Flag OFF
-    /// keeps the shipped REST codex behavior byte-identical.
+    /// DEV-0006 S5.e, same gate as the WS path: managed codex launch defaults ON;
+    /// only the exact string "0" opts out. Mode scoping is unchanged: non-codex
+    /// modes never plan.
     #[test]
     fn rest_codex_managed_launch_gate_is_mode_and_flag_scoped() {
         assert!(codex_create_uses_managed_launch("codex", Some("1")));
-        assert!(!codex_create_uses_managed_launch("codex", None));
+        assert!(codex_create_uses_managed_launch("codex", None));
+        assert!(codex_create_uses_managed_launch("codex", Some("")));
         assert!(!codex_create_uses_managed_launch("codex", Some("0")));
-        assert!(!codex_create_uses_managed_launch("codex", Some("")));
         assert!(!codex_create_uses_managed_launch("shell", Some("1")));
-        assert!(!codex_create_uses_managed_launch("claude", Some("1")));
-        assert!(!codex_create_uses_managed_launch("opencode", Some("1")));
+        assert!(!codex_create_uses_managed_launch("claude", None));
+        assert!(!codex_create_uses_managed_launch("opencode", None));
     }
 
     /// `agentRouteErrorStatus` (`router.ts:54-59`): a `CodexLaunchConfigError` (invalid
@@ -3091,7 +3091,30 @@ mod tests {
         // locator tests pass Some(std::sync::Arc::new(...)) because the
         // builders take Option (with_opencode_locator / with_codex_locator).
 
-        arm_locators_for_fresh_pane(&state, "term-codex-1", "codex", Some("/tmp/proj"), None);
+        // S5.b / D-03: a MANAGED codex pane binds identity from the proxy
+        // Candidate stream, so the REST door must never arm the codex locator.
+        arm_locators_for_fresh_pane(
+            &state,
+            "term-codex-0",
+            "codex",
+            Some("/tmp/proj"),
+            None,
+            true,
+        );
+        assert_eq!(
+            locator.armed_count(),
+            0,
+            "managed codex panes must never arm the locator (D-03)"
+        );
+
+        arm_locators_for_fresh_pane(
+            &state,
+            "term-codex-1",
+            "codex",
+            Some("/tmp/proj"),
+            None,
+            false,
+        );
 
         assert_eq!(
             locator.armed_count(),
@@ -3389,6 +3412,9 @@ mod tests {
 
     #[tokio::test]
     async fn create_codex_tab_accepts_session_ref_and_derives_resume_args() {
+        // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+        // plain-CLI codex path (recording CLI spec, no app-server), so pin OFF.
+        std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
         let argv_file = unique_argv_file("codex-accept");
         let state =
             state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
@@ -4527,6 +4553,9 @@ mod tests {
     /// re-opens); non-submit text must not touch either.
     #[tokio::test]
     async fn send_keys_enter_feeds_codex_locator() {
+        // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+        // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
+        std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
         let root = unique_temp_home("codex-submit");
         let argv_file = unique_argv_file("codex-submit");
         let locator = std::sync::Arc::new(freshell_sessions::codex_locator::CodexLocator::new(

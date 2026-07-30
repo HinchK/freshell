@@ -1033,10 +1033,10 @@ fn home_dir() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// DEV-0006 S4 gate (council fence: FLAG-GATED, default OFF): a codex terminal.create
-/// plans a managed app-server launch ONLY when the mode is codex AND the
-/// `FRESHELL_CODEX_MANAGED_LAUNCH` flag is exactly `"1"`. Flag OFF keeps the shipped
-/// plain-CLI codex argv byte-identical (golden G-X0 stays the live-path shape).
+/// DEV-0006 gate (S5.e: default ON): a codex terminal.create plans a managed
+/// app-server launch when the mode is codex, unless the
+/// `FRESHELL_CODEX_MANAGED_LAUNCH` flag is exactly `"0"` — the only opt-out
+/// back to the plain-CLI codex argv.
 fn codex_create_uses_managed_launch(mode: &str, flag_value: Option<&str>) -> bool {
     mode == "codex" && freshell_codex::launch_plan::codex_managed_launch_enabled(flag_value)
 }
@@ -1091,13 +1091,13 @@ fn cli_provider_settings(
     (pick("permissionMode"), pick("model"), pick("sandbox"))
 }
 
-/// codex `--remote <wsUrl>` planning (DEV-0006 S4, FLAG-GATED default OFF —
-/// council fence): with `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed
-/// app-server launch (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote
-/// proxy, 5-attempt initial budget); the codex provider settings route through
-/// the PLAN, not argv (the `ws:2464-2465` strip). Flag OFF: `Ok(None)` —
-/// today's plain-CLI launch, byte-identical to the shipped deviation shape
-/// (golden G-X0) — DEV-0006 stays open until S5 flips the default.
+/// codex `--remote <wsUrl>` planning (DEV-0006, `FRESHELL_CODEX_MANAGED_LAUNCH`
+/// default ON since S5.e): plan the managed app-server launch
+/// (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote proxy, 5-attempt
+/// initial budget); the codex provider settings route through the PLAN, not
+/// argv (the `ws:2464-2465` strip). Flag `"0"` opts out to the plain-CLI shape
+/// (`Ok(None)` — the retired G-X0 shape; G-X1/G-X2 pin the live path since the
+/// S5.e flip).
 ///
 /// Extracted from `handle_create` so the auto-resume respawn seam (Task 4)
 /// plans identically. `Err` carries the thrown planCodexLaunch message —
@@ -2001,13 +2001,13 @@ pub(crate) async fn handle_create(
         None
     };
 
-    // codex `--remote <wsUrl>` (DEV-0006 S4, FLAG-GATED default OFF — council fence):
-    // with `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed app-server launch
-    // (`planCodexLaunch`, ws:2442-2449: sidecar spawn + remote proxy, 5-attempt
-    // initial budget) and point the TUI at the PROXY's ws URL; the codex provider
-    // settings route through the PLAN, not argv (the `ws:2464-2465` strip above).
-    // Flag OFF: today's plain-CLI launch, byte-identical to the shipped deviation
-    // shape (golden G-X0) — DEV-0006 stays open until S5 flips the default.
+    // codex `--remote <wsUrl>` (DEV-0006, `FRESHELL_CODEX_MANAGED_LAUNCH` default
+    // ON since S5.e): plan the managed app-server launch (`planCodexLaunch`,
+    // ws:2442-2449: sidecar spawn + remote proxy, 5-attempt initial budget) and
+    // point the TUI at the PROXY's ws URL; the codex provider settings route
+    // through the PLAN, not argv (the `ws:2464-2465` strip above). Flag `"0"`
+    // opts out to the plain-CLI shape (the retired G-X0 shape; G-X1/G-X2 pin the
+    // live path since the S5.e flip).
     // Extracted to `plan_codex_managed_launch` (shared with the auto-resume
     // respawn seam, Task 4). Legacy plans with the RAW create cwd (`ws:2444`
     // passes `m.cwd`).
@@ -2424,6 +2424,10 @@ pub(crate) async fn handle_create(
         let mode = mode.clone();
         let cwd = resolved_cwd.clone();
         let resume = resume_session_id.clone();
+        // S5.b / D-03: managed panes bind identity from the proxy Candidate
+        // stream, so the locator never ARMS for them (suppressed inside
+        // `maybe_arm` -- never via `locator.disarm`).
+        let managed_codex = codex_remote_ws_url.is_some();
         let _ = tokio::task::spawn_blocking(move || {
             crate::codex_association::maybe_arm(
                 &state,
@@ -2431,6 +2435,7 @@ pub(crate) async fn handle_create(
                 &mode,
                 cwd.as_deref(),
                 resume.as_deref(),
+                managed_codex,
             );
             // Resume-launched codex panes are (correctly) refused by arm() --
             // their session already exists. They DO need fork detection: an
@@ -3014,6 +3019,10 @@ pub async fn respawn_agent_terminal(
         let mode = mode.clone();
         let cwd = resolved_cwd.clone();
         let resume = resume_session_id.clone();
+        // S5.b / D-03: managed panes bind identity from the proxy Candidate
+        // stream, so the locator never ARMS for them (suppressed inside
+        // `maybe_arm` -- never via `locator.disarm`).
+        let managed_codex = codex_remote_ws_url.is_some();
         let _ = tokio::task::spawn_blocking(move || {
             crate::codex_association::maybe_arm(
                 &state,
@@ -3021,6 +3030,7 @@ pub async fn respawn_agent_terminal(
                 &mode,
                 cwd.as_deref(),
                 resume.as_deref(),
+                managed_codex,
             );
         })
         .await;
@@ -4729,18 +4739,17 @@ mod cli_create_helper_tests {
         assert_eq!(js_number_string(" "), "0");
     }
 
-    /// DEV-0006 S4 council fence: managed codex launch is FLAG-GATED, default OFF.
-    /// OFF keeps today's plain-CLI codex behavior byte-identical (golden G-X0 stays
-    /// the live-path shape); only mode=codex + flag exactly "1" plans a launch.
+    /// DEV-0006 S5.e: managed codex launch defaults ON; only the exact string
+    /// "0" opts out. Mode scoping is unchanged: non-codex modes never plan.
     #[test]
     fn codex_managed_launch_gate_is_mode_and_flag_scoped() {
         assert!(codex_create_uses_managed_launch("codex", Some("1")));
-        assert!(!codex_create_uses_managed_launch("codex", None));
+        assert!(codex_create_uses_managed_launch("codex", None));
+        assert!(codex_create_uses_managed_launch("codex", Some("")));
         assert!(!codex_create_uses_managed_launch("codex", Some("0")));
-        assert!(!codex_create_uses_managed_launch("codex", Some("")));
         assert!(!codex_create_uses_managed_launch("shell", Some("1")));
-        assert!(!codex_create_uses_managed_launch("claude", Some("1")));
-        assert!(!codex_create_uses_managed_launch("opencode", Some("1")));
+        assert!(!codex_create_uses_managed_launch("claude", None));
+        assert!(!codex_create_uses_managed_launch("opencode", None));
     }
 
     #[test]

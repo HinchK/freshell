@@ -26,6 +26,7 @@ pub mod backpressure;
 pub mod claude_signal;
 pub mod codex_association;
 pub(crate) mod codex_identity;
+pub mod codex_proxy_route;
 pub(crate) mod codex_reconcile;
 pub mod create_dedupe;
 pub(crate) mod create_gate;

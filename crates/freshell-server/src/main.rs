@@ -872,6 +872,16 @@ async fn main() -> ExitCode {
             LOCATOR_SWEEP_INTERVAL,
         );
     }
+    // DEV-0006 S5.a: proxy-event sink + router (the ONE consumer of managed
+    // codex launches' RemoteProxyEvent streams). UNCONDITIONAL — a managed
+    // pane's gate release depends on the router even when the locator is
+    // absent — and installed before the HTTP listener binds.
+    let (codex_proxy_events_tx, codex_proxy_events_rx) = tokio::sync::mpsc::unbounded_channel();
+    freshell_codex::launch_lifecycle::set_codex_proxy_event_sink(codex_proxy_events_tx);
+    freshell_ws::codex_proxy_route::spawn_codex_proxy_router(
+        ws_state.clone(),
+        codex_proxy_events_rx,
+    );
     // P4 (stale-resume-identity): claude SessionStart signal sweep — drains
     // the signal files Task 11's launch hook writes
     // (`$HOME/.freshell/session-signals/claude/<terminal_id>__<nonce>.json`)

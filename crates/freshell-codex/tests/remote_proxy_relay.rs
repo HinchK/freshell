@@ -351,6 +351,8 @@ async fn thread_fork_request_is_rewritten_to_exclude_turns_before_forwarding() {
         CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
             .await
             .unwrap();
+    // S5.c: release the identity gate up front — this test exercises fork rewrite, not the gate.
+    proxy.mark_candidate_persisted();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let mut conn = upstream.accept().await;
 
@@ -390,6 +392,8 @@ async fn thread_fork_response_is_normalized_for_the_tui_and_yields_a_candidate()
         CodexRemoteProxy::start(CodexRemoteProxyOptions::new(&upstream.ws_url, true))
             .await
             .unwrap();
+    // S5.c: release the identity gate up front — this test exercises fork rewrite, not the gate.
+    proxy.mark_candidate_persisted();
     let mut tui = connect_tui(proxy.ws_url()).await;
     let mut conn = upstream.accept().await;
 

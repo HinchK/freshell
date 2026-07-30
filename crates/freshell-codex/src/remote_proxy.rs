@@ -13,17 +13,14 @@
 //!
 //! ## Scope decisions (flagged; see the task report for the full rationale)
 //!
-//! - **The "identity gate" (`initial_capture`/`fork_handoff` hold-until-persisted
-//!   mechanism, `remote-proxy.ts:67-96,206-256,842-980`) is deliberately OUT OF SCOPE for
-//!   this slice.** Its entire purpose is to hold `turn/start`/`thread/fork` client
-//!   requests until a durability consumer calls `markCandidatePersisted()` — a consumer
-//!   that does not exist until Slice 3/5 wire durability. Porting the hold-forever gate
-//!   with nothing to ever release it would make every codex terminal pane in the interim
-//!   worse, not safer. `CodexRemoteProxyOptions` therefore has no
-//!   `require_candidate_persistence` knob yet; `mark_candidate_persisted`/
-//!   `fail_candidate_capture`/`pause_candidate_capture`/`resume_candidate_capture` and the
-//!   new-connection-rejection-after-failure path are not ported. Add them when Slice 3
-//!   defines what "persisted" means and wires the call.
+//! - **The `initial_capture` identity gate IS ported (DEV-0006 S5.c).** When
+//!   `require_candidate_persistence` is true, client `turn/start`/`thread/fork` requests
+//!   are HELD until the durability consumer calls
+//!   [`CodexRemoteProxy::mark_candidate_persisted`]; capture failure/timeout answers the
+//!   held frames with JSON-RPC `-32000` errors and emits
+//!   [`RemoteProxyRepairTrigger::CandidateCaptureTimeout`]. The `fork_handoff` gate
+//!   variant (and its `pause_candidate_capture`/`resume_candidate_capture` controls)
+//!   remains UNPORTED — codexForkHandoff is fenced off (spec S5 out-of-scope list).
 //! - **The proxy's own listener socket + the sidecar-process ownership reaper
 //!   (`transport::reap_owned_codex_sidecars`) are different lifecycles.** `close()` here
 //!   tears down the WS listener and all active client/upstream socket pairs (mirrors
@@ -48,6 +45,7 @@
 //!   sequential integers/strings) never hit this edge.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Map, Value};
@@ -85,6 +83,13 @@ const STATEFUL_NOTIFICATION_METHODS: &[&str] = &[
 /// `MAX_COMPLETED_TURN_KEYS` (`remote-proxy.ts:95`).
 const MAX_COMPLETED_TURN_KEYS: usize = 256;
 
+/// `DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS` (`remote-proxy.ts:94`).
+pub const CANDIDATE_CAPTURE_TIMEOUT_MS: u64 = 45_000;
+/// `DEFAULT_REQUEST_HOLD_TIMEOUT_MS` (`remote-proxy.ts:93`) — armed on the FIRST held frame.
+pub const IDENTITY_GATE_HOLD_TIMEOUT_MS: u64 = 5_000;
+/// Legacy cap on held gate frames (`remote-proxy.ts` initial_capture hold queue).
+pub const MAX_HELD_IDENTITY_GATE_FRAMES: usize = 32;
+
 // ── public options / errors ─────────────────────────────────────────────────────────
 
 /// Constructor options (`CodexRemoteProxyOptions`, `remote-proxy.ts:84-91`) — scoped to
@@ -97,10 +102,16 @@ pub struct CodexRemoteProxyOptions {
     /// `requireCandidatePersistence` (`remote-proxy.ts:89,140`). Legacy defaults this to
     /// `true` AT THE PROXY; the Rust options carry NO default — the launch planner passes
     /// the plan's value explicitly on both the fresh and resume branches (S3 review
-    /// note 2: no shadow default may stand in for the planner's intent). RECORDED ONLY in
-    /// this slice: the identity gate that consumes it (`markCandidatePersisted`,
-    /// hold-until-persisted) is deliberately deferred to S5 — see the module docs.
+    /// note 2: no shadow default may stand in for the planner's intent). Consumed by the
+    /// S5.c `initial_capture` identity gate (hold `turn/start`/`thread/fork` until
+    /// [`CodexRemoteProxy::mark_candidate_persisted`]).
     pub require_candidate_persistence: bool,
+    /// `DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS` override (`remote-proxy.ts:94,139`);
+    /// default [`CANDIDATE_CAPTURE_TIMEOUT_MS`].
+    pub candidate_capture_timeout_ms: u64,
+    /// `DEFAULT_REQUEST_HOLD_TIMEOUT_MS` override (`remote-proxy.ts:93`);
+    /// default [`IDENTITY_GATE_HOLD_TIMEOUT_MS`].
+    pub identity_gate_hold_timeout_ms: u64,
 }
 
 impl CodexRemoteProxyOptions {
@@ -109,6 +120,8 @@ impl CodexRemoteProxyOptions {
             upstream_ws_url: upstream_ws_url.into(),
             max_raw_forward_bytes: MAX_RAW_FORWARD_BYTES,
             require_candidate_persistence,
+            candidate_capture_timeout_ms: CANDIDATE_CAPTURE_TIMEOUT_MS,
+            identity_gate_hold_timeout_ms: IDENTITY_GATE_HOLD_TIMEOUT_MS,
         }
     }
 }
@@ -157,9 +170,7 @@ pub enum ThreadLifecycleLossEvent {
     ThreadStatusChanged { thread_id: String, status: String },
 }
 
-/// `CodexRemoteProxyRepairTrigger` (`remote-proxy.ts:36-38`) — scoped to the variants this
-/// slice's relay loop can actually produce; `candidate_capture_timeout` is omitted (it's
-/// the deferred identity-gate's, see module docs).
+/// `CodexRemoteProxyRepairTrigger` (`remote-proxy.ts:36-38`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum RemoteProxyRepairTrigger {
     ProxyClose,
@@ -170,6 +181,9 @@ pub enum RemoteProxyRepairTrigger {
         watch_id: String,
         changed_paths: Vec<String>,
     },
+    /// `repair_trigger{kind:'candidate_capture_timeout'}` — the S5.c identity gate
+    /// timed out waiting for the durability consumer to persist the candidate.
+    CandidateCaptureTimeout,
 }
 
 /// The proxy's typed consumer event stream — the seam Slice 3/5 will subscribe to for
@@ -222,7 +236,26 @@ impl CodexRemoteProxy {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let (hub_tx, hub_rx) = mpsc::unbounded_channel();
 
-        let hub_task = tokio::spawn(run_hub(hub_rx, events_tx, options.max_raw_forward_bytes));
+        let hub_task = tokio::spawn(run_hub(
+            hub_rx,
+            events_tx,
+            options.max_raw_forward_bytes,
+            options.require_candidate_persistence,
+            options.identity_gate_hold_timeout_ms,
+            hub_tx.clone(),
+        ));
+
+        // Arm the candidate-capture timer (`DEFAULT_CANDIDATE_CAPTURE_TIMEOUT_MS`,
+        // `remote-proxy.ts:94`): if nothing persists (or fails) the candidate first,
+        // the gate fails with `candidate_capture_timeout`.
+        if options.require_candidate_persistence {
+            let timer_tx = hub_tx.clone();
+            let timeout_ms = options.candidate_capture_timeout_ms;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                let _ = timer_tx.send(HubMsg::CandidateCaptureTimedOut);
+            });
+        }
 
         let upstream_ws_url = options.upstream_ws_url;
         let accept_hub_tx = hub_tx.clone();
@@ -266,9 +299,23 @@ impl CodexRemoteProxy {
         self.require_candidate_persistence
     }
 
+    /// S5.c release: the durability consumer persisted the candidate
+    /// (`markCandidatePersisted`, `remote-proxy.ts:206-256`). Fire-and-forget.
+    pub fn mark_candidate_persisted(&self) {
+        let _ = self.hub_tx.send(HubMsg::MarkCandidatePersisted);
+    }
+
+    /// S5.c failure: the candidate was refused (identity guards) — reject held
+    /// frames and close (`failCandidateCapture`).
+    pub fn fail_candidate_capture(&self, message: &str) {
+        let _ = self.hub_tx.send(HubMsg::FailCandidateCapture {
+            message: message.to_string(),
+        });
+    }
+
     /// Tear down the listener and every active client/upstream socket pair
-    /// (`close()`, `remote-proxy.ts:178-204` — sans the identity-gate held-frame drain,
-    /// deliberately out of scope here; see module docs).
+    /// (`close()`, `remote-proxy.ts:178-204`), draining the identity gate first:
+    /// any still-held gated frames are answered with -32000 errors on shutdown.
     pub async fn close(self) {
         self.accept_task.abort();
         let (done_tx, done_rx) = oneshot::channel();
@@ -324,6 +371,12 @@ enum HubMsg {
     UpstreamErrored {
         conn_id: u64,
     },
+    MarkCandidatePersisted,
+    FailCandidateCapture {
+        message: String,
+    },
+    CandidateCaptureTimedOut,
+    IdentityGateHoldTimedOut,
     Shutdown {
         done: oneshot::Sender<()>,
     },
@@ -536,6 +589,29 @@ impl ConnState {
     }
 }
 
+struct HeldGateFrame {
+    conn_id: u64,
+    data: Vec<u8>,
+    binary: bool,
+}
+
+/// The ported `initial_capture` identity gate (`remote-proxy.ts:67-96,422-425`).
+/// The fork_handoff gate variant is NOT ported (codexForkHandoff is fenced off,
+/// spec S5 out-of-scope list) — this gate has exactly one reason.
+enum IdentityGate {
+    /// require_candidate_persistence=false, or the candidate was persisted.
+    Open,
+    /// Fresh managed launch awaiting candidate persistence. `held_bytes` is
+    /// the cumulative size of the held frames (legacy `heldBytes`, ledger A28).
+    Holding {
+        held: Vec<HeldGateFrame>,
+        held_bytes: usize,
+        hold_timer_armed: bool,
+    },
+    /// Capture failed or timed out: gated methods are rejected outright.
+    Failed,
+}
+
 struct Hub {
     connections: HashMap<u64, ConnState>,
     max_raw_forward_bytes: usize,
@@ -543,6 +619,10 @@ struct Hub {
     completed_turn_keys_set: HashSet<String>,
     completed_turn_keys_order: VecDeque<String>,
     events_tx: mpsc::UnboundedSender<RemoteProxyEvent>,
+    identity_gate: IdentityGate,
+    /// The hub's own inbox — used to arm the hold timer on the FIRST held frame.
+    hub_tx: mpsc::UnboundedSender<HubMsg>,
+    hold_timeout_ms: u64,
 }
 
 /// The FULL upstream side-effect bundle for one notification frame — mirrors
@@ -562,6 +642,9 @@ async fn run_hub(
     mut rx: mpsc::UnboundedReceiver<HubMsg>,
     events_tx: mpsc::UnboundedSender<RemoteProxyEvent>,
     max_raw_forward_bytes: usize,
+    require_candidate_persistence: bool,
+    hold_timeout_ms: u64,
+    hub_tx: mpsc::UnboundedSender<HubMsg>,
 ) {
     let mut hub = Hub {
         connections: HashMap::new(),
@@ -570,6 +653,17 @@ async fn run_hub(
         completed_turn_keys_set: HashSet::new(),
         completed_turn_keys_order: VecDeque::new(),
         events_tx,
+        identity_gate: if require_candidate_persistence {
+            IdentityGate::Holding {
+                held: Vec::new(),
+                held_bytes: 0,
+                hold_timer_armed: false,
+            }
+        } else {
+            IdentityGate::Open
+        },
+        hub_tx,
+        hold_timeout_ms,
     };
 
     while let Some(msg) = rx.recv().await {
@@ -637,7 +731,45 @@ async fn run_hub(
                 ));
                 hub.close_connection(conn_id);
             }
+            HubMsg::MarkCandidatePersisted => {
+                hub.release_identity_gate();
+            }
+            HubMsg::FailCandidateCapture { message } => {
+                if matches!(hub.identity_gate, IdentityGate::Holding { .. }) {
+                    let msg = format!("Codex candidate capture failed: {message}");
+                    // A28: any initial-capture failure (identity-guard refusal
+                    // included) fires candidate_capture_timeout, not proxy_error.
+                    hub.fail_identity_gate(
+                        &msg,
+                        Some(RemoteProxyRepairTrigger::CandidateCaptureTimeout),
+                    );
+                }
+            }
+            HubMsg::CandidateCaptureTimedOut => {
+                if matches!(hub.identity_gate, IdentityGate::Holding { .. }) {
+                    hub.fail_identity_gate(
+                        "Codex candidate capture timed out before the candidate was persisted.",
+                        Some(RemoteProxyRepairTrigger::CandidateCaptureTimeout),
+                    );
+                }
+            }
+            HubMsg::IdentityGateHoldTimedOut => {
+                if let IdentityGate::Holding { held, .. } = &hub.identity_gate {
+                    if !held.is_empty() {
+                        hub.fail_identity_gate(
+                            "Codex identity gate held a request past the hold timeout.",
+                            Some(RemoteProxyRepairTrigger::CandidateCaptureTimeout),
+                        );
+                    }
+                }
+            }
             HubMsg::Shutdown { done } => {
+                if matches!(hub.identity_gate, IdentityGate::Holding { .. }) {
+                    hub.fail_identity_gate(
+                        "Codex remote proxy closed while identity-gated requests were held.",
+                        None,
+                    );
+                }
                 for (_, conn) in hub.connections.drain() {
                     if let Some(tx) = conn.client_tx {
                         let _ = tx.send(WriterMsg::Close);
@@ -712,6 +844,37 @@ impl Hub {
         self.send_to_client(conn_id, bytes, false);
     }
 
+    fn release_identity_gate(&mut self) {
+        let gate = std::mem::replace(&mut self.identity_gate, IdentityGate::Open);
+        if let IdentityGate::Holding { held, .. } = gate {
+            // Replay in order through the normal path (thread/fork frames get
+            // their exclude-turns rewrite; turn/start forwards).
+            for frame in held {
+                self.handle_client_frame(frame.conn_id, frame.data, frame.binary);
+            }
+        }
+    }
+
+    /// `failIdentityGate(..., closeAllConnections: true)` (`remote-proxy.ts:948-980`):
+    /// answer every held frame with a -32000 error, mark the gate failed, and
+    /// close every socket pair.
+    fn fail_identity_gate(&mut self, message: &str, trigger: Option<RemoteProxyRepairTrigger>) {
+        let gate = std::mem::replace(&mut self.identity_gate, IdentityGate::Failed);
+        if let IdentityGate::Holding { held, .. } = gate {
+            for frame in held {
+                let id = scan_json_rpc_envelope(&frame.data).ok().and_then(|e| e.id);
+                self.send_json_rpc_error_to_client(frame.conn_id, id.as_ref(), message);
+            }
+        }
+        if let Some(trigger) = trigger {
+            self.emit(RemoteProxyEvent::RepairTrigger(trigger));
+        }
+        let conn_ids: Vec<u64> = self.connections.keys().copied().collect();
+        for conn_id in conn_ids {
+            self.close_connection(conn_id);
+        }
+    }
+
     fn send_json_rpc_success_to_client(&self, conn_id: u64, id: &JsonRpcEnvelopeId) {
         let obj = serde_json::json!({"id": envelope_id_to_json(id), "result": {}});
         let bytes = serde_json::to_vec(&obj).unwrap_or_default();
@@ -763,6 +926,76 @@ impl Hub {
 
         let method = envelope.method.clone();
         let id = envelope.id.clone();
+
+        // S5.c identity gate (`remote-proxy.ts:422-425`): on a fresh managed
+        // launch, hold turn/start + thread/fork until the durability consumer
+        // persists the candidate. Everything else flows so the pane boots.
+        if matches!(method.as_deref(), Some("turn/start") | Some("thread/fork")) {
+            let mut frame_held = false;
+            match &mut self.identity_gate {
+                IdentityGate::Holding {
+                    hold_timer_armed, ..
+                } => {
+                    if !*hold_timer_armed {
+                        *hold_timer_armed = true;
+                        let timer_tx = self.hub_tx.clone();
+                        let timeout_ms = self.hold_timeout_ms;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+                            let _ = timer_tx.send(HubMsg::IdentityGateHoldTimedOut);
+                        });
+                    }
+                    frame_held = true;
+                }
+                IdentityGate::Failed => {
+                    self.send_json_rpc_error_to_client(
+                        conn_id,
+                        id.as_ref(),
+                        "Codex candidate capture failed; identity-gated request rejected.",
+                    );
+                    return;
+                }
+                IdentityGate::Open => {}
+            }
+            // (`frame_held`/`capture_failure` keep the `fail_identity_gate(&mut self, ...)`
+            // call OUTSIDE the `IdentityGate::Holding` borrow; `data` is moved into the
+            // hold queue only on this unconditionally-returning branch.)
+            if frame_held {
+                let mut capture_failure: Option<&'static str> = None;
+                if let IdentityGate::Holding {
+                    held, held_bytes, ..
+                } = &mut self.identity_gate
+                {
+                    // Legacy parity (ledger A28): push FIRST, then evaluate the
+                    // caps — queue overflow and the cumulative held-bytes cap
+                    // are capture FAILURES (legacy pushes the 33rd frame and
+                    // THEN fails the gate), never silent per-frame refusals.
+                    *held_bytes = held_bytes.saturating_add(data.len());
+                    held.push(HeldGateFrame {
+                        conn_id,
+                        data,
+                        binary,
+                    });
+                    if held.len() > MAX_HELD_IDENTITY_GATE_FRAMES {
+                        capture_failure =
+                            Some("Codex remote proxy identity gate hold queue overflowed.");
+                    } else if *held_bytes > self.max_raw_forward_bytes {
+                        capture_failure = Some(
+                            "Codex remote proxy identity gate held bytes exceeded the raw-forward cap.",
+                        );
+                    }
+                }
+                if let Some(message) = capture_failure {
+                    // A28: ANY initial-capture failure (overflow/refusal
+                    // included) fires candidate_capture_timeout.
+                    self.fail_identity_gate(
+                        message,
+                        Some(RemoteProxyRepairTrigger::CandidateCaptureTimeout),
+                    );
+                }
+                return;
+            }
+        }
 
         if method.as_deref() == Some("thread/fork") {
             self.handle_thread_fork_request(conn_id, data, binary, id);
@@ -912,6 +1145,29 @@ impl Hub {
         binary: bool,
         req_id: Option<RequestId>,
     ) {
+        // Legacy parity (`handleThreadStartResponse`, `remote-proxy.ts:526-543`): a frame
+        // small enough for a full parse is forwarded REGARDLESS — the candidate is emitted
+        // only when the response actually carries a valid thread
+        // (`maybeEmitThreadStartResponseCandidate`, `remote-proxy.ts:513-524`); e.g. a
+        // JSON-RPC ERROR response to thread/start relays untouched. Only an OVERSIZED
+        // frame takes the strict extract-or-fail-closed path.
+        if data.len() <= MAX_FULL_PARSE_BYTES {
+            if let Some(req_id) = req_id {
+                let mut pending = HashSet::new();
+                pending.insert(req_id);
+                if let Ok(candidate) = extract_thread_start_response_candidate(
+                    &data,
+                    &ThreadStartResponseOptions {
+                        pending_thread_start_request_ids: &pending,
+                    },
+                ) {
+                    self.emit(RemoteProxyEvent::Candidate(candidate));
+                }
+            }
+            self.send_to_client(conn_id, data, binary);
+            return;
+        }
+
         let Some(req_id) = req_id else {
             self.fail_unsafe_upstream_frame(
                 conn_id,

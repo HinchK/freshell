@@ -188,6 +188,9 @@ async fn failed_claude_resume_create_leaves_prior_binding_row_untouched() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fresh_identity_bearing_pane_gets_a_pending_marker_at_spawn() {
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sleeper CLI spec, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     // Trigger (d): identity in flight (fresh codex — no resume id) ->
     // durable pending marker from spawn until resolution.
     let dir = unique_ledger_dir("codex-pending");
@@ -231,6 +234,9 @@ async fn fresh_identity_bearing_pane_gets_a_pending_marker_at_spawn() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn resume_create_writes_binding_and_kill_retires_it_closed() {
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sleeper CLI spec, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     // Trigger (a/e): a resume create (identity known at spawn) writes the
     // binding row; an explicit user kill best-effort retires it `closed` —
     // never load-bearing, but recorded.

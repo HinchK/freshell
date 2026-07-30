@@ -59,9 +59,9 @@ pub const CODEX_LAUNCH_PLANNER_SHUTDOWN_MESSAGE: &str =
 pub const CODEX_SIDECAR_NOT_ADOPTABLE_MESSAGE: &str =
     "Codex launch sidecar is shutting down; it cannot be adopted.";
 
-/// How long a spawned app-server gets to bring its WS listener up — matches
-/// `freshell-freshagent/src/codex.rs::SIDECAR_START_BUDGET`.
-const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
+/// How long a spawned app-server gets to bring its WS listener up — the shared
+/// sidecar-spawn budget (S5.d.1 unification; also `freshell-freshagent`'s spawn).
+pub const SIDECAR_START_BUDGET: Duration = Duration::from_secs(45);
 
 // ─── the runtime seam (CodexRuntimeLike, launch-planner.ts:34-52, scoped) ───────────────
 
@@ -149,6 +149,21 @@ impl CodexLaunchSidecar {
             .proxy
             .as_ref()
             .map(|proxy| proxy.require_candidate_persistence())
+    }
+
+    /// S5.c: forward the persistence release to the live proxy's identity gate.
+    /// No-op once the proxy is torn down.
+    pub async fn mark_candidate_persisted(&self) {
+        if let Some(proxy) = self.inner.lock().await.proxy.as_ref() {
+            proxy.mark_candidate_persisted();
+        }
+    }
+
+    /// S5.c: forward a capture failure (candidate refused by identity guards).
+    pub async fn fail_candidate_capture(&self, message: &str) {
+        if let Some(proxy) = self.inner.lock().await.proxy.as_ref() {
+            proxy.fail_candidate_capture(message);
+        }
     }
 
     async fn assert_adoptable(&self) -> Result<(), String> {
@@ -369,11 +384,78 @@ impl CodexLaunchPlanner {
 
 // ─── the terminal-keyed manager (the ONE shared seam for both create paths) ─────────────
 
+/// S5.a: one proxy event, tagged with its adopting terminal.
+#[derive(Debug)]
+pub struct TerminalProxyEvent {
+    pub terminal_id: String,
+    /// The plan's create cwd (`CodexLaunchPlan.runtime_cwd`) — the identity
+    /// adoption tail's cwd hint.
+    pub cwd: Option<String>,
+    pub event: RemoteProxyEvent,
+}
+
+/// S5.d.2 DECISION (recorded): the manager stays a process-global singleton.
+/// Instead of DI'ing the 12 `::global()` call sites, freshell-ws installs this
+/// set-once sink at boot (the spawn-gate set-once-handle precedent) and runs
+/// the WsState-aware router on its far side. The drain task itself never
+/// needs WsState, so no singleton→DI conversion is required.
+static PROXY_EVENT_SINK: Mutex<Option<mpsc::UnboundedSender<TerminalProxyEvent>>> =
+    Mutex::new(None);
+
+/// Install the process-wide proxy-event sink. Called exactly once at server
+/// boot (before any codex terminal can be adopted); later calls replace the
+/// sink (test affordance).
+pub fn set_codex_proxy_event_sink(tx: mpsc::UnboundedSender<TerminalProxyEvent>) {
+    *PROXY_EVENT_SINK.lock().unwrap() = Some(tx);
+}
+
+fn codex_proxy_event_sink() -> Option<mpsc::UnboundedSender<TerminalProxyEvent>> {
+    PROXY_EVENT_SINK.lock().unwrap().clone()
+}
+
+/// S5.a: the ONE per-terminal drain task, spawned at adopt (covers all three
+/// adopt sites: WS create, WS auto-resume respawn, REST /api/tabs). Ends when
+/// the proxy's event senders drop (sidecar shutdown) or the sink closes.
+fn spawn_proxy_event_drain(
+    terminal_id: String,
+    cwd: Option<String>,
+    mut events: mpsc::UnboundedReceiver<RemoteProxyEvent>,
+    sink: Option<mpsc::UnboundedSender<TerminalProxyEvent>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            let Some(sink) = sink.as_ref() else {
+                // No consumer installed (tests / bare servers): drop, matching
+                // the pre-S5 parked-receiver behavior.
+                continue;
+            };
+            if sink
+                .send(TerminalProxyEvent {
+                    terminal_id: terminal_id.clone(),
+                    cwd: cwd.clone(),
+                    event,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+}
+
 struct AdoptedTerminalLaunch {
     sidecar: Arc<CodexLaunchSidecar>,
-    /// Held (unconsumed) so the proxy's event senders stay connected for S5.
-    _events: mpsc::UnboundedReceiver<RemoteProxyEvent>,
+    /// S5.a: the per-terminal proxy-event drain. Ends on its own when the
+    /// proxy's senders drop; aborted by the teardown worker as a belt.
+    drain: tokio::task::JoinHandle<()>,
 }
+
+/// D-C-REVISIT — RESOLVED (2026-07-30, spec S5.e precondition): sidecar
+/// planning budget covering BOTH doors. Bounds concurrent codex plans
+/// server-wide so a burst can never stack ~226s plan holds; waiters fail fast
+/// instead of queueing behind them.
+pub const CODEX_SIDECAR_PLAN_CONCURRENCY: usize = 2;
+pub const CODEX_SIDECAR_PLAN_WAIT: Duration = Duration::from_secs(30);
 
 /// The shared `resolve_codex_launch` seam (spec §5 Slice 4): plan → adopt-by-terminal-id →
 /// teardown-on-terminal-exit, used by BOTH the WS `terminal.create` codex branch and the
@@ -383,6 +465,8 @@ pub struct CodexTerminalLaunchManager {
     planner: CodexLaunchPlanner,
     adopted: Mutex<HashMap<String, AdoptedTerminalLaunch>>,
     teardown_tx: OnceLock<mpsc::UnboundedSender<AdoptedTerminalLaunch>>,
+    plan_budget: Arc<tokio::sync::Semaphore>,
+    plan_budget_wait: Duration,
 }
 
 impl CodexTerminalLaunchManager {
@@ -391,7 +475,21 @@ impl CodexTerminalLaunchManager {
             planner: CodexLaunchPlanner::new(runtime_factory),
             adopted: Mutex::new(HashMap::new()),
             teardown_tx: OnceLock::new(),
+            plan_budget: Arc::new(tokio::sync::Semaphore::new(CODEX_SIDECAR_PLAN_CONCURRENCY)),
+            plan_budget_wait: CODEX_SIDECAR_PLAN_WAIT,
         }
+    }
+
+    /// Test/DI constructor with an explicit sidecar planning budget.
+    pub fn with_plan_budget(
+        runtime_factory: CodexRuntimeFactory,
+        concurrency: usize,
+        wait: Duration,
+    ) -> Self {
+        let mut manager = Self::new(runtime_factory);
+        manager.plan_budget = Arc::new(tokio::sync::Semaphore::new(concurrency));
+        manager.plan_budget_wait = wait;
+        manager
     }
 
     /// The process-wide manager over the REAL spawn runtime — legacy has exactly one
@@ -413,6 +511,19 @@ impl CodexTerminalLaunchManager {
         attempts: u32,
     ) -> Result<CodexTerminalLaunch, CodexLaunchError> {
         self.ensure_teardown_worker();
+        let _budget =
+            match tokio::time::timeout(
+                self.plan_budget_wait,
+                self.plan_budget.clone().acquire_owned(),
+            )
+            .await
+            {
+                Ok(Ok(permit)) => permit,
+                _ => return Err(CodexLaunchError::Failed(
+                    "codex sidecar planning budget exhausted; too many concurrent codex launches"
+                        .to_string(),
+                )),
+            };
         self.planner
             .plan_create_with_retry(input, attempts, CODEX_INITIAL_LAUNCH_RETRY_DELAY_MS)
             .await
@@ -427,11 +538,21 @@ impl CodexTerminalLaunchManager {
         generation: u64,
     ) -> Result<(), String> {
         launch.sidecar.adopt(terminal_id, generation).await?;
+        // S5.d.3 DECISION (recorded): `launch.plan.binding_reason` is
+        // deliberately DROPPED here — the identity tail derives adopt-vs-rebind
+        // from context, and no Rust wire frame carries sessionBindingReason.
+        // See CodexLaunchPlan::binding_reason's doc.
+        let drain = spawn_proxy_event_drain(
+            terminal_id.to_string(),
+            launch.plan.runtime_cwd.clone(),
+            launch.events,
+            codex_proxy_event_sink(),
+        );
         self.adopted.lock().unwrap().insert(
             terminal_id.to_string(),
             AdoptedTerminalLaunch {
                 sidecar: launch.sidecar,
-                _events: launch.events,
+                drain,
             },
         );
         Ok(())
@@ -442,6 +563,40 @@ impl CodexTerminalLaunchManager {
     /// the create error the caller is already surfacing is the primary failure.
     pub async fn discard(&self, launch: CodexTerminalLaunch) {
         let _ = launch.sidecar.shutdown().await;
+    }
+
+    /// S5.c: release the candidate-persistence gate for an adopted terminal's
+    /// proxy. Called by the freshell-ws proxy-event router after
+    /// `adopt_codex_identity` returned true (the ledger write is awaited inside
+    /// that tail — fsync-before-announce IS the "persisted" signal). Idempotent;
+    /// unknown terminals are a silent no-op (legacy has five release sites, most
+    /// of them dedupe paths — this single seam is called on every candidate
+    /// re-observation too).
+    pub async fn mark_candidate_persisted(&self, terminal_id: &str) {
+        let sidecar = {
+            self.adopted
+                .lock()
+                .unwrap()
+                .get(terminal_id)
+                .map(|entry| entry.sidecar.clone())
+        };
+        if let Some(sidecar) = sidecar {
+            sidecar.mark_candidate_persisted().await;
+        }
+    }
+
+    /// S5.c: fail the gate for an adopted terminal (candidate refused).
+    pub async fn fail_candidate_capture(&self, terminal_id: &str, message: &str) {
+        let sidecar = {
+            self.adopted
+                .lock()
+                .unwrap()
+                .get(terminal_id)
+                .map(|entry| entry.sidecar.clone())
+        };
+        if let Some(sidecar) = sidecar {
+            sidecar.fail_candidate_capture(message).await;
+        }
     }
 
     /// Sync-safe (callable from the PTY exit hook's non-async thread): detach the
@@ -470,6 +625,7 @@ impl CodexTerminalLaunchManager {
         };
         for entry in adopted {
             let _ = entry.sidecar.shutdown().await;
+            entry.drain.abort();
         }
     }
 
@@ -479,6 +635,7 @@ impl CodexTerminalLaunchManager {
             tokio::spawn(async move {
                 while let Some(entry) = rx.recv().await {
                     let _ = entry.sidecar.shutdown().await;
+                    entry.drain.abort();
                 }
             });
             tx
@@ -556,8 +713,9 @@ impl SpawnedCodexAppServerRuntime {
 }
 
 /// Allocate a loopback ephemeral port (`allocateLocalhostPort`-shaped: bind
-/// `127.0.0.1:0`, read the assigned port, release). Never a fixed port.
-fn allocate_loopback_port() -> Result<u16, String> {
+/// `127.0.0.1:0`, read the assigned port, release). Never a fixed port. Shared
+/// sidecar-spawn mechanics (S5.d.1 unification; also `freshell-freshagent`'s spawn).
+pub fn allocate_loopback_port() -> Result<u16, String> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .map_err(|error| format!("loopback port allocation failed: {error}"))?;
     let port = listener
@@ -568,7 +726,10 @@ fn allocate_loopback_port() -> Result<u16, String> {
     Ok(port)
 }
 
-fn drain_child_io(child: &mut tokio::process::Child) {
+/// Drain the child's piped stdout/stderr to a sink so verbose app-server logs never
+/// back-pressure it. Shared sidecar-spawn mechanics (S5.d.1 unification; also
+/// `freshell-freshagent`'s spawn).
+pub fn drain_child_io(child: &mut tokio::process::Child) {
     if let Some(mut stdout) = child.stdout.take() {
         tokio::spawn(async move {
             let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
@@ -678,5 +839,58 @@ impl CodexLaunchRuntime for SpawnedCodexAppServerRuntime {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drain_forwards_tagged_events_to_the_sink() {
+        let (proxy_tx, proxy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = spawn_proxy_event_drain(
+            "term-1".to_string(),
+            Some("/tmp/work".to_string()),
+            proxy_rx,
+            Some(sink_tx),
+        );
+        proxy_tx
+            .send(crate::remote_proxy::RemoteProxyEvent::RepairTrigger(
+                crate::remote_proxy::RemoteProxyRepairTrigger::ProxyClose,
+            ))
+            .unwrap();
+        let tagged = tokio::time::timeout(std::time::Duration::from_secs(2), sink_rx.recv())
+            .await
+            .expect("drain must forward within 2s")
+            .expect("sink open");
+        assert_eq!(tagged.terminal_id, "term-1");
+        assert_eq!(tagged.cwd.as_deref(), Some("/tmp/work"));
+        assert!(matches!(
+            tagged.event,
+            crate::remote_proxy::RemoteProxyEvent::RepairTrigger(_)
+        ));
+        drop(proxy_tx); // senders gone -> drain exits
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("drain task must end when the proxy senders drop")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_without_a_sink_discards_and_survives() {
+        let (proxy_tx, proxy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = spawn_proxy_event_drain("term-2".to_string(), None, proxy_rx, None);
+        proxy_tx
+            .send(crate::remote_proxy::RemoteProxyEvent::RepairTrigger(
+                crate::remote_proxy::RemoteProxyRepairTrigger::ProxyClose,
+            ))
+            .unwrap();
+        drop(proxy_tx);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("no-sink drain must still terminate")
+            .unwrap();
     }
 }

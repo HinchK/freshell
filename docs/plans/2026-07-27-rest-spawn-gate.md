@@ -114,6 +114,20 @@ carries this forward.
 
 > Tripwire (added 2026-07-29, kata bccd item 5): grep `D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH)` — marker comments sit at the REST call site (`terminal_tabs.rs`) and on the flag const (`launch_plan.rs`) so the default flip cannot ship without hitting this decision.
 
+> **§D-C ADDENDUM — D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH) RESOLVED (2026-07-30, DEV-0006 S5.e).**
+> The flag default flipped ON with two mitigations, replacing the accepted flag-ON exposure:
+> (1) a **sidecar planning budget** inside `CodexTerminalLaunchManager::plan_create_with_retry`
+> (2 concurrent plans server-wide, 30 s bounded wait, fail-fast) covering both doors;
+> (2) the **REST door's acquire moved below the codex plan** (into `settle_gated_create`,
+> immediately before the PTY fork), mirroring the WS auto-resume door's plan→acquire→discard
+> ordering — a REST codex create no longer holds a spawn permit during planning. Trade-off
+> knowingly taken: gate rejection now requires cleanup (codex plan discard + MCP config +
+> amplifier-stub GC — the same statements as the PTY-spawn-failure arm), reversing this
+> section's "rejection needs NO cleanup" property for the post-plan acquire point.
+> RESIDUAL (accepted): WS restore-creates still plan under the caller-held permit
+> (`create_gate.rs`); the budget bounds that to ≤2 long holds server-wide. Revisit if a
+> restore-fleet incident implicates it. The in-code D-C-REVISIT markers now point here.
+
 **D-D. Codex sidecar evaluation.** (The kata has NO numbered items — its
 sidecar mention is the un-numbered aside *"Also noted: the codex-sidecar
 launch path bypasses the gate similarly"*, and it is NOT in the kata's

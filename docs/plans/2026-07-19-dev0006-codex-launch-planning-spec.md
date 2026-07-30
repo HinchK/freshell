@@ -18,6 +18,8 @@
 > **§8 reconciliation** for the revised remaining scope. Dated `> 2026-07-30:` annotations
 > throughout mark claims that are now historical. §7 anchors re-anchored to the 2026-07-30
 > `main` working tree.
+> **2026-07-30 (later):** Revised Slice 5 LANDED (docs/plans/2026-07-30-codex-managed-launch-s5.md):
+> flag default ON, G-X0 retired, DEV-0006 + DEV-0008 closed. The status lines above are historical.
 
 ---
 

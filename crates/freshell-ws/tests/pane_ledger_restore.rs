@@ -25,6 +25,9 @@ fn unique_ledger_dir(label: &str) -> std::path::PathBuf {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn inventory_stamping_falls_back_to_ledger_bound_rows() {
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sleeper CLI spec, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     // Authority chain (spec §4.2 precedence): in-memory registry first,
     // ledger bound rows second. HONESTY (V7.md / A21): this window is
     // FABRICATED — in production today, in-memory identity is written

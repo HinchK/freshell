@@ -348,7 +348,9 @@ async fn in_tui_fork_rebinds_the_pane_identity() {
     let sessions_day = sessions_root.join("2026").join("07").join("27");
     std::fs::create_dir_all(&sessions_day).expect("sessions tree");
     std::env::set_var("CODEX_HOME", codex_home.path());
-    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
 
     // 1. Spawn server with codex locator rooted at the temp sessions dir.
     let (url, registry) = common::spawn_server_with_specs_activity_and_codex_locator(
@@ -498,7 +500,9 @@ async fn resume_launched_pane_gets_fork_detection() {
     let sessions_day = sessions_root.join("2026").join("07").join("27");
     std::fs::create_dir_all(&sessions_day).expect("sessions tree");
     std::env::set_var("CODEX_HOME", codex_home.path());
-    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
 
     // Rollout A (the resumed session's file) exists BEFORE the create -- a
     // resume targets a session already on disk. The spawn-time watch
@@ -585,7 +589,9 @@ async fn after_rebind_a_recreate_resumes_the_new_session_id() {
     let sessions_day = sessions_root.join("2026").join("07").join("27");
     std::fs::create_dir_all(&sessions_day).expect("sessions tree");
     std::env::set_var("CODEX_HOME", codex_home.path());
-    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
     let capture_for = |phase: &str| {
         std::env::temp_dir().join(format!(
             "freshell-codex-fork-rebind-restart-argv-{phase}-{}.txt",
@@ -699,7 +705,9 @@ async fn fork_targeting_a_live_owned_session_is_refused() {
     let sessions_day = sessions_root.join("2026").join("07").join("27");
     std::fs::create_dir_all(&sessions_day).expect("sessions tree");
     std::env::set_var("CODEX_HOME", codex_home.path());
-    std::env::remove_var("FRESHELL_CODEX_MANAGED_LAUNCH");
+    // DEV-0006 S5.e: the managed-launch default is ON; this suite exercises the
+    // plain-CLI codex path (sh-script fake codex, no app-server), so pin OFF.
+    std::env::set_var("FRESHELL_CODEX_MANAGED_LAUNCH", "0");
 
     // Distinct cwds: the adoption lane's cwd match (and contested-cwd census)
     // must never couple the two panes.

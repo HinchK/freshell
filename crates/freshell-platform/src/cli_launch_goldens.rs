@@ -257,7 +257,10 @@ fn codex_inputs<'a>(injection: McpInjection) -> CliLaunchInputs<'a> {
     }
 }
 
-/// G-X1 — codex, linux, live path, fresh.
+/// G-X1 — codex, linux, live path, fresh. THE live-path pin since the S5.e
+/// flag flip (DEV-0006 closed): managed launches feed `codex_remote_ws_url`,
+/// so this is the shape every default codex create resolves to. (G-X0, the
+/// shipped-deviation no-remote shape, was retired at the flip.)
 #[test]
 fn g_x1_codex_live_fresh() {
     let mut inputs = codex_inputs(codex_mcp_unix());
@@ -283,9 +286,11 @@ fn g_x1_codex_live_fresh() {
             r#"mcp_servers.freshell.args=["--import", "/repo/node_modules/tsx/dist/loader.mjs", "/repo/server/mcp/server.ts"]"#.to_string(),
         ]
     );
+    assert!(launch.env.is_empty()); // folded from retired G-X0 (S5.e)
 }
 
 /// G-X2 — codex, linux, live path, resume: G-X1 args + resume pair last.
+/// Live-path pin since the S5.e flip.
 #[test]
 fn g_x2_codex_live_resume() {
     let mut fresh = codex_inputs(codex_mcp_unix());
@@ -726,35 +731,6 @@ fn gemini_env_injection_passes_through_command_env() {
             .map(String::as_str),
         Some("/tmp/freshell-mcp/term1.json")
     );
-}
-
-/// G-X0 — the ACTUAL SHIPPED codex live-path argv under deviation DEV-0006
-/// (spec §5 U2): `codex_remote_ws_url = None`, no model/sandbox (stripped on the
-/// live path), fresh. Pins the deviation's precise byte shape so a future
-/// refactor cannot half-emit the `--remote` pair unnoticed (council condition,
-/// 2026-07-13). When the codex app-server plan is wired into terminal.create,
-/// this golden is REPLACED by G-X1 as the live-path shape.
-#[test]
-fn g_x0_codex_shipped_deviation_shape_dev_0006() {
-    let launch =
-        resolve_coding_cli_command(&specs(), &codex_inputs(codex_mcp_unix()), &env_of(&[]))
-            .unwrap()
-            .unwrap();
-    assert_eq!(launch.command, "codex");
-    assert_eq!(
-        launch.args,
-        vec![
-            "-c".to_string(),
-            "tui.notification_method=bel".to_string(),
-            "-c".to_string(),
-            "tui.notifications=['agent-turn-complete']".to_string(),
-            "-c".to_string(),
-            r#"mcp_servers.freshell.command="node""#.to_string(),
-            "-c".to_string(),
-            r#"mcp_servers.freshell.args=["--import", "/repo/node_modules/tsx/dist/loader.mjs", "/repo/server/mcp/server.ts"]"#.to_string(),
-        ]
-    );
-    assert!(launch.env.is_empty());
 }
 
 // ===========================================================================
