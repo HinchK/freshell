@@ -2,16 +2,31 @@
 # deploy-tab-diff.sh -- pre/post-restart tab identity ritual (continuity trio
 # deliverable 3, docs/plans/2026-07-22-continuity-safety-trio.md).
 #
-#   scripts/deploy-tab-diff.sh capture --url U --token T --out before.json
+#   scripts/deploy-tab-diff.sh capture --url U --token T --out before.json [--allow-uncovered]
 #   ... restart/deploy the server ...
 #   scripts/deploy-tab-diff.sh verify  --url U --token T --before before.json
+#
+# capture GATES on coverage (docs/plans/2026-07-29-capture-coverage-gate.md):
+# if any running terminal is covered by NO persisted open-tab snapshot pane,
+# a restart permanently kills its pane (PTY, scrollback, placement --
+# session=none terminals are lost outright; session-bearing ones survive only
+# as manually recoverable sessions), so capture prints the uncovered list
+# (with mode/cwd/title/session), still writes the artifact for diagnosis, and
+# exits 4. Pass --allow-uncovered to accept the loss: same list as a WARNING,
+# exit 0.
+# verify re-runs the same guard on the before-file (defense in depth against
+# artifacts from older script versions or --allow-uncovered captures).
+#
+# Exit codes: 0 ok; 1 operational failure or post-restart divergence;
+# 2 usage; 4 capture coverage gap (artifact written, but restoring from it
+# would lose running terminal panes).
 #
 # READ-ONLY against the server (GETs only). Exit non-zero on any divergence.
 # NEVER point this at a server you do not operate. Requires curl + jq.
 set -euo pipefail
 
 CMD="${1:-}"; shift || true
-URL="" TOKEN="${FRESHELL_TOKEN:-}" OUT="" BEFORE="" AFTER_IN=""
+URL="" TOKEN="${FRESHELL_TOKEN:-}" OUT="" BEFORE="" AFTER_IN="" ALLOW_UNCOVERED=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --url) URL="$2"; shift 2 ;;
@@ -19,6 +34,7 @@ while [[ $# -gt 0 ]]; do
     --out) OUT="$2"; shift 2 ;;
     --before) BEFORE="$2"; shift 2 ;;
     --after) AFTER_IN="$2"; shift 2 ;;
+    --allow-uncovered) ALLOW_UNCOVERED=true; shift ;;
     -h|--help) grep '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -131,6 +147,59 @@ fetch_state_coherent() {
   return 1
 }
 
+uncovered_terminals() {
+  # THE coverage check, shared by capture (pre-restart gate) and verify
+  # (post-restart defense in depth) -- single home so the two call sites can
+  # never diverge. Emits the COMPLETE set of running terminals in the
+  # capture-shaped JSON file $1 that are covered by NO persisted open-tab
+  # snapshot pane, one terminalId per line (empty output == full coverage).
+  # Returns jq's status; callers must check it explicitly (:2544 convention).
+  # NOTE (docs indented on purpose): column-0 comments leak into --help.
+  # `. as $t | ($covered | index($t))` binds the id BEFORE indexing -- piping
+  # into `$covered` would rebind `.` to the array and search it for ITSELF
+  # (the :2563 scoping bug); do not "simplify" it.
+  jq -r '
+    ([.terminals[] | select(.status=="running") | .terminalId]) as $live
+    | ([.devices | to_entries[] | .value.records // [] | .[]
+         | select(.status=="open") | .panes // [] | .[]
+         | .payload.liveTerminal.terminalId | select(. != null)]) as $covered
+    | [ $live[] | select(. as $t | ($covered | index($t)) == null) ] | .[]' "$1"
+}
+
+report_uncovered() {
+  # Uncovered-terminal report to stderr for the CAPTURE gate: a severity
+  # header ($2: FAIL or WARNING) with the count, then one
+  #   - <terminalId> (mode=..., cwd=..., title=..., session=...)
+  # line per id in $3 (newline-separated), enriched from the capture file
+  # $1's own .terminals[] -- the data is already in the artifact, no extra
+  # fetch, and the script stays GET-only. session= is the recoverability
+  # split: .sessionRef is an OBJECT {provider, sessionId} the server emits
+  # only for terminals with a session identity at capture time (omitted for
+  # plain shells), so test PRESENCE, never string-match it. session=none
+  # means the terminal is unrecoverable outright; a provider name means the
+  # session (not the pane/PTY/scrollback) can be manually recovered
+  # post-restart via recover-my-panes / provider resume.
+  # Enrichment is best-effort: on any failure fall back to bare ids rather
+  # than mask the coverage report.
+  # Ids travel via temp file + --slurpfile, never --argjson (ARG_MAX).
+  local state_file="$1" severity="$2" uncovered="$3"
+  local n ids_tmp=""
+  n=$(printf '%s\n' "$uncovered" | grep -c .)
+  echo "${severity}: ${n} running terminal(s) at capture are covered by NO persisted snapshot pane (tabs-sync persistence/coverage gap):" >&2
+  if ids_tmp=$(mktemp) \
+     && printf '%s\n' "$uncovered" | jq -Rn '[inputs | select(length > 0)]' > "$ids_tmp" \
+     && jq -r --slurpfile ids "$ids_tmp" '
+          (.terminals | map({key: .terminalId, value: .}) | from_entries) as $byId
+          | $ids[0][] | . as $t | ($byId[$t] // {}) as $info
+          | "  - \($t) (mode=\($info.mode // "?"), cwd=\($info.cwd // "?"), title=\($info.title // "?"), session=\(if ($info.sessionRef // null) != null then ($info.sessionRef.provider // "yes") else "none" end))"' \
+          "$state_file" >&2; then
+    :
+  else
+    printf '%s\n' "$uncovered" | sed 's/^/  - /' >&2
+  fi
+  rm -f -- "$ids_tmp"
+}
+
 case "$CMD" in
   capture)
     [[ -n "$OUT" ]] || { echo "ERROR: capture requires --out FILE" >&2; exit 2; }
@@ -176,6 +245,32 @@ case "$CMD" in
     if ! nrun=$(jq -e '[.terminals[] | select(.status=="running")] | length' "$OUT"); then
       echo "ERROR: counting captured terminals failed" >&2; exit 1; fi
     echo "captured ${ndev} device snapshot(s), ${nrun} running terminal(s) -> $OUT"
+    # COVERAGE GATE (:2559, pre-restart edition): the same guard verify runs,
+    # moved to BEFORE the restart. If any running terminal is covered by no
+    # persisted open-tab pane, restoring from this capture permanently loses
+    # its PANE -- PTY, scrollback, pane placement die with the server; a
+    # terminal WITH a session identity (session=<provider> in the report) can
+    # have its session manually recovered afterwards via recover-my-panes,
+    # session=none terminals are lost outright. Discovering the gap in
+    # verify, AFTER the restart, is too late (2026-07-29 incident: 9 of 28
+    # running terminals uncovered and killed). The artifact is ALWAYS
+    # published first (diagnosis needs it); the gate only decides messaging
+    # and exit status: 4 = coverage gap (distinct from 1 = capture unusable),
+    # or a WARNING + exit 0 under --allow-uncovered (the operator's
+    # informed-consent path).
+    if ! uncovered=$(uncovered_terminals "$OUT"); then
+      echo "ERROR: computing capture coverage gate failed" >&2; exit 1; fi
+    if [[ -n "$uncovered" ]]; then
+      if $ALLOW_UNCOVERED; then
+        report_uncovered "$OUT" "WARNING" "$uncovered"
+        echo "WARNING: proceeding despite the coverage gap (--allow-uncovered): a restart now permanently kills the panes listed above (session=none entries are unrecoverable; session-bearing ones only via manual recovery)." >&2
+      else
+        report_uncovered "$OUT" "FAIL" "$uncovered"
+        echo "FAIL: the capture artifact WAS written to ${OUT} (keep it for diagnosis), but a restart/restore from this state permanently loses the panes listed above (PTY, scrollback, placement); session=none terminals are lost outright, session-bearing ones survive only as manually recoverable sessions." >&2
+        echo "Fix tabs-sync coverage (open the affected tabs in a connected client) and re-capture, or re-run with --allow-uncovered to accept the loss." >&2
+        exit 4
+      fi
+    fi
     ;;
   verify)
     [[ -n "$BEFORE" && -f "$BEFORE" ]] || { echo "ERROR: verify requires --before FILE" >&2; exit 2; }
@@ -193,17 +288,14 @@ case "$CMD" in
     # the OK path with exit 1 before its `exit 0`.
     cleanup() { if $AFTER_OWNED; then rm -f "$AFTER"; fi; }
 
-    # Coverage guard (:2559): compute the COMPLETE set of running terminals at
-    # capture that are covered by NO persisted snapshot pane, and FAIL listing them
-    # if that set is nonempty. `. as $t | $covered | index($t)` binds the id to a
-    # variable BEFORE indexing -- piping into `$covered` would otherwise rebind `.`
-    # to the array and search it for ITSELF (the :2563 scoping bug).
-    uncovered=$(jq -r '
-      ([.terminals[] | select(.status=="running") | .terminalId]) as $live
-      | ([.devices | to_entries[] | .value.records // [] | .[]
-           | select(.status=="open") | .panes // [] | .[]
-           | .payload.liveTerminal.terminalId | select(. != null)]) as $covered
-      | [ $live[] | select(. as $t | ($covered | index($t)) == null) ] | .[]' "$BEFORE")
+    # Coverage guard (:2559): the coverage jq lives in the shared
+    # uncovered_terminals helper above. Kept in verify as DEFENSE IN DEPTH:
+    # a before-file produced by an older script version or by an operator-
+    # overridden capture must still be flagged here, before the identity
+    # diff. Decision and output format are unchanged (pinned by
+    # test/unit/server/deploy-tab-diff-coverage-gate.test.ts).
+    if ! uncovered=$(uncovered_terminals "$BEFORE"); then
+      echo "ERROR: computing coverage guard failed" >&2; cleanup; exit 1; fi
     if [[ -n "$uncovered" ]]; then
       n=$(printf '%s\n' "$uncovered" | grep -c .)
       echo "FAIL: ${n} running terminal(s) at capture are covered by NO persisted snapshot pane (tabs-sync persistence/coverage gap):" >&2
@@ -291,6 +383,6 @@ case "$CMD" in
     cleanup; exit 1
     ;;
   *)
-    echo "usage: deploy-tab-diff.sh {capture|verify} --url U --token T [--out F | --before F [--after F]]" >&2
+    echo "usage: deploy-tab-diff.sh {capture|verify} --url U --token T [--out F [--allow-uncovered] | --before F [--after F]]" >&2
     exit 2 ;;
 esac

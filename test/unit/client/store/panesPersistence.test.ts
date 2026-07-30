@@ -424,6 +424,58 @@ describe('Panes Persistence Integration', () => {
     expect(restored.resumeSessionId).toBeUndefined() // always stripped; re-derived from sessionRef at create time
   })
 
+  it('crashTrace persists across a panes round-trip (denylist keeps new fields)', () => {
+    // znhn item 1: the crash trace lives on pane content BECAUSE the
+    // pane-content persistence strip is a denylist — a new field persists by
+    // default with no persistMiddleware change. This pins that property.
+    const store1 = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+
+    store1.dispatch(addTab({ mode: 'claude' }))
+    const tabId = store1.getState().tabs.tabs[0].id
+    store1.dispatch(initLayout({
+      tabId,
+      content: {
+        kind: 'terminal',
+        mode: 'claude',
+        shell: 'system',
+        createRequestId: 'req-trace',
+        status: 'running',
+        crashTrace: { exitCode: 1, resumedAtMs: 1_753_760_220_000 },
+      } as any,
+    }))
+
+    vi.runAllTimers()
+    const persistedTabs = loadPersistedTabs()
+    const persistedPanes = loadPersistedPanes()
+
+    const store2 = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+      },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+    if (persistedTabs?.tabs) {
+      store2.dispatch(hydrateTabs(persistedTabs.tabs))
+    }
+    if (persistedPanes) {
+      store2.dispatch(hydratePanes(persistedPanes))
+    }
+
+    const restoredLayout = store2.getState().panes.layouts[tabId]
+    expect(restoredLayout).toBeDefined()
+    expect(restoredLayout.type).toBe('leaf')
+    const restored = (restoredLayout as any).content
+    expect(restored.kind).toBe('terminal')
+    expect(restored.crashTrace).toEqual({ exitCode: 1, resumedAtMs: 1_753_760_220_000 })
+  })
+
   it('flushes pending writes on visibility change', () => {
     const store = configureStore({
       reducer: {

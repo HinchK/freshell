@@ -3015,10 +3015,14 @@
         "reason": {
           "type": "string"
         },
+        "resumeCycles": {
+          "type": "number"
+        },
         "status": {
           "enum": [
             "running",
-            "recovering"
+            "recovering",
+            "exited"
           ],
           "type": "string"
         },

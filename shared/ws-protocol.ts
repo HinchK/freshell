@@ -356,6 +356,13 @@ export const TerminalDetachSchema = z.object({
   terminalId: z.string().min(1),
 })
 
+export const TerminalAutoResumeCancelSchema = z.object({
+  type: z.literal('terminal.autoResumeCancel'),
+  /** The OLD (crashed) terminal id from the recovering notice frame. */
+  terminalId: z.string().min(1),
+})
+export type TerminalAutoResumeCancelMessage = z.infer<typeof TerminalAutoResumeCancelSchema>
+
 export const TerminalInputSchema = z.object({
   type: z.literal('terminal.input'),
   terminalId: z.string().min(1),
@@ -659,6 +666,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalCreateSchema,
   TerminalCodexCandidatePersistedSchema,
   TerminalAttachSchema,
+  TerminalAutoResumeCancelSchema,
   TerminalDetachSchema,
   TerminalInputSchema,
   TerminalResizeSchema,
@@ -772,7 +780,7 @@ export type TerminalExitMessage = {
 export type TerminalStatusMessage = {
   type: 'terminal.status'
   terminalId: string
-  status: 'running' | 'recovering'
+  status: 'running' | 'recovering' | 'exited'
   reason?: string
   attempt?: number
   /** Auto-resume 'recovering' frames only: the bounded retry budget. The
@@ -781,6 +789,10 @@ export type TerminalStatusMessage = {
   maxAttempts?: number
   /** Auto-resume 'recovering' frames only: the crashed generation's exit code. */
   exitCode?: number
+  /** Flap-circuit-breaker settle frames ('exited') only: successful
+   * auto-resumes inside the rolling window — the typed source for the
+   * "crashed N times" banner. */
+  resumeCycles?: number
 }
 
 /** Lane D1: server-initiated crash auto-resume replaced a pane's terminal.

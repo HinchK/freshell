@@ -3783,6 +3783,12 @@ export class WsHandler {
         return
       }
 
+      case 'terminal.autoResumeCancel':
+        // Rust-only feature: agent auto-resume lives in freshell-ws. The
+        // Node server has no auto-resume hub — accept and ignore so a valid
+        // client message never triggers UNKNOWN_MESSAGE.
+        return
+
       default:
         this.sendError(ws, { code: 'UNKNOWN_MESSAGE', message: 'Unknown message type' })
         return

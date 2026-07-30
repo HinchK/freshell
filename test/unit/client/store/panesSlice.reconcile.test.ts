@@ -135,6 +135,21 @@ describe('reconcile reducers', () => {
     expect(c.reconcileNotice).toBe('Started fresh (identity_never_observed).')
   })
 
+  it('resetPaneForReconcileCreate(fresh) clears a stale crashTrace; respawn keeps it (znhn#1)', () => {
+    // Fresh-eyes finding: fresh = a genuinely NEW identity-less conversation —
+    // the old "crashed & auto-resumed" trace belongs to the retired session
+    // and must not leak onto it. Respawn resumes the SAME conversation, so
+    // its trace legitimately stays.
+    const trace = { exitCode: 1, resumedAtMs: 1_753_760_220_000 }
+    const freshState = stateWithTerminalPane({ crashTrace: trace, sessionRef: { provider: 'claude', sessionId: 'gone' } })
+    const fresh = panesReducer(freshState, resetPaneForReconcileCreate({ tabId: 'tab1', paneId: 'p1', intent: 'fresh', reason: 'identity_never_observed' }))
+    expect(terminalContent(fresh, 'tab1', 'p1').crashTrace).toBeUndefined()
+
+    const respawnState = stateWithTerminalPane({ crashTrace: trace, sessionRef: { provider: 'claude', sessionId: 'keep' } })
+    const respawn = panesReducer(respawnState, resetPaneForReconcileCreate({ tabId: 'tab1', paneId: 'p1', intent: 'respawn', sessionRef: { provider: 'claude', sessionId: 'keep' } }))
+    expect(terminalContent(respawn, 'tab1', 'p1').crashTrace).toEqual(trace)
+  })
+
   it('resetPaneForReconcileCreate(respawn) with provider mismatch degrades loudly to fresh', () => {
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
     try {

@@ -27,6 +27,75 @@ pub(crate) const AUTO_RESUME_DEFAULT_DELAYS_MS: [u64; 2] = [2_000, 10_000];
 /// `DEFAULT_RESPAWN_LIVENESS_WINDOW_MS` in freshell-terminal).
 pub(crate) const AUTO_RESUME_HEALTHY_LIFETIME_MS: i64 = 30_000;
 
+/// Flap circuit breaker (kata znhn item 2, user ruling: bounded-and-loud,
+/// never infinite-and-silent). A "cycle" is one SUCCESSFUL auto-resume.
+/// Cycles are pruned to a rolling window at each crash and are NEVER reset
+/// by healthy generations — that is the cross-reset bound (it also bounds
+/// the out-of-band `kill` resurrection loop). When a crash arrives with
+/// cycles >= max, settle exited instead of resuming; Relaunch stays
+/// available.
+pub(crate) const AUTO_RESUME_DEFAULT_MAX_CYCLES: u32 = 5;
+pub(crate) const AUTO_RESUME_DEFAULT_CYCLE_WINDOW_MS: i64 = 3_600_000;
+
+fn env_parse<T: std::str::FromStr + PartialOrd + Default>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<T>().ok())
+        .filter(|v| *v > T::default())
+        .unwrap_or(default)
+}
+
+pub(crate) fn auto_resume_max_cycles() -> u32 {
+    env_parse(
+        "FRESHELL_AUTO_RESUME_MAX_CYCLES",
+        AUTO_RESUME_DEFAULT_MAX_CYCLES,
+    )
+}
+pub(crate) fn auto_resume_cycle_window_ms() -> i64 {
+    env_parse(
+        "FRESHELL_AUTO_RESUME_CYCLE_WINDOW_MS",
+        AUTO_RESUME_DEFAULT_CYCLE_WINDOW_MS,
+    )
+}
+/// e2e knob: shrinking this lets tests exercise healthy-reset flap loops in
+/// milliseconds. Production default matches the frozen 30s semantics.
+pub(crate) fn auto_resume_healthy_lifetime_ms() -> i64 {
+    env_parse(
+        "FRESHELL_AUTO_RESUME_HEALTHY_LIFETIME_MS",
+        AUTO_RESUME_HEALTHY_LIFETIME_MS,
+    )
+}
+
+/// Hub policy knobs, resolved once at spawn (env-overridable for e2e).
+#[derive(Debug, Clone)]
+pub(crate) struct HubConfig {
+    pub delays: Vec<u64>,
+    pub healthy_lifetime_ms: i64,
+    pub max_cycles: u32,
+    pub cycle_window_ms: i64,
+}
+
+impl HubConfig {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            delays: auto_resume_delays(),
+            healthy_lifetime_ms: auto_resume_healthy_lifetime_ms(),
+            max_cycles: auto_resume_max_cycles(),
+            cycle_window_ms: auto_resume_cycle_window_ms(),
+        }
+    }
+}
+
+/// Per-createRequestId resume history. `attempts` is the consecutive
+/// fast-fail budget (reset by a healthy generation); `cycles` is the
+/// wall-clock record of every successful auto-resume, pruned to the rolling
+/// window — deliberately NOT reset by healthy generations.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ResumeHistory {
+    pub attempts: u32,
+    pub cycles: Vec<i64>,
+}
+
 /// Crash notification from the PTY exit hook. Only sent for NATURAL exits
 /// (`finish_pty_exit` returned `true`) — user kills never produce one.
 /// `pub` (not `pub(crate)`): it rides the public `WsState.auto_resume_tx`
@@ -52,6 +121,11 @@ pub(crate) struct CrashContext<'a> {
     pub prior_attempts: u32,
     /// `registry.respawn_exhausted(create_request_id)` — outer loop bound.
     pub cap_exhausted: bool,
+    /// Successful auto-resumes inside the rolling window (flap breaker,
+    /// znhn item 2) — NEVER reset by healthy generations.
+    pub recent_cycles: u32,
+    /// Breaker threshold (cfg.max_cycles).
+    pub max_cycles: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,7 +134,11 @@ pub(crate) enum AutoResumeDecision {
     SettleExited { reason: &'static str },
 }
 
-pub(crate) fn decide(ctx: &CrashContext<'_>, delays: &[u64]) -> AutoResumeDecision {
+pub(crate) fn decide(
+    ctx: &CrashContext<'_>,
+    delays: &[u64],
+    healthy_lifetime_ms: i64,
+) -> AutoResumeDecision {
     use AutoResumeDecision::SettleExited;
     if ctx.exit_code == 0 {
         return SettleExited {
@@ -82,12 +160,19 @@ pub(crate) fn decide(ctx: &CrashContext<'_>, delays: &[u64]) -> AutoResumeDecisi
             reason: "no_resumable_identity",
         };
     }
+    // Flap circuit breaker (znhn item 2): checked BEFORE the healthy-reset —
+    // a flap loop is exactly the case where every generation looks healthy.
+    if ctx.recent_cycles >= ctx.max_cycles {
+        return SettleExited {
+            reason: "flap_circuit_breaker",
+        };
+    }
     if ctx.cap_exhausted {
         return SettleExited {
             reason: "respawn_cap_exhausted",
         };
     }
-    let effective_prior = if ctx.lifetime_ms >= AUTO_RESUME_HEALTHY_LIFETIME_MS {
+    let effective_prior = if ctx.lifetime_ms >= healthy_lifetime_ms {
         0
     } else {
         ctx.prior_attempts
@@ -143,7 +228,7 @@ const HUB_SUPERVISOR_BACKOFF_MS: &[u64] = &[1_000, 5_000, 30_000, 60_000];
 pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver + Sync>(
     driver: D,
     mut rx: tokio::sync::mpsc::UnboundedReceiver<CrashEvent>,
-    delays: Vec<u64>,
+    cfg: HubConfig,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // SUPERVISOR: `rx` and the attempts map are owned HERE, outside the
@@ -152,20 +237,22 @@ pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver + Sync>(
         // in every PTY exit hook) and the retry bookkeeping both survive the
         // restart. (Respawning with a fresh channel would NOT work: exit
         // hooks clone the sender at hook-build time.)
-        let mut attempts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut attempts: std::collections::HashMap<String, ResumeHistory> =
+            std::collections::HashMap::new();
         let mut consecutive_panics: u32 = 0;
         loop {
             let body_started = std::time::Instant::now();
-            let body = std::panic::AssertUnwindSafe(run_hub_body(
-                &driver,
-                &mut rx,
-                &delays,
-                &mut attempts,
-            ));
+            let body =
+                std::panic::AssertUnwindSafe(run_hub_body(&driver, &mut rx, &cfg, &mut attempts));
             match futures_util::FutureExt::catch_unwind(body).await {
                 // Channel closed: every sender dropped (server shutdown).
                 Ok(()) => return,
                 Err(panic) => {
+                    // Deliberate const (NOT cfg.healthy_lifetime_ms): panic
+                    // supervision health is orthogonal to the attempts/cycles
+                    // policy and must not follow the e2e knob — a shrunken
+                    // env value would let a hot-panicking driver reset its
+                    // own backoff.
                     if body_started.elapsed().as_millis() as i64 >= AUTO_RESUME_HEALTHY_LIFETIME_MS
                     {
                         consecutive_panics = 0;
@@ -202,14 +289,14 @@ pub(crate) fn spawn_hub_with_driver<D: AutoResumeDriver + Sync>(
 async fn run_hub_body<D: AutoResumeDriver + Sync>(
     driver: &D,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<CrashEvent>,
-    delays: &[u64],
-    attempts: &mut std::collections::HashMap<String, u32>,
+    cfg: &HubConfig,
+    attempts: &mut std::collections::HashMap<String, ResumeHistory>,
 ) {
     {
         // Retaining exhausted / pane-closed entries is DELIBERATE (not a
         // leak): evicting on exhaustion would refill the retry budget for an
         // immediate manual-Relaunch re-crash.
-        let max_attempts = delays.len() as u32;
+        let max_attempts = cfg.delays.len() as u32;
         // Design note (serialization): handling events sequentially in ONE
         // task means a backoff sleep delays other panes' resumes by up to
         // 10s worst-case. Acceptable at v1 — crashes are rare, the budget is
@@ -217,38 +304,70 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
         // (one respawn in flight, ever).
         while let Some(ev) = rx.recv().await {
             let sref = driver.resumable_session_ref(&ev.terminal_id);
+            // Prune the cycle record to the rolling window BEFORE deciding
+            // (znhn item 2): recent_cycles feeds the breaker threshold.
+            let now = crate::terminal::now_ms();
+            let (prior_attempts, recent_cycles) = match &ev.create_request_id {
+                Some(k) => {
+                    let h = attempts.entry(k.clone()).or_default();
+                    h.cycles.retain(|t| now - *t <= cfg.cycle_window_ms);
+                    (h.attempts, h.cycles.len() as u32)
+                }
+                None => (0, 0),
+            };
             let ctx = CrashContext {
                 exit_code: ev.exit_code,
                 mode: &ev.mode,
                 create_request_id: ev.create_request_id.as_deref(),
                 has_resumable_identity: sref.is_some(),
                 lifetime_ms: ev.lifetime_ms,
-                prior_attempts: ev
-                    .create_request_id
-                    .as_deref()
-                    .and_then(|k| attempts.get(k).copied())
-                    .unwrap_or(0),
+                prior_attempts,
                 cap_exhausted: ev
                     .create_request_id
                     .as_deref()
                     .map(|k| driver.cap_exhausted(k))
                     .unwrap_or(true),
+                recent_cycles,
+                max_cycles: cfg.max_cycles,
             };
-            match decide(&ctx, delays) {
+            match decide(&ctx, &cfg.delays, cfg.healthy_lifetime_ms) {
                 AutoResumeDecision::SettleExited { reason } => {
                     if ev.mode != "shell" {
+                        driver.emit_settled(
+                            &ev.terminal_id,
+                            reason,
+                            if reason == "flap_circuit_breaker" {
+                                Some(recent_cycles)
+                            } else {
+                                None
+                            },
+                        );
                         driver.log_settled(&ev.terminal_id, reason);
                     }
-                    if reason == "clean_exit" || ev.lifetime_ms >= AUTO_RESUME_HEALTHY_LIFETIME_MS {
+                    if reason == "clean_exit" || ev.lifetime_ms >= cfg.healthy_lifetime_ms {
                         if let Some(k) = &ev.create_request_id {
-                            attempts.remove(k);
+                            // Reset attempts only, KEEP cycles: the breaker's
+                            // cross-reset bound requires cycles to survive
+                            // healthy generations (znhn item 2; validated A8:
+                            // this condition must use the SAME configured
+                            // healthy-lifetime as `decide`).
+                            if let Some(h) = attempts.get_mut(k) {
+                                h.attempts = 0;
+                            }
                         }
                     }
+                    // Fresh-eyes fix: a cancel whose terminal settles without
+                    // ever reaching the Resume arm's take_cancel check would
+                    // otherwise leak in auto_resume_cancels forever — the
+                    // "removed on consumption" invariant must hold on EVERY
+                    // settle tail. Consumed silently: the pane is already
+                    // settled, there is nothing left to abort.
+                    let _ = driver.take_cancel(&ev.terminal_id);
                 }
                 AutoResumeDecision::Resume { attempt, delay_ms } => {
                     let (provider, session_id, cwd) = sref.expect("checked by decide");
                     let key = ev.create_request_id.clone().expect("checked by decide");
-                    attempts.insert(key.clone(), attempt);
+                    attempts.entry(key.clone()).or_default().attempts = attempt;
                     driver.emit_recovering(
                         &ev.terminal_id,
                         &ev.mode,
@@ -258,14 +377,33 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     // Guards AFTER the sleep — the world may have moved on.
+                    if driver.take_cancel(&ev.terminal_id) {
+                        // D-4 (validated A5): re-emit the settle frame here
+                        // too. The handler's immediate frame covers the
+                        // click-latency story; THIS frame guarantees a
+                        // late-consumed or pre-seeded cancel is loud and can
+                        // never strand a recovering notice. Idempotent
+                        // client-side (recordAutoResumeSettled).
+                        driver.emit_settled(&ev.terminal_id, "auto-resume cancelled", None);
+                        driver.log_settled(&ev.terminal_id, "user_cancelled");
+                        continue;
+                    }
                     if let Some(reason) =
                         driver.pre_respawn_guard(&provider, &session_id, &ev.terminal_id)
                     {
+                        driver.emit_settled(&ev.terminal_id, reason, None);
                         driver.log_settled(&ev.terminal_id, reason);
+                        // Cancel-set hygiene (fresh-eyes fix): a cancel that
+                        // landed after the take_cancel check above must not
+                        // leak — every settle tail cleans it up.
+                        let _ = driver.take_cancel(&ev.terminal_id);
                         continue;
                     }
                     if !driver.claim_session(&provider, &session_id, &key).await {
+                        driver.emit_settled(&ev.terminal_id, "session_lease_held", None);
                         driver.log_settled(&ev.terminal_id, "session_lease_held");
+                        // Cancel-set hygiene (see the guard tail above).
+                        let _ = driver.take_cancel(&ev.terminal_id);
                         continue;
                     }
                     let spec = RespawnSpec {
@@ -288,19 +426,36 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                                     attempt,
                                     max_attempts,
                                 );
+                                // One successful auto-resume = one breaker
+                                // cycle (znhn item 2). Re-fetch the entry —
+                                // the earlier borrow ended before the awaits.
+                                attempts
+                                    .entry(key.clone())
+                                    .or_default()
+                                    .cycles
+                                    .push(crate::terminal::now_ms());
                             } else {
                                 // Binding raced away between claim and completion; the
                                 // driver already killed its own orphan child. No
                                 // terminal.replaced — the pane stays settled exited.
+                                driver.emit_settled(&ev.terminal_id, "lease_completion_lost", None);
                                 driver.log_settled(&ev.terminal_id, "lease_completion_lost");
                             }
                         }
                         Err(err) => {
                             driver.fail_claim(&provider, &session_id, &key);
                             tracing::warn!(terminal_id = %ev.terminal_id, error = %err, "terminal.auto_resume.respawn_failed");
+                            driver.emit_settled(&ev.terminal_id, "respawn_failed", None);
                             driver.log_settled(&ev.terminal_id, "respawn_failed");
                         }
                     }
+                    // Cancel-set hygiene (fresh-eyes fix): a cancel landing
+                    // DURING the respawn await — after the post-sleep
+                    // take_cancel check — would otherwise leak forever. Too
+                    // late to abort (the resume already ran); clean up on
+                    // every tail of the respawn match (replaced /
+                    // lease_completion_lost / respawn_failed).
+                    let _ = driver.take_cancel(&ev.terminal_id);
                 }
             }
         }
@@ -373,6 +528,13 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
         max_attempts: u32,
     );
     fn emit_replaced(&self, old: &str, new: &str, exit_code: i64, attempt: u32, max_attempts: u32);
+    /// Broadcast the settle frame — `terminal.status { status: 'exited' }`
+    /// for the OLD terminal id (znhn item 3). Every agent-mode settle emits
+    /// it: the client clears the recovering notice on a FRAME, never on a
+    /// timer. `resume_cycles` is Some only for flap-circuit-breaker settles.
+    fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>);
+    /// Consume a pending user cancel for this terminal id (znhn item 2).
+    fn take_cancel(&self, terminal_id: &str) -> bool;
     fn log_settled(&self, terminal_id: &str, reason: &str);
 }
 
@@ -617,6 +779,7 @@ impl AutoResumeDriver for WsAutoResumeDriver {
             reason: Some(format!(
                 "{mode} crashed (exit {exit_code}) — auto-resuming, attempt {attempt}/{max_attempts}"
             )),
+            resume_cycles: None,
         });
         match serde_json::to_string(&msg) {
             Ok(json) => {
@@ -648,6 +811,35 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         }
     }
 
+    fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>) {
+        let msg =
+            freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
+                status: freshell_protocol::RuntimeStatus::Exited,
+                terminal_id: terminal_id.to_string(),
+                attempt: None,
+                max_attempts: None,
+                exit_code: None,
+                reason: Some(reason.to_string()),
+                resume_cycles: resume_cycles.map(i64::from),
+            });
+        match serde_json::to_string(&msg) {
+            Ok(json) => {
+                let _ = self.state.broadcast_tx.send(json);
+            }
+            Err(err) => {
+                tracing::error!(terminal_id, error = %err, "terminal.auto_resume.settled_frame_serialize_failed");
+            }
+        }
+    }
+
+    fn take_cancel(&self, terminal_id: &str) -> bool {
+        self.state
+            .auto_resume_cancels
+            .lock()
+            .expect("auto_resume_cancels lock")
+            .remove(terminal_id)
+    }
+
     fn log_settled(&self, terminal_id: &str, reason: &str) {
         tracing::info!(terminal_id, reason, "terminal.auto_resume.settled");
     }
@@ -660,7 +852,7 @@ pub fn spawn_auto_resume_hub(
     state: crate::WsState,
     rx: tokio::sync::mpsc::UnboundedReceiver<CrashEvent>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_auto_resume_hub_with_delays(state, rx, auto_resume_delays())
+    spawn_hub_with_driver(WsAutoResumeDriver { state }, rx, HubConfig::from_env())
 }
 
 /// [`spawn_auto_resume_hub`] with an explicit backoff schedule. The
@@ -672,7 +864,14 @@ pub fn spawn_auto_resume_hub_with_delays(
     rx: tokio::sync::mpsc::UnboundedReceiver<CrashEvent>,
     delays: Vec<u64>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_hub_with_driver(WsAutoResumeDriver { state }, rx, delays)
+    spawn_hub_with_driver(
+        WsAutoResumeDriver { state },
+        rx,
+        HubConfig {
+            delays,
+            ..HubConfig::from_env()
+        },
+    )
 }
 
 #[cfg(test)]
@@ -688,14 +887,25 @@ mod tests {
             lifetime_ms: 5_000,
             prior_attempts: 0,
             cap_exhausted: false,
+            recent_cycles: 0,
+            max_cycles: AUTO_RESUME_DEFAULT_MAX_CYCLES,
         }
     }
     const DELAYS: [u64; 2] = [2_000, 10_000];
 
+    fn test_cfg(delays: Vec<u64>) -> HubConfig {
+        HubConfig {
+            delays,
+            healthy_lifetime_ms: AUTO_RESUME_HEALTHY_LIFETIME_MS,
+            max_cycles: AUTO_RESUME_DEFAULT_MAX_CYCLES,
+            cycle_window_ms: AUTO_RESUME_DEFAULT_CYCLE_WINDOW_MS,
+        }
+    }
+
     #[test]
     fn nonzero_agent_exit_resumes_with_schedule() {
         assert_eq!(
-            decide(&ctx(), &DELAYS),
+            decide(&ctx(), &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
             AutoResumeDecision::Resume {
                 attempt: 1,
                 delay_ms: 2_000
@@ -706,7 +916,7 @@ mod tests {
             ..ctx()
         };
         assert_eq!(
-            decide(&c, &DELAYS),
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
             AutoResumeDecision::Resume {
                 attempt: 2,
                 delay_ms: 10_000
@@ -721,7 +931,7 @@ mod tests {
             ..ctx()
         };
         assert_eq!(
-            decide(&c, &DELAYS),
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
             AutoResumeDecision::SettleExited {
                 reason: "clean_exit"
             }
@@ -735,7 +945,7 @@ mod tests {
             ..ctx()
         };
         assert_eq!(
-            decide(&c, &DELAYS),
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
             AutoResumeDecision::SettleExited {
                 reason: "not_agent_mode"
             }
@@ -746,7 +956,7 @@ mod tests {
             ..ctx()
         };
         assert_eq!(
-            decide(&c, &DELAYS),
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
             AutoResumeDecision::SettleExited {
                 reason: "not_agent_mode"
             }
@@ -758,7 +968,10 @@ mod tests {
         for mode in AUTO_RESUME_MODES {
             let c = CrashContext { mode, ..ctx() };
             assert!(
-                matches!(decide(&c, &DELAYS), AutoResumeDecision::Resume { .. }),
+                matches!(
+                    decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
+                    AutoResumeDecision::Resume { .. }
+                ),
                 "mode {mode}"
             );
         }
@@ -771,7 +984,7 @@ mod tests {
             ..ctx()
         };
         assert_eq!(
-            decide(&c, &DELAYS),
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
             AutoResumeDecision::SettleExited {
                 reason: "no_resumable_identity"
             }
@@ -781,7 +994,7 @@ mod tests {
             ..ctx()
         };
         assert_eq!(
-            decide(&c, &DELAYS),
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
             AutoResumeDecision::SettleExited {
                 reason: "no_create_request_id"
             }
@@ -795,7 +1008,7 @@ mod tests {
             ..ctx()
         };
         assert_eq!(
-            decide(&c, &DELAYS),
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
             AutoResumeDecision::SettleExited {
                 reason: "respawn_cap_exhausted"
             }
@@ -809,7 +1022,7 @@ mod tests {
             ..ctx()
         };
         assert_eq!(
-            decide(&c, &DELAYS),
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
             AutoResumeDecision::SettleExited {
                 reason: "retries_exhausted"
             }
@@ -826,7 +1039,40 @@ mod tests {
             ..ctx()
         };
         assert_eq!(
-            decide(&c, &DELAYS),
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
+            AutoResumeDecision::Resume {
+                attempt: 1,
+                delay_ms: 2_000
+            }
+        );
+    }
+
+    #[test]
+    fn flap_circuit_breaker_settles_when_cycles_reach_max() {
+        let c = CrashContext {
+            lifetime_ms: i64::MAX, // healthy — attempts would reset
+            recent_cycles: 5,
+            max_cycles: 5,
+            ..ctx()
+        };
+        assert_eq!(
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
+            AutoResumeDecision::SettleExited {
+                reason: "flap_circuit_breaker"
+            }
+        );
+    }
+
+    #[test]
+    fn cycles_below_max_still_resume_even_when_healthy_reset_applies() {
+        let c = CrashContext {
+            lifetime_ms: i64::MAX,
+            recent_cycles: 4,
+            max_cycles: 5,
+            ..ctx()
+        };
+        assert_eq!(
+            decide(&c, &DELAYS, AUTO_RESUME_HEALTHY_LIFETIME_MS),
             AutoResumeDecision::Resume {
                 attempt: 1,
                 delay_ms: 2_000
@@ -868,6 +1114,13 @@ mod tests {
         cap_exhausted: bool,
         session: Option<(String, String, Option<String>)>,
         guard: Option<&'static str>,
+        /// Pending user cancels (znhn item 2) — consumed by `take_cancel`.
+        cancels: std::collections::HashSet<String>,
+        /// Test knob: when true, `respawn` inserts the spec's OLD terminal id
+        /// into `cancels` — simulates a user cancel landing DURING the
+        /// respawn await, i.e. after the hub's post-sleep take_cancel check
+        /// (the leak window the fresh-eyes review flagged).
+        insert_cancel_on_respawn: bool,
         claim_ok: bool,
         complete_ok: bool,
         panic_next_recovering: bool,
@@ -879,6 +1132,9 @@ mod tests {
         completes: Vec<String>,
         fails: Vec<String>,
         settled: Vec<(String, String)>,
+        /// (terminal_id, reason, resume_cycles) — settle FRAMES broadcast
+        /// (znhn item 3), distinct from the `settled` log records.
+        settled_frames: Vec<(String, String, Option<u32>)>,
     }
 
     /// Records every orchestrator effect; each knob is mutable mid-test so
@@ -896,6 +1152,8 @@ mod tests {
                     cap_exhausted: false,
                     session: Some(("claude".into(), "sess-1".into(), None)),
                     guard: None,
+                    cancels: std::collections::HashSet::new(),
+                    insert_cancel_on_respawn: false,
                     claim_ok: true,
                     complete_ok: true,
                     panic_next_recovering: false,
@@ -907,6 +1165,7 @@ mod tests {
                     completes: Vec::new(),
                     fails: Vec::new(),
                     settled: Vec::new(),
+                    settled_frames: Vec::new(),
                 })),
             }
         }
@@ -936,6 +1195,17 @@ mod tests {
         fn set_panic_next_recovering(&self, v: bool) {
             self.lock().panic_next_recovering = v;
         }
+        fn set_cancelled(&self, terminal_id: &str) {
+            self.lock().cancels.insert(terminal_id.to_string());
+        }
+        fn set_insert_cancel_on_respawn(&self, v: bool) {
+            self.lock().insert_cancel_on_respawn = v;
+        }
+        /// Pending (unconsumed) cancel entries — the leak the fresh-eyes
+        /// review flagged: must drain to zero on every settle/replaced tail.
+        fn pending_cancels(&self) -> usize {
+            self.lock().cancels.len()
+        }
 
         /// (old_terminal_id, attempt, max_attempts)
         fn recovering_calls(&self) -> Vec<(String, u32, u32)> {
@@ -959,6 +1229,10 @@ mod tests {
         }
         fn settled_reasons(&self) -> Vec<String> {
             self.lock().settled.iter().map(|(_, r)| r.clone()).collect()
+        }
+        /// (terminal_id, reason, resume_cycles) settle FRAMES (znhn item 3).
+        fn settled_frames(&self) -> Vec<(String, String, Option<u32>)> {
+            self.lock().settled_frames.clone()
         }
     }
 
@@ -1017,6 +1291,17 @@ mod tests {
             let result = {
                 let mut s = self.lock();
                 s.respawns.push(req.clone());
+                if s.insert_cancel_on_respawn {
+                    // Simulate a user cancel landing DURING the respawn —
+                    // after the hub's post-sleep take_cancel check. The hub
+                    // must still clean this entry up on the replaced tail.
+                    let old_tid = s
+                        .recovering
+                        .last()
+                        .map(|(tid, _, _)| tid.clone())
+                        .unwrap_or_default();
+                    s.cancels.insert(old_tid);
+                }
                 s.respawn_result.clone()
             };
             std::future::ready(result)
@@ -1059,6 +1344,16 @@ mod tests {
                 .replaced
                 .push((old.to_string(), new.to_string(), attempt));
         }
+        fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>) {
+            self.lock().settled_frames.push((
+                terminal_id.to_string(),
+                reason.to_string(),
+                resume_cycles,
+            ));
+        }
+        fn take_cancel(&self, terminal_id: &str) -> bool {
+            self.lock().cancels.remove(terminal_id)
+        }
         fn log_settled(&self, terminal_id: &str, reason: &str) {
             self.lock()
                 .settled
@@ -1078,7 +1373,7 @@ mod tests {
     async fn crash_resumes_after_first_backoff_and_emits_frames() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy(); // identity present, cap ok, claim ok, respawn -> Ok("t-new")
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 5_000))
             .unwrap();
         tokio::task::yield_now().await;
@@ -1099,7 +1394,7 @@ mod tests {
         // crash again -> settled("retries_exhausted"), NO third respawn.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
 
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
             .unwrap();
@@ -1147,7 +1442,7 @@ mod tests {
         // attempt resets to 1 with the first delay again.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
 
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
             .unwrap();
@@ -1185,7 +1480,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
         fake.set_guard(Some("session_owned_live"));
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
 
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
             .unwrap();
@@ -1198,6 +1493,11 @@ mod tests {
             fake.settled_reasons(),
             vec!["session_owned_live".to_string()]
         );
+        // znhn #3: even the "silent" guard-abort broadcasts the settle frame.
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "session_owned_live".to_string(), None)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1206,7 +1506,7 @@ mod tests {
         // the backoff): no respawn, no claim, settled("pane_closed").
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
 
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
             .unwrap();
@@ -1218,6 +1518,10 @@ mod tests {
         assert!(fake.respawn_calls().is_empty());
         assert!(fake.claim_calls().is_empty());
         assert_eq!(fake.settled_reasons(), vec!["pane_closed".to_string()]);
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "pane_closed".to_string(), None)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1226,7 +1530,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
         fake.set_claim_ok(false);
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
 
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
             .unwrap();
@@ -1239,6 +1543,10 @@ mod tests {
             fake.settled_reasons(),
             vec!["session_lease_held".to_string()]
         );
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "session_lease_held".to_string(), None)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1248,7 +1556,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
         fake.set_respawn_result(Err("spawn failed".into()));
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
 
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
             .unwrap();
@@ -1259,6 +1567,10 @@ mod tests {
         assert_eq!(fake.fail_calls(), vec!["cr-1".to_string()]);
         assert!(fake.complete_calls().is_empty());
         assert_eq!(fake.settled_reasons(), vec!["respawn_failed".to_string()]);
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "respawn_failed".to_string(), None)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1269,7 +1581,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
         fake.set_complete_ok(false);
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
 
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
             .unwrap();
@@ -1287,6 +1599,10 @@ mod tests {
             fake.settled_reasons(),
             vec!["lease_completion_lost".to_string()]
         );
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "lease_completion_lost".to_string(), None)]
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1295,7 +1611,7 @@ mod tests {
         // exit_code=0 / mode="shell" — zero respawn calls, zero recovering frames.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![2_000, 10_000]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
 
         fake.set_cap_exhausted(true);
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
@@ -1318,6 +1634,332 @@ mod tests {
         assert!(fake.respawn_calls().is_empty());
         assert!(fake.recovering_calls().is_empty());
         assert!(fake.claim_calls().is_empty());
+        // znhn #3: agent-mode settles are LOUD (frame emitted), shell is not.
+        assert_eq!(
+            fake.settled_frames(),
+            vec![
+                ("t1".to_string(), "respawn_cap_exhausted".to_string(), None),
+                ("t2".to_string(), "no_resumable_identity".to_string(), None),
+                ("t3".to_string(), "clean_exit".to_string(), None),
+            ],
+            "shell-mode settles must NOT emit a settle frame"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flap_loop_trips_the_circuit_breaker_and_settles_loud() {
+        // 3 healthy flap cycles (lifetime >= healthy: attempts reset each
+        // time — pre-breaker this loops forever), then crash #4 must settle
+        // with the breaker reason + typed cycle count, and respawn nothing.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let cfg = HubConfig {
+            max_cycles: 3,
+            healthy_lifetime_ms: 1,
+            ..test_cfg(vec![2_000, 10_000])
+        };
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, cfg);
+
+        for _ in 0..3 {
+            tx.send(crash("t1", 1, "claude", Some("cr-1"), 60_000))
+                .unwrap();
+            drain().await;
+            tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+            drain().await;
+        }
+        assert_eq!(fake.respawn_calls().len(), 3);
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 60_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 3, "no 4th respawn");
+        assert_eq!(
+            fake.settled_frames().last().unwrap(),
+            &(
+                "t1".to_string(),
+                "flap_circuit_breaker".to_string(),
+                Some(3)
+            )
+        );
+        assert_eq!(
+            fake.recovering_calls().len(),
+            3,
+            "no recovering frame for the breaker settle"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cycle_window_prunes_old_cycles_and_the_loop_may_continue() {
+        // max_cycles 2, cycle_window_ms 1 — every prior cycle is stale
+        // (wall-clock) by the time the next crash arrives, so the breaker
+        // never trips: 4 crash/resume rounds all succeed.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let cfg = HubConfig {
+            max_cycles: 2,
+            cycle_window_ms: 1,
+            healthy_lifetime_ms: 1,
+            ..test_cfg(vec![2_000, 10_000])
+        };
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, cfg);
+
+        for _ in 0..4 {
+            // Real (not virtual) sleep: cycle timestamps are wall-clock, so
+            // >1ms of real time must pass for the window to prune them.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            tx.send(crash("t1", 1, "claude", Some("cr-1"), 60_000))
+                .unwrap();
+            drain().await;
+            tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+            drain().await;
+        }
+        assert_eq!(fake.respawn_calls().len(), 4, "breaker must never trip");
+        assert_eq!(fake.replaced_calls().len(), 4);
+        assert!(fake.settled_frames().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_generations_reset_attempts_but_never_cycles() {
+        // Healthy crashes reset the attempt budget (each resume is attempt 1)
+        // while the cycle record accumulates and trips the breaker at max.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let cfg = HubConfig {
+            max_cycles: 2,
+            ..test_cfg(vec![2_000, 10_000])
+        };
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, cfg);
+
+        // Fast-fail crash: attempt 1.
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        // Healthy crash: attempts reset — attempt 1 again (not 2).
+        tx.send(crash("t2", 1, "claude", Some("cr-1"), 60_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(
+            fake.recovering_calls(),
+            vec![("t1".into(), 1u32, 2u32), ("t2".into(), 1u32, 2u32)]
+        );
+        assert_eq!(fake.respawn_calls().len(), 2);
+
+        // Two successful resumes accumulated DESPITE the healthy reset:
+        // crash #3 trips the breaker.
+        tx.send(crash("t3", 1, "claude", Some("cr-1"), 60_000))
+            .unwrap();
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 2, "breaker blocks the 3rd");
+        assert_eq!(
+            fake.settled_frames().last().unwrap(),
+            &(
+                "t3".to_string(),
+                "flap_circuit_breaker".to_string(),
+                Some(2)
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn eviction_and_decide_agree_on_the_configured_healthy_lifetime() {
+        // Between-thresholds pin (validated A8): cfg.healthy_lifetime_ms =
+        // 500, generation lifetime 1_000ms — ABOVE the config but BELOW the
+        // 30_000 compile-time const. Both the decide-time reset AND the
+        // eviction branch must treat this as healthy. 60_000 lifetimes
+        // CANNOT detect a const/cfg split — this one can.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let cfg = HubConfig {
+            max_cycles: 100,
+            healthy_lifetime_ms: 500,
+            ..test_cfg(vec![2_000, 10_000])
+        };
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, cfg);
+
+        // Two fast-fail crashes drain the budget to attempt 2.
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 100))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        tx.send(crash("t2", 1, "claude", Some("cr-1"), 100))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 2);
+
+        // Between-thresholds crash: healthy per CFG (1_000 >= 500) — decide
+        // must reset to attempt 1, NOT settle retries_exhausted (which the
+        // 30_000 const would produce).
+        tx.send(crash("t3", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 3);
+
+        // Eviction-branch pin: a between-thresholds SETTLE must reset the
+        // attempts entry (cfg agreement), so the NEXT fast crash is attempt 1.
+        fake.set_cap_exhausted(true);
+        tx.send(crash("t4", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        fake.set_cap_exhausted(false);
+        tx.send(crash("t5", 1, "claude", Some("cr-1"), 100))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(
+            fake.recovering_calls(),
+            vec![
+                ("t1".into(), 1u32, 2u32),
+                ("t2".into(), 2u32, 2u32),
+                ("t3".into(), 1u32, 2u32),
+                ("t5".into(), 1u32, 2u32),
+            ],
+            "t5 must start a fresh budget: the eviction branch reset attempts on t4's settle"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_cancel_during_backoff_aborts_the_respawn_and_settles_loud() {
+        // Crash schedules a resume; the cancel lands during the backoff.
+        // The hub must consume the flag, respawn NOTHING, and EMIT the
+        // settle frame itself (D-4, validated A5): the take_cancel arm is
+        // loud so a late-consumed or pre-seeded cancel can never strand a
+        // recovering notice. Idempotent with the WS handler's immediate
+        // frame — the client folds duplicates.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        // Pre-seed the cancel BEFORE the crash event (the flag is checked
+        // post-sleep, so a pre-seeded flag exercises the late-consume path).
+        fake.set_cancelled("t1");
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert!(fake.respawn_calls().is_empty(), "cancel aborts the respawn");
+        assert!(fake.claim_calls().is_empty());
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "auto-resume cancelled".to_string(), None)]
+        );
+        assert_eq!(fake.settled_reasons(), vec!["user_cancelled".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_for_a_settling_terminal_is_cleaned_up_not_leaked() {
+        // Fresh-eyes fix: a cancel whose terminal settles WITHOUT reaching
+        // the post-sleep take_cancel check (here: decide settles on
+        // cap_exhausted, no Resume arm at all) must still be removed from
+        // the set — "removed on consumption" has to hold on every path.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_cap_exhausted(true);
+        fake.set_cancelled("t1");
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "respawn_cap_exhausted".to_string(), None)]
+        );
+        assert_eq!(
+            fake.pending_cancels(),
+            0,
+            "the stale cancel entry must be cleaned up on the settle tail"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancel_landing_during_the_respawn_is_cleaned_up_on_the_replaced_tail() {
+        // Fresh-eyes fix: a cancel that lands AFTER the hub's post-sleep
+        // take_cancel check (simulated: inserted during the respawn await)
+        // used to leak in auto_resume_cancels forever. The replaced tail
+        // must remove it. (It is too late to abort — the resume already
+        // happened — so cleanup, not abort, is the correct semantics.)
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        fake.set_insert_cancel_on_respawn(true);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert_eq!(fake.replaced_calls().len(), 1, "the resume completed");
+        assert_eq!(
+            fake.pending_cancels(),
+            0,
+            "the late cancel entry must be cleaned up on the replaced tail"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn guard_abort_emits_a_settle_frame() {
+        // pane_closed guard-abort must broadcast the settle frame so the
+        // client clears the recovering notice deterministically (znhn #3).
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        fake.set_guard(Some("pane_closed"));
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        let settled = fake.settled_frames();
+        assert_eq!(
+            settled,
+            vec![("t1".to_string(), "pane_closed".to_string(), None)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retries_exhausted_emits_a_settle_frame() {
+        // Same shape as second_crash_uses_second_delay_then_exhausts: after
+        // the budget drains, the final crash must broadcast a settle frame.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        tx.send(crash("t-new", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(10_000)).await;
+        drain().await;
+        assert_eq!(fake.respawn_calls().len(), 2);
+
+        tx.send(crash("t-new2", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        let settled = fake.settled_frames();
+        assert!(
+            settled
+                .iter()
+                .any(|(t, r, _)| t == "t-new2" && r == "retries_exhausted"),
+            "exhaustion must be a LOUD settle frame: {settled:?}"
+        );
     }
 
     /// Council MEDIUM fix (crusty, 7w4h/xkhx review): a driver panic must not
@@ -1333,7 +1975,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let fake = FakeDriver::healthy();
         fake.set_panic_next_recovering(true);
-        let _hub = spawn_hub_with_driver(fake.clone(), rx, vec![10]);
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![10]));
 
         // Event 1: the driver panics mid-processing (inside emit_recovering).
         tx.send(crash("t1", 1, "claude", Some("cr-1"), 5_000))

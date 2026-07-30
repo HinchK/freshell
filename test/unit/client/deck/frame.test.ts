@@ -4,11 +4,13 @@ import {
   ACTION_KEYS, buildFrame, clampPage, pageCount, planLayout, ringColor, stripText, visibleTabs,
 } from '@/deck/frame'
 import type { DeckModel, DeckTab } from '@/deck/deck-selectors'
+import { providerIconDataUrl } from '@/deck/provider-icon-svg'
+import { PANE_TINT_COLORS } from '@/deck/pane-tint-colors'
 
 function makeDeckTab(over: Partial<DeckTab> & Pick<DeckTab, 'id' | 'title'>): DeckTab {
   return {
     active: false, busy: false, attention: false, pendingApproval: false, fill: 'none', dot: null,
-    priority: 4, repoIcons: [], ...over,
+    priority: 4, repoIcons: [], paneIcons: [], ...over,
   }
 }
 function model(n: number, activeId = 'tab-0'): DeckModel {
@@ -81,12 +83,13 @@ describe('buildFrame', () => {
     expect(frame.keys[ACTION_KEYS.stop]).toEqual({ kind: 'action', action: 'stop', enabled: true })
     expect(frame.keys[3]).toEqual({ kind: 'empty' })
   })
-  it('buildFrame carries fill/dot/icons onto tab keys, with iconReady resolving readiness', () => {
+  it('buildFrame carries fill/paneIcons/icons onto tab keys, with iconReady resolving readiness', () => {
     const model: DeckModel = {
       activeTabId: 't1',
       tileStyle: 'status-icons',
       tabs: [makeDeckTab({
         id: 't1', title: 'alpha', active: true, fill: 'barTop', dot: 'green',
+        paneIcons: [{ provider: 'claude', tint: 'green' }],
         repoIcons: [
           { url: '/api/repo-icon?cwd=%2Fr%2Fa', letter: 'A', hue: 120 },
           { url: null, letter: 'B', hue: 200 },
@@ -99,12 +102,34 @@ describe('buildFrame', () => {
       previewFor: noPreview,
     })
     expect(frame.keys[0]).toMatchObject({
-      kind: 'tab', tabId: 't1', fill: 'barTop', dot: 'green',
+      kind: 'tab', tabId: 't1', fill: 'barTop',
+      paneIcons: [{ provider: 'claude', tint: 'green', ready: false }],
       icons: [
         { url: '/api/repo-icon?cwd=%2Fr%2Fa', letter: 'A', hue: 120, ready: true },
         { url: null, letter: 'B', hue: 200, ready: false },
       ],
     })
+  })
+  it('pane icon readiness is stamped from iconReady using the tinted data URL', () => {
+    const m: DeckModel = {
+      activeTabId: 't1', tileStyle: 'status-icons',
+      tabs: [makeDeckTab({ id: 't1', title: 'alpha', active: true, paneIcons: [{ provider: 'claude', tint: 'green' }] })],
+    }
+    const url = providerIconDataUrl('claude', PANE_TINT_COLORS.green)
+    const asked: string[] = []
+    const build = (ready: boolean) => buildFrame({
+      model: m, caps: MINI_CAPS, page: 1, actionLayer: null,
+      iconReady: (u) => { asked.push(u); return ready }, previewFor: noPreview,
+    })
+    const before = build(false)
+    // buildFrame consults iconReady with the EXACT URL the renderer will pass to
+    // getIcon — in production that call (bitmapFor) also STARTS the async load.
+    expect(asked).toContain(url)
+    expect(before.keys[0]).toMatchObject({ paneIcons: [{ provider: 'claude', tint: 'green', ready: false }] })
+    const after = build(true)
+    expect(after.keys[0]).toMatchObject({ paneIcons: [{ provider: 'claude', tint: 'green', ready: true }] })
+    // The decode flips the spec JSON — this is what un-skips the controller's per-key diff.
+    expect(JSON.stringify(after.keys[0])).not.toBe(JSON.stringify(before.keys[0]))
   })
   it('full mode fills the strip and never emits a pager', () => {
     const m = model(10)

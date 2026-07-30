@@ -34,7 +34,8 @@ use std::collections::HashSet;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -594,28 +595,42 @@ fn codex_launch_error_response(
 
 /// REST mapping of a spawn-gate rejection (WS analogue:
 /// `spawn_gate_error_parts` in freshell-ws/src/terminal.rs).
-/// QueueFull -> 429: the caller should back off and retry.
-/// Timeout   -> 503: spawn capacity unavailable right now.
-/// The retry guidance lives in the MESSAGE because the MCP bridge
-/// (server/mcp/freshell-tool.ts) surfaces only the message text, not the
-/// HTTP status. Body key is `code`+`message` (never `error`) so the MCP
-/// http-client's `data.error || data.message` precedence keeps showing the
-/// human message.
-fn spawn_gate_error_response(err: crate::spawn_gate::SpawnGateError) -> Response {
+/// QueueFull -> 429 with Retry-After (bccd item 1): header for HTTP
+/// convention + `retryAfterMs` body field (house convention, session-lease
+/// SESSION_RESERVED). The retry guidance ALSO stays in the MESSAGE because
+/// the MCP bridge (server/mcp/freshell-tool.ts) surfaces only message text.
+/// Timeout -> 503: spawn capacity unavailable right now.
+/// Body key is `code`+`message` (never `error`).
+fn spawn_gate_error_response(
+    err: crate::spawn_gate::SpawnGateError,
+    retry_after: std::time::Duration,
+) -> Response {
     match err {
-        crate::spawn_gate::SpawnGateError::QueueFull => crate::fail_json_code(
-            StatusCode::TOO_MANY_REQUESTS,
-            "SPAWN_QUEUE_FULL",
-            "Too many concurrent terminal spawns; retry shortly".to_string(),
-        ),
+        crate::spawn_gate::SpawnGateError::QueueFull => {
+            let secs = retry_after.as_secs().max(1);
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    axum::http::HeaderValue::from(secs),
+                )],
+                Json(json!({
+                    "status": "error",
+                    "code": "SPAWN_QUEUE_FULL",
+                    "message": "Too many concurrent terminal spawns; retry shortly",
+                    "retryAfterMs": retry_after.as_millis() as u64,
+                })),
+            )
+                .into_response()
+        }
         crate::spawn_gate::SpawnGateError::Timeout => crate::fail_json_code(
             StatusCode::SERVICE_UNAVAILABLE,
             "SPAWN_TIMEOUT",
             "Timed out waiting for a terminal spawn slot".to_string(),
         ),
-        // Unreachable on the REST door: the handler holds its cancel
-        // sender (never fired, never dropped) across the whole acquire.
-        // Mapped like Timeout so an impossible arm still fails safe.
+        // Unreachable since acquire_uncancellable (znhn item 4): no cancel
+        // sender exists on this door at all. Mapped like Timeout so an
+        // impossible arm still fails safe.
         crate::spawn_gate::SpawnGateError::Cancelled => crate::fail_json_code(
             StatusCode::SERVICE_UNAVAILABLE,
             "SPAWN_TIMEOUT",
@@ -1085,17 +1100,14 @@ pub(crate) async fn spawn_terminal_pane(
     // server wiring keep legacy behavior.
     let spawn_permit = match state.spawn_gate() {
         Some(rest_gate) => {
-            // The gate's acquire is cancellable via a watch channel (the WS
-            // door wires its per-connection cancel signal). REST has no such
-            // signal: hold a live, never-fired sender for the whole acquire
-            // (dropping it early would read as "connection gone" =>
-            // Cancelled). If the HTTP request itself is dropped while
-            // QUEUED, axum drops this future and the gate's queue-slot
-            // guard reclaims the slot — nothing has been spawned yet.
-            let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+            // Uncancellable acquire (kata znhn item 4): REST has no
+            // connection whose death should cancel the wait — the gate owns
+            // that semantics now. If the HTTP request is dropped while
+            // QUEUED, axum drops this future and the gate's queue-slot guard
+            // reclaims the slot — nothing has been spawned yet.
             match rest_gate
                 .gate
-                .acquire(rest_gate.timeout, &mut cancel_rx)
+                .acquire_uncancellable(rest_gate.timeout)
                 .await
             {
                 Ok(permit) => Some(permit),
@@ -1110,7 +1122,7 @@ pub(crate) async fn spawn_terminal_pane(
                         let _ =
                             freshell_sessions::amplifier_stub::gc_stub_if_unused(&stub.session_dir);
                     }
-                    return Err(spawn_gate_error_response(err));
+                    return Err(spawn_gate_error_response(err, rest_gate.timeout));
                 }
             }
         }
@@ -1321,6 +1333,14 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             .and_then(Value::as_str)
             .map(str::to_string);
 
+        // D-C-REVISIT(FRESHELL_CODEX_MANAGED_LAUNCH): this plan runs UNDER
+        // the held spawn permit — plan_create_with_retry can hold it ~226s
+        // worst case (5 × SIDECAR_START_BUDGET 45s + 1s backoff) vs the 10s
+        // permit wait. Accepted while the flag defaults OFF. If the default
+        // ever flips ON, the permit-hold duration MUST be revisited (likely
+        // a separate sidecar budget covering both doors). Decision record:
+        // docs/plans/2026-07-27-rest-spawn-gate.md §D-C.
+        //
         // DEV-0006 S4 inc.2 (FLAG-GATED, default OFF — council fence): with
         // `FRESHELL_CODEX_MANAGED_LAUNCH=1`, plan the managed app-server launch through
         // the SAME `CodexTerminalLaunchManager` the WS path uses (`router.ts:160-195`
@@ -4649,7 +4669,26 @@ mod tests {
             Arc::new(crate::spawn_gate::SpawnGate::new(0, 0)),
             std::time::Duration::from_secs(5),
         );
-        let (status, body) = post(app(state), "/api/tabs", shell_create_body(), true).await;
+        // Raw oneshot (not the `post` helper): this test also asserts the
+        // Retry-After HEADER, which the (status, body) helper discards.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/tabs")
+            .header("content-type", "application/json")
+            .header("x-auth-token", "tok")
+            .body(Body::from(shell_create_body().to_string()))
+            .unwrap();
+        let response = app(state).oneshot(req).await.unwrap();
+        let status = response.status();
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap().to_string()),
+            Some("5".to_string()),
+            "429 must carry a machine-readable Retry-After (bccd item 1)"
+        );
+        let body = body_json(response).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
         assert_eq!(body["status"], json!("error"));
         assert_eq!(body["code"], json!("SPAWN_QUEUE_FULL"));
@@ -4657,6 +4696,7 @@ mod tests {
             body["message"],
             json!("Too many concurrent terminal spawns; retry shortly")
         );
+        assert_eq!(body["retryAfterMs"], 5_000);
     }
 
     #[tokio::test]
@@ -4701,16 +4741,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn fifteen_plus_rest_create_burst_is_bounded_and_all_complete() {
-        // Concurrency-1 gate: at most ONE request may hold the spawn permit
-        // at a time, so a 16-burst must serialize through the gate — the
-        // queued_total counter proves the burst actually queued (bounded
-        // in-flight) instead of spawning in parallel, and every request
-        // still completes (FIFO drain, nothing dropped).
+        // Deterministic pin (kata bccd item 2, council enn3): pre-holding the
+        // single permit forces EVERY burst request through the queue —
+        // queued_total() reaches exactly 16 (the fast path cannot fire while
+        // the budget is held), and ZERO requests may complete while the
+        // budget is exhausted. That pins max-in-flight <= budget without the
+        // probabilistic `queued_total >= 8` lower bound (the fast path skips
+        // the counter). Mirrors the re-acquire precedent at
+        // `abort_burst_rest_creates_stay_gated...`.
         let state = state_with_registry();
         let registry = state.terminal_registry.clone().unwrap();
         let gate = Arc::new(crate::spawn_gate::SpawnGate::new(1, 64));
         state.set_spawn_gate(Arc::clone(&gate), std::time::Duration::from_secs(30));
         let router = app(state);
+
+        let held = gate
+            .acquire_uncancellable(std::time::Duration::from_secs(1))
+            .await
+            .expect("test pre-hold of the single permit");
 
         let mut handles = Vec::new();
         for _ in 0..16 {
@@ -4719,20 +4767,32 @@ mod tests {
                 post(r, "/api/tabs", shell_create_body(), true).await
             }));
         }
+
+        // Every request must queue behind the held permit — exact, not
+        // probabilistic.
+        for _ in 0..600 {
+            if gate.queued_total() == 16 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            gate.queued_total(),
+            16,
+            "all 16 burst requests must queue while the permit is held"
+        );
+        assert!(
+            handles.iter().all(|h| !h.is_finished()),
+            "no request may complete while the budget is fully held (max-in-flight <= budget)"
+        );
+
+        drop(held);
         let mut terminal_ids = Vec::new();
         for h in handles {
             let (status, body) = h.await.expect("request task");
             assert_eq!(status, StatusCode::OK, "{body}");
             terminal_ids.push(body["data"]["terminalId"].as_str().unwrap().to_string());
         }
-        // With 16 near-simultaneous arrivals and 1 permit, the overwhelming
-        // majority must have queued. (The fast path skips the counter when
-        // the queue is momentarily empty, hence >= 8, not == 15.)
-        assert!(
-            gate.queued_total() >= 8,
-            "burst did not queue through the gate: queued_total={}",
-            gate.queued_total()
-        );
         assert_eq!(gate.queue_rejections(), 0, "no loud rejections expected");
         assert_eq!(gate.timeouts(), 0, "no permit-wait timeouts expected");
 

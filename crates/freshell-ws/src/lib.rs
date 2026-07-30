@@ -105,6 +105,13 @@ pub struct WsState {
     /// (Task 5); until then tests drain it directly (construction sites
     /// without a consumer drop the receiver — sends are best-effort).
     pub auto_resume_tx: tokio::sync::mpsc::UnboundedSender<crate::auto_resume::CrashEvent>,
+    /// Pending user cancels for planned auto-resumes, keyed by the OLD
+    /// (crashed) terminal id (znhn item 2). Inserted by the WS handler
+    /// ONLY after registry validation (unknown ids never enter — D-4),
+    /// consumed by the hub's post-sleep guard, which re-emits the settle
+    /// frame so a consumed cancel is always loud. Bounded: one
+    /// registry-known entry per cancel click, removed on consumption.
+    pub auto_resume_cancels: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// The freshcodex WS fresh-agent slice: the post-handshake loop dispatches
     /// `freshAgent.create` / `freshAgent.send` (codex) here, which spawns the codex
     /// app-server sidecar and broadcasts `freshAgent.created` / `freshAgent.send.accepted`
@@ -774,6 +781,7 @@ mod tests {
             settings: Arc::new(test_settings()),
             broadcast_tx: Arc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
             fresh_codex: freshell_freshagent::FreshCodexState::new(
                 Arc::clone(&auth_token),
                 Arc::clone(&broadcast_tx),

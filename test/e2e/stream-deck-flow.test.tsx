@@ -27,6 +27,8 @@ import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
 import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
 import { IconImageCache } from '@/deck/icon-image-cache'
+import { providerIconDataUrl } from '@/deck/provider-icon-svg'
+import { PANE_TINT_COLORS } from '@/deck/pane-tint-colors'
 import { registerTerminalTextReader, resetTerminalTextRegistryForTests } from '@/deck/terminal-text-registry'
 import type { KeySpec } from '@/deck/frame'
 
@@ -215,7 +217,7 @@ afterEach(() => {
 })
 
 describe('Stream Deck e2e flows (fake transport, real store)', () => {
-  it('tabs appear on keys with titles, fills, dots, and icons', () => {
+  it('tabs appear on keys with titles, fills, paneIcons, and icons', () => {
     const { device } = setup({
       tabs: 3,
       busy: ['term-1'],
@@ -227,15 +229,15 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     // (greenIcon) < t1 busy (blueIcon), so busy t1 lands after the others.
     expect(decodeKey(device, 0)).toEqual({
       kind: 'tab', style: 'icons', tabId: 't2', title: 'tab2', active: false,
-      fill: 'green', dot: 'green', icons: [],
+      fill: 'green', paneIcons: [{ provider: 'claude', tint: 'green', ready: false }], icons: [],
     })
     expect(decodeKey(device, 1)).toEqual({
       kind: 'tab', style: 'icons', tabId: 't3', title: 'tab3', active: false,
-      fill: 'none', dot: 'green', icons: [],
+      fill: 'none', paneIcons: [{ provider: 'freshclaude', tint: 'green', ready: false }], icons: [],
     })
     expect(decodeKey(device, 2)).toEqual({
       kind: 'tab', style: 'icons', tabId: 't1', title: 'tab1', active: true,
-      fill: 'none', dot: 'blue', icons: [],
+      fill: 'none', paneIcons: [{ provider: 'claude', tint: 'blue', ready: false }], icons: [],
     })
   })
 
@@ -251,20 +253,20 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     expect(decodeKey(device, 1)).toMatchObject({ kind: 'tab', tabId: 't2', active: true, fill: 'none' })
   })
 
-  it('tile fill and dot track state changes', () => {
+  it('tile fill and paneIcons track state changes', () => {
     const { store, device } = setup({ tabs: 3, freshAgentTab: 3 })
-    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', fill: 'none', dot: 'green' })
+    expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', fill: 'none', paneIcons: [{ provider: 'claude', tint: 'green', ready: false }] })
     store.dispatch(upsertClaudeActivity({ terminals: [{ terminalId: 'term-1', phase: 'busy', updatedAt: 1 }] }))
     // busy t1 (blueIcon) sorts after the green-icon tabs -> key 2
-    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't1', dot: 'blue' })
+    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't1', paneIcons: [{ provider: 'claude', tint: 'blue', ready: false }] })
     store.dispatch(markTabAttention({ tabId: 't1' }))
     // attention outranks busy; active+attention (barTop) sorts t1 back to key 0
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'tab', tabId: 't1', fill: 'barTop' })
     store.dispatch(addPermissionRequest({
       sessionId: 's1', sessionType: 'freshclaude', provider: 'claude', requestId: 'r9',
     }))
-    // a pending approval suppresses busy on the fresh-agent tab: still a green-dot tile
-    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't3', fill: 'none', dot: 'green' })
+    // a pending approval suppresses busy on the fresh-agent tab: still a green pane-icon tile
+    expect(decodeKey(device, 2)).toMatchObject({ kind: 'tab', tabId: 't3', fill: 'none', paneIcons: [{ provider: 'freshclaude', tint: 'green', ready: false }] })
   })
 
   it('overflow paging with wrap on the 6-key profile', () => {
@@ -405,10 +407,10 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     expect(decodeKey(device, 2)).toMatchObject({ tabId: 't3', fill: 'none', active: false })
   })
 
-  it('busy and idle-running tabs expose blue/green dots', () => {
+  it('busy and idle-running tabs expose blue/green paneIcons', () => {
     const { device } = setup({ tabs: 2, busy: ['term-2'] })
-    expect(decodeKey(device, 0)).toMatchObject({ tabId: 't1', dot: 'green' }) // idle running
-    expect(decodeKey(device, 1)).toMatchObject({ tabId: 't2', dot: 'blue' })  // busy sorts after green
+    expect(decodeKey(device, 0)).toMatchObject({ tabId: 't1', paneIcons: [{ provider: 'claude', tint: 'green', ready: false }] }) // idle running
+    expect(decodeKey(device, 1)).toMatchObject({ tabId: 't2', paneIcons: [{ provider: 'claude', tint: 'blue', ready: false }] })  // busy sorts after green
   })
 
   it('repo icons: unready at first paint, repaint to ready when the bitmap loads', async () => {
@@ -454,6 +456,27 @@ describe('Stream Deck e2e flows (fake transport, real store)', () => {
     expect(store.getState().tabs.activeTabId).toBe('t3')
     holdKey(device, 1, 600) // long-press whatever now occupies key 1
     expect(decodeKey(device, 0)).toMatchObject({ kind: 'action', action: 'back' })
+  })
+
+  describe('deck font loading', () => {
+    it('font ready forces a full repaint of otherwise-unchanged keys, and stop() cancels the wait', () => {
+      let fontCb: (() => void) | null = null
+      let cancelled = false
+      const { device, controller } = setup({ tabs: 2 }, undefined, defaultSettings, {
+        fontReady: (onReady) => {
+          fontCb = onReady
+          return () => { cancelled = true }
+        },
+      })
+      expect(fontCb).not.toBeNull()
+      // Steady state: nothing changed, so a plain repaint would paint zero keys.
+      device.keyImages.clear()
+      fontCb!()
+      // The font hook invalidates the diff cache -> every visible key repaints.
+      expect(device.keyImages.size).toBeGreaterThan(0)
+      controller.stop()
+      expect(cancelled).toBe(true)
+    })
   })
 })
 
@@ -519,5 +542,39 @@ describe('tile styles', () => {
     expect(decodeStrip(device)).toContain('2 waiting')
     store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: 'terminal-previews' } }))
     expect(decodeStrip(device)).toContain('2 waiting')
+  })
+
+  it('icons style: busy agent pane surfaces as a blue-tinted paneIcon on the wire', () => {
+    const { device } = setup({ tabs: 2, busy: ['term-2'] })
+    // Sorted order: idle-running t1 (green icon) at key 0, busy t2 (blue icon) at key 1.
+    const spec = decodeKey(device, 1)
+    expect(spec).toMatchObject({
+      kind: 'tab',
+      style: 'icons',
+      tabId: 't2',
+      // ready is false: jsdom never decodes images, so the default cache never
+      // reports a bitmap — this asserts the pre-decode wire state.
+      paneIcons: [{ provider: 'claude', tint: 'blue', ready: false }],
+    })
+  })
+
+  it('icons style: pane icon flips to ready on the wire when its data URL decodes (A1 falsification fix, proven on the real controller+cache)', async () => {
+    // Mirrors the repo-icon deferred-loader test above: the REAL IconImageCache
+    // with a hand-resolved loader. buildFrame's iconReady probe (bitmapFor)
+    // starts the load with the tinted data URL; resolving it fires the cache
+    // notify, and the repaint must flip `ready` in the spec JSON — the diff-skip
+    // in DeckController would otherwise never repaint this key.
+    const { loader, pending } = deferredLoader()
+    const cache = new IconImageCache(loader)
+    const { device } = setup({ tabs: 1 }, undefined, defaultSettings, { iconCache: cache })
+    expect(decodeKey(device, 0)).toMatchObject({
+      paneIcons: [{ provider: 'claude', tint: 'green', ready: false }],
+    })
+    const url = providerIconDataUrl('claude', PANE_TINT_COLORS.green)
+    pending.get(url)!.resolve({} as CanvasImageSource) // frame-time probe already requested this exact URL
+    await vi.advanceTimersByTimeAsync(0)
+    expect(decodeKey(device, 0)).toMatchObject({
+      paneIcons: [{ provider: 'claude', tint: 'green', ready: true }],
+    })
   })
 })

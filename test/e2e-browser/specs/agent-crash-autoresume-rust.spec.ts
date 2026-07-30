@@ -175,8 +175,14 @@ async function createClaudePane(page: Page, info: TestServerInfo): Promise<TestH
 }
 
 /** The auto-resume notice strip (role=status, TerminalExitBanner.tsx) — the
- *  filter excludes unrelated role=status surfaces (offline / attach-recovery). */
+ *  filter excludes unrelated role=status surfaces (offline / attach-recovery).
+ *  Matches BOTH the in-flight recovering notice ("auto-resuming") and the
+ *  persistent crash trace ("auto-resumed at HH:MM"). */
 const autoResumeNotice = (page: Page) => page.getByRole('status').filter({ hasText: /auto-resum/ })
+
+/** ONLY the in-flight recovering notice (znhn#1 retired the ephemeral
+ *  'resumed' strip; the persistent crash trace says "auto-resumed at"). */
+const recoveringNotice = (page: Page) => page.getByRole('status').filter({ hasText: /auto-resuming/ })
 
 test.describe('agent crash auto-resume (rust only)', () => {
   // Pay any cold cargo release build inside a generous HOOK timeout, not a
@@ -216,8 +222,10 @@ test.describe('agent crash auto-resume (rust only)', () => {
         ).toBe(true)
       }).toPass({ timeout: 30_000 })
 
-      // UI: the auto-resume notice is visible (the 'resumed' notice persists
-      // for its 30s TTL, so this cannot race the 100ms recovering window)...
+      // UI: the auto-resume surface is visible (znhn#1: the persistent crash
+      // trace — "crashed & auto-resumed at HH:MM" — replaced the ephemeral
+      // resumed strip and persists until dismissed, so this cannot race the
+      // 100ms recovering window)...
       await expect(autoResumeNotice(page)).toBeVisible({ timeout: 15_000 })
       // ...and the pane is back to a live terminal: no role=alert error bar,
       // and the claude pane's content settles on a running terminal.
@@ -341,12 +349,112 @@ test.describe('agent crash auto-resume (rust only)', () => {
 
       // Genuinely LIVE: the argv log stays at EXACTLY 4 invocations for >=1s
       // (a clean exit-0 would re-settle the pane; a crash would append
-      // invocation 5), and neither the alert bar nor an auto-resume notice
-      // reappears in that window.
+      // invocation 5), and neither the alert bar nor an in-flight recovering
+      // notice reappears in that window. (The persistent crash trace from the
+      // earlier successful auto-resumes legitimately remains — znhn#1 — so
+      // the assertion targets the RECOVERING notice specifically.)
       await page.waitForTimeout(1_000)
       expect((await readArgvLog(rig.argvLog)).length, 'invocation 4 must stay alive').toBe(4)
       await expect(page.getByRole('alert')).toHaveCount(0)
-      await expect(autoResumeNotice(page)).toHaveCount(0)
+      await expect(recoveringNotice(page)).toHaveCount(0)
+    } finally {
+      await teardownRig(rig)
+    }
+  })
+
+  test('a persistent crash trace survives reload and is dismissible', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000)
+    let rig: Rig | undefined
+    try {
+      rig = await bootRig('trace', { FAKE_CRASH_MODE: 'once' })
+      await createClaudePane(page, rig.info)
+
+      const trace = page.getByTestId('crash-trace')
+      await expect(trace).toBeVisible({ timeout: 30_000 })
+      await expect(trace).toHaveText(/claude crashed \(exit 1\) & auto-resumed at \d{2}:\d{2}/)
+      await expect(page.getByRole('alert')).toHaveCount(0)
+
+      // The morning-user scenario: the trace survives a reload.
+      await page.reload()
+      await connect(page, rig.info)
+      await expect(page.getByTestId('crash-trace')).toBeVisible({ timeout: 30_000 })
+
+      // Dismiss → gone, and STAYS gone across another reload.
+      await page.getByRole('button', { name: 'Dismiss claude crash notice' }).click()
+      await expect(page.getByTestId('crash-trace')).toHaveCount(0)
+      await page.reload()
+      await connect(page, rig.info)
+      await expect(page.locator('.xterm').first()).toBeVisible({ timeout: 30_000 })
+      await expect(page.getByTestId('crash-trace')).toHaveCount(0)
+    } finally {
+      await teardownRig(rig)
+    }
+  })
+
+  test('a flap loop trips the circuit breaker: settles with the crashed-N-times banner', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000)
+    let rig: Rig | undefined
+    try {
+      rig = await bootRig('flap', {
+        FAKE_CRASH_MODE: 'always',
+        FAKE_CRASH_LIVE_MS: '1000',
+        FRESHELL_AUTO_RESUME_DELAYS_MS: '100,200',
+        // Each 1s generation counts as "healthy" (budget resets — the
+        // forever-loop precondition) and stays under the registry window so
+        // the generation cap never preempts the breaker.
+        FRESHELL_AUTO_RESUME_HEALTHY_LIFETIME_MS: '500',
+        FRESHELL_RESPAWN_LIVENESS_WINDOW_MS: '500',
+        FRESHELL_AUTO_RESUME_MAX_CYCLES: '3',
+      })
+      await createClaudePane(page, rig.info)
+
+      const alert = page.getByRole('alert').filter({ hasText: 'claude crashed 3 times — auto-resume paused' })
+      await expect(alert).toBeVisible({ timeout: 60_000 })
+
+      // Bounded: 1 original + 3 auto-resumes, then nothing more.
+      await expect(async () => {
+        expect((await readArgvLog(rig!.argvLog)).length).toBe(4)
+      }).toPass({ timeout: 15_000 })
+      await page.waitForTimeout(3_000)
+      expect((await readArgvLog(rig.argvLog)).length, 'breaker must stay open').toBe(4)
+      await expect(page.getByRole('button', { name: 'Relaunch claude session' })).toBeVisible()
+    } finally {
+      await teardownRig(rig)
+    }
+  })
+
+  test('cancel clears the recovering notice immediately and no respawn happens', async ({ page, e2eServerKind }) => {
+    expect(e2eServerKind).toBe('rust')
+    test.setTimeout(240_000)
+    let rig: Rig | undefined
+    try {
+      // Long backoff = a wide window where the OLD behavior would have lied
+      // for 30s (znhn#3) and no window at all for the alert bar (znhn#6).
+      // FAKE_CRASH_LIVE_MS keeps invocation 1 alive ~5s so the pane-creation
+      // choreography fully settles BEFORE the crash: the cancel click then
+      // lands early in the 8s backoff (observed: a crash mid-choreography
+      // pushed the click past the first backoff, so attempt 1 had already
+      // respawned before the cancel could land).
+      rig = await bootRig('cancel', {
+        FAKE_CRASH_MODE: 'always',
+        FAKE_CRASH_LIVE_MS: '5000',
+        FRESHELL_AUTO_RESUME_DELAYS_MS: '8000,8000',
+      })
+      await createClaudePane(page, rig.info)
+
+      await expect(recoveringNotice(page)).toBeVisible({ timeout: 30_000 })
+      await page.getByRole('button', { name: 'Cancel auto-resume for claude' }).click()
+
+      // Settle frame, not TTL: the notice clears within seconds, the loud
+      // alert takes its place.
+      await expect(recoveringNotice(page)).toHaveCount(0, { timeout: 3_000 })
+      await expect(page.getByRole('alert').filter({ hasText: 'process exited (code 1)' })).toBeVisible({ timeout: 5_000 })
+
+      // The planned respawn was guard-aborted: still only 1 invocation.
+      await page.waitForTimeout(10_000)
+      expect((await readArgvLog(rig.argvLog)).length, 'cancel must abort the planned respawn').toBe(1)
     } finally {
       await teardownRig(rig)
     }

@@ -60,9 +60,9 @@ use freshell_platform::{
 };
 use freshell_protocol::{
     ClientMessage, ErrorCode, ErrorMsg, Pong, ServerMessage, SessionLocator, Shell, TerminalAttach,
-    TerminalCreate, TerminalCreated, TerminalIdOnly, TerminalInputBlocked,
-    TerminalInputBlockedReason, TerminalKill, TerminalMetaRecord, TerminalMetaUpdated,
-    TerminalResize,
+    TerminalAutoResumeCancel, TerminalCreate, TerminalCreated, TerminalIdOnly,
+    TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill, TerminalMetaRecord,
+    TerminalMetaUpdated, TerminalResize,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -694,6 +694,10 @@ async fn handle_client_text(
             handle_detach(&detach.terminal_id, ws_tx, state, conn_id).await
         }
         ClientMessage::TerminalKill(kill) => handle_kill(kill, ws_tx, state).await,
+        ClientMessage::TerminalAutoResumeCancel(cancel) => {
+            handle_auto_resume_cancel(cancel, state);
+            true
+        }
         // freshAgent.create / freshAgent.send (codex + claude slices): dispatch to the
         // shared provider state as a DETACHED task so the cold sidecar spawn + the live
         // turn never block this connection's select loop (which must keep fanning out
@@ -2906,18 +2910,14 @@ pub async fn respawn_agent_terminal(
     // doors. (The per-connection CreateRateLimiter is connection-loop-local
     // and does not apply here.)
     //
-    // The gate's acquire is cancellable via a watch channel (the WS restore
-    // door wires its per-connection cancel signal; kata enn3). Auto-resume
-    // is server-initiated with no connection to die, so — like the REST
-    // door (`terminal_tabs.rs` rest gate) — hold a never-fired sender for
-    // the acquire's duration; the timeout still bounds the wait.
-    let (_respawn_cancel_tx, mut respawn_cancel_rx) = tokio::sync::watch::channel(false);
+    // Uncancellable acquire (kata znhn item 4): auto-resume is
+    // server-initiated with no connection to die; the timeout still bounds
+    // the wait.
     let _spawn_permit = match state
         .spawn_gate
-        .acquire(
-            std::time::Duration::from_millis(state.create_protect.spawn_timeout_ms),
-            &mut respawn_cancel_rx,
-        )
+        .acquire_uncancellable(std::time::Duration::from_millis(
+            state.create_protect.spawn_timeout_ms,
+        ))
         .await
     {
         Ok(permit) => permit,
@@ -3844,6 +3844,39 @@ async fn handle_detach(
 /// live-pinned 2026-07-14 in the kill re-probe, `kill-orig-r16.json`: the invalid
 /// kill draws an `error` frame on the original; the port previously dropped it
 /// silently).
+/// znhn item 2: flag the pending resume for the hub's post-sleep guard AND
+/// settle the client IMMEDIATELY — the notice must clear on click, not
+/// after the backoff sleep completes. The id is VALIDATED against the
+/// registry first (D-4, kill-handler precedent): an unknown id is ignored
+/// with a log — no insert, no broadcast — so the set cannot grow without
+/// bound and spoofed ids cannot broadcast settle frames. The hub consumes
+/// the flag post-sleep and re-emits the settle frame (idempotent), so a
+/// late-consumed cancel is always loud.
+fn handle_auto_resume_cancel(cancel: TerminalAutoResumeCancel, state: &WsState) {
+    if !state.registry.exists(&cancel.terminal_id) {
+        tracing::info!(terminal_id = %cancel.terminal_id, "terminal.auto_resume.cancel_unknown_id_ignored");
+        return;
+    }
+    state
+        .auto_resume_cancels
+        .lock()
+        .expect("auto_resume_cancels lock")
+        .insert(cancel.terminal_id.clone());
+    let msg = freshell_protocol::ServerMessage::TerminalStatus(freshell_protocol::TerminalStatus {
+        status: freshell_protocol::RuntimeStatus::Exited,
+        terminal_id: cancel.terminal_id.clone(),
+        attempt: None,
+        max_attempts: None,
+        exit_code: None,
+        reason: Some("auto-resume cancelled".to_string()),
+        resume_cycles: None,
+    });
+    if let Ok(json) = serde_json::to_string(&msg) {
+        let _ = state.broadcast_tx.send(json);
+    }
+    tracing::info!(terminal_id = %cancel.terminal_id, "terminal.auto_resume.user_cancelled");
+}
+
 async fn handle_kill(kill: TerminalKill, ws_tx: &mut WsSink, state: &WsState) -> bool {
     if kill_and_broadcast(state, &kill.terminal_id) {
         // P1.8 trigger (e): explicit user close — best-effort retire of the
@@ -4777,6 +4810,7 @@ mod terminals_changed_tests {
             ),
             broadcast_tx: Arc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
             fresh_codex: freshell_freshagent::FreshCodexState::new(
                 Arc::clone(&auth_token),
                 Arc::clone(&broadcast_tx),
@@ -4868,6 +4902,33 @@ mod terminals_changed_tests {
             rx.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn cancel_with_an_unknown_terminal_id_is_ignored_and_the_set_does_not_grow() {
+        // D-4 (validated A5): unknown id -> log + return. Assert (a) no
+        // settle frame is broadcast, (b) state.auto_resume_cancels stays
+        // EMPTY — the set is bounded by registry-known ids, a client cannot
+        // grow it with spoofed ids or pre-poison a future resume.
+        let (state, mut rx) = state_with_bus();
+        handle_auto_resume_cancel(
+            TerminalAutoResumeCancel {
+                terminal_id: "spoofed-id".to_string(),
+            },
+            &state,
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(
+            state
+                .auto_resume_cancels
+                .lock()
+                .expect("auto_resume_cancels lock")
+                .is_empty(),
+            "unknown ids must never enter the cancel set"
+        );
     }
 }
 
@@ -4984,6 +5045,7 @@ mod terminal_meta_created_tests {
             ),
             broadcast_tx: std::sync::Arc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
             fresh_codex: freshell_freshagent::FreshCodexState::new(
                 std::sync::Arc::clone(&auth_token),
                 std::sync::Arc::clone(&broadcast_tx),

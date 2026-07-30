@@ -1607,6 +1607,20 @@ async fn send_keys(
         // COLD-START + create the durable session. `create_session` runs `ensure_started`
         // (spawn serve → bounded health wait — the DEV-0001 fix, NO warm-proxy) then
         // `POST /session`. Success here IS the cold-start-clean fingerprint.
+        //
+        // bccd item 4 (council enn3 D-D evaluate-and-decide) — DELIBERATELY
+        // UNGATED. Decision reversed at plan validation: gating this
+        // cold-start would hold a spawn permit for a worst-case ~50-70s
+        // (health_timeout 20_000ms serve.rs:303 + request_timeout 30_000ms
+        // serve.rs:308,546 under the permit; the serialized `running`-mutex
+        // queue adds ~20s per failing holder) vs the 10s gate waits at
+        // every other door — and k cold first-sends queued on the singleton
+        // mutex would hold k permits, starving ALL spawn doors. The
+        // double-mutex single-flight already bounds actual sidecar forks
+        // to AT MOST ONE server-wide: the gate would add starvation
+        // without reducing fork concurrency. Moving the acquire inside
+        // the single-flight would invert lock order (cycle hazard).
+        // Decision record: docs/plans/2026-07-29-znhn-bccd-followups.md §D-7.
         let created = match manager
             .create_session(None, None, pane.cwd.as_deref())
             .await

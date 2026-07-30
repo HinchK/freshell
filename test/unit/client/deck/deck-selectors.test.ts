@@ -21,7 +21,7 @@ import type { RepoIconEntry } from '@/store/repoIconsSlice'
 import { buildRepoIconUrl } from '@/lib/repo-icon'
 import { hueFromString } from '@/components/icons/RepoIcon'
 import {
-  findApproveTarget, findStopTarget, getTabRepoIcons, getTabStatusFlags, selectDeckModel,
+  findApproveTarget, findStopTarget, getTabRepoIcons, getTabStatusFlags, getTabPaneIcons, selectDeckModel,
 } from '@/deck/deck-selectors'
 
 const reducer = {
@@ -426,5 +426,55 @@ describe('selectDeckModel (sorted, tile fields)', () => {
     expect(t1.repoIcons).toEqual([{ url: buildRepoIconUrl('/repos/alpha'), letter: 'A', hue: hueFromString('alpha') }])
     expect(t2.fill).toBe('none')
     expect(t2.dot).toBe('blue')
+  })
+})
+
+describe('getTabPaneIcons', () => {
+  it('non-shell terminal pane -> provider = mode, tint green when running and not busy', () => {
+    const state = makeState()
+    expect(getTabPaneIcons(state, tabsOf(state)[0])).toEqual([{ provider: 'claude', tint: 'green' }])
+  })
+
+  it('busy wins over status: busy claude pane tints blue', () => {
+    const state = makeState({ claudeBusy: true })
+    expect(getTabPaneIcons(state, tabsOf(state)[0])).toEqual([{ provider: 'claude', tint: 'blue' }])
+  })
+
+  it('fresh-agent pane -> provider = sessionType, treated as running (green) unless busy', () => {
+    const state = makeState()
+    expect(getTabPaneIcons(state, tabsOf(state)[1])).toEqual([{ provider: 'freshclaude', tint: 'green' }])
+  })
+
+  it('shell panes yield no agent icon', () => {
+    const state = makeState({
+      t1Layout: { type: 'leaf', id: 'p1', content: { kind: 'terminal', terminalId: 'term-1', createRequestId: 'c1', status: 'running', mode: 'shell' } } as never,
+    })
+    expect(getTabPaneIcons(state, tabsOf(state)[0])).toEqual([])
+  })
+
+  it('status maps like the tab bar: exited -> mutedDim, error -> red, creating -> muted, recovering -> amber', () => {
+    for (const [status, tint] of [['exited', 'mutedDim'], ['error', 'red'], ['creating', 'muted'], ['recovering', 'amber']] as const) {
+      const state = makeState({ paneStatus: { p1: status } })
+      expect(getTabPaneIcons(state, tabsOf(state)[0])).toEqual([{ provider: 'claude', tint }])
+    }
+  })
+
+  it('multiple agent panes stay in layout order and are NOT capped here', () => {
+    const state = makeState({
+      t1Layout: split('s1', claudeLeaf('p1', 'term-1'), split('s2', claudeLeaf('p2', 'term-2'), claudeLeaf('p3', 'term-3'))),
+      busy: ['term-2'],
+    })
+    expect(getTabPaneIcons(state, tabsOf(state)[0])).toEqual([
+      { provider: 'claude', tint: 'green' },
+      { provider: 'claude', tint: 'blue' },
+      { provider: 'claude', tint: 'green' },
+    ])
+  })
+
+  it('selectDeckModel carries paneIcons per tab', () => {
+    const state = makeState({ claudeBusy: true })
+    const model = selectDeckModel(state)
+    const t1 = model.tabs.find((t) => t.id === 't1')!
+    expect(t1.paneIcons).toEqual([{ provider: 'claude', tint: 'blue' }])
   })
 })
