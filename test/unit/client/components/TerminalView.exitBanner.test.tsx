@@ -120,10 +120,11 @@ interface StoreOptions {
   mode?: string
   status?: TerminalPaneContent['status']
   withSessionRef?: boolean
+  crashTrace?: { exitCode: number; resumedAtMs: number }
   lifecycle?: {
     lastTerminalId?: string
     exit?: { exitCode: number; at: number }
-    notice?: { kind: 'recovering' | 'resumed'; attempt: number; maxAttempts: number; exitCode: number; at: number }
+    notice?: { kind: 'recovering'; attempt: number; maxAttempts: number; exitCode: number; at: number }
   }
 }
 
@@ -135,6 +136,7 @@ function makeStore(opts: StoreOptions = {}) {
     status: opts.status ?? 'exited',
     mode: mode as TerminalPaneContent['mode'],
     shell: 'system',
+    ...(opts.crashTrace ? { crashTrace: opts.crashTrace } : {}),
     ...(opts.withSessionRef === false
       ? {}
       : { sessionRef: { provider: mode, sessionId: SESSION_ID } }),
@@ -458,6 +460,78 @@ describe('TerminalView exited-pane error banner', () => {
     })
     expect(screen.queryByText(/auto-resuming/)).toBeNull()
     expect(screen.getByRole('alert')).toHaveTextContent('process exited (code 1)')
+  })
+
+  it('terminal.replaced writes a persistent crash trace onto pane content and shows the trace strip', async () => {
+    const at = Date.now()
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'running',
+      lifecycle: {
+        lastTerminalId: 'term-crashed',
+        notice: { kind: 'recovering', attempt: 1, maxAttempts: 2, exitCode: 1, at },
+      },
+    })
+    const { rerender } = render(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneContent} />
+      </Provider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(messageHandler).not.toBeNull()
+
+    await act(async () => {
+      messageHandler!({ type: 'terminal.replaced', oldTerminalId: 'term-crashed', newTerminalId: 'term-new', exitCode: 1, attempt: 1, maxAttempts: 2 })
+    })
+
+    // The store now carries it on pane CONTENT (the persisted home):
+    const content = paneState(store)
+    expect(content.crashTrace?.exitCode).toBe(1)
+    expect(typeof content.crashTrace?.resumedAtMs).toBe('number')
+
+    // Re-render with the updated content (in production the parent passes
+    // fresh store content on every render).
+    rerender(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneState(store)} />
+      </Provider>
+    )
+    const trace = screen.getByTestId('crash-trace')
+    expect(trace).toHaveTextContent(/claude crashed \(exit 1\) & auto-resumed at \d{2}:\d{2}/)
+    expect(trace).toHaveAttribute('role', 'status')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('dismissing the crash trace clears it from pane content', async () => {
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'running',
+      crashTrace: { exitCode: 1, resumedAtMs: Date.now() },
+    })
+    const { rerender } = render(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneContent} />
+      </Provider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(screen.getByTestId('crash-trace')).toBeInTheDocument()
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Dismiss claude crash notice' }))
+    })
+    expect(paneState(store).crashTrace).toBeUndefined()
+    rerender(
+      <Provider store={store}>
+        <TerminalView tabId={TAB} paneId={PANE} paneContent={paneState(store)} />
+      </Provider>
+    )
+    expect(screen.queryByTestId('crash-trace')).toBeNull()
   })
 
   it('cancel button sends terminal.autoResumeCancel with the old terminal id', async () => {

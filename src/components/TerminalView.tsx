@@ -20,6 +20,8 @@ import {
   RECONCILE_NOTICE_FRESH_BY_RACE,
   repairCodexIdentityMismatch,
   resetPaneForReconcileCreate,
+  setPaneCrashTrace,
+  clearPaneCrashTrace,
   splitPane,
   updatePaneContent,
   updatePaneTitle,
@@ -4414,6 +4416,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
               maxAttempts: msg.maxAttempts,
               at: Date.now(),
             }))
+            // znhn item 1: the persistent, dismissible crash trace lives on
+            // pane CONTENT (persistence is a denylist — it survives reload).
+            dispatch(
+              setPaneCrashTrace({
+                tabId,
+                paneId: paneIdRef.current,
+                crashTrace: { exitCode: msg.exitCode, resumedAtMs: Date.now() },
+              })
+            )
             // Fold the new terminalId into this pane via the ONE reducer built
             // for server-supplied rebinds (mirrors pane-reconcile.ts:428-436).
             // applyReconcileAttach unconditionally overwrites serverInstanceId
@@ -5244,12 +5255,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   //   (agent process died), same alert. Plain launch failures (create
   //   rejected — no exit record) keep today's presentation.
   const isAgentPane = Boolean(terminalContent.mode && terminalContent.mode !== 'shell')
+  const settledDead =
+    (terminalContent.status === 'exited' && (exitRecord ? exitRecord.exitCode !== 0 : true)) ||
+    (terminalContent.status === 'error' && Boolean(exitRecord && exitRecord.exitCode !== 0))
   const showExitBanner = Boolean(
-    isAgentPane && (
-      activeNotice ||
-      (terminalContent.status === 'exited' && (exitRecord ? exitRecord.exitCode !== 0 : true)) ||
-      (terminalContent.status === 'error' && exitRecord && exitRecord.exitCode !== 0)
-    )
+    isAgentPane && (activeNotice || terminalContent.crashTrace || settledDead)
   )
 
   return (
@@ -5350,6 +5360,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             mode={terminalContent.mode ?? 'agent'}
             exitCode={exitRecord?.exitCode ?? null}
             notice={activeNotice ?? null}
+            crashTrace={terminalContent.crashTrace ?? null}
+            settledDead={settledDead}
+            onDismissCrashTrace={() => dispatch(clearPaneCrashTrace({ tabId, paneId }))}
             onRelaunch={() => {
               // Discard the OLD crash's lifecycle entry: if the relaunch
               // create is rejected (pane settles 'error' with no new

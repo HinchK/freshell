@@ -49,20 +49,28 @@ describe('terminalLifecycleSlice', () => {
     expect(selectResumeCycles({ terminalLifecycle: s }, 'p1')).toBeUndefined()
   })
 
-  it('fold clears the exit record, sets a resumed notice, and advances lastTerminalId', () => {
+  it('foldTerminalReplacement clears the notice (the persistent crash trace replaces the resumed strip)', () => {
+    // znhn item 1: the 'resumed' notice kind is retired — the dismissible
+    // crash trace on pane content is the post-resume indicator.
     let s = reducer(empty, recordTerminalExit({ paneId: 'p1', terminalId: 't1', exitCode: 1, at: 1000 }))
     s = reducer(s, recordAutoResumeRecovering({ paneId: 'p1', attempt: 1, maxAttempts: 2, exitCode: 1, at: 1000 }))
     s = reducer(s, foldTerminalReplacement({ paneId: 'p1', newTerminalId: 't2', exitCode: 1, attempt: 1, maxAttempts: 2, at: 2000 }))
     expect(selectExitRecordFrom(s, 'p1')).toBeUndefined() // pane is alive again — no error bar
-    expect(selectActiveNoticeFrom(s, 'p1')).toEqual({ kind: 'resumed', attempt: 1, maxAttempts: 2, exitCode: 1, at: 2000 })
+    expect(selectActiveNoticeFrom(s, 'p1')).toBeUndefined()
     expect(selectLastTerminalIdFrom(s, 'p1')).toBe('t2')
   })
 
-  it('a later exit clears any active notice (exhaustion must not be masked by a stale resumed strip)', () => {
-    // fold sets a 'resumed' notice; the replacement then crashes and the hub
-    // settles retries_exhausted WITHOUT emitting any frame — the exit record
-    // must surface the alert immediately, not after the 30s TTL.
-    let s = reducer(empty, foldTerminalReplacement({ paneId: 'p1', newTerminalId: 't2', exitCode: 1, attempt: 2, maxAttempts: 2, at: 1000 }))
+  it('a replacement clears prior settle state (stale resumeCycles cannot leak into a later crash banner)', () => {
+    // Pairs with the recordTerminalExit pin above (validated A15): nothing
+    // else ever deletes the settle state, and the REST-door relaunch/
+    // reconcile never advances lastTerminalId.
+    let s = reducer(empty, recordAutoResumeSettled({ paneId: 'p1', resumeCycles: 5, at: 1 }))
+    s = reducer(s, foldTerminalReplacement({ paneId: 'p1', newTerminalId: 't2', exitCode: 1, attempt: 1, maxAttempts: 2, at: 2000 }))
+    expect(selectResumeCycles({ terminalLifecycle: s }, 'p1')).toBeUndefined()
+  })
+
+  it('a later exit clears any active notice (exhaustion must not be masked by a stale strip)', () => {
+    let s = reducer(empty, recordAutoResumeRecovering({ paneId: 'p1', attempt: 1, maxAttempts: 2, exitCode: 1, at: 1000 }))
     s = reducer(s, recordTerminalExit({ paneId: 'p1', terminalId: 't2', exitCode: 1, at: 2000 }))
     expect(selectActiveNoticeFrom(s, 'p1')).toBeUndefined()
     expect(selectExitRecordFrom(s, 'p1')).toEqual({ exitCode: 1, at: 2000 })

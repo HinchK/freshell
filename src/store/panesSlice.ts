@@ -5,6 +5,7 @@ import {
   normalizeFreshAgentModelSelection,
   normalizeFreshAgentPendingLocalEcho,
   type DeadSessionEntry,
+  type CrashTrace,
   type FreshAgentPaneContent,
   type LivePaneContentInput,
   type PanesState,
@@ -60,6 +61,16 @@ function readRestoreError(value: unknown): RestoreError | undefined {
 /**
  * Normalize pane content to the full persisted/runtime shape.
  */
+/** Shape guard for the persisted crash trace (znhn item 1). */
+function isCrashTrace(value: unknown): value is CrashTrace {
+  return (
+    typeof value === 'object'
+    && value !== null
+    && typeof (value as { exitCode?: unknown }).exitCode === 'number'
+    && typeof (value as { resumedAtMs?: unknown }).resumedAtMs === 'number'
+  )
+}
+
 function normalizePaneContent(
   rawInput: PaneContentInput | PaneContent | Record<string, unknown>,
   previous?: PaneContent,
@@ -100,6 +111,13 @@ function normalizePaneContent(
         ? input.pendingReconcile
         : undefined,
       reconcileEpoch: typeof input.reconcileEpoch === 'number' ? input.reconcileEpoch : undefined,
+      // znhn item 1: the persistent crash trace must survive the hydrate
+      // normalize (this function is a whitelist — without this line the
+      // "survives reload" property silently dies here even though the
+      // persistMiddleware strip and persistedState load both keep it).
+      ...(isCrashTrace((input as { crashTrace?: unknown }).crashTrace)
+        ? { crashTrace: (input as { crashTrace: CrashTrace }).crashTrace }
+        : {}),
     }
   }
   if (input.kind === 'browser') {
@@ -2095,6 +2113,23 @@ export const panesSlice = createSlice({
       content.reconcileNotice = undefined
     },
 
+    // znhn item 1: persistent crash trace — written on terminal.replaced,
+    // cleared only by user dismissal (pane close deletes the pane node).
+    setPaneCrashTrace: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string; crashTrace: CrashTrace }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (content) content.crashTrace = action.payload.crashTrace
+    },
+    clearPaneCrashTrace: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const content = findReconcileTerminalContent(state, action.payload.tabId, action.payload.paneId)
+      if (content && content.crashTrace) delete content.crashTrace
+    },
+
     /** Council rule 12: dead_session is a UI state, not a deletion — panes wait for the user. */
     setDeadSessionAdjudication: (state, action: PayloadAction<DeadSessionEntry[]>) => {
       state.deadSessionAdjudication = action.payload
@@ -2235,6 +2270,8 @@ export const {
   resetFreshAgentPaneForReconcileCreate,
   setPaneReconcileNotice,
   clearPaneReconcileNotice,
+  setPaneCrashTrace,
+  clearPaneCrashTrace,
   setDeadSessionAdjudication,
   resolveDeadSessionEntry,
   clearDeadSessionAdjudication,

@@ -62,10 +62,14 @@ const slice = createSlice({
       entry(state, paneId).notice = { kind: 'recovering', ...n }
     },
     foldTerminalReplacement(state, a: PayloadAction<{ paneId: string; newTerminalId: string; exitCode: number; attempt: number; maxAttempts: number; at: number }>) {
-      const { paneId, newTerminalId, exitCode, attempt, maxAttempts, at } = a.payload
+      const { paneId, newTerminalId } = a.payload
       const e = entry(state, paneId)
       delete e.exit // pane is alive again — no error bar
-      e.notice = { kind: 'resumed', attempt, maxAttempts, exitCode, at }
+      // znhn item 1: the ephemeral 'resumed' strip is retired — the
+      // persistent crash trace on pane content is the post-resume indicator.
+      delete e.notice
+      // Stale-settle leak fix (validated A15, pairs with recordTerminalExit).
+      delete e.settle
       e.lastTerminalId = newTerminalId
     },
     // Settle frame (terminal.status status:'exited') — the deterministic
