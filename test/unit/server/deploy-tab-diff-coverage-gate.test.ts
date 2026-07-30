@@ -305,3 +305,13 @@ describe('deploy-tab-diff capture coverage gate', () => {
     }
   })
 })
+
+describe('deploy-tab-diff --help', () => {
+  it('documents the coverage gate: exit 4 and --allow-uncovered', async () => {
+    // --help is parsed inside the flag loop, so it needs a leading subcommand.
+    const r = await runScript(['capture', '--help'])
+    expect(r.code).toBe(0)
+    expect(r.out).toContain('--allow-uncovered')
+    expect(r.out).toContain('4 capture coverage gap')
+  })
+})

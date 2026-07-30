@@ -2,9 +2,24 @@
 # deploy-tab-diff.sh -- pre/post-restart tab identity ritual (continuity trio
 # deliverable 3, docs/plans/2026-07-22-continuity-safety-trio.md).
 #
-#   scripts/deploy-tab-diff.sh capture --url U --token T --out before.json
+#   scripts/deploy-tab-diff.sh capture --url U --token T --out before.json [--allow-uncovered]
 #   ... restart/deploy the server ...
 #   scripts/deploy-tab-diff.sh verify  --url U --token T --before before.json
+#
+# capture GATES on coverage (docs/plans/2026-07-29-capture-coverage-gate.md):
+# if any running terminal is covered by NO persisted open-tab snapshot pane,
+# a restart permanently kills its pane (PTY, scrollback, placement --
+# session=none terminals are lost outright; session-bearing ones survive only
+# as manually recoverable sessions), so capture prints the uncovered list
+# (with mode/cwd/title/session), still writes the artifact for diagnosis, and
+# exits 4. Pass --allow-uncovered to accept the loss: same list as a WARNING,
+# exit 0.
+# verify re-runs the same guard on the before-file (defense in depth against
+# artifacts from older script versions or --allow-uncovered captures).
+#
+# Exit codes: 0 ok; 1 operational failure or post-restart divergence;
+# 2 usage; 4 capture coverage gap (artifact written, but restoring from it
+# would lose running terminal panes).
 #
 # READ-ONLY against the server (GETs only). Exit non-zero on any divergence.
 # NEVER point this at a server you do not operate. Requires curl + jq.
@@ -368,6 +383,6 @@ case "$CMD" in
     cleanup; exit 1
     ;;
   *)
-    echo "usage: deploy-tab-diff.sh {capture|verify} --url U --token T [--out F | --before F [--after F]]" >&2
+    echo "usage: deploy-tab-diff.sh {capture|verify} --url U --token T [--out F [--allow-uncovered] | --before F [--after F]]" >&2
     exit 2 ;;
 esac
