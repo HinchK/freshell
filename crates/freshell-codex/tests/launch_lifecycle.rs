@@ -413,6 +413,83 @@ async fn manager_discard_tears_down_an_unadopted_plan() {
     assert_eq!(runtime.shutdown_calls.load(Ordering::SeqCst), 1);
 }
 
+/// discard_sync must tear the sidecar down (asynchronously) without the
+/// caller awaiting — the seam Task 4's RAII guard uses from Drop.
+#[tokio::test(flavor = "multi_thread")]
+async fn discard_sync_tears_down_an_unadopted_plan() {
+    let runtime = FakeRuntime::start().await;
+    let factory_runtime = runtime.clone();
+    let manager = CodexTerminalLaunchManager::with_plan_budget(
+        Box::new(move || factory_runtime.clone() as std::sync::Arc<dyn CodexLaunchRuntime>),
+        2,
+        std::time::Duration::from_secs(30),
+        64,
+    );
+    let launch = manager
+        .plan_create_with_retry_uncancellable(
+            &CodexLaunchPlanInput::default(),
+            1,
+            LaunchClass::Interactive,
+        )
+        .await
+        .expect("plan");
+    manager.discard_sync(launch);
+    // Teardown is fire-and-forget: poll for the shutdown.
+    for _ in 0..200 {
+        if runtime
+            .shutdown_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        runtime
+            .shutdown_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "discard_sync must shut the sidecar down"
+    );
+}
+
+/// A8 (V4): `tokio::spawn` panics with no ambient runtime, and discard_sync
+/// is called from Drop — where a panic is a double-panic abort during
+/// unwind. Plan on a locally-built runtime, tear the runtime down, then
+/// call discard_sync from plain (non-tokio) test context: pre-hardening
+/// this PANICS ("there is no reactor running"); post-hardening it must
+/// degrade to best-effort kill / log-and-leak.
+#[test] // deliberately NOT #[tokio::test]
+fn discard_sync_outside_runtime_context_does_not_panic() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("local runtime");
+    let (manager, launch) = rt.block_on(async {
+        let runtime = FakeRuntime::start().await;
+        let factory_runtime = runtime.clone();
+        let manager = CodexTerminalLaunchManager::with_plan_budget(
+            Box::new(move || factory_runtime.clone() as std::sync::Arc<dyn CodexLaunchRuntime>),
+            2,
+            std::time::Duration::from_secs(30),
+            64,
+        );
+        let launch = manager
+            .plan_create_with_retry_uncancellable(
+                &CodexLaunchPlanInput::default(),
+                1,
+                LaunchClass::Interactive,
+            )
+            .await
+            .expect("plan");
+        (manager, launch)
+    });
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    // No ambient runtime here: must not panic (teardown is best-effort).
+    manager.discard_sync(launch);
+}
+
 #[tokio::test]
 async fn manager_shutdown_tears_down_adopted_and_unadopted_and_rejects_new_plans() {
     // main.rs graceful-shutdown wiring (inc.2): `manager.shutdown()` mirrors legacy's

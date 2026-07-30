@@ -519,6 +519,17 @@ impl Drop for PlanWaitingGuard<'_> {
     }
 }
 
+static GLOBAL_MANAGER: OnceLock<CodexTerminalLaunchManager> = OnceLock::new();
+
+/// Test-only global installer (mirrors the `set_codex_proxy_event_sink`
+/// seam): lets integration suites make [`CodexTerminalLaunchManager::global`]
+/// resolve to a manager over a fake runtime. Set-once: returns `false` (and
+/// installs nothing) if the global was already initialized. Production code
+/// must never call this.
+pub fn set_global_codex_launch_manager_for_tests(manager: CodexTerminalLaunchManager) -> bool {
+    GLOBAL_MANAGER.set(manager).is_ok()
+}
+
 /// The shared `resolve_codex_launch` seam (spec §5 Slice 4): plan → adopt-by-terminal-id →
 /// teardown-on-terminal-exit, used by BOTH the WS `terminal.create` codex branch and the
 /// REST `/api/tabs` codex branch. Teardown is decoupled from the (sync) PTY exit hook via
@@ -571,8 +582,7 @@ impl CodexTerminalLaunchManager {
     /// The process-wide manager over the REAL spawn runtime — legacy has exactly one
     /// `CodexLaunchPlanner` per server (`server/index.ts:359`).
     pub fn global() -> &'static CodexTerminalLaunchManager {
-        static GLOBAL: OnceLock<CodexTerminalLaunchManager> = OnceLock::new();
-        GLOBAL.get_or_init(|| {
+        GLOBAL_MANAGER.get_or_init(|| {
             CodexTerminalLaunchManager::new(Box::new(|| {
                 Arc::new(SpawnedCodexAppServerRuntime::new()) as Arc<dyn CodexLaunchRuntime>
             }))
@@ -713,6 +723,40 @@ impl CodexTerminalLaunchManager {
     /// the create error the caller is already surfacing is the primary failure.
     pub async fn discard(&self, launch: CodexTerminalLaunch) {
         let _ = launch.sidecar.shutdown().await;
+    }
+
+    /// [`Self::discard`] for sync contexts (RAII Drop guards): fire-and-forget
+    /// the sidecar teardown on the runtime. Same best-effort semantics —
+    /// teardown errors are swallowed; the create failure the caller is
+    /// surfacing (or the silent cancel) is the primary event.
+    ///
+    /// A8 hardening (V4): `tokio::spawn` PANICS when no ambient runtime
+    /// exists, and this fn is called from Drop (`PreparedCodexLaunch`),
+    /// where panicking is never acceptable (double-panic abort during
+    /// unwind). Spawn only when a handle exists; otherwise degrade to a
+    /// best-effort SYNCHRONOUS kill of the sidecar child (or, if no sync
+    /// kill seam is reachable from here, `tracing::warn!` and leak) —
+    /// NEVER panic.
+    pub fn discard_sync(&self, launch: CodexTerminalLaunch) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let _ = launch.sidecar.shutdown().await;
+                });
+            }
+            Err(_) => {
+                // No runtime (e.g. Drop during unwind after runtime
+                // teardown): no sync kill seam is reachable from here — the
+                // sidecar's shutdown path is async-only (`CodexLaunchRuntime::
+                // shutdown` returns a future, and the runtime handle lives
+                // behind an async mutex) — so log-and-leak. Leaking is
+                // acceptable; panicking is not.
+                tracing::warn!(
+                    target: "freshell_codex::launch",
+                    "discard_sync outside runtime context; best-effort kill/leak"
+                );
+            }
+        }
     }
 
     /// S5.c: release the candidate-persistence gate for an adopted terminal's
