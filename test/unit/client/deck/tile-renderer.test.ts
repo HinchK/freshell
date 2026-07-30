@@ -33,6 +33,8 @@ function recordingCtx(width: number, height: number) {
   const measures: Measure[] = []
   let pendingArc: { cx: number; cy: number; r: number } | null = null
   let pendingRound: RRect | null = null
+  let saves = 0
+  let restores = 0
   const ctx = {
     fillStyle: '#000000' as string,
     strokeStyle: '#000000' as string,
@@ -71,8 +73,12 @@ function recordingCtx(width: number, height: number) {
       if (pendingArc) circles.push({ ...pendingArc, style: String(this.fillStyle) })
       pendingArc = null
     },
-    save() {},
-    restore() {},
+    save() {
+      saves++
+    },
+    restore() {
+      restores++
+    },
     measureText(t: string) {
       measures.push({ text: t, letterSpacing: this.letterSpacing })
       const ls = parseFloat(this.letterSpacing) || 0
@@ -82,7 +88,7 @@ function recordingCtx(width: number, height: number) {
       return { data: new Uint8ClampedArray(width * height * 4) } as ImageData
     },
   } as unknown as Ctx2D
-  return { ctx, rects, texts, images, circles, clips, strokes, measures }
+  return { ctx, rects, texts, images, circles, clips, strokes, measures, getSaves: () => saves, getRestores: () => restores }
 }
 
 describe('title fitting', () => {
@@ -145,8 +151,8 @@ function renderTab(spec: KeySpec, getIcon?: IconSource) {
     return captured.ctx
   }
   const out = renderKey(spec, MINI_CAPS, factory, getIcon)
-  const { rects, texts, images, circles, clips, strokes, measures } = captured!
-  return { out, rects, texts, images, circles, clips, strokes, measures }
+  const { rects, texts, images, circles, clips, strokes, measures, getSaves, getRestores } = captured!
+  return { out, rects, texts, images, circles, clips, strokes, measures, getSaves, getRestores }
 }
 
 describe('renderKey', () => {
@@ -256,6 +262,7 @@ describe('rounded key frame', () => {
   it('every key kind paints a pure-black surround then clips to the rounded frame', () => {
     // 80x80 Mini caps => frame margin 3, radius 10, inner 74x74.
     const empty = renderTab({ kind: 'empty' })
+    let captured: ReturnType<typeof renderTab> | null = null
     for (const rec of [
       empty,
       renderTab(tabSpec()),
@@ -263,8 +270,14 @@ describe('rounded key frame', () => {
       renderTab({ kind: 'pager', page: 2, pageCount: 3 }),
       renderTab({ kind: 'action', action: 'approve', enabled: true }),
     ]) {
+      captured = rec
       expect(rec.rects[0]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: EMPTY_BG })
       expect(rec.clips[0]).toEqual({ x: 3, y: 3, w: 74, h: 74, r: 10 })
+      // Verify save/restore balance: each key rendering saves and restores
+      const saves = typeof rec.getSaves === 'function' ? rec.getSaves() : 0
+      const restores = typeof rec.getRestores === 'function' ? rec.getRestores() : 0
+      expect(saves).toBe(restores)
+      expect(saves).toBeGreaterThanOrEqual(1)
     }
     // Empty kind: the frame surround plus the empty case's own fill (now
     // clipped and pixel-identical) - two full-bleed EMPTY_BG rects.

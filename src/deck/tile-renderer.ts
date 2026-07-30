@@ -371,6 +371,7 @@ export function renderKey(
       drawAction(ctx, w, h, spec)
       break
   }
+  ctx.restore()
   return ctx.getImageData(0, 0, w, h).data
 }
 
