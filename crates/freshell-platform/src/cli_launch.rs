@@ -597,6 +597,34 @@ pub fn resolve_cli_launch(
         label: spec.label.clone(),
     })
 }
+// ===========================================================================
+// Fresh-claude preallocation predicate (shared with REST spawn pipeline)
+// ===========================================================================
+
+/// LIVE-PATH LAW (specs/coding-cli.md § 2.1(3)): fresh claude ALWAYS gets a
+/// server-preallocated `--session-id`. This is the single shared "is this
+/// create a fresh claude that must mint its own session id?" predicate,
+/// used by BOTH doors — the WS `terminal.create` handler
+/// (`freshell-ws/src/terminal.rs`) and the REST spawn pipeline
+/// (`freshell-freshagent/src/terminal_tabs.rs`) — so the two cannot drift
+/// (kata hbsa: the REST door skipped preallocation entirely, leaving
+/// un-resumable panes invisible to the A13 live-owner guard).
+///
+/// The caller that gets `true` mints `Uuid::new_v4()`, sets
+/// `LaunchIntent::Start` (claude's manifest has `create_session_args`),
+/// and marks the create as a fresh prealloc for PIN 2 gating (eaa25b7d).
+pub fn should_preallocate_fresh_claude(
+    mode: &str,
+    restore: Option<bool>,
+    has_session_ref: bool,
+    resume_session_id: Option<&str>,
+) -> bool {
+    mode == "claude"
+        && restore != Some(true)
+        && !has_session_ref
+        && resume_session_id.filter(|s| !s.is_empty()).is_none()
+}
+
 // §4 golden argv tests (split to keep this file within the campaign's
 // ≤1K-lines-per-file limit).
 #[cfg(test)]
@@ -659,6 +687,35 @@ mod tests {
             "BSD fallback: seconds + 9 zero digits"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_claude_preallocation_predicate_truth_table() {
+        use super::should_preallocate_fresh_claude as pred;
+        // The three-part freshness predicate from the WS reference
+        // (crates/freshell-ws/src/terminal.rs:1630-1637): mode == "claude"
+        // AND restore != Some(true) AND no sessionRef AND no non-empty
+        // resumeSessionId.
+        assert!(pred("claude", None, false, None));
+        assert!(pred("claude", Some(false), false, None));
+        // Empty resume id is treated as absent (matches the WS
+        // `.filter(|s| !s.is_empty()).is_none()` shape).
+        assert!(pred("claude", None, false, Some("")));
+        // Any disqualifier kills the mint:
+        assert!(!pred("claude", Some(true), false, None)); // restore create
+        assert!(!pred("claude", None, true, None)); // wire sessionRef present
+        assert!(!pred(
+            "claude",
+            None,
+            false,
+            Some("29a53649-0000-4000-8000-000000000000")
+        )); // resume
+            // Only claude mints with Start intent; other providers never do here:
+        assert!(!pred("shell", None, false, None));
+        assert!(!pred("codex", None, false, None));
+        assert!(!pred("amplifier", None, false, None));
+        assert!(!pred("opencode", None, false, None));
+        assert!(!pred("gemini", None, false, None));
     }
 
     /// GNU date passthrough: full nanosecond precision is preserved.

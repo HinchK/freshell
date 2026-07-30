@@ -281,9 +281,33 @@ async fn main() -> ExitCode {
     // live-session guard can consume it through the `SessionIdentityLookup`
     // seam (cheap-clone handle; `WsState` keeps using this same binding).
     let terminal_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    // P1.8: the pane-identity ledger (spec §4.2). Root resolved ONCE here;
+    // the module itself never reads env vars. No home => disabled no-op,
+    // same policy as tabs-snapshots. `new_locked` = the single-writer
+    // guard (V2.md): exclusive flock on <root>/lock, ConfigLock pattern —
+    // a second server on the same home comes up with a DISABLED ledger and
+    // a loud ERROR instead of two writers corrupting one store. Hoisted
+    // above the fresh-agent builder chain (kata hbsa Task 5, ledger A8):
+    // it depends only on `home`, and the REST spawn pipeline's
+    // `PaneIdentityBinder` below must share THIS instance with `ws_state`.
+    let pane_ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(
+        home.as_ref()
+            .map(|h| h.join(".freshell").join("pane-ledger")),
+    ));
     let fresh_agent_state = fresh_agent_state
         .with_terminal_registry(registry.clone())
-        .with_session_identity(std::sync::Arc::new(terminal_identity.clone()));
+        .with_session_identity(std::sync::Arc::new(terminal_identity.clone()))
+        // Write-side twin (kata hbsa Task 5): REST creates write identity
+        // rows and durable ledger bindings through the SAME
+        // `TerminalIdentityRegistry` + `PaneLedger` instances `ws_state`
+        // uses below — REST-written rows must be visible to the WS
+        // guard/drain and vice versa.
+        .with_pane_identity_binder(std::sync::Arc::new(
+            freshell_ws::pane_identity_binder::LedgerPaneIdentityBinder::new(
+                terminal_identity.clone(),
+                std::sync::Arc::clone(&pane_ledger),
+            ),
+        ));
     // TERM-11 fix: honor `settings.safety.autoKillIdleMinutes` at boot (the
     // Rust registry previously never read it at all, so a config that raised
     // or lowered it from the default had no effect). See
@@ -529,16 +553,6 @@ async fn main() -> ExitCode {
     );
     // Shutdown latch shared with shutdown_signal (Task 7 wires the setter).
     let shutdown_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    // P1.8: the pane-identity ledger (spec §4.2). Root resolved ONCE here;
-    // the module itself never reads env vars. No home => disabled no-op,
-    // same policy as tabs-snapshots. `new_locked` = the single-writer
-    // guard (V2.md): exclusive flock on <root>/lock, ConfigLock pattern —
-    // a second server on the same home comes up with a DISABLED ledger and
-    // a loud ERROR instead of two writers corrupting one store.
-    let pane_ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new_locked(
-        home.as_ref()
-            .map(|h| h.join(".freshell").join("pane-ledger")),
-    ));
     // P1.13: inject the ledger-backed identity sink into the fresh-agent
     // states (constructed earlier, before the ledger exists — the
     // post-construction setter exists precisely for this ordering). All
