@@ -1141,6 +1141,7 @@ pub(crate) async fn spawn_terminal_pane(
         resume_session_id,
         accepted_session_ref,
         claude_fresh_prealloc,
+        pane_identity: state.pane_identity.clone(),
         create_request_id,
         session_ref_lease,
         registry,
@@ -1182,6 +1183,12 @@ struct GatedSettleInputs {
     /// spawn-failure delete (Task 5 call sites) are BOTH gated on this exact
     /// flag, never on `mode == "claude"`.
     claude_fresh_prealloc: bool,
+    /// Write-side pane-identity seam (kata hbsa, Task 5): `Some` in
+    /// production (wired by `freshell-server::main` via
+    /// [`FreshAgentState::with_pane_identity_binder`]); `None` (tests
+    /// without identity concerns) keeps the legacy no-write behavior —
+    /// every call site below is `if let Some`-gated.
+    pane_identity: Option<std::sync::Arc<dyn freshell_terminal::registry::PaneIdentityBinder>>,
     create_request_id: String,
     session_ref_lease: Option<RestSessionRefLease>,
     registry: freshell_terminal::TerminalRegistry,
@@ -1221,6 +1228,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         mut resume_session_id,
         accepted_session_ref,
         claude_fresh_prealloc,
+        pane_identity,
         create_request_id,
         mut session_ref_lease,
         registry,
@@ -1449,21 +1457,36 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     // registry bookkeeping, then disarm the opencode locator -- so a
     // REST-created opencode pane's armed entry is never left dangling on exit,
     // exactly like the WS path's on_exit closes this same gap (the parity
-    // fix this slice's scope item 2 requires). KNOWN GAP (documented, not
-    // silently dropped): unlike the WS on_exit, this hook cannot call
-    // `identity.retire(&tid)` -- `TerminalIdentityRegistry` is
-    // `freshell-ws`-owned and unreachable here without a circular crate
-    // dependency; a REST-created terminal's identity entry (written by the
-    // SHARED locator sweep once association resolves) simply persists past
-    // exit instead of being explicitly retired. Acceptable: the entry is
-    // inert once the terminal is gone, and a future create for the same
-    // terminal id (a fresh UUID) never collides with it.
+    // fix this slice's scope item 2 requires). Identity retire (kata hbsa):
+    // the FORMER known gap here -- `TerminalIdentityRegistry` is
+    // `freshell-ws`-owned and unreachable across the crate boundary -- is
+    // closed by the `PaneIdentityBinder` seam: the hook calls
+    // `retire_pane_identity` (identity retire + pending-marker delete,
+    // mirroring the WS exit hook's inline-sync pair, terminal.rs:1334-1342)
+    // as a PLAIN SYNC CALL. That is deliberate: the ExitHook (`pty.rs:55`,
+    // `FnOnce + Send`) runs on the PTY reader OS thread with NO tokio
+    // runtime (`Handle::current()` would panic there), where blocking IO is
+    // safe -- the one truly-synchronous ledger call site. Non-shell creates
+    // only; idempotent no-op for panes without identity rows. Ledger A2
+    // stakes: without it the session directory lists dead REST panes as
+    // running (session_directory.rs), the rename cascade persists
+    // `titleOverride` for dead terminals (sessions.rs), and a late new-id
+    // SessionStart can durably rebind a dead pane (claude_signal.rs).
     let on_exit: Option<freshell_terminal::pty::ExitHook> = {
         let tid = terminal_id.clone();
         let cleanup_mode = mode.clone();
         let cleanup_cwd = mcp_cwd.clone();
         let registry_for_exit = registry.clone();
         let opencode_locator = state.opencode_locator.clone();
+        // Owned binder clone for the exit-side retire (see the block comment
+        // above): shell panes are never session-identified by design.
+        let exit_binder: Option<
+            std::sync::Arc<dyn freshell_terminal::registry::PaneIdentityBinder>,
+        > = if mode == "shell" {
+            None
+        } else {
+            pane_identity.clone()
+        };
         // Launcher-assigned amplifier identity (Task 11, REST twin of the WS
         // Task 10 hook): only a stub THIS create wrote (`created == true`) is
         // ours to GC on exit; found/existing sessions are never touched.
@@ -1481,6 +1504,12 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             // path's on_exit (`crates/freshell-ws/src/terminal.rs`).
             freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
                 .notify_terminal_exit(&tid);
+            // Identity retire + pending-marker delete (kata hbsa, ledger A2):
+            // inline sync on the PTY reader thread — see the block comment
+            // above the hook for why this must NOT hop through tokio.
+            if let Some(binder) = &exit_binder {
+                binder.retire_pane_identity(&tid);
+            }
             if let Some(locator) = &opencode_locator {
                 locator.disarm(&tid);
             }
@@ -1511,6 +1540,31 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             }
         }))
     };
+
+    // PIN2_CLAUDE_PRE_SPAWN_BINDING (REST rung, kata hbsa): durability
+    // before observability — the spawn below puts the preallocated id in
+    // argv; a SIGKILL right after spawn must still find a durable ledger
+    // row. Gated on `claude_fresh_prealloc` ONLY (eaa25b7d: this create
+    // minted the id, so the row is provably exclusive; a resume-create's
+    // row belongs to the prior epoch). Mirrors
+    // freshell-ws/src/terminal.rs's PIN2 block.
+    if claude_fresh_prealloc {
+        if let (Some(binder), Some(session_id)) =
+            (pane_identity.as_ref(), resume_session_id.as_deref())
+        {
+            // Binder methods are sync (blocking fsync IO inside) — hop
+            // through spawn_blocking, the WS create path's own idiom
+            // (terminal.rs:2211-2234). Awaited: PIN 2 requires the
+            // durable row to exist BEFORE the spawn below.
+            let binder = std::sync::Arc::clone(binder);
+            let (sid, tid, m) = (session_id.to_string(), terminal_id.clone(), mode.clone());
+            let (c, rid) = (cwd.clone(), create_request_id.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                binder.record_prespawn_claude_binding(&sid, &tid, &m, c.as_deref(), Some(&rid));
+            })
+            .await; // JoinError only — write failures are warned inside the binder
+        }
+    }
 
     // The PTY spawn is synchronous; run it on the blocking pool so hung/slow
     // spawns occupy a permit + a blocking thread, never an async worker (WS
@@ -1553,6 +1607,23 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         ))),
     };
     if let Err(err) = create_result {
+        // PIN 2 compensating delete — SAME gate as the write (eaa25b7d).
+        // MUST be the FIRST thing in this branch: the error arm below has
+        // TWO returns (the AlreadyExists 409 and the wrapped 400), and this
+        // branch is the only exit between the pre-spawn write above and
+        // spawn success (ledger A3) — the delete must precede both.
+        if claude_fresh_prealloc {
+            if let (Some(binder), Some(session_id)) =
+                (pane_identity.as_ref(), resume_session_id.as_deref())
+            {
+                let binder = std::sync::Arc::clone(binder);
+                let sid = session_id.to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    binder.delete_prespawn_claude_binding(&sid);
+                })
+                .await;
+            }
+        }
         // Nothing was recorded yet (no tab, no pane, no map entry) -> rollback
         // is a no-op by construction, EXCEPT the MCP config file(s)
         // `generate_mcp_injection` may already have written -- clean those up
@@ -1644,6 +1715,27 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         Some(mode.clone()),
         resume_session_id.clone(),
     );
+
+    // Identity registration (kata hbsa): identity row + durable binding
+    // for any create with a session id (fresh mint OR resume — the
+    // resume half is what made REST-resumed claude panes die at
+    // restart), pending marker for the locator-resolved providers.
+    // The identity row is the prerequisite for BOTH the A13 live-owner
+    // guard's identity arm and the SessionStart signal drain acting
+    // (claude_signal.rs retains signals for identity-less panes forever).
+    if let Some(binder) = pane_identity.as_ref() {
+        let binder = std::sync::Arc::clone(binder);
+        let (tid, m) = (terminal_id.clone(), mode.clone());
+        let (sid, c, rid) = (
+            resume_session_id.clone(),
+            cwd.clone(),
+            create_request_id.clone(),
+        );
+        let _ = tokio::task::spawn_blocking(move || {
+            binder.register_create_identity(&tid, &m, sid.as_deref(), c.as_deref(), Some(&rid));
+        })
+        .await;
+    }
 
     // Restore-across-restart fix (amplifier) + OpenCode terminal-pane restore
     // fix (opencode): arm the SHARED locator for a FRESH (non-resuming) pane
@@ -3450,6 +3542,20 @@ mod tests {
         (state, registry, argv_file)
     }
 
+    /// The spawn-failure twin of [`state_with_claude_capture_spec`]: same
+    /// spec shape (`create_session_args` present, so `LaunchIntent::Start`
+    /// resolves fine; no `env_var`) but `default_cmd` points at a
+    /// nonexistent path (the `:4444` broken-spawn idiom) — resolution
+    /// succeeds and the PTY fork itself fails.
+    fn state_with_broken_claude_spec() -> (FreshAgentState, freshell_terminal::TerminalRegistry) {
+        let argv_file = unique_argv_file("binder-broken");
+        let mut spec = claude_prealloc_recording_cli_spec(&argv_file);
+        spec.default_cmd = "/nonexistent/freshell-task5-missing-claude".to_string();
+        let state = state_with_registry().with_cli_commands(std::sync::Arc::new(vec![spec]));
+        let registry = state.terminal_registry.clone().expect("registry wired");
+        (state, registry)
+    }
+
     /// Subscribe BEFORE the POST — the `:3383` sibling's broadcast-capture
     /// idiom (`state.broadcast_tx.subscribe()`).
     fn subscribe_broadcast_frames(
@@ -3745,6 +3851,224 @@ mod tests {
 
         for r in registry.identity_probe_rows() {
             registry.kill(&r.terminal_id);
+        }
+        let _ = std::fs::remove_file(&_capture);
+    }
+
+    // ── kata hbsa Task 5: PaneIdentityBinder threading through the REST rung ─
+
+    /// Recording fake for the write-side identity seam: appends one string
+    /// per binder call so the tests can assert call ORDER (PIN 2: durability
+    /// before observability) as well as presence/absence.
+    #[derive(Default, Debug)]
+    struct RecordingBinder {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingBinder {
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl freshell_terminal::registry::PaneIdentityBinder for RecordingBinder {
+        fn record_prespawn_claude_binding(
+            &self,
+            session_id: &str,
+            terminal_id: &str,
+            _mode: &str,
+            _cwd: Option<&str>,
+            _create_request_id: Option<&str>,
+        ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("prespawn:{terminal_id}:{session_id}"));
+        }
+        fn delete_prespawn_claude_binding(&self, session_id: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("delete:{session_id}"));
+        }
+        fn register_create_identity(
+            &self,
+            terminal_id: &str,
+            mode: &str,
+            resume_session_id: Option<&str>,
+            _cwd: Option<&str>,
+            _create_request_id: Option<&str>,
+        ) {
+            self.events.lock().unwrap().push(format!(
+                "register:{terminal_id}:{mode}:{}",
+                resume_session_id.unwrap_or("-")
+            ));
+        }
+        fn retire_pane_identity(&self, terminal_id: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("retire:{terminal_id}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_claude_rest_create_drives_binder_prespawn_then_register() {
+        // kata hbsa P1: PIN 2 ordering on the REST rung — durable pre-spawn
+        // binding, then spawn, then identity registration.
+        let binder = std::sync::Arc::new(RecordingBinder::default());
+        let (state, registry, _capture) = state_with_claude_capture_spec("binder-prespawn");
+        let state = state.with_pane_identity_binder(binder.clone());
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            serde_json::json!({"mode":"claude","cwd": std::env::temp_dir().to_string_lossy()}),
+            true,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        // The REST body carries only ids; the minted sid comes from the
+        // registry row (same read as Task 2's assertion 2).
+        let tid = body["data"]["terminalId"].as_str().unwrap().to_string();
+        let sid = registry
+            .identity_probe_rows()
+            .into_iter()
+            .find(|r| r.terminal_id == tid)
+            .and_then(|r| r.resume_session_id)
+            .expect("minted id in the registry row");
+
+        let events = binder.events();
+        let prespawn = events
+            .iter()
+            .position(|e| e == &format!("prespawn:{tid}:{sid}"))
+            .unwrap_or_else(|| panic!("prespawn event missing: {events:?}"));
+        let register = events
+            .iter()
+            .position(|e| e == &format!("register:{tid}:claude:{sid}"))
+            .unwrap_or_else(|| panic!("register event missing: {events:?}"));
+        assert!(
+            prespawn < register,
+            "PIN 2: durability before registration: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.starts_with("delete:")),
+            "no failure-delete on success"
+        );
+
+        registry.kill(&tid);
+        let _ = std::fs::remove_file(&_capture);
+    }
+
+    #[tokio::test]
+    async fn resume_claude_rest_create_registers_identity_without_prespawn_write() {
+        // eaa25b7d scoping on the REST rung: a RESUME create never writes the
+        // pre-spawn row (it belongs to the prior epoch) but DOES register
+        // identity post-spawn — this closes the resume-direction half of the
+        // gap (REST resumes previously died at restart: pane_ledger_restore.rs).
+        let binder = std::sync::Arc::new(RecordingBinder::default());
+        let (state, registry, _capture) = state_with_claude_capture_spec("binder-resume");
+        let state = state.with_pane_identity_binder(binder.clone());
+
+        const S: &str = "29a53649-2222-4333-8444-555566667777";
+        // Mirror the request shape of the existing passing with-identity create
+        // test (create_tab_with_identity_or_shell_mode_does_not_warn_invariant).
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            serde_json::json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+                "sessionRef": {"provider": "claude", "sessionId": S},
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let tid = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        let events = binder.events();
+        assert!(
+            !events.iter().any(|e| e.starts_with("prespawn:")),
+            "resume creates must not write the pre-spawn row (eaa25b7d): {events:?}"
+        );
+        assert!(
+            events.contains(&format!("register:{tid}:claude:{S}")),
+            "{events:?}"
+        );
+
+        registry.kill(&tid);
+        let _ = std::fs::remove_file(&_capture);
+    }
+
+    #[tokio::test]
+    async fn failed_fresh_claude_spawn_deletes_its_prespawn_binding() {
+        // eaa25b7d symmetry: the failure-delete fires with the SAME gate as the
+        // write, for the id THIS create minted.
+        let binder = std::sync::Arc::new(RecordingBinder::default());
+        // A spec whose command cannot spawn: point default_cmd at a
+        // nonexistent path (no env_var), same spec shape as the capture spec.
+        let (state, _registry) = state_with_broken_claude_spec();
+        let state = state.with_pane_identity_binder(binder.clone());
+
+        let (status, _body) = post(
+            app(state),
+            "/api/tabs",
+            serde_json::json!({"mode":"claude","cwd": std::env::temp_dir().to_string_lossy()}),
+            true,
+        )
+        .await;
+        assert!(!status.is_success(), "spawn must fail");
+
+        let events = binder.events();
+        let prespawn_sid = events
+            .iter()
+            .find_map(|e| {
+                e.strip_prefix("prespawn:")
+                    .and_then(|rest| rest.split(':').nth(1))
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| panic!("prespawn happened before the spawn attempt: {events:?}"));
+        assert!(
+            events.contains(&format!("delete:{prespawn_sid}")),
+            "failure-delete for the minted id: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.starts_with("register:")),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_pane_exit_retires_identity_via_binder() {
+        // Ledger A2: dead REST panes must not keep live-looking identity rows.
+        let binder = std::sync::Arc::new(RecordingBinder::default());
+        let (state, registry, _capture) = state_with_claude_capture_spec("binder-exit");
+        let state = state.with_pane_identity_binder(binder.clone());
+
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            serde_json::json!({"mode":"claude","cwd": std::env::temp_dir().to_string_lossy()}),
+            true,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let tid = body["data"]["terminalId"].as_str().unwrap().to_string();
+
+        registry.kill(&tid);
+        // The exit hook runs asynchronously — poll with a bounded deadline.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if binder.events().contains(&format!("retire:{tid}")) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exit hook never retired the pane: {:?}",
+                binder.events()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         let _ = std::fs::remove_file(&_capture);
     }
