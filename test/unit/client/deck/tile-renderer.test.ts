@@ -65,14 +65,17 @@ function recordingCtx(width: number, height: number) {
     clip() {
       if (pendingRound) clips.push(pendingRound)
       pendingRound = null
+      pendingArc = null
     },
     stroke() {
       if (pendingRound) strokes.push({ ...pendingRound, style: String(this.strokeStyle), lineWidth: this.lineWidth })
       pendingRound = null
+      pendingArc = null
     },
     fill() {
       if (pendingArc) circles.push({ ...pendingArc, style: String(this.fillStyle) })
       pendingArc = null
+      pendingRound = null
     },
     save() {
       saves++
@@ -232,15 +235,18 @@ describe('renderKey', () => {
     expect(one[0].y).toBeGreaterThanOrEqual(BANNER_HEIGHT) // clear of the banner
 
     const two = iconLayout(80, 80, 2)
+    expect(two).toHaveLength(2)
     expect(two.every((s) => s.size === 27)).toBe(true) // round(60 * 0.45), fits unclamped
 
     const three = iconLayout(80, 80, 3)
+    expect(three).toHaveLength(3)
     expect(three.every((s) => s.size === 20)).toBe(true) // clamped: floor((80 - 12 - 2*3) / 3)
     expect(three[1].x - three[0].x).toBe(20 + 3) // size + gap
     const last = three[2]
     expect(last.x + last.size).toBeLessThanOrEqual(80 - ICON_ROW_SIDE_INSET) // on-frame guarantee
 
     const threeSmall = iconLayout(72, 72, 3)
+    expect(threeSmall).toHaveLength(3)
     expect(threeSmall.every((s) => s.size === 18)).toBe(true) // floor((72 - 12 - 6) / 3)
     expect(threeSmall[0].x).toBeGreaterThanOrEqual(ICON_ROW_SIDE_INSET)
   })
@@ -275,7 +281,6 @@ describe('rounded key frame', () => {
   it('every key kind paints a pure-black surround then clips to the rounded frame', () => {
     // 80x80 Mini caps => frame margin 3, radius 10, inner 74x74.
     const empty = renderTab({ kind: 'empty' })
-    let captured: ReturnType<typeof renderTab> | null = null
     for (const rec of [
       empty,
       renderTab(tabSpec()),
@@ -283,7 +288,6 @@ describe('rounded key frame', () => {
       renderTab({ kind: 'pager', page: 2, pageCount: 3 }),
       renderTab({ kind: 'action', action: 'approve', enabled: true }),
     ]) {
-      captured = rec
       expect(rec.rects[0]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: EMPTY_BG })
       expect(rec.clips[0]).toEqual({ x: 3, y: 3, w: 74, h: 74, r: 10 })
       // Verify save/restore balance: each key rendering saves and restores
