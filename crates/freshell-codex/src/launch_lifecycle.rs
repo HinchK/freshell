@@ -151,6 +151,21 @@ impl CodexLaunchSidecar {
             .map(|proxy| proxy.require_candidate_persistence())
     }
 
+    /// S5.c: forward the persistence release to the live proxy's identity gate.
+    /// No-op once the proxy is torn down.
+    pub async fn mark_candidate_persisted(&self) {
+        if let Some(proxy) = self.inner.lock().await.proxy.as_ref() {
+            proxy.mark_candidate_persisted();
+        }
+    }
+
+    /// S5.c: forward a capture failure (candidate refused by identity guards).
+    pub async fn fail_candidate_capture(&self, message: &str) {
+        if let Some(proxy) = self.inner.lock().await.proxy.as_ref() {
+            proxy.fail_candidate_capture(message);
+        }
+    }
+
     async fn assert_adoptable(&self) -> Result<(), String> {
         let shutting_down = self.planner_shutdown.load(Ordering::SeqCst)
             || self.inner.lock().await.shutdown_started;
@@ -442,6 +457,40 @@ impl CodexTerminalLaunchManager {
     /// the create error the caller is already surfacing is the primary failure.
     pub async fn discard(&self, launch: CodexTerminalLaunch) {
         let _ = launch.sidecar.shutdown().await;
+    }
+
+    /// S5.c: release the candidate-persistence gate for an adopted terminal's
+    /// proxy. Called by the freshell-ws proxy-event router after
+    /// `adopt_codex_identity` returned true (the ledger write is awaited inside
+    /// that tail — fsync-before-announce IS the "persisted" signal). Idempotent;
+    /// unknown terminals are a silent no-op (legacy has five release sites, most
+    /// of them dedupe paths — this single seam is called on every candidate
+    /// re-observation too).
+    pub async fn mark_candidate_persisted(&self, terminal_id: &str) {
+        let sidecar = {
+            self.adopted
+                .lock()
+                .unwrap()
+                .get(terminal_id)
+                .map(|entry| entry.sidecar.clone())
+        };
+        if let Some(sidecar) = sidecar {
+            sidecar.mark_candidate_persisted().await;
+        }
+    }
+
+    /// S5.c: fail the gate for an adopted terminal (candidate refused).
+    pub async fn fail_candidate_capture(&self, terminal_id: &str, message: &str) {
+        let sidecar = {
+            self.adopted
+                .lock()
+                .unwrap()
+                .get(terminal_id)
+                .map(|entry| entry.sidecar.clone())
+        };
+        if let Some(sidecar) = sidecar {
+            sidecar.fail_candidate_capture(message).await;
+        }
     }
 
     /// Sync-safe (callable from the PTY exit hook's non-async thread): detach the

@@ -528,3 +528,19 @@ async fn spawned_runtime_launches_the_app_server_and_relays_through_the_proxy() 
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+// ────── S5.c persistence plumbing (mark_candidate_persisted, fail_candidate_capture) ──────
+
+#[tokio::test]
+async fn mark_candidate_persisted_is_a_noop_for_unknown_terminals() {
+    let runtime = FakeRuntime::start().await;
+    let factory_runtime = runtime.clone();
+    let manager = CodexTerminalLaunchManager::new(Box::new(move || {
+        factory_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    }));
+    // Must not panic, hang, or error for a terminal that was never adopted.
+    manager.mark_candidate_persisted("no-such-terminal").await;
+    manager
+        .fail_candidate_capture("no-such-terminal", "test refusal")
+        .await;
+}
