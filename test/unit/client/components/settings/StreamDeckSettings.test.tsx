@@ -157,4 +157,18 @@ describe('StreamDeckSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: /terminal previews/i }))
     expect(applyLocalSetting).toHaveBeenCalledWith({ streamDeck: { tileStyle: 'terminal-previews' } })
   })
+
+  it('offers the key layout choice with Auto selected by default', () => {
+    renderSection()
+    const group = screen.getByRole('group', { name: /key layout/i })
+    expect(within(group).getByRole('button', { name: 'Auto' })).toHaveAttribute('aria-pressed', 'true')
+    expect(within(group).getByRole('button', { name: 'Newest first' })).toHaveAttribute('aria-pressed', 'false')
+    expect(within(group).getByRole('button', { name: 'Status sorted' })).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('selecting Newest first patches streamDeck.keyLayout', () => {
+    const { applyLocalSetting } = renderSection()
+    fireEvent.click(within(screen.getByRole('group', { name: /key layout/i })).getByRole('button', { name: 'Newest first' }))
+    expect(applyLocalSetting).toHaveBeenCalledWith({ streamDeck: { keyLayout: 'newest-first' } })
+  })
 })
