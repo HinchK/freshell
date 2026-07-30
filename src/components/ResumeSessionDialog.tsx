@@ -169,6 +169,7 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
       className={`fixed inset-0 flex items-center justify-center bg-black/50 ${OVERLAY_Z.modal}`}
       onClick={onClose}
     >
+      {/* eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- same convention as App.tsx's update-instructions dialog: the container's onClick is a stopPropagation shield and onKeyDown handles Escape; the dialog's real controls are native buttons/inputs. */}
       <div
         role="dialog"
         aria-modal="true"
