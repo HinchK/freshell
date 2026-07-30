@@ -14,6 +14,12 @@ export interface TerminalExitBannerProps {
   notice: AutoResumeNotice | null
   crashTrace: CrashTrace | null
   settledDead: boolean
+  /** Flap-circuit-breaker settles only (znhn item 2): successful auto-resumes
+   * inside the rolling window, from the settle frame's TYPED field. */
+  resumeCycles: number | null
+  /** znhn item 5: honest Relaunch copy — true when the pane's sessionRef can
+   * resume this conversation (provider matches mode). */
+  canResume: boolean
   onRelaunch: () => void
   onCancelAutoResume: () => void
   onDismissCrashTrace: () => void
@@ -25,6 +31,8 @@ export function TerminalExitBanner({
   notice,
   crashTrace,
   settledDead,
+  resumeCycles,
+  canResume,
   onRelaunch,
   onCancelAutoResume,
   onDismissCrashTrace,
@@ -55,14 +63,18 @@ export function TerminalExitBanner({
         role="alert"
         className="flex items-center justify-between gap-2 border-t border-destructive/30 bg-destructive/15 px-3 py-1.5 text-sm text-destructive"
       >
-        <span>process exited{exitCode !== null ? ` (code ${exitCode})` : ''}</span>
+        <span>
+          {resumeCycles != null
+            ? `${mode} crashed ${resumeCycles} times — auto-resume paused`
+            : `process exited${exitCode !== null ? ` (code ${exitCode})` : ''}`}
+        </span>
         <button
           type="button"
           aria-label={`Relaunch ${mode} session`}
           className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 text-xs font-medium hover:bg-destructive/20"
           onClick={onRelaunch}
         >
-          Relaunch
+          {canResume ? 'Relaunch — resumes this conversation' : 'Relaunch'}
         </button>
       </div>
     )

@@ -551,6 +551,36 @@ describe('TerminalView exited-pane error banner', () => {
     expect(wsMocks.send).toHaveBeenCalledWith({ type: 'terminal.autoResumeCancel', terminalId: 'term-crashed' })
   })
 
+  it('renders the circuit-breaker banner from the typed resumeCycles settle field (znhn#2)', async () => {
+    const at = Date.now()
+    const { store, paneContent } = makeStore({
+      mode: 'claude',
+      status: 'exited',
+      lifecycle: {
+        lastTerminalId: 'term-crashed',
+        exit: { exitCode: 1, at },
+        notice: { kind: 'recovering', attempt: 1, maxAttempts: 2, exitCode: 1, at },
+      },
+    })
+    await renderPane(store, paneContent)
+
+    await act(async () => {
+      messageHandler!({
+        type: 'terminal.status',
+        terminalId: 'term-crashed',
+        status: 'exited',
+        reason: 'flap_circuit_breaker',
+        resumeCycles: 3,
+      })
+    })
+
+    expect(screen.getByRole('alert')).toHaveTextContent('claude crashed 3 times — auto-resume paused')
+    // canResume derives from the seeded sessionRef (provider matches mode):
+    // the button copy is honest about resuming this conversation.
+    expect(screen.getByRole('button', { name: 'Relaunch claude session' }))
+      .toHaveTextContent('Relaunch — resumes this conversation')
+  })
+
   it('renders the recovering notice from the frame FIELDS — prose is presentational, never parsed', async () => {
     // Council MEDIUM fix (7w4h/xkhx review): the client must read
     // attempt/maxAttempts/exitCode from the terminal.status frame's typed

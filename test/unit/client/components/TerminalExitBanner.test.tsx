@@ -5,6 +5,8 @@ import { TerminalExitBanner } from '@/components/TerminalExitBanner'
 const noop = () => {}
 const baseProps = {
   crashTrace: null,
+  resumeCycles: null,
+  canResume: false,
   onRelaunch: noop,
   onCancelAutoResume: noop,
   onDismissCrashTrace: noop,
@@ -66,5 +68,24 @@ describe('TerminalExitBanner', () => {
       <TerminalExitBanner {...baseProps} mode="claude" exitCode={null} notice={null} settledDead={false} />
     )
     expect(container).toBeEmptyDOMElement()
+  })
+
+  it('labels Relaunch honestly when the sessionRef can resume the conversation (znhn#5)', () => {
+    render(<TerminalExitBanner {...baseProps} mode="claude" exitCode={1} notice={null} settledDead canResume />)
+    const btn = screen.getByRole('button', { name: 'Relaunch claude session' })
+    expect(btn).toHaveTextContent('Relaunch — resumes this conversation')
+  })
+
+  it('keeps plain Relaunch copy when no matching sessionRef exists (degrades to fresh)', () => {
+    render(<TerminalExitBanner {...baseProps} mode="claude" exitCode={1} notice={null} settledDead canResume={false} />)
+    const btn = screen.getByRole('button', { name: 'Relaunch claude session' })
+    expect(btn).toHaveTextContent(/^Relaunch$/)
+  })
+
+  it('renders the circuit-breaker banner from the typed resumeCycles field (znhn#2)', () => {
+    render(<TerminalExitBanner {...baseProps} mode="claude" exitCode={1} notice={null} settledDead resumeCycles={5} />)
+    expect(screen.getByRole('alert')).toHaveTextContent('claude crashed 5 times — auto-resume paused')
+    // Relaunch stays available — bounded and loud, never dead-ended.
+    expect(screen.getByRole('button', { name: 'Relaunch claude session' })).toBeInTheDocument()
   })
 })

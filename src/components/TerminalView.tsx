@@ -43,6 +43,7 @@ import {
   selectActiveNotice,
   selectExitRecord,
   selectLastTerminalIdFrom,
+  selectResumeCycles,
 } from '@/store/terminalLifecycleSlice'
 import { TerminalExitBanner } from '@/components/TerminalExitBanner'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -612,6 +613,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // apparatus (selector filter + expiry re-render timer) is deleted. A
   // missed frame is corrected by the reconnect backstop (D-3) below.
   const activeNotice = useAppSelector((s) => selectActiveNotice(s, paneId))
+  // Flap-circuit-breaker settle count (znhn item 2) — typed field, feeds the
+  // "crashed N times — auto-resume paused" alert copy.
+  const resumeCycles = useAppSelector((s) => selectResumeCycles(s, paneId)) ?? null
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
@@ -5362,6 +5366,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
             notice={activeNotice ?? null}
             crashTrace={terminalContent.crashTrace ?? null}
             settledDead={settledDead}
+            resumeCycles={resumeCycles}
+            canResume={Boolean(
+              terminalContent.sessionRef && terminalContent.sessionRef.provider === terminalContent.mode
+            )}
             onDismissCrashTrace={() => dispatch(clearPaneCrashTrace({ tabId, paneId }))}
             onRelaunch={() => {
               // Discard the OLD crash's lifecycle entry: if the relaunch
