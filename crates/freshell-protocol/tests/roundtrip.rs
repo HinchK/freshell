@@ -510,3 +510,15 @@ fn terminal_status_exited_settle_frame_roundtrips() {
     let back: ServerMessage = serde_json::from_value(json).unwrap();
     assert_eq!(back, msg);
 }
+
+#[test]
+fn terminal_auto_resume_cancel_roundtrips() {
+    // znhn item 2: the user opts out of an in-flight auto-resume.
+    let json = serde_json::json!({"type": "terminal.autoResumeCancel", "terminalId": "t1"});
+    let msg: ClientMessage = serde_json::from_value(json.clone()).unwrap();
+    match &msg {
+        ClientMessage::TerminalAutoResumeCancel(c) => assert_eq!(c.terminal_id, "t1"),
+        other => panic!("wrong variant: {other:?}"),
+    }
+    assert_eq!(serde_json::to_value(&msg).unwrap(), json);
+}

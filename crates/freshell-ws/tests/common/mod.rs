@@ -129,6 +129,7 @@ pub async fn spawn_server_with_specs(
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -205,6 +206,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_rx(
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx,
+        auto_resume_cancels: Default::default(),
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -285,6 +287,7 @@ pub async fn spawn_server_with_specs_and_auto_resume_hub(
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx,
+        auto_resume_cancels: Default::default(),
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -362,6 +365,7 @@ pub async fn spawn_server_with_specs_and_state(
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -447,6 +451,7 @@ pub async fn spawn_server_with_ledger(
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -528,6 +533,7 @@ pub async fn spawn_server_with_specs_and_activity(
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -608,6 +614,7 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
@@ -686,6 +693,7 @@ pub async fn spawn_server_with_create_protect(
         settings,
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),

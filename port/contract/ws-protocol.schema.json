@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 66,
+  "schemaCount": 67,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -984,6 +984,24 @@
             "intent",
             "cols",
             "rows"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "terminalId": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "terminal.autoResumeCancel",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "terminalId"
           ],
           "type": "object"
         },
@@ -4374,6 +4392,25 @@
         "intent",
         "cols",
         "rows"
+      ],
+      "type": "object"
+    },
+    "TerminalAutoResumeCancelSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "terminalId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.autoResumeCancel",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "terminalId"
       ],
       "type": "object"
     },

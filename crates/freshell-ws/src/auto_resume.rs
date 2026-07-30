@@ -370,6 +370,17 @@ async fn run_hub_body<D: AutoResumeDriver + Sync>(
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     // Guards AFTER the sleep — the world may have moved on.
+                    if driver.take_cancel(&ev.terminal_id) {
+                        // D-4 (validated A5): re-emit the settle frame here
+                        // too. The handler's immediate frame covers the
+                        // click-latency story; THIS frame guarantees a
+                        // late-consumed or pre-seeded cancel is loud and can
+                        // never strand a recovering notice. Idempotent
+                        // client-side (recordAutoResumeSettled).
+                        driver.emit_settled(&ev.terminal_id, "auto-resume cancelled", None);
+                        driver.log_settled(&ev.terminal_id, "user_cancelled");
+                        continue;
+                    }
                     if let Some(reason) =
                         driver.pre_respawn_guard(&provider, &session_id, &ev.terminal_id)
                     {
@@ -502,6 +513,8 @@ pub(crate) trait AutoResumeDriver: Send + 'static {
     /// it: the client clears the recovering notice on a FRAME, never on a
     /// timer. `resume_cycles` is Some only for flap-circuit-breaker settles.
     fn emit_settled(&self, terminal_id: &str, reason: &str, resume_cycles: Option<u32>);
+    /// Consume a pending user cancel for this terminal id (znhn item 2).
+    fn take_cancel(&self, terminal_id: &str) -> bool;
     fn log_settled(&self, terminal_id: &str, reason: &str);
 }
 
@@ -799,6 +812,14 @@ impl AutoResumeDriver for WsAutoResumeDriver {
         }
     }
 
+    fn take_cancel(&self, terminal_id: &str) -> bool {
+        self.state
+            .auto_resume_cancels
+            .lock()
+            .expect("auto_resume_cancels lock")
+            .remove(terminal_id)
+    }
+
     fn log_settled(&self, terminal_id: &str, reason: &str) {
         tracing::info!(terminal_id, reason, "terminal.auto_resume.settled");
     }
@@ -1073,6 +1094,8 @@ mod tests {
         cap_exhausted: bool,
         session: Option<(String, String, Option<String>)>,
         guard: Option<&'static str>,
+        /// Pending user cancels (znhn item 2) — consumed by `take_cancel`.
+        cancels: std::collections::HashSet<String>,
         claim_ok: bool,
         complete_ok: bool,
         panic_next_recovering: bool,
@@ -1104,6 +1127,7 @@ mod tests {
                     cap_exhausted: false,
                     session: Some(("claude".into(), "sess-1".into(), None)),
                     guard: None,
+                    cancels: std::collections::HashSet::new(),
                     claim_ok: true,
                     complete_ok: true,
                     panic_next_recovering: false,
@@ -1144,6 +1168,9 @@ mod tests {
         }
         fn set_panic_next_recovering(&self, v: bool) {
             self.lock().panic_next_recovering = v;
+        }
+        fn set_cancelled(&self, terminal_id: &str) {
+            self.lock().cancels.insert(terminal_id.to_string());
         }
 
         /// (old_terminal_id, attempt, max_attempts)
@@ -1278,6 +1305,9 @@ mod tests {
                 reason.to_string(),
                 resume_cycles,
             ));
+        }
+        fn take_cancel(&self, terminal_id: &str) -> bool {
+            self.lock().cancels.remove(terminal_id)
         }
         fn log_settled(&self, terminal_id: &str, reason: &str) {
             self.lock()
@@ -1752,6 +1782,35 @@ mod tests {
             ],
             "t5 must start a fresh budget: the eviction branch reset attempts on t4's settle"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_cancel_during_backoff_aborts_the_respawn_and_settles_loud() {
+        // Crash schedules a resume; the cancel lands during the backoff.
+        // The hub must consume the flag, respawn NOTHING, and EMIT the
+        // settle frame itself (D-4, validated A5): the take_cancel arm is
+        // loud so a late-consumed or pre-seeded cancel can never strand a
+        // recovering notice. Idempotent with the WS handler's immediate
+        // frame — the client folds duplicates.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let fake = FakeDriver::healthy();
+        // Pre-seed the cancel BEFORE the crash event (the flag is checked
+        // post-sleep, so a pre-seeded flag exercises the late-consume path).
+        fake.set_cancelled("t1");
+        let _hub = spawn_hub_with_driver(fake.clone(), rx, test_cfg(vec![2_000, 10_000]));
+
+        tx.send(crash("t1", 1, "claude", Some("cr-1"), 1_000))
+            .unwrap();
+        drain().await;
+        tokio::time::advance(std::time::Duration::from_millis(2_000)).await;
+        drain().await;
+        assert!(fake.respawn_calls().is_empty(), "cancel aborts the respawn");
+        assert!(fake.claim_calls().is_empty());
+        assert_eq!(
+            fake.settled_frames(),
+            vec![("t1".to_string(), "auto-resume cancelled".to_string(), None)]
+        );
+        assert_eq!(fake.settled_reasons(), vec!["user_cancelled".to_string()]);
     }
 
     #[tokio::test(start_paused = true)]

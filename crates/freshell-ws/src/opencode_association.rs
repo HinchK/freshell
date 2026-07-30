@@ -265,6 +265,7 @@ mod tests {
             ),
             broadcast_tx: StdArc::clone(&broadcast_tx),
             auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
             fresh_codex: freshell_freshagent::FreshCodexState::new(
                 StdArc::clone(&auth_token),
                 StdArc::clone(&broadcast_tx),

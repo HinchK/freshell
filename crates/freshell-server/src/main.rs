@@ -558,6 +558,7 @@ async fn main() -> ExitCode {
         tokio::sync::mpsc::unbounded_channel::<freshell_ws::auto_resume::CrashEvent>();
     let ws_state = WsState {
         auto_resume_tx,
+        auto_resume_cancels: Default::default(),
         activity: Some(activity_hub.clone()),
         identity: terminal_identity.clone(),
         opencode_locator: opencode_locator.clone(),

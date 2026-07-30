@@ -356,6 +356,13 @@ export const TerminalDetachSchema = z.object({
   terminalId: z.string().min(1),
 })
 
+export const TerminalAutoResumeCancelSchema = z.object({
+  type: z.literal('terminal.autoResumeCancel'),
+  /** The OLD (crashed) terminal id from the recovering notice frame. */
+  terminalId: z.string().min(1),
+})
+export type TerminalAutoResumeCancelMessage = z.infer<typeof TerminalAutoResumeCancelSchema>
+
 export const TerminalInputSchema = z.object({
   type: z.literal('terminal.input'),
   terminalId: z.string().min(1),
@@ -659,6 +666,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalCreateSchema,
   TerminalCodexCandidatePersistedSchema,
   TerminalAttachSchema,
+  TerminalAutoResumeCancelSchema,
   TerminalDetachSchema,
   TerminalInputSchema,
   TerminalResizeSchema,

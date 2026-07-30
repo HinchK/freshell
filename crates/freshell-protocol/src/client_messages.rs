@@ -28,6 +28,8 @@ pub enum ClientMessage {
     TerminalCodexCandidatePersisted(TerminalCodexCandidatePersisted),
     #[serde(rename = "terminal.attach")]
     TerminalAttach(TerminalAttach),
+    #[serde(rename = "terminal.autoResumeCancel")]
+    TerminalAutoResumeCancel(TerminalAutoResumeCancel),
     #[serde(rename = "terminal.detach")]
     TerminalDetach(TerminalDetach),
     #[serde(rename = "terminal.input")]
@@ -81,7 +83,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 29] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 30] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -103,6 +105,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 29] = [
     "pane.reconcile.request",
     "ping",
     "terminal.attach",
+    "terminal.autoResumeCancel",
     "terminal.codex.candidate.persisted",
     "terminal.create",
     "terminal.detach",
@@ -242,6 +245,15 @@ pub struct TerminalCodexCandidatePersisted {
     pub candidate_thread_id: String,
     pub captured_at: i64,
     pub rollout_path: String,
+    pub terminal_id: String,
+}
+
+/// znhn item 2: the user opts out of an in-flight auto-resume ("stop
+/// trying, leave it dead"). Carries the OLD (crashed) terminal id — the
+/// same id the recovering `terminal.status` frame was broadcast with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalAutoResumeCancel {
     pub terminal_id: String,
 }
 
