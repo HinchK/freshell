@@ -543,4 +543,26 @@ async fn mark_candidate_persisted_is_a_noop_for_unknown_terminals() {
     manager
         .fail_candidate_capture("no-such-terminal", "test refusal")
         .await;
+    // Observe the no-op: create and adopt a real launch, verify calling the
+    // no-op methods on unknown terminals does not affect it (observable: the
+    // adopted launch can still be shut down cleanly).
+    let planner_runtime = runtime.clone();
+    let planner = CodexLaunchPlanner::new(Box::new(move || {
+        planner_runtime.clone() as Arc<dyn CodexLaunchRuntime>
+    }));
+    let launch = planner
+        .plan_create(&CodexLaunchPlanInput::default())
+        .await
+        .expect("plan_create");
+    manager
+        .adopt("known-terminal", launch, 0)
+        .await
+        .expect("adopt");
+    // Calling operations on other unknown terminals is still a no-op.
+    manager.mark_candidate_persisted("still-unknown").await;
+    manager
+        .fail_candidate_capture("still-unknown", "test")
+        .await;
+    // The adopted terminal is unaffected (observable: manager can shut down cleanly).
+    manager.shutdown().await;
 }
