@@ -54,7 +54,7 @@ export function arrangeTabs(tabs: DeckTab[], arrangement: DeckArrangement): Deck
   return [...tabs].sort((a, b) => b.tabIndex - a.tabIndex)
 }
 
-export function planLayout(caps: DeckCapabilities, tabCount: number, arrangement: DeckArrangement = 'standard'): LayoutPlan {
+export function planLayout(caps: DeckCapabilities, tabCount: number, arrangement: DeckArrangement): LayoutPlan {
   const range = (n: number) => Array.from({ length: n }, (_, i) => i)
   if (arrangement === 'reversed') {
     const full = caps.dialCount >= 2 && caps.hasTouchStrip

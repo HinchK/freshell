@@ -13,11 +13,11 @@
 
 import type { DeckCapabilities, DeckDevice, DeckInputEvent } from './deck-device'
 import type { DeckStore } from './deck-actions'
-import type { KeySpec } from './frame'
-import type { DeckModel } from './deck-selectors'
+import type { DeckArrangement, KeySpec, LayoutPlan } from './frame'
+import type { DeckModel, DeckTab } from './deck-selectors'
 import type { RootState } from '@/store/store'
 import type { DeckTileStyle } from '@shared/settings'
-import { ACTION_KEYS, buildFrame, clampPage, pageCount, planLayout, visibleTabs } from './frame'
+import { ACTION_KEYS, arrangeTabs, buildFrame, clampPage, pageCount, planLayout, resolveArrangement, visibleTabs } from './frame'
 import { findApproveTarget, findStopTarget, panesForTab, selectDeckModel } from './deck-selectors'
 import { executeDeckStop, focusTabFromDeck, sendDeckApproval } from './deck-actions'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -144,7 +144,7 @@ export class DeckController {
     const model = pre?.model ?? selectDeckModel(state)
     this.lastModelJson = pre?.modelJson ?? JSON.stringify(model)
     const caps = this.device.capabilities
-    const plan = planLayout(caps, model.tabs.length)
+    const { plan } = this.layout(model)
     this.lastTabsPerPage = plan.tabsPerPage
     const pages = pageCount(model.tabs.length, plan.tabsPerPage)
     this.page = clampPage(this.page, pages)
@@ -235,7 +235,7 @@ export class DeckController {
     const model = selectDeckModel(state)
     const modelJson = JSON.stringify(model)
     if (modelJson === this.lastModelJson) return
-    const plan = planLayout(this.device.capabilities, model.tabs.length)
+    const { plan } = this.layout(model)
     if (this.lastTabsPerPage !== null && plan.tabsPerPage !== this.lastTabsPerPage) this.page = 1
     this.page = clampPage(this.page, pageCount(model.tabs.length, plan.tabsPerPage))
     this.repaint({ model, modelJson })
@@ -267,15 +267,27 @@ export class DeckController {
     }
   }
 
+  /** Single source of arrangement truth for this device: plan + ordered tabs.
+   * buildFrame derives the same pair internally from model.keyLayout + caps,
+   * so painting and press targeting stay mirror images. */
+  private layout(model: DeckModel): { arrangement: DeckArrangement; plan: LayoutPlan; tabs: DeckTab[] } {
+    const arrangement = resolveArrangement(model.keyLayout, this.device.capabilities.keyCount)
+    return {
+      arrangement,
+      plan: planLayout(this.device.capabilities, model.tabs.length, arrangement),
+      tabs: arrangeTabs(model.tabs, arrangement),
+    }
+  }
+
   /** What this key DISPLAYS right now - captured at press-down so re-sorts can't retarget a press. */
   private resolveKeyTarget(keyIndex: number): PressTarget {
     const model = selectDeckModel(this.store.getState())
-    const plan = planLayout(this.device.capabilities, model.tabs.length)
+    const { plan, tabs } = this.layout(model)
     if (plan.pagerKey !== null && keyIndex === plan.pagerKey) return { kind: 'pager' }
     const slot = plan.tabSlots.indexOf(keyIndex)
     if (slot === -1) return { kind: 'none' }
     const pages = pageCount(model.tabs.length, plan.tabsPerPage)
-    const tab = visibleTabs(model.tabs, clampPage(this.page, pages), plan.tabsPerPage)[slot]
+    const tab = visibleTabs(tabs, clampPage(this.page, pages), plan.tabsPerPage)[slot]
     return tab ? { kind: 'tab', tabId: tab.id } : { kind: 'none' }
   }
 
@@ -291,7 +303,7 @@ export class DeckController {
     const duration = this.now() - press.at
     if (press.target.kind === 'pager') {
       const model = selectDeckModel(this.store.getState())
-      const plan = planLayout(this.device.capabilities, model.tabs.length)
+      const { plan } = this.layout(model)
       const pages = pageCount(model.tabs.length, plan.tabsPerPage)
       this.page = this.page >= pages ? 1 : this.page + 1
       this.repaint()
@@ -355,14 +367,14 @@ export class DeckController {
     this.noteActivity()
     const state = this.store.getState()
     const model = selectDeckModel(state)
-    const plan = planLayout(this.device.capabilities, model.tabs.length)
+    const { plan, tabs } = this.layout(model)
     if (!plan.useDials) return
     if (dialIndex === 0) {
-      const n = model.tabs.length
+      const n = tabs.length
       if (n === 0) return
-      const idx = model.tabs.findIndex((t) => t.id === model.activeTabId)
+      const idx = tabs.findIndex((t) => t.id === model.activeTabId)
       const next = ((((idx === -1 ? 0 : idx) + ticks) % n) + n) % n
-      focusTabFromDeck(this.store, model.tabs[next].id)
+      focusTabFromDeck(this.store, tabs[next].id)
       return
     }
     if (dialIndex === 1) {
@@ -375,7 +387,7 @@ export class DeckController {
     this.noteActivity()
     const state = this.store.getState()
     const model = selectDeckModel(state)
-    const plan = planLayout(this.device.capabilities, model.tabs.length)
+    const { plan } = this.layout(model)
     if (!plan.useDials) return
     if (dialIndex === 0) {
       if (model.activeTabId) focusTabFromDeck(this.store, model.activeTabId)

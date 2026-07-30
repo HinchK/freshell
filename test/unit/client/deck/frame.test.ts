@@ -28,19 +28,19 @@ const noPreview = () => []
 
 describe('planLayout', () => {
   it('mini, 3 tabs: keys mode, no pager, 6 tab slots', () => {
-    expect(planLayout(MINI_CAPS, 3)).toEqual({
+    expect(planLayout(MINI_CAPS, 3, 'standard')).toEqual({
       mode: 'keys', keyCount: 6, tabSlots: [0, 1, 2, 3, 4, 5], pagerKey: null,
       tabsPerPage: 6, useDials: false, useStrip: false,
     })
   })
   it('mini, 8 tabs: pager at key 5, 5 tabs per page', () => {
-    const plan = planLayout(MINI_CAPS, 8)
+    const plan = planLayout(MINI_CAPS, 8, 'standard')
     expect(plan.pagerKey).toBe(5)
     expect(plan.tabSlots).toEqual([0, 1, 2, 3, 4])
     expect(plan.tabsPerPage).toBe(5)
   })
   it('plus: full mode regardless of overflow', () => {
-    const plan = planLayout(PLUS_CAPS, 20)
+    const plan = planLayout(PLUS_CAPS, 20, 'standard')
     expect(plan).toMatchObject({ mode: 'full', pagerKey: null, tabsPerPage: 8, useDials: true, useStrip: true })
   })
 })

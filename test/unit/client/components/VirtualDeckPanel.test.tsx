@@ -88,13 +88,21 @@ describe('VirtualDeckPanel', () => {
     expect(screen.getAllByRole('button', { name: /deck key/i })).toHaveLength(6)
   })
 
-  it('clicking key 2 focuses tab 2 in the store (short press)', () => {
+  it('clicking key 2 focuses the last tab in tab-bar order (default auto layout is reversed on Mini; key 1 is the pager)', () => {
+    // The real settings reducer defaults keyLayout to 'auto', which resolves
+    // REVERSED on the 6-key Mini: physical key 0 ('Deck key 1') is the pager,
+    // and 'Deck key 2' (physical key 1) shows the LAST tab in tab-bar order (t2).
     const store = renderPanel()
     openPanel(store)
     expect(store.getState().tabs.activeTabId).toBe('t1')
     const key2 = screen.getByRole('button', { name: 'Deck key 2' })
     fireEvent.pointerDown(key2)
     fireEvent.pointerUp(key2)
+    expect(store.getState().tabs.activeTabId).toBe('t2')
+    // Pressing the pager key is a page wrap, never a focus change.
+    const key1 = screen.getByRole('button', { name: 'Deck key 1' })
+    fireEvent.pointerDown(key1)
+    fireEvent.pointerUp(key1)
     expect(store.getState().tabs.activeTabId).toBe('t2')
   })
 
