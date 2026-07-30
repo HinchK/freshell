@@ -27,6 +27,8 @@ import { FakeDeckDevice, PLUS_CAPS } from '@/deck/fake-deck-device'
 import type { DeckCapabilities } from '@/deck/deck-device'
 import { DeckController, type DeckControllerOptions } from '@/deck/deck-controller'
 import { IconImageCache } from '@/deck/icon-image-cache'
+import { providerIconDataUrl } from '@/deck/provider-icon-svg'
+import { PANE_TINT_COLORS } from '@/deck/pane-tint-colors'
 import { registerTerminalTextReader, resetTerminalTextRegistryForTests } from '@/deck/terminal-text-registry'
 import type { KeySpec } from '@/deck/frame'
 
@@ -540,5 +542,39 @@ describe('tile styles', () => {
     expect(decodeStrip(device)).toContain('2 waiting')
     store.dispatch(updateSettingsLocal({ streamDeck: { tileStyle: 'terminal-previews' } }))
     expect(decodeStrip(device)).toContain('2 waiting')
+  })
+
+  it('icons style: busy agent pane surfaces as a blue-tinted paneIcon on the wire', () => {
+    const { device } = setup({ tabs: 2, busy: ['term-2'] })
+    // Sorted order: idle-running t1 (green icon) at key 0, busy t2 (blue icon) at key 1.
+    const spec = decodeKey(device, 1)
+    expect(spec).toMatchObject({
+      kind: 'tab',
+      style: 'icons',
+      tabId: 't2',
+      // ready is false: jsdom never decodes images, so the default cache never
+      // reports a bitmap — this asserts the pre-decode wire state.
+      paneIcons: [{ provider: 'claude', tint: 'blue', ready: false }],
+    })
+  })
+
+  it('icons style: pane icon flips to ready on the wire when its data URL decodes (A1 falsification fix, proven on the real controller+cache)', async () => {
+    // Mirrors the repo-icon deferred-loader test above: the REAL IconImageCache
+    // with a hand-resolved loader. buildFrame's iconReady probe (bitmapFor)
+    // starts the load with the tinted data URL; resolving it fires the cache
+    // notify, and the repaint must flip `ready` in the spec JSON — the diff-skip
+    // in DeckController would otherwise never repaint this key.
+    const { loader, pending } = deferredLoader()
+    const cache = new IconImageCache(loader)
+    const { device } = setup({ tabs: 1 }, undefined, defaultSettings, { iconCache: cache })
+    expect(decodeKey(device, 0)).toMatchObject({
+      paneIcons: [{ provider: 'claude', tint: 'green', ready: false }],
+    })
+    const url = providerIconDataUrl('claude', PANE_TINT_COLORS.green)
+    pending.get(url)!.resolve({} as CanvasImageSource) // frame-time probe already requested this exact URL
+    await vi.advanceTimersByTimeAsync(0)
+    expect(decodeKey(device, 0)).toMatchObject({
+      paneIcons: [{ provider: 'claude', tint: 'green', ready: true }],
+    })
   })
 })

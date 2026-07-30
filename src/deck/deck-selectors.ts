@@ -2,7 +2,7 @@ import type { RootState } from '@/store/store'
 import type { Tab } from '@/store/types'
 import type { FreshAgentPaneContent, PaneContent, PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import type { TabStatusFlags } from './tile-state'
-import { tileFill, tileDot, tilePriority, type TileFill, type TileDot } from './tile-state'
+import { tileFill, tilePriority, type TileFill } from './tile-state'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab, hasWaitingPrompt, resolvePaneActivity } from '@/lib/pane-activity'
 import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
@@ -23,7 +23,6 @@ export type DeckTab = {
   attention: boolean
   pendingApproval: boolean
   fill: TileFill
-  dot: TileDot
   priority: number
   repoIcons: TileRepoIcon[]
   paneIcons: TilePaneIcon[]
@@ -211,7 +210,6 @@ export function selectDeckModel(state: RootState): DeckModel {
       attention: flags.attention,
       pendingApproval: tabHasPendingApproval(state, tab.id),
       fill: tileFill(active, flags),
-      dot: tileDot(flags),
       priority: tilePriority(active, flags),
       repoIcons: getTabRepoIcons(state, tab),
       paneIcons: getTabPaneIcons(state, tab),
