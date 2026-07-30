@@ -9,7 +9,7 @@
 
 **Architecture:** All deck pixels flow through one file — `src/deck/tile-renderer.ts` — consumed identically by the physical WebHID deck and the in-app `VirtualDeckPanel` (both inject the same `renderKey`/`renderStrip`). Changes are made in the renderer only; the injectable-`Ctx2D` seam is extended once (type + two fake contexts) and every tweak is proven at the recorded-draw-call level in the existing `recordingCtx` harness (jsdom has no real canvas; pixel reads are impossible by design).
 
-**Tech Stack:** TypeScript, HTML Canvas 2D (Chromium-only surface — WebHID requires it, so `ctx.roundRect`/`ctx.letterSpacing` are safe at runtime), Vitest + jsdom with an injected recording context.
+**Tech Stack:** TypeScript, HTML Canvas 2D, Vitest + jsdom with an injected recording context. The physical deck path is Chromium (WebHID requires it), but `VirtualDeckPanel`'s real-canvas path runs in whatever browser loads the web client (README advertises the panel for browsers without WebHID), so: `ctx.roundRect` is guarded at both real-ctx seams (Task 1's `ensureRoundRect` — square-corner degrade on pre-Baseline-2023 browsers: Firefox ≤111 / Safari ≤15); `ctx.letterSpacing` needs no guard (assigning it on a non-supporting canvas is an inert expando — no throw, and rendering stays self-consistent because `measureText` excludes the tracking there too). Chromium's trailing-inclusive `letterSpacing` measurement model (the basis of Task 5 and the test stub) was verified empirically in real headless Chromium 145 — see the assumption ledger at `.worktrees/.the-usual-logs/deck-visual-tweaks/load-bearing-ledger.md`.
 
 ## Global Constraints
 
@@ -48,7 +48,7 @@ Reference geometry (used throughout the tasks):
 
 ### Task 1: Extend the Ctx2D contract and all three context implementations
 
-Pure scaffolding for Tasks 2–6: the renderer's narrow `Ctx2D` type gains the members the tweaks need (`save`/`restore`/`clip`/`stroke`/`roundRect`/`strokeStyle`/`lineWidth`/`letterSpacing`), and both fake contexts (production `noopCtx`, test `recordingCtx`) are extended in lockstep. No behavior change; the gate is typecheck + existing suite green. (No RED phase — this task adds unused capability; every later task drives it through failing tests.)
+Pure scaffolding for Tasks 2–6: the renderer's narrow `Ctx2D` type gains the members the tweaks need (`save`/`restore`/`clip`/`stroke`/`roundRect`/`strokeStyle`/`lineWidth`/`letterSpacing`), both fake contexts (production `noopCtx`, test `recordingCtx`) are extended in lockstep, and a tiny `ensureRoundRect` compatibility guard is installed at both real-ctx seams. No behavior change; the gate is typecheck + suite green. (No RED phase — this task adds unused capability plus one directly-tested compatibility guard; every later task drives the rest through failing tests.)
 
 **Files:**
 - Modify: `src/deck/tile-renderer.ts` (the `Ctx2D` type at lines ~12-15 and `defaultCtxFactory` at ~348-355)
@@ -59,7 +59,8 @@ Pure scaffolding for Tasks 2–6: the renderer's narrow `Ctx2D` type gains the m
 - Consumes: existing `Ctx2D` type and the three implementations listed above.
 - Produces (relied on by Tasks 2–6):
   - `Ctx2D` includes: `save(): void`, `restore(): void`, `clip(): void`, `stroke(): void`, `roundRect(x: number, y: number, w: number, h: number, radii?: number): void`, `strokeStyle: string | CanvasGradient | CanvasPattern`, `lineWidth: number`, `letterSpacing: string` (plus everything it had).
-  - `recordingCtx(...)` additionally returns `clips: Array<{ x: number; y: number; w: number; h: number; r: number }>`, `strokes: Array<{ x: number; y: number; w: number; h: number; r: number; style: string; lineWidth: number }>`, `measures: Array<{ text: string; letterSpacing: string }>`; its `Text` records gain `letterSpacing: string`; its `measureText` returns `t.length * (6 + parsedLetterSpacing)`.
+  - `recordingCtx(...)` additionally returns `clips: Array<{ x: number; y: number; w: number; h: number; r: number }>`, `strokes: Array<{ x: number; y: number; w: number; h: number; r: number; style: string; lineWidth: number }>`, `measures: Array<{ text: string; letterSpacing: string }>`; its `Text` records gain `letterSpacing: string`; its `measureText` returns `t.length * (6 + parsedLetterSpacing)`. (This trailing-inclusive model was verified against real Chromium 145: `measureText` adds the tracking after EVERY glyph including the last, and assigning `font` after `letterSpacing` does not reset the spacing — see the assumption ledger.)
+  - `export function ensureRoundRect(ctx: CanvasRenderingContext2D): void` — applied inside `defaultCtxFactory` (tile-renderer) and `safeCtxFactory` (VirtualDeckPanel): polyfills a missing `roundRect` with a square-corner `rect()` delegate so pre-Baseline-2023 browsers (Firefox ≤111, Safari ≤15) degrade instead of throwing.
 
 - [ ] **Step 1: Extend the `Ctx2D` type in `src/deck/tile-renderer.ts`**
 
@@ -101,7 +102,42 @@ In `defaultCtxFactory` (same file), change the final `return ctx` to:
   return ctx as unknown as Ctx2D
 ```
 
-- [ ] **Step 3: Extend `noopCtx` in `src/components/VirtualDeckPanel.tsx`**
+- [ ] **Step 3: Guard `roundRect` at both real-ctx seams (`ensureRoundRect`)**
+
+Validation FALSIFIED the assumption that every real 2D context has `roundRect`: it is
+Baseline 2023 (Chrome/Edge 99+, Firefox 112+, Safari 16+), and `VirtualDeckPanel`'s
+`safeCtxFactory` hands the renderer a REAL ctx in any browser where `getContext('2d')`
+succeeds (the README advertises the virtual deck panel for browsers without WebHID; a
+missing `roundRect` would throw uncaught through `DeckController.render`). Add to
+`src/deck/tile-renderer.ts`, next to `defaultCtxFactory`:
+
+```ts
+/** Pre-Baseline-2023 canvases (Firefox <=111, Safari <=15) lack roundRect; an
+ * unguarded call would crash VirtualDeckPanel rendering in those browsers.
+ * Degrade to square corners instead. (ctx.letterSpacing needs no guard:
+ * assigning it on a non-supporting canvas is an inert expando — no throw, and
+ * text stays self-consistent since measureText excludes the tracking there too.) */
+export function ensureRoundRect(ctx: CanvasRenderingContext2D): void {
+  const c = ctx as CanvasRenderingContext2D & { roundRect?: unknown }
+  if (typeof c.roundRect !== 'function') {
+    c.roundRect = function (this: CanvasRenderingContext2D, x: number, y: number, w: number, h: number) {
+      this.rect(x, y, w, h)
+    }
+  }
+}
+```
+
+Call `ensureRoundRect(ctx)` in `defaultCtxFactory` immediately before Step 2's
+`return`, and in `safeCtxFactory` (`src/components/VirtualDeckPanel.tsx`) on the real
+ctx before it is returned (the `noopCtx` fallback branch defines `roundRect` itself and
+needs nothing).
+
+Add one unit test in `test/unit/client/deck/tile-renderer.test.ts` near the harness:
+calling `ensureRoundRect` on a stub `{ rect: <recorder> }` WITHOUT `roundRect` installs
+a `roundRect` that delegates x/y/w/h to `rect` (radius dropped); calling it on a stub
+WITH a `roundRect` function leaves that function untouched.
+
+- [ ] **Step 4: Extend `noopCtx` in `src/components/VirtualDeckPanel.tsx`**
 
 Add these members to the object literal returned by `noopCtx` (keep every existing member):
 
@@ -116,7 +152,7 @@ Add these members to the object literal returned by `noopCtx` (keep every existi
     roundRect: () => {},
 ```
 
-- [ ] **Step 4: Extend `recordingCtx` in `test/unit/client/deck/tile-renderer.test.ts`**
+- [ ] **Step 5: Extend `recordingCtx` in `test/unit/client/deck/tile-renderer.test.ts`**
 
 Update the record types and the harness. `Text` gains `letterSpacing`; new `clips`/`strokes`/`measures` arrays; `measureText` models Chromium's tracking (spacing added after every char, including the last):
 
@@ -194,18 +230,18 @@ function recordingCtx(width: number, height: number) {
 
 Then update the per-test render-helper wrapper(s) just below (lines ~110-119, plus the inline pager/action/strip variants at ~196-212 and ~263-271) following their existing pattern so the returned record object passes through `clips`, `strokes`, and `measures` (if a wrapper already returns the whole `recordingCtx(...)` result, no change is needed there).
 
-- [ ] **Step 5: Verify no behavior changed**
+- [ ] **Step 6: Verify no behavior changed**
 
 Run: `npm run typecheck`
 Expected: PASS (if it errors ONLY on `letterSpacing` not existing on `CanvasRenderingContext2D`, the Step 2 cast is missing — apply it).
 
 Run: `npm run test:vitest -- run test/unit/client/deck/tile-renderer.test.ts`
-Expected: PASS (all existing tests green; nothing exercises the new members yet).
+Expected: PASS (all existing tests green plus the new `ensureRoundRect` unit test; nothing else exercises the new members yet).
 
 Run: `npm run lint`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/deck/tile-renderer.ts src/components/VirtualDeckPanel.tsx test/unit/client/deck/tile-renderer.test.ts
@@ -259,7 +295,7 @@ describe('rounded key frame', () => {
 })
 ```
 
-(`renderKeyKind`/`iconsSpec`/`pagerSpec`/`actionSpec` are stand-ins: reuse the file's existing wrapper that calls `renderKey(spec, MINI_CAPS-equivalent caps, factory)` and its existing spec builders for tab/pager/action/empty — every kind is already rendered somewhere in this file; follow those call sites exactly.)
+(`renderKeyKind`/`iconsSpec`/`pagerSpec`/`actionSpec` are stand-ins: reuse the file's existing wrapper that calls `renderKey(spec, MINI_CAPS-equivalent caps, factory)` and its existing spec builders for tab/pager/action — those four kinds are already rendered somewhere in this file; follow those call sites exactly. NOTE: `kind: 'empty'` is NOT currently rendered anywhere in the test file — this frame test introduces the first empty-kind render; build the spec inline as `{ kind: 'empty' }` and pass it through the same wrapper.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -310,7 +346,7 @@ In `renderKey`, wrap the existing switch (the switch body itself is unchanged �
 Every rendered key now records one extra leading rect (the black surround). In `test/unit/client/deck/tile-renderer.test.ts`:
 - `'no status dot: a plain icons tile draws only the background and the banner'` (~:178-182): `expect(rects).toHaveLength(2)` → `toHaveLength(3)`; the background assertion moves from `rects[0]` to `rects[1]` (banner is `rects[2]`). Update the test name to mention the frame surround.
 - `rects[0]`-is-background assertions at ~:125, ~:134, ~:139 (tab tiles) and ~:200 (pager `CONTROL_BG`): shift to `rects[1]`.
-- The empty-key test (asserting a single black rect): now two black rects — assert `rects[0]` AND `rects[1]` are `EMPTY_BG` full-bleed.
+- There is NO pre-existing empty-key render test (the frame test in Step 1 introduces the first `kind: 'empty'` render). In that new test, for the empty kind expect TWO full-bleed `EMPTY_BG` rects: `rects[0]` (the frame surround) and `rects[1]` (the empty case's own fill, now clipped and pixel-identical).
 - Any other test indexing `rects[0]`/counting rects for a rendered key: shift by one. Tests that call `drawRing`/`iconLayout`/`fitLabel` directly are unaffected.
 
 - [ ] **Step 5: Run the full renderer suite**
@@ -332,7 +368,7 @@ git commit -m "feat(deck): render every key inside a rounded-rect frame with pur
 
 ### Task 3: Rings and borders follow the rounded shape (tweak 4, part 2)
 
-`drawRing` currently paints `width` nested 1px square `fillRect` frames. Replace with a single rounded-rect stroke inset from the frame. All 7 call sites (icons barTop green ring, white active rings, classic status rings, action rings) keep their exact signatures — one rewrite covers every border.
+`drawRing` currently paints `width` nested 1px square `fillRect` frames. Replace with a single rounded-rect stroke inset from the frame. All 8 call sites (icons barTop green ring, white active rings, classic status rings, action rings) keep their exact signatures — one rewrite covers every border.
 
 **Files:**
 - Modify: `src/deck/tile-renderer.ts` (`drawRing`, lines ~125-134)
@@ -740,3 +776,12 @@ git add -A && git commit -m "test(deck): verification sweep fix-ups for deck vis
 - **No silent deferrals:** all four tweaks land as production rendering changes proven by draw-call-level tests (the repo's only renderer-testing mechanism — jsdom deliberately has no canvas, so "corner pixels are black" is proven as *black surround fill + rounded clip installed before any content*, the strongest observable this harness supports). Both consumers share the changed functions; no stubs stand in for shipped behavior.
 - **Type consistency:** `keyFrameGeometry`/`KEY_FRAME_RADIUS_RATIO` (Task 2) consumed by Task 3/6; `TEXT_LETTER_SPACING`/`TITLE_SIDE_PADDING` (Task 5) and `ICON_ROW_SIDE_INSET` (Task 6) names used consistently; `drawRing` signature preserved across Task 3; harness fields (`clips`/`strokes`/`measures`, `Text.letterSpacing`) defined in Task 1 and used in Tasks 2–6.
 - **Known cross-task test interaction (intentional):** Task 4 writes an avatar-font assertion that Task 6 updates when the slot grows 30 → 45; Task 4 flags this inline so neither implementer is surprised.
+
+## Load-Bearing Validation Notes (post-plan hardening)
+
+Full ledger + evidence reports: `.worktrees/.the-usual-logs/deck-visual-tweaks/load-bearing-ledger.md`.
+
+- **Verified in real headless Chromium 145 (empirical):** `measureText` includes `letterSpacing` after EVERY glyph including the trailing one (10×'M' @5px → exactly +50), matching the Task 1 stub model `t.length * (6 + ls)`; setting `font` after `letterSpacing` neither resets nor ignores the spacing (Task 5's statement order is safe).
+- **Falsified → plan changed:** "every real ctx has `roundRect`" is false for Firefox ≤111 / Safari ≤15, and `VirtualDeckPanel`'s `safeCtxFactory` hands a real ctx to the renderer in any browser (README advertises the panel for browsers without WebHID; a throw would propagate uncaught through `DeckController.render`). Fix: Task 1 Step 3 (`ensureRoundRect` guard at both real-ctx seams, square-corner degrade). `ctx.letterSpacing` needs no guard (inert expando pre-support; rendering stays self-consistent).
+- **Verified by rendering the real (unmodified) renderer in real Chromium and masking with the planned frame:** clipping the pinned classic preview loses no legible content at any size (72/80px lose 3.5–4.8% of body ink, all right-edge fragments that are ALREADY mid-cut today because `PREVIEW_CHAR_WIDTH = 5.5` understates the true ~6.62px monospace advance — a pre-existing, pinned, out-of-scope quirk the frame tidies). Uniform frame-in-`renderKey` architecture stands; no per-kind opt-out needed. Before/after/diff PNGs in the logs `reports/` dir.
+- **Corrections from code inspection:** `drawRing` has 8 call sites (Task 3 said 7 — fixed); `kind: 'empty'` was never rendered in the test file (Task 2's "every kind is already rendered" claim fixed; the frame test introduces the first empty render).
