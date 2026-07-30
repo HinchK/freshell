@@ -161,15 +161,17 @@ export function iconLayout(w: number, h: number, count: number): Array<{ x: numb
   return Array.from({ length: count }, (_, i) => ({ x: x0 + i * (size + ICON_GAP), y, size }))
 }
 
+/** Ring/border that follows the rounded key frame: a rounded-rect stroke of
+ * `width` px, `inset` px inside the frame edge. (Replaces the old nested
+ * 1px square fillRect frames — strokes keep the rounded shape at corners.) */
 export function drawRing(ctx: Ctx2D, w: number, h: number, color: string, width: number, inset = 0): void {
-  ctx.fillStyle = color
-  for (let i = 0; i < width; i++) {
-    const o = inset + i
-    ctx.fillRect(o, o, w - 2 * o, 1) // top
-    ctx.fillRect(o, h - 1 - o, w - 2 * o, 1) // bottom
-    ctx.fillRect(o, o, 1, h - 2 * o) // left
-    ctx.fillRect(w - 1 - o, o, 1, h - 2 * o) // right
-  }
+  const { margin, radius } = keyFrameGeometry(w, h)
+  const off = margin + inset + width / 2
+  ctx.strokeStyle = color
+  ctx.lineWidth = width
+  ctx.beginPath()
+  ctx.roundRect(off, off, w - 2 * off, h - 2 * off, Math.max(1, radius - inset - width / 2))
+  ctx.stroke()
 }
 
 function drawCenteredText(ctx: Ctx2D, text: string, w: number, y: number): void {

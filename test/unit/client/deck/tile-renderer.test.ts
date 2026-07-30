@@ -105,14 +105,17 @@ describe('title fitting', () => {
 })
 
 describe('drawRing', () => {
-  it('paints width nested 1px frames at the given inset', () => {
-    const { ctx, rects } = recordingCtx(80, 80)
-    drawRing(ctx, 80, 80, '#3b82f6', 2, 1)
-    // each 1px frame = 4 rects (top, bottom, left, right) => 8 rects
-    expect(rects).toHaveLength(8)
-    expect(rects.every((r) => r.style === '#3b82f6')).toBe(true)
-    // first frame at offset 1: top strip spans full width at y=1
-    expect(rects[0]).toMatchObject({ x: 1, y: 1, w: 78, h: 1 })
+  it('drawRing strokes a rounded rect that follows the key frame', () => {
+    const rec = recordingCtx(80, 80)
+    drawRing(rec.ctx, 80, 80, '#ffffff', 3, 0)
+    // margin 3, radius 10 => off = 3 + 0 + 1.5 = 4.5, r = 10 - 1.5 = 8.5
+    expect(rec.strokes[0]).toEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: '#ffffff', lineWidth: 3 })
+    expect(rec.rects).toHaveLength(0)
+
+    const inner = recordingCtx(80, 80)
+    drawRing(inner.ctx, 80, 80, '#ffffff', 2, 3)
+    // off = 3 + 3 + 1 = 7, r = 10 - 3 - 1 = 6
+    expect(inner.strokes[0]).toEqual({ x: 7, y: 7, w: 66, h: 66, r: 6, style: '#ffffff', lineWidth: 2 })
   })
 })
 
@@ -157,12 +160,12 @@ function renderTab(spec: KeySpec, getIcon?: IconSource) {
 
 describe('renderKey', () => {
   it('no-fill tile: near-black bg, banner, white title, no rings, no dot, no preview text', () => {
-    const { out, rects, texts } = renderTab(tabSpec())
+    const { out, rects, texts, strokes } = renderTab(tabSpec())
     expect(out).toBeInstanceOf(Uint8ClampedArray)
     expect(rects[1]).toMatchObject({ x: 0, y: 0, w: 80, h: 80, style: TILE_BG })
     expect(rects.some((r) => r.y === 0 && r.h === 20 && r.style.startsWith('rgba'))).toBe(true) // banner
     expect(texts.some((t) => t.text === 'build' && t.style === '#ffffff')).toBe(true)           // title
-    expect(rects.filter((r) => r.style === ACTIVE_COLOR)).toHaveLength(0)
+    expect(strokes).toHaveLength(0) // no rings
     expect(texts.filter((t) => t.style === PREVIEW_TEXT_COLOR)).toHaveLength(0) // no preview text anywhere on the tile
   })
 
@@ -172,16 +175,16 @@ describe('renderKey', () => {
   })
 
   it('barTop state paints light-green background + 3px green border ring', () => {
-    const { rects } = renderTab(tabSpec({ fill: 'barTop', active: true }))
+    const { rects, strokes } = renderTab(tabSpec({ fill: 'barTop', active: true }))
     expect(rects[1].style).toBe(TILE_FILL_GREEN)
-    expect(rects.filter((r) => r.style === BAR_TOP_BORDER).length).toBeGreaterThan(0)
+    expect(strokes).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: BAR_TOP_BORDER, lineWidth: 3 })
     // active tab keeps its white ring nested inside the border
-    expect(rects.filter((r) => r.style === ACTIVE_COLOR && r.h <= 1).length).toBeGreaterThan(0)
+    expect(strokes).toContainEqual({ x: 7, y: 7, w: 66, h: 66, r: 6, style: ACTIVE_COLOR, lineWidth: 2 })
   })
 
   it('active tab without fill gets the plain white ring', () => {
-    const { rects } = renderTab(tabSpec({ active: true }))
-    expect(rects.filter((r) => r.style === ACTIVE_COLOR).length).toBeGreaterThan(0)
+    const { strokes } = renderTab(tabSpec({ active: true }))
+    expect(strokes).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: ACTIVE_COLOR, lineWidth: 3 })
   })
 
   it('ready icon draws via drawImage at the centered layout slot', () => {
@@ -241,13 +244,13 @@ describe('renderKey', () => {
   })
 
   it('disabled action key gets the grey ring; enabled approve gets green', () => {
-    const rectsFor = (enabled: boolean) => {
+    const strokesFor = (enabled: boolean) => {
       let cap: ReturnType<typeof recordingCtx> | null = null
       renderKey({ kind: 'action', action: 'approve', enabled }, MINI_CAPS, (w, h) => (cap = recordingCtx(w, h)).ctx)
-      return cap!.rects
+      return cap!.strokes
     }
-    expect(rectsFor(false).some((r) => r.style === DISABLED_ACTION_COLOR)).toBe(true)
-    expect(rectsFor(true).some((r) => r.style === APPROVE_COLOR)).toBe(true)
+    expect(strokesFor(false)).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: DISABLED_ACTION_COLOR, lineWidth: 3 })
+    expect(strokesFor(true)).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: APPROVE_COLOR, lineWidth: 3 })
   })
 })
 
@@ -294,14 +297,14 @@ describe('renderKey preview style', () => {
   })
 
   it('status ring + active tab draws the status ring plus the white inner ring', () => {
-    const { rects } = renderTab(previewSpec({ ring: 'green', active: true }))
-    expect(rects.some((r) => r.style === RING_COLORS.green)).toBe(true)
-    expect(rects.some((r) => r.style === ACTIVE_COLOR)).toBe(true) // white inner ring
+    const { strokes } = renderTab(previewSpec({ ring: 'green', active: true }))
+    expect(strokes).toContainEqual({ x: 4.5, y: 4.5, w: 71, h: 71, r: 8.5, style: RING_COLORS.green, lineWidth: 3 })
+    expect(strokes).toContainEqual({ x: 7, y: 7, w: 66, h: 66, r: 6, style: ACTIVE_COLOR, lineWidth: 2 }) // white inner ring
   })
 
   it('amber ring renders for a waiting-for-approval tab', () => {
-    const { rects } = renderTab(previewSpec({ ring: 'amber' }))
-    expect(rects.some((r) => r.style === RING_COLORS.amber)).toBe(true)
+    const { strokes } = renderTab(previewSpec({ ring: 'amber' }))
+    expect(strokes).toContainEqual({ x: 5, y: 5, w: 70, h: 70, r: 8, style: RING_COLORS.amber, lineWidth: 4 })
   })
 
   it('icons style still renders fills (dispatch regression)', () => {
