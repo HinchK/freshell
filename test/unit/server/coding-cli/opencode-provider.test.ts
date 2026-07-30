@@ -89,7 +89,7 @@ class FakeDatabaseSync {
             { name: 'time_archived' },
           ]
         }
-        if (/SELECT\s+id,\s+parent_id\s+FROM\s+session/i.test(sql)) {
+        if (/SELECT\s+id,\s+parent_id,\s+directory\s+FROM\s+session/i.test(sql)) {
           const failure = FakeDatabaseSync.rootQueryFailures.shift()
           if (failure) throw failure
           if (!hasParentId) throw new Error('no such column: parent_id')
@@ -99,6 +99,7 @@ class FakeDatabaseSync {
             .map((session) => ({
               id: session.id,
               parent_id: session.parent_id,
+              directory: session.directory,
             }))
         }
         if (!hasParentId && /parent_id/i.test(sql)) {
@@ -375,6 +376,7 @@ describe('OpencodeProvider', () => {
     const resolved = await provider.resolveOpencodeSessionRoots(['child_session'])
 
     expect(resolved.rootsBySessionId.get('child_session')).toBe('root_session')
+    expect(resolved.directoriesBySessionId?.get('child_session')).toBe('/repo/root')
     expect(resolved.unresolvedSessionIds.size).toBe(0)
   })
 
