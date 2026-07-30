@@ -22,6 +22,7 @@
 - All work stays in the worktree `/home/dan/code/freshell/.worktrees/graceful-restore-resume-s1` on its branch; **never touch the main checkout**; leave the branch **unmerged**.
 - Test servers bind ephemeral loopback ports only — NEVER 3001/3002; never use broad kill patterns (`pkill -f node` etc.).
 - Broad repo-supported test runs wait for the shared coordinator gate (`AGENTS.md:28-31`); use `npm run test:status` to inspect holders.
+- **Environment precondition (node deps — required for EVERY `freshell-ws` test gate):** `handle_create` runs `generate_mcp_injection` unconditionally for every non-shell mode (`terminal.rs:2043-2063`), and the codex arm requires `<worktree_root>/node_modules/tsx/dist/loader.mjs` (`mcp_inject.rs:123-128`; `find_repo_root` at `:146-164` walks up from cwd to the FIRST `package.json` with `name == "freshell"` — the worktree's own root — so the main checkout's `node_modules` is never reached). No env var, settings field, or test seam bypasses injection; without installed deps every codex-mode create dies with `PTY_SPAWN_FAILED "Unable to resolve MCP dependency \"tsx\""`. Before the FIRST gate that runs any `freshell-ws` integration test (Task 3 Step 1 and everything after), run in the worktree root: `test -f node_modules/tsx/dist/loader.mjs || npm ci --no-audit --no-fund`. This is the repo's sanctioned fix (precedent: `docs/plans/2026-07-24-rust-attach-viewport.md:26`, `docs/plans/2026-07-29-rebind-review-polish.md:1207-1210`); do not chase tsx-resolution failures in Rust code.
 - README.md untouched; the only doc edits are this plan's own file and the §D-C addendum to `docs/plans/2026-07-27-rest-spawn-gate.md` (Task 6).
 - Task 4's commit message MUST cite **D-GATE-SOFT** (spec §9.1 obligation).
 - **Accepted residual (A5, V3):** permit-held awaits (PTY spawn, association fs walk, fsync ledger writes) are deadline-free, so a correlated fs hang (the gate's founding WSL RCA) now parks restores silently where today they died loud at 10s; S1 compensates with warn-level tracing (periodic parked-waiter logs + a slow-hold watchdog — Task 4), NOT with new frames/fields. Disconnect-cancel remains the client escape.
@@ -909,7 +910,11 @@ pub(crate) fn derive_launch_prep(
 
 - [ ] **Step 1: Snapshot the pins that must stay green (the "red" for a refactor is a broken pin)**
 
+Environment precondition FIRST (Global Constraints): these binaries perform codex-mode creates, which die at MCP injection (`PTY_SPAWN_FAILED "Unable to resolve MCP dependency \"tsx\""`) in a worktree without node deps — an environmental failure unrelated to this slice.
+
 ```bash
+cd /home/dan/code/freshell/.worktrees/graceful-restore-resume-s1
+test -f node_modules/tsx/dist/loader.mjs || npm ci --no-audit --no-fund
 cargo test -p freshell-ws --test claude_restore_unavailable 2>&1 | tail -5
 cargo test -p freshell-ws --test codex_session_ref_resume 2>&1 | tail -5
 cargo test -p freshell-ws --test restore_spawn_gate 2>&1 | tail -5
@@ -1687,6 +1692,8 @@ Expected: PASS. (Task 3 Step 1 ran these files as pre-change pin snapshots — c
 
 - [ ] **Step 9: Full verification of the rewire**
 
+(Node-deps precondition from Global Constraints must already hold — `test -f node_modules/tsx/dist/loader.mjs || npm ci --no-audit --no-fund` in the worktree root — or the `freshell-ws` codex-create tests fail environmentally at MCP injection.)
+
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -3
@@ -1738,7 +1745,7 @@ class pinned by permit_released_only_after_work_completes)."
 
 **Test-harness ground rules (from the repo's own precedents):**
 - Copy `spawn_server` from `crates/freshell-ws/tests/restore_spawn_gate.rs:76-163` verbatim, then add a `codex` sleeper CLI spec to `cli_commands`. Sleeper scripts MUST use a unique-per-call path (append a per-call counter/UUID to the filename), NOT the shared `{name}-{pid}` shape — the `1839b11e` ETXTBSY fix.
-- **MCP pin (V6-N1):** the harness's ONLY MCP control is the settings document `test_settings_value()` (`restore_spawn_gate.rs:22-40`), whose `"codingCli"` object sets `"mcpServer": true` at `:25`. In BOTH new binaries' copies (`restore_storm.rs` AND `restore_plan_queue_cap.rs`), pin `"mcpServer": false` — with `mcpServer: true` and no resolvable `tsx` (bare worktrees, some CI), every codex create dies at MCP injection with `PTY_SPAWN_FAILED "Unable to resolve MCP dependency \"tsx\""` BEFORE spawn; `codex_session_ref_resume` demonstrably fails exactly this way in THIS worktree today. Without this pin, "12 settle with zero error frames" fails for a reason unrelated to anything this slice changes.
+- **MCP precondition (V6-N1, corrected in fresheyes iteration 1):** there is NO settings- or env-level MCP off-switch. `settings.codingCli.mcpServer` is never read in the create path — it is only declared (`freshell-protocol/src/settings.rs:80`), defaulted (`freshell-server/src/settings.rs:44`), and key-whitelisted (`freshell-server/src/settings_store.rs:1467-1471`) — so pinning `"mcpServer": false` in a test settings fixture is a NO-OP; do not rely on it. `handle_create` runs `generate_mcp_injection` unconditionally for every non-shell mode (`terminal.rs:2043-2063`), and the codex arm requires `<worktree_root>/node_modules/tsx/dist/loader.mjs` (`mcp_inject.rs:123-128`); without it every codex create dies at MCP injection with `PTY_SPAWN_FAILED "Unable to resolve MCP dependency \"tsx\""` BEFORE spawn (this is exactly how `codex_session_ref_resume` fails in a bare worktree). The ONLY mechanism that makes these storm binaries (and every existing codex-create test) runnable is the Global Constraints environment precondition — node deps installed in the worktree root (`test -f node_modules/tsx/dist/loader.mjs || npm ci --no-audit --no-fund`) BEFORE the test gates. Copy `test_settings_value()` (`restore_spawn_gate.rs:22-40`) verbatim, leaving `"mcpServer": true` untouched (the value is inert). Without the precondition, "12 settle with zero error frames" fails for a reason unrelated to anything this slice changes.
 - **Fresh-plan consistency (A4):** every storm codex frame carries a `sessionRef` (`codex_restore_frame` below), so every storm codex create derives a resume session id and is resume-planned PRE-GATE (`LaunchClass::Restore`) — consistent with the A4 exclusion (only a no-session codex restore, which no storm test sends, plans on-permit Interactive). Do not add a sessionRef-less codex restore frame to these binaries without also accepting that it exercises the inline Interactive path instead of the plan queue.
 - Copy `connect_and_hello` (`:165-208`) verbatim INCLUDING `set_nodelay(true)` (load-bearing for bursts) and `send_text`.
 - One installed global manager per test binary (set-once). All test fns in `restore_storm.rs` share it: budget `with_plan_budget(factory, 2, Duration::from_secs(30), 64)`; the shared runtime is switchable via atomics; serialize test fns with a `static TEST_LOCK: tokio::sync::Mutex<()>` (via `OnceLock`) and reset counters at each test start.
@@ -2312,6 +2319,7 @@ S1 spec ("contention may not kill a restore").
 
 ```bash
 cd /home/dan/code/freshell/.worktrees/graceful-restore-resume-s1
+test -f node_modules/tsx/dist/loader.mjs || npm ci --no-audit --no-fund
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings 2>&1 | tail -3
 cargo clippy -p freshell-codex --features real-transport --all-targets -- -D warnings 2>&1 | tail -3
