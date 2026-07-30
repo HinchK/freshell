@@ -104,19 +104,15 @@ committed artifacts.
 | Electron | rust 17873 (native Windows) | `sbp9-elwin-*.png` |
 | Client-interchange (same token, URL-only switch; cross-client) | 17871↔17872↔17873 | `port/oracle/interchange/leg{1,2,3}-*.png`, `interchange-results.json`, `report-2026-07-14.md` |
 
-### 0.2.3 User-facing disclosures (council-mandated, verbatim from `port/oracle/DEVIATIONS.md`)
+### 0.2.3 User-facing disclosures (council-mandated; closed records carry their closure_progress-corrected wording — see each record)
 
-- **DEV-0006:** "codex panes in the Rust build run standalone, without freshell's managed
-  app-server integration."
+- DEV-0006 (closed 2026-07-30 — see its closure_progress): codex panes in the Rust build now launch MANAGED by default (app-server sidecar + remote proxy + durability binding), matching the original. Opt-out: FRESHELL_CODEX_MANAGED_LAUNCH=0.
 - **DEV-0007:** "On native Windows, coding-CLI panes do not receive their bootstrap
   `--settings`/hook payload — claude starts and prints a settings error (in the original it fails
   to launch at all via the default shell). This is a known, permanent condition of the current
   Windows shell-quoting pipeline; no workaround exists." (Council standing note: a user-reachable
   known-issues note is recommended at productization; product-surface decision, not taken here.)
-- **DEV-0008:** "On the Rust server, live sidebar terminal metadata badges (git branch/dirty
-  state, token usage) are not populated at all: the push channel that feeds them is not
-  implemented, so those badges stay absent for the life of a terminal — they never show stale
-  data, they show none. Terminal titles and the session directory still load and refresh via REST."
+- DEV-0008 (closed 2026-07-30 — see its closure_progress): sidebar terminal metadata badges receive provider/session identity via the terminal.meta.updated push at create and association time; git branch/dirty state and token usage enrichment are not populated (enrichment subsystem unported — those two badge fields stay absent, never stale). Titles and the session directory refresh via REST as before.
 - **DEV-0004** (port-side bounded fix, disclosed): the updater's GitHub update-check is bounded at
   5s in the rust build (the original's fetch is unbounded); on a hung GitHub API the rust
   `/api/version` returns with `updateCheck` omitted instead of hanging.
@@ -143,9 +139,11 @@ committed artifacts.
    focused + full-suite green); re-run focused before believing a red.
 8. **PORT-GAP-002**: DISCHARGED at task-005f (`b90b1d5d`) — search ported + byte-matched;
    viewport/scrollback remain YAGNI-deferred with the 404 pin (§8 status update).
-9. **terminal.meta.updated push subsystem: DEV-0008 documented gap** — `terminals.changed`
-   WS-lifecycle parity PORTED (aadd41a6); the metadata push closes together with DEV-0006's
-   sidecar-lifecycle scope.
+9. **terminal.meta.updated push subsystem: DEV-0008 CLOSED (2026-07-30, with DEV-0006)** —
+   `terminals.changed` WS-lifecycle parity PORTED (aadd41a6); the metadata push landed via
+   DEV-0006's sidecar-lifecycle scope and codex managed launch is now default-ON
+   (`FRESHELL_CODEX_MANAGED_LAUNCH`, only exact "0" disables). Remaining: git/tokenUsage
+   enrichment only (unported, separately adjudicable — see the DEV-0008 closure_progress).
 10. **WSLg Weston window-position offset**: the compositor applies +(6,27) to EVERY window move
     request (proven with a plain `xdotool windowmove` control) — Tauri window-state SIZE restore
     is exact; POSITION exact-restore is unverifiable on this display server (any client,
