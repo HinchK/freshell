@@ -292,7 +292,9 @@ function drawIconsTab(ctx: Ctx2D, w: number, h: number, spec: Extract<KeySpec, {
   // 3. Title banner across the top (unchanged treatment).
   ctx.fillStyle = BANNER_FILL
   ctx.fillRect(0, 0, w, BANNER_HEIGHT)
-  ctx.font = `600 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
+  // Weight rule: 400 everywhere, EXCEPT where the deck mirrors the app UI —
+  // the letter avatar and +N badge keep RepoIcon's 600 (see RepoIcon.tsx).
+  ctx.font = `400 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   const label = fitLabel((t) => ctx.measureText(t).width, truncateTitle(spec.title), w - 4)
@@ -324,7 +326,7 @@ function drawPager(
   ctx.fillStyle = CONTROL_DIM
   drawCenteredText(ctx, 'PAGE', w, 2)
 
-  ctx.font = `600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
+  ctx.font = `400 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.fillStyle = ACTIVE_COLOR
   drawCenteredText(ctx, `${spec.page}/${spec.pageCount}`, w, (h - CONTROL_VALUE_FONT_SIZE) / 2)
 
@@ -340,7 +342,7 @@ function drawAction(
   ctx.fillStyle = CONTROL_BG
   ctx.fillRect(0, 0, w, h)
 
-  ctx.font = `600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
+  ctx.font = `400 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`
   ctx.textBaseline = 'top'
   ctx.fillStyle = ACTIVE_COLOR
   drawCenteredText(ctx, ACTION_LABELS[spec.action], w, (h - CONTROL_VALUE_FONT_SIZE) / 2)

@@ -314,27 +314,27 @@ describe('renderKey preview style', () => {
 })
 
 describe('fonts (Inter)', () => {
-  it('icons tile: banner title and avatar letter render in 600-weight Inter', () => {
+  it('icons tile: banner title renders regular-weight (400) Inter; avatar letter keeps RepoIcon 600', () => {
     const { texts } = renderTab(
       tabSpec({ title: 'build', icons: [{ url: null, letter: 'B', hue: 200, ready: false }] }),
     )
     const title = texts.find((t) => t.text === 'build')
-    expect(title?.font).toBe(`600 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(title?.font).toBe(`400 ${TITLE_FONT_SIZE}px ${DECK_FONT_STACK}`)
     const letter = texts.find((t) => t.text === 'B')
-    expect(letter?.font).toContain(`px ${DECK_FONT_STACK}`)
-    expect(letter?.font.startsWith('600 ')).toBe(true)
+    const slot = iconLayout(80, 80, 1)[0]
+    expect(letter?.font).toBe(`600 ${Math.round(slot.size * (9 / 16))}px ${DECK_FONT_STACK}`)
   })
 
-  it('pager: dim labels are 400 Inter, the page count is 600 Inter', () => {
+  it('pager: labels and page count render 400 Inter', () => {
     const { texts } = renderTab({ kind: 'pager', page: 2, pageCount: 3 })
     expect(texts.find((t) => t.text === 'PAGE')?.font).toBe(`400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`)
     expect(texts.find((t) => t.text === 'NEXT >')?.font).toBe(`400 ${CONTROL_LABEL_FONT_SIZE}px ${DECK_FONT_STACK}`)
-    expect(texts.find((t) => t.text === '2/3')?.font).toBe(`600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(texts.find((t) => t.text === '2/3')?.font).toBe(`400 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
   })
 
-  it('action key labels render in 600 Inter', () => {
+  it('action key labels render in 400 Inter', () => {
     const { texts } = renderTab({ kind: 'action', action: 'approve', enabled: true })
-    expect(texts.find((t) => t.text === 'APPROVE')?.font).toBe(`600 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
+    expect(texts.find((t) => t.text === 'APPROVE')?.font).toBe(`400 ${CONTROL_VALUE_FONT_SIZE}px ${DECK_FONT_STACK}`)
   })
 
   it('strip text renders in 400 Inter', () => {
