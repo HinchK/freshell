@@ -9,7 +9,7 @@
 
 **Architecture:** Three moves. (1) Extract the WS fresh-claude preallocation *predicate* into `freshell-platform` (both crates already depend on it) and mint the UUID on the REST path, flipping `LaunchIntent` to `Start` so `claude --session-id <uuid>` lands in argv — this alone populates the registry row, `paneContent.sessionRef`, and `GET /api/terminals` rung 0. (2) Bridge the crate boundary for the two write-side identity homes (`TerminalIdentityRegistry` + `PaneLedger`, both `freshell-ws`-owned and unreachable from `freshell-freshagent`) with a new `PaneIdentityBinder` trait defined in `freshell-terminal` (same seam pattern as the existing read-only `SessionIdentityLookup`), implemented in `freshell-ws`, injected in `freshell-server::main` — carrying the create-time writes AND the exit-time retire hygiene the REST exit hook could never reach (load-bearing validation A2: un-retired rows leave dead panes live-looking to the session directory and durably rebindable by late signals). (3) Regression tests at the merged REST+WS server level proving resume identity, A13 refusal, and SessionStart signal consumption, plus pinning tests for the codex/opencode REST lanes.
 
-**Tech Stack:** Rust (toolchain pinned 1.96.0), axum, tokio, `async-trait`, `uuid`; existing test harnesses in `crates/freshell-ws/tests/common/mod.rs` and `crates/freshell-freshagent/src/terminal_tabs.rs mod tests`.
+**Tech Stack:** Rust (toolchain pinned 1.96.0), axum, tokio, `uuid` — no new dependencies (the binder trait is synchronous, matching the `SessionIdentityLookup` precedent; the codebase deliberately declines `async-trait`, see `identity_sink.rs:37`); existing test harnesses in `crates/freshell-ws/tests/common/mod.rs` and `crates/freshell-freshagent/src/terminal_tabs.rs mod tests`.
 
 **Baseline:** branch `fix/rest-terminal-session-identity` in worktree `/home/dan/code/freshell/.worktrees/rest-terminal-session-identity`, branched from `origin/main` @ `4c04dc9c`. All file:line references below are against that commit.
 
@@ -27,7 +27,7 @@
 - Kata: tracked as kata issue hbsa. Do NOT close it from within this workflow; the controller closes it after the branch lands.
 - Do NOT create a PR — stop after pushing the branch.
 - README.md is the only end-user markdown doc; this plan under `docs/plans/` is a working/agent doc. Create no other markdown files.
-- There is a pre-existing **untracked** file `docs/superpowers/plans/2026-07-29-rest-terminal-session-identity.md` in the worktree from a different (codex-scoped) workflow. Leave it untracked; never `git add -A` — stage files explicitly in every commit.
+- The file `docs/superpowers/plans/2026-07-29-rest-terminal-session-identity.md` is a **different (codex-scoped) workflow's plan that is already committed on this branch** (commit `eb28b3dc`, "docs: plan REST Codex terminal identity publication"). It is out of scope here: do not modify, delete, or implement from it. Never `git add -A` — stage files explicitly in every commit.
 
 ## Node Parity Decision (Required Outcome 5 — resolved, no Node code changes)
 
@@ -46,8 +46,7 @@ What Requirement 5 therefore reduces to in this plan: (a) zero `server/` changes
 |---|---|---|
 | `crates/freshell-platform/src/cli_launch.rs` | Modify | New shared pure predicate `should_preallocate_fresh_claude(..)` + unit tests (truth table). Single source of the "fresh claude" policy for both doors. |
 | `crates/freshell-ws/src/terminal.rs` | Modify | `handle_create` adopts the shared predicate (behavior-preserving swap of `terminal.rs:1630-1637`). |
-| `crates/freshell-terminal/src/registry.rs` | Modify | New `PaneIdentityBinder` trait next to `SessionIdentityLookup` (`registry.rs:638-641`) — the write-side + exit-retire seam. |
-| `crates/freshell-terminal/Cargo.toml` | Modify | Add `async-trait` dependency (workspace version). |
+| `crates/freshell-terminal/src/registry.rs` | Modify | New `PaneIdentityBinder` trait next to `SessionIdentityLookup` (`registry.rs:638-641`) — the write-side + exit-retire seam. **Synchronous** (like `SessionIdentityLookup`): `freshell-terminal` is deliberately tokio-free (`pty.rs:38-44`) and the exit hook that must call it is a sync `FnOnce` on the PTY reader thread. No new dependencies. |
 | `crates/freshell-ws/src/pane_identity_binder.rs` | Create | `LedgerPaneIdentityBinder` — the production impl over `TerminalIdentityRegistry` + `Arc<PaneLedger>`, mirroring `terminal.rs:2211-2236`, `:2281-2292`, `:2487-2538`. In-module unit tests with tempdir ledger. |
 | `crates/freshell-ws/src/lib.rs` | Modify | `pub mod pane_identity_binder;` |
 | `crates/freshell-freshagent/src/terminal_tabs.rs` | Modify | UUID mint after `derive_resume_identity` (`:767`); `claude_fresh_prealloc` threading through `GatedSettleInputs`; `LaunchIntent` conditional (`:1335`); binder call sites (pre-spawn, failure-delete, post-spawn, exit-retire); `tab_create_missing_session_identity` condition update (`:1792-1805`); unit tests in `mod tests`. |
@@ -499,8 +498,7 @@ git commit -m "test(freshagent): pin claude identity mint on REST split and resp
 ### Task 4: `PaneIdentityBinder` seam + `LedgerPaneIdentityBinder`
 
 **Files:**
-- Modify: `crates/freshell-terminal/src/registry.rs` (trait, next to `SessionIdentityLookup` at `:638-641`)
-- Modify: `crates/freshell-terminal/Cargo.toml` (add `async-trait` — use the workspace-dep form other crates use, e.g. copy the line from `crates/freshell-freshagent/Cargo.toml`)
+- Modify: `crates/freshell-terminal/src/registry.rs` (trait, next to `SessionIdentityLookup` at `:638-641`; NO Cargo.toml change — the trait is synchronous, and the workspace deliberately has zero `async-trait` dependents: the house pattern where async is unavoidable is a boxed-future alias, see `identity_sink.rs:37-39`, `serve.rs:43-44`; here async is avoidable because every underlying operation is sync)
 - Create: `crates/freshell-ws/src/pane_identity_binder.rs`
 - Modify: `crates/freshell-ws/src/lib.rs` (`pub mod pane_identity_binder;`)
 
@@ -508,14 +506,26 @@ git commit -m "test(freshagent): pin claude identity mint on REST split and resp
 - Consumes: `crate::identity::TerminalIdentityRegistry` (`identity.rs:33-56`, methods `upsert`), `crate::pane_ledger::{PaneLedger, BindingWrite}` (`pane_ledger.rs:144-152`, `:358`), the `MARKER_MODES` list + `record_pending` call currently at `terminal.rs:2523-2540`, and `freshell-ws`'s existing `now_ms()` helper (grep `fn now_ms` in the crate; reuse, don't redefine).
 - Produces (Task 5 and Task 6 depend on these exact signatures):
 
+The trait is **fully synchronous** — a deliberate, load-bearing choice, not a style preference:
+every underlying operation is sync (`TerminalIdentityRegistry` is an `Arc<RwLock<..>>` with plain
+`fn` methods, `identity.rs:65/:95/:111/:160`; every `PaneLedger` writer is a plain
+`fn -> std::io::Result<()>` behind a `std::sync::Mutex`, `pane_ledger.rs:358/:597/:727`), and the
+one caller that CANNOT be async is the pane exit hook: `freshell_terminal::pty::ExitHook` is
+`Box<dyn FnOnce(i64) + Send>` (`pty.rs:55`) invoked on the plain OS reader thread
+(`pty.rs:485-507`) where there is no tokio runtime (`freshell-terminal` is deliberately
+tokio-free, `pty.rs:38-44`) — an `async fn retire` would be uncallable there. This exactly
+mirrors the WS twin: its exit hook does the retire + pending-delete **inline sync**
+(`terminal.rs:1334-1342`, the self-described "one truly-synchronous ledger call site"). Async
+REST call sites hop ledger-touching calls through `tokio::task::spawn_blocking` (the WS create
+path's own idiom, `terminal.rs:2211-2234`) — see Task 5.
+
 ```rust
 // crates/freshell-terminal/src/registry.rs
-#[async_trait::async_trait]
-pub trait PaneIdentityBinder: Send + Sync {
+pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
     /// PIN 2 durability-before-argv: durable claude binding row written
     /// BEFORE the spawn makes the preallocated id observable. Callers gate
     /// this on their fresh-prealloc flag ONLY (eaa25b7d).
-    async fn record_prespawn_claude_binding(
+    fn record_prespawn_claude_binding(
         &self,
         session_id: &str,
         terminal_id: &str,
@@ -525,12 +535,12 @@ pub trait PaneIdentityBinder: Send + Sync {
     );
     /// Compensating delete when the spawn that minted the id fails.
     /// MUST be gated on the SAME predicate as the record (eaa25b7d).
-    async fn delete_prespawn_claude_binding(&self, session_id: &str);
+    fn delete_prespawn_claude_binding(&self, session_id: &str);
     /// Post-spawn identity registration, mirroring the WS post-spawn block
     /// (freshell-ws/src/terminal.rs): identity row + durable binding for any
     /// non-shell create with a session id; pending marker for the
     /// locator-resolved providers (codex/opencode/amplifier) without one.
-    async fn register_create_identity(
+    fn register_create_identity(
         &self,
         terminal_id: &str,
         mode: &str,
@@ -548,10 +558,15 @@ pub trait PaneIdentityBinder: Send + Sync {
     /// `current.retired -> Acted` no-op arm and durably rebinds a dead pane
     /// (claude_signal.rs:253-342). Idempotent; harmless no-op for terminals
     /// with no identity row. Called from the pane exit hook for ALL
-    /// non-shell creates.
-    async fn retire_pane_identity(&self, terminal_id: &str);
+    /// non-shell creates. SYNC ON PURPOSE: the exit hook is a plain FnOnce
+    /// on the PTY reader thread — blocking IO is safe there, .await is
+    /// impossible (mirrors the WS exit hook, terminal.rs:1334-1342).
+    fn retire_pane_identity(&self, terminal_id: &str);
 }
 ```
+
+(The `std::fmt::Debug` supertrait matches `SessionIdentityLookup` at `registry.rs:638-641`, which
+carries it because these objects land in `Debug`-derived state.)
 
 and `freshell_ws::pane_identity_binder::LedgerPaneIdentityBinder::new(identity: TerminalIdentityRegistry, ledger: Arc<PaneLedger>) -> LedgerPaneIdentityBinder` implementing it.
 
@@ -584,25 +599,25 @@ mod tests {
 
     const SID: &str = "29a53649-1111-4222-8333-444455556666";
 
-    #[tokio::test]
-    async fn prespawn_binding_writes_a_bound_claude_row_and_delete_removes_it() {
+    #[test]
+    fn prespawn_binding_writes_a_bound_claude_row_and_delete_removes_it() {
         use freshell_terminal::registry::PaneIdentityBinder as _;
         let (b, ledger, _identity, dir) = binder("prespawn");
-        b.record_prespawn_claude_binding(SID, "t-rest-1", "claude", Some("/tmp"), Some("req-1")).await;
+        b.record_prespawn_claude_binding(SID, "t-rest-1", "claude", Some("/tmp"), Some("req-1"));
         let row = ledger.load_binding("claude", SID).expect("pre-spawn row exists (PIN 2)");
         assert_eq!(row.live_terminal_id.as_deref(), Some("t-rest-1"));
         assert_eq!(row.state, RowState::Bound);
 
-        b.delete_prespawn_claude_binding(SID).await;
+        b.delete_prespawn_claude_binding(SID);
         assert!(ledger.load_binding("claude", SID).is_none(), "failure-delete removes the row");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn register_create_identity_writes_identity_row_and_binding() {
+    #[test]
+    fn register_create_identity_writes_identity_row_and_binding() {
         use freshell_terminal::registry::PaneIdentityBinder as _;
         let (b, ledger, identity, dir) = binder("register");
-        b.register_create_identity("t-rest-2", "claude", Some(SID), Some("/tmp"), Some("req-2")).await;
+        b.register_create_identity("t-rest-2", "claude", Some(SID), Some("/tmp"), Some("req-2"));
         let row = identity.get("t-rest-2").expect("identity row (the A13/signal-drain prerequisite)");
         assert_eq!(row.provider.as_deref(), Some("claude"));
         assert_eq!(row.session_id.as_deref(), Some(SID));
@@ -611,41 +626,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn register_create_identity_skips_shell_and_marks_pending_for_marker_modes() {
+    #[test]
+    fn register_create_identity_skips_shell_and_marks_pending_for_marker_modes() {
         use freshell_terminal::registry::PaneIdentityBinder as _;
         let (b, ledger, identity, dir) = binder("markers");
         // shell: nothing at all
-        b.register_create_identity("t-shell", "shell", None, None, None).await;
+        b.register_create_identity("t-shell", "shell", None, None, None);
         assert!(identity.get("t-shell").is_none());
         // codex without an id: pending marker (locator lane resolves later),
         // exactly the WS MARKER_MODES arm (terminal.rs:2523-2540).
-        b.register_create_identity("t-codex", "codex", None, Some("/tmp"), Some("req-3")).await;
+        b.register_create_identity("t-codex", "codex", None, Some("/tmp"), Some("req-3"));
         assert!(identity.get("t-codex").is_none(), "no premature identity row");
         assert!(ledger.has_pending("t-codex"), "pending marker written"); // use the ledger's actual pending-read API — see pane_ledger.rs `pending/` store and how terminal.rs/pane_ledger_tests assert markers; adjust the accessor name to match.
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn ledger_write_failure_never_panics_the_create() {
+    #[test]
+    fn ledger_write_failure_never_panics_the_create() {
         use freshell_terminal::registry::PaneIdentityBinder as _;
         // A disabled ledger (or an unwritable root) must degrade to a warn,
         // never an Err/panic — failure never blocks the create.
         let identity = crate::identity::TerminalIdentityRegistry::default();
         let b = LedgerPaneIdentityBinder::new(identity.clone(), Arc::new(PaneLedger::disabled()));
-        b.record_prespawn_claude_binding(SID, "t-x", "claude", None, None).await;
-        b.register_create_identity("t-x", "claude", Some(SID), None, None).await;
+        b.record_prespawn_claude_binding(SID, "t-x", "claude", None, None);
+        b.register_create_identity("t-x", "claude", Some(SID), None, None);
         // identity row still lands even when durability is degraded:
         assert!(identity.get("t-x").is_some());
     }
 
-    #[tokio::test]
-    async fn retire_pane_identity_retires_row_and_clears_pending() {
+    #[test]
+    fn retire_pane_identity_retires_row_and_clears_pending() {
         use freshell_terminal::registry::PaneIdentityBinder as _;
         // Ledger A2: exit-side hygiene — retired rows must stop looking live.
+        // Sync test on purpose: retire MUST be callable with no runtime,
+        // because production calls it from the PTY reader thread's exit hook.
         let (b, _ledger, identity, dir) = binder("retire");
-        b.register_create_identity("t-rest-4", "claude", Some(SID), Some("/tmp"), None).await;
-        b.retire_pane_identity("t-rest-4").await;
+        b.register_create_identity("t-rest-4", "claude", Some(SID), Some("/tmp"), None);
+        b.retire_pane_identity("t-rest-4");
         // Retired == invisible to live lookups, exactly what the WS kill path
         // produces (match the accessor the identity.rs retire tests use —
         // e.g. the live find_by_session no longer returns the terminal,
@@ -655,8 +672,8 @@ mod tests {
         // And the pending-marker delete arm: register a marker-mode pane,
         // retire it, assert its pending/<tid>.json is gone (same
         // marker-read idiom as the markers test above).
-        b.register_create_identity("t-codex-r", "codex", None, Some("/tmp"), None).await;
-        b.retire_pane_identity("t-codex-r").await;
+        b.register_create_identity("t-codex-r", "codex", None, Some("/tmp"), None);
+        b.retire_pane_identity("t-codex-r");
         // assert pending marker absent for "t-codex-r"
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -672,9 +689,8 @@ Expected: FAIL to compile — trait and struct don't exist.
 
 - [ ] **Step 3: Implement trait + impl**
 
-1. `crates/freshell-terminal/Cargo.toml`: add `async-trait` (same form as `freshell-freshagent`'s dependency on it).
-2. `crates/freshell-terminal/src/registry.rs`: add the trait exactly as specified in **Interfaces** above, directly below `SessionIdentityLookup` (`:638-641`), with a doc comment naming both consumers (REST spawn pipeline) and the producer (`freshell-ws`).
-3. `crates/freshell-ws/src/pane_identity_binder.rs`:
+1. `crates/freshell-terminal/src/registry.rs`: add the trait exactly as specified in **Interfaces** above, directly below `SessionIdentityLookup` (`:638-641`), with a doc comment naming both consumers (REST spawn pipeline) and the producer (`freshell-ws`). NO dependency changes — the trait is sync, so `freshell-terminal/Cargo.toml` is untouched.
+2. `crates/freshell-ws/src/pane_identity_binder.rs`:
 
 ```rust
 //! Write-side pane-identity seam for the REST spawn pipeline (kata hbsa).
@@ -721,9 +737,15 @@ impl LedgerPaneIdentityBinder {
     }
 }
 
-#[async_trait::async_trait]
+// The binder itself is plain sync: every PaneLedger writer is a sync
+// `fn -> io::Result<()>` (pane_ledger.rs:358/:597/:727) and the identity
+// registry is a sync RwLock (identity.rs). Async REST call sites hop the
+// ledger-touching calls through spawn_blocking (Task 5), mirroring the WS
+// create path's own idiom (terminal.rs:2211-2234); the exit hook calls
+// retire_pane_identity inline on the PTY reader thread, mirroring the WS
+// exit hook's inline-sync retire (terminal.rs:1334-1342).
 impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinder {
-    async fn record_prespawn_claude_binding(
+    fn record_prespawn_claude_binding(
         &self,
         session_id: &str,
         terminal_id: &str,
@@ -731,41 +753,26 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
         cwd: Option<&str>,
         create_request_id: Option<&str>,
     ) {
-        let ledger = Arc::clone(&self.ledger);
-        let (sid, tid, m) = (session_id.to_string(), terminal_id.to_string(), mode.to_string());
-        let (c, rid) = (cwd.map(str::to_string), create_request_id.map(str::to_string));
-        let now = crate::now_ms(); // reuse the crate's existing helper; adjust path to where it lives
-        let tid_for_log = tid.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            ledger.record_binding(&BindingWrite {
-                provider: "claude",
-                session_id: &sid,
-                terminal_id: &tid,
-                mode: &m,
-                cwd: c.as_deref(),
-                create_request_id: rid.as_deref(),
-                now_ms: now,
-            })
-        })
-        .await
-        .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
-        if let Err(err) = result {
-            Self::warn_write_failure(&tid_for_log, "pre-spawn claude binding (PIN 2)", &err);
+        if let Err(err) = self.ledger.record_binding(&BindingWrite {
+            provider: "claude",
+            session_id,
+            terminal_id,
+            mode,
+            cwd,
+            create_request_id,
+            now_ms: crate::now_ms(), // reuse the crate's existing helper; adjust path to where it lives
+        }) {
+            Self::warn_write_failure(terminal_id, "pre-spawn claude binding (PIN 2)", &err);
         }
     }
 
-    async fn delete_prespawn_claude_binding(&self, session_id: &str) {
-        let ledger = Arc::clone(&self.ledger);
-        let sid = session_id.to_string();
-        let result = tokio::task::spawn_blocking(move || ledger.delete_binding("claude", &sid))
-            .await
-            .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
-        if let Err(err) = result {
+    fn delete_prespawn_claude_binding(&self, session_id: &str) {
+        if let Err(err) = self.ledger.delete_binding("claude", session_id) {
             Self::warn_write_failure("(spawn-failed)", "pre-spawn binding failure-delete", &err);
         }
     }
 
-    async fn register_create_identity(
+    fn register_create_identity(
         &self,
         terminal_id: &str,
         mode: &str,
@@ -779,60 +786,58 @@ impl freshell_terminal::registry::PaneIdentityBinder for LedgerPaneIdentityBinde
         // terminal.rs:2453-2540 (terminal_meta_record_for_create semantics,
         // identity.upsert, record_binding, MARKER_MODES/record_pending),
         // substituting self.identity / self.ledger and the warn above for
-        // surface_write_failure. Export MARKER_MODES from terminal.rs
-        // (`pub(crate) const` -> keep crate-visible and reference it here)
-        // rather than duplicating the list.
+        // surface_write_failure, and dropping the spawn_blocking wrappers
+        // (the async hop lives at the Task 5 call sites, not here). Export
+        // MARKER_MODES from terminal.rs (`pub(crate) const` -> keep
+        // crate-visible and reference it here) rather than duplicating the
+        // list.
         if mode == "shell" {
             return;
         }
         if let Some(session_id) = resume_session_id.filter(|s| !s.is_empty()) {
             self.identity.upsert(terminal_id, Some(mode), Some(session_id), cwd, crate::now_ms());
-            let ledger = Arc::clone(&self.ledger);
-            let (sid, tid, m) = (session_id.to_string(), terminal_id.to_string(), mode.to_string());
-            let (c, rid) = (cwd.map(str::to_string), create_request_id.map(str::to_string));
-            let now = crate::now_ms();
-            let tid_for_log = tid.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                ledger.record_binding(&BindingWrite {
-                    provider: &m.clone(),
-                    session_id: &sid,
-                    terminal_id: &tid,
-                    mode: &m,
-                    cwd: c.as_deref(),
-                    create_request_id: rid.as_deref(),
-                    now_ms: now,
-                })
-            })
-            .await
-            .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
-            if let Err(err) = result {
-                Self::warn_write_failure(&tid_for_log, "post-spawn identity binding", &err);
+            if let Err(err) = self.ledger.record_binding(&BindingWrite {
+                provider: mode, // keep exactly what the WS block does (provider = mode)
+                session_id,
+                terminal_id,
+                mode,
+                cwd,
+                create_request_id,
+                now_ms: crate::now_ms(),
+            }) {
+                Self::warn_write_failure(terminal_id, "post-spawn identity binding", &err);
             }
         } else if crate::terminal::MARKER_MODES.contains(&mode) {
             // PORT (not new design): the pending-marker arm — copy the exact
             // record_pending call from terminal.rs's MARKER_MODES block
-            // (:2523-2540): same arguments, wrapped in spawn_blocking, with
-            // the warn_write_failure policy above replacing
+            // (:2523-2540): same arguments, called directly (sync), with the
+            // warn_write_failure policy above replacing
             // surface_write_failure. Make MARKER_MODES `pub(crate)` in
             // terminal.rs if it is private today.
         }
     }
 
-    async fn retire_pane_identity(&self, terminal_id: &str) {
+    fn retire_pane_identity(&self, terminal_id: &str) {
         // PORT (not new design): the WS kill-path hygiene — identity retire
         // (terminal.rs:1334 / :3896), pending-marker delete (:1342 / :3866),
         // and retire_closed for the terminal's ledger rows (:3860-3868) —
         // substituting self.identity / self.ledger and warn_write_failure,
-        // ledger I/O wrapped in spawn_blocking like the methods above. The
-        // identity retire is an in-memory flag flip; this method changes NO
-        // drain logic (the #573/#578-pinned drains stay untouched).
+        // all called directly (sync). This method MUST stay runtime-free:
+        // production calls it from the PTY reader thread's exit hook, where
+        // blocking IO is safe and tokio does not exist. The identity retire
+        // is an in-memory flag flip; this method changes NO drain logic
+        // (the #573/#578-pinned drains stay untouched).
     }
 }
 ```
 
+Also give `LedgerPaneIdentityBinder` a `Debug` impl to satisfy the trait's supertrait — a manual
+one-liner (`impl std::fmt::Debug for LedgerPaneIdentityBinder { .. write "LedgerPaneIdentityBinder" .. }`)
+is fine if `PaneLedger`/`TerminalIdentityRegistry` don't derive it.
+
 The two `...port from terminal.rs...` spots are literal ports: open `crates/freshell-ws/src/terminal.rs:2453-2540`, copy the bodies, substitute `self.identity`/`self.ledger`, and adjust visibility of `MARKER_MODES` (make it `pub(crate)` if it isn't) and `now_ms` (reuse wherever it's defined in the crate). Do NOT re-derive the provider-vs-mode choice — keep exactly what the WS block does (`provider = mode` on the post-spawn write).
 
-4. `crates/freshell-ws/src/lib.rs`: `pub mod pane_identity_binder;`
+3. `crates/freshell-ws/src/lib.rs`: `pub mod pane_identity_binder;`
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -847,9 +852,9 @@ Expected: PASS, no warnings.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/freshell-terminal/Cargo.toml crates/freshell-terminal/src/registry.rs \
+git add crates/freshell-terminal/src/registry.rs \
         crates/freshell-ws/src/pane_identity_binder.rs crates/freshell-ws/src/lib.rs \
-        crates/freshell-ws/src/terminal.rs Cargo.lock
+        crates/freshell-ws/src/terminal.rs
 git commit -m "feat(ws,terminal): PaneIdentityBinder seam — write-side identity/ledger bridge for the REST lane"
 ```
 
@@ -860,8 +865,9 @@ git commit -m "feat(ws,terminal): PaneIdentityBinder seam — write-side identit
 **Files:**
 - Modify: `crates/freshell-freshagent/src/lib.rs` (state field + builder)
 - Modify: `crates/freshell-freshagent/src/terminal_tabs.rs` (`GatedSettleInputs`, four call sites in `settle_gated_create` — pre-spawn, failure-delete, post-spawn, exit-retire — `mod tests`)
-- Modify: `crates/freshell-freshagent/Cargo.toml` (add `async-trait` if not already a direct dep)
 - Modify: `crates/freshell-server/src/main.rs` (wiring)
+
+(No Cargo.toml changes: the binder trait is sync and lives in `freshell-terminal`, which `freshell-freshagent` already depends on.)
 
 **Interfaces:**
 - Consumes: `freshell_terminal::registry::PaneIdentityBinder` (Task 4), `GatedSettleInputs.claude_fresh_prealloc` (Task 2), `freshell_ws::pane_identity_binder::LedgerPaneIdentityBinder` (Task 4, wiring only — freshagent code references only the trait).
@@ -872,7 +878,7 @@ git commit -m "feat(ws,terminal): PaneIdentityBinder seam — write-side identit
 In `crates/freshell-freshagent/src/terminal_tabs.rs` `mod tests`:
 
 ```rust
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct RecordingBinder {
     events: std::sync::Mutex<Vec<String>>,
 }
@@ -883,18 +889,17 @@ impl RecordingBinder {
     }
 }
 
-#[async_trait::async_trait]
 impl freshell_terminal::registry::PaneIdentityBinder for RecordingBinder {
-    async fn record_prespawn_claude_binding(
+    fn record_prespawn_claude_binding(
         &self, session_id: &str, terminal_id: &str, _mode: &str,
         _cwd: Option<&str>, _create_request_id: Option<&str>,
     ) {
         self.events.lock().unwrap().push(format!("prespawn:{terminal_id}:{session_id}"));
     }
-    async fn delete_prespawn_claude_binding(&self, session_id: &str) {
+    fn delete_prespawn_claude_binding(&self, session_id: &str) {
         self.events.lock().unwrap().push(format!("delete:{session_id}"));
     }
-    async fn register_create_identity(
+    fn register_create_identity(
         &self, terminal_id: &str, mode: &str, resume_session_id: Option<&str>,
         _cwd: Option<&str>, _create_request_id: Option<&str>,
     ) {
@@ -902,7 +907,7 @@ impl freshell_terminal::registry::PaneIdentityBinder for RecordingBinder {
             "register:{terminal_id}:{mode}:{}", resume_session_id.unwrap_or("-")
         ));
     }
-    async fn retire_pane_identity(&self, terminal_id: &str) {
+    fn retire_pane_identity(&self, terminal_id: &str) {
         self.events.lock().unwrap().push(format!("retire:{terminal_id}"));
     }
 }
@@ -1057,20 +1062,28 @@ initialize `pane_identity: None` in `FreshAgentState::new`, and add the builder 
             if let (Some(binder), Some(session_id)) =
                 (pane_identity.as_ref(), resume_session_id.as_deref())
             {
-                binder
-                    .record_prespawn_claude_binding(
-                        session_id,
-                        &terminal_id,
-                        &mode,
-                        cwd.as_deref(),
-                        Some(&create_request_id),
-                    )
-                    .await;
+                // Binder methods are sync (blocking fsync IO inside) — hop
+                // through spawn_blocking, the WS create path's own idiom
+                // (terminal.rs:2211-2234). Awaited: PIN 2 requires the
+                // durable row to exist BEFORE the spawn below.
+                let binder = std::sync::Arc::clone(binder);
+                let (sid, tid, m) = (session_id.to_string(), terminal_id.clone(), mode.clone());
+                let (c, rid) = (cwd.clone(), create_request_id.clone());
+                let _ = tokio::task::spawn_blocking(move || {
+                    binder.record_prespawn_claude_binding(
+                        &sid,
+                        &tid,
+                        &m,
+                        c.as_deref(),
+                        Some(&rid),
+                    );
+                })
+                .await; // JoinError only — write failures are warned inside the binder
             }
         }
 ```
 
-(Use the locally destructured variable names — `terminal_id`/`cwd`/`create_request_id` exist under whatever names `GatedSettleInputs` destructures them to at `:1168`; keep the argument *meanings* fixed.)
+(Use the locally destructured variable names — `terminal_id`/`cwd`/`create_request_id` exist under whatever names `GatedSettleInputs` destructures them to at `:1168`, and adjust the `.clone()`s to their actual types — e.g. if `create_request_id` is already `String`, `Some(&rid)` as shown; keep the argument *meanings* fixed.)
 
 3. **Spawn-failure arm** — inside the error branch of the `create_result` match, **at the TOP of the branch, before the AlreadyExists 409 early-return at `:1525` and before the "ORDER IS LOAD-BEARING" cleanup cluster (`:1534+`)**. The load-bearing validation (ledger A3) proved this error branch is the only exit between the pre-spawn write and spawn success — but it contains TWO returns, so the delete MUST precede the first:
 
@@ -1080,7 +1093,12 @@ initialize `pane_identity: None` in `FreshAgentState::new`, and add the builder 
                 if let (Some(binder), Some(session_id)) =
                     (pane_identity.as_ref(), resume_session_id.as_deref())
                 {
-                    binder.delete_prespawn_claude_binding(session_id).await;
+                    let binder = std::sync::Arc::clone(binder);
+                    let sid = session_id.to_string();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        binder.delete_prespawn_claude_binding(&sid);
+                    })
+                    .await;
                 }
             }
 ```
@@ -1096,19 +1114,24 @@ initialize `pane_identity: None` in `FreshAgentState::new`, and add the builder 
         // guard's identity arm and the SessionStart signal drain acting
         // (claude_signal.rs retains signals for identity-less panes forever).
         if let Some(binder) = pane_identity.as_ref() {
-            binder
-                .register_create_identity(
-                    &terminal_id,
-                    &mode,
-                    resume_session_id.as_deref(),
-                    cwd.as_deref(),
-                    Some(&create_request_id),
-                )
-                .await;
+            let binder = std::sync::Arc::clone(binder);
+            let (tid, m) = (terminal_id.clone(), mode.clone());
+            let (sid, c, rid) =
+                (resume_session_id.clone(), cwd.clone(), create_request_id.clone());
+            let _ = tokio::task::spawn_blocking(move || {
+                binder.register_create_identity(
+                    &tid,
+                    &m,
+                    sid.as_deref(),
+                    c.as_deref(),
+                    Some(&rid),
+                );
+            })
+            .await;
         }
 ```
 
-5. **Exit hook** — the pane exit hook built in `settle_gated_create` (~`:1396-1463`; its KNOWN GAP comment at `:1401-1409` documents that it cannot call `identity.retire` across the crate boundary — the binder is exactly that bridge). Capture `pane_identity` and the terminal id into the hook and call `binder.retire_pane_identity(&terminal_id).await` when the pane exits, for ALL non-shell creates (idempotent; no-op for panes without identity rows). Rewrite the stale KNOWN GAP comment to describe the binder seam. Validated stakes (ledger A2): without this, the session directory lists dead REST panes as running (`session_directory.rs:716-766`), the rename cascade persists `titleOverride` for dead terminals (`sessions.rs:167-187`), and a late new-id SessionStart durably rebinds a dead pane (`claude_signal.rs:253-342`).
+5. **Exit hook** — the pane exit hook built in `settle_gated_create` (~`:1396-1463`; its KNOWN GAP comment at `:1401-1409` documents that it cannot call `identity.retire` across the crate boundary — the binder is exactly that bridge). Capture an owned `Option<Arc<dyn PaneIdentityBinder>>` clone and an owned terminal-id `String` into the hook closure and call `binder.retire_pane_identity(&terminal_id)` — a PLAIN SYNC CALL, no `.await`, no `tokio::spawn` — when the pane exits, for ALL non-shell creates (idempotent; no-op for panes without identity rows). This is why the trait is sync: the exit hook is `Box<dyn FnOnce(i64) + Send>` (`pty.rs:55`) invoked on the PTY reader OS thread (`pty.rs:485-507`) with NO tokio runtime (`Handle::current()` would panic there); blocking IO is safe on that thread, and this exactly mirrors the WS exit hook's inline-sync retire + pending-delete (`terminal.rs:1334-1342`, "the one truly-synchronous ledger call site"). Rewrite the stale KNOWN GAP comment to describe the binder seam. Validated stakes (ledger A2): without this, the session directory lists dead REST panes as running (`session_directory.rs:716-766`), the rename cascade persists `titleOverride` for dead terminals (`sessions.rs:167-187`), and a late new-id SessionStart durably rebinds a dead pane (`claude_signal.rs:253-342`).
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
@@ -1137,7 +1160,7 @@ Expected: compiles clean.
 
 ```bash
 git add crates/freshell-freshagent/src/lib.rs crates/freshell-freshagent/src/terminal_tabs.rs \
-        crates/freshell-freshagent/Cargo.toml crates/freshell-server/src/main.rs Cargo.lock
+        crates/freshell-server/src/main.rs
 git commit -m "feat(freshagent): REST creates write identity rows and ledger bindings via PaneIdentityBinder (kata hbsa)"
 ```
 
@@ -1519,7 +1542,7 @@ Expected: green. (Waits for the shared coordinator gate if another agent holds i
 - [ ] **Step 4: Push the branch (no PR)**
 
 ```bash
-git status --short   # must show ONLY the untracked docs/superpowers/plans/... file
+git status --short   # must be EMPTY — everything is committed (the docs/superpowers/plans/... file is tracked on this branch, see Global Constraints)
 git log --oneline origin/main..HEAD
 git push -u origin fix/rest-terminal-session-identity
 ```
