@@ -5,10 +5,12 @@
 > quality review after each task. Steps use checkbox (`- [ ]`) syntax
 > for tracking.
 
-**Goal:** Add an always-visible **Resume** button pinned below the Sidebar's session
-list that opens a dialog where the user pastes any session-id-bearing text; freshell
-resolves it to a concrete (provider, full session id, cwd, sessionType) tuple across
-all four CLI providers and resumes that session in a tab.
+**Goal:** Add a **Resume** button pinned below the Sidebar's session list — always
+visible at every scroll position on Node-served deployments (feature-flag gated:
+the Rust server ships the same client without the resolve endpoint, so the button
+hides there) — that opens a dialog where the user pastes any session-id-bearing
+text; freshell resolves it to a concrete (provider, full session id, cwd,
+sessionType) tuple across all four CLI providers and resumes that session in a tab.
 
 **Architecture:** A pure shared parser (`shared/resume-input-parser.ts`) extracts
 candidate tokens + an advisory provider hint from arbitrary pasted text. A new
@@ -25,8 +27,10 @@ Playwright for browser e2e.
 ## Global Constraints
 
 - Providers are exactly `DEFAULT_ENABLED_CLI_PROVIDERS = ['claude', 'codex', 'opencode', 'amplifier']` from `shared/coding-cli-defaults.ts`.
-- Target backend is the **Node server** (`server/index.ts`) — confirmed: `npm run dev` runs `tsx watch server/index.ts` and `npm start` runs `dist/server/index.js`. Rust-server parity is **out of scope**.
-- **Accepted limitation (per spec):** prefix matching only matches **indexed** sessions. Exact-id misses additionally consult the claude transcript locator and the opencode by-id query. "Provider unavailable" is approximated by the single global index-readiness flag (`startup-state.ts` task `codingCliIndexer`) — the Node server has no per-provider readiness.
+- Target backend is the **Node server** (`server/index.ts`) — confirmed: `npm run dev` runs `tsx watch server/index.ts` and `npm start` runs `dist/server/index.js`. The "server/ is FROZEN" comments found in some e2e files (e.g. `test/e2e-browser/playwright.config.ts:212`, `test/e2e-browser/specs/sidebar-click-resume.spec.ts:31`) are **stale**: that freeze was branch-scoped parity discipline for the `feat/rust-tauri-port` branch, which merged into main on 2026-07-27; `server/` is actively developed and is the shipping backend. Rust-server parity is **out of scope** — record `POST /api/sessions/resolve` **and the new `sessionResolve` feature flag** as a Rust-parity follow-up item (`docs/plans/2026-07-14-rust-tauri-parity-completion-checklist.md`); the parity implementation itself stays out of scope.
+- The Resume button is **feature-flag gated**: the Node server declares `sessionResolve: true` in `detectFeatureFlags()` (`server/platform-router.ts:20-25`, Task 3), served in `/api/platform` (`server/platform-router.ts:37-38`) and `/api/bootstrap` (`server/index.ts:223`); the client stores it via `setFeatureFlags` into `connection.featureFlags` (`src/App.tsx:601-602`, `src/store/connectionSlice.ts:16,68-69`) and the Sidebar renders the Resume footer only when the flag is true (Task 5; selector precedent `src/components/panes/PanePicker.tsx:105`). The Rust server serves the **same** `dist/client` bundle and 404s cleanly on unmatched `/api/*`; its `/api/platform` featureFlags parity (`crates/freshell-server/src/boot.rs:12,58,167`) intentionally does NOT declare the flag, so the button stays hidden on Rust/Tauri deployments **by design**. Both sides type featureFlags as `Record<string, boolean>`, so the new key forces no type changes.
+- **Accepted limitation (per spec):** prefix matching only matches **indexed** sessions. Exact-id misses additionally consult the claude transcript locator and the opencode by-id query. "Provider unavailable" is approximated by the single global index-readiness flag (`startup-state.ts` task `codingCliIndexer`) — the Node server has no per-provider readiness. A **time-extension** of the same limitation (real-store verified): the snapshot stays partial until the first FULL scan completes even after the readiness flag flips (codex worst-case ~4% coverage right after cold start); the exact-id fallbacks still cover claude (locator) and opencode (by-id query) in that window.
+- Real-store note: ~20% of indexed cwds no longer exist on disk. Terminal create already handles a missing cwd by defaulting (`server/terminal-registry.ts:1575` — homedir on Linux); a cwd-existence policy is deliberately out of scope for this plan.
 - Hex-prefix token rule: **≥8 hex chars containing at least one digit, ≤32 chars** (rejects `decade`, `facade`, `deadbeef`).
 - Disambiguation list is capped at **20**, sorted most-recent first by `lastActivityAt` desc.
 - Evidence (store scan) decides the provider; hints (agent words, command shapes, id-shape heuristics) are advisory only — they pre-fill the picker and set the "resume anyway" default.
@@ -53,9 +57,11 @@ Each task below is still independently testable.
 | `server/coding-cli/resolve-session.ts` (create) | Resolve engine: index scan (exact+prefix) + fallbacks; pure w.r.t. injected deps |
 | `server/sessions-router.ts` (modify) | Add `POST /sessions/resolve` route + widen `SessionsRouterDeps` |
 | `server/index.ts` (modify) | Wire readiness + fallback deps into `createSessionsRouter` (~line 748) |
+| `server/platform-router.ts` (modify) | Declare the `sessionResolve` feature flag in `detectFeatureFlags()` (client gate for the Resume button) |
+| `server/coding-cli/providers/opencode.ts` (modify) | By-id fallback query also selects `directory`; `OpencodeRootResolution` gains `directoriesBySessionId` |
 | `src/lib/resume-session.ts` (create) | Client resume helper: `findPaneForSession` dedup → focus, else `openSessionTab` |
 | `src/components/ResumeSessionDialog.tsx` (create) | The Resume dialog (paste field, picker, all outcome states) |
-| `src/components/Sidebar.tsx` (modify) | Pinned footer with the Resume button (sibling AFTER the list wrapper) |
+| `src/components/Sidebar.tsx` (modify) | Pinned footer with the Resume button (gated on the `sessionResolve` feature flag; sibling AFTER the list wrapper) |
 | `test/unit/shared/resume-input-parser.test.ts` (create) | Table-driven parser tests |
 | `test/integration/server/claude-transcript-locator.test.ts` (create) | Locator tests against tmpdir fixtures |
 | `test/integration/server/sessions-resolve-router.test.ts` (create) | supertest endpoint tests (exact/prefix/ambiguous/missing/warming/fallbacks) |
@@ -77,8 +83,10 @@ Each task below is still independently testable.
 | `"claude --resume ed2afda6-…"`, picker=codex → claude + note | Task 1 noise-stripping test; Task 4 dialog test 2 |
 | prefix matching multiple → capped list, recent first | Task 3 ambiguous + cap tests; Task 4 dialog test 3 |
 | valid id, index warming → loading/retry, NOT "not found" | Task 3 warming test; Task 4 dialog test 5 |
-| garbage → inline error, no tab | Task 1 parser test; Task 4 dialog test 6 |
+| garbage → inline error, no tab | Task 1 parser test; Task 4 dialog garbage-input test |
 | session already open in pane → focus, no duplicate | Task 5 helper test (Task 4's `resume-session.test.ts`) |
+| Rust/Tauri deployment (no `sessionResolve` flag) → button hidden | Task 5 "no flag" footer test |
+| index start failed → bounded warming retries, then manual retry | Task 4 dialog retry-exhaustion test |
 
 ---
 
@@ -280,6 +288,9 @@ function deriveHint(text: string, candidates: ResumeCandidate[]): ResumeHint | n
   if (top.kind === 'uuid') {
     const version = top.token.charAt(14)
     if (version === '7') return { provider: 'codex', source: 'id-shape' }
+    // Real-store caveat: amplifier TOP-LEVEL session ids are also UUIDv4,
+    // so v4 => claude is a heuristic, not an invariant. Acceptable because
+    // hints are advisory only — store evidence decides the provider.
     if (version === '4') return { provider: 'claude', source: 'id-shape' }
     return null
   }
@@ -530,6 +541,8 @@ git commit -m "feat(server): claude transcript exact-id locator for index misses
 - Create: `server/coding-cli/resolve-session.ts`
 - Modify: `server/sessions-router.ts` (deps interface ~lines 39–58; new route after the existing `/sessions/*` routes ~line 223)
 - Modify: `server/index.ts` (the `createSessionsRouter({...})` call at ~line 748; startupState lives at ~line 188, the provider array near ~line 236)
+- Modify: `server/coding-cli/providers/opencode.ts` (the by-id query at ~line 255 also selects `directory`; `OpencodeRootResolution` at lines 32–35 gains `directoriesBySessionId`)
+- Modify: `server/platform-router.ts` (declare the `sessionResolve` feature flag in `detectFeatureFlags()`, lines 20–25 — the client gate Task 5 consumes)
 - Test: `test/integration/server/sessions-resolve-router.test.ts`
 
 **Interfaces:**
@@ -537,8 +550,11 @@ git commit -m "feat(server): claude transcript exact-id locator for index misses
   `CodingCliSession`/`ProjectGroup` from `server/coding-cli/types.ts` (fields:
   `sessionId`, `provider`, `projectPath`, `cwd?`, `title?`, `sessionType?`,
   `firstUserMessage?`, `lastActivityAt: number`),
-  `OpencodeProvider.resolveOpencodeSessionRoots(sessionIds: readonly string[]): Promise<{ rootsBySessionId: Map<string, string>; unresolvedSessionIds: Set<string> }>`
-  (`server/coding-cli/providers/opencode.ts:199`),
+  `OpencodeProvider.resolveOpencodeSessionRoots(sessionIds: readonly string[]): Promise<OpencodeRootResolution>`
+  (`server/coding-cli/providers/opencode.ts:199`; `OpencodeRootResolution` at `:32-35` is
+  `{ rootsBySessionId: Map<string, string>; unresolvedSessionIds: Set<string> }` — this task
+  extends it with `directoriesBySessionId?: Map<string, string>` so the fallback can return
+  the session's cwd),
   `startupState.snapshot(): { ready: boolean; tasks: Record<string, boolean> }`
   (`server/startup-state.ts`), `getClaudeProjectsDir()` (`server/claude-home.ts`).
 - Produces (used by Task 4):
@@ -546,6 +562,7 @@ git commit -m "feat(server): claude transcript exact-id locator for index misses
   - `ResumeResolveRequestSchema`, `ResumeResolveResponseSchema`, `ResumeResolveMatchSchema` and inferred types `ResumeResolveRequest`, `ResumeResolveResponse`, `ResumeResolveMatch` from `shared/resume-resolve-contract.ts`.
   - Response: `{ status: 'ready' | 'warming', matches: ResumeResolveMatch[], hint: { provider, source } | null }` where a match is `{ provider, sessionId, cwd?, sessionType?, title?, firstUserMessage?, lastActivityAt?, matchKind: 'exact' | 'prefix' }`, capped at 20, sorted `lastActivityAt` desc.
   - `resolveResumeInput(input, deps)` and `RESOLVE_MATCH_CAP = 20` from `server/coding-cli/resolve-session.ts`.
+  - `sessionResolve: true` in `detectFeatureFlags()` (`server/platform-router.ts:20-25`) — reaches the client via `/api/bootstrap`/`/api/platform` and gates Task 5's Resume footer.
 
 - [ ] **Step 1: Write the shared contract**
 
@@ -666,7 +683,11 @@ interface HarnessOptions {
   ready?: boolean
   resolveOpencodeSessionIds?: (
     ids: readonly string[],
-  ) => Promise<{ rootsBySessionId: Map<string, string>; unresolvedSessionIds: Set<string> }>
+  ) => Promise<{
+    rootsBySessionId: Map<string, string>
+    directoriesBySessionId?: Map<string, string>
+    unresolvedSessionIds: Set<string>
+  }>
   locateClaudeTranscript?: (
     id: string,
   ) => Promise<{ sessionId: string; sourceFile: string; cwd?: string } | null>
@@ -759,6 +780,37 @@ describe('POST /api/sessions/resolve', () => {
     expect(res.body.matches[0].lastActivityAt).toBe(24) // most recent first
   })
 
+  it('dedupes duplicate (provider, sessionId) snapshot entries, keeping the most recent', async () => {
+    // Real-store finding: the same claude sessionId can appear on MULTIPLE
+    // snapshot entries (same id, different transcript files).
+    const dup: ProjectGroup[] = [
+      {
+        projectPath: '/repo/alpha',
+        sessions: [
+          {
+            provider: 'claude',
+            sessionId: CLAUDE_ID,
+            projectPath: '/repo/alpha',
+            cwd: '/repo/alpha',
+            title: 'older file',
+            lastActivityAt: 100,
+          },
+          {
+            provider: 'claude',
+            sessionId: CLAUDE_ID,
+            projectPath: '/repo/alpha',
+            cwd: '/repo/alpha',
+            title: 'newer file',
+            lastActivityAt: 500,
+          },
+        ],
+      },
+    ]
+    const res = await post(buildApp({ projects: dup }), { input: CLAUDE_ID })
+    expect(res.body.matches).toHaveLength(1)
+    expect(res.body.matches[0]).toMatchObject({ title: 'newer file', lastActivityAt: 500 })
+  })
+
   it('reports hint alongside evidence', async () => {
     const res = await post(app, { input: `codex resume ${CODEX_ID}` })
     expect(res.body.hint).toEqual({ provider: 'codex', source: 'command' })
@@ -774,19 +826,26 @@ describe('POST /api/sessions/resolve', () => {
     expect(res.body).toMatchObject({ status: 'warming', matches: [] })
   })
 
-  it('falls back to the opencode by-id query on exact-id index miss', async () => {
+  it('falls back to the opencode by-id query on exact-id index miss (with the row directory as cwd)', async () => {
     const unknown = 'ses_child000000000000000000000'
     const res = await post(
       buildApp({
         resolveOpencodeSessionIds: vi.fn().mockResolvedValue({
           rootsBySessionId: new Map([[unknown, OPENCODE_ID]]),
+          directoriesBySessionId: new Map([[unknown, '/repo/beta']]),
           unresolvedSessionIds: new Set<string>(),
         }),
       }),
       { input: unknown },
     )
     expect(res.body.matches).toEqual([
-      { provider: 'opencode', sessionId: unknown, sessionType: 'opencode', matchKind: 'exact' },
+      {
+        provider: 'opencode',
+        sessionId: unknown,
+        cwd: '/repo/beta',
+        sessionType: 'opencode',
+        matchKind: 'exact',
+      },
     ])
   })
 
@@ -852,7 +911,11 @@ export interface ResolveResumeDeps {
   isIndexReady: () => boolean
   resolveOpencodeSessionIds?: (
     ids: readonly string[],
-  ) => Promise<{ rootsBySessionId: Map<string, string>; unresolvedSessionIds: Set<string> }>
+  ) => Promise<{
+    rootsBySessionId: Map<string, string>
+    directoriesBySessionId?: Map<string, string>
+    unresolvedSessionIds: Set<string>
+  }>
   locateClaudeTranscript?: (sessionId: string) => Promise<ClaudeTranscriptHit | null>
 }
 
@@ -905,6 +968,11 @@ export async function resolveResumeInput(
             {
               provider: 'opencode',
               sessionId: candidate.token,
+              // opencode resumes in the SPAWN cwd, not the session's stored
+              // project dir — a cwd-less match would run the agent in the
+              // wrong directory. The sqlite row's NOT NULL `directory`
+              // column always supplies it.
+              cwd: resolution.directoriesBySessionId?.get(candidate.token),
               sessionType: 'opencode',
               matchKind: 'exact',
             },
@@ -949,6 +1017,10 @@ function toMatch(session: CodingCliSession, matchKind: 'exact' | 'prefix'): Resu
   }
 }
 
+// Real stores carry the SAME (provider, sessionId) on multiple snapshot
+// entries (observed: one claude id across 3 transcript files). Matches are
+// sorted lastActivityAt desc BEFORE deduping, so the survivor is the entry
+// with the most recent activity.
 function dedupe(matches: ResumeResolveMatch[]): ResumeResolveMatch[] {
   const seen = new Set<string>()
   return matches.filter((match) => {
@@ -1013,6 +1085,61 @@ only sibling POST is `/sessions/:sessionId/generate-title`, a deeper path) — b
 any `router.all('/sessions/:sessionId', …)` style catch-all is ever present, register
 `/sessions/resolve` BEFORE parameterized `/sessions/:sessionId` routes.
 
+4. In `server/platform-router.ts`, declare the client gate for this endpoint in
+`detectFeatureFlags()` (lines 20–25):
+
+```ts
+export function detectFeatureFlags(): Record<string, boolean> {
+  return {
+    kilroy: isTruthy(process.env.KILROY_ENABLED),
+    aiEnabled: AI_CONFIG.enabled(),
+    // Resume-by-id UI: only the Node server implements POST /api/sessions/resolve.
+    // The Rust server's featureFlags parity (crates/freshell-server/src/boot.rs)
+    // intentionally omits this key, hiding the Sidebar Resume button there.
+    sessionResolve: true,
+  }
+}
+```
+
+No type ripples: both servers and the client already treat featureFlags as
+`Record<string, boolean>` (`server/platform-router.ts:20`, `src/store/connectionSlice.ts:16`),
+and `/api/bootstrap`'s `getPlatform` dep is typed `Promise<unknown>`
+(`server/shell-bootstrap-router.ts:13`). The flag is a constant, so it gets no
+dedicated server test; Task 5's Sidebar tests cover the client half of the gate.
+
+5. In `server/coding-cli/providers/opencode.ts`, make the by-id fallback return the
+session's directory. Rationale (validated): opencode resumes in the SPAWN cwd, not
+the session's stored project dir, so a cwd-less match would run the agent in the
+wrong directory; the sqlite `session` table's `directory` column is NOT NULL, so
+the cwd is always recoverable.
+
+- Extend `OpencodeRootResolution` (lines 32–35) with an optional field (optional so
+  the other literal constructors — e.g. `defaultResolveOpencodeSessionRoots` in
+  `server/coding-cli/opencode-activity-tracker.ts:201` and existing test fakes —
+  keep compiling unchanged):
+
+```ts
+export type OpencodeRootResolution = {
+  rootsBySessionId: Map<string, string>
+  /** Requested id -> that session row's NOT NULL `directory` (the resume cwd). */
+  directoriesBySessionId?: Map<string, string>
+  unresolvedSessionIds: Set<string>
+}
+```
+
+- In `resolveOpencodeSessionRoots` (line 199), widen the by-id SELECT (~line 255)
+  to `SELECT id, parent_id, directory FROM session WHERE id IN (…)`, record each
+  REQUESTED id's own row `directory` into a `directoriesBySessionId` map (child
+  rows carry the same directory as their root — 1394/1394 empirically — so no
+  root join is needed), and include the map in the returned resolution. The
+  schema-without-`parent_id` early return (lines 245–248) may omit the map (the
+  field is optional; the engine then returns a cwd-less match, same as today's
+  behavior for that degenerate schema).
+- Extend the existing `resolveOpencodeSessionRoots` cases in
+  `test/unit/server/coding-cli/opencode-provider.test.ts` (its fixture DB already
+  has a `directory` column) with an assertion that `directoriesBySessionId` maps a
+  requested child id to its row's directory.
+
 - [ ] **Step 6: Run test to verify it passes**
 
 Run: `npm run test:vitest -- --config config/vitest/vitest.server.config.ts test/integration/server/sessions-resolve-router.test.ts --run`
@@ -1066,8 +1193,8 @@ Expected: PASS — new route works and the existing sessions-router suite still 
 - [ ] **Step 9: Commit**
 
 ```bash
-git add shared/resume-resolve-contract.ts server/coding-cli/resolve-session.ts server/sessions-router.ts server/index.ts test/integration/server/sessions-resolve-router.test.ts
-git commit -m "feat(server): POST /api/sessions/resolve scans all CLI providers with exact-id fallbacks"
+git add shared/resume-resolve-contract.ts server/coding-cli/resolve-session.ts server/sessions-router.ts server/index.ts server/platform-router.ts server/coding-cli/providers/opencode.ts test/integration/server/sessions-resolve-router.test.ts test/unit/server/coding-cli/opencode-provider.test.ts
+git commit -m "feat(server): POST /api/sessions/resolve with exact-id fallbacks and sessionResolve feature flag"
 ```
 
 ---
@@ -1091,7 +1218,7 @@ git commit -m "feat(server): POST /api/sessions/resolve scans all CLI providers 
   - `resumeSessionInTab(state: RootState, dispatch: AppDispatch, target: ResumeTarget, onNavigate?: (view: 'terminal') => void): { deduped: boolean }`
   - `interface ResumeTarget { provider: string; sessionId: string; cwd?: string; sessionType?: string; title?: string; firstUserMessage?: string }`
   - `<ResumeSessionDialog open onClose={...} onNavigate={...} />` with props `{ open: boolean; onClose: () => void; onNavigate?: (view: 'terminal') => void }`.
-  - Dialog data-testids: `resume-dialog`, `resume-input`, `resume-agent-picker`, `resume-resolve-button`, `resume-warming`, `resume-error`, `resume-note`, `resume-match-list`, `resume-match`, `resume-anyway-cwd`, `resume-anyway-button`.
+  - Dialog data-testids: `resume-dialog`, `resume-input`, `resume-agent-picker`, `resume-resolve-button`, `resume-warming`, `resume-index-unavailable`, `resume-index-retry`, `resume-error`, `resume-note`, `resume-match-list`, `resume-match`, `resume-anyway-cwd`, `resume-anyway-button`.
 
 - [ ] **Step 1: Write the failing helper test**
 
@@ -1396,6 +1523,25 @@ describe('ResumeSessionDialog', () => {
     await waitFor(() => expect(resumeSessionInTab).toHaveBeenCalled())
   })
 
+  it('warming auto-retry is bounded: exhaustion shows "index unavailable" with a working manual Retry', async () => {
+    // Readiness can stick false forever (indexer start rejection is only
+    // logged) — the dialog must not spin the auto-retry loop indefinitely.
+    apiPost.mockReturnValue(Promise.resolve({ status: 'warming', matches: [], hint: null }))
+    renderDialog()
+    typeAndResolve(V7)
+    await screen.findByTestId('resume-warming')
+    // Burn through the budget: 15 auto-retries, then the terminal state.
+    for (let i = 0; i < 16; i += 1) {
+      await vi.advanceTimersByTimeAsync(2100)
+    }
+    await screen.findByTestId('resume-index-unavailable')
+    expect(screen.queryByTestId('resume-warming')).toBeNull()
+    // The manual Retry still works (it resets the budget) and can succeed.
+    apiPost.mockReturnValue(ok([match()]))
+    fireEvent.click(screen.getByTestId('resume-index-retry'))
+    await waitFor(() => expect(resumeSessionInTab).toHaveBeenCalled())
+  })
+
   it('garbage input: inline error, no server call, no tab', async () => {
     renderDialog()
     typeAndResolve('hello decade facade!!')
@@ -1448,12 +1594,19 @@ import {
 } from '@shared/resume-resolve-contract'
 
 const WARMING_RETRY_MS = 2000
+// Readiness can stick false FOREVER: startupState.markReady('codingCliIndexer')
+// is only called in the success .then() of the indexer start chain
+// (server/index.ts:1057) and the .catch (:1077-1079) only logs. Bound the
+// auto-retry so a failed indexer degrades to a manual-retry state instead of
+// an infinite spinner.
+const WARMING_RETRY_LIMIT = 15 // ~30s of auto-retries
 const RESUMED_CLOSE_MS = 1500
 
 type Phase =
   | { kind: 'idle' }
   | { kind: 'resolving' }
   | { kind: 'warming' }
+  | { kind: 'index-unavailable' }
   | { kind: 'no-token' }
   | { kind: 'no-match' }
   | { kind: 'disambiguate'; matches: ResumeResolveMatch[] }
@@ -1478,6 +1631,7 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
   const [phase, setPhase] = useState<Phase>({ kind: 'idle' })
   const inputRef = useRef<HTMLTextAreaElement | null>(null)
   const closeTimerRef = useRef<number | undefined>(undefined)
+  const warmingRetriesRef = useRef(0)
 
   // Advisory hint pre-fills the picker; never overrides a manual choice.
   useEffect(() => {
@@ -1514,6 +1668,11 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
         return
       }
       if (response.status === 'warming') {
+        if (warmingRetriesRef.current >= WARMING_RETRY_LIMIT) {
+          setPhase({ kind: 'index-unavailable' })
+          return
+        }
+        warmingRetriesRef.current += 1
         setPhase({ kind: 'warming' })
         return
       }
@@ -1531,7 +1690,18 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
     [finishResume],
   )
 
-  // Warming is NOT "not found": keep re-resolving until the index is ready.
+  // User-initiated resolves reset the warming auto-retry budget.
+  const resolveFromUser = useCallback(
+    (text: string) => {
+      warmingRetriesRef.current = 0
+      return resolveInput(text)
+    },
+    [resolveInput],
+  )
+
+  // Warming is NOT "not found": keep re-resolving until the index is ready —
+  // but only within the WARMING_RETRY_LIMIT budget (readiness can stick false
+  // forever if the indexer start rejects; see the constant's comment).
   useEffect(() => {
     if (phase.kind !== 'warming') return
     const timer = window.setInterval(() => {
@@ -1605,13 +1775,13 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
           onKeyDown={(event) => {
             if (event.key === 'Enter' && !event.shiftKey) {
               event.preventDefault()
-              void resolveInput(event.currentTarget.value)
+              void resolveFromUser(event.currentTarget.value)
             }
           }}
           onPaste={() => {
             // Paste-then-Enter fast path: auto-resolve once the value lands.
             window.setTimeout(() => {
-              void resolveInput(inputRef.current?.value ?? '')
+              void resolveFromUser(inputRef.current?.value ?? '')
             }, 0)
           }}
         />
@@ -1642,7 +1812,7 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
         <button
           type="button"
           data-testid="resume-resolve-button"
-          onClick={() => void resolveInput(input)}
+          onClick={() => void resolveFromUser(input)}
           disabled={phase.kind === 'resolving'}
           className="h-8 px-3 text-xs rounded-md bg-muted/50 hover:bg-muted focus:outline-none focus:ring-1 focus:ring-border disabled:opacity-50"
         >
@@ -1655,9 +1825,26 @@ export function ResumeSessionDialog({ open, onClose, onNavigate }: ResumeSession
             <button
               type="button"
               className="ml-2 underline"
-              onClick={() => void resolveInput(input)}
+              onClick={() => void resolveFromUser(input)}
             >
               Retry now
+            </button>
+          </div>
+        )}
+        {phase.kind === 'index-unavailable' && (
+          <div
+            data-testid="resume-index-unavailable"
+            role="alert"
+            className="text-xs text-destructive"
+          >
+            Session index unavailable — retry manually.
+            <button
+              type="button"
+              data-testid="resume-index-retry"
+              className="ml-2 underline"
+              onClick={() => void resolveFromUser(input)}
+            >
+              Retry
             </button>
           </div>
         )}
@@ -1745,7 +1932,7 @@ the type authority either way.
 - [ ] **Step 9: Run dialog test to verify it passes**
 
 Run: `npm run test:vitest -- --config config/vitest/vitest.config.ts test/unit/client/components/ResumeSessionDialog.test.tsx --run`
-Expected: PASS (8 tests).
+Expected: PASS (9 tests).
 
 - [ ] **Step 10: Commit**
 
@@ -1763,19 +1950,28 @@ git commit -m "feat(client): resume session dialog with resolve flow, disambigua
 - Test: `test/unit/client/components/Sidebar.resume-footer.test.tsx`
 
 **Interfaces:**
-- Consumes: `ResumeSessionDialog` (Task 4); Sidebar's existing `onNavigate` prop and `fullWidth` prop (`fullWidth={isMobile}` is passed from `src/App.tsx` ~line 1755).
+- Consumes: `ResumeSessionDialog` (Task 4); Sidebar's existing `onNavigate` prop and `fullWidth` prop (`fullWidth={isMobile}` is passed from `src/App.tsx` line 1755); `connection.featureFlags` from `src/store/connectionSlice.ts` (:16; populated by `setFeatureFlags` from `/api/bootstrap`, `src/App.tsx:601-602`) — the footer renders only when `featureFlags.sessionResolve === true` (declared by the Node server in Task 3; the Rust server intentionally omits it, hiding the button there). Selector precedent: `src/components/panes/PanePicker.tsx:105`.
 - Produces: data-testids `sidebar-resume-footer` and `sidebar-resume-button`, used by Task 6's Playwright spec.
 
 - [ ] **Step 1: Write the failing test**
 
 Create `test/unit/client/components/Sidebar.resume-footer.test.tsx`. Copy the
-store/render harness from `test/unit/client/components/Sidebar.render-stability.test.tsx`
-(same mocks for `@/lib/ws-client` and `@/lib/api`, same partial `configureStore`,
-same required Sidebar props), then add:
+store/render harness from `test/unit/client/components/Sidebar.mobile.test.tsx`
+(same `react-window`, `@/lib/ws-client` and `@/lib/api` mocks, same
+`createTestStore` built on the real slice reducers, same
+`<Sidebar view="terminal" onNavigate={...} />` render). One required change:
+the preloaded `connection` state must carry the feature flag — preloadedState
+replaces `connectionSlice`'s initial state, so set
+`connection: { status: 'connected', error: null, featureFlags: { sessionResolve: true } }`
+by default and let tests override it. Then add:
 
 ```tsx
-// ...harness copied from Sidebar.render-stability.test.tsx, exposing:
-// renderSidebar(overrides?: Partial<SidebarProps>): ReturnType<typeof render>
+// ...harness copied from Sidebar.mobile.test.tsx, exposing:
+// renderSidebar(
+//   overrides?: Partial<ComponentProps<typeof Sidebar>>,
+//   featureFlags: Record<string, boolean> = { sessionResolve: true },
+// ): ReturnType<typeof render>
+// (featureFlags lands in the preloaded `connection` slice state.)
 
 import { screen } from '@testing-library/react'
 import { fireEvent } from '@testing-library/react'
@@ -1833,6 +2029,14 @@ describe('Sidebar resume footer', () => {
     expect(button.tagName).toBe('BUTTON')
     expect(button).toHaveAccessibleName()
   })
+
+  it('does not render the footer without the sessionResolve feature flag', () => {
+    // e.g. the Rust/Tauri deployments: same client bundle, no resolve
+    // endpoint, and a featureFlags payload that omits the flag.
+    renderSidebar({}, {})
+    expect(screen.queryByTestId('sidebar-resume-footer')).toBeNull()
+    expect(screen.queryByTestId('sidebar-resume-button')).toBeNull()
+  })
 })
 ```
 
@@ -1845,12 +2049,18 @@ Expected: FAIL — `sidebar-resume-footer` not found.
 
 In `src/components/Sidebar.tsx`:
 
-1. Imports + state (top of component, alongside existing `useState` calls):
+1. Imports + state (top of component, alongside existing `useState` calls;
+`useAppSelector` is already imported at `Sidebar.tsx:6`):
 
 ```tsx
 import { ResumeSessionDialog } from '@/components/ResumeSessionDialog'
 // inside the component:
 const [resumeDialogOpen, setResumeDialogOpen] = useState(false)
+// Server-declared capability gate: only the Node server declares
+// `sessionResolve` (Task 3, server/platform-router.ts). The Rust server
+// serves the same bundle WITHOUT the flag or the resolve endpoint, so the
+// footer must not render there.
+const resumeEnabled = useAppSelector((s) => s.connection?.featureFlags?.sessionResolve === true)
 ```
 
 2. Insert at ~line 900 — immediately AFTER the closing `</div>` of the
@@ -1858,21 +2068,23 @@ const [resumeDialogOpen, setResumeDialogOpen] = useState(false)
 `</div>` (~line 901):
 
 ```tsx
-      <div
-        data-testid="sidebar-resume-footer"
-        className="flex-shrink-0 border-t border-border p-2"
-      >
-        <button
-          type="button"
-          data-testid="sidebar-resume-button"
-          aria-label="Resume a session by id"
-          onClick={() => setResumeDialogOpen(true)}
-          className="w-full min-h-11 md:min-h-0 md:h-7 px-2 text-xs bg-muted/50 hover:bg-muted rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+      {resumeEnabled && (
+        <div
+          data-testid="sidebar-resume-footer"
+          className="flex-shrink-0 border-t border-border p-2"
         >
-          Resume session…
-        </button>
-      </div>
-      {resumeDialogOpen && (
+          <button
+            type="button"
+            data-testid="sidebar-resume-button"
+            aria-label="Resume a session by id"
+            onClick={() => setResumeDialogOpen(true)}
+            className="w-full min-h-11 md:min-h-0 md:h-7 px-2 text-xs bg-muted/50 hover:bg-muted rounded-md focus:outline-none focus:ring-1 focus:ring-border"
+          >
+            Resume session…
+          </button>
+        </div>
+      )}
+      {resumeEnabled && resumeDialogOpen && (
         <ResumeSessionDialog
           open
           onClose={() => setResumeDialogOpen(false)}
@@ -1900,7 +2112,7 @@ Expected: PASS.
 
 ```bash
 git add src/components/Sidebar.tsx test/unit/client/components/Sidebar.resume-footer.test.tsx
-git commit -m "feat(sidebar): pinned resume footer below the session list"
+git commit -m "feat(sidebar): flag-gated pinned resume footer below the session list"
 ```
 
 ---
@@ -1909,11 +2121,11 @@ git commit -m "feat(sidebar): pinned resume footer below the session list"
 
 **Files:**
 - Create: `test/e2e-browser/specs/resume-button.spec.ts`
-- Modify: `test/e2e-browser/playwright.config.ts` (add the new spec to `MATRIX_SPECS` so it runs on the chromium project — new specs must be routed deliberately)
 - Modify: `docs/index.html` (one feature line)
+- Deliberately NOT modified: `test/e2e-browser/playwright.config.ts` — see Step 3 (the default `chromium` project picks up unlisted specs automatically; list membership would ADD a guaranteed-red rust run).
 
 **Interfaces:**
-- Consumes: testids from Tasks 4–5 (`sidebar-resume-button`, `resume-dialog`, `resume-input`, `sidebar-session-list`); the harness/helpers of `test/e2e-browser/specs/sidebar-click-resume.spec.ts` (the direct prior art — it already proves a UI click yields `resume <sessionId>` in spawned argv, and shows how to seed sessions and boot the app).
+- Consumes: testids from Tasks 4–5 (`sidebar-resume-button`, `resume-dialog`, `resume-input`, `sidebar-session-list`); the `sessionResolve` feature flag (Task 3 — the harness boots the real Node server, which declares it, so the footer renders); the harness/helpers of `test/e2e-browser/specs/sidebar-click-resume.spec.ts` (the direct prior art — it shows how to seed sessions, boot the app, and prove `resume <sessionId>` argv); the dual-mode codex app-server fixture `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` (see Step 1's root-cause note).
 - Produces: end-user proof of the two spec NFRs jsdom cannot prove: pinned visibility under real scrolling, and the paste→Enter→real-resume path.
 
 - [ ] **Step 1: Study the prior art**
@@ -1932,22 +2144,111 @@ Read `test/e2e-browser/specs/sidebar-click-resume.spec.ts` end-to-end and
   the prior-art spec).
 - Fake CLI + argv proof: the spec-local helpers `installFakeCli(source, binName, binDir)`,
   `bootAndConnect(page, { baseUrl, token })`, `readArgvLog(logPath)`, and the
-  `CODEX_CMD`/`FAKE_*_ARGV_LOG` env wiring. The resume proof is a polled
-  `readArgvLog()` check (e.g. codex: `argv[argv.indexOf('resume') + 1] === ID`)
-  plus `harness.waitForTerminalText('<provider>: resumed session <id>')`.
-- Spec conventions: no `beforeEach` — `test.setTimeout(90_000)` at top; skip logic
-  keyed on the `e2eServerKind` fixture.
+  `CODEX_CMD`/`FAKE_CODEX_ARGV_LOG` env wiring. The resume proof is a polled
+  `readArgvLog()` check (codex: the ADJACENT `'resume', ID` pair anywhere in argv —
+  the launch-arg builder appends `resumeArgs` LAST, after the `--remote`/`-c`
+  overrides) plus the terminal-buffer marker `codex: resumed session <id>`
+  (polled `harness.getTerminalBuffer(terminalId)` or
+  `harness.waitForTerminalText(...)`, `test/e2e-browser/helpers/test-harness.ts:72,132`).
+- Spec conventions: no `beforeEach` — `test.setTimeout(90_000)` at top; every test
+  destructures the `e2eServerKind` fixture and guards itself (Step 2).
+
+**Why the prior art's codex leg is `test.fixme` on legacy — and why THIS spec can
+pass there (root-caused, do not inherit the fixme):** legacy codex terminal-create
+runs `planCodexLaunch` → `runtime.ensureReady`, which spawns the SAME `CODEX_CMD`
+binary as a JSON-RPC sidecar — `CODEX_CMD [..., 'app-server', '--listen', <wsUrl>]`
+(`server/coding-cli/codex-app-server/runtime.ts:1828-1834`; the command comes from
+`CODEX_CMD` at `:1493`) — and requires an `initialize` handshake BEFORE the PTY is
+spawned. The prior art's `fixtures/fake-codex-cli.mjs` only logs argv and never
+listens on the `--listen` URL, so the create settles into `status: 'error'` with no
+terminalId — that is the entire fixme (`sidebar-click-resume.spec.ts:147`), a
+fixture/architecture mismatch, not a server bug. Proof the legacy path goes green
+with the right fake: `test/integration/server/codex-session-flow.test.ts` (passing)
+uses `test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs` as the sidecar,
+and its restore test records PTY argv `['--remote', ws://…, …, 'resume', '<id>']`
+(:719-724). This spec therefore uses a dual-mode CODEX_CMD wrapper (Step 2).
 
 - [ ] **Step 2: Write the failing spec**
 
 Create `test/e2e-browser/specs/resume-button.spec.ts`. Copy the prior-art spec's
-boot/seed/fake-CLI scaffolding verbatim (same imports, same `setupHome` seeding
-blocks, same `installFakeCli` + argv-log wiring), seeding **40+ codex sessions**
-(loop writing `~/.codex/sessions/<uuid>.jsonl`) so the sidebar list scrolls, with
-one known target id `RESUME_ID` among them. Then three `test(...)` blocks:
+boot/seed scaffolding verbatim (same imports, same `setupHome` seeding blocks,
+same argv-log wiring), seeding **40+ codex sessions** (loop writing
+`~/.codex/sessions/<uuid>.jsonl`) so the sidebar list scrolls, with one known
+target id `RESUME_ID` among them — with ONE deliberate difference: do NOT copy
+`fixtures/fake-codex-cli.mjs` as `CODEX_CMD`. Per Step 1's root cause, write a
+dual-mode wrapper into the throwaway bin dir instead and point
+`CODEX_CMD`/`FAKE_CODEX_ARGV_LOG` at it (same env wiring as the prior art):
 
 ```ts
-test('resume button stays visible at top/middle/bottom scroll', async ({ page }) => {
+const FAKE_APP_SERVER_SOURCE = path.resolve(
+  __dirname,
+  '../../fixtures/coding-cli/codex-app-server/fake-app-server.mjs',
+)
+
+/**
+ * Legacy codex terminal-create spawns CODEX_CMD TWICE: first as the JSON-RPC
+ * sidecar (`… app-server --listen <ws>`, runtime.ts:1828-1834) whose
+ * `initialize` handshake gates the PTY spawn, then as the PTY TUI with the
+ * resume argv. fixtures/fake-codex-cli.mjs handles only the second mode —
+ * exactly why the prior art is test.fixme on legacy. This wrapper handles both.
+ */
+async function writeDualModeCodexCli(binDir: string): Promise<string> {
+  await fs.mkdir(binDir, { recursive: true })
+  const target = path.join(binDir, 'codex')
+  const script = `#!/usr/bin/env node
+import { spawn } from 'node:child_process'
+import fs from 'node:fs'
+import path from 'node:path'
+
+const argv = process.argv.slice(2)
+if (argv.includes('app-server')) {
+  // Delegate to the protocol-faithful fixture AT ITS REPO PATH — it has a
+  // bare \`import 'ws'\` that must resolve against the repo's node_modules,
+  // so it cannot be copied into this tmp bin dir.
+  const child = spawn(process.execPath, [${JSON.stringify(FAKE_APP_SERVER_SOURCE)}, ...argv], { stdio: 'inherit' })
+  process.on('SIGTERM', () => child.kill('SIGTERM'))
+  child.on('exit', (code) => process.exit(code ?? 0))
+} else {
+  // TUI mode (the PTY): same contract as fixtures/fake-codex-cli.mjs —
+  // argv-log JSONL + greppable marker + stay alive. Only this mode logs
+  // argv, so the log carries PTY invocations, not sidecar ones.
+  const logPath = process.env.FAKE_CODEX_ARGV_LOG
+  if (logPath) {
+    fs.mkdirSync(path.dirname(logPath), { recursive: true })
+    fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, t: Date.now(), argv }) + '\\n')
+  }
+  const resumeIndex = argv.indexOf('resume')
+  if (resumeIndex !== -1) {
+    process.stdout.write('codex: resumed session ' + (argv[resumeIndex + 1] ?? '') + '\\r\\n')
+  } else {
+    process.stdout.write('codex> \\r\\n')
+  }
+  process.stdin.resume()
+}
+`
+  await fs.writeFile(target, script, 'utf8')
+  await fs.chmod(target, 0o755)
+  return target
+}
+```
+
+(With that wrapper, the legacy PTY argv is `['--remote', ws://…, -c …, 'resume',
+RESUME_ID]` — the resume pair appended LAST — so the argv-pair assertion below
+matches reality; verified against the passing integration test's recorded argv.)
+
+Then three `test(...)` blocks. Every test destructures `e2eServerKind` and guards
+itself — the defensive prior-art pattern (`sidebar-click-resume.spec.ts:288-293`,
+inverted): the button is flag-hidden on Rust AND the Rust server has no resolve
+endpoint, so a future broad-testMatch rust run must skip loudly, not go red:
+
+```ts
+const RUST_SKIP =
+  'KNOWN DIVERGENCE: the Rust server has no POST /api/sessions/resolve and does not ' +
+  'declare the sessionResolve feature flag (button hidden there by design) — ' +
+  'out of scope, see docs/plans/2026-07-29-resume-session-button.md.'
+
+test('resume button stays visible at top/middle/bottom scroll', async ({ page, e2eServerKind }) => {
+  test.skip(e2eServerKind !== 'legacy', RUST_SKIP)
   // boot + connect exactly as sidebar-click-resume.spec.ts does
   const button = page.getByTestId('sidebar-resume-button')
   await expect(button).toBeVisible()
@@ -1963,20 +2264,24 @@ test('resume button stays visible at top/middle/bottom scroll', async ({ page })
   }
 })
 
-test('resume button is visible in fullWidth mobile mode', async ({ page }) => {
+test('resume button is visible in fullWidth mobile mode', async ({ page, e2eServerKind }) => {
+  test.skip(e2eServerKind !== 'legacy', RUST_SKIP)
   await page.setViewportSize({ width: 390, height: 844 })
   // boot + connect, then open the sidebar via the mobile control
   // (testid 'show-sidebar-button' — same approach as mobile-viewport.spec.ts)
   await expect(page.getByTestId('sidebar-resume-button')).toBeVisible()
 })
 
-test('paste-then-Enter resumes the session with the right agent', async ({ page }) => {
+test('paste-then-Enter resumes the session with the right agent', async ({ page, e2eServerKind }) => {
+  test.skip(e2eServerKind !== 'legacy', RUST_SKIP)
   // boot + connect
   await page.getByTestId('sidebar-resume-button').click()
   await expect(page.getByTestId('resume-dialog')).toBeVisible()
   await page.getByTestId('resume-input').fill(RESUME_ID)
   await page.getByTestId('resume-input').press('Enter')
-  // argv proof — identical mechanism to sidebar-click-resume.spec.ts:
+  // argv proof — identical mechanism to sidebar-click-resume.spec.ts (the
+  // adjacent `resume <id>` pair anywhere in argv, since resumeArgs are
+  // appended last):
   await expect
     .poll(async () => {
       const entries = await readArgvLog(argvLogPath)
@@ -1990,14 +2295,25 @@ test('paste-then-Enter resumes the session with the right agent', async ({ page 
 
 The `// boot + connect` lines are the prior-art spec's real setup calls
 (`createE2eServerHandle(...)`, `.start()`, `bootAndConnect(page, {...})`) — lift
-them verbatim, including cleanup in the same style the prior-art spec uses.
+them verbatim, including cleanup in the same style the prior-art spec uses, with
+`env: { CODEX_CMD: <writeDualModeCodexCli result>, FAKE_CODEX_ARGV_LOG: argvLogPath }`.
 
-- [ ] **Step 3: Route the spec**
+- [ ] **Step 3: Verify the spec's routing (no config change)**
 
-Add `'resume-button.spec.ts'` to `MATRIX_SPECS` in
-`test/e2e-browser/playwright.config.ts`, alongside `sidebar-click-resume.spec.ts`
-(same project routing as that spec — chromium; do NOT add to `RUST_ONLY_SPECS`:
-the Rust server has no resolve endpoint, which is out of scope).
+Do NOT touch `test/e2e-browser/playwright.config.ts` — add the spec to NEITHER
+`MATRIX_SPECS` nor `RUST_ONLY_SPECS`. The default `chromium` project has no
+`testMatch` and only `testIgnore: RUST_ONLY_SPECS`
+(playwright.config.ts:190-194), so it picks up any new spec automatically and
+runs it with the fixture-default `e2eServerKind: 'legacy'`
+(`test/e2e-browser/helpers/fixtures.ts:76`) — exactly one local run, like
+`mobile-viewport.spec.ts`. `MATRIX_SPECS` membership would instead ADD
+`legacy-chromium` AND `rust-chromium` runs (playwright.config.ts:199-217); the
+rust leg has no resolve endpoint and would be guaranteed red. The in-spec
+`test.skip(e2eServerKind !== 'legacy', …)` guard from Step 2 is defensive cover
+for any future broad-testMatch rust run.
+
+Verify: `npx playwright test --config test/e2e-browser/playwright.config.ts --list resume-button`
+Expected: 3 tests, all listed under `[chromium]` only.
 
 - [ ] **Step 4: Run the spec**
 
@@ -2032,7 +2348,7 @@ Expected: all PASS, no lint errors (a11y rules are CI-gated on `src/`).
 - [ ] **Step 7: Commit**
 
 ```bash
-git add test/e2e-browser/specs/resume-button.spec.ts test/e2e-browser/playwright.config.ts docs/index.html
+git add test/e2e-browser/specs/resume-button.spec.ts docs/index.html
 git commit -m "test(e2e): resume button pinned placement and paste-to-resume proof"
 ```
 
@@ -2069,5 +2385,9 @@ are consumed with the same names in Tasks 3–4; `ResumeResolveMatch`/`ResumeRes
 (Task 3) match the dialog's usage (Task 4); `resumeSessionInTab(state, dispatch, target, onNavigate)`
 signature is identical in Task 4's helper, its tests, and the dialog;
 `getIndexReadiness`/`resolveOpencodeSessionIds`/`locateClaudeTranscript` dep names
-match between the router deps, the harness, and the `server/index.ts` wiring;
+match between the router deps, the harness, and the `server/index.ts` wiring
+(including the optional `directoriesBySessionId` map in the opencode resolution
+shape, consistent across the provider type, the deps, the engine, and the router
+test fixture); the `sessionResolve` flag name matches between Task 3's
+`detectFeatureFlags()`, Task 5's selector + test harness, and Task 6's skip reason;
 `sidebar-resume-footer`/`sidebar-resume-button` testids match between Task 5 and Task 6.
